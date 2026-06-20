@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: mindhive
+Version: 0.1.0
+Summary: Deterministic event-sourced memory for long-running Claude sessions
+Requires-Python: >=3.11
+Provides-Extra: vectors
+Requires-Dist: chromadb>=0.5; extra == "vectors"
+Requires-Dist: sentence-transformers>=2.2; extra == "vectors"
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
