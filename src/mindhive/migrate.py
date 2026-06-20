@@ -31,7 +31,7 @@ def import_memory_file(path, project=None) -> int:
         m = _DATE.search(block)
         if m:
             last_date = m.group(1)
-        ts = f"{last_date}T00:00:{i % 60:02d}Z"
+        ts = f"{last_date}T{(i // 3600) % 24:02d}:{(i // 60) % 60:02d}:{i % 60:02d}Z"
         events.append_event(_classify(block), {"text": block},
                             session_id="seed-import", tags=["seed"], ts=ts,
                             project=project)

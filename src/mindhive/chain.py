@@ -25,10 +25,14 @@ def write_chain(project=None) -> dict:
 def verify(project=None) -> dict:
     try:
         actual = compute_chain(events.read_all(project))
+    except json.JSONDecodeError as e:
+        return {"ok": False, "reason": "corrupt_event_log", "detail": str(e)}
     except Exception as e:
-        return {"ok": False, "reason": f"read error: {e}"}
+        return {"ok": False, "reason": "read_error", "detail": str(e)}
     p = paths.project_dir(project) / "chain.json"
     if not p.exists():
         return {"ok": False, "reason": "no chain.json (run: hive project)", "actual": actual}
     stored = json.loads(p.read_text(encoding="utf-8"))
-    return {"ok": stored == actual, "stored": stored, "actual": actual}
+    if stored != actual:
+        return {"ok": False, "reason": "hash_mismatch", "stored": stored, "actual": actual}
+    return {"ok": True, "stored": stored, "actual": actual}

@@ -20,7 +20,7 @@ def test_import_splits_into_events(tmp_path, monkeypatch):
     src = tmp_path / "fabio.md"
     src.write_text(SAMPLE, encoding="utf-8")
     n = migrate.import_memory_file(str(src))
-    assert n >= 3
+    assert n == 3
     evs = events.read_all()
     texts = " ".join(e.payload.get("text", "") for e in evs)
     assert "resource exhaustion" in texts

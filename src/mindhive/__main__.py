@@ -14,10 +14,11 @@ def main(argv=None) -> int:
 
     a = sub.add_parser("append", help="append an event")
     a.add_argument("type")
-    a.add_argument("payload")
+    a.add_argument("payload", nargs="?", default=None)
     a.add_argument("--tags", default="")
     a.add_argument("--session", default=None)
     a.add_argument("--json", action="store_true", help="parse payload as JSON dict")
+    a.add_argument("--stdin", action="store_true", help="read payload from stdin")
 
     sub.add_parser("project", help="rebuild projections")
     sub.add_parser("state", help="print STATE.md")
@@ -40,7 +41,14 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "append":
-        payload = json.loads(args.payload) if args.json else {"text": args.payload}
+        if args.stdin:
+            raw = sys.stdin.read()
+        elif args.payload is not None:
+            raw = args.payload
+        else:
+            print("error: provide a payload argument or use --stdin", file=sys.stderr)
+            return 2
+        payload = json.loads(raw) if args.json else {"text": raw}
         tags = [t for t in args.tags.split(",") if t]
         ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
         print(f"appended {ev.type} @ {ev.ts}")

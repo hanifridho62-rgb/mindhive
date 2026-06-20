@@ -81,11 +81,13 @@ def project(project=None) -> dict:
     for fname, content, _ev in entries:
         (ldir / fname).write_text(content, encoding="utf-8")
         keep.add(fname)
+    pruned = 0
     for f in ldir.glob("*.md"):
         if f.name not in keep:
             f.unlink()
+            pruned += 1
 
     (pdir / "index.json").write_text(
         events.canonical_json(build_index(entries)), encoding="utf-8")
     chain.write_chain(project)
-    return {"events": len(evs), "ledger": len(entries)}
+    return {"events": len(evs), "ledger": len(entries), "pruned": pruned}
