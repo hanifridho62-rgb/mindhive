@@ -99,7 +99,8 @@ _RENDERER_JS = r"""
   var W = svg.clientWidth || 800, H = svg.clientHeight || 600;
 
   // Real-time edge "buzz": a subtle perpendicular ripple on every real edge.
-  // AMP = peak px offset, WAVES = ripples per line, SPEED = rad/s (user "speed 2"),
+  // AMP = peak px offset, WAVES = ripples per line, SPEED = angular rate in rad/s
+  // (the "speed 2" chosen on the design mockup maps to ~5.2 rad/s),
   // PHASE = per-edge desync, SAMPLES = polyline resolution of each path.
   var VIBE_AMP = 2, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
       VIBE_SAMPLES = 20;
