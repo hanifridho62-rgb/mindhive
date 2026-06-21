@@ -223,7 +223,7 @@ _RENDERER_JS = r"""
       e.t.vx -= (dx / d) * f; e.t.vy -= (dy / d) * f;
     });
     nodes.forEach(function (n) {
-      n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
+      n.vx += (W / 2 - n.x) * 0.006; n.vy += (H / 2 - n.y) * 0.006;
       // Motion is scaled by alpha so the layout cools to a stop (see below).
       if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
       n.vx *= 0.85; n.vy *= 0.85;
