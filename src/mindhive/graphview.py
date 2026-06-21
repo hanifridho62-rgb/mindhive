@@ -50,6 +50,9 @@ _TEMPLATE = """<!DOCTYPE html>
   #fitbtn:hover { background: #30363d; }
   #panel .chip { display: inline-block; padding: 2px 8px; border-radius: 10px;
     font-size: 11px; margin: 0 4px 4px 0; background: #21262d; color: #c9d1d9; }
+  #panel .body { white-space: pre-wrap; word-break: break-word; background: #0e1116;
+    border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin: 10px 0;
+    max-height: 280px; overflow-y: auto; font-size: 12.5px; color: #c9d1d9; }
 </style>
 </head>
 <body>
@@ -294,10 +297,15 @@ _RENDERER_JS = r"""
     var kindLabel = KIND_LABELS[nodeKey(n)] || nodeKey(n);
     var ts = n.type === "event" ? tsFromLabel(n) : "";
 
-    var html = "<h2>" + esc(n.text ? n.text : n.label) + "</h2>";
+    // Title = a short first-line summary; the full (possibly multi-line) text
+    // lives in a scrollable body block below so big payloads stay readable.
+    var firstLine = n.text ? String(n.text).split("\n")[0] : "";
+    var title = firstLine ? snippet(firstLine, 70) : (n.text ? snippet(n.text, 70) : n.label);
+    var html = "<h2>" + esc(title) + "</h2>";
     html += "<span class=type style=\"background:" + color + "33;color:" + color +
       "\">" + esc(kindLabel) + "</span>";
     if (ts) html += "<div class=rel>" + esc(ts) + "</div>";
+    if (n.text) html += "<div class=body>" + esc(n.text) + "</div>";
     if (tags.length) {
       html += "<h3>Tags</h3>" + tags.map(function (c) {
         return "<span class=chip>" + esc((byId[c.id] && byId[c.id].label) || c.id) +
@@ -338,7 +346,7 @@ _RENDERER_JS = r"""
 
   if (!nodes.length) {
     panel.innerHTML = "<div id=empty>This graph has no nodes yet.<br>" +
-      "Append some events and run <code>hive graph build</code>.</div>";
+      "Append some memory events, then reopen.</div>";
   }
 })();
 """

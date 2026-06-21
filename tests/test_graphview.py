@@ -76,6 +76,14 @@ def test_render_html_uses_node_kind_and_text():
     assert ".text" in html
 
 
+def test_render_html_panel_has_prewrap_body():
+    # Long multi-line payloads must render as a readable, wrapped body block,
+    # not be crammed into the headline.
+    html = graphview.render_html(_graph())
+    assert "pre-wrap" in html
+    assert "class=body" in html
+
+
 from mindhive import events, paths
 
 
