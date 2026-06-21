@@ -177,3 +177,15 @@ def test_related_sorted_by_id(tmp_path, monkeypatch):
     neighbors = related("python", project=None)
     ids = [n["id"] for n in neighbors]
     assert ids == sorted(ids)
+
+
+def test_related_includes_event_text(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    evs = _make_evs()
+    build(project=None, _evs=evs)
+    neighbors = related("decision", project=None)
+    dec = [n for n in neighbors if n["id"] == "ev:2026-06-20T09:02:00Z:decision"]
+    assert dec and dec[0].get("text") == "Use TDD"
+    # nodes without text don't grow a spurious empty field
+    tag = [n for n in neighbors if n["type"] == "tag"]
+    assert all("text" not in n for n in tag)
