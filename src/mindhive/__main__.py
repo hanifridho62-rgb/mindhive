@@ -58,6 +58,19 @@ def main(argv=None) -> int:
     sp.add_argument("--no-briefing", action="store_true",
                     help="omit BRIEFING.md from native MEMORY.md")
 
+    # --- harvest (auto-capture from Claude Code transcripts; no hooks needed) ---
+    hv = sub.add_parser("harvest", help="capture events from Claude Code transcripts")
+    hv.add_argument("--transcripts", required=True)
+    hv.add_argument("--project", required=True)
+
+    # --- autosync (registry-driven: harvest + project + briefing + graph + sync) ---
+    asp = sub.add_parser("autosync", help="automated sync for registered projects")
+    asub = asp.add_subparsers(dest="autosync_cmd", required=False)
+    areg = asub.add_parser("register", help="register a project for autosync")
+    areg.add_argument("--project", required=True)
+    areg.add_argument("--transcripts", required=True)
+    areg.add_argument("--folder", required=True)
+
     args = p.parse_args(argv)
 
     if args.cmd == "append":
@@ -109,6 +122,16 @@ def main(argv=None) -> int:
         folder = args.folder or os.getcwd()
         native_path = sync_mod.sync(folder, include_briefing=not args.no_briefing)
         print(str(native_path))
+    elif args.cmd == "harvest":
+        from . import harvest as harvest_mod
+        print(json.dumps(harvest_mod.harvest(args.transcripts, args.project)))
+    elif args.cmd == "autosync":
+        from . import autosync as autosync_mod
+        if getattr(args, "autosync_cmd", None) == "register":
+            print(json.dumps(autosync_mod.register(args.project, args.transcripts, args.folder),
+                             ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(autosync_mod.run_all(), ensure_ascii=False, indent=2))
     return 0
 
 
