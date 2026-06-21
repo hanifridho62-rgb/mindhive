@@ -65,6 +65,20 @@ def test_build_creates_event_nodes(tmp_path, monkeypatch):
     assert "ev:2026-06-20T09:02:00Z:decision" in node_ids
 
 
+def test_build_event_nodes_carry_kind_and_text(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    evs = _make_evs()
+    g = build(project=None, _evs=evs)
+    nodes = {n["id"]: n for n in g["nodes"]}
+    dec = nodes["ev:2026-06-20T09:02:00Z:decision"]
+    assert dec["kind"] == "decision"
+    assert dec["text"] == "Use TDD"
+    # event without payload text still gets a kind, and no text field
+    ft = nodes["ev:2026-06-20T09:01:00Z:file_touched"]
+    assert ft["kind"] == "file_touched"
+    assert "text" not in ft
+
+
 def test_build_in_session_edges(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     evs = _make_evs()

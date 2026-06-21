@@ -52,6 +52,30 @@ def test_render_html_escapes_script_closing_tag():
     assert "</script><script>" not in html
 
 
+def test_render_html_has_color_legend():
+    html = graphview.render_html(_graph())
+    assert 'id="legend"' in html
+
+
+def test_render_html_has_subtype_color_map():
+    # The renderer bakes a per-kind color map so caveats/decisions look distinct.
+    html = graphview.render_html(_graph())
+    assert "caveat" in html
+    assert "experiment_result" in html
+
+
+def test_render_html_has_zoom_to_fit():
+    html = graphview.render_html(_graph())
+    assert "fitView" in html
+
+
+def test_render_html_uses_node_kind_and_text():
+    # On-canvas labels/colors must be driven by the enriched fields.
+    html = graphview.render_html(_graph())
+    assert ".kind" in html
+    assert ".text" in html
+
+
 from mindhive import events, paths
 
 
