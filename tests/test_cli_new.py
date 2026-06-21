@@ -63,3 +63,15 @@ def test_cli_sync(tmp_path, monkeypatch, capsys):
     assert ret == 0
     out = capsys.readouterr().out
     assert "MEMORY.md" in out
+
+
+def test_graph_export_writes_html(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "Use TDD"},
+                        session_id="sess1", tags=["arch"], ts="2026-06-20T09:02:00Z")
+    from mindhive import paths
+    rc = cli_mod.main(["graph", "export"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "graph.html" in out
+    assert (paths.project_dir() / "graph.html").exists()
