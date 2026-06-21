@@ -48,6 +48,11 @@ need to run `hive graph build` first.
 `hive graph app` opens the same always-fresh view in a native window
 (`pip install -e .[app]`).
 
+Nodes are labelled and coloured by meaning — decisions, caveats (amber),
+experiment results, open questions, etc. — with a colour legend, click-to-inspect
+side panel (full text, timestamp, tags, connections), and a **Fit** button that
+frames the whole graph.
+
 To build a double-click binary for your machine:
 
     pip install -e .[app,build]
