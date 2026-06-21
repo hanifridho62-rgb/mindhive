@@ -94,6 +94,32 @@ def test_render_html_panel_has_prewrap_body():
     assert "class=body" in html
 
 
+def test_render_html_edges_are_vibrating_paths():
+    # Edges render as <path> (so they can bend), not straight <line> elements,
+    # and the open path must be stroked rather than filled.
+    html = graphview.render_html(_graph())
+    assert 'createElementNS(NS, "path")' in html
+    assert 'createElementNS(NS, "line")' not in html
+    assert "fill: none" in html
+
+
+def test_render_html_edges_vibrate_in_realtime():
+    # The buzz is driven by the frame timestamp and is decoupled from the alpha
+    # cooling, so edges keep moving after the layout settles.
+    html = graphview.render_html(_graph())
+    assert "VIBE_AMP" in html
+    assert "VIBE_SPEED" in html
+    assert "VIBE_WAVES" in html
+    assert "now / 1000" in html
+
+
+def test_render_html_edges_reflect_real_connections():
+    # Every vibrating line maps 1:1 to a real data.edges relationship: the
+    # renderer only draws edges whose both endpoints exist — no synthetic lines.
+    html = graphview.render_html(_graph())
+    assert "byId[e.src] && byId[e.dst]" in html
+
+
 from mindhive import events, paths
 
 

@@ -21,7 +21,7 @@ _TEMPLATE = """<!DOCTYPE html>
   #stage { flex: 1; position: relative; }
   svg { width: 100%; height: 100%; display: block; cursor: grab; }
   svg.panning { cursor: grabbing; }
-  .edge { stroke: #30363d; stroke-width: 1; }
+  .edge { stroke: #30363d; stroke-width: 1; fill: none; }
   .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
   .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
   .node.dim circle, .edge.dim { opacity: 0.15; }
@@ -98,6 +98,12 @@ _RENDERER_JS = r"""
   var panel = document.getElementById("panel");
   var W = svg.clientWidth || 800, H = svg.clientHeight || 600;
 
+  // Real-time edge "buzz": a subtle perpendicular ripple on every real edge.
+  // AMP = peak px offset, WAVES = ripples per line, SPEED = rad/s (user "speed 2"),
+  // PHASE = per-edge desync, SAMPLES = polyline resolution of each path.
+  var VIBE_AMP = 2, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
+      VIBE_SAMPLES = 20;
+
   function nodeColor(n) {
     if (n.type === "event") return KIND_COLORS[n.kind] || TYPE_COLORS.event;
     return TYPE_COLORS[n.type] || "#888";
@@ -161,7 +167,7 @@ _RENDERER_JS = r"""
   })();
 
   var edgeEls = edges.map(function (e) {
-    var l = document.createElementNS(NS, "line");
+    var l = document.createElementNS(NS, "path");
     l.setAttribute("class", "edge");
     root.appendChild(l);
     return l;
@@ -202,7 +208,8 @@ _RENDERER_JS = r"""
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
 
-  function tick() {
+  function tick(now) {
+    now = now || 0;
     for (var i = 0; i < nodes.length; i++) {
       var a = nodes[i];
       for (var j = i + 1; j < nodes.length; j++) {
@@ -228,9 +235,25 @@ _RENDERER_JS = r"""
       if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
       n.vx *= 0.85; n.vy *= 0.85;
     });
+    // Edge buzz: rebuild each edge as a perpendicular sine waveform. Driven by
+    // the frame timestamp (not alpha), so edges keep vibrating after the layout
+    // freezes. The sin(pi*s) envelope pins displacement to 0 at both endpoints.
+    var t = now / 1000;
     edges.forEach(function (e, i) {
-      edgeEls[i].setAttribute("x1", e.s.x); edgeEls[i].setAttribute("y1", e.s.y);
-      edgeEls[i].setAttribute("x2", e.t.x); edgeEls[i].setAttribute("y2", e.t.y);
+      var sx = e.s.x, sy = e.s.y, tx = e.t.x, ty = e.t.y;
+      var dx = tx - sx, dy = ty - sy, len = Math.sqrt(dx * dx + dy * dy) || 1;
+      var nx = -dy / len, ny = dx / len;       // unit perpendicular
+      var phase = i * VIBE_PHASE;
+      var d = "M" + sx + " " + sy;
+      for (var k = 1; k <= VIBE_SAMPLES; k++) {
+        var s = k / VIBE_SAMPLES;
+        var env = Math.sin(s * Math.PI);
+        var disp = VIBE_AMP * env *
+          Math.sin(s * Math.PI * VIBE_WAVES + phase + t * VIBE_SPEED);
+        var bx = sx + dx * s, by = sy + dy * s;
+        d += " L" + (bx + nx * disp).toFixed(1) + " " + (by + ny * disp).toFixed(1);
+      }
+      edgeEls[i].setAttribute("d", d);
     });
     nodes.forEach(function (n, i) {
       nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
