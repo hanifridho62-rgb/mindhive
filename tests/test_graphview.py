@@ -50,3 +50,53 @@ def test_render_html_escapes_script_closing_tag():
         "edges": [],
     })
     assert "</script><script>" not in html
+
+
+from mindhive import events, paths
+
+
+def _setup(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
+
+
+def _seed_events():
+    return [
+        events.Event(ts="2026-06-20T09:00:00Z", session_id="sess1",
+                     type="session_start", payload={}, tags=[]),
+        events.Event(ts="2026-06-20T09:02:00Z", session_id="sess1",
+                     type="decision", payload={"text": "Use TDD"}, tags=["arch"]),
+    ]
+
+
+def test_export_writes_graph_html(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from mindhive.graph import build
+    build(project=None, _evs=_seed_events())
+    out = graphview.export(project=None)
+    assert out.exists()
+    assert out.name == "graph.html"
+    html = out.read_text(encoding="utf-8")
+    assert "session:sess1" in html
+
+
+def test_export_builds_graph_if_missing(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    d = paths.events_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    for ev in _seed_events():
+        events.append_event(ev.type, ev.payload, session_id=ev.session_id,
+                            tags=ev.tags, ts=ev.ts)
+    out = graphview.export(project=None)
+    assert out.exists()
+    assert (paths.project_dir() / "graph.json").exists()
+
+
+def test_export_honors_out_path(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from mindhive.graph import build
+    build(project=None, _evs=_seed_events())
+    target = tmp_path / "custom.html"
+    out = graphview.export(project=None, out=str(target))
+    assert out == target
+    assert target.exists()

@@ -1,6 +1,8 @@
 # src/mindhive/graphview.py
 from __future__ import annotations
 import json
+from pathlib import Path
+from . import paths
 
 # Self-contained page: graph data is inlined as JSON; the renderer is a small
 # vanilla-JS SVG force layout. No external (http/https) references, so the file
@@ -246,3 +248,27 @@ def render_html(graph: dict) -> str:
         .replace("__RENDERER_JS__", _RENDERER_JS)   # constant first
         .replace("__GRAPH_JSON__", graph_json)       # user data second
     )
+
+
+def export(project=None, out: str | None = None, semantic: bool = False) -> Path:
+    """Render the project's graph to a standalone graph.html and return its path.
+
+    Loads graph.json (builds it first if missing or if semantic is requested).
+    Writes atomically (tmp + replace), matching graph.json's persistence.
+    """
+    from . import graph as graph_mod
+
+    pdir = paths.project_dir(project)
+    gfile = pdir / "graph.json"
+    if semantic or not gfile.exists():
+        graph_data = graph_mod.build(project=project, semantic=semantic)
+    else:
+        graph_data = json.loads(gfile.read_text(encoding="utf-8"))
+
+    html = render_html(graph_data)
+    dest = Path(out) if out else (pdir / "graph.html")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp.write_text(html, encoding="utf-8")
+    tmp.replace(dest)
+    return dest
