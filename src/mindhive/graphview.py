@@ -243,6 +243,6 @@ def render_html(graph: dict) -> str:
     graph_json = graph_json.replace("</", "<\\/")
     return (
         _TEMPLATE
-        .replace("__GRAPH_JSON__", graph_json)
-        .replace("__RENDERER_JS__", _RENDERER_JS)
+        .replace("__RENDERER_JS__", _RENDERER_JS)   # constant first
+        .replace("__GRAPH_JSON__", graph_json)       # user data second
     )

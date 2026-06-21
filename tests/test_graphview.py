@@ -42,3 +42,11 @@ def test_render_html_empty_graph_is_valid():
     html = graphview.render_html({"nodes": [], "edges": []})
     assert html.startswith("<!DOCTYPE html>")
     assert "</html>" in html
+
+
+def test_render_html_escapes_script_closing_tag():
+    html = graphview.render_html({
+        "nodes": [{"id": "x", "type": "tag", "label": "</script><script>alert(1)"}],
+        "edges": [],
+    })
+    assert "</script><script>" not in html
