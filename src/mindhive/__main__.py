@@ -51,6 +51,14 @@ def main(argv=None) -> int:
     gr.add_argument("query")
     gr.add_argument("--depth", type=int, default=1)
 
+    ge = gsub.add_parser("export", help="write standalone graph.html")
+    ge.add_argument("--out", default=None)
+    ge.add_argument("--semantic", action="store_true")
+    ge.add_argument("--open", dest="open_after", action="store_true",
+                    help="open the file in the default browser")
+
+    gsub.add_parser("app", help="open the desktop graph window")
+
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
     sp.add_argument("--folder", default=None,
@@ -117,6 +125,16 @@ def main(argv=None) -> int:
         elif args.graph_cmd == "related":
             neighbors = graph_mod.related(args.query, depth=args.depth)
             print(json.dumps(neighbors, ensure_ascii=False, indent=2))
+        elif args.graph_cmd == "export":
+            from . import graphview
+            dest = graphview.export(out=args.out, semantic=args.semantic)
+            print(str(dest))
+            if args.open_after:
+                import webbrowser
+                webbrowser.open(dest.as_uri())
+        elif args.graph_cmd == "app":
+            from . import desktop
+            desktop.launch_app()
     elif args.cmd == "sync":
         from . import sync as sync_mod
         folder = args.folder or os.getcwd()
