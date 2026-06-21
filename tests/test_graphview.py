@@ -69,10 +69,16 @@ def _seed_events():
     ]
 
 
+def _append_seed_events():
+    """Append the seed events to disk so export()'s rebuild picks them up."""
+    for ev in _seed_events():
+        events.append_event(ev.type, ev.payload, session_id=ev.session_id,
+                            tags=ev.tags, ts=ev.ts)
+
+
 def test_export_writes_graph_html(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    from mindhive.graph import build
-    build(project=None, _evs=_seed_events())
+    _append_seed_events()
     out = graphview.export(project=None)
     assert out.exists()
     assert out.name == "graph.html"
@@ -121,3 +127,16 @@ def test_launch_app_without_pywebview_raises_clear_error(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     with pytest.raises(RuntimeError, match=r"pip install -e \.\[app\]"):
         desktop.launch_app(project=None)
+
+
+def test_export_reflects_newly_appended_events(tmp_path, monkeypatch):
+    """A second export must show events appended after the first export."""
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "first decision"},
+                        session_id="sess1", tags=["a"], ts="2026-06-20T09:00:00Z")
+    graphview.export(project=None)  # first export (builds + persists graph.json)
+    events.append_event("decision", {"text": "second decision"},
+                        session_id="sess1", tags=["b"], ts="2026-06-20T09:05:00Z")
+    out = graphview.export(project=None)  # must rebuild, not serve stale cache
+    html = out.read_text(encoding="utf-8")
+    assert "ev:2026-06-20T09:05:00Z:decision" in html

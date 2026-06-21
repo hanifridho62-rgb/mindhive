@@ -1,7 +1,6 @@
 # src/mindhive/desktop.py
 from __future__ import annotations
-import json
-from . import paths, graphview
+from . import graphview
 
 
 def _require_webview():
@@ -15,12 +14,9 @@ def _require_webview():
 
 
 def _load_graph(project=None) -> dict:
-    pdir = paths.project_dir(project)
-    gfile = pdir / "graph.json"
-    if not gfile.exists():
-        from . import graph as graph_mod
-        return graph_mod.build(project=project)
-    return json.loads(gfile.read_text(encoding="utf-8"))
+    # Always rebuild from current events so the window is never stale.
+    from . import graph as graph_mod
+    return graph_mod.build(project=project)
 
 
 def launch_app(project=None) -> None:
