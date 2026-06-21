@@ -1,4 +1,10 @@
 ﻿.venv/
+.build-venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# PyInstaller desktop-app build artifacts
+/dist/
+/build/MindHiveGraph/
+/*.spec
