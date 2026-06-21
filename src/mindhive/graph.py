@@ -36,9 +36,12 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
 
-    def add_node(nid: str, ntype: str, label: str):
+    def add_node(nid: str, ntype: str, label: str, **extra):
         if nid not in nodes:
-            nodes[nid] = {"id": nid, "type": ntype, "label": label}
+            node = {"id": nid, "type": ntype, "label": label}
+            # Only attach extra fields that carry a value (keeps nodes lean).
+            node.update({k: v for k, v in extra.items() if v})
+            nodes[nid] = node
 
     def add_edge(src: str, dst: str, rel: str):
         edges.append({"src": src, "dst": dst, "rel": rel})
@@ -47,7 +50,10 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     for ev in evs:
         eid = _ev_id(ev)
         sid = _session_id(ev)
-        add_node(eid, "event", f"{ev.type} @ {ev.ts}")
+        # kind = event subtype (decision/caveat/...); text = payload prose, if any.
+        # These enrich the node so the graph view can label and color by meaning.
+        text = ev.payload.get("text") if isinstance(ev.payload, dict) else None
+        add_node(eid, "event", f"{ev.type} @ {ev.ts}", kind=ev.type, text=text)
         add_node(sid, "session", ev.session_id)
 
         # every event -> session

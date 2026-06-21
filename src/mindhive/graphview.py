@@ -38,12 +38,26 @@ _TEMPLATE = """<!DOCTYPE html>
   #empty { padding: 40px; color: #8b949e; text-align: center; }
   #hint { position: absolute; bottom: 8px; left: 12px; color: #8b949e;
     font-size: 12px; }
+  #legend { position: absolute; top: 10px; left: 10px;
+    background: rgba(22,27,34,0.85); border: 1px solid #30363d; border-radius: 8px;
+    padding: 8px 10px; font-size: 11px; max-width: 200px; }
+  #legend .row { display: flex; align-items: center; margin: 3px 0; }
+  #legend .dot { width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;
+    flex: 0 0 auto; }
+  #fitbtn { position: absolute; top: 10px; right: 10px; background: #21262d;
+    color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+    padding: 4px 12px; cursor: pointer; font: inherit; }
+  #fitbtn:hover { background: #30363d; }
+  #panel .chip { display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; margin: 0 4px 4px 0; background: #21262d; color: #c9d1d9; }
 </style>
 </head>
 <body>
 <div id="app">
   <div id="stage">
     <svg id="svg"></svg>
+    <div id="legend"></div>
+    <button id="fitbtn" title="Fit graph to window">Fit</button>
     <div id="hint">drag nodes &middot; scroll to zoom &middot; drag background to pan &middot; click a node</div>
   </div>
   <div id="panel"><div id="empty">Click a node to inspect it.</div></div>
@@ -58,11 +72,45 @@ __RENDERER_JS__
 
 _RENDERER_JS = r"""
 (function () {
-  var COLORS = { event: "#58a6ff", session: "#3fb950", file: "#d29922", tag: "#bc8cff" };
+  // Color by event subtype (kind) so meaning is visible at a glance; structural
+  // node types (session/file/tag) keep their own distinct hues.
+  var KIND_COLORS = {
+    decision: "#58a6ff", caveat: "#f0883e", experiment_result: "#2ea043",
+    open_question: "#bc8cff", next_step: "#39c5cf", state_set: "#d2a8ff",
+    file_touched: "#6e7681", command_run: "#6e7681", git_diff: "#6e7681",
+    session_start: "#6e7681", session_end: "#6e7681", compaction: "#6e7681"
+  };
+  var TYPE_COLORS = { session: "#e3b341", file: "#768390", tag: "#db61a2",
+                      event: "#58a6ff" };
+  var KIND_LABELS = {
+    decision: "decision", caveat: "caveat", experiment_result: "experiment",
+    open_question: "open question", next_step: "next step", state_set: "state",
+    file_touched: "file touched", command_run: "command", git_diff: "git diff",
+    session_start: "session start", session_end: "session end",
+    compaction: "compaction", session: "session", file: "file", tag: "tag"
+  };
+
   var data = JSON.parse(document.getElementById("graph-data").textContent);
   var svg = document.getElementById("svg");
   var panel = document.getElementById("panel");
   var W = svg.clientWidth || 800, H = svg.clientHeight || 600;
+
+  function nodeColor(n) {
+    if (n.type === "event") return KIND_COLORS[n.kind] || TYPE_COLORS.event;
+    return TYPE_COLORS[n.type] || "#888";
+  }
+  function nodeKey(n) { return n.type === "event" ? (n.kind || "event") : n.type; }
+  function snippet(s, max) {
+    s = String(s).replace(/\s+/g, " ").trim();
+    return s.length > max ? s.slice(0, max - 1) + "…" : s;
+  }
+  function canvasLabel(n) {
+    if (n.type === "event") {
+      var base = KIND_LABELS[n.kind] || n.kind || "event";
+      return n.text ? base + ": " + snippet(n.text, 22) : base;
+    }
+    return snippet(n.label, 26);
+  }
 
   var NS = "http:" + "//www.w3.org/2000/svg";
   var root = document.createElementNS(NS, "g");
@@ -76,7 +124,7 @@ _RENDERER_JS = r"""
 
   var nodes = data.nodes.map(function (n, i) {
     var a = (i / Math.max(1, data.nodes.length)) * 2 * Math.PI;
-    return { id: n.id, type: n.type, label: n.label,
+    return { id: n.id, type: n.type, label: n.label, kind: n.kind, text: n.text,
              x: W / 2 + Math.cos(a) * 180, y: H / 2 + Math.sin(a) * 180,
              vx: 0, vy: 0 };
   });
@@ -91,6 +139,24 @@ _RENDERER_JS = r"""
     (adj[e.dst] = adj[e.dst] || []).push({ id: e.src, rel: e.rel });
   });
 
+  // Legend: one row per node kind/type actually present in this graph.
+  (function buildLegend() {
+    var legend = document.getElementById("legend");
+    if (!legend) return;
+    var seen = {}, rows = [];
+    nodes.forEach(function (n) {
+      var k = nodeKey(n);
+      if (seen[k]) return;
+      seen[k] = true;
+      rows.push({ color: nodeColor(n), label: KIND_LABELS[k] || k });
+    });
+    if (!rows.length) { legend.style.display = "none"; return; }
+    legend.innerHTML = rows.map(function (r) {
+      return "<div class=row><span class=dot style=\"background:" + r.color +
+        "\"></span>" + esc(r.label) + "</div>";
+    }).join("");
+  })();
+
   var edgeEls = edges.map(function (e) {
     var l = document.createElementNS(NS, "line");
     l.setAttribute("class", "edge");
@@ -102,16 +168,36 @@ _RENDERER_JS = r"""
     g.setAttribute("class", "node");
     var c = document.createElementNS(NS, "circle");
     c.setAttribute("r", n.type === "session" ? 9 : 6);
-    c.setAttribute("fill", COLORS[n.type] || "#888");
+    c.setAttribute("fill", nodeColor(n));
     var t = document.createElementNS(NS, "text");
     t.setAttribute("x", 9); t.setAttribute("y", 4);
-    t.textContent = n.label.length > 28 ? n.label.slice(0, 27) + "…" : n.label;
+    t.textContent = canvasLabel(n);
     g.appendChild(c); g.appendChild(t);
     g.addEventListener("mousedown", function (ev) { startDrag(ev, n); });
     g.addEventListener("click", function (ev) { ev.stopPropagation(); select(n); });
     root.appendChild(g);
     return g;
   });
+
+  var frame = 0, fitted = false;
+  function fitView() {
+    if (!nodes.length) return;
+    var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    nodes.forEach(function (n) {
+      minx = Math.min(minx, n.x); maxx = Math.max(maxx, n.x);
+      miny = Math.min(miny, n.y); maxy = Math.max(maxy, n.y);
+    });
+    var pad = 80;
+    var gw = Math.max(1, maxx - minx), gh = Math.max(1, maxy - miny);
+    var k = Math.min((W - pad) / gw, (H - pad) / gh);
+    k = Math.max(0.2, Math.min(2.5, k));
+    view.k = k;
+    view.x = W / 2 - k * (minx + maxx) / 2;
+    view.y = H / 2 - k * (miny + maxy) / 2;
+    applyView();
+  }
+  var fitbtn = document.getElementById("fitbtn");
+  if (fitbtn) fitbtn.addEventListener("click", fitView);
 
   function tick() {
     for (var i = 0; i < nodes.length; i++) {
@@ -145,6 +231,9 @@ _RENDERER_JS = r"""
     nodes.forEach(function (n, i) {
       nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
     });
+    // Auto fit-to-window once the layout has settled (user can refit anytime).
+    frame++;
+    if (!fitted && frame >= 140) { fitted = true; fitView(); }
     requestAnimationFrame(tick);
   }
   if (nodes.length) requestAnimationFrame(tick);
@@ -188,20 +277,44 @@ _RENDERER_JS = r"""
     return { x: (ev.clientX - view.x) / view.k, y: (ev.clientY - view.y) / view.k };
   }
 
+  function tsFromLabel(n) {
+    // Event labels are "type @ timestamp"; pull the timestamp for display.
+    var parts = String(n.label || "").split(" @ ");
+    return parts.length > 1 ? parts[parts.length - 1] : "";
+  }
   function select(n) {
     var conns = (adj[n.id] || []);
-    var connHtml = conns.length
-      ? "<ul>" + conns.map(function (c) {
-          var label = (byId[c.id] && byId[c.id].label) || c.id;
-          return "<li>" + esc(label) + " <span class=rel>(" + esc(c.rel) + ")</span></li>";
+    var tags = conns.filter(function (c) {
+      return byId[c.id] && byId[c.id].type === "tag";
+    });
+    var others = conns.filter(function (c) {
+      return !(byId[c.id] && byId[c.id].type === "tag");
+    });
+    var color = nodeColor(n);
+    var kindLabel = KIND_LABELS[nodeKey(n)] || nodeKey(n);
+    var ts = n.type === "event" ? tsFromLabel(n) : "";
+
+    var html = "<h2>" + esc(n.text ? n.text : n.label) + "</h2>";
+    html += "<span class=type style=\"background:" + color + "33;color:" + color +
+      "\">" + esc(kindLabel) + "</span>";
+    if (ts) html += "<div class=rel>" + esc(ts) + "</div>";
+    if (tags.length) {
+      html += "<h3>Tags</h3>" + tags.map(function (c) {
+        return "<span class=chip>" + esc((byId[c.id] && byId[c.id].label) || c.id) +
+          "</span>";
+      }).join("");
+    }
+    html += "<h3>Connected (" + others.length + ")</h3>";
+    html += others.length
+      ? "<ul>" + others.map(function (c) {
+          var node = byId[c.id];
+          var label = node ? canvasLabel(node) : c.id;
+          return "<li>" + esc(label) + " <span class=rel>(" + esc(c.rel) +
+            ")</span></li>";
         }).join("") + "</ul>"
-      : "<p class=rel>No connections.</p>";
-    panel.innerHTML =
-      "<h2>" + esc(n.label) + "</h2>" +
-      "<span class=type style=\"background:" + (COLORS[n.type] || "#888") + "33;color:" +
-        (COLORS[n.type] || "#888") + "\">" + esc(n.type) + "</span>" +
-      "<div class=rel style=\"word-break:break-all\">" + esc(n.id) + "</div>" +
-      "<h3>Connected (" + conns.length + ")</h3>" + connHtml;
+      : "<p class=rel>No other connections.</p>";
+    panel.innerHTML = html;
+
     nodeEls.forEach(function (el, i) {
       var keep = nodes[i] === n || conns.some(function (c) { return c.id === nodes[i].id; });
       el.classList.toggle("dim", !keep);
