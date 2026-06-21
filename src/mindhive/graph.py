@@ -80,14 +80,31 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
             if set(a.tags or []) & set(b.tags or []):
                 add_edge(_ev_id(a), _ev_id(b), "shares_tag")
 
-    # Optional semantic edges (graceful degradation)
+    # Optional semantic edges (graceful degradation if deps/embeddings absent)
     if semantic:
         try:
-            from . import vectors  # noqa: F401
-            # If vectors available, attempt semantic_near edges
-            # (not wiring full vector lookup here — skip silently if not ready)
+            from . import vectors
+            from .projector import build_ledger_entries
+
+            ledger = build_ledger_entries(evs)  # [(fname, content, ev), ...]
+            fname_to_evid = {fn: _ev_id(ev) for fn, _c, ev in ledger}
+            seen_pairs: set[tuple[str, str]] = set()
+            for fn, _c, ev in ledger:
+                src_id = _ev_id(ev)
+                body = ev.payload.get("text", "") if isinstance(ev.payload, dict) else str(ev.payload)
+                if not body:
+                    continue
+                for hit in vectors.semantic_recall(body, project=project, limit=4):
+                    tgt_id = fname_to_evid.get(hit["file"])
+                    if not tgt_id or tgt_id == src_id:
+                        continue
+                    pair = tuple(sorted((src_id, tgt_id)))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    add_edge(pair[0], pair[1], "semantic_near")
         except Exception:
-            pass
+            pass  # deps missing / LIVE_LOCK / not embedded -> deterministic edges only
 
     result = {
         "nodes": sorted(nodes.values(), key=lambda n: n["id"]),
