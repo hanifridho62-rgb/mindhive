@@ -1,6 +1,7 @@
 # src/mindhive/__main__.py
 import argparse
 import json
+import os
 import sys
 from . import events, projector, chain, paths
 from . import recall as recall_mod
@@ -38,6 +39,25 @@ def main(argv=None) -> int:
     em = sub.add_parser("embed", help="build vector index (on-demand)")
     em.add_argument("--force", action="store_true")
 
+    # --- briefing ---
+    sub.add_parser("briefing", help="build and print BRIEFING.md")
+
+    # --- graph build / graph related ---
+    gp = sub.add_parser("graph", help="knowledge graph commands")
+    gsub = gp.add_subparsers(dest="graph_cmd", required=True)
+    gb = gsub.add_parser("build", help="build graph.json")
+    gb.add_argument("--semantic", action="store_true")
+    gr = gsub.add_parser("related", help="find related nodes")
+    gr.add_argument("query")
+    gr.add_argument("--depth", type=int, default=1)
+
+    # --- sync ---
+    sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
+    sp.add_argument("--folder", default=None,
+                    help="project folder to encode (default: cwd)")
+    sp.add_argument("--no-briefing", action="store_true",
+                    help="omit BRIEFING.md from native MEMORY.md")
+
     args = p.parse_args(argv)
 
     if args.cmd == "append":
@@ -71,6 +91,24 @@ def main(argv=None) -> int:
         print(json.dumps(vectors.embed(force=args.force)))
     elif args.cmd == "selftest":
         return selftest_mod.run()
+    elif args.cmd == "briefing":
+        from .briefing import briefing as build_briefing
+        bpath = build_briefing()
+        print(str(bpath))
+        print(bpath.read_text(encoding="utf-8"))
+    elif args.cmd == "graph":
+        from . import graph as graph_mod
+        if args.graph_cmd == "build":
+            result = graph_mod.build(semantic=args.semantic)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.graph_cmd == "related":
+            neighbors = graph_mod.related(args.query, depth=args.depth)
+            print(json.dumps(neighbors, ensure_ascii=False, indent=2))
+    elif args.cmd == "sync":
+        from . import sync as sync_mod
+        folder = args.folder or os.getcwd()
+        native_path = sync_mod.sync(folder, include_briefing=not args.no_briefing)
+        print(str(native_path))
     return 0
 
 
