@@ -1,0 +1,142 @@
+# src/mindhive/briefing.py
+import re
+from pathlib import Path
+from . import events as ev_mod, paths, projector
+
+
+SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES  # decision, experiment_result, caveat, next_step, open_question, state_set
+_TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set"}
+
+
+def headline(text: str) -> str:
+    """Return first non-empty content line after any frontmatter, collapsed + truncated to 140."""
+    lines = text.splitlines()
+    # Strip frontmatter (--- ... ---)
+    if lines and lines[0].strip() == "---":
+        i = 1
+        while i < len(lines) and lines[i].strip() != "---":
+            i += 1
+        # skip past closing ---
+        lines = lines[i + 1:]
+    # Find first non-empty line
+    first = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            first = stripped
+            break
+    # Collapse whitespace
+    collapsed = re.sub(r"\s+", " ", first).strip()
+    # Truncate
+    if len(collapsed) > 140:
+        return collapsed[:140] + "…"
+    return collapsed
+
+
+def _payload_text(payload) -> str:
+    if isinstance(payload, dict):
+        return payload.get("text", "")
+    return str(payload)
+
+
+def build_briefing(evs) -> str:
+    """Build a Markdown briefing string from a list of Event objects (deterministic)."""
+    lines = ["# PROJECT BRIEFING", ""]
+
+    # --- Current state ---
+    lines.append("## Current state")
+    lines.append("")
+    latest_state = None
+    for ev in evs:
+        if ev.type == "state_set":
+            latest_state = ev
+    if latest_state is None:
+        lines.append("(no state_set yet)")
+    else:
+        s = latest_state.payload
+        lines.append(f"**task:** {s.get('task', '(none)')}")
+        lines.append(f"**verified:** {s.get('verified', '(none)')}")
+        lines.append(f"**next_step:** {s.get('next_step', '(none)')}")
+        oqs = s.get("open_questions") or []
+        lines.append("**open_questions:**")
+        for q in oqs:
+            lines.append(f"- {q}")
+        deferred = s.get("deferred") or []
+        lines.append("**deferred:**")
+        for d in deferred:
+            lines.append(f"- {d}")
+    lines.append("")
+
+    # --- Timeline (full coverage) ---
+    lines.append("## Timeline (full coverage — every entry)")
+    lines.append("")
+    for ev in evs:
+        if ev.type not in _TIMELINE_TYPES:
+            continue
+        text = _payload_text(ev.payload)
+        hl = headline(text)
+        lines.append(f"- {ev.ts} [{ev.type}] {hl}")
+    lines.append("")
+
+    # --- Key decisions ---
+    lines.append("## Key decisions")
+    lines.append("")
+    for ev in evs:
+        if ev.type == "decision":
+            lines.append(f"- {headline(_payload_text(ev.payload))}")
+    lines.append("")
+
+    # --- Lessons & caveats ---
+    lines.append("## Lessons & caveats")
+    lines.append("")
+    for ev in evs:
+        if ev.type == "caveat":
+            lines.append(f"- {headline(_payload_text(ev.payload))}")
+    lines.append("")
+
+    # --- Activity ---
+    lines.append("## Activity (deterministic)")
+    lines.append("")
+    n_file_touched = sum(1 for ev in evs if ev.type == "file_touched")
+    n_command_run = sum(1 for ev in evs if ev.type == "command_run")
+    n_session_start = sum(1 for ev in evs if ev.type == "session_start")
+    lines.append(f"- file_touched: {n_file_touched}")
+    lines.append(f"- command_run: {n_command_run}")
+    lines.append(f"- session_start: {n_session_start}")
+
+    # Collect up to 15 distinct touched file paths
+    seen_paths: list[str] = []
+    seen_set: set[str] = set()
+    for ev in evs:
+        if ev.type == "file_touched":
+            p = ""
+            if isinstance(ev.payload, dict):
+                p = ev.payload.get("path") or ev.payload.get("text") or ""
+            if p and p not in seen_set:
+                seen_set.add(p)
+                seen_paths.append(p)
+                if len(seen_paths) >= 15:
+                    break
+    if seen_paths:
+        lines.append("**touched files:**")
+        for fp in seen_paths:
+            lines.append(f"  - {fp}")
+    lines.append("")
+
+    # Footer
+    lines.append(f"_events: {len(evs)}_")
+
+    return "\n".join(lines) + "\n"
+
+
+def briefing(project=None) -> Path:
+    """Build and write BRIEFING.md to the project dir; return the path."""
+    evs = ev_mod.read_all(project)
+    pdir = paths.project_dir(project)
+    pdir.mkdir(parents=True, exist_ok=True)
+    content = build_briefing(evs)
+    tmp = pdir / "BRIEFING.md.tmp"
+    tmp.write_text(content, encoding="utf-8")
+    dest = pdir / "BRIEFING.md"
+    tmp.replace(dest)
+    return dest
