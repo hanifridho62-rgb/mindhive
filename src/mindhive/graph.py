@@ -1,0 +1,158 @@
+# src/mindhive/graph.py
+from __future__ import annotations
+from collections import defaultdict
+from . import events as ev_mod, paths
+
+
+SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES
+
+
+def _ev_id(ev) -> str:
+    return f"ev:{ev.ts}:{ev.type}"
+
+
+def _session_id(ev) -> str:
+    return f"session:{ev.session_id}"
+
+
+def _file_id(path: str) -> str:
+    return f"file:{path}"
+
+
+def _tag_id(tag: str) -> str:
+    return f"tag:{tag}"
+
+
+def _file_path_from_payload(payload) -> str | None:
+    if isinstance(payload, dict):
+        return payload.get("path") or payload.get("text") or None
+    return None
+
+
+def build(project=None, semantic: bool = False, _evs=None) -> dict:
+    """Build and persist knowledge graph as graph.json; return the dict."""
+    evs = _evs if _evs is not None else ev_mod.read_all(project)
+
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    def add_node(nid: str, ntype: str, label: str):
+        if nid not in nodes:
+            nodes[nid] = {"id": nid, "type": ntype, "label": label}
+
+    def add_edge(src: str, dst: str, rel: str):
+        edges.append({"src": src, "dst": dst, "rel": rel})
+
+    # Build nodes and deterministic edges
+    for ev in evs:
+        eid = _ev_id(ev)
+        sid = _session_id(ev)
+        add_node(eid, "event", f"{ev.type} @ {ev.ts}")
+        add_node(sid, "session", ev.session_id)
+
+        # every event -> session
+        add_edge(eid, sid, "in_session")
+
+        # file_touched -> file node
+        if ev.type == "file_touched":
+            fp = _file_path_from_payload(ev.payload)
+            if fp:
+                fid = _file_id(fp)
+                add_node(fid, "file", fp)
+                add_edge(eid, fid, "touched")
+
+        # tags
+        for tag in (ev.tags or []):
+            tid = _tag_id(tag)
+            add_node(tid, "tag", tag)
+            add_edge(eid, tid, "tagged")
+
+    # Temporal chain: consecutive semantic events -> next
+    sem_evs = [ev for ev in evs if ev.type in SEMANTIC_TYPES]
+    for i in range(len(sem_evs) - 1):
+        add_edge(_ev_id(sem_evs[i]), _ev_id(sem_evs[i + 1]), "next")
+
+    # shares_tag: pairs of semantic events sharing >=1 tag
+    # emit once per unordered pair
+    for i in range(len(sem_evs)):
+        for j in range(i + 1, len(sem_evs)):
+            a, b = sem_evs[i], sem_evs[j]
+            if set(a.tags or []) & set(b.tags or []):
+                add_edge(_ev_id(a), _ev_id(b), "shares_tag")
+
+    # Optional semantic edges (graceful degradation)
+    if semantic:
+        try:
+            from . import vectors  # noqa: F401
+            # If vectors available, attempt semantic_near edges
+            # (not wiring full vector lookup here — skip silently if not ready)
+        except Exception:
+            pass
+
+    result = {
+        "nodes": sorted(nodes.values(), key=lambda n: n["id"]),
+        "edges": edges,
+    }
+
+    # Persist
+    pdir = paths.project_dir(project)
+    pdir.mkdir(parents=True, exist_ok=True)
+    from . import events as ev_mod2  # canonical_json lives here
+    gfile = pdir / "graph.json"
+    tmp = pdir / "graph.json.tmp"
+    tmp.write_text(ev_mod2.canonical_json(result), encoding="utf-8")
+    tmp.replace(gfile)
+
+    return result
+
+
+def related(query: str, project=None, depth: int = 1) -> list[dict]:
+    """Load graph.json (build if missing), return neighbor nodes within depth hops."""
+    import json
+    pdir = paths.project_dir(project)
+    gfile = pdir / "graph.json"
+    if not gfile.exists():
+        build(project=project)
+
+    g = json.loads(gfile.read_text(encoding="utf-8"))
+    nodes_by_id: dict[str, dict] = {n["id"]: n for n in g["nodes"]}
+    edges = g["edges"]
+
+    q = query.lower()
+
+    # Find seed nodes matching query
+    seeds = {nid for nid, n in nodes_by_id.items()
+             if q in nid.lower() or q in n["label"].lower()}
+
+    # BFS up to depth hops
+    visited: set[str] = set(seeds)
+    frontier = set(seeds)
+    for _ in range(depth):
+        next_frontier: set[str] = set()
+        for e in edges:
+            if e["src"] in frontier and e["dst"] not in visited:
+                next_frontier.add(e["dst"])
+            if e["dst"] in frontier and e["src"] not in visited:
+                next_frontier.add(e["src"])
+        frontier = next_frontier
+        visited |= frontier
+
+    # Include all visited nodes (seeds + neighbors) so callers see both the
+    # matched node and its connected nodes within depth hops.
+    neighbor_ids = visited
+
+    result = []
+    for nid in neighbor_ids:
+        if nid not in nodes_by_id:
+            continue
+        n = nodes_by_id[nid]
+        # Find which rel connected it
+        via = ""
+        for e in edges:
+            if (e["src"] in seeds and e["dst"] == nid) or \
+               (e["dst"] in seeds and e["src"] == nid):
+                via = e["rel"]
+                break
+        result.append({"id": n["id"], "type": n["type"], "label": n["label"], "via": via})
+
+    return sorted(result, key=lambda x: x["id"])
