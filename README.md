@@ -41,13 +41,17 @@ any model/client. It is deterministic and costs no API tokens.
 ## Desktop graph app
 
 `hive graph export` writes a single self-contained `graph.html` (data + renderer
-inlined, no network, no keys) you can open in any browser on any PC.
+inlined, no network, no keys) you can open in any browser on any PC. It rebuilds
+the graph from your current events every time, so the view is never stale — no
+need to run `hive graph build` first.
 
-`hive graph app` opens the same view in a native window (`pip install -e .[app]`).
+`hive graph app` opens the same always-fresh view in a native window
+(`pip install -e .[app]`).
 
 To build a double-click binary for your machine:
 
     pip install -e .[app,build]
     python build/build_app.py        # -> dist/MindHiveGraph(.exe)
 
-PyInstaller builds for the OS it runs on. Expected size ~30-50 MB.
+PyInstaller builds for the OS it runs on. The window/exe use `build/icon.ico`.
+Built size is ~13 MB (Windows WebView2 is shared, not bundled).
