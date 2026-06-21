@@ -182,7 +182,7 @@ _RENDERER_JS = r"""
     return g;
   });
 
-  var frame = 0, fitted = false;
+  var fitted = false, alpha = 1;
   function fitView() {
     if (!nodes.length) return;
     var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -224,7 +224,8 @@ _RENDERER_JS = r"""
     });
     nodes.forEach(function (n) {
       n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
-      if (n !== dragging) { n.x += n.vx; n.y += n.vy; }
+      // Motion is scaled by alpha so the layout cools to a stop (see below).
+      if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
       n.vx *= 0.85; n.vy *= 0.85;
     });
     edges.forEach(function (e, i) {
@@ -234,9 +235,11 @@ _RENDERER_JS = r"""
     nodes.forEach(function (n, i) {
       nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
     });
-    // Auto fit-to-window once the layout has settled (user can refit anytime).
-    frame++;
-    if (!fitted && frame >= 140) { fitted = true; fitView(); }
+    // Cool the layout each frame; once it has settled (alpha hits 0) the node
+    // positions are frozen, so a single fit-to-window holds instead of going
+    // stale while the simulation keeps drifting (which clipped the graph).
+    alpha = alpha > 0 ? Math.max(0, alpha - 0.008) : 0;
+    if (!fitted && alpha === 0) { fitted = true; fitView(); }
     requestAnimationFrame(tick);
   }
   if (nodes.length) requestAnimationFrame(tick);
@@ -245,6 +248,7 @@ _RENDERER_JS = r"""
   function startDrag(ev, n) {
     ev.preventDefault(); ev.stopPropagation();
     dragging = n;
+    alpha = Math.max(alpha, 0.3);  // gently reheat so neighbours respond
     var p = toWorld(ev);
     dragOff = { x: p.x - n.x, y: p.y - n.y };
   }

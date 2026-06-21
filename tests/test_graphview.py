@@ -76,6 +76,16 @@ def test_render_html_uses_node_kind_and_text():
     assert ".text" in html
 
 
+def test_render_html_layout_cools_and_fits_on_settle():
+    # Regression: the layout must cool to a stop (alpha) and fit once settled,
+    # not at a fixed frame — otherwise the one-shot fit goes stale while the
+    # simulation keeps drifting and the graph gets clipped off-screen.
+    html = graphview.render_html(_graph())
+    assert "alpha" in html
+    assert "alpha === 0" in html
+    assert "frame >= 140" not in html
+
+
 def test_render_html_panel_has_prewrap_body():
     # Long multi-line payloads must render as a readable, wrapped body block,
     # not be crammed into the headline.
