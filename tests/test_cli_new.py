@@ -77,6 +77,19 @@ def test_graph_export_writes_html(tmp_path, monkeypatch, capsys):
     assert (paths.project_dir() / "graph.html").exists()
 
 
+def test_graph_export_open_invokes_browser(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "Use TDD"},
+                        session_id="sess1", tags=["arch"], ts="2026-06-20T09:02:00Z")
+    import webbrowser
+    opened = {}
+    monkeypatch.setattr(webbrowser, "open",
+                        lambda uri: opened.setdefault("uri", uri))
+    rc = cli_mod.main(["graph", "export", "--open"])
+    assert rc == 0
+    assert "graph.html" in opened.get("uri", "")
+
+
 def test_graph_app_invokes_launch(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     called = {}
