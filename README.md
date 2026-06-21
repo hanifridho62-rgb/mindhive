@@ -8,6 +8,8 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive project` — rebuild STATE.md + LEDGER/ + index.json + chain.json
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
+- `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
+- `hive graph app` — open the desktop graph window (needs `pip install -e .[app]`)
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain
 - `hive embed [--force]` — build the on-demand vector index
@@ -35,3 +37,17 @@ exists (V17 is trading). Override with `--force` only when the box is idle.
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into
 any model/client. It is deterministic and costs no API tokens.
+
+## Desktop graph app
+
+`hive graph export` writes a single self-contained `graph.html` (data + renderer
+inlined, no network, no keys) you can open in any browser on any PC.
+
+`hive graph app` opens the same view in a native window (`pip install -e .[app]`).
+
+To build a double-click binary for your machine:
+
+    pip install -e .[app,build]
+    python build/build_app.py        # -> dist/MindHiveGraph(.exe)
+
+PyInstaller builds for the OS it runs on. Expected size ~30-50 MB.
