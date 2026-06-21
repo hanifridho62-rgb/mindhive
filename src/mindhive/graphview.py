@@ -253,17 +253,14 @@ def render_html(graph: dict) -> str:
 def export(project=None, out: str | None = None, semantic: bool = False) -> Path:
     """Render the project's graph to a standalone graph.html and return its path.
 
-    Loads graph.json (builds it first if missing or if semantic is requested).
-    Writes atomically (tmp + replace), matching graph.json's persistence.
+    Always rebuilds the graph from the current events so the exported view is
+    never stale (build() also persists graph.json). Writes atomically
+    (tmp + replace), matching graph.json's persistence.
     """
     from . import graph as graph_mod
 
     pdir = paths.project_dir(project)
-    gfile = pdir / "graph.json"
-    if semantic or not gfile.exists():
-        graph_data = graph_mod.build(project=project, semantic=semantic)
-    else:
-        graph_data = json.loads(gfile.read_text(encoding="utf-8"))
+    graph_data = graph_mod.build(project=project, semantic=semantic)
 
     html = render_html(graph_data)
     dest = Path(out) if out else (pdir / "graph.html")
