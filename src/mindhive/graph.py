@@ -176,6 +176,9 @@ def related(query: str, project=None, depth: int = 1) -> list[dict]:
                (e["dst"] in seeds and e["src"] == nid):
                 via = e["rel"]
                 break
-        result.append({"id": n["id"], "type": n["type"], "label": n["label"], "via": via})
+        item = {"id": n["id"], "type": n["type"], "label": n["label"], "via": via}
+        if n.get("text"):
+            item["text"] = n["text"]
+        result.append(item)
 
     return sorted(result, key=lambda x: x["id"])
