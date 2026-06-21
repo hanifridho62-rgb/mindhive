@@ -57,6 +57,8 @@ def main(argv=None) -> int:
     ge.add_argument("--open", dest="open_after", action="store_true",
                     help="open the file in the default browser")
 
+    gsub.add_parser("app", help="open the desktop graph window")
+
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
     sp.add_argument("--folder", default=None,
@@ -130,6 +132,9 @@ def main(argv=None) -> int:
             if args.open_after:
                 import webbrowser
                 webbrowser.open(dest.as_uri())
+        elif args.graph_cmd == "app":
+            from . import desktop
+            desktop.launch_app()
     elif args.cmd == "sync":
         from . import sync as sync_mod
         folder = args.folder or os.getcwd()

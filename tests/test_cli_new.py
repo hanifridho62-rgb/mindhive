@@ -75,3 +75,14 @@ def test_graph_export_writes_html(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "graph.html" in out
     assert (paths.project_dir() / "graph.html").exists()
+
+
+def test_graph_app_invokes_launch(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    called = {}
+    import mindhive.desktop as desktop_mod
+    monkeypatch.setattr(desktop_mod, "launch_app",
+                        lambda project=None: called.setdefault("hit", True))
+    rc = cli_mod.main(["graph", "app"])
+    assert rc == 0
+    assert called.get("hit") is True
