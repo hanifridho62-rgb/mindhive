@@ -611,13 +611,35 @@ def render_page(token: str) -> str:
   }
 
   // --- Memory: the semantic layer (decisions/caveats/…) — intent & context ---
+  // MEM_ITEMS caches the last fetch so search/sort repaint instantly without a
+  // round-trip; MEM_QUERY / MEM_SORT live outside the view so the 2.5s live
+  // refresh (which only rewrites #view) preserves what you typed and picked.
+  let MEM_ITEMS = [];
+  let MEM_QUERY = '';
+  let MEM_SORT = 'new';            // 'new' = newest first, 'old' = oldest first
   async function renderMemory(){
     const path = '/api/memory' + (SESSION ? '?session='+encodeURIComponent(SESSION) : '');
-    const items = await apiGet(path);
-    if (!items.length) { showText(SESSION ? 'No memory in this session.'
+    MEM_ITEMS = await apiGet(path);
+    paintMemory();
+  }
+  function paintMemory(){
+    if (!MEM_ITEMS.length) { showText(SESSION ? 'No memory in this session.'
       : 'No memory yet — append a decision / caveat / experiment_result / …'); return; }
+    const q = MEM_QUERY.trim().toLowerCase();
+    let items = MEM_ITEMS;
+    if (q) items = items.filter(m => (
+        (m.text||'')+' '+(m.type||'')+' '+(m.session||'')+' '+(m.project||'')
+        +' '+((m.tags||[]).join(' '))).toLowerCase().includes(q));
+    // ts is an ISO timestamp, so a lexical compare orders it chronologically.
+    items = items.slice().sort((a,b) => MEM_SORT==='new'
+      ? String(b.ts||'').localeCompare(String(a.ts||''))
+      : String(a.ts||'').localeCompare(String(b.ts||'')));
+    if (!items.length) { showHTML('<h2 class="h">No memory matches “'+esc(MEM_QUERY)+'”.</h2>'); return; }
     const showProj = (PROJECT === '*');
-    showHTML('<h2 class="h">'+items.length+' memory item'+(items.length>1?'s':'')
+    const total = MEM_ITEMS.length;
+    const head = q ? items.length+' of '+total+' memory item'+(total>1?'s':'')+' match “'+esc(MEM_QUERY)+'”'
+                   : items.length+' memory item'+(items.length>1?'s':'');
+    showHTML('<h2 class="h">'+head
       + (SESSION ? ' in '+esc(SESSION) : '')+(showProj?' across all projects':'')+'</h2><ul class="hits">'
       + items.map(m => '<li><div class="file">'
           + (showProj && m.project ? esc(m.project)+' · ' : '')
@@ -626,10 +648,20 @@ def render_page(token: str) -> str:
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
   }
+  function onMemSearch(v){ MEM_QUERY = v; paintMemory(); }
+  function toggleMemSort(){
+    MEM_SORT = MEM_SORT==='new' ? 'old' : 'new';
+    document.getElementById('memsort').textContent = MEM_SORT==='new' ? 'newest first' : 'oldest first';
+    paintMemory();
+  }
   function showMemory(){
-    controls.innerHTML = SESSION
-      ? '<div class="row">filtered to session <b>'+esc(SESSION)+'</b> '
-        + '<button onclick="clearSession()">show all</button></div>' : '';
+    controls.innerHTML =
+      (SESSION ? '<div class="row">filtered to session <b>'+esc(SESSION)+'</b> '
+        + '<button onclick="clearSession()">show all</button></div>' : '')
+      + '<div class="row"><input id="memq" placeholder="search memory…" style="min-width:260px" '
+        + 'value="'+escAttr(MEM_QUERY)+'" oninput="onMemSearch(this.value)">'
+      + '<button id="memsort" onclick="toggleMemSort()">'
+        + (MEM_SORT==='new' ? 'newest first' : 'oldest first')+'</button></div>';
     liveFn = renderMemory; run('loading memory', renderMemory);
   }
   function clearSession(){ SESSION = null; showMemory(); }
