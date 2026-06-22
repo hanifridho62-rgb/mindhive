@@ -80,3 +80,24 @@ def test_recall_endpoint_returns_list():
         assert isinstance(obj, list)
     finally:
         server.shutdown()
+
+
+def test_graph_endpoint_returns_html():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/api/graph", token)
+        assert status == 200
+        assert "<" in body
+    finally:
+        server.shutdown()
+
+
+def test_plugins_recommend_returns_json():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/api/plugins/recommend", token)
+        assert status == 200
+        obj = json.loads(body)
+        assert isinstance(obj, dict)
+    finally:
+        server.shutdown()

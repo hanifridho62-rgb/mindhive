@@ -10,6 +10,10 @@ from urllib.parse import urlparse, parse_qs
 
 from . import paths, chain
 from . import recall as recall_mod
+from . import graph as graph_mod
+from . import graphview
+from . import plugins as plugins_mod
+from . import export as export_mod
 from .briefing import briefing as build_briefing
 
 
@@ -61,6 +65,21 @@ def make_handler(token: str):
                     force = (qs.get("force") or ["0"])[0] in ("1", "true")
                     hits = recall_mod.recall(q, semantic=semantic, limit=limit, force=force)
                     return self._json(list(hits))
+                if route == "/api/graph":
+                    html = graphview.render_html(graph_mod.build())
+                    return self._send(200, html, "text/html; charset=utf-8")
+                if route == "/api/plugins/recommend":
+                    return self._json(plugins_mod.latest_catalog() or {})
+                if route == "/api/export":
+                    path = export_mod.export()
+                    data = path.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                    self.send_header("Content-Disposition", 'attachment; filename="handoff.md"')
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
             except Exception as e:  # never crash the server
                 return self._json({"ok": False, "error": str(e)}, 200)
             return self._json({"ok": False, "error": "not found"}, 404)
