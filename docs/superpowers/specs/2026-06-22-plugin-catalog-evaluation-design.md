@@ -66,6 +66,7 @@ This mirrors the existing module-per-concern layout (`recall.py`, `export.py`, `
 ```
 {
   "scanned_at": "<iso>",
+  "engine": "claude-opus-4-8",   # sole AI behind the curated notes (provenance)
   "cache_dir": "<path>",
   "counts": {"plugins_total": N, "free": F, "paid": P, "skills_total": S},
   "free_plugins":   [ <plugin dict incl. score + skills> ],

@@ -15,8 +15,9 @@ def _print_recommendations(payload: dict, scanned: bool) -> None:
         print(f"scanned {c.get('plugins_total', 0)} plugins "
               f"({c.get('free', 0)} free, {c.get('paid', 0)} paid, "
               f"{c.get('skills_total', 0)} skills) -> stored plugin_catalog")
+    engine = payload.get("engine", "claude-opus-4-8")
     print(f"\nTop {len(payload.get('recommendations', []))} free plugins "
-          f"(by breadth score):")
+          f"recommended by {engine} (by breadth score):")
     for i, r in enumerate(payload.get("recommendations", []), 1):
         print(f"  {i}. {r['name']}  [score {r['breadth_score']:g}]")
         if r.get("note"):

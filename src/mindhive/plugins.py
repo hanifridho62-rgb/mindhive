@@ -14,6 +14,11 @@ from pathlib import Path
 
 from . import events as ev_mod, paths
 
+# The sole AI behind this evaluation. The curated notes below are authored by
+# Claude Opus 4.8 and the snapshot is stamped with this id for provenance; no
+# other model is ever consulted (the scan/score pipeline is fully deterministic).
+ENGINE = "claude-opus-4-8"
+
 # Breadth weight: distinct-topic spread is worth this many "extra triggers".
 # Kept as a named constant so the ranking is easy to tune and audit.
 BREADTH_WEIGHT = 1.0
@@ -214,6 +219,7 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
 
     return {
         "scanned_at": ev_mod.now_iso(),
+        "engine": ENGINE,
         "cache_dir": str(Path(cache_dir) if cache_dir
                          else Path.home() / ".claude" / "plugins" / "cache"),
         "counts": {

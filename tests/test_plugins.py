@@ -112,3 +112,11 @@ def test_evaluate_empty_cache(tmp_path):
     payload = plugins.evaluate(tmp_path / "nope")
     assert payload["counts"]["plugins_total"] == 0
     assert payload["recommendations"] == []
+    # provenance is stamped even on an empty scan
+    assert payload["engine"] == "claude-opus-4-8"
+
+
+def test_evaluate_stamps_engine(tmp_path):
+    cache = make_cache(tmp_path)
+    payload = plugins.evaluate(cache)
+    assert payload["engine"] == plugins.ENGINE == "claude-opus-4-8"
