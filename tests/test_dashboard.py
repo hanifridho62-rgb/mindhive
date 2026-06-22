@@ -48,3 +48,35 @@ def test_api_requires_token():
             assert e.code == 403
     finally:
         server.shutdown()
+
+
+def test_state_endpoint_returns_text():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/api/state", token)
+        assert status == 200
+        assert isinstance(body, str)
+    finally:
+        server.shutdown()
+
+
+def test_verify_endpoint_returns_json():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/api/verify", token)
+        assert status == 200
+        obj = json.loads(body)
+        assert isinstance(obj, dict)
+    finally:
+        server.shutdown()
+
+
+def test_recall_endpoint_returns_list():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/api/recall?q=anything", token)
+        assert status == 200
+        obj = json.loads(body)
+        assert isinstance(obj, list)
+    finally:
+        server.shutdown()
