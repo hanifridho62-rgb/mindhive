@@ -332,6 +332,70 @@ def test_project_scoping_isolates_overview():
         server.shutdown()
 
 
+def test_hivemind_overview_aggregates_all_projects():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "decision", "payload": "a", "project": "alpha"}, token)
+        _post(base, "/api/append", {"type": "file_touched", "payload": "x.py", "project": "alpha"}, token)
+        _post(base, "/api/append", {"type": "caveat", "payload": "b", "project": "beta"}, token)
+        status, body = _get(base, "/api/overview?project=*", token)
+        o = json.loads(body)
+        assert o["events"] == 3                      # alpha(2) + beta(1)
+        assert o["memory_events"] == 2               # decision + caveat
+        assert o["auto_events"] == 1                 # file_touched
+        assert o["projects"] == 2
+    finally:
+        server.shutdown()
+
+
+def test_hivemind_memory_spans_projects_and_labels_them():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "decision", "payload": "from-alpha", "project": "alpha"}, token)
+        _post(base, "/api/append", {"type": "caveat", "payload": "from-beta", "project": "beta"}, token)
+        status, body = _get(base, "/api/memory?project=*", token)
+        items = json.loads(body)
+        projs = {m["project"] for m in items}
+        assert projs == {"alpha", "beta"}
+        assert {m["text"] for m in items} == {"from-alpha", "from-beta"}
+    finally:
+        server.shutdown()
+
+
+def test_hivemind_projects_endpoint_exposes_unified_totals():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "decision", "payload": "a", "project": "alpha"}, token)
+        _post(base, "/api/append", {"type": "decision", "payload": "b", "project": "beta"}, token)
+        status, body = _get(base, "/api/projects", token)
+        data = json.loads(body)
+        assert data["hivemind"]["events"] == 2
+        assert data["hivemind"]["id"] == "*"
+    finally:
+        server.shutdown()
+
+
+def test_hivemind_append_is_rejected():
+    server, base, token = _start()
+    try:
+        status, obj = _post(base, "/api/append",
+                            {"type": "decision", "payload": "nope", "project": "*"}, token)
+        assert obj["ok"] is False
+        assert "HIVE MIND" in obj["error"]
+    finally:
+        server.shutdown()
+
+
+def test_page_has_hivemind_picker():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/")
+        assert 'value="*"' in body or "hivemind" in body
+        assert "all projects" in body.lower()
+    finally:
+        server.shutdown()
+
+
 def test_page_has_project_and_memory_controls():
     server, base, token = _start()
     try:

@@ -95,6 +95,36 @@ def default_project() -> str:
     return paths.detect_project()
 
 
+# --- HIVE MIND: one unified view across every project --------------------
+# Selecting project="*" in the panel aggregates all namespaces into a single
+# stream — every session, log, memory and bit of context unified. It's a
+# read-only lens; mutating actions still need a concrete target project.
+ALL_TOKENS = {"*", "__all__", "all"}
+HIVEMIND_LABEL = "⨁ HIVE MIND (all projects)"
+HIVEMIND_PROJECT = "__hivemind__"   # synthetic namespace for the unified graph cache
+
+
+def is_all(proj) -> bool:
+    return proj in ALL_TOKENS
+
+
+def all_event_pairs() -> list:
+    """(project_name, Event) across every namespace, ordered oldest→newest."""
+    pairs = []
+    for name in _all_projects():
+        for ev in events.read_all(name):
+            pairs.append((name, ev))
+    pairs.sort(key=lambda pe: pe[1].ts or "")
+    return pairs
+
+
+def _safe_chain_ok(name: str) -> bool:
+    try:
+        return bool(chain.verify(name).get("ok"))
+    except Exception:
+        return False
+
+
 def make_handler(token: str):
     class DashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep the console quiet
@@ -132,25 +162,57 @@ def make_handler(token: str):
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             qs = parse_qs(parsed.query)
             proj = (qs.get("project") or [None])[0] or default_project()
+            am = is_all(proj)
             try:
                 if route == "/api/projects":
                     stats = [_project_stats(n) for n in _all_projects()]
                     stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
-                    return self._json({"projects": stats,
-                                       "default": default_project(),
-                                       "current": proj})
+                    total = {"name": HIVEMIND_LABEL, "id": "*",
+                             "events": sum(s["events"] for s in stats),
+                             "memory": sum(s["memory"] for s in stats),
+                             "auto": sum(s["auto"] for s in stats),
+                             "sessions": sum(s["sessions"] for s in stats)}
+                    return self._json({"projects": stats, "hivemind": total,
+                                       "default": default_project(), "current": proj})
                 if route == "/api/state":
+                    if am:
+                        return self._send(200, "HIVE MIND unifies every project — pick a single "
+                                          "project to read its STATE.md.", "text/plain; charset=utf-8")
                     p = paths.project_dir(proj) / "STATE.md"
                     text = p.read_text(encoding="utf-8") if p.exists() else "(no STATE.md — run project)"
                     return self._send(200, text, "text/plain; charset=utf-8")
                 if route == "/api/briefing":
+                    if am:
+                        return self._send(200, "HIVE MIND unifies every project — pick a single "
+                                          "project for its briefing.", "text/plain; charset=utf-8")
                     bpath = build_briefing(proj)
                     return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
                 if route == "/api/verify":
+                    if am:
+                        per = {n: _safe_chain_ok(n) for n in _all_projects()}
+                        return self._json({"ok": all(per.values()) if per else False, "per_project": per})
                     return self._json(chain.verify(proj))
                 if route == "/api/overview":
+                    if am:
+                        pairs = all_event_pairs()
+                        by_type, sessions, mem, auto = {}, set(), 0, 0
+                        for name, ev in pairs:
+                            by_type[ev.type] = by_type.get(ev.type, 0) + 1
+                            sessions.add((name, ev.session_id))
+                            if ev.type in events.SEMANTIC_TYPES:
+                                mem += 1
+                            else:
+                                auto += 1
+                        names = _all_projects()
+                        return self._json({
+                            "project": HIVEMIND_LABEL, "projects": len(names),
+                            "events": len(pairs), "memory_events": mem, "auto_events": auto,
+                            "sessions": len(sessions), "by_type": by_type,
+                            "last_ts": pairs[-1][1].ts if pairs else None,
+                            "chain_ok": all(_safe_chain_ok(n) for n in names) if names else False,
+                        })
                     evs = events.read_all(proj)
-                    by_type: dict = {}
+                    by_type = {}
                     sessions, mem, auto = set(), 0, 0
                     for ev in evs:
                         by_type[ev.type] = by_type.get(ev.type, 0) + 1
@@ -173,23 +235,37 @@ def make_handler(token: str):
                     # the semantic subset only — the intent/context layer
                     session = (qs.get("session") or [None])[0]
                     limit = int((qs.get("limit") or ["200"])[0])
+                    if am:
+                        rows = [(n, e) for n, e in all_event_pairs()
+                                if e.type in events.SEMANTIC_TYPES]
+                        if session:
+                            rows = [(n, e) for n, e in rows if e.session_id == session]
+                        rows = list(reversed(rows))[:limit]
+                        return self._json([
+                            {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
+                             "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
+                             "tags": e.tags}
+                            for n, e in rows
+                        ])
                     evs = [e for e in events.read_all(proj) if e.type in events.SEMANTIC_TYPES]
                     if session:
                         evs = [e for e in evs if e.session_id == session]
                     evs = list(reversed(evs))[:limit]      # newest first
                     return self._json([
-                        {"ts": e.ts, "type": e.type, "session": e.session_id,
+                        {"ts": e.ts, "type": e.type, "session": e.session_id, "project": proj,
                          "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
                          "tags": e.tags}
                         for e in evs
                     ])
                 if route == "/api/sessions":
                     by: dict = {}
-                    for e in events.read_all(proj):
-                        s = by.get(e.session_id)
+                    src = all_event_pairs() if am else [(proj, e) for e in events.read_all(proj)]
+                    for name, e in src:
+                        key = (name, e.session_id)
+                        s = by.get(key)
                         if s is None:
-                            s = by[e.session_id] = {"session_id": e.session_id, "events": 0,
-                                                    "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
+                            s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
+                                           "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
                         s["events"] += 1
                         if e.type in events.SEMANTIC_TYPES:
                             s["memory"] += 1
@@ -204,12 +280,29 @@ def make_handler(token: str):
                     semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
                     limit = int((qs.get("limit") or ["10"])[0])
                     force = (qs.get("force") or ["0"])[0] in ("1", "true")
-                    hits = recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)
-                    return self._json(list(hits))
+                    if am:
+                        hits = []
+                        for n in _all_projects():
+                            for h in recall_mod.recall(q, project=n, semantic=semantic, limit=limit, force=force):
+                                h = dict(h)
+                                h["project"] = n
+                                hits.append(h)
+                        return self._json(hits)
+                    return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
                 if route == "/api/graph":
-                    html = graphview.render_html(graph_mod.build(proj))
+                    if am:
+                        evs = [e for _, e in all_event_pairs()]
+                        html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs))
+                    else:
+                        html = graphview.render_html(graph_mod.build(proj))
                     return self._send(200, html, "text/html; charset=utf-8")
                 if route == "/api/plugins/recommend":
+                    if am:
+                        for n in _all_projects():
+                            cat = plugins_mod.latest_catalog(n)
+                            if cat:
+                                return self._json(cat)
+                        return self._json({})
                     return self._json(plugins_mod.latest_catalog(proj) or {})
                 if route == "/api/export":
                     path = export_mod.export()
@@ -232,6 +325,14 @@ def make_handler(token: str):
             try:
                 body = self._body()
                 proj = body.get("project") or default_project()
+                if is_all(proj):
+                    if route == "/api/project":
+                        res = {n: projector.project(n) for n in _all_projects()}
+                        return self._json({"ok": True, "result": res})
+                    if route != "/api/selftest":   # selftest is global; everything else needs a target
+                        return self._json({"ok": False, "error":
+                            "HIVE MIND is a unified read-only view across all projects — "
+                            "pick a specific project for this action."}, 200)
                 if route == "/api/append":
                     etype = body.get("type")
                     text = body.get("payload", "")
@@ -461,11 +562,14 @@ def render_page(token: str) -> str:
       const data = await apiGet('/api/projects');
       const sel = document.getElementById('proj');
       const cur = PROJECT || data.current || data.default || '';
-      const opts = (data.projects || []);
-      sel.innerHTML = opts.length
-        ? opts.map(p => '<option value="'+escAttr(p.name)+'"'+(p.name===cur?' selected':'')
-            +'>'+esc(p.name)+' ('+p.events+')</option>').join('')
-        : '<option value="">(no projects)</option>';
+      let html = '';
+      if (data.hivemind) {                       // unified view, always first
+        html += '<option value="*"'+(cur==='*'?' selected':'')+'>'
+              + esc(data.hivemind.name)+' ('+data.hivemind.events+')</option>';
+      }
+      html += (data.projects || []).map(p => '<option value="'+escAttr(p.name)+'"'
+          +(p.name===cur?' selected':'')+'>'+esc(p.name)+' ('+p.events+')</option>').join('');
+      sel.innerHTML = html || '<option value="">(no projects)</option>';
       PROJECT = cur;
     } catch(_) { /* keep server default */ }
   }
@@ -490,6 +594,7 @@ def render_page(token: str) -> str:
     showHTML(
       '<h2 class="h">'+esc(o.project)+'</h2>'
       + '<div class="cards">'
+      + (o.projects != null ? '<div class="card"><div class="big">'+o.projects+'</div><div class="lbl">projects</div></div>' : '')
       + '<div class="card"><div class="big">'+o.events+'</div><div class="lbl">events</div></div>'
       + '<div class="card"><div class="big ok">'+(o.memory_events ?? '—')+'</div><div class="lbl">memory</div></div>'
       + '<div class="card"><div class="big">'+(o.auto_events ?? '—')+'</div><div class="lbl">session / auto</div></div>'
@@ -505,9 +610,12 @@ def render_page(token: str) -> str:
     const items = await apiGet(path);
     if (!items.length) { showText(SESSION ? 'No memory in this session.'
       : 'No memory yet — append a decision / caveat / experiment_result / …'); return; }
+    const showProj = (PROJECT === '*');
     showHTML('<h2 class="h">'+items.length+' memory item'+(items.length>1?'s':'')
-      + (SESSION ? ' in '+esc(SESSION) : '')+'</h2><ul class="hits">'
-      + items.map(m => '<li><div class="file">'+esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
+      + (SESSION ? ' in '+esc(SESSION) : '')+(showProj?' across all projects':'')+'</h2><ul class="hits">'
+      + items.map(m => '<li><div class="file">'
+          + (showProj && m.project ? esc(m.project)+' · ' : '')
+          + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
@@ -526,7 +634,7 @@ def render_page(token: str) -> str:
     if (!items.length) { showText('No sessions yet.'); return; }
     showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
       + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
-          + '<div class="file">'+esc(s.session_id)+'</div>'
+          + '<div class="file">'+(PROJECT==='*' && s.project ? esc(s.project)+' · ' : '')+esc(s.session_id)+'</div>'
           + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
           + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
       + '</ul>');

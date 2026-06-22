@@ -93,6 +93,15 @@ stay legible:
 Every endpoint takes a `?project=` (GET) / `"project"` (POST) parameter, so the
 same running server serves any namespace; the picker just drives that.
 
+**HIVE MIND — one unified view.** The first entry in the project picker
+(`⨁ HIVE MIND (all projects)`, internally `project=*`) aggregates **every**
+project into a single stream: all sessions, logs, memory and context unified.
+Overview sums events/memory/sessions across the whole store (plus a project
+count); Memory, Sessions, Recall and the Graph span all namespaces and label
+each item with its project; Verify reports per-project chain status. It's a
+read-only lens — mutating actions (append, sync, embed, scans) still need a
+concrete target project, so select one first.
+
 `hive graph export` still writes a single self-contained `graph.html` (data +
 renderer inlined, no network, no keys) you can open in any browser on any PC.
 Nodes are labelled and coloured by meaning — decisions, caveats (amber),
