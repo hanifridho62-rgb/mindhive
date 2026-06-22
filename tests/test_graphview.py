@@ -176,27 +176,6 @@ def test_export_honors_out_path(tmp_path, monkeypatch):
     assert target.exists()
 
 
-import builtins
-import pytest
-
-
-def test_launch_app_without_pywebview_raises_clear_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-    from mindhive import desktop
-
-    real_import = builtins.__import__
-
-    def fake_import(name, *a, **k):
-        if name == "webview":
-            raise ImportError("no webview")
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    with pytest.raises(RuntimeError, match=r"pip install -e \.\[app\]"):
-        desktop.launch_app(project=None)
-
-
 def test_export_reflects_newly_appended_events(tmp_path, monkeypatch):
     """A second export must show events appended after the first export."""
     _setup(tmp_path, monkeypatch)

@@ -72,8 +72,6 @@ def main(argv=None) -> int:
     ge.add_argument("--open", dest="open_after", action="store_true",
                     help="open the file in the default browser")
 
-    gsub.add_parser("app", help="open the desktop graph window")
-
     # --- plugins (scan free skills/plugins, score, recommend) ---
     pl = sub.add_parser("plugins", help="catalog & recommend free skills/plugins")
     plsub = pl.add_subparsers(dest="plugins_cmd", required=True)
@@ -88,6 +86,12 @@ def main(argv=None) -> int:
                     help="project folder to encode (default: cwd)")
     sp.add_argument("--no-briefing", action="store_true",
                     help="omit BRIEFING.md from native MEMORY.md")
+
+    # --- dashboard (one-window control panel; powers MindHive.exe) ---
+    dp = sub.add_parser("dashboard", help="open the web control panel for all features")
+    dp.add_argument("--port", type=int, default=0, help="port (default: a free one)")
+    dp.add_argument("--no-browser", dest="no_browser", action="store_true",
+                    help="don't auto-open the browser")
 
     # --- harvest (auto-capture from Claude Code transcripts; no hooks needed) ---
     hv = sub.add_parser("harvest", help="capture events from Claude Code transcripts")
@@ -155,9 +159,9 @@ def main(argv=None) -> int:
             if args.open_after:
                 import webbrowser
                 webbrowser.open(dest.as_uri())
-        elif args.graph_cmd == "app":
-            from . import desktop
-            desktop.launch_app()
+    elif args.cmd == "dashboard":
+        from . import dashboard
+        dashboard.serve(port=args.port, open_browser=not args.no_browser)
     elif args.cmd == "plugins":
         from . import plugins as plugins_mod
         if args.plugins_cmd == "scan":

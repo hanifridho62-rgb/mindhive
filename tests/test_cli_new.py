@@ -123,12 +123,10 @@ def test_cli_plugins_recommend_without_scan(tmp_path, monkeypatch, capsys):
     assert "run: hive plugins scan" in out
 
 
-def test_graph_app_invokes_launch(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_dashboard_subcommand_parses(monkeypatch):
     called = {}
-    import mindhive.desktop as desktop_mod
-    monkeypatch.setattr(desktop_mod, "launch_app",
-                        lambda project=None: called.setdefault("hit", True))
-    rc = cli_mod.main(["graph", "app"])
+    import mindhive.dashboard as dash
+    monkeypatch.setattr(dash, "serve", lambda **kw: called.update(kw))
+    rc = cli_mod.main(["dashboard", "--no-browser", "--port", "8123"])
     assert rc == 0
-    assert called.get("hit") is True
+    assert called == {"port": 8123, "open_browser": False}
