@@ -4,7 +4,18 @@ import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
 
+import pytest
+
 from mindhive import dashboard
+
+
+@pytest.fixture(autouse=True)
+def _isolate_store(tmp_path, monkeypatch):
+    """Point every dashboard test at a throwaway store so the live ~/.mindhive
+    ledger is never touched. paths.* read these env vars at call time, and the
+    handler runs in-process, so the server threads see the same isolation."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
 
 def _start():

@@ -8,3 +8,5 @@ Requires-Dist: chromadb>=0.5; extra == "vectors"
 Requires-Dist: sentence-transformers>=2.2; extra == "vectors"
 Provides-Extra: dev
 Requires-Dist: pytest>=8; extra == "dev"
+Provides-Extra: build
+Requires-Dist: pyinstaller>=6; extra == "build"
