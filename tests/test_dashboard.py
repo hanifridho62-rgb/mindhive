@@ -252,3 +252,91 @@ def test_token_is_persisted_and_stable(tmp_path, monkeypatch):
 def test_token_env_overrides_file(monkeypatch):
     monkeypatch.setenv("MINDHIVE_DASHBOARD_TOKEN", "fixed-env-token")
     assert dashboard.load_or_create_token() == "fixed-env-token"
+
+
+# --------------------------------------------------------------------------
+# Project / session / memory separation
+# --------------------------------------------------------------------------
+
+def test_projects_endpoint_lists_namespaces_with_stats():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "decision", "payload": "a", "project": "alpha"}, token)
+        _post(base, "/api/append", {"type": "decision", "payload": "b", "project": "alpha"}, token)
+        _post(base, "/api/append", {"type": "decision", "payload": "c", "project": "beta"}, token)
+        status, obj = _get(base, "/api/projects", token)
+        assert status == 200
+        data = json.loads(obj)
+        names = {p["name"]: p for p in data["projects"]}
+        assert "alpha" in names and "beta" in names
+        assert names["alpha"]["events"] == 2
+        assert data["default"] == "alpha"          # richest wins
+    finally:
+        server.shutdown()
+
+
+def test_overview_separates_memory_from_auto():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "decision", "payload": "intent", "project": "p"}, token)
+        _post(base, "/api/append", {"type": "file_touched", "payload": "x.py", "project": "p"}, token)
+        status, body = _get(base, "/api/overview?project=p", token)
+        o = json.loads(body)
+        assert o["events"] == 2
+        assert o["memory_events"] == 1             # decision only
+        assert o["auto_events"] == 1               # file_touched
+    finally:
+        server.shutdown()
+
+
+def test_memory_endpoint_returns_semantic_only():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "caveat", "payload": "watch out", "project": "p"}, token)
+        _post(base, "/api/append", {"type": "command_run", "payload": "ls", "project": "p"}, token)
+        status, body = _get(base, "/api/memory?project=p", token)
+        items = json.loads(body)
+        assert len(items) == 1
+        assert items[0]["type"] == "caveat"
+        assert items[0]["text"] == "watch out"
+    finally:
+        server.shutdown()
+
+
+def test_sessions_endpoint_groups_by_session(monkeypatch):
+    server, base, token = _start()
+    try:
+        monkeypatch.setenv("MINDHIVE_SESSION", "sess-1")
+        _post(base, "/api/append", {"type": "decision", "payload": "one", "project": "p"}, token)
+        monkeypatch.setenv("MINDHIVE_SESSION", "sess-2")
+        _post(base, "/api/append", {"type": "decision", "payload": "two", "project": "p"}, token)
+        _post(base, "/api/append", {"type": "file_touched", "payload": "y.py", "project": "p"}, token)
+        status, body = _get(base, "/api/sessions?project=p", token)
+        sessions = {s["session_id"]: s for s in json.loads(body)}
+        assert set(sessions) == {"sess-1", "sess-2"}
+        assert sessions["sess-2"]["events"] == 2
+        assert sessions["sess-2"]["memory"] == 1   # only the decision counts as memory
+    finally:
+        server.shutdown()
+
+
+def test_project_scoping_isolates_overview():
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "decision", "payload": "only-A", "project": "A"}, token)
+        status, body = _get(base, "/api/overview?project=B", token)
+        o = json.loads(body)
+        assert o["project"] == "B"
+        assert o["events"] == 0                     # A's event must not leak into B
+    finally:
+        server.shutdown()
+
+
+def test_page_has_project_and_memory_controls():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/")
+        for needle in ['id="proj"', "onProjChange", "showMemory", "showSessions", "/api/projects"]:
+            assert needle in body, f"missing: {needle}"
+    finally:
+        server.shutdown()

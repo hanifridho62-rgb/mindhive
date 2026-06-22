@@ -72,11 +72,26 @@ override the token with the `MINDHIVE_DASHBOARD_TOKEN` env var. If the port is
 already bound (the dashboard is already running), a second launch just reopens
 that same URL instead of failing.
 
-The panel updates in **real time**: the Overview and State views auto-refresh
-every few seconds and the moment you append a memory, so new events — including
-ones written by another session or hook — appear without a manual reload. A
-`● live` toggle in the header pauses/resumes it; polling also pauses while the
-tab is hidden.
+The panel updates in **real time**: the Overview, Memory, Sessions and State
+views auto-refresh every few seconds and the moment you append a memory, so new
+events — including ones written by another session or hook — appear without a
+manual reload. A `● live` toggle in the header pauses/resumes it; polling also
+pauses while the tab is hidden.
+
+**Project → Session → Memory.** A **project** picker in the header switches which
+store namespace the page shows (it defaults to the one with the most events, so
+a fresh launch lands on real data rather than an empty cwd-derived namespace).
+Within a project the panel keeps three layers distinct so intent and context
+stay legible:
+- **Memory** — the semantic events you/Claude author (decision, caveat,
+  experiment_result, next_step, open_question, state_set): the intent layer.
+- **Sessions** — each append stream (`session_id`); click one to scope Memory to it.
+- **session / auto** — deterministic telemetry (file_touched, command_run,
+  session_start/end, …), counted separately on the Overview so it never drowns
+  out the memory.
+
+Every endpoint takes a `?project=` (GET) / `"project"` (POST) parameter, so the
+same running server serves any namespace; the picker just drives that.
 
 `hive graph export` still writes a single self-contained `graph.html` (data +
 renderer inlined, no network, no keys) you can open in any browser on any PC.

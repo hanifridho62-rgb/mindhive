@@ -54,6 +54,47 @@ from . import sync as sync_mod
 from .briefing import briefing as build_briefing
 
 
+# --- project / session / memory separation -------------------------------
+# A "project" is a store namespace; a "session" is one append stream
+# (session_id) within it; "memory" is the semantic subset of events (decisions,
+# caveats, …) as opposed to deterministic session telemetry. Keeping the three
+# distinct is what makes intent and context legible at a glance.
+
+def _all_projects() -> list:
+    """Names of every store namespace that has an events log."""
+    home = paths.store_home()
+    names = []
+    if home.exists():
+        for d in sorted(home.iterdir()):
+            if d.is_dir() and (d / "events").is_dir():
+                names.append(d.name)
+    return names
+
+
+def _project_stats(name: str) -> dict:
+    evs = events.read_all(name)
+    sessions, mem, auto = set(), 0, 0
+    for ev in evs:
+        sessions.add(ev.session_id)
+        if ev.type in events.SEMANTIC_TYPES:
+            mem += 1
+        else:
+            auto += 1
+    return {"name": name, "events": len(evs), "memory": mem, "auto": auto,
+            "sessions": len(sessions), "last_ts": evs[-1].ts if evs else None}
+
+
+def default_project() -> str:
+    """The project the panel opens on: the one with the most events (so a fresh
+    launch shows real data, not an empty cwd-derived namespace). Falls back to
+    the cwd-detected project when the store is empty."""
+    stats = [s for s in (_project_stats(n) for n in _all_projects()) if s["events"] > 0]
+    if stats:
+        stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
+        return stats[0]["name"]
+    return paths.detect_project()
+
+
 def make_handler(token: str):
     class DashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep the console quiet
@@ -90,40 +131,86 @@ def make_handler(token: str):
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             qs = parse_qs(parsed.query)
+            proj = (qs.get("project") or [None])[0] or default_project()
             try:
+                if route == "/api/projects":
+                    stats = [_project_stats(n) for n in _all_projects()]
+                    stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
+                    return self._json({"projects": stats,
+                                       "default": default_project(),
+                                       "current": proj})
                 if route == "/api/state":
-                    p = paths.project_dir() / "STATE.md"
+                    p = paths.project_dir(proj) / "STATE.md"
                     text = p.read_text(encoding="utf-8") if p.exists() else "(no STATE.md — run project)"
                     return self._send(200, text, "text/plain; charset=utf-8")
                 if route == "/api/briefing":
-                    bpath = build_briefing()
+                    bpath = build_briefing(proj)
                     return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
                 if route == "/api/verify":
-                    return self._json(chain.verify())
+                    return self._json(chain.verify(proj))
                 if route == "/api/overview":
-                    evs = events.read_all()
+                    evs = events.read_all(proj)
                     by_type: dict = {}
+                    sessions, mem, auto = set(), 0, 0
                     for ev in evs:
                         by_type[ev.type] = by_type.get(ev.type, 0) + 1
+                        sessions.add(ev.session_id)
+                        if ev.type in events.SEMANTIC_TYPES:
+                            mem += 1
+                        else:
+                            auto += 1
                     return self._json({
-                        "project": paths.project_dir().name,
+                        "project": proj,
                         "events": len(evs),
+                        "memory_events": mem,
+                        "auto_events": auto,
+                        "sessions": len(sessions),
                         "by_type": by_type,
                         "last_ts": evs[-1].ts if evs else None,
-                        "chain_ok": bool(chain.verify().get("ok")),
+                        "chain_ok": bool(chain.verify(proj).get("ok")),
                     })
+                if route == "/api/memory":
+                    # the semantic subset only — the intent/context layer
+                    session = (qs.get("session") or [None])[0]
+                    limit = int((qs.get("limit") or ["200"])[0])
+                    evs = [e for e in events.read_all(proj) if e.type in events.SEMANTIC_TYPES]
+                    if session:
+                        evs = [e for e in evs if e.session_id == session]
+                    evs = list(reversed(evs))[:limit]      # newest first
+                    return self._json([
+                        {"ts": e.ts, "type": e.type, "session": e.session_id,
+                         "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
+                         "tags": e.tags}
+                        for e in evs
+                    ])
+                if route == "/api/sessions":
+                    by: dict = {}
+                    for e in events.read_all(proj):
+                        s = by.get(e.session_id)
+                        if s is None:
+                            s = by[e.session_id] = {"session_id": e.session_id, "events": 0,
+                                                    "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
+                        s["events"] += 1
+                        if e.type in events.SEMANTIC_TYPES:
+                            s["memory"] += 1
+                        if e.ts and e.ts < s["first_ts"]:
+                            s["first_ts"] = e.ts
+                        if e.ts and e.ts > s["last_ts"]:
+                            s["last_ts"] = e.ts
+                    out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
+                    return self._json(out)
                 if route == "/api/recall":
                     q = (qs.get("q") or [""])[0]
                     semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
                     limit = int((qs.get("limit") or ["10"])[0])
                     force = (qs.get("force") or ["0"])[0] in ("1", "true")
-                    hits = recall_mod.recall(q, semantic=semantic, limit=limit, force=force)
+                    hits = recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)
                     return self._json(list(hits))
                 if route == "/api/graph":
-                    html = graphview.render_html(graph_mod.build())
+                    html = graphview.render_html(graph_mod.build(proj))
                     return self._send(200, html, "text/html; charset=utf-8")
                 if route == "/api/plugins/recommend":
-                    return self._json(plugins_mod.latest_catalog() or {})
+                    return self._json(plugins_mod.latest_catalog(proj) or {})
                 if route == "/api/export":
                     path = export_mod.export()
                     data = path.read_bytes()
@@ -144,34 +231,36 @@ def make_handler(token: str):
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
                 body = self._body()
+                proj = body.get("project") or default_project()
                 if route == "/api/append":
                     etype = body.get("type")
                     text = body.get("payload", "")
                     tags = [t for t in (body.get("tags") or "").split(",") if t]
                     if not etype:
                         return self._json({"ok": False, "error": "type is required"}, 200)
-                    ev = events.append_event(etype, {"text": text}, tags=tags)
-                    projector.project()
-                    return self._json({"ok": True, "type": ev.type, "ts": ev.ts})
+                    ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
+                    projector.project(proj)
+                    return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
                 if route == "/api/project":
-                    return self._json({"ok": True, "result": projector.project()})
+                    return self._json({"ok": True, "result": projector.project(proj)})
                 if route == "/api/sync":
                     import os
-                    path = sync_mod.sync(os.getcwd())
+                    path = sync_mod.sync(os.getcwd(), project=proj)
                     return self._json({"ok": True, "path": str(path)})
                 if route == "/api/embed":
                     force = bool(body.get("force", False))
                     guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
                     from . import vectors
-                    return self._json({"ok": True, "result": vectors.embed(force=force)})
+                    return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
                 if route == "/api/plugins/scan":
-                    result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)))
+                    result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
                     return self._json({"ok": True, "result": result})
                 if route == "/api/plugins/autoscan":
                     res = plugins_mod.ensure_fresh(
                         top_n=int(body.get("top", 5)),
                         max_age_hours=float(body.get("max_age_hours", 24)),
                         force=bool(body.get("force", False)),
+                        project=proj,
                     )
                     return self._json({"ok": True, "scanned": res["scanned"],
                                        "age_hours": res["age_hours"], "result": res["payload"]})
@@ -207,6 +296,8 @@ def render_page(token: str) -> str:
   header #live.paused { color:#6b7488; }
   header #live .blip { animation: pulse 1.6s infinite; }
   header #synced { font-size:11px; color:#6b7488; min-width:118px; text-align:right; }
+  header #projwrap { font-size:12px; color:#9aa3b8; display:flex; align-items:center; gap:6px; }
+  header #projwrap select { padding:3px 6px; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 50px); }
   nav { background:#141722; border-right:1px solid #2a2f3d; padding:12px; }
@@ -244,12 +335,17 @@ def render_page(token: str) -> str:
   <h1>MIND HIVE</h1>
   <span id="busy" class="dot"></span>
   <span id="status">ready</span>
+  <label id="projwrap" title="Which project's memory to show">project
+    <select id="proj" onchange="onProjChange()"></select></label>
   <span id="live" title="Real-time updates — click to pause/resume" onclick="toggleLive()"><span class="blip">&#9679;</span> live</span>
   <span id="synced"></span>
 </header>
 <main>
   <nav>
     <button onclick="showOverview()">Overview</button>
+    <div class="group">Memory</div>
+    <button onclick="showMemory()">Memory</button>
+    <button onclick="showSessions()">Sessions</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -339,15 +435,45 @@ def render_page(token: str) -> str:
     }
   }
 
+  // --- project / session scoping ---
+  // PROJECT is the selected store namespace ('' = server's default, the
+  // richest one). SESSION optionally narrows the Memory view to one session.
+  let PROJECT = localStorage.getItem('mh_project') || '';
+  let SESSION = null;
+  function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+  function withProj(path){
+    return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
+  }
   async function apiGet(path){
-    const r = await fetch(u(path), { headers: { 'X-Hive-Token': TOKEN } });
+    const r = await fetch(u(withProj(path)), { headers: { 'X-Hive-Token': TOKEN } });
     const ct = r.headers.get('content-type') || '';
     return ct.includes('json') ? r.json() : r.text();
   }
   async function apiPost(path, body){
-    const r = await fetch(u(path), { method:'POST', headers:{ 'Content-Type':'application/json',
-      'X-Hive-Token': TOKEN }, body: JSON.stringify(body || {}) });
+    const b = Object.assign({}, body || {});
+    if (PROJECT) b.project = PROJECT;
+    const r = await fetch(u(withProj(path)), { method:'POST', headers:{ 'Content-Type':'application/json',
+      'X-Hive-Token': TOKEN }, body: JSON.stringify(b) });
     return r.json();
+  }
+  async function loadProjects(){
+    try {
+      const data = await apiGet('/api/projects');
+      const sel = document.getElementById('proj');
+      const cur = PROJECT || data.current || data.default || '';
+      const opts = (data.projects || []);
+      sel.innerHTML = opts.length
+        ? opts.map(p => '<option value="'+escAttr(p.name)+'"'+(p.name===cur?' selected':'')
+            +'>'+esc(p.name)+' ('+p.events+')</option>').join('')
+        : '<option value="">(no projects)</option>';
+      PROJECT = cur;
+    } catch(_) { /* keep server default */ }
+  }
+  function onProjChange(){
+    PROJECT = document.getElementById('proj').value;
+    localStorage.setItem('mh_project', PROJECT);
+    SESSION = null;
+    showOverview();
   }
   // wrap any async unit of work with busy state + error handling
   async function run(label, fn){
@@ -365,10 +491,49 @@ def render_page(token: str) -> str:
       '<h2 class="h">'+esc(o.project)+'</h2>'
       + '<div class="cards">'
       + '<div class="card"><div class="big">'+o.events+'</div><div class="lbl">events</div></div>'
+      + '<div class="card"><div class="big ok">'+(o.memory_events ?? '—')+'</div><div class="lbl">memory</div></div>'
+      + '<div class="card"><div class="big">'+(o.auto_events ?? '—')+'</div><div class="lbl">session / auto</div></div>'
+      + '<div class="card"><div class="big">'+(o.sessions ?? '—')+'</div><div class="lbl">sessions</div></div>'
       + '<div class="card"><div>'+chip+'</div><div class="lbl">hash chain</div></div>'
       + '<div class="card"><div class="big" style="font-size:15px">'+esc(o.last_ts || '—')+'</div><div class="lbl">last activity</div></div>'
       + '</div><div class="types">'+types+'</div>');
   }
+
+  // --- Memory: the semantic layer (decisions/caveats/…) — intent & context ---
+  async function renderMemory(){
+    const path = '/api/memory' + (SESSION ? '?session='+encodeURIComponent(SESSION) : '');
+    const items = await apiGet(path);
+    if (!items.length) { showText(SESSION ? 'No memory in this session.'
+      : 'No memory yet — append a decision / caveat / experiment_result / …'); return; }
+    showHTML('<h2 class="h">'+items.length+' memory item'+(items.length>1?'s':'')
+      + (SESSION ? ' in '+esc(SESSION) : '')+'</h2><ul class="hits">'
+      + items.map(m => '<li><div class="file">'+esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
+          + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
+          + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
+      + '</ul>');
+  }
+  function showMemory(){
+    controls.innerHTML = SESSION
+      ? '<div class="row">filtered to session <b>'+esc(SESSION)+'</b> '
+        + '<button onclick="clearSession()">show all</button></div>' : '';
+    liveFn = renderMemory; run('loading memory', renderMemory);
+  }
+  function clearSession(){ SESSION = null; showMemory(); }
+
+  // --- Sessions: the episode layer; click one to scope Memory to it ---
+  async function renderSessions(){
+    const items = await apiGet('/api/sessions');
+    if (!items.length) { showText('No sessions yet.'); return; }
+    showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
+      + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
+          + '<div class="file">'+esc(s.session_id)+'</div>'
+          + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
+          + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
+      + '</ul>');
+    view.querySelectorAll('.sessrow').forEach(el => el.onclick = () => openSession(el.dataset.sid));
+  }
+  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
+  function openSession(sid){ SESSION = sid; showMemory(); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }
@@ -444,8 +609,8 @@ def render_page(token: str) -> str:
     run(label+' running…', async () => showText(await apiPost(path, body)));
   }
 
-  // land on the overview
-  showOverview();
+  // populate the project picker, then land on the overview
+  (async () => { await loadProjects(); showOverview(); })();
 </script>
 </body></html>""".replace("__TOKEN__", json.dumps(token))
 
