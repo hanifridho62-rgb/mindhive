@@ -230,3 +230,25 @@ def test_page_has_feature_controls():
         assert "fetch(" in body
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------
+# Stable URL: fixed port + persisted token
+# --------------------------------------------------------------------------
+
+def test_default_port_is_fixed():
+    assert dashboard.DEFAULT_PORT == 54461
+
+
+def test_token_is_persisted_and_stable(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_DASHBOARD_TOKEN", raising=False)
+    t1 = dashboard.load_or_create_token()
+    t2 = dashboard.load_or_create_token()
+    assert t1 and t1 == t2                     # identical across launches
+    # and it's actually on disk under the store home
+    assert dashboard._token_path().read_text(encoding="utf-8").strip() == t1
+
+
+def test_token_env_overrides_file(monkeypatch):
+    monkeypatch.setenv("MINDHIVE_DASHBOARD_TOKEN", "fixed-env-token")
+    assert dashboard.load_or_create_token() == "fixed-env-token"

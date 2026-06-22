@@ -96,7 +96,8 @@ def main(argv=None) -> int:
 
     # --- dashboard (one-window control panel; powers MindHive.exe) ---
     dp = sub.add_parser("dashboard", help="open the web control panel for all features")
-    dp.add_argument("--port", type=int, default=0, help="port (default: a free one)")
+    dp.add_argument("--port", type=int, default=None,
+                    help="port (default: fixed 54461 for a stable URL; pass 0 for an ephemeral port)")
     dp.add_argument("--no-browser", dest="no_browser", action="store_true",
                     help="don't auto-open the browser")
 

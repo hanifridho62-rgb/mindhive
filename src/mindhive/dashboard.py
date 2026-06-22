@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import webbrowser
@@ -9,6 +10,39 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import paths, chain
+
+# A fixed default port + a token persisted under the store home keep the
+# dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
+DEFAULT_PORT = 54461
+
+
+def _token_path():
+    return paths.store_home() / "dashboard.token"
+
+
+def load_or_create_token() -> str:
+    """Return a stable dashboard token so the URL doesn't change between
+    launches. Resolution order: MINDHIVE_DASHBOARD_TOKEN env → persisted file →
+    freshly generated (and then persisted). Best-effort: a read/write failure
+    falls back to an in-memory token rather than crashing the launch."""
+    env = os.environ.get("MINDHIVE_DASHBOARD_TOKEN")
+    if env:
+        return env
+    p = _token_path()
+    try:
+        if p.exists():
+            tok = p.read_text(encoding="utf-8").strip()
+            if tok:
+                return tok
+    except Exception:
+        pass
+    tok = secrets.token_urlsafe(16)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(tok, encoding="utf-8")
+    except Exception:
+        pass
+    return tok
 from . import guard
 from . import recall as recall_mod
 from . import graph as graph_mod
@@ -416,11 +450,28 @@ def render_page(token: str) -> str:
 </body></html>""".replace("__TOKEN__", json.dumps(token))
 
 
-def serve(port: int = 0, open_browser: bool = True) -> None:
-    """Start the dashboard, open the browser, and serve until interrupted."""
-    token = secrets.token_urlsafe(16)
+def serve(port: int | None = None, open_browser: bool = True,
+          token: str | None = None) -> None:
+    """Start the dashboard on a fixed port with a persisted token so the URL is
+    stable across launches, open the browser, and serve until interrupted.
+
+    ``port=None`` uses the fixed DEFAULT_PORT; pass ``port=0`` for an ephemeral
+    port. If the fixed port is already bound (the dashboard is likely already
+    running), this reopens that same stable URL and returns instead of crashing.
+    """
+    if port is None:
+        port = DEFAULT_PORT
+    token = token or load_or_create_token()
     handler = make_handler(token)
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except OSError as e:
+        url = f"http://127.0.0.1:{port}/?token={token}"
+        print(f"MIND HIVE dashboard could not bind port {port}: {e}", flush=True)
+        print(f"It may already be running — opening {url}", flush=True)
+        if open_browser:
+            webbrowser.open(url)
+        return
     actual = server.server_address[1]
     url = f"http://127.0.0.1:{actual}/?token={token}"
     print(f"MIND HIVE dashboard: {url}", flush=True)

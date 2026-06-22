@@ -64,6 +64,14 @@ browser to a control panel for every feature — view state/briefing/graph, run
 recall, append memories, project, sync, verify, export, embed, and plugins
 scan. The graph is one of its views.
 
+**The URL is stable across launches.** It binds a fixed port (**54461**) and a
+token persisted to `~/.mindhive/dashboard.token`, so every launch (CLI or
+`MindHive.exe`) serves the same `http://127.0.0.1:54461/?token=…` — bookmark it
+once. Override the port with `--port N`, or use `--port 0` for an ephemeral one;
+override the token with the `MINDHIVE_DASHBOARD_TOKEN` env var. If the port is
+already bound (the dashboard is already running), a second launch just reopens
+that same URL instead of failing.
+
 The panel updates in **real time**: the Overview and State views auto-refresh
 every few seconds and the moment you append a memory, so new events — including
 ones written by another session or hook — appear without a manual reload. A
@@ -81,5 +89,5 @@ To build a double-click binary (Windows, Python 3.12):
     pip install -e .[build]
     python build/build_app.py        # -> dist/MindHive.exe
 
-The exe runs a small console window showing the URL; close it to stop the server.
-The window/exe use `build/icon.ico`.
+The exe runs a small console window showing the (stable) URL; close it to stop
+the server. The window/exe use `build/icon.ico`.
