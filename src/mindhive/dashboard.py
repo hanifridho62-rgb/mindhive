@@ -66,6 +66,18 @@ def make_handler(token: str):
                     return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
                 if route == "/api/verify":
                     return self._json(chain.verify())
+                if route == "/api/overview":
+                    evs = events.read_all()
+                    by_type: dict = {}
+                    for ev in evs:
+                        by_type[ev.type] = by_type.get(ev.type, 0) + 1
+                    return self._json({
+                        "project": paths.project_dir().name,
+                        "events": len(evs),
+                        "by_type": by_type,
+                        "last_ts": evs[-1].ts if evs else None,
+                        "chain_ok": bool(chain.verify().get("ok")),
+                    })
                 if route == "/api/recall":
                     q = (qs.get("q") or [""])[0]
                     semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
@@ -139,55 +151,103 @@ def render_page(token: str) -> str:
 <title>MIND HIVE</title>
 <style>
   :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
   body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background:#11131a; color:#e6e8ef; }
-  header { padding: 14px 20px; background:#171a23; border-bottom:1px solid #2a2f3d; }
-  header h1 { margin:0; font-size:18px; letter-spacing:.5px; }
-  main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 52px); }
+  header { padding: 12px 20px; background:#171a23; border-bottom:1px solid #2a2f3d;
+    display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:5; }
+  header h1 { margin:0; font-size:17px; letter-spacing:.5px; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#3a4054; }
+  header .dot.busy { background:#e0b341; animation: pulse 1s infinite; }
+  header .dot.ok { background:#46c46a; }
+  header #status { font-size:12px; color:#9aa3b8; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 50px); }
   nav { background:#141722; border-right:1px solid #2a2f3d; padding:12px; }
+  nav .group { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:#6b7488;
+    margin:14px 6px 4px; }
   nav button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
     background:#1d2230; color:#e6e8ef; border:1px solid #2a2f3d; border-radius:6px; cursor:pointer; }
-  nav button:hover { background:#262d3d; }
+  nav button:hover:not(:disabled) { background:#262d3d; }
+  nav button:disabled { opacity:.45; cursor:wait; }
   section.panel { padding:18px 22px; }
   pre#out { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px;
-    padding:14px; min-height:120px; max-height:60vh; overflow:auto; }
-  iframe#graph { width:100%; height:70vh; border:1px solid #2a2f3d; border-radius:8px; background:#fff; }
+    padding:14px; min-height:120px; max-height:62vh; overflow:auto; }
+  iframe#graph { width:100%; height:72vh; border:1px solid #2a2f3d; border-radius:8px; background:#fff; }
   input, select, textarea { background:#0c0e14; color:#e6e8ef; border:1px solid #2a2f3d;
-    border-radius:6px; padding:6px 8px; }
+    border-radius:6px; padding:6px 8px; font:inherit; }
   .row { margin:8px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .hidden { display:none; }
   .err { color:#ff8a8a; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
+  .card { background:#0c0e14; border:1px solid #2a2f3d; border-radius:10px; padding:14px 16px; }
+  .card .big { font-size:26px; font-weight:600; }
+  .card .lbl { font-size:12px; color:#9aa3b8; margin-top:2px; }
+  .card .big.ok { color:#46c46a; } .card .big.bad { color:#ff8a8a; }
+  .types { margin-top:14px; display:flex; flex-wrap:wrap; gap:8px; }
+  .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
+  .pill b { color:#fff; }
+  .hits { list-style:none; padding:0; margin:0; }
+  .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
+  .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
+  .hits .snip { white-space:pre-wrap; margin-top:4px; }
+  h2.h { margin:2px 0 12px; font-size:16px; }
 </style></head>
 <body>
-<header><h1>MIND HIVE &mdash; control panel</h1></header>
+<header>
+  <h1>MIND HIVE</h1>
+  <span id="busy" class="dot"></span>
+  <span id="status">ready</span>
+</header>
 <main>
   <nav>
+    <button onclick="showOverview()">Overview</button>
+    <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
-    <button onclick="showAppend()">Append memory</button>
     <button onclick="showPlugins()">Plugins</button>
+    <div class="group">Actions</div>
+    <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
     <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
     <button onclick="doAction('/api/sync','Sync')">Sync</button>
     <button onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
-    <button onclick="confirmAction('/api/embed','Embed (heavy)')">Embed</button>
-    <button onclick="confirmAction('/api/plugins/scan','Plugins scan (heavy)')">Plugins scan</button>
-    <button onclick="confirmAction('/api/selftest','Self-test (heavy)')">Self-test</button>
+    <div class="group">Heavy</div>
+    <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
+    <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
+    <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
     <div id="controls"></div>
-    <pre id="out">Pick a feature on the left.</pre>
+    <div id="view"></div>
+    <pre id="out" class="hidden"></pre>
     <iframe id="graph" class="hidden"></iframe>
   </section>
 </main>
 <script>
   const TOKEN = __TOKEN__;
   const out = document.getElementById('out');
+  const view = document.getElementById('view');
   const graph = document.getElementById('graph');
   const controls = document.getElementById('controls');
-  function showOut(){ graph.classList.add('hidden'); out.classList.remove('hidden'); }
+  const busyDot = document.getElementById('busy');
+  const statusEl = document.getElementById('status');
+  const navButtons = () => Array.from(document.querySelectorAll('nav button'));
+
+  function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
   function u(path){ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }
+  function setBusy(on, label){
+    busyDot.className = 'dot' + (on ? ' busy' : '');
+    statusEl.textContent = on ? (label || 'working…') : 'ready';
+    navButtons().forEach(b => b.disabled = on);
+  }
+  // panel switching
+  function only(el){ for (const e of [out, view, graph]) e.classList.toggle('hidden', e !== el); }
+  function showText(v){ only(out); out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
+  function showHTML(html){ only(view); view.innerHTML = html; }
+  function fail(e){ only(out); out.innerHTML = '<span class="err">'+ esc(e && e.message || e) +'</span>'; }
+
   async function apiGet(path){
     const r = await fetch(u(path), { headers: { 'X-Hive-Token': TOKEN } });
     const ct = r.headers.get('content-type') || '';
@@ -198,55 +258,92 @@ def render_page(token: str) -> str:
       'X-Hive-Token': TOKEN }, body: JSON.stringify(body || {}) });
     return r.json();
   }
-  function render(v){ showOut(); out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
-  function fail(e){ showOut(); out.innerHTML = '<span class="err">'+ (e && e.message || e) +'</span>'; }
+  // wrap any async unit of work with busy state + error handling
+  async function run(label, fn){
+    setBusy(true, label);
+    try { await fn(); } catch(e) { fail(e); } finally { setBusy(false); }
+  }
 
-  async function showState(){ controls.innerHTML=''; try{ render(await apiGet('/api/state')); }catch(e){ fail(e); } }
-  async function showBriefing(){ controls.innerHTML=''; try{ render(await apiGet('/api/briefing')); }catch(e){ fail(e); } }
+  function showOverview(){ controls.innerHTML=''; run('loading overview', async () => {
+    const o = await apiGet('/api/overview');
+    const chip = o.chain_ok
+      ? '<span class="big ok">OK</span>' : '<span class="big bad">CHECK</span>';
+    const types = Object.entries(o.by_type || {}).sort((a,b)=>b[1]-a[1])
+      .map(([t,n]) => '<span class="pill">'+esc(t)+' <b>'+n+'</b></span>').join('') || '<span class="lbl">no events yet</span>';
+    showHTML(
+      '<h2 class="h">'+esc(o.project)+'</h2>'
+      + '<div class="cards">'
+      + '<div class="card"><div class="big">'+o.events+'</div><div class="lbl">events</div></div>'
+      + '<div class="card"><div>'+chip+'</div><div class="lbl">hash chain</div></div>'
+      + '<div class="card"><div class="big" style="font-size:15px">'+esc(o.last_ts || '—')+'</div><div class="lbl">last activity</div></div>'
+      + '</div><div class="types">'+types+'</div>');
+  }); }
+
+  function showState(){ controls.innerHTML=''; run('loading state', async () => showText(await apiGet('/api/state'))); }
+  function showBriefing(){ controls.innerHTML=''; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
+
   function showRecall(){
-    controls.innerHTML = '<div class="row"><input id="q" placeholder="search query">'
+    controls.innerHTML = '<div class="row"><input id="q" placeholder="search query" style="min-width:260px">'
       + '<label><input type="checkbox" id="sem"> semantic</label>'
       + '<button onclick="runRecall()">Search</button></div>';
-    showOut(); out.textContent = 'Enter a query.';
+    showText('Enter a query and search.');
+    const q = document.getElementById('q');
+    q.focus();
+    q.addEventListener('keydown', e => { if (e.key === 'Enter') runRecall(); });
   }
-  async function runRecall(){
+  function runRecall(){
     const q = document.getElementById('q').value;
     const sem = document.getElementById('sem').checked ? '1' : '0';
-    try{ render(await apiGet('/api/recall?q='+encodeURIComponent(q)+'&semantic='+sem)); }catch(e){ fail(e); }
+    run('searching', async () => {
+      const hits = await apiGet('/api/recall?q='+encodeURIComponent(q)+'&semantic='+sem);
+      if (!hits.length) { showText('No matches for "'+q+'".'); return; }
+      showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
+        + hits.map(h => '<li><div class="file">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
+        + '</ul>');
+    });
   }
-  async function showGraph(){
-    controls.innerHTML='';
-    try{ const html = await apiGet('/api/graph'); out.classList.add('hidden');
-      graph.classList.remove('hidden'); graph.srcdoc = html; }catch(e){ fail(e); }
-  }
+
+  function showGraph(){ controls.innerHTML=''; run('building graph', async () => {
+    const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
+  }); }
+
   function showAppend(){
     controls.innerHTML = '<div class="row"><select id="etype">'
       + ['decision','caveat','experiment_result','next_step','open_question','state_set']
         .map(t=>'<option>'+t+'</option>').join('')
       + '</select></div>'
-      + '<div class="row"><textarea id="etext" rows="3" cols="60" placeholder="one line"></textarea></div>'
+      + '<div class="row"><textarea id="etext" rows="3" style="width:min(100%,520px)" placeholder="one line"></textarea></div>'
       + '<div class="row"><input id="etags" placeholder="tags,comma,separated">'
       + '<button onclick="runAppend()">Append</button></div>';
-    showOut(); out.textContent = 'Fill the form and append.';
+    showText('Fill the form and append a memory event.');
   }
-  async function runAppend(){
+  function runAppend(){
     const body = { type: document.getElementById('etype').value,
       payload: document.getElementById('etext').value, tags: document.getElementById('etags').value };
-    try{ render(await apiPost('/api/append', body)); }catch(e){ fail(e); }
+    if (!body.payload.trim()) { showText('Nothing to append — type a line first.'); return; }
+    run('appending', async () => {
+      const res = await apiPost('/api/append', body);
+      showText(res.ok ? ('Appended '+res.type+' @ '+res.ts) : res);
+    });
   }
-  async function showPlugins(){ controls.innerHTML=''; try{ render(await apiGet('/api/plugins/recommend')); }catch(e){ fail(e); } }
+
+  function showPlugins(){ controls.innerHTML=''; run('loading plugins', async () => showText(await apiGet('/api/plugins/recommend'))); }
   function doExport(){ window.location = u('/api/export'); }
-  async function doAction(path, label, method){
-    controls.innerHTML=''; render(label + '…');
-    try{ render(method === 'GET' ? await apiGet(path) : await apiPost(path, {})); }catch(e){ fail(e); }
+
+  function doAction(path, label, method){
+    controls.innerHTML='';
+    run(label+'…', async () => showText(method === 'GET' ? await apiGet(path) : await apiPost(path, {})));
   }
-  async function confirmAction(path, label){
+  function confirmAction(path, label){
     if(!confirm(label + ' — this can take a while. Continue?')) return;
     let body = {};
     if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
-    controls.innerHTML=''; render(label + ' running…');
-    try{ render(await apiPost(path, body)); }catch(e){ fail(e); }
+    controls.innerHTML='';
+    run(label+' running…', async () => showText(await apiPost(path, body)));
   }
+
+  // land on the overview
+  showOverview();
 </script>
 </body></html>""".replace("__TOKEN__", json.dumps(token))
 

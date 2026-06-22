@@ -103,6 +103,34 @@ def test_graph_endpoint_returns_html():
         server.shutdown()
 
 
+def test_overview_endpoint_returns_stats():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/api/overview", token)
+        assert status == 200
+        obj = json.loads(body)
+        for key in ("project", "events", "by_type", "last_ts", "chain_ok"):
+            assert key in obj, f"overview missing {key}"
+        assert isinstance(obj["events"], int)
+        assert isinstance(obj["by_type"], dict)
+        assert isinstance(obj["chain_ok"], bool)
+    finally:
+        server.shutdown()
+
+
+def test_overview_counts_an_appended_event():
+    server, base, token = _start()
+    try:
+        before = json.loads(_get(base, "/api/overview", token)[1])["events"]
+        _post(base, "/api/append", {"type": "decision", "payload": "ov note"}, token)
+        after = json.loads(_get(base, "/api/overview", token)[1])
+        assert after["events"] == before + 1
+        assert after["by_type"].get("decision", 0) >= 1
+        assert after["last_ts"]
+    finally:
+        server.shutdown()
+
+
 def test_plugins_recommend_returns_json():
     server, base, token = _start()
     try:
