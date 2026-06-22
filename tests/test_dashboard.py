@@ -101,3 +101,41 @@ def test_plugins_recommend_returns_json():
         assert isinstance(obj, dict)
     finally:
         server.shutdown()
+
+
+def _post(base, path, payload, token):
+    url = f"{base}{path}?token={token}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, json.loads(r.read().decode("utf-8"))
+
+
+def test_append_creates_event():
+    server, base, token = _start()
+    try:
+        status, obj = _post(base, "/api/append",
+                            {"type": "decision", "payload": "dashboard test note",
+                             "tags": "test"}, token)
+        assert status == 200
+        assert obj["ok"] is True
+        assert obj["type"] == "decision"
+        assert "ts" in obj
+    finally:
+        server.shutdown()
+
+
+def test_post_requires_token():
+    server, base, token = _start()
+    try:
+        url = f"{base}/api/project"
+        req = urllib.request.Request(url, data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 403"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+    finally:
+        server.shutdown()

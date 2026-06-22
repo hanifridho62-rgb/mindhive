@@ -14,6 +14,8 @@ from . import graph as graph_mod
 from . import graphview
 from . import plugins as plugins_mod
 from . import export as export_mod
+from . import events, projector
+from . import sync as sync_mod
 from .briefing import briefing as build_briefing
 
 
@@ -38,6 +40,11 @@ def make_handler(token: str):
 
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+
+        def _body(self) -> dict:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            return json.loads(raw.decode("utf-8")) if raw else {}
 
         # --- routing ---
         def do_GET(self):
@@ -85,8 +92,28 @@ def make_handler(token: str):
             return self._json({"ok": False, "error": "not found"}, 404)
 
         def do_POST(self):
+            route = urlparse(self.path).path
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
+            try:
+                body = self._body()
+                if route == "/api/append":
+                    etype = body.get("type")
+                    text = body.get("payload", "")
+                    tags = [t for t in (body.get("tags") or "").split(",") if t]
+                    if not etype:
+                        return self._json({"ok": False, "error": "type is required"}, 200)
+                    ev = events.append_event(etype, {"text": text}, tags=tags)
+                    projector.project()
+                    return self._json({"ok": True, "type": ev.type, "ts": ev.ts})
+                if route == "/api/project":
+                    return self._json({"ok": True, "result": projector.project()})
+                if route == "/api/sync":
+                    import os
+                    path = sync_mod.sync(os.getcwd())
+                    return self._json({"ok": True, "path": str(path)})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 200)
             return self._json({"ok": False, "error": "not found"}, 404)
 
     return DashboardHandler
