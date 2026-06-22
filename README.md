@@ -47,6 +47,12 @@ browser to a control panel for every feature — view state/briefing/graph, run
 recall, append memories, project, sync, verify, export, embed, and plugins
 scan. The graph is one of its views.
 
+The panel updates in **real time**: the Overview and State views auto-refresh
+every few seconds and the moment you append a memory, so new events — including
+ones written by another session or hook — appear without a manual reload. A
+`● live` toggle in the header pauses/resumes it; polling also pauses while the
+tab is hidden.
+
 `hive graph export` still writes a single self-contained `graph.html` (data +
 renderer inlined, no network, no keys) you can open in any browser on any PC.
 Nodes are labelled and coloured by meaning — decisions, caveats (amber),

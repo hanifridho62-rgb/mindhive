@@ -160,6 +160,11 @@ def render_page(token: str) -> str:
   header .dot.busy { background:#e0b341; animation: pulse 1s infinite; }
   header .dot.ok { background:#46c46a; }
   header #status { font-size:12px; color:#9aa3b8; }
+  header #live { font-size:12px; cursor:pointer; user-select:none; margin-left:auto;
+    color:#46c46a; }
+  header #live.paused { color:#6b7488; }
+  header #live .blip { animation: pulse 1.6s infinite; }
+  header #synced { font-size:11px; color:#6b7488; min-width:118px; text-align:right; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 50px); }
   nav { background:#141722; border-right:1px solid #2a2f3d; padding:12px; }
@@ -197,6 +202,8 @@ def render_page(token: str) -> str:
   <h1>MIND HIVE</h1>
   <span id="busy" class="dot"></span>
   <span id="status">ready</span>
+  <span id="live" title="Real-time updates — click to pause/resume" onclick="toggleLive()"><span class="blip">&#9679;</span> live</span>
+  <span id="synced"></span>
 </header>
 <main>
   <nav>
@@ -234,6 +241,37 @@ def render_page(token: str) -> str:
   const busyDot = document.getElementById('busy');
   const statusEl = document.getElementById('status');
   const navButtons = () => Array.from(document.querySelectorAll('nav button'));
+  const liveEl = document.getElementById('live');
+  const syncedEl = document.getElementById('synced');
+
+  // --- real-time engine ---
+  // liveFn is the silent re-renderer for the current view (null = view isn't
+  // auto-refreshable). A timer re-runs it on an interval, and actions that
+  // mutate memory call refreshLive() so changes appear without a manual click.
+  let liveFn = null;
+  let liveOn = true;
+  const LIVE_MS = 2500;
+  function pad2(n){ return (n<10?'0':'')+n; }
+  function markSynced(){
+    const d = new Date();
+    syncedEl.textContent = 'updated ' + pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());
+  }
+  function toggleLive(){
+    liveOn = !liveOn;
+    liveEl.classList.toggle('paused', !liveOn);
+    liveEl.innerHTML = (liveOn ? '<span class="blip">&#9679;</span> live' : '&#9679; paused');
+    if (liveOn) refreshLive();
+  }
+  // silent refresh: no busy spinner, no nav-disable, errors swallowed so a
+  // transient blip never disrupts what the user is reading.
+  async function refreshLive(){
+    if (!liveOn || !liveFn) return;
+    if (document.hidden) return;
+    if (busyDot.classList.contains('busy')) return;  // don't fight a manual op
+    try { await liveFn(); markSynced(); } catch(_) { /* keep last good view */ }
+  }
+  setInterval(refreshLive, LIVE_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshLive(); });
 
   function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
   function u(path){ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }
@@ -275,7 +313,7 @@ def render_page(token: str) -> str:
     try { await fn(); } catch(e) { fail(e); } finally { setBusy(false); }
   }
 
-  function showOverview(){ controls.innerHTML=''; run('loading overview', async () => {
+  async function renderOverview(){
     const o = await apiGet('/api/overview');
     const chip = o.chain_ok
       ? '<span class="big ok">OK</span>' : '<span class="big bad">CHECK</span>';
@@ -288,12 +326,15 @@ def render_page(token: str) -> str:
       + '<div class="card"><div>'+chip+'</div><div class="lbl">hash chain</div></div>'
       + '<div class="card"><div class="big" style="font-size:15px">'+esc(o.last_ts || '—')+'</div><div class="lbl">last activity</div></div>'
       + '</div><div class="types">'+types+'</div>');
-  }); }
+  }
+  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
-  function showState(){ controls.innerHTML=''; run('loading state', async () => showText(await apiGet('/api/state'))); }
-  function showBriefing(){ controls.innerHTML=''; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
+  async function renderState(){ showText(await apiGet('/api/state')); }
+  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
+  function showBriefing(){ controls.innerHTML=''; liveFn = null; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
 
   function showRecall(){
+    liveFn = null;
     controls.innerHTML = '<div class="row"><input id="q" placeholder="search query" style="min-width:260px">'
       + '<label><input type="checkbox" id="sem"> semantic</label>'
       + '<button onclick="runRecall()">Search</button></div>';
@@ -314,11 +355,12 @@ def render_page(token: str) -> str:
     });
   }
 
-  function showGraph(){ controls.innerHTML=''; run('building graph', async () => {
+  function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
     const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
   }); }
 
   function showAppend(){
+    liveFn = null;
     controls.innerHTML = '<div class="row"><select id="etype">'
       + ['decision','caveat','experiment_result','next_step','open_question','state_set']
         .map(t=>'<option>'+t+'</option>').join('')
@@ -334,22 +376,22 @@ def render_page(token: str) -> str:
     if (!body.payload.trim()) { showText('Nothing to append — type a line first.'); return; }
     run('appending', async () => {
       const res = await apiPost('/api/append', body);
-      showText(res.ok ? ('Appended '+res.type+' @ '+res.ts) : res);
+      if (res.ok) { showOverview(); } else { showText(res); }
     });
   }
 
-  function showPlugins(){ controls.innerHTML=''; run('loading plugins', async () => showText(await apiGet('/api/plugins/recommend'))); }
+  function showPlugins(){ controls.innerHTML=''; liveFn = null; run('loading plugins', async () => showText(await apiGet('/api/plugins/recommend'))); }
   function doExport(){ window.location = u('/api/export'); }
 
   function doAction(path, label, method){
-    controls.innerHTML='';
+    controls.innerHTML=''; liveFn = null;
     run(label+'…', async () => showText(method === 'GET' ? await apiGet(path) : await apiPost(path, {})));
   }
   function confirmAction(path, label){
     if(!confirm(label + ' — this can take a while. Continue?')) return;
     let body = {};
     if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
-    controls.innerHTML='';
+    controls.innerHTML=''; liveFn = null;
     run(label+' running…', async () => showText(await apiPost(path, body)));
   }
 
