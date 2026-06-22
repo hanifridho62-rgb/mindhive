@@ -139,3 +139,25 @@ def test_post_requires_token():
             assert e.code == 403
     finally:
         server.shutdown()
+
+
+from mindhive import paths as hp
+
+
+def test_embed_blocked_by_live_lock():
+    server, base, token = _start()
+    lock = hp.store_home() / "LIVE_LOCK"
+    created = False
+    if not lock.exists():
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("test", encoding="utf-8")
+        created = True
+    try:
+        status, obj = _post(base, "/api/embed", {"force": False}, token)
+        assert status == 200
+        assert obj["ok"] is False
+        assert "LIVE_LOCK" in obj["error"]
+    finally:
+        if created:
+            lock.unlink()
+        server.shutdown()

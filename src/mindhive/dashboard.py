@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import paths, chain
+from . import guard
 from . import recall as recall_mod
 from . import graph as graph_mod
 from . import graphview
@@ -112,6 +113,18 @@ def make_handler(token: str):
                     import os
                     path = sync_mod.sync(os.getcwd())
                     return self._json({"ok": True, "path": str(path)})
+                if route == "/api/embed":
+                    force = bool(body.get("force", False))
+                    guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
+                    from . import vectors
+                    return self._json({"ok": True, "result": vectors.embed(force=force)})
+                if route == "/api/plugins/scan":
+                    result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)))
+                    return self._json({"ok": True, "result": result})
+                if route == "/api/selftest":
+                    from . import selftest as selftest_mod
+                    code = selftest_mod.run()
+                    return self._json({"ok": code == 0, "exit_code": code})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)}, 200)
             return self._json({"ok": False, "error": "not found"}, 404)
