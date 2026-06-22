@@ -165,7 +165,7 @@ def main(argv=None) -> int:
         elif args.plugins_cmd == "recommend":
             payload = plugins_mod.latest_catalog()
             if not payload:
-                print("(no plugin_catalog yet — run: hive plugins scan)")
+                print("(no plugin_catalog yet - run: hive plugins scan)")
             else:
                 _print_recommendations(payload, scanned=False)
     elif args.cmd == "sync":
