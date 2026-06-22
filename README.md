@@ -11,6 +11,7 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
+- `hive plugins autoscan [--max-age-hours H] [--top N] [--force]` — scan **only when the catalog is missing or stale** (default 24h); a near-instant no-op otherwise, so it's safe to run every session
 - `hive plugins recommend` — print the top recommendations from the latest snapshot
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain
@@ -20,8 +21,24 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 ## Event types
 Semantic (you/Claude emit): decision, experiment_result, caveat, next_step,
 open_question, state_set.
-Deterministic (hooks emit): file_touched, command_run, git_diff, session_start,
-session_end, compaction, plugin_catalog.
+Deterministic (machine-generated, no AI/API cost): file_touched, command_run,
+git_diff, session_start, session_end, compaction, plugin_catalog. The first six
+are emitted by the session hooks; `plugin_catalog` is emitted on demand by
+`plugins scan`/`autoscan` (the `session_start` hook fires a stale-gated
+`autoscan` so it refreshes across sessions without you lifting a finger).
+
+## Plugin/skill catalog: auto + manual
+The recommendation catalog refreshes three ways, so it's current in any session:
+- **Auto (new sessions):** the `session_start` hook runs `plugins autoscan` in
+  the background — stale-gated, so it only does real work when the snapshot is
+  missing or >24h old.
+- **Auto (panel):** opening the dashboard **Plugins** view calls the same
+  stale-gated autoscan, so just looking at it keeps it fresh.
+- **Manual (force):** `hive plugins scan` or the dashboard **Plugins scan**
+  (Heavy) button force a full rescan anytime, in any session.
+
+Because every session shares one event store, a refresh by one session is
+immediately visible to all the others.
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:

@@ -78,6 +78,13 @@ def main(argv=None) -> int:
     pls = plsub.add_parser("scan", help="scan cache, score, store a catalog snapshot")
     pls.add_argument("--cache", default=None, help="plugin cache dir (default: ~/.claude/plugins/cache)")
     pls.add_argument("--top", type=int, default=5, help="how many to recommend")
+    pla = plsub.add_parser("autoscan",
+                           help="scan only if the catalog is missing or stale (cheap; safe every session)")
+    pla.add_argument("--cache", default=None, help="plugin cache dir (default: ~/.claude/plugins/cache)")
+    pla.add_argument("--top", type=int, default=5, help="how many to recommend")
+    pla.add_argument("--max-age-hours", type=float, default=24.0, dest="max_age_hours",
+                     help="rescan when the latest snapshot is older than this (default: 24)")
+    pla.add_argument("--force", action="store_true", help="rescan even if the catalog is fresh")
     plr = plsub.add_parser("recommend", help="print the latest catalog's top recommendations")
 
     # --- sync ---
@@ -167,6 +174,12 @@ def main(argv=None) -> int:
         if args.plugins_cmd == "scan":
             payload = plugins_mod.scan_and_store(cache_dir=args.cache, top_n=args.top)
             _print_recommendations(payload, scanned=True)
+        elif args.plugins_cmd == "autoscan":
+            res = plugins_mod.ensure_fresh(cache_dir=args.cache, top_n=args.top,
+                                           max_age_hours=args.max_age_hours, force=args.force)
+            if not res["scanned"]:
+                print(f"catalog fresh ({res['age_hours']:.1f}h old) - skipping scan")
+            _print_recommendations(res["payload"], scanned=res["scanned"])
         elif args.plugins_cmd == "recommend":
             payload = plugins_mod.latest_catalog()
             if not payload:

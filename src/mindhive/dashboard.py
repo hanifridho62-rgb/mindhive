@@ -133,6 +133,14 @@ def make_handler(token: str):
                 if route == "/api/plugins/scan":
                     result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)))
                     return self._json({"ok": True, "result": result})
+                if route == "/api/plugins/autoscan":
+                    res = plugins_mod.ensure_fresh(
+                        top_n=int(body.get("top", 5)),
+                        max_age_hours=float(body.get("max_age_hours", 24)),
+                        force=bool(body.get("force", False)),
+                    )
+                    return self._json({"ok": True, "scanned": res["scanned"],
+                                       "age_hours": res["age_hours"], "result": res["payload"]})
                 if route == "/api/selftest":
                     from . import selftest as selftest_mod
                     code = selftest_mod.run()
@@ -380,7 +388,14 @@ def render_page(token: str) -> str:
     });
   }
 
-  function showPlugins(){ controls.innerHTML=''; liveFn = null; run('loading plugins', async () => showText(await apiGet('/api/plugins/recommend'))); }
+  // Plugins view auto-refreshes when stale: it asks the server to scan only if
+  // the catalog is missing or >24h old, so just opening the view keeps it current
+  // without forcing a heavy rescan. The Heavy "Plugins scan" button forces one.
+  function showPlugins(){ controls.innerHTML=''; liveFn = null; run('refreshing plugins', async () => {
+    const res = await apiPost('/api/plugins/autoscan', {});
+    const note = res.scanned ? 'scanned just now' : ('catalog fresh ('+(Number(res.age_hours)||0).toFixed(1)+'h old)');
+    showText(note + '\\n\\n' + JSON.stringify(res.result || res, null, 2));
+  }); }
   function doExport(){ window.location = u('/api/export'); }
 
   function doAction(path, label, method){

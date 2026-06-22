@@ -15,4 +15,10 @@ try {
     & $py -m mindhive append session_start "session opened" | Out-Null
     & $py -m mindhive state
 } catch {}
+# Auto-refresh the plugin/skill catalog in the background — detached and
+# fire-and-forget so it never delays session start. 'autoscan' is stale-gated:
+# it only does real work when the catalog is missing or older than 24h, so on a
+# warm store this is a near-instant no-op. Manual 'hive plugins scan' / the
+# dashboard buttons still force a full rescan anytime.
+try { Start-Process -FilePath $py -ArgumentList '-m','mindhive','plugins','autoscan' -WindowStyle Hidden } catch {}
 exit 0

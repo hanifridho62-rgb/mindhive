@@ -241,10 +241,50 @@ def scan_and_store(cache_dir=None, top_n: int = 5, project=None) -> dict:
     return payload
 
 
-def latest_catalog(project=None) -> dict | None:
-    """Return the most recent plugin_catalog snapshot payload, or None."""
+def latest_catalog_event(project=None):
+    """Return the most recent plugin_catalog Event, or None."""
     latest = None
     for ev in ev_mod.read_all(project):
         if ev.type == "plugin_catalog":
             latest = ev
-    return latest.payload if latest else None
+    return latest
+
+
+def latest_catalog(project=None) -> dict | None:
+    """Return the most recent plugin_catalog snapshot payload, or None."""
+    ev = latest_catalog_event(project)
+    return ev.payload if ev else None
+
+
+def _age_hours(ts: str):
+    """Hours elapsed since a UTC event ts ('YYYY-MM-DDTHH:MM:SSZ'), or None if
+    the timestamp can't be parsed (treated as stale by callers)."""
+    import calendar
+    import time as _time
+    try:
+        t = _time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        return (_time.time() - calendar.timegm(t)) / 3600.0
+    except Exception:
+        return None
+
+
+def ensure_fresh(cache_dir=None, top_n: int = 5, max_age_hours: float = 24.0,
+                 force: bool = False, project=None) -> dict:
+    """Auto-refresh the catalog only when it's missing or stale — cheap enough
+    to call on every session start.
+
+    Scans (and stores a new plugin_catalog snapshot) when there is no snapshot,
+    when the newest one is older than ``max_age_hours``, or when ``force`` is
+    set. Otherwise it returns the existing snapshot without scanning.
+
+    Returns ``{"scanned": bool, "age_hours": float|None, "payload": dict}``.
+    The shared event store means a refresh by one session is immediately seen
+    by every other session.
+    """
+    ev = None if force else latest_catalog_event(project)
+    if ev is not None:
+        age = _age_hours(ev.ts)
+        if age is not None and age < max_age_hours:
+            return {"scanned": False, "age_hours": age, "payload": ev.payload}
+    payload = scan_and_store(cache_dir=cache_dir, top_n=top_n, project=project)
+    return {"scanned": True, "age_hours": 0.0, "payload": payload}

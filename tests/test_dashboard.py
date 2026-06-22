@@ -151,6 +151,24 @@ def _post(base, path, payload, token):
         return r.status, json.loads(r.read().decode("utf-8"))
 
 
+def test_plugins_autoscan_is_stale_gated():
+    server, base, token = _start()
+    try:
+        # empty store -> first autoscan must actually scan
+        status, obj = _post(base, "/api/plugins/autoscan", {}, token)
+        assert status == 200 and obj["ok"] is True
+        assert obj["scanned"] is True
+        assert isinstance(obj["result"], dict)
+        # second autoscan finds a fresh snapshot -> skips the scan
+        status, obj2 = _post(base, "/api/plugins/autoscan", {}, token)
+        assert obj2["scanned"] is False
+        # force overrides the freshness gate
+        status, obj3 = _post(base, "/api/plugins/autoscan", {"force": True}, token)
+        assert obj3["scanned"] is True
+    finally:
+        server.shutdown()
+
+
 def test_append_creates_event():
     server, base, token = _start()
     try:

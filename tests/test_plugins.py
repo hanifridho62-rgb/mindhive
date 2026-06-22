@@ -328,3 +328,45 @@ def test_latest_catalog_returns_most_recent(tmp_path, monkeypatch):
     latest = plugins.latest_catalog()
     assert len(latest["recommendations"]) == 2     # the second (most recent) scan
     assert len([e for e in events.read_all() if e.type == "plugin_catalog"]) == 2
+
+
+# --------------------------------------------------------------------------
+# ensure_fresh — stale-gated auto-refresh (powers the session hook & panel)
+# --------------------------------------------------------------------------
+
+def _catalog_count():
+    return len([e for e in events.read_all() if e.type == "plugin_catalog"])
+
+
+def test_ensure_fresh_scans_when_no_snapshot(tmp_path, monkeypatch):
+    _store(tmp_path, monkeypatch)
+    res = plugins.ensure_fresh(cache_dir=tmp_path / "nope")
+    assert res["scanned"] is True
+    assert res["age_hours"] == 0.0
+    assert _catalog_count() == 1
+
+
+def test_ensure_fresh_skips_when_fresh(tmp_path, monkeypatch):
+    _store(tmp_path, monkeypatch)
+    plugins.ensure_fresh(cache_dir=tmp_path / "nope")          # first, real scan
+    res = plugins.ensure_fresh(cache_dir=tmp_path / "nope")    # second, should skip
+    assert res["scanned"] is False
+    assert res["payload"]                                       # still returns the snapshot
+    assert _catalog_count() == 1                                # no extra event written
+
+
+def test_ensure_fresh_rescans_when_stale(tmp_path, monkeypatch):
+    _store(tmp_path, monkeypatch)
+    events.append_event("plugin_catalog", {"recommendations": []},
+                        ts="2000-01-01T00:00:00Z")             # ancient snapshot
+    res = plugins.ensure_fresh(cache_dir=tmp_path / "nope", max_age_hours=24)
+    assert res["scanned"] is True
+    assert _catalog_count() == 2
+
+
+def test_ensure_fresh_force_rescans_even_when_fresh(tmp_path, monkeypatch):
+    _store(tmp_path, monkeypatch)
+    plugins.ensure_fresh(cache_dir=tmp_path / "nope")          # fresh snapshot exists
+    res = plugins.ensure_fresh(cache_dir=tmp_path / "nope", force=True)
+    assert res["scanned"] is True
+    assert _catalog_count() == 2
