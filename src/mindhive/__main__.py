@@ -9,6 +9,20 @@ from . import export as export_mod
 from . import selftest as selftest_mod
 
 
+def _print_recommendations(payload: dict, scanned: bool) -> None:
+    c = payload.get("counts", {})
+    if scanned:
+        print(f"scanned {c.get('plugins_total', 0)} plugins "
+              f"({c.get('free', 0)} free, {c.get('paid', 0)} paid, "
+              f"{c.get('skills_total', 0)} skills) -> stored plugin_catalog")
+    print(f"\nTop {len(payload.get('recommendations', []))} free plugins "
+          f"(by breadth score):")
+    for i, r in enumerate(payload.get("recommendations", []), 1):
+        print(f"  {i}. {r['name']}  [score {r['breadth_score']:g}]")
+        if r.get("note"):
+            print(f"       {r['note']}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="hive", description="MIND HIVE memory CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -58,6 +72,14 @@ def main(argv=None) -> int:
                     help="open the file in the default browser")
 
     gsub.add_parser("app", help="open the desktop graph window")
+
+    # --- plugins (scan free skills/plugins, score, recommend) ---
+    pl = sub.add_parser("plugins", help="catalog & recommend free skills/plugins")
+    plsub = pl.add_subparsers(dest="plugins_cmd", required=True)
+    pls = plsub.add_parser("scan", help="scan cache, score, store a catalog snapshot")
+    pls.add_argument("--cache", default=None, help="plugin cache dir (default: ~/.claude/plugins/cache)")
+    pls.add_argument("--top", type=int, default=5, help="how many to recommend")
+    plr = plsub.add_parser("recommend", help="print the latest catalog's top recommendations")
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
@@ -135,6 +157,17 @@ def main(argv=None) -> int:
         elif args.graph_cmd == "app":
             from . import desktop
             desktop.launch_app()
+    elif args.cmd == "plugins":
+        from . import plugins as plugins_mod
+        if args.plugins_cmd == "scan":
+            payload = plugins_mod.scan_and_store(cache_dir=args.cache, top_n=args.top)
+            _print_recommendations(payload, scanned=True)
+        elif args.plugins_cmd == "recommend":
+            payload = plugins_mod.latest_catalog()
+            if not payload:
+                print("(no plugin_catalog yet — run: hive plugins scan)")
+            else:
+                _print_recommendations(payload, scanned=False)
     elif args.cmd == "sync":
         from . import sync as sync_mod
         folder = args.folder or os.getcwd()

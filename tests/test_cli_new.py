@@ -90,6 +90,39 @@ def test_graph_export_open_invokes_browser(tmp_path, monkeypatch, capsys):
     assert "graph.html" in opened.get("uri", "")
 
 
+def test_cli_plugins_scan_stores_one_event(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    from tests.test_plugins import make_cache
+    cache = make_cache(tmp_path)
+    ret = cli_mod.main(["plugins", "scan", "--cache", str(cache)])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "free-plugin" in out
+    assert "stored plugin_catalog" in out
+    catalogs = [e for e in events.read_all() if e.type == "plugin_catalog"]
+    assert len(catalogs) == 1
+
+
+def test_cli_plugins_recommend_reads_latest(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    from tests.test_plugins import make_cache
+    cache = make_cache(tmp_path)
+    cli_mod.main(["plugins", "scan", "--cache", str(cache)])
+    capsys.readouterr()
+    ret = cli_mod.main(["plugins", "recommend"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "free-plugin" in out
+
+
+def test_cli_plugins_recommend_without_scan(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    ret = cli_mod.main(["plugins", "recommend"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "run: hive plugins scan" in out
+
+
 def test_graph_app_invokes_launch(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     called = {}

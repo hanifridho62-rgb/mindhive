@@ -29,6 +29,48 @@ def _file_path_from_payload(payload) -> str | None:
     return None
 
 
+def _expand_plugin_catalog(evs, add_node, add_edge) -> None:
+    """Expand the most recent plugin_catalog snapshot into graph nodes/edges.
+
+    Only free plugins are rendered. Each plugin links to its skills (provides),
+    to the topics it covers (covers), and the recommendation node links to the
+    top-5 plugins (recommends). Pure and deterministic given the snapshot.
+    """
+    snap = None
+    for ev in evs:
+        if ev.type == "plugin_catalog" and isinstance(ev.payload, dict):
+            snap = ev.payload  # keep the last (latest) one
+    if not snap:
+        return
+
+    rec_id = f"recommendation:{snap.get('scanned_at', '')}"
+    recs = snap.get("recommendations") or []
+    if recs:
+        add_node(rec_id, "recommendation",
+                 f"top {len(recs)} @ {snap.get('scanned_at', '')}")
+
+    rec_names = {r.get("name") for r in recs}
+
+    for p in snap.get("free_plugins") or []:
+        pid = f"plugin:{p.get('marketplace')}/{p.get('name')}"
+        add_node(pid, "plugin", p.get("name", "?"),
+                 version=p.get("version"),
+                 breadth=(p.get("score") or {}).get("breadth_score"))
+
+        for sk in p.get("skills") or []:
+            skid = f"skill:{p.get('name')}/{sk.get('name')}"
+            add_node(skid, "skill", sk.get("name", "?"), text=sk.get("trigger"))
+            add_edge(pid, skid, "provides")
+
+        for topic in p.get("topics") or []:
+            tid = f"topic:{topic}"
+            add_node(tid, "topic", topic)
+            add_edge(pid, tid, "covers")
+
+        if recs and p.get("name") in rec_names:
+            add_edge(rec_id, pid, "recommends")
+
+
 def build(project=None, semantic: bool = False, _evs=None) -> dict:
     """Build and persist knowledge graph as graph.json; return the dict."""
     evs = _evs if _evs is not None else ev_mod.read_all(project)
@@ -48,6 +90,10 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
 
     # Build nodes and deterministic edges
     for ev in evs:
+        # plugin_catalog snapshots are expanded separately into plugin/skill
+        # nodes below; a generic event node for them would just be noise.
+        if ev.type == "plugin_catalog":
+            continue
         eid = _ev_id(ev)
         sid = _session_id(ev)
         # kind = event subtype (decision/caveat/...); text = payload prose, if any.
@@ -85,6 +131,9 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
             a, b = sem_evs[i], sem_evs[j]
             if set(a.tags or []) & set(b.tags or []):
                 add_edge(_ev_id(a), _ev_id(b), "shares_tag")
+
+    # Expand the latest plugin_catalog snapshot into plugin/skill/topic nodes.
+    _expand_plugin_catalog(evs, add_node, add_edge)
 
     # Optional semantic edges (graceful degradation if deps/embeddings absent)
     if semantic:

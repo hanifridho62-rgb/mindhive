@@ -189,3 +189,56 @@ def test_related_includes_event_text(tmp_path, monkeypatch):
     # nodes without text don't grow a spurious empty field
     tag = [n for n in neighbors if n["type"] == "tag"]
     assert all("text" not in n for n in tag)
+
+
+def _catalog_event(ts, scanned_at, rec_name="free-plugin"):
+    return events.Event(
+        ts=ts, session_id="s", type="plugin_catalog", tags=[],
+        payload={
+            "scanned_at": scanned_at,
+            "free_plugins": [{
+                "marketplace": "mkt", "name": "free-plugin", "version": "1.2.0",
+                "description": "d", "free": True,
+                "skills": [{"name": "alpha", "trigger": "Use when testing."}],
+                "topics": ["test"],
+                "score": {"trigger_count": 1, "topic_spread": 1, "breadth_score": 2.0},
+            }],
+            "paid_plugins": [],
+            "recommendations": [{"name": rec_name, "breadth_score": 2.0, "note": "n"}],
+        },
+    )
+
+
+def test_plugin_catalog_expands_into_nodes(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    evs = [_catalog_event("2026-06-21T10:00:00Z", "2026-06-21T10:00:00Z")]
+    g = build(project=None, _evs=evs)
+    ids = {n["id"] for n in g["nodes"]}
+    assert "plugin:mkt/free-plugin" in ids
+    assert "skill:free-plugin/alpha" in ids
+    assert "topic:test" in ids
+    assert "recommendation:2026-06-21T10:00:00Z" in ids
+    # no generic event node for the snapshot
+    assert "ev:2026-06-21T10:00:00Z:plugin_catalog" not in ids
+
+
+def test_plugin_catalog_edges(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    evs = [_catalog_event("2026-06-21T10:00:00Z", "2026-06-21T10:00:00Z")]
+    g = build(project=None, _evs=evs)
+    edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
+    assert ("plugin:mkt/free-plugin", "skill:free-plugin/alpha", "provides") in edges
+    assert ("plugin:mkt/free-plugin", "topic:test", "covers") in edges
+    assert ("recommendation:2026-06-21T10:00:00Z", "plugin:mkt/free-plugin", "recommends") in edges
+
+
+def test_latest_plugin_catalog_supersedes(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    evs = [
+        _catalog_event("2026-06-21T10:00:00Z", "2026-06-21T10:00:00Z"),
+        _catalog_event("2026-06-21T11:00:00Z", "2026-06-21T11:00:00Z"),
+    ]
+    g = build(project=None, _evs=evs)
+    ids = {n["id"] for n in g["nodes"]}
+    assert "recommendation:2026-06-21T11:00:00Z" in ids
+    assert "recommendation:2026-06-21T10:00:00Z" not in ids

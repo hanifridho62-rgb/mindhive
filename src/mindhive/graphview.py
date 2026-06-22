@@ -84,13 +84,16 @@ _RENDERER_JS = r"""
     session_start: "#6e7681", session_end: "#6e7681", compaction: "#6e7681"
   };
   var TYPE_COLORS = { session: "#e3b341", file: "#768390", tag: "#db61a2",
-                      event: "#58a6ff" };
+                      event: "#58a6ff", plugin: "#3fb950", skill: "#a5d6ff",
+                      topic: "#d29922", recommendation: "#f778ba" };
   var KIND_LABELS = {
     decision: "decision", caveat: "caveat", experiment_result: "experiment",
     open_question: "open question", next_step: "next step", state_set: "state",
     file_touched: "file touched", command_run: "command", git_diff: "git diff",
     session_start: "session start", session_end: "session end",
-    compaction: "compaction", session: "session", file: "file", tag: "tag"
+    compaction: "compaction", session: "session", file: "file", tag: "tag",
+    plugin: "plugin", skill: "skill", topic: "topic",
+    recommendation: "recommendation"
   };
 
   var data = JSON.parse(document.getElementById("graph-data").textContent);

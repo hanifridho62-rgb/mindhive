@@ -12,6 +12,7 @@ SEMANTIC_TYPES = {
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
     "session_start", "session_end", "compaction",
+    "plugin_catalog",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 

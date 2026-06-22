@@ -10,6 +10,8 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive graph app` — open the desktop graph window (needs `pip install -e .[app]`)
+- `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
+- `hive plugins recommend` — print the top recommendations from the latest snapshot
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain
 - `hive embed [--force]` — build the on-demand vector index
@@ -19,7 +21,7 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 Semantic (you/Claude emit): decision, experiment_result, caveat, next_step,
 open_question, state_set.
 Deterministic (hooks emit): file_touched, command_run, git_diff, session_start,
-session_end, compaction.
+session_end, compaction, plugin_catalog.
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:
