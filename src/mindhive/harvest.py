@@ -71,6 +71,18 @@ def iter_transcript_events(path) -> list:
     return out
 
 
+def _hook_captured_sessions(project) -> set:
+    """session_ids that already carry a NON-harvest event in this project's
+    store — i.e. the live hooks recorded them. Re-harvesting those would double
+    the same actions, so skip them. This is what makes harvest safe to run
+    alongside the live hooks."""
+    out = set()
+    for ev in events.read_all(project):
+        if "harvest" not in (ev.tags or []):
+            out.add(ev.session_id)
+    return out
+
+
 def _state_path(project):
     return paths.project_dir(project) / "harvest_state.json"
 
@@ -90,15 +102,26 @@ def _save_state(project, state):
     _state_path(project).write_text(events.canonical_json(state), encoding="utf-8")
 
 
-def harvest(transcript_dir, project, now=None) -> dict:
-    """Append events for NEW transcript lines only (cursor in harvest_state.json)."""
+def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
+    """Append events for NEW transcript lines only (cursor in harvest_state.json).
+
+    With ``skip_captured=True`` any session the live hooks already recorded is
+    left untouched, so harvest is safe to run alongside the hooks without
+    double-counting the same tool actions."""
     d = Path(transcript_dir)
     state = _load_state(project)
+    captured = _hook_captured_sessions(project) if skip_captured else set()
     new_events = 0
     files = 0
+    skipped = 0
     if d.exists():
         for f in sorted(d.glob("*.jsonl")):
             files += 1
+            if skip_captured and f.stem in captured:
+                skipped += 1
+                state[f.name] = max(int(state.get(f.name, 0)),
+                                    len(f.read_text(encoding="utf-8", errors="ignore").splitlines()))
+                continue
             try:
                 all_lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
             except Exception:
@@ -128,4 +151,75 @@ def harvest(transcript_dir, project, now=None) -> dict:
                     new_events += 1
             state[f.name] = len(all_lines)
     _save_state(project, state)
-    return {"processed_files": files, "new_events": new_events}
+    return {"processed_files": files, "new_events": new_events, "skipped_captured": skipped}
+
+
+def claude_projects_root() -> Path:
+    """Where Claude Code stores per-folder session transcripts."""
+    return Path.home() / ".claude" / "projects"
+
+
+def project_for_transcript_dir(d) -> str | None:
+    """Infer the MIND HIVE project namespace for a Claude transcript directory
+    by reading the first ``cwd`` recorded in any transcript and applying the
+    normal project detection. None when no cwd is found (can't be placed)."""
+    for f in sorted(Path(d).glob("*.jsonl")):
+        try:
+            for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line or '"cwd"' not in line:
+                    continue
+                cwd = (json.loads(line) or {}).get("cwd")
+                if cwd:
+                    return paths.detect_project(Path(cwd))
+        except Exception:
+            continue
+    return None
+
+
+def existing_projects() -> list:
+    """Store namespaces that already have an events log — i.e. projects the user
+    already tracks in MIND HIVE."""
+    home = paths.store_home()
+    out = []
+    if home.exists():
+        for d in sorted(home.iterdir()):
+            if d.is_dir() and (d / "events").is_dir():
+                out.append(d.name)
+    return out
+
+
+def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
+    """Self-healing fallback: scan every Claude Code transcript directory and
+    harvest any session the live hooks didn't capture, into the project its cwd
+    maps to. Safe to run repeatedly and alongside the hooks (skip_captured).
+    This is what backfills sessions in environments where the hooks never fire
+    (e.g. the Agent SDK harness).
+
+    ``known_only`` (default) bounds the blast radius to namespaces the user
+    already tracks, so incidental sessions (e.g. run from the home folder) never
+    spawn surprise projects. Returns a per-project summary plus any skipped
+    namespaces."""
+    root = claude_projects_root()
+    known = set(existing_projects()) if known_only else None
+    per_project: dict = {}
+    skipped_unknown: set = set()
+    total_new = 0
+    if root.exists():
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            proj = project_for_transcript_dir(d)
+            if not proj:
+                continue
+            if known is not None and proj not in known:
+                skipped_unknown.add(proj)
+                continue
+            r = harvest(d, proj, now=now, skip_captured=skip_captured)
+            if r["new_events"]:
+                acc = per_project.setdefault(proj, {"new_events": 0, "dirs": 0})
+                acc["new_events"] += r["new_events"]
+                acc["dirs"] += 1
+                total_new += r["new_events"]
+    return {"projects": per_project, "total_new": total_new,
+            "skipped_unknown": sorted(skipped_unknown)}

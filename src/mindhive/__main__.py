@@ -103,8 +103,16 @@ def main(argv=None) -> int:
 
     # --- harvest (auto-capture from Claude Code transcripts; no hooks needed) ---
     hv = sub.add_parser("harvest", help="capture events from Claude Code transcripts")
-    hv.add_argument("--transcripts", required=True)
-    hv.add_argument("--project", required=True)
+    hv.add_argument("--transcripts", default=None,
+                    help="transcript DIRECTORY (omit with --catch-up)")
+    hv.add_argument("--project", default=None,
+                    help="target namespace (omit with --catch-up — it auto-detects per session)")
+    hv.add_argument("--catch-up", dest="catch_up", action="store_true",
+                    help="scan ALL Claude transcript dirs and backfill sessions the hooks missed")
+    hv.add_argument("--include-captured", dest="include_captured", action="store_true",
+                    help="also (re)harvest sessions the live hooks already recorded (risks double-counting)")
+    hv.add_argument("--all-projects", dest="all_projects", action="store_true",
+                    help="with --catch-up, also harvest into namespaces that don't exist yet (default: only known projects)")
 
     # --- autosync (registry-driven: harvest + project + briefing + graph + sync) ---
     asp = sub.add_parser("autosync", help="automated sync for registered projects")
@@ -194,7 +202,19 @@ def main(argv=None) -> int:
         print(str(native_path))
     elif args.cmd == "harvest":
         from . import harvest as harvest_mod
-        print(json.dumps(harvest_mod.harvest(args.transcripts, args.project)))
+        if args.catch_up:
+            res = harvest_mod.catch_up(skip_captured=not args.include_captured,
+                                       known_only=not args.all_projects)
+            from . import projector
+            for proj in res["projects"]:           # refresh projections for touched namespaces
+                projector.project(proj)
+            print(json.dumps(res))
+        elif args.transcripts and args.project:
+            print(json.dumps(harvest_mod.harvest(args.transcripts, args.project,
+                                                 skip_captured=not args.include_captured)))
+        else:
+            print("error: give --transcripts and --project, or use --catch-up", file=sys.stderr)
+            return 2
     elif args.cmd == "autosync":
         from . import autosync as autosync_mod
         if getattr(args, "autosync_cmd", None) == "register":

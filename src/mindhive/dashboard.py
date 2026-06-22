@@ -329,10 +329,15 @@ def make_handler(token: str):
                     if route == "/api/project":
                         res = {n: projector.project(n) for n in _all_projects()}
                         return self._json({"ok": True, "result": res})
-                    if route != "/api/selftest":   # selftest is global; everything else needs a target
+                    # selftest + harvest are global (not tied to one project)
+                    if route not in ("/api/selftest", "/api/harvest"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)
+                if route == "/api/harvest":
+                    # self-healing backfill: capture any session the hooks missed
+                    res = run_catch_up()
+                    return self._json({"ok": True, "result": res})
                 if route == "/api/append":
                     etype = body.get("type")
                     text = body.get("payload", "")
@@ -458,6 +463,7 @@ def render_page(token: str) -> str:
     <button onclick="doExport()">Export handoff.md</button>
     <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
     <button onclick="doAction('/api/sync','Sync')">Sync</button>
+    <button onclick="doAction('/api/harvest','Catch up (harvest missed sessions)')">Catch up</button>
     <button onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
     <div class="group">Heavy</div>
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
@@ -723,6 +729,44 @@ def render_page(token: str) -> str:
 </body></html>""".replace("__TOKEN__", json.dumps(token))
 
 
+def run_catch_up() -> dict:
+    """Smart-harvest every transcript dir into its project and refresh the
+    touched projections. Used by the manual endpoint and the background loop."""
+    from . import harvest as harvest_mod
+    res = harvest_mod.catch_up(skip_captured=True)
+    for proj in res.get("projects", {}):
+        try:
+            projector.project(proj)
+        except Exception:
+            pass
+    return res
+
+
+def _auto_harvest_loop(stop_event) -> None:
+    """Background self-healer: periodically backfill any session the live hooks
+    didn't capture (e.g. when hooks don't fire in the Agent SDK harness). Off
+    via MINDHIVE_AUTOHARVEST=0; interval via MINDHIVE_AUTOHARVEST_SECS."""
+    if os.environ.get("MINDHIVE_AUTOHARVEST", "1").lower() in ("0", "false", "off", "no"):
+        return
+    try:
+        interval = max(30, int(os.environ.get("MINDHIVE_AUTOHARVEST_SECS", "180")))
+    except Exception:
+        interval = 180
+    first = True
+    while not stop_event.is_set():
+        stop_event.wait(8 if first else interval)   # short delay first, then steady cadence
+        first = False
+        if stop_event.is_set():
+            break
+        try:
+            res = run_catch_up()
+            if res.get("total_new"):
+                print(f"MIND HIVE auto-harvest: +{res['total_new']} events "
+                      f"across {len(res['projects'])} project(s)", flush=True)
+        except Exception:
+            pass   # never let the healer disturb the server
+
+
 def serve(port: int | None = None, open_browser: bool = True,
           token: str | None = None) -> None:
     """Start the dashboard on a fixed port with a persisted token so the URL is
@@ -731,6 +775,9 @@ def serve(port: int | None = None, open_browser: bool = True,
     ``port=None`` uses the fixed DEFAULT_PORT; pass ``port=0`` for an ephemeral
     port. If the fixed port is already bound (the dashboard is likely already
     running), this reopens that same stable URL and returns instead of crashing.
+
+    A background loop also auto-harvests sessions the live hooks miss, so the
+    store self-heals even where hooks never fire (disable: MINDHIVE_AUTOHARVEST=0).
     """
     if port is None:
         port = DEFAULT_PORT
@@ -751,9 +798,12 @@ def serve(port: int | None = None, open_browser: bool = True,
     print("Close this window or press Ctrl+C to stop.", flush=True)
     if open_browser:
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    stop_event = threading.Event()
+    threading.Thread(target=_auto_harvest_loop, args=(stop_event,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
         server.shutdown()

@@ -64,6 +64,15 @@ browser to a control panel for every feature — view state/briefing/graph, run
 recall, append memories, project, sync, verify, export, embed, and plugins
 scan. The graph is one of its views.
 
+**Self-healing capture.** The server runs a background loop that periodically
+**auto-harvests** any session the live hooks missed — so the store stays current
+even in environments where the hooks never fire (e.g. the Agent SDK harness).
+It's safe alongside the hooks: it skips sessions already captured live (no
+double-counting) and only touches projects you already track (no surprise
+namespaces). Disable with `MINDHIVE_AUTOHARVEST=0`; tune cadence with
+`MINDHIVE_AUTOHARVEST_SECS` (default 180). Trigger it by hand with the **Catch
+up** button, the `POST /api/harvest` endpoint, or `hive harvest --catch-up`.
+
 **The URL is stable across launches.** It binds a fixed port (**54461**) and a
 token persisted to `~/.mindhive/dashboard.token`, so every launch (CLI or
 `MindHive.exe`) serves the same `http://127.0.0.1:54461/?token=…` — bookmark it

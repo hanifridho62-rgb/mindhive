@@ -386,6 +386,29 @@ def test_hivemind_append_is_rejected():
         server.shutdown()
 
 
+def test_harvest_endpoint_runs_catch_up(monkeypatch):
+    import mindhive.harvest as h
+    monkeypatch.setattr(h, "catch_up", lambda skip_captured=True: {"projects": {}, "total_new": 0})
+    server, base, token = _start()
+    try:
+        status, obj = _post(base, "/api/harvest", {}, token)
+        assert obj["ok"] is True
+        assert obj["result"]["total_new"] == 0
+    finally:
+        server.shutdown()
+
+
+def test_harvest_endpoint_allowed_under_hivemind(monkeypatch):
+    import mindhive.harvest as h
+    monkeypatch.setattr(h, "catch_up", lambda skip_captured=True: {"projects": {}, "total_new": 0})
+    server, base, token = _start()
+    try:
+        status, obj = _post(base, "/api/harvest", {"project": "*"}, token)
+        assert obj["ok"] is True            # harvest is global, not blocked by HIVE MIND guard
+    finally:
+        server.shutdown()
+
+
 def test_page_has_hivemind_picker():
     server, base, token = _start()
     try:
