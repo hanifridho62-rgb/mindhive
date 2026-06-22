@@ -9,7 +9,7 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
-- `hive graph app` — open the desktop graph window (needs `pip install -e .[app]`)
+- `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
 - `hive plugins recommend` — print the top recommendations from the latest snapshot
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
@@ -40,25 +40,23 @@ exists (V17 is trading). Override with `--force` only when the box is idle.
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into
 any model/client. It is deterministic and costs no API tokens.
 
-## Desktop graph app
+## Desktop control panel
 
-`hive graph export` writes a single self-contained `graph.html` (data + renderer
-inlined, no network, no keys) you can open in any browser on any PC. It rebuilds
-the graph from your current events every time, so the view is never stale — no
-need to run `hive graph build` first.
+`hive dashboard` starts a localhost web app (bound to 127.0.0.1) and opens your
+browser to a control panel for every feature — view state/briefing/graph, run
+recall, append memories, project, sync, verify, export, embed, and plugins
+scan. The graph is one of its views.
 
-`hive graph app` opens the same always-fresh view in a native window
-(`pip install -e .[app]`).
-
+`hive graph export` still writes a single self-contained `graph.html` (data +
+renderer inlined, no network, no keys) you can open in any browser on any PC.
 Nodes are labelled and coloured by meaning — decisions, caveats (amber),
 experiment results, open questions, etc. — with a colour legend, click-to-inspect
-side panel (full text, timestamp, tags, connections), and a **Fit** button that
-frames the whole graph.
+side panel, and a **Fit** button that frames the whole graph.
 
-To build a double-click binary for your machine:
+To build a double-click binary (Windows, Python 3.12):
 
-    pip install -e .[app,build]
-    python build/build_app.py        # -> dist/MindHiveGraph(.exe)
+    pip install -e .[build]
+    python build/build_app.py        # -> dist/MindHive.exe
 
-PyInstaller builds for the OS it runs on. The window/exe use `build/icon.ico`.
-Built size is ~13 MB (Windows WebView2 is shared, not bundled).
+The exe runs a small console window showing the URL; close it to stop the server.
+The window/exe use `build/icon.ico`.

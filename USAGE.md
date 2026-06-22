@@ -9,3 +9,4 @@
 Recall details on demand:  hive recall "<query>"   (add --semantic for meaning-based)
 See connections:           hive graph related "<thing>"
 Full current state:        hive state        Full briefing: hive briefing
+Open everything in one window:  hive dashboard   (or double-click MindHive.exe)
