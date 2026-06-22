@@ -102,7 +102,7 @@ _RENDERER_JS = r"""
   // AMP = peak px offset, WAVES = ripples per line, SPEED = angular rate in rad/s
   // (the "speed 2" chosen on the design mockup maps to ~5.2 rad/s),
   // PHASE = per-edge desync, SAMPLES = polyline resolution of each path.
-  var VIBE_AMP = 2, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
+  var VIBE_AMP = 3.5, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
       VIBE_SAMPLES = 20;
 
   function nodeColor(n) {
