@@ -133,13 +133,122 @@ def make_handler(token: str):
 
 
 def render_page(token: str) -> str:
-    return (
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
-        "<title>MIND HIVE</title></head><body>"
-        "<h1>MIND HIVE</h1>"
-        f"<script>window.HIVE_TOKEN={json.dumps(token)};</script>"
-        "</body></html>"
-    )
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIND HIVE</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background:#11131a; color:#e6e8ef; }
+  header { padding: 14px 20px; background:#171a23; border-bottom:1px solid #2a2f3d; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.5px; }
+  main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 52px); }
+  nav { background:#141722; border-right:1px solid #2a2f3d; padding:12px; }
+  nav button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
+    background:#1d2230; color:#e6e8ef; border:1px solid #2a2f3d; border-radius:6px; cursor:pointer; }
+  nav button:hover { background:#262d3d; }
+  section.panel { padding:18px 22px; }
+  pre#out { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px;
+    padding:14px; min-height:120px; max-height:60vh; overflow:auto; }
+  iframe#graph { width:100%; height:70vh; border:1px solid #2a2f3d; border-radius:8px; background:#fff; }
+  input, select, textarea { background:#0c0e14; color:#e6e8ef; border:1px solid #2a2f3d;
+    border-radius:6px; padding:6px 8px; }
+  .row { margin:8px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .hidden { display:none; }
+  .err { color:#ff8a8a; }
+</style></head>
+<body>
+<header><h1>MIND HIVE &mdash; control panel</h1></header>
+<main>
+  <nav>
+    <button onclick="showState()">State</button>
+    <button onclick="showBriefing()">Briefing</button>
+    <button onclick="showRecall()">Recall</button>
+    <button onclick="showGraph()">Graph</button>
+    <button onclick="showAppend()">Append memory</button>
+    <button onclick="showPlugins()">Plugins</button>
+    <button onclick="doExport()">Export handoff.md</button>
+    <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
+    <button onclick="doAction('/api/sync','Sync')">Sync</button>
+    <button onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
+    <button onclick="confirmAction('/api/embed','Embed (heavy)')">Embed</button>
+    <button onclick="confirmAction('/api/plugins/scan','Plugins scan (heavy)')">Plugins scan</button>
+    <button onclick="confirmAction('/api/selftest','Self-test (heavy)')">Self-test</button>
+  </nav>
+  <section class="panel">
+    <div id="controls"></div>
+    <pre id="out">Pick a feature on the left.</pre>
+    <iframe id="graph" class="hidden"></iframe>
+  </section>
+</main>
+<script>
+  const TOKEN = __TOKEN__;
+  const out = document.getElementById('out');
+  const graph = document.getElementById('graph');
+  const controls = document.getElementById('controls');
+  function showOut(){ graph.classList.add('hidden'); out.classList.remove('hidden'); }
+  function u(path){ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }
+  async function apiGet(path){
+    const r = await fetch(u(path), { headers: { 'X-Hive-Token': TOKEN } });
+    const ct = r.headers.get('content-type') || '';
+    return ct.includes('json') ? r.json() : r.text();
+  }
+  async function apiPost(path, body){
+    const r = await fetch(u(path), { method:'POST', headers:{ 'Content-Type':'application/json',
+      'X-Hive-Token': TOKEN }, body: JSON.stringify(body || {}) });
+    return r.json();
+  }
+  function render(v){ showOut(); out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
+  function fail(e){ showOut(); out.innerHTML = '<span class="err">'+ (e && e.message || e) +'</span>'; }
+
+  async function showState(){ controls.innerHTML=''; try{ render(await apiGet('/api/state')); }catch(e){ fail(e); } }
+  async function showBriefing(){ controls.innerHTML=''; try{ render(await apiGet('/api/briefing')); }catch(e){ fail(e); } }
+  function showRecall(){
+    controls.innerHTML = '<div class="row"><input id="q" placeholder="search query">'
+      + '<label><input type="checkbox" id="sem"> semantic</label>'
+      + '<button onclick="runRecall()">Search</button></div>';
+    showOut(); out.textContent = 'Enter a query.';
+  }
+  async function runRecall(){
+    const q = document.getElementById('q').value;
+    const sem = document.getElementById('sem').checked ? '1' : '0';
+    try{ render(await apiGet('/api/recall?q='+encodeURIComponent(q)+'&semantic='+sem)); }catch(e){ fail(e); }
+  }
+  async function showGraph(){
+    controls.innerHTML='';
+    try{ const html = await apiGet('/api/graph'); out.classList.add('hidden');
+      graph.classList.remove('hidden'); graph.srcdoc = html; }catch(e){ fail(e); }
+  }
+  function showAppend(){
+    controls.innerHTML = '<div class="row"><select id="etype">'
+      + ['decision','caveat','experiment_result','next_step','open_question','state_set']
+        .map(t=>'<option>'+t+'</option>').join('')
+      + '</select></div>'
+      + '<div class="row"><textarea id="etext" rows="3" cols="60" placeholder="one line"></textarea></div>'
+      + '<div class="row"><input id="etags" placeholder="tags,comma,separated">'
+      + '<button onclick="runAppend()">Append</button></div>';
+    showOut(); out.textContent = 'Fill the form and append.';
+  }
+  async function runAppend(){
+    const body = { type: document.getElementById('etype').value,
+      payload: document.getElementById('etext').value, tags: document.getElementById('etags').value };
+    try{ render(await apiPost('/api/append', body)); }catch(e){ fail(e); }
+  }
+  async function showPlugins(){ controls.innerHTML=''; try{ render(await apiGet('/api/plugins/recommend')); }catch(e){ fail(e); } }
+  function doExport(){ window.location = u('/api/export'); }
+  async function doAction(path, label, method){
+    controls.innerHTML=''; render(label + '…');
+    try{ render(method === 'GET' ? await apiGet(path) : await apiPost(path, {})); }catch(e){ fail(e); }
+  }
+  async function confirmAction(path, label){
+    if(!confirm(label + ' — this can take a while. Continue?')) return;
+    let body = {};
+    if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
+    controls.innerHTML=''; render(label + ' running…');
+    try{ render(await apiPost(path, body)); }catch(e){ fail(e); }
+  }
+</script>
+</body></html>""".replace("__TOKEN__", json.dumps(token))
 
 
 def serve(port: int = 0, open_browser: bool = True) -> None:

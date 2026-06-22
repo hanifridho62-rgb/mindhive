@@ -161,3 +161,15 @@ def test_embed_blocked_by_live_lock():
         if created:
             lock.unlink()
         server.shutdown()
+
+
+def test_page_has_feature_controls():
+    server, base, token = _start()
+    try:
+        status, body = _get(base, "/")
+        assert status == 200
+        for needle in ["State", "Recall", "Graph", "Append", "Plugins", "Export"]:
+            assert needle in body, f"missing control: {needle}"
+        assert "fetch(" in body
+    finally:
+        server.shutdown()
