@@ -2,10 +2,10 @@
 """Freeze the MIND HIVE Graph desktop app into a single binary.
 
 Usage:
-    pip install -e .[app,build]
+    pip install -e .[build]
     python build/build_app.py
 
-Produces dist/MindHiveGraph (.exe on Windows). PyInstaller builds for the OS it
+Produces dist/MindHive (.exe on Windows). PyInstaller builds for the OS it
 runs on, so run this on the target OS.
 """
 import subprocess
@@ -22,10 +22,8 @@ def main() -> int:
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
         "--onefile",
-        "--windowed",
-        "--name", "MindHiveGraph",
+        "--name", "MindHive",
         "--paths", str(ROOT / "src"),
-        "--collect-all", "webview",
     ]
     if ICON.exists():
         args += ["--icon", str(ICON)]

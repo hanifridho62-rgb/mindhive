@@ -8,7 +8,6 @@ dependencies = []
 [project.optional-dependencies]
 vectors = ["chromadb>=0.5", "sentence-transformers>=2.2"]
 dev = ["pytest>=8"]
-app = ["pywebview>=5"]
 build = ["pyinstaller>=6"]
 
 [project.scripts]
