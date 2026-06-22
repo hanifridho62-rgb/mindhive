@@ -246,7 +246,18 @@ def render_page(token: str) -> str:
   function only(el){ for (const e of [out, view, graph]) e.classList.toggle('hidden', e !== el); }
   function showText(v){ only(out); out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
   function showHTML(html){ only(view); view.innerHTML = html; }
-  function fail(e){ only(out); out.innerHTML = '<span class="err">'+ esc(e && e.message || e) +'</span>'; }
+  function fail(e){
+    only(out);
+    const msg = (e && e.message) || String(e);
+    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+      out.innerHTML = '<span class="err">Can\\'t reach the MIND HIVE server.</span>\\n\\n'
+        + 'The server has stopped, or this tab is from an earlier run. Re-open '
+        + '<b>MindHive.exe</b> \\u2014 it opens a fresh tab. Each run uses its own one-time '
+        + 'link, so older tabs stop working.';
+    } else {
+      out.innerHTML = '<span class="err">'+ esc(msg) +'</span>';
+    }
+  }
 
   async function apiGet(path){
     const r = await fetch(u(path), { headers: { 'X-Hive-Token': TOKEN } });
@@ -355,8 +366,8 @@ def serve(port: int = 0, open_browser: bool = True) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     actual = server.server_address[1]
     url = f"http://127.0.0.1:{actual}/?token={token}"
-    print(f"MIND HIVE dashboard: {url}")
-    print("Close this window or press Ctrl+C to stop.")
+    print(f"MIND HIVE dashboard: {url}", flush=True)
+    print("Close this window or press Ctrl+C to stop.", flush=True)
     if open_browser:
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()
     try:
