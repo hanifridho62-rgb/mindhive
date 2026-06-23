@@ -8,8 +8,9 @@ Status: awaiting approval
 Make MIND HIVE capture happen **automatically, with no manual trigger**, for
 every project, in every environment — including the Claude Agent SDK / app
 harness where user-defined Claude Code hooks never fire. The user should never
-have to run `hive harvest` or register a project for their work to land in
-memory.
+have to run `hive harvest` for their work to land in memory. (Registration is
+no longer needed for capture; it remains a one-time step only for a project that
+also wants an external desktop-auto-load `MEMORY.md`.)
 
 ## What "memory" means here (locked)
 
@@ -62,35 +63,33 @@ New pipeline (replaces the registry-iteration loop):
 2. For every project that had **new events** this run
    (`catch_up` returns them): `projector.project(p)` + `graph.build(p,
    semantic=False)` to keep STATE / LEDGER / index / chain / graph current.
-3. **Native `MEMORY.md` sync — mindhive only.** Run `sync.sync(folder,
-   project="mindhive")` *only* for the `mindhive` project, and only when it had
-   new events this run. No other project gets an external `MEMORY.md`; they are
-   fully captured in the `~/.mindhive` store and visible in the dashboard /
-   HIVE MIND view, but nothing is written into their folders.
+3. **Native `MEMORY.md` sync — registered projects only.** Run `sync.sync(folder,
+   project=p)` for each project that is **in the registry** (`autosync.json`)
+   and had new events this run. This keeps `fabio-hft-v18`'s existing sync and
+   adds `mindhive` (registered once during rollout). Auto-discovered /
+   unregistered projects get **no external `MEMORY.md`** — they are fully
+   captured in the `~/.mindhive` store and visible in the dashboard / HIVE MIND
+   view, but nothing is written into their folders.
 
 ### 2. Where the mindhive `MEMORY.md` goes
 
-The single native file is written to mindhive's desktop auto-load path via the
-existing `sync.native_memory_path`:
+mindhive's native file is written to its desktop auto-load path via the existing
+`sync.native_memory_path`:
 
 ```
 ~/.claude/projects/C--Users-hanif-mindhive/memory/MEMORY.md
 ```
 
-derived from `folder = C:\Users\hanif\mindhive`. The mindhive folder is resolved
-automatically (registry entry if present, else derived from the git-root `cwd`
-of a mindhive transcript) — **no manual registration required**.
+derived from `folder = C:\Users\hanif\mindhive`. mindhive is added to the
+registry once during rollout (folder = the mindhive repo root) so the native
+sync step has its folder mapping — a one-time setup step, not per-session.
 
 ### 3. Registry's new role
 
-`autosync.json` is no longer required for capture. It is retained only as an
-optional folder-mapping/override source. The capture path ignores it; the native
-sync path uses it (or the derived folder) solely to locate mindhive's folder.
-
-> Open item for spec review: `fabio-hft-v18` currently gets a native `MEMORY.md`
-> via its registry entry. Under this design, native sync is confined to
-> `mindhive`, so fabio would no longer receive a `MEMORY.md` (it remains fully
-> captured in the store). Confirm this is intended.
+`autosync.json` is no longer required for **capture** (capture auto-discovers
+every project). It is now purely the **native-sync allow-list**: only projects
+listed there get an external `MEMORY.md`. After rollout it holds
+`fabio-hft-v18` (unchanged) and `mindhive` (added once).
 
 ### 4. Scheduled task retune (operational, applied separately)
 
@@ -118,9 +117,9 @@ Claude session (any harness) ──writes──▶ ~/.claude/projects/<enc>/<uui
                 │
    projector.project(p) + graph.build(p)          ← every project w/ new events
                 │
-   sync.sync(mindhive_folder, "mindhive")          ← mindhive ONLY
+   sync.sync(folder, p) for p in registry          ← registered only (fabio, mindhive)
                 ▼
-   ~/.claude/projects/C--Users-hanif-mindhive/memory/MEMORY.md
+   ~/.claude/projects/<enc(folder)>/memory/MEMORY.md
 ```
 
 ## Error handling
@@ -139,9 +138,10 @@ Claude session (any harness) ──writes──▶ ~/.claude/projects/<enc>/<uui
   (creates its namespace, appends events).
 - `run_all` honors `skip_captured` (a hook-captured session is not re-harvested).
 - `run_all` rebuilds projections/graph for every project with new events.
-- `run_all` native-syncs **only** mindhive — assert other projects get no
-  `MEMORY.md` write (spy on `sync.sync`).
-- `run_all` resolves the mindhive folder without a manual registry entry.
+- `run_all` native-syncs **only registered** projects — assert an unregistered
+  auto-discovered project gets no `MEMORY.md` write (spy on `sync.sync`).
+- `run_all` native-syncs each registered project that had new events (fabio +
+  mindhive style), using its registry folder.
 - Per-project error isolation: one failing project doesn't abort the others.
 
 Tests stub the heavy stages (project/graph/sync) and assert orchestration, plus
@@ -150,7 +150,11 @@ one end-to-end test using a fake transcript tree and `MINDHIVE_HOME`.
 ## Rollout
 
 1. Land the `autosync.run_all()` change + tests (green suite).
-2. Retune the scheduled task (`schtasks`) — confirmed step.
-3. Verify: run `mindhive autosync` once; confirm this `mindhive` session's
-   events appear in `~/.mindhive/mindhive/events/` and a fresh `MEMORY.md` is
-   written for mindhive only.
+2. Register mindhive once: `hive autosync register --project mindhive
+   --transcripts <~/.claude/projects/C--Users-hanif-mindhive> --folder
+   C:\Users\hanif\mindhive` (so it joins fabio on the native-sync allow-list).
+3. Retune the scheduled task (`schtasks`) — confirmed step.
+4. Verify: run `mindhive autosync` once; confirm this `mindhive` session's
+   events appear in `~/.mindhive/mindhive/events/`, a fresh `MEMORY.md` is
+   written for the registered projects (mindhive, fabio), and an unregistered
+   project is captured in the store but has no `MEMORY.md`.
