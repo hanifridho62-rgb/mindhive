@@ -156,9 +156,14 @@ def build_briefing(evs) -> str:
     return "\n".join(lines) + "\n"
 
 
-def briefing(project=None) -> Path:
-    """Build and write BRIEFING.md to the project dir; return the path."""
-    evs = ev_mod.read_all(project)
+def briefing(project=None, evs=None) -> Path:
+    """Build and write BRIEFING.md to the project dir; return the path.
+
+    Accepts pre-read events so a caller (e.g. sync) that already read the event
+    log can avoid a second full read.
+    """
+    if evs is None:
+        evs = ev_mod.read_all(project)
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
     content = build_briefing(evs)

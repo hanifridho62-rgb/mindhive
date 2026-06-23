@@ -65,8 +65,11 @@ def build_index(entries) -> dict:
     return idx
 
 
-def project(project=None) -> dict:
-    evs = events.read_all(project)
+def project(project=None, evs=None) -> dict:
+    # Accept pre-read events so a caller (e.g. sync) that already has them need
+    # not read the whole event log again.
+    if evs is None:
+        evs = events.read_all(project)
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
 
