@@ -5,6 +5,20 @@ def _setup(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
     monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
+def test_read_all_fails_loud_on_missing_required_field(tmp_path, monkeypatch):
+    import json
+    import pytest
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "ok"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    seg = next((tmp_path / "test" / "events").glob("*.jsonl"))
+    # Append a structurally valid JSON line that lacks required fields.
+    with open(seg, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": "2026-06-20T11:00:00Z", "type": "decision"}) + "\n")
+    with pytest.raises(json.JSONDecodeError, match="missing required field"):
+        events.read_all("test")
+
+
 def test_canonical_json_is_stable():
     a = events.canonical_json({"b": 1, "a": 2})
     b = events.canonical_json({"a": 2, "b": 1})
