@@ -2,7 +2,7 @@
 # Hook-free automation: harvest transcripts -> rebuild projections -> sync native MEMORY.md.
 # Driven by a Windows Scheduled Task (see hooks/autosync.ps1).
 import json
-from . import paths, harvest, projector, briefing, graph, sync
+from . import paths, harvest, projector, graph, sync
 
 
 def _registry_path():
@@ -29,19 +29,32 @@ def register(project, transcripts, folder) -> list:
     return reg
 
 
-def run_all() -> list:
+def run_all(now=None) -> list:
+    """Auto-discover and capture EVERY project from Claude transcripts, then
+    rebuild projections + graph for each project that changed this run. Write the
+    native MEMORY.md only for REGISTERED projects (the registry is the native-sync
+    allow-list; it is no longer required for capture).
+
+    ``skip_captured=True`` keeps capture safe alongside the live hooks (no
+    double-count); ``known_only=False`` lets brand-new projects be discovered
+    without prior registration.
+    """
+    cu = harvest.catch_up(now=now, skip_captured=True, known_only=False)
+    folders = {e["project"]: e["folder"]
+               for e in load_registry() if e.get("project") and e.get("folder")}
     results = []
-    for entry in load_registry():
-        proj = entry.get("project")
+    for proj in sorted(cu.get("projects", {}).keys()):
+        info = cu["projects"][proj]
         try:
-            # skip_captured=True enforces the invariant: never re-harvest a
-            # session the live hooks already recorded, or we double-count.
-            h = harvest.harvest(entry["transcripts"], proj, skip_captured=True)
-            projector.project(proj)
-            briefing.briefing(proj)
+            if proj in folders:
+                # sync.sync runs projector.project + briefing + writes MEMORY.md
+                sync.sync(folders[proj], project=proj)
+            else:
+                projector.project(proj)   # store capture only, no external file
             graph.build(proj, semantic=False)
-            sync.sync(entry["folder"], project=proj)
-            results.append({"project": proj, "harvest": h})
-        except Exception as e:  # one bad entry must not abort the rest
+            results.append({"project": proj,
+                            "new_events": info.get("new_events", 0),
+                            "synced": proj in folders})
+        except Exception as e:  # one bad project must not abort the rest
             results.append({"project": proj, "error": str(e)})
     return results
