@@ -214,6 +214,13 @@ _RENDERER_JS = r"""
 
   function tick(now) {
     now = now || 0;
+    // Once the layout has cooled (alpha 0) and nothing is being dragged, node
+    // positions are frozen — so skip the O(n^2) physics AND the per-node DOM
+    // transforms entirely; only the edge buzz keeps running. This is the single
+    // biggest render saving on large graphs and is visually identical (nothing
+    // was moving). A drag reheats alpha, which resumes the simulation.
+    var simulating = alpha > 0 || dragging;
+    if (simulating) {
     for (var i = 0; i < nodes.length; i++) {
       var a = nodes[i];
       for (var j = i + 1; j < nodes.length; j++) {
@@ -239,6 +246,7 @@ _RENDERER_JS = r"""
       if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
       n.vx *= 0.85; n.vy *= 0.85;
     });
+    }
     // Edge buzz: rebuild each edge as a perpendicular sine waveform. Driven by
     // the frame timestamp (not alpha), so edges keep vibrating after the layout
     // freezes. The sin(pi*s) envelope pins displacement to 0 at both endpoints.
@@ -259,9 +267,11 @@ _RENDERER_JS = r"""
       }
       edgeEls[i].setAttribute("d", d);
     });
-    nodes.forEach(function (n, i) {
-      nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-    });
+    if (simulating) {
+      nodes.forEach(function (n, i) {
+        nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+      });
+    }
     // Cool the layout each frame; once it has settled (alpha hits 0) the node
     // positions are frozen, so a single fit-to-window holds instead of going
     // stale while the simulation keeps drifting (which clipped the graph).
