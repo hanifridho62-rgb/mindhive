@@ -293,7 +293,7 @@ def test_recommend_tiebreak_alphabetical(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# store round-trip (event integration)
+# store round-trip (latest-only sidecar — NOT the append-only ledger)
 # --------------------------------------------------------------------------
 
 def _store(tmp_path, monkeypatch):
@@ -301,13 +301,27 @@ def _store(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
 
-def test_scan_and_store_appends_one_event(tmp_path, monkeypatch):
+def test_scan_and_store_writes_sidecar_not_event(tmp_path, monkeypatch):
+    """The catalog must NOT be appended to the hash-chained ledger — it goes to a
+    sidecar so daily autoscans never bloat (and never tamper with) the chain."""
     _store(tmp_path, monkeypatch)
     cache = make_cache(tmp_path)
     plugins.scan_and_store(cache_dir=cache)
-    cat = [e for e in events.read_all() if e.type == "plugin_catalog"]
-    assert len(cat) == 1
-    assert cat[0].payload["engine"] == "claude-opus-4-8"
+    assert not [e for e in events.read_all() if e.type == "plugin_catalog"]
+    snap = plugins.latest_catalog()
+    assert snap and snap["engine"] == "claude-opus-4-8"
+    assert plugins._catalog_path().exists()
+
+
+def test_repeated_scans_overwrite_sidecar_no_growth(tmp_path, monkeypatch):
+    """N scans leave exactly ONE sidecar and ZERO ledger events — the bug the
+    audit flagged (unbounded plugin_catalog growth) is gone by construction."""
+    _store(tmp_path, monkeypatch)
+    cache = make_cache(tmp_path)
+    for _ in range(5):
+        plugins.scan_and_store(cache_dir=cache)
+    assert plugins._catalog_path().exists()
+    assert not [e for e in events.read_all() if e.type == "plugin_catalog"]
 
 
 def test_latest_catalog_returns_none_when_absent(tmp_path, monkeypatch):
@@ -326,16 +340,15 @@ def test_latest_catalog_returns_most_recent(tmp_path, monkeypatch):
     plugins.scan_and_store(cache_dir=cache, top_n=3)
     plugins.scan_and_store(cache_dir=cache, top_n=2)
     latest = plugins.latest_catalog()
-    assert len(latest["recommendations"]) == 2     # the second (most recent) scan
-    assert len([e for e in events.read_all() if e.type == "plugin_catalog"]) == 2
+    assert len(latest["recommendations"]) == 2     # the second (most recent) scan won
 
 
 # --------------------------------------------------------------------------
 # ensure_fresh — stale-gated auto-refresh (powers the session hook & panel)
 # --------------------------------------------------------------------------
 
-def _catalog_count():
-    return len([e for e in events.read_all() if e.type == "plugin_catalog"])
+def _has_sidecar():
+    return plugins._catalog_path().exists()
 
 
 def test_ensure_fresh_scans_when_no_snapshot(tmp_path, monkeypatch):
@@ -343,7 +356,7 @@ def test_ensure_fresh_scans_when_no_snapshot(tmp_path, monkeypatch):
     res = plugins.ensure_fresh(cache_dir=tmp_path / "nope")
     assert res["scanned"] is True
     assert res["age_hours"] == 0.0
-    assert _catalog_count() == 1
+    assert _has_sidecar()
 
 
 def test_ensure_fresh_skips_when_fresh(tmp_path, monkeypatch):
@@ -352,21 +365,20 @@ def test_ensure_fresh_skips_when_fresh(tmp_path, monkeypatch):
     res = plugins.ensure_fresh(cache_dir=tmp_path / "nope")    # second, should skip
     assert res["scanned"] is False
     assert res["payload"]                                       # still returns the snapshot
-    assert _catalog_count() == 1                                # no extra event written
 
 
 def test_ensure_fresh_rescans_when_stale(tmp_path, monkeypatch):
     _store(tmp_path, monkeypatch)
-    events.append_event("plugin_catalog", {"recommendations": []},
-                        ts="2000-01-01T00:00:00Z")             # ancient snapshot
+    # seed an ancient sidecar snapshot directly
+    plugins._write_catalog({"recommendations": [], "scanned_at": "2000-01-01T00:00:00Z"})
     res = plugins.ensure_fresh(cache_dir=tmp_path / "nope", max_age_hours=24)
     assert res["scanned"] is True
-    assert _catalog_count() == 2
+    # the stale snapshot was overwritten by a fresh one
+    assert plugins.latest_catalog()["scanned_at"] != "2000-01-01T00:00:00Z"
 
 
 def test_ensure_fresh_force_rescans_even_when_fresh(tmp_path, monkeypatch):
     _store(tmp_path, monkeypatch)
-    plugins.ensure_fresh(cache_dir=tmp_path / "nope")          # fresh snapshot exists
+    first = plugins.ensure_fresh(cache_dir=tmp_path / "nope")          # fresh snapshot exists
     res = plugins.ensure_fresh(cache_dir=tmp_path / "nope", force=True)
     assert res["scanned"] is True
-    assert _catalog_count() == 2

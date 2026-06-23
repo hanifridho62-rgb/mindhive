@@ -1,5 +1,6 @@
 # src/mindhive/graph.py
 from __future__ import annotations
+import hashlib
 from collections import defaultdict
 from . import events as ev_mod, paths
 
@@ -8,7 +9,13 @@ SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES
 
 
 def _ev_id(ev) -> str:
-    return f"ev:{ev.ts}:{ev.type}"
+    # Include a short hash of the payload so two DISTINCT events that share the
+    # same timestamp and type get distinct node ids instead of silently
+    # overwriting each other (add_node dedupes on id). Two truly identical
+    # events still map to one node, which is the intended behaviour.
+    body = ev_mod.canonical_json(ev.payload) if ev.payload else ""
+    h = hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+    return f"ev:{ev.ts}:{ev.type}:{h}"
 
 
 def _session_id(ev) -> str:
@@ -29,18 +36,14 @@ def _file_path_from_payload(payload) -> str | None:
     return None
 
 
-def _expand_plugin_catalog(evs, add_node, add_edge) -> None:
-    """Expand the most recent plugin_catalog snapshot into graph nodes/edges.
+def _expand_plugin_catalog(snap, add_node, add_edge) -> None:
+    """Expand a plugin_catalog snapshot payload into graph nodes/edges.
 
     Only free plugins are rendered. Each plugin links to its skills (provides),
     to the topics it covers (covers), and the recommendation node links to the
     top-5 plugins (recommends). Pure and deterministic given the snapshot.
     """
-    snap = None
-    for ev in evs:
-        if ev.type == "plugin_catalog" and isinstance(ev.payload, dict):
-            snap = ev.payload  # keep the last (latest) one
-    if not snap:
+    if not isinstance(snap, dict):
         return
 
     rec_id = f"recommendation:{snap.get('scanned_at', '')}"
@@ -124,16 +127,28 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     for i in range(len(sem_evs) - 1):
         add_edge(_ev_id(sem_evs[i]), _ev_id(sem_evs[i + 1]), "next")
 
-    # shares_tag: pairs of semantic events sharing >=1 tag
-    # emit once per unordered pair
-    for i in range(len(sem_evs)):
-        for j in range(i + 1, len(sem_evs)):
-            a, b = sem_evs[i], sem_evs[j]
-            if set(a.tags or []) & set(b.tags or []):
-                add_edge(_ev_id(a), _ev_id(b), "shares_tag")
+    # shares_tag: pairs of semantic events sharing >=1 tag, once per pair.
+    # Build an inverted tag -> [event indices] map and only pair within each
+    # tag bucket. This replaces the O(n^2)-over-all-events scan with work
+    # proportional to the actual co-tagging, which is typically far smaller.
+    tag_to_idx: dict[str, list[int]] = defaultdict(list)
+    for idx, ev in enumerate(sem_evs):
+        for tag in (ev.tags or []):
+            tag_to_idx[tag].append(idx)  # appended in ascending idx order
+    seen_pairs: set[tuple[int, int]] = set()
+    for idxs in tag_to_idx.values():
+        for x in range(len(idxs)):
+            for y in range(x + 1, len(idxs)):
+                i, j = idxs[x], idxs[y]  # i < j (idxs ascending)
+                if (i, j) in seen_pairs:  # dedupe pairs sharing multiple tags
+                    continue
+                seen_pairs.add((i, j))
+                add_edge(_ev_id(sem_evs[i]), _ev_id(sem_evs[j]), "shares_tag")
 
-    # Expand the latest plugin_catalog snapshot into plugin/skill/topic nodes.
-    _expand_plugin_catalog(evs, add_node, add_edge)
+    # Expand the latest plugin_catalog snapshot (a sidecar file, not a ledger
+    # event) into plugin/skill/topic nodes.
+    from . import plugins
+    _expand_plugin_catalog(plugins.latest_catalog(project), add_node, add_edge)
 
     # Optional semantic edges (graceful degradation if deps/embeddings absent)
     if semantic:

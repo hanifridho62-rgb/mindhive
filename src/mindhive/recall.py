@@ -16,5 +16,7 @@ def recall(query, project=None, semantic=False, limit=10, force=False):
         low = text.lower()
         if all(t in low for t in terms):
             snippet = " ".join(text.split())[:200]
-            results.append({"file": str(f), "snippet": snippet})
+            # Return the bare ledger filename (not the full path) to match
+            # vectors.semantic_recall — one consistent shape for both modes.
+            results.append({"file": f.name, "snippet": snippet})
     return results[:limit]

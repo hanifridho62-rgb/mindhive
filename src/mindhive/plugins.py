@@ -234,31 +234,47 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
     }
 
 
+def _catalog_path(project=None) -> Path:
+    """Sidecar file holding the single latest plugin catalog snapshot."""
+    return paths.project_dir(project) / "plugin_catalog.json"
+
+
+def _write_catalog(payload: dict, project=None) -> None:
+    p = _catalog_path(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(ev_mod.canonical_json(payload), encoding="utf-8")
+    tmp.replace(p)  # atomic overwrite-in-place — no unbounded growth
+
+
 def scan_and_store(cache_dir=None, top_n: int = 5, project=None) -> dict:
-    """Run the evaluation and append a single plugin_catalog snapshot event."""
+    """Run the evaluation and overwrite the latest-catalog sidecar.
+
+    The plugin catalog is DERIVED, ephemeral data (a snapshot of what's on disk),
+    not a memory — so it lives in a single overwrite-in-place sidecar rather than
+    the append-only, hash-chained event ledger. Putting it in the ledger would
+    bloat the chain by one snapshot per daily autoscan forever, with no way to
+    prune (pruning would break the hash chain). The sidecar sidesteps that
+    entirely while keeping the latest snapshot instantly available."""
     payload = evaluate(cache_dir, top_n=top_n)
-    ev_mod.append_event("plugin_catalog", payload, project=project)
+    _write_catalog(payload, project=project)
     return payload
 
 
-def latest_catalog_event(project=None):
-    """Return the most recent plugin_catalog Event, or None."""
-    latest = None
-    for ev in ev_mod.read_all(project):
-        if ev.type == "plugin_catalog":
-            latest = ev
-    return latest
-
-
 def latest_catalog(project=None) -> dict | None:
-    """Return the most recent plugin_catalog snapshot payload, or None."""
-    ev = latest_catalog_event(project)
-    return ev.payload if ev else None
+    """Return the latest plugin catalog snapshot payload, or None if never scanned."""
+    p = _catalog_path(project)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def _age_hours(ts: str):
-    """Hours elapsed since a UTC event ts ('YYYY-MM-DDTHH:MM:SSZ'), or None if
-    the timestamp can't be parsed (treated as stale by callers)."""
+    """Hours elapsed since a UTC ts ('YYYY-MM-DDTHH:MM:SSZ'), or None if the
+    timestamp can't be parsed (treated as stale by callers)."""
     import calendar
     import time as _time
     try:
@@ -273,18 +289,18 @@ def ensure_fresh(cache_dir=None, top_n: int = 5, max_age_hours: float = 24.0,
     """Auto-refresh the catalog only when it's missing or stale — cheap enough
     to call on every session start.
 
-    Scans (and stores a new plugin_catalog snapshot) when there is no snapshot,
-    when the newest one is older than ``max_age_hours``, or when ``force`` is
-    set. Otherwise it returns the existing snapshot without scanning.
+    Rescans (overwriting the sidecar) when there is no snapshot, when the
+    snapshot's ``scanned_at`` is older than ``max_age_hours``, or when ``force``
+    is set. Otherwise it returns the existing snapshot without scanning.
 
     Returns ``{"scanned": bool, "age_hours": float|None, "payload": dict}``.
-    The shared event store means a refresh by one session is immediately seen
-    by every other session.
+    The shared store means a refresh by one session is immediately seen by every
+    other session.
     """
-    ev = None if force else latest_catalog_event(project)
-    if ev is not None:
-        age = _age_hours(ev.ts)
+    payload = None if force else latest_catalog(project)
+    if payload is not None:
+        age = _age_hours(payload.get("scanned_at", ""))
         if age is not None and age < max_age_hours:
-            return {"scanned": False, "age_hours": age, "payload": ev.payload}
+            return {"scanned": False, "age_hours": age, "payload": payload}
     payload = scan_and_store(cache_dir=cache_dir, top_n=top_n, project=project)
     return {"scanned": True, "age_hours": 0.0, "payload": payload}

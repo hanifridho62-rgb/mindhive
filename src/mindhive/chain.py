@@ -14,8 +14,10 @@ def compute_chain(evs) -> dict:
     return {"count": len(evs), "head": head}
 
 
-def write_chain(project=None) -> dict:
-    c = compute_chain(events.read_all(project))
+def write_chain(project=None, evs=None) -> dict:
+    # Accept pre-parsed events to avoid a second full read of the event log when
+    # the caller (e.g. projector.project) already has them in hand.
+    c = compute_chain(events.read_all(project) if evs is None else evs)
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
     (pdir / "chain.json").write_text(events.canonical_json(c), encoding="utf-8")

@@ -90,17 +90,19 @@ def test_graph_export_open_invokes_browser(tmp_path, monkeypatch, capsys):
     assert "graph.html" in opened.get("uri", "")
 
 
-def test_cli_plugins_scan_stores_one_event(tmp_path, monkeypatch, capsys):
+def test_cli_plugins_scan_stores_sidecar(tmp_path, monkeypatch, capsys):
     _setup(tmp_path, monkeypatch)
     from tests.test_plugins import make_cache
+    from mindhive import plugins
     cache = make_cache(tmp_path)
     ret = cli_mod.main(["plugins", "scan", "--cache", str(cache)])
     assert ret == 0
     out = capsys.readouterr().out
     assert "free-plugin" in out
-    assert "stored plugin_catalog" in out
-    catalogs = [e for e in events.read_all() if e.type == "plugin_catalog"]
-    assert len(catalogs) == 1
+    assert "stored plugin catalog" in out
+    # the catalog goes to the latest-only sidecar, NOT the append-only ledger
+    assert plugins.latest_catalog() is not None
+    assert not [e for e in events.read_all() if e.type == "plugin_catalog"]
 
 
 def test_cli_plugins_recommend_reads_latest(tmp_path, monkeypatch, capsys):

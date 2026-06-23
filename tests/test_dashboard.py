@@ -450,3 +450,66 @@ def test_page_has_project_and_memory_controls():
             assert needle in body, f"missing: {needle}"
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------
+# Token comparison (constant-time) + /api/sync folder resolution
+# --------------------------------------------------------------------------
+
+def test_wrong_token_is_rejected():
+    server, base, token = _start()
+    try:
+        try:
+            _get(base, "/api/state", token="totally-wrong-token")
+            assert False, "expected 403"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+    finally:
+        server.shutdown()
+
+
+def test_correct_token_is_accepted():
+    server, base, token = _start()
+    try:
+        status, _ = _get(base, "/api/state", token)
+        assert status == 200
+    finally:
+        server.shutdown()
+
+
+def test_sync_uses_registered_project_folder(monkeypatch):
+    """/api/sync must write the selected project's OWN folder (from the autosync
+    registry), not the directory the dashboard server was launched from."""
+    from mindhive import autosync
+    autosync.register("test", "C:/tx/test", "C:/code/test-project")
+    captured = {}
+
+    def spy_sync(folder, project=None):
+        captured["folder"] = folder
+        captured["project"] = project
+        return "C:/code/test-project/MEMORY.md"
+
+    monkeypatch.setattr(dashboard.sync_mod, "sync", spy_sync)
+    server, base, token = _start()
+    try:
+        status, obj = _post(base, "/api/sync", {"project": "test"}, token)
+        assert status == 200 and obj["ok"] is True
+        assert captured["folder"] == "C:/code/test-project"   # registry folder, not cwd
+        assert captured["project"] == "test"
+        assert obj["folder"] == "C:/code/test-project"
+    finally:
+        server.shutdown()
+
+
+def test_sync_falls_back_to_cwd_when_unregistered(monkeypatch):
+    """An unregistered project has no folder mapping, so sync uses the cwd."""
+    import os
+    captured = {}
+    monkeypatch.setattr(dashboard.sync_mod, "sync",
+                        lambda folder, project=None: captured.update(folder=folder) or "x")
+    server, base, token = _start()
+    try:
+        _post(base, "/api/sync", {"project": "never-registered"}, token)
+        assert captured["folder"] == os.getcwd()
+    finally:
+        server.shutdown()

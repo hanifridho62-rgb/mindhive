@@ -42,3 +42,28 @@ def test_verify_without_chain_file(tmp_path, monkeypatch):
     events.append_event("decision", {"text": "a"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
     assert chain.verify()["ok"] is False
+
+def test_write_chain_accepts_pre_parsed_events(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    from_disk = chain.write_chain()
+    evs = events.read_all()
+    from_mem = chain.write_chain(evs=evs)
+    # Passing the events in must produce an identical chain to reading from disk.
+    assert from_mem == from_disk
+
+def test_project_reads_event_log_only_once(tmp_path, monkeypatch):
+    """projector.project must not re-read the event log inside write_chain."""
+    from mindhive import projector
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    calls = {"n": 0}
+    real = events.read_all
+    def counting(project=None):
+        calls["n"] += 1
+        return real(project)
+    monkeypatch.setattr(events, "read_all", counting)
+    projector.project()
+    assert calls["n"] == 1

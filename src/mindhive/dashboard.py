@@ -61,6 +61,18 @@ from .briefing import briefing as build_briefing
 # caveats, …) as opposed to deterministic session telemetry. Keeping the three
 # distinct is what makes intent and context legible at a glance.
 
+def _folder_for_project(proj: str) -> str:
+    """The project's own folder (where its native MEMORY.md belongs), taken from
+    the autosync registry. Falls back to the server's cwd only when the project
+    isn't registered — so picking a project in the UI syncs THAT project's
+    folder, not wherever the dashboard happens to be launched from."""
+    from . import autosync
+    for e in autosync.load_registry():
+        if e.get("project") == proj and e.get("folder"):
+            return e["folder"]
+    return os.getcwd()
+
+
 def _all_projects() -> list:
     """Names of every store namespace that has an events log."""
     home = paths.store_home()
@@ -135,7 +147,10 @@ def make_handler(token: str):
         def _check_token(self) -> bool:
             qs = parse_qs(urlparse(self.path).query)
             supplied = self.headers.get("X-Hive-Token") or (qs.get("token") or [None])[0]
-            return supplied == token
+            if supplied is None:
+                return False
+            # constant-time compare to avoid leaking the token via timing
+            return secrets.compare_digest(str(supplied), str(token))
 
         def _send(self, code, body, ctype="application/json; charset=utf-8"):
             data = body.encode("utf-8") if isinstance(body, str) else body
@@ -354,9 +369,9 @@ def make_handler(token: str):
                 if route == "/api/project":
                     return self._json({"ok": True, "result": projector.project(proj)})
                 if route == "/api/sync":
-                    import os
-                    path = sync_mod.sync(os.getcwd(), project=proj)
-                    return self._json({"ok": True, "path": str(path)})
+                    folder = _folder_for_project(proj)
+                    path = sync_mod.sync(folder, project=proj)
+                    return self._json({"ok": True, "path": str(path), "folder": folder})
                 if route == "/api/embed":
                     force = bool(body.get("force", False))
                     guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force

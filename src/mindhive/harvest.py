@@ -2,11 +2,27 @@
 # Deterministic, hook-free auto-capture: turn Claude Code session transcripts
 # (~/.claude/projects/<encoded>/<uuid>.jsonl) into MIND HIVE events.
 import json
+import re
 from pathlib import Path
 from . import events, paths
 
 _MARKERS = ("remember:", "memo:", "decision:", "caveat:")
+# Hint words only disambiguate the GENERIC markers (remember:/memo:). An explicit
+# decision:/caveat: marker is authoritative and never reclassified.
 _CAVEAT_HINT = ("bug", "fail", "lesson", "incident", "careful", "don't", "avoid", "broke")
+_AMBIGUOUS_MARKERS = ("remember:", "memo:")
+
+_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _normalize_ts(raw) -> str | None:
+    """Reduce a transcript ISO-8601 timestamp (e.g. '2026-06-20T09:15:30.500Z')
+    to the canonical second-resolution UTC form the store uses, or None when it
+    can't be parsed."""
+    if not isinstance(raw, str):
+        return None
+    m = _TS_RE.match(raw.strip())
+    return (m.group(1) + "Z") if m else None
 
 
 def _user_text(content) -> str:
@@ -43,16 +59,27 @@ def _items_from_obj(o) -> list:
     elif t == "user":
         text = _user_text(msg.get("content")).strip()
         low = text.lower()
+        # Pick the marker that appears FIRST in the text (smallest position),
+        # not whichever happens to come first in _MARKERS.
+        best = None  # (position, marker)
         for m in _MARKERS:
-            if m in low:
-                val = text[low.index(m) + len(m):].strip()
-                mtype = "caveat" if (m == "caveat:" or any(h in low for h in _CAVEAT_HINT)) else "decision"
-                if val:
-                    # Store the full memo — no truncation. Redundant re-phrasings
-                    # are collapsed by meaning at display time (see dedupe.py),
-                    # so the ledger keeps every memory verbatim and complete.
-                    items.append({"kind": "memo", "value": val, "memo_type": mtype})
-                break
+            i = low.find(m)
+            if i != -1 and (best is None or i < best[0]):
+                best = (i, m)
+        if best is not None:
+            pos, m = best
+            val = text[pos + len(m):].strip()
+            if val:
+                if m == "caveat:":
+                    mtype = "caveat"
+                elif m == "decision:":
+                    mtype = "decision"            # explicit marker is authoritative
+                else:                              # remember:/memo: -> infer from hints
+                    mtype = "caveat" if any(h in low for h in _CAVEAT_HINT) else "decision"
+                # Store the full memo — no truncation. Redundant re-phrasings
+                # are collapsed by meaning at display time (see dedupe.py),
+                # so the ledger keeps every memory verbatim and complete.
+                items.append({"kind": "memo", "value": val, "memo_type": mtype})
     return items
 
 
@@ -141,16 +168,19 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                     o = json.loads(line)
                 except Exception:
                     continue
+                # Preserve the real time the action happened (from the transcript
+                # line), falling back to `now` only when the line has no timestamp.
+                line_ts = _normalize_ts(o.get("timestamp")) or now
                 for item in _items_from_obj(o):
                     if item["kind"] == "file_touched":
                         events.append_event("file_touched", {"text": item["value"]},
-                                            session_id=sid, tags=["harvest", "auto"], ts=now, project=project)
+                                            session_id=sid, tags=["harvest", "auto"], ts=line_ts, project=project)
                     elif item["kind"] == "command_run":
                         events.append_event("command_run", {"text": item["value"]},
-                                            session_id=sid, tags=["harvest", "auto"], ts=now, project=project)
+                                            session_id=sid, tags=["harvest", "auto"], ts=line_ts, project=project)
                     elif item["kind"] == "memo":
                         events.append_event(item["memo_type"], {"text": item["value"]},
-                                            session_id=sid, tags=["harvest", "memo"], ts=now, project=project)
+                                            session_id=sid, tags=["harvest", "memo"], ts=line_ts, project=project)
                     new_events += 1
             state[f.name] = len(all_lines)
     _save_state(project, state)

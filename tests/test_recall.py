@@ -22,3 +22,16 @@ def test_recall_empty_when_no_match(tmp_path, monkeypatch):
                         session_id="s", ts="2026-06-20T10:00:00Z")
     projector.project()
     assert recall.recall("nonexistent term") == []
+
+def test_recall_returns_bare_filename(tmp_path, monkeypatch):
+    """Lexical recall must return a bare ledger filename (no path separators),
+    matching the shape of vectors.semantic_recall."""
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "default OFF for ofi gate"},
+                        session_id="s", ts="2026-06-20T11:00:00Z")
+    projector.project()
+    hits = recall.recall("ofi gate")
+    assert hits
+    f = hits[0]["file"]
+    assert "/" not in f and "\\" not in f
+    assert f.endswith(".md")

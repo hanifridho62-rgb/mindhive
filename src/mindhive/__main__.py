@@ -14,7 +14,7 @@ def _print_recommendations(payload: dict, scanned: bool) -> None:
     if scanned:
         print(f"scanned {c.get('plugins_total', 0)} plugins "
               f"({c.get('free', 0)} free, {c.get('paid', 0)} paid, "
-              f"{c.get('skills_total', 0)} skills) -> stored plugin_catalog")
+              f"{c.get('skills_total', 0)} skills) -> stored plugin catalog")
     engine = payload.get("engine", "claude-opus-4-8")
     print(f"\nTop {len(payload.get('recommendations', []))} free plugins "
           f"recommended by {engine} (by breadth score):")
@@ -25,6 +25,19 @@ def _print_recommendations(payload: dict, scanned: bool) -> None:
 
 
 def main(argv=None) -> int:
+    """CLI entry point. Frames a corrupt event log as a clean error instead of
+    leaking a traceback — read_all itself stays fail-loud so the tamper-evident
+    hash chain is never silently weakened; we only present the failure nicely."""
+    try:
+        return _run(argv)
+    except json.JSONDecodeError as e:
+        print(f"error: corrupt event log ({e})", file=sys.stderr)
+        print("       a line in the event log is not valid JSON; "
+              "run `hive verify` to locate it.", file=sys.stderr)
+        return 1
+
+
+def _run(argv=None) -> int:
     p = argparse.ArgumentParser(prog="hive", description="MIND HIVE memory CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -205,7 +218,6 @@ def main(argv=None) -> int:
         if args.catch_up:
             res = harvest_mod.catch_up(skip_captured=not args.include_captured,
                                        known_only=not args.all_projects)
-            from . import projector
             for proj in res["projects"]:           # refresh projections for touched namespaces
                 projector.project(proj)
             print(json.dumps(res))

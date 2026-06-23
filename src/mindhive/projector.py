@@ -89,5 +89,5 @@ def project(project=None) -> dict:
 
     (pdir / "index.json").write_text(
         events.canonical_json(build_index(entries)), encoding="utf-8")
-    chain.write_chain(project)
+    chain.write_chain(project, evs=evs)  # reuse the events we already read
     return {"events": len(evs), "ledger": len(entries), "pruned": pruned}

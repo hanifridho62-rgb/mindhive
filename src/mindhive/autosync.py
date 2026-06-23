@@ -34,7 +34,9 @@ def run_all() -> list:
     for entry in load_registry():
         proj = entry.get("project")
         try:
-            h = harvest.harvest(entry["transcripts"], proj)
+            # skip_captured=True enforces the invariant: never re-harvest a
+            # session the live hooks already recorded, or we double-count.
+            h = harvest.harvest(entry["transcripts"], proj, skip_captured=True)
             projector.project(proj)
             briefing.briefing(proj)
             graph.build(proj, semantic=False)
