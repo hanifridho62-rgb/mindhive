@@ -13,6 +13,7 @@ if (-not $sid) { $sid = "unknown" }
 $env:MINDHIVE_SESSION = $sid
 try {
     & $py -m mindhive append session_start "session opened" | Out-Null
+    & $py -m mindhive directives
     & $py -m mindhive state
 } catch {}
 # Auto-refresh the plugin/skill catalog in the background — detached and
