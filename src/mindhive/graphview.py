@@ -128,6 +128,11 @@ _RENDERER_JS = r"""
   var NS = "http:" + "//www.w3.org/2000/svg";
   var root = document.createElementNS(NS, "g");
   svg.appendChild(root);
+  // Behind everything: a layer for the per-group halos + labels so each cluster
+  // is visibly named. pointer-events:none so it never swallows node clicks.
+  var groupLayer = document.createElementNS(NS, "g");
+  groupLayer.setAttribute("pointer-events", "none");
+  root.appendChild(groupLayer);
 
   var view = { x: 0, y: 0, k: 1 };
   function applyView() {
@@ -223,6 +228,7 @@ _RENDERER_JS = r"""
 
   var dragging = null, dragOff = null;
   var fitted = false, alpha = 0;   // alpha 0 = frozen; a drag reheats the sim
+  var wasSimulating = false;       // tracks settle transitions (for group halos)
   function fitView() {
     if (!nodes.length) return;
     var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -298,6 +304,47 @@ _RENDERER_JS = r"""
     }
   }
 
+  // Draw a faint halo + label around each settled cluster so the grouping is
+  // legible at a glance. Centroid/radius come from the actual node positions
+  // (not the seed anchors), so the labels always sit on the real cluster.
+  function renderGroups() {
+    while (groupLayer.firstChild) groupLayer.removeChild(groupLayer.firstChild);
+    groupKeys.forEach(function (k) {
+      var members = nodes.filter(function (n) { return n.group === k; });
+      if (!members.length) return;
+      var cx = 0, cy = 0;
+      members.forEach(function (n) { cx += n.x; cy += n.y; });
+      cx /= members.length; cy /= members.length;
+      var r = 30;
+      members.forEach(function (n) {
+        var dx = n.x - cx, dy = n.y - cy;
+        r = Math.max(r, Math.sqrt(dx * dx + dy * dy));
+      });
+      r += 30;
+      var color = nodeColor(members[0]);
+      var halo = document.createElementNS(NS, "circle");
+      halo.setAttribute("cx", cx.toFixed(1));
+      halo.setAttribute("cy", cy.toFixed(1));
+      halo.setAttribute("r", r.toFixed(1));
+      halo.setAttribute("fill", color);
+      halo.setAttribute("fill-opacity", "0.05");
+      halo.setAttribute("stroke", color);
+      halo.setAttribute("stroke-opacity", "0.25");
+      halo.setAttribute("stroke-dasharray", "4 4");
+      groupLayer.appendChild(halo);
+      var label = document.createElementNS(NS, "text");
+      label.setAttribute("x", cx.toFixed(1));
+      label.setAttribute("y", (cy - r - 6).toFixed(1));
+      label.setAttribute("text-anchor", "middle");
+      label.setAttribute("fill", color);
+      label.setAttribute("font-size", "13");
+      label.setAttribute("font-weight", "600");
+      label.setAttribute("opacity", "0.85");
+      label.textContent = (KIND_LABELS[k] || k) + " (" + members.length + ")";
+      groupLayer.appendChild(label);
+    });
+  }
+
   function tick(now) {
     now = now || 0;
     // Node positions are frozen unless a drag is reheating the layout, so the
@@ -305,6 +352,10 @@ _RENDERER_JS = r"""
     // only the edge buzz below keeps running. A drag sets alpha, resuming both.
     var simulating = alpha > 0 || dragging;
     if (simulating) { physicsStep(alpha); renderNodes(); }
+    // When a drag-reheated layout settles back to rest, redraw the cluster
+    // halos/labels so they follow the moved nodes.
+    if (wasSimulating && !simulating) renderGroups();
+    wasSimulating = simulating;
     // Edge buzz: rebuild each edge as a perpendicular sine waveform. Driven by
     // the frame timestamp (not alpha), so edges keep their subtle ripple after
     // the layout freezes. The sin(pi*s) envelope pins displacement to 0 at both
@@ -336,6 +387,7 @@ _RENDERER_JS = r"""
   if (nodes.length) {
     warmUp();
     renderNodes();
+    renderGroups();
     if (!fitted && alpha === 0) { fitted = true; fitView(); }
     requestAnimationFrame(tick);
   }
