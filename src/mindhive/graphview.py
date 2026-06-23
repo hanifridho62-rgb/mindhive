@@ -135,10 +135,39 @@ _RENDERER_JS = r"""
       "translate(" + view.x + "," + view.y + ") scale(" + view.k + ")");
   }
 
+  // Group anchors: every node belongs to a group (its kind for events, its type
+  // otherwise — the same key the legend uses). Each group gets its own anchor
+  // region, spread evenly on a ring around centre, and the layout adds a
+  // restoring force toward that anchor (see physicsStep). The result is tidy,
+  // context-grouped clusters instead of one random blob.
+  var groupKeys = [], groupCount = {};
+  data.nodes.forEach(function (n) {
+    var k = nodeKey(n);
+    if (groupKeys.indexOf(k) < 0) groupKeys.push(k);
+    groupCount[k] = (groupCount[k] || 0) + 1;
+  });
+  var maxGroup = groupKeys.reduce(function (m, k) {
+    return Math.max(m, groupCount[k]); }, 1);
+  // Ring radius scales with how many groups there are and the biggest cluster,
+  // so neighbouring clusters don't overlap.
+  var GROUP_R = groupKeys.length > 1
+    ? Math.max(260, groupKeys.length * 55, Math.sqrt(maxGroup) * 95) : 0;
+  var groupAnchor = {};
+  groupKeys.forEach(function (k, i) {
+    var a = (i / groupKeys.length) * 2 * Math.PI;
+    groupAnchor[k] = { x: W / 2 + Math.cos(a) * GROUP_R,
+                       y: H / 2 + Math.sin(a) * GROUP_R };
+  });
+
   var nodes = data.nodes.map(function (n, i) {
+    var key = nodeKey(n);
+    var anc = groupAnchor[key] || { x: W / 2, y: H / 2 };
+    // Seed each node in a small ring around its own group anchor so warm-up
+    // settles straight into clusters rather than untangling from one big ring.
     var a = (i / Math.max(1, data.nodes.length)) * 2 * Math.PI;
     return { id: n.id, type: n.type, label: n.label, kind: n.kind, text: n.text,
-             x: W / 2 + Math.cos(a) * 180, y: H / 2 + Math.sin(a) * 180,
+             group: key,
+             x: anc.x + Math.cos(a) * 50, y: anc.y + Math.sin(a) * 50,
              vx: 0, vy: 0 };
   });
   var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
@@ -240,7 +269,10 @@ _RENDERER_JS = r"""
     });
     var MAXV = 12;
     nodes.forEach(function (n) {
-      n.vx += (W / 2 - n.x) * 0.006; n.vy += (H / 2 - n.y) * 0.006;
+      // Pull toward this node's GROUP anchor (not the global centre) so each
+      // context settles into its own cluster.
+      var anc = groupAnchor[n.group] || { x: W / 2, y: H / 2 };
+      n.vx += (anc.x - n.x) * 0.02; n.vy += (anc.y - n.y) * 0.02;
       var sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
       if (sp > MAXV) { n.vx = n.vx / sp * MAXV; n.vy = n.vy / sp * MAXV; }
       // Motion is scaled by `a` so the layout cools to a stop.
