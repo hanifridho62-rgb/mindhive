@@ -2,9 +2,46 @@
 # Deterministic, hook-free auto-capture: turn Claude Code session transcripts
 # (~/.claude/projects/<encoded>/<uuid>.jsonl) into MIND HIVE events.
 import json
+import os
 import re
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from . import events, paths
+
+
+def _harvest_lock_path() -> Path:
+    return paths.store_home() / "harvest.lock"
+
+
+@contextmanager
+def _harvest_lock(stale_secs: float = 120.0):
+    """Cross-process mutex so concurrent harvesters (the dashboard's fast loop
+    and the scheduled autosync task) never process the same transcript lines at
+    once and double-write events. Yields True if acquired, False if another
+    harvest already holds it. A lock older than ``stale_secs`` is presumed
+    orphaned (crashed process) and stolen."""
+    p = _harvest_lock_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if p.exists() and (time.time() - p.stat().st_mtime) > stale_secs:
+            p.unlink()
+    except OSError:
+        pass
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:               # already held by another harvester
+        yield False
+        return
+    try:
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        yield True
+    finally:
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 _MARKERS = ("remember:", "memo:", "decision:", "caveat:")
 # Hint words only disambiguate the GENERIC markers (remember:/memo:). An explicit
@@ -264,6 +301,13 @@ def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
     already tracks, so incidental sessions (e.g. run from the home folder) never
     spawn surprise projects. Returns a per-project summary plus any skipped
     namespaces."""
+    with _harvest_lock() as got:
+        if not got:               # another harvester is running — skip this tick
+            return {"projects": {}, "total_new": 0, "skipped_unknown": [], "locked": True}
+        return _catch_up_unlocked(now=now, skip_captured=skip_captured, known_only=known_only)
+
+
+def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
     root = claude_projects_root()
     known = set(existing_projects()) if known_only else None
     per_project: dict = {}

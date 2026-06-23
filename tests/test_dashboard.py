@@ -303,6 +303,26 @@ def test_memory_endpoint_returns_semantic_only():
         server.shutdown()
 
 
+def test_transcripts_fingerprint_advances_on_append(tmp_path):
+    """The low-latency loop gates on this: it must change when a session file
+    grows, so a new prompt triggers a harvest within one poll."""
+    import os, time
+    root = tmp_path / "projects"
+    (root / "enc").mkdir(parents=True)
+    f = root / "enc" / "s.jsonl"
+    f.write_text("line1\n", encoding="utf-8")
+    fp1 = dashboard._transcripts_fingerprint(root)
+    assert fp1 > 0
+    newer = time.time() + 5
+    os.utime(f, (newer, newer))            # simulate an append a moment later
+    fp2 = dashboard._transcripts_fingerprint(root)
+    assert fp2 > fp1
+
+
+def test_transcripts_fingerprint_empty_root_is_zero(tmp_path):
+    assert dashboard._transcripts_fingerprint(tmp_path / "nope") == 0.0
+
+
 def test_memory_endpoint_includes_user_prompts():
     """Every captured prompt shows in the Memory view (a user_prompt event),
     while deterministic activity (command_run) still does not."""

@@ -1,6 +1,8 @@
 # tests/test_harvest.py
 import json
-from mindhive import harvest, events
+import os
+import time
+from mindhive import harvest, events, paths
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -247,3 +249,51 @@ def test_catch_up_skips_unknown_projects_by_default(tmp_path, monkeypatch):
     res = harvest.catch_up()                        # known_only=True (default)
     assert res["total_new"] == 0                    # nothing harvested into a surprise namespace
     assert "test" in res["skipped_unknown"]
+
+
+# --- cross-process harvest lock (low-latency loop must not race the task) ---
+
+def test_catch_up_skips_when_locked(tmp_path, monkeypatch):
+    """If another harvester holds the lock, catch_up no-ops (no double-write)."""
+    _isolate(tmp_path, monkeypatch)
+    lock = paths.store_home() / "harvest.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("99999", encoding="utf-8")          # fresh lock held by "someone"
+    root = tmp_path / "projects"
+    _write_transcript(root / "enc", "s1", [
+        json.dumps({"type": "attachment", "cwd": "C:/x", "sessionId": "s1"}),
+        _tooluse("Edit", {"file_path": "a.py"}),
+    ])
+    monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
+    res = harvest.catch_up(known_only=False)
+    assert res.get("locked") is True
+    assert res["total_new"] == 0
+    assert [e for e in events.read_all("test") if e.type == "file_touched"] == []
+
+
+def test_catch_up_steals_stale_lock(tmp_path, monkeypatch):
+    """A lock older than the stale window is treated as orphaned and stolen."""
+    _isolate(tmp_path, monkeypatch)
+    lock = paths.store_home() / "harvest.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("dead", encoding="utf-8")
+    old = time.time() - 10_000
+    os.utime(lock, (old, old))
+    root = tmp_path / "projects"
+    _write_transcript(root / "enc", "s1", [
+        json.dumps({"type": "attachment", "cwd": "C:/x", "sessionId": "s1"}),
+        _tooluse("Edit", {"file_path": "a.py"}),
+    ])
+    monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
+    res = harvest.catch_up(known_only=False)
+    assert not res.get("locked")
+    assert res["total_new"] == 1           # stale lock stolen, harvest proceeded
+
+
+def test_catch_up_releases_lock(tmp_path, monkeypatch):
+    """The lock is released after a normal run so the next tick can acquire it."""
+    _isolate(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
+    harvest.catch_up(known_only=False)
+    assert not (paths.store_home() / "harvest.lock").exists()

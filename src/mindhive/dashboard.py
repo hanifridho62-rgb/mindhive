@@ -795,23 +795,59 @@ def run_catch_up() -> dict:
     return res
 
 
+def _transcripts_fingerprint(root=None) -> float:
+    """Cheap activity signal: the newest mtime across all transcript .jsonl
+    files. Advances whenever any session file is created or appended, so the
+    harvest loop can skip work entirely when nothing has changed. Stat-only —
+    no file contents are read."""
+    if root is None:
+        from . import harvest as harvest_mod
+        root = harvest_mod.claude_projects_root()
+    newest = 0.0
+    try:
+        for d in os.scandir(root):
+            if not d.is_dir():
+                continue
+            try:
+                for f in os.scandir(d.path):
+                    if f.name.endswith(".jsonl"):
+                        m = f.stat().st_mtime
+                        if m > newest:
+                            newest = m
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return newest
+
+
 def _auto_harvest_loop(stop_event) -> None:
-    """Background self-healer: periodically backfill any session the live hooks
-    didn't capture (e.g. when hooks don't fire in the Agent SDK harness). Off
-    via MINDHIVE_AUTOHARVEST=0; interval via MINDHIVE_AUTOHARVEST_SECS."""
+    """Low-latency background capture: poll a cheap mtime fingerprint of the
+    transcripts and harvest ONLY when something actually changed. Idle ticks cost
+    just stat() calls, so the poll can be fast without wasting CPU/IO; a freshly
+    typed prompt is captured within one poll interval.
+
+    Off via MINDHIVE_AUTOHARVEST=0; poll seconds via MINDHIVE_AUTOHARVEST_SECS
+    (default 3, floor 1). The cross-process harvest lock keeps this safe to run
+    alongside the scheduled autosync task."""
     if os.environ.get("MINDHIVE_AUTOHARVEST", "1").lower() in ("0", "false", "off", "no"):
         return
     try:
-        interval = max(30, int(os.environ.get("MINDHIVE_AUTOHARVEST_SECS", "180")))
+        poll = max(1, int(os.environ.get("MINDHIVE_AUTOHARVEST_SECS", "3")))
     except Exception:
-        interval = 180
-    first = True
-    while not stop_event.is_set():
-        stop_event.wait(8 if first else interval)   # short delay first, then steady cadence
-        first = False
-        if stop_event.is_set():
-            break
+        poll = 3
+    # Catch up once on startup so an already-running session is captured promptly.
+    try:
+        run_catch_up()
+    except Exception:
+        pass
+    last_fp = _transcripts_fingerprint()
+    while not stop_event.wait(poll):
         try:
+            fp = _transcripts_fingerprint()
+            if fp == last_fp:
+                continue            # nothing changed — skip the harvest entirely
+            last_fp = fp
             res = run_catch_up()
             if res.get("total_new"):
                 print(f"MIND HIVE auto-harvest: +{res['total_new']} events "
