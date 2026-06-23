@@ -286,13 +286,15 @@ def project_for_transcript_dir(d) -> str | None:
     normal project detection. None when no cwd is found (can't be placed)."""
     for f in sorted(Path(d).glob("*.jsonl")):
         try:
-            for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if not line or '"cwd"' not in line:
-                    continue
-                cwd = (json.loads(line) or {}).get("cwd")
-                if cwd:
-                    return paths.detect_project(Path(cwd))
+            # Stream and stop at the first cwd (it's near the top) instead of
+            # loading the whole transcript — these files can be multi-MB.
+            with open(f, encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if '"cwd"' not in line:
+                        continue
+                    cwd = (json.loads(line) or {}).get("cwd")
+                    if cwd:
+                        return paths.detect_project(Path(cwd))
         except Exception:
             continue
     return None

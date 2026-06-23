@@ -376,3 +376,23 @@ def test_assistant_response_capped_at_5000_words(tmp_path, monkeypatch):
     r = [e for e in events.read_all("test") if e.type == "assistant_response"][0]
     assert len(r.payload["text"].split()) == 5001
     assert "[truncated]" in r.payload["text"]
+
+
+# --- project_for_transcript_dir streams (stops at first cwd, no full-file read) ---
+
+def test_project_for_transcript_dir_extracts_first_cwd(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    d = tmp_path / "enc"
+    d.mkdir()
+    lines = [json.dumps({"cwd": "C:/ProjX"})] + [json.dumps({"i": i}) for i in range(200)]
+    (d / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert harvest.project_for_transcript_dir(d) == "ProjX"
+
+
+def test_project_for_transcript_dir_none_without_cwd(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    d = tmp_path / "enc"
+    d.mkdir()
+    (d / "s.jsonl").write_text(json.dumps({"type": "x"}) + "\n", encoding="utf-8")
+    assert harvest.project_for_transcript_dir(d) is None
