@@ -1,5 +1,6 @@
 # tests/test_autosync.py
-from mindhive import autosync
+import json
+from mindhive import autosync, events
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -7,12 +8,14 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
 
-def _stub_downstream(monkeypatch, calls):
-    """Replace the heavy projection stages with no-ops that record their calls."""
-    monkeypatch.setattr(autosync.projector, "project", lambda p: calls.append(("project", p)))
-    monkeypatch.setattr(autosync.briefing, "briefing", lambda p: calls.append(("briefing", p)))
-    monkeypatch.setattr(autosync.graph, "build", lambda p, semantic=False: calls.append(("graph", p)))
-    monkeypatch.setattr(autosync.sync, "sync", lambda folder, project=None: calls.append(("sync", folder, project)))
+def _tooluse(name, inp):
+    return json.dumps({"type": "assistant",
+                       "message": {"content": [{"type": "tool_use", "name": name, "input": inp}]}})
+
+
+def _write_transcript(dirpath, sid, lines):
+    dirpath.mkdir(parents=True, exist_ok=True)
+    (dirpath / f"{sid}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_register_and_load_roundtrip(tmp_path, monkeypatch):
@@ -34,49 +37,106 @@ def test_register_replaces_existing_entry(tmp_path, monkeypatch):
     assert reg[0]["transcripts"] == "C:/new"
 
 
-def test_run_all_passes_skip_captured_true(tmp_path, monkeypatch):
-    """The invariant: autosync must NOT re-harvest sessions the live hooks already
-    recorded, or it double-counts. run_all must call harvest with skip_captured=True."""
+# --- run_all: auto-discover capture (new behavior) ---
+
+def test_run_all_discovers_all_via_catch_up(tmp_path, monkeypatch):
+    """run_all must harvest via catch_up with skip_captured=True (no double-count)
+    and known_only=False (discover brand-new projects, not just registered ones)."""
     _isolate(tmp_path, monkeypatch)
-    autosync.register("test", "C:/tx", "C:/code")
     seen = {}
 
-    def spy_harvest(transcripts, project, **kwargs):
-        seen["kwargs"] = kwargs
-        return {"new_events": 0}
+    def spy_catch_up(now=None, skip_captured=True, known_only=True):
+        seen["skip_captured"] = skip_captured
+        seen["known_only"] = known_only
+        return {"projects": {}, "total_new": 0, "skipped_unknown": []}
 
-    monkeypatch.setattr(autosync.harvest, "harvest", spy_harvest)
-    _stub_downstream(monkeypatch, [])
+    monkeypatch.setattr(autosync.harvest, "catch_up", spy_catch_up)
+    monkeypatch.setattr(autosync, "load_registry", lambda: [])
     autosync.run_all()
-    assert seen["kwargs"].get("skip_captured") is True
+    assert seen["skip_captured"] is True
+    assert seen["known_only"] is False
 
 
-def test_run_all_runs_full_pipeline_per_project(tmp_path, monkeypatch):
+def test_run_all_rebuilds_every_touched_project(tmp_path, monkeypatch):
+    """Every project that gained events gets projector.project + graph.build.
+    With nothing registered, NO native sync happens."""
     _isolate(tmp_path, monkeypatch)
-    autosync.register("test", "C:/tx", "C:/code")
-    monkeypatch.setattr(autosync.harvest, "harvest", lambda t, p, **k: {"new_events": 1})
+    monkeypatch.setattr(autosync.harvest, "catch_up",
+                        lambda **k: {"projects": {"alpha": {"new_events": 2},
+                                                  "beta": {"new_events": 1}},
+                                     "total_new": 3, "skipped_unknown": []})
+    monkeypatch.setattr(autosync, "load_registry", lambda: [])
     calls = []
-    _stub_downstream(monkeypatch, calls)
-    results = autosync.run_all()
-    stages = [c[0] for c in calls]
-    assert stages == ["project", "briefing", "graph", "sync"]
-    assert results[0]["project"] == "test"
+    monkeypatch.setattr(autosync.projector, "project", lambda p: calls.append(("project", p)))
+    monkeypatch.setattr(autosync.graph, "build", lambda p, semantic=False: calls.append(("graph", p)))
+    monkeypatch.setattr(autosync.sync, "sync", lambda folder, project=None: calls.append(("sync", project)))
+    autosync.run_all()
+    assert ("project", "alpha") in calls and ("graph", "alpha") in calls
+    assert ("project", "beta") in calls and ("graph", "beta") in calls
+    assert not any(c[0] == "sync" for c in calls)   # nothing registered -> no MEMORY.md
 
 
-def test_run_all_isolates_per_entry_errors(tmp_path, monkeypatch):
-    """A single failing entry must not abort the rest of the registry."""
+def test_run_all_native_syncs_only_registered(tmp_path, monkeypatch):
+    """Registered projects get a native MEMORY.md (via sync.sync); unregistered
+    auto-discovered projects do NOT (store capture only)."""
     _isolate(tmp_path, monkeypatch)
-    autosync.register("bad", "C:/tx/bad", "C:/code/bad")
-    autosync.register("good", "C:/tx/good", "C:/code/good")
+    monkeypatch.setattr(autosync.harvest, "catch_up",
+                        lambda **k: {"projects": {"mindhive": {"new_events": 1},
+                                                  "randoproj": {"new_events": 1}},
+                                     "total_new": 2, "skipped_unknown": []})
+    monkeypatch.setattr(autosync, "load_registry",
+                        lambda: [{"project": "mindhive", "transcripts": "T",
+                                  "folder": "C:/Users/hanif/mindhive"}])
+    synced, projected, graphed = [], [], []
+    monkeypatch.setattr(autosync.sync, "sync",
+                        lambda folder, project=None: synced.append((project, folder)))
+    monkeypatch.setattr(autosync.projector, "project", lambda p: projected.append(p))
+    monkeypatch.setattr(autosync.graph, "build", lambda p, semantic=False: graphed.append(p))
+    autosync.run_all()
+    # registered -> sync (not a direct projector call, sync does that internally)
+    assert synced == [("mindhive", "C:/Users/hanif/mindhive")]
+    # unregistered -> projector.project, never sync
+    assert projected == ["randoproj"]
+    assert set(graphed) == {"mindhive", "randoproj"}
 
-    def harvest_maybe_fail(transcripts, project, **kwargs):
-        if project == "bad":
+
+def test_run_all_isolates_per_project_errors(tmp_path, monkeypatch):
+    """One failing project must not abort the others."""
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(autosync.harvest, "catch_up",
+                        lambda **k: {"projects": {"good": {"new_events": 1},
+                                                  "bad": {"new_events": 1}},
+                                     "total_new": 2, "skipped_unknown": []})
+    monkeypatch.setattr(autosync, "load_registry", lambda: [])
+
+    def proj(p):
+        if p == "bad":
             raise RuntimeError("boom")
-        return {"new_events": 0}
 
-    monkeypatch.setattr(autosync.harvest, "harvest", harvest_maybe_fail)
-    _stub_downstream(monkeypatch, [])
+    monkeypatch.setattr(autosync.projector, "project", proj)
+    monkeypatch.setattr(autosync.graph, "build", lambda p, semantic=False: None)
     results = autosync.run_all()
-    by_proj = {r["project"]: r for r in results}
-    assert "error" in by_proj["bad"]
-    assert "harvest" in by_proj["good"]
+    by = {r["project"]: r for r in results}
+    assert "error" in by["bad"]
+    assert "error" not in by["good"]
+
+
+def test_run_all_end_to_end_captures_unregistered_without_memory_md(tmp_path, monkeypatch):
+    """Real path: a transcript session for an unregistered project is captured in
+    the store, but no native MEMORY.md is written for it."""
+    _isolate(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "enc", "s1", [
+        json.dumps({"type": "attachment", "cwd": "C:/whatever", "sessionId": "s1"}),
+        _tooluse("Edit", {"file_path": "a.py"}),
+    ])
+    monkeypatch.setattr(autosync.harvest, "claude_projects_root", lambda: root)
+    monkeypatch.setattr(autosync, "load_registry", lambda: [])   # nothing registered
+    synced = []
+    monkeypatch.setattr(autosync.sync, "sync",
+                        lambda folder, project=None: synced.append(project))
+    autosync.run_all()
+    # MINDHIVE_PROJECT=test forces the namespace to "test" regardless of cwd
+    evs = events.read_all("test")
+    assert any(e.type == "file_touched" for e in evs)   # captured in the store
+    assert synced == []                                  # unregistered -> no MEMORY.md
