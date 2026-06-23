@@ -76,22 +76,29 @@ def test_render_html_uses_node_kind_and_text():
     assert ".text" in html
 
 
-def test_render_html_freezes_physics_when_settled():
-    # Once cooled (alpha 0) with no drag, the O(n^2) physics + node transforms are
-    # skipped each frame — only the edge buzz keeps running. Big no-op-work saving
-    # on large graphs, no visual change (positions were already frozen).
+def test_render_html_uses_seeded_meteor_layout():
+    # Nodes are arranged into a deterministic, seeded "meteor" (head / filaments /
+    # comet tail) computed once — not an iterative force layout.
     html = graphview.render_html(_graph())
-    assert "alpha > 0 || dragging" in html
+    assert "function layoutMeteor()" in html
+    assert "mulberry32" in html          # seeded RNG => reproducible per seed
+    assert "META" in html and "tailDir" in html
 
 
-def test_render_html_layout_cools_and_fits_on_settle():
-    # Regression: the layout must cool to a stop (alpha) and fit once settled,
-    # not at a fixed frame — otherwise the one-shot fit goes stale while the
-    # simulation keeps drifting and the graph gets clipped off-screen.
+def test_render_html_has_no_iterative_physics():
+    # The O(n^2) repulsion / spring / cooling simulation is gone: positions are
+    # the fixed meteor, so none of the old physics machinery should remain.
     html = graphview.render_html(_graph())
-    assert "alpha" in html
-    assert "alpha === 0" in html
-    assert "frame >= 140" not in html
+    assert "1200 / d2" not in html       # the old inverse-square repulsion
+    assert "alpha" not in html           # no cooling variable anymore
+
+
+def test_render_html_fits_to_window_once():
+    # A single fit-to-window still happens (the meteor is static, so one fit holds
+    # instead of going stale behind a drifting simulation).
+    html = graphview.render_html(_graph())
+    assert "!fitted" in html
+    assert "fitView()" in html
 
 
 def test_render_html_panel_has_prewrap_body():
@@ -112,8 +119,8 @@ def test_render_html_edges_are_vibrating_paths():
 
 
 def test_render_html_edges_vibrate_in_realtime():
-    # The buzz is driven by the frame timestamp and is decoupled from the alpha
-    # cooling, so edges keep moving after the layout settles.
+    # The buzz is driven by the frame timestamp, so the filaments keep shimmering
+    # even though the meteor layout itself is static.
     html = graphview.render_html(_graph())
     assert "VIBE_AMP" in html
     assert "VIBE_SPEED" in html

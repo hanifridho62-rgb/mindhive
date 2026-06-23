@@ -5,8 +5,10 @@ from pathlib import Path
 from . import paths
 
 # Self-contained page: graph data is inlined as JSON; the renderer is a small
-# vanilla-JS SVG force layout. No external (http/https) references, so the file
-# works fully offline in any browser or webview.
+# vanilla-JS SVG engine that arranges the nodes into a seeded "meteor" — a dense
+# glowing head of recent, well-connected memories, a radial spray of filaments,
+# and a comet tail of older nodes streaming down-left. No external (http/https)
+# references, so the file works fully offline in any browser or webview.
 _TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -21,10 +23,13 @@ _TEMPLATE = """<!DOCTYPE html>
   #stage { flex: 1; position: relative; }
   svg { width: 100%; height: 100%; display: block; cursor: grab; }
   svg.panning { cursor: grabbing; }
-  .edge { stroke: #30363d; stroke-width: 1; fill: none; }
-  .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
-  .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
-  .node.dim circle, .edge.dim { opacity: 0.15; }
+  .edge { stroke: #3a4759; stroke-width: .7; fill: none; opacity: .5; }
+  .node circle { stroke: #0e1116; stroke-width: .8; cursor: pointer; }
+  .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none;
+    opacity: 0; transition: opacity .12s; }
+  svg.show-labels .node text { opacity: .9; }
+  .node:hover text, .node.kin text { opacity: 1; }
+  .node.dim circle, .edge.dim { opacity: 0.12; }
   #panel { width: 320px; background: #161b22; border-left: 1px solid #30363d;
     padding: 16px; overflow-y: auto; }
   #panel h2 { font-size: 15px; margin: 0 0 4px; word-break: break-word; }
@@ -105,8 +110,45 @@ _RENDERER_JS = r"""
   // AMP = peak px offset, WAVES = ripples per line, SPEED = angular rate in rad/s
   // (the "speed 2" chosen on the design mockup maps to ~5.2 rad/s),
   // PHASE = per-edge desync, SAMPLES = polyline resolution of each path.
-  var VIBE_AMP = 3.5, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
-      VIBE_SAMPLES = 20;
+  var VIBE_AMP = 2.5, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
+      VIBE_SAMPLES = 18;
+
+  // ---- Meteor layout ("Sidereal Decay") -----------------------------------
+  // A deterministic, seeded arrangement (no physics): the freshest / most-
+  // connected memories pack into a glowing spherical HEAD (upper-right), older
+  // and leaf nodes spray outward as fine radial FILAMENTS, and the whole cloud
+  // streams DOWN-LEFT into a tapering comet TAIL. Same seed => same meteor.
+  var META = {
+    seed: 7,
+    headR: 150,          // radius of the dense head, in virtual units
+    tailLen: 1000,       // how far the comet body streams down-tail
+    hairLen: 300,        // length of the radial filament spray
+    tailDir: [-0.70711, 0.70711],  // down-left in screen space (y points down)
+    tailSpread: 1.35,    // angular half-width (rad) of the hairy tail
+    pTailHair: 0.6,      // share of filaments that lean into the tail
+    wRecency: 0.6, wDegree: 0.4    // how "core" a node is: time + connectivity
+  };
+  function hashStr(s) {
+    var h = 2166136261 >>> 0;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i); h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function parseTime(n) {
+    // Event labels look like "type @ 2026-06-23T...": pull the ISO timestamp.
+    var s = String(n.label || ""), i = s.lastIndexOf(" @ ");
+    var v = i >= 0 ? Date.parse(s.slice(i + 3)) : NaN;
+    return isNaN(v) ? null : v;
+  }
 
   function nodeColor(n) {
     if (n.type === "event") return KIND_COLORS[n.kind] || TYPE_COLORS.event;
@@ -129,10 +171,35 @@ _RENDERER_JS = r"""
   var root = document.createElementNS(NS, "g");
   svg.appendChild(root);
 
+  // Soft halo behind the head (origin in virtual space) so the core reads as a
+  // glowing meteor. Appended before edges/nodes, so it always sits behind them.
+  (function addGlow() {
+    var defs = document.createElementNS(NS, "defs");
+    var grad = document.createElementNS(NS, "radialGradient");
+    grad.setAttribute("id", "meteor-glow");
+    [["0%", "#e6edff", "0.55"], ["38%", "#9db6ff", "0.16"],
+     ["100%", "#9db6ff", "0"]].forEach(function (st) {
+      var s = document.createElementNS(NS, "stop");
+      s.setAttribute("offset", st[0]);
+      s.setAttribute("stop-color", st[1]);
+      s.setAttribute("stop-opacity", st[2]);
+      grad.appendChild(s);
+    });
+    defs.appendChild(grad); root.appendChild(defs);
+    var halo = document.createElementNS(NS, "circle");
+    halo.setAttribute("cx", "0"); halo.setAttribute("cy", "0");
+    halo.setAttribute("r", "340"); halo.setAttribute("fill", "url(#meteor-glow)");
+    root.appendChild(halo);
+  })();
+
   var view = { x: 0, y: 0, k: 1 };
   function applyView() {
     root.setAttribute("transform",
       "translate(" + view.x + "," + view.y + ") scale(" + view.k + ")");
+    // Labels would be unreadable mush across the whole meteor; reveal them only
+    // when the user zooms in (hover and selection still reveal them any time).
+    if (view.k >= 0.9) svg.classList.add("show-labels");
+    else svg.classList.remove("show-labels");
   }
 
   var nodes = data.nodes.map(function (n, i) {
@@ -151,6 +218,52 @@ _RENDERER_JS = r"""
     (adj[e.src] = adj[e.src] || []).push({ id: e.dst, rel: e.rel });
     (adj[e.dst] = adj[e.dst] || []).push({ id: e.src, rel: e.rel });
   });
+
+  // Compute coreness (recency + degree) and place every node into the meteor.
+  function layoutMeteor() {
+    var D = META.tailDir, P = [-D[1], D[0]], tailAng = Math.atan2(D[1], D[0]);
+    var tmin = Infinity, tmax = -Infinity, degMax = 1;
+    nodes.forEach(function (n) {
+      n.deg = (adj[n.id] || []).length; if (n.deg > degMax) degMax = n.deg;
+      n.time = parseTime(n);
+      if (n.time != null) {
+        if (n.time < tmin) tmin = n.time;
+        if (n.time > tmax) tmax = n.time;
+      }
+    });
+    var haveTime = tmax >= tmin, span = (tmax - tmin) || 1;
+    // Below headT the node belongs in the round head; above it, the comet body.
+    var headT = 2 * META.headR / (META.tailLen + META.headR);
+    nodes.forEach(function (n) {
+      var recN = (haveTime && n.time != null) ? (n.time - tmin) / span : 0.35;
+      n.core = META.wRecency * recN + META.wDegree * (n.deg / degMax);  // 1 = head
+      // Per-node seeded RNG: stable id hash mixed with the layout seed.
+      var rnd = mulberry32(hashStr(String(n.id)) ^ (Math.imul(META.seed, 2654435761) >>> 0));
+      var t = 1 - n.core, x, y;
+      if (n.deg <= 1 && rnd() < 0.85) {
+        // Radial filament — the meteor's hairy spray, biased into the tail.
+        var ang = rnd() < META.pTailHair
+          ? tailAng + (rnd() + rnd() - 1) * META.tailSpread
+          : rnd() * 2 * Math.PI;
+        var L = META.headR * 0.55 + (0.35 + 0.65 * t) * META.hairLen * Math.sqrt(rnd());
+        x = Math.cos(ang) * L + D[0] * t * META.tailLen * 0.12;
+        y = Math.sin(ang) * L + D[1] * t * META.tailLen * 0.12;
+      } else if (t < headT) {
+        // Dense round head — the glowing core of fresh, well-connected memories.
+        var rr = META.headR * Math.sqrt(rnd()), aa = rnd() * 2 * Math.PI;
+        x = Math.cos(aa) * rr; y = Math.sin(aa) * rr;
+      } else {
+        // Comet body — older memories tapering down the tail (ρ ∝ (1-frac)^0.75).
+        var frac = (t - headT) / (1 - headT);
+        var ax = META.headR + frac * META.tailLen;
+        var rho = META.headR * Math.pow(1 - frac, 0.75);
+        var off = rho * (rnd() + rnd() - 1);   // triangular: denser toward the spine
+        x = D[0] * ax + P[0] * off; y = D[1] * ax + P[1] * off;
+      }
+      n.x = x; n.y = y; n.vx = 0; n.vy = 0;
+    });
+  }
+  layoutMeteor();
 
   // Legend: one row per node kind/type actually present in this graph.
   (function buildLegend() {
@@ -176,23 +289,29 @@ _RENDERER_JS = r"""
     root.appendChild(l);
     return l;
   });
-  var nodeEls = nodes.map(function (n) {
+  var nodeEls = nodes.map(function (n, i) {
     var g = document.createElementNS(NS, "g");
     g.setAttribute("class", "node");
     var c = document.createElementNS(NS, "circle");
-    c.setAttribute("r", n.type === "session" ? 9 : 6);
+    // Core nodes are larger and brighter (the incandescent head); tail nodes
+    // shrink and fade — the comet's glow falling off behind it.
+    var baseR = n.type === "session" ? 7 : 4.5;
+    c.setAttribute("r", (baseR * (0.45 + 0.9 * n.core)).toFixed(2));
     c.setAttribute("fill", nodeColor(n));
+    c.setAttribute("fill-opacity", (0.3 + 0.7 * n.core).toFixed(2));
     var t = document.createElementNS(NS, "text");
-    t.setAttribute("x", 9); t.setAttribute("y", 4);
+    t.setAttribute("x", 7); t.setAttribute("y", 3);
     t.textContent = canvasLabel(n);
     g.appendChild(c); g.appendChild(t);
+    g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    n._i = i;
     g.addEventListener("mousedown", function (ev) { startDrag(ev, n); });
     g.addEventListener("click", function (ev) { ev.stopPropagation(); select(n); });
     root.appendChild(g);
     return g;
   });
 
-  var fitted = false, alpha = 1;
+  var fitted = false;
   function fitView() {
     if (!nodes.length) return;
     var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -212,44 +331,13 @@ _RENDERER_JS = r"""
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
 
+  // No physics: node positions ARE the fixed meteor (computed once in
+  // layoutMeteor). Each frame we only (1) keep the edge "buzz" shimmering along
+  // the filaments — the incandescent-hair effect — and (2) fit-to-window once.
+  // Dragging a node updates its own transform directly (see mousemove); its
+  // incident edges follow on the next buzz frame.
   function tick(now) {
     now = now || 0;
-    // Once the layout has cooled (alpha 0) and nothing is being dragged, node
-    // positions are frozen — so skip the O(n^2) physics AND the per-node DOM
-    // transforms entirely; only the edge buzz keeps running. This is the single
-    // biggest render saving on large graphs and is visually identical (nothing
-    // was moving). A drag reheats alpha, which resumes the simulation.
-    var simulating = alpha > 0 || dragging;
-    if (simulating) {
-    for (var i = 0; i < nodes.length; i++) {
-      var a = nodes[i];
-      for (var j = i + 1; j < nodes.length; j++) {
-        var b = nodes[j];
-        var dx = a.x - b.x, dy = a.y - b.y;
-        var d2 = dx * dx + dy * dy || 0.01;
-        var f = 1200 / d2;
-        var d = Math.sqrt(d2);
-        a.vx += (dx / d) * f; a.vy += (dy / d) * f;
-        b.vx -= (dx / d) * f; b.vy -= (dy / d) * f;
-      }
-    }
-    edges.forEach(function (e) {
-      var dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
-      var d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      var f = (d - 90) * 0.02;
-      e.s.vx += (dx / d) * f; e.s.vy += (dy / d) * f;
-      e.t.vx -= (dx / d) * f; e.t.vy -= (dy / d) * f;
-    });
-    nodes.forEach(function (n) {
-      n.vx += (W / 2 - n.x) * 0.006; n.vy += (H / 2 - n.y) * 0.006;
-      // Motion is scaled by alpha so the layout cools to a stop (see below).
-      if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
-      n.vx *= 0.85; n.vy *= 0.85;
-    });
-    }
-    // Edge buzz: rebuild each edge as a perpendicular sine waveform. Driven by
-    // the frame timestamp (not alpha), so edges keep vibrating after the layout
-    // freezes. The sin(pi*s) envelope pins displacement to 0 at both endpoints.
     var t = now / 1000;
     edges.forEach(function (e, i) {
       var sx = e.s.x, sy = e.s.y, tx = e.t.x, ty = e.t.y;
@@ -259,7 +347,7 @@ _RENDERER_JS = r"""
       var d = "M" + sx + " " + sy;
       for (var k = 1; k <= VIBE_SAMPLES; k++) {
         var s = k / VIBE_SAMPLES;
-        var env = Math.sin(s * Math.PI);
+        var env = Math.sin(s * Math.PI);       // pins displacement to 0 at ends
         var disp = VIBE_AMP * env *
           Math.sin(s * Math.PI * VIBE_WAVES + phase + t * VIBE_SPEED);
         var bx = sx + dx * s, by = sy + dy * s;
@@ -267,16 +355,7 @@ _RENDERER_JS = r"""
       }
       edgeEls[i].setAttribute("d", d);
     });
-    if (simulating) {
-      nodes.forEach(function (n, i) {
-        nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-      });
-    }
-    // Cool the layout each frame; once it has settled (alpha hits 0) the node
-    // positions are frozen, so a single fit-to-window holds instead of going
-    // stale while the simulation keeps drifting (which clipped the graph).
-    alpha = alpha > 0 ? Math.max(0, alpha - 0.008) : 0;
-    if (!fitted && alpha === 0) { fitted = true; fitView(); }
+    if (!fitted) { fitted = true; fitView(); }
     requestAnimationFrame(tick);
   }
   if (nodes.length) requestAnimationFrame(tick);
@@ -285,7 +364,6 @@ _RENDERER_JS = r"""
   function startDrag(ev, n) {
     ev.preventDefault(); ev.stopPropagation();
     dragging = n;
-    alpha = Math.max(alpha, 0.3);  // gently reheat so neighbours respond
     var p = toWorld(ev);
     dragOff = { x: p.x - n.x, y: p.y - n.y };
   }
@@ -298,7 +376,8 @@ _RENDERER_JS = r"""
     if (dragging) {
       var p = toWorld(ev);
       dragging.x = p.x - dragOff.x; dragging.y = p.y - dragOff.y;
-      dragging.vx = 0; dragging.vy = 0;
+      nodeEls[dragging._i].setAttribute("transform",
+        "translate(" + dragging.x + "," + dragging.y + ")");
     } else if (panning) {
       view.x = ev.clientX - panning.x; view.y = ev.clientY - panning.y;
       applyView();
@@ -367,6 +446,7 @@ _RENDERER_JS = r"""
     nodeEls.forEach(function (el, i) {
       var keep = nodes[i] === n || conns.some(function (c) { return c.id === nodes[i].id; });
       el.classList.toggle("dim", !keep);
+      el.classList.toggle("kin", keep);   // reveal labels for the focused cluster
     });
     edgeEls.forEach(function (el, i) {
       var e = edges[i];
@@ -375,7 +455,7 @@ _RENDERER_JS = r"""
   }
   svg.addEventListener("click", function () {
     panel.innerHTML = "<div id=empty>Click a node to inspect it.</div>";
-    nodeEls.forEach(function (el) { el.classList.remove("dim"); });
+    nodeEls.forEach(function (el) { el.classList.remove("dim"); el.classList.remove("kin"); });
     edgeEls.forEach(function (el) { el.classList.remove("dim"); });
   });
 
