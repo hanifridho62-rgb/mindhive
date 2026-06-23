@@ -69,7 +69,7 @@ def test_build_briefing_no_state_set(tmp_path, monkeypatch):
     assert "(no state_set yet)" in out
 
 
-def test_build_briefing_timeline_full_coverage(tmp_path, monkeypatch):
+def test_build_briefing_timeline_lists_distinct_semantic_events(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="decision",
@@ -82,14 +82,56 @@ def test_build_briefing_timeline_full_coverage(tmp_path, monkeypatch):
                      payload={"task": "x"}, tags=[]),
     ]
     out = build_briefing(evs)
-    # Timeline section must have ALL 3 non-state_set semantic events
+    # Distinct (non-duplicate) semantic events all survive dedup; state_set is
+    # excluded from the timeline.
     assert "## Timeline" in out
     assert "Decision A" in out
     assert "Caveat B" in out
     assert "Experiment C" in out
-    # state_set excluded from timeline
-    lines = [l for l in out.splitlines() if l.startswith("- ") and "[" in l]
+    timeline = out[out.index("## Timeline"):out.index("## Key decisions")]
+    lines = [l for l in timeline.splitlines() if l.startswith("- ") and "[" in l]
     assert len(lines) == 3
+
+
+def test_build_briefing_dedups_repeated_caveats(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    # Eight verbatim repeats of the same caveat — the real-world bloat case.
+    evs = [
+        events.Event(ts=f"2026-06-20T09:0{i}:00Z", session_id="s", type="caveat",
+                     payload={"text": "Decide per question: browser or terminal"},
+                     tags=[])
+        for i in range(8)
+    ]
+    out = build_briefing(evs)
+    # A caveat legitimately appears in both the Timeline and the Lessons
+    # sections — but within EACH it collapses from 8 verbatim repeats to a
+    # single representative carrying the occurrence count.
+    tl_idx = out.index("## Timeline")
+    lc_idx = out.index("## Lessons")
+    timeline = out[tl_idx:lc_idx]
+    lessons = out[lc_idx:]
+    assert timeline.count("Decide per question: browser or terminal") == 1
+    assert lessons.count("Decide per question: browser or terminal") == 1
+    assert timeline.count("(×8)") == 1
+    assert lessons.count("(×8)") == 1
+
+
+def test_build_briefing_timeline_capped(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from mindhive.briefing import _TIMELINE_CAP
+    evs = [
+        events.Event(ts=f"2026-06-20T09:{i:02d}:00Z", session_id="s",
+                     type="decision", payload={"text": f"Distinct decision {i}"},
+                     tags=[])
+        for i in range(_TIMELINE_CAP + 10)
+    ]
+    out = build_briefing(evs)
+    timeline_lines = [l for l in out.splitlines()
+                      if l.startswith("- ") and "[decision]" in l]
+    assert len(timeline_lines) == _TIMELINE_CAP
+    # The cap keeps the most recent entries.
+    assert f"Distinct decision {_TIMELINE_CAP + 9}" in out
+    assert "Distinct decision 0" not in out
 
 
 def test_build_briefing_key_decisions(tmp_path, monkeypatch):

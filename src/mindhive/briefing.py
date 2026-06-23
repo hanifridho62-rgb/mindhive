@@ -1,11 +1,43 @@
 # src/mindhive/briefing.py
 import re
 from pathlib import Path
-from . import events as ev_mod, paths, projector
+from . import events as ev_mod, paths, projector, dedupe
 
 
 SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES  # decision, experiment_result, caveat, next_step, open_question, state_set
 _TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set"}
+
+# Cap on how many distinct (post-dedup) entries each list section emits. The
+# briefing is wrapped verbatim into the native MEMORY.md that auto-loads every
+# session (see sync.py), so an unbounded list grows context cost forever. Full
+# history always remains on disk in the append-only ledger.
+_TIMELINE_CAP = 40
+
+
+def _collapsed_entries(evs, types, cap=None):
+    """Collapse near-duplicate events of *types* into representatives.
+
+    Returns a list of ``(Event, occurrences)`` newest-first. Display-time only:
+    the append-only ledger is never touched. Uses :func:`dedupe.collapse`
+    (deterministic Jaccard) so reworded repeats of the same note merge, and the
+    newest of each cluster is kept. Capped to the most-recent *cap* distinct
+    entries when given.
+    """
+    # dedupe.collapse expects newest-first; read_all yields oldest-first.
+    items = [
+        {"type": ev.type, "project": None,
+         "text": _payload_text(ev.payload), "_ev": ev}
+        for ev in evs if ev.type in types
+    ]
+    items.reverse()
+    reps = dedupe.collapse(items)
+    if cap is not None:
+        reps = reps[:cap]
+    return [(r["_ev"], r.get("similar_count", 0) + 1) for r in reps]
+
+
+def _count_suffix(occurrences) -> str:
+    return f" (×{occurrences})" if occurrences > 1 else ""
 
 
 def headline(text: str) -> str:
@@ -67,31 +99,26 @@ def build_briefing(evs) -> str:
             lines.append(f"- {d}")
     lines.append("")
 
-    # --- Timeline (full coverage) ---
-    lines.append("## Timeline (full coverage — every entry)")
+    # --- Timeline (deduped, most-recent-first, capped) ---
+    lines.append("## Timeline (deduped — most recent first)")
     lines.append("")
-    for ev in evs:
-        if ev.type not in _TIMELINE_TYPES:
-            continue
-        text = _payload_text(ev.payload)
-        hl = headline(text)
-        lines.append(f"- {ev.ts} [{ev.type}] {hl}")
+    for ev, n in _collapsed_entries(evs, _TIMELINE_TYPES, cap=_TIMELINE_CAP):
+        hl = headline(_payload_text(ev.payload))
+        lines.append(f"- {ev.ts} [{ev.type}] {hl}{_count_suffix(n)}")
     lines.append("")
 
     # --- Key decisions ---
     lines.append("## Key decisions")
     lines.append("")
-    for ev in evs:
-        if ev.type == "decision":
-            lines.append(f"- {headline(_payload_text(ev.payload))}")
+    for ev, n in _collapsed_entries(evs, {"decision"}, cap=_TIMELINE_CAP):
+        lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
     lines.append("")
 
     # --- Lessons & caveats ---
     lines.append("## Lessons & caveats")
     lines.append("")
-    for ev in evs:
-        if ev.type == "caveat":
-            lines.append(f"- {headline(_payload_text(ev.payload))}")
+    for ev, n in _collapsed_entries(evs, {"caveat"}, cap=_TIMELINE_CAP):
+        lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
     lines.append("")
 
     # --- Activity ---
