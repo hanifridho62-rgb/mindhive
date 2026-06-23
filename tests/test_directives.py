@@ -1,5 +1,6 @@
 # tests/test_directives.py
 from mindhive import directives
+from mindhive import __main__ as cli_mod
 
 
 def test_directives_returns_nonempty_string():
@@ -29,3 +30,11 @@ def test_directives_carry_core_safety_invariants():
 def test_directives_is_stable():
     # Pure constant accessor — repeated calls return identical text.
     assert directives.directives() == directives.directives()
+
+
+def test_cli_directives_prints_spec(capsys):
+    ret = cli_mod.main(["directives"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "MINDHIVE ASSISTANT" in out
+    assert "confirm with the user first" in out
