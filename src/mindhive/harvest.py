@@ -14,6 +14,28 @@ _AMBIGUOUS_MARKERS = ("remember:", "memo:")
 
 _TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 
+# Noise the Claude Code transcript wraps around (or injects beside) a real prompt.
+_CMD_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+_SYS_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+_CMD_TAG_RE = re.compile(r"</?command-(?:message|name|args)>", re.DOTALL)
+
+
+def _clean_prompt(text: str) -> str:
+    """Reduce a user-message body to just what the user actually typed: pull the
+    real input out of a slash command's <command-args>, and drop injected
+    <system-reminder> blocks and stray command tags."""
+    m = _CMD_ARGS_RE.search(text)
+    if m:                                 # slash command -> the args ARE the input
+        text = m.group(1)
+    text = _SYS_REMINDER_RE.sub("", text)
+    text = _CMD_TAG_RE.sub("", text)
+    return text.strip()
+
+
+def _is_injected_prompt(text: str) -> bool:
+    """Skill bodies arrive as user-role messages but aren't prompts the user typed."""
+    return text.lstrip()[:40].lower().startswith("base directory for this skill:")
+
 
 def _normalize_ts(raw) -> str | None:
     """Reduce a transcript ISO-8601 timestamp (e.g. '2026-06-20T09:15:30.500Z')
@@ -80,6 +102,12 @@ def _items_from_obj(o) -> list:
                 # are collapsed by meaning at display time (see dedupe.py),
                 # so the ledger keeps every memory verbatim and complete.
                 items.append({"kind": "memo", "value": val, "memo_type": mtype})
+        # Capture the typed prompt itself so EVERY prompt enters the hive — not
+        # only marker-bearing ones. Skip injected skill bodies (not user-typed).
+        if text and not _is_injected_prompt(text):
+            prompt = _clean_prompt(text)
+            if prompt:
+                items.append({"kind": "user_prompt", "value": prompt})
     return items
 
 
@@ -181,6 +209,9 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                     elif item["kind"] == "memo":
                         events.append_event(item["memo_type"], {"text": item["value"]},
                                             session_id=sid, tags=["harvest", "memo"], ts=line_ts, project=project)
+                    elif item["kind"] == "user_prompt":
+                        events.append_event("user_prompt", {"text": item["value"]},
+                                            session_id=sid, tags=["harvest", "prompt"], ts=line_ts, project=project)
                     new_events += 1
             state[f.name] = len(all_lines)
     _save_state(project, state)

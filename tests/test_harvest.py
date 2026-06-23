@@ -69,6 +69,77 @@ def test_skip_captured_avoids_double_counting(tmp_path, monkeypatch):
     assert len(s2) == 1 and "harvest" in s2[0].tags               # the missed one IS harvested
 
 
+# --- user_prompt capture (every typed prompt enters memory) ---
+
+def test_every_plain_prompt_becomes_user_prompt(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_usermsg("how do I run the tests?")])
+    harvest.harvest(tdir, "test")
+    prompts = [e for e in events.read_all("test") if e.type == "user_prompt"]
+    assert len(prompts) == 1
+    assert prompts[0].payload["text"] == "how do I run the tests?"
+    assert "prompt" in prompts[0].tags
+
+
+def test_marker_prompt_yields_both_memo_and_prompt(tmp_path, monkeypatch):
+    """A prompt with a marker still produces its typed-decision memo AND the
+    full prompt event — every prompt enters, markers add the curated memo."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_usermsg("decision: ship the queue")])
+    harvest.harvest(tdir, "test")
+    types = sorted(e.type for e in events.read_all("test"))
+    assert types == ["decision", "user_prompt"]
+
+
+def test_slash_command_args_captured_as_prompt(tmp_path, monkeypatch):
+    """For a slash command, the user's real input lives in <command-args>."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    msg = ("<command-message>x</command-message>\n"
+           "<command-name>/foo</command-name>\n"
+           "<command-args>please refactor the parser</command-args>")
+    _write_transcript(tdir, "s1", [_usermsg(msg)])
+    harvest.harvest(tdir, "test")
+    prompts = [e for e in events.read_all("test") if e.type == "user_prompt"]
+    assert len(prompts) == 1
+    assert prompts[0].payload["text"] == "please refactor the parser"
+
+
+def test_injected_skill_body_not_captured_as_prompt(tmp_path, monkeypatch):
+    """Skill bodies are loaded as user-role messages but are not prompts."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_usermsg("Base directory for this skill: C:/x\n\nsome skill body text")])
+    harvest.harvest(tdir, "test")
+    prompts = [e for e in events.read_all("test") if e.type == "user_prompt"]
+    assert prompts == []
+
+
+def test_system_reminder_stripped_from_prompt(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1",
+                      [_usermsg("real question here\n<system-reminder>injected noise</system-reminder>")])
+    harvest.harvest(tdir, "test")
+    prompts = [e for e in events.read_all("test") if e.type == "user_prompt"]
+    assert len(prompts) == 1
+    assert prompts[0].payload["text"] == "real question here"
+
+
+def test_tool_result_user_message_not_captured(tmp_path, monkeypatch):
+    """A user-role message that is a tool_result (no text) is not a prompt."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    line = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "content": "ok"}]}})
+    _write_transcript(tdir, "s1", [line])
+    harvest.harvest(tdir, "test")
+    prompts = [e for e in events.read_all("test") if e.type == "user_prompt"]
+    assert prompts == []
+
+
 def _tooluse_at(ts, name, inp):
     return json.dumps({"type": "assistant", "timestamp": ts,
                        "message": {"content": [{"type": "tool_use", "name": name, "input": inp}]}})
@@ -87,9 +158,11 @@ def test_explicit_decision_not_reclassified_as_caveat(tmp_path, monkeypatch):
     tdir = tmp_path / "tx"
     _write_transcript(tdir, "s1", [_usermsg("decision: avoid the global lock, use a queue")])
     harvest.harvest(tdir, "test")
-    evs = events.read_all("test")
-    assert len(evs) == 1
-    assert evs[0].type == "decision"
+    # the marker yields a memo (+ a user_prompt for the raw prompt); the memo
+    # must be a decision, NOT reclassified to caveat by the 'avoid' hint word.
+    memos = [e for e in events.read_all("test") if e.type in ("decision", "caveat")]
+    assert len(memos) == 1
+    assert memos[0].type == "decision"
 
 
 def test_explicit_caveat_marker_is_caveat(tmp_path, monkeypatch):

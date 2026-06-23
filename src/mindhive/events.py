@@ -12,9 +12,15 @@ SEMANTIC_TYPES = {
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
     "session_start", "session_end", "compaction",
-    "plugin_catalog",
+    "plugin_catalog", "user_prompt",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
+
+# Types surfaced in the dashboard "Memory" view: the curated semantic memos PLUS
+# the raw prompt log. user_prompt is intentionally NOT semantic — it stays out of
+# the LEDGER, the hash-chained intent layer, and the knowledge graph — but it is
+# shown in the Memory view so every prompt is visible in the hive.
+MEMORY_VIEW_TYPES = SEMANTIC_TYPES | {"user_prompt"}
 
 
 @dataclass

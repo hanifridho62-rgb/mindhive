@@ -16,6 +16,16 @@ def test_append_rejects_unknown_type(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         events.append_event("bogus", {"text": "x"})
 
+def test_user_prompt_is_valid_and_in_memory_view(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    ev = events.append_event("user_prompt", {"text": "hello"}, session_id="s",
+                             ts="2026-06-23T10:00:00Z")
+    assert ev.type == "user_prompt"
+    assert "user_prompt" in events.VALID_TYPES
+    # shows in the dashboard Memory view, but is NOT a curated semantic type
+    assert "user_prompt" in events.MEMORY_VIEW_TYPES
+    assert "user_prompt" not in events.SEMANTIC_TYPES
+
 def test_append_and_read_orders_by_ts(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     events.append_event("decision", {"text": "second"}, session_id="s1",

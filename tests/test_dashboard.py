@@ -303,6 +303,22 @@ def test_memory_endpoint_returns_semantic_only():
         server.shutdown()
 
 
+def test_memory_endpoint_includes_user_prompts():
+    """Every captured prompt shows in the Memory view (a user_prompt event),
+    while deterministic activity (command_run) still does not."""
+    server, base, token = _start()
+    try:
+        _post(base, "/api/append", {"type": "user_prompt", "payload": "what is the plan?", "project": "p"}, token)
+        _post(base, "/api/append", {"type": "command_run", "payload": "ls", "project": "p"}, token)
+        status, body = _get(base, "/api/memory?project=p", token)
+        items = json.loads(body)
+        texts = {(m["type"], m["text"]) for m in items}
+        assert ("user_prompt", "what is the plan?") in texts
+        assert not any(m["type"] == "command_run" for m in items)
+    finally:
+        server.shutdown()
+
+
 def test_memory_endpoint_collapses_near_duplicates():
     server, base, token = _start()
     try:

@@ -89,7 +89,7 @@ def _project_stats(name: str) -> dict:
     sessions, mem, auto = set(), 0, 0
     for ev in evs:
         sessions.add(ev.session_id)
-        if ev.type in events.SEMANTIC_TYPES:
+        if ev.type in events.MEMORY_VIEW_TYPES:
             mem += 1
         else:
             auto += 1
@@ -215,7 +215,7 @@ def make_handler(token: str):
                         for name, ev in pairs:
                             by_type[ev.type] = by_type.get(ev.type, 0) + 1
                             sessions.add((name, ev.session_id))
-                            if ev.type in events.SEMANTIC_TYPES:
+                            if ev.type in events.MEMORY_VIEW_TYPES:
                                 mem += 1
                             else:
                                 auto += 1
@@ -233,7 +233,7 @@ def make_handler(token: str):
                     for ev in evs:
                         by_type[ev.type] = by_type.get(ev.type, 0) + 1
                         sessions.add(ev.session_id)
-                        if ev.type in events.SEMANTIC_TYPES:
+                        if ev.type in events.MEMORY_VIEW_TYPES:
                             mem += 1
                         else:
                             auto += 1
@@ -253,7 +253,7 @@ def make_handler(token: str):
                     limit = int((qs.get("limit") or ["200"])[0])
                     if am:
                         rows = [(n, e) for n, e in all_event_pairs()
-                                if e.type in events.SEMANTIC_TYPES]
+                                if e.type in events.MEMORY_VIEW_TYPES]
                         if session:
                             rows = [(n, e) for n, e in rows if e.session_id == session]
                         rows = list(reversed(rows))[:limit]
@@ -263,7 +263,7 @@ def make_handler(token: str):
                              "tags": e.tags}
                             for n, e in rows
                         ]))
-                    evs = [e for e in events.read_all(proj) if e.type in events.SEMANTIC_TYPES]
+                    evs = [e for e in events.read_all(proj) if e.type in events.MEMORY_VIEW_TYPES]
                     if session:
                         evs = [e for e in evs if e.session_id == session]
                     evs = list(reversed(evs))[:limit]      # newest first
@@ -286,7 +286,7 @@ def make_handler(token: str):
                             s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
                                            "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
                         s["events"] += 1
-                        if e.type in events.SEMANTIC_TYPES:
+                        if e.type in events.MEMORY_VIEW_TYPES:
                             s["memory"] += 1
                         if e.ts and e.ts < s["first_ts"]:
                             s["first_ts"] = e.ts
