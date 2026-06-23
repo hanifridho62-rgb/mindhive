@@ -37,6 +37,18 @@ def test_verify_corrupt_event_log(tmp_path, monkeypatch):
     assert result["ok"] is False
     assert result["reason"] == "corrupt_event_log"
 
+def test_verify_corrupt_chain_file(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    chain.write_chain()
+    # Truncate/corrupt chain.json itself — verify must return a verdict, not raise.
+    (tmp_path / "test" / "chain.json").write_text("{not json", encoding="utf-8")
+    result = chain.verify()
+    assert result["ok"] is False
+    assert result["reason"] == "corrupt_chain_file"
+
+
 def test_verify_without_chain_file(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     events.append_event("decision", {"text": "a"}, session_id="s",

@@ -396,3 +396,18 @@ def test_project_for_transcript_dir_none_without_cwd(tmp_path, monkeypatch):
     d.mkdir()
     (d / "s.jsonl").write_text(json.dumps({"type": "x"}) + "\n", encoding="utf-8")
     assert harvest.project_for_transcript_dir(d) is None
+
+
+def test_project_for_transcript_dir_skips_malformed_cwd_line(tmp_path, monkeypatch):
+    """A malformed line containing '"cwd"' must not abandon the whole file — a
+    later valid cwd line still resolves the project."""
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    d = tmp_path / "enc"
+    d.mkdir()
+    lines = [
+        '{"cwd": "C:/Broken"',                       # truncated JSON, has "cwd"
+        json.dumps({"cwd": "C:/ProjY"}),             # valid, later
+    ]
+    (d / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert harvest.project_for_transcript_dir(d) == "ProjY"

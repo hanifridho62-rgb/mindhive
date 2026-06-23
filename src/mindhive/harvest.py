@@ -292,10 +292,17 @@ def project_for_transcript_dir(d) -> str | None:
                 for line in fh:
                     if '"cwd"' not in line:
                         continue
-                    cwd = (json.loads(line) or {}).get("cwd")
+                    try:
+                        cwd = (json.loads(line) or {}).get("cwd")
+                    except (json.JSONDecodeError, ValueError):
+                        # A malformed line (e.g. a transcript caught mid-write)
+                        # must skip to the next LINE, not abandon the whole file
+                        # — otherwise the session is mis-detected as None and
+                        # dropped from catch_up entirely.
+                        continue
                     if cwd:
                         return paths.detect_project(Path(cwd))
-        except Exception:
+        except OSError:
             continue
     return None
 
