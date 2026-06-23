@@ -131,9 +131,29 @@ def all_event_pairs() -> list:
     return pairs
 
 
-def _safe_chain_ok(name: str) -> bool:
+def _overview_counts(pairs) -> dict:
+    """Tally overview stats from an iterable of (session_key, Event). Shared by
+    the single-project and HIVE MIND overviews so the counting lives in one
+    place; the caller chooses the session key (a bare id, or (project, id) when
+    unifying across projects)."""
+    by_type, sessions, mem, auto, total, last_ts = {}, set(), 0, 0, 0, None
+    for skey, ev in pairs:
+        by_type[ev.type] = by_type.get(ev.type, 0) + 1
+        sessions.add(skey)
+        if ev.type in events.MEMORY_VIEW_TYPES:
+            mem += 1
+        else:
+            auto += 1
+        total += 1
+        if ev.ts and (last_ts is None or ev.ts > last_ts):
+            last_ts = ev.ts
+    return {"events": total, "memory_events": mem, "auto_events": auto,
+            "sessions": len(sessions), "by_type": by_type, "last_ts": last_ts}
+
+
+def _safe_chain_ok(name: str, evs=None) -> bool:
     try:
-        return bool(chain.verify(name).get("ok"))
+        return bool(chain.verify(name, evs=evs).get("ok"))
     except Exception:
         return False
 
@@ -210,41 +230,22 @@ def make_handler(token: str):
                     return self._json(chain.verify(proj))
                 if route == "/api/overview":
                     if am:
-                        pairs = all_event_pairs()
-                        by_type, sessions, mem, auto = {}, set(), 0, 0
-                        for name, ev in pairs:
-                            by_type[ev.type] = by_type.get(ev.type, 0) + 1
-                            sessions.add((name, ev.session_id))
-                            if ev.type in events.MEMORY_VIEW_TYPES:
-                                mem += 1
-                            else:
-                                auto += 1
                         names = _all_projects()
+                        # read each project's log ONCE, then derive stats AND the
+                        # chain check from the same events (no second full read)
+                        evs_by_proj = {n: events.read_all(n) for n in names}
+                        stats = _overview_counts(
+                            ((name, ev.session_id), ev)
+                            for name, evs in evs_by_proj.items() for ev in evs)
                         return self._json({
-                            "project": HIVEMIND_LABEL, "projects": len(names),
-                            "events": len(pairs), "memory_events": mem, "auto_events": auto,
-                            "sessions": len(sessions), "by_type": by_type,
-                            "last_ts": pairs[-1][1].ts if pairs else None,
-                            "chain_ok": all(_safe_chain_ok(n) for n in names) if names else False,
+                            "project": HIVEMIND_LABEL, "projects": len(names), **stats,
+                            "chain_ok": (all(_safe_chain_ok(n, evs_by_proj[n]) for n in names)
+                                         if names else False),
                         })
                     evs = events.read_all(proj)
-                    by_type = {}
-                    sessions, mem, auto = set(), 0, 0
-                    for ev in evs:
-                        by_type[ev.type] = by_type.get(ev.type, 0) + 1
-                        sessions.add(ev.session_id)
-                        if ev.type in events.MEMORY_VIEW_TYPES:
-                            mem += 1
-                        else:
-                            auto += 1
+                    stats = _overview_counts((ev.session_id, ev) for ev in evs)
                     return self._json({
-                        "project": proj,
-                        "events": len(evs),
-                        "memory_events": mem,
-                        "auto_events": auto,
-                        "sessions": len(sessions),
-                        "by_type": by_type,
-                        "last_ts": evs[-1].ts if evs else None,
+                        "project": proj, **stats,
                         # reuse the events we just read — no second full read
                         "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
                     })
