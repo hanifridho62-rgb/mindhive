@@ -192,7 +192,8 @@ _RENDERER_JS = r"""
     return g;
   });
 
-  var fitted = false, alpha = 1;
+  var dragging = null, dragOff = null;
+  var fitted = false, alpha = 0;   // alpha 0 = frozen; a drag reheats the sim
   function fitView() {
     if (!nodes.length) return;
     var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -212,25 +213,22 @@ _RENDERER_JS = r"""
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
 
-  function tick(now) {
-    now = now || 0;
-    // Once the layout has cooled (alpha 0) and nothing is being dragged, node
-    // positions are frozen — so skip the O(n^2) physics AND the per-node DOM
-    // transforms entirely; only the edge buzz keeps running. This is the single
-    // biggest render saving on large graphs and is visually identical (nothing
-    // was moving). A drag reheats alpha, which resumes the simulation.
-    var simulating = alpha > 0 || dragging;
-    if (simulating) {
+  // One integration step of the force layout, scaled by the cooling factor `a`.
+  // Repulsion is O(n^2); springs pull connected nodes to a rest length; a weak
+  // pull toward centre keeps the graph framed. Per-node speed is clamped (MAXV)
+  // so two close nodes can no longer fling apart in a single frame — that
+  // uncapped spike was the source of the irregular jitter on open.
+  function physicsStep(a) {
     for (var i = 0; i < nodes.length; i++) {
-      var a = nodes[i];
+      var p = nodes[i];
       for (var j = i + 1; j < nodes.length; j++) {
-        var b = nodes[j];
-        var dx = a.x - b.x, dy = a.y - b.y;
+        var q = nodes[j];
+        var dx = p.x - q.x, dy = p.y - q.y;
         var d2 = dx * dx + dy * dy || 0.01;
         var f = 1200 / d2;
         var d = Math.sqrt(d2);
-        a.vx += (dx / d) * f; a.vy += (dy / d) * f;
-        b.vx -= (dx / d) * f; b.vy -= (dy / d) * f;
+        p.vx += (dx / d) * f; p.vy += (dy / d) * f;
+        q.vx -= (dx / d) * f; q.vy -= (dy / d) * f;
       }
     }
     edges.forEach(function (e) {
@@ -240,16 +238,45 @@ _RENDERER_JS = r"""
       e.s.vx += (dx / d) * f; e.s.vy += (dy / d) * f;
       e.t.vx -= (dx / d) * f; e.t.vy -= (dy / d) * f;
     });
+    var MAXV = 12;
     nodes.forEach(function (n) {
       n.vx += (W / 2 - n.x) * 0.006; n.vy += (H / 2 - n.y) * 0.006;
-      // Motion is scaled by alpha so the layout cools to a stop (see below).
-      if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
+      var sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
+      if (sp > MAXV) { n.vx = n.vx / sp * MAXV; n.vy = n.vy / sp * MAXV; }
+      // Motion is scaled by `a` so the layout cools to a stop.
+      if (n !== dragging) { n.x += n.vx * a; n.y += n.vy * a; }
       n.vx *= 0.85; n.vy *= 0.85;
     });
+  }
+
+  // Pre-warm: settle the layout to a stable state *synchronously*, before the
+  // first paint. The graph therefore opens already laid out and still — no
+  // visible scatter-then-vibrate while the simulation cools on screen. It's a
+  // one-time cost; the animation loop afterwards only drives the edge buzz
+  // until a drag reheats the sim.
+  function warmUp() {
+    for (var a = 1; a > 0; a -= 0.008) physicsStep(a);
+    nodes.forEach(function (n) { n.vx = 0; n.vy = 0; });
+  }
+
+  function renderNodes() {
+    for (var i = 0; i < nodes.length; i++) {
+      nodeEls[i].setAttribute("transform",
+        "translate(" + nodes[i].x + "," + nodes[i].y + ")");
     }
+  }
+
+  function tick(now) {
+    now = now || 0;
+    // Node positions are frozen unless a drag is reheating the layout, so the
+    // O(n^2) physics and per-node DOM writes are skipped in the steady state —
+    // only the edge buzz below keeps running. A drag sets alpha, resuming both.
+    var simulating = alpha > 0 || dragging;
+    if (simulating) { physicsStep(alpha); renderNodes(); }
     // Edge buzz: rebuild each edge as a perpendicular sine waveform. Driven by
-    // the frame timestamp (not alpha), so edges keep vibrating after the layout
-    // freezes. The sin(pi*s) envelope pins displacement to 0 at both endpoints.
+    // the frame timestamp (not alpha), so edges keep their subtle ripple after
+    // the layout freezes. The sin(pi*s) envelope pins displacement to 0 at both
+    // endpoints.
     var t = now / 1000;
     edges.forEach(function (e, i) {
       var sx = e.s.x, sy = e.s.y, tx = e.t.x, ty = e.t.y;
@@ -267,21 +294,20 @@ _RENDERER_JS = r"""
       }
       edgeEls[i].setAttribute("d", d);
     });
-    if (simulating) {
-      nodes.forEach(function (n, i) {
-        nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-      });
-    }
-    // Cool the layout each frame; once it has settled (alpha hits 0) the node
-    // positions are frozen, so a single fit-to-window holds instead of going
-    // stale while the simulation keeps drifting (which clipped the graph).
+    // Cool any reheat from a drag back down to a frozen state.
     alpha = alpha > 0 ? Math.max(0, alpha - 0.008) : 0;
+    requestAnimationFrame(tick);
+  }
+
+  // Lay the graph out and frame it before the first paint, then start the loop
+  // — so the very first frame the user sees is already settled, not scattering.
+  if (nodes.length) {
+    warmUp();
+    renderNodes();
     if (!fitted && alpha === 0) { fitted = true; fitView(); }
     requestAnimationFrame(tick);
   }
-  if (nodes.length) requestAnimationFrame(tick);
 
-  var dragging = null, dragOff = null;
   function startDrag(ev, n) {
     ev.preventDefault(); ev.stopPropagation();
     dragging = n;
