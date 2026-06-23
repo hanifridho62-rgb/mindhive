@@ -49,6 +49,10 @@ def _run(argv=None) -> int:
     a.add_argument("--json", action="store_true", help="parse payload as JSON dict")
     a.add_argument("--stdin", action="store_true", help="read payload from stdin")
 
+    hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
+    hk.add_argument("stage", choices=["post_tool_use"],
+                    help="which hook fired")
+
     sub.add_parser("project", help="rebuild projections")
     sub.add_parser("state", help="print STATE.md")
     sub.add_parser("verify", help="verify hash chain")
@@ -149,6 +153,11 @@ def _run(argv=None) -> int:
         tags = [t for t in args.tags.split(",") if t]
         ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
         print(f"appended {ev.type} @ {ev.ts}")
+    elif args.cmd == "hook":
+        from . import hookcapture
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        if args.stage == "post_tool_use":
+            print(json.dumps(hookcapture.record_post_tool_use(raw)))
     elif args.cmd == "project":
         print(json.dumps(projector.project()))
     elif args.cmd == "state":
