@@ -245,7 +245,8 @@ def make_handler(token: str):
                         "sessions": len(sessions),
                         "by_type": by_type,
                         "last_ts": evs[-1].ts if evs else None,
-                        "chain_ok": bool(chain.verify(proj).get("ok")),
+                        # reuse the events we just read — no second full read
+                        "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
                     })
                 if route == "/api/memory":
                     # the semantic subset only — the intent/context layer

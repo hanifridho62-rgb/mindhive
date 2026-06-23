@@ -67,3 +67,14 @@ def test_project_reads_event_log_only_once(tmp_path, monkeypatch):
     monkeypatch.setattr(events, "read_all", counting)
     projector.project()
     assert calls["n"] == 1
+
+
+def test_verify_accepts_pre_read_events(tmp_path, monkeypatch):
+    """verify(evs=...) must equal verify() — lets the overview poll reuse the
+    events it already read instead of a second full event-log read."""
+    _setup(tmp_path, monkeypatch)
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    chain.write_chain()
+    evs = events.read_all()
+    assert chain.verify(evs=evs) == chain.verify()

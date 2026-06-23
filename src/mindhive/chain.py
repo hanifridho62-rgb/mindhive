@@ -24,9 +24,11 @@ def write_chain(project=None, evs=None) -> dict:
     return c
 
 
-def verify(project=None) -> dict:
+def verify(project=None, evs=None) -> dict:
+    # Accept pre-read events so a caller that already has them (e.g. the dashboard
+    # overview poll) need not read the whole event log a second time.
     try:
-        actual = compute_chain(events.read_all(project))
+        actual = compute_chain(events.read_all(project) if evs is None else evs)
     except json.JSONDecodeError as e:
         return {"ok": False, "reason": "corrupt_event_log", "detail": str(e)}
     except Exception as e:

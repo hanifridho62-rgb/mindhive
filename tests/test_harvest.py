@@ -297,3 +297,27 @@ def test_catch_up_releases_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(harvest, "claude_projects_root", lambda: root)
     harvest.catch_up(known_only=False)
     assert not (paths.store_home() / "harvest.lock").exists()
+
+
+# --- per-bubble 5,000-word cap (one memory entry == one bubble) ---
+
+def test_prompt_capped_at_5000_words(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_usermsg("word " * 6000)])     # 6000 words
+    harvest.harvest(tdir, "test")
+    p = [e for e in events.read_all("test") if e.type == "user_prompt"][0]
+    toks = p.payload["text"].split()
+    assert toks[:3] == ["word", "word", "word"]    # kept the leading words
+    assert "[truncated]" in p.payload["text"]       # marked as cut
+    assert len(toks) == 5001                         # 5000 words + the marker token
+
+
+def test_normal_prompt_not_capped(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_usermsg("a short normal prompt")])
+    harvest.harvest(tdir, "test")
+    p = [e for e in events.read_all("test") if e.type == "user_prompt"][0]
+    assert p.payload["text"] == "a short normal prompt"
+    assert "[truncated]" not in p.payload["text"]

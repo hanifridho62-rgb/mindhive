@@ -74,6 +74,18 @@ def _is_injected_prompt(text: str) -> bool:
     return text.lstrip()[:40].lower().startswith("base directory for this skill:")
 
 
+_MAX_WORDS = 5000
+
+
+def _cap_words(text: str, limit: int = _MAX_WORDS) -> str:
+    """Bound a single captured memory (one bubble) to ``limit`` words so a giant
+    paste can't bloat the store/UI, while still allowing very long entries."""
+    words = text.split()
+    if len(words) <= limit:
+        return text
+    return " ".join(words[:limit]) + " …[truncated]"
+
+
 def _normalize_ts(raw) -> str | None:
     """Reduce a transcript ISO-8601 timestamp (e.g. '2026-06-20T09:15:30.500Z')
     to the canonical second-resolution UTC form the store uses, or None when it
@@ -138,13 +150,13 @@ def _items_from_obj(o) -> list:
                 # Store the full memo — no truncation. Redundant re-phrasings
                 # are collapsed by meaning at display time (see dedupe.py),
                 # so the ledger keeps every memory verbatim and complete.
-                items.append({"kind": "memo", "value": val, "memo_type": mtype})
+                items.append({"kind": "memo", "value": _cap_words(val), "memo_type": mtype})
         # Capture the typed prompt itself so EVERY prompt enters the hive — not
         # only marker-bearing ones. Skip injected skill bodies (not user-typed).
         if text and not _is_injected_prompt(text):
             prompt = _clean_prompt(text)
             if prompt:
-                items.append({"kind": "user_prompt", "value": prompt})
+                items.append({"kind": "user_prompt", "value": _cap_words(prompt)})
     return items
 
 
