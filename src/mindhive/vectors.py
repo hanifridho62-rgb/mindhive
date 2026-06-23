@@ -55,5 +55,16 @@ def semantic_recall(query, project=None, limit=10, force=False):
     res = col.query(query_embeddings=enc([query]), n_results=limit)
     docs = res.get("documents", [[]])[0]
     ids = res.get("ids", [[]])[0]
-    return [{"file": ids[i], "snippet": " ".join(d.split())[:200]}
+    # Surface the similarity so callers can rank and drop weak matches. chroma
+    # returns a distance (lower = closer); score = 1 - distance. Some configs
+    # omit distances entirely — fall back to None rather than crash.
+    dist_outer = res.get("distances") or [[]]
+    dists = dist_outer[0] if dist_outer else []
+
+    def _score(i):
+        if i < len(dists) and dists[i] is not None:
+            return round(1.0 - dists[i], 6)
+        return None
+
+    return [{"file": ids[i], "snippet": " ".join(d.split())[:200], "score": _score(i)}
             for i, d in enumerate(docs)]

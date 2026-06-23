@@ -160,7 +160,9 @@ def _run(argv=None) -> int:
     elif args.cmd == "recall":
         for h in recall_mod.recall(args.query, semantic=args.semantic,
                                    limit=args.limit, force=args.force):
-            print(f"{h['file']}\n  {h['snippet']}")
+            score = h.get("score")
+            tag = f" [score {score:g}]" if isinstance(score, (int, float)) else ""
+            print(f"{h['file']}{tag}\n  {h['snippet']}")
     elif args.cmd == "export":
         print(str(export_mod.export(out=args.out, recent=args.recent)))
     elif args.cmd == "embed":
