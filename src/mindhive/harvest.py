@@ -48,7 +48,10 @@ def _items_from_obj(o) -> list:
                 val = text[low.index(m) + len(m):].strip()
                 mtype = "caveat" if (m == "caveat:" or any(h in low for h in _CAVEAT_HINT)) else "decision"
                 if val:
-                    items.append({"kind": "memo", "value": val[:300], "memo_type": mtype})
+                    # Store the full memo — no truncation. Redundant re-phrasings
+                    # are collapsed by meaning at display time (see dedupe.py),
+                    # so the ledger keeps every memory verbatim and complete.
+                    items.append({"kind": "memo", "value": val, "memo_type": mtype})
                 break
     return items
 

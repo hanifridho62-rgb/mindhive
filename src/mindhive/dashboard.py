@@ -50,6 +50,7 @@ from . import graphview
 from . import plugins as plugins_mod
 from . import export as export_mod
 from . import events, projector
+from . import dedupe
 from . import sync as sync_mod
 from .briefing import briefing as build_briefing
 
@@ -241,22 +242,25 @@ def make_handler(token: str):
                         if session:
                             rows = [(n, e) for n, e in rows if e.session_id == session]
                         rows = list(reversed(rows))[:limit]
-                        return self._json([
+                        return self._json(dedupe.collapse([
                             {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
                              "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
                              "tags": e.tags}
                             for n, e in rows
-                        ])
+                        ]))
                     evs = [e for e in events.read_all(proj) if e.type in events.SEMANTIC_TYPES]
                     if session:
                         evs = [e for e in evs if e.session_id == session]
                     evs = list(reversed(evs))[:limit]      # newest first
-                    return self._json([
+                    # Collapse near-duplicate memories by meaning (same type +
+                    # project), keeping the newest; display-time only, ledger
+                    # untouched. similar_count rides along for the UI hint.
+                    return self._json(dedupe.collapse([
                         {"ts": e.ts, "type": e.type, "session": e.session_id, "project": proj,
                          "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
                          "tags": e.tags}
                         for e in evs
-                    ])
+                    ]))
                 if route == "/api/sessions":
                     by: dict = {}
                     src = all_event_pairs() if am else [(proj, e) for e in events.read_all(proj)]
@@ -434,6 +438,7 @@ def render_page(token: str) -> str:
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
   .hits .snip { white-space:pre-wrap; margin-top:4px; }
+  .hits .dup { color:#8a93a6; }
   h2.h { margin:2px 0 12px; font-size:16px; }
 </style></head>
 <body>
@@ -645,6 +650,7 @@ def render_page(token: str) -> str:
           + (showProj && m.project ? esc(m.project)+' · ' : '')
           + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
+          + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
   }

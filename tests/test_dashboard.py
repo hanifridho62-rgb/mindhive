@@ -303,6 +303,29 @@ def test_memory_endpoint_returns_semantic_only():
         server.shutdown()
 
 
+def test_memory_endpoint_collapses_near_duplicates():
+    server, base, token = _start()
+    try:
+        # Two re-phrasings of the same caveat + one distinct memo.
+        _post(base, "/api/append", {"type": "caveat",
+              "payload": "prefer the browser for visual content like mockups and diagrams",
+              "project": "p"}, token)
+        _post(base, "/api/append", {"type": "caveat",
+              "payload": "prefer browser for visual content like mockups and diagrams",
+              "project": "p"}, token)
+        _post(base, "/api/append", {"type": "caveat",
+              "payload": "rebuild the exe with python 3.12 before launching", "project": "p"}, token)
+        status, body = _get(base, "/api/memory?project=p", token)
+        items = json.loads(body)
+        assert len(items) == 2                      # the pair collapsed to one
+        rep = next(m for m in items if "browser" in m["text"])
+        assert rep["similar_count"] == 1            # absorbed one older duplicate
+        # newest wording wins (the second append, without "the")
+        assert rep["text"] == "prefer browser for visual content like mockups and diagrams"
+    finally:
+        server.shutdown()
+
+
 def test_sessions_endpoint_groups_by_session(monkeypatch):
     server, base, token = _start()
     try:

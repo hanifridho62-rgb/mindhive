@@ -29,6 +29,21 @@ def test_harvest_captures_edits_and_commands(tmp_path, monkeypatch):
     assert types.count("file_touched") == 1 and types.count("command_run") == 1
 
 
+def _usermsg(text):
+    return json.dumps({"type": "user", "message": {"content": text}})
+
+
+def test_harvest_stores_full_memo_without_truncation(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    long_memo = "x " * 400 + "tail"               # ~800 chars, well past the old 300 cap
+    _write_transcript(tdir, "s1", [_usermsg("memo: " + long_memo)])
+    harvest.harvest(tdir, "test")
+    memos = [e for e in events.read_all("test") if e.type in events.SEMANTIC_TYPES]
+    assert len(memos) == 1
+    assert memos[0].payload["text"] == long_memo  # full text, nothing cut off
+
+
 def test_harvest_is_idempotent(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     tdir = tmp_path / "tx"
