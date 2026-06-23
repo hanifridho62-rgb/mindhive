@@ -94,9 +94,10 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     # Build nodes and deterministic edges
     for ev in evs:
         # plugin_catalog snapshots are expanded separately into plugin/skill
-        # nodes below; user_prompt is the raw prompt log (Memory view only) and
-        # would explode the graph. A generic event node for either is just noise.
-        if ev.type in ("plugin_catalog", "user_prompt"):
+        # nodes below; user_prompt / assistant_response are the raw conversation
+        # log (Memory view only) and would explode the graph. A generic event
+        # node for any of these is just noise.
+        if ev.type in ("plugin_catalog", "user_prompt", "assistant_response"):
             continue
         eid = _ev_id(ev)
         sid = _session_id(ev)

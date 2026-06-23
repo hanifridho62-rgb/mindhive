@@ -321,3 +321,58 @@ def test_normal_prompt_not_capped(tmp_path, monkeypatch):
     p = [e for e in events.read_all("test") if e.type == "user_prompt"][0]
     assert p.payload["text"] == "a short normal prompt"
     assert "[truncated]" not in p.payload["text"]
+
+
+# --- assistant_response capture (Claude's output enters the hive too) ---
+
+def _assistant(text=None, tool=None):
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    if tool:
+        content.append({"type": "tool_use", "name": tool[0], "input": tool[1]})
+    return json.dumps({"type": "assistant", "message": {"content": content}})
+
+
+def test_assistant_text_captured_as_response(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_assistant(text="Here is the plan: do X then Y.")])
+    harvest.harvest(tdir, "test")
+    rs = [e for e in events.read_all("test") if e.type == "assistant_response"]
+    assert len(rs) == 1
+    assert rs[0].payload["text"] == "Here is the plan: do X then Y."
+    assert "response" in rs[0].tags
+
+
+def test_tool_only_assistant_has_no_response(tmp_path, monkeypatch):
+    """An assistant turn that is only a tool call (no prose) yields no response
+    event, but the tool action is still captured."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_assistant(tool=("Edit", {"file_path": "a.py"}))])
+    harvest.harvest(tdir, "test")
+    evs = events.read_all("test")
+    assert [e for e in evs if e.type == "assistant_response"] == []
+    assert any(e.type == "file_touched" for e in evs)
+
+
+def test_assistant_response_with_text_and_tool(tmp_path, monkeypatch):
+    """A turn with both prose and a tool call captures both."""
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_assistant(text="Editing the file now.",
+                                              tool=("Edit", {"file_path": "a.py"}))])
+    harvest.harvest(tdir, "test")
+    types = sorted(e.type for e in events.read_all("test"))
+    assert types == ["assistant_response", "file_touched"]
+
+
+def test_assistant_response_capped_at_5000_words(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_assistant(text="word " * 6000)])
+    harvest.harvest(tdir, "test")
+    r = [e for e in events.read_all("test") if e.type == "assistant_response"][0]
+    assert len(r.payload["text"].split()) == 5001
+    assert "[truncated]" in r.payload["text"]

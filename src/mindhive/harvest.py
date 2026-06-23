@@ -127,6 +127,11 @@ def _items_from_obj(o) -> list:
                     cmd = inp.get("command")
                     if cmd:
                         items.append({"kind": "command_run", "value": cmd[:180]})
+        # Capture Claude's prose response too, so the OUTPUT enters the hive
+        # alongside the prompt. Tool-only turns have no text and are skipped.
+        resp = _user_text(content).strip()
+        if resp:
+            items.append({"kind": "assistant_response", "value": _cap_words(resp)})
     elif t == "user":
         text = _user_text(msg.get("content")).strip()
         low = text.lower()
@@ -261,6 +266,9 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                     elif item["kind"] == "user_prompt":
                         events.append_event("user_prompt", {"text": item["value"]},
                                             session_id=sid, tags=["harvest", "prompt"], ts=line_ts, project=project)
+                    elif item["kind"] == "assistant_response":
+                        events.append_event("assistant_response", {"text": item["value"]},
+                                            session_id=sid, tags=["harvest", "response"], ts=line_ts, project=project)
                     new_events += 1
             state[f.name] = len(all_lines)
     _save_state(project, state)

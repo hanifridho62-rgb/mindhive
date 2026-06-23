@@ -40,3 +40,12 @@ def test_segments_are_per_session(tmp_path, monkeypatch):
     events.append_event("caveat", {"text": "x"}, session_id="abc",
                         ts="2026-06-20T10:00:00Z")
     assert (paths.events_dir() / "abc.jsonl").exists()
+
+
+def test_assistant_response_is_valid_and_in_memory_view(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    ev = events.append_event("assistant_response", {"text": "ok"}, session_id="s",
+                             ts="2026-06-23T10:00:00Z")
+    assert ev.type == "assistant_response"
+    assert "assistant_response" in events.MEMORY_VIEW_TYPES
+    assert "assistant_response" not in events.SEMANTIC_TYPES
