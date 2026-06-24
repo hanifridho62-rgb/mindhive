@@ -19,7 +19,9 @@ class MtimeTracker:
                 continue
             if p.is_file():
                 st = p.stat()
-                state[str(p)] = (st.st_mtime, st.st_size)
+                # nanosecond mtime avoids float-seconds rounding; size catches
+                # changes the coarse OS last-write-time tick might otherwise miss.
+                state[str(p)] = (st.st_mtime_ns, st.st_size)
         return state
 
     def snapshot(self):

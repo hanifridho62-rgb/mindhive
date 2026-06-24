@@ -8,8 +8,10 @@ def test_mtime_tracker_detects_change(tmp_path):
     tracker = progress.MtimeTracker(tmp_path)
     tracker.snapshot()                 # baseline
     assert tracker.changed() is False  # nothing changed yet
-    f.write_text("two", encoding="utf-8")
-    assert tracker.changed() is True   # mtime/content changed
+    # write content of a DIFFERENT size: the cheap (mtime_ns, size) detector
+    # must not depend on sub-tick mtime resolution to notice an edit.
+    f.write_text("rewritten", encoding="utf-8")
+    assert tracker.changed() is True   # size changed
 
 
 def test_mtime_tracker_detects_new_file(tmp_path):
