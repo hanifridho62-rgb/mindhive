@@ -51,6 +51,7 @@ def _run(argv=None) -> int:
 
     sub.add_parser("project", help="rebuild projections")
     sub.add_parser("state", help="print STATE.md")
+    sub.add_parser("directives", help="print the session operating directives")
     sub.add_parser("verify", help="verify hash chain")
     sub.add_parser("selftest", help="run test suite")
 
@@ -164,6 +165,9 @@ def _run(argv=None) -> int:
         s = paths.project_dir() / "STATE.md"
         print(s.read_text(encoding="utf-8") if s.exists()
               else "(no STATE.md — run: hive project)")
+    elif args.cmd == "directives":
+        from . import directives as directives_mod
+        print(directives_mod.directives())
     elif args.cmd == "verify":
         print(json.dumps(chain.verify()))
     elif args.cmd == "recall":

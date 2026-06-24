@@ -59,6 +59,29 @@ acceptance, direct-over-magic, type cleanliness, and canonical layering. It runs
 as a queued, session-end-triggered review surfaced in the next session. See
 `docs/adr/0004-queue-and-inject-thermo-nuclear-review.md`.
 
+### Methodology spine
+The default end-to-end software-development workflow Claude follows in this repo:
+the superpowers skill chain (brainstorming → writing-plans →
+subagent-driven-development → test-driven-development →
+verification-before-completion → requesting-code-review), with named carve-outs
+where a sharper tool wins. "On the spine" means using these skills by default,
+not a peer toolchain (`/ce-*`, anthropic-skills), which are supplements invoked
+only on explicit request. See `directives.py` §8 and `docs/adr/0005`.
+
+### Triviality bypass
+The rule that exempts trivial mechanical edits — one-line fixes, typos, renames,
+config tweaks, doc edits — from the brainstorm→plan gate, sending them straight to
+the change. The gate re-engages when work adds/changes behavior, spans multiple
+files, or carries design ambiguity. The boundary, not the skills, is what the term
+names.
+
+### Worktree-consent envelope
+The scope within which Claude executes autonomously without per-task confirmation:
+the tasks of an **approved plan** running in an **isolated worktree**. Plan
+approval is the batched, up-front consent for §4 mutations inside it. Actions that
+leave the envelope — out-of-scope work, unplanned destructive ops, or
+memory-store/network/deploy changes — fall back to per-action confirmation.
+
 ## Thermo-nuclear review — captured decisions
 
 > These are the operating parameters settled while designing the thermo-nuclear

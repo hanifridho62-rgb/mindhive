@@ -24,6 +24,8 @@ _TEMPLATE = """<!DOCTYPE html>
   .edge { stroke: #30363d; stroke-width: 1; fill: none; }
   .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
   .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
+  .hoverlabel { font-size: 11px; pointer-events: none; paint-order: stroke;
+    stroke: #0e1116; stroke-width: 3px; fill: #e6edf3; }
   .node.dim circle, .edge.dim { opacity: 0.15; }
   #panel { width: 320px; background: #161b22; border-left: 1px solid #30363d;
     padding: 16px; overflow-y: auto; }
@@ -48,6 +50,10 @@ _TEMPLATE = """<!DOCTYPE html>
     color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
     padding: 4px 12px; cursor: pointer; font: inherit; }
   #fitbtn:hover { background: #30363d; }
+  #artbtn { position: absolute; top: 46px; right: 10px; background: #21262d;
+    color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+    padding: 4px 12px; cursor: pointer; font: inherit; }
+  #artbtn:hover { background: #30363d; }
   #panel .chip { display: inline-block; padding: 2px 8px; border-radius: 10px;
     font-size: 11px; margin: 0 4px 4px 0; background: #21262d; color: #c9d1d9; }
   #panel .body { white-space: pre-wrap; word-break: break-word; background: #0e1116;
@@ -61,6 +67,7 @@ _TEMPLATE = """<!DOCTYPE html>
     <svg id="svg"></svg>
     <div id="legend"></div>
     <button id="fitbtn" title="Fit graph to window">Fit</button>
+    <button id="artbtn" title="Toggle pinwheel view">Pinwheel</button>
     <div id="hint">drag nodes &middot; scroll to zoom &middot; drag background to pan &middot; click a node</div>
   </div>
   <div id="panel"><div id="empty">Click a node to inspect it.</div></div>
@@ -108,6 +115,34 @@ _RENDERER_JS = r"""
   var VIBE_AMP = 3.5, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
       VIBE_SAMPLES = 20;
 
+  // Force-layout stability constants. Large memory graphs contain mega-hub tags
+  // (e.g. "harvest"/"auto" tag nearly every event), so one node can be wired to
+  // ~all others. With explicit-Euler integration that concentration of spring
+  // pull, combined with the 1/d^2 repulsion spiking when two hub-siblings briefly
+  // coincide, sends velocities to infinity and the coordinates explode (1e90+),
+  // after which fitView zooms into garbage and the whole graph renders as a
+  // single dot. REPULSE_MINDIST floors the repulsion denominator, SPRING_CAP
+  // bounds the per-edge pull, and MAX_VEL clamps per-axis speed — together they
+  // keep the simulation bounded no matter how dense the hub.
+  var REPULSE_MINDIST2 = 12 * 12, SPRING_CAP = 8, MAX_VEL = 30, COOL_RATE = 0.004;
+
+  // Clustered ("grouped clumps") layout. Spring strength per edge relation:
+  // structural edges (a node and its session/file/next) pull their clump tight;
+  // tag edges pull NOTHING, because the mega-hub tags wire to ~every node and
+  // any pull would drag all clumps back into one blob. Nodes are also held to a
+  // per-group anchor (see below) so each session settles into its own clump.
+  var SPRING_K = { in_session: 0.03, touched: 0.02, next: 0.04,
+                   tagged: 0, shares_tag: 0 };
+  var SPRING_REST = 40, ANCHOR_GRAVITY = 0.06, REPULSE = 900;
+
+  // The per-frame edge "buzz" rebuilds every edge as a 20-point polyline each
+  // frame, forever. On a big graph (thousands of edges) that animation never
+  // stops and steals the main thread from zoom/pan, making them feel laggy.
+  // So buzz only on small graphs; large graphs draw static straight edges and
+  // the render loop HALTS once the layout settles (see kick()/tick) — after
+  // which zoom and pan are just a CSS transform on the root group, zero JS.
+  var BUZZ_MAX_EDGES = 600;
+
   function nodeColor(n) {
     if (n.type === "event") return KIND_COLORS[n.kind] || TYPE_COLORS.event;
     return TYPE_COLORS[n.type] || "#888";
@@ -128,11 +163,12 @@ _RENDERER_JS = r"""
   var NS = "http:" + "//www.w3.org/2000/svg";
   var root = document.createElementNS(NS, "g");
   svg.appendChild(root);
-  // Behind everything: a layer for the per-group halos + labels so each cluster
-  // is visibly named. pointer-events:none so it never swallows node clicks.
-  var groupLayer = document.createElementNS(NS, "g");
-  groupLayer.setAttribute("pointer-events", "none");
-  root.appendChild(groupLayer);
+  // Two layers under the shared pan/zoom transform: the force graph and the
+  // pinwheel art view. Only one is visible at a time (toggled by #artbtn).
+  var graphLayer = document.createElementNS(NS, "g");
+  var artLayer = document.createElementNS(NS, "g");
+  artLayer.style.display = "none";
+  root.appendChild(graphLayer); root.appendChild(artLayer);
 
   var view = { x: 0, y: 0, k: 1 };
   function applyView() {
@@ -140,45 +176,55 @@ _RENDERER_JS = r"""
       "translate(" + view.x + "," + view.y + ") scale(" + view.k + ")");
   }
 
-  // Group anchors: every node belongs to a group (its kind for events, its type
-  // otherwise — the same key the legend uses). Each group gets its own anchor
-  // region, spread evenly on a ring around centre, and the layout adds a
-  // restoring force toward that anchor (see physicsStep). The result is tidy,
-  // context-grouped clusters instead of one random blob.
-  var groupKeys = [], groupCount = {};
-  data.nodes.forEach(function (n) {
-    var k = nodeKey(n);
-    if (groupKeys.indexOf(k) < 0) groupKeys.push(k);
-    groupCount[k] = (groupCount[k] || 0) + 1;
+  // --- Assign each node to a clump ----------------------------------------
+  // event -> its session; file -> the session of a file it touched; session ->
+  // itself; tags (and anything left over) -> their own group. Group anchors are
+  // spread on a ring so the clumps land in separate regions of the canvas.
+  var nodeType = {};
+  data.nodes.forEach(function (n) { nodeType[n.id] = n.type; });
+  var group = {};
+  data.edges.forEach(function (e) {
+    if (e.rel !== "in_session") return;
+    var ev = nodeType[e.src] === "event" ? e.src : e.dst;
+    group[ev] = ev === e.src ? e.dst : e.src;
   });
-  var maxGroup = groupKeys.reduce(function (m, k) {
-    return Math.max(m, groupCount[k]); }, 1);
-  // Ring radius scales with how many groups there are and the biggest cluster,
-  // so neighbouring clusters don't overlap.
-  var GROUP_R = groupKeys.length > 1
-    ? Math.max(260, groupKeys.length * 55, Math.sqrt(maxGroup) * 95) : 0;
-  var groupAnchor = {};
-  groupKeys.forEach(function (k, i) {
-    var a = (i / groupKeys.length) * 2 * Math.PI;
-    groupAnchor[k] = { x: W / 2 + Math.cos(a) * GROUP_R,
-                       y: H / 2 + Math.sin(a) * GROUP_R };
+  data.nodes.forEach(function (n) { if (n.type === "session") group[n.id] = n.id; });
+  data.edges.forEach(function (e) {
+    if (e.rel !== "touched") return;
+    var fl = nodeType[e.src] === "file" ? e.src : e.dst;
+    var ot = fl === e.src ? e.dst : e.src;
+    if (group[ot] != null) group[fl] = group[ot];
+    else if (nodeType[ot] === "session") group[fl] = ot;
+  });
+  data.nodes.forEach(function (n) {
+    if (group[n.id] == null) group[n.id] = n.type === "tag" ? "__tags__" : "__misc__";
+  });
+  var groupIds = [], seenG = {};
+  data.nodes.forEach(function (n) {
+    var g = group[n.id];
+    if (!seenG[g]) { seenG[g] = true; groupIds.push(g); }
+  });
+  var G = Math.max(1, groupIds.length), groupIdx = {};
+  groupIds.forEach(function (g, i) { groupIdx[g] = i; });
+  var RGROUP = 140 + G * 16;
+  var anchors = groupIds.map(function (g, i) {
+    var a = (i / G) * 2 * Math.PI;
+    return { x: W / 2 + Math.cos(a) * RGROUP, y: H / 2 + Math.sin(a) * RGROUP };
   });
 
   var nodes = data.nodes.map(function (n, i) {
-    var key = nodeKey(n);
-    var anc = groupAnchor[key] || { x: W / 2, y: H / 2 };
-    // Seed each node in a small ring around its own group anchor so warm-up
-    // settles straight into clusters rather than untangling from one big ring.
-    var a = (i / Math.max(1, data.nodes.length)) * 2 * Math.PI;
+    var an = anchors[groupIdx[group[n.id]]];
+    var jx = ((i * 71) % 60) - 30, jy = ((i * 37) % 60) - 30;  // break symmetry
     return { id: n.id, type: n.type, label: n.label, kind: n.kind, text: n.text,
-             group: key,
-             x: anc.x + Math.cos(a) * 50, y: anc.y + Math.sin(a) * 50,
-             vx: 0, vy: 0 };
+             ax: an.x, ay: an.y, x: an.x + jx, y: an.y + jy, vx: 0, vy: 0 };
   });
   var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
   var edges = data.edges
     .filter(function (e) { return byId[e.src] && byId[e.dst]; })
-    .map(function (e) { return { s: byId[e.src], t: byId[e.dst], rel: e.rel }; });
+    .map(function (e) {
+      var k = SPRING_K[e.rel]; if (k == null) k = 0.01;
+      return { s: byId[e.src], t: byId[e.dst], rel: e.rel, k: k };
+    });
 
   var adj = {};
   data.edges.forEach(function (e) {
@@ -207,30 +253,54 @@ _RENDERER_JS = r"""
   var edgeEls = edges.map(function (e) {
     var l = document.createElementNS(NS, "path");
     l.setAttribute("class", "edge");
-    root.appendChild(l);
+    graphLayer.appendChild(l);
     return l;
   });
+  // Keep zoom/pan light: only the structural anchor nodes (sessions, tags)
+  // carry a permanent <text> label. Labelling all ~1000 event nodes forced the
+  // browser to re-rasterize a thousand text elements on every zoom step (and
+  // they overlapped into an unreadable smear anyway). Event/file labels show on
+  // hover via one shared element, and in full in the side panel on click.
+  function hasLabel(n) { return n.type === "session" || n.type === "tag"; }
   var nodeEls = nodes.map(function (n) {
     var g = document.createElementNS(NS, "g");
     g.setAttribute("class", "node");
     var c = document.createElementNS(NS, "circle");
     c.setAttribute("r", n.type === "session" ? 9 : 6);
     c.setAttribute("fill", nodeColor(n));
-    var t = document.createElementNS(NS, "text");
-    t.setAttribute("x", 9); t.setAttribute("y", 4);
-    t.textContent = canvasLabel(n);
-    g.appendChild(c); g.appendChild(t);
+    g.appendChild(c);
+    if (hasLabel(n)) {
+      var t = document.createElementNS(NS, "text");
+      t.setAttribute("x", 9); t.setAttribute("y", 4);
+      t.textContent = canvasLabel(n);
+      g.appendChild(t);
+    } else {
+      g.addEventListener("mouseover", function () { showHover(n); });
+      g.addEventListener("mouseout", hideHover);
+    }
     g.addEventListener("mousedown", function (ev) { startDrag(ev, n); });
     g.addEventListener("click", function (ev) { ev.stopPropagation(); select(n); });
-    root.appendChild(g);
+    graphLayer.appendChild(g);
     return g;
   });
 
-  var dragging = null, dragOff = null;
-  var fitted = false, alpha = 0;   // alpha 0 = frozen; a drag reheats the sim
-  var wasSimulating = false;       // tracks settle transitions (for group halos)
+  // One reused label for hovering an unlabelled node (instead of ~1000 always-on
+  // labels). Lives in world space so it tracks the node under the current zoom.
+  var hoverLabel = document.createElementNS(NS, "text");
+  hoverLabel.setAttribute("class", "hoverlabel");
+  hoverLabel.style.display = "none";
+  graphLayer.appendChild(hoverLabel);
+  function showHover(n) {
+    hoverLabel.setAttribute("x", n.x + 9); hoverLabel.setAttribute("y", n.y + 4);
+    hoverLabel.textContent = canvasLabel(n);
+    hoverLabel.style.display = "";
+  }
+  function hideHover() { hoverLabel.style.display = "none"; }
+
+  var fitted = false, alpha = 1, running = false;
+  var BUZZ = edges.length <= BUZZ_MAX_EDGES;   // animate edges only when cheap
   function fitView() {
-    if (!nodes.length) return;
+    if (!nodes.length || artMode) return;
     var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
     nodes.forEach(function (n) {
       minx = Math.min(minx, n.x); maxx = Math.max(maxx, n.x);
@@ -248,154 +318,179 @@ _RENDERER_JS = r"""
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
 
-  // One integration step of the force layout, scaled by the cooling factor `a`.
-  // Repulsion is O(n^2); springs pull connected nodes to a rest length; a weak
-  // pull toward centre keeps the graph framed. Per-node speed is clamped (MAXV)
-  // so two close nodes can no longer fling apart in a single frame — that
-  // uncapped spike was the source of the irregular jitter on open.
-  function physicsStep(a) {
-    for (var i = 0; i < nodes.length; i++) {
-      var p = nodes[i];
-      for (var j = i + 1; j < nodes.length; j++) {
-        var q = nodes[j];
-        var dx = p.x - q.x, dy = p.y - q.y;
-        var d2 = dx * dx + dy * dy || 0.01;
-        var f = 1200 / d2;
-        var d = Math.sqrt(d2);
-        p.vx += (dx / d) * f; p.vy += (dy / d) * f;
-        q.vx -= (dx / d) * f; q.vy -= (dy / d) * f;
+  // --- Pinwheel art view ---------------------------------------------------
+  // Each session becomes a "petal": a spiral of nested squares that scale and
+  // rotate toward the centre, depth scaled by how many events the session holds.
+  // Petals are clickable — clicking opens that session in the side panel. It's a
+  // second layer under the same pan/zoom, toggled by #artbtn.
+  var artMode = false, artBuilt = false, savedView = null;
+  function buildArt() {
+    var groupSize = {};
+    data.nodes.forEach(function (n) { var g = group[n.id]; groupSize[g] = (groupSize[g] || 0) + 1; });
+    var petals = groupIds
+      .filter(function (g) { return nodeType[g] === "session"; })
+      .map(function (g) { return { id: g, size: groupSize[g] }; })
+      .sort(function (a, b) { return b.size - a.size; });
+    if (!petals.length) return;
+    var P = petals.length, maxSize = petals[0].size;
+    var minDim = Math.min(W, H), CX = W / 2, CY = H / 2;
+    var Rc = minDim * 0.30, h = minDim * 0.165, sk = 0.5, f = 0.84,
+        dTheta = -20 * Math.PI / 180;
+    var base = [[-h, -h], [h, -h], [h, h], [-h, h]].map(function (c) {
+      return [Rc + (c[0] * Math.cos(sk) - c[1] * Math.sin(sk)),
+              c[0] * Math.sin(sk) + c[1] * Math.cos(sk)];
+    });
+    var R = Rc + h * 1.7;
+    var paper = document.createElementNS(NS, "rect");
+    paper.setAttribute("x", CX - R - 24); paper.setAttribute("y", CY - R - 24);
+    paper.setAttribute("width", 2 * (R + 24)); paper.setAttribute("height", 2 * (R + 24));
+    paper.setAttribute("rx", 16); paper.setAttribute("fill", "#eef2fb");
+    artLayer.appendChild(paper);
+    petals.forEach(function (pt, i) {
+      var A = i * 2 * Math.PI / P;
+      var L = Math.max(5, Math.min(18, Math.round(pt.size / maxSize * 18)));
+      var pg = document.createElementNS(NS, "g");
+      pg.setAttribute("cursor", "pointer");
+      var fillsAdded = false;
+      for (var k = 0; k < L; k++) {
+        var s = Math.pow(f, k), ang = A + k * dTheta,
+            ca = Math.cos(ang), sa = Math.sin(ang);
+        var pts = base.map(function (v) {
+          var x = s * (ca * v[0] - sa * v[1]), y = s * (sa * v[0] + ca * v[1]);
+          return (CX + x).toFixed(1) + "," + (CY + y).toFixed(1);
+        }).join(" ");
+        if (!fillsAdded) {
+          var poly = document.createElementNS(NS, "polygon");
+          poly.setAttribute("points", pts);
+          poly.setAttribute("fill", "#e7d391"); poly.setAttribute("fill-opacity", "0.55");
+          poly.setAttribute("stroke", "none");
+          pg.appendChild(poly); fillsAdded = true;
+        }
+        var line = document.createElementNS(NS, "polygon");
+        line.setAttribute("points", pts); line.setAttribute("fill", "none");
+        line.setAttribute("stroke", "#2c3c66"); line.setAttribute("stroke-width", "0.8");
+        line.setAttribute("stroke-opacity", "0.85");
+        pg.appendChild(line);
       }
-    }
-    edges.forEach(function (e) {
-      var dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
-      var d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      var f = (d - 90) * 0.02;
-      e.s.vx += (dx / d) * f; e.s.vy += (dy / d) * f;
-      e.t.vx -= (dx / d) * f; e.t.vy -= (dy / d) * f;
-    });
-    var MAXV = 12;
-    nodes.forEach(function (n) {
-      // Pull toward this node's GROUP anchor (not the global centre) so each
-      // context settles into its own cluster.
-      var anc = groupAnchor[n.group] || { x: W / 2, y: H / 2 };
-      n.vx += (anc.x - n.x) * 0.02; n.vy += (anc.y - n.y) * 0.02;
-      var sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
-      if (sp > MAXV) { n.vx = n.vx / sp * MAXV; n.vy = n.vy / sp * MAXV; }
-      // Motion is scaled by `a` so the layout cools to a stop.
-      if (n !== dragging) { n.x += n.vx * a; n.y += n.vy * a; }
-      n.vx *= 0.85; n.vy *= 0.85;
-    });
-  }
-
-  // Pre-warm: settle the layout to a stable state *synchronously*, before the
-  // first paint. The graph therefore opens already laid out and still — no
-  // visible scatter-then-vibrate while the simulation cools on screen. It's a
-  // one-time cost; the animation loop afterwards only drives the edge buzz
-  // until a drag reheats the sim.
-  function warmUp() {
-    for (var a = 1; a > 0; a -= 0.008) physicsStep(a);
-    nodes.forEach(function (n) { n.vx = 0; n.vy = 0; });
-  }
-
-  function renderNodes() {
-    for (var i = 0; i < nodes.length; i++) {
-      nodeEls[i].setAttribute("transform",
-        "translate(" + nodes[i].x + "," + nodes[i].y + ")");
-    }
-  }
-
-  // Draw a faint halo + label around each settled cluster so the grouping is
-  // legible at a glance. Centroid/radius come from the actual node positions
-  // (not the seed anchors), so the labels always sit on the real cluster.
-  function renderGroups() {
-    while (groupLayer.firstChild) groupLayer.removeChild(groupLayer.firstChild);
-    groupKeys.forEach(function (k) {
-      var members = nodes.filter(function (n) { return n.group === k; });
-      if (!members.length) return;
-      var cx = 0, cy = 0;
-      members.forEach(function (n) { cx += n.x; cy += n.y; });
-      cx /= members.length; cy /= members.length;
-      var r = 30;
-      members.forEach(function (n) {
-        var dx = n.x - cx, dy = n.y - cy;
-        r = Math.max(r, Math.sqrt(dx * dx + dy * dy));
+      pg.addEventListener("click", function (ev) {
+        ev.stopPropagation(); if (byId[pt.id]) select(byId[pt.id]);
       });
-      r += 30;
-      var color = nodeColor(members[0]);
-      var halo = document.createElementNS(NS, "circle");
-      halo.setAttribute("cx", cx.toFixed(1));
-      halo.setAttribute("cy", cy.toFixed(1));
-      halo.setAttribute("r", r.toFixed(1));
-      halo.setAttribute("fill", color);
-      halo.setAttribute("fill-opacity", "0.05");
-      halo.setAttribute("stroke", color);
-      halo.setAttribute("stroke-opacity", "0.25");
-      halo.setAttribute("stroke-dasharray", "4 4");
-      groupLayer.appendChild(halo);
-      var label = document.createElementNS(NS, "text");
-      label.setAttribute("x", cx.toFixed(1));
-      label.setAttribute("y", (cy - r - 6).toFixed(1));
-      label.setAttribute("text-anchor", "middle");
-      label.setAttribute("fill", color);
-      label.setAttribute("font-size", "13");
-      label.setAttribute("font-weight", "600");
-      label.setAttribute("opacity", "0.85");
-      label.textContent = (KIND_LABELS[k] || k) + " (" + members.length + ")";
-      groupLayer.appendChild(label);
+      artLayer.appendChild(pg);
     });
+    artBuilt = true;
   }
+  function setArt(on) {
+    artMode = on;
+    if (on) {
+      if (!artBuilt) buildArt();
+      savedView = { x: view.x, y: view.y, k: view.k };
+      view.x = 0; view.y = 0; view.k = 1; applyView();
+      graphLayer.style.display = "none"; artLayer.style.display = "";
+      if (artbtn) artbtn.textContent = "Graph";
+      panel.innerHTML = "<div id=empty>Click a petal to inspect its session.</div>";
+    } else {
+      if (savedView) { view.x = savedView.x; view.y = savedView.y; view.k = savedView.k; applyView(); }
+      artLayer.style.display = "none"; graphLayer.style.display = "";
+      if (artbtn) artbtn.textContent = "Pinwheel";
+    }
+  }
+  var artbtn = document.getElementById("artbtn");
+  if (artbtn) artbtn.addEventListener("click", function () { setArt(!artMode); });
 
   function tick(now) {
     now = now || 0;
-    // Node positions are frozen unless a drag is reheating the layout, so the
-    // O(n^2) physics and per-node DOM writes are skipped in the steady state —
-    // only the edge buzz below keeps running. A drag sets alpha, resuming both.
+    // Once the layout has cooled (alpha 0) and nothing is being dragged, node
+    // positions are frozen — so skip the O(n^2) physics AND the per-node DOM
+    // transforms entirely; only the edge buzz keeps running. This is the single
+    // biggest render saving on large graphs and is visually identical (nothing
+    // was moving). A drag reheats alpha, which resumes the simulation.
     var simulating = alpha > 0 || dragging;
-    if (simulating) { physicsStep(alpha); renderNodes(); }
-    // When a drag-reheated layout settles back to rest, redraw the cluster
-    // halos/labels so they follow the moved nodes.
-    if (wasSimulating && !simulating) renderGroups();
-    wasSimulating = simulating;
-    // Edge buzz: rebuild each edge as a perpendicular sine waveform. Driven by
-    // the frame timestamp (not alpha), so edges keep their subtle ripple after
-    // the layout freezes. The sin(pi*s) envelope pins displacement to 0 at both
-    // endpoints.
-    var t = now / 1000;
-    edges.forEach(function (e, i) {
-      var sx = e.s.x, sy = e.s.y, tx = e.t.x, ty = e.t.y;
-      var dx = tx - sx, dy = ty - sy, len = Math.sqrt(dx * dx + dy * dy) || 1;
-      var nx = -dy / len, ny = dx / len;       // unit perpendicular
-      var phase = i * VIBE_PHASE;
-      var d = "M" + sx + " " + sy;
-      for (var k = 1; k <= VIBE_SAMPLES; k++) {
-        var s = k / VIBE_SAMPLES;
-        var env = Math.sin(s * Math.PI);
-        var disp = VIBE_AMP * env *
-          Math.sin(s * Math.PI * VIBE_WAVES + phase + t * VIBE_SPEED);
-        var bx = sx + dx * s, by = sy + dy * s;
-        d += " L" + (bx + nx * disp).toFixed(1) + " " + (by + ny * disp).toFixed(1);
+    if (simulating) {
+    for (var i = 0; i < nodes.length; i++) {
+      var a = nodes[i];
+      for (var j = i + 1; j < nodes.length; j++) {
+        var b = nodes[j];
+        var dx = a.x - b.x, dy = a.y - b.y;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < REPULSE_MINDIST2) d2 = REPULSE_MINDIST2;  // avoid 1/0 blowup
+        var f = REPULSE / d2;
+        var d = Math.sqrt(d2);
+        a.vx += (dx / d) * f; a.vy += (dy / d) * f;
+        b.vx -= (dx / d) * f; b.vy -= (dy / d) * f;
       }
-      edgeEls[i].setAttribute("d", d);
+    }
+    edges.forEach(function (e) {
+      if (e.k === 0) return;                  // tag edges don't pull clumps together
+      var dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
+      var d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      var f = (d - SPRING_REST) * e.k;
+      if (f > SPRING_CAP) f = SPRING_CAP;            // bound mega-hub pull
+      else if (f < -SPRING_CAP) f = -SPRING_CAP;
+      e.s.vx += (dx / d) * f; e.s.vy += (dy / d) * f;
+      e.t.vx -= (dx / d) * f; e.t.vy -= (dy / d) * f;
     });
-    // Cool any reheat from a drag back down to a frozen state.
-    alpha = alpha > 0 ? Math.max(0, alpha - 0.008) : 0;
-    requestAnimationFrame(tick);
-  }
-
-  // Lay the graph out and frame it before the first paint, then start the loop
-  // — so the very first frame the user sees is already settled, not scattering.
-  if (nodes.length) {
-    warmUp();
-    renderNodes();
-    renderGroups();
+    nodes.forEach(function (n) {
+      n.vx += (n.ax - n.x) * ANCHOR_GRAVITY; n.vy += (n.ay - n.y) * ANCHOR_GRAVITY;
+      // Clamp per-axis speed: the single guard that keeps explicit-Euler from
+      // diverging on dense hubs. Without it, accumulated velocity explodes.
+      if (n.vx > MAX_VEL) n.vx = MAX_VEL; else if (n.vx < -MAX_VEL) n.vx = -MAX_VEL;
+      if (n.vy > MAX_VEL) n.vy = MAX_VEL; else if (n.vy < -MAX_VEL) n.vy = -MAX_VEL;
+      // Motion is scaled by alpha so the layout cools to a stop (see below).
+      if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
+      n.vx *= 0.85; n.vy *= 0.85;
+    });
+    }
+    // Redraw edges. Small graphs get the animated "buzz" (perpendicular sine,
+    // sin(pi*s) envelope pins both endpoints); big graphs get static straight
+    // lines, redrawn only while the layout is still moving.
+    if (BUZZ) {
+      var t = now / 1000;
+      edges.forEach(function (e, i) {
+        var sx = e.s.x, sy = e.s.y, tx = e.t.x, ty = e.t.y;
+        var dx = tx - sx, dy = ty - sy, len = Math.sqrt(dx * dx + dy * dy) || 1;
+        var nx = -dy / len, ny = dx / len;       // unit perpendicular
+        var phase = i * VIBE_PHASE;
+        var d = "M" + sx + " " + sy;
+        for (var k = 1; k <= VIBE_SAMPLES; k++) {
+          var s = k / VIBE_SAMPLES;
+          var env = Math.sin(s * Math.PI);
+          var disp = VIBE_AMP * env *
+            Math.sin(s * Math.PI * VIBE_WAVES + phase + t * VIBE_SPEED);
+          var bx = sx + dx * s, by = sy + dy * s;
+          d += " L" + (bx + nx * disp).toFixed(1) + " " + (by + ny * disp).toFixed(1);
+        }
+        edgeEls[i].setAttribute("d", d);
+      });
+    } else if (simulating) {
+      edges.forEach(function (e, i) {
+        edgeEls[i].setAttribute("d", "M" + e.s.x.toFixed(1) + " " + e.s.y.toFixed(1) +
+          "L" + e.t.x.toFixed(1) + " " + e.t.y.toFixed(1));
+      });
+    }
+    if (simulating) {
+      nodes.forEach(function (n, i) {
+        nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+      });
+    }
+    // Cool the layout each frame; once it has settled (alpha hits 0) the node
+    // positions are frozen, so a single fit-to-window holds instead of going
+    // stale while the simulation keeps drifting (which clipped the graph).
+    alpha = alpha > 0 ? Math.max(0, alpha - COOL_RATE) : 0;
     if (!fitted && alpha === 0) { fitted = true; fitView(); }
-    requestAnimationFrame(tick);
+    // Keep animating only while there's work: the simulation is live, or buzz
+    // is on. Otherwise halt — zoom/pan then cost nothing until a drag kicks us.
+    if (simulating || BUZZ) requestAnimationFrame(tick);
+    else running = false;
   }
+  function kick() { if (!running) { running = true; requestAnimationFrame(tick); } }
+  if (nodes.length) kick();
 
+  var dragging = null, dragOff = null;
   function startDrag(ev, n) {
     ev.preventDefault(); ev.stopPropagation();
     dragging = n;
     alpha = Math.max(alpha, 0.3);  // gently reheat so neighbours respond
+    kick();                        // restart the loop if it had halted
     var p = toWorld(ev);
     dragOff = { x: p.x - n.x, y: p.y - n.y };
   }
