@@ -56,6 +56,37 @@ Personalization must be disclosed, not concealed.
 No zero-hallucination guarantee (unachievable), no claim of statefulness
 (false), no autonomous mutation (unsafe), no concealed personalization
 (untrustworthy). Determinism and auditability are the product.
+
+## 8. Methodology — superpowers as the default spine
+Use the superpowers skills as the default end-to-end methodology. Reach for
+them automatically; do not wait to be told. See ADR 0005.
+
+- Spine. Feature/behavior work flows: brainstorming (design gate) →
+  writing-plans (docs/superpowers/plans/) → subagent-driven-development →
+  test-driven-development (red/green) → verification-before-completion →
+  requesting-code-review. Use using-git-worktrees to isolate;
+  dispatching-parallel-agents for independent work.
+- Triviality bypass. Skip the brainstorm→plan gate for trivial mechanical
+  edits — one-line fixes, typos, renames, config tweaks, doc edits — and go
+  straight to the change (still under §4). Engage the gate when work
+  adds/changes behavior, spans multiple files, or carries design ambiguity.
+  When triviality is genuinely unclear, decide toward the lighter path.
+- Debugging. systematic-debugging is the default — root-cause before fix. Use
+  ce-debug only when the bug originates from an issue-tracker reference
+  (GitHub/Linear/Jira).
+- Execution envelope. An approved plan in an isolated worktree is batched
+  consent: execute all in-scope tasks without per-task check-ins. Halt and
+  confirm only for work outside the plan's scope, an unplanned destructive op,
+  or anything touching the memory store, network, or deploy (§4/§6).
+- Close-out. After execution: verification-before-completion →
+  requesting-code-review (correctness) → thermo-nuclear review (final
+  maintainability gate) → then finishing-a-development-branch / push / PR HALTS
+  for explicit confirmation (it leaves the worktree envelope).
+- Carve-outs. thermo-nuclear review is the maintainability gate (superpowers'
+  code-review does not replace it). grill-with-docs sharpens a plan against the
+  glossary/ADRs (distinct from brainstorming's intent exploration). Other
+  /ce-* and anthropic-skills are supplements — used only when explicitly
+  requested, never auto-triggered alongside the spine.
 """
 
 
