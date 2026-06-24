@@ -21,6 +21,14 @@ def run_loop(project, loop_dir, cfg, driver, *,
     loop_dir = Path(loop_dir)
     guard.ensure_safe(force=force)              # LIVE_LOCK check
 
+    if progress_fn is None:
+        from .progress import MtimeTracker
+        _tracker = MtimeTracker(loop_dir.parent)
+        _tracker.snapshot()
+
+        def progress_fn(_i, _t=_tracker):   # noqa: E306
+            return _t.changed()
+
     cb = safeguards.CircuitBreaker(safeguards.BreakerConfig(
         cfg.no_progress_threshold, cfg.same_error_threshold, cfg.cooldown_seconds))
     ccfg = ctx_mod.ContextConfig(cfg.context_window, cfg.smart_zone_ratio)
