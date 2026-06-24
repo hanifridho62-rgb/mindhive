@@ -24,6 +24,8 @@ _TEMPLATE = """<!DOCTYPE html>
   .edge { stroke: #30363d; stroke-width: 1; fill: none; }
   .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
   .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
+  .hoverlabel { font-size: 11px; pointer-events: none; paint-order: stroke;
+    stroke: #0e1116; stroke-width: 3px; fill: #e6edf3; }
   .node.dim circle, .edge.dim { opacity: 0.15; }
   #panel { width: 320px; background: #161b22; border-left: 1px solid #30363d;
     padding: 16px; overflow-y: auto; }
@@ -243,21 +245,46 @@ _RENDERER_JS = r"""
     root.appendChild(l);
     return l;
   });
+  // Keep zoom/pan light: only the structural anchor nodes (sessions, tags)
+  // carry a permanent <text> label. Labelling all ~1000 event nodes forced the
+  // browser to re-rasterize a thousand text elements on every zoom step (and
+  // they overlapped into an unreadable smear anyway). Event/file labels show on
+  // hover via one shared element, and in full in the side panel on click.
+  function hasLabel(n) { return n.type === "session" || n.type === "tag"; }
   var nodeEls = nodes.map(function (n) {
     var g = document.createElementNS(NS, "g");
     g.setAttribute("class", "node");
     var c = document.createElementNS(NS, "circle");
     c.setAttribute("r", n.type === "session" ? 9 : 6);
     c.setAttribute("fill", nodeColor(n));
-    var t = document.createElementNS(NS, "text");
-    t.setAttribute("x", 9); t.setAttribute("y", 4);
-    t.textContent = canvasLabel(n);
-    g.appendChild(c); g.appendChild(t);
+    g.appendChild(c);
+    if (hasLabel(n)) {
+      var t = document.createElementNS(NS, "text");
+      t.setAttribute("x", 9); t.setAttribute("y", 4);
+      t.textContent = canvasLabel(n);
+      g.appendChild(t);
+    } else {
+      g.addEventListener("mouseover", function () { showHover(n); });
+      g.addEventListener("mouseout", hideHover);
+    }
     g.addEventListener("mousedown", function (ev) { startDrag(ev, n); });
     g.addEventListener("click", function (ev) { ev.stopPropagation(); select(n); });
     root.appendChild(g);
     return g;
   });
+
+  // One reused label for hovering an unlabelled node (instead of ~1000 always-on
+  // labels). Lives in world space so it tracks the node under the current zoom.
+  var hoverLabel = document.createElementNS(NS, "text");
+  hoverLabel.setAttribute("class", "hoverlabel");
+  hoverLabel.style.display = "none";
+  root.appendChild(hoverLabel);
+  function showHover(n) {
+    hoverLabel.setAttribute("x", n.x + 9); hoverLabel.setAttribute("y", n.y + 4);
+    hoverLabel.textContent = canvasLabel(n);
+    hoverLabel.style.display = "";
+  }
+  function hideHover() { hoverLabel.style.display = "none"; }
 
   var fitted = false, alpha = 1, running = false;
   var BUZZ = edges.length <= BUZZ_MAX_EDGES;   // animate edges only when cheap
