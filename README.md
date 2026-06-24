@@ -1,5 +1,7 @@
 # MIND HIVE
 
+[![CI](https://github.com/hanifridho62-rgb/Lintester-project/actions/workflows/ci.yml/badge.svg)](https://github.com/hanifridho62-rgb/Lintester-project/actions/workflows/ci.yml)
+
 Deterministic, event-sourced memory for long-running Claude sessions.
 Append events; deterministic projections rebuild everything. Nothing is hand-edited.
 
@@ -13,6 +15,9 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
 - `hive plugins autoscan [--max-age-hours H] [--top N] [--force]` — scan **only when the catalog is missing or stale** (default 24h); a near-instant no-op otherwise, so it's safe to run every session
 - `hive plugins recommend` — print the top recommendations from the latest snapshot
+- `hive review queue [--session id]` — queue the session's touched source files for a thermo-nuclear review (run by `session_end`; writes the pending-review marker)
+- `hive review show` — print the pending-review marker, if any
+- `hive review clear` — clear the pending-review marker once the review has run
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain
 - `hive embed [--force]` — build the on-demand vector index

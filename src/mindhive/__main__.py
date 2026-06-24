@@ -51,6 +51,7 @@ def _run(argv=None) -> int:
 
     sub.add_parser("project", help="rebuild projections")
     sub.add_parser("state", help="print STATE.md")
+    sub.add_parser("directives", help="print the session operating directives")
     sub.add_parser("verify", help="verify hash chain")
     sub.add_parser("selftest", help="run test suite")
 
@@ -69,6 +70,15 @@ def _run(argv=None) -> int:
 
     # --- briefing ---
     sub.add_parser("briefing", help="build and print BRIEFING.md")
+
+    # --- review (thermo-nuclear review queue) ---
+    rv = sub.add_parser("review", help="thermo-nuclear review queue")
+    rvsub = rv.add_subparsers(dest="review_cmd", required=True)
+    rvq = rvsub.add_parser("queue", help="queue this session's touched source files for review")
+    rvq.add_argument("--session", default=None,
+                     help="session id to queue (default: $MINDHIVE_SESSION)")
+    rvsub.add_parser("clear", help="clear the pending-review marker (after the review runs)")
+    rvsub.add_parser("show", help="print the pending-review marker, if any")
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")
@@ -155,6 +165,9 @@ def _run(argv=None) -> int:
         s = paths.project_dir() / "STATE.md"
         print(s.read_text(encoding="utf-8") if s.exists()
               else "(no STATE.md — run: hive project)")
+    elif args.cmd == "directives":
+        from . import directives as directives_mod
+        print(directives_mod.directives())
     elif args.cmd == "verify":
         print(json.dumps(chain.verify()))
     elif args.cmd == "recall":
@@ -173,6 +186,21 @@ def _run(argv=None) -> int:
         bpath = build_briefing()
         print(str(bpath))
         print(bpath.read_text(encoding="utf-8"))
+    elif args.cmd == "review":
+        from . import review as review_mod
+        if args.review_cmd == "queue":
+            sid = args.session or os.environ.get("MINDHIVE_SESSION")
+            marker = review_mod.queue(events.read_all(), session_id=sid)
+            if marker:
+                print(f"queued {len(marker['files'])} file(s) in "
+                      f"{marker['batch_count']} batch(es) for thermo-nuclear review")
+            else:
+                print("nothing in scope to review")
+        elif args.review_cmd == "clear":
+            print("cleared pending review" if review_mod.clear()
+                  else "no pending review")
+        elif args.review_cmd == "show":
+            print(json.dumps(review_mod.load_pending(), indent=2))
     elif args.cmd == "graph":
         from . import graph as graph_mod
         if args.graph_cmd == "build":
