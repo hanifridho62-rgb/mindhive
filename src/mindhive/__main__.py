@@ -149,6 +149,15 @@ def _run(argv=None) -> int:
     areg.add_argument("--transcripts", required=True)
     areg.add_argument("--folder", required=True)
 
+    # --- loop (autonomous Claude Code loop with MindHive memory) ---
+    lp = sub.add_parser("loop", help="run an autonomous Claude Code loop until done")
+    lp.add_argument("loop_cmd", nargs="?", choices=["init", "status"], default=None,
+                    help="init: scaffold .hive-loop/; status: show last run; omit to run")
+    lp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="build prompts and show projected math without calling the CLI")
+    lp.add_argument("--live", action="store_true", help="stream Claude output")
+    lp.add_argument("--force", action="store_true", help="override the LIVE_LOCK guard")
+
     args = p.parse_args(argv)
 
     if args.cmd == "append":
@@ -273,6 +282,49 @@ def _run(argv=None) -> int:
                              ensure_ascii=False, indent=2))
         else:
             print(json.dumps(autosync_mod.run_all(), ensure_ascii=False, indent=2))
+    elif args.cmd == "loop":
+        import os as _os
+        from pathlib import Path as _Path
+        from .loop import config as loop_config, scaffold as loop_scaffold
+        from .loop import state as loop_state, driver as loop_driver, engine as loop_engine
+        loop_dir = _Path(_os.getcwd()) / ".hive-loop"
+        if args.loop_cmd == "init":
+            created = loop_scaffold.scaffold(loop_dir)
+            ok = loop_driver.preflight("claude")
+            print(f"scaffolded .hive-loop/ ({', '.join(created) or 'all files already present'})")
+            print("claude CLI: " + ("found on PATH" if ok else
+                  "NOT on PATH — install Claude Code before running `hive loop`"))
+            return 0
+        if args.loop_cmd == "status":
+            s = loop_state.last_run_status()
+            if not s:
+                print("no loop runs recorded yet")
+            else:
+                print(json.dumps(s, indent=2))
+            return 0
+        # run
+        cfg = loop_config.load_config(loop_dir / "loop.toml")
+        if args.dry_run:
+            from .loop import task as loop_task, prompt as loop_prompt
+            from .briefing import build_briefing as _bb
+            tasks = loop_task.load_tasks(loop_dir)
+            ctx = loop_prompt.build_loop_context(_bb(events.read_all()))
+            tp = loop_prompt.build_task_prompt(tasks, [])
+            print("DRY-RUN — would run claude with:")
+            print(f"  required items remaining: {loop_task.required_remaining_count(tasks.fix_plan)}")
+            print(f"  context_window={cfg.context_window} smart_zone_ratio={cfg.smart_zone_ratio}")
+            print(f"  allowed_tools={cfg.allowed_tools}")
+            print(f"  task prompt ({len(tp)} chars), loop context ({len(ctx)} chars)")
+            return 0
+        if not loop_driver.preflight("claude"):
+            print("error: claude CLI not on PATH — install Claude Code first", file=sys.stderr)
+            return 2
+        result = loop_engine.run_loop(
+            project=None, loop_dir=loop_dir, cfg=cfg,
+            driver=loop_driver.CLIDriver("claude"),
+            live=args.live, force=args.force)
+        print(json.dumps(result, indent=2))
+        return 0 if result["reason"] in ("completed",) else 1
     return 0
 
 
