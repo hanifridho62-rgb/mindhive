@@ -22,6 +22,10 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive verify` — check the hash chain
 - `hive embed [--force]` — build the on-demand vector index
 - `hive selftest` — run the test suite
+- `hive loop init` — scaffold `.hive-loop/` (PROMPT.md, fix_plan.md, AGENT.md, loop.toml) and check the `claude` CLI
+- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker
+- `hive loop status` — summarize the last loop run
+- `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI
 
 ## Event types
 Semantic (you/Claude emit): decision, experiment_result, caveat, next_step,
