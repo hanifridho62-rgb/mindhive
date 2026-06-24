@@ -163,12 +163,16 @@ _RENDERER_JS = r"""
   var NS = "http:" + "//www.w3.org/2000/svg";
   var root = document.createElementNS(NS, "g");
   svg.appendChild(root);
-  // Two layers under the shared pan/zoom transform: the force graph and the
-  // pinwheel art view. Only one is visible at a time (toggled by #artbtn).
-  var graphLayer = document.createElementNS(NS, "g");
+  // Layers under the shared pan/zoom transform. Nodes are drawn in BOTH views
+  // (the pinwheel is built FROM the real nodes, repositioned onto spirals), so
+  // they live in their own layer that stays visible. Graph edges hide in
+  // pinwheel mode; the pinwheel tracery layer hides in graph mode.
+  // Stacking back->front: edges, pinwheel tracery, nodes.
+  var edgesLayer = document.createElementNS(NS, "g");
   var artLayer = document.createElementNS(NS, "g");
+  var nodesLayer = document.createElementNS(NS, "g");
   artLayer.style.display = "none";
-  root.appendChild(graphLayer); root.appendChild(artLayer);
+  root.appendChild(edgesLayer); root.appendChild(artLayer); root.appendChild(nodesLayer);
 
   var view = { x: 0, y: 0, k: 1 };
   function applyView() {
@@ -253,7 +257,7 @@ _RENDERER_JS = r"""
   var edgeEls = edges.map(function (e) {
     var l = document.createElementNS(NS, "path");
     l.setAttribute("class", "edge");
-    graphLayer.appendChild(l);
+    edgesLayer.appendChild(l);
     return l;
   });
   // Keep zoom/pan light: only the structural anchor nodes (sessions, tags)
@@ -280,7 +284,7 @@ _RENDERER_JS = r"""
     }
     g.addEventListener("mousedown", function (ev) { startDrag(ev, n); });
     g.addEventListener("click", function (ev) { ev.stopPropagation(); select(n); });
-    graphLayer.appendChild(g);
+    nodesLayer.appendChild(g);
     return g;
   });
 
@@ -289,9 +293,11 @@ _RENDERER_JS = r"""
   var hoverLabel = document.createElementNS(NS, "text");
   hoverLabel.setAttribute("class", "hoverlabel");
   hoverLabel.style.display = "none";
-  graphLayer.appendChild(hoverLabel);
+  nodesLayer.appendChild(hoverLabel);
   function showHover(n) {
-    hoverLabel.setAttribute("x", n.x + 9); hoverLabel.setAttribute("y", n.y + 4);
+    var x = artMode && n.px != null ? n.px : n.x;
+    var y = artMode && n.py != null ? n.py : n.y;
+    hoverLabel.setAttribute("x", x + 9); hoverLabel.setAttribute("y", y + 4);
     hoverLabel.textContent = canvasLabel(n);
     hoverLabel.style.display = "";
   }
@@ -318,79 +324,91 @@ _RENDERER_JS = r"""
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
 
-  // --- Pinwheel art view ---------------------------------------------------
-  // Each session becomes a "petal": a spiral of nested squares that scale and
-  // rotate toward the centre, depth scaled by how many events the session holds.
-  // Petals are clickable — clicking opens that session in the side panel. It's a
-  // second layer under the same pan/zoom, toggled by #artbtn.
+  // --- Pinwheel layout -----------------------------------------------------
+  // NOT a drawing of a pinwheel — the real nodes are repositioned so that, all
+  // together, they FORM one. Each session is a petal: its own nodes are placed
+  // along a spiral of nested rotating squares (depth scaled by node count), and
+  // the only line drawn is a polyline THROUGH those node positions — so the
+  // tracery is literally the nodes in sequence. Tag/leftover nodes gather into
+  // the central knot. Nodes stay their real colours and stay clickable.
   var artMode = false, artBuilt = false, savedView = null;
   function buildArt() {
-    var groupSize = {};
-    data.nodes.forEach(function (n) { var g = group[n.id]; groupSize[g] = (groupSize[g] || 0) + 1; });
+    var petalNodes = {};
+    nodes.forEach(function (n) {
+      var g = group[n.id]; (petalNodes[g] = petalNodes[g] || []).push(n);
+    });
     var petals = groupIds
       .filter(function (g) { return nodeType[g] === "session"; })
-      .map(function (g) { return { id: g, size: groupSize[g] }; })
-      .sort(function (a, b) { return b.size - a.size; });
-    if (!petals.length) return;
-    var P = petals.length, maxSize = petals[0].size;
+      .map(function (g) { return { id: g, nodes: petalNodes[g] || [] }; })
+      .sort(function (a, b) { return b.nodes.length - a.nodes.length; });
+    if (!petals.length) { artBuilt = true; return; }
+    var P = petals.length, maxN = Math.max(1, petals[0].nodes.length);
     var minDim = Math.min(W, H), CX = W / 2, CY = H / 2;
-    var Rc = minDim * 0.30, h = minDim * 0.165, sk = 0.5, f = 0.84,
+    var Rc = minDim * 0.30, hh = minDim * 0.165, sk = 0.5, f = 0.84,
         dTheta = -20 * Math.PI / 180;
-    var base = [[-h, -h], [h, -h], [h, h], [-h, h]].map(function (c) {
+    var base = [[-hh, -hh], [hh, -hh], [hh, hh], [-hh, hh]].map(function (c) {
       return [Rc + (c[0] * Math.cos(sk) - c[1] * Math.sin(sk)),
               c[0] * Math.sin(sk) + c[1] * Math.cos(sk)];
     });
-    var R = Rc + h * 1.7;
-    var paper = document.createElementNS(NS, "rect");
-    paper.setAttribute("x", CX - R - 24); paper.setAttribute("y", CY - R - 24);
-    paper.setAttribute("width", 2 * (R + 24)); paper.setAttribute("height", 2 * (R + 24));
-    paper.setAttribute("rx", 16); paper.setAttribute("fill", "#eef2fb");
-    artLayer.appendChild(paper);
-    petals.forEach(function (pt, i) {
-      var A = i * 2 * Math.PI / P;
-      var L = Math.max(5, Math.min(18, Math.round(pt.size / maxSize * 18)));
-      var pg = document.createElementNS(NS, "g");
-      pg.setAttribute("cursor", "pointer");
-      var fillsAdded = false;
-      for (var k = 0; k < L; k++) {
-        var s = Math.pow(f, k), ang = A + k * dTheta,
-            ca = Math.cos(ang), sa = Math.sin(ang);
-        var pts = base.map(function (v) {
-          var x = s * (ca * v[0] - sa * v[1]), y = s * (sa * v[0] + ca * v[1]);
-          return (CX + x).toFixed(1) + "," + (CY + y).toFixed(1);
-        }).join(" ");
-        if (!fillsAdded) {
-          var poly = document.createElementNS(NS, "polygon");
-          poly.setAttribute("points", pts);
-          poly.setAttribute("fill", "#e7d391"); poly.setAttribute("fill-opacity", "0.55");
-          poly.setAttribute("stroke", "none");
-          pg.appendChild(poly); fillsAdded = true;
+    function petalPath(A, L) {
+      var pts = [];
+      for (var k = 0; k <= L; k++) {
+        for (var c = 0; c < 4; c++) {
+          var kk = k + c / 4, s = Math.pow(f, kk), ang = A + kk * dTheta,
+              ca = Math.cos(ang), sa = Math.sin(ang), v = base[c];
+          pts.push([CX + s * (ca * v[0] - sa * v[1]), CY + s * (sa * v[0] + ca * v[1])]);
         }
-        var line = document.createElementNS(NS, "polygon");
-        line.setAttribute("points", pts); line.setAttribute("fill", "none");
-        line.setAttribute("stroke", "#2c3c66"); line.setAttribute("stroke-width", "0.8");
-        line.setAttribute("stroke-opacity", "0.85");
-        pg.appendChild(line);
       }
-      pg.addEventListener("click", function (ev) {
-        ev.stopPropagation(); if (byId[pt.id]) select(byId[pt.id]);
-      });
-      artLayer.appendChild(pg);
+      return pts;
+    }
+    petals.forEach(function (pt, i) {
+      var A = i * 2 * Math.PI / P, m = pt.nodes.length;
+      var L = Math.max(4, Math.min(16, Math.round(m / maxN * 16)));
+      var path = petalPath(A, L), seg = path.length - 1, poly = [];
+      for (var j = 0; j < m; j++) {
+        var u = (m <= 1 ? 0 : j / (m - 1)) * seg, i0 = Math.floor(u), t = u - i0;
+        var a = path[i0], b = path[Math.min(i0 + 1, path.length - 1)];
+        var x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t;
+        pt.nodes[j].px = x; pt.nodes[j].py = y;
+        poly.push(x.toFixed(1) + "," + y.toFixed(1));
+      }
+      var pl = document.createElementNS(NS, "polyline");
+      pl.setAttribute("points", poly.join(" ")); pl.setAttribute("fill", "none");
+      pl.setAttribute("stroke", "#5b7cc4"); pl.setAttribute("stroke-width", "0.6");
+      pl.setAttribute("stroke-opacity", "0.5");
+      artLayer.appendChild(pl);
+    });
+    // Tag / leftover nodes -> a tight central spiral (the knot).
+    var j = 0;
+    nodes.forEach(function (n) {
+      if (nodeType[group[n.id]] === "session") return;
+      var a = j * 0.7, r = 6 + (j % 24) * 1.3;
+      n.px = CX + Math.cos(a) * r; n.py = CY + Math.sin(a) * r; j++;
     });
     artBuilt = true;
+  }
+  function placeNodes(art) {
+    nodeEls.forEach(function (el, i) {
+      var n = nodes[i];
+      var x = art && n.px != null ? n.px : n.x;
+      var y = art && n.py != null ? n.py : n.y;
+      el.setAttribute("transform", "translate(" + x + "," + y + ")");
+    });
   }
   function setArt(on) {
     artMode = on;
     if (on) {
       if (!artBuilt) buildArt();
+      alpha = 0; dragging = null;   // freeze sim so it can't overwrite pinwheel positions
       savedView = { x: view.x, y: view.y, k: view.k };
       view.x = 0; view.y = 0; view.k = 1; applyView();
-      graphLayer.style.display = "none"; artLayer.style.display = "";
+      placeNodes(true);
+      edgesLayer.style.display = "none"; artLayer.style.display = "";
       if (artbtn) artbtn.textContent = "Graph";
-      panel.innerHTML = "<div id=empty>Click a petal to inspect its session.</div>";
     } else {
       if (savedView) { view.x = savedView.x; view.y = savedView.y; view.k = savedView.k; applyView(); }
-      artLayer.style.display = "none"; graphLayer.style.display = "";
+      placeNodes(false);
+      edgesLayer.style.display = ""; artLayer.style.display = "none";
       if (artbtn) artbtn.textContent = "Pinwheel";
     }
   }
@@ -488,6 +506,7 @@ _RENDERER_JS = r"""
   var dragging = null, dragOff = null;
   function startDrag(ev, n) {
     ev.preventDefault(); ev.stopPropagation();
+    if (artMode) { select(n); return; }   // in pinwheel view nodes are fixed; just inspect
     dragging = n;
     alpha = Math.max(alpha, 0.3);  // gently reheat so neighbours respond
     kick();                        // restart the loop if it had halted
