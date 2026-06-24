@@ -36,7 +36,13 @@ def verify(project=None, evs=None) -> dict:
     p = paths.project_dir(project) / "chain.json"
     if not p.exists():
         return {"ok": False, "reason": "no chain.json (run: hive project)", "actual": actual}
-    stored = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        stored = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        # A corrupt/truncated chain.json must not crash verify() — callers like
+        # the dashboard overview poll rely on it always returning a verdict.
+        return {"ok": False, "reason": "corrupt_chain_file", "detail": str(e),
+                "actual": actual}
     if stored != actual:
         return {"ok": False, "reason": "hash_mismatch", "stored": stored, "actual": actual}
     return {"ok": True, "stored": stored, "actual": actual}

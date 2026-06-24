@@ -87,6 +87,44 @@ def test_sync_no_briefing(tmp_path, monkeypatch):
     assert "PROJECT BRIEFING" not in content
 
 
+def test_sync_does_not_duplicate_state_block(tmp_path, monkeypatch):
+    """With the briefing included, the curated state block must appear once —
+    not duplicated by embedding both STATE.md and the briefing's Current state."""
+    _setup(tmp_path, monkeypatch)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    events.append_event("state_set",
+                        {"task": "Unique-task-token", "verified": "ok",
+                         "next_step": "go", "open_questions": [], "deferred": []},
+                        session_id="s", ts="2026-06-20T09:00:00Z")
+    p = sync(r"C:\TEMP\demo", project=None, include_briefing=True, home=fake_home)
+    content = p.read_text(encoding="utf-8")
+    assert content.count("Unique-task-token") == 1
+    # The standalone "## Current State" wrapper is dropped in favor of the briefing.
+    assert "## Current State" not in content
+    assert "PROJECT BRIEFING" in content
+
+
+def test_sync_reads_event_log_once(tmp_path, monkeypatch):
+    """sync must read the event log a single time and reuse it for both the
+    STATE and briefing projections (was 2+ full read_all calls)."""
+    _setup(tmp_path, monkeypatch)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    events.append_event("decision", {"text": "x"},
+                        session_id="s", ts="2026-06-20T09:00:00Z")
+    calls = {"n": 0}
+    real = events.read_all
+
+    def counting(project=None):
+        calls["n"] += 1
+        return real(project)
+
+    monkeypatch.setattr(events, "read_all", counting)
+    sync(r"C:\TEMP\demo", project=None, include_briefing=True, home=fake_home)
+    assert calls["n"] == 1
+
+
 def test_sync_path_matches_encode_folder(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     fake_home = tmp_path / "home"

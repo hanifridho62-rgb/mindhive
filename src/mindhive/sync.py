@@ -1,6 +1,6 @@
 # src/mindhive/sync.py
 from pathlib import Path
-from . import paths, projector
+from . import paths, projector, events as ev_mod
 from .briefing import briefing as build_briefing_file
 
 USAGE_NOTE = """\
@@ -53,13 +53,16 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     STATE.md and BRIEFING.md are up-to-date. Then writes native MEMORY.md.
     Returns the path written.
     """
-    # Ensure projections are up to date
-    projector.project(project)
+    # Read the event log ONCE and reuse it for both projections — avoids the
+    # extra full read_all() each of projector.project() and briefing() used to
+    # do on every sync.
+    evs = ev_mod.read_all(project)
+    projector.project(project, evs=evs)
 
     # Ensure briefing (if needed)
     briefing_path = None
     if include_briefing:
-        briefing_path = build_briefing_file(project)
+        briefing_path = build_briefing_file(project, evs=evs)
 
     # Resolve paths
     pdir = paths.project_dir(project)
@@ -69,17 +72,19 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     sections = []
     sections.append(USAGE_NOTE)
 
-    # STATE section
-    sections.append("## Current State\n")
-    if state_path.exists():
-        sections.append("```\n" + state_path.read_text(encoding="utf-8") + "\n```\n")
-    else:
-        sections.append("*(no STATE.md yet — run: hive project)*\n")
-
-    # BRIEFING section
     if include_briefing and briefing_path and briefing_path.exists():
+        # The briefing already carries a "Current state" section, so embedding
+        # STATE.md too would duplicate the whole state block in the auto-loaded
+        # MEMORY.md. Include only the briefing.
         sections.append("## Full Briefing\n")
         sections.append("```\n" + briefing_path.read_text(encoding="utf-8") + "\n```\n")
+    else:
+        # No briefing: surface the curated state block on its own.
+        sections.append("## Current State\n")
+        if state_path.exists():
+            sections.append("```\n" + state_path.read_text(encoding="utf-8") + "\n```\n")
+        else:
+            sections.append("*(no STATE.md yet — run: hive project)*\n")
 
     content = "\n".join(sections)
 

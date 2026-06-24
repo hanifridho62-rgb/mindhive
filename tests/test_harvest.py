@@ -71,6 +71,41 @@ def test_skip_captured_avoids_double_counting(tmp_path, monkeypatch):
     assert len(s2) == 1 and "harvest" in s2[0].tags               # the missed one IS harvested
 
 
+def test_partial_capture_backfills_missed_events(tmp_path, monkeypatch):
+    """A session the hooks captured only PARTIALLY (e.g. hook crashed after the
+    first tool call) must still get its missed events backfilled — not be
+    fast-forwarded past forever."""
+    _isolate(tmp_path, monkeypatch)
+    # Hook captured only the FIRST of two tool calls in session s1.
+    events.append_event("file_touched", {"text": "a.py"}, session_id="s1",
+                        tags=["auto"], project="test")
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_tooluse("Edit", {"file_path": "a.py"}),   # already captured
+                                   _tooluse("Edit", {"file_path": "b.py"})])  # missed by the hook
+    harvest.harvest(tdir, "test", skip_captured=True)
+    s1 = [e for e in events.read_all("test") if e.session_id == "s1"]
+    paths_touched = sorted(e.payload["text"] for e in s1)
+    assert paths_touched == ["a.py", "b.py"]          # a.py once (not doubled), b.py backfilled
+    # The backfilled one carries the harvest tag; the original hook one does not.
+    b = next(e for e in s1 if e.payload["text"] == "b.py")
+    assert "harvest" in b.tags
+
+
+def test_partial_capture_backfill_is_idempotent(tmp_path, monkeypatch):
+    """Re-running harvest after a partial-capture backfill adds nothing more."""
+    _isolate(tmp_path, monkeypatch)
+    events.append_event("file_touched", {"text": "a.py"}, session_id="s1",
+                        tags=["auto"], project="test")
+    tdir = tmp_path / "tx"
+    _write_transcript(tdir, "s1", [_tooluse("Edit", {"file_path": "a.py"}),
+                                   _tooluse("Edit", {"file_path": "b.py"})])
+    harvest.harvest(tdir, "test", skip_captured=True)
+    before = len(events.read_all("test"))
+    r2 = harvest.harvest(tdir, "test", skip_captured=True)
+    assert r2["new_events"] == 0
+    assert len(events.read_all("test")) == before
+
+
 # --- user_prompt capture (every typed prompt enters memory) ---
 
 def test_every_plain_prompt_becomes_user_prompt(tmp_path, monkeypatch):
@@ -396,3 +431,18 @@ def test_project_for_transcript_dir_none_without_cwd(tmp_path, monkeypatch):
     d.mkdir()
     (d / "s.jsonl").write_text(json.dumps({"type": "x"}) + "\n", encoding="utf-8")
     assert harvest.project_for_transcript_dir(d) is None
+
+
+def test_project_for_transcript_dir_skips_malformed_cwd_line(tmp_path, monkeypatch):
+    """A malformed line containing '"cwd"' must not abandon the whole file — a
+    later valid cwd line still resolves the project."""
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(harvest.paths, "detect_project", lambda p: p.name)
+    d = tmp_path / "enc"
+    d.mkdir()
+    lines = [
+        '{"cwd": "C:/Broken"',                       # truncated JSON, has "cwd"
+        json.dumps({"cwd": "C:/ProjY"}),             # valid, later
+    ]
+    (d / "s.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert harvest.project_for_transcript_dir(d) == "ProjY"

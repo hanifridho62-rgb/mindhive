@@ -75,6 +75,15 @@ def read_all(project=None) -> list["Event"]:
                 raise json.JSONDecodeError(
                     f"{seg.name}:{i}: {e.msg}", e.doc, e.pos
                 ) from e
+            # A structurally valid JSON line that is missing a required Event
+            # field would otherwise raise a raw TypeError from Event(**known),
+            # bypassing the framed corrupt-log handling. Fail loud, framed.
+            missing = [k for k in ("ts", "session_id", "type", "payload")
+                       if k not in obj]
+            if missing:
+                raise json.JSONDecodeError(
+                    f"{seg.name}:{i}: event missing required field(s): "
+                    f"{', '.join(missing)}", line, 0)
             known = {k: obj[k] for k in Event.__dataclass_fields__ if k in obj}
             rows.append((obj.get("ts", ""), seg.name, i, Event(**known)))
     rows.sort(key=lambda t: (t[0], t[1], t[2]))
