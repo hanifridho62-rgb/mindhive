@@ -33,6 +33,11 @@ def run_loop(project, loop_dir, cfg, driver, *,
         cfg.no_progress_threshold, cfg.same_error_threshold, cfg.cooldown_seconds))
     ccfg = ctx_mod.ContextConfig(cfg.context_window, cfg.smart_zone_ratio)
 
+    from . import budget as budget_mod
+    bcfg = budget_mod.BudgetConfig(cfg.window_hours, cfg.window_token_budget,
+                                   cfg.window_cost_budget_usd)
+    budget_entries = []
+
     events.append_event("loop_run_start",
                         {"goal_dir": str(loop_dir), "max_iterations": cfg.max_iterations},
                         project=project)
@@ -49,6 +54,15 @@ def run_loop(project, loop_dir, cfg, driver, *,
         if not cb.allow(now=now_fn()):
             reason = "breaker_open"
             break
+
+        # --- budget projection gate ---
+        avg_t, avg_c = budget_mod.rolling_avg(budget_entries, n=3)
+        if budget_entries and budget_mod.would_exceed(
+                budget_entries, now_fn(), bcfg, avg_t, avg_c):
+            if cfg.on_cap == "stop":
+                reason = "budget_cap"
+                break
+            sleep_fn(budget_mod.wait_seconds(budget_entries, now_fn(), bcfg, avg_t, avg_c))
 
         iteration += 1
         tasks = task_mod.load_tasks(loop_dir)
@@ -79,6 +93,10 @@ def run_loop(project, loop_dir, cfg, driver, *,
             "breaker_state": cb.state,
             "session_id": result.session_id,
         }, project=project)
+
+        budget_entries.append(budget_mod.BudgetEntry(
+            ts=now_fn(), tokens=result.usage.total_tokens,
+            cost_usd=result.usage.cost_usd))
 
         if result.rate_limited:
             reason = "api_cap"
