@@ -4,6 +4,11 @@ import re
 import subprocess
 from pathlib import Path
 
+# On Windows, a console child (e.g. git.exe) spawned from a window-less parent
+# (the dashboard runs via pythonw / detached) pops a fresh console window for a
+# split second. CREATE_NO_WINDOW suppresses it. No-op flag (0) elsewhere.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def store_home() -> Path:
     return Path(os.environ.get("MINDHIVE_HOME", str(Path.home() / ".mindhive")))
@@ -27,6 +32,7 @@ def detect_project(cwd: Path | None = None) -> str:
         r = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"],
             cwd=str(cwd), capture_output=True, text=True, timeout=2,
+            creationflags=NO_WINDOW,
         )
         if r.returncode == 0 and r.stdout.strip():
             gcd = Path(r.stdout.strip())
@@ -42,6 +48,7 @@ def detect_project(cwd: Path | None = None) -> str:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=str(cwd), capture_output=True, text=True, timeout=2,
+            creationflags=NO_WINDOW,
         )
         if r.returncode == 0 and r.stdout.strip():
             return normalize(Path(r.stdout.strip()).name)
