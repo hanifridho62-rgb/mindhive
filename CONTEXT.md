@@ -33,3 +33,39 @@ the hooks record during coding.
   session's `session_start.ps1` injects the pending-review notice so interactive Claude runs
   the skill in-context. A fire-and-forget hook cannot reason, so the review happens where an
   LLM actually exists: the next interactive session.
+
+- **Scope = first-party source + tests** (grill Q4, 2026-06-24). Queue only
+  `src\mindhive\**\*.py` and `tests\**\*.py`; exclude generated (`*.pyc`, `*.egg-info`),
+  `docs\`, `build\`, `dist\`, and the memory store. Dedup; skip queuing when the filtered
+  list is empty.
+
+- **Large scope => staged batches** (grill Q4 follow-up, 2026-06-24). When the queued file
+  set is large, the review runs in sequential batches rather than one oversized pass.
+
+- **Batch sizing = by total lines** (grill Q5, 2026-06-24). Trigger batching when the filtered
+  set exceeds ~1,500 total lines; pack whole files into batches of ≤~1,500 lines each; never
+  split a file across batches. All batches run sequentially in the next session
+  (user-interruptible), not one-batch-per-session.
+
+- **Marker = sidecar JSON, surfaced through hive memory** (grill Q6, 2026-06-24).
+  Source of truth is a sidecar `~/.mindhive/pending_review.json`
+  (`{files, batches, created_at, session_id}`) — written by `session_end.ps1`, deleted when
+  the review completes. No change to the closed `VALID_TYPES` event schema. For Claude to read
+  it as context with zero new wiring, `projector` renders a "⚠ Pending thermo-nuclear review"
+  notice from the sidecar into `STATE.md`, which `session_start.ps1` already injects via
+  `mindhive state`. The `file_touched` history stays in the event log; only the transient
+  marker is a sidecar.
+
+- **Skill artifact = project-level, Claude Code format** (grill Q7, 2026-06-24). Lives at
+  `.claude/skills/thermo-nuclear-code-quality-review/SKILL.md` in the mindhive repo, versioned
+  alongside the hooks that invoke it. Cursor frontmatter is rewritten to Claude Code
+  `name`/`description` form (description is a real trigger string, not disabled-invocation);
+  the seven standards become the skill body.
+
+- **Verdict = advisory, findings compound into memory** (grill Q8, 2026-06-24). Standards stay
+  strict (seven non-negotiables, 1,000-line flag, code-judo hunting) but output is ranked
+  advisory findings, not a blocking gate — a post-hoc review has nothing to block. Only
+  presumptive-blocker-level findings are written back as `caveat` events
+  (`mindhive append caveat …`) so they flow into `BRIEFING.md`, the timeline, and the graph,
+  and resurface next session; lower-severity findings are shown in-session only, to avoid
+  flooding the timeline.
