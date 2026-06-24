@@ -1,6 +1,6 @@
 # src/mindhive/projector.py
 import hashlib
-from . import paths, events, chain
+from . import paths, events, chain, review
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
@@ -13,7 +13,7 @@ def _ts_compact(ts: str) -> str:
     return ts.replace("-", "").replace(":", "").replace("T", "-").rstrip("Z")
 
 
-def build_state(evs) -> str:
+def build_state(evs, pending=None) -> str:
     latest_state = None
     last_decision = None
     for ev in evs:
@@ -23,6 +23,11 @@ def build_state(evs) -> str:
             last_decision = ev
     s = latest_state.payload if latest_state else {}
     out = ["# STATE", ""]
+    # Pending thermo-nuclear review rides at the top so the next session sees it
+    # first when session_start injects STATE.md via `hive state`.
+    note = review.notice(pending)
+    if note:
+        out.append(note)
     out.append(f"**Active task:** {s.get('task', '(none)')}")
     out.append(f"**Last verified:** {s.get('verified', '(none)')}")
     out.append(f"**Next step:** {s.get('next_step', '(none)')}")
@@ -71,7 +76,7 @@ def project(project=None) -> dict:
     pdir.mkdir(parents=True, exist_ok=True)
 
     tmp = pdir / "STATE.md.tmp"
-    tmp.write_text(build_state(evs), encoding="utf-8")
+    tmp.write_text(build_state(evs, pending=review.load_pending(project)), encoding="utf-8")
     tmp.replace(pdir / "STATE.md")
 
     ldir = pdir / "LEDGER"
