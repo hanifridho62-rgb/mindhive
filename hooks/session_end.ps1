@@ -15,7 +15,7 @@ try {
     # Queue a thermo-nuclear review of the source files touched this session BEFORE
     # rebuilding projections, so the pending-review notice lands in STATE.md (which
     # the next session_start injects). Cheap, LLM-free; the review itself runs in
-    # the next interactive session. See docs/adr/0001-*.
+    # the next interactive session. See docs/adr/0004-*.
     & $py -m mindhive review queue --session $sid | Out-Null
     & $py -m mindhive project | Out-Null
     & $py -m mindhive briefing | Out-Null

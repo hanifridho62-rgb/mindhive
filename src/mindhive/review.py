@@ -7,7 +7,7 @@ the cheap bookkeeping here: filter touched files to first-party source/tests,
 split them into line-bounded batches, and write a sidecar marker. The projector
 renders that marker into STATE.md, which session_start injects — so the *next*
 interactive session runs the review where an LLM actually exists. See
-docs/adr/0001-queue-and-inject-thermo-nuclear-review.md.
+docs/adr/0004-queue-and-inject-thermo-nuclear-review.md.
 """
 import json
 from . import events as ev_mod, paths

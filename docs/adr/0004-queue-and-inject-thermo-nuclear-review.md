@@ -1,4 +1,4 @@
-# 1. Queue-and-inject the thermo-nuclear review instead of running it in the hook
+# 4. Queue-and-inject the thermo-nuclear review instead of running it in the hook
 
 Date: 2026-06-24
 Status: Accepted
