@@ -13,6 +13,7 @@ DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
     "session_start", "session_end", "compaction",
     "plugin_catalog", "user_prompt", "assistant_response",
+    "loop_run_start", "loop_iteration", "loop_run_end",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
