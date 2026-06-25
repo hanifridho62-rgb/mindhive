@@ -26,7 +26,17 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker
 - `hive loop status` — summarize the last loop run
 - `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI
-- **`/circle`** — the in-session front door to `hive loop`: type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. Shipped as **both** a slash command (`.claude/commands/circle.md`, what you type) and an auto-invoked skill (`.claude/skills/circle/`). Start a **new** Claude session in this folder to load it.
+- **`/circle`** — the in-session front door to `hive loop`: type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
+
+## Install the `/circle` plugin (global)
+This repo is a self-contained Claude Code plugin marketplace. To get `/circle` in **every** project:
+
+```
+/plugin marketplace add hanifridho62-rgb/Lintester-project
+/plugin install mindhive@mindhive-dev
+```
+
+(or `/plugin marketplace add C:\Users\hanif\mindhive` to install from the local checkout). Then start a new session and type `/circle`. `hive loop` itself still needs the `mindhive` package importable (the plugin shells out to `python -m mindhive loop`) and the `claude` CLI on PATH.
 
 ## Event types
 Semantic (you/Claude emit): decision, experiment_result, caveat, next_step,

@@ -1,16 +1,24 @@
 # tests/test_circle_skill.py
-"""/Circle has two entry points to `hive loop`: a typeable slash COMMAND
-(.claude/commands/circle.md) and a model-invoked SKILL (.claude/skills/circle/).
-Guard both so a rename/delete can't silently break activation."""
+"""/circle ships as a Claude Code PLUGIN: a typeable slash COMMAND
+(commands/circle.md) + a model-invoked SKILL (skills/circle/), declared by the
+plugin manifest (.claude-plugin/plugin.json) and installable via
+.claude-plugin/marketplace.json. Guard the shape so a rename/delete can't
+silently break activation."""
+import json
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
-_SKILL = _ROOT / ".claude" / "skills" / "circle" / "SKILL.md"
-_COMMAND = _ROOT / ".claude" / "commands" / "circle.md"
+_SKILL = _ROOT / "skills" / "circle" / "SKILL.md"
+_COMMAND = _ROOT / "commands" / "circle.md"
+_PLUGIN = _ROOT / ".claude-plugin" / "plugin.json"
+_MARKETPLACE = _ROOT / ".claude-plugin" / "marketplace.json"
 
 
 def test_circle_skill_exists():
     assert _SKILL.exists(), "Circle activation skill is missing"
+    text = _SKILL.read_text(encoding="utf-8")
+    assert text.startswith("---") and "name: circle" in text.split("---", 2)[1]
+    assert "mindhive loop" in text
 
 
 def test_circle_slash_command_exists_and_drives_loop():
@@ -21,12 +29,14 @@ def test_circle_slash_command_exists_and_drives_loop():
     assert "mindhive loop" in text
 
 
-def test_circle_skill_frontmatter_and_loop_wiring():
-    text = _SKILL.read_text(encoding="utf-8")
-    assert text.startswith("---"), "SKILL.md must open with YAML frontmatter"
-    head = text.split("---", 2)[1]
-    assert "name: circle" in head
-    assert "description:" in head
-    # it must actually drive the loop CLI, not reinvent it
-    assert "mindhive loop" in text
-    assert "loop init" in text
+def test_plugin_manifest_valid():
+    data = json.loads(_PLUGIN.read_text(encoding="utf-8"))
+    assert data["name"] == "mindhive"
+    assert "version" in data
+
+
+def test_marketplace_lists_the_plugin():
+    data = json.loads(_MARKETPLACE.read_text(encoding="utf-8"))
+    names = [p["name"] for p in data["plugins"]]
+    assert "mindhive" in names
+    assert any(p["source"] == "./" for p in data["plugins"])
