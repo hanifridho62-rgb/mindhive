@@ -26,6 +26,7 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker
 - `hive loop status` — summarize the last loop run
 - `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI
+- **`/Circle`** (skill) — the in-session front door to `hive loop`: type `/Circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default.
 
 ## Event types
 Semantic (you/Claude emit): decision, experiment_result, caveat, next_step,
