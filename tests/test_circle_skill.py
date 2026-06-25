@@ -1,13 +1,24 @@
 # tests/test_circle_skill.py
-"""The /Circle skill is the human-facing entry point to `hive loop`. Guard its
-shape so a rename/delete can't silently break activation."""
+"""/Circle has two entry points to `hive loop`: a typeable slash COMMAND
+(.claude/commands/circle.md) and a model-invoked SKILL (.claude/skills/circle/).
+Guard both so a rename/delete can't silently break activation."""
 from pathlib import Path
 
-_SKILL = Path(__file__).resolve().parents[1] / ".claude" / "skills" / "circle" / "SKILL.md"
+_ROOT = Path(__file__).resolve().parents[1]
+_SKILL = _ROOT / ".claude" / "skills" / "circle" / "SKILL.md"
+_COMMAND = _ROOT / ".claude" / "commands" / "circle.md"
 
 
 def test_circle_skill_exists():
     assert _SKILL.exists(), "Circle activation skill is missing"
+
+
+def test_circle_slash_command_exists_and_drives_loop():
+    # The typeable `/circle` entry point — what the user literally types.
+    assert _COMMAND.exists(), "Circle slash command is missing"
+    text = _COMMAND.read_text(encoding="utf-8")
+    assert text.startswith("---")               # frontmatter
+    assert "mindhive loop" in text
 
 
 def test_circle_skill_frontmatter_and_loop_wiring():
