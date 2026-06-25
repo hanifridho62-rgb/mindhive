@@ -1,0 +1,20 @@
+{
+  "name": "mindhive-dev",
+  "description": "MindHive plugin marketplace — the /circle autonomous loop.",
+  "owner": {
+    "name": "hanifridho62",
+    "email": "hanifridho62@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "mindhive",
+      "description": "MindHive autonomous loop — type /circle to drive the headless Claude Code CLI until a task is done, bounded by token/cost budgets, a context smart-zone reset, a dual-condition exit gate, and a circuit breaker.",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "hanifridho62",
+        "email": "hanifridho62@gmail.com"
+      }
+    }
+  ]
+}

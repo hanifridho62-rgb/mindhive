@@ -314,6 +314,7 @@ def _run(argv=None) -> int:
             print(f"  required items remaining: {loop_task.required_remaining_count(tasks.fix_plan)}")
             print(f"  context_window={cfg.context_window} smart_zone_ratio={cfg.smart_zone_ratio}")
             print(f"  allowed_tools={cfg.allowed_tools}")
+            print(f"  permission_mode={cfg.permission_mode or '(allowedTools only)'}")
             print(f"  task prompt ({len(tp)} chars), loop context ({len(ctx)} chars)")
             return 0
         if not loop_driver.preflight("claude"):
