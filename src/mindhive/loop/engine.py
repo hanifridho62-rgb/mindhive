@@ -74,13 +74,15 @@ def run_loop(project, loop_dir, cfg, driver, *,
         result = driver.run(
             task_prompt, loop_context,
             allowed_tools=cfg.allowed_tools, session_id=session_id,
-            model=cfg.model, effort=cfg.effort,
+            model=cfg.model, permission_mode=cfg.permission_mode,
             timeout_s=cfg.iteration_timeout_seconds, live=live)
 
         from .contract import parse_status
         status = parse_status(result.text)
         progressed = progress_fn(iteration) if progress_fn else True
-        error_sig = "rate_limited" if result.rate_limited else None
+        # A driver-level error (timeout / spawn failure) feeds the breaker just
+        # like a rate-limit, so repeated failures open it instead of crashing.
+        error_sig = "rate_limited" if result.rate_limited else result.error
         occupancy = result.usage.context_occupancy
 
         events.append_event("loop_iteration", {
@@ -113,8 +115,12 @@ def run_loop(project, loop_dir, cfg, driver, *,
             reason = "breaker_open"
             break
 
+        # A timed-out / failed iteration leaves no usable session to resume —
+        # drop it so the next iteration starts fresh.
+        if result.error:
+            session_id = None
         # context smart-zone: keep session warm, or reset before the dumb zone
-        if ctx_mod.needs_reset(occupancy, ccfg):
+        elif ctx_mod.needs_reset(occupancy, ccfg):
             events.append_event("compaction",
                                 {"text": f"loop context reset at fill "
                                          f"{ctx_mod.fill_ratio(occupancy, cfg.context_window):.2f}"},

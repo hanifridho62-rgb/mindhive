@@ -97,6 +97,34 @@ def test_loop_context_resets_when_window_half_full(tmp_path, monkeypatch):
     assert any(e.type == "compaction" for e in events.read_all())
 
 
+def test_loop_survives_repeated_timeouts(tmp_path, monkeypatch):
+    # A driver that always times out must NOT crash the loop: the breaker opens
+    # and the run ends gracefully with a loop_run_end event.
+    loop_dir = _setup(tmp_path, monkeypatch)
+    timeout = DriverResult(text="", usage=Usage(), session_id=None, num_turns=0,
+                           rate_limited=False, error="timeout")
+
+    class TimeoutDriver:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, prompt, loop_context, **kw):
+            self.calls.append(kw)
+            return timeout
+
+    drv = TimeoutDriver()
+    cfg = config.LoopConfig(max_iterations=20, no_progress_threshold=3,
+                            same_error_threshold=3)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: False)
+    assert result["reason"] == "breaker_open"
+    types = [e.type for e in events.read_all()]
+    assert "loop_run_end" in types          # graceful end, not a crash
+    # each timed-out iteration drops the session (never resumes a dead one)
+    assert all(c["session_id"] is None for c in drv.calls)
+
+
 def _fake_clock():
     t = {"v": 0.0}
 
