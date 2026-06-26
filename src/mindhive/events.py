@@ -57,10 +57,49 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None, proje
     seg = d / f"{session_id}.jsonl"
     with open(seg, "a", encoding="utf-8") as f:
         f.write(canonical_json(to_dict(ev)) + "\n")
+    _maybe_mirror_to_pg(ev, project)
     return ev
 
 
+def _maybe_mirror_to_pg(ev, project=None) -> None:
+    """Phase B dual-write seam. Default backend 'file' is a no-op so behavior is
+    unchanged. When MINDHIVE_EVENT_BACKEND is 'dual' or 'pg', mirror the event
+    into Postgres via the CC-v3 host bridge (event_write.append_pg), which never
+    raises — the file segment written just above is the source of truth, so a
+    Postgres failure degrades to file-only. The host import is deferred so
+    MindHive stays standalone (no asyncpg) in 'file' mode."""
+    backend = os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower()
+    if backend not in ("dual", "pg"):
+        return
+    try:
+        from scripts.core import event_write
+    except Exception:
+        return  # CC-v3 host bridge not importable -> stay file-only
+    event_write.append_pg(
+        project or paths.detect_project(),
+        ev.type, ev.payload, ev.session_id, ev.tags, ts=ev.ts,
+    )
+
+
+def _maybe_read_from_pg(project=None):
+    """Phase B read seam (U8). Returns events from Postgres ONLY when the backend
+    is 'pg' (post-retirement); for 'file' and 'dual' the file store is still the
+    canonical read, so this returns None and the caller reads files. Falls back
+    to file (returns None) on any host/DB failure. Host import is deferred."""
+    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower() != "pg":
+        return None
+    try:
+        from scripts.core import event_write
+
+        return event_write.read_pg(project or paths.detect_project())
+    except Exception:
+        return None  # degrade to file read
+
+
 def read_all(project=None) -> list["Event"]:
+    pg = _maybe_read_from_pg(project)
+    if pg is not None:
+        return pg
     d = paths.events_dir(project)
     rows = []
     if not d.exists():
