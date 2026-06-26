@@ -81,7 +81,25 @@ def _maybe_mirror_to_pg(ev, project=None) -> None:
     )
 
 
+def _maybe_read_from_pg(project=None):
+    """Phase B read seam (U8). Returns events from Postgres ONLY when the backend
+    is 'pg' (post-retirement); for 'file' and 'dual' the file store is still the
+    canonical read, so this returns None and the caller reads files. Falls back
+    to file (returns None) on any host/DB failure. Host import is deferred."""
+    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower() != "pg":
+        return None
+    try:
+        from scripts.core import event_write
+
+        return event_write.read_pg(project or paths.detect_project())
+    except Exception:
+        return None  # degrade to file read
+
+
 def read_all(project=None) -> list["Event"]:
+    pg = _maybe_read_from_pg(project)
+    if pg is not None:
+        return pg
     d = paths.events_dir(project)
     rows = []
     if not d.exists():

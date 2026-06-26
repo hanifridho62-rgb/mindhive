@@ -54,3 +54,55 @@ def test_dual_backend_mirrors_to_pg(tmp_path, monkeypatch):
     args, kwargs = calls[0]
     assert args[0] == "seamtest" and args[1] == "caveat"  # project, type
     assert kwargs.get("ts")  # ts forwarded for parity ordering
+
+
+def _fake_host_read(monkeypatch, returns=None, raises=False):
+    scripts = types.ModuleType("scripts")
+    scripts.__path__ = []
+    core = types.ModuleType("scripts.core")
+    core.__path__ = []
+    ew = types.ModuleType("scripts.core.event_write")
+
+    def read_pg(project):
+        if raises:
+            raise RuntimeError("pg down")
+        return returns
+
+    ew.read_pg = read_pg
+    core.event_write = ew
+    monkeypatch.setitem(sys.modules, "scripts", scripts)
+    monkeypatch.setitem(sys.modules, "scripts.core", core)
+    monkeypatch.setitem(sys.modules, "scripts.core.event_write", ew)
+
+
+def test_read_default_and_dual_read_files(tmp_path, monkeypatch):
+    # 'file' and 'dual' both read the file store (file stays canonical-read).
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.setenv("MINDHIVE_PROJECT", "rtest")
+    _fake_host_read(monkeypatch, returns=["SENTINEL_PG"])
+    events.append_event("decision", {"text": "from file"}, session_id="s1")
+    for backend in ("file", "dual"):
+        monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", backend)
+        evs = events.read_all()
+        assert evs and evs[0].payload["text"] == "from file"  # file, not the PG sentinel
+
+
+def test_read_pg_backend_reads_from_postgres(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.setenv("MINDHIVE_PROJECT", "rtest")
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "pg")
+    _fake_host_read(monkeypatch, returns=["PG_EVENTS"])
+    assert events.read_all() == ["PG_EVENTS"]
+
+
+def test_read_pg_falls_back_to_file_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.setenv("MINDHIVE_PROJECT", "rtest")
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "pg")
+    _fake_host_read(monkeypatch, raises=True)
+    # seed a file event with backend temporarily 'file' so the write isn't mirrored
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "file")
+    events.append_event("decision", {"text": "file fallback"}, session_id="s1")
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "pg")
+    evs = events.read_all()  # pg read raises -> falls back to file
+    assert evs and evs[0].payload["text"] == "file fallback"
