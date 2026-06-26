@@ -1,6 +1,31 @@
 # Phase A — Postgres Event Backbone: Implementation & Parity Report
 
-**Status:** Code complete and verified; live `migrate-all` run **pending** (Postgres unavailable in the build environment).
+**Status:** Code complete and verified; live `migrate-all` run **DONE — all projects byte-verified** (2026-06-26).
+
+## Live migration result (golden parity gate — PASSED)
+
+`migrate-all` was run against the **real** MIND HIVE store (`~/.mindhive`). Every project's file
+chain head equals its Postgres chain head — **11 projects, 7,399 events, all `ok: true`**:
+
+| Project | count | file_head == pg_head |
+|---------|-------|----------------------|
+| continuous-claude-v3 | 1918 | ✓ `6de364b4ee5db100…` |
+| hanif | 2815 | ✓ `ba749a29ef71497f…` |
+| mindhive | 2030 | ✓ `cf3df8cac3ed0200…` |
+| fabio-hft-v18 | 33 | ✓ `10924335daac610c…` |
+| heuristic-kare-a9be8c | 187 | ✓ `a4c7522c70b65e26…` |
+| quirky-pare-71712c | 182 | ✓ `10eb28742b573cbb…` |
+| friendly-jackson-2e4529 | 115 | ✓ `07e7ef31d4ee535b…` |
+| reverent-yonath-12bcfa | 110 | ✓ `c7d18ebc1fb4b3fe…` |
+| optimistic-hertz-b71dd8 | 6 | ✓ `997f6072928e1ce2…` |
+| pedantic-haibt-82400b | 2 | ✓ `66ca19219d6dafcf…` |
+| brave-brattain-28ae65 | 1 | ✓ `bb739ef75adae99f…` |
+
+`state_from_pg` rendered a valid STATE.md from Postgres for `mindhive` and `hanif`. `fabio-hft-v18`
+migrated as plain rows; nothing touched `LIVE_LOCK`. The run used a userspace embedded Postgres
+(`pgserver`, no sudo, WSL) driving the real cc-v3 `event_migrate` code with `init_pgvector` no-op'd
+(the event-log migration uses no vector columns); the file store stayed canonical and untouched.
+The store is **live**, so `hanif`/ephemeral counts drift between runs — parity held on every run.
 
 This is the MIND HIVE project's record of Phase A of the MindHive→Postgres staged cutover
 (see [`docs/adr/0006`](../adr/0006-postgres-canonical-event-substrate-staged-cutover.md) and

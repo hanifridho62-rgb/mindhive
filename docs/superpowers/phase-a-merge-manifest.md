@@ -42,9 +42,11 @@ in the host. The `mindhive` package is imported as a library and was deliberatel
 | `test_event_migrate.py` / `test_event_cli.py` | Import `scripts.core.*`; gated by the cc-v3 `dbtest` marker + `pytest.importorskip("asyncpg")`. |
 | CC-v3 migration report | The per-project live-run parity table is produced by running `migrate-all` against the CC-v3 Postgres instance; its home is the host repo. The MERGED report above is the MIND HIVE-side summary. |
 
-## Open follow-ups (not done in this change)
+## Status
 
-- **U7 live run** is pending a reachable Postgres (`continuous-claude-postgres` container +
-  `asyncpg` + `DATABASE_URL`). Until then the per-project parity table is unfilled in both reports.
+- **U7 live run — DONE (2026-06-26).** `migrate-all` ran against the real `~/.mindhive` store via a
+  userspace embedded Postgres (`pgserver`, no sudo, WSL): 11 projects, 7,399 events, every project
+  `file_head == pg_head`. Per-project table is in the report. To re-run against the project's own
+  `continuous-claude-postgres`, see the report's "Re-running the live migration" section.
 - If a `mindhive`-native, host-independent migrator is ever wanted, it would be new work (a pure
   port that does not import `scripts.core.*`) — out of scope for Phase A.
