@@ -66,7 +66,8 @@ def test_state_endpoint_returns_text():
     try:
         status, body = _get(base, "/api/state", token)
         assert status == 200
-        assert isinstance(body, str)
+        # Real STATE.md content (or the known empty sentinel) — not just "is a str".
+        assert "# STATE" in body or "no STATE.md" in body
     finally:
         server.shutdown()
 
@@ -77,7 +78,8 @@ def test_verify_endpoint_returns_json():
         status, body = _get(base, "/api/verify", token)
         assert status == 200
         obj = json.loads(body)
-        assert isinstance(obj, dict)
+        # /api/verify wraps chain.verify() — assert its real contract key.
+        assert "ok" in obj and isinstance(obj["ok"], bool)
     finally:
         server.shutdown()
 
@@ -98,7 +100,8 @@ def test_graph_endpoint_returns_html():
     try:
         status, body = _get(base, "/api/graph", token)
         assert status == 200
-        assert "<" in body
+        # Real rendered graph page (the template emits these), not just any "<".
+        assert "<html" in body.lower() and '<svg id="svg">' in body
     finally:
         server.shutdown()
 
