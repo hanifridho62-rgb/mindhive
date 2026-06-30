@@ -4,10 +4,12 @@ from pathlib import Path
 
 from .. import events, guard, recall as recall_mod
 from ..briefing import build_briefing
+from . import budget as budget_mod
 from . import context as ctx_mod
 from . import prompt as prompt_mod
 from . import safeguards
 from . import task as task_mod
+from .contract import parse_status
 from .driver import preflight
 
 
@@ -33,7 +35,6 @@ def run_loop(project, loop_dir, cfg, driver, *,
         cfg.no_progress_threshold, cfg.same_error_threshold, cfg.cooldown_seconds))
     ccfg = ctx_mod.ContextConfig(cfg.context_window, cfg.smart_zone_ratio)
 
-    from . import budget as budget_mod
     bcfg = budget_mod.BudgetConfig(cfg.window_hours, cfg.window_token_budget,
                                    cfg.window_cost_budget_usd)
     budget_entries = []
@@ -77,7 +78,6 @@ def run_loop(project, loop_dir, cfg, driver, *,
             model=cfg.model, permission_mode=cfg.permission_mode,
             timeout_s=cfg.iteration_timeout_seconds, live=live)
 
-        from .contract import parse_status
         status = parse_status(result.text)
         progressed = progress_fn(iteration) if progress_fn else True
         # A driver-level error (timeout / spawn failure) feeds the breaker just
