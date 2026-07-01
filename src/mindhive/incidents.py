@@ -318,6 +318,8 @@ def promote(signature, project=None) -> dict:
     rule = _active_rule_for(signature, project)
     if not rule:
         return {"promoted": False, "reason": "no active rule"}
+    if _has_lifecycle(project, "rule_promoted", signature):
+        return {"promoted": False, "reason": "already promoted"}
     sp = soul_path(project)
     sp.parent.mkdir(parents=True, exist_ok=True)
     header = "" if sp.exists() else "# SOUL — canonical operating rules\n\n"

@@ -6,6 +6,8 @@ A failure is a tool_result block with is_error==True that was NOT interrupted
 `toolUseResult.stderr`, falling back to the block's own content. Each failure is
 keyed to a root-cause signature and stored as a `tool_failed` event.
 """
+import re
+
 from . import events, paths, signature as sig
 
 _EXCERPT_MAX = 4000
@@ -87,6 +89,20 @@ def action_from_tool_use(block) -> str:
     return (name or "unknown")[:_ACTION_MAX]
 
 
+_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _normalize_ts(raw):
+    """Reduce a transcript ISO-8601 timestamp to the store's second-resolution
+    UTC form, or None when it can't be parsed. Mirrors harvest._normalize_ts so
+    captured failures carry their REAL occurrence time (needed for leak timing),
+    not capture wall-clock."""
+    if not isinstance(raw, str):
+        return None
+    m = _TS_RE.match(raw.strip())
+    return (m.group(1) + "Z") if m else None
+
+
 def _iter_lines(path):
     for raw in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
         raw = raw.strip()
@@ -133,6 +149,9 @@ def capture_dir(transcript_dir, project=None, now=None) -> dict:
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
                         actions[b["id"]] = action_from_tool_use(b)
+            # Preserve the failure's REAL time from the transcript line; fall back
+            # to `now` only when the line has no timestamp.
+            line_ts = _normalize_ts(obj.get("timestamp")) or now
             for fail in extract_failures(obj):
                 action = actions.get(fail["tool_use_id"], "unknown")
                 key = (sid, fail["signature"], action)
@@ -143,6 +162,6 @@ def capture_dir(transcript_dir, project=None, now=None) -> dict:
                     "tool_failed",
                     {"text": fail["error_excerpt"], "signature": fail["signature"],
                      "action": action},
-                    session_id=sid, tags=["auto", "failure"], ts=now, project=project)
+                    session_id=sid, tags=["auto", "failure"], ts=line_ts, project=project)
                 new_failures += 1
     return {"new_failures": new_failures, "files": files}

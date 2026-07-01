@@ -278,6 +278,10 @@ def cmd_loop(args) -> int | None:
 def cmd_failures_capture(args) -> int | None:
     from . import failures as failures_mod, incidents as incidents_mod
     res = failures_mod.capture_dir(args.transcripts, project=args.project)
+    # Advance the rule lifecycle on capture: stamp activation for signatures that
+    # just crossed the recurrence threshold, so leak-based auto-demotion is
+    # reachable from the natural flow without a separate `hive rules audit`.
+    incidents_mod.audit(project=args.project)
     incidents_mod.project(project=args.project)
     print(json.dumps(res))
     return None

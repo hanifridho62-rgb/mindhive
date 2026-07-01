@@ -88,6 +88,23 @@ def test_capture_is_idempotent(tmp_path):
     assert len(evs) == 1
 
 
+def test_capture_preserves_transcript_timestamp(tmp_path):
+    tdir = tmp_path / "tx"
+    tdir.mkdir()
+    line = {
+        "timestamp": "2026-06-30T08:15:30.500Z",
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tu1", "is_error": True, "content": ""}]},
+        "toolUseResult": {"stderr": "No module named 'zzz'", "interrupted": False},
+    }
+    (tdir / "s.jsonl").write_text(json.dumps(line), encoding="utf-8")
+    failures.capture_dir(str(tdir), project="test")
+    evs = [e for e in events.read_all("test") if e.type == "tool_failed"]
+    assert len(evs) == 1
+    assert evs[0].ts == "2026-06-30T08:15:30Z"     # real transcript time, not wall-clock
+
+
 def test_model_unavailable_is_not_a_failure():
     line = _tool_result_line(
         True, stderr="claude-opus-4-8 is temporarily unavailable, so auto mode "
