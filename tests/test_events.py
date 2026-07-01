@@ -54,3 +54,13 @@ def test_assistant_response_is_valid_and_in_memory_view():
     assert ev.type == "assistant_response"
     assert "assistant_response" in events.MEMORY_VIEW_TYPES
     assert "assistant_response" not in events.SEMANTIC_TYPES
+
+
+def test_tool_failed_is_a_valid_deterministic_type():
+    assert "tool_failed" in events.VALID_TYPES
+    assert "tool_failed" in events.DETERMINISTIC_TYPES
+    # deterministic, not semantic: must stay out of the LEDGER/graph intent layer
+    assert "tool_failed" not in events.SEMANTIC_TYPES
+    ev = events.append_event("tool_failed", {"text": "boom", "signature": "pymodule:x"},
+                             session_id="s1", tags=["auto", "failure"], project="test")
+    assert ev.type == "tool_failed"
