@@ -73,3 +73,12 @@ def test_rule_revised_is_a_valid_deterministic_type():
                              {"signature": "pymodule:x", "text": "do Y", "source": "human"},
                              session_id="s1", tags=["reconcile"], project="test")
     assert ev.type == "rule_revised"
+
+
+def test_lifecycle_event_types_are_valid():
+    for t in ("rule_activated", "rule_promoted", "rule_demoted"):
+        assert t in events.DETERMINISTIC_TYPES
+        assert t not in events.SEMANTIC_TYPES
+    ev = events.append_event("rule_promoted", {"signature": "pymodule:x"},
+                             session_id="s", tags=["promote"], project="test")
+    assert ev.type == "rule_promoted"
