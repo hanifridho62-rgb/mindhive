@@ -197,3 +197,26 @@ def test_human_rule_flagged_not_demoted_on_leak():
     rec = incidents.load("pymodule:mindhive", project="test")
     assert rec["status"] == "active"            # human never auto-demoted
     assert rec["flag"] == "needs_review"
+
+
+def test_inject_lists_only_active_rules_with_text():
+    # active with an auto rule -> included
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
+    # candidate (1 occurrence) -> excluded
+    _add_failure_ts("pymodule:tools", "z", "s3", "2026-07-01T10:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", "- Prevention rule: run with -m"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+
+    block = incidents.inject(project="test")
+    assert "PREVENTION RULES" in block
+    assert "run with -m" in block                 # active + has rule
+    assert "pymodule:tools" not in block          # candidate excluded
+
+
+def test_inject_empty_when_no_active_rules():
+    assert incidents.inject(project="test") == ""

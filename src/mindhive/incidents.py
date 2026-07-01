@@ -260,6 +260,44 @@ def reconcile(project=None) -> dict:
     return {"revised": revised}
 
 
+def _active_rules(project) -> list:
+    """(signature, active_rule) for each injectable incident: status active,
+    rule_source != none. Demoted/candidate/promoted are excluded."""
+    out = []
+    d = _incident_dir(project)
+    if not d.exists():
+        return out
+    for path in sorted(d.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        fm = {}
+        for line in text.splitlines():
+            m = re.match(r"^(\w+):\s*(.*)$", line)
+            if m:
+                fm[m.group(1)] = m.group(2).strip()
+            if line.startswith("# Incident:"):
+                break
+        if fm.get("status") != "active" or fm.get("rule_source") in (None, "none", ""):
+            continue
+        secs = _split_sections(text)
+        active, _ = derive_active(secs.get("Auto Evaluation", ""),
+                                  secs.get("Human Evaluation", ""))
+        if active:
+            out.append((fm.get("signature", ""), active))
+    return out
+
+
+def inject(project=None) -> str:
+    """The machine-learned prevention-rules block for session-start injection.
+    Empty string when there is nothing active to inject."""
+    rules = _active_rules(project)
+    if not rules:
+        return ""
+    lines = ["# PREVENTION RULES (machine-learned — avoid repeating these)"]
+    for signature, rule in rules:
+        lines.append(f"- [{signature}] {rule}")
+    return "\n".join(lines)
+
+
 def load(signature, project=None) -> dict:
     """Read back a record's frontmatter as a dict (for tests/inspection)."""
     p = _incident_dir(project) / f"{_safe_name(signature)}.md"
