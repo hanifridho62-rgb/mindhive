@@ -10,6 +10,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import paths, chain
+from . import guard
+from . import recall as recall_mod
+from . import graph as graph_mod
+from . import graphview
+from . import plugins as plugins_mod
+from . import export as export_mod
+from . import events, projector
+from . import dedupe
+from . import sync as sync_mod
+from .briefing import briefing as build_briefing
 
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
@@ -43,16 +53,6 @@ def load_or_create_token() -> str:
     except Exception:
         pass
     return tok
-from . import guard
-from . import recall as recall_mod
-from . import graph as graph_mod
-from . import graphview
-from . import plugins as plugins_mod
-from . import export as export_mod
-from . import events, projector
-from . import dedupe
-from . import sync as sync_mod
-from .briefing import briefing as build_briefing
 
 
 # --- project / session / memory separation -------------------------------
@@ -131,6 +131,15 @@ def all_event_pairs() -> list:
     return pairs
 
 
+def event_pairs(proj: str, am: bool) -> list:
+    """(project_name, Event) for the current selection, oldest→newest — the one
+    place the HIVE MIND (am) fork lives for event-iterating routes. am → every
+    project's events unified; otherwise → just ``proj``'s, each labelled ``proj``."""
+    if am:
+        return all_event_pairs()
+    return [(proj, e) for e in events.read_all(proj)]
+
+
 def _overview_counts(pairs) -> dict:
     """Tally overview stats from an iterable of (session_key, Event). Shared by
     the single-project and HIVE MIND overviews so the counting lives in one
@@ -188,6 +197,152 @@ def make_handler(token: str):
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
 
+        # --- GET route handlers -------------------------------------------
+        # Each takes (proj, am, qs) and sends its own response. They are wired to
+        # their path in _GET_ROUTES (bottom of the class) and dispatched once by
+        # do_GET, so there is no long if/elif ladder. Routes that iterate events
+        # get their (project, Event) source from event_pairs(), which is the one
+        # place the HIVE MIND (am) fork lives.
+        def _get_projects(self, proj, am, qs):
+            stats = [_project_stats(n) for n in _all_projects()]
+            stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
+            total = {"name": HIVEMIND_LABEL, "id": "*",
+                     "events": sum(s["events"] for s in stats),
+                     "memory": sum(s["memory"] for s in stats),
+                     "auto": sum(s["auto"] for s in stats),
+                     "sessions": sum(s["sessions"] for s in stats)}
+            return self._json({"projects": stats, "hivemind": total,
+                               "default": default_project(), "current": proj})
+
+        def _get_state(self, proj, am, qs):
+            if am:
+                return self._send(200, "HIVE MIND unifies every project — pick a single "
+                                  "project to read its STATE.md.", "text/plain; charset=utf-8")
+            p = paths.project_dir(proj) / "STATE.md"
+            text = p.read_text(encoding="utf-8") if p.exists() else "(no STATE.md — run project)"
+            return self._send(200, text, "text/plain; charset=utf-8")
+
+        def _get_briefing(self, proj, am, qs):
+            if am:
+                return self._send(200, "HIVE MIND unifies every project — pick a single "
+                                  "project for its briefing.", "text/plain; charset=utf-8")
+            bpath = build_briefing(proj)
+            return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
+
+        def _get_verify(self, proj, am, qs):
+            if am:
+                per = {n: _safe_chain_ok(n) for n in _all_projects()}
+                return self._json({"ok": all(per.values()) if per else False, "per_project": per})
+            return self._json(chain.verify(proj))
+
+        def _get_overview(self, proj, am, qs):
+            if am:
+                names = _all_projects()
+                # read each project's log ONCE, then derive stats AND the chain
+                # check from the same events (no second full read)
+                evs_by_proj = {n: events.read_all(n) for n in names}
+                stats = _overview_counts(
+                    ((name, ev.session_id), ev)
+                    for name, evs in evs_by_proj.items() for ev in evs)
+                return self._json({
+                    "project": HIVEMIND_LABEL, "projects": len(names), **stats,
+                    "chain_ok": (all(_safe_chain_ok(n, evs_by_proj[n]) for n in names)
+                                 if names else False),
+                })
+            evs = events.read_all(proj)
+            stats = _overview_counts((ev.session_id, ev) for ev in evs)
+            return self._json({
+                "project": proj, **stats,
+                # reuse the events we just read — no second full read
+                "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
+            })
+
+        def _get_memory(self, proj, am, qs):
+            # the semantic subset only — the intent/context layer. Build the
+            # (project, Event) rows once so the projection + dedupe.collapse lives
+            # in a single place instead of once per am / single-project branch.
+            session = (qs.get("session") or [None])[0]
+            limit = int((qs.get("limit") or ["200"])[0])
+            rows = [(n, e) for n, e in event_pairs(proj, am)
+                    if e.type in events.MEMORY_VIEW_TYPES]
+            if session:
+                rows = [(n, e) for n, e in rows if e.session_id == session]
+            rows = list(reversed(rows))[:limit]      # newest first
+            # Collapse near-duplicate memories by meaning (same type + project),
+            # keeping the newest; display-time only, ledger untouched.
+            # similar_count rides along for the UI hint.
+            return self._json(dedupe.collapse([
+                {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
+                 "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
+                 "tags": e.tags}
+                for n, e in rows
+            ]))
+
+        def _get_sessions(self, proj, am, qs):
+            by: dict = {}
+            for name, e in event_pairs(proj, am):
+                key = (name, e.session_id)
+                s = by.get(key)
+                if s is None:
+                    s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
+                                   "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
+                s["events"] += 1
+                if e.type in events.MEMORY_VIEW_TYPES:
+                    s["memory"] += 1
+                if e.ts and e.ts < s["first_ts"]:
+                    s["first_ts"] = e.ts
+                if e.ts and e.ts > s["last_ts"]:
+                    s["last_ts"] = e.ts
+            out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
+            return self._json(out)
+
+        def _get_recall(self, proj, am, qs):
+            q = (qs.get("q") or [""])[0]
+            semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
+            limit = int((qs.get("limit") or ["10"])[0])
+            force = (qs.get("force") or ["0"])[0] in ("1", "true")
+            if am:
+                hits = []
+                for n in _all_projects():
+                    for h in recall_mod.recall(q, project=n, semantic=semantic, limit=limit, force=force):
+                        h = dict(h)
+                        h["project"] = n
+                        hits.append(h)
+                return self._json(hits)
+            return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
+
+        def _get_graph(self, proj, am, qs):
+            # semantic=True folds the embedding-derived semantic_near edges into
+            # the interactive graph (degrades to deterministic edges if
+            # embeddings/deps are absent). Cost scales with ledger size, so a
+            # large namespace's graph takes longer to build on demand.
+            if am:
+                evs = [e for _, e in all_event_pairs()]
+                html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs, semantic=True))
+            else:
+                html = graphview.render_html(graph_mod.build(proj, semantic=True))
+            return self._send(200, html, "text/html; charset=utf-8")
+
+        def _get_plugins_recommend(self, proj, am, qs):
+            if am:
+                for n in _all_projects():
+                    cat = plugins_mod.latest_catalog(n)
+                    if cat:
+                        return self._json(cat)
+                return self._json({})
+            return self._json(plugins_mod.latest_catalog(proj) or {})
+
+        def _get_export(self, proj, am, qs):
+            path = export_mod.export()
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="handoff.md"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         # --- routing ---
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -196,152 +351,76 @@ def make_handler(token: str):
                 return self._send(200, render_page(token), "text/html; charset=utf-8")
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
+            handler = self._GET_ROUTES.get(route)
+            if handler is None:
+                return self._json({"ok": False, "error": "not found"}, 404)
             qs = parse_qs(parsed.query)
             proj = (qs.get("project") or [None])[0] or default_project()
             am = is_all(proj)
             try:
-                if route == "/api/projects":
-                    stats = [_project_stats(n) for n in _all_projects()]
-                    stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
-                    total = {"name": HIVEMIND_LABEL, "id": "*",
-                             "events": sum(s["events"] for s in stats),
-                             "memory": sum(s["memory"] for s in stats),
-                             "auto": sum(s["auto"] for s in stats),
-                             "sessions": sum(s["sessions"] for s in stats)}
-                    return self._json({"projects": stats, "hivemind": total,
-                                       "default": default_project(), "current": proj})
-                if route == "/api/state":
-                    if am:
-                        return self._send(200, "HIVE MIND unifies every project — pick a single "
-                                          "project to read its STATE.md.", "text/plain; charset=utf-8")
-                    p = paths.project_dir(proj) / "STATE.md"
-                    text = p.read_text(encoding="utf-8") if p.exists() else "(no STATE.md — run project)"
-                    return self._send(200, text, "text/plain; charset=utf-8")
-                if route == "/api/briefing":
-                    if am:
-                        return self._send(200, "HIVE MIND unifies every project — pick a single "
-                                          "project for its briefing.", "text/plain; charset=utf-8")
-                    bpath = build_briefing(proj)
-                    return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
-                if route == "/api/verify":
-                    if am:
-                        per = {n: _safe_chain_ok(n) for n in _all_projects()}
-                        return self._json({"ok": all(per.values()) if per else False, "per_project": per})
-                    return self._json(chain.verify(proj))
-                if route == "/api/overview":
-                    if am:
-                        names = _all_projects()
-                        # read each project's log ONCE, then derive stats AND the
-                        # chain check from the same events (no second full read)
-                        evs_by_proj = {n: events.read_all(n) for n in names}
-                        stats = _overview_counts(
-                            ((name, ev.session_id), ev)
-                            for name, evs in evs_by_proj.items() for ev in evs)
-                        return self._json({
-                            "project": HIVEMIND_LABEL, "projects": len(names), **stats,
-                            "chain_ok": (all(_safe_chain_ok(n, evs_by_proj[n]) for n in names)
-                                         if names else False),
-                        })
-                    evs = events.read_all(proj)
-                    stats = _overview_counts((ev.session_id, ev) for ev in evs)
-                    return self._json({
-                        "project": proj, **stats,
-                        # reuse the events we just read — no second full read
-                        "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
-                    })
-                if route == "/api/memory":
-                    # the semantic subset only — the intent/context layer
-                    session = (qs.get("session") or [None])[0]
-                    limit = int((qs.get("limit") or ["200"])[0])
-                    if am:
-                        rows = [(n, e) for n, e in all_event_pairs()
-                                if e.type in events.MEMORY_VIEW_TYPES]
-                        if session:
-                            rows = [(n, e) for n, e in rows if e.session_id == session]
-                        rows = list(reversed(rows))[:limit]
-                        return self._json(dedupe.collapse([
-                            {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
-                             "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                             "tags": e.tags}
-                            for n, e in rows
-                        ]))
-                    evs = [e for e in events.read_all(proj) if e.type in events.MEMORY_VIEW_TYPES]
-                    if session:
-                        evs = [e for e in evs if e.session_id == session]
-                    evs = list(reversed(evs))[:limit]      # newest first
-                    # Collapse near-duplicate memories by meaning (same type +
-                    # project), keeping the newest; display-time only, ledger
-                    # untouched. similar_count rides along for the UI hint.
-                    return self._json(dedupe.collapse([
-                        {"ts": e.ts, "type": e.type, "session": e.session_id, "project": proj,
-                         "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                         "tags": e.tags}
-                        for e in evs
-                    ]))
-                if route == "/api/sessions":
-                    by: dict = {}
-                    src = all_event_pairs() if am else [(proj, e) for e in events.read_all(proj)]
-                    for name, e in src:
-                        key = (name, e.session_id)
-                        s = by.get(key)
-                        if s is None:
-                            s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
-                                           "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
-                        s["events"] += 1
-                        if e.type in events.MEMORY_VIEW_TYPES:
-                            s["memory"] += 1
-                        if e.ts and e.ts < s["first_ts"]:
-                            s["first_ts"] = e.ts
-                        if e.ts and e.ts > s["last_ts"]:
-                            s["last_ts"] = e.ts
-                    out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
-                    return self._json(out)
-                if route == "/api/recall":
-                    q = (qs.get("q") or [""])[0]
-                    semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
-                    limit = int((qs.get("limit") or ["10"])[0])
-                    force = (qs.get("force") or ["0"])[0] in ("1", "true")
-                    if am:
-                        hits = []
-                        for n in _all_projects():
-                            for h in recall_mod.recall(q, project=n, semantic=semantic, limit=limit, force=force):
-                                h = dict(h)
-                                h["project"] = n
-                                hits.append(h)
-                        return self._json(hits)
-                    return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
-                if route == "/api/graph":
-                    # semantic=True folds the embedding-derived semantic_near edges
-                    # into the interactive graph (degrades to deterministic edges if
-                    # embeddings/deps are absent). Cost scales with ledger size, so a
-                    # large namespace's graph takes longer to build on demand.
-                    if am:
-                        evs = [e for _, e in all_event_pairs()]
-                        html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs, semantic=True))
-                    else:
-                        html = graphview.render_html(graph_mod.build(proj, semantic=True))
-                    return self._send(200, html, "text/html; charset=utf-8")
-                if route == "/api/plugins/recommend":
-                    if am:
-                        for n in _all_projects():
-                            cat = plugins_mod.latest_catalog(n)
-                            if cat:
-                                return self._json(cat)
-                        return self._json({})
-                    return self._json(plugins_mod.latest_catalog(proj) or {})
-                if route == "/api/export":
-                    path = export_mod.export()
-                    data = path.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/markdown; charset=utf-8")
-                    self.send_header("Content-Disposition", 'attachment; filename="handoff.md"')
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
+                return handler(self, proj, am, qs)
             except Exception as e:  # never crash the server
+                # Unexpected failure -> 500 so monitoring and clients can tell a
+                # server fault apart from a normal empty/negative result. Expected
+                # domain rejections return their own ok:False, 200 inside handlers.
+                return self._json({"ok": False, "error": str(e)}, 500)
+
+        # --- POST route handlers ------------------------------------------
+        # Each takes (proj, body) and sends its own response, wired via
+        # _POST_ROUTES. The HIVE MIND read-only guard and the mutating-action
+        # target check live in do_POST, before dispatch.
+        def _post_harvest(self, proj, body):
+            # self-healing backfill: capture any session the hooks missed
+            res = run_catch_up()
+            return self._json({"ok": True, "result": res})
+
+        def _post_append(self, proj, body):
+            etype = body.get("type")
+            text = body.get("payload", "")
+            tags = [t for t in (body.get("tags") or "").split(",") if t]
+            if not etype:
+                return self._json({"ok": False, "error": "type is required"}, 200)
+            ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
+            projector.project(proj)
+            return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
+
+        def _post_project(self, proj, body):
+            return self._json({"ok": True, "result": projector.project(proj)})
+
+        def _post_sync(self, proj, body):
+            folder = _folder_for_project(proj)
+            path = sync_mod.sync(folder, project=proj)
+            return self._json({"ok": True, "path": str(path), "folder": folder})
+
+        def _post_embed(self, proj, body):
+            force = bool(body.get("force", False))
+            try:
+                guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
+            except RuntimeError as e:
+                # LIVE_LOCK is an expected, safe-to-report rejection — not a
+                # server fault — so keep it ok:False, 200.
                 return self._json({"ok": False, "error": str(e)}, 200)
-            return self._json({"ok": False, "error": "not found"}, 404)
+            from . import vectors
+            return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
+
+        def _post_plugins_scan(self, proj, body):
+            result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
+            return self._json({"ok": True, "result": result})
+
+        def _post_plugins_autoscan(self, proj, body):
+            res = plugins_mod.ensure_fresh(
+                top_n=int(body.get("top", 5)),
+                max_age_hours=float(body.get("max_age_hours", 24)),
+                force=bool(body.get("force", False)),
+                project=proj,
+            )
+            return self._json({"ok": True, "scanned": res["scanned"],
+                               "age_hours": res["age_hours"], "result": res["payload"]})
+
+        def _post_selftest(self, proj, body):
+            from . import selftest as selftest_mod
+            code = selftest_mod.run()
+            return self._json({"ok": code == 0, "exit_code": code})
 
         def do_POST(self):
             route = urlparse(self.path).path
@@ -354,54 +433,48 @@ def make_handler(token: str):
                     if route == "/api/project":
                         res = {n: projector.project(n) for n in _all_projects()}
                         return self._json({"ok": True, "result": res})
-                    # selftest + harvest are global (not tied to one project)
+                    # selftest + harvest are global (not tied to one project);
+                    # every other mutating action needs a concrete target.
                     if route not in ("/api/selftest", "/api/harvest"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)
-                if route == "/api/harvest":
-                    # self-healing backfill: capture any session the hooks missed
-                    res = run_catch_up()
-                    return self._json({"ok": True, "result": res})
-                if route == "/api/append":
-                    etype = body.get("type")
-                    text = body.get("payload", "")
-                    tags = [t for t in (body.get("tags") or "").split(",") if t]
-                    if not etype:
-                        return self._json({"ok": False, "error": "type is required"}, 200)
-                    ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
-                    projector.project(proj)
-                    return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
-                if route == "/api/project":
-                    return self._json({"ok": True, "result": projector.project(proj)})
-                if route == "/api/sync":
-                    folder = _folder_for_project(proj)
-                    path = sync_mod.sync(folder, project=proj)
-                    return self._json({"ok": True, "path": str(path), "folder": folder})
-                if route == "/api/embed":
-                    force = bool(body.get("force", False))
-                    guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
-                    from . import vectors
-                    return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
-                if route == "/api/plugins/scan":
-                    result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
-                    return self._json({"ok": True, "result": result})
-                if route == "/api/plugins/autoscan":
-                    res = plugins_mod.ensure_fresh(
-                        top_n=int(body.get("top", 5)),
-                        max_age_hours=float(body.get("max_age_hours", 24)),
-                        force=bool(body.get("force", False)),
-                        project=proj,
-                    )
-                    return self._json({"ok": True, "scanned": res["scanned"],
-                                       "age_hours": res["age_hours"], "result": res["payload"]})
-                if route == "/api/selftest":
-                    from . import selftest as selftest_mod
-                    code = selftest_mod.run()
-                    return self._json({"ok": code == 0, "exit_code": code})
+                handler = self._POST_ROUTES.get(route)
+                if handler is None:
+                    return self._json({"ok": False, "error": "not found"}, 404)
+                return handler(self, proj, body)
             except Exception as e:
-                return self._json({"ok": False, "error": str(e)}, 200)
-            return self._json({"ok": False, "error": "not found"}, 404)
+                # Unexpected failure -> 500 (see do_GET). The HIVE MIND read-only
+                # guard and the "type is required" check return ok:False, 200
+                # explicitly as expected domain rejections.
+                return self._json({"ok": False, "error": str(e)}, 500)
+
+        # --- route tables (path -> handler) -------------------------------
+        # Defined after the handlers so the names resolve; dispatched once by
+        # do_GET / do_POST in place of a long if/elif ladder.
+        _GET_ROUTES = {
+            "/api/projects": _get_projects,
+            "/api/state": _get_state,
+            "/api/briefing": _get_briefing,
+            "/api/verify": _get_verify,
+            "/api/overview": _get_overview,
+            "/api/memory": _get_memory,
+            "/api/sessions": _get_sessions,
+            "/api/recall": _get_recall,
+            "/api/graph": _get_graph,
+            "/api/plugins/recommend": _get_plugins_recommend,
+            "/api/export": _get_export,
+        }
+        _POST_ROUTES = {
+            "/api/harvest": _post_harvest,
+            "/api/append": _post_append,
+            "/api/project": _post_project,
+            "/api/sync": _post_sync,
+            "/api/embed": _post_embed,
+            "/api/plugins/scan": _post_plugins_scan,
+            "/api/plugins/autoscan": _post_plugins_autoscan,
+            "/api/selftest": _post_selftest,
+        }
 
     return DashboardHandler
 
