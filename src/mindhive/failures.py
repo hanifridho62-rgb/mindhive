@@ -52,3 +52,79 @@ def extract_failures(obj) -> list:
             "signature": sig.signature(text),
         })
     return out
+
+
+import json
+from pathlib import Path
+
+
+def action_from_tool_use(block) -> str:
+    """Human-readable action string for a tool_use content block."""
+    name = block.get("name")
+    inp = block.get("input") or {}
+    if name in _CMD_TOOLS and inp.get("command"):
+        return str(inp["command"])[:_ACTION_MAX]
+    if name in _FILE_TOOLS and inp.get("file_path"):
+        return f"{name} {inp['file_path']}"[:_ACTION_MAX]
+    return (name or "unknown")[:_ACTION_MAX]
+
+
+def _iter_lines(path):
+    for raw in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            yield json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+
+def _existing_failure_keys(project) -> set:
+    """(session, signature, action) already stored — makes capture idempotent."""
+    keys = set()
+    for ev in events.read_all(project):
+        if ev.type != "tool_failed":
+            continue
+        p = ev.payload if isinstance(ev.payload, dict) else {}
+        keys.add((ev.session_id, p.get("signature"), p.get("action")))
+    return keys
+
+
+def capture_dir(transcript_dir, project=None, now=None) -> dict:
+    """Scan a transcript directory, append a `tool_failed` event per new failure.
+
+    Correlates each failing tool_use_id to its action (the assistant tool_use
+    earlier in the same session). Idempotent: a (session, signature, action)
+    already stored is skipped.
+    """
+    seen = _existing_failure_keys(project)
+    new_failures = 0
+    d = Path(transcript_dir)
+    if not d.exists():
+        return {"new_failures": 0, "files": 0}
+    files = 0
+    for f in sorted(d.glob("*.jsonl")):
+        files += 1
+        sid = f.stem
+        actions = {}                    # tool_use_id -> action string
+        for obj in _iter_lines(f):
+            msg = obj.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
+                        actions[b["id"]] = action_from_tool_use(b)
+            for fail in extract_failures(obj):
+                action = actions.get(fail["tool_use_id"], "unknown")
+                key = (sid, fail["signature"], action)
+                if key in seen:
+                    continue
+                seen.add(key)
+                events.append_event(
+                    "tool_failed",
+                    {"text": fail["error_excerpt"], "signature": fail["signature"],
+                     "action": action},
+                    session_id=sid, tags=["auto", "failure"], ts=now, project=project)
+                new_failures += 1
+    return {"new_failures": new_failures, "files": files}
