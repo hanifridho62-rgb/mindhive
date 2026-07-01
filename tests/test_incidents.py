@@ -158,3 +158,42 @@ def test_audit_stamps_activation_at_threshold_crossing():
 def test_audit_ignores_below_threshold():
     _add_failure_ts("pymodule:tools", "x", "s1", "2026-07-01T10:00:00Z")
     assert incidents.audit(project="test", threshold=2)["activated"] == 0
+
+
+def test_leaks_counts_failures_after_activation():
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")   # activation
+    incidents.audit(project="test", threshold=2)
+    assert incidents.leaks(project="test", signature="pymodule:mindhive") == 0
+    _add_failure_ts("pymodule:mindhive", "z", "s3", "2026-07-01T12:00:00Z")   # leak 1
+    _add_failure_ts("pymodule:mindhive", "w", "s4", "2026-07-01T13:00:00Z")   # leak 2
+    assert incidents.leaks(project="test", signature="pymodule:mindhive") == 2
+
+
+def test_auto_rule_demoted_after_two_leaks():
+    for i, ts in enumerate(["10", "11", "12", "13"]):
+        _add_failure_ts("pymodule:mindhive", "x", f"s{i}", f"2026-07-01T{ts}:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    incidents.project(project="test", threshold=2)
+    txt = incidents._replace_section(path.read_text(encoding="utf-8"),
+                                     "Auto Evaluation", "- Prevention rule: do X")
+    path.write_text(txt, encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+    rec = incidents.load("pymodule:mindhive", project="test")
+    assert rec["status"] == "demoted"           # auto + 2 leaks
+
+
+def test_human_rule_flagged_not_demoted_on_leak():
+    for i, ts in enumerate(["10", "11", "12", "13"]):
+        _add_failure_ts("pymodule:mindhive", "x", f"s{i}", f"2026-07-01T{ts}:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    incidents.project(project="test", threshold=2)
+    txt = incidents._replace_section(path.read_text(encoding="utf-8"),
+                                     "Human Evaluation", "always cd first")
+    path.write_text(txt, encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+    rec = incidents.load("pymodule:mindhive", project="test")
+    assert rec["status"] == "active"            # human never auto-demoted
+    assert rec["flag"] == "needs_review"

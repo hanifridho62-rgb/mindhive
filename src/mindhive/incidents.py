@@ -44,6 +44,30 @@ def _activation_ts(project, signature) -> str | None:
     return None
 
 
+def leaks(project=None, signature=None) -> int:
+    """Count tool_failed events for a signature that occurred AFTER its rule
+    activated — i.e. the same error recurred despite an active rule."""
+    act = _activation_ts(project, signature)
+    if not act:
+        return 0
+    evs = _failures_by_sig(project).get(signature, [])
+    return sum(1 for e in evs if e.ts > act)
+
+
+def _status_and_flag(project, signature, rec, threshold, source):
+    if _has_lifecycle(project, "rule_promoted", signature):
+        return "promoted", ""
+    if rec["occurrences"] < threshold:
+        return "candidate", ""
+    if _has_lifecycle(project, "rule_demoted", signature):
+        return "demoted", ""
+    lk = leaks(project, signature)
+    if source == "auto" and lk >= LEAK_LIMIT:
+        return "demoted", ""
+    flag = "needs_review" if source == "human" and lk >= 1 else ""
+    return "active", flag
+
+
 def audit(project=None, threshold=THRESHOLD) -> dict:
     """Emit a one-time rule_activated event (stamped at the threshold-crossing
     failure's ts) for any signature that has reached the recurrence threshold and
@@ -145,7 +169,7 @@ def derive_active(auto_section: str, human_section: str):
     return "", "none"
 
 
-def _render(signature, rec, status, auto_body, human_body, active, source) -> str:
+def _render(signature, rec, status, auto_body, human_body, active, source, flag="") -> str:
     actions = "\n".join(f"- `{a}`" for a in rec["actions"][:5]) or "- (unknown)"
     sessions = ", ".join(rec["sessions"][:5]) + (
         f" (+{len(rec['sessions']) - 5})" if len(rec["sessions"]) > 5 else "")
@@ -155,6 +179,7 @@ signature: {signature}
 status: {status}
 occurrences: {rec['occurrences']}
 rule_source: {source}
+flag: {flag}
 sessions: {len(rec['sessions'])}
 ---
 
@@ -192,9 +217,9 @@ def project(project=None, threshold=THRESHOLD) -> dict:
             auto_body = secs.get("Auto Evaluation", auto_body) or auto_body
             human_body = secs.get("Human Evaluation", human_body) or human_body
         active, source = derive_active(auto_body, human_body)
-        status = "active" if rec["occurrences"] >= threshold else "candidate"
+        status, flag = _status_and_flag(project, signature, rec, threshold, source)
         path.write_text(_render(signature, rec, status, auto_body, human_body,
-                                active, source), encoding="utf-8")
+                                active, source, flag), encoding="utf-8")
     return {"records": len(acc)}
 
 
@@ -243,7 +268,8 @@ def load(signature, project=None) -> dict:
         return out
     for line in p.read_text(encoding="utf-8").splitlines():
         m = re.match(r"^(\w+):\s*(.*)$", line)
-        if m and m.group(1) in ("signature", "status", "occurrences", "rule_source", "sessions"):
+        if m and m.group(1) in ("signature", "status", "occurrences",
+                                "rule_source", "flag", "sessions"):
             v = m.group(2)
             out[m.group(1)] = int(v) if v.isdigit() else v
         if line.startswith("# Incident:"):
