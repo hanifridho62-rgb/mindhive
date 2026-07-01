@@ -42,3 +42,32 @@ def test_record_file_has_required_sections(tmp_path):
     for section in ("## Raw Signal", "## Auto Evaluation",
                     "## Human Evaluation", "## Active Prevention Rule"):
         assert section in body
+
+
+import json
+from mindhive import failures
+
+
+def test_end_to_end_two_sessions_same_signature_activates(tmp_path):
+    tdir = tmp_path / "tx"
+    tdir.mkdir()
+    def line(tu, cmd, err):
+        return [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": tu, "name": "Bash", "input": {"command": cmd}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tu, "is_error": True, "content": ""}]},
+             "toolUseResult": {"stderr": err, "interrupted": False}},
+        ]
+    (tdir / "s1.jsonl").write_text("\n".join(
+        json.dumps(o) for o in line("a", "python mindhive.py", "No module named 'mindhive'")),
+        encoding="utf-8")
+    (tdir / "s2.jsonl").write_text("\n".join(
+        json.dumps(o) for o in line("b", "python mindhive.py state", "No module named 'mindhive.paths'")),
+        encoding="utf-8")
+
+    failures.capture_dir(str(tdir), project="test")
+    incidents.project(project="test", threshold=2)
+    rec = incidents.load("pymodule:mindhive", project="test")
+    assert rec["occurrences"] == 2
+    assert rec["status"] == "active"
