@@ -275,6 +275,26 @@ def cmd_loop(args) -> int | None:
     return 0 if result["reason"] in ("completed",) else 1
 
 
+def cmd_failures_capture(args) -> int | None:
+    from . import failures as failures_mod, incidents as incidents_mod
+    res = failures_mod.capture_dir(args.transcripts, project=args.project)
+    incidents_mod.project(project=args.project)
+    print(json.dumps(res))
+    return None
+
+
+def cmd_failures_list(args) -> int | None:
+    from . import incidents as incidents_mod
+    acc = incidents_mod._collect(args.project)
+    if not acc:
+        print("(no failures captured yet)")
+        return None
+    for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
+        status = "active" if rec["occurrences"] >= incidents_mod.THRESHOLD else "candidate"
+        print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -414,6 +434,17 @@ def _build_parser() -> argparse.ArgumentParser:
     lp.add_argument("--live", action="store_true", help="stream Claude output")
     lp.add_argument("--force", action="store_true", help="override the LIVE_LOCK guard")
     lp.set_defaults(func=cmd_loop)
+
+    # --- failures (Learning Loop capture stage) ---
+    fp = sub.add_parser("failures", help="capture tool failures + list incidents")
+    fsub = fp.add_subparsers(dest="failures_cmd", required=True)
+    fc = fsub.add_parser("capture", help="scan a transcript dir, store tool_failed events")
+    fc.add_argument("--transcripts", required=True, help="transcript DIRECTORY")
+    fc.add_argument("--project", default=None, help="target namespace")
+    fc.set_defaults(func=cmd_failures_capture)
+    fl = fsub.add_parser("list", help="list incident signatures by occurrence")
+    fl.add_argument("--project", default=None)
+    fl.set_defaults(func=cmd_failures_list)
 
     return p
 
