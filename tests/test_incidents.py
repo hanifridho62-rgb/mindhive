@@ -71,3 +71,47 @@ def test_end_to_end_two_sessions_same_signature_activates(tmp_path):
     rec = incidents.load("pymodule:mindhive", project="test")
     assert rec["occurrences"] == 2
     assert rec["status"] == "active"
+
+
+def test_derive_active_prefers_human():
+    active, src = incidents.derive_active(
+        "- Prevention rule: use -m from repo root",
+        "always cd to repo root first")
+    assert active == "always cd to repo root first"
+    assert src == "human"
+
+
+def test_derive_active_falls_back_to_auto():
+    active, src = incidents.derive_active(
+        "- Prevention rule: use -m from repo root",
+        "<!-- leave blank to accept Auto -->")
+    assert active == "use -m from repo root"
+    assert src == "auto"
+
+
+def test_derive_active_none_when_empty():
+    active, src = incidents.derive_active("", "<!-- blank -->")
+    assert active == ""
+    assert src == "none"
+
+
+def test_reprojection_preserves_human_and_auto():
+    _add_failure("pymodule:mindhive", "python mindhive.py", "s1")
+    _add_failure("pymodule:mindhive", "python mindhive.py state", "s2")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    txt = path.read_text(encoding="utf-8")
+    txt = incidents._replace_section(txt, "Auto Evaluation",
+                                     "- Prevention rule: run with -m from repo root")
+    txt = incidents._replace_section(txt, "Human Evaluation",
+                                     "ALWAYS activate the venv first")
+    path.write_text(txt, encoding="utf-8")
+    _add_failure("pymodule:mindhive", "python x", "s3")
+    incidents.project(project="test", threshold=2)
+    body = path.read_text(encoding="utf-8")
+    assert "run with -m from repo root" in body           # Auto preserved
+    assert "ALWAYS activate the venv first" in body        # Human preserved
+    assert "> ALWAYS activate the venv first" in body      # Active = Human
+    rec = incidents.load("pymodule:mindhive", project="test")
+    assert rec["rule_source"] == "human"
+    assert rec["occurrences"] == 3                          # frontmatter refreshed
