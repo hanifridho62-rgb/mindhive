@@ -1,0 +1,53 @@
+# src/mindhive/reflect.py
+"""Reflection pass: turn one incident into a structured prevention rule.
+
+Pure helpers (build_prompt/parse_reflection) are unit-tested. reflect_incident
+calls an injectable runner; the default shells out to the `claude` CLI on Sonnet
+(mirroring loop/driver.py) and is NOT unit-tested.
+"""
+import json
+import subprocess
+
+MODEL = "claude-sonnet-4-6"
+
+_SYSTEM = (
+    "You are the Reflection Engine. Analyze ONE execution failure and output ONLY "
+    "a JSON object — no prose, no code fences — with keys: root_cause, lesson, "
+    "prevention_rule, task_category. task_category is one of: architecture, syntax, "
+    "git_merge, engine_logic, dependency, tool_use. prevention_rule is a single "
+    "imperative sentence a future agent can follow to avoid this failure."
+)
+
+
+def build_prompt(signature, error_excerpt, actions) -> str:
+    acts = "\n".join(f"- {a}" for a in (actions or [])) or "- (unknown)"
+    return (f"{_SYSTEM}\n\nSIGNATURE: {signature}\nFAILING ACTIONS:\n{acts}\n"
+            f"ERROR:\n{error_excerpt}\n\nReturn the JSON now.")
+
+
+def parse_reflection(text: str) -> dict:
+    """Extract the JSON verdict from a model response, tolerating fences/prose."""
+    if not text:
+        return {}
+    s, e = text.find("{"), text.rfind("}")
+    if s == -1 or e == -1 or e <= s:
+        return {}
+    try:
+        obj = json.loads(text[s:e + 1])
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
+    """Default runner: one-shot headless `claude` call, returns the result text."""
+    argv = ["claude", "--output-format", "json", "--model", MODEL, "-p", prompt]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+    try:
+        return json.loads((proc.stdout or "").strip()).get("result", "") or ""
+    except (json.JSONDecodeError, ValueError):
+        return (proc.stdout or "").strip()
