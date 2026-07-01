@@ -13,6 +13,51 @@ THRESHOLD = 2                       # recurrence gate N (D2)
 _SAFE = re.compile(r"[^a-z0-9]+")
 
 
+LEAK_LIMIT = 2
+
+
+def _failures_by_sig(project) -> dict:
+    """signature -> list of tool_failed Events, in ts order (read_all is sorted)."""
+    out = {}
+    for ev in events.read_all(project):
+        if ev.type != "tool_failed":
+            continue
+        s = ev.payload.get("signature") if isinstance(ev.payload, dict) else None
+        if s:
+            out.setdefault(s, []).append(ev)
+    return out
+
+
+def _has_lifecycle(project, etype, signature) -> bool:
+    for ev in events.read_all(project):
+        if ev.type == etype and isinstance(ev.payload, dict) \
+                and ev.payload.get("signature") == signature:
+            return True
+    return False
+
+
+def _activation_ts(project, signature) -> str | None:
+    for ev in events.read_all(project):
+        if ev.type == "rule_activated" and isinstance(ev.payload, dict) \
+                and ev.payload.get("signature") == signature:
+            return ev.ts
+    return None
+
+
+def audit(project=None, threshold=THRESHOLD) -> dict:
+    """Emit a one-time rule_activated event (stamped at the threshold-crossing
+    failure's ts) for any signature that has reached the recurrence threshold and
+    isn't activated yet. Idempotent."""
+    activated = 0
+    for signature, evs in _failures_by_sig(project).items():
+        if len(evs) >= threshold and not _has_lifecycle(project, "rule_activated", signature):
+            crossing_ts = evs[threshold - 1].ts
+            events.append_event("rule_activated", {"signature": signature},
+                                tags=["lifecycle"], ts=crossing_ts, project=project)
+            activated += 1
+    return {"activated": activated}
+
+
 def _safe_name(signature: str) -> str:
     return _SAFE.sub("-", signature.lower()).strip("-") or "unknown"
 

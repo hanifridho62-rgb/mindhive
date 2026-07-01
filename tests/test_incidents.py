@@ -135,3 +135,26 @@ def test_reconcile_appends_rule_revised_for_human_edits():
 
     # idempotent: re-running with no new edit adds nothing
     assert incidents.reconcile(project="test")["revised"] == 0
+
+
+def _add_failure_ts(sig, action, session, ts):
+    events.append_event("tool_failed",
+                        {"text": f"err {sig}", "signature": sig, "action": action},
+                        session_id=session, tags=["auto", "failure"], ts=ts, project="test")
+
+
+def test_audit_stamps_activation_at_threshold_crossing():
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
+    res = incidents.audit(project="test", threshold=2)
+    assert res["activated"] == 1
+    acts = [e for e in events.read_all("test") if e.type == "rule_activated"]
+    assert len(acts) == 1
+    assert acts[0].payload["signature"] == "pymodule:mindhive"
+    assert acts[0].ts == "2026-07-01T11:00:00Z"          # the 2nd (crossing) failure
+    assert incidents.audit(project="test", threshold=2)["activated"] == 0
+
+
+def test_audit_ignores_below_threshold():
+    _add_failure_ts("pymodule:tools", "x", "s1", "2026-07-01T10:00:00Z")
+    assert incidents.audit(project="test", threshold=2)["activated"] == 0
