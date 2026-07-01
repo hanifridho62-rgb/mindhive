@@ -295,6 +295,43 @@ def cmd_failures_list(args) -> int | None:
     return None
 
 
+def cmd_rules_list(args) -> int | None:
+    from . import incidents as inc
+    acc = inc._collect(args.project)
+    if not acc:
+        print("(no incidents yet)")
+        return None
+    for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
+        status = "active" if rec["occurrences"] >= inc.THRESHOLD else "candidate"
+        print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
+    return None
+
+
+def cmd_rules_show(args) -> int | None:
+    from . import incidents as inc
+    path = inc._incident_dir(args.project) / f"{inc._safe_name(args.signature)}.md"
+    print(path.read_text(encoding="utf-8") if path.exists() else "(no such incident)")
+    return None
+
+
+def cmd_rules_reflect(args) -> int | None:
+    from . import reflect as reflect_mod, incidents as inc
+    acc = inc._collect(args.project)
+    done = 0
+    for signature, rec in acc.items():
+        if rec["occurrences"] >= inc.THRESHOLD:      # active only
+            if reflect_mod.reflect_incident(signature, project=args.project).get("reflected"):
+                done += 1
+    print(json.dumps({"reflected": done}))
+    return None
+
+
+def cmd_rules_reconcile(args) -> int | None:
+    from . import incidents as inc
+    print(json.dumps(inc.reconcile(project=args.project)))
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -445,6 +482,23 @@ def _build_parser() -> argparse.ArgumentParser:
     fl = fsub.add_parser("list", help="list incident signatures by occurrence")
     fl.add_argument("--project", default=None)
     fl.set_defaults(func=cmd_failures_list)
+
+    # --- rules (Learning Loop reflection stage) ---
+    rp = sub.add_parser("rules", help="reflect on incidents; manage prevention rules")
+    rsub = rp.add_subparsers(dest="rules_cmd", required=True)
+    rl = rsub.add_parser("list", help="list incidents by occurrence")
+    rl.add_argument("--project", default=None)
+    rl.set_defaults(func=cmd_rules_list)
+    rsh = rsub.add_parser("show", help="print one incident record")
+    rsh.add_argument("signature")
+    rsh.add_argument("--project", default=None)
+    rsh.set_defaults(func=cmd_rules_show)
+    rr = rsub.add_parser("reflect", help="run the reflection pass over active incidents")
+    rr.add_argument("--project", default=None)
+    rr.set_defaults(func=cmd_rules_reflect)
+    rc = rsub.add_parser("reconcile", help="record human edits as rule_revised events")
+    rc.add_argument("--project", default=None)
+    rc.set_defaults(func=cmd_rules_reconcile)
 
     return p
 
