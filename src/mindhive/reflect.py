@@ -51,3 +51,32 @@ def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
         return json.loads((proc.stdout or "").strip()).get("result", "") or ""
     except (json.JSONDecodeError, ValueError):
         return (proc.stdout or "").strip()
+
+
+from . import incidents
+
+
+def _auto_section(verdict: dict) -> str:
+    return (f"- Root cause: {verdict.get('root_cause', '').strip()}\n"
+            f"- Lesson: {verdict.get('lesson', '').strip()}\n"
+            f"- Prevention rule: {verdict.get('prevention_rule', '').strip()}\n"
+            f"- Category: {verdict.get('task_category', '').strip()}")
+
+
+def reflect_incident(signature, project=None, runner=_claude_runner) -> dict:
+    """Reflect one incident: build a prompt from its Raw Signal, run the model,
+    write the Auto Evaluation section, and re-derive the Active rule."""
+    d = incidents._incident_dir(project)
+    path = d / f"{incidents._safe_name(signature)}.md"
+    if not path.exists():
+        return {"reflected": False, "reason": "no such incident"}
+    secs = incidents._split_sections(path.read_text(encoding="utf-8"))
+    raw = secs.get("Raw Signal", "")
+    verdict = parse_reflection(runner(build_prompt(signature, raw, [])))
+    if not verdict.get("prevention_rule"):
+        return {"reflected": False, "reason": "empty verdict"}
+    txt = incidents._replace_section(path.read_text(encoding="utf-8"),
+                                     "Auto Evaluation", _auto_section(verdict))
+    path.write_text(txt, encoding="utf-8")
+    incidents.project(project)          # re-derive Active + rule_source, preserve sections
+    return {"reflected": True}
