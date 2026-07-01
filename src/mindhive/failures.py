@@ -13,6 +13,22 @@ _ACTION_MAX = 500
 _FILE_TOOLS = ("Edit", "Write", "NotebookEdit")
 _CMD_TOOLS = ("Bash", "PowerShell")
 
+# is_error results that are NOT preventable coding mistakes — transient infra or
+# user choices. Matched case-insensitively as substrings; excluded like
+# `interrupted` (see Plan 1 Task 9 findings).
+_NOISE = (
+    "auto mode cannot determine the safety",
+    "is temporarily unavailable",
+    "the user doesn't want to proceed",
+    "tool use was rejected",
+    "the user chose not to",
+)
+
+
+def _is_noise(text: str) -> bool:
+    low = (text or "").lower()
+    return any(n in low for n in _NOISE)
+
 
 def _block_text(content) -> str:
     """A tool_result block's content is a string or a list of {type,text} parts."""
@@ -46,6 +62,8 @@ def extract_failures(obj) -> list:
         if b.get("is_error") is not True or interrupted:
             continue
         text = (stderr or "").strip() or _block_text(b.get("content")).strip()
+        if _is_noise(text):
+            continue
         out.append({
             "tool_use_id": b.get("tool_use_id"),
             "error_excerpt": text[:_EXCERPT_MAX],

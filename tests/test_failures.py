@@ -86,3 +86,22 @@ def test_capture_is_idempotent(tmp_path):
     assert res2["new_failures"] == 0
     evs = [e for e in events.read_all("test") if e.type == "tool_failed"]
     assert len(evs) == 1
+
+
+def test_model_unavailable_is_not_a_failure():
+    line = _tool_result_line(
+        True, stderr="claude-opus-4-8 is temporarily unavailable, so auto mode "
+                     "cannot determine the safety of Bash right now. Wait briefly")
+    assert failures.extract_failures(line) == []
+
+
+def test_user_rejection_is_not_a_failure():
+    line = _tool_result_line(
+        True, stderr="The user doesn't want to proceed with this tool use. "
+                     "The tool use was rejected")
+    assert failures.extract_failures(line) == []
+
+
+def test_real_failure_still_captured_after_noise_filter():
+    line = _tool_result_line(True, stderr="No module named 'mindhive'")
+    assert len(failures.extract_failures(line)) == 1
