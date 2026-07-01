@@ -35,3 +35,20 @@ def test_fallback_masks_line_numbers_and_paths_so_variants_collapse():
 def test_empty_error_is_stable():
     assert signature("") == signature(None)
     assert signature("").startswith("raw:")
+
+
+def test_real_behavioral_families():
+    assert signature("<tool_use_error>File has not been read yet. Read it first "
+                     "before writing to it.</tool_use_error>") == "edit:not-read"
+    assert signature("<tool_use_error>String to replace not found in file. "
+                     "String: empty = L1OBI(...)</tool_use_error>") == "edit:string-not-found"
+    assert signature("Ripgrep search timed out after 20 seconds. The search may "
+                     "have matched") == "tool:ripgrep-timeout"
+    assert signature("File content (1.5MB) exceeds maximum allowed size (256KB). "
+                     "Use offset and limit") == "read:file-too-large"
+
+
+def test_behavioral_families_take_priority_over_fallback():
+    for err in ("File has not been read yet", "String to replace not found",
+                "Ripgrep search timed out", "exceeds maximum allowed size"):
+        assert not signature(err).startswith("raw:")

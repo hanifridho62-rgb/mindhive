@@ -30,6 +30,18 @@ def signature(error_text) -> str:
     if "SyntaxError" in t:
         return "pysyntax:other"
 
+    # Real behavioral families (the dominant recurring failures in practice —
+    # see the Plan 1 corpus-replay findings), matched case-insensitively.
+    low = t.lower()
+    if "file has not been read yet" in low:
+        return "edit:not-read"
+    if "string to replace not found" in low:
+        return "edit:string-not-found"
+    if "ripgrep search timed out" in low:
+        return "tool:ripgrep-timeout"
+    if "exceeds maximum allowed size" in low:
+        return "read:file-too-large"
+
     # Fallback: hash the first line with volatile bits (numbers, paths) masked so
     # the same error with different line numbers/paths still collapses together.
     first = next((ln for ln in t.splitlines() if ln.strip()), "")
