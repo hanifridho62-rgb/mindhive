@@ -131,11 +131,6 @@ def test_render_html_edges_reflect_real_connections():
 from mindhive import events, paths
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
 def _seed_events():
     return [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="sess1",
@@ -152,8 +147,7 @@ def _append_seed_events():
                             tags=ev.tags, ts=ev.ts)
 
 
-def test_export_writes_graph_html(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_writes_graph_html():
     _append_seed_events()
     out = graphview.export(project=None)
     assert out.exists()
@@ -162,8 +156,7 @@ def test_export_writes_graph_html(tmp_path, monkeypatch):
     assert "session:sess1" in html
 
 
-def test_export_builds_graph_if_missing(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_builds_graph_if_missing():
     d = paths.events_dir()
     d.mkdir(parents=True, exist_ok=True)
     for ev in _seed_events():
@@ -174,8 +167,7 @@ def test_export_builds_graph_if_missing(tmp_path, monkeypatch):
     assert (paths.project_dir() / "graph.json").exists()
 
 
-def test_export_honors_out_path(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_honors_out_path(tmp_path):
     from mindhive.graph import build
     build(project=None, _evs=_seed_events())
     target = tmp_path / "custom.html"
@@ -184,9 +176,8 @@ def test_export_honors_out_path(tmp_path, monkeypatch):
     assert target.exists()
 
 
-def test_export_reflects_newly_appended_events(tmp_path, monkeypatch):
+def test_export_reflects_newly_appended_events():
     """A second export must show events appended after the first export."""
-    _setup(tmp_path, monkeypatch)
     events.append_event("decision", {"text": "first decision"},
                         session_id="sess1", tags=["a"], ts="2026-06-20T09:00:00Z")
     graphview.export(project=None)  # first export (builds + persists graph.json)

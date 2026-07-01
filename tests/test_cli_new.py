@@ -3,13 +3,7 @@ import json
 from mindhive import __main__ as cli_mod, events
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
-def test_cli_briefing(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_cli_briefing(capsys):
     events.append_event("decision", {"text": "cli test decision"},
                         session_id="s", ts="2026-06-20T09:00:00Z")
     ret = cli_mod.main(["briefing"])
@@ -19,8 +13,7 @@ def test_cli_briefing(tmp_path, monkeypatch, capsys):
     assert "BRIEFING.md" in out
 
 
-def test_cli_graph_build(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_cli_graph_build(capsys):
     events.append_event("decision", {"text": "graph build test"},
                         session_id="s", ts="2026-06-20T09:00:00Z",
                         tags=["arch"])
@@ -32,8 +25,7 @@ def test_cli_graph_build(tmp_path, monkeypatch, capsys):
     assert "edges" in data
 
 
-def test_cli_graph_related(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_cli_graph_related(capsys):
     events.append_event("file_touched", {"path": "src/myfile.py"},
                         session_id="s", ts="2026-06-20T09:00:00Z")
     # Build first
@@ -47,7 +39,6 @@ def test_cli_graph_related(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_sync(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
     # Use tmp_path as fake home via monkeypatching Path.home
     from pathlib import Path
     fake_home = tmp_path / "home"
@@ -65,8 +56,7 @@ def test_cli_sync(tmp_path, monkeypatch, capsys):
     assert "MEMORY.md" in out
 
 
-def test_graph_export_writes_html(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_graph_export_writes_html(capsys):
     events.append_event("decision", {"text": "Use TDD"},
                         session_id="sess1", tags=["arch"], ts="2026-06-20T09:02:00Z")
     from mindhive import paths
@@ -77,8 +67,7 @@ def test_graph_export_writes_html(tmp_path, monkeypatch, capsys):
     assert (paths.project_dir() / "graph.html").exists()
 
 
-def test_graph_export_open_invokes_browser(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_graph_export_open_invokes_browser(monkeypatch, capsys):
     events.append_event("decision", {"text": "Use TDD"},
                         session_id="sess1", tags=["arch"], ts="2026-06-20T09:02:00Z")
     import webbrowser
@@ -90,8 +79,7 @@ def test_graph_export_open_invokes_browser(tmp_path, monkeypatch, capsys):
     assert "graph.html" in opened.get("uri", "")
 
 
-def test_cli_plugins_scan_stores_sidecar(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_cli_plugins_scan_stores_sidecar(tmp_path, capsys):
     from tests.test_plugins import make_cache
     from mindhive import plugins
     cache = make_cache(tmp_path)
@@ -105,8 +93,7 @@ def test_cli_plugins_scan_stores_sidecar(tmp_path, monkeypatch, capsys):
     assert not [e for e in events.read_all() if e.type == "plugin_catalog"]
 
 
-def test_cli_plugins_recommend_reads_latest(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_cli_plugins_recommend_reads_latest(tmp_path, capsys):
     from tests.test_plugins import make_cache
     cache = make_cache(tmp_path)
     cli_mod.main(["plugins", "scan", "--cache", str(cache)])
@@ -117,8 +104,7 @@ def test_cli_plugins_recommend_reads_latest(tmp_path, monkeypatch, capsys):
     assert "free-plugin" in out
 
 
-def test_cli_plugins_recommend_without_scan(tmp_path, monkeypatch, capsys):
-    _setup(tmp_path, monkeypatch)
+def test_cli_plugins_recommend_without_scan(capsys):
     ret = cli_mod.main(["plugins", "recommend"])
     assert ret == 0
     out = capsys.readouterr().out

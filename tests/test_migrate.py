@@ -1,10 +1,6 @@
 # tests/test_migrate.py
 from mindhive import migrate, events, projector, paths
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
 SAMPLE = """\
 # FABIO V18
 
@@ -15,8 +11,7 @@ SAMPLE = """\
 INSIDEN 2026-06-15: V17 live died from resource exhaustion. Lesson: pid-file teardown.
 """
 
-def test_import_splits_into_events(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_import_splits_into_events(tmp_path):
     src = tmp_path / "fabio.md"
     src.write_text(SAMPLE, encoding="utf-8")
     n = migrate.import_memory_file(str(src))
@@ -25,8 +20,7 @@ def test_import_splits_into_events(tmp_path, monkeypatch):
     texts = " ".join(e.payload.get("text", "") for e in evs)
     assert "resource exhaustion" in texts
 
-def test_pensyve_disable_writes_flags(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_pensyve_disable_writes_flags(tmp_path):
     cfg = tmp_path / "pensyve-plugin.local.md"
     migrate.disable_pensyve(str(cfg))
     body = cfg.read_text(encoding="utf-8")

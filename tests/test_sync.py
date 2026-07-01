@@ -4,11 +4,6 @@ from mindhive import events, paths
 from mindhive.sync import encode_folder, native_memory_path, sync, USAGE_NOTE
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
 def test_encode_folder_hanif():
     assert encode_folder(r"C:\Users\hanif") == "C--Users-hanif"
 
@@ -26,8 +21,7 @@ def test_native_memory_path_structure(tmp_path):
     assert p == tmp_path / ".claude" / "projects" / "C--Users-hanif" / "memory" / "MEMORY.md"
 
 
-def test_sync_writes_file(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_sync_writes_file(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("state_set",
@@ -39,8 +33,7 @@ def test_sync_writes_file(tmp_path, monkeypatch):
     assert p.name == "MEMORY.md"
 
 
-def test_sync_contains_state_task(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_sync_contains_state_task(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("state_set",
@@ -52,8 +45,7 @@ def test_sync_contains_state_task(tmp_path, monkeypatch):
     assert "My active task" in content
 
 
-def test_sync_contains_usage_note(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_sync_contains_usage_note(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("decision", {"text": "use python"},
@@ -65,8 +57,7 @@ def test_sync_contains_usage_note(tmp_path, monkeypatch):
     assert "END" in content
 
 
-def test_sync_with_briefing(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_sync_with_briefing(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("decision", {"text": "briefing decision"},
@@ -76,8 +67,7 @@ def test_sync_with_briefing(tmp_path, monkeypatch):
     assert "PROJECT BRIEFING" in content
 
 
-def test_sync_no_briefing(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_sync_no_briefing(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("decision", {"text": "no briefing decision"},
@@ -87,10 +77,9 @@ def test_sync_no_briefing(tmp_path, monkeypatch):
     assert "PROJECT BRIEFING" not in content
 
 
-def test_sync_does_not_duplicate_state_block(tmp_path, monkeypatch):
+def test_sync_does_not_duplicate_state_block(tmp_path):
     """With the briefing included, the curated state block must appear once —
     not duplicated by embedding both STATE.md and the briefing's Current state."""
-    _setup(tmp_path, monkeypatch)
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("state_set",
@@ -108,7 +97,6 @@ def test_sync_does_not_duplicate_state_block(tmp_path, monkeypatch):
 def test_sync_reads_event_log_once(tmp_path, monkeypatch):
     """sync must read the event log a single time and reuse it for both the
     STATE and briefing projections (was 2+ full read_all calls)."""
-    _setup(tmp_path, monkeypatch)
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("decision", {"text": "x"},
@@ -125,8 +113,7 @@ def test_sync_reads_event_log_once(tmp_path, monkeypatch):
     assert calls["n"] == 1
 
 
-def test_sync_path_matches_encode_folder(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_sync_path_matches_encode_folder(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     events.append_event("decision", {"text": "x"},
