@@ -267,6 +267,21 @@ def cmd_loop(args) -> int | None:
     if not loop_driver.preflight("claude"):
         print("error: claude CLI not on PATH — install Claude Code first", file=sys.stderr)
         return 2
+    # Bring up the web dashboard automatically for a real run so the loop can be
+    # watched live (init/status/--dry-run returned above, so this fires on runs
+    # only). Best-effort: a launch failure must never abort the loop. Opt out per
+    # run with --no-dashboard, or globally with MINDHIVE_LOOP_DASHBOARD=0.
+    _env = _os.environ.get("MINDHIVE_LOOP_DASHBOARD", "1").lower()
+    if not args.no_dashboard and _env not in ("0", "false", "off", "no"):
+        try:
+            from . import dashboard as _dashboard
+            res = _dashboard.launch_background()
+            if res.get("launched"):
+                print(f"dashboard: {res['url']}")
+            else:
+                print(f"dashboard: not launched ({res.get('reason')})", file=sys.stderr)
+        except Exception as e:  # never let the dashboard disturb the loop
+            print(f"dashboard: not launched ({e})", file=sys.stderr)
     result = loop_engine.run_loop(
         project=None, loop_dir=loop_dir, cfg=cfg,
         driver=loop_driver.CLIDriver("claude"),
@@ -502,6 +517,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="build prompts and show projected math without calling the CLI")
     lp.add_argument("--live", action="store_true", help="stream Claude output")
     lp.add_argument("--force", action="store_true", help="override the LIVE_LOCK guard")
+    lp.add_argument("--no-dashboard", dest="no_dashboard", action="store_true",
+                    help="don't auto-open the web dashboard for this run "
+                         "(also disabled by MINDHIVE_LOOP_DASHBOARD=0)")
     lp.set_defaults(func=cmd_loop)
 
     # --- failures (Learning Loop capture stage) ---
