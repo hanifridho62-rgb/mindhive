@@ -329,6 +329,14 @@ def promote(signature, project=None) -> dict:
     return {"promoted": True}
 
 
+def demote(signature, project=None) -> dict:
+    """Manually demote a rule (leaves injection). Records a rule_demoted event."""
+    events.append_event("rule_demoted", {"signature": signature},
+                        tags=["demote"], project=project)
+    globals()["project"](project)
+    return {"demoted": True}
+
+
 def load(signature, project=None) -> dict:
     """Read back a record's frontmatter as a dict (for tests/inspection)."""
     p = _incident_dir(project) / f"{_safe_name(signature)}.md"

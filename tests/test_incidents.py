@@ -246,3 +246,19 @@ def test_promote_noop_without_active_rule():
     _add_failure_ts("pymodule:tools", "x", "s1", "2026-07-01T10:00:00Z")
     incidents.project(project="test", threshold=2)
     assert incidents.promote("pymodule:tools", project="test")["promoted"] is False
+
+
+def test_manual_demote_sets_status_and_excludes_from_inject():
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", "- Prevention rule: run with -m"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+
+    assert incidents.demote("pymodule:mindhive", project="test")["demoted"] is True
+    rec = incidents.load("pymodule:mindhive", project="test")
+    assert rec["status"] == "demoted"
+    assert "pymodule:mindhive" not in incidents.inject(project="test")
