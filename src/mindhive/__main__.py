@@ -332,6 +332,34 @@ def cmd_rules_reconcile(args) -> int | None:
     return None
 
 
+def cmd_rules_audit(args) -> int | None:
+    from . import incidents as inc
+    res = inc.audit(project=args.project)
+    inc.project(project=args.project)
+    print(json.dumps(res))
+    return None
+
+
+def cmd_rules_inject(args) -> int | None:
+    from . import incidents as inc
+    block = inc.inject(project=args.project)
+    if block:
+        print(block)
+    return None
+
+
+def cmd_rules_promote(args) -> int | None:
+    from . import incidents as inc
+    print(json.dumps(inc.promote(args.signature, project=args.project)))
+    return None
+
+
+def cmd_rules_demote(args) -> int | None:
+    from . import incidents as inc
+    print(json.dumps(inc.demote(args.signature, project=args.project)))
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -496,6 +524,20 @@ def _build_parser() -> argparse.ArgumentParser:
     rr = rsub.add_parser("reflect", help="run the reflection pass over active incidents")
     rr.add_argument("--project", default=None)
     rr.set_defaults(func=cmd_rules_reflect)
+    ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
+    ra.add_argument("--project", default=None)
+    ra.set_defaults(func=cmd_rules_audit)
+    ri = rsub.add_parser("inject", help="print the active prevention-rules block")
+    ri.add_argument("--project", default=None)
+    ri.set_defaults(func=cmd_rules_inject)
+    rpr = rsub.add_parser("promote", help="promote a rule into canonical SOUL.md")
+    rpr.add_argument("signature")
+    rpr.add_argument("--project", default=None)
+    rpr.set_defaults(func=cmd_rules_promote)
+    rdm = rsub.add_parser("demote", help="manually demote a rule")
+    rdm.add_argument("signature")
+    rdm.add_argument("--project", default=None)
+    rdm.set_defaults(func=cmd_rules_demote)
     rc = rsub.add_parser("reconcile", help="record human edits as rule_revised events")
     rc.add_argument("--project", default=None)
     rc.set_defaults(func=cmd_rules_reconcile)
