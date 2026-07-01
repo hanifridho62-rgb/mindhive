@@ -14,7 +14,7 @@ DETERMINISTIC_TYPES = {
     "session_start", "session_end", "compaction",
     "plugin_catalog", "user_prompt", "assistant_response",
     "loop_run_start", "loop_iteration", "loop_run_end",
-    "tool_failed",
+    "tool_failed", "rule_revised",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 

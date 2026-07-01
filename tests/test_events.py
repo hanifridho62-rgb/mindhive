@@ -64,3 +64,12 @@ def test_tool_failed_is_a_valid_deterministic_type():
     ev = events.append_event("tool_failed", {"text": "boom", "signature": "pymodule:x"},
                              session_id="s1", tags=["auto", "failure"], project="test")
     assert ev.type == "tool_failed"
+
+
+def test_rule_revised_is_a_valid_deterministic_type():
+    assert "rule_revised" in events.DETERMINISTIC_TYPES
+    assert "rule_revised" not in events.SEMANTIC_TYPES
+    ev = events.append_event("rule_revised",
+                             {"signature": "pymodule:x", "text": "do Y", "source": "human"},
+                             session_id="s1", tags=["reconcile"], project="test")
+    assert ev.type == "rule_revised"
