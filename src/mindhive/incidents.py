@@ -298,6 +298,37 @@ def inject(project=None) -> str:
     return "\n".join(lines)
 
 
+def soul_path(project=None):
+    return paths.project_dir(project) / "SOUL.md"
+
+
+def _active_rule_for(signature, project):
+    path = _incident_dir(project) / f"{_safe_name(signature)}.md"
+    if not path.exists():
+        return ""
+    secs = _split_sections(path.read_text(encoding="utf-8"))
+    active, _ = derive_active(secs.get("Auto Evaluation", ""),
+                              secs.get("Human Evaluation", ""))
+    return active
+
+
+def promote(signature, project=None) -> dict:
+    """Append a signature's Active rule to the canonical SOUL.md and mark the
+    incident promoted. The only write to canonical memory (human-invoked)."""
+    rule = _active_rule_for(signature, project)
+    if not rule:
+        return {"promoted": False, "reason": "no active rule"}
+    sp = soul_path(project)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    header = "" if sp.exists() else "# SOUL — canonical operating rules\n\n"
+    with open(sp, "a", encoding="utf-8") as f:
+        f.write(f"{header}- [{signature}] {rule}\n")
+    events.append_event("rule_promoted", {"signature": signature, "text": rule},
+                        tags=["promote"], project=project)
+    globals()["project"](project)          # re-project -> status promoted
+    return {"promoted": True}
+
+
 def load(signature, project=None) -> dict:
     """Read back a record's frontmatter as a dict (for tests/inspection)."""
     p = _incident_dir(project) / f"{_safe_name(signature)}.md"

@@ -220,3 +220,29 @@ def test_inject_lists_only_active_rules_with_text():
 
 def test_inject_empty_when_no_active_rules():
     assert incidents.inject(project="test") == ""
+
+
+def test_promote_appends_to_soul_and_marks_promoted():
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", "- Prevention rule: run with -m"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+
+    res = incidents.promote("pymodule:mindhive", project="test")
+    assert res["promoted"] is True
+    soul = incidents.soul_path("test").read_text(encoding="utf-8")
+    assert "run with -m" in soul
+    rec = incidents.load("pymodule:mindhive", project="test")
+    assert rec["status"] == "promoted"
+    # excluded from Quarantine injection once promoted
+    assert "pymodule:mindhive" not in incidents.inject(project="test")
+
+
+def test_promote_noop_without_active_rule():
+    _add_failure_ts("pymodule:tools", "x", "s1", "2026-07-01T10:00:00Z")
+    incidents.project(project="test", threshold=2)
+    assert incidents.promote("pymodule:tools", project="test")["promoted"] is False
