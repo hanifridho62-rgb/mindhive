@@ -455,3 +455,66 @@ def test_sync_falls_back_to_cwd_when_unregistered(dashboard_server, monkeypatch)
     base, token = dashboard_server
     _post(base, "/api/sync", {"project": "never-registered"}, token)
     assert captured["folder"] == os.getcwd()
+
+
+# --- launch_background(): detached background launcher for the loop ----------
+
+def test_stable_url_uses_default_port_and_token(monkeypatch):
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "tok-xyz")
+    url = dashboard.stable_url()
+    assert url == f"http://127.0.0.1:{dashboard.DEFAULT_PORT}/?token=tok-xyz"
+
+
+def test_launch_background_spawns_dashboard_subprocess(monkeypatch):
+    captured = {}
+
+    class _FakeProc:
+        pid = 4321
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "tok-abc")
+    monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
+    res = dashboard.launch_background()
+    assert res["launched"] is True
+    assert res["pid"] == 4321
+    assert "tok-abc" in res["url"]
+    assert captured["argv"][0] == dashboard.sys.executable
+    assert captured["argv"][1:] == ["-m", "mindhive", "dashboard"]
+    assert captured["kwargs"]["stdout"] == dashboard.subprocess.DEVNULL
+
+
+def test_launch_background_passes_explicit_port(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard.subprocess, "Popen",
+                        lambda argv, **kw: captured.update(argv=argv) or type("P", (), {"pid": 1})())
+    dashboard.launch_background(port=0)
+    assert captured["argv"][-2:] == ["--port", "0"]
+
+
+def test_launch_background_uses_platform_detach_flags(monkeypatch):
+    import os as _os
+    captured = {}
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard.subprocess, "Popen",
+                        lambda argv, **kw: captured.update(kw=kw) or type("P", (), {"pid": 1})())
+    dashboard.launch_background()
+    if _os.name == "nt":
+        assert captured["kw"].get("creationflags", 0) != 0
+    else:
+        assert captured["kw"].get("start_new_session") is True
+
+
+def test_launch_background_is_non_fatal_on_spawn_failure(monkeypatch):
+    def boom(argv, **kw):
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard.subprocess, "Popen", boom)
+    res = dashboard.launch_background()
+    assert res["launched"] is False
+    assert "cannot spawn" in res["reason"]

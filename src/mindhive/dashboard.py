@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import subprocess
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -552,6 +554,47 @@ def _auto_harvest_loop(stop_event) -> None:
                       f"across {len(res['projects'])} project(s)", flush=True)
         except Exception:
             pass   # never let the healer disturb the server
+
+
+def stable_url(port: int | None = None, token: str | None = None) -> str:
+    """The dashboard's stable URL for the given (or default) port and token.
+    Kept in one place so the launcher, the server, and any caller all report the
+    identical http://127.0.0.1:<port>/?token=<tok> that a browser will open."""
+    port = DEFAULT_PORT if port is None else port
+    token = token or load_or_create_token()
+    return f"http://127.0.0.1:{port}/?token={token}"
+
+
+def launch_background(port: int | None = None) -> dict:
+    """Spawn `hive dashboard` as a *detached* background process so a caller
+    (e.g. the autonomous loop) can bring the panel up without blocking on
+    serve()'s serve_forever(). The child outlives this process and — thanks to
+    serve()'s fixed-port reuse — a second launch just reopens the same stable URL
+    instead of erroring.
+
+    Best-effort by contract: any spawn failure is swallowed and reported in the
+    return value rather than raised, so a dashboard problem can never abort the
+    caller. Returns {"launched": True, "url": ..., "pid": ...} on success or
+    {"launched": False, "reason": ...} when the spawn could not start.
+    """
+    url = stable_url(port)
+    argv = [sys.executable, "-m", "mindhive", "dashboard"]
+    if port is not None:
+        argv += ["--port", str(port)]
+    # Detach so the child survives this process and doesn't hold its console.
+    kwargs: dict = {"stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(argv, **kwargs)
+    except Exception as e:   # never let a launch failure disturb the caller
+        return {"launched": False, "reason": str(e)}
+    return {"launched": True, "url": url, "pid": proc.pid}
 
 
 def serve(port: int | None = None, open_browser: bool = True,
