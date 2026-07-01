@@ -24,6 +24,22 @@ def test_parse_reflection_returns_empty_on_garbage():
     assert reflect.parse_reflection("") == {}
 
 
+def test_result_text_empty_on_api_error_envelope():
+    # Real 401 seen in the smoke test: is_error true, result is an error string.
+    env = '{"is_error": true, "result": "Failed to authenticate. API Error: 401"}'
+    assert reflect._result_text(env) == ""
+
+
+def test_result_text_returns_result_on_success():
+    env = '{"is_error": false, "result": "{\\"prevention_rule\\": \\"x\\"}"}'
+    assert reflect._result_text(env) == '{"prevention_rule": "x"}'
+
+
+def test_result_text_empty_on_garbage():
+    assert reflect._result_text("not json") == ""
+    assert reflect._result_text("") == ""
+
+
 from mindhive import events, incidents, paths
 
 

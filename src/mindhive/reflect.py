@@ -39,6 +39,19 @@ def parse_reflection(text: str) -> dict:
     return obj if isinstance(obj, dict) else {}
 
 
+def _result_text(stdout: str) -> str:
+    """The model's result text from a `claude --output-format json` envelope, or
+    "" when the envelope is missing, unparseable, or reports is_error (e.g. a 401
+    auth failure — never feed that error string into reflection)."""
+    try:
+        obj = json.loads((stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(obj, dict) or obj.get("is_error"):
+        return ""
+    return obj.get("result", "") or ""
+
+
 def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
     """Default runner: one-shot headless `claude` call, returns the result text."""
     argv = ["claude", "--output-format", "json", "--model", MODEL, "-p", prompt]
@@ -47,10 +60,7 @@ def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return ""
-    try:
-        return json.loads((proc.stdout or "").strip()).get("result", "") or ""
-    except (json.JSONDecodeError, ValueError):
-        return (proc.stdout or "").strip()
+    return _result_text(proc.stdout or "")
 
 
 from . import incidents
