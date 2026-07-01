@@ -22,6 +22,9 @@ _TEMPLATE = """<!DOCTYPE html>
   svg { width: 100%; height: 100%; display: block; cursor: grab; }
   svg.panning { cursor: grabbing; }
   .edge { stroke: #30363d; stroke-width: 1; fill: none; }
+  /* semantic_near edges (embedding-derived) read as dashed violet so they are
+     visually separable from the solid grey structural edges. */
+  .edge.semantic { stroke: #a371f7; stroke-dasharray: 4 3; stroke-opacity: 0.5; }
   .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
   .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
   .hoverlabel { font-size: 11px; pointer-events: none; paint-order: stroke;
@@ -131,8 +134,11 @@ _RENDERER_JS = r"""
   // tag edges pull NOTHING, because the mega-hub tags wire to ~every node and
   // any pull would drag all clumps back into one blob. Nodes are also held to a
   // per-group anchor (see below) so each session settles into its own clump.
+  // semantic_near gets 0 pull like tags: on a richly-embedded namespace these
+  // edges are very dense, and any spring force would drag every clump into one
+  // blob. They are surfaced visually (dashed violet) without steering layout.
   var SPRING_K = { in_session: 0.03, touched: 0.02, next: 0.04,
-                   tagged: 0, shares_tag: 0 };
+                   tagged: 0, shares_tag: 0, semantic_near: 0 };
   var SPRING_REST = 40, ANCHOR_GRAVITY = 0.06, REPULSE = 900;
 
   // The per-frame edge "buzz" rebuilds every edge as a 20-point polyline each
@@ -247,16 +253,26 @@ _RENDERER_JS = r"""
       seen[k] = true;
       rows.push({ color: nodeColor(n), label: KIND_LABELS[k] || k });
     });
-    if (!rows.length) { legend.style.display = "none"; return; }
-    legend.innerHTML = rows.map(function (r) {
+    var html = rows.map(function (r) {
       return "<div class=row><span class=dot style=\"background:" + r.color +
         "\"></span>" + esc(r.label) + "</div>";
     }).join("");
+    // Edge legend: only show the semantic-link key when such edges are present,
+    // drawn as a short dashed line so it reads as an edge, not a node kind.
+    if (edges.some(function (e) { return e.rel === "semantic_near"; })) {
+      html += "<div class=row><span style=\"display:inline-block;width:10px;" +
+        "height:0;border-top:2px dashed #a371f7;margin-right:6px\"></span>" +
+        "semantic link</div>";
+    }
+    if (!html) { legend.style.display = "none"; return; }
+    legend.innerHTML = html;
   })();
 
   var edgeEls = edges.map(function (e) {
     var l = document.createElementNS(NS, "path");
-    l.setAttribute("class", "edge");
+    // Geometry is the only attribute the tick loop rewrites, so styling the
+    // semantic class here persists across frames.
+    l.setAttribute("class", e.rel === "semantic_near" ? "edge semantic" : "edge");
     graphLayer.appendChild(l);
     return l;
   });

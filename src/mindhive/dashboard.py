@@ -311,11 +311,15 @@ def make_handler(token: str):
                         return self._json(hits)
                     return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
                 if route == "/api/graph":
+                    # semantic=True folds the embedding-derived semantic_near edges
+                    # into the interactive graph (degrades to deterministic edges if
+                    # embeddings/deps are absent). Cost scales with ledger size, so a
+                    # large namespace's graph takes longer to build on demand.
                     if am:
                         evs = [e for _, e in all_event_pairs()]
-                        html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs))
+                        html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs, semantic=True))
                     else:
-                        html = graphview.render_html(graph_mod.build(proj))
+                        html = graphview.render_html(graph_mod.build(proj, semantic=True))
                     return self._send(200, html, "text/html; charset=utf-8")
                 if route == "/api/plugins/recommend":
                     if am:
