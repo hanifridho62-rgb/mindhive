@@ -153,6 +153,43 @@ def project(project=None, threshold=THRESHOLD) -> dict:
     return {"records": len(acc)}
 
 
+def _last_revision(project, signature) -> str:
+    """The most recent human rule_revised text for a signature, or ''. """
+    latest = ""
+    for ev in events.read_all(project):
+        if ev.type == "rule_revised" and isinstance(ev.payload, dict) \
+                and ev.payload.get("signature") == signature:
+            latest = ev.payload.get("text", "")
+    return latest
+
+
+def reconcile(project=None) -> dict:
+    """Scan incident files; append a rule_revised event for any Human Evaluation
+    that is non-empty and differs from the last recorded revision. Idempotent."""
+    d = _incident_dir(project)
+    revised = 0
+    if not d.exists():
+        return {"revised": 0}
+    for path in sorted(d.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        secs = _split_sections(text)
+        signature = None
+        for line in text.splitlines():
+            m = re.match(r"^signature:\s*(.+)$", line)
+            if m:
+                signature = m.group(1).strip()
+                break
+        if not signature:
+            continue
+        human = _human_text(secs.get("Human Evaluation", ""))
+        if human and human != _last_revision(project, signature):
+            events.append_event("rule_revised",
+                                {"signature": signature, "text": human, "source": "human"},
+                                tags=["reconcile"], project=project)
+            revised += 1
+    return {"revised": revised}
+
+
 def load(signature, project=None) -> dict:
     """Read back a record's frontmatter as a dict (for tests/inspection)."""
     p = _incident_dir(project) / f"{_safe_name(signature)}.md"

@@ -115,3 +115,23 @@ def test_reprojection_preserves_human_and_auto():
     rec = incidents.load("pymodule:mindhive", project="test")
     assert rec["rule_source"] == "human"
     assert rec["occurrences"] == 3                          # frontmatter refreshed
+
+
+def test_reconcile_appends_rule_revised_for_human_edits():
+    _add_failure("pymodule:mindhive", "python x", "s1")
+    _add_failure("pymodule:mindhive", "python y", "s2")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    txt = incidents._replace_section(path.read_text(encoding="utf-8"),
+                                     "Human Evaluation", "activate venv first")
+    path.write_text(txt, encoding="utf-8")
+
+    res = incidents.reconcile(project="test")
+    assert res["revised"] == 1
+    revs = [e for e in events.read_all("test") if e.type == "rule_revised"]
+    assert revs and revs[0].payload["source"] == "human"
+    assert revs[0].payload["text"] == "activate venv first"
+    assert revs[0].payload["signature"] == "pymodule:mindhive"
+
+    # idempotent: re-running with no new edit adds nothing
+    assert incidents.reconcile(project="test")["revised"] == 0
