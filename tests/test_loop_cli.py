@@ -1,5 +1,6 @@
 # tests/test_loop_cli.py
 import os
+import pytest
 from mindhive.__main__ import main
 
 
@@ -121,3 +122,59 @@ def test_init_and_status_do_not_launch_dashboard(tmp_path, monkeypatch):
     main(["loop", "init"])
     main(["loop", "status"])
     assert calls["launch"] == 0
+
+
+def test_live_lock_refuses_run_and_does_not_launch_dashboard(tmp_path, monkeypatch, capsys):
+    """LIVE_LOCK (V17 live trading) must refuse the run BEFORE spawning the
+    dashboard + its auto-harvest loop. The gate fires with a clean error + exit
+    code 2, not a raw traceback, and nothing with side effects runs."""
+    from mindhive import paths
+    _setup(tmp_path, monkeypatch)
+    main(["loop", "init"])
+    calls = _stub_run(monkeypatch)
+    (paths.store_home() / "LIVE_LOCK").write_text("x", encoding="utf-8")
+    rc = main(["loop"])                 # no --force
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert calls["launch"] == 0         # dashboard NOT spawned during live trading
+    assert calls["run_loop"] == 0       # run refused before the engine
+    assert "LIVE_LOCK" in err
+
+
+def test_live_lock_with_force_allows_launch(tmp_path, monkeypatch):
+    """--force overrides LIVE_LOCK, so the dashboard launches and the loop runs."""
+    from mindhive import paths
+    _setup(tmp_path, monkeypatch)
+    main(["loop", "init"])
+    calls = _stub_run(monkeypatch)
+    (paths.store_home() / "LIVE_LOCK").write_text("x", encoding="utf-8")
+    rc = main(["loop", "--force"])
+    assert rc == 0
+    assert calls["launch"] == 1
+    assert calls["run_loop"] == 1
+
+
+def test_soft_launch_failure_reports_to_stderr(tmp_path, monkeypatch, capsys):
+    """launch_background returning {'launched': False} (graceful soft failure,
+    no exception) still prints a diagnostic to stderr and never aborts the loop."""
+    _setup(tmp_path, monkeypatch)
+    main(["loop", "init"])
+    calls = _stub_run(monkeypatch,
+                      launch_result={"launched": False, "reason": "port in use"})
+    rc = main(["loop"])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert calls["run_loop"] == 1
+    assert "not launched" in err and "port in use" in err
+
+
+@pytest.mark.parametrize("val", ["0", "false", "off", "no", "OFF", "False"])
+def test_env_opt_out_spellings_all_suppress(tmp_path, monkeypatch, val):
+    """Every documented opt-out spelling (case-insensitive) suppresses launch."""
+    _setup(tmp_path, monkeypatch)
+    main(["loop", "init"])
+    monkeypatch.setenv("MINDHIVE_LOOP_DASHBOARD", val)
+    calls = _stub_run(monkeypatch)
+    main(["loop"])
+    assert calls["launch"] == 0
+    assert calls["run_loop"] == 1

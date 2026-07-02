@@ -267,6 +267,16 @@ def cmd_loop(args) -> int | None:
     if not loop_driver.preflight("claude"):
         print("error: claude CLI not on PATH — install Claude Code first", file=sys.stderr)
         return 2
+    # Honor the LIVE_LOCK safety gate BEFORE doing anything with side effects
+    # (dashboard spawn + auto-harvest). run_loop re-checks this as defense in
+    # depth, but gating here means a run refused while V17 is live-trading never
+    # spawns a background server. Clean refusal instead of a raw traceback.
+    from . import guard as _guard
+    try:
+        _guard.ensure_safe(force=args.force)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     # Bring up the web dashboard automatically for a real run so the loop can be
     # watched live (init/status/--dry-run returned above, so this fires on runs
     # only). Best-effort: a launch failure must never abort the loop. Opt out per

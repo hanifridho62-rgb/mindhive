@@ -484,7 +484,10 @@ def test_launch_background_spawns_dashboard_subprocess(monkeypatch):
     assert "tok-abc" in res["url"]
     assert captured["argv"][0] == dashboard.sys.executable
     assert captured["argv"][1:] == ["-m", "mindhive", "dashboard"]
+    # child stdio is fully detached from the parent console (all three streams)
+    assert captured["kwargs"]["stdin"] == dashboard.subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] == dashboard.subprocess.DEVNULL
+    assert captured["kwargs"]["stderr"] == dashboard.subprocess.DEVNULL
 
 
 def test_launch_background_passes_explicit_port(monkeypatch):
