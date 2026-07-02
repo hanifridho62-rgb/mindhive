@@ -277,3 +277,84 @@ def test_promote_is_idempotent():
     assert incidents.promote("pymodule:mindhive", project="test")["promoted"] is False
     soul = incidents.soul_path("test").read_text(encoding="utf-8")
     assert soul.count("run with -m") == 1          # not duplicated
+
+
+# --- summaries(): structured lesson dicts for the Improvements view ---
+
+_VERDICT = ("- Root cause: module run from wrong directory\n"
+            "- Lesson: python -m needs the repo root on sys.path\n"
+            "- Prevention rule: run with -m from the repo root\n"
+            "- Category: tool_use")
+
+
+def _write_auto(sig, body):
+    path = (paths.project_dir("test") / "rules" / "incidents"
+            / f"{incidents._safe_name(sig)}.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", body), encoding="utf-8")
+
+
+def test_summaries_unreflected_record_has_empty_lesson_fields():
+    _add_failure("pymodule:mindhive", "python mindhive.py", "s1")
+    _add_failure("pymodule:mindhive", "python mindhive.py state", "s2")
+    incidents.project(project="test", threshold=2)
+    recs = incidents.summaries(project="test")
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["signature"] == "pymodule:mindhive"
+    assert rec["occurrences"] == 2
+    assert rec["sessions"] == 2
+    assert rec["excerpt"] == "err pymodule:mindhive"
+    assert rec["lesson"] == "" and rec["root_cause"] == ""
+    assert rec["prevention_rule"] == "" and rec["category"] == ""
+    assert rec["rule_source"] == "none" and rec["active_rule"] == ""
+
+
+def test_summaries_parses_reflected_verdict():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    _add_failure("pymodule:mindhive", "y", "s2")
+    incidents.project(project="test", threshold=2)
+    _write_auto("pymodule:mindhive", _VERDICT)
+    rec = incidents.summaries(project="test")[0]
+    assert rec["root_cause"] == "module run from wrong directory"
+    assert rec["lesson"] == "python -m needs the repo root on sys.path"
+    assert rec["prevention_rule"] == "run with -m from the repo root"
+    assert rec["category"] == "tool_use"
+    assert rec["rule_source"] == "auto"
+    assert rec["active_rule"] == "run with -m from the repo root"
+
+
+def test_summaries_human_override_wins():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents"
+            / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Human Evaluation", "always cd to repo root"), encoding="utf-8")
+    rec = incidents.summaries(project="test")[0]
+    assert rec["rule_source"] == "human"
+    assert rec["active_rule"] == "always cd to repo root"
+
+
+def test_summaries_empty_when_no_incident_dir():
+    assert incidents.summaries(project="fresh-nothing") == []
+
+
+def test_summaries_skips_malformed_file_without_raising():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    d = paths.project_dir("test") / "rules" / "incidents"
+    (d / "junk.md").write_text("no frontmatter here\n", encoding="utf-8")
+    recs = incidents.summaries(project="test")
+    assert [r["signature"] for r in recs] == ["pymodule:mindhive"]
+
+
+def test_summaries_multiline_verdict_keeps_first_line():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    _write_auto("pymodule:mindhive",
+                "- Lesson: first line\nsecond line of the lesson\n"
+                "- Prevention rule: one liner")
+    rec = incidents.summaries(project="test")[0]
+    assert rec["lesson"] == "first line"
+    assert rec["prevention_rule"] == "one liner"

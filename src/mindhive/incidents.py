@@ -354,3 +354,61 @@ def load(signature, project=None) -> dict:
         if line.startswith("# Incident:"):
             break
     return out
+
+
+def _auto_field(section: str, name: str) -> str:
+    """One labelled value from an Auto Evaluation body ('- Name: value').
+    Line-wise by format contract: a multi-line value keeps its first line."""
+    m = re.search(rf"{name}:\s*(.+)", section or "", re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _raw_excerpt(section: str) -> str:
+    """The error excerpt line from a Raw Signal body, backtick quoting removed."""
+    m = re.search(r"Error excerpt:\s*(.+)", section or "")
+    return m.group(1).strip().strip("`") if m else ""
+
+
+def summaries(project=None) -> list:
+    """Structured lesson dicts for every incident record — the dashboard's
+    Improvements view reads these. One dict per record: frontmatter status
+    fields plus the parsed Auto Evaluation verdict (empty strings until the
+    reflection pass fills it) and the derived active rule."""
+    out = []
+    d = _incident_dir(project)
+    if not d.exists():
+        return out
+    for path in sorted(d.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm = {}
+        for line in text.splitlines():
+            m = re.match(r"^(\w+):\s*(.*)$", line)
+            if m and m.group(1) in ("signature", "status", "occurrences",
+                                    "rule_source", "flag", "sessions"):
+                v = m.group(2)
+                fm[m.group(1)] = int(v) if v.isdigit() else v
+            if line.startswith("# Incident:"):
+                break
+        if not fm.get("signature"):
+            continue
+        secs = _split_sections(text)
+        auto = secs.get("Auto Evaluation", "")
+        active, source = derive_active(auto, secs.get("Human Evaluation", ""))
+        out.append({
+            "signature": fm["signature"],
+            "status": fm.get("status", ""),
+            "occurrences": fm.get("occurrences", 0),
+            "sessions": fm.get("sessions", 0),
+            "rule_source": source,
+            "flag": fm.get("flag", ""),
+            "excerpt": _raw_excerpt(secs.get("Raw Signal", "")),
+            "root_cause": _auto_field(auto, "Root cause"),
+            "lesson": _auto_field(auto, "Lesson"),
+            "prevention_rule": _auto_rule(auto),
+            "category": _auto_field(auto, "Category"),
+            "active_rule": active,
+        })
+    return out
