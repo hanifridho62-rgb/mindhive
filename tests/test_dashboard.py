@@ -604,3 +604,12 @@ def test_improvements_unexpected_error_returns_500_json(dashboard_server, monkey
         assert e.code == 500
         obj = json.loads(e.read().decode("utf-8"))
         assert obj["ok"] is False and "kaput" in obj["error"]
+
+
+def test_page_has_improvements_view(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    for needle in ("Improvements", "renderImprovements", "paintImprovements",
+                   "impstatus", "impcat"):
+        assert needle in body, f"missing improvements hook: {needle}"

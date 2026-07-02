@@ -63,6 +63,7 @@ def render_page(token: str) -> str:
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
   .hits .snip { white-space:pre-wrap; margin-top:4px; }
   .hits .dup { color:#8a93a6; }
+  .snip.one { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   h2.h { margin:2px 0 12px; font-size:16px; }
 </style></head>
 <body>
@@ -81,6 +82,7 @@ def render_page(token: str) -> str:
     <div class="group">Memory</div>
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
+    <button onclick="showImprovements(true)">Improvements</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -295,6 +297,111 @@ def render_page(token: str) -> str:
     liveFn = renderMemory; run('loading memory', renderMemory);
   }
   function clearSession(){ SESSION = null; showMemory(); }
+
+  // --- Improvements: lessons learned from past failures + manual notes ---
+  // IMP_ITEMS mirrors the /api/improvements shape ({auto, manual}); query and
+  // the two filter selects live outside the view so the 2.5s live refresh
+  // preserves what you typed and picked. IMP_BANNER carries the result line of
+  // the last Reflect run until the view is re-entered from the nav.
+  let IMP_ITEMS = {auto: [], manual: []};
+  let IMP_QUERY = '';
+  let IMP_STATUS = 'all';
+  let IMP_CAT = 'all';
+  let IMP_BANNER = '';
+  async function renderImprovements(){
+    IMP_ITEMS = await apiGet('/api/improvements');
+    paintImprovements();
+  }
+  function fillSelect(id, values, cur){
+    const el = document.getElementById(id);
+    if (!el) return;
+    const opts = ['all'].concat(values);
+    // a selection that vanished from fresh data stays selected (may match nothing)
+    if (cur !== 'all' && !opts.includes(cur)) opts.push(cur);
+    el.innerHTML = opts.map(v => '<option value="'+escAttr(v)+'"'
+      + (v===cur?' selected':'')+'>'+esc(v)+'</option>').join('');
+  }
+  function lessonPills(a){
+    let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
+    if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
+    if (a.rule_source && a.rule_source !== 'none')
+      p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (!a.active_rule) p += (a.status === 'candidate'
+      ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
+      : ' <span class="pill">not yet reflected</span>');
+    return p;
+  }
+  function lessonCard(a, showProj){
+    const head = (showProj && a.project ? esc(a.project)+' \\u00b7 ' : '')
+      + esc(a.signature)+' \\u00b7 '+(a.occurrences||0)+'\\u00d7 \\u00b7 '
+      + (a.sessions||0)+' session'+((a.sessions||0)===1?'':'s');
+    let body = '';
+    if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
+    if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
+    if (a.root_cause) body += '<div class="snip dup">Root cause: '+esc(a.root_cause)+'</div>';
+    if (a.excerpt) body += '<div class="snip dup">'+esc(a.excerpt)+'</div>';
+    return '<li><div class="file">'+head+'</div><div style="margin:4px 0">'
+      + lessonPills(a)+'</div>'+body+'</li>';
+  }
+  function noteRow(m, showProj){
+    return '<li class="noterow" style="cursor:pointer"><div class="file">'
+      + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
+      + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
+      + '</div><div class="snip one">'+esc(m.text||'')+'</div></li>';
+  }
+  function paintImprovements(){
+    const auto = IMP_ITEMS.auto || [], manual = IMP_ITEMS.manual || [];
+    fillSelect('impstatus', [...new Set(auto.map(a=>a.status).filter(Boolean))], IMP_STATUS);
+    fillSelect('impcat', [...new Set(auto.map(a=>a.category).filter(Boolean))], IMP_CAT);
+    const banner = IMP_BANNER
+      ? '<div class="row"><span class="pill">'+esc(IMP_BANNER)+'</span></div>' : '';
+    if (!auto.length && !manual.length) {
+      showText('No lessons yet \\u2014 failures are captured automatically; '
+        + 'recurring ones can be reflected into lessons (Heavy \\u2192 Reflect).');
+      return;
+    }
+    const q = IMP_QUERY.trim().toLowerCase();
+    const lessons = auto.filter(a =>
+      (IMP_STATUS==='all' || a.status===IMP_STATUS)
+      && (IMP_CAT==='all' || a.category===IMP_CAT)
+      && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
+          +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)));
+    const notes = manual.filter(m => !q
+      || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q));
+    if (!lessons.length && !notes.length) {
+      showHTML(banner+'<h2 class="h">No lessons match your filters.</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    let html = banner;
+    html += '<h2 class="h">'+lessons.length+' lesson'+(lessons.length===1?'':'s')
+      + (showProj?' across all projects':'')+'</h2>';
+    html += lessons.length
+      ? '<ul class="hits">'+lessons.map(a=>lessonCard(a, showProj)).join('')+'</ul>'
+      : '<div class="dup">none match</div>';
+    if (notes.length) {
+      html += '<h2 class="h" style="margin-top:16px">'+notes.length+' manual note'
+        + (notes.length===1?'':'s')+'</h2><ul class="hits">'
+        + notes.map(m=>noteRow(m, showProj)).join('')+'</ul>';
+    }
+    showHTML(html);
+    view.querySelectorAll('.noterow .snip').forEach(el =>
+      el.parentElement.onclick = () => el.classList.toggle('one'));
+  }
+  function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
+  function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
+  function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
+  function showImprovements(clearBanner){
+    if (clearBanner) IMP_BANNER = '';
+    controls.innerHTML = '<div class="row">'
+      + '<input id="impq" placeholder="search lessons\\u2026" style="min-width:260px" '
+      + 'value="'+escAttr(IMP_QUERY)+'" oninput="onImpSearch(this.value)">'
+      + '<label>status <select id="impstatus" onchange="onImpStatus(this.value)"></select></label>'
+      + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
+      + '</div>';
+    liveFn = renderImprovements; run('loading improvements', renderImprovements);
+  }
 
   // --- Sessions: the episode layer; click one to scope Memory to it ---
   async function renderSessions(){
