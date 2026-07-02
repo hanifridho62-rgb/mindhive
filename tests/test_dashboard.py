@@ -613,3 +613,122 @@ def test_page_has_improvements_view(dashboard_server):
     for needle in ("Improvements", "renderImprovements", "paintImprovements",
                    "impstatus", "impcat"):
         assert needle in body, f"missing improvements hook: {needle}"
+
+
+# --------------------------------------------------------------------------
+# POST /api/rules/reflect: bounded, guarded reflection from the panel
+# --------------------------------------------------------------------------
+from mindhive import reflect as refl_mod, dashboard as dash_mod
+
+
+def _write_verdict(project, sig):
+    path = (hp.project_dir(project) / "rules" / "incidents"
+            / f"{inc_mod._safe_name(sig)}.md")
+    path.write_text(inc_mod._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Root cause: x\n- Lesson: y\n- Prevention rule: z\n- Category: tool_use"),
+        encoding="utf-8")
+
+
+def test_reflect_happy_path(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:one")
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert status == 200
+    assert obj == {"ok": True, "reflected": 1, "failed": 0, "pending": 0}
+
+
+def test_reflect_skips_already_reflected(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:done")
+    _write_verdict("test", "sig:done")
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert obj["ok"] is True and obj["reflected"] == 0 and obj["pending"] == 0
+    assert calls == []
+
+
+def test_reflect_batch_cap_reports_pending(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    for i in range(5):
+        _seed_incident("test", sig=f"sig:batch{i}")
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect",
+                        {"project": "test", "limit": 3}, token)
+    assert len(calls) == 3
+    assert obj["reflected"] == 3 and obj["pending"] == 2
+
+
+def test_reflect_excludes_candidates(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:single", n=1)      # below threshold
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert obj == {"ok": True, "reflected": 0, "failed": 0, "pending": 0}
+    assert calls == []
+
+
+def test_reflect_rejects_concurrent_run(dashboard_server):
+    base, token = dashboard_server
+    assert dash_mod._REFLECT_LOCK.acquire(blocking=False)
+    try:
+        status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+        assert status == 200
+        assert obj["ok"] is False and "already running" in obj["error"]
+    finally:
+        dash_mod._REFLECT_LOCK.release()
+
+
+def test_reflect_all_failed_missing_cli_is_domain_rejection(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:nocli")
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: {"reflected": False,
+                                                   "reason": "empty verdict"})
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "claude CLI unavailable" in obj["error"]
+
+
+def test_reflect_noop_on_empty_store(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect", {"project": "bare"}, token)
+    assert obj == {"ok": True, "reflected": 0, "failed": 0, "pending": 0}
+
+
+def test_reflect_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect", {"project": "*"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "read-only" in obj["error"]
+
+
+def test_reflect_unexpected_error_returns_500(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:boom")
+
+    def boom(sig, project=None):
+        raise RuntimeError("reflector exploded")
+
+    monkeypatch.setattr(refl_mod, "reflect_incident", boom)
+    url = f"{base}/api/rules/reflect?token={token}"
+    data = json.dumps({"project": "test"}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "expected 500"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "exploded" in obj["error"]

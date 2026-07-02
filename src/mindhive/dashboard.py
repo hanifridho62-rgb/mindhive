@@ -28,6 +28,14 @@ from .dashboard_page import render_page
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
 DEFAULT_PORT = 54461
 
+# One reflection batch at a time: a second Reflect click while one is running
+# would double token spend and race two writers over the same incident files.
+_REFLECT_LOCK = threading.Lock()
+
+# Reflect batch size per request. Each incident is one `claude` CLI call (up
+# to 120s), so an unbounded batch could outlive the browser's fetch timeout.
+REFLECT_BATCH_LIMIT = 3
+
 
 def _token_path():
     return paths.store_home() / "dashboard.token"
@@ -443,6 +451,41 @@ def make_handler(token: str):
             return self._json({"ok": True, "scanned": res["scanned"],
                                "age_hours": res["age_hours"], "result": res["payload"]})
 
+        def _post_rules_reflect(self, proj, body):
+            # Reflect a bounded batch of active, not-yet-reflected incidents
+            # into structured lessons. Candidates (below the recurrence
+            # threshold) wait until they recur; already-reflected records are
+            # skipped (the CLI's `hive rules reflect` re-reflects everything —
+            # this endpoint deliberately does not).
+            import shutil
+            from . import incidents, reflect as reflect_mod
+            limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "reflection already running"}, 200)
+            try:
+                # self-heal a stale or missing incident projection first
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+                eligible = [
+                    s["signature"] for s in incidents.summaries(proj)
+                    if s["status"] == "active" and s["rule_source"] == "none"
+                ]
+                reflected = failed = 0
+                for signature in eligible[:max(0, limit)]:
+                    if reflect_mod.reflect_incident(signature, project=proj).get("reflected"):
+                        reflected += 1
+                    else:
+                        failed += 1
+                if failed and not reflected and not shutil.which("claude"):
+                    return self._json({"ok": False, "error":
+                        "claude CLI unavailable — reflection needs it on PATH"}, 200)
+                return self._json({"ok": True, "reflected": reflected,
+                                   "failed": failed,
+                                   "pending": len(eligible) - reflected})
+            finally:
+                _REFLECT_LOCK.release()
+
         def _post_selftest(self, proj, body):
             from . import selftest as selftest_mod
             code = selftest_mod.run()
@@ -500,6 +543,7 @@ def make_handler(token: str):
             "/api/embed": _post_embed,
             "/api/plugins/scan": _post_plugins_scan,
             "/api/plugins/autoscan": _post_plugins_autoscan,
+            "/api/rules/reflect": _post_rules_reflect,
             "/api/selftest": _post_selftest,
         }
 

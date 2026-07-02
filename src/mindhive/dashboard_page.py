@@ -99,6 +99,7 @@ def render_page(token: str) -> str:
     <div class="group">Heavy</div>
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
+    <button onclick="runReflect()">Reflect (learn from failures)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -388,6 +389,21 @@ def render_page(token: str) -> str:
     showHTML(html);
     view.querySelectorAll('.noterow .snip').forEach(el =>
       el.parentElement.onclick = () => el.classList.toggle('one'));
+  }
+  // Reflect keeps the Heavy confirm (token spend) but lands back on the
+  // Improvements view with an inline result banner instead of confirmAction's
+  // full-panel JSON dump.
+  async function runReflect(){
+    if(!confirm('Reflect (learn from failures) \\u2014 runs the claude CLI once '
+      + 'per recurring incident (a few per click). Continue?')) return;
+    await run('reflecting\\u2026', async () => {
+      const res = await apiPost('/api/rules/reflect', {});
+      IMP_BANNER = res.ok
+        ? ('Reflect: '+res.reflected+' reflected \\u00b7 '+res.failed
+           +' failed \\u00b7 '+res.pending+' pending')
+        : (res.error || 'reflection failed');
+    });
+    showImprovements();
   }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
