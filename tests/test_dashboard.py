@@ -521,3 +521,86 @@ def test_launch_background_is_non_fatal_on_spawn_failure(monkeypatch):
     res = dashboard.launch_background()
     assert res["launched"] is False
     assert "cannot spawn" in res["reason"]
+
+
+# --------------------------------------------------------------------------
+# /api/improvements: lessons learned (auto incidents + manual caveats)
+# --------------------------------------------------------------------------
+from mindhive import events as ev_mod, incidents as inc_mod
+
+
+def _seed_incident(project, sig="pymodule:mindhive", n=2):
+    for i in range(n):
+        ev_mod.append_event("tool_failed",
+                            {"text": f"err {sig}", "signature": sig,
+                             "action": f"cmd{i}"},
+                            session_id=f"s{i}", tags=["auto", "failure"],
+                            project=project)
+    inc_mod.audit(project=project)
+    inc_mod.project(project=project)
+
+
+def test_improvements_returns_auto_and_manual(dashboard_server):
+    base, token = dashboard_server
+    _seed_incident("test")
+    ev_mod.append_event("caveat", {"text": "never run embed while V17 trades"},
+                        session_id="s9", project="test")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert len(obj["auto"]) == 1
+    a = obj["auto"][0]
+    assert a["signature"] == "pymodule:mindhive"
+    assert a["occurrences"] == 2
+    assert a["source"] == "auto" and a["project"] == "test"
+    assert a["status"] == "active"
+    assert a["lesson"] == ""                     # not yet reflected
+    assert a["excerpt"].startswith("err ")
+    assert len(obj["manual"]) == 1
+    m = obj["manual"][0]
+    assert m["source"] == "manual" and "V17" in m["text"]
+
+
+def test_improvements_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/improvements")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_improvements_empty_store_returns_empty_lists(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/api/improvements?project=nothing-here", token)
+    assert status == 200
+    assert json.loads(body) == {"auto": [], "manual": []}
+
+
+def test_improvements_hivemind_aggregates_projects(dashboard_server):
+    base, token = dashboard_server
+    ev_mod.append_event("caveat", {"text": "p1 lesson about flaky socket"},
+                        session_id="a", project="p1")
+    ev_mod.append_event("caveat", {"text": "p2 note on schema drift"},
+                        session_id="b", project="p2")
+    status, body = _get(base, "/api/improvements?project=*", token)
+    assert status == 200
+    obj = json.loads(body)
+    projects = {m["project"] for m in obj["manual"]}
+    assert {"p1", "p2"} <= projects
+
+
+def test_improvements_unexpected_error_returns_500_json(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+
+    def boom(project=None):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(inc_mod, "summaries", boom)
+    try:
+        _get(base, "/api/improvements?project=test", token)
+        assert False, "expected 500"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "kaput" in obj["error"]

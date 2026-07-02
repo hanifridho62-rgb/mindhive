@@ -281,6 +281,29 @@ def make_handler(token: str):
                 for n, e in rows
             ]))
 
+        def _get_improvements(self, proj, am, qs):
+            # Lessons learned: machine-learned incident lessons (auto) plus
+            # user-dictated caveat notes (manual), kept as two shapes so long
+            # status memos can't masquerade as lesson cards.
+            from . import incidents
+            names = _all_projects() if am else [proj]
+            auto, manual = [], []
+            for n in names:
+                for s in incidents.summaries(n):
+                    auto.append(dict(s, project=n, source="auto"))
+                for e in events.read_all(n):
+                    if e.type != "caveat":
+                        continue
+                    manual.append({
+                        "ts": e.ts, "type": e.type, "session": e.session_id,
+                        "project": n, "source": "manual", "tags": e.tags,
+                        "text": (e.payload.get("text", "")
+                                 if isinstance(e.payload, dict) else str(e.payload)),
+                    })
+            auto.sort(key=lambda s: s.get("occurrences", 0), reverse=True)
+            manual.sort(key=lambda m: m.get("ts") or "", reverse=True)
+            return self._json({"auto": auto, "manual": dedupe.collapse(manual)})
+
         def _get_sessions(self, proj, am, qs):
             by: dict = {}
             for name, e in event_pairs(proj, am):
@@ -462,6 +485,7 @@ def make_handler(token: str):
             "/api/verify": _get_verify,
             "/api/overview": _get_overview,
             "/api/memory": _get_memory,
+            "/api/improvements": _get_improvements,
             "/api/sessions": _get_sessions,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
