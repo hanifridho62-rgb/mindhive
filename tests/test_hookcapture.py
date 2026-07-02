@@ -8,11 +8,6 @@ import json
 from mindhive import hookcapture, events, paths
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
 def test_extract_file_touched_for_edit_write_notebook():
     for tool in ("Edit", "Write", "NotebookEdit"):
         payload = {"tool_name": tool, "tool_input": {"file_path": "src/foo.py"}}
@@ -33,8 +28,7 @@ def test_extract_ignores_unknown_tools_and_missing_fields():
     assert hookcapture.extract_events({}) == []
 
 
-def test_record_appends_events_with_session_and_auto_tag(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_record_appends_events_with_session_and_auto_tag():
     raw = json.dumps({"session_id": "sess-1", "tool_name": "Edit",
                       "tool_input": {"file_path": "a/b.py"}})
     res = hookcapture.record_post_tool_use(raw, project="test")
@@ -47,8 +41,7 @@ def test_record_appends_events_with_session_and_auto_tag(tmp_path, monkeypatch):
     assert evs[0].payload.get("text") == "a/b.py"
 
 
-def test_malformed_payload_is_logged_not_raised(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_malformed_payload_is_logged_not_raised():
     res = hookcapture.record_post_tool_use("this is not json{", project="test")
     assert res.get("error")                       # returned, not raised
     log = paths.store_home() / "hooks_errors.log"
@@ -56,7 +49,6 @@ def test_malformed_payload_is_logged_not_raised(tmp_path, monkeypatch):
     assert "post_tool_use" in log.read_text(encoding="utf-8")
 
 
-def test_empty_input_is_noop(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_empty_input_is_noop():
     assert hookcapture.record_post_tool_use("", project="test") == {"appended": 0}
     assert hookcapture.record_post_tool_use("   ", project="test") == {"appended": 0}

@@ -137,14 +137,14 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     for idx, ev in enumerate(sem_evs):
         for tag in (ev.tags or []):
             tag_to_idx[tag].append(idx)  # appended in ascending idx order
-    seen_pairs: set[tuple[int, int]] = set()
+    seen_tag_pairs: set[tuple[int, int]] = set()
     for idxs in tag_to_idx.values():
         for x in range(len(idxs)):
             for y in range(x + 1, len(idxs)):
                 i, j = idxs[x], idxs[y]  # i < j (idxs ascending)
-                if (i, j) in seen_pairs:  # dedupe pairs sharing multiple tags
+                if (i, j) in seen_tag_pairs:  # dedupe pairs sharing multiple tags
                     continue
-                seen_pairs.add((i, j))
+                seen_tag_pairs.add((i, j))
                 add_edge(_ev_id(sem_evs[i]), _ev_id(sem_evs[j]), "shares_tag")
 
     # Expand the latest plugin_catalog snapshot (a sidecar file, not a ledger
@@ -160,7 +160,7 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
 
             ledger = build_ledger_entries(evs)  # [(fname, content, ev), ...]
             fname_to_evid = {fn: _ev_id(ev) for fn, _c, ev in ledger}
-            seen_pairs: set[tuple[str, str]] = set()
+            seen_sem_pairs: set[tuple[str, str]] = set()
             for fn, _c, ev in ledger:
                 src_id = _ev_id(ev)
                 body = ev.payload.get("text", "") if isinstance(ev.payload, dict) else str(ev.payload)
@@ -171,9 +171,9 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
                     if not tgt_id or tgt_id == src_id:
                         continue
                     pair = tuple(sorted((src_id, tgt_id)))
-                    if pair in seen_pairs:
+                    if pair in seen_sem_pairs:
                         continue
-                    seen_pairs.add(pair)
+                    seen_sem_pairs.add(pair)
                     add_edge(pair[0], pair[1], "semantic_near")
         except Exception:
             pass  # deps missing / LIVE_LOCK / not embedded -> deterministic edges only

@@ -23,9 +23,9 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive embed [--force]` — build the on-demand vector index
 - `hive selftest` — run the test suite
 - `hive loop init` — scaffold `.hive-loop/` (PROMPT.md, fix_plan.md, AGENT.md, loop.toml) and check the `claude` CLI
-- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker
+- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker. A real run also **auto-opens the web dashboard** so you can watch it live — opt out with `--no-dashboard` or `MINDHIVE_LOOP_DASHBOARD=0`
 - `hive loop status` — summarize the last loop run
-- `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI
+- `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI (no dashboard is opened)
 - **`/circle`** — the in-session front door to `hive loop`: type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
 
 ## Install the `/circle` plugin (global)

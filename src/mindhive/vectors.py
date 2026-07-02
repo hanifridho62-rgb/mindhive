@@ -1,6 +1,9 @@
 # src/mindhive/vectors.py
+import logging
+
 from . import paths, guard
 
+_log = logging.getLogger("mindhive.vectors")
 _MODEL = None
 
 
@@ -39,10 +42,15 @@ def embed(project=None, force=False) -> dict:
     col = _collection(project)
     ids = [f.name for f in files]
     docs = [f.read_text(encoding="utf-8") for f in files]
+    # Best-effort delete-before-add so a reembed refreshes rather than
+    # duplicates. On the first embed the ids don't exist yet; tolerate that but
+    # surface any real failure instead of hiding it (a silently-failed delete
+    # could otherwise leave stale vectors behind).
     try:
         col.delete(ids=ids)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 — best-effort, but logged not swallowed
+        _log.warning("vectors: delete-before-reembed failed for %s ids in %s: %s",
+                     len(ids), project, e)
     col.add(ids=ids, documents=docs, embeddings=enc(docs))
     return {"embedded": len(files)}
 

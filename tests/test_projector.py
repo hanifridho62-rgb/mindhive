@@ -1,12 +1,8 @@
 # tests/test_projector.py
 from mindhive import events, projector, paths
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
-def test_state_reflects_latest_state_set(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_state_reflects_latest_state_set():
     events.append_event("state_set",
                         {"task": "OLD", "next_step": "x", "open_questions": []},
                         session_id="s", ts="2026-06-20T09:00:00Z")
@@ -25,8 +21,7 @@ def test_state_reflects_latest_state_set(tmp_path, monkeypatch):
     assert "perp feed?" in state
     assert "default OFF" in state
 
-def test_ledger_one_file_per_semantic_event(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_ledger_one_file_per_semantic_event():
     events.append_event("decision", {"text": "d1"}, session_id="s",
                         ts="2026-06-20T10:00:00Z", tags=["strategy"])
     events.append_event("caveat", {"text": "c1"}, session_id="s",
@@ -38,8 +33,7 @@ def test_ledger_one_file_per_semantic_event(tmp_path, monkeypatch):
     files = list(ldir.glob("*.md"))
     assert len(files) == 2  # deterministic events are NOT ledger entries
 
-def test_projection_is_idempotent(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_projection_is_idempotent():
     events.append_event("decision", {"text": "d1"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
     projector.project()
@@ -48,8 +42,7 @@ def test_projection_is_idempotent(tmp_path, monkeypatch):
     second = (paths.project_dir() / "STATE.md").read_text(encoding="utf-8")
     assert first == second
 
-def test_index_maps_tags(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_index_maps_tags():
     events.append_event("decision", {"text": "d1"}, session_id="s",
                         ts="2026-06-20T10:00:00Z", tags=["ofi"])
     projector.project()

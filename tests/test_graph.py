@@ -4,11 +4,6 @@ from mindhive import events, paths
 from mindhive.graph import build, related, _ev_id
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
 def _make_evs():
     """Craft a deterministic set of events for graph tests."""
     return [
@@ -31,24 +26,21 @@ def _make_evs():
     ]
 
 
-def test_build_creates_session_nodes(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_creates_session_nodes():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     node_ids = {n["id"] for n in g["nodes"]}
     assert "session:sess1" in node_ids
 
 
-def test_build_creates_file_nodes(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_creates_file_nodes():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     node_ids = {n["id"] for n in g["nodes"]}
     assert "file:src/foo.py" in node_ids
 
 
-def test_build_creates_tag_nodes(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_creates_tag_nodes():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     node_ids = {n["id"] for n in g["nodes"]}
@@ -56,8 +48,7 @@ def test_build_creates_tag_nodes(tmp_path, monkeypatch):
     assert "tag:arch" in node_ids
 
 
-def test_build_creates_event_nodes(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_creates_event_nodes():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     node_ids = {n["id"] for n in g["nodes"]}
@@ -65,8 +56,7 @@ def test_build_creates_event_nodes(tmp_path, monkeypatch):
     assert _ev_id(evs[2]) in node_ids
 
 
-def test_build_event_nodes_carry_kind_and_text(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_event_nodes_carry_kind_and_text():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     nodes = {n["id"]: n for n in g["nodes"]}
@@ -79,8 +69,7 @@ def test_build_event_nodes_carry_kind_and_text(tmp_path, monkeypatch):
     assert "text" not in ft
 
 
-def test_build_in_session_edges(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_in_session_edges():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
@@ -88,16 +77,14 @@ def test_build_in_session_edges(tmp_path, monkeypatch):
     assert (_ev_id(evs[2]), "session:sess1", "in_session") in edges
 
 
-def test_build_touched_edges(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_touched_edges():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
     assert (_ev_id(evs[1]), "file:src/foo.py", "touched") in edges
 
 
-def test_build_tagged_edges(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_tagged_edges():
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
@@ -107,9 +94,8 @@ def test_build_tagged_edges(tmp_path, monkeypatch):
     assert (_ev_id(evs[2]), "tag:arch", "tagged") in edges
 
 
-def test_build_next_edges(tmp_path, monkeypatch):
+def test_build_next_edges():
     """Consecutive semantic events get a 'next' edge."""
-    _setup(tmp_path, monkeypatch)
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
@@ -117,9 +103,8 @@ def test_build_next_edges(tmp_path, monkeypatch):
     assert (_ev_id(evs[2]), _ev_id(evs[3]), "next") in edges
 
 
-def test_build_shares_tag_edges(tmp_path, monkeypatch):
+def test_build_shares_tag_edges():
     """Pairs of semantic events sharing >=1 tag get shares_tag edge."""
-    _setup(tmp_path, monkeypatch)
     evs = _make_evs()
     g = build(project=None, _evs=evs)
     edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
@@ -131,10 +116,9 @@ def test_build_shares_tag_edges(tmp_path, monkeypatch):
     assert found
 
 
-def test_distinct_events_same_ts_type_do_not_collide(tmp_path, monkeypatch):
+def test_distinct_events_same_ts_type_do_not_collide():
     """Two different events sharing a timestamp AND type must not overwrite each
     other — the node id includes a payload hash to keep them distinct."""
-    _setup(tmp_path, monkeypatch)
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="decision",
                      payload={"text": "alpha"}, tags=[]),
@@ -149,8 +133,7 @@ def test_distinct_events_same_ts_type_do_not_collide(tmp_path, monkeypatch):
     assert _ev_id(evs[0]) != _ev_id(evs[1])
 
 
-def test_build_persists_graph_json(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_persists_graph_json():
     evs = _make_evs()
     build(project=None, _evs=evs)
     graph_file = paths.project_dir() / "graph.json"
@@ -159,16 +142,14 @@ def test_build_persists_graph_json(tmp_path, monkeypatch):
     assert "nodes" in data and "edges" in data
 
 
-def test_build_semantic_false_no_error(tmp_path, monkeypatch):
+def test_build_semantic_false_no_error():
     """semantic=False must never fail even if vector deps missing."""
-    _setup(tmp_path, monkeypatch)
     evs = _make_evs()
     g = build(project=None, semantic=False, _evs=evs)
     assert "nodes" in g
 
 
-def test_related_finds_file_node(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_related_finds_file_node():
     evs = _make_evs()
     build(project=None, _evs=evs)
     neighbors = related("foo.py", project=None)
@@ -178,8 +159,7 @@ def test_related_finds_file_node(tmp_path, monkeypatch):
     assert any("foo" in nid for nid in ids)
 
 
-def test_related_returns_event_that_touched_file(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_related_returns_event_that_touched_file():
     evs = _make_evs()
     build(project=None, _evs=evs)
     # Query the file path substring
@@ -188,8 +168,7 @@ def test_related_returns_event_that_touched_file(tmp_path, monkeypatch):
     assert _ev_id(evs[1]) in ids
 
 
-def test_related_sorted_by_id(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_related_sorted_by_id():
     evs = _make_evs()
     build(project=None, _evs=evs)
     neighbors = related("python", project=None)
@@ -197,8 +176,7 @@ def test_related_sorted_by_id(tmp_path, monkeypatch):
     assert ids == sorted(ids)
 
 
-def test_related_includes_event_text(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_related_includes_event_text():
     evs = _make_evs()
     build(project=None, _evs=evs)
     neighbors = related("decision", project=None)
@@ -233,8 +211,7 @@ def _seed_catalog(scanned_at, project=None):
     plugins._write_catalog(_catalog_event(scanned_at, scanned_at).payload, project=project)
 
 
-def test_plugin_catalog_expands_into_nodes(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_plugin_catalog_expands_into_nodes():
     _seed_catalog("2026-06-21T10:00:00Z")
     g = build(project=None, _evs=[])
     ids = {n["id"] for n in g["nodes"]}
@@ -246,8 +223,7 @@ def test_plugin_catalog_expands_into_nodes(tmp_path, monkeypatch):
     assert not any(nid.startswith("ev:") and "plugin_catalog" in nid for nid in ids)
 
 
-def test_plugin_catalog_edges(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_plugin_catalog_edges():
     _seed_catalog("2026-06-21T10:00:00Z")
     g = build(project=None, _evs=[])
     edges = {(e["src"], e["dst"], e["rel"]) for e in g["edges"]}
@@ -256,8 +232,7 @@ def test_plugin_catalog_edges(tmp_path, monkeypatch):
     assert ("recommendation:2026-06-21T10:00:00Z", "plugin:mkt/free-plugin", "recommends") in edges
 
 
-def test_latest_plugin_catalog_supersedes(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_latest_plugin_catalog_supersedes():
     # the sidecar is overwritten in place — only the most recent snapshot remains
     _seed_catalog("2026-06-21T10:00:00Z")
     _seed_catalog("2026-06-21T11:00:00Z")

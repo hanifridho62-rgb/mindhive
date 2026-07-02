@@ -371,6 +371,9 @@ def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
 
 
 def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
+    # Local import: the Learning-Loop capture stage. Kept local so importing
+    # harvest stays cheap and there is no import-time coupling.
+    from . import failures, incidents
     root = claude_projects_root()
     known = set(existing_projects()) if known_only else None
     per_project: dict = {}
@@ -387,9 +390,18 @@ def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
                 skipped_unknown.add(proj)
                 continue
             r = harvest(d, proj, now=now, skip_captured=skip_captured)
-            if r["new_events"]:
-                acc = per_project.setdefault(proj, {"new_events": 0, "dirs": 0})
+            # Also capture tool FAILURES and advance the incident lifecycle, so
+            # the Learning Loop self-feeds from the same automatic sweep instead
+            # of requiring a manual `hive failures capture`.
+            fr = failures.capture_dir(str(d), project=proj, now=now)
+            if fr.get("new_failures"):
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+            if r["new_events"] or fr.get("new_failures"):
+                acc = per_project.setdefault(
+                    proj, {"new_events": 0, "new_failures": 0, "dirs": 0})
                 acc["new_events"] += r["new_events"]
+                acc["new_failures"] += fr.get("new_failures", 0)
                 acc["dirs"] += 1
                 total_new += r["new_events"]
     return {"projects": per_project, "total_new": total_new,
