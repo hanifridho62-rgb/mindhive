@@ -339,21 +339,28 @@ def demote(signature, project=None) -> dict:
     return {"demoted": True}
 
 
-def load(signature, project=None) -> dict:
-    """Read back a record's frontmatter as a dict (for tests/inspection)."""
-    p = _incident_dir(project) / f"{_safe_name(signature)}.md"
+_FM_KEYS = ("signature", "status", "occurrences", "rule_source", "flag", "sessions")
+
+
+def _frontmatter(text: str) -> dict:
+    """Parse an incident record's frontmatter fields from its text."""
     out = {}
-    if not p.exists():
-        return out
-    for line in p.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         m = re.match(r"^(\w+):\s*(.*)$", line)
-        if m and m.group(1) in ("signature", "status", "occurrences",
-                                "rule_source", "flag", "sessions"):
+        if m and m.group(1) in _FM_KEYS:
             v = m.group(2)
             out[m.group(1)] = int(v) if v.isdigit() else v
         if line.startswith("# Incident:"):
             break
     return out
+
+
+def load(signature, project=None) -> dict:
+    """Read back a record's frontmatter as a dict (for tests/inspection)."""
+    p = _incident_dir(project) / f"{_safe_name(signature)}.md"
+    if not p.exists():
+        return {}
+    return _frontmatter(p.read_text(encoding="utf-8"))
 
 
 def _auto_field(section: str, name: str) -> str:
@@ -383,15 +390,7 @@ def summaries(project=None) -> list:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        fm = {}
-        for line in text.splitlines():
-            m = re.match(r"^(\w+):\s*(.*)$", line)
-            if m and m.group(1) in ("signature", "status", "occurrences",
-                                    "rule_source", "flag", "sessions"):
-                v = m.group(2)
-                fm[m.group(1)] = int(v) if v.isdigit() else v
-            if line.startswith("# Incident:"):
-                break
+        fm = _frontmatter(text)
         if not fm.get("signature"):
             continue
         secs = _split_sections(text)
