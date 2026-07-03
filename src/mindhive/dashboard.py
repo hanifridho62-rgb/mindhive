@@ -7,6 +7,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -106,6 +107,76 @@ def _project_stats(name: str) -> dict:
             auto += 1
     return {"name": name, "events": len(evs), "memory": mem, "auto": auto,
             "sessions": len(sessions), "last_ts": evs[-1].ts if evs else None}
+
+
+# --- Improvements efficiency strip ----------------------------------------
+# Failure rate = tool_failed per 100 tool actions. The denominator is tool
+# activity only — user_prompt/assistant_response are logged for every exchange
+# and would make the rate track conversation length instead of tool behavior.
+_TOOL_ACTION_TYPES = ("command_run", "file_touched", "tool_failed")
+_EFF_WINDOWS = (("day", 86400), ("week", 7 * 86400),
+                ("month", 30 * 86400), ("quarter", 90 * 86400))
+LOW_SAMPLE_FLOOR = 20     # tool actions per window below which a % is noise
+
+
+def _iso_utc(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(epoch)) + "Z"
+
+
+def _empty_tallies() -> dict:
+    # window -> [cur_failures, cur_actions, prev_failures, prev_actions]
+    return {key: [0, 0, 0, 0] for key, _ in _EFF_WINDOWS}
+
+
+def _add_tallies(tallies: dict, evs, now: float) -> None:
+    """Accumulate one project's tool-action counts into the window tallies.
+    Called once per project; HIVE MIND sums across projects before rating."""
+    cuts = {key: (_iso_utc(now - span), _iso_utc(now - 2 * span))
+            for key, span in _EFF_WINDOWS}
+    for ev in evs:
+        if ev.type not in _TOOL_ACTION_TYPES:
+            continue
+        for key, _ in _EFF_WINDOWS:
+            cur_cut, prev_cut = cuts[key]
+            if ev.ts >= cur_cut:
+                i = 0
+            elif ev.ts >= prev_cut:
+                i = 2
+            else:
+                continue
+            t = tallies[key]
+            t[i + 1] += 1
+            if ev.type == "tool_failed":
+                t[i] += 1
+
+
+def _efficiency(tallies: dict) -> dict:
+    """Rates, deltas, and honesty dispositions per window: an empty current
+    window and thin samples render as neutral states, never fake percents.
+    delta_pct is signed relative change — negative means fewer failures."""
+    out = {}
+    for key, _ in _EFF_WINDOWS:
+        cf, ca, pf, pa = tallies[key]
+        cur_rate = round(cf * 100.0 / ca, 1) if ca else None
+        prev_rate = round(pf * 100.0 / pa, 1) if pa else None
+        row = {"cur_failures": cf, "cur_actions": ca,
+               "prev_failures": pf, "prev_actions": pa,
+               "cur_rate": cur_rate, "prev_rate": prev_rate, "delta_pct": None}
+        if ca == 0:
+            row["disposition"] = "no_current_data"
+        elif pa == 0:
+            row["disposition"] = "no_baseline"
+        elif ca < LOW_SAMPLE_FLOOR or pa < LOW_SAMPLE_FLOOR:
+            row["disposition"] = "low_sample"
+        elif prev_rate == 0 and cur_rate == 0:
+            row["disposition"], row["delta_pct"] = "no_change", 0.0
+        elif prev_rate == 0:
+            row["disposition"] = "regression_from_zero"
+        else:
+            row["delta_pct"] = round((cur_rate - prev_rate) * 100.0 / prev_rate, 1)
+            row["disposition"] = "ok"
+        out[key] = row
+    return out
 
 
 def default_project() -> str:
@@ -292,14 +363,27 @@ def make_handler(token: str):
         def _get_improvements(self, proj, am, qs):
             # Lessons learned: machine-learned incident lessons (auto) plus
             # user-dictated caveat notes (manual), kept as two shapes so long
-            # status memos can't masquerade as lesson cards.
+            # status memos can't masquerade as lesson cards. One event pass per
+            # project feeds the caveats, the per-signature enrichment
+            # (timestamps, leaks, resolution glyph), and the efficiency tiles.
             from . import incidents
             names = _all_projects() if am else [proj]
+            now = time.time()
             auto, manual = [], []
+            tallies = _empty_tallies()
             for n in names:
+                evs = events.read_all(n)
+                _add_tallies(tallies, evs, now)
+                stats_map = incidents.signal_stats(n, evs=evs)
                 for s in incidents.summaries(n):
-                    auto.append(dict(s, project=n, source="auto"))
-                for e in events.read_all(n):
+                    st = stats_map.get(s["signature"], {})
+                    auto.append(dict(
+                        s, project=n, source="auto",
+                        first_seen=st.get("first_seen"),
+                        last_seen=st.get("last_seen"),
+                        leaks=st.get("leaks", 0),
+                        resolution=incidents.classify_resolution(s, st)))
+                for e in evs:
                     if e.type != "caveat":
                         continue
                     manual.append({
@@ -310,7 +394,8 @@ def make_handler(token: str):
                     })
             auto.sort(key=lambda s: s.get("occurrences", 0), reverse=True)
             manual.sort(key=lambda m: m.get("ts") or "", reverse=True)
-            return self._json({"auto": auto, "manual": dedupe.collapse(manual)})
+            return self._json({"auto": auto, "manual": dedupe.collapse(manual),
+                               "stats": _efficiency(tallies)})
 
         def _get_sessions(self, proj, am, qs):
             by: dict = {}

@@ -574,7 +574,13 @@ def test_improvements_empty_store_returns_empty_lists(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/api/improvements?project=nothing-here", token)
     assert status == 200
-    assert json.loads(body) == {"auto": [], "manual": []}
+    obj = json.loads(body)
+    assert obj["auto"] == [] and obj["manual"] == []
+    # four tiles, all honest about having no data at all
+    assert set(obj["stats"]) == {"day", "week", "month", "quarter"}
+    for row in obj["stats"].values():
+        assert row["disposition"] == "no_current_data"
+        assert row["delta_pct"] is None
 
 
 def test_improvements_hivemind_aggregates_projects(dashboard_server):
@@ -732,3 +738,132 @@ def test_reflect_unexpected_error_returns_500(dashboard_server, monkeypatch):
         assert e.code == 500
         obj = json.loads(e.read().decode("utf-8"))
         assert obj["ok"] is False and "exploded" in obj["error"]
+
+
+# --------------------------------------------------------------------------
+# /api/improvements efficiency stats + per-lesson enrichment
+# --------------------------------------------------------------------------
+import time as time_mod
+
+
+def _iso_ago(seconds):
+    return time_mod.strftime("%Y-%m-%dT%H:%M:%S",
+                             time_mod.gmtime(time_mod.time() - seconds)) + "Z"
+
+
+def _seed_actions(project, session, ts, n, failures=0, sig="sig:x"):
+    for i in range(n - failures):
+        ev_mod.append_event("command_run", {"text": f"cmd{i}"},
+                            session_id=session, ts=ts, project=project)
+    for i in range(failures):
+        ev_mod.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=session, ts=ts, project=project)
+
+
+def _stats(base, token, project):
+    status, body = _get(base, f"/api/improvements?project={project}", token)
+    assert status == 200
+    return json.loads(body)["stats"]
+
+
+def test_efficiency_week_improvement_is_ok_with_negative_delta(dashboard_server):
+    base, token = dashboard_server
+    _seed_actions("eff", "s1", _iso_ago(10 * 86400), 22, failures=2)  # prev week
+    _seed_actions("eff", "s2", _iso_ago(2 * 86400), 21, failures=1)   # this week
+    week = _stats(base, token, "eff")["week"]
+    assert week["disposition"] == "ok"
+    assert week["cur_actions"] == 21 and week["prev_actions"] == 22
+    assert week["delta_pct"] < 0                     # fewer failures = improvement
+
+
+def test_efficiency_ignores_conversation_events(dashboard_server):
+    base, token = dashboard_server
+    _seed_actions("eff", "s1", _iso_ago(10 * 86400), 22, failures=2)
+    _seed_actions("eff", "s2", _iso_ago(2 * 86400), 21, failures=1)
+    before = _stats(base, token, "eff")["week"]
+    for i in range(50):
+        ev_mod.append_event("user_prompt", {"text": f"p{i}"}, session_id="s2",
+                            ts=_iso_ago(3600), project="eff")
+    after = _stats(base, token, "eff")["week"]
+    assert after == before
+
+
+def test_efficiency_sparse_dispositions(dashboard_server):
+    base, token = dashboard_server
+    # current data, no previous week -> no_baseline; empty day -> no_current_data
+    _seed_actions("ebase", "s1", _iso_ago(2 * 86400), 21, failures=1)
+    st = _stats(base, token, "ebase")
+    assert st["week"]["disposition"] == "no_baseline"
+    assert st["day"]["disposition"] == "no_current_data"
+    # thin samples in both windows -> low_sample, never a colored percent
+    _seed_actions("elow", "s1", _iso_ago(10 * 86400), 3, failures=1)
+    _seed_actions("elow", "s2", _iso_ago(2 * 86400), 3)
+    assert _stats(base, token, "elow")["week"]["disposition"] == "low_sample"
+    # clean in both windows -> no_change at 0.0
+    _seed_actions("ezero", "s1", _iso_ago(10 * 86400), 20)
+    _seed_actions("ezero", "s2", _iso_ago(2 * 86400), 20)
+    zero = _stats(base, token, "ezero")["week"]
+    assert zero["disposition"] == "no_change" and zero["delta_pct"] == 0.0
+    # failures where the baseline was zero -> regression marker, no percent
+    _seed_actions("ereg", "s1", _iso_ago(10 * 86400), 20)
+    _seed_actions("ereg", "s2", _iso_ago(2 * 86400), 21, failures=1)
+    reg = _stats(base, token, "ereg")["week"]
+    assert reg["disposition"] == "regression_from_zero" and reg["delta_pct"] is None
+
+
+def test_efficiency_hivemind_aggregates_tallies(dashboard_server):
+    base, token = dashboard_server
+    # 12 + 12 actions per window: below the floor alone, above it combined
+    _seed_actions("p1", "s1", _iso_ago(10 * 86400), 12, failures=2)
+    _seed_actions("p1", "s2", _iso_ago(2 * 86400), 12, failures=1)
+    _seed_actions("p2", "s1", _iso_ago(10 * 86400), 12)
+    _seed_actions("p2", "s2", _iso_ago(2 * 86400), 12)
+    week = _stats(base, token, "*")["week"]
+    assert week["cur_actions"] == 24 and week["prev_actions"] == 24
+    assert week["disposition"] == "ok"
+
+
+def test_improvements_items_carry_resolution_and_timestamps(dashboard_server):
+    base, token = dashboard_server
+    # reflected rule, then a clean newer session -> resolved (green)
+    _seed_actions("test", "g1", _iso_ago(9000), 1, failures=1, sig="sig:green")
+    _seed_actions("test", "g1", _iso_ago(8000), 1, failures=1, sig="sig:green")
+    # reflected rule that recurred cross-session -> unresolved (red)
+    _seed_actions("test", "r1", _iso_ago(9000), 1, failures=1, sig="sig:red")
+    _seed_actions("test", "r1", _iso_ago(8000), 1, failures=1, sig="sig:red")
+    inc_mod.audit(project="test")
+    inc_mod.project(project="test")
+    _write_verdict("test", "sig:green")
+    _write_verdict("test", "sig:red")
+    inc_mod.project(project="test")
+    ev_mod.append_event("command_run", {"text": "fine"}, session_id="g2",
+                        ts=_iso_ago(1000), project="test")          # exposure
+    _seed_actions("test", "r2", _iso_ago(500), 1, failures=1, sig="sig:red")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    items = {a["signature"]: a for a in json.loads(body)["auto"]}
+    green, red = items["sig:green"], items["sig:red"]
+    assert green["resolution"] == "resolved" and green["leaks"] == 0
+    assert green["first_seen"] and green["last_seen"] > green["first_seen"]
+    assert red["resolution"] == "unresolved" and red["leaks"] == 1
+    assert red["last_seen"] > red["first_seen"]
+
+
+def test_improvements_stats_miss_is_watching_not_resolved(dashboard_server):
+    base, token = dashboard_server
+    # incident file with no backing events (projection outlived its events)
+    d = hp.project_dir("ghosty") / "rules" / "incidents"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ghost-sig.md").write_text(
+        "---\nsignature: ghost:sig\nstatus: active\noccurrences: 2\n"
+        "rule_source: auto\nflag: \nsessions: 1\n---\n\n# Incident: ghost:sig\n\n"
+        "## Raw Signal\n- Error excerpt: `boom`\n\n"
+        "## Auto Evaluation\n- Prevention rule: do X\n\n"
+        "## Human Evaluation\n<!-- -->\n\n"
+        "## Active Prevention Rule\n> do X\n", encoding="utf-8")
+    status, body = _get(base, "/api/improvements?project=ghosty", token)
+    assert status == 200
+    a = json.loads(body)["auto"][0]
+    assert a["resolution"] == "watching"            # never green without events
+    assert a["first_seen"] is None and a["last_seen"] is None
+    assert a["leaks"] == 0
