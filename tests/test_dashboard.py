@@ -258,6 +258,16 @@ def test_page_has_invoke_and_status_hooks(dashboard_server):
         assert needle in body, f"missing invoke/status hook: {needle}"
 
 
+def test_skills_plugins_view_has_improvements_style_controls(dashboard_server):
+    """The Skills & plugins view mirrors the Improvements mechanism: a fetch/paint
+    split, persistent search + filter + sort controls, and a status legend."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("paintPlugins", "onPlugSearch", "plugstatus", "plugmarket",
+                   "plugsort", "plugdir", "plugLegend", "PLUG_QUERY"):
+        assert needle in body, f"missing plugins filter/sort hook: {needle}"
+
+
 def test_page_has_skill_detail_hooks(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")
