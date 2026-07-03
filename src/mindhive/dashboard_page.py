@@ -63,7 +63,15 @@ def render_page(token: str) -> str:
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
   .hits .snip { white-space:pre-wrap; margin-top:4px; }
   .hits .dup { color:#8a93a6; }
+  .snip.one { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   h2.h { margin:2px 0 12px; font-size:16px; }
+  .glyph { font-weight:700; margin-right:6px; }
+  .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
+  .glyph.watch { color:#e0b341; } .glyph.dis { color:#8a93a6; }
+  .legend { font-size:12px; color:#9aa3b8; margin:2px 0 10px; }
+  button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
+    color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
+  button.mini:hover { color:#ff8a8a; }
 </style></head>
 <body>
 <header>
@@ -81,6 +89,7 @@ def render_page(token: str) -> str:
     <div class="group">Memory</div>
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
+    <button onclick="showImprovements(true)">Improvements</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -97,6 +106,7 @@ def render_page(token: str) -> str:
     <div class="group">Heavy</div>
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
+    <button onclick="runReflect()">Reflect (learn from failures)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -295,6 +305,227 @@ def render_page(token: str) -> str:
     liveFn = renderMemory; run('loading memory', renderMemory);
   }
   function clearSession(){ SESSION = null; showMemory(); }
+
+  // --- Improvements: lessons learned from past failures + manual notes ---
+  // IMP_ITEMS mirrors the /api/improvements shape ({auto, manual}); query and
+  // the two filter selects live outside the view so the 2.5s live refresh
+  // preserves what you typed and picked. IMP_BANNER carries the result line of
+  // the last Reflect run until the view is re-entered from the nav.
+  let IMP_ITEMS = {auto: [], manual: []};
+  let IMP_QUERY = '';
+  let IMP_STATUS = 'all';
+  let IMP_CAT = 'all';
+  let IMP_BANNER = '';
+  let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
+  let IMP_DIR = 'desc';            // toggle reverses the active order
+  // Resolution glyph = the OUTCOME axis (did the lesson take?); the status /
+  // category pills on the same card stay as the lifecycle axis — complementary.
+  const IMP_GLYPHS = {
+    resolved:   ['\\u2713', 'res',   'resolved \\u2014 rule active and holding'],
+    unresolved: ['\\u2717', 'unres', 'unresolved \\u2014 no rule yet, or it recurred'],
+    watching:   ['\\u25cf', 'watch', 'watching \\u2014 below threshold or rule not yet tested'],
+    dismissed:  ['\\u25cb', 'dis',   'dismissed \\u2014 no resolution needed']};
+  function glyphSpan(res){
+    const g = IMP_GLYPHS[res] || IMP_GLYPHS.watching;
+    return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
+  }
+  function impLegend(){
+    return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
+      .map(r => glyphSpan(r)+IMP_GLYPHS[r][2]).join(' \\u00b7 ')+'</div>';
+  }
+  // --- efficiency strip: failure rate (tool_failed per 100 tool actions) vs
+  // the previous day / week / month / 3 months. Tiles render placeholders
+  // until stats arrive, and dispositions instead of fake percentages.
+  const EFF_LABELS = [['day','24h'],['week','7 days'],['month','30 days'],['quarter','3 months']];
+  function effTile(lbl, s){
+    let v = '\\u2014', cls = '', sub = '';
+    if (s && typeof s === 'object') {
+      const c = s.cur_rate == null ? '\\u2014' : s.cur_rate;
+      const p = s.prev_rate == null ? '\\u2014' : s.prev_rate;
+      sub = ' \\u00b7 '+c+' vs '+p+' per 100 actions';
+      if (s.disposition === 'ok') {
+        if (s.delta_pct < 0) { v = '\\u25bc '+Math.abs(s.delta_pct)+'% fewer failures'; cls = ' ok'; }
+        else if (s.delta_pct > 0) { v = '\\u25b2 '+s.delta_pct+'% more failures'; cls = ' bad'; }
+        else v = 'no change';
+      }
+      else if (s.disposition === 'no_change') v = 'no change';
+      else if (s.disposition === 'no_baseline') v = 'no baseline';
+      else if (s.disposition === 'no_current_data') v = 'no recent data';
+      else if (s.disposition === 'low_sample') v = 'low sample ('+s.cur_actions+'/'+s.prev_actions+' actions)';
+      else if (s.disposition === 'regression_from_zero') { v = '\\u25b2 new failures'; cls = ' bad'; }
+    }
+    return '<div class="card"><div class="big'+cls+'" style="font-size:15px">'+v+'</div>'
+      + '<div class="lbl">vs previous '+lbl+sub+'</div></div>';
+  }
+  function effStrip(){
+    const st = (IMP_ITEMS && IMP_ITEMS.stats && typeof IMP_ITEMS.stats === 'object')
+      ? IMP_ITEMS.stats : {};
+    return '<div class="cards" style="margin-bottom:12px">'
+      + EFF_LABELS.map(kl => effTile(kl[1], st[kl[0]])).join('')+'</div>';
+  }
+  // --- sorting: three keys, one direction toggle whose label always names
+  // the full (key, direction) state so reversing 'critical' reads sensibly.
+  const IMP_SORT_LABELS = {
+    new: ['newest first', 'oldest first'],
+    critical: ['most critical first', 'least critical first'],
+    freq: ['most frequent first', 'least frequent first']};
+  const IMP_RANK = {unresolved:0, watching:1, resolved:2, dismissed:3};
+  function impDirLabel(){ return IMP_SORT_LABELS[IMP_SORT][IMP_DIR==='desc' ? 0 : 1]; }
+  function syncImpDirBtn(){ const b = document.getElementById('impdir'); if (b) b.textContent = impDirLabel(); }
+  function onImpSort(v){ IMP_SORT = v; syncImpDirBtn(); paintImprovements(); }
+  function toggleImpDir(){ IMP_DIR = IMP_DIR==='desc' ? 'asc' : 'desc'; syncImpDirBtn(); paintImprovements(); }
+  function impCompare(a, b){
+    const ts = x => String(x.last_seen || '');   // missing timestamps sort oldest
+    let c;
+    if (IMP_SORT === 'new') c = ts(b).localeCompare(ts(a));
+    else if (IMP_SORT === 'freq')
+      c = (b.occurrences||0)-(a.occurrences||0) || ts(b).localeCompare(ts(a));
+    else c = (IMP_RANK[a.resolution] ?? 1)-(IMP_RANK[b.resolution] ?? 1)
+      || (b.leaks||0)-(a.leaks||0)
+      || (b.occurrences||0)-(a.occurrences||0)
+      || ts(b).localeCompare(ts(a));
+    return IMP_DIR === 'desc' ? c : -c;
+  }
+  async function dismissLesson(sig){
+    if (!confirm('Dismiss \\u201c'+sig+'\\u201d? It stops being enforced and shows the '
+        + 'gray \\u25cb (no resolution needed).')) return;
+    await run('dismissing\\u2026', async () => {
+      const res = await apiPost('/api/rules/dismiss', {signature: sig});
+      IMP_BANNER = res.ok ? ('Dismissed '+sig) : (res.error || 'dismiss failed');
+    });
+    showImprovements();
+  }
+  async function renderImprovements(){
+    IMP_ITEMS = await apiGet('/api/improvements');
+    paintImprovements();
+  }
+  function fillSelect(id, values, cur){
+    const el = document.getElementById(id);
+    if (!el) return;
+    const opts = ['all'].concat(values);
+    // a selection that vanished from fresh data stays selected (may match nothing)
+    if (cur !== 'all' && !opts.includes(cur)) opts.push(cur);
+    el.innerHTML = opts.map(v => '<option value="'+escAttr(v)+'"'
+      + (v===cur?' selected':'')+'>'+esc(v)+'</option>').join('');
+  }
+  function lessonPills(a){
+    let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
+    if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
+    if (a.rule_source && a.rule_source !== 'none')
+      p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (!a.active_rule) p += (a.status === 'candidate'
+      ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
+      : ' <span class="pill">not yet reflected</span>');
+    return p;
+  }
+  function lessonCard(a, showProj){
+    const head = glyphSpan(a.resolution)
+      + (showProj && a.project ? esc(a.project)+' \\u00b7 ' : '')
+      + esc(a.signature)+' \\u00b7 '+(a.occurrences||0)+'\\u00d7 \\u00b7 '
+      + (a.sessions||0)+' session'+((a.sessions||0)===1?'':'s')
+      + (a.last_seen ? ' \\u00b7 last seen '+esc(a.last_seen) : '')
+      + (a.resolution !== 'dismissed'
+         ? '<button class="mini dismissbtn" data-sig="'+escAttr(a.signature)+'">dismiss</button>'
+         : '');
+    let body = '';
+    if (a.first_seen) body += '<div class="snip dup">first seen '+esc(a.first_seen)
+      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the rule activated' : '')
+      + '</div>';
+    if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
+    if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
+    if (a.root_cause) body += '<div class="snip dup">Root cause: '+esc(a.root_cause)+'</div>';
+    if (a.excerpt) body += '<div class="snip dup">'+esc(a.excerpt)+'</div>';
+    return '<li><div class="file">'+head+'</div><div style="margin:4px 0">'
+      + lessonPills(a)+'</div>'+body+'</li>';
+  }
+  function noteRow(m, showProj){
+    return '<li class="noterow" style="cursor:pointer"><div class="file">'
+      + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
+      + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
+      + '</div><div class="snip one">'+esc(m.text||'')+'</div></li>';
+  }
+  function paintImprovements(){
+    const auto = IMP_ITEMS.auto || [], manual = IMP_ITEMS.manual || [];
+    fillSelect('impstatus', [...new Set(auto.map(a=>a.status).filter(Boolean))], IMP_STATUS);
+    fillSelect('impcat', [...new Set(auto.map(a=>a.category).filter(Boolean))], IMP_CAT);
+    const banner = IMP_BANNER
+      ? '<div class="row"><span class="pill">'+esc(IMP_BANNER)+'</span></div>' : '';
+    // strip + legend render on every branch, including the empty states — an
+    // idle store still shows its four (honest) tiles.
+    const strip = effStrip() + impLegend();
+    if (!auto.length && !manual.length) {
+      showHTML(banner + strip + '<h2 class="h">No lessons yet \\u2014 failures are '
+        + 'captured automatically; recurring ones can be reflected into lessons '
+        + '(Heavy \\u2192 Reflect).</h2>');
+      return;
+    }
+    const q = IMP_QUERY.trim().toLowerCase();
+    const lessons = auto.filter(a =>
+      (IMP_STATUS==='all' || a.status===IMP_STATUS)
+      && (IMP_CAT==='all' || a.category===IMP_CAT)
+      && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
+          +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
+      .sort(impCompare);
+    const notes = manual.filter(m => !q
+      || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
+      .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
+                       return IMP_DIR==='desc' ? c : -c; });
+    if (!lessons.length && !notes.length) {
+      showHTML(banner+strip+'<h2 class="h">No lessons match your filters.</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    let html = banner + strip;
+    html += '<h2 class="h">'+lessons.length+' lesson'+(lessons.length===1?'':'s')
+      + (showProj?' across all projects':'')+'</h2>';
+    html += lessons.length
+      ? '<ul class="hits">'+lessons.map(a=>lessonCard(a, showProj)).join('')+'</ul>'
+      : '<div class="dup">none match</div>';
+    if (notes.length) {
+      html += '<h2 class="h" style="margin-top:16px">'+notes.length+' manual note'
+        + (notes.length===1?'':'s')+'</h2><ul class="hits">'
+        + notes.map(m=>noteRow(m, showProj)).join('')+'</ul>';
+    }
+    showHTML(html);
+    view.querySelectorAll('.noterow .snip').forEach(el =>
+      el.parentElement.onclick = () => el.classList.toggle('one'));
+    view.querySelectorAll('.dismissbtn').forEach(el =>
+      el.onclick = (ev) => { ev.stopPropagation(); dismissLesson(el.dataset.sig); });
+  }
+  // Reflect keeps the Heavy confirm (token spend) but lands back on the
+  // Improvements view with an inline result banner instead of confirmAction's
+  // full-panel JSON dump.
+  async function runReflect(){
+    if(!confirm('Reflect (learn from failures) \\u2014 runs the claude CLI once '
+      + 'per recurring incident (a few per click). Continue?')) return;
+    await run('reflecting\\u2026', async () => {
+      const res = await apiPost('/api/rules/reflect', {});
+      IMP_BANNER = res.ok
+        ? ('Reflect: '+res.reflected+' reflected \\u00b7 '+res.failed
+           +' failed \\u00b7 '+res.pending+' pending')
+        : (res.error || 'reflection failed');
+    });
+    showImprovements();
+  }
+  function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
+  function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
+  function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
+  function showImprovements(clearBanner){
+    if (clearBanner) IMP_BANNER = '';
+    const sortOpts = [['critical','most critical'],['new','newest'],['freq','most frequent']]
+      .map(kv => '<option value="'+kv[0]+'"'+(IMP_SORT===kv[0]?' selected':'')+'>'
+                 +kv[1]+'</option>').join('');
+    controls.innerHTML = '<div class="row">'
+      + '<input id="impq" placeholder="search lessons\\u2026" style="min-width:260px" '
+      + 'value="'+escAttr(IMP_QUERY)+'" oninput="onImpSearch(this.value)">'
+      + '<label>status <select id="impstatus" onchange="onImpStatus(this.value)"></select></label>'
+      + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
+      + '<label>sort <select id="impsort" onchange="onImpSort(this.value)">'+sortOpts+'</select></label>'
+      + '<button id="impdir" onclick="toggleImpDir()">'+impDirLabel()+'</button>'
+      + '</div>';
+    liveFn = renderImprovements; run('loading improvements', renderImprovements);
+  }
 
   // --- Sessions: the episode layer; click one to scope Memory to it ---
   async function renderSessions(){
