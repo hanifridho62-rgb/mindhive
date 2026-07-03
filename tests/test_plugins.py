@@ -1,7 +1,7 @@
 # tests/test_plugins.py
 import json
 import pytest
-from mindhive import plugins, events
+from mindhive import plugins, events, invoker
 
 
 def _write(path, text):
@@ -349,6 +349,203 @@ def test_latest_catalog_returns_most_recent(tmp_path, monkeypatch):
 
 def _has_sidecar():
     return plugins._catalog_path().exists()
+
+
+# --------------------------------------------------------------------------
+# Live inventory — what is installed RIGHT NOW (registry-driven, not cache)
+# --------------------------------------------------------------------------
+
+def make_claude_dir(tmp_path):
+    """Fake ~/.claude with one installed plugin, one cached-but-uninstalled
+    plugin, and one standalone local skill."""
+    claude = tmp_path / "claude"
+    inst = claude / "plugins" / "cache" / "mkt" / "alpha" / "1.0.0"
+    _plugin_json(inst, {"name": "alpha", "version": "1.0.0",
+                        "description": "installed one"})
+    _skill(inst, "s1", "one", "Use for testing.")
+    _skill(inst, "s2", "two", "Use for deploys.")
+    # cached but NOT in the registry -> uninstalled -> must not appear
+    ghost = claude / "plugins" / "cache" / "mkt" / "ghost" / "1.0.0"
+    _plugin_json(ghost, {"name": "ghost", "version": "1.0.0"})
+    _skill(ghost, "g", "g", "Use for nothing.")
+    _write(claude / "plugins" / "installed_plugins.json", json.dumps({
+        "version": 2,
+        "plugins": {"alpha@mkt": [{"scope": "user", "version": "1.0.0",
+                                   "installPath": str(inst),
+                                   "installedAt": "2026-06-11T04:07:43.030Z"}]},
+    }))
+    _write(claude / "skills" / "local-note" / "SKILL.md",
+           "---\nname: local-note\ndescription: Use when noting locally.\n---\n"
+           "\n# Local note\n\nBody text for the local skill.\n")
+    return claude
+
+
+def test_inventory_lists_only_installed_plugins(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    inv = plugins.inventory(claude)
+    names = {p["name"] for p in inv["plugins"]}
+    assert names == {"alpha"}                    # ghost is cached but uninstalled
+    alpha = inv["plugins"][0]
+    assert alpha["marketplace"] == "mkt"
+    assert alpha["version"] == "1.0.0"
+    assert [s["name"] for s in alpha["skills"]] == ["one", "two"]
+
+
+def test_inventory_includes_local_skills(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    inv = plugins.inventory(claude)
+    assert inv["local_skills"] == [
+        {"name": "local-note", "trigger": "Use when noting locally."}]
+
+
+def test_inventory_counts(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    c = plugins.inventory(claude)["counts"]
+    assert c == {"plugins": 1, "plugin_skills": 2,
+                 "local_skills": 1, "skills_total": 3}
+
+
+def test_inventory_missing_registry_lists_no_plugins(tmp_path):
+    claude = tmp_path / "claude"
+    _write(claude / "skills" / "solo" / "SKILL.md",
+           "---\nname: solo\ndescription: Use alone.\n---\n")
+    inv = plugins.inventory(claude)
+    assert inv["plugins"] == []
+    assert [s["name"] for s in inv["local_skills"]] == ["solo"]
+
+
+def test_inventory_malformed_registry_lists_no_plugins(tmp_path):
+    claude = tmp_path / "claude"
+    _write(claude / "plugins" / "installed_plugins.json", "{ nope ")
+    inv = plugins.inventory(claude)
+    assert inv["plugins"] == []
+
+
+def test_inventory_keeps_entry_when_install_path_is_gone(tmp_path):
+    """Registry says installed but the folder vanished -> still listed (with a
+    present:false marker) so the user sees the broken install, not silence."""
+    claude = tmp_path / "claude"
+    _write(claude / "plugins" / "installed_plugins.json", json.dumps({
+        "version": 2,
+        "plugins": {"lost@mkt": [{"version": "2.0.0",
+                                  "installPath": str(tmp_path / "nowhere")}]},
+    }))
+    inv = plugins.inventory(claude)
+    lost = inv["plugins"][0]
+    assert lost["name"] == "lost" and lost["present"] is False
+    assert lost["skills"] == []
+
+
+def test_inventory_dedupes_registry_entries_newest_version_wins(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    reg = json.loads((claude / "plugins" / "installed_plugins.json")
+                     .read_text(encoding="utf-8"))
+    old = claude / "plugins" / "cache" / "mkt" / "alpha" / "0.9.0"
+    _plugin_json(old, {"name": "alpha", "version": "0.9.0"})
+    reg["plugins"]["alpha@mkt"].append({"scope": "project", "version": "0.9.0",
+                                        "installPath": str(old)})
+    _write(claude / "plugins" / "installed_plugins.json", json.dumps(reg))
+    inv = plugins.inventory(claude)
+    assert len(inv["plugins"]) == 1
+    assert inv["plugins"][0]["version"] == "1.0.0"
+
+
+def test_signature_changes_on_uninstall(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    sig1 = plugins.inventory_signature(claude)
+    _write(claude / "plugins" / "installed_plugins.json",
+           json.dumps({"version": 2, "plugins": {}}))
+    assert plugins.inventory_signature(claude) != sig1
+
+
+def test_signature_changes_when_local_skill_added_and_deleted(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    sig1 = plugins.inventory_signature(claude)
+    new = claude / "skills" / "fresh" / "SKILL.md"
+    _write(new, "---\nname: fresh\ndescription: Use freshly.\n---\n")
+    sig2 = plugins.inventory_signature(claude)
+    assert sig2 != sig1
+    new.unlink()
+    new.parent.rmdir()
+    sig3 = plugins.inventory_signature(claude)
+    assert sig3 != sig2
+
+
+def test_signature_changes_when_plugin_skill_deleted(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    sig1 = plugins.inventory_signature(claude)
+    gone = (claude / "plugins" / "cache" / "mkt" / "alpha" / "1.0.0"
+            / "skills" / "s2" / "SKILL.md")
+    gone.unlink()
+    assert plugins.inventory_signature(claude) != sig1
+
+
+def _ok_runner(p): return {"exit": 0, "stdout": '{"is_error": false, "result": "ok"}'}
+def _fail_runner(p): return {"exit": 1, "stdout": '{"is_error": true, "result": "boom"}'}
+
+
+def test_call_status_empty_is_empty():
+    assert plugins.call_status(project="test") == {}
+
+
+def test_call_status_reflects_last_outcome():
+    invoker.invoke_skill("good", runner=_ok_runner, project="test")
+    invoker.invoke_skill("bad", runner=_fail_runner, project="test")
+    st = plugins.call_status(project="test")
+    assert st["good"] == "ok"
+    assert st["bad"] == "fail"
+
+
+def test_call_status_last_call_wins_over_earlier():
+    invoker.invoke_skill("x", runner=_fail_runner, project="test")   # red first
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")     # then green
+    assert plugins.call_status(project="test")["x"] == "ok"
+
+
+def test_strip_frontmatter_returns_body_only():
+    body = plugins._strip_frontmatter(
+        "---\nname: x\ndescription: d\n---\n\n# Title\n\nParagraph.\n")
+    assert body == "# Title\n\nParagraph."
+    # no frontmatter -> whole text back, trimmed
+    assert plugins._strip_frontmatter("# Just body\n") == "# Just body"
+
+
+def test_skill_detail_local_puts_intended_use_and_body(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    d = plugins.skill_detail("local-note", claude_dir=claude)
+    assert d["name"] == "local-note"
+    assert d["intended_use"] == "Use when noting locally."
+    assert "Body text for the local skill." in d["body"]
+    assert d["source"] == "local"
+    assert d["added_at"]                          # local skills date from mtime
+
+
+def test_skill_detail_plugin_dates_from_registry(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    d = plugins.skill_detail("one", plugin="alpha", claude_dir=claude)
+    assert d["intended_use"] == "Use for testing."
+    assert d["source"] == "alpha"
+    assert d["added_at"] == "2026-06-11T04:07:43.030Z"
+
+
+def test_skill_detail_missing_returns_none(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    assert plugins.skill_detail("nope", claude_dir=claude) is None
+    assert plugins.skill_detail("one", plugin="ghost", claude_dir=claude) is None
+
+
+def test_live_inventory_caches_until_disk_changes(tmp_path):
+    claude = make_claude_dir(tmp_path)
+    first = plugins.live_inventory(claude)
+    assert first["changed"] is True
+    second = plugins.live_inventory(claude)
+    assert second["changed"] is False
+    assert second["inventory"] == first["inventory"]
+    _write(claude / "skills" / "fresh" / "SKILL.md",
+           "---\nname: fresh\ndescription: Use freshly.\n---\n")
+    third = plugins.live_inventory(claude)
+    assert third["changed"] is True
+    assert "fresh" in {s["name"] for s in third["inventory"]["local_skills"]}
 
 
 def test_ensure_fresh_scans_when_no_snapshot(tmp_path, monkeypatch):

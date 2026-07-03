@@ -18,6 +18,7 @@ from . import recall as recall_mod
 from . import graph as graph_mod
 from . import graphview
 from . import plugins as plugins_mod
+from . import invoker as invoker_mod
 from . import export as export_mod
 from . import events, projector
 from . import dedupe
@@ -32,6 +33,9 @@ DEFAULT_PORT = 54461
 # One reflection batch at a time: a second Reflect click while one is running
 # would double token spend and race two writers over the same incident files.
 _REFLECT_LOCK = threading.Lock()
+# Serialize headless-invoke calls: each spawns a full `claude` subprocess, so
+# concurrent clicks would fork a fleet of agents. One at a time, like reflect.
+_INVOKE_LOCK = threading.Lock()
 
 # Reflect batch size per request. Each incident is one `claude` CLI call (up
 # to 120s), so an unbounded batch could outlive the browser's fetch timeout.
@@ -459,6 +463,22 @@ def make_handler(token: str):
                 return self._json({})
             return self._json(plugins_mod.latest_catalog(proj) or {})
 
+        def _get_plugins_inventory(self, proj, am, qs):
+            # machine-level (what THIS Claude install has), so project-agnostic
+            return self._json(plugins_mod.live_inventory())
+
+        def _get_skills_detail(self, proj, am, qs):
+            name = (qs.get("name") or [""])[0]
+            plugin = (qs.get("plugin") or [None])[0] or None
+            detail = plugins_mod.skill_detail(name, plugin=plugin)
+            if detail is None:
+                return self._json({"ok": False, "error": "not found"}, 404)
+            return self._json(detail)
+
+        def _get_skills_status(self, proj, am, qs):
+            # green/red per skill = last recorded call outcome from the ledger
+            return self._json(plugins_mod.call_status(project=proj))
+
         def _get_export(self, proj, am, qs):
             path = export_mod.export()
             data = path.read_bytes()
@@ -533,6 +553,21 @@ def make_handler(token: str):
         def _post_plugins_scan(self, proj, body):
             result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
             return self._json({"ok": True, "result": result})
+
+        def _post_skills_invoke(self, proj, body):
+            name = (body.get("name") or "").strip()
+            plugin = (body.get("plugin") or None)
+            if not name:
+                return self._json({"ok": False, "error": "name is required"}, 200)
+            if not _INVOKE_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "another skill call is running"}, 200)
+            try:
+                res = invoker_mod.invoke_skill(name, plugin=plugin, project=proj)
+            finally:
+                _INVOKE_LOCK.release()
+            return self._json({"ok": res["ok"], "name": name, "plugin": plugin,
+                               "exit": res["exit"], "excerpt": res["excerpt"]})
 
         def _post_plugins_autoscan(self, proj, body):
             res = plugins_mod.ensure_fresh(
@@ -644,6 +679,9 @@ def make_handler(token: str):
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
             "/api/plugins/recommend": _get_plugins_recommend,
+            "/api/plugins/inventory": _get_plugins_inventory,
+            "/api/skills/detail": _get_skills_detail,
+            "/api/skills/status": _get_skills_status,
             "/api/export": _get_export,
         }
         _POST_ROUTES = {
@@ -653,6 +691,7 @@ def make_handler(token: str):
             "/api/sync": _post_sync,
             "/api/embed": _post_embed,
             "/api/plugins/scan": _post_plugins_scan,
+            "/api/skills/invoke": _post_skills_invoke,
             "/api/plugins/autoscan": _post_plugins_autoscan,
             "/api/rules/reflect": _post_rules_reflect,
             "/api/rules/dismiss": _post_rules_dismiss,

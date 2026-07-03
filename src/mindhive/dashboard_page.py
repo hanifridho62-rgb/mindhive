@@ -64,6 +64,17 @@ def render_page(token: str) -> str:
   .hits .snip { white-space:pre-wrap; margin-top:4px; }
   .hits .dup { color:#8a93a6; }
   .snip.one { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .skchip { display:inline-block; cursor:pointer; color:#9ecbff; background:#12182a;
+    border:1px solid #2a3550; border-radius:6px; padding:1px 7px; margin:2px 3px 0 0; }
+  .skchip:hover { background:#1b2540; border-color:#3d6; color:#dfeaff; }
+  .statusDot { font-size:11px; margin-right:5px; vertical-align:middle; }
+  .statusDot.sok { color:#3fb950; }
+  .statusDot.sbad { color:#f85149; }
+  .statusDot.snone { color:#3a4150; }
+  .skmeta { margin:10px 0; }
+  .skmeta b { color:#7fb2ff; }
+  .skbody { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d;
+    border-radius:8px; padding:10px 12px; margin-top:4px; max-height:52vh; overflow:auto; }
   h2.h { margin:2px 0 12px; font-size:16px; }
   .glyph { font-weight:700; margin-right:6px; }
   .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
@@ -95,7 +106,7 @@ def render_page(token: str) -> str:
     <button onclick="showBriefing()">Briefing</button>
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
-    <button onclick="showPlugins()">Plugins</button>
+    <button onclick="showPlugins()">Skills &amp; plugins</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -594,13 +605,111 @@ def render_page(token: str) -> str:
     });
   }
 
-  // Plugins view auto-refreshes when stale: it asks the server to scan only if
-  // the catalog is missing or >24h old, so just opening the view keeps it current
-  // without forcing a heavy rescan. The Heavy "Plugins scan" button forces one.
-  function showPlugins(){ controls.innerHTML=''; liveFn = null; run('refreshing plugins', async () => {
-    const res = await apiPost('/api/plugins/autoscan', {});
-    const note = res.scanned ? 'scanned just now' : ('catalog fresh ('+(Number(res.age_hours)||0).toFixed(1)+'h old)');
-    showText(note + '\\n\\n' + JSON.stringify(res.result || res, null, 2));
+  // Skills & plugins: the live list re-renders every LIVE_MS via liveFn, and
+  // the server rebuilds only when its cheap disk signature changes — so an
+  // install, uninstall, or local-panel skill delete shows up within seconds
+  // at near-zero polling cost. The free/paid ranking stays below the list,
+  // fed by the stale-gated evaluation sidecar (autoscan kicked on view open;
+  // the Heavy "Plugins scan" button still forces a full re-evaluation).
+  let PLUG_RANKING = null;
+  let PLUG_STATUS = {};             // {skillName: 'ok'|'fail'} last call outcome
+  // green when the last headless call succeeded, red when it failed, grey when
+  // never called. A skill name calls invokeSkill(name, plugin) to run it.
+  function statusDot(name){
+    const s = PLUG_STATUS[name];
+    const cls = s === 'ok' ? 'sok' : (s === 'fail' ? 'sbad' : 'snone');
+    const title = s === 'ok' ? 'last call succeeded'
+      : (s === 'fail' ? 'last call FAILED — see Improvements' : 'never called');
+    return '<span class="statusDot '+cls+'" title="'+title+'">\\u25cf</span>';
+  }
+  async function renderPlugins(){
+    const res = await apiGet('/api/plugins/inventory');
+    const inv = res.inventory || {};
+    const plugs = inv.plugins || [];
+    const local = inv.local_skills || [];
+    const c = inv.counts || {};
+    try { PLUG_STATUS = await apiGet('/api/skills/status') || {}; } catch(_){}
+    let html = '<h2 class="h">Skills &amp; plugins</h2>'
+      + '<div class="cards">'
+      + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
+      + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
+      + '<div class="card"><div class="big">'+(c.local_skills ?? 0)+'</div><div class="lbl">local skills</div></div>'
+      + '</div>';
+    // rows are click-to-expand: a skill name calls showSkillDetail(name, plugin)
+    // which fetches /api/skills/detail and renders intended-use FIRST, then the
+    // date it was added, then the full SKILL.md body, into an inline panel.
+    const skillChip = (name, plugin) => statusDot(name) + '<span class="skchip" onclick="showSkillDetail('
+        + escAttr(JSON.stringify(name)) + ',' + escAttr(JSON.stringify(plugin||null)) + ')">'
+        + esc(name)+'</span>';
+    if (local.length){
+      html += '<h3 class="h">Local skills</h3><ul class="hits">'
+        + local.map(s => '<li><div class="file">'+skillChip(s.name, null)+'</div>'
+            + (s.trigger ? '<div class="snip">'+esc(s.trigger)+'</div>' : '')+'</li>').join('')
+        + '</ul>';
+    }
+    html += '<h3 class="h">Plugins</h3>' + (plugs.length ? '<ul class="hits">'
+      + plugs.map(p => '<li><div class="file">'+esc(p.name)+' '+esc(p.version)
+          + ' \\u00b7 '+esc(p.marketplace)
+          + (p.present === false ? ' \\u00b7 <span class="err">missing on disk</span>' : '')
+          + ' \\u00b7 '+p.skills.length+' skill'+(p.skills.length===1?'':'s')+'</div>'
+          + (p.skills.length ? '<div class="snip">'+p.skills.map(s=>skillChip(s.name, p.name)).join(' ')+'</div>' : '')
+          + '</li>').join('')
+      + '</ul>' : '<div class="lbl">no plugins installed</div>');
+    if (PLUG_RANKING && (PLUG_RANKING.recommendations || []).length){
+      html += '<h3 class="h">Recommended (free, by breadth)</h3><ul class="hits">'
+        + PLUG_RANKING.recommendations.map(r => '<li><div class="file">'+esc(r.name)
+            + ' \\u00b7 score '+esc(r.breadth_score)+'</div>'
+            + (r.note ? '<div class="snip">'+esc(r.note)+'</div>' : '')+'</li>').join('')
+        + '</ul>';
+    }
+    showHTML(html);
+  }
+  // Click-through detail: intended use at the very top, then when it was added,
+  // then the full SKILL.md body. Pauses the live refresh so the panel you're
+  // reading isn't wiped by the 2.5s inventory poll.
+  async function showSkillDetail(name, plugin){
+    liveFn = null;
+    const q = '/api/skills/detail?name='+encodeURIComponent(name)
+      + (plugin ? '&plugin='+encodeURIComponent(plugin) : '');
+    run('loading '+name, async () => {
+      const d = await apiGet(q);
+      if (!d || d.ok === false){ showText('No detail found for “'+name+'”.'); return; }
+      const plug = d.source && d.source !== 'local' ? d.source : null;
+      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back to skills &amp; plugins</button>'
+        + '<button onclick="invokeSkill('+escAttr(JSON.stringify(d.name))+','+escAttr(JSON.stringify(plug))+')">'
+        + '\\u25b6 call this skill</button>'+statusDot(d.name)+'</div>'
+        + '<h2 class="h">'+esc(d.name)+'</h2>'
+        + '<div class="skmeta"><b>Intended use</b><div class="snip">'+esc(d.intended_use || '—')+'</div></div>'
+        + '<div class="skmeta"><b>Added</b> <span class="lbl">'+esc(d.added_at || 'unknown')
+        + (d.source ? ' \\u00b7 '+esc(d.source) : '')+'</span></div>'
+        + '<div class="skmeta"><b>Full description</b><pre class="skbody">'+esc(d.body || '')+'</pre></div>');
+    });
+  }
+  // Call a skill headlessly via MindHive. Each call spawns a full `claude`, so
+  // it's gated behind an explicit confirm. The dot turns green on success, red
+  // on failure; a failure is recorded as an incident and flows into the
+  // Improvements loop so the system learns from bad calls.
+  function invokeSkill(name, plugin){
+    if(!confirm('Call the "'+name+'" skill now? This runs a headless Claude and can take a while.')) return;
+    controls.innerHTML=''; liveFn = null;
+    run('calling '+name+'…', async () => {
+      const res = await apiPost('/api/skills/invoke', {name: name, plugin: plugin});
+      PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+      const head = res.ok ? '<span class="ok">\\u2714 '+esc(name)+' succeeded</span>'
+                          : '<span class="err">\\u2716 '+esc(name)+' failed (exit '+esc(res.exit)+')</span>';
+      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '
+        + '<button onclick="showImprovements(true)">open Improvements</button></div>'
+        + '<h2 class="h">'+head+'</h2>'
+        + '<div class="skmeta"><b>Output</b><pre class="skbody">'+esc(res.excerpt || '(no output)')+'</pre></div>'
+        + (res.ok ? '' : '<div class="lbl">This failure was recorded — the Improvements view will learn a prevention rule from it.</div>'));
+    });
+  }
+  function showPlugins(){ controls.innerHTML=''; liveFn = renderPlugins; run('loading skills & plugins', async () => {
+    await renderPlugins();                        // the live list paints first
+    apiPost('/api/plugins/autoscan', {})          // ranking refreshes stale-gated
+      .then(() => apiGet('/api/plugins/recommend'))
+      .then(cat => { PLUG_RANKING = cat; if (liveFn === renderPlugins) return renderPlugins(); })
+      .catch(()=>{});
   }); }
   function doExport(){ window.location = u('/api/export'); }
 
