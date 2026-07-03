@@ -134,8 +134,8 @@ def _add_tallies(tallies: dict, evs, now: float) -> None:
     cuts = {key: (_iso_utc(now - span), _iso_utc(now - 2 * span))
             for key, span in _EFF_WINDOWS}
     for ev in evs:
-        if ev.type not in _TOOL_ACTION_TYPES:
-            continue
+        if ev.type not in _TOOL_ACTION_TYPES or not ev.ts:
+            continue          # guard a null ts (corrupt segment) like signal_stats
         for key, _ in _EFF_WINDOWS:
             cur_cut, prev_cut = cuts[key]
             if ev.ts >= cur_cut:
@@ -274,8 +274,16 @@ def make_handler(token: str):
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
 
+        # Bodies are tiny JSON control messages; cap the read so an
+        # unauthenticated caller (do_POST drains the body before the token
+        # check to avoid a WinError 10053 reset) can't force an arbitrarily
+        # large allocation or hold a worker thread on a slow/oversized body.
+        MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > self.MAX_BODY_BYTES:
+                raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
 

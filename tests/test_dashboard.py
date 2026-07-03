@@ -890,6 +890,27 @@ def test_dismiss_unknown_or_missing_signature_rejected(dashboard_server):
     assert not [e for e in ev_mod.read_all("test") if e.type == "rule_demoted"]
 
 
+def test_post_oversized_body_is_rejected_without_unbounded_read(dashboard_server):
+    # A caller advertising a huge Content-Length must be rejected before the
+    # body is read, so an (even unauthenticated) POST can't force a large
+    # allocation. We send a modest real body but lie about its length.
+    base, token = dashboard_server
+    url = f"{base}/api/append?token={token}"
+    big = (1 << 20) + 1
+    req = urllib.request.Request(
+        url, data=b"{}", method="POST",
+        headers={"Content-Type": "application/json", "Content-Length": str(big)})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected rejection"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "too large" in obj["error"]
+    except (urllib.error.URLError, ConnectionError):
+        pass          # server closed the connection without reading the body — also acceptable
+
+
 def test_dismiss_rejected_for_hivemind(dashboard_server):
     base, token = dashboard_server
     status, obj = _post(base, "/api/rules/dismiss",
