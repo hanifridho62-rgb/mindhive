@@ -44,6 +44,9 @@ def test_mindhive_slash_command_exists_and_drives_orchestrator():
 def test_plugin_manifest_advertises_mindhive():
     data = json.loads(_PLUGIN.read_text(encoding="utf-8"))
     assert data["name"] == "mindhive"
-    # Bumped when /mindhive shipped; never regress below it.
-    assert data["version"] >= "0.2.0"
+    # Bumped when /mindhive shipped; never regress below it. Compare as a
+    # numeric tuple, not a string — lexicographic ">=" would rank "0.10.0"
+    # below "0.2.0" and fail the guard on a future minor bump.
+    version = tuple(int(part) for part in data["version"].split("."))
+    assert version >= (0, 2, 0)
     assert "/mindhive" in data["description"]
