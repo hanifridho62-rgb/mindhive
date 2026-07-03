@@ -85,6 +85,19 @@ browser to a control panel for every feature — view state/briefing/graph, run
 recall, append memories, project, sync, verify, export, embed, and plugins
 scan. The graph is one of its views.
 
+**Improvements view.** The Memory group also has an **Improvements** view:
+lessons learned from past session logs — recurring tool failures projected into
+incident lessons (root cause, lesson, prevention rule, category) plus manually
+recorded caveat notes, with search and status/category filters. An efficiency
+strip compares the tool-failure rate (per 100 tool actions) against the
+previous day / week / month / 3 months; lessons sort by newest, most critical,
+or most frequent (with a direction toggle), carry first/last-seen timestamps,
+and lead with a resolution glyph — green ✓ (rule holding), red ✗ (unresolved
+or recurring), amber ● (watching / not yet tested), gray ○ (dismissed via the
+per-card dismiss button). The **Reflect (learn from failures)** button (Heavy)
+turns recurring unreflected incidents into lessons via the `claude` CLI, a
+small bounded batch per click.
+
 **Self-healing capture.** The server runs a background loop that periodically
 **auto-harvests** any session the live hooks missed — so the store stays current
 even in environments where the hooks never fire (e.g. the Agent SDK harness).

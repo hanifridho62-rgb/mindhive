@@ -7,6 +7,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -27,6 +28,14 @@ from .dashboard_page import render_page
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
 DEFAULT_PORT = 54461
+
+# One reflection batch at a time: a second Reflect click while one is running
+# would double token spend and race two writers over the same incident files.
+_REFLECT_LOCK = threading.Lock()
+
+# Reflect batch size per request. Each incident is one `claude` CLI call (up
+# to 120s), so an unbounded batch could outlive the browser's fetch timeout.
+REFLECT_BATCH_LIMIT = 3
 
 
 def _token_path():
@@ -98,6 +107,76 @@ def _project_stats(name: str) -> dict:
             auto += 1
     return {"name": name, "events": len(evs), "memory": mem, "auto": auto,
             "sessions": len(sessions), "last_ts": evs[-1].ts if evs else None}
+
+
+# --- Improvements efficiency strip ----------------------------------------
+# Failure rate = tool_failed per 100 tool actions. The denominator is tool
+# activity only — user_prompt/assistant_response are logged for every exchange
+# and would make the rate track conversation length instead of tool behavior.
+_TOOL_ACTION_TYPES = ("command_run", "file_touched", "tool_failed")
+_EFF_WINDOWS = (("day", 86400), ("week", 7 * 86400),
+                ("month", 30 * 86400), ("quarter", 90 * 86400))
+LOW_SAMPLE_FLOOR = 20     # tool actions per window below which a % is noise
+
+
+def _iso_utc(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(epoch)) + "Z"
+
+
+def _empty_tallies() -> dict:
+    # window -> [cur_failures, cur_actions, prev_failures, prev_actions]
+    return {key: [0, 0, 0, 0] for key, _ in _EFF_WINDOWS}
+
+
+def _add_tallies(tallies: dict, evs, now: float) -> None:
+    """Accumulate one project's tool-action counts into the window tallies.
+    Called once per project; HIVE MIND sums across projects before rating."""
+    cuts = {key: (_iso_utc(now - span), _iso_utc(now - 2 * span))
+            for key, span in _EFF_WINDOWS}
+    for ev in evs:
+        if ev.type not in _TOOL_ACTION_TYPES or not ev.ts:
+            continue          # guard a null ts (corrupt segment) like signal_stats
+        for key, _ in _EFF_WINDOWS:
+            cur_cut, prev_cut = cuts[key]
+            if ev.ts >= cur_cut:
+                i = 0
+            elif ev.ts >= prev_cut:
+                i = 2
+            else:
+                continue
+            t = tallies[key]
+            t[i + 1] += 1
+            if ev.type == "tool_failed":
+                t[i] += 1
+
+
+def _efficiency(tallies: dict) -> dict:
+    """Rates, deltas, and honesty dispositions per window: an empty current
+    window and thin samples render as neutral states, never fake percents.
+    delta_pct is signed relative change — negative means fewer failures."""
+    out = {}
+    for key, _ in _EFF_WINDOWS:
+        cf, ca, pf, pa = tallies[key]
+        cur_rate = round(cf * 100.0 / ca, 1) if ca else None
+        prev_rate = round(pf * 100.0 / pa, 1) if pa else None
+        row = {"cur_failures": cf, "cur_actions": ca,
+               "prev_failures": pf, "prev_actions": pa,
+               "cur_rate": cur_rate, "prev_rate": prev_rate, "delta_pct": None}
+        if ca == 0:
+            row["disposition"] = "no_current_data"
+        elif pa == 0:
+            row["disposition"] = "no_baseline"
+        elif ca < LOW_SAMPLE_FLOOR or pa < LOW_SAMPLE_FLOOR:
+            row["disposition"] = "low_sample"
+        elif prev_rate == 0 and cur_rate == 0:
+            row["disposition"], row["delta_pct"] = "no_change", 0.0
+        elif prev_rate == 0:
+            row["disposition"] = "regression_from_zero"
+        else:
+            row["delta_pct"] = round((cur_rate - prev_rate) * 100.0 / prev_rate, 1)
+            row["disposition"] = "ok"
+        out[key] = row
+    return out
 
 
 def default_project() -> str:
@@ -195,8 +274,16 @@ def make_handler(token: str):
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
 
+        # Bodies are tiny JSON control messages; cap the read so an
+        # unauthenticated caller (do_POST drains the body before the token
+        # check to avoid a WinError 10053 reset) can't force an arbitrarily
+        # large allocation or hold a worker thread on a slow/oversized body.
+        MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > self.MAX_BODY_BYTES:
+                raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
 
@@ -280,6 +367,43 @@ def make_handler(token: str):
                  "tags": e.tags}
                 for n, e in rows
             ]))
+
+        def _get_improvements(self, proj, am, qs):
+            # Lessons learned: machine-learned incident lessons (auto) plus
+            # user-dictated caveat notes (manual), kept as two shapes so long
+            # status memos can't masquerade as lesson cards. One event pass per
+            # project feeds the caveats, the per-signature enrichment
+            # (timestamps, leaks, resolution glyph), and the efficiency tiles.
+            from . import incidents
+            names = _all_projects() if am else [proj]
+            now = time.time()
+            auto, manual = [], []
+            tallies = _empty_tallies()
+            for n in names:
+                evs = events.read_all(n)
+                _add_tallies(tallies, evs, now)
+                stats_map = incidents.signal_stats(n, evs=evs)
+                for s in incidents.summaries(n):
+                    st = stats_map.get(s["signature"], {})
+                    auto.append(dict(
+                        s, project=n, source="auto",
+                        first_seen=st.get("first_seen"),
+                        last_seen=st.get("last_seen"),
+                        leaks=st.get("leaks", 0),
+                        resolution=incidents.classify_resolution(s, st)))
+                for e in evs:
+                    if e.type != "caveat":
+                        continue
+                    manual.append({
+                        "ts": e.ts, "type": e.type, "session": e.session_id,
+                        "project": n, "source": "manual", "tags": e.tags,
+                        "text": (e.payload.get("text", "")
+                                 if isinstance(e.payload, dict) else str(e.payload)),
+                    })
+            auto.sort(key=lambda s: s.get("occurrences", 0), reverse=True)
+            manual.sort(key=lambda m: m.get("ts") or "", reverse=True)
+            return self._json({"auto": auto, "manual": dedupe.collapse(manual),
+                               "stats": _efficiency(tallies)})
 
         def _get_sessions(self, proj, am, qs):
             by: dict = {}
@@ -420,6 +544,53 @@ def make_handler(token: str):
             return self._json({"ok": True, "scanned": res["scanned"],
                                "age_hours": res["age_hours"], "result": res["payload"]})
 
+        def _post_rules_reflect(self, proj, body):
+            # Reflect a bounded batch of active, not-yet-reflected incidents
+            # into structured lessons. Candidates (below the recurrence
+            # threshold) wait until they recur; already-reflected records are
+            # skipped (the CLI's `hive rules reflect` re-reflects everything —
+            # this endpoint deliberately does not).
+            import shutil
+            from . import incidents, reflect as reflect_mod
+            limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "reflection already running"}, 200)
+            try:
+                # self-heal a stale or missing incident projection first
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+                eligible = [
+                    s["signature"] for s in incidents.summaries(proj)
+                    if s["status"] == "active" and s["rule_source"] == "none"
+                ]
+                reflected = failed = 0
+                for signature in eligible[:max(0, limit)]:
+                    if reflect_mod.reflect_incident(signature, project=proj).get("reflected"):
+                        reflected += 1
+                    else:
+                        failed += 1
+                if failed and not reflected and not shutil.which("claude"):
+                    return self._json({"ok": False, "error":
+                        "claude CLI unavailable — reflection needs it on PATH"}, 200)
+                return self._json({"ok": True, "reflected": reflected,
+                                   "failed": failed,
+                                   "pending": len(eligible) - reflected})
+            finally:
+                _REFLECT_LOCK.release()
+
+        def _post_rules_dismiss(self, proj, body):
+            # Explicit demotion from a lesson card — the only way the gray
+            # "dismissed" state is reachable without dropping to the CLI.
+            # demote() appends the rule_demoted event and re-projects the
+            # record, so the next Improvements fetch classifies it dismissed.
+            from . import incidents
+            sig = (body.get("signature") or "").strip()
+            if not sig or not incidents.load(sig, project=proj):
+                return self._json({"ok": False, "error": "unknown signature"}, 200)
+            incidents.demote(sig, project=proj)
+            return self._json({"ok": True, "signature": sig})
+
         def _post_selftest(self, proj, body):
             from . import selftest as selftest_mod
             code = selftest_mod.run()
@@ -427,10 +598,16 @@ def make_handler(token: str):
 
         def do_POST(self):
             route = urlparse(self.path).path
+            # Drain the request body BEFORE any early response: replying 403
+            # while the client is still sending aborts the connection on
+            # Windows (WinError 10053) instead of delivering the status.
+            try:
+                body = self._body()
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
-                body = self._body()
                 proj = body.get("project") or default_project()
                 if is_all(proj):
                     if route == "/api/project":
@@ -462,6 +639,7 @@ def make_handler(token: str):
             "/api/verify": _get_verify,
             "/api/overview": _get_overview,
             "/api/memory": _get_memory,
+            "/api/improvements": _get_improvements,
             "/api/sessions": _get_sessions,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
@@ -476,6 +654,8 @@ def make_handler(token: str):
             "/api/embed": _post_embed,
             "/api/plugins/scan": _post_plugins_scan,
             "/api/plugins/autoscan": _post_plugins_autoscan,
+            "/api/rules/reflect": _post_rules_reflect,
+            "/api/rules/dismiss": _post_rules_dismiss,
             "/api/selftest": _post_selftest,
         }
 

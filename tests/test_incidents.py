@@ -277,3 +277,181 @@ def test_promote_is_idempotent():
     assert incidents.promote("pymodule:mindhive", project="test")["promoted"] is False
     soul = incidents.soul_path("test").read_text(encoding="utf-8")
     assert soul.count("run with -m") == 1          # not duplicated
+
+
+# --- summaries(): structured lesson dicts for the Improvements view ---
+
+_VERDICT = ("- Root cause: module run from wrong directory\n"
+            "- Lesson: python -m needs the repo root on sys.path\n"
+            "- Prevention rule: run with -m from the repo root\n"
+            "- Category: tool_use")
+
+
+def _write_auto(sig, body):
+    path = (paths.project_dir("test") / "rules" / "incidents"
+            / f"{incidents._safe_name(sig)}.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", body), encoding="utf-8")
+
+
+def test_summaries_unreflected_record_has_empty_lesson_fields():
+    _add_failure("pymodule:mindhive", "python mindhive.py", "s1")
+    _add_failure("pymodule:mindhive", "python mindhive.py state", "s2")
+    incidents.project(project="test", threshold=2)
+    recs = incidents.summaries(project="test")
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["signature"] == "pymodule:mindhive"
+    assert rec["occurrences"] == 2
+    assert rec["sessions"] == 2
+    assert rec["excerpt"] == "err pymodule:mindhive"
+    assert rec["lesson"] == "" and rec["root_cause"] == ""
+    assert rec["prevention_rule"] == "" and rec["category"] == ""
+    assert rec["rule_source"] == "none" and rec["active_rule"] == ""
+
+
+def test_summaries_parses_reflected_verdict():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    _add_failure("pymodule:mindhive", "y", "s2")
+    incidents.project(project="test", threshold=2)
+    _write_auto("pymodule:mindhive", _VERDICT)
+    rec = incidents.summaries(project="test")[0]
+    assert rec["root_cause"] == "module run from wrong directory"
+    assert rec["lesson"] == "python -m needs the repo root on sys.path"
+    assert rec["prevention_rule"] == "run with -m from the repo root"
+    assert rec["category"] == "tool_use"
+    assert rec["rule_source"] == "auto"
+    assert rec["active_rule"] == "run with -m from the repo root"
+
+
+def test_summaries_human_override_wins():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents"
+            / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Human Evaluation", "always cd to repo root"), encoding="utf-8")
+    rec = incidents.summaries(project="test")[0]
+    assert rec["rule_source"] == "human"
+    assert rec["active_rule"] == "always cd to repo root"
+
+
+def test_summaries_empty_when_no_incident_dir():
+    assert incidents.summaries(project="fresh-nothing") == []
+
+
+def test_summaries_skips_malformed_file_without_raising():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    d = paths.project_dir("test") / "rules" / "incidents"
+    (d / "junk.md").write_text("no frontmatter here\n", encoding="utf-8")
+    recs = incidents.summaries(project="test")
+    assert [r["signature"] for r in recs] == ["pymodule:mindhive"]
+
+
+def test_summaries_multiline_verdict_keeps_first_line():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    _write_auto("pymodule:mindhive",
+                "- Lesson: first line\nsecond line of the lesson\n"
+                "- Prevention rule: one liner")
+    rec = incidents.summaries(project="test")[0]
+    assert rec["lesson"] == "first line"
+    assert rec["prevention_rule"] == "one liner"
+
+
+# --- signal_stats() + classify_resolution(): Improvements view enrichment ---
+
+
+def test_signal_stats_timestamps_and_activation_session_excluded():
+    # three failures in ONE session; activation backdated to the 2nd — the 3rd
+    # failure is same-session, so it is not a leak and there is no exposure
+    _add_failure_ts("pymodule:a", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:a", "y", "s1", "2026-07-01T10:05:00Z")
+    _add_failure_ts("pymodule:a", "z", "s1", "2026-07-01T10:10:00Z")
+    incidents.audit(project="test", threshold=2)
+    st = incidents.signal_stats(project="test")["pymodule:a"]
+    assert st["first_seen"] == "2026-07-01T10:00:00Z"
+    assert st["last_seen"] == "2026-07-01T10:10:00Z"
+    assert st["event_occurrences"] == 3
+    assert st["leaks"] == 0
+    assert st["exposure"] is False
+    assert st["dismissed"] is False
+
+
+def test_signal_stats_cross_session_leak_counts():
+    _add_failure_ts("pymodule:a", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:a", "y", "s1", "2026-07-01T11:00:00Z")   # activation
+    incidents.audit(project="test", threshold=2)
+    _add_failure_ts("pymodule:a", "z", "s2", "2026-07-01T12:00:00Z")   # leak
+    st = incidents.signal_stats(project="test")["pymodule:a"]
+    assert st["leaks"] == 1
+    assert st["exposure"] is True
+    assert incidents.leaks(project="test", signature="pymodule:a") == 1
+
+
+def test_signal_stats_clean_new_session_gives_exposure_without_leak():
+    _add_failure_ts("pymodule:a", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:a", "y", "s1", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    events.append_event("command_run", {"text": "ok"}, session_id="s2",
+                        ts="2026-07-01T12:00:00Z", project="test")
+    st = incidents.signal_stats(project="test")["pymodule:a"]
+    assert st["leaks"] == 0
+    assert st["exposure"] is True
+
+
+def test_signal_stats_no_activation_and_missing_signature():
+    _add_failure_ts("pymodule:a", "x", "s1", "2026-07-01T10:00:00Z")
+    stats = incidents.signal_stats(project="test")
+    assert stats["pymodule:a"]["leaks"] == 0
+    assert stats["pymodule:a"]["exposure"] is False
+    assert "pymodule:other" not in stats
+    assert incidents.signal_stats(project="fresh-nothing") == {}
+
+
+def test_signal_stats_dismissed_flag_and_malformed_payload():
+    _add_failure_ts("pymodule:a", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:a", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    incidents.demote("pymodule:a", project="test")
+    events.append_event("tool_failed", "not a dict", session_id="s1",
+                        project="test")                    # skipped, no raise
+    st = incidents.signal_stats(project="test")["pymodule:a"]
+    assert st["dismissed"] is True
+
+
+def test_signal_stats_accepts_prefetched_events():
+    _add_failure_ts("pymodule:a", "x", "s1", "2026-07-01T10:00:00Z")
+    evs = events.read_all("test")
+    assert incidents.signal_stats(project="test", evs=evs) == \
+        incidents.signal_stats(project="test")
+
+
+def test_classify_resolution_table():
+    cr = incidents.classify_resolution
+    assert cr({"occurrences": 1, "rule_source": "none"}, {}) == "watching"
+    assert cr({"occurrences": 2, "rule_source": "none"},
+              {"exposure": True}) == "unresolved"
+    assert cr({"occurrences": 2, "rule_source": "auto"},
+              {"leaks": 1, "exposure": True}) == "unresolved"
+    assert cr({"occurrences": 2, "rule_source": "auto"},
+              {"leaks": 0, "exposure": False}) == "watching"
+    assert cr({"occurrences": 2, "rule_source": "auto"},
+              {"leaks": 0, "exposure": True}) == "resolved"
+    assert cr({"occurrences": 2, "rule_source": "human", "status": "promoted"},
+              {"leaks": 0, "exposure": True}) == "resolved"
+    assert cr({"occurrences": 5, "rule_source": "auto"},
+              {"leaks": 3, "exposure": True, "dismissed": True}) == "dismissed"
+
+
+def test_classify_resolution_live_count_overrides_stale_frontmatter():
+    assert incidents.classify_resolution(
+        {"occurrences": 1, "rule_source": "none"},
+        {"event_occurrences": 2}) == "unresolved"
+
+
+def test_classify_resolution_stats_miss_never_resolved():
+    assert incidents.classify_resolution(
+        {"occurrences": 2, "rule_source": "auto"}, {}) == "watching"

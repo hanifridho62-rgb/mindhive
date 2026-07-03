@@ -521,3 +521,452 @@ def test_launch_background_is_non_fatal_on_spawn_failure(monkeypatch):
     res = dashboard.launch_background()
     assert res["launched"] is False
     assert "cannot spawn" in res["reason"]
+
+
+# --------------------------------------------------------------------------
+# /api/improvements: lessons learned (auto incidents + manual caveats)
+# --------------------------------------------------------------------------
+from mindhive import events as ev_mod, incidents as inc_mod
+
+
+def _seed_incident(project, sig="pymodule:mindhive", n=2):
+    for i in range(n):
+        ev_mod.append_event("tool_failed",
+                            {"text": f"err {sig}", "signature": sig,
+                             "action": f"cmd{i}"},
+                            session_id=f"s{i}", tags=["auto", "failure"],
+                            project=project)
+    inc_mod.audit(project=project)
+    inc_mod.project(project=project)
+
+
+def test_improvements_returns_auto_and_manual(dashboard_server):
+    base, token = dashboard_server
+    _seed_incident("test")
+    ev_mod.append_event("caveat", {"text": "never run embed while V17 trades"},
+                        session_id="s9", project="test")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert len(obj["auto"]) == 1
+    a = obj["auto"][0]
+    assert a["signature"] == "pymodule:mindhive"
+    assert a["occurrences"] == 2
+    assert a["source"] == "auto" and a["project"] == "test"
+    assert a["status"] == "active"
+    assert a["lesson"] == ""                     # not yet reflected
+    assert a["excerpt"].startswith("err ")
+    assert len(obj["manual"]) == 1
+    m = obj["manual"][0]
+    assert m["source"] == "manual" and "V17" in m["text"]
+
+
+def test_improvements_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/improvements")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_improvements_empty_store_returns_empty_lists(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/api/improvements?project=nothing-here", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["auto"] == [] and obj["manual"] == []
+    # four tiles, all honest about having no data at all
+    assert set(obj["stats"]) == {"day", "week", "month", "quarter"}
+    for row in obj["stats"].values():
+        assert row["disposition"] == "no_current_data"
+        assert row["delta_pct"] is None
+
+
+def test_improvements_hivemind_aggregates_projects(dashboard_server):
+    base, token = dashboard_server
+    ev_mod.append_event("caveat", {"text": "p1 lesson about flaky socket"},
+                        session_id="a", project="p1")
+    ev_mod.append_event("caveat", {"text": "p2 note on schema drift"},
+                        session_id="b", project="p2")
+    status, body = _get(base, "/api/improvements?project=*", token)
+    assert status == 200
+    obj = json.loads(body)
+    projects = {m["project"] for m in obj["manual"]}
+    assert {"p1", "p2"} <= projects
+
+
+def test_improvements_unexpected_error_returns_500_json(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+
+    def boom(project=None):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(inc_mod, "summaries", boom)
+    try:
+        _get(base, "/api/improvements?project=test", token)
+        assert False, "expected 500"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "kaput" in obj["error"]
+
+
+def test_page_has_improvements_view(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    for needle in ("Improvements", "renderImprovements", "paintImprovements",
+                   "impstatus", "impcat"):
+        assert needle in body, f"missing improvements hook: {needle}"
+
+
+# --------------------------------------------------------------------------
+# POST /api/rules/reflect: bounded, guarded reflection from the panel
+# --------------------------------------------------------------------------
+from mindhive import reflect as refl_mod, dashboard as dash_mod
+
+
+def _write_verdict(project, sig):
+    path = (hp.project_dir(project) / "rules" / "incidents"
+            / f"{inc_mod._safe_name(sig)}.md")
+    path.write_text(inc_mod._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Root cause: x\n- Lesson: y\n- Prevention rule: z\n- Category: tool_use"),
+        encoding="utf-8")
+
+
+def test_reflect_happy_path(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:one")
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert status == 200
+    assert obj == {"ok": True, "reflected": 1, "failed": 0, "pending": 0}
+
+
+def test_reflect_skips_already_reflected(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:done")
+    _write_verdict("test", "sig:done")
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert obj["ok"] is True and obj["reflected"] == 0 and obj["pending"] == 0
+    assert calls == []
+
+
+def test_reflect_batch_cap_reports_pending(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    for i in range(5):
+        _seed_incident("test", sig=f"sig:batch{i}")
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect",
+                        {"project": "test", "limit": 3}, token)
+    assert len(calls) == 3
+    assert obj["reflected"] == 3 and obj["pending"] == 2
+
+
+def test_reflect_excludes_candidates(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:single", n=1)      # below threshold
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert obj == {"ok": True, "reflected": 0, "failed": 0, "pending": 0}
+    assert calls == []
+
+
+def test_reflect_rejects_concurrent_run(dashboard_server):
+    base, token = dashboard_server
+    assert dash_mod._REFLECT_LOCK.acquire(blocking=False)
+    try:
+        status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+        assert status == 200
+        assert obj["ok"] is False and "already running" in obj["error"]
+    finally:
+        dash_mod._REFLECT_LOCK.release()
+
+
+def test_reflect_all_failed_missing_cli_is_domain_rejection(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:nocli")
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: {"reflected": False,
+                                                   "reason": "empty verdict"})
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "claude CLI unavailable" in obj["error"]
+
+
+def test_reflect_noop_on_empty_store(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect", {"project": "bare"}, token)
+    assert obj == {"ok": True, "reflected": 0, "failed": 0, "pending": 0}
+
+
+def test_reflect_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect", {"project": "*"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "read-only" in obj["error"]
+
+
+def test_reflect_unexpected_error_returns_500(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:boom")
+
+    def boom(sig, project=None):
+        raise RuntimeError("reflector exploded")
+
+    monkeypatch.setattr(refl_mod, "reflect_incident", boom)
+    url = f"{base}/api/rules/reflect?token={token}"
+    data = json.dumps({"project": "test"}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "expected 500"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "exploded" in obj["error"]
+
+
+# --------------------------------------------------------------------------
+# /api/improvements efficiency stats + per-lesson enrichment
+# --------------------------------------------------------------------------
+import time as time_mod
+
+
+def _iso_ago(seconds):
+    return time_mod.strftime("%Y-%m-%dT%H:%M:%S",
+                             time_mod.gmtime(time_mod.time() - seconds)) + "Z"
+
+
+def _seed_actions(project, session, ts, n, failures=0, sig="sig:x"):
+    for i in range(n - failures):
+        ev_mod.append_event("command_run", {"text": f"cmd{i}"},
+                            session_id=session, ts=ts, project=project)
+    for i in range(failures):
+        ev_mod.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=session, ts=ts, project=project)
+
+
+def _stats(base, token, project):
+    status, body = _get(base, f"/api/improvements?project={project}", token)
+    assert status == 200
+    return json.loads(body)["stats"]
+
+
+def test_efficiency_week_improvement_is_ok_with_negative_delta(dashboard_server):
+    base, token = dashboard_server
+    _seed_actions("eff", "s1", _iso_ago(10 * 86400), 22, failures=2)  # prev week
+    _seed_actions("eff", "s2", _iso_ago(2 * 86400), 21, failures=1)   # this week
+    week = _stats(base, token, "eff")["week"]
+    assert week["disposition"] == "ok"
+    assert week["cur_actions"] == 21 and week["prev_actions"] == 22
+    assert week["delta_pct"] < 0                     # fewer failures = improvement
+
+
+def test_efficiency_ignores_conversation_events(dashboard_server):
+    base, token = dashboard_server
+    _seed_actions("eff", "s1", _iso_ago(10 * 86400), 22, failures=2)
+    _seed_actions("eff", "s2", _iso_ago(2 * 86400), 21, failures=1)
+    before = _stats(base, token, "eff")["week"]
+    for i in range(50):
+        ev_mod.append_event("user_prompt", {"text": f"p{i}"}, session_id="s2",
+                            ts=_iso_ago(3600), project="eff")
+    after = _stats(base, token, "eff")["week"]
+    assert after == before
+
+
+def test_efficiency_sparse_dispositions(dashboard_server):
+    base, token = dashboard_server
+    # current data, no previous week -> no_baseline; empty day -> no_current_data
+    _seed_actions("ebase", "s1", _iso_ago(2 * 86400), 21, failures=1)
+    st = _stats(base, token, "ebase")
+    assert st["week"]["disposition"] == "no_baseline"
+    assert st["day"]["disposition"] == "no_current_data"
+    # thin samples in both windows -> low_sample, never a colored percent
+    _seed_actions("elow", "s1", _iso_ago(10 * 86400), 3, failures=1)
+    _seed_actions("elow", "s2", _iso_ago(2 * 86400), 3)
+    assert _stats(base, token, "elow")["week"]["disposition"] == "low_sample"
+    # clean in both windows -> no_change at 0.0
+    _seed_actions("ezero", "s1", _iso_ago(10 * 86400), 20)
+    _seed_actions("ezero", "s2", _iso_ago(2 * 86400), 20)
+    zero = _stats(base, token, "ezero")["week"]
+    assert zero["disposition"] == "no_change" and zero["delta_pct"] == 0.0
+    # failures where the baseline was zero -> regression marker, no percent
+    _seed_actions("ereg", "s1", _iso_ago(10 * 86400), 20)
+    _seed_actions("ereg", "s2", _iso_ago(2 * 86400), 21, failures=1)
+    reg = _stats(base, token, "ereg")["week"]
+    assert reg["disposition"] == "regression_from_zero" and reg["delta_pct"] is None
+
+
+def test_efficiency_hivemind_aggregates_tallies(dashboard_server):
+    base, token = dashboard_server
+    # 12 + 12 actions per window: below the floor alone, above it combined
+    _seed_actions("p1", "s1", _iso_ago(10 * 86400), 12, failures=2)
+    _seed_actions("p1", "s2", _iso_ago(2 * 86400), 12, failures=1)
+    _seed_actions("p2", "s1", _iso_ago(10 * 86400), 12)
+    _seed_actions("p2", "s2", _iso_ago(2 * 86400), 12)
+    week = _stats(base, token, "*")["week"]
+    assert week["cur_actions"] == 24 and week["prev_actions"] == 24
+    assert week["disposition"] == "ok"
+
+
+def test_improvements_items_carry_resolution_and_timestamps(dashboard_server):
+    base, token = dashboard_server
+    # reflected rule, then a clean newer session -> resolved (green)
+    _seed_actions("test", "g1", _iso_ago(9000), 1, failures=1, sig="sig:green")
+    _seed_actions("test", "g1", _iso_ago(8000), 1, failures=1, sig="sig:green")
+    # reflected rule that recurred cross-session -> unresolved (red)
+    _seed_actions("test", "r1", _iso_ago(9000), 1, failures=1, sig="sig:red")
+    _seed_actions("test", "r1", _iso_ago(8000), 1, failures=1, sig="sig:red")
+    inc_mod.audit(project="test")
+    inc_mod.project(project="test")
+    _write_verdict("test", "sig:green")
+    _write_verdict("test", "sig:red")
+    inc_mod.project(project="test")
+    ev_mod.append_event("command_run", {"text": "fine"}, session_id="g2",
+                        ts=_iso_ago(1000), project="test")          # exposure
+    _seed_actions("test", "r2", _iso_ago(500), 1, failures=1, sig="sig:red")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    items = {a["signature"]: a for a in json.loads(body)["auto"]}
+    green, red = items["sig:green"], items["sig:red"]
+    assert green["resolution"] == "resolved" and green["leaks"] == 0
+    assert green["first_seen"] and green["last_seen"] > green["first_seen"]
+    assert red["resolution"] == "unresolved" and red["leaks"] == 1
+    assert red["last_seen"] > red["first_seen"]
+
+
+def test_page_has_sort_glyph_and_strip_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    for needle in ("impsort", "impdir", "toggleImpDir", "impCompare", "effStrip",
+                   "effTile", "glyphSpan", "impLegend", "dismissLesson",
+                   "last seen", "first seen"):
+        assert needle in body, f"missing view hook: {needle}"
+
+
+# --------------------------------------------------------------------------
+# POST /api/rules/dismiss: explicit demotion from a lesson card
+# --------------------------------------------------------------------------
+
+
+def test_dismiss_happy_path_turns_card_gray(dashboard_server):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:bye")
+    status, obj = _post(base, "/api/rules/dismiss",
+                        {"project": "test", "signature": "sig:bye"}, token)
+    assert status == 200
+    assert obj == {"ok": True, "signature": "sig:bye"}
+    demos = [e for e in ev_mod.read_all("test") if e.type == "rule_demoted"]
+    assert demos and demos[0].payload["signature"] == "sig:bye"
+    assert inc_mod.load("sig:bye", project="test")["status"] == "demoted"
+    status, body = _get(base, "/api/improvements?project=test", token)
+    item = [a for a in json.loads(body)["auto"] if a["signature"] == "sig:bye"][0]
+    assert item["resolution"] == "dismissed"
+
+
+def test_dismiss_unknown_or_missing_signature_rejected(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/dismiss",
+                        {"project": "test", "signature": "nope:x"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "unknown signature" in obj["error"]
+    status, obj = _post(base, "/api/rules/dismiss", {"project": "test"}, token)
+    assert obj["ok"] is False
+    assert not [e for e in ev_mod.read_all("test") if e.type == "rule_demoted"]
+
+
+def test_post_oversized_body_is_rejected_without_unbounded_read(dashboard_server):
+    # A caller advertising a huge Content-Length must be rejected before the
+    # body is read, so an (even unauthenticated) POST can't force a large
+    # allocation. We send a modest real body but lie about its length.
+    base, token = dashboard_server
+    url = f"{base}/api/append?token={token}"
+    big = (1 << 20) + 1
+    req = urllib.request.Request(
+        url, data=b"{}", method="POST",
+        headers={"Content-Type": "application/json", "Content-Length": str(big)})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected rejection"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "too large" in obj["error"]
+    except (urllib.error.URLError, ConnectionError):
+        pass          # server closed the connection without reading the body — also acceptable
+
+
+def test_dismiss_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/dismiss",
+                        {"project": "*", "signature": "x"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "read-only" in obj["error"]
+
+
+def test_dismiss_requires_token(dashboard_server):
+    base, token = dashboard_server
+    req = urllib.request.Request(f"{base}/api/rules/dismiss", data=b"{}",
+                                 method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_dismiss_unexpected_error_returns_500(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:boomd")
+
+    def boom(sig, project=None):
+        raise RuntimeError("demoter exploded")
+
+    monkeypatch.setattr(inc_mod, "demote", boom)
+    url = f"{base}/api/rules/dismiss?token={token}"
+    data = json.dumps({"project": "test", "signature": "sig:boomd"}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "expected 500"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "exploded" in obj["error"]
+
+
+def test_improvements_stats_miss_is_watching_not_resolved(dashboard_server):
+    base, token = dashboard_server
+    # incident file with no backing events (projection outlived its events)
+    d = hp.project_dir("ghosty") / "rules" / "incidents"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ghost-sig.md").write_text(
+        "---\nsignature: ghost:sig\nstatus: active\noccurrences: 2\n"
+        "rule_source: auto\nflag: \nsessions: 1\n---\n\n# Incident: ghost:sig\n\n"
+        "## Raw Signal\n- Error excerpt: `boom`\n\n"
+        "## Auto Evaluation\n- Prevention rule: do X\n\n"
+        "## Human Evaluation\n<!-- -->\n\n"
+        "## Active Prevention Rule\n> do X\n", encoding="utf-8")
+    status, body = _get(base, "/api/improvements?project=ghosty", token)
+    assert status == 200
+    a = json.loads(body)["auto"][0]
+    assert a["resolution"] == "watching"            # never green without events
+    assert a["first_seen"] is None and a["last_seen"] is None
+    assert a["leaks"] == 0

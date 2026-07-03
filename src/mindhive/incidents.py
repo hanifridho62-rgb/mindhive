@@ -339,18 +339,150 @@ def demote(signature, project=None) -> dict:
     return {"demoted": True}
 
 
-def load(signature, project=None) -> dict:
-    """Read back a record's frontmatter as a dict (for tests/inspection)."""
-    p = _incident_dir(project) / f"{_safe_name(signature)}.md"
+_FM_KEYS = ("signature", "status", "occurrences", "rule_source", "flag", "sessions")
+
+
+def _frontmatter(text: str) -> dict:
+    """Parse an incident record's frontmatter fields from its text."""
     out = {}
-    if not p.exists():
-        return out
-    for line in p.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         m = re.match(r"^(\w+):\s*(.*)$", line)
-        if m and m.group(1) in ("signature", "status", "occurrences",
-                                "rule_source", "flag", "sessions"):
+        if m and m.group(1) in _FM_KEYS:
             v = m.group(2)
             out[m.group(1)] = int(v) if v.isdigit() else v
         if line.startswith("# Incident:"):
             break
+    return out
+
+
+def load(signature, project=None) -> dict:
+    """Read back a record's frontmatter as a dict (for tests/inspection)."""
+    p = _incident_dir(project) / f"{_safe_name(signature)}.md"
+    if not p.exists():
+        return {}
+    return _frontmatter(p.read_text(encoding="utf-8"))
+
+
+def _auto_field(section: str, name: str) -> str:
+    """One labelled value from an Auto Evaluation body ('- Name: value').
+    Line-wise by format contract: a multi-line value keeps its first line."""
+    m = re.search(rf"{name}:\s*(.+)", section or "", re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _raw_excerpt(section: str) -> str:
+    """The error excerpt line from a Raw Signal body, backtick quoting removed."""
+    m = re.search(r"Error excerpt:\s*(.+)", section or "")
+    return m.group(1).strip().strip("`") if m else ""
+
+
+_LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted", "rule_revised"}
+
+
+def signal_stats(project=None, evs=None) -> dict:
+    """Per-signature enrichment from the event log in one pass, for the
+    dashboard's Improvements view: first/last failure ts, live occurrence
+    count, leak count, rule exposure, and explicit dismissal.
+
+    Leaks count failures after the rule's activation ts from a session other
+    than the one containing the threshold-crossing failure — prevention rules
+    inject at session start, so same-session recurrences predate the rule
+    being in play. Exposure is whether any non-lifecycle activity arrived from
+    a different session after activation, i.e. whether the rule has had a
+    chance to prove itself. Pass evs to reuse an events.read_all() result."""
+    if evs is None:
+        evs = events.read_all(project)
+    fails = {}                          # sig -> [(ts, session_id), ...] in ts order
+    act_ts = {}                         # sig -> first rule_activated ts
+    demoted = set()                     # sigs with an explicit rule_demoted event
+    sess_last = {}                      # session_id -> latest activity ts
+    for ev in evs:
+        if ev.ts and ev.type not in _LIFECYCLE_TYPES:
+            if ev.ts > sess_last.get(ev.session_id, ""):
+                sess_last[ev.session_id] = ev.ts
+        p = ev.payload if isinstance(ev.payload, dict) else {}
+        s = p.get("signature")
+        if not s:
+            continue
+        if ev.type == "tool_failed":
+            fails.setdefault(s, []).append((ev.ts, ev.session_id))
+        elif ev.type == "rule_activated" and s not in act_ts:
+            act_ts[s] = ev.ts
+        elif ev.type == "rule_demoted":
+            demoted.add(s)
+    out = {}
+    for s, hits in fails.items():
+        act = act_ts.get(s)
+        act_sess = next((sess for ts, sess in hits if ts == act), None) if act else None
+        leaks = sum(1 for ts, sess in hits
+                    if ts > act and sess != act_sess) if act else 0
+        exposure = bool(act) and any(
+            last > act and sess != act_sess for sess, last in sess_last.items())
+        out[s] = {
+            "first_seen": hits[0][0],
+            "last_seen": hits[-1][0],
+            "event_occurrences": len(hits),
+            "leaks": leaks,
+            "exposure": exposure,
+            "dismissed": s in demoted,
+        }
+    return out
+
+
+def classify_resolution(summary: dict, stats: dict) -> str:
+    """Outcome axis for a lesson card: explicit dismissal wins; below the
+    recurrence threshold (live-count aware) it's watching; at threshold with
+    no rule it's unresolved; a leaking rule is unresolved; an untested rule
+    (no post-activation exposure) is watching; a tested, holding rule is
+    resolved. `stats` is signal_stats().get(signature, {}) — with a stats miss
+    (projection outlived its events) a record can never classify as resolved."""
+    if stats.get("dismissed"):
+        return "dismissed"
+    occurrences = max(int(summary.get("occurrences") or 0),
+                      int(stats.get("event_occurrences") or 0))
+    if occurrences < THRESHOLD:
+        return "watching"
+    if summary.get("rule_source") in (None, "", "none"):
+        return "unresolved"
+    if int(stats.get("leaks") or 0) > 0:
+        return "unresolved"
+    if not stats.get("exposure"):
+        return "watching"
+    return "resolved"
+
+
+def summaries(project=None) -> list:
+    """Structured lesson dicts for every incident record — the dashboard's
+    Improvements view reads these. One dict per record: frontmatter status
+    fields plus the parsed Auto Evaluation verdict (empty strings until the
+    reflection pass fills it) and the derived active rule."""
+    out = []
+    d = _incident_dir(project)
+    if not d.exists():
+        return out
+    for path in sorted(d.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm = _frontmatter(text)
+        if not fm.get("signature"):
+            continue
+        secs = _split_sections(text)
+        auto = secs.get("Auto Evaluation", "")
+        active, source = derive_active(auto, secs.get("Human Evaluation", ""))
+        out.append({
+            "signature": fm["signature"],
+            "status": fm.get("status", ""),
+            "occurrences": fm.get("occurrences", 0),
+            "sessions": fm.get("sessions", 0),
+            "rule_source": source,
+            "flag": fm.get("flag", ""),
+            "excerpt": _raw_excerpt(secs.get("Raw Signal", "")),
+            "root_cause": _auto_field(auto, "Root cause"),
+            "lesson": _auto_field(auto, "Lesson"),
+            "prevention_rule": _auto_rule(auto),
+            "category": _auto_field(auto, "Category"),
+            "active_rule": active,
+        })
     return out
