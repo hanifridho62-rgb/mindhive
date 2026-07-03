@@ -571,6 +571,18 @@ def make_handler(token: str):
             finally:
                 _REFLECT_LOCK.release()
 
+        def _post_rules_dismiss(self, proj, body):
+            # Explicit demotion from a lesson card — the only way the gray
+            # "dismissed" state is reachable without dropping to the CLI.
+            # demote() appends the rule_demoted event and re-projects the
+            # record, so the next Improvements fetch classifies it dismissed.
+            from . import incidents
+            sig = (body.get("signature") or "").strip()
+            if not sig or not incidents.load(sig, project=proj):
+                return self._json({"ok": False, "error": "unknown signature"}, 200)
+            incidents.demote(sig, project=proj)
+            return self._json({"ok": True, "signature": sig})
+
         def _post_selftest(self, proj, body):
             from . import selftest as selftest_mod
             code = selftest_mod.run()
@@ -578,10 +590,16 @@ def make_handler(token: str):
 
         def do_POST(self):
             route = urlparse(self.path).path
+            # Drain the request body BEFORE any early response: replying 403
+            # while the client is still sending aborts the connection on
+            # Windows (WinError 10053) instead of delivering the status.
+            try:
+                body = self._body()
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
-                body = self._body()
                 proj = body.get("project") or default_project()
                 if is_all(proj):
                     if route == "/api/project":
@@ -629,6 +647,7 @@ def make_handler(token: str):
             "/api/plugins/scan": _post_plugins_scan,
             "/api/plugins/autoscan": _post_plugins_autoscan,
             "/api/rules/reflect": _post_rules_reflect,
+            "/api/rules/dismiss": _post_rules_dismiss,
             "/api/selftest": _post_selftest,
         }
 

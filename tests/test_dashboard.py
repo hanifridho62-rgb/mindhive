@@ -849,6 +849,88 @@ def test_improvements_items_carry_resolution_and_timestamps(dashboard_server):
     assert red["last_seen"] > red["first_seen"]
 
 
+def test_page_has_sort_glyph_and_strip_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    for needle in ("impsort", "impdir", "toggleImpDir", "impCompare", "effStrip",
+                   "effTile", "glyphSpan", "impLegend", "dismissLesson",
+                   "last seen", "first seen"):
+        assert needle in body, f"missing view hook: {needle}"
+
+
+# --------------------------------------------------------------------------
+# POST /api/rules/dismiss: explicit demotion from a lesson card
+# --------------------------------------------------------------------------
+
+
+def test_dismiss_happy_path_turns_card_gray(dashboard_server):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:bye")
+    status, obj = _post(base, "/api/rules/dismiss",
+                        {"project": "test", "signature": "sig:bye"}, token)
+    assert status == 200
+    assert obj == {"ok": True, "signature": "sig:bye"}
+    demos = [e for e in ev_mod.read_all("test") if e.type == "rule_demoted"]
+    assert demos and demos[0].payload["signature"] == "sig:bye"
+    assert inc_mod.load("sig:bye", project="test")["status"] == "demoted"
+    status, body = _get(base, "/api/improvements?project=test", token)
+    item = [a for a in json.loads(body)["auto"] if a["signature"] == "sig:bye"][0]
+    assert item["resolution"] == "dismissed"
+
+
+def test_dismiss_unknown_or_missing_signature_rejected(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/dismiss",
+                        {"project": "test", "signature": "nope:x"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "unknown signature" in obj["error"]
+    status, obj = _post(base, "/api/rules/dismiss", {"project": "test"}, token)
+    assert obj["ok"] is False
+    assert not [e for e in ev_mod.read_all("test") if e.type == "rule_demoted"]
+
+
+def test_dismiss_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/dismiss",
+                        {"project": "*", "signature": "x"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "read-only" in obj["error"]
+
+
+def test_dismiss_requires_token(dashboard_server):
+    base, token = dashboard_server
+    req = urllib.request.Request(f"{base}/api/rules/dismiss", data=b"{}",
+                                 method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_dismiss_unexpected_error_returns_500(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:boomd")
+
+    def boom(sig, project=None):
+        raise RuntimeError("demoter exploded")
+
+    monkeypatch.setattr(inc_mod, "demote", boom)
+    url = f"{base}/api/rules/dismiss?token={token}"
+    data = json.dumps({"project": "test", "signature": "sig:boomd"}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "expected 500"
+    except urllib.error.HTTPError as e:
+        assert e.code == 500
+        obj = json.loads(e.read().decode("utf-8"))
+        assert obj["ok"] is False and "exploded" in obj["error"]
+
+
 def test_improvements_stats_miss_is_watching_not_resolved(dashboard_server):
     base, token = dashboard_server
     # incident file with no backing events (projection outlived its events)
