@@ -12,3 +12,6 @@ Full current state:        hive state        Full briefing: hive briefing
 Open everything in one window:  hive dashboard   (or double-click MindHive.exe)
 Run the autonomous loop:        hive loop   (or /circle) — auto-opens the dashboard;
                                 add --no-dashboard to skip it
+Orchestrate an idea end-to-end:  /mindhive <idea> — recall-informed interview,
+                                a scored skill Recommendation Matrix, execution
+                                with follow-up chaining, and learnings logged back.

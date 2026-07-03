@@ -27,6 +27,7 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive loop status` — summarize the last loop run
 - `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI (no dashboard is opened)
 - **`/circle`** — the in-session front door to `hive loop`: type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
+- **`/mindhive <idea>`** — the MindHive Orchestrator: turns an idea into finished, quality-checked work through a four-phase pipeline — recall-informed interview (one question at a time, recalling from the ledger before it asks), a scored skill **Recommendation Matrix** (suitability, compatibility, success probability, risk, speed, cost, verdict), execution through the chosen skill(s) with proactive follow-up chaining (debug / security / quality), and learnings appended back to the ledger. Offers a context **Handoff** at ~50%. Shipped in the same plugin (`commands/mindhive.md` + `skills/mindhive-orchestrator/`).
 
 ## Install the `/circle` plugin (global)
 This repo is a self-contained Claude Code plugin marketplace. To get `/circle` in **every** project:
