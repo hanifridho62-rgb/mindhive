@@ -8,8 +8,8 @@
   "plugins": [
     {
       "name": "mindhive",
-      "description": "MindHive — /circle drives the headless Claude Code CLI until a task is done (budget-gated, circuit-broken); /mindhive orchestrates an idea end-to-end: recall-informed interview, scored skill Recommendation Matrix, execution with follow-up chaining, learnings logged back.",
-      "version": "0.2.0",
+      "description": "MindHive — /circle drives the headless Claude Code CLI until a task is done (budget-gated, circuit-broken); /mindhive orchestrates an idea end-to-end (recall-informed interview, scored skill Recommendation Matrix, follow-up chaining, learnings logged back); /engineering-loop fuses circle+lfg into a memory-driven plan→work→review→fix→verify→learn loop, with any skill callable through MindHive (green/red) and failures feeding an improvement loop.",
+      "version": "0.3.0",
       "source": "./",
       "author": {
         "name": "hanifridho62",
