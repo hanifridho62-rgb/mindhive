@@ -191,6 +191,45 @@ def cmd_plugins_recommend(args) -> int | None:
     return None
 
 
+def cmd_skills_list(args) -> int | None:
+    from . import plugins as plugins_mod
+    res = plugins_mod.live_inventory()
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+        return None
+    inv = res["inventory"]
+    c = inv["counts"]
+    print(f"{c['plugins']} plugins · {c['skills_total']} skills "
+          f"({c['local_skills']} local)")
+    for p in inv["plugins"]:
+        flag = "" if p.get("present", True) else "  [MISSING ON DISK]"
+        print(f"  {p['marketplace']}/{p['name']} {p['version']} "
+              f"· {len(p['skills'])} skills{flag}")
+    return None
+
+
+def cmd_skills_invoke(args) -> int | None:
+    """Call ANY installed skill through MindHive (headless claude), recording the
+    outcome. Returns exit 1 on failure so /circle and /mindhive can gate on it."""
+    from . import invoker
+    res = invoker.invoke_skill(args.name, plugin=args.plugin)
+    status = "ok" if res["ok"] else "FAILED"
+    print(f"skill {args.name}: {status} (exit {res['exit']})")
+    if res.get("excerpt"):
+        print(res["excerpt"])
+    return 0 if res["ok"] else 1
+
+
+def cmd_skills_status(args) -> int | None:
+    from . import plugins as plugins_mod
+    status = plugins_mod.call_status()
+    if not status:
+        print("(no skill calls recorded yet)")
+    for name, s in sorted(status.items()):
+        print(f"  {name}: {s}")
+    return None
+
+
 def cmd_sync(args) -> int | None:
     from . import sync as sync_mod
     folder = args.folder or os.getcwd()
@@ -478,6 +517,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pla.add_argument("--force", action="store_true", help="rescan even if the catalog is fresh")
     pla.set_defaults(func=cmd_plugins_autoscan)
     plsub.add_parser("recommend", help="print the latest catalog's top recommendations").set_defaults(func=cmd_plugins_recommend)
+
+    # --- skills: the invoke channel /mindhive and /circle drive ---
+    sk = sub.add_parser("skills", help="list, invoke, or check status of installed skills")
+    sksub = sk.add_subparsers(dest="skills_cmd", required=True)
+    skl = sksub.add_parser("list", help="list installed plugins + skills (live)")
+    skl.add_argument("--json", action="store_true", help="emit the raw inventory JSON")
+    skl.set_defaults(func=cmd_skills_list)
+    ski = sksub.add_parser("invoke", help="call a skill via headless claude and record the outcome")
+    ski.add_argument("name", help="skill name (as shown by `skills list`)")
+    ski.add_argument("--plugin", default=None, help="owning plugin, when disambiguation is needed")
+    ski.set_defaults(func=cmd_skills_invoke)
+    sksub.add_parser("status", help="green/red last-call outcome per skill").set_defaults(func=cmd_skills_status)
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")

@@ -90,6 +90,29 @@ Give a one-line **rationale** for each follow-up you recommend (why it refines
 the architecture or de-risks the deployment). Recommend; let the user choose
 which to chain.
 
+### Phase 3b — Invoke skills through MindHive (green/red + self-healing)
+
+Any installed skill is callable **through MindHive**, not just a hand-picked
+few. When execution should be driven by MindHive itself (e.g. inside `/circle`
+or a headless run where the dashboard shows live status), use the invoke
+channel instead of only the in-agent Skill tool:
+
+- **List what's callable:** `python -m mindhive skills list` — the live,
+  registry-truth inventory (updates the instant a plugin is installed/removed).
+- **Call any skill:** `python -m mindhive skills invoke <name> [--plugin <p>]`
+  — runs it via a headless `claude` and records the outcome. Exit code is `0`
+  on success, `1` on failure, so you can gate the next step on it.
+- **Check health first:** `python -m mindhive skills status` shows the last
+  outcome per skill (`ok`/`fail`). **Before invoking a skill that shows `fail`,
+  read its Improvements lesson** (`python -m mindhive rules show "skill:<name>"`)
+  and apply the prevention rule — this is the learning loop closing.
+
+Every failed invoke is written as a `tool_failed` event with a `skill:<name>`
+signature, which flows automatically into the incidents → reflect → Improvements
+pipeline. So a skill that fails or returns poorly **teaches the system a
+prevention rule**, and its dashboard indicator turns red until it succeeds
+again. Prefer skills showing green; treat red as "fix or avoid, with a reason".
+
 ### Phase 4 — Log the learnings back into MindHive
 
 After the workflow concludes, evaluate the run and write durable lessons to the
