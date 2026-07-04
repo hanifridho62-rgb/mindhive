@@ -71,6 +71,12 @@ def render_page(token: str) -> str:
   .statusDot.sok { color:#3fb950; }
   .statusDot.sbad { color:#f85149; }
   .statusDot.snone { color:#3a4150; }
+  .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
+  .legitem:hover { background:#1b2540; }
+  .legitem.on { background:#233; outline:1px solid #3d6; }
+  .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid #2a5;
+    color:#9f9; border-radius:6px; font-size:11px; padding:0 7px; }
+  .callbtn:hover { background:#1b3a26; color:#dfffe6; }
   .skmeta { margin:10px 0; }
   .skmeta b { color:#7fb2ff; }
   .skbody { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d;
@@ -638,10 +644,19 @@ def render_page(token: str) -> str:
     ok:       ['sok',  'green \\u2014 last call succeeded'],
     fail:     ['sbad', 'red \\u2014 last call failed (feeds Improvements)'],
     uncalled: ['snone','grey \\u2014 never called']};
+  // legend items double as one-click status filters (click again to clear) —
+  // the active filter is highlighted so the legend and the dropdown stay in sync.
   function plugLegend(){
     return '<div class="legend">'+['ok','fail','uncalled'].map(k =>
-      '<span class="statusDot '+PLUG_STATUS_LEGEND[k][0]+'">\\u25cf</span>'
-      + PLUG_STATUS_LEGEND[k][1]).join(' \\u00b7 ')+'</div>';
+      '<span class="legitem'+(PLUG_STATUSF===k?' on':'')+'" title="click to filter" '
+      + 'onclick="setPlugStatus('+escAttr(JSON.stringify(k))+')">'
+      + '<span class="statusDot '+PLUG_STATUS_LEGEND[k][0]+'">\\u25cf</span>'
+      + PLUG_STATUS_LEGEND[k][1]+'</span>').join(' \\u00b7 ')+'</div>';
+  }
+  function setPlugStatus(k){
+    PLUG_STATUSF = (PLUG_STATUSF === k) ? 'all' : k;   // toggle off when re-clicked
+    const sel = document.getElementById('plugstatus'); if (sel) sel.value = PLUG_STATUSF;
+    paintPlugins();
   }
   // stats strip — three count tiles, rendered on every branch incl. empty states
   function plugStrip(){
@@ -715,7 +730,10 @@ def render_page(token: str) -> str:
     html += '<h2 class="h">'+skills.length+' skill'+(skills.length===1?'':'s')+'</h2>';
     html += skills.length
       ? '<ul class="hits">'+skills.map(e => '<li><div class="file">'+skillChip(e.name, e.plugin)
-          + ' \\u00b7 <span class="pill">'+esc(e.source)+'</span></div>'
+          + ' \\u00b7 <span class="pill">'+esc(e.source)+'</span>'
+          + '<button class="mini callbtn" title="run this skill via a headless Claude" '
+          + 'onclick="invokeSkill('+escAttr(JSON.stringify(e.name))+','+escAttr(JSON.stringify(e.plugin))+')">\\u25b6 call</button>'
+          + '</div>'
           + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '')+'</li>').join('')+'</ul>'
       : '<div class="dup">none match</div>';
     html += '<h2 class="h" style="margin-top:16px">'+plugins.length+' plugin'+(plugins.length===1?'':'s')+'</h2>';
