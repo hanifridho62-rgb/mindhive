@@ -1,7 +1,7 @@
 {
   "name": "mindhive",
-  "description": "MindHive autonomous loop. /circle drives the headless Claude Code CLI iteration-by-iteration until a task is done — memory-seeded each round and bounded by token/cost budgets, a context smart-zone reset, a dual-condition exit gate, and a circuit breaker.",
-  "version": "0.1.0",
+  "description": "MindHive. /circle drives the headless Claude Code CLI iteration-by-iteration until a task is done — memory-seeded each round and bounded by token/cost budgets, a context smart-zone reset, a dual-condition exit gate, and a circuit breaker. /mindhive orchestrates an idea end-to-end: recall-informed interview, a scored skill Recommendation Matrix, execution with follow-up chaining, and learnings logged back to the ledger. /engineering-loop fuses /circle with the lfg pipeline into a plan→work→review→fix→verify→learn loop; any installed skill is callable through MindHive (green/red status) with failures feeding an improvement loop.",
+  "version": "0.3.0",
   "author": {
     "name": "hanifridho62",
     "email": "hanifridho62@gmail.com"

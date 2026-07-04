@@ -142,6 +142,139 @@ def test_plugins_autoscan_is_stale_gated(dashboard_server):
     assert obj3["scanned"] is True
 
 
+def test_plugins_inventory_endpoint_returns_live_snapshot(dashboard_server, monkeypatch):
+    """GET /api/plugins/inventory serves the signature-gated live inventory —
+    the payload the Skills & plugins view polls every LIVE_MS."""
+    from mindhive import plugins as plugins_mod
+    fake = {"changed": True, "signature": "abc",
+            "inventory": {"plugins": [], "local_skills": [],
+                          "counts": {"plugins": 0, "plugin_skills": 0,
+                                     "local_skills": 0, "skills_total": 0}}}
+    monkeypatch.setattr(plugins_mod, "live_inventory", lambda: fake)
+    base, token = dashboard_server
+    status, body = _get(base, "/api/plugins/inventory", token)
+    assert status == 200
+    assert json.loads(body) == fake
+
+
+def test_plugins_inventory_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/plugins/inventory")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_page_has_skills_and_plugins_view(dashboard_server):
+    """The nav entry is renamed and the view is wired to the live engine."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "Skills &amp; plugins" in body
+    for needle in ("renderPlugins", "/api/plugins/inventory"):
+        assert needle in body, f"missing skills&plugins hook: {needle}"
+
+
+def test_skills_detail_endpoint_returns_intended_use_body_and_date(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    detail = {"name": "one", "intended_use": "Use for testing.",
+              "added_at": "2026-06-11T04:07:43.030Z", "body": "# One\n\nbody",
+              "source": "alpha"}
+    captured = {}
+    monkeypatch.setattr(plugins_mod, "skill_detail",
+                        lambda name, plugin=None: captured.update(name=name, plugin=plugin) or detail)
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/detail?name=one&plugin=alpha", token)
+    assert status == 200
+    assert json.loads(body) == detail
+    assert captured == {"name": "one", "plugin": "alpha"}
+
+
+def test_skills_detail_unknown_returns_404(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    monkeypatch.setattr(plugins_mod, "skill_detail", lambda name, plugin=None: None)
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/skills/detail?name=nope", token)
+        assert False, "expected 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_skills_detail_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/skills/detail?name=one")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_skills_invoke_records_and_returns_ok(dashboard_server, monkeypatch):
+    from mindhive import invoker as invoker_mod
+    seen = {}
+    monkeypatch.setattr(invoker_mod, "invoke_skill",
+        lambda name, plugin=None, project=None: seen.update(name=name, plugin=plugin)
+        or {"ok": True, "exit": 0, "excerpt": "done"})
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/skills/invoke",
+                        {"name": "brainstorming", "plugin": "superpowers"}, token)
+    assert status == 200 and obj["ok"] is True
+    assert seen == {"name": "brainstorming", "plugin": "superpowers"}
+
+
+def test_skills_invoke_requires_name(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/skills/invoke", {}, token)
+    assert obj["ok"] is False and "name" in obj["error"]
+
+
+def test_skills_invoke_requires_token(dashboard_server):
+    base, token = dashboard_server
+    req = urllib.request.Request(f"{base}/api/skills/invoke", data=b"{}",
+                                 method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_skills_status_endpoint_returns_map(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    monkeypatch.setattr(plugins_mod, "call_status", lambda project=None: {"a": "ok", "b": "fail"})
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/status", token)
+    assert status == 200
+    assert json.loads(body) == {"a": "ok", "b": "fail"}
+
+
+def test_page_has_invoke_and_status_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("invokeSkill", "/api/skills/invoke", "/api/skills/status", "statusDot"):
+        assert needle in body, f"missing invoke/status hook: {needle}"
+
+
+def test_skills_plugins_view_has_improvements_style_controls(dashboard_server):
+    """The Skills & plugins view mirrors the Improvements mechanism: a fetch/paint
+    split, persistent search + filter + sort controls, and a status legend."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("paintPlugins", "onPlugSearch", "plugstatus", "plugmarket",
+                   "plugsort", "plugdir", "plugLegend", "PLUG_QUERY"):
+        assert needle in body, f"missing plugins filter/sort hook: {needle}"
+
+
+def test_page_has_skill_detail_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("showSkillDetail", "/api/skills/detail", "Intended use"):
+        assert needle in body, f"missing detail hook: {needle}"
+
+
 def test_append_creates_event(dashboard_server):
     base, token = dashboard_server
     status, obj = _post(base, "/api/append",

@@ -15,6 +15,9 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
 - `hive plugins autoscan [--max-age-hours H] [--top N] [--force]` — scan **only when the catalog is missing or stale** (default 24h); a near-instant no-op otherwise, so it's safe to run every session
 - `hive plugins recommend` — print the top recommendations from the latest snapshot
+- `hive skills list [--json]` — list every installed plugin + skill from the live registry (updates the instant one is installed/removed)
+- `hive skills invoke <name> [--plugin p]` — call any installed skill through MindHive via a headless `claude`; records the outcome and exits non-zero on failure so callers can gate on it
+- `hive skills status` — green/red last-call outcome per skill from the ledger
 - `hive review queue [--session id]` — queue the session's touched source files for a thermo-nuclear review (run by `session_end`; writes the pending-review marker)
 - `hive review show` — print the pending-review marker, if any
 - `hive review clear` — clear the pending-review marker once the review has run
@@ -27,6 +30,8 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive loop status` — summarize the last loop run
 - `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI (no dashboard is opened)
 - **`/circle`** — the in-session front door to `hive loop`: type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
+- **`/mindhive <idea>`** — the MindHive Orchestrator: turns an idea into finished, quality-checked work through a four-phase pipeline — recall-informed interview (one question at a time, recalling from the ledger before it asks), a scored skill **Recommendation Matrix** (suitability, compatibility, success probability, risk, speed, cost, verdict), execution through the chosen skill(s) with proactive follow-up chaining (debug / security / quality), and learnings appended back to the ledger. Offers a context **Handoff** at ~50%. Shipped in the same plugin (`commands/mindhive.md` + `skills/mindhive-orchestrator/`).
+- **`/engineering-loop`** — the primary autonomous engineering foundation: fuses `/circle`'s bounded headless loop with the compound-engineering `lfg` pipeline into a memory-driven **plan → work → review → fix → verify → learn** loop. It's more detailed than `lfg` because MindHive memory sits between every stage (recall before, append after), it drives the chosen skills through the invoke channel with green/red status, and any skill failure feeds the improvement loop as a `skill:<name>` prevention rule. Shipped in the same plugin (`skills/engineering-loop/`).
 
 ## Install the `/circle` plugin (global)
 This repo is a self-contained Claude Code plugin marketplace. To get `/circle` in **every** project:
@@ -52,13 +57,28 @@ The recommendation catalog refreshes three ways, so it's current in any session:
 - **Auto (new sessions):** the `session_start` hook runs `plugins autoscan` in
   the background — stale-gated, so it only does real work when the snapshot is
   missing or >24h old.
-- **Auto (panel):** opening the dashboard **Plugins** view calls the same
+- **Auto (panel):** opening the dashboard **Skills & plugins** view calls the same
   stale-gated autoscan, so just looking at it keeps it fresh.
 - **Manual (force):** `hive plugins scan` or the dashboard **Plugins scan**
   (Heavy) button force a full rescan anytime, in any session.
 
 Because every session shares one event store, a refresh by one session is
 immediately visible to all the others.
+
+## Skills & plugins: a live, callable, self-healing view
+The dashboard's **Skills & plugins** view is a real-time inventory driven by
+Claude's own `installed_plugins.json`, so installing or uninstalling a plugin —
+or deleting a local skill — updates the list within seconds (a cheap disk
+signature gates the rebuild). Every entry is:
+- **Click-through** — opens a detail panel with the skill's **intended use**
+  first, then the date it was added, then the full `SKILL.md` body.
+- **Callable** — a **▶ call this skill** button (or `hive skills invoke`) runs it
+  through MindHive via a headless `claude`. The indicator turns **green** on
+  success and **red** on failure.
+- **Self-healing** — a failed call is recorded as a `skill:<name>` incident that
+  flows into the **Improvements** loop, so a bad call becomes a prevention rule
+  the next run can consult. All installed skills are callable this way, not a
+  hand-picked subset.
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:
@@ -81,8 +101,9 @@ any model/client. It is deterministic and costs no API tokens.
 
 `hive dashboard` starts a localhost web app (bound to 127.0.0.1) and opens your
 browser to a control panel for every feature — view state/briefing/graph, run
-recall, append memories, project, sync, verify, export, embed, and plugins
-scan. The graph is one of its views.
+recall, append memories, project, sync, verify, export, embed, and the live
+**Skills & plugins** view (click-through detail, one-click skill calls, green/red
+status). The graph is one of its views.
 
 **Improvements view.** The Memory group also has an **Improvements** view:
 lessons learned from past session logs — recurring tool failures projected into

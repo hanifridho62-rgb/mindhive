@@ -64,6 +64,17 @@ def render_page(token: str) -> str:
   .hits .snip { white-space:pre-wrap; margin-top:4px; }
   .hits .dup { color:#8a93a6; }
   .snip.one { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .skchip { display:inline-block; cursor:pointer; color:#9ecbff; background:#12182a;
+    border:1px solid #2a3550; border-radius:6px; padding:1px 7px; margin:2px 3px 0 0; }
+  .skchip:hover { background:#1b2540; border-color:#3d6; color:#dfeaff; }
+  .statusDot { font-size:11px; margin-right:5px; vertical-align:middle; }
+  .statusDot.sok { color:#3fb950; }
+  .statusDot.sbad { color:#f85149; }
+  .statusDot.snone { color:#3a4150; }
+  .skmeta { margin:10px 0; }
+  .skmeta b { color:#7fb2ff; }
+  .skbody { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d;
+    border-radius:8px; padding:10px 12px; margin-top:4px; max-height:52vh; overflow:auto; }
   h2.h { margin:2px 0 12px; font-size:16px; }
   .glyph { font-weight:700; margin-right:6px; }
   .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
@@ -95,7 +106,7 @@ def render_page(token: str) -> str:
     <button onclick="showBriefing()">Briefing</button>
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
-    <button onclick="showPlugins()">Plugins</button>
+    <button onclick="showPlugins()">Skills &amp; plugins</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -594,14 +605,207 @@ def render_page(token: str) -> str:
     });
   }
 
-  // Plugins view auto-refreshes when stale: it asks the server to scan only if
-  // the catalog is missing or >24h old, so just opening the view keeps it current
-  // without forcing a heavy rescan. The Heavy "Plugins scan" button forces one.
-  function showPlugins(){ controls.innerHTML=''; liveFn = null; run('refreshing plugins', async () => {
-    const res = await apiPost('/api/plugins/autoscan', {});
-    const note = res.scanned ? 'scanned just now' : ('catalog fresh ('+(Number(res.age_hours)||0).toFixed(1)+'h old)');
-    showText(note + '\\n\\n' + JSON.stringify(res.result || res, null, 2));
-  }); }
+  // Skills & plugins: the live list re-renders every LIVE_MS via liveFn, and
+  // the server rebuilds only when its cheap disk signature changes — so an
+  // install, uninstall, or local-panel skill delete shows up within seconds
+  // at near-zero polling cost. The free/paid ranking stays below the list,
+  // fed by the stale-gated evaluation sidecar (autoscan kicked on view open;
+  // the Heavy "Plugins scan" button still forces a full re-evaluation).
+  // --- Skills & plugins: same mechanism as Improvements ---
+  // PLUG_INV/PLUG_STATUS/PLUG_RANKING are the cache; renderPlugins fetches them,
+  // paintPlugins filters/sorts/renders instantly (no round-trip). Query + the
+  // filter/sort selects live OUTSIDE the view (in the controls bar) so the 2.5s
+  // live refresh — which only rewrites #view via paintPlugins — preserves what
+  // you typed and picked, exactly like the Improvements view.
+  let PLUG_INV = {plugins: [], local_skills: [], counts: {}};
+  let PLUG_STATUS = {};             // {skillName: 'ok'|'fail'} last call outcome
+  let PLUG_RANKING = null;
+  let PLUG_QUERY = '';
+  let PLUG_STATUSF = 'all';         // all | ok | fail | uncalled
+  let PLUG_MARKET = 'all';          // marketplace/source filter
+  let PLUG_SORT = 'status';         // status | name | source
+  let PLUG_DIR = 'asc';             // toggle reverses the active order
+  // green when the last headless call succeeded, red when it failed, grey when
+  // never called. A skill name calls invokeSkill(name, plugin) to run it.
+  function statusDot(name){
+    const s = PLUG_STATUS[name];
+    const cls = s === 'ok' ? 'sok' : (s === 'fail' ? 'sbad' : 'snone');
+    const title = s === 'ok' ? 'last call succeeded'
+      : (s === 'fail' ? 'last call FAILED — see Improvements' : 'never called');
+    return '<span class="statusDot '+cls+'" title="'+title+'">\\u25cf</span>';
+  }
+  const PLUG_STATUS_LEGEND = {
+    ok:       ['sok',  'green \\u2014 last call succeeded'],
+    fail:     ['sbad', 'red \\u2014 last call failed (feeds Improvements)'],
+    uncalled: ['snone','grey \\u2014 never called']};
+  function plugLegend(){
+    return '<div class="legend">'+['ok','fail','uncalled'].map(k =>
+      '<span class="statusDot '+PLUG_STATUS_LEGEND[k][0]+'">\\u25cf</span>'
+      + PLUG_STATUS_LEGEND[k][1]).join(' \\u00b7 ')+'</div>';
+  }
+  // stats strip — three count tiles, rendered on every branch incl. empty states
+  function plugStrip(){
+    const c = PLUG_INV.counts || {};
+    return '<div class="cards" style="margin-bottom:12px">'
+      + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
+      + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
+      + '<div class="card"><div class="big">'+(c.local_skills ?? 0)+'</div><div class="lbl">local skills</div></div>'
+      + '</div>';
+  }
+  const PLUG_SORT_LABELS = {
+    status: ['needs-attention first', 'healthy first'],
+    name:   ['name A\\u2192Z', 'name Z\\u2192A'],
+    source: ['by source A\\u2192Z', 'by source Z\\u2192A']};
+  const PLUG_STATUS_RANK = {fail: 0, uncalled: 1, ok: 2};
+  function plugDirLabel(){ return PLUG_SORT_LABELS[PLUG_SORT][PLUG_DIR==='asc' ? 0 : 1]; }
+  function syncPlugDirBtn(){ const b = document.getElementById('plugdir'); if (b) b.textContent = plugDirLabel(); }
+  function plugCompare(a, b){
+    let c;
+    if (PLUG_SORT === 'name') c = (a.name||'').localeCompare(b.name||'');
+    else if (PLUG_SORT === 'source')
+      c = (a.source||'').localeCompare(b.source||'') || (a.name||'').localeCompare(b.name||'');
+    else c = (PLUG_STATUS_RANK[a.status] ?? 1)-(PLUG_STATUS_RANK[b.status] ?? 1)
+      || (a.name||'').localeCompare(b.name||'');
+    return PLUG_DIR === 'asc' ? c : -c;
+  }
+  // one flat, filterable entry per skill (local + every plugin's skills), each
+  // carrying its call status — the primary card list, analogous to lessons.
+  function plugSkillEntries(){
+    const out = [];
+    (PLUG_INV.local_skills || []).forEach(s => out.push({
+      name: s.name, plugin: null, source: 'local', marketplace: 'local',
+      trigger: s.trigger || '', status: PLUG_STATUS[s.name] || 'uncalled'}));
+    (PLUG_INV.plugins || []).forEach(p => (p.skills || []).forEach(s => out.push({
+      name: s.name, plugin: p.name, source: p.name, marketplace: p.marketplace,
+      trigger: s.trigger || '', status: PLUG_STATUS[s.name] || 'uncalled'})));
+    return out;
+  }
+  const skillChip = (name, plugin) => statusDot(name) + '<span class="skchip" onclick="showSkillDetail('
+      + escAttr(JSON.stringify(name)) + ',' + escAttr(JSON.stringify(plugin||null)) + ')">'
+      + esc(name)+'</span>';
+  async function renderPlugins(){
+    const res = await apiGet('/api/plugins/inventory');
+    PLUG_INV = res.inventory || {plugins: [], local_skills: [], counts: {}};
+    try { PLUG_STATUS = await apiGet('/api/skills/status') || {}; } catch(_){}
+    paintPlugins();
+  }
+  function paintPlugins(){
+    const markets = [...new Set((PLUG_INV.plugins||[]).map(p=>p.marketplace).filter(Boolean))];
+    if (PLUG_INV.local_skills && PLUG_INV.local_skills.length) markets.push('local');
+    fillSelect('plugmarket', markets, PLUG_MARKET);
+    const strip = plugStrip() + plugLegend();
+    const q = PLUG_QUERY.trim().toLowerCase();
+    const skills = plugSkillEntries().filter(e =>
+        (PLUG_STATUSF==='all' || e.status===PLUG_STATUSF)
+        && (PLUG_MARKET==='all' || e.marketplace===PLUG_MARKET)
+        && (!q || ((e.name||'')+' '+(e.source||'')+' '+(e.trigger||'')).toLowerCase().includes(q)))
+      .sort(plugCompare);
+    const plugins = (PLUG_INV.plugins||[]).filter(p =>
+        (PLUG_MARKET==='all' || p.marketplace===PLUG_MARKET)
+        && (!q || ((p.name||'')+' '+(p.marketplace||'')+' '+(p.version||'')).toLowerCase().includes(q)))
+      .sort((a,b)=>{ const c=(a.name||'').localeCompare(b.name||''); return PLUG_DIR==='asc'?c:-c; });
+    if (!skills.length && !plugins.length) {
+      showHTML(strip + '<h2 class="h">'
+        + ((PLUG_INV.plugins||[]).length || (PLUG_INV.local_skills||[]).length
+           ? 'No skills or plugins match your filters.'
+           : 'No plugins installed.')+'</h2>');
+      return;
+    }
+    let html = strip;
+    html += '<h2 class="h">'+skills.length+' skill'+(skills.length===1?'':'s')+'</h2>';
+    html += skills.length
+      ? '<ul class="hits">'+skills.map(e => '<li><div class="file">'+skillChip(e.name, e.plugin)
+          + ' \\u00b7 <span class="pill">'+esc(e.source)+'</span></div>'
+          + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '')+'</li>').join('')+'</ul>'
+      : '<div class="dup">none match</div>';
+    html += '<h2 class="h" style="margin-top:16px">'+plugins.length+' plugin'+(plugins.length===1?'':'s')+'</h2>';
+    html += plugins.length
+      ? '<ul class="hits">'+plugins.map(p => '<li><div class="file">'+esc(p.name)+' '+esc(p.version)
+          + ' \\u00b7 '+esc(p.marketplace)
+          + (p.present === false ? ' \\u00b7 <span class="err">missing on disk</span>' : '')
+          + ' \\u00b7 '+p.skills.length+' skill'+(p.skills.length===1?'':'s')+'</div>'
+          + (p.skills.length ? '<div class="snip">'+p.skills.map(s=>skillChip(s.name, p.name)).join(' ')+'</div>' : '')
+          + '</li>').join('')+'</ul>'
+      : '<div class="dup">none match</div>';
+    if (PLUG_RANKING && (PLUG_RANKING.recommendations || []).length){
+      html += '<h2 class="h" style="margin-top:16px">Recommended (free, by breadth)</h2><ul class="hits">'
+        + PLUG_RANKING.recommendations.map(r => '<li><div class="file">'+esc(r.name)
+            + ' \\u00b7 score '+esc(r.breadth_score)+'</div>'
+            + (r.note ? '<div class="snip">'+esc(r.note)+'</div>' : '')+'</li>').join('')
+        + '</ul>';
+    }
+    showHTML(html);
+    // click a skill's trigger line to expand/collapse it (mirrors note rows)
+    view.querySelectorAll('.hits .snip.one').forEach(el =>
+      el.onclick = () => el.classList.toggle('one'));
+  }
+  function onPlugSearch(v){ PLUG_QUERY = v; paintPlugins(); }
+  function onPlugStatus(v){ PLUG_STATUSF = v; paintPlugins(); }
+  function onPlugMarket(v){ PLUG_MARKET = v; paintPlugins(); }
+  function onPlugSort(v){ PLUG_SORT = v; syncPlugDirBtn(); paintPlugins(); }
+  function togglePlugDir(){ PLUG_DIR = PLUG_DIR==='asc' ? 'desc' : 'asc'; syncPlugDirBtn(); paintPlugins(); }
+  // Click-through detail: intended use at the very top, then when it was added,
+  // then the full SKILL.md body. Pauses the live refresh so the panel you're
+  // reading isn't wiped by the 2.5s inventory poll.
+  async function showSkillDetail(name, plugin){
+    liveFn = null;
+    const q = '/api/skills/detail?name='+encodeURIComponent(name)
+      + (plugin ? '&plugin='+encodeURIComponent(plugin) : '');
+    run('loading '+name, async () => {
+      const d = await apiGet(q);
+      if (!d || d.ok === false){ showText('No detail found for “'+name+'”.'); return; }
+      const plug = d.source && d.source !== 'local' ? d.source : null;
+      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back to skills &amp; plugins</button>'
+        + '<button onclick="invokeSkill('+escAttr(JSON.stringify(d.name))+','+escAttr(JSON.stringify(plug))+')">'
+        + '\\u25b6 call this skill</button>'+statusDot(d.name)+'</div>'
+        + '<h2 class="h">'+esc(d.name)+'</h2>'
+        + '<div class="skmeta"><b>Intended use</b><div class="snip">'+esc(d.intended_use || '—')+'</div></div>'
+        + '<div class="skmeta"><b>Added</b> <span class="lbl">'+esc(d.added_at || 'unknown')
+        + (d.source ? ' \\u00b7 '+esc(d.source) : '')+'</span></div>'
+        + '<div class="skmeta"><b>Full description</b><pre class="skbody">'+esc(d.body || '')+'</pre></div>');
+    });
+  }
+  // Call a skill headlessly via MindHive. Each call spawns a full `claude`, so
+  // it's gated behind an explicit confirm. The dot turns green on success, red
+  // on failure; a failure is recorded as an incident and flows into the
+  // Improvements loop so the system learns from bad calls.
+  function invokeSkill(name, plugin){
+    if(!confirm('Call the "'+name+'" skill now? This runs a headless Claude and can take a while.')) return;
+    controls.innerHTML=''; liveFn = null;
+    run('calling '+name+'…', async () => {
+      const res = await apiPost('/api/skills/invoke', {name: name, plugin: plugin});
+      PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+      const head = res.ok ? '<span class="ok">\\u2714 '+esc(name)+' succeeded</span>'
+                          : '<span class="err">\\u2716 '+esc(name)+' failed (exit '+esc(res.exit)+')</span>';
+      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '
+        + '<button onclick="showImprovements(true)">open Improvements</button></div>'
+        + '<h2 class="h">'+head+'</h2>'
+        + '<div class="skmeta"><b>Output</b><pre class="skbody">'+esc(res.excerpt || '(no output)')+'</pre></div>'
+        + (res.ok ? '' : '<div class="lbl">This failure was recorded — the Improvements view will learn a prevention rule from it.</div>'));
+    });
+  }
+  function showPlugins(){
+    const statusOpts = [['all','all'],['fail','red (failed)'],['uncalled','grey (uncalled)'],['ok','green (ok)']]
+      .map(kv => '<option value="'+kv[0]+'"'+(PLUG_STATUSF===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
+    const sortOpts = [['status','needs attention'],['name','name'],['source','source']]
+      .map(kv => '<option value="'+kv[0]+'"'+(PLUG_SORT===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
+    controls.innerHTML = '<div class="row">'
+      + '<input id="plugq" placeholder="search skills &amp; plugins\\u2026" style="min-width:240px" '
+      + 'value="'+escAttr(PLUG_QUERY)+'" oninput="onPlugSearch(this.value)">'
+      + '<label>status <select id="plugstatus" onchange="onPlugStatus(this.value)">'+statusOpts+'</select></label>'
+      + '<label>marketplace <select id="plugmarket" onchange="onPlugMarket(this.value)"></select></label>'
+      + '<label>sort <select id="plugsort" onchange="onPlugSort(this.value)">'+sortOpts+'</select></label>'
+      + '<button id="plugdir" onclick="togglePlugDir()">'+plugDirLabel()+'</button>'
+      + '</div>';
+    liveFn = renderPlugins;
+    run('loading skills & plugins', async () => {
+      await renderPlugins();                        // the live list paints first
+      apiPost('/api/plugins/autoscan', {})          // ranking refreshes stale-gated
+        .then(() => apiGet('/api/plugins/recommend'))
+        .then(cat => { PLUG_RANKING = cat; if (liveFn === renderPlugins) paintPlugins(); })
+        .catch(()=>{});
+    });
+  }
   function doExport(){ window.location = u('/api/export'); }
 
   function doAction(path, label, method){

@@ -14,3 +14,6 @@ Lessons from past failures:     dashboard -> Memory -> Improvements
                                 (Reflect button turns recurring failures into lessons)
 Run the autonomous loop:        hive loop   (or /circle) — auto-opens the dashboard;
                                 add --no-dashboard to skip it
+Orchestrate an idea end-to-end:  /mindhive <idea> — recall-informed interview,
+                                a scored skill Recommendation Matrix, execution
+                                with follow-up chaining, and learnings logged back.

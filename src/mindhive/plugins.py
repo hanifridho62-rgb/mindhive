@@ -8,6 +8,7 @@ plain dicts that the event store and graph projection consume.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -82,6 +83,16 @@ def _parse_frontmatter(text: str) -> dict:
         if m:
             out[m.group(1).lower()] = m.group(2).strip().strip('"').strip("'")
     return out
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Return the markdown body with any leading `---` frontmatter block removed."""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            nl = text.find("\n", end + 1)
+            text = text[nl + 1:] if nl != -1 else ""
+    return text.strip()
 
 
 def _semver_key(version: str):
@@ -232,6 +243,195 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
         "paid_plugins": sorted(paid_plugins, key=lambda p: p["name"]),
         "recommendations": recommendations,
     }
+
+
+# --------------------------------------------------------------------------
+# Live inventory — registry-driven view of what is installed RIGHT NOW.
+# The cache-walking scan() above keeps powering the free/paid evaluation, but
+# the cache can lag reality (uninstalled plugins leave folders behind). The
+# inventory instead trusts installed_plugins.json — the file Claude itself
+# rewrites on every install/uninstall (including local-panel uploads) — plus
+# the standalone ~/.claude/skills directory.
+# --------------------------------------------------------------------------
+
+def _claude_dir(claude_dir=None) -> Path:
+    return Path(claude_dir) if claude_dir else (Path.home() / ".claude")
+
+
+def _read_registry(claude_dir=None) -> dict:
+    data = _read_json(_claude_dir(claude_dir) / "plugins" / "installed_plugins.json")
+    plugs = (data or {}).get("plugins")
+    return plugs if isinstance(plugs, dict) else {}
+
+
+def inventory(claude_dir=None) -> dict:
+    """Snapshot of every installed plugin (with its skills) + local skills."""
+    plugins_out = []
+    for key, entries in sorted(_read_registry(claude_dir).items()):
+        name, _, marketplace = key.rpartition("@")
+        if not name:                       # malformed key like "justaname"
+            name, marketplace = marketplace, ""
+        # several scopes may hold the same plugin — newest version wins
+        entry = max((e for e in entries if isinstance(e, dict)),
+                    key=lambda e: _semver_key(str(e.get("version", ""))),
+                    default=None)
+        if entry is None:
+            continue
+        install = Path(str(entry.get("installPath", "")))
+        present = install.is_dir()
+        manifest = _read_json(install / ".claude-plugin" / "plugin.json") or {}
+        plugins_out.append({
+            "marketplace": marketplace,
+            "name": name,
+            "version": str(entry.get("version", "")),
+            "scope": entry.get("scope", ""),
+            "description": manifest.get("description", ""),
+            "present": present,
+            "skills": _skills_for(install) if present else [],
+        })
+    plugins_out.sort(key=lambda p: (p["marketplace"], p["name"]))
+    # ~/.claude/skills/*/SKILL.md has the same layout as a plugin's skills dir,
+    # so the one canonical reader covers standalone local skills too
+    local = _skills_for(_claude_dir(claude_dir))
+    plugin_skills = sum(len(p["skills"]) for p in plugins_out)
+    return {
+        "generated_at": ev_mod.now_iso(),
+        "plugins": plugins_out,
+        "local_skills": local,
+        "counts": {
+            "plugins": len(plugins_out),
+            "plugin_skills": plugin_skills,
+            "local_skills": len(local),
+            "skills_total": plugin_skills + len(local),
+        },
+    }
+
+
+def inventory_signature(claude_dir=None) -> str:
+    """Cheap fingerprint of everything the inventory depends on. Any install,
+    uninstall, or skill add/delete changes it; identical disk state yields an
+    identical signature, so pollers can skip the full rescan."""
+    root = _claude_dir(claude_dir)
+    parts = []
+
+    def stat_of(p: Path):
+        try:
+            st = p.stat()
+            parts.append(f"{p}|{st.st_mtime_ns}|{st.st_size}")
+        except OSError:
+            parts.append(f"{p}|missing")
+
+    stat_of(root / "plugins" / "installed_plugins.json")
+    for skill_md in sorted((root / "skills").glob("*/SKILL.md")):
+        stat_of(skill_md)
+    # the set of SKILL.md paths inside each installed plugin catches a skill
+    # folder deleted from an install without any registry change
+    for entries in _read_registry(claude_dir).values():
+        for e in entries:
+            if isinstance(e, dict) and e.get("installPath"):
+                sdir = Path(str(e["installPath"])) / "skills"
+                parts.extend(str(p) for p in sorted(sdir.glob("*/SKILL.md")))
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+# per-claude-dir cache: signature of the last build -> its inventory payload
+_INV_CACHE: dict[str, tuple[str, dict]] = {}
+
+
+def live_inventory(claude_dir=None) -> dict:
+    """Signature-gated inventory: rebuild only when the disk actually changed.
+    Cheap enough for the dashboard to poll every couple of seconds."""
+    key = str(_claude_dir(claude_dir))
+    sig = inventory_signature(claude_dir)
+    cached = _INV_CACHE.get(key)
+    if cached and cached[0] == sig:
+        return {"changed": False, "signature": sig, "inventory": cached[1]}
+    payload = inventory(claude_dir)
+    _INV_CACHE[key] = (sig, payload)
+    return {"changed": True, "signature": sig, "inventory": payload}
+
+
+def _newest_entry(entries: list) -> dict | None:
+    return max((e for e in entries if isinstance(e, dict)),
+               key=lambda e: _semver_key(str(e.get("version", ""))), default=None)
+
+
+def _find_skill_md(sdir: Path, name: str) -> Path | None:
+    """The SKILL.md under sdir whose frontmatter name (or folder) matches name."""
+    for skill_md in sorted(sdir.glob("*/SKILL.md")):
+        fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+        if name in ((fm.get("name") or ""), skill_md.parent.name):
+            return skill_md
+    return None
+
+
+def _mtime_iso(path: Path) -> str:
+    import time
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime))
+    except OSError:
+        return ""
+
+
+def skill_detail(name: str, plugin: str | None = None, claude_dir=None) -> dict | None:
+    """Full click-through detail for one skill: intended use (its description),
+    when it was added, and the full SKILL.md body. Returns None if not found.
+
+    A plugin skill dates from the registry's ``installedAt``; a standalone local
+    skill dates from its SKILL.md mtime (there is no registry row for it)."""
+    if plugin:
+        for key, entries in _read_registry(claude_dir).items():
+            pname, _, _mkt = key.rpartition("@")
+            if (pname or _mkt) != plugin:
+                continue
+            entry = _newest_entry(entries)
+            if not entry:
+                return None
+            install = Path(str(entry.get("installPath", "")))
+            skill_md = _find_skill_md(install / "skills", name)
+            if not skill_md:
+                return None
+            fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+            return {
+                "name": fm.get("name") or skill_md.parent.name,
+                "intended_use": fm.get("description", ""),
+                "added_at": str(entry.get("installedAt", "")),
+                "body": _strip_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore")),
+                "source": plugin,
+            }
+        return None
+
+    skill_md = _find_skill_md(_claude_dir(claude_dir) / "skills", name)
+    if not skill_md:
+        return None
+    fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+    return {
+        "name": fm.get("name") or skill_md.parent.name,
+        "intended_use": fm.get("description", ""),
+        "added_at": _mtime_iso(skill_md),
+        "body": _strip_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore")),
+        "source": "local",
+    }
+
+
+def call_status(project=None) -> dict:
+    """Last-outcome per skill from the ledger: ``{name: "ok"|"fail"}``.
+
+    Reads ``invoke_result`` (ok) and ``tool_failed`` with a ``skill:<name>``
+    signature (fail). ``read_all`` is time-then-append ordered, so iterating and
+    overwriting leaves each skill at its most recent call — the green/red the
+    dashboard paints. Skills never called are simply absent (rendered grey)."""
+    status: dict[str, str] = {}
+    for e in ev_mod.read_all(project):
+        if e.type == "invoke_result":
+            name = e.payload.get("name")
+            if name:
+                status[name] = "ok"
+        elif e.type == "tool_failed":
+            sig = e.payload.get("signature", "")
+            if isinstance(sig, str) and sig.startswith("skill:"):
+                status[sig[len("skill:"):]] = "fail"
+    return status
 
 
 def _catalog_path(project=None) -> Path:
