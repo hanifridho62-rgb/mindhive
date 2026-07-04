@@ -95,7 +95,11 @@ class CLIDriver:
     accepts any object with a matching run() for fakes."""
 
     def __init__(self, cmd: str = "claude"):
-        self.cmd = cmd
+        # Resolve to the real executable path so subprocess.run can launch it.
+        # On Windows `claude` is a .CMD shim that the bare name can't start
+        # (WinError 2 -> spawn_failed); shutil.which returns the extensioned
+        # path there and the plain binary on POSIX. Consistent with preflight().
+        self.cmd = shutil.which(cmd) or cmd
 
     def run(self, prompt, loop_context, *, allowed_tools, session_id,
             model, permission_mode, timeout_s, live=False) -> DriverResult:
