@@ -6,6 +6,7 @@ calls an injectable runner; the default shells out to the `claude` CLI on Sonnet
 (mirroring loop/driver.py) and is NOT unit-tested.
 """
 import json
+import shutil
 import subprocess
 
 MODEL = "claude-sonnet-4-6"
@@ -54,7 +55,10 @@ def _result_text(stdout: str) -> str:
 
 def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
     """Default runner: one-shot headless `claude` call, returns the result text."""
-    argv = ["claude", "--output-format", "json", "--model", MODEL, "-p", prompt]
+    # Resolve the real path — on Windows `claude` is a .CMD shim that
+    # subprocess.run (no shell) can't find by the bare name.
+    exe = shutil.which("claude") or "claude"
+    argv = [exe, "--output-format", "json", "--model", MODEL, "-p", prompt]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

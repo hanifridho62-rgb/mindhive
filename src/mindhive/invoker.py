@@ -15,6 +15,7 @@ with zero extra plumbing. Status derivation (green/red) reads these two event
 types back — see ``plugins.call_status``.
 """
 import json
+import shutil
 import subprocess
 
 from . import events as ev_mod
@@ -48,7 +49,11 @@ def _excerpt(stdout: str, limit: int = 300) -> str:
 
 
 def _default_runner(prompt: str, timeout_s: int = 180) -> dict:
-    argv = ["claude", "--output-format", "json", "--model", MODEL, "-p", prompt]
+    # Resolve the real executable path: on Windows the npm shim is `claude.CMD`,
+    # which `subprocess.run(["claude", ...])` (no shell) can't find. shutil.which
+    # returns the extensioned path there and the plain binary on POSIX.
+    exe = shutil.which("claude") or "claude"
+    argv = [exe, "--output-format", "json", "--model", MODEL, "-p", prompt]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
