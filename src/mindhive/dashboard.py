@@ -556,6 +556,12 @@ def make_handler(token: str):
             return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
 
         def _post_plugins_scan(self, proj, body):
+            # Plugins/skills are installed machine-wide, so a scan is global. In
+            # HIVE MIND (all-projects) mode there's no concrete namespace to store
+            # the catalog under — fall back to the default project so the snapshot
+            # stays retrievable by the recommend route.
+            if is_all(proj):
+                proj = default_project()
             result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
             return self._json({"ok": True, "result": result})
 
@@ -575,6 +581,8 @@ def make_handler(token: str):
                                "exit": res["exit"], "excerpt": res["excerpt"]})
 
         def _post_plugins_autoscan(self, proj, body):
+            if is_all(proj):                       # global scan; see _post_plugins_scan
+                proj = default_project()
             res = plugins_mod.ensure_fresh(
                 top_n=int(body.get("top", 5)),
                 max_age_hours=float(body.get("max_age_hours", 24)),
@@ -686,9 +694,12 @@ def make_handler(token: str):
                     if route == "/api/project":
                         res = {n: projector.project(n) for n in _all_projects()}
                         return self._json({"ok": True, "result": res})
-                    # selftest + harvest are global (not tied to one project);
-                    # every other mutating action needs a concrete target.
-                    if route not in ("/api/selftest", "/api/harvest"):
+                    # selftest + harvest + plugin scans are global (machine-wide,
+                    # not tied to one project); every other mutating action needs
+                    # a concrete target. The plugin handlers substitute the
+                    # default project for storage when in all-mode.
+                    if route not in ("/api/selftest", "/api/harvest",
+                                     "/api/plugins/scan", "/api/plugins/autoscan"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)

@@ -563,6 +563,17 @@ def test_harvest_endpoint_allowed_under_hivemind(dashboard_server, monkeypatch):
     assert obj["ok"] is True            # harvest is global, not blocked by HIVE MIND guard
 
 
+def test_plugins_scan_allowed_under_hivemind(dashboard_server):
+    # Plugins/skills are installed machine-wide, so scanning is global — the
+    # HIVE MIND (all-projects) view must NOT reject it with the read-only guard.
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/plugins/autoscan", {"project": "*"}, token)
+    assert obj["ok"] is True
+    assert "HIVE MIND" not in str(obj.get("error", ""))
+    status, obj2 = _post(base, "/api/plugins/scan", {"project": "*"}, token)
+    assert obj2["ok"] is True
+
+
 def test_page_has_hivemind_picker(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")
