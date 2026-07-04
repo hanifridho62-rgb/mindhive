@@ -119,6 +119,31 @@ def cmd_recall(args) -> int | None:
     return None
 
 
+def cmd_gc(args) -> int | None:
+    from . import hygiene
+    if not args.prune:
+        print(hygiene.report())
+        return None
+    if not (args.target or args.orphans or args.graph_blobs):
+        print("error: --prune requires a target: a namespace name, --orphans, "
+              "or --graph-blobs", file=sys.stderr)
+        return 2
+    # Refuse destructive store ops while V17 is live-trading (defense in depth).
+    from . import guard
+    try:
+        guard.ensure_safe(force=args.force)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    res = hygiene.prune(target=args.target, orphans=args.orphans,
+                        graph_blobs=args.graph_blobs, force=args.force)
+    if res.get("refused"):
+        print(f"refused: {res['refused']}", file=sys.stderr)
+        return 2
+    print(json.dumps(res))
+    return None
+
+
 def cmd_export(args) -> int | None:
     print(str(export_mod.export(out=args.out, recent=args.recent)))
     return None
@@ -499,6 +524,19 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--limit", type=int, default=10)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_recall)
+
+    gc = sub.add_parser("gc", help="store hygiene: report sizes; prune junk (opt-in)")
+    gc.add_argument("target", nargs="?", default=None,
+                    help="namespace to prune (requires --prune)")
+    gc.add_argument("--prune", action="store_true",
+                    help="delete the target (default: report only)")
+    gc.add_argument("--orphans", action="store_true",
+                    help="with --prune: remove all unregistered namespaces")
+    gc.add_argument("--graph-blobs", dest="graph_blobs", action="store_true",
+                    help="with --prune: delete graph.json/graph.html blobs only")
+    gc.add_argument("--force", action="store_true",
+                    help="override the registered-namespace / LIVE_LOCK guard")
+    gc.set_defaults(func=cmd_gc)
 
     e = sub.add_parser("export", help="write handoff.md")
     e.add_argument("--out", default=None)
