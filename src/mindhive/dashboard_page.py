@@ -812,10 +812,30 @@ def render_page(token: str) -> str:
       const head = res.ok ? '<span class="ok">\\u2714 '+esc(name)+' succeeded</span>'
                           : '<span class="err">\\u2716 '+esc(name)+' failed (exit '+esc(res.exit)+')</span>';
       showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '
-        + '<button onclick="showImprovements(true)">open Improvements</button></div>'
+        + '<button onclick="showImprovements(true)">open Improvements</button>'
+        + (res.ok ? '' : ' <button onclick="reflectFailure('+escAttr(JSON.stringify(name))+')">'
+            + '\\u21bb reflect this failure</button>')+'</div>'
         + '<h2 class="h">'+head+'</h2>'
         + '<div class="skmeta"><b>Output</b><pre class="skbody">'+esc(res.excerpt || '(no output)')+'</pre></div>'
-        + (res.ok ? '' : '<div class="lbl">This failure was recorded — the Improvements view will learn a prevention rule from it.</div>'));
+        + (res.ok ? '' : '<div class="lbl">This failure was recorded. Click \\u201creflect this failure\\u201d to learn a prevention rule from it now, or let it feed the Improvements loop on recurrence.</div>'));
+    });
+  }
+  // Learn from a single failed call on demand: reflect the skill:<name> incident
+  // into a prevention rule immediately (bypassing the recurrence gate), so the
+  // system adapts from one mistake instead of waiting for it to recur. Spawns
+  // the claude CLI once, so it's behind a confirm.
+  function reflectFailure(name){
+    if(!confirm('Reflect the "'+name+'" failure into a prevention rule now? Runs the claude CLI once.')) return;
+    controls.innerHTML=''; liveFn = null;
+    run('reflecting '+name+'\\u2026', async () => {
+      const res = await apiPost('/api/rules/reflect_one', {signature: 'skill:'+name});
+      const head = res.ok
+        ? '<span class="ok">\\u2714 learned a prevention rule for '+esc(name)+'</span>'
+        : '<span class="err">\\u2716 '+esc(res.error || 'reflection failed')+'</span>';
+      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '
+        + '<button onclick="showImprovements(true)">open Improvements</button></div>'
+        + '<h2 class="h">'+head+'</h2>'
+        + (res.ok ? '<div class="lbl">See it in the Improvements view — its lesson and prevention rule are now recorded.</div>' : ''));
     });
   }
   function showPlugins(){
