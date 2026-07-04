@@ -2,14 +2,12 @@
 """Reflection pass: turn one incident into a structured prevention rule.
 
 Pure helpers (build_prompt/parse_reflection) are unit-tested. reflect_incident
-calls an injectable runner; the default shells out to the `claude` CLI on Sonnet
-(mirroring loop/driver.py) and is NOT unit-tested.
+calls an injectable runner; the default shells out to the shared headless
+`claude` helper (claude_cli) and is NOT unit-tested.
 """
 import json
-import shutil
-import subprocess
 
-MODEL = "claude-sonnet-4-6"
+from . import claude_cli
 
 _SYSTEM = (
     "You are the Reflection Engine. Analyze ONE execution failure and output ONLY "
@@ -40,31 +38,11 @@ def parse_reflection(text: str) -> dict:
     return obj if isinstance(obj, dict) else {}
 
 
-def _result_text(stdout: str) -> str:
-    """The model's result text from a `claude --output-format json` envelope, or
-    "" when the envelope is missing, unparseable, or reports is_error (e.g. a 401
-    auth failure — never feed that error string into reflection)."""
-    try:
-        obj = json.loads((stdout or "").strip())
-    except (json.JSONDecodeError, ValueError):
-        return ""
-    if not isinstance(obj, dict) or obj.get("is_error"):
-        return ""
-    return obj.get("result", "") or ""
-
-
 def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
-    """Default runner: one-shot headless `claude` call, returns the result text."""
-    # Resolve the real path — on Windows `claude` is a .CMD shim that
-    # subprocess.run (no shell) can't find by the bare name.
-    exe = shutil.which("claude") or "claude"
-    argv = [exe, "--output-format", "json", "--model", MODEL, "-p", prompt]
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return ""
-    return _result_text(proc.stdout or "")
+    """Default runner: one-shot headless `claude` call, returns the result text
+    (empty on any spawn failure or an is_error envelope)."""
+    return claude_cli.result_text(
+        claude_cli.run_headless(prompt, timeout_s=timeout_s)["stdout"])
 
 
 from . import incidents

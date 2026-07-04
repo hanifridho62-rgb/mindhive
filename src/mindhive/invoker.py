@@ -15,12 +15,8 @@ with zero extra plumbing. Status derivation (green/red) reads these two event
 types back — see ``plugins.call_status``.
 """
 import json
-import shutil
-import subprocess
 
-from . import events as ev_mod
-
-MODEL = "claude-sonnet-4-6"
+from . import claude_cli, events as ev_mod
 
 
 def build_prompt(name: str, plugin: str | None = None) -> str:
@@ -29,17 +25,10 @@ def build_prompt(name: str, plugin: str | None = None) -> str:
             f"If the skill cannot be found or fails, say so plainly.")
 
 
-def _envelope_ok(stdout: str) -> bool:
-    """True only when the `claude --output-format json` envelope parses and does
-    not report is_error (a 401/auth failure sets is_error even on exit 0)."""
-    try:
-        obj = json.loads((stdout or "").strip())
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return isinstance(obj, dict) and not obj.get("is_error")
-
-
 def _excerpt(stdout: str, limit: int = 300) -> str:
+    """A short human excerpt for the ledger — the model's result if present,
+    else the raw stdout. Unlike claude_cli.result_text this keeps the result
+    text even on an is_error envelope (so a 401 message still shows in history)."""
     try:
         obj = json.loads((stdout or "").strip())
         text = obj.get("result", "") if isinstance(obj, dict) else ""
@@ -48,32 +37,16 @@ def _excerpt(stdout: str, limit: int = 300) -> str:
     return (text or "").strip()[:limit]
 
 
-def _default_runner(prompt: str, timeout_s: int = 180) -> dict:
-    # Resolve the real executable path: on Windows the npm shim is `claude.CMD`,
-    # which `subprocess.run(["claude", ...])` (no shell) can't find. shutil.which
-    # returns the extensioned path there and the plain binary on POSIX.
-    exe = shutil.which("claude") or "claude"
-    argv = [exe, "--output-format", "json", "--model", MODEL, "-p", prompt]
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return {"exit": proc.returncode, "stdout": proc.stdout or ""}
-    except FileNotFoundError:
-        return {"exit": 127, "stdout": ""}          # claude CLI not installed
-    except subprocess.TimeoutExpired:
-        return {"exit": 124, "stdout": ""}
-
-
 def invoke_skill(name, plugin=None, runner=None, project=None,
                  session_id=None) -> dict:
     """Invoke one skill headlessly and record the outcome. Returns
     ``{ok, exit, excerpt}``. ``runner`` is injectable for tests."""
-    run = runner or _default_runner
+    run = runner or claude_cli.run_headless
     prompt = build_prompt(name, plugin)
     out = run(prompt)
     exit_code = int(out.get("exit", 1))
     stdout = out.get("stdout", "")
-    ok = exit_code == 0 and _envelope_ok(stdout)
+    ok = exit_code == 0 and claude_cli.envelope_ok(stdout)
     excerpt = _excerpt(stdout)
 
     if ok:
