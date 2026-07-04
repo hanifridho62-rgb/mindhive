@@ -125,6 +125,32 @@ def test_recall_threshold_drops_weak_tail():
     assert "maker" in hits[0]["snippet"].lower()
 
 
+def test_recall_threshold_every_hit_above_cut():
+    """Every returned hit (except a guaranteed single best) scores at or above
+    the relative-with-floor cut."""
+    events.append_event("decision", {"text": "fee tier maker taker rebate schedule"},
+                        session_id="s", ts="2026-06-20T10:00:00Z")
+    for i in range(6):
+        events.append_event("caveat", {"text": "generic fee mention only"},
+                            session_id="s", ts=f"2026-06-20T1{i}:30:00Z")
+    projector.project()
+    hits = recall.recall("fee tier maker taker rebate")
+    top = hits[0]["score"]
+    cut = max(top * recall._THRESHOLD_RATIO, recall._THRESHOLD_FLOOR)
+    for h in hits[1:]:
+        assert h["score"] >= cut
+
+
+def test_recall_single_weak_best_hit_retained():
+    """A lone hit weaker than the floor is still returned — the i==0 always-keep
+    guard fires so recall never returns [] when something matched."""
+    events.append_event("caveat", {"text": "a for the is only stopwords plus fee"},
+                        session_id="s", ts="2026-06-20T10:00:00Z")
+    projector.project()
+    hits = recall.recall("fee")
+    assert len(hits) == 1                             # the single match survives
+
+
 def test_recall_regression_fee_tier_query():
     """Audit regression: `real fee tier maker taker` must rank the fee/cost entry
     above governance-config entries (the original failure returned the reverse)."""

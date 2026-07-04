@@ -31,6 +31,15 @@ def test_known_projects_empty_without_registry(tmp_path, monkeypatch):
     assert paths.known_projects() == set()
 
 
+def test_known_projects_corrupt_registry(tmp_path, monkeypatch):
+    """A corrupt autosync.json must degrade to an empty set, not raise. (The
+    downstream bulk-prune guard treats this empty set as unsafe — see
+    tests/test_hygiene.py.)"""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    (tmp_path / "autosync.json").write_text("{not json", encoding="utf-8")
+    assert paths.known_projects() == set()
+
+
 def test_list_namespaces_filters_non_namespace_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
     (tmp_path / "fabio" / "events").mkdir(parents=True)

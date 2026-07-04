@@ -82,9 +82,36 @@ def prune(target=None, orphans=False, graph_blobs=False, force=False) -> dict:
     deletes a registered namespace's data unless force=True."""
     known = paths.known_projects()
     home = paths.store_home()
+    namespaces = paths.list_namespaces()
+
+    # Confine an explicit target to a real namespace on disk. This single check
+    # blocks four ways the raw target could escape the intended blast radius:
+    #   - path traversal ("../../x") and absolute paths ("C:/Windows") — `home /
+    #     target` would otherwise resolve outside the store and rmtree it;
+    #   - non-namespace dirs sharing the store root ("downloads", "dist");
+    #   - casing/format variants of a registered name ("Fabio" vs "fabio") that
+    #     miss the normalized `known` guard yet hit the real dir on a
+    #     case-insensitive filesystem.
+    if target is not None:
+        target = paths.normalize(target)
+        if target not in namespaces:
+            return {"refused": f"'{target}' is not a namespace on disk; "
+                               "run `hive gc` to see the list"}
+
+    # Bulk deletion (orphans, or graph-blobs across all namespaces) is only safe
+    # when the registry is positively readable. An empty `known` set is
+    # ambiguous: a MISSING or CORRUPT autosync.json also yields an empty set, and
+    # then every namespace looks like an orphan and gets wiped. Refuse rather
+    # than guess — the user can register a project, name an explicit target, or
+    # pass --force to accept the risk.
+    bulk = orphans or (graph_blobs and target is None)
+    if bulk and not known and not force:
+        return {"refused": "registry empty or unreadable — refusing bulk prune "
+                           "(every namespace would look unregistered). Register a "
+                           "project, name an explicit namespace, or use --force."}
 
     if orphans:
-        targets = [n for n in paths.list_namespaces() if n not in known]
+        targets = [n for n in namespaces if n not in known]
     elif target:
         targets = [target]
     else:
@@ -98,8 +125,10 @@ def prune(target=None, orphans=False, graph_blobs=False, force=False) -> dict:
     if graph_blobs:
         # Delete only the graph.json/graph.html blobs, leaving the event log and
         # projections intact. Scope to the selected namespaces, or all when none
-        # were named.
-        scope = targets or paths.list_namespaces()
+        # were named — the in-loop registered-skip is the last line of defense
+        # for the scope-all case (the bulk guard above already refused when the
+        # registry was unreadable).
+        scope = targets or namespaces
         removed = []
         for name in scope:
             if name in known and not force:
@@ -115,7 +144,7 @@ def prune(target=None, orphans=False, graph_blobs=False, force=False) -> dict:
     removed = []
     for name in targets:
         d = home / name
-        if d.exists():
+        if d.is_dir():
             freed = _dir_size(d)
             shutil.rmtree(d)
             removed.append({"namespace": name, "bytes": freed})

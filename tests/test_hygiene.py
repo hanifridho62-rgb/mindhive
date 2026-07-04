@@ -78,11 +78,96 @@ def test_prune_refuses_registered_without_force(tmp_path, monkeypatch):
 
 def test_prune_graph_blobs_keeps_events(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    _register(tmp_path, "keeper")   # non-empty registry so bulk prune is allowed
     _make_namespace(tmp_path, "orphan", graph_bytes=5000)
     res = hygiene.prune(graph_blobs=True)
     assert res["removed_blobs"]
     assert not (tmp_path / "orphan" / "graph.json").exists()
     assert (tmp_path / "orphan" / "events").exists()   # event log intact
+
+
+def test_prune_graph_blobs_skips_registered(tmp_path, monkeypatch):
+    """Scope-all --graph-blobs must not delete a registered namespace's blob,
+    but --force overrides."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    _register(tmp_path, "fabio")
+    _make_namespace(tmp_path, "fabio", graph_bytes=5000)
+    _make_namespace(tmp_path, "orphan", graph_bytes=5000)
+    hygiene.prune(graph_blobs=True)
+    assert (tmp_path / "fabio" / "graph.json").exists()        # registered kept
+    assert not (tmp_path / "orphan" / "graph.json").exists()   # orphan removed
+    hygiene.prune(graph_blobs=True, force=True)
+    assert not (tmp_path / "fabio" / "graph.json").exists()    # force removes it
+
+
+def test_prune_target_rejects_path_traversal(tmp_path, monkeypatch):
+    """A traversal/absolute target must be refused, not resolved outside the
+    store and deleted."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    sibling = tmp_path.parent / "DO_NOT_DELETE"
+    sibling.mkdir(exist_ok=True)
+    try:
+        res = hygiene.prune(target="../DO_NOT_DELETE")
+        assert "refused" in res
+        assert sibling.exists()                      # untouched
+    finally:
+        sibling.rmdir()
+
+
+def test_prune_target_rejects_non_namespace_dir(tmp_path, monkeypatch):
+    """A dir under the store that isn't a namespace (no markers) can't be pruned
+    by name."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    (tmp_path / "downloads").mkdir()                 # incidental, no markers
+    res = hygiene.prune(target="downloads")
+    assert "refused" in res
+    assert (tmp_path / "downloads").exists()
+
+
+def test_prune_target_normalizes_casing(tmp_path, monkeypatch):
+    """`prune('Fabio')` normalizes to the registered 'fabio' and is refused,
+    rather than slipping the guard and hitting the real dir."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    _register(tmp_path, "fabio")
+    _make_namespace(tmp_path, "fabio")
+    res = hygiene.prune(target="Fabio")
+    assert "refused" in res
+    assert (tmp_path / "fabio").exists()
+
+
+def test_prune_orphans_refused_on_corrupt_registry(tmp_path, monkeypatch):
+    """A corrupt autosync.json yields empty known_projects(); bulk orphan prune
+    must refuse rather than treat every namespace as an orphan and wipe it."""
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    (tmp_path / "autosync.json").write_text("{not json", encoding="utf-8")
+    _make_namespace(tmp_path, "fabio")
+    res = hygiene.prune(orphans=True)
+    assert "refused" in res
+    assert (tmp_path / "fabio").exists()             # not wiped
+
+
+def test_prune_orphans_refused_on_missing_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    _make_namespace(tmp_path, "fabio")
+    res = hygiene.prune(orphans=True)
+    assert "refused" in res
+    assert (tmp_path / "fabio").exists()
+
+
+def test_prune_force_overrides_registered_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    _register(tmp_path, "fabio")
+    _make_namespace(tmp_path, "fabio")
+    res = hygiene.prune(target="fabio", force=True)
+    assert res["removed_namespaces"]
+    assert not (tmp_path / "fabio").exists()
+
+
+def test_report_renders_oversized_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    _make_namespace(tmp_path, "bloated",
+                    graph_bytes=hygiene.GRAPH_BLOB_WARN_BYTES + 1)
+    assert "OVERSIZED" in hygiene.report()
 
 
 def test_cli_gc_report_default(tmp_path, monkeypatch, capsys):
