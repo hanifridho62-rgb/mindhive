@@ -479,6 +479,11 @@ def make_handler(token: str):
             # green/red per skill = last recorded call outcome from the ledger
             return self._json(plugins_mod.call_status(project=proj))
 
+        def _get_skills_history(self, proj, am, qs):
+            name = (qs.get("name") or [""])[0]
+            limit = int((qs.get("limit") or ["20"])[0])
+            return self._json(plugins_mod.call_history(name, project=proj, limit=limit))
+
         def _get_export(self, proj, am, qs):
             path = export_mod.export()
             data = path.read_bytes()
@@ -682,6 +687,7 @@ def make_handler(token: str):
             "/api/plugins/inventory": _get_plugins_inventory,
             "/api/skills/detail": _get_skills_detail,
             "/api/skills/status": _get_skills_status,
+            "/api/skills/history": _get_skills_history,
             "/api/export": _get_export,
         }
         _POST_ROUTES = {

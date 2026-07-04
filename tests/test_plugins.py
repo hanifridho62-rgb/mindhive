@@ -502,6 +502,31 @@ def test_call_status_last_call_wins_over_earlier():
     assert plugins.call_status(project="test")["x"] == "ok"
 
 
+def test_call_history_newest_first_with_outcomes():
+    invoker.invoke_skill("h", runner=_ok_runner, project="test")
+    invoker.invoke_skill("h", runner=_fail_runner, project="test")
+    hist = plugins.call_history("h", project="test")
+    assert [e["ok"] for e in hist] == [False, True]     # newest (the fail) first
+    assert all("ts" in e and "text" in e for e in hist)
+
+
+def test_call_history_filters_by_skill():
+    invoker.invoke_skill("a", runner=_ok_runner, project="test")
+    invoker.invoke_skill("b", runner=_fail_runner, project="test")
+    assert [e["ok"] for e in plugins.call_history("a", project="test")] == [True]
+    assert [e["ok"] for e in plugins.call_history("b", project="test")] == [False]
+
+
+def test_call_history_respects_limit():
+    for _ in range(5):
+        invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    assert len(plugins.call_history("x", project="test", limit=3)) == 3
+
+
+def test_call_history_empty_for_uncalled_skill():
+    assert plugins.call_history("never-called", project="test") == []
+
+
 def test_strip_frontmatter_returns_body_only():
     body = plugins._strip_frontmatter(
         "---\nname: x\ndescription: d\n---\n\n# Title\n\nParagraph.\n")

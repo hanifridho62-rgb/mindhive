@@ -434,6 +434,25 @@ def call_status(project=None) -> dict:
     return status
 
 
+def call_history(name, project=None, limit=20) -> list[dict]:
+    """Past invoke outcomes for one skill, newest first: a list of
+    ``{ts, ok, text, session}``. Reads the same ``invoke_result`` / ``tool_failed``
+    events ``call_status`` derives from, but keeps every occurrence so the
+    dashboard can show a skill's call log. ``read_all`` is chronological, so
+    reversing yields newest-first with append order preserved on ties."""
+    sig = f"skill:{name}"
+    out = []
+    for e in ev_mod.read_all(project):
+        if e.type == "invoke_result" and e.payload.get("name") == name:
+            out.append({"ts": e.ts, "ok": True,
+                        "text": e.payload.get("text", ""), "session": e.session_id})
+        elif e.type == "tool_failed" and e.payload.get("signature") == sig:
+            out.append({"ts": e.ts, "ok": False,
+                        "text": e.payload.get("text", ""), "session": e.session_id})
+    out.reverse()
+    return out[:max(0, limit)]
+
+
 def _catalog_path(project=None) -> Path:
     """Sidecar file holding the single latest plugin catalog snapshot."""
     return paths.project_dir(project) / "plugin_catalog.json"

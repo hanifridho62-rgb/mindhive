@@ -762,6 +762,20 @@ def render_page(token: str) -> str:
   function onPlugMarket(v){ PLUG_MARKET = v; paintPlugins(); }
   function onPlugSort(v){ PLUG_SORT = v; syncPlugDirBtn(); paintPlugins(); }
   function togglePlugDir(){ PLUG_DIR = PLUG_DIR==='asc' ? 'desc' : 'asc'; syncPlugDirBtn(); paintPlugins(); }
+  // Call history: every past invoke of this skill (green ✔ / red ✖), newest
+  // first, from the same ledger events that drive the status dot — so the detail
+  // panel shows not just the LAST outcome but the whole record of calls.
+  function callHistoryHTML(hist){
+    if (!hist || !hist.length)
+      return '<div class="skmeta"><b>Call history</b> <span class="lbl">never called</span></div>';
+    return '<div class="skmeta"><b>Call history</b> <span class="lbl">'+hist.length
+      + ' call'+(hist.length===1?'':'s')+'</span><ul class="hits">'
+      + hist.map(h => '<li><div class="file">'
+          + (h.ok ? '<span class="ok">\\u2714 ok</span>' : '<span class="err">\\u2716 failed</span>')
+          + ' \\u00b7 '+esc(h.ts||'')+(h.session ? ' \\u00b7 '+esc(h.session) : '')+'</div>'
+          + (h.text ? '<div class="snip one">'+esc(h.text)+'</div>' : '')+'</li>').join('')
+      + '</ul></div>';
+  }
   // Click-through detail: intended use at the very top, then when it was added,
   // then the full SKILL.md body. Pauses the live refresh so the panel you're
   // reading isn't wiped by the 2.5s inventory poll.
@@ -770,7 +784,8 @@ def render_page(token: str) -> str:
     const q = '/api/skills/detail?name='+encodeURIComponent(name)
       + (plugin ? '&plugin='+encodeURIComponent(plugin) : '');
     run('loading '+name, async () => {
-      const d = await apiGet(q);
+      const hq = '/api/skills/history?name='+encodeURIComponent(name)+'&limit=25';
+      const [d, hist] = await Promise.all([apiGet(q), apiGet(hq).catch(()=>[])]);
       if (!d || d.ok === false){ showText('No detail found for “'+name+'”.'); return; }
       const plug = d.source && d.source !== 'local' ? d.source : null;
       showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back to skills &amp; plugins</button>'
@@ -780,6 +795,7 @@ def render_page(token: str) -> str:
         + '<div class="skmeta"><b>Intended use</b><div class="snip">'+esc(d.intended_use || '—')+'</div></div>'
         + '<div class="skmeta"><b>Added</b> <span class="lbl">'+esc(d.added_at || 'unknown')
         + (d.source ? ' \\u00b7 '+esc(d.source) : '')+'</span></div>'
+        + callHistoryHTML(hist || [])
         + '<div class="skmeta"><b>Full description</b><pre class="skbody">'+esc(d.body || '')+'</pre></div>');
     });
   }
