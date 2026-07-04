@@ -268,6 +268,15 @@ def test_skills_plugins_view_has_improvements_style_controls(dashboard_server):
         assert needle in body, f"missing plugins filter/sort hook: {needle}"
 
 
+def test_skills_plugins_view_has_card_call_button_and_clickable_legend(dashboard_server):
+    """Callable straight from the list (per-card ▶ call) and a legend whose
+    green/red/grey items filter by status on click."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("callbtn", "setPlugStatus", "legitem"):
+        assert needle in body, f"missing polish hook: {needle}"
+
+
 def test_page_has_skill_detail_hooks(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")
