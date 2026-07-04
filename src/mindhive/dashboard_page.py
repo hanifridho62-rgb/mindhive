@@ -723,11 +723,16 @@ def render_page(token: str) -> str:
       showHTML(strip + '<h2 class="h">'
         + ((PLUG_INV.plugins||[]).length || (PLUG_INV.local_skills||[]).length
            ? 'No skills or plugins match your filters.'
-           : 'No plugins installed.')+'</h2>');
+           : 'No skills or plugins installed.')+'</h2>');
       return;
     }
     let html = strip;
-    html += '<h2 class="h">'+skills.length+' skill'+(skills.length===1?'':'s')+'</h2>';
+    // Skills and plugins share ONE combined heading — a plugin is a container of
+    // skills, so they read as a single "Skills & Plugins" surface rather than two
+    // disconnected sections with a standalone "Plugins" banner.
+    html += '<h2 class="h">Skills &amp; Plugins <span class="lbl">'
+      + skills.length+' skill'+(skills.length===1?'':'s')
+      + ' \\u00b7 '+plugins.length+' plugin'+(plugins.length===1?'':'s')+'</span></h2>';
     html += skills.length
       ? '<ul class="hits">'+skills.map(e => '<li><div class="file">'+skillChip(e.name, e.plugin)
           + ' \\u00b7 <span class="pill">'+esc(e.source)+'</span>'
@@ -736,7 +741,9 @@ def render_page(token: str) -> str:
           + '</div>'
           + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '')+'</li>').join('')+'</ul>'
       : '<div class="dup">none match</div>';
-    html += '<h2 class="h" style="margin-top:16px">'+plugins.length+' plugin'+(plugins.length===1?'':'s')+'</h2>';
+    // Light divider inside the same section (not a second heading) so the plugin
+    // rows stay visually grouped under the one combined banner above.
+    html += '<div class="lbl" style="margin-top:16px;margin-bottom:6px">plugins</div>';
     html += plugins.length
       ? '<ul class="hits">'+plugins.map(p => '<li><div class="file">'+esc(p.name)+' '+esc(p.version)
           + ' \\u00b7 '+esc(p.marketplace)
