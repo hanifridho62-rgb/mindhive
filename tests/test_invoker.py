@@ -55,21 +55,34 @@ def test_prompt_names_the_skill_and_plugin():
     assert "compound-engineering" in seen["prompt"]
 
 
+class _Proc:
+    returncode = 0
+    stdout = '{"is_error": false, "result": "ok"}'
+    stderr = ""
+
+
 def test_default_runner_builds_headless_claude_argv(monkeypatch):
+    import shutil
     captured = {}
-
-    class _Proc:
-        returncode = 0
-        stdout = '{"is_error": false, "result": "ok"}'
-        stderr = ""
-
-    def fake_run(argv, **kw):
-        captured["argv"] = argv
-        return _Proc()
-
-    monkeypatch.setattr(invoker.subprocess, "run", fake_run)
+    monkeypatch.setattr(shutil, "which", lambda name: None)   # not resolvable -> bare name
+    monkeypatch.setattr(invoker.subprocess, "run",
+                        lambda argv, **kw: captured.update(argv=argv) or _Proc())
     invoker.invoke_skill("brainstorming", project="test")
     argv = captured["argv"]
     assert argv[0] == "claude"
     assert "-p" in argv
     assert any("brainstorming" in a for a in argv)
+
+
+def test_default_runner_resolves_executable_via_which(monkeypatch):
+    """On Windows `subprocess.run(['claude', ...])` fails (WinError 2) because
+    the npm shim is claude.CMD. Resolve the real path via shutil.which so the
+    headless call works cross-platform."""
+    import shutil
+    captured = {}
+    monkeypatch.setattr(shutil, "which",
+                        lambda name: "C:/npm/claude.CMD" if name == "claude" else None)
+    monkeypatch.setattr(invoker.subprocess, "run",
+                        lambda argv, **kw: captured.update(argv=argv) or _Proc())
+    invoker.invoke_skill("s", project="test")
+    assert captured["argv"][0] == "C:/npm/claude.CMD"   # resolved, not bare "claude"
