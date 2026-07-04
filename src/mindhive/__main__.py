@@ -60,9 +60,37 @@ def cmd_project(args) -> int | None:
 
 
 def cmd_state(args) -> int | None:
-    s = paths.project_dir() / "STATE.md"
+    project = getattr(args, "project", None)
+    # Warn (stderr, non-fatal) when a bare `hive state` is about to resolve to a
+    # brand-new namespace inferred from cwd — the "wrong project from the wrong
+    # directory" failure. An explicit --project or MINDHIVE_PROJECT silences it.
+    if project is None and paths.is_freshly_minted():
+        print(f"warning: no memory for detected project "
+              f"'{paths.detect_project()}' — run from the project dir, set "
+              f"MINDHIVE_PROJECT, or pass --project. See `hive projects`.",
+              file=sys.stderr)
+    s = paths.project_dir(project) / "STATE.md"
     print(s.read_text(encoding="utf-8") if s.exists()
           else "(no STATE.md — run: hive project)")
+    return None
+
+
+def cmd_projects(args) -> int | None:
+    """List namespaces on disk, marking each registered (in the autosync
+    allow-list) or unregistered — surfacing junk/orphan namespaces without
+    deleting anything."""
+    known = paths.known_projects()
+    names = paths.list_namespaces()
+    if not names:
+        print("(no namespaces on disk yet)")
+        return None
+    for name in names:
+        flag = "registered" if name in known else "unregistered"
+        print(f"  [{flag:12}] {name}")
+    unregistered = [n for n in names if n not in known]
+    print(f"\n{len(names)} namespace(s): "
+          f"{len(names) - len(unregistered)} registered, "
+          f"{len(unregistered)} unregistered")
     return None
 
 
@@ -78,11 +106,41 @@ def cmd_verify(args) -> int | None:
 
 
 def cmd_recall(args) -> int | None:
-    for h in recall_mod.recall(args.query, semantic=args.semantic,
+    project = getattr(args, "project", None)
+    if project is None and paths.is_freshly_minted():
+        print(f"warning: no memory for detected project "
+              f"'{paths.detect_project()}' — searching an empty namespace. Pass "
+              f"--project or see `hive projects`.", file=sys.stderr)
+    for h in recall_mod.recall(args.query, project=project, semantic=args.semantic,
                                limit=args.limit, force=args.force):
         score = h.get("score")
         tag = f" [score {score:g}]" if isinstance(score, (int, float)) else ""
         print(f"{h['file']}{tag}\n  {h['snippet']}")
+    return None
+
+
+def cmd_gc(args) -> int | None:
+    from . import hygiene
+    if not args.prune:
+        print(hygiene.report())
+        return None
+    if not (args.target or args.orphans or args.graph_blobs):
+        print("error: --prune requires a target: a namespace name, --orphans, "
+              "or --graph-blobs", file=sys.stderr)
+        return 2
+    # Refuse destructive store ops while V17 is live-trading (defense in depth).
+    from . import guard
+    try:
+        guard.ensure_safe(force=args.force)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    res = hygiene.prune(target=args.target, orphans=args.orphans,
+                        graph_blobs=args.graph_blobs, force=args.force)
+    if res.get("refused"):
+        print(f"refused: {res['refused']}", file=sys.stderr)
+        return 2
+    print(json.dumps(res))
     return None
 
 
@@ -449,17 +507,36 @@ def _build_parser() -> argparse.ArgumentParser:
     hk.set_defaults(func=cmd_hook)
 
     sub.add_parser("project", help="rebuild projections").set_defaults(func=cmd_project)
-    sub.add_parser("state", help="print STATE.md").set_defaults(func=cmd_state)
+    st = sub.add_parser("state", help="print STATE.md")
+    st.add_argument("--project", default=None,
+                    help="target namespace explicitly (default: detect from cwd)")
+    st.set_defaults(func=cmd_state)
+    sub.add_parser("projects", help="list namespaces (registered vs unregistered)").set_defaults(func=cmd_projects)
     sub.add_parser("directives", help="print the session operating directives").set_defaults(func=cmd_directives)
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
 
     r = sub.add_parser("recall", help="search ledger")
     r.add_argument("query")
+    r.add_argument("--project", default=None,
+                   help="target namespace explicitly (default: detect from cwd)")
     r.add_argument("--semantic", action="store_true")
     r.add_argument("--limit", type=int, default=10)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_recall)
+
+    gc = sub.add_parser("gc", help="store hygiene: report sizes; prune junk (opt-in)")
+    gc.add_argument("target", nargs="?", default=None,
+                    help="namespace to prune (requires --prune)")
+    gc.add_argument("--prune", action="store_true",
+                    help="delete the target (default: report only)")
+    gc.add_argument("--orphans", action="store_true",
+                    help="with --prune: remove all unregistered namespaces")
+    gc.add_argument("--graph-blobs", dest="graph_blobs", action="store_true",
+                    help="with --prune: delete graph.json/graph.html blobs only")
+    gc.add_argument("--force", action="store_true",
+                    help="override the registered-namespace / LIVE_LOCK guard")
+    gc.set_defaults(func=cmd_gc)
 
     e = sub.add_parser("export", help="write handoff.md")
     e.add_argument("--out", default=None)

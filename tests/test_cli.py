@@ -1,7 +1,7 @@
 # tests/test_cli.py
 import io
 import sys
-from mindhive import __main__ as cli_mod, events
+from mindhive import __main__ as cli_mod, events, projector, paths
 
 
 def test_append_positional_text():
@@ -46,6 +46,51 @@ def test_hook_post_tool_use_captures_from_stdin(monkeypatch):
     assert evs[0].type == "command_run"
     assert evs[0].session_id == "s9"
     assert evs[0].payload.get("text") == "pytest -q"
+
+
+def test_recall_project_override_targets_named_namespace(capsys):
+    """`recall --project X` searches X's ledger regardless of the detected
+    (env) namespace — the fix for 'wrong project from the wrong directory'."""
+    events.append_event("decision", {"text": "fee tier maker taker in fabio"},
+                        session_id="s", ts="2026-06-20T10:00:00Z", project="fabio")
+    projector.project("fabio")
+    ret = cli_mod.main(["recall", "fee tier maker taker", "--project", "fabio"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "fee tier maker taker" in out
+
+
+def test_state_project_override(capsys):
+    events.append_event("state_set", {"task": "fabio task"},
+                        session_id="s", ts="2026-06-20T10:00:00Z", project="fabio")
+    projector.project("fabio")
+    ret = cli_mod.main(["state", "--project", "fabio"])
+    assert ret == 0
+    assert "fabio task" in capsys.readouterr().out
+
+
+def test_projects_lists_registered_and_unregistered(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    (tmp_path / "autosync.json").write_text(
+        '[{"project": "fabio"}]', encoding="utf-8")
+    (tmp_path / "fabio" / "events").mkdir(parents=True)
+    (tmp_path / "brave-brattain-28ae65").mkdir()
+    (tmp_path / "brave-brattain-28ae65" / "STATE.md").write_text("# STATE\n", encoding="utf-8")
+    ret = cli_mod.main(["projects"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "registered" in out and "fabio" in out
+    assert "unregistered" in out and "brave-brattain-28ae65" in out
+
+
+def test_state_warns_on_freshly_minted_namespace(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.delenv("MINDHIVE_PROJECT", raising=False)
+    monkeypatch.setattr(paths, "detect_project", lambda cwd=None: "brave-brattain-28ae65")
+    ret = cli_mod.main(["state"])
+    assert ret == 0
+    err = capsys.readouterr().err
+    assert "no memory for detected project" in err.lower()
 
 
 def test_project_on_corrupt_log_exits_cleanly(tmp_path, capsys):
