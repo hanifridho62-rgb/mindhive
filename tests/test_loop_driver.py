@@ -30,6 +30,20 @@ def test_build_argv_emits_permission_mode_not_effort():
     assert "--permission-mode" in argv and "acceptEdits" in argv
 
 
+def test_cli_driver_resolves_cmd_via_which(monkeypatch):
+    """On Windows `claude` is a .CMD shim that subprocess.run(["claude", ...])
+    can't launch (WinError 2 -> spawn_failed). Resolve to the real path so the
+    loop iteration can actually start the CLI."""
+    monkeypatch.setattr(driver.shutil, "which",
+                        lambda name: "C:/npm/claude.CMD" if name == "claude" else None)
+    assert driver.CLIDriver().cmd == "C:/npm/claude.CMD"
+
+
+def test_cli_driver_falls_back_to_bare_cmd_when_unresolved(monkeypatch):
+    monkeypatch.setattr(driver.shutil, "which", lambda name: None)
+    assert driver.CLIDriver("claude").cmd == "claude"
+
+
 def test_run_timeout_returns_error_not_raises(monkeypatch):
     def boom(*a, **k):
         raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
