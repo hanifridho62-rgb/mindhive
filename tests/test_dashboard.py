@@ -242,6 +242,35 @@ def test_skills_invoke_requires_token(dashboard_server):
         assert e.code == 403
 
 
+def test_skills_history_endpoint_returns_list(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    seen = {}
+    monkeypatch.setattr(plugins_mod, "call_history",
+        lambda name, project=None, limit=20: seen.update(name=name, limit=limit)
+        or [{"ts": "t", "ok": True, "text": "x", "session": "s"}])
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/history?name=foo&limit=7", token)
+    assert status == 200
+    assert json.loads(body) == [{"ts": "t", "ok": True, "text": "x", "session": "s"}]
+    assert seen == {"name": "foo", "limit": 7}
+
+
+def test_skills_history_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/skills/history?name=foo")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_page_has_call_history_hook(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("/api/skills/history", "Call history"):
+        assert needle in body, f"missing call-history hook: {needle}"
+
+
 def test_skills_status_endpoint_returns_map(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
     monkeypatch.setattr(plugins_mod, "call_status", lambda project=None: {"a": "ok", "b": "fail"})
