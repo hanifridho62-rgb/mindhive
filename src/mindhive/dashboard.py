@@ -619,6 +619,39 @@ def make_handler(token: str):
             finally:
                 _REFLECT_LOCK.release()
 
+        def _post_rules_reflect_one(self, proj, body):
+            # Reflect ONE named failure signature on demand — the "reflect this
+            # failure" action on a failed skill call. Unlike the batch endpoint,
+            # this bypasses the recurrence-threshold gate: the user is explicitly
+            # asking to learn from this single failure now.
+            import shutil
+            from . import incidents, reflect as reflect_mod
+            signature = (body.get("signature") or "").strip()
+            if not signature:
+                return self._json({"ok": False, "error": "signature is required"}, 200)
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "reflection already running"}, 200)
+            try:
+                # ensure the incident projection exists (even a single-occurrence
+                # candidate gets a file), then reflect that specific signature.
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+                if not incidents.load(signature, project=proj):
+                    return self._json({"ok": False,
+                                       "error": f"no such incident: {signature}"}, 200)
+                res = reflect_mod.reflect_incident(signature, project=proj)
+                if not res.get("reflected"):
+                    if not shutil.which("claude"):
+                        return self._json({"ok": False, "error":
+                            "claude CLI unavailable — reflection needs it on PATH"}, 200)
+                    return self._json({"ok": False, "signature": signature,
+                        "error": res.get("reason", "reflection produced no rule")}, 200)
+                return self._json({"ok": True, "reflected": True,
+                                   "signature": signature})
+            finally:
+                _REFLECT_LOCK.release()
+
         def _post_rules_dismiss(self, proj, body):
             # Explicit demotion from a lesson card — the only way the gray
             # "dismissed" state is reachable without dropping to the CLI.
@@ -700,6 +733,7 @@ def make_handler(token: str):
             "/api/skills/invoke": _post_skills_invoke,
             "/api/plugins/autoscan": _post_plugins_autoscan,
             "/api/rules/reflect": _post_rules_reflect,
+            "/api/rules/reflect_one": _post_rules_reflect_one,
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/selftest": _post_selftest,
         }

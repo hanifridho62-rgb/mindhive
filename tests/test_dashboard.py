@@ -890,6 +890,68 @@ def test_reflect_rejected_for_hivemind(dashboard_server):
     assert obj["ok"] is False and "read-only" in obj["error"]
 
 
+# --------------------------------------------------------------------------
+# POST /api/rules/reflect_one: on-demand reflection of ONE failure signature —
+# lets a single skill-call failure be learned from immediately (the UI's
+# "reflect this failure" action), bypassing the recurrence-threshold gate.
+# --------------------------------------------------------------------------
+
+def test_reflect_one_reflects_a_single_named_failure(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    # one failure (below the recurrence threshold) -> the endpoint still reflects it
+    ev_mod.append_event("tool_failed",
+                        {"text": "boom", "signature": "skill:foo",
+                         "action": "invoke skill foo"},
+                        session_id="s1", project="test")
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect_one",
+                        {"project": "test", "signature": "skill:foo"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj["reflected"] is True
+    assert obj["signature"] == "skill:foo"
+
+
+def test_reflect_one_unknown_signature_rejected(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect_one",
+                        {"project": "test", "signature": "skill:never"}, token)
+    assert obj["ok"] is False and "no such incident" in obj["error"]
+
+
+def test_reflect_one_requires_signature(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect_one", {"project": "test"}, token)
+    assert obj["ok"] is False and "signature" in obj["error"]
+
+
+def test_reflect_one_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/reflect_one",
+                        {"project": "*", "signature": "skill:x"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "read-only" in obj["error"]
+
+
+def test_reflect_one_requires_token(dashboard_server):
+    base, token = dashboard_server
+    req = urllib.request.Request(f"{base}/api/rules/reflect_one", data=b"{}",
+                                 method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_page_has_reflect_failure_hook(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("/api/rules/reflect_one", "reflectFailure"):
+        assert needle in body, f"missing reflect-failure hook: {needle}"
+
+
 def test_reflect_unexpected_error_returns_500(dashboard_server, monkeypatch):
     base, token = dashboard_server
     _seed_incident("test", sig="sig:boom")
