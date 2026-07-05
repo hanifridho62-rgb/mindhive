@@ -10,6 +10,7 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive project` — rebuild STATE.md + LEDGER/ + index.json + chain.json
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
+- `hive rules summaries [--project P] [--json]` — structured lesson records (root cause, lesson, prevention rule, category, active rule) for every incident — the same data the dashboard **Improvements** view shows, for agents working headless. `--json` emits the raw list
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N

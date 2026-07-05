@@ -433,6 +433,26 @@ def cmd_rules_list(args) -> int | None:
     return None
 
 
+def cmd_rules_summaries(args) -> int | None:
+    """Structured lesson records (the same shape the dashboard Improvements view
+    reads) for an agent working from the CLI. --json emits the raw list; the
+    default is a human-readable digest per signature."""
+    from . import incidents as inc
+    recs = inc.summaries(args.project)
+    if args.json:
+        print(json.dumps(recs, indent=2))
+        return None
+    if not recs:
+        print("(no incidents yet)")
+        return None
+    for r in sorted(recs, key=lambda r: -r.get("occurrences", 0)):
+        lesson = r.get("lesson") or r.get("active_rule") or "(not yet reflected)"
+        cat = f" {{{r['category']}}}" if r.get("category") else ""
+        print(f"{r.get('occurrences', 0):>3}x  [{r.get('status', '?'):9}]{cat} "
+              f"{r.get('signature', '')}\n       {lesson}")
+    return None
+
+
 def cmd_rules_show(args) -> int | None:
     from . import incidents as inc
     path = inc._incident_dir(args.project) / f"{inc._safe_name(args.signature)}.md"
@@ -677,6 +697,11 @@ def _build_parser() -> argparse.ArgumentParser:
     rl = rsub.add_parser("list", help="list incidents by occurrence")
     rl.add_argument("--project", default=None)
     rl.set_defaults(func=cmd_rules_list)
+    rsm = rsub.add_parser("summaries",
+                          help="structured lesson records (dashboard parity; --json for raw)")
+    rsm.add_argument("--project", default=None)
+    rsm.add_argument("--json", action="store_true", help="emit the raw list as JSON")
+    rsm.set_defaults(func=cmd_rules_summaries)
     rsh = rsub.add_parser("show", help="print one incident record")
     rsh.add_argument("signature")
     rsh.add_argument("--project", default=None)

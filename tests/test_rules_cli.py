@@ -48,3 +48,32 @@ def test_rules_inject_and_promote_cli(tmp_path, capsys):
     assert cli.main(["rules", "promote", "pymodule:mindhive", "--project", "test"]) == 0
     assert '"promoted": true' in capsys.readouterr().out.lower()
     assert incidents.soul_path("test").exists()
+
+
+def test_rules_summaries_human_and_json(tmp_path, capsys):
+    _seed()                                      # 2 failures -> active, unreflected
+    # human digest
+    assert cli.main(["rules", "summaries", "--project", "test"]) == 0
+    out = capsys.readouterr().out
+    assert "pymodule:mindhive" in out and "active" in out
+    assert "not yet reflected" in out            # no lesson yet
+
+    # --json emits the structured list the dashboard route also returns
+    import json as _json
+    assert cli.main(["rules", "summaries", "--project", "test", "--json"]) == 0
+    recs = _json.loads(capsys.readouterr().out)
+    assert isinstance(recs, list) and len(recs) == 1
+    r = recs[0]
+    assert r["signature"] == "pymodule:mindhive"
+    assert r["occurrences"] == 2 and r["status"] == "active"
+    for field in ("root_cause", "lesson", "prevention_rule", "category", "active_rule"):
+        assert field in r
+
+
+def test_rules_summaries_empty(tmp_path, capsys):
+    assert cli.main(["rules", "summaries", "--project", "nothing"]) == 0
+    assert "(no incidents yet)" in capsys.readouterr().out
+
+    assert cli.main(["rules", "summaries", "--project", "nothing", "--json"]) == 0
+    import json as _json
+    assert _json.loads(capsys.readouterr().out) == []
