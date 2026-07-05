@@ -474,3 +474,58 @@ def test_project_write_is_atomic_no_tmp_left():
     incidents.project(project="test", threshold=2)
     d = paths.project_dir("test") / "rules" / "incidents"
     assert not list(d.glob("*.tmp"))             # temp file replaced, not left
+
+
+# --- cross-process incident-write guard ---
+import os as _os, time as _time
+
+
+def test_write_guard_reentrant_and_releases_lock():
+    # reflect takes the guard, then calls project() which re-enters it — must not
+    # deadlock, and the file lock must be gone afterward.
+    _add_failure("pymodule:mindhive", "x", "s1")
+    _add_failure("pymodule:mindhive", "y", "s2")
+    incidents.project(project="test", threshold=2)
+    from mindhive import reflect
+    stub = lambda prompt: ('{"root_cause":"rc","lesson":"le",'
+                           '"prevention_rule":"run -m","task_category":"tool_use"}')
+    res = reflect.reflect_incident("pymodule:mindhive", project="test", runner=stub)
+    assert res["reflected"] is True
+    assert not incidents._incidents_lock_path("test").exists()
+    assert incidents._LOCK_DEPTH == 0
+    rec = incidents.summaries(project="test")[0]
+    assert rec["prevention_rule"] == "run -m"       # verdict persisted, not clobbered
+
+
+def test_acquire_steals_stale_lock():
+    p = incidents._incidents_lock_path("test")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("999999", encoding="utf-8")
+    old = _time.time() - 3600
+    _os.utime(p, (old, old))
+    incidents._acquire_file_lock("test", timeout=1.0, stale_secs=60)
+    assert p.exists() and p.read_text(encoding="utf-8") == str(_os.getpid())
+    incidents._release_file_lock("test")
+    assert not p.exists()
+
+
+def test_acquire_times_out_on_fresh_lock_then_proceeds():
+    p = incidents._incidents_lock_path("test")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = _os.open(str(p), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)  # held, fresh
+    _os.close(fd)
+    t0 = _time.monotonic()
+    incidents._acquire_file_lock("test", timeout=0.3, stale_secs=600)  # can't steal
+    assert _time.monotonic() - t0 >= 0.3            # waited the full timeout
+    assert p.exists()                               # still the other holder's lock
+    p.unlink()
+
+
+def test_project_does_not_leak_lock_or_tmp_into_summaries():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    recs = incidents.summaries(project="test")
+    assert [r["signature"] for r in recs] == ["pymodule:mindhive"]
+    d = incidents._incident_dir("test")
+    assert not incidents._incidents_lock_path("test").exists()
+    assert not list(d.glob("*.tmp"))
