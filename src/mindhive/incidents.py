@@ -9,6 +9,8 @@ sections are stubs that Plan 2 populates.
 import os
 import re
 import threading
+import time
+from contextlib import contextmanager
 from . import events, paths
 
 THRESHOLD = 2                       # recurrence gate N (D2)
@@ -20,6 +22,69 @@ _SAFE = re.compile(r"[^a-z0-9]+")
 # write and silently discard a just-computed reflection verdict. Reentrant so
 # reflect_incident can hold it across its own project() re-derivation.
 _WRITE_LOCK = threading.RLock()
+
+# Cross-process reentrancy depth, guarded by _WRITE_LOCK. The in-process RLock
+# alone only serializes writers within ONE process; a separate `hive rules
+# reflect` CLI run or a second dashboard is a distinct process and races the
+# same files. The file lock below closes that gap — but O_EXCL is not
+# reentrant, so only the OUTERMOST writer in this process takes/releases it
+# (reflect's tail holds it across its own project() call). Depth tracks nesting.
+_LOCK_DEPTH = 0
+
+
+def _incidents_lock_path(project=None):
+    return _incident_dir(project) / ".write.lock"
+
+
+def _acquire_file_lock(project, timeout: float = 30.0, stale_secs: float = 60.0) -> None:
+    """Block until this process holds the per-project incident-write file lock.
+    Steals a lock older than ``stale_secs`` (crashed writer). Best-effort: on
+    timeout it proceeds unlocked rather than dropping a paid write — the
+    in-process lock still holds, and a lost cross-process update is strictly
+    less bad than refusing to persist a reflection verdict."""
+    p = _incidents_lock_path(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if p.exists() and (time.time() - p.stat().st_mtime) > stale_secs:
+                p.unlink()
+        except OSError:
+            pass
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.close(fd)
+            return
+        except OSError:                 # held by another process
+            if time.monotonic() >= deadline:
+                return                  # give up the cross-process guard, proceed
+            time.sleep(0.05)
+
+
+def _release_file_lock(project) -> None:
+    try:
+        _incidents_lock_path(project).unlink()
+    except OSError:
+        pass
+
+
+@contextmanager
+def _write_guard(project):
+    """Serialize incident-file writers both within this process (the RLock) and
+    across processes (the file lock, taken once at the outermost depth)."""
+    global _LOCK_DEPTH
+    with _WRITE_LOCK:
+        outermost = _LOCK_DEPTH == 0
+        if outermost:
+            _acquire_file_lock(project)
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
+            if outermost:
+                _release_file_lock(project)
 
 
 def _atomic_write(path, text) -> None:
@@ -225,7 +290,7 @@ def project(project=None, threshold=THRESHOLD) -> dict:
     acc = _collect(project)
     d = _incident_dir(project)
     d.mkdir(parents=True, exist_ok=True)
-    with _WRITE_LOCK:
+    with _write_guard(project):
         for signature, rec in acc.items():
             path = d / f"{_safe_name(signature)}.md"
             auto_body = "<!-- filled by the reflection pass (hive rules reflect) -->"
