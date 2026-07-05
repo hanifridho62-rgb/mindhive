@@ -600,7 +600,15 @@ def make_handler(token: str):
             # this endpoint deliberately does not).
             import shutil
             from . import incidents, reflect as reflect_mod
-            limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            # Clamp to [0, REFLECT_BATCH_LIMIT]: a direct API caller must not be
+            # able to request an unbounded batch of 120s-per-incident claude
+            # calls while holding _REFLECT_LOCK. Non-numeric is a domain error.
+            try:
+                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            except (TypeError, ValueError):
+                return self._json({"ok": False,
+                                   "error": "limit must be an integer"}, 200)
+            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
             if not _REFLECT_LOCK.acquire(blocking=False):
                 return self._json({"ok": False,
                                    "error": "reflection already running"}, 200)
@@ -613,7 +621,7 @@ def make_handler(token: str):
                     if s["status"] == "active" and s["rule_source"] == "none"
                 ]
                 reflected = failed = 0
-                for signature in eligible[:max(0, limit)]:
+                for signature in eligible[:limit]:
                     if reflect_mod.reflect_incident(signature, project=proj).get("reflected"):
                         reflected += 1
                     else:
@@ -621,9 +629,11 @@ def make_handler(token: str):
                 if failed and not reflected and not shutil.which("claude"):
                     return self._json({"ok": False, "error":
                         "claude CLI unavailable — reflection needs it on PATH"}, 200)
+                # pending = eligible not yet turned into a lesson: exclude the
+                # ones that failed this round (they were attempted, not skipped).
                 return self._json({"ok": True, "reflected": reflected,
                                    "failed": failed,
-                                   "pending": len(eligible) - reflected})
+                                   "pending": max(0, len(eligible) - reflected - failed)})
             finally:
                 _REFLECT_LOCK.release()
 

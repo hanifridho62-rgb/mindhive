@@ -1214,3 +1214,43 @@ def test_improvements_stats_miss_is_watching_not_resolved(dashboard_server):
     assert a["resolution"] == "watching"            # never green without events
     assert a["first_seen"] is None and a["last_seen"] is None
     assert a["leaks"] == 0
+
+
+# --- review fixes: limit clamp, non-numeric guard, pending accounting ---
+
+def test_reflect_clamps_oversized_limit(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    for i in range(5):
+        _seed_incident("test", sig=f"sig:clamp{i}")
+    calls = []
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: calls.append(sig) or {"reflected": True})
+    status, obj = _post(base, "/api/rules/reflect",
+                        {"project": "test", "limit": 100}, token)
+    assert len(calls) == 3                       # clamped to REFLECT_BATCH_LIMIT
+    assert obj["reflected"] == 3 and obj["pending"] == 2
+
+
+def test_reflect_rejects_non_numeric_limit(dashboard_server):
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:badlimit")
+    status, obj = _post(base, "/api/rules/reflect",
+                        {"project": "test", "limit": "abc"}, token)
+    assert status == 200
+    assert obj["ok"] is False and "integer" in obj["error"]
+
+
+def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    for i in range(3):
+        _seed_incident("test", sig=f"sig:mix{i}")
+    seen = []
+
+    def one_ok_rest_fail(sig, project=None):
+        seen.append(sig)
+        return {"reflected": len(seen) == 1}     # first ok, rest fail
+
+    monkeypatch.setattr(refl_mod, "reflect_incident", one_ok_rest_fail)
+    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert obj["reflected"] == 1 and obj["failed"] == 2
+    assert obj["pending"] == 0                    # attempted-but-failed is not pending
