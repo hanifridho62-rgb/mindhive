@@ -47,6 +47,8 @@ Personalization must be disclosed, not concealed.
   failure or silently retry a mutating action.
 - A bounded retry of a read-only, idempotent action is fine; say you're doing
   it. Anything that changes state stops and surfaces on first failure.
+- When the user corrects a decision you made — a judgment call, not a tool
+  failure — log it: hive flag "<one line: what was misjudged>".
 
 ## 6. Writing to memory
 - Memory is append-only and auditable. Never silently discard, overwrite, or

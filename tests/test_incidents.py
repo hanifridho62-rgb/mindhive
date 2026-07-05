@@ -568,3 +568,98 @@ def test_project_does_not_leak_lock_or_tmp_into_summaries():
     d = incidents._incident_dir("test")
     assert not incidents._incidents_lock_path("test").exists()
     assert not list(d.glob("*.tmp"))
+
+
+# --- judgment capture + candidate decay (U4) ---
+
+
+def _rel_ts(offset_secs):
+    """Store-format ts at now + offset (negative = past) — decay tests must not
+    go stale as the calendar advances, so they use relative timestamps."""
+    return _time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          _time.gmtime(_time.time() + offset_secs))
+
+
+def test_judgment_flag_active_at_one_occurrence():
+    sig = "judgment:flag:committed-to-master"
+    _add_failure_ts(sig, "hive flag", "s1", "2026-07-01T10:00:00Z")
+    res = incidents.audit(project="test", threshold=2)
+    assert res["activated"] == 1
+    incidents.project(project="test", threshold=2)
+    rec = incidents.load(sig, project="test")
+    assert rec["status"] == "active"
+    assert rec["occurrences"] == 1
+
+
+def test_stale_single_candidate_expires_and_stays_expired_across_rebuild():
+    _add_failure_ts("pymodule:stale", "x", "s1", _rel_ts(-20 * 86400))
+    res = incidents.audit(project="test", threshold=2)
+    assert res["expired"] == 1
+    exps = [e for e in events.read_all("test") if e.type == "rule_expired"]
+    assert len(exps) == 1
+    assert exps[0].payload["signature"] == "pymodule:stale"
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:stale", project="test")["status"] == "expired"
+    # idempotent: the expiry zeroes the live count, no second event
+    assert incidents.audit(project="test", threshold=2)["expired"] == 0
+    # a full projection rebuild re-derives expired from the event, not state
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:stale", project="test")["status"] == "expired"
+
+
+def test_judgment_flag_of_same_age_does_not_expire():
+    sig = "judgment:flag:old-but-gold"
+    _add_failure_ts(sig, "hive flag", "s1", _rel_ts(-20 * 86400))
+    res = incidents.audit(project="test", threshold=2)
+    assert res["expired"] == 0
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(sig, project="test")["status"] == "active"
+
+
+def test_recent_single_candidate_does_not_expire():
+    _add_failure_ts("pymodule:fresh", "x", "s1", _rel_ts(-3600))
+    assert incidents.audit(project="test", threshold=2)["expired"] == 0
+
+
+def test_reentry_after_expiry_counts_occurrences_from_expiry():
+    _add_failure_ts("pymodule:re", "x", "s1", _rel_ts(-20 * 86400))
+    assert incidents.audit(project="test", threshold=2)["expired"] == 1
+    # 1 post-expiry occurrence -> candidate again, not active
+    _add_failure_ts("pymodule:re", "y", "s2", _rel_ts(60))
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:re", project="test")["status"] == "candidate"
+    assert incidents.audit(project="test", threshold=2)["activated"] == 0
+    # 2 post-expiry occurrences -> active
+    _add_failure_ts("pymodule:re", "z", "s3", _rel_ts(120))
+    assert incidents.audit(project="test", threshold=2)["activated"] == 1
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:re", project="test")["status"] == "active"
+
+
+def test_expired_excluded_from_inject_and_default_summaries():
+    _add_failure_ts("pymodule:stale", "x", "s1", _rel_ts(-20 * 86400))
+    incidents.project(project="test", threshold=2)
+    _write_auto("pymodule:stale", "- Prevention rule: avoid staleness")
+    incidents.audit(project="test", threshold=2)          # decays it
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:stale", project="test")["status"] == "expired"
+    assert incidents.inject(project="test") == ""
+    assert incidents.summaries(project="test") == []
+    kept = incidents.summaries(project="test", include_expired=True)
+    assert [r["signature"] for r in kept] == ["pymodule:stale"]
+
+
+def test_reflected_judgment_incident_injects_alongside_technical():
+    _add_failure_ts("judgment:flag:pushed-to-master", "hive flag", "s1",
+                    "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "x", "s2", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s3", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    _write_auto("judgment:flag:pushed-to-master",
+                "- Prevention rule: never push to master without explicit ok")
+    _write_auto("pymodule:mindhive", "- Prevention rule: run with -m")
+    incidents.project(project="test", threshold=2)
+    block = incidents.inject(project="test")
+    assert "[judgment:flag:pushed-to-master] never push to master" in block
+    assert "[pymodule:mindhive] run with -m" in block

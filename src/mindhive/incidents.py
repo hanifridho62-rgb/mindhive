@@ -6,6 +6,7 @@ canonical truth; these files are the human-editable workspace/projection. Plan 1
 writes the immutable Raw Signal and frontmatter; the Auto/Human evaluation
 sections are stubs that Plan 2 populates.
 """
+import calendar
 import os
 import re
 import threading
@@ -14,7 +15,16 @@ from contextlib import contextmanager
 from . import events, paths
 
 THRESHOLD = 2                       # recurrence gate N (D2)
+DECAY_DAYS = 14                     # candidate staleness horizon (KTD4 decay)
+_FLAG_PREFIX = "judgment:flag:"     # explicit human self-flags (hive flag)
 _SAFE = re.compile(r"[^a-z0-9]+")
+
+
+def _threshold_for(signature, threshold=THRESHOLD) -> int:
+    """Explicit judgment flags are rare, high-value, and human-initiated — they
+    activate at the first occurrence. Everything else (including
+    judgment:rejected:*) keeps the recurrence gate."""
+    return 1 if str(signature).startswith(_FLAG_PREFIX) else threshold
 
 # Serializes every writer of an incident .md file. The dashboard runs the
 # auto-harvest thread (calls project()) alongside request threads (reflect →
@@ -127,6 +137,34 @@ def _activation_ts(project, signature) -> str | None:
     return None
 
 
+def _latest_expiry_ts(project, signature) -> str | None:
+    """ts of the most recent rule_expired event for a signature, or None.
+    Occurrences for status purposes count only failures after this point, so
+    re-entry after decay starts a fresh candidate→active climb."""
+    latest = None
+    for ev in events.read_all(project):
+        if ev.type == "rule_expired" and isinstance(ev.payload, dict) \
+                and ev.payload.get("signature") == signature:
+            if latest is None or ev.ts > latest:
+                latest = ev.ts
+    return latest
+
+
+def _live_failures(project, signature, evs) -> list:
+    """The status-relevant slice of a signature's failures: everything after
+    the latest rule_expired, or all of them when it never expired."""
+    exp = _latest_expiry_ts(project, signature)
+    return [e for e in evs if e.ts > exp] if exp else evs
+
+
+def _ts_secs(ts) -> float | None:
+    """Epoch seconds for a store ISO timestamp, or None when unparseable."""
+    try:
+        return calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
 def leaks(project=None, signature=None) -> int:
     """Count tool_failed events for a signature that occurred AFTER its rule
     activated — i.e. the same error recurred despite an active rule."""
@@ -140,7 +178,15 @@ def leaks(project=None, signature=None) -> int:
 def _status_and_flag(project, signature, rec, threshold, source):
     if _has_lifecycle(project, "rule_promoted", signature):
         return "promoted", ""
-    if rec["occurrences"] < threshold:
+    occurrences = rec["occurrences"]
+    if _latest_expiry_ts(project, signature) is not None:
+        # Post-expiry occurrences only: 0 -> expired (stays expired across a
+        # full project() rebuild), 1 -> candidate again, threshold -> active.
+        occurrences = len(_live_failures(
+            project, signature, _failures_by_sig(project).get(signature, [])))
+        if occurrences == 0:
+            return "expired", ""
+    if occurrences < _threshold_for(signature, threshold):
         return "candidate", ""
     if _has_lifecycle(project, "rule_demoted", signature):
         return "demoted", ""
@@ -151,18 +197,32 @@ def _status_and_flag(project, signature, rec, threshold, source):
     return "active", flag
 
 
-def audit(project=None, threshold=THRESHOLD) -> dict:
+def audit(project=None, threshold=THRESHOLD, now=None) -> dict:
     """Emit a one-time rule_activated event (stamped at the threshold-crossing
-    failure's ts) for any signature that has reached the recurrence threshold and
-    isn't activated yet. Idempotent."""
-    activated = 0
+    failure's ts) for any signature that has reached its recurrence threshold
+    (judgment:flag:* activates at 1) and isn't activated yet. Also decays stale
+    noise: a candidate with exactly one live occurrence whose latest failure is
+    older than DECAY_DAYS gains a rule_expired lifecycle event — except
+    judgment:flag:* incidents, which never expire. Idempotent: an expiry zeroes
+    the live count, so re-running appends nothing new."""
+    activated = expired = 0
+    now_secs = _ts_secs(now) if now else time.time()
     for signature, evs in _failures_by_sig(project).items():
-        if len(evs) >= threshold and not _has_lifecycle(project, "rule_activated", signature):
-            crossing_ts = evs[threshold - 1].ts
+        live = _live_failures(project, signature, evs)
+        thr = _threshold_for(signature, threshold)
+        if len(live) >= thr and not _has_lifecycle(project, "rule_activated", signature):
+            crossing_ts = live[thr - 1].ts
             events.append_event("rule_activated", {"signature": signature},
                                 tags=["lifecycle"], ts=crossing_ts, project=project)
             activated += 1
-    return {"activated": activated}
+        elif len(live) == 1 and not signature.startswith(_FLAG_PREFIX):
+            last = _ts_secs(live[-1].ts)
+            if last is not None and now_secs is not None \
+                    and (now_secs - last) > DECAY_DAYS * 86400:
+                events.append_event("rule_expired", {"signature": signature},
+                                    tags=["lifecycle"], project=project)
+                expired += 1
+    return {"activated": activated, "expired": expired}
 
 
 def _safe_name(signature: str) -> str:
@@ -479,7 +539,8 @@ def _raw_excerpt(section: str) -> str:
     return m.group(1).strip().strip("`") if m else ""
 
 
-_LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted", "rule_revised"}
+_LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted",
+                    "rule_revised", "rule_expired"}
 
 
 def signal_stats(project=None, evs=None) -> dict:
@@ -543,7 +604,7 @@ def classify_resolution(summary: dict, stats: dict) -> str:
         return "dismissed"
     occurrences = max(int(summary.get("occurrences") or 0),
                       int(stats.get("event_occurrences") or 0))
-    if occurrences < THRESHOLD:
+    if occurrences < _threshold_for(summary.get("signature", "")):
         return "watching"
     if summary.get("rule_source") in (None, "", "none"):
         return "unresolved"
@@ -562,11 +623,12 @@ def _as_int(v) -> int:
         return 0
 
 
-def summaries(project=None) -> list:
+def summaries(project=None, include_expired=False) -> list:
     """Structured lesson dicts for every incident record — the dashboard's
     Improvements view reads these. One dict per record: frontmatter status
     fields plus the parsed Auto Evaluation verdict (empty strings until the
-    reflection pass fills it) and the derived active rule."""
+    reflection pass fills it) and the derived active rule. Decayed (expired)
+    records are excluded by default; pass include_expired=True to see them."""
     out = []
     d = _incident_dir(project)
     if not d.exists():
@@ -578,6 +640,8 @@ def summaries(project=None) -> list:
             continue
         fm = _frontmatter(text)
         if not fm.get("signature"):
+            continue
+        if fm.get("status") == "expired" and not include_expired:
             continue
         secs = _split_sections(text)
         auto = secs.get("Auto Evaluation", "")

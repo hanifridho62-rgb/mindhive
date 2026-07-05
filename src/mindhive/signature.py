@@ -8,7 +8,16 @@ recurrence, dedup, and rules key off. Two failures with the same root cause
 import hashlib
 import re
 
+_SLUG = re.compile(r"[^a-z0-9]+")
+
 _NO_MODULE = re.compile(r"No module named '([^']+)'")
+
+
+def slug(text, max_len: int = 48) -> str:
+    """Lowercase-hyphenated bounded slug for a signature component (e.g. the
+    context stem of a judgment signature). Never empty."""
+    s = _SLUG.sub("-", str(text or "").lower()).strip("-")
+    return s[:max_len].rstrip("-") or "unknown"
 _PS_TERM = re.compile(r"The term '([^']+)'")
 _PS_NOTRECOG = re.compile(r"'([^']+)' is not recognized")
 

@@ -397,6 +397,25 @@ def cmd_loop(args) -> int | None:
     return 0 if result["reason"] in ("completed",) else 1
 
 
+def cmd_flag(args) -> int | None:
+    """Self-flag a judgment error (KTD4): appends a tool_failed event carrying a
+    judgment:flag:<slug> signature, so the entire existing incident projection
+    works unchanged — no new event type. Flags activate at occurrence 1."""
+    from . import incidents as incidents_mod, signature as sig_mod
+    signature = f"judgment:flag:{sig_mod.slug(args.text)}"
+    tags = ["judgment"] + ([args.category] if args.category else [])
+    ev = events.append_event(
+        "tool_failed",
+        {"text": args.text, "signature": signature, "action": "hive flag"},
+        tags=tags, project=args.project)
+    # Advance the lifecycle immediately (mirrors failures capture): flags cross
+    # their threshold of 1 on the spot, so the incident is active right away.
+    incidents_mod.audit(project=args.project)
+    incidents_mod.project(project=args.project)
+    print(f"flagged {signature} @ {ev.ts}")
+    return None
+
+
 def cmd_failures_capture(args) -> int | None:
     from . import failures as failures_mod, incidents as incidents_mod
     res = failures_mod.capture_dir(args.transcripts, project=args.project)
@@ -416,7 +435,8 @@ def cmd_failures_list(args) -> int | None:
         print("(no failures captured yet)")
         return None
     for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
-        status = "active" if rec["occurrences"] >= incidents_mod.THRESHOLD else "candidate"
+        status = ("active" if rec["occurrences"] >= incidents_mod._threshold_for(signature)
+                  else "candidate")
         print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
     return None
 
@@ -428,7 +448,8 @@ def cmd_rules_list(args) -> int | None:
         print("(no incidents yet)")
         return None
     for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
-        status = "active" if rec["occurrences"] >= inc.THRESHOLD else "candidate"
+        status = ("active" if rec["occurrences"] >= inc._threshold_for(signature)
+                  else "candidate")
         print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
     return None
 
@@ -706,6 +727,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="don't auto-open the web dashboard for this run "
                          "(also disabled by MINDHIVE_LOOP_DASHBOARD=0)")
     lp.set_defaults(func=cmd_loop)
+
+    # --- flag (Learning Loop judgment-error capture, KTD4) ---
+    fg = sub.add_parser("flag", help="self-flag a judgment error (active at 1 occurrence)")
+    fg.add_argument("text", help="one line: what was misjudged")
+    fg.add_argument("--category", default=None,
+                    help="optional category tag (e.g. git, scope, permissions)")
+    fg.add_argument("--project", default=None, help="target namespace")
+    fg.set_defaults(func=cmd_flag)
 
     # --- failures (Learning Loop capture stage) ---
     fp = sub.add_parser("failures", help="capture tool failures + list incidents")

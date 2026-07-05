@@ -112,13 +112,91 @@ def test_model_unavailable_is_not_a_failure():
     assert failures.extract_failures(line) == []
 
 
-def test_user_rejection_is_not_a_failure():
-    line = _tool_result_line(
-        True, stderr="The user doesn't want to proceed with this tool use. "
-                     "The tool use was rejected")
-    assert failures.extract_failures(line) == []
-
-
 def test_real_failure_still_captured_after_noise_filter():
     line = _tool_result_line(True, stderr="No module named 'mindhive'")
     assert len(failures.extract_failures(line)) == 1
+
+
+# --- judgment:rejected capture (KTD4): user rejections are signal, not noise ---
+
+_REJECT_TEXT = ("The user doesn't want to proceed with this tool use. "
+                "The tool use was rejected")
+
+
+def test_user_rejection_yields_judgment_marker_not_noise():
+    out = failures.extract_failures(_tool_result_line(True, stderr=_REJECT_TEXT))
+    assert len(out) == 1
+    assert out[0]["rejected"] is True
+    assert out[0]["signature"] is None            # finalized by capture_dir
+    assert "rejected" in out[0]["error_excerpt"]
+
+
+def test_rejection_wins_over_interrupted_flag():
+    # a rejection sometimes rides an interrupted result — rejection semantics win
+    out = failures.extract_failures(
+        _tool_result_line(True, stderr=_REJECT_TEXT, interrupted=True))
+    assert len(out) == 1 and out[0]["rejected"] is True
+
+
+def test_technical_failure_carries_rejected_false():
+    out = failures.extract_failures(
+        _tool_result_line(True, stderr="No module named 'mindhive'"))
+    assert out[0]["rejected"] is False
+
+
+def _rejection_session(tdir, name, tu, cmd):
+    lines = [_assistant_tool_use(tu, "Bash", cmd=cmd),
+             _tool_result_line(True, stderr=_REJECT_TEXT)]
+    lines[1]["message"]["content"][0]["tool_use_id"] = tu
+    (tdir / f"{name}.jsonl").write_text(
+        "\n".join(json.dumps(o) for o in lines), encoding="utf-8")
+
+
+def test_rejection_capture_candidate_at_one_activates_at_two(tmp_path):
+    from mindhive import incidents
+    tdir = tmp_path / "tx"
+    tdir.mkdir()
+    _rejection_session(tdir, "s1", "tu_1", "git push --force")
+    failures.capture_dir(str(tdir), project="test")
+    evs = [e for e in events.read_all("test") if e.type == "tool_failed"]
+    assert len(evs) == 1
+    signature = evs[0].payload["signature"]
+    assert signature == "judgment:rejected:bash:git-push-force"
+    assert "judgment" in evs[0].tags
+    incidents.audit(project="test")
+    incidents.project(project="test")
+    assert incidents.load(signature, project="test")["status"] == "candidate"
+
+    _rejection_session(tdir, "s2", "tu_2", "git push --force")
+    failures.capture_dir(str(tdir), project="test")
+    incidents.audit(project="test")
+    incidents.project(project="test")
+    rec = incidents.load(signature, project="test")
+    assert rec["status"] == "active"
+    assert rec["occurrences"] == 2
+
+
+def test_unrelated_rejections_do_not_share_a_signature(tmp_path):
+    tdir = tmp_path / "tx"
+    tdir.mkdir()
+    _rejection_session(tdir, "s1", "tu_1", "git push --force")
+    _rejection_session(tdir, "s2", "tu_2", "rm -rf build")
+    failures.capture_dir(str(tdir), project="test")
+    sigs = {e.payload["signature"] for e in events.read_all("test")
+            if e.type == "tool_failed"}
+    assert sigs == {"judgment:rejected:bash:git-push-force",
+                    "judgment:rejected:bash:rm-rf-build"}
+
+
+def test_transient_infra_error_still_produces_nothing(tmp_path):
+    tdir = tmp_path / "tx"
+    tdir.mkdir()
+    lines = [_assistant_tool_use("tu_1", "Bash", cmd="x"),
+             _tool_result_line(
+                 True, stderr="claude-opus-4-8 is temporarily unavailable")]
+    lines[1]["message"]["content"][0]["tool_use_id"] = "tu_1"
+    (tdir / "s1.jsonl").write_text(
+        "\n".join(json.dumps(o) for o in lines), encoding="utf-8")
+    res = failures.capture_dir(str(tdir), project="test")
+    assert res["new_failures"] == 0
+    assert [e for e in events.read_all("test") if e.type == "tool_failed"] == []
