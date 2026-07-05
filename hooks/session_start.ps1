@@ -1,5 +1,6 @@
 # session_start — inject STATE.md into the new session; stamp session id.
 # Hang-proof (only reads stdin if piped) and never blocks the session.
+if ($env:MINDHIVE_HEADLESS -eq "1") { exit 0 }   # headless reflection session: no recursion, no phantom events
 $ErrorActionPreference = "SilentlyContinue"
 $py = "C:\Users\hanif\mindhive\.venv\Scripts\python.exe"
 $sid = "unknown"

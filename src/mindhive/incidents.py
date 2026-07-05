@@ -98,10 +98,11 @@ def _atomic_write(path, text) -> None:
 LEAK_LIMIT = 2
 
 
-def _failures_by_sig(project) -> dict:
-    """signature -> list of tool_failed Events, in ts order (read_all is sorted)."""
+def _failures_by_sig(project, evs=None) -> dict:
+    """signature -> list of tool_failed Events, in ts order (read_all is sorted).
+    Pass evs to reuse an events.read_all() result."""
     out = {}
-    for ev in events.read_all(project):
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type != "tool_failed":
             continue
         s = ev.payload.get("signature") if isinstance(ev.payload, dict) else None
@@ -369,15 +370,34 @@ def _active_rules(project) -> list:
     return out
 
 
-def inject(project=None) -> str:
+# Hard cap on injected rules (KTD2): the block rides into every session via
+# STATE.md and the native MEMORY.md digest, so a backlog drain that activates
+# dozens of rules must not be able to blow the per-session context budget.
+INJECT_CAP = 10
+
+
+def inject(project=None, evs=None) -> str:
     """The machine-learned prevention-rules block for session-start injection.
-    Empty string when there is nothing active to inject."""
+    Empty string when there is nothing active to inject. Capped at INJECT_CAP
+    rules ranked by occurrences then recency, with a `+N more` trailer when
+    rules were cut. Pass evs to reuse an events.read_all() result."""
     rules = _active_rules(project)
     if not rules:
         return ""
+    by_sig = _failures_by_sig(project, evs=evs)
+    # Rank: occurrences desc, then last-failure recency desc. Two passes with a
+    # stable sort (ts desc first, then occurrences desc) instead of one mixed key
+    # because an ISO ts string cannot be negated.
+    ranked = sorted(rules, key=lambda it: (
+        by_sig[it[0]][-1].ts if by_sig.get(it[0]) else ""), reverse=True)
+    ranked.sort(key=lambda it: -len(by_sig.get(it[0], [])))
+    shown = ranked[:INJECT_CAP]
     lines = ["# PREVENTION RULES (machine-learned — avoid repeating these)"]
-    for signature, rule in rules:
+    for signature, rule in shown:
         lines.append(f"- [{signature}] {rule}")
+    cut = len(ranked) - len(shown)
+    if cut > 0:
+        lines.append(f"+{cut} more: hive rules list")
     return "\n".join(lines)
 
 

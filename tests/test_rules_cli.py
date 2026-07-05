@@ -77,3 +77,93 @@ def test_rules_summaries_empty(tmp_path, capsys):
     assert cli.main(["rules", "summaries", "--project", "nothing", "--json"]) == 0
     import json as _json
     assert _json.loads(capsys.readouterr().out) == []
+
+
+# --- rules reflect: --limit / --cooldown-hours / --all-projects (KTD3) -------
+
+import json as _json
+from mindhive import paths
+
+_GOOD = ('{"root_cause": "rc", "lesson": "le", '
+         '"prevention_rule": "always pin the venv", "task_category": "tool_use"}')
+
+
+def _seed_unreflected(n, project="test"):
+    for i in range(n):
+        sig = f"pymodule:batch{i}"
+        for s in ("s1", "s2"):
+            events.append_event("tool_failed",
+                                {"text": "boom", "signature": sig, "action": "x"},
+                                session_id=s, tags=["auto", "failure"],
+                                project=project)
+    incidents.project(project=project, threshold=2)
+
+
+def test_rules_reflect_cli_respects_limit(tmp_path, capsys, monkeypatch):
+    from mindhive import reflect as reflect_mod
+    _seed_unreflected(5)
+    monkeypatch.setattr(reflect_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _GOOD)
+    assert cli.main(["rules", "reflect", "--project", "test", "--limit", "3"]) == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["reflected"] == 3 and out["attempted"] == 3
+
+
+def test_rules_reflect_cli_cooldown_skips_second_run(tmp_path, capsys, monkeypatch):
+    from mindhive import reflect as reflect_mod
+    _seed_unreflected(2)
+    calls = {"n": 0}
+
+    def stub(prompt, timeout_s=120):
+        calls["n"] += 1
+        return _GOOD
+
+    monkeypatch.setattr(reflect_mod, "_claude_runner", stub)
+    assert cli.main(["rules", "reflect", "--project", "test", "--limit", "1"]) == 0
+    capsys.readouterr()
+    assert cli.main(["rules", "reflect", "--project", "test", "--limit", "1"]) == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["skipped"] == "cooldown"
+    assert calls["n"] == 1
+
+
+def test_rules_reflect_cli_failing_runner_exits_zero(tmp_path, capsys, monkeypatch):
+    from mindhive import reflect as reflect_mod
+    _seed_unreflected(1)
+
+    def boom(prompt, timeout_s=120):
+        raise RuntimeError("auth expired")
+
+    monkeypatch.setattr(reflect_mod, "_claude_runner", boom)
+    assert cli.main(["rules", "reflect", "--project", "test",
+                     "--cooldown-hours", "0"]) == 0     # hook-safe: exit 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["reflected"] == 0
+    m = reflect_mod.read_marker("test")
+    assert m["last_error"] == "RuntimeError"
+    assert not m.get("cooldown_started")                # window not consumed
+
+
+def test_rules_reflect_all_projects_skips_live_lock(tmp_path, capsys, monkeypatch):
+    from mindhive import reflect as reflect_mod
+    store = paths.store_home()
+    # register two namespaces (empty folder -> no native MEMORY.md write)
+    (store / "autosync.json").write_text(_json.dumps([
+        {"project": "alpha", "transcripts": "t", "folder": ""},
+        {"project": "fabio-live", "transcripts": "t", "folder": ""},
+    ]), encoding="utf-8")
+    _seed_unreflected(2, project="alpha")
+    _seed_unreflected(2, project="fabio-live")
+    (store / "LIVE_LOCK").write_text("fabio-live\n", encoding="utf-8")
+    monkeypatch.setattr(reflect_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _GOOD)
+
+    assert cli.main(["rules", "reflect", "--all-projects", "--limit", "3"]) == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["alpha"]["reflected"] == 2               # namespace drained
+    assert out["fabio-live"] == {"reflected": 0, "attempted": 0,
+                                 "skipped": "LIVE_LOCK"}
+    # the locked namespace was never touched: no marker, no reflected rule
+    assert reflect_mod.read_marker("fabio-live") == {}
+    assert incidents.inject(project="fabio-live") == ""
+    assert "always pin the venv" in incidents.inject(project="alpha")

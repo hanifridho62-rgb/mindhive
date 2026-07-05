@@ -460,16 +460,43 @@ def cmd_rules_show(args) -> int | None:
     return None
 
 
+def _safe_reflect_batch(reflect_mod, project, args) -> dict:
+    """One namespace's bounded reflection pass, never raising — session_end
+    spawns this command fire-and-forget, so a failing runner must map to a JSON
+    result and exit 0, not a traceback."""
+    try:
+        return reflect_mod.reflect_batch(project=project, limit=args.limit,
+                                         cooldown_hours=args.cooldown_hours)
+    except Exception as e:
+        return {"reflected": 0, "attempted": 0,
+                "error": f"{type(e).__name__}: {e}"}
+
+
 def cmd_rules_reflect(args) -> int | None:
-    from . import reflect as reflect_mod, incidents as inc
-    acc = inc._collect(args.project)
-    done = 0
-    for signature, rec in acc.items():
-        if rec["occurrences"] >= inc.THRESHOLD:      # active only
-            if reflect_mod.reflect_incident(signature, project=args.project).get("reflected"):
-                done += 1
-    print(json.dumps({"reflected": done}))
-    return None
+    from . import reflect as reflect_mod
+    if args.all_projects:
+        # One-time supervised backlog drain over registered namespaces — run
+        # manually, never from hooks. Honor LIVE_LOCK: skip any namespace the
+        # lock file names (defensive; reflection only writes inside ~/.mindhive,
+        # but the lock is absolute).
+        lock = paths.store_home() / "LIVE_LOCK"
+        lock_text = ""
+        if lock.exists():
+            try:
+                lock_text = lock.read_text(encoding="utf-8").lower()
+            except OSError:
+                lock_text = ""
+        results = {}
+        for name in sorted(paths.known_projects()):
+            if lock_text and name.lower() in lock_text:
+                results[name] = {"reflected": 0, "attempted": 0,
+                                 "skipped": "LIVE_LOCK"}
+                continue
+            results[name] = _safe_reflect_batch(reflect_mod, name, args)
+        print(json.dumps(results))
+        return 0
+    print(json.dumps(_safe_reflect_batch(reflect_mod, args.project, args)))
+    return 0
 
 
 def cmd_rules_reconcile(args) -> int | None:
@@ -706,8 +733,17 @@ def _build_parser() -> argparse.ArgumentParser:
     rsh.add_argument("signature")
     rsh.add_argument("--project", default=None)
     rsh.set_defaults(func=cmd_rules_show)
-    rr = rsub.add_parser("reflect", help="run the reflection pass over active incidents")
+    rr = rsub.add_parser("reflect",
+                         help="bounded reflection pass over active un-reflected incidents")
     rr.add_argument("--project", default=None)
+    rr.add_argument("--limit", type=int, default=3,
+                    help="max incidents to reflect this batch (default: 3)")
+    rr.add_argument("--cooldown-hours", type=float, default=6.0, dest="cooldown_hours",
+                    help="skip when the last batch started within this window "
+                         "(default: 6; pass 0 to disable)")
+    rr.add_argument("--all-projects", dest="all_projects", action="store_true",
+                    help="drain every registered namespace (manual backlog drain; "
+                         "never invoked from hooks; LIVE_LOCK-named namespaces skipped)")
     rr.set_defaults(func=cmd_rules_reflect)
     ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
     ra.add_argument("--project", default=None)

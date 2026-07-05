@@ -222,6 +222,45 @@ def test_inject_empty_when_no_active_rules():
     assert incidents.inject(project="test") == ""
 
 
+def test_inject_caps_at_limit_ranked_by_occurrences_then_recency():
+    # 12 active reflected rules: sig00..sig11, later index = more recent last
+    # failure; sig05 gets a third occurrence so it outranks everything.
+    for i in range(12):
+        sig = f"pymodule:sig{i:02d}"
+        _add_failure_ts(sig, "x", "s1", f"2026-07-01T10:{i:02d}:00Z")
+        _add_failure_ts(sig, "y", "s2", f"2026-07-02T10:{i:02d}:00Z")
+    _add_failure_ts("pymodule:sig05", "z", "s3", "2026-07-01T09:00:00Z")
+    incidents.project(project="test", threshold=2)
+    d = paths.project_dir("test") / "rules" / "incidents"
+    for i in range(12):
+        path = d / f"pymodule-sig{i:02d}.md"
+        path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                        "Auto Evaluation", f"- Prevention rule: avoid {i:02d}"),
+                        encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+
+    block = incidents.inject(project="test")
+    lines = [ln for ln in block.splitlines() if ln.startswith("- [")]
+    assert len(lines) == incidents.INJECT_CAP
+    assert block.splitlines()[-1] == "+2 more: hive rules list"
+    assert lines[0].startswith("- [pymodule:sig05]")   # 3 occurrences ranks first
+    assert "avoid 11" in block                         # recent kept
+    assert "avoid 00" not in block                     # two oldest cut
+    assert "avoid 01" not in block
+
+
+def test_inject_accepts_prefetched_events():
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", "- Prevention rule: run with -m"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+    evs = events.read_all("test")
+    assert incidents.inject(project="test", evs=evs) == incidents.inject(project="test")
+
+
 def test_promote_appends_to_soul_and_marks_promoted():
     _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
     _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")

@@ -9,6 +9,7 @@ richer argv (stream-json, --resume, --permission-mode, --allowedTools), so its
 runner stays its own.
 """
 import json
+import os
 import shutil
 import subprocess
 
@@ -27,8 +28,13 @@ def run_headless(prompt: str, model: str = MODEL, timeout_s: int = 180) -> dict:
     ``{"exit": int, "stdout": str}``. Spawn failures map to conventional exit
     codes (127 not-found, 124 timeout) so callers treat them uniformly."""
     argv = [resolve_exe(), "--output-format", "json", "--model", model, "-p", prompt]
+    # Recursion guard (KTD3): every hooks/*.ps1 exits immediately when this
+    # variable is set, so a headless session spawned here can never re-fire the
+    # hooks (no reflect->session_end->reflect loop, no phantom session events).
+    env = dict(os.environ, MINDHIVE_HEADLESS="1")
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                              env=env,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {"exit": proc.returncode, "stdout": proc.stdout or ""}
     except FileNotFoundError:

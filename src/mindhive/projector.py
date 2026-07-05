@@ -1,6 +1,6 @@
 # src/mindhive/projector.py
 import hashlib
-from . import paths, events, chain, review
+from . import paths, events, chain, review, incidents, reflect
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
@@ -13,7 +13,7 @@ def _ts_compact(ts: str) -> str:
     return ts.replace("-", "").replace(":", "").replace("T", "-").rstrip("Z")
 
 
-def build_state(evs, pending=None) -> str:
+def build_state(evs, pending=None, health_note="") -> str:
     latest_state = None
     last_decision = None
     for ev in evs:
@@ -28,6 +28,11 @@ def build_state(evs, pending=None) -> str:
     note = review.notice(pending)
     if note:
         out.append(note)
+    # Reflection-health warning (one line, KTD3): auto-reflection failing for
+    # too long must be visible, not silent.
+    if health_note:
+        out.append(health_note)
+        out.append("")
     out.append(f"**Active task:** {s.get('task', '(none)')}")
     out.append(f"**Last verified:** {s.get('verified', '(none)')}")
     out.append(f"**Next step:** {s.get('next_step', '(none)')}")
@@ -46,6 +51,20 @@ def build_state(evs, pending=None) -> str:
     out.append("")
     out.append(f"_events: {len(evs)}_")
     return "\n".join(out) + "\n"
+
+
+def compose_state(evs, project=None, include_rules=True) -> str:
+    """Full STATE.md text: the state body (with any reflection-health notice)
+    plus the capped prevention-rules block appended when non-empty (KTD2 —
+    STATE.md is the single delivery choke point for rules). sync embeds the
+    include_rules=False variant so rules appear exactly once in MEMORY.md."""
+    body = build_state(evs, pending=review.load_pending(project),
+                       health_note=reflect.health_note(project))
+    if include_rules:
+        block = incidents.inject(project, evs=evs)
+        if block:
+            body = body + "\n" + block + "\n"
+    return body
 
 
 def build_ledger_entries(evs):
@@ -79,7 +98,7 @@ def project(project=None, evs=None) -> dict:
     pdir.mkdir(parents=True, exist_ok=True)
 
     tmp = pdir / "STATE.md.tmp"
-    tmp.write_text(build_state(evs, pending=review.load_pending(project)), encoding="utf-8")
+    tmp.write_text(compose_state(evs, project), encoding="utf-8")
     tmp.replace(pdir / "STATE.md")
 
     ldir = pdir / "LEDGER"

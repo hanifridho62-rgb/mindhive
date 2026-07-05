@@ -61,3 +61,142 @@ def test_reflect_incident_noop_on_empty_verdict(tmp_path):
     res = reflect.reflect_incident("pymodule:mindhive", project="test",
                                    runner=lambda p, timeout_s=120: "garbage")
     assert res["reflected"] is False
+
+
+# --- reflect_batch: bounded, cooldown-gated auto-reflection (KTD3) -----------
+
+_GOOD = ('{"root_cause": "rc", "lesson": "le", '
+         '"prevention_rule": "always pin the venv", "task_category": "tool_use"}')
+
+
+def _seed_unreflected(n):
+    for i in range(n):
+        sig = f"pymodule:batch{i}"
+        for s in ("s1", "s2"):
+            events.append_event("tool_failed",
+                                {"text": "boom", "signature": sig, "action": "x"},
+                                session_id=s, tags=["auto", "failure"], project="test")
+    incidents.project(project="test", threshold=2)
+
+
+def test_reflect_batch_limits_and_marker_written_before_first_call():
+    _seed_unreflected(5)
+    marker_seen = []
+
+    def stub(prompt, timeout_s=120):
+        marker_seen.append(reflect._marker_path("test").exists())
+        return _GOOD
+
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=stub)
+    assert res["reflected"] == 3 and res["attempted"] == 3
+    assert len(marker_seen) == 3
+    assert marker_seen[0] is True          # cooldown consumed BEFORE first call
+    m = reflect.read_marker("test")
+    assert m["last_success"] and m["last_error"] == ""
+
+
+def test_reflect_batch_second_call_inside_cooldown_is_noop():
+    _seed_unreflected(2)
+    calls = {"n": 0}
+
+    def stub(prompt, timeout_s=120):
+        calls["n"] += 1
+        return _GOOD
+
+    reflect.reflect_batch(project="test", limit=1, cooldown_hours=6, runner=stub)
+    assert calls["n"] == 1
+    res = reflect.reflect_batch(project="test", limit=1, cooldown_hours=6,
+                                runner=stub)
+    assert res["skipped"] == "cooldown"
+    assert calls["n"] == 1                 # no runner calls inside the window
+
+
+def test_reflect_batch_failed_batch_rolls_cooldown_back():
+    _seed_unreflected(2)
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=lambda p, timeout_s=120: "garbage")
+    assert res["reflected"] == 0 and res["attempted"] == 2
+    m = reflect.read_marker("test")
+    assert not m.get("cooldown_started")   # window NOT consumed by failure
+    assert m["last_attempt"] and m["last_error"] == "empty verdict"
+    # the very next invocation reaches the runner again
+    calls = {"n": 0}
+
+    def stub(prompt, timeout_s=120):
+        calls["n"] += 1
+        return "garbage"
+
+    reflect.reflect_batch(project="test", limit=1, cooldown_hours=6, runner=stub)
+    assert calls["n"] == 1
+
+
+def test_reflect_batch_runner_exception_recorded_without_raising():
+    _seed_unreflected(1)
+
+    def boom(prompt, timeout_s=120):
+        raise RuntimeError("auth expired")
+
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=boom)
+    assert res["reflected"] == 0
+    assert reflect.read_marker("test")["last_error"] == "RuntimeError"
+
+
+def test_reflect_batch_success_refreshes_state_projection():
+    _seed_unreflected(1)
+    reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                          runner=lambda p, timeout_s=120: _GOOD)
+    state = (paths.project_dir("test") / "STATE.md").read_text(encoding="utf-8")
+    assert "PREVENTION RULES" in state
+    assert "always pin the venv" in state
+
+
+def test_reflect_batch_noop_when_nothing_active_unreflected():
+    calls = {"n": 0}
+
+    def stub(prompt, timeout_s=120):
+        calls["n"] += 1
+        return _GOOD
+
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=stub)
+    assert res["skipped"] == "nothing to reflect"
+    assert calls["n"] == 0
+    assert reflect.read_marker("test") == {}   # nothing-to-do writes no marker
+
+
+def test_health_note_warns_when_success_lags_attempt():
+    reflect.write_marker("test", {"last_attempt": "2026-07-05T10:00:00Z",
+                                  "last_success": "2026-07-01T10:00:00Z",
+                                  "last_error": "empty verdict"})
+    note = reflect.health_note("test")
+    assert "Reflection health" in note and "empty verdict" in note
+
+
+def test_health_note_empty_when_healthy_or_untried():
+    assert reflect.health_note("test") == ""   # no marker yet
+    reflect.write_marker("test", {"last_attempt": "2026-07-05T10:00:00Z",
+                                  "last_success": "2026-07-05T10:01:00Z",
+                                  "last_error": ""})
+    assert reflect.health_note("test") == ""
+
+
+def test_run_headless_pins_headless_env(monkeypatch):
+    """The runner subprocess env sets MINDHIVE_HEADLESS=1 so hooks/*.ps1 exit
+    immediately in spawned headless sessions (no recursion)."""
+    from mindhive import claude_cli
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = "{}"
+
+    def fake_run(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", fake_run)
+    claude_cli.run_headless("hello")
+    assert captured["env"] is not None
+    assert captured["env"]["MINDHIVE_HEADLESS"] == "1"
