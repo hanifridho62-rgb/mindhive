@@ -455,3 +455,22 @@ def test_classify_resolution_live_count_overrides_stale_frontmatter():
 def test_classify_resolution_stats_miss_never_resolved():
     assert incidents.classify_resolution(
         {"occurrences": 2, "rule_source": "auto"}, {}) == "watching"
+
+
+def test_summaries_coerces_non_numeric_occurrences():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents"
+            / "pymodule-mindhive.md")
+    text = path.read_text(encoding="utf-8").replace(
+        "occurrences: 1", "occurrences: not-a-number")
+    path.write_text(text, encoding="utf-8")
+    rec = incidents.summaries(project="test")[0]
+    assert rec["occurrences"] == 0 and isinstance(rec["occurrences"], int)
+
+
+def test_project_write_is_atomic_no_tmp_left():
+    _add_failure("pymodule:mindhive", "x", "s1")
+    incidents.project(project="test", threshold=2)
+    d = paths.project_dir("test") / "rules" / "incidents"
+    assert not list(d.glob("*.tmp"))             # temp file replaced, not left

@@ -335,6 +335,10 @@ def render_page(token: str) -> str:
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
+  // Manual-note expansion survives the 2.5s repaint: DOM class state is wiped
+  // on every rebuild, so the expanded set is the source of truth, keyed stably.
+  const IMP_EXPANDED = new Set();
+  function noteKey(m){ return (m.project||'')+'|'+(m.ts||'')+'|'+(m.session||''); }
   // Resolution glyph = the OUTCOME axis (did the lesson take?); the status /
   // category pills on the same card stay as the lifecycle axis — complementary.
   const IMP_GLYPHS = {
@@ -413,7 +417,11 @@ def render_page(token: str) -> str:
     showImprovements();
   }
   async function renderImprovements(){
-    IMP_ITEMS = await apiGet('/api/improvements');
+    const res = await apiGet('/api/improvements');
+    // Surface a server error instead of rendering it as an empty "no lessons"
+    // state; run() shows it, and the live tick keeps the last good view.
+    if (!res || res.ok === false) throw new Error((res && res.error) || 'improvements fetch failed');
+    IMP_ITEMS = res;
     paintImprovements();
   }
   function fillSelect(id, values, cur){
@@ -422,8 +430,11 @@ def render_page(token: str) -> str:
     const opts = ['all'].concat(values);
     // a selection that vanished from fresh data stays selected (may match nothing)
     if (cur !== 'all' && !opts.includes(cur)) opts.push(cur);
-    el.innerHTML = opts.map(v => '<option value="'+escAttr(v)+'"'
+    const html = opts.map(v => '<option value="'+escAttr(v)+'"'
       + (v===cur?' selected':'')+'>'+esc(v)+'</option>').join('');
+    // Skip the rewrite when nothing changed so a live tick can't close an open
+    // dropdown or reset an in-progress selection under the user.
+    if (el.innerHTML !== html) el.innerHTML = html;
   }
   function lessonPills(a){
     let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
@@ -456,11 +467,12 @@ def render_page(token: str) -> str:
       + lessonPills(a)+'</div>'+body+'</li>';
   }
   function noteRow(m, showProj){
-    return '<li class="noterow" style="cursor:pointer"><div class="file">'
+    const open = IMP_EXPANDED.has(noteKey(m));
+    return '<li class="noterow" data-key="'+escAttr(noteKey(m))+'" style="cursor:pointer"><div class="file">'
       + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
       + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
       + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
-      + '</div><div class="snip one">'+esc(m.text||'')+'</div></li>';
+      + '</div><div class="snip'+(open?'':' one')+'">'+esc(m.text||'')+'</div></li>';
   }
   function paintImprovements(){
     const auto = IMP_ITEMS.auto || [], manual = IMP_ITEMS.manual || [];
@@ -505,8 +517,11 @@ def render_page(token: str) -> str:
         + notes.map(m=>noteRow(m, showProj)).join('')+'</ul>';
     }
     showHTML(html);
-    view.querySelectorAll('.noterow .snip').forEach(el =>
-      el.parentElement.onclick = () => el.classList.toggle('one'));
+    view.querySelectorAll('.noterow').forEach(li => li.onclick = () => {
+      const k = li.dataset.key, snip = li.querySelector('.snip');
+      if (IMP_EXPANDED.has(k)) IMP_EXPANDED.delete(k); else IMP_EXPANDED.add(k);
+      if (snip) snip.classList.toggle('one');
+    });
     view.querySelectorAll('.dismissbtn').forEach(el =>
       el.onclick = (ev) => { ev.stopPropagation(); dismissLesson(el.dataset.sig); });
   }
@@ -516,14 +531,17 @@ def render_page(token: str) -> str:
   async function runReflect(){
     if(!confirm('Reflect (learn from failures) \\u2014 runs the claude CLI once '
       + 'per recurring incident (a few per click). Continue?')) return;
+    // POST and repaint inside ONE run() so the live timer can't fire in a
+    // busy=false gap between the reflect call and the follow-up render.
+    liveFn = renderImprovements;
     await run('reflecting\\u2026', async () => {
       const res = await apiPost('/api/rules/reflect', {});
       IMP_BANNER = res.ok
         ? ('Reflect: '+res.reflected+' reflected \\u00b7 '+res.failed
            +' failed \\u00b7 '+res.pending+' pending')
         : (res.error || 'reflection failed');
+      await renderImprovements();
     });
-    showImprovements();
   }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }

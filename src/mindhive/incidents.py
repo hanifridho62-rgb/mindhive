@@ -6,11 +6,28 @@ canonical truth; these files are the human-editable workspace/projection. Plan 1
 writes the immutable Raw Signal and frontmatter; the Auto/Human evaluation
 sections are stubs that Plan 2 populates.
 """
+import os
 import re
+import threading
 from . import events, paths
 
 THRESHOLD = 2                       # recurrence gate N (D2)
 _SAFE = re.compile(r"[^a-z0-9]+")
+
+# Serializes every writer of an incident .md file. The dashboard runs the
+# auto-harvest thread (calls project()) alongside request threads (reflect →
+# write + project()), so two writers can otherwise interleave a read → render →
+# write and silently discard a just-computed reflection verdict. Reentrant so
+# reflect_incident can hold it across its own project() re-derivation.
+_WRITE_LOCK = threading.RLock()
+
+
+def _atomic_write(path, text) -> None:
+    """Write via a temp file + os.replace so a concurrent reader (the 2.5s
+    Improvements poll) always sees a whole file, never a torn one."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 LEAK_LIMIT = 2
@@ -208,18 +225,19 @@ def project(project=None, threshold=THRESHOLD) -> dict:
     acc = _collect(project)
     d = _incident_dir(project)
     d.mkdir(parents=True, exist_ok=True)
-    for signature, rec in acc.items():
-        path = d / f"{_safe_name(signature)}.md"
-        auto_body = "<!-- filled by the reflection pass (hive rules reflect) -->"
-        human_body = "<!-- leave blank to accept Auto; fill to override -->"
-        if path.exists():
-            secs = _split_sections(path.read_text(encoding="utf-8"))
-            auto_body = secs.get("Auto Evaluation", auto_body) or auto_body
-            human_body = secs.get("Human Evaluation", human_body) or human_body
-        active, source = derive_active(auto_body, human_body)
-        status, flag = _status_and_flag(project, signature, rec, threshold, source)
-        path.write_text(_render(signature, rec, status, auto_body, human_body,
-                                active, source, flag), encoding="utf-8")
+    with _WRITE_LOCK:
+        for signature, rec in acc.items():
+            path = d / f"{_safe_name(signature)}.md"
+            auto_body = "<!-- filled by the reflection pass (hive rules reflect) -->"
+            human_body = "<!-- leave blank to accept Auto; fill to override -->"
+            if path.exists():
+                secs = _split_sections(path.read_text(encoding="utf-8"))
+                auto_body = secs.get("Auto Evaluation", auto_body) or auto_body
+                human_body = secs.get("Human Evaluation", human_body) or human_body
+            active, source = derive_active(auto_body, human_body)
+            status, flag = _status_and_flag(project, signature, rec, threshold, source)
+            _atomic_write(path, _render(signature, rec, status, auto_body,
+                                        human_body, active, source, flag))
     return {"records": len(acc)}
 
 
@@ -451,6 +469,14 @@ def classify_resolution(summary: dict, stats: dict) -> str:
     return "resolved"
 
 
+def _as_int(v) -> int:
+    """Best-effort int for a frontmatter field; 0 when missing or non-numeric."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 def summaries(project=None) -> list:
     """Structured lesson dicts for every incident record — the dashboard's
     Improvements view reads these. One dict per record: frontmatter status
@@ -474,8 +500,10 @@ def summaries(project=None) -> list:
         out.append({
             "signature": fm["signature"],
             "status": fm.get("status", ""),
-            "occurrences": fm.get("occurrences", 0),
-            "sessions": fm.get("sessions", 0),
+            # Coerce to int: a hand-edited non-numeric value must not reach
+            # innerHTML unescaped or break the occurrences sort (int vs str).
+            "occurrences": _as_int(fm.get("occurrences")),
+            "sessions": _as_int(fm.get("sessions")),
             "rule_source": source,
             "flag": fm.get("flag", ""),
             "excerpt": _raw_excerpt(secs.get("Raw Signal", "")),

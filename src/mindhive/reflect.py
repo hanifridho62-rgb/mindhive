@@ -67,8 +67,12 @@ def reflect_incident(signature, project=None, runner=_claude_runner) -> dict:
     verdict = parse_reflection(runner(build_prompt(signature, raw, [])))
     if not verdict.get("prevention_rule"):
         return {"reflected": False, "reason": "empty verdict"}
-    txt = incidents._replace_section(path.read_text(encoding="utf-8"),
-                                     "Auto Evaluation", _auto_section(verdict))
-    path.write_text(txt, encoding="utf-8")
-    incidents.project(project)          # re-derive Active + rule_source, preserve sections
+    # Hold the incident write lock across re-read → replace → write → project so
+    # the auto-harvest thread's project() can't clobber this verdict mid-flight.
+    # (The model call above is deliberately OUTSIDE the lock — it can take 120s.)
+    with incidents._WRITE_LOCK:
+        txt = incidents._replace_section(path.read_text(encoding="utf-8"),
+                                         "Auto Evaluation", _auto_section(verdict))
+        incidents._atomic_write(path, txt)
+        incidents.project(project)      # re-derive Active + rule_source, preserve sections
     return {"reflected": True}
