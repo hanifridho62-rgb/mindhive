@@ -166,14 +166,14 @@ def test_plugins_inventory_requires_token(dashboard_server):
         assert e.code == 403
 
 
-def test_page_has_skills_and_plugins_view(dashboard_server):
-    """The nav entry is renamed and the view is wired to the live engine."""
+def test_page_has_skill_and_plugin_view(dashboard_server):
+    """The nav entry carries the Skill & Plugin panel wired to the live engine."""
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert status == 200
-    assert "Skills &amp; plugins" in body
-    for needle in ("renderPlugins", "/api/plugins/inventory"):
-        assert needle in body, f"missing skills&plugins hook: {needle}"
+    assert "Skill &amp; Plugin" in body
+    for needle in ("renderPlugins", "/api/plugins/inventory", "/api/skills/recommend"):
+        assert needle in body, f"missing skill&plugin hook: {needle}"
 
 
 def test_skills_detail_endpoint_returns_intended_use_body_and_date(dashboard_server, monkeypatch):
