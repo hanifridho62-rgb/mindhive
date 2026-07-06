@@ -280,6 +280,41 @@ def test_skills_status_endpoint_returns_map(dashboard_server, monkeypatch):
     assert json.loads(body) == {"a": "ok", "b": "fail"}
 
 
+def test_skills_stats_endpoint_returns_stats_keyed_by_skill(dashboard_server):
+    from mindhive import events
+    events.append_event("invoke_result", {"name": "a", "ok": True, "text": ""},
+                        session_id="s", ts="2026-07-01T10:00:00Z", project="test")
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/stats?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["stats"]["a"]["calls"] == 1
+    assert obj["stats"]["a"]["completion_rate"] == 1.0
+
+
+def test_skills_stats_endpoint_unknown_project_is_empty_not_500(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/stats?project=no-such-ns", token)
+    assert status == 200
+    assert json.loads(body) == {"stats": {}}
+
+
+def test_skills_recommend_endpoint_returns_ranked_payload(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    monkeypatch.setattr(plugins_mod, "live_inventory", lambda: {
+        "changed": True, "signature": "x", "inventory": {
+            "plugins": [{"name": "p", "skills": [
+                {"name": "tester", "trigger": "Use when tests fail."}]}],
+            "local_skills": [], "counts": {}}})
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/recommend?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert "coverage" in obj and "recommendations" in obj
+    assert obj["recommendations"][0]["name"] == "tester"
+    assert obj["recommendations"][0]["provenance"] in ("measured", "estimated")
+
+
 def test_page_has_invoke_and_status_hooks(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")

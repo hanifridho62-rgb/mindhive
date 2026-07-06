@@ -453,6 +453,127 @@ def call_history(name, project=None, limit=20) -> list[dict]:
     return out[:max(0, limit)]
 
 
+# A passive `skill_used` capture and an explicit record (invoke_result or a
+# `skills record` tool_failed) can describe the SAME execution — hookcapture
+# sees the Skill tool fire while the agent/orchestrator writes its own verdict
+# moments later. Within this window (same skill, same session) the explicit
+# record wins and the pair counts once.
+DEDUP_WINDOW_SECS = 120
+
+
+def _stat_secs(ts):
+    """Epoch seconds for a store ISO timestamp, or None when unparseable."""
+    import calendar
+    import time as _time
+    try:
+        return calendar.timegm(_time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _skill_calls(evs) -> list[dict]:
+    """Normalize the three skill-telemetry event sources into one call list
+    (chronological — read_all is already ordered): ``skill_used`` (passive hook
+    capture), ``invoke_result`` (ok), and ``tool_failed`` with a ``skill:*``
+    signature (fail). Explicit records tagged ``agent-assessed`` keep that
+    provenance (KTD5 — self-grades are never presented as measured)."""
+    calls = []
+    for e in evs:
+        p = e.payload if isinstance(e.payload, dict) else {}
+        if e.type == "skill_used":
+            name = p.get("name")
+            if not name:
+                continue
+            calls.append({"name": name, "ts": e.ts, "ok": bool(p.get("ok", True)),
+                          "session": e.session_id, "explicit": False,
+                          "provenance": "passive", "source": "skill_used"})
+        elif e.type == "invoke_result":
+            name = p.get("name")
+            if not name:
+                continue
+            prov = "agent-assessed" if "agent-assessed" in (e.tags or []) else "invoke"
+            calls.append({"name": name, "ts": e.ts, "ok": True,
+                          "session": e.session_id, "explicit": True,
+                          "provenance": prov, "source": "invoke_result"})
+        elif e.type == "tool_failed":
+            sig = p.get("signature", "")
+            if not (isinstance(sig, str) and sig.startswith("skill:")):
+                continue
+            prov = "agent-assessed" if "agent-assessed" in (e.tags or []) else "invoke"
+            calls.append({"name": sig[len("skill:"):], "ts": e.ts, "ok": False,
+                          "session": e.session_id, "explicit": True,
+                          "provenance": prov, "source": "tool_failed"})
+    return calls
+
+
+def _dedup_calls(calls: list[dict]) -> list[dict]:
+    """Drop each passive capture that an explicit record already covers: same
+    skill, same session, timestamps within DEDUP_WINDOW_SECS. Greedy 1:1
+    pairing — one explicit record retires at most one passive capture, so two
+    genuine executions never collapse into one."""
+    explicit_pool: dict[tuple, list[dict]] = {}
+    for c in calls:
+        if c["explicit"]:
+            explicit_pool.setdefault((c["name"], c["session"]), []).append(c)
+    paired: set[int] = set()
+    kept = []
+    for c in calls:
+        if not c["explicit"]:
+            cs = _stat_secs(c["ts"])
+            mate = None
+            for x in explicit_pool.get((c["name"], c["session"]), []):
+                if id(x) in paired:
+                    continue
+                xs = _stat_secs(x["ts"])
+                if cs is not None and xs is not None \
+                        and abs(cs - xs) <= DEDUP_WINDOW_SECS:
+                    mate = x
+                    break
+            if mate is not None:
+                paired.add(id(mate))
+                continue                    # explicit record wins; passive drops
+        kept.append(c)
+    return kept
+
+
+def skill_stats(project=None, evs=None) -> dict:
+    """Per-skill telemetry counters from the ledger, keyed by skill name:
+    ``{calls, ok, fail, completion_rate, last_outcome, last_used, streak,
+    provenance, sources}``.
+
+    The rate is a COMPLETION rate (ran without a tool error), never a success
+    rate (KTD5); it is None when a skill has zero calls. ``provenance`` breaks
+    calls down by capture path (``passive`` hook capture / ``invoke`` channel /
+    ``agent-assessed`` `skills record` write-throughs); ``streak`` is the
+    trailing run of failure-free calls (the completion record the recommend
+    tie-break reads). Pass evs to reuse an events.read_all() result."""
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    out: dict[str, dict] = {}
+    for c in _dedup_calls(_skill_calls(evs)):
+        s = out.setdefault(c["name"], {
+            "calls": 0, "ok": 0, "fail": 0, "completion_rate": None,
+            "last_outcome": None, "last_used": None, "streak": 0,
+            "provenance": {}, "sources": []})
+        s["calls"] += 1
+        if c["ok"]:
+            s["ok"] += 1
+            s["streak"] += 1
+        else:
+            s["fail"] += 1
+            s["streak"] = 0
+        s["last_outcome"] = "ok" if c["ok"] else "fail"
+        s["last_used"] = c["ts"]
+        s["provenance"][c["provenance"]] = s["provenance"].get(c["provenance"], 0) + 1
+        if c["source"] not in s["sources"]:
+            s["sources"].append(c["source"])
+    for s in out.values():
+        if s["calls"]:
+            s["completion_rate"] = s["ok"] / s["calls"]
+        s["sources"].sort()
+    return out
+
+
 def _catalog_path(project=None) -> Path:
     """Sidecar file holding the single latest plugin catalog snapshot."""
     return paths.project_dir(project) / "plugin_catalog.json"

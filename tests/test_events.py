@@ -75,6 +75,18 @@ def test_rule_revised_is_a_valid_deterministic_type():
     assert ev.type == "rule_revised"
 
 
+def test_skill_used_is_a_valid_deterministic_type():
+    # U5: without this registration append_event raises and every Skill-tool
+    # capture would be silently dropped to hooks_errors.log
+    assert "skill_used" in events.DETERMINISTIC_TYPES
+    assert "skill_used" not in events.SEMANTIC_TYPES
+    ev = events.append_event("skill_used",
+                             {"name": "ce-plan", "plugin": "compound-engineering",
+                              "ok": True, "text": "done"},
+                             session_id="s1", tags=["auto"], project="test")
+    assert ev.type == "skill_used"
+
+
 def test_lifecycle_event_types_are_valid():
     for t in ("rule_activated", "rule_promoted", "rule_demoted"):
         assert t in events.DETERMINISTIC_TYPES

@@ -288,6 +288,88 @@ def cmd_skills_status(args) -> int | None:
     return None
 
 
+def cmd_skills_stats(args) -> int | None:
+    from . import plugins as plugins_mod
+    stats = plugins_mod.skill_stats(project=args.project)
+    if args.json:
+        print(json.dumps(stats, indent=2))
+        return None
+    if not stats:
+        print("(no skill telemetry yet)")
+        return None
+    for name, s in sorted(stats.items()):
+        rate = (f"{s['completion_rate'] * 100:.0f}%"
+                if s["completion_rate"] is not None else "-")
+        print(f"  {name}: {s['calls']} calls · {s['ok']} ok · {s['fail']} fail "
+              f"· completion {rate} · last {s['last_outcome']} @ {s['last_used']}")
+    return None
+
+
+def cmd_skills_record(args) -> int | None:
+    """Explicit skill-outcome write-through for the orchestrator/agent (KTD5):
+    --ok appends an invoke_result, --fail a tool_failed with a skill:<name>
+    signature (feeding the incident pipeline unchanged). Both carry
+    agent-assessed provenance so self-grades never masquerade as measured."""
+    note = args.note or ""
+    if args.ok:
+        ev = events.append_event(
+            "invoke_result",
+            {"name": args.name, "plugin": args.plugin, "ok": True, "text": note,
+             "provenance": "agent-assessed"},
+            tags=["skill", "record", "agent-assessed"], project=args.project)
+        print(f"recorded ok for {args.name} @ {ev.ts}")
+    else:
+        signature = f"skill:{args.name}"
+        ev = events.append_event(
+            "tool_failed",
+            {"text": note or f"skill {args.name} failed (agent-assessed)",
+             "signature": signature,
+             "action": f"skills record {args.name} --fail",
+             "provenance": "agent-assessed"},
+            tags=["skill", "record", "agent-assessed", "failure"],
+            project=args.project)
+        print(f"recorded fail for {args.name} ({signature}) @ {ev.ts}")
+    return None
+
+
+def cmd_skills_recommend(args) -> int | None:
+    """Deterministic most-needed-skills ranking (KTD6). One ledger read feeds
+    both the telemetry stats and the need extraction, so --brief stays cheap
+    enough for a session-start hook."""
+    from . import incidents as incidents_mod
+    from . import plugins as plugins_mod
+    from . import recommend as recommend_mod
+    evs = events.read_all(args.project)
+    skills = recommend_mod.flatten_inventory(
+        plugins_mod.live_inventory()["inventory"])
+    stats = plugins_mod.skill_stats(project=args.project, evs=evs)
+    summaries = incidents_mod.summaries(args.project)
+    needs = recommend_mod.extract_needs(summaries, evs)
+    payload = recommend_mod.recommend(skills, stats, incidents=summaries,
+                                      needs=needs, top=args.top)
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return None
+    recs = payload["recommendations"]
+    if args.brief:
+        for e in recs[:3]:
+            print(f"{e['name']} — {e['reason']} ({e['provenance']})")
+        return None
+    cov = payload["coverage"]
+    print(f"measured {cov['measured']} of {cov['total']} skills")
+    if not recs:
+        print("(no skills in inventory)")
+        return None
+    for i, e in enumerate(recs, 1):
+        print(f"  {i}. {e['name']}  [score {e['score']:g}, {e['provenance']}]"
+              f"{'  (try to measure)' if e.get('try_to_measure') else ''}")
+        print(f"       {e['reason']}")
+        for a in e.get("alternatives", []):
+            flag = " — try to measure" if a.get("try_to_measure") else ""
+            print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
+    return None
+
+
 def cmd_sync(args) -> int | None:
     from . import sync as sync_mod
     folder = args.folder or os.getcwd()
@@ -674,6 +756,28 @@ def _build_parser() -> argparse.ArgumentParser:
     ski.add_argument("--plugin", default=None, help="owning plugin, when disambiguation is needed")
     ski.set_defaults(func=cmd_skills_invoke)
     sksub.add_parser("status", help="green/red last-call outcome per skill").set_defaults(func=cmd_skills_status)
+    sks = sksub.add_parser("stats", help="per-skill completion-rate telemetry from the ledger")
+    sks.add_argument("--json", action="store_true", help="emit the raw stats JSON")
+    sks.add_argument("--project", default=None, help="target namespace")
+    sks.set_defaults(func=cmd_skills_stats)
+    skr = sksub.add_parser("record",
+                           help="record a skill outcome (agent-assessed write-through)")
+    skr.add_argument("name", help="skill name")
+    outcome = skr.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("--ok", action="store_true", help="the skill completed")
+    outcome.add_argument("--fail", action="store_true", help="the skill failed")
+    skr.add_argument("--note", default="", help="one-line context for the outcome")
+    skr.add_argument("--plugin", default=None, help="owning plugin, if known")
+    skr.add_argument("--project", default=None, help="target namespace")
+    skr.set_defaults(func=cmd_skills_record)
+    skc = sksub.add_parser("recommend",
+                           help="deterministic most-needed-skills ranking from measured data")
+    skc.add_argument("--json", action="store_true", help="emit the full ranked payload")
+    skc.add_argument("--top", type=int, default=None, help="limit to the top N entries")
+    skc.add_argument("--brief", action="store_true",
+                     help="<= 3 one-line suggestions (fast; for the session hook)")
+    skc.add_argument("--project", default=None, help="target namespace")
+    skc.set_defaults(func=cmd_skills_recommend)
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
