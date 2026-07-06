@@ -4,6 +4,8 @@ from . import paths, events, chain, review, incidents, reflect
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
+SUGGEST_CAP = 3  # max suggested-skill lines embedded in STATE.md (R9)
+
 
 def _short(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
@@ -53,17 +55,52 @@ def build_state(evs, pending=None, health_note="") -> str:
     return "\n".join(out) + "\n"
 
 
+def suggested_skills_block(project=None, evs=None) -> str:
+    """Compact suggested-skills block (<= SUGGEST_CAP lines, same brief format
+    as `hive skills recommend --brief`) refreshed at every projection rebuild
+    (R9). Empty string on ANY failure — a recommendation problem must never
+    break the state build. Imports are lazy so projector keeps no hard
+    dependency on the plugins/recommend stack (and no import cycles)."""
+    try:
+        from . import incidents as incidents_mod
+        from . import plugins as plugins_mod
+        from . import recommend as recommend_mod
+        if evs is None:
+            evs = events.read_all(project)
+        skills = recommend_mod.flatten_inventory(
+            plugins_mod.live_inventory()["inventory"])
+        stats = plugins_mod.skill_stats(project=project, evs=evs)
+        summaries = incidents_mod.summaries(project)
+        needs = recommend_mod.extract_needs(summaries, evs)
+        payload = recommend_mod.recommend(skills, stats, incidents=summaries,
+                                          needs=needs, top=SUGGEST_CAP)
+        recs = (payload.get("recommendations") or [])[:SUGGEST_CAP]
+        if not recs:
+            return ""
+        lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)"]
+        for e in recs:
+            lines.append(f"- {e['name']} — {e['reason']} ({e['provenance']})")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def compose_state(evs, project=None, include_rules=True) -> str:
     """Full STATE.md text: the state body (with any reflection-health notice)
     plus the capped prevention-rules block appended when non-empty (KTD2 —
-    STATE.md is the single delivery choke point for rules). sync embeds the
-    include_rules=False variant so rules appear exactly once in MEMORY.md."""
+    STATE.md is the single delivery choke point for rules), plus the compact
+    suggested-skills block (R9). sync embeds the include_rules=False variant so
+    rules appear exactly once in MEMORY.md; suggestions ride the embedded state
+    body in both variants (they exist nowhere else in MEMORY.md)."""
     body = build_state(evs, pending=review.load_pending(project),
                        health_note=reflect.health_note(project))
     if include_rules:
         block = incidents.inject(project, evs=evs)
         if block:
             body = body + "\n" + block + "\n"
+    sugg = suggested_skills_block(project, evs=evs)
+    if sugg:
+        body = body + "\n" + sugg + "\n"
     return body
 
 

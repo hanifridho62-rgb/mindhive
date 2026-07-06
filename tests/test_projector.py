@@ -143,3 +143,61 @@ def test_state_carries_reflection_health_warning():
     state = _state()
     assert "Reflection health" in state
     assert "empty verdict" in state
+
+
+# --- suggested-skills block embedded in STATE.md (R9) -------------------------
+
+from mindhive import plugins
+
+
+def _fake_inventory(skills):
+    """A plugins.live_inventory()-shaped payload with one test plugin."""
+    return {"inventory": {
+        "plugins": [{"name": "testplug",
+                     "skills": [{"name": n, "trigger": d} for n, d in skills]}],
+        "local_skills": []}}
+
+
+def test_state_contains_suggested_skills_when_recommend_yields(monkeypatch):
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _fake_inventory([
+                            ("alpha-skill", "use when testing alpha paths"),
+                            ("beta-skill", "handles beta deployments")]))
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    state = _state()
+    assert "# SUGGESTED SKILLS" in state
+    assert "alpha-skill" in state
+    assert "(estimated)" in state          # never-called -> estimated provenance
+    # block rides AFTER the state body
+    assert state.index("_events:") < state.index("# SUGGESTED SKILLS")
+
+
+def test_suggested_skills_block_bounded_to_three(monkeypatch):
+    six = [(f"skill-{i:02d}", f"totally distinct purpose number {i}")
+           for i in range(6)]
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _fake_inventory(six))
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    state = _state()
+    block = state.split("# SUGGESTED SKILLS", 1)[1]
+    bullets = [ln for ln in block.splitlines() if ln.startswith("- ")]
+    assert len(bullets) == projector.SUGGEST_CAP == 3
+
+
+def test_recommend_failure_skips_block_state_still_builds(monkeypatch):
+    from mindhive import recommend as recommend_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("recommend broke")
+
+    monkeypatch.setattr(recommend_mod, "recommend", boom)
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()   # must not raise
+    state = _state()
+    assert "SUGGESTED SKILLS" not in state
+    assert "d1" in state                   # state body intact
