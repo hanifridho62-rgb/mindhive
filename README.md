@@ -27,12 +27,13 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive review queue [--session id]` — queue the session's touched source files for a thermo-nuclear review (run by `session_end`; writes the pending-review marker)
 - `hive review show` — print the pending-review marker, if any
 - `hive review clear` — clear the pending-review marker once the review has run
+- `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain
 - `hive embed [--force]` — build the on-demand vector index
 - `hive selftest` — run the test suite
 - `hive loop init` — scaffold `.hive-loop/` (PROMPT.md, fix_plan.md, AGENT.md, loop.toml) and check the `claude` CLI
-- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker. A real run also **auto-opens the web dashboard** so you can watch it live — opt out with `--no-dashboard` or `MINDHIVE_LOOP_DASHBOARD=0`
+- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate (the explicit `EXIT_SIGNAL: true` **plus** ≥2 natural-language completion signals in the reply — `[loop] min_completion_heuristics` in loop.toml, `0` restores explicit-only), and a circuit breaker (3 no-progress / 5 same-error iterations). When no `[model].model` is pinned, iterations **route to a model tier** (light/mid/heavy, `[model.tiers]` in loop.toml): small tasks start light, a failed or no-progress iteration escalates one tier, and the starting tier is learned from what completed comparable-size runs in the ledger. A real run also **auto-opens the web dashboard** so you can watch it live — opt out with `--no-dashboard` or `MINDHIVE_LOOP_DASHBOARD=0`
 - `hive loop status` — summarize the last loop run
 - `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI (no dashboard is opened)
 - **`/circle`** — the in-session front door to `hive loop`: type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous loop and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
@@ -102,6 +103,24 @@ exists (V17 is trading). Override with `--force` only when the box is idle.
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into
 any model/client. It is deterministic and costs no API tokens.
+
+## Oversee: live work sessions
+
+The dashboard's **Oversee** view (Work group) lists every `hive loop` run for
+the selected project as a titled card — the title is a one-line summary of
+what the run is doing (the latest iteration summary, seeded from PROMPT.md).
+Click a title to expand the progress detail: **Done** (past iteration
+summaries + checked fix_plan items), **Doing** (current iteration), **Planned**
+(unchecked required items) and **Not yet** (Future/Optional items). While a
+run is live, an **online** strip shows at the top (heartbeat = last event
+within one iteration timeout); it disappears when nothing is working.
+
+Sessions are **removed automatically** when a run ends through the dual-
+condition exit gate (graceful exit) or the circuit breaker trips, and any
+session can be deleted manually with its per-card **delete** button. Deletion
+is an append-only `loop_run_dismissed` tombstone — the run's events stay in
+the hash chain (the archive), it just stops being shown, so `hive verify`
+never breaks.
 
 ## Desktop control panel
 
