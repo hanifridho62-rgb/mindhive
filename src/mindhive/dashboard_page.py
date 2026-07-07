@@ -104,6 +104,8 @@ def render_page(token: str) -> str:
 <main>
   <nav>
     <button onclick="showOverview()">Overview</button>
+    <div class="group">Work</div>
+    <button onclick="showOversee()">Oversee</button>
     <div class="group">Memory</div>
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
@@ -215,7 +217,9 @@ def render_page(token: str) -> str:
   }
   async function apiPost(path, body){
     const b = Object.assign({}, body || {});
-    if (PROJECT) b.project = PROJECT;
+    // a caller-supplied project wins (e.g. HIVE MIND rows acting on their own
+    // namespace); otherwise scope to the picker like every other call
+    if (PROJECT && !b.project) b.project = PROJECT;
     const r = await fetch(u(withProj(path)), { method:'POST', headers:{ 'Content-Type':'application/json',
       'X-Hive-Token': TOKEN }, body: JSON.stringify(b) });
     return r.json();
@@ -577,6 +581,93 @@ def render_page(token: str) -> str:
   }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
+
+  // --- Oversee: live Claude work sessions (hive loop runs) -------------
+  // Cards mirror the Improvements view (glyph + pills + expandable body);
+  // expansion state survives the live refresh via OV_EXPANDED.
+  let OV_DATA = null;
+  const OV_EXPANDED = new Set();
+  function ovStatus(r){
+    if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
+    if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
+    if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
+    return ['\\u25a0', 'snone', r.status || 'ended'];
+  }
+  function ovGroup(label, items){
+    if (!items || !items.length) return '';
+    return '<div class="snip"><b>'+label+':</b></div>'
+      + items.map(x => '<div class="snip dup">\\u2022 '+esc(x)+'</div>').join('');
+  }
+  function ovCard(r, showProj){
+    const st = ovStatus(r);
+    const open = OV_EXPANDED.has(r.run_id);
+    const head = '<span class="statusDot '+st[1]+'">'+st[0]+'</span>'
+      + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
+      + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
+      + esc(r.title || r.run_id)+'</span>'
+      + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
+      + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
+    const pills = '<span class="pill">'+esc(st[2])+'</span> '
+      + '<span class="pill">'+(r.iterations||0)+' iteration'+((r.iterations||0)===1?'':'s')+'</span> '
+      + '<span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>'
+      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">online</span>' : '');
+    let body = '';
+    if (open){
+      if (r.doing) body += '<div class="snip"><b>Doing:</b> '+esc(r.doing)+'</div>';
+      body += ovGroup('Done', r.done) + ovGroup('Planned', r.planned)
+            + ovGroup('Not yet', r.not_yet);
+      body += '<div class="snip dup">started '+esc(r.started||'')
+            + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
+    }
+    return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
+      + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
+  }
+  function paintOversee(){
+    if (!OV_DATA) return;
+    // Online/offline strip: shown ONLY while Claude is working on a session.
+    const online = OV_DATA.any_online
+      ? '<div class="row"><span class="pill" style="color:#46c46a;border-color:#2a5">'
+        + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
+      : '';
+    if (!OV_DATA.runs.length){
+      showHTML(online + '<h2 class="h">No work sessions \\u2014 start one with '
+        + '<code>hive loop</code>. Finished sessions are removed automatically.</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(online
+      + '<h2 class="h">'+OV_DATA.runs.length+' work session'
+      + (OV_DATA.runs.length===1?'':'s')
+      + (OV_DATA.dismissed ? ' <span class="dup">\\u00b7 '+OV_DATA.dismissed
+         +' finished &amp; removed</span>' : '')+'</h2>'
+      + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>');
+    view.querySelectorAll('.ovtitle').forEach(el => el.onclick = () => {
+      const rid = el.closest('li').dataset.rid;
+      if (OV_EXPANDED.has(rid)) OV_EXPANDED.delete(rid); else OV_EXPANDED.add(rid);
+      paintOversee();
+    });
+    view.querySelectorAll('.ovdel').forEach(el => el.onclick = (ev) => {
+      ev.stopPropagation(); deleteRun(el.dataset.rid, el.dataset.proj);
+    });
+  }
+  async function renderOversee(){
+    const res = await apiGet('/api/oversee');
+    if (!res || res.ok === false) throw new Error((res && res.error) || 'oversee fetch failed');
+    OV_DATA = res;
+    paintOversee();
+  }
+  async function deleteRun(rid, proj){
+    if (!confirm('Delete this session from Oversee? Its events stay in the '
+        + 'ledger (append-only), it just stops being shown.')) return;
+    await run('deleting session\\u2026', async () => {
+      const body = {run_id: rid};
+      if (PROJECT === '*' && proj) body.project = proj;
+      const res = await apiPost('/api/oversee/dismiss', body);
+      if (!res.ok) { showText(res); return; }
+      await renderOversee();
+    });
+  }
+  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }

@@ -1290,3 +1290,81 @@ def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
     status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
     assert obj["reflected"] == 1 and obj["failed"] == 2
     assert obj["pending"] == 0                    # attempted-but-failed is not pending
+
+
+# --- Oversee: work sessions view (U3/U4) ---------------------------------
+
+def _seed_loop_run(run_id, hour, reason=None, title="Fix the parser"):
+    ev_mod.append_event("loop_run_start",
+                        {"run_id": run_id, "title": title, "goal_dir": "d"},
+                        ts=f"2026-07-07T{hour:02d}:00:00Z", project="test")
+    ev_mod.append_event("loop_iteration",
+                        {"run_id": run_id, "iteration": 1, "summary": "working",
+                         "cost_usd": 0.1, "total_tokens": 100},
+                        ts=f"2026-07-07T{hour:02d}:01:00Z", project="test")
+    if reason:
+        ev_mod.append_event("loop_run_end", {"run_id": run_id, "reason": reason},
+                            ts=f"2026-07-07T{hour:02d}:02:00Z", project="test")
+
+
+def test_oversee_lists_runs_and_online_flag(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)                     # running (no end event)
+    status, body = _get(base, "/api/oversee?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert [r["run_id"] for r in obj["runs"]] == ["run1"]
+    r = obj["runs"][0]
+    assert r["status"] == "running"
+    assert r["title"] == "working"                 # latest summary supersedes
+    # events are seeded in the past, so the heartbeat window has lapsed
+    assert r["online"] is False and obj["any_online"] is False
+
+
+def test_oversee_dismiss_removes_run(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10, reason="max_iterations")
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert status == 200 and obj == {"ok": True, "run_id": "run1"}
+    tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
+    assert tombs and tombs[0].payload["cause"] == "manual"
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    assert obj["runs"] == [] and obj["dismissed"] == 1
+
+
+def test_oversee_dismiss_unknown_or_missing_run_rejected(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "nope"}, token)
+    assert status == 200 and obj["ok"] is False
+    status, obj = _post(base, "/api/oversee/dismiss", {"project": "test"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert not [e for e in ev_mod.read_all("test")
+                if e.type == "loop_run_dismissed"]
+
+
+def test_oversee_dismiss_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "*", "run_id": "run1"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "read-only" in obj["error"]
+
+
+def test_oversee_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/oversee")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_page_has_oversee_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "showOversee" in body and "Oversee" in body
+    assert "/api/oversee" in body and "deleteRun" in body
