@@ -94,3 +94,12 @@ def test_lifecycle_event_types_are_valid():
     ev = events.append_event("rule_promoted", {"signature": "pymodule:x"},
                              session_id="s", tags=["promote"], project="test")
     assert ev.type == "rule_promoted"
+
+
+def test_loop_run_dismissed_is_valid_deterministic_type():
+    assert "loop_run_dismissed" in events.DETERMINISTIC_TYPES
+    assert "loop_run_dismissed" not in events.SEMANTIC_TYPES
+    ev = events.append_event("loop_run_dismissed",
+                             {"run_id": "abc123", "cause": "manual"},
+                             session_id="s", project="test")
+    assert ev.type == "loop_run_dismissed"

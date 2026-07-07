@@ -13,7 +13,7 @@ DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
     "session_start", "session_end", "compaction",
     "plugin_catalog", "user_prompt", "assistant_response",
-    "loop_run_start", "loop_iteration", "loop_run_end",
+    "loop_run_start", "loop_iteration", "loop_run_end", "loop_run_dismissed",
     "tool_failed", "rule_revised",
     "rule_activated", "rule_promoted", "rule_demoted", "rule_expired",
     "invoke_requested", "invoke_result", "skill_used",

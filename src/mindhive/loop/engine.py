@@ -1,5 +1,6 @@
 # src/mindhive/loop/engine.py
 import time
+import uuid
 from pathlib import Path
 
 from .. import events, guard, recall as recall_mod
@@ -39,8 +40,12 @@ def run_loop(project, loop_dir, cfg, driver, *,
                                    cfg.window_cost_budget_usd)
     budget_entries = []
 
+    run_id = uuid.uuid4().hex[:12]
+    title = task_mod.load_tasks(loop_dir).prompt.strip().splitlines()
+    title = title[0].lstrip("# ").strip() if title else ""
     events.append_event("loop_run_start",
-                        {"goal_dir": str(loop_dir), "max_iterations": cfg.max_iterations},
+                        {"run_id": run_id, "title": title,
+                         "goal_dir": str(loop_dir), "max_iterations": cfg.max_iterations},
                         project=project)
 
     start = now_fn()
@@ -86,6 +91,7 @@ def run_loop(project, loop_dir, cfg, driver, *,
         occupancy = result.usage.context_occupancy
 
         events.append_event("loop_iteration", {
+            "run_id": run_id,
             "iteration": iteration,
             "summary": status.summary or "",
             "progress": progressed,
@@ -130,5 +136,12 @@ def run_loop(project, loop_dir, cfg, driver, *,
             session_id = result.session_id
 
     events.append_event("loop_run_end",
-                        {"reason": reason, "iterations": iteration}, project=project)
-    return {"reason": reason, "iterations": iteration}
+                        {"run_id": run_id, "reason": reason, "iterations": iteration},
+                        project=project)
+    # Lifecycle deletion: a gracefully-exited or breaker-tripped run leaves the
+    # Oversee view via an append-only tombstone — never by touching the chain.
+    if reason in ("completed", "breaker_open"):
+        cause = "completed" if reason == "completed" else "breaker"
+        events.append_event("loop_run_dismissed",
+                            {"run_id": run_id, "cause": cause}, project=project)
+    return {"reason": reason, "iterations": iteration, "run_id": run_id}
