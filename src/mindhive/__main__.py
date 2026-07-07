@@ -497,6 +497,22 @@ def cmd_flag(args) -> int | None:
     return None
 
 
+def cmd_consolidate(args) -> int | None:
+    """One bounded memory-consolidation ("dreaming") pass: merge near-duplicate
+    semantic memories into survivors, exclude the absorbed originals from the
+    briefing/MEMORY.md digest, keep everything in the append-only chain."""
+    from . import consolidate as consolidate_mod
+    try:
+        res = consolidate_mod.consolidate(
+            project=args.project, limit=args.limit,
+            cooldown_hours=args.cooldown_hours, force=args.force)
+    except RuntimeError as e:       # LIVE_LOCK guard
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(res))
+    return None
+
+
 def cmd_failures_capture(args) -> int | None:
     from . import failures as failures_mod, incidents as incidents_mod
     res = failures_mod.capture_dir(args.transcripts, project=args.project)
@@ -660,6 +676,19 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--limit", type=int, default=10)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_recall)
+
+    cons = sub.add_parser("consolidate",
+                          help="dreaming pass: merge near-duplicate memories "
+                               "into survivors (append-only, bounded)")
+    cons.add_argument("--project", default=None)
+    cons.add_argument("--limit", type=int, default=3,
+                      help="max duplicate clusters merged per pass")
+    cons.add_argument("--cooldown-hours", dest="cooldown_hours", type=float,
+                      default=6.0, help="skip when a pass ran within this window "
+                                        "(0 disables)")
+    cons.add_argument("--force", action="store_true",
+                      help="override the LIVE_LOCK guard")
+    cons.set_defaults(func=cmd_consolidate)
 
     gc = sub.add_parser("gc", help="store hygiene: report sizes; prune junk (opt-in)")
     gc.add_argument("target", nargs="?", default=None,
