@@ -8,6 +8,7 @@ from ..briefing import build_briefing
 from . import budget as budget_mod
 from . import context as ctx_mod
 from . import prompt as prompt_mod
+from . import router as router_mod
 from . import safeguards
 from . import task as task_mod
 from .contract import parse_status
@@ -41,10 +42,21 @@ def run_loop(project, loop_dir, cfg, driver, *,
     budget_entries = []
 
     run_id = uuid.uuid4().hex[:12]
-    title = task_mod.load_tasks(loop_dir).prompt.strip().splitlines()
+    tasks0 = task_mod.load_tasks(loop_dir)
+    title = tasks0.prompt.strip().splitlines()
     title = title[0].lstrip("# ").strip() if title else ""
+    # Model-tier routing: only when no explicit model is pinned. The starting
+    # tier comes from the task's static size, overridden by what actually
+    # worked for comparable runs in this project's ledger.
+    size = router_mod.size_class(
+        task_mod.required_remaining_count(tasks0.fix_plan), len(tasks0.prompt))
+    routing = cfg.model is None
+    tier = router_mod.pick_initial_tier(
+        size, router_mod.run_history(events.read_all(project))) if routing else None
+    tier_models = {"light": cfg.tier_light, "mid": cfg.tier_mid,
+                   "heavy": cfg.tier_heavy}
     events.append_event("loop_run_start",
-                        {"run_id": run_id, "title": title,
+                        {"run_id": run_id, "title": title, "size_class": size,
                          "goal_dir": str(loop_dir), "max_iterations": cfg.max_iterations},
                         project=project)
 
@@ -77,10 +89,11 @@ def run_loop(project, loop_dir, cfg, driver, *,
         loop_context = prompt_mod.build_loop_context(briefing_text)
         task_prompt = prompt_mod.build_task_prompt(tasks, hits)
 
+        model = tier_models[tier] if routing else cfg.model
         result = driver.run(
             task_prompt, loop_context,
             allowed_tools=cfg.allowed_tools, session_id=session_id,
-            model=cfg.model, permission_mode=cfg.permission_mode,
+            model=model, permission_mode=cfg.permission_mode,
             timeout_s=cfg.iteration_timeout_seconds, live=live)
 
         status = parse_status(result.text)
@@ -92,6 +105,8 @@ def run_loop(project, loop_dir, cfg, driver, *,
 
         events.append_event("loop_iteration", {
             "run_id": run_id,
+            "model": model,
+            "tier": tier,
             "iteration": iteration,
             "summary": status.summary or "",
             "progress": progressed,
@@ -122,6 +137,11 @@ def run_loop(project, loop_dir, cfg, driver, *,
         if cb.state == "OPEN":
             reason = "breaker_open"
             break
+
+        # measured escalation: a lightweight iteration that errored or made no
+        # progress hands the next one to the tier above (saturates at heavy)
+        if routing and (error_sig or not progressed):
+            tier = router_mod.escalate(tier)
 
         # A timed-out / failed iteration leaves no usable session to resume —
         # drop it so the next iteration starts fresh.

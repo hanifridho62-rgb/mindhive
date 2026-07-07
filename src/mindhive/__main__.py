@@ -427,8 +427,16 @@ def cmd_loop(args) -> int | None:
         tasks = loop_task.load_tasks(loop_dir)
         ctx = loop_prompt.build_loop_context(_bb(events.read_all()))
         tp = loop_prompt.build_task_prompt(tasks, [])
+        from .loop import router as loop_router
+        req = loop_task.required_remaining_count(tasks.fix_plan)
+        size = loop_router.size_class(req, len(tasks.prompt))
+        tier = (loop_router.pick_initial_tier(
+                    size, loop_router.run_history(events.read_all()))
+                if cfg.model is None else None)
         print("DRY-RUN — would run claude with:")
-        print(f"  required items remaining: {loop_task.required_remaining_count(tasks.fix_plan)}")
+        print(f"  required items remaining: {req}")
+        print(f"  model routing: " + (f"size={size} -> tier={tier}"
+              if tier else f"pinned model {cfg.model} (routing bypassed)"))
         print(f"  context_window={cfg.context_window} smart_zone_ratio={cfg.smart_zone_ratio}")
         print(f"  allowed_tools={cfg.allowed_tools}")
         print(f"  permission_mode={cfg.permission_mode or '(allowedTools only)'}")
