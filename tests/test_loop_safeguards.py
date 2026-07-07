@@ -71,3 +71,44 @@ def test_breaker_half_open_after_cooldown_then_closes_on_progress():
     assert cb.state == "HALF_OPEN"
     cb.record(progress=True, error_sig=None, now=151.0)
     assert cb.state == "CLOSED"
+
+
+def _hstatus(exit_signal=None, status=None, has=False, heuristics=0):
+    return LoopStatus(summary=None, progress=None, status=status,
+                      exit_signal=exit_signal, has_completion_signal=has,
+                      heuristic_count=heuristics)
+
+
+def test_explicit_signal_alone_fails_heuristic_gate():
+    s = _hstatus(exit_signal=True, has=True, heuristics=0)
+    done, reason = safeguards.should_exit(s, required_remaining=0, json_mode=True,
+                                          min_heuristics=2)
+    assert done is False and reason == "insufficient_completion_heuristics"
+
+
+def test_explicit_signal_plus_two_heuristics_exits():
+    s = _hstatus(exit_signal=True, status="COMPLETE", has=True, heuristics=2)
+    done, reason = safeguards.should_exit(s, required_remaining=0, json_mode=True,
+                                          min_heuristics=2)
+    assert done is True and reason == "completed"
+
+
+def test_heuristics_never_override_explicit_false():
+    s = _hstatus(exit_signal=False, status="COMPLETE", has=False, heuristics=3)
+    done, _ = safeguards.should_exit(s, required_remaining=0, json_mode=True,
+                                     min_heuristics=2)
+    assert done is False
+
+
+def test_heuristics_do_not_bypass_required_items():
+    s = _hstatus(exit_signal=True, status="COMPLETE", has=True, heuristics=3)
+    done, reason = safeguards.should_exit(s, required_remaining=1, json_mode=True,
+                                          min_heuristics=2)
+    assert done is False and reason == "required_items_remain"
+
+
+def test_min_heuristics_zero_restores_explicit_only_gate():
+    s = _hstatus(exit_signal=True, has=True, heuristics=0)
+    done, _ = safeguards.should_exit(s, required_remaining=0, json_mode=True,
+                                     min_heuristics=0)
+    assert done is True

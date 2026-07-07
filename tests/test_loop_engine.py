@@ -37,7 +37,7 @@ def test_loop_completes_on_dual_condition(tmp_path, monkeypatch):
     # iteration 2 checks the box and exits.
     drv = FakeDriver([
         _result("working\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n"),
-        _result("done\nLOOP_STATUS:\n  progress: true\n  STATUS: COMPLETE\n  EXIT_SIGNAL: true\n"),
+        _result("All tasks have been completed.\nLOOP_STATUS:\n  progress: true\n  STATUS: COMPLETE\n  EXIT_SIGNAL: true\n"),
     ])
 
     # the engine re-reads fix_plan each iteration; simulate the box being checked
@@ -77,7 +77,7 @@ def test_loop_context_resets_when_window_half_full(tmp_path, monkeypatch):
     drv = FakeDriver([
         _result("a\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n",
                 occupancy=120000, session="big"),
-        _result("b\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: true\n  STATUS: COMPLETE\n",
+        _result("All tasks have been completed.\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: true\n  STATUS: COMPLETE\n",
                 occupancy=1000, session="fresh"),
     ])
     cfg = config.LoopConfig(max_iterations=5)

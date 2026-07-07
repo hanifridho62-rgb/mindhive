@@ -21,6 +21,9 @@ class LoopConfig:
     allowed_tools: str = "Write,Read,Edit,Bash(git *),Bash(npm *)"
     iteration_timeout_minutes: int = 15
     permission_mode: str = "acceptEdits"   # headless autonomy; "" to disable
+    # Graceful exit needs the explicit EXIT_SIGNAL PLUS this many distinct
+    # natural-language completion signals in the reply text. 0 = explicit only.
+    min_completion_heuristics: int = 2
     # [breaker]
     no_progress_threshold: int = 3
     same_error_threshold: int = 5
@@ -59,6 +62,8 @@ def load_config(path: Path) -> LoopConfig:
         allowed_tools=loop.get("allowed_tools", cfg.allowed_tools),
         iteration_timeout_minutes=loop.get("iteration_timeout_minutes", cfg.iteration_timeout_minutes),
         permission_mode=loop.get("permission_mode", cfg.permission_mode),
+        min_completion_heuristics=loop.get("min_completion_heuristics",
+                                           cfg.min_completion_heuristics),
         no_progress_threshold=breaker.get("no_progress_threshold", cfg.no_progress_threshold),
         same_error_threshold=breaker.get("same_error_threshold", cfg.same_error_threshold),
         cooldown_minutes=breaker.get("cooldown_minutes", cfg.cooldown_minutes),

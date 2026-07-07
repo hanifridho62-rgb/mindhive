@@ -111,7 +111,9 @@ def run_loop(project, loop_dir, cfg, driver, *,
             break
 
         required_remaining = task_mod.required_remaining_count(tasks.fix_plan)
-        done, exit_reason = safeguards.should_exit(status, required_remaining, json_mode=not live)
+        done, exit_reason = safeguards.should_exit(
+            status, required_remaining, json_mode=not live,
+            min_heuristics=cfg.min_completion_heuristics)
         if done:
             reason = "completed"
             break
