@@ -34,3 +34,11 @@ def test_engineering_loop_wires_the_invoke_and_improvement_channel():
     text = _SKILL.read_text(encoding="utf-8")
     assert "skills invoke" in text            # drives skills through MindHive
     assert "skill:" in text or "Improvements" in text   # failure→learning loop
+
+
+def test_loop_is_learning_gated_and_parallel_aware():
+    text = _SKILL.read_text(encoding="utf-8")
+    assert "execution_mode" in text
+    assert "discontinued" in text
+    assert "Parallel whenever independent" in text
+    assert "Oversee" in text

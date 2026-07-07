@@ -83,8 +83,21 @@ risk level, execution speed, resource cost, and a final verdict.
   clarity** — an explicit "use when" trigger, then the shorter, less ambiguous
   description; (3) the longer **failure-free completion streak**. List the
   losers as alternatives, not as separate recommendations.
+- **Execution mode (learning-gated, from `skills recommend --json`):** every
+  entry carries `execution_mode`. `auto` = proven track record (measured ≥3
+  calls, completion rate ≥ 0.8, no open incident) — apply it during the task
+  without asking. `suggest` = unproven (above all a never-used skill) — propose
+  it and wait for the user's approval before invoking. Never auto-apply a
+  `suggest`-mode skill, and say which mode applied when presenting the matrix.
+- **Discontinued skills:** the payload's `discontinued` list names skills
+  stopped by the improvements linkage (an active `skill:*` prevention rule plus
+  a trailing failure streak). Do not invoke or recommend them; if one would
+  otherwise be the best fit, surface its rule text and offer the alternatives
+  instead. They return when the incident resolves or a successful call breaks
+  the streak.
 - Present the matrix, state your recommended selection, and get the user's
-  approval (or revision) before executing.
+  approval (or revision) before executing — `auto`-mode selections may proceed
+  without a blocking question, but still announce them.
 
 ### Phase 3 — Execute, then chain
 
@@ -143,6 +156,31 @@ ledger so the next `/mindhive` is smarter:
 Only append when something **memorable** actually happened. A smooth,
 unremarkable run writes nothing — do not create noise events. End by running
 `python -m mindhive sync` so next session's briefing reflects the new lessons.
+
+## Parallel dispatch and dynamic workflows
+
+The orchestrator is the top orchestration layer: it groups the work, classifies
+each piece's complexity, and then **executes in parallel whenever the pieces
+are independent** — sequential execution is reserved for genuinely dependent
+stages, never chosen out of convenience.
+
+- **Fan out independent tasks.** When selected work splits into units that
+  touch disjoint files/modules (e.g. refactor one module, run integration
+  tests, audit security in another), dispatch them concurrently — subagents
+  via the platform's subagent primitive (`Agent`/`Task` in Claude Code), or
+  concurrent `hive loop` runs (one task dir per unit; every run shows up
+  separately in the dashboard's **Oversee** section). Before fanning out,
+  check the units' file sets for overlap — overlapping units run sequentially.
+- **Dependent stages get evaluation checkpoints.** When stage 2 needs stage
+  1's output, run them in order and verify each boundary: build/tests pass,
+  the artifact exists, the assumption still holds. On failure, **read the
+  failure log (stack trace) yourself, re-verify your assumptions, and fix it
+  without new instructions from the user** — the loop's circuit breaker and
+  budget gates bound the retries, so never bounce the first hurdle back to
+  the user.
+- **Model routing applies per unit:** lightweight analysis does not need a
+  flagship model — `hive loop` routes tiers automatically when no model is
+  pinned; match that spirit when choosing subagent models.
 
 ## Non-conflict protocol (coordinator, not competitor)
 
