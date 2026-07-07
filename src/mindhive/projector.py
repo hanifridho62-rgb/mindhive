@@ -62,18 +62,9 @@ def suggested_skills_block(project=None, evs=None) -> str:
     break the state build. Imports are lazy so projector keeps no hard
     dependency on the plugins/recommend stack (and no import cycles)."""
     try:
-        from . import incidents as incidents_mod
         from . import plugins as plugins_mod
-        from . import recommend as recommend_mod
-        if evs is None:
-            evs = events.read_all(project)
-        skills = recommend_mod.flatten_inventory(
-            plugins_mod.live_inventory()["inventory"])
-        stats = plugins_mod.skill_stats(project=project, evs=evs)
-        summaries = incidents_mod.summaries(project)
-        needs = recommend_mod.extract_needs(summaries, evs)
-        payload = recommend_mod.recommend(skills, stats, incidents=summaries,
-                                          needs=needs, top=SUGGEST_CAP)
+        payload = plugins_mod.recommend_for(project=project, evs=evs,
+                                            top=SUGGEST_CAP)
         recs = (payload.get("recommendations") or [])[:SUGGEST_CAP]
         if not recs:
             return ""
@@ -85,20 +76,25 @@ def suggested_skills_block(project=None, evs=None) -> str:
         return ""
 
 
-def compose_state(evs, project=None, include_rules=True) -> str:
+def compose_state(evs, project=None, include_rules=True, suggestions=None) -> str:
     """Full STATE.md text: the state body (with any reflection-health notice)
     plus the capped prevention-rules block appended when non-empty (KTD2 —
     STATE.md is the single delivery choke point for rules), plus the compact
     suggested-skills block (R9). sync embeds the include_rules=False variant so
     rules appear exactly once in MEMORY.md; suggestions ride the embedded state
-    body in both variants (they exist nowhere else in MEMORY.md)."""
+    body in both variants (they exist nowhere else in MEMORY.md).
+
+    ``suggestions``: None -> compute the suggested-skills block here; an
+    explicit str (possibly "") -> use as-is, so a caller composing the state
+    twice per pass (sync) runs the recommend chain exactly once."""
     body = build_state(evs, pending=review.load_pending(project),
                        health_note=reflect.health_note(project))
     if include_rules:
         block = incidents.inject(project, evs=evs)
         if block:
             body = body + "\n" + block + "\n"
-    sugg = suggested_skills_block(project, evs=evs)
+    sugg = (suggested_skills_block(project, evs=evs)
+            if suggestions is None else suggestions)
     if sugg:
         body = body + "\n" + sugg + "\n"
     return body
@@ -126,16 +122,17 @@ def build_index(entries) -> dict:
     return idx
 
 
-def project(project=None, evs=None) -> dict:
-    # Accept pre-read events so a caller (e.g. sync) that already has them need
-    # not read the whole event log again.
+def project(project=None, evs=None, suggestions=None) -> dict:
+    # Accept pre-read events (and a pre-computed suggested-skills block) so a
+    # caller (e.g. sync) that already has them need not recompute either.
     if evs is None:
         evs = events.read_all(project)
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
 
     tmp = pdir / "STATE.md.tmp"
-    tmp.write_text(compose_state(evs, project), encoding="utf-8")
+    tmp.write_text(compose_state(evs, project, suggestions=suggestions),
+                   encoding="utf-8")
     tmp.replace(pdir / "STATE.md")
 
     ldir = pdir / "LEDGER"

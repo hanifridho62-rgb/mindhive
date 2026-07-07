@@ -657,6 +657,7 @@ def render_page(token: str) -> str:
   const PLUG_REFLECT = {};          // name -> last reflect_one result line
   const PLUG_CALLING = new Set();   // in-flight invokes (button spinner state)
   const PLUG_REFLECTING = new Set();  // in-flight reflect_one calls
+  let PLUG_GEN = 0;                 // poll generation: stale fetches discard themselves
   function statusDot(status){
     const cls = status === 'ok' ? 'sok' : (status === 'fail' ? 'sbad' : 'snone');
     const title = status === 'ok' ? 'last call succeeded'
@@ -759,7 +760,11 @@ def render_page(token: str) -> str:
   // recommend + improvements (for the skill:* prevention-rule index) + the
   // call history of every expanded card. Auxiliary fetches degrade to their
   // last good cache so a single flaky endpoint can't blank the view.
+  // Each cycle stamps a generation before fetching; a cycle that resolves
+  // after a newer one started (or after invokeSkill wrote fresher data)
+  // discards its results — no cache writes, no paint.
   async function renderPlugins(){
+    const gen = ++PLUG_GEN;
     const expanded = Array.from(PLUG_EXPANDED);
     const res = await Promise.all([
       apiGet('/api/plugins/inventory'),
@@ -769,13 +774,14 @@ def render_page(token: str) -> str:
       apiGet('/api/improvements').catch(() => null),
     ].concat(expanded.map(n =>
       apiGet('/api/skills/history?name='+encodeURIComponent(n)+'&limit=25').catch(() => null))));
+    if (gen !== PLUG_GEN) return;   // a newer cycle owns the caches now
     PLUG_INV = (res[0] && res[0].inventory) || {plugins: [], local_skills: [], counts: {}};
     if (res[1]) PLUG_STATUS = res[1];
     if (res[2] && res[2].stats) PLUG_STATS = res[2].stats;
     if (res[3] && res[3].recommendations) PLUG_REC = res[3];
     if (res[4] && res[4].auto) indexSkillRules(res[4].auto);
     expanded.forEach((n, i) => { if (res[5+i]) PLUG_HIST[n] = res[5+i]; });
-    paintPlugins();
+    if (liveFn === renderPlugins) paintPlugins();
   }
   function fmtRate(r){ return r == null ? '\\u2014' : Math.round(r*100)+'%'; }
   function skMetrics(st){
@@ -1023,6 +1029,7 @@ def render_page(token: str) -> str:
     PLUG_LASTCALL[name] = res;
     PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
     PLUG_CALLING.delete(name);
+    PLUG_GEN++;   // invalidate any in-flight poll so it can't clobber the fresh result
     try {
       const r = await Promise.all([
         apiGet('/api/skills/stats').catch(() => null),

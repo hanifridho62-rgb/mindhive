@@ -33,6 +33,16 @@ def test_cli_skills_invoke_passes_plugin(capsys, monkeypatch):
     assert seen == {"name": "ce-plan", "plugin": "compound-engineering"}
 
 
+def test_cli_skills_invoke_passes_project(capsys, monkeypatch):
+    from mindhive import invoker
+    seen = {}
+    monkeypatch.setattr(invoker, "invoke_skill",
+        lambda name, plugin=None, project=None: seen.update(name=name, project=project)
+        or {"ok": True, "exit": 0, "excerpt": ""})
+    cli_mod.main(["skills", "invoke", "ce-plan", "--project", "other-ns"])
+    assert seen == {"name": "ce-plan", "project": "other-ns"}
+
+
 def test_cli_skills_status_prints_map(capsys, monkeypatch):
     from mindhive import plugins
     monkeypatch.setattr(plugins, "call_status", lambda project=None: {"a": "ok", "b": "fail"})
@@ -144,3 +154,12 @@ def test_cli_skills_recommend_brief_is_fast_and_three_lines_max(capsys, monkeypa
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
     assert 1 <= len(lines) <= 3
     assert all("(measured)" in ln or "(estimated)" in ln for ln in lines)
+
+
+def test_cli_skills_recommend_brief_honors_top(capsys, monkeypatch):
+    from mindhive import plugins
+    monkeypatch.setattr(plugins, "live_inventory", lambda: _FAKE_INVENTORY)
+    ret = cli_mod.main(["skills", "recommend", "--brief", "--top", "2"])
+    assert ret == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert len(lines) == 2                 # --top overrides the default 3-cap

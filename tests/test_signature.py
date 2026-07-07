@@ -1,4 +1,26 @@
-from mindhive.signature import signature
+from mindhive.signature import signature, slug_id
+
+
+def test_slug_id_distinct_texts_never_collide():
+    # Two texts that slug to the same 40-char prefix must NOT share a component
+    # (the content hash disambiguates them).
+    a = slug_id("commit to master " + "x" * 60)
+    b = slug_id("commit to master " + "y" * 60)
+    assert a != b
+    assert a.startswith("commit-to-master")
+
+
+def test_slug_id_non_latin_gets_unique_hash_not_shared_bucket():
+    # Non-latin text slugs to empty; slug() would collapse every such text onto
+    # the shared "unknown" bucket. slug_id gives each its own hash.
+    a = slug_id("提交到主分支")
+    b = slug_id("强制推送")
+    assert a and b and a != b
+    assert "unknown" not in (a, b)
+
+
+def test_slug_id_is_deterministic():
+    assert slug_id("git push --force") == slug_id("git push --force")
 
 
 def test_python_missing_module_collapses_to_top_level_package():

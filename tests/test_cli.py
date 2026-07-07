@@ -96,11 +96,13 @@ def test_state_warns_on_freshly_minted_namespace(tmp_path, monkeypatch, capsys):
 def test_flag_creates_judgment_incident_active_at_one(capsys):
     ret = cli_mod.main(["flag", "committed to master without permission"])
     assert ret == 0
-    sig = "judgment:flag:committed-to-master-without-permission"
-    assert sig in capsys.readouterr().out
+    out = capsys.readouterr().out
     evs = [e for e in events.read_all() if e.type == "tool_failed"]
     assert len(evs) == 1
-    assert evs[0].payload["signature"] == sig
+    sig = evs[0].payload["signature"]
+    # readable slug prefix + collision-resistant content hash (sig.slug_id)
+    assert sig.startswith("judgment:flag:committed-to-master-without-permission-")
+    assert sig in out
     assert evs[0].payload["text"] == "committed to master without permission"
     assert "judgment" in evs[0].tags
     from mindhive import incidents

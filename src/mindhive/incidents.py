@@ -121,28 +121,29 @@ def _failures_by_sig(project, evs=None) -> dict:
     return out
 
 
-def _has_lifecycle(project, etype, signature) -> bool:
-    for ev in events.read_all(project):
+def _has_lifecycle(project, etype, signature, evs=None) -> bool:
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == etype and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
             return True
     return False
 
 
-def _activation_ts(project, signature) -> str | None:
-    for ev in events.read_all(project):
+def _activation_ts(project, signature, evs=None) -> str | None:
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_activated" and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
             return ev.ts
     return None
 
 
-def _latest_expiry_ts(project, signature) -> str | None:
+def _latest_expiry_ts(project, signature, evs=None) -> str | None:
     """ts of the most recent rule_expired event for a signature, or None.
     Occurrences for status purposes count only failures after this point, so
-    re-entry after decay starts a fresh candidate→active climb."""
+    re-entry after decay starts a fresh candidate→active climb. Pass evs to
+    reuse an events.read_all() result."""
     latest = None
-    for ev in events.read_all(project):
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_expired" and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
             if latest is None or ev.ts > latest:
@@ -150,11 +151,13 @@ def _latest_expiry_ts(project, signature) -> str | None:
     return latest
 
 
-def _live_failures(project, signature, evs) -> list:
+def _live_failures(project, signature, failures, evs=None) -> list:
     """The status-relevant slice of a signature's failures: everything after
-    the latest rule_expired, or all of them when it never expired."""
-    exp = _latest_expiry_ts(project, signature)
-    return [e for e in evs if e.ts > exp] if exp else evs
+    the latest rule_expired, or all of them when it never expired. ``failures``
+    is that signature's tool_failed list; ``evs`` optionally reuses the full
+    events.read_all() result for the expiry lookup."""
+    exp = _latest_expiry_ts(project, signature, evs=evs)
+    return [e for e in failures if e.ts > exp] if exp else failures
 
 
 def _ts_secs(ts) -> float | None:

@@ -492,18 +492,9 @@ def make_handler(token: str):
         def _get_skills_recommend(self, proj, am, qs):
             # deterministic most-needed-skills ranking (U6/KTD6): one ledger
             # read feeds both the stats and the need extraction
-            from . import incidents as incidents_mod
-            from . import recommend as recommend_mod
-            evs = events.read_all(proj)
-            skills = recommend_mod.flatten_inventory(
-                plugins_mod.live_inventory()["inventory"])
-            stats = plugins_mod.skill_stats(project=proj, evs=evs)
-            summaries = incidents_mod.summaries(proj)
-            needs = recommend_mod.extract_needs(summaries, evs)
             top = (qs.get("top") or [None])[0]
-            return self._json(recommend_mod.recommend(
-                skills, stats, incidents=summaries, needs=needs,
-                top=int(top) if top else None))
+            return self._json(plugins_mod.recommend_for(
+                project=proj, top=int(top) if top else None))
 
         def _get_export(self, proj, am, qs):
             path = export_mod.export()

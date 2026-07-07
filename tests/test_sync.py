@@ -118,6 +118,26 @@ def test_sync_reads_event_log_once(tmp_path, monkeypatch):
     assert calls["n"] == 1
 
 
+def test_sync_runs_recommend_chain_exactly_once(tmp_path, monkeypatch):
+    """sync composes the state twice (STATE.md + the embedded digest) but must
+    compute the suggested-skills block — the recommend chain — exactly once."""
+    from mindhive import plugins
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    events.append_event("decision", {"text": "x"},
+                        session_id="s", ts="2026-06-20T09:00:00Z")
+    calls = {"n": 0}
+    real = plugins.recommend_for
+
+    def counting(project=None, evs=None, top=None):
+        calls["n"] += 1
+        return real(project=project, evs=evs, top=top)
+
+    monkeypatch.setattr(plugins, "recommend_for", counting)
+    sync(r"C:\TEMP\demo", project=None, include_briefing=True, home=fake_home)
+    assert calls["n"] == 1
+
+
 def test_sync_path_matches_encode_folder(tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()

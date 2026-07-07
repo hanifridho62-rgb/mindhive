@@ -162,7 +162,7 @@ def test_rules_reflect_all_projects_skips_live_lock(tmp_path, capsys, monkeypatc
     out = _json.loads(capsys.readouterr().out)
     assert out["alpha"]["reflected"] == 2               # namespace drained
     assert out["fabio-live"] == {"reflected": 0, "attempted": 0,
-                                 "skipped": "LIVE_LOCK"}
+                                 "skipped": "live_lock"}
     # the locked namespace was never touched: no marker, no reflected rule
     assert reflect_mod.read_marker("fabio-live") == {}
     assert incidents.inject(project="fabio-live") == ""

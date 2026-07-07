@@ -508,20 +508,32 @@ def _skill_calls(evs) -> list[dict]:
 
 def _dedup_calls(calls: list[dict]) -> list[dict]:
     """Drop each passive capture that an explicit record already covers: same
-    skill, same session, timestamps within DEDUP_WINDOW_SECS. Greedy 1:1
+    skill, same session, timestamps within DEDUP_WINDOW_SECS. Explicit records
+    whose session is "manual" or None act as a session WILDCARD (skill name +
+    time window only): agent-run `skills record` CLI writes carry session
+    "manual" (events.py stamps it when MINDHIVE_SESSION is unset) while the
+    passive hook capture of the same execution carries the real hook session
+    id, so a same-session precondition would never pair them. Greedy 1:1
     pairing — one explicit record retires at most one passive capture, so two
     genuine executions never collapse into one."""
+    _WILDCARD = (None, "manual")
     explicit_pool: dict[tuple, list[dict]] = {}
+    wildcard_pool: dict[str, list[dict]] = {}
     for c in calls:
         if c["explicit"]:
-            explicit_pool.setdefault((c["name"], c["session"]), []).append(c)
+            if c["session"] in _WILDCARD:
+                wildcard_pool.setdefault(c["name"], []).append(c)
+            else:
+                explicit_pool.setdefault((c["name"], c["session"]), []).append(c)
     paired: set[int] = set()
     kept = []
     for c in calls:
         if not c["explicit"]:
             cs = _stat_secs(c["ts"])
             mate = None
-            for x in explicit_pool.get((c["name"], c["session"]), []):
+            candidates = (explicit_pool.get((c["name"], c["session"]), [])
+                          + wildcard_pool.get(c["name"], []))
+            for x in candidates:
                 if id(x) in paired:
                     continue
                 xs = _stat_secs(x["ts"])
@@ -572,6 +584,26 @@ def skill_stats(project=None, evs=None) -> dict:
             s["completion_rate"] = s["ok"] / s["calls"]
         s["sources"].sort()
     return out
+
+
+def recommend_for(project=None, evs=None, top=None) -> dict:
+    """One-stop deterministic most-needed-skills ranking (KTD6): read the
+    ledger once, flatten the live inventory, aggregate skill stats, extract
+    needs from incident summaries, and rank. The single implementation behind
+    `hive skills recommend`, the dashboard endpoint, and the projector's
+    suggested-skills block. Pass evs to reuse an events.read_all() result.
+    Imports are lazy so plugins keeps no hard dependency on incidents/recommend
+    (and no import cycles)."""
+    from . import incidents as incidents_mod
+    from . import recommend as recommend_mod
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    skills = recommend_mod.flatten_inventory(live_inventory()["inventory"])
+    stats = skill_stats(project=project, evs=evs)
+    summaries = incidents_mod.summaries(project)
+    needs = recommend_mod.extract_needs(summaries, evs)
+    return recommend_mod.recommend(skills, stats, incidents=summaries,
+                                   needs=needs, top=top)
 
 
 def _catalog_path(project=None) -> Path:

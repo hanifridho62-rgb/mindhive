@@ -17,15 +17,7 @@ try {
     & $py -m mindhive directives
     & $py -m mindhive state
 } catch {}
-# Top skill suggestions (R9) — same fast CLI pattern as the lines above: one
-# short-lived python call reading the cached inventory + ledger, no waits.
-try {
-    $rec = & $py -m mindhive skills recommend --top 3 --brief
-    if ($rec) {
-        Write-Output "MIND HIVE suggested skills:"
-        $rec | Write-Output
-    }
-} catch {}
+# Skill suggestions (R9) arrive via the SUGGESTED SKILLS block embedded in STATE.md above — no extra call here.
 # Auto-refresh the plugin/skill catalog in the background — detached and
 # fire-and-forget so it never delays session start. 'autoscan' is stale-gated:
 # it only does real work when the catalog is missing or older than 24h, so on a

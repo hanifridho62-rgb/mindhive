@@ -161,7 +161,9 @@ def test_rejection_capture_candidate_at_one_activates_at_two(tmp_path):
     evs = [e for e in events.read_all("test") if e.type == "tool_failed"]
     assert len(evs) == 1
     signature = evs[0].payload["signature"]
-    assert signature == "judgment:rejected:bash:git-push-force"
+    # readable stem prefix + content hash (sig.slug_id) — same action recurs to
+    # the same signature (deterministic hash), so candidate->active still holds.
+    assert signature.startswith("judgment:rejected:bash:git-push-force-")
     assert "judgment" in evs[0].tags
     incidents.audit(project="test")
     incidents.project(project="test")
@@ -184,8 +186,10 @@ def test_unrelated_rejections_do_not_share_a_signature(tmp_path):
     failures.capture_dir(str(tdir), project="test")
     sigs = {e.payload["signature"] for e in events.read_all("test")
             if e.type == "tool_failed"}
-    assert sigs == {"judgment:rejected:bash:git-push-force",
-                    "judgment:rejected:bash:rm-rf-build"}
+    assert len(sigs) == 2                        # distinct actions stay distinct
+    prefixes = {s.rsplit("-", 1)[0] for s in sigs}   # strip the content hash
+    assert prefixes == {"judgment:rejected:bash:git-push-force",
+                        "judgment:rejected:bash:rm-rf-build"}
 
 
 def test_transient_infra_error_still_produces_nothing(tmp_path):

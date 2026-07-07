@@ -11,6 +11,8 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive rules summaries [--project P] [--json]` — structured lesson records (root cause, lesson, prevention rule, category, active rule) for every incident — the same data the dashboard **Improvements** view shows, for agents working headless. `--json` emits the raw list
+- `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks
+- `hive flag "<text>" [--category tag]` — self-flag a judgment error (wrong call, not a tool failure); active as a prevention rule from the first occurrence
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
@@ -19,6 +21,9 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive skills list [--json]` — list every installed plugin + skill from the live registry (updates the instant one is installed/removed)
 - `hive skills invoke <name> [--plugin p]` — call any installed skill through MindHive via a headless `claude`; records the outcome and exits non-zero on failure so callers can gate on it
 - `hive skills status` — green/red last-call outcome per skill from the ledger
+- `hive skills stats [--json]` — per-skill completion-rate telemetry from the ledger (calls, ok/fail, last outcome, last used)
+- `hive skills record <name> --ok|--fail [--note "…"]` — record an agent-assessed skill outcome directly (write-through for skills driven in-session rather than via `invoke`)
+- `hive skills recommend [--json|--top N|--brief]` — deterministic most-needed-skills ranking from measured data; `--brief` prints ≤3 one-liners (the same block STATE.md embeds at every projection rebuild)
 - `hive review queue [--session id]` — queue the session's touched source files for a thermo-nuclear review (run by `session_end`; writes the pending-review marker)
 - `hive review show` — print the pending-review marker, if any
 - `hive review clear` — clear the pending-review marker once the review has run

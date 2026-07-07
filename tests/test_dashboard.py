@@ -172,7 +172,8 @@ def test_page_has_skill_and_plugin_view(dashboard_server):
     status, body = _get(base, "/")
     assert status == 200
     assert "Skill &amp; Plugin" in body
-    for needle in ("renderPlugins", "/api/plugins/inventory", "/api/skills/recommend"):
+    for needle in ("renderPlugins", "showSkillPanel", "Recommended now",
+                   "/api/plugins/inventory", "/api/skills/recommend"):
         assert needle in body, f"missing skill&plugin hook: {needle}"
 
 

@@ -88,9 +88,12 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     """
     # Read the event log ONCE and reuse it for both projections — avoids the
     # extra full read_all() each of projector.project() and briefing() used to
-    # do on every sync.
+    # do on every sync. The suggested-skills block is likewise computed ONCE
+    # and passed to both compose_state calls (STATE.md + the embedded digest),
+    # so the recommend chain runs a single time per sync.
     evs = ev_mod.read_all(project)
-    projector.project(project, evs=evs)
+    suggestions = projector.suggested_skills_block(project, evs=evs)
+    projector.project(project, evs=evs, suggestions=suggestions)
 
     # Keep the full briefing fresh on disk (on-demand reads), not embedded.
     if include_briefing:
@@ -103,7 +106,8 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     # rules appear exactly once in MEMORY.md (single block below).
     sections.append("## Current State\n")
     sections.append("```\n"
-                    + projector.compose_state(evs, project, include_rules=False)
+                    + projector.compose_state(evs, project, include_rules=False,
+                                              suggestions=suggestions)
                     + "```\n")
 
     rules_block = incidents.inject(project, evs=evs)

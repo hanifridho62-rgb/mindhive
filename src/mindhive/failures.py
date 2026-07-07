@@ -187,7 +187,7 @@ def capture_dir(transcript_dir, project=None, now=None) -> dict:
                     # of the rejected command/action — keeps unrelated
                     # rejections from aggregating into one mush incident.
                     tool = (tools.get(fail["tool_use_id"]) or "unknown").lower()
-                    signature = f"judgment:rejected:{tool}:{sig.slug(action)}"
+                    signature = f"judgment:rejected:{tool}:{sig.slug_id(action)}"
                     tags = ["auto", "failure", "judgment"]
                 else:
                     signature = fail["signature"]

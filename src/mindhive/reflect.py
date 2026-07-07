@@ -12,7 +12,10 @@ spawns detached.
 """
 import calendar
 import json
+import os
+import re
 import time
+from contextlib import contextmanager
 
 from . import claude_cli, paths
 
@@ -106,9 +109,74 @@ def read_marker(project=None) -> dict:
 
 
 def write_marker(project=None, data=None) -> None:
+    """Atomic marker write (temp file + os.replace) so a concurrent reader —
+    another session_end batch, the health notice — never sees a torn file."""
     p = _marker_path(project)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data or {}, indent=2), encoding="utf-8")
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data or {}, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+_GATE_STALE_SECS = 600.0        # a crashed batch may hold the gate ~10 min max
+
+
+def _gate_lock_path(project=None):
+    return paths.project_dir(project) / "rules" / ".reflect.lock"
+
+
+@contextmanager
+def _cooldown_gate(project=None, timeout: float = 10.0,
+                   stale_secs: float = _GATE_STALE_SECS):
+    """Cross-process lock (O_CREAT|O_EXCL lockfile) around reflect_batch's
+    cooldown read-check → marker-write gate so two racing session_end batches
+    can't both pass the check and double-spend the window. Steals a lock older
+    than ``stale_secs`` (crashed batch). Best-effort, mirroring incidents'
+    policy: on timeout proceed unlocked rather than dropping the batch."""
+    p = _gate_lock_path(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if p.exists() and (time.time() - p.stat().st_mtime) > stale_secs:
+                p.unlink()
+        except OSError:
+            pass
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.close(fd)
+            break
+        except OSError:                 # held by another process
+            if time.monotonic() >= deadline:
+                break                   # proceed unlocked (best-effort guard)
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _live_lock_blocks(project=None) -> bool:
+    """True when the global LIVE_LOCK file names this namespace as a whole
+    token. The lock text is tokenized on whitespace/punctuation separators and
+    each token normalized like paths.normalize; only whole-token equality with
+    the namespace matches — a namespace that is merely a substring of a longer
+    token does not. Missing/unreadable lock -> False (proceed)."""
+    try:
+        text = (paths.store_home() / "LIVE_LOCK").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    name = paths.normalize(project or paths.detect_project())
+    tokens = set()
+    for t in re.split(r"[\s,;:]+", text):
+        slug = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")
+        if slug:                        # never fall back to "default" here
+            tokens.add(slug)
+    return name in tokens
 
 
 def _ts_epoch(ts):
@@ -169,24 +237,35 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
     incidents. Marker semantics (KTD3): the cooldown timestamp is written BEFORE
     the first runner call; a batch that reflects zero incidents rolls the
     cooldown back (failures don't consume the window) but keeps last_attempt +
-    last_error for the health notice. Never raises for a failing runner."""
+    last_error for the health notice. Never raises for a failing runner.
+
+    Honors the global LIVE_LOCK (whole-token namespace match) BEFORE touching
+    the marker, so both entry points (`hive rules reflect` and the detached
+    session_end spawn) refuse while that namespace is live-trading. The
+    cooldown read-check → marker-write gate runs under a cross-process lock,
+    and the zero-reflected rollback is compare-and-swap: it only restores the
+    previous cooldown_started when the marker still holds the value THIS
+    process wrote (a newer batch's window is never clobbered)."""
     from . import events as ev_mod
     runner = runner or _claude_runner       # late-bound so tests can stub _claude_runner
-    marker = read_marker(project)
-    prev_cooldown = marker.get("cooldown_started")
-    cd = _ts_epoch(prev_cooldown)
-    if cd is not None and (time.time() - cd) < cooldown_hours * 3600:
-        return {"reflected": 0, "attempted": 0, "skipped": "cooldown"}
-    incidents.audit(project=project)
-    incidents.project(project=project)
-    targets = [r["signature"] for r in incidents.summaries(project=project)
-               if r["status"] == "active" and r["rule_source"] == "none"]
-    targets = targets[:max(0, int(limit))]
-    if not targets:
-        return {"reflected": 0, "attempted": 0, "skipped": "nothing to reflect"}
-    now = ev_mod.now_iso()
-    marker.update({"cooldown_started": now, "last_attempt": now})
-    write_marker(project, marker)           # consume the window BEFORE the first call
+    if _live_lock_blocks(project):
+        return {"reflected": 0, "attempted": 0, "skipped": "live_lock"}
+    with _cooldown_gate(project):
+        marker = read_marker(project)
+        prev_cooldown = marker.get("cooldown_started")
+        cd = _ts_epoch(prev_cooldown)
+        if cd is not None and (time.time() - cd) < cooldown_hours * 3600:
+            return {"reflected": 0, "attempted": 0, "skipped": "cooldown"}
+        incidents.audit(project=project)
+        incidents.project(project=project)
+        targets = [r["signature"] for r in incidents.summaries(project=project)
+                   if r["status"] == "active" and r["rule_source"] == "none"]
+        targets = targets[:max(0, int(limit))]
+        if not targets:
+            return {"reflected": 0, "attempted": 0, "skipped": "nothing to reflect"}
+        now = ev_mod.now_iso()
+        marker.update({"cooldown_started": now, "last_attempt": now})
+        write_marker(project, marker)       # consume the window BEFORE the first call
     done, last_error = 0, ""
     for signature in targets:
         try:
@@ -204,7 +283,8 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
         write_marker(project, marker)
         _refresh_projections(project)       # rules land in the very next session
     else:
-        marker["cooldown_started"] = prev_cooldown   # roll back: window not consumed
+        if marker.get("cooldown_started") == now:    # CAS: our write, roll it back
+            marker["cooldown_started"] = prev_cooldown
         marker["last_error"] = last_error
         write_marker(project, marker)
     return {"reflected": done, "attempted": len(targets)}

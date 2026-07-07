@@ -18,6 +18,18 @@ def slug(text, max_len: int = 48) -> str:
     context stem of a judgment signature). Never empty."""
     s = _SLUG.sub("-", str(text or "").lower()).strip("-")
     return s[:max_len].rstrip("-") or "unknown"
+
+
+def slug_id(text, max_len: int = 40) -> str:
+    """Collision-resistant signature component: a readable slug prefix plus a
+    short content hash. Two distinct texts never share a component — even when
+    their slugs would truncate to the same prefix, or when the text is
+    non-latin and slugs to nothing (which would otherwise collapse every such
+    text onto the shared ``unknown`` bucket). Deterministic and stdlib-only."""
+    raw = str(text or "")
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:6]
+    prefix = _SLUG.sub("-", raw.lower()).strip("-")[:max_len].rstrip("-")
+    return f"{prefix}-{h}" if prefix else h
 _PS_TERM = re.compile(r"The term '([^']+)'")
 _PS_NOTRECOG = re.compile(r"'([^']+)' is not recognized")
 

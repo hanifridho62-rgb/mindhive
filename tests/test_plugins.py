@@ -606,6 +606,25 @@ def test_skill_stats_no_dedup_across_sessions():
     assert plugins.skill_stats(project="test")["s"]["calls"] == 2
 
 
+def test_skill_stats_dedup_manual_session_is_wildcard():
+    # agent-run `skills record` carries session "manual" while the passive
+    # hook capture of the SAME execution carries the real hook session id;
+    # "manual" pairs as a session wildcard -> one call, explicit outcome wins
+    _used("s", "2026-07-01T10:00:00Z", session="real-hook-sid")
+    _failed("s", "2026-07-01T10:01:00Z", session="manual",
+            tags=("skill", "record", "agent-assessed"))
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 1 and st["fail"] == 1 and st["ok"] == 0
+    assert st["last_outcome"] == "fail"
+    assert st["provenance"] == {"agent-assessed": 1}
+
+
+def test_skill_stats_manual_wildcard_still_respects_window():
+    _used("s", "2026-07-01T10:00:00Z", session="real-hook-sid")
+    _invoked_ok("s", "2026-07-01T11:00:00Z", session="manual")
+    assert plugins.skill_stats(project="test")["s"]["calls"] == 2
+
+
 def test_skill_stats_one_explicit_retires_one_passive_only():
     # two passive captures + one explicit in the window -> 2 calls, not 1
     _used("s", "2026-07-01T10:00:00Z")

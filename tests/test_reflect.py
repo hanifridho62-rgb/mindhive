@@ -166,6 +166,71 @@ def test_reflect_batch_noop_when_nothing_active_unreflected():
     assert reflect.read_marker("test") == {}   # nothing-to-do writes no marker
 
 
+def test_write_marker_is_atomic_and_always_valid_json():
+    import json
+    reflect.write_marker("test", {"last_attempt": "2026-07-05T10:00:00Z"})
+    p = reflect._marker_path("test")
+    assert json.loads(p.read_text(encoding="utf-8")) == {
+        "last_attempt": "2026-07-05T10:00:00Z"}
+    assert not p.with_name(p.name + ".tmp").exists()   # temp cleaned by os.replace
+
+
+def test_reflect_batch_rollback_cas_skips_when_marker_replaced_mid_batch():
+    # Another process starts its own batch mid-flight and writes a NEW
+    # cooldown_started; our failing batch must NOT roll that newer window back.
+    _seed_unreflected(1)
+    foreign = "2099-01-01T00:00:00Z"
+
+    def stub(prompt, timeout_s=120):
+        m = reflect.read_marker("test")
+        m["cooldown_started"] = foreign        # foreign batch replaces the window
+        reflect.write_marker("test", m)
+        return "garbage"                       # this batch reflects zero
+
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=stub)
+    assert res["reflected"] == 0
+    m = reflect.read_marker("test")
+    assert m["cooldown_started"] == foreign    # CAS: rollback skipped
+    assert m["last_error"] == "empty verdict"
+
+
+# --- LIVE_LOCK gate inside reflect_batch (whole-token namespace match) -------
+
+def test_reflect_batch_live_lock_exact_token_skips_without_touching_marker():
+    _seed_unreflected(1)
+    (paths.store_home() / "LIVE_LOCK").write_text(
+        "V17 live: test, hands off\n", encoding="utf-8")
+    calls = {"n": 0}
+
+    def stub(prompt, timeout_s=120):
+        calls["n"] += 1
+        return _GOOD
+
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=stub)
+    assert res == {"reflected": 0, "attempted": 0, "skipped": "live_lock"}
+    assert calls["n"] == 0
+    assert reflect.read_marker("test") == {}   # marker never touched
+
+
+def test_reflect_batch_live_lock_substring_of_longer_token_not_skipped():
+    _seed_unreflected(1)
+    (paths.store_home() / "LIVE_LOCK").write_text("test-extended v17\n",
+                                                  encoding="utf-8")
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=lambda p, timeout_s=120: _GOOD)
+    assert res["reflected"] == 1               # "test" != token "test-extended"
+
+
+def test_reflect_batch_unreadable_live_lock_proceeds():
+    _seed_unreflected(1)
+    (paths.store_home() / "LIVE_LOCK").mkdir()  # read_text raises OSError
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=lambda p, timeout_s=120: _GOOD)
+    assert res["reflected"] == 1
+
+
 def test_health_note_warns_when_success_lags_attempt():
     reflect.write_marker("test", {"last_attempt": "2026-07-05T10:00:00Z",
                                   "last_success": "2026-07-01T10:00:00Z",

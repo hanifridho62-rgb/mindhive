@@ -270,7 +270,7 @@ def cmd_skills_invoke(args) -> int | None:
     """Call ANY installed skill through MindHive (headless claude), recording the
     outcome. Returns exit 1 on failure so /circle and /mindhive can gate on it."""
     from . import invoker
-    res = invoker.invoke_skill(args.name, plugin=args.plugin)
+    res = invoker.invoke_skill(args.name, plugin=args.plugin, project=args.project)
     status = "ok" if res["ok"] else "FAILED"
     print(f"skill {args.name}: {status} (exit {res['exit']})")
     if res.get("excerpt"):
@@ -336,23 +336,14 @@ def cmd_skills_recommend(args) -> int | None:
     """Deterministic most-needed-skills ranking (KTD6). One ledger read feeds
     both the telemetry stats and the need extraction, so --brief stays cheap
     enough for a session-start hook."""
-    from . import incidents as incidents_mod
     from . import plugins as plugins_mod
-    from . import recommend as recommend_mod
-    evs = events.read_all(args.project)
-    skills = recommend_mod.flatten_inventory(
-        plugins_mod.live_inventory()["inventory"])
-    stats = plugins_mod.skill_stats(project=args.project, evs=evs)
-    summaries = incidents_mod.summaries(args.project)
-    needs = recommend_mod.extract_needs(summaries, evs)
-    payload = recommend_mod.recommend(skills, stats, incidents=summaries,
-                                      needs=needs, top=args.top)
+    payload = plugins_mod.recommend_for(project=args.project, top=args.top)
     if args.json:
         print(json.dumps(payload, indent=2))
         return None
     recs = payload["recommendations"]
     if args.brief:
-        for e in recs[:3]:
+        for e in recs[:(args.top or 3)]:
             print(f"{e['name']} — {e['reason']} ({e['provenance']})")
         return None
     cov = payload["coverage"]
@@ -484,7 +475,7 @@ def cmd_flag(args) -> int | None:
     judgment:flag:<slug> signature, so the entire existing incident projection
     works unchanged — no new event type. Flags activate at occurrence 1."""
     from . import incidents as incidents_mod, signature as sig_mod
-    signature = f"judgment:flag:{sig_mod.slug(args.text)}"
+    signature = f"judgment:flag:{sig_mod.slug_id(args.text)}"
     tags = ["judgment"] + ([args.category] if args.category else [])
     ev = events.append_event(
         "tool_failed",
@@ -579,23 +570,10 @@ def cmd_rules_reflect(args) -> int | None:
     from . import reflect as reflect_mod
     if args.all_projects:
         # One-time supervised backlog drain over registered namespaces — run
-        # manually, never from hooks. Honor LIVE_LOCK: skip any namespace the
-        # lock file names (defensive; reflection only writes inside ~/.mindhive,
-        # but the lock is absolute).
-        lock = paths.store_home() / "LIVE_LOCK"
-        lock_text = ""
-        if lock.exists():
-            try:
-                lock_text = lock.read_text(encoding="utf-8").lower()
-            except OSError:
-                lock_text = ""
-        results = {}
-        for name in sorted(paths.known_projects()):
-            if lock_text and name.lower() in lock_text:
-                results[name] = {"reflected": 0, "attempted": 0,
-                                 "skipped": "LIVE_LOCK"}
-                continue
-            results[name] = _safe_reflect_batch(reflect_mod, name, args)
+        # manually, never from hooks. LIVE_LOCK is honored inside reflect_batch
+        # (whole-token namespace match), so both entry points share one check.
+        results = {name: _safe_reflect_batch(reflect_mod, name, args)
+                   for name in sorted(paths.known_projects())}
         print(json.dumps(results))
         return 0
     print(json.dumps(_safe_reflect_batch(reflect_mod, args.project, args)))
@@ -754,6 +732,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ski = sksub.add_parser("invoke", help="call a skill via headless claude and record the outcome")
     ski.add_argument("name", help="skill name (as shown by `skills list`)")
     ski.add_argument("--plugin", default=None, help="owning plugin, when disambiguation is needed")
+    ski.add_argument("--project", default=None, help="target namespace")
     ski.set_defaults(func=cmd_skills_invoke)
     sksub.add_parser("status", help="green/red last-call outcome per skill").set_defaults(func=cmd_skills_status)
     sks = sksub.add_parser("stats", help="per-skill completion-rate telemetry from the ledger")
