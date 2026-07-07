@@ -939,9 +939,19 @@ def render_page(token: str) -> str:
       + '" data-plugin="'+escAttr(e.plugin||'')+'" '
       + 'title="run this skill via a headless Claude">\\u25b6 call</button>';
   }
+  function modePill(mode){
+    if (mode === 'auto')
+      return ' <span class="pill" style="color:#46c46a;border-color:#2a5" '
+        + 'title="proven track record \\u2014 may be applied automatically">auto</span>';
+    return ' <span class="pill est" title="unproven \\u2014 suggested only, '
+      + 'needs your approval before it runs">suggest</span>';
+  }
   function skBadges(e){
     let b = ' \\u00b7 <span class="pill">'+esc(e.plugin||'local')+'</span>';
     if (e.estimated) b += ' <span class="pill est" title="score used the description-breadth prior \\u2014 no measured completion rate yet">estimated</span>';
+    if (e.rec && e.rec.execution_mode) b += modePill(e.rec.execution_mode);
+    if (e.rec && e.rec.outcome_category)
+      b += ' <span class="pill">'+esc(e.rec.outcome_category)+'</span>';
     if (e.rec && e.rec.try_to_measure) b += ' <span class="pill est">try to measure</span>';
     if (e.missing) b += ' <span class="err">plugin missing on disk</span>';
     return b;
@@ -974,22 +984,39 @@ def render_page(token: str) -> str:
   }
   function recSection(byName){
     const recs = (PLUG_REC.recommendations || []).slice(0, PLUG_REC_TOP);
-    if (!recs.length) return '';
-    return '<h2 class="h">Recommended now</h2><ul class="hits">'
-      + recs.map(r => {
-          const e = byName[r.name];
-          return '<li><div class="file">'+statusDot(e ? e.status : 'uncalled')
-            + recChip(r.name)
-            + ' \\u00b7 <span class="pill'+(r.provenance==='estimated'?' est':'')+'">'+esc(r.provenance)+'</span>'
-            + ' \\u00b7 score '+esc(r.score)
-            + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
-            + (e ? callBtn(e) : '')+'</div>'
-            + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
-            + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
-                + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
-                    + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
-            + '</li>';
-        }).join('')+'</ul>';
+    let html = '';
+    if (recs.length){
+      html += '<h2 class="h">Recommended now</h2><ul class="hits">'
+        + recs.map(r => {
+            const e = byName[r.name];
+            return '<li><div class="file">'+statusDot(e ? e.status : 'uncalled')
+              + recChip(r.name)
+              + ' \\u00b7 <span class="pill'+(r.provenance==='estimated'?' est':'')+'">'+esc(r.provenance)+'</span>'
+              + modePill(r.execution_mode)
+              + ' \\u00b7 score '+esc(r.score)
+              + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
+              + (e ? callBtn(e) : '')+'</div>'
+              + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
+                  + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
+                      + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
+              + '</li>';
+          }).join('')+'</ul>';
+    }
+    // Discontinued: skills stopped by the improvements linkage (active
+    // prevention rule + failure streak) — shown with WHY so recovery is clear.
+    const disc = PLUG_REC.discontinued || [];
+    if (disc.length){
+      html += '<h2 class="h">Discontinued <span class="lbl">excluded until the '
+        + 'incident resolves or a successful call breaks the streak</span></h2>'
+        + '<ul class="hits">'+disc.map(d =>
+            '<li><div class="file"><span class="statusDot sbad">\\u2716</span>'
+            + recChip(d.name)+' \\u00b7 <span class="pill">'+d.fail_streak
+            + ' consecutive failures</span></div>'
+            + '<div class="snip"><b>Rule:</b> '+esc(d.rule)+'</div></li>').join('')
+        + '</ul>';
+    }
+    return html;
   }
   // Plugins section = a COMPACT INDEX, not a second card render: name, version,
   // aggregate dot (any fail → red, else any ok → green), and skill-name chips

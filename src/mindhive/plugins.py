@@ -551,7 +551,7 @@ def _dedup_calls(calls: list[dict]) -> list[dict]:
 def skill_stats(project=None, evs=None) -> dict:
     """Per-skill telemetry counters from the ledger, keyed by skill name:
     ``{calls, ok, fail, completion_rate, last_outcome, last_used, streak,
-    provenance, sources}``.
+    fail_streak, provenance, sources}``.
 
     The rate is a COMPLETION rate (ran without a tool error), never a success
     rate (KTD5); it is None when a skill has zero calls. ``provenance`` breaks
@@ -566,14 +566,16 @@ def skill_stats(project=None, evs=None) -> dict:
         s = out.setdefault(c["name"], {
             "calls": 0, "ok": 0, "fail": 0, "completion_rate": None,
             "last_outcome": None, "last_used": None, "streak": 0,
-            "provenance": {}, "sources": []})
+            "fail_streak": 0, "provenance": {}, "sources": []})
         s["calls"] += 1
         if c["ok"]:
             s["ok"] += 1
             s["streak"] += 1
+            s["fail_streak"] = 0
         else:
             s["fail"] += 1
             s["streak"] = 0
+            s["fail_streak"] += 1
         s["last_outcome"] = "ok" if c["ok"] else "fail"
         s["last_used"] = c["ts"]
         s["provenance"][c["provenance"]] = s["provenance"].get(c["provenance"], 0) + 1

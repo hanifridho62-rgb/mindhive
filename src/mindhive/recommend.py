@@ -51,6 +51,8 @@ OPEN_INCIDENT_PENALTY = 0.4  # per open skill:* incident
 EXPLORE_BONUS = 0.05        # deterministic nudge for unmeasured need-matches
 EXPLORE_NEED_MIN = 0.2      # need_match at/above which measuring is worth it
 SIMILARITY_THRESHOLD = 0.3  # description-keyword Jaccard for overlap grouping
+AUTO_MIN_RATE = 0.8         # measured completion rate needed for auto execution
+DISCONTINUE_STREAK = 3      # trailing failures that, with an active rule, stop a skill
 
 _WORD = re.compile(r"[a-z0-9]+")
 _STOP = {
@@ -97,6 +99,36 @@ def extract_needs(summaries=None, recent_events=None, limit=40) -> list[str]:
             if text:
                 needs.append(text)
     return needs[-limit:]
+
+
+def active_skill_rules(incidents) -> dict:
+    """skill name -> active prevention-rule text from ``skill:*`` incidents.
+    The improvements linkage: a skill whose failures reflected into a rule
+    that is still active carries that rule as its discontinuation reason."""
+    out: dict[str, str] = {}
+    for s in (incidents or []):
+        sig = str(s.get("signature", ""))
+        if (sig.startswith("skill:") and s.get("status") == "active"
+                and s.get("active_rule")):
+            out[sig[len("skill:"):]] = str(s["active_rule"])
+    return out
+
+
+def outcome_category(st) -> str | None:
+    """Improvements-style outcome category for a skill's recorded history:
+    ``failure`` (last call failed), ``supervision-needed`` (history contains
+    agent-assessed write-throughs — an agent had to intervene and grade),
+    ``no-intervention-needed`` (a solid failure-free streak of clean runs),
+    ``success`` (last call ok, record still thin). None when never called."""
+    if not st or not st.get("calls"):
+        return None
+    if st.get("last_outcome") == "fail":
+        return "failure"
+    if (st.get("provenance") or {}).get("agent-assessed"):
+        return "supervision-needed"
+    if int(st.get("streak") or 0) >= MEASURED_MIN_CALLS:
+        return "no-intervention-needed"
+    return "success"
 
 
 def open_skill_incidents(incidents) -> dict:
@@ -159,6 +191,11 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
     try_measure = (not measured) and nm >= EXPLORE_NEED_MIN
     score = ((rate if measured else prior) + W_NEED * nm - penalty
              + (EXPLORE_BONUS if try_measure else 0.0))
+    # Learning-gated execution: only a proven skill (measured, high completion
+    # rate, no open incident) may run automatically; everything else — above
+    # all a never-used skill — is suggest-only.
+    auto = (measured and (rate or 0.0) >= AUTO_MIN_RATE
+            and not (open_incidents or {}).get(name, 0))
     return {
         "name": name,
         "plugin": skill.get("plugin", ""),
@@ -172,6 +209,9 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
         "breadth_prior": None if measured else prior,
         "incident_penalty": round(penalty, 4),
         "try_to_measure": try_measure,
+        "execution_mode": "auto" if auto else "suggest",
+        "outcome_category": outcome_category(st),
+        "fail_streak": int(st.get("fail_streak") or 0),
         "reason": _reason(measured, st, calls, nm, penalty),
     }
 
@@ -220,12 +260,31 @@ def _overlap_groups(entries: list[dict]) -> list[list[dict]]:
 
 def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
     """Rank the most-needed skills from measured data. Returns
-    ``{coverage: {measured, total}, recommendations: [...]}`` where each
-    recommendation is a scored entry (see score_skill) plus ``alternatives``:
-    the overlap-group losers, each with its own provenance and flags."""
+    ``{coverage: {measured, total}, recommendations: [...], discontinued: [...]}``
+    where each recommendation is a scored entry (see score_skill) plus
+    ``alternatives``: the overlap-group losers, each with its own provenance
+    and flags. ``discontinued`` holds skills stopped by the improvements
+    linkage — an active ``skill:*`` prevention rule plus a trailing failure
+    streak of DISCONTINUE_STREAK — excluded from ranking until the incident
+    resolves or a successful call breaks the streak."""
     open_inc = open_skill_incidents(incidents)
+    rules = active_skill_rules(incidents)
     entries = [score_skill(s, stats, needs=needs, open_incidents=open_inc)
                for s in (skills or []) if s.get("name")]
+    discontinued = []
+    active = []
+    for e in entries:
+        rule = rules.get(e["name"])
+        if rule and e["fail_streak"] >= DISCONTINUE_STREAK:
+            discontinued.append({
+                "name": e["name"], "plugin": e["plugin"],
+                "fail_streak": e["fail_streak"], "rule": rule,
+                "reason": (f"discontinued: {e['fail_streak']} consecutive "
+                           f"failures with an active prevention rule"),
+            })
+        else:
+            active.append(e)
+    entries = active
     recs = []
     for group in _overlap_groups(entries):
         ordered = sorted(group, key=lambda e: e["name"])
@@ -242,5 +301,7 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
     measured_n = sum(1 for e in entries if e["provenance"] == "measured")
     if top is not None:
         recs = recs[:max(0, int(top))]
-    return {"coverage": {"measured": measured_n, "total": len(entries)},
-            "recommendations": recs}
+    return {"coverage": {"measured": measured_n,
+                         "total": len(entries) + len(discontinued)},
+            "recommendations": recs,
+            "discontinued": discontinued}
