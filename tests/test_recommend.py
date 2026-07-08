@@ -337,3 +337,15 @@ def test_brief_line_omits_clause_when_description_empty():
     line = recommend.brief_line(entry)
     assert "intended use:" not in line
     assert line == "bare — never called — breadth-estimated (estimated)"
+
+
+def test_brief_line_handles_delimiter_in_description():
+    # a description containing the ' · intended use:' delimiter text must not
+    # break rendering — brief_line does pure concatenation, no parsing
+    entry = {"name": "meta", "reason": "never called — breadth-estimated",
+             "provenance": "estimated",
+             "description": "Use · intended use: nested markers stay literal"}
+    line = recommend.brief_line(entry)
+    assert line.count("(estimated)") == 1
+    assert line.endswith("Use · intended use: nested markers stay literal")
+    assert line.startswith("meta — never called")

@@ -364,8 +364,11 @@ def cmd_skills_recommend(args) -> int | None:
         print(f"  {i}. {e['name']}  [score {e['score']:g}, {e['provenance']}]"
               f"{'  (try to measure)' if e.get('try_to_measure') else ''}")
         print(f"       {e['reason']}")
-        if e.get("description"):
-            print(f"       intended use: {e['description']}")
+        # Full width (no truncation) but the SAME empty/whitespace handling as
+        # brief_line, so an empty description never prints a dangling clause.
+        use = recommend_mod._truncate(e.get("description"))
+        if use:
+            print(f"       intended use: {use}")
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")

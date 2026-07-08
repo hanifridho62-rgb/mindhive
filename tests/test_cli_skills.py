@@ -184,3 +184,24 @@ def test_cli_skills_recommend_full_surfaces_intended_use(capsys, monkeypatch):
     assert ret == 0
     out = capsys.readouterr().out
     assert "intended use: Use when tests fail in the suite." in out
+
+
+_BLANK_TRIGGER_INVENTORY = {"changed": True, "signature": "x", "inventory": {
+    "plugins": [{"name": "p", "skills": [
+        {"name": "mystery", "trigger": "   "},   # whitespace-only description
+    ]}],
+    "local_skills": [],
+    "counts": {"plugins": 1, "plugin_skills": 1, "local_skills": 0,
+               "skills_total": 1}}}
+
+
+def test_cli_skills_recommend_full_omits_empty_intended_use(capsys, monkeypatch):
+    # a whitespace-only description must not leave a dangling 'intended use:'
+    # line — full mode shares brief_line's empty-handling via _truncate
+    from mindhive import plugins
+    monkeypatch.setattr(plugins, "live_inventory", lambda: _BLANK_TRIGGER_INVENTORY)
+    ret = cli_mod.main(["skills", "recommend"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "mystery" in out
+    assert "intended use:" not in out

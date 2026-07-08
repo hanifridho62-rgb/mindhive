@@ -177,11 +177,15 @@ def _reason(measured: bool, st: dict, calls: int, nm: float, penalty: float) -> 
     return base
 
 
-def _truncate(text, width: int) -> str:
-    """Collapse whitespace and cap ``text`` at ``width`` chars, adding an
-    ellipsis on overflow. Deterministic — no locale/word-boundary heuristics."""
+def _truncate(text, width=None) -> str:
+    """Collapse whitespace; when ``width`` is set, cap ``text`` at ``width``
+    chars with an ellipsis on overflow. ``width=None`` collapses only — the CLI
+    full view uses this to render the untruncated intended use while sharing the
+    same empty/whitespace handling as the truncating surfaces (so an empty
+    description never leaves a dangling clause on any surface). Deterministic —
+    no locale/word-boundary heuristics."""
     s = " ".join(str(text or "").split())
-    if len(s) <= width:
+    if width is None or len(s) <= width:
         return s
     return s[:max(0, width - 1)].rstrip() + "…"
 
