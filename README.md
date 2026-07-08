@@ -106,21 +106,32 @@ any model/client. It is deterministic and costs no API tokens.
 
 ## Oversee: live work sessions
 
-The dashboard's **Oversee** view (Work group) lists every `hive loop` run for
-the selected project as a titled card — the title is a one-line summary of
-what the run is doing (the latest iteration summary, seeded from PROMPT.md).
-Click a title to expand the progress detail: **Done** (past iteration
-summaries + checked fix_plan items), **Doing** (current iteration), **Planned**
-(unchecked required items) and **Not yet** (Future/Optional items). While a
-run is live, an **online** strip shows at the top (heartbeat = last event
-within one iteration timeout); it disappears when nothing is working.
+The dashboard's **Oversee** view (Work group) shows every kind of live Claude
+work for the selected project as a titled card:
 
-Sessions are **removed automatically** when a run ends through the dual-
-condition exit gate (graceful exit) or the circuit breaker trips, and any
-session can be deleted manually with its per-card **delete** button. Deletion
-is an append-only `loop_run_dismissed` tombstone — the run's events stay in
-the hash chain (the archive), it just stops being shown, so `hive verify`
-never breaks.
+- **`hive loop` runs** — titled by a one-line summary of what the run is doing
+  (the latest iteration summary, seeded from PROMPT.md).
+- **Interactive Claude sessions** — no `/circle` or loop needed: the moment a
+  session's hook telemetry flows (prompts, file touches, commands), it appears,
+  titled by your latest prompt.
+
+Click a title to expand the progress detail, rendered as a Claude-style task
+checklist in the hive palette: green **✓** done lines (past iteration
+summaries / checked fix_plan items / decisions and touched files), a pulsing
+**◐** for what's happening right now, and gray **○** pending lines (unchecked
+required items, next steps; Future/Optional items dimmed). While anything is
+live, an **online — Claude is working** strip shows at the top (loop heartbeat
+= one iteration timeout; chat heartbeat = tool events within ~3 minutes); it
+disappears when nothing is working.
+
+Sessions are **removed automatically** when a loop run ends through the dual-
+condition exit gate (graceful exit) or the circuit breaker trips, when an
+interactive session ends, or when a chat session goes idle past ~6 hours. Any
+card can be deleted manually with its **delete** button. Deletion is an
+append-only `loop_run_dismissed` tombstone — the events stay in the hash chain
+(the archive), so `hive verify` never breaks — and a session that was actually
+still alive resurfaces on its next event instead of burning tokens out of
+sight.
 
 ## Desktop control panel
 

@@ -87,6 +87,9 @@ def render_page(token: str) -> str:
   .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
   .glyph.watch { color:#e0b341; } .glyph.dis { color:#8a93a6; }
   .legend { font-size:12px; color:#9aa3b8; margin:2px 0 10px; }
+  .ovdone { color:#46c46a; font-weight:600; }
+  .ovpend { color:#8a93a6; }
+  .ovspin { color:#e0b341; display:inline-block; animation: pulse 1.6s infinite; }
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
@@ -582,21 +585,26 @@ def render_page(token: str) -> str:
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
-  // --- Oversee: live Claude work sessions (hive loop runs) -------------
+  // --- Oversee: live Claude work — loop runs AND interactive sessions ---
   // Cards mirror the Improvements view (glyph + pills + expandable body);
-  // expansion state survives the live refresh via OV_EXPANDED.
+  // expansion state survives the live refresh via OV_EXPANDED. The expanded
+  // detail is a Claude-style task checklist (\\u2713 done, pulsing \\u25d0
+  // doing, \\u25cb pending) in the hive palette.
   let OV_DATA = null;
   const OV_EXPANDED = new Set();
   function ovStatus(r){
+    if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
     if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
     if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
     return ['\\u25a0', 'snone', r.status || 'ended'];
   }
-  function ovGroup(label, items){
-    if (!items || !items.length) return '';
-    return '<div class="snip"><b>'+label+':</b></div>'
-      + items.map(x => '<div class="snip dup">\\u2022 '+esc(x)+'</div>').join('');
+  function ovRow(glyph, cls, text, dim){
+    return '<div class="snip'+(dim?' dup':'')+'"><span class="'+cls+'">'+glyph
+      + '</span> '+esc(text)+'</div>';
+  }
+  function ovGroup(items, glyph, cls, dim){
+    return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
   }
   function ovCard(r, showProj){
     const st = ovStatus(r);
@@ -607,15 +615,20 @@ def render_page(token: str) -> str:
       + esc(r.title || r.run_id)+'</span>'
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
+    const chat = r.kind === 'chat';
     const pills = '<span class="pill">'+esc(st[2])+'</span> '
-      + '<span class="pill">'+(r.iterations||0)+' iteration'+((r.iterations||0)===1?'':'s')+'</span> '
-      + '<span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>'
-      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">online</span>' : '');
+      + '<span class="pill">'+(r.iterations||0)+(chat
+          ? ' command'+((r.iterations||0)===1?'':'s')
+          : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
+      + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
+      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
+                    + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';
     if (open){
-      if (r.doing) body += '<div class="snip"><b>Doing:</b> '+esc(r.doing)+'</div>';
-      body += ovGroup('Done', r.done) + ovGroup('Planned', r.planned)
-            + ovGroup('Not yet', r.not_yet);
+      body += ovGroup(r.done, '\\u2713', 'ovdone');
+      if (r.doing) body += ovRow('\\u25d0', 'ovspin', r.doing);
+      body += ovGroup(r.planned, '\\u25cb', 'ovpend')
+            + ovGroup(r.not_yet, '\\u25cb', 'ovpend', true);
       body += '<div class="snip dup">started '+esc(r.started||'')
             + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
     }
@@ -630,8 +643,10 @@ def render_page(token: str) -> str:
         + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
       : '';
     if (!OV_DATA.runs.length){
-      showHTML(online + '<h2 class="h">No work sessions \\u2014 start one with '
-        + '<code>hive loop</code>. Finished sessions are removed automatically.</h2>');
+      showHTML(online + '<h2 class="h">No work sessions \\u2014 interactive '
+        + 'Claude sessions appear here as their telemetry flows, and '
+        + '<code>hive loop</code> runs join them. Finished sessions are '
+        + 'removed automatically.</h2>');
       return;
     }
     const showProj = (PROJECT === '*');

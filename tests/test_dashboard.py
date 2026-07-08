@@ -1382,3 +1382,24 @@ def test_oversee_double_dismiss_is_idempotent(dashboard_server):
     assert obj["ok"] is True and obj.get("already_dismissed") is True
     tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
     assert len(tombs) == 1                             # no duplicate tombstone
+
+
+def test_oversee_includes_interactive_sessions(dashboard_server):
+    base, token = dashboard_server
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("session_start", {}, session_id="chat-1", ts=ts, project="test")
+    ev_mod.append_event("user_prompt", {"text": "live chat work"},
+                        session_id="chat-1", ts=ts, project="test")
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    kinds = {r["run_id"]: r["kind"] for r in obj["runs"]}
+    assert kinds.get("chat-1") == "chat"
+    chat = [r for r in obj["runs"] if r["run_id"] == "chat-1"][0]
+    assert chat["title"] == "live chat work"
+    assert chat["online"] is True and obj["any_online"] is True
+    # manual delete works for chat sessions through the same endpoint
+    status, res = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "chat-1"}, token)
+    assert res["ok"] is True

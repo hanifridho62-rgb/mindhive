@@ -497,15 +497,18 @@ def make_handler(token: str):
                 project=proj, top=int(top) if top else None))
 
         def _get_oversee(self, proj, am, qs):
-            # Oversee: live Claude work sessions (hive loop runs) with progress
-            # detail. Dismissed runs (graceful exit / breaker trip / manual
-            # delete) are already excluded by the projection.
+            # Oversee: every kind of live Claude work — hive loop runs AND
+            # interactive sessions (straight from hook telemetry, no /circle
+            # needed). Dismissed/finished/stale entries are already excluded
+            # by the projections.
+            from . import oversee as oversee_mod
             from .loop import state as loop_state
             names = _all_projects() if am else [proj]
             runs, dismissed = [], 0
             for n in names:
+                evs = events.read_all(n)
                 res = loop_state.list_runs(n)
-                for r in res["runs"]:
+                for r in res["runs"] + oversee_mod.interactive_sessions(n, evs=evs):
                     r["project"] = n
                     runs.append(r)
                 dismissed += res["dismissed"]
@@ -716,11 +719,13 @@ def make_handler(token: str):
             # stays intact and every projection rebuild keeps the run hidden.
             # Deleting an already-dismissed run (e.g. the engine auto-dismissed
             # it between poll and click) is a benign no-op, not an error.
+            from . import oversee as oversee_mod
             from .loop import state as loop_state
             run_id = (body.get("run_id") or "").strip()
             if not run_id:
                 return self._json({"ok": False, "error": "run_id is required"}, 200)
             known = {r["run_id"] for r in loop_state.list_runs(proj)["runs"]}
+            known |= {s["run_id"] for s in oversee_mod.interactive_sessions(proj)}
             if run_id not in known:
                 already = any(
                     e.type == "loop_run_dismissed"

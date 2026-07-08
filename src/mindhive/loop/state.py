@@ -102,7 +102,8 @@ def list_runs(project=None, *, now_fn=time.time,
         r = runs.get(rid)
         if r is None:
             r = runs[rid] = {
-                "run_id": rid, "title": "", "goal_dir": "", "started": e.ts,
+                "run_id": rid, "kind": "loop",
+                "title": "", "goal_dir": "", "started": e.ts,
                 "status": "running", "iterations": 0, "total_cost_usd": 0.0,
                 "total_tokens": 0, "last_event_ts": e.ts, "summaries": [],
                 "heartbeat_seconds": None,
