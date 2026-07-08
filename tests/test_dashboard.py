@@ -1368,3 +1368,17 @@ def test_page_has_oversee_hooks(dashboard_server):
     status, body = _get(base, "/")
     assert "showOversee" in body and "Oversee" in body
     assert "/api/oversee" in body and "deleteRun" in body
+
+
+def test_oversee_double_dismiss_is_idempotent(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10, reason="max_iterations")
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert obj == {"ok": True, "run_id": "run1"}
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj.get("already_dismissed") is True
+    tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
+    assert len(tombs) == 1                             # no duplicate tombstone

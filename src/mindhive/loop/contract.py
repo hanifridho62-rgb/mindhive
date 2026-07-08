@@ -2,9 +2,11 @@
 import re
 from dataclasses import dataclass
 
-_EXIT_RE = re.compile(r"EXIT_SIGNAL:\s*(true|false)", re.IGNORECASE)
-_STATUS_RE = re.compile(r"STATUS:\s*(COMPLETE|IN_PROGRESS)", re.IGNORECASE)
-_PROGRESS_RE = re.compile(r"progress:\s*(true|false)", re.IGNORECASE)
+# (?![|\w]) refuses the unfilled template literal "true|false" — an echoed,
+# blank contract block must never read as a filled-in signal.
+_EXIT_RE = re.compile(r"EXIT_SIGNAL:\s*(true|false)(?![|\w])", re.IGNORECASE)
+_STATUS_RE = re.compile(r"STATUS:\s*(COMPLETE|IN_PROGRESS)(?![|\w])", re.IGNORECASE)
+_PROGRESS_RE = re.compile(r"progress:\s*(true|false)(?![|\w])", re.IGNORECASE)
 _SUMMARY_RE = re.compile(r"summary:\s*(.+)", re.IGNORECASE)
 
 # Natural-language completion heuristics for the dual-condition exit gate:
@@ -25,20 +27,35 @@ _COMPLETION_PATTERNS = (
 
 
 def count_completion_heuristics(text: str) -> int:
-    """Number of DISTINCT completion patterns present in the reply text."""
+    """Number of DISTINCT completion patterns present in the reply text.
+    STATUS is judged on its LAST occurrence (the real LOOP_STATUS block), so
+    an echo of the instruction template can't count a phantom COMPLETE."""
     count = 0
     for pat in _COMPLETION_PATTERNS:
-        m = pat.search(text)
         if pat is _STATUS_RE:
-            if m and m.group(1).upper() == "COMPLETE":
+            m = None
+            for m in pat.finditer(text):
+                pass
+            if m is not None and m.group(1).upper() == "COMPLETE":
                 count += 1
-        elif m:
+        elif pat.search(text):
             count += 1
     return count
 
 
 def _to_bool(m):
     return None if m is None else (m.group(1).lower() == "true")
+
+
+def _last(pattern, text):
+    """LAST regex match in the text, or None. The LOOP_STATUS block is the
+    final thing in a reply, so the last occurrence is authoritative — earlier
+    matches are usually the agent quoting the contract instruction or
+    discussing the fields in prose, and must not override the real block."""
+    last = None
+    for m in pattern.finditer(text):
+        last = m
+    return last
 
 
 @dataclass
@@ -52,11 +69,11 @@ class LoopStatus:
 
 
 def parse_status(text: str) -> LoopStatus:
-    exit_signal = _to_bool(_EXIT_RE.search(text))
-    status_m = _STATUS_RE.search(text)
+    exit_signal = _to_bool(_last(_EXIT_RE, text))
+    status_m = _last(_STATUS_RE, text)
     status = status_m.group(1).upper() if status_m else None
-    progress = _to_bool(_PROGRESS_RE.search(text))
-    summary_m = _SUMMARY_RE.search(text)
+    progress = _to_bool(_last(_PROGRESS_RE, text))
+    summary_m = _last(_SUMMARY_RE, text)
     summary = summary_m.group(1).strip() if summary_m else None
 
     # Precedence: explicit EXIT_SIGNAL is authoritative. Only when it is absent

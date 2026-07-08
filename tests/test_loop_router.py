@@ -152,3 +152,11 @@ def test_tier_config_round_trip(tmp_path):
     assert cfg.tier_light == "l-model"
     assert cfg.tier_mid == "m-model"
     assert cfg.tier_heavy == config.LoopConfig().tier_heavy
+
+
+def test_history_window_forgets_ancient_completions():
+    # an ancient light completion followed by a full window of breaker trips
+    # at light must not keep pinning the start tier to light
+    hist = [_h("small", "light", "completed")]
+    hist += [_h("small", "light", "breaker_open")] * router.HISTORY_WINDOW
+    assert router.pick_initial_tier("small", hist) == "mid"

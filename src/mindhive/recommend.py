@@ -271,6 +271,9 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
     rules = active_skill_rules(incidents)
     entries = [score_skill(s, stats, needs=needs, open_incidents=open_inc)
                for s in (skills or []) if s.get("name")]
+    # Coverage counts the whole inventory — measured before the discontinued
+    # split, since a discontinued skill is (by construction) a measured one.
+    measured_n = sum(1 for e in entries if e["provenance"] == "measured")
     discontinued = []
     active = []
     for e in entries:
@@ -298,7 +301,6 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
         recs.append(primary)
     recs.sort(key=lambda e: e["name"])
     recs.sort(key=lambda e: -e["score"])
-    measured_n = sum(1 for e in entries if e["provenance"] == "measured")
     if top is not None:
         recs = recs[:max(0, int(top))]
     return {"coverage": {"measured": measured_n,

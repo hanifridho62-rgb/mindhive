@@ -47,15 +47,24 @@ def _ts_epoch(ts):
         return None
 
 
+_FIX_PLAN_MAX_BYTES = 256 * 1024
+
+
 def _fix_plan_items(goal_dir: str) -> dict:
     """Best-effort snapshot of the run's fix_plan checklist; the goal dir may
-    live outside this machine's reach, so any read failure degrades to empty."""
+    live outside this machine's reach, so any read failure degrades to empty.
+    goal_dir comes from an event payload (untrusted): only a real `.hive-loop`
+    directory is read, and oversized files are skipped so a hostile or bloated
+    path can't stall the single-threaded dashboard."""
     empty = {"done": [], "planned": [], "not_yet": []}
     if not goal_dir:
         return empty
-    fp = Path(goal_dir) / "fix_plan.md"
     try:
-        if not fp.exists():
+        d = Path(goal_dir)
+        if d.name != ".hive-loop":
+            return empty
+        fp = d / "fix_plan.md"
+        if not fp.is_file() or fp.stat().st_size > _FIX_PLAN_MAX_BYTES:
             return empty
         return task_mod.plan_items(fp.read_text(encoding="utf-8"))
     except OSError:
@@ -70,7 +79,7 @@ def list_runs(project=None, *, now_fn=time.time,
     only their count is reported. Events written before run_id stamping group
     into synthetic per-start legacy buckets, so old ledgers still render."""
     evs = [e for e in events.read_all(project) if e.type in _LOOP_TYPES]
-    runs, order, dismissed = {}, [], set()
+    runs, order, dismissed = {}, [], {}
     legacy = None
 
     def bucket(e):
@@ -87,7 +96,7 @@ def list_runs(project=None, *, now_fn=time.time,
         if e.type == "loop_run_dismissed":
             rid = p.get("run_id")
             if rid:
-                dismissed.add(rid)
+                dismissed[rid] = e.ts
             continue
         rid = bucket(e)
         r = runs.get(rid)
@@ -96,6 +105,7 @@ def list_runs(project=None, *, now_fn=time.time,
                 "run_id": rid, "title": "", "goal_dir": "", "started": e.ts,
                 "status": "running", "iterations": 0, "total_cost_usd": 0.0,
                 "total_tokens": 0, "last_event_ts": e.ts, "summaries": [],
+                "heartbeat_seconds": None,
             }
             order.append(rid)
         r["last_event_ts"] = e.ts
@@ -103,6 +113,8 @@ def list_runs(project=None, *, now_fn=time.time,
             r["started"] = e.ts
             r["goal_dir"] = str(p.get("goal_dir") or "")
             r["title"] = str(p.get("title") or "").strip()
+            hb = p.get("heartbeat_seconds")
+            r["heartbeat_seconds"] = float(hb) if hb else None
         elif e.type == "loop_iteration":
             r["iterations"] += 1
             r["total_cost_usd"] += p.get("cost_usd", 0.0) or 0.0
@@ -115,14 +127,20 @@ def list_runs(project=None, *, now_fn=time.time,
 
     now = now_fn()
     out = []
+    excluded = 0
     for rid in order:
-        if rid in dismissed:
-            continue
         r = runs[rid]
+        # A dismissal hides a run only while it stays the run's LAST word: a
+        # still-live run that keeps appending events after a (mistaken) manual
+        # delete resurfaces instead of silently burning money out of sight.
+        if rid in dismissed and dismissed[rid] >= r["last_event_ts"]:
+            excluded += 1
+            continue
         running = r["status"] == "running"
         last = _ts_epoch(r["last_event_ts"])
+        window = r.get("heartbeat_seconds") or heartbeat_seconds
         r["online"] = bool(running and last is not None
-                           and (now - last) < heartbeat_seconds)
+                           and (now - last) < window)
         summaries = r.pop("summaries")
         if summaries:
             r["title"] = summaries[-1][1]
@@ -134,4 +152,4 @@ def list_runs(project=None, *, now_fn=time.time,
         r["not_yet"] = items["not_yet"]
         out.append(r)
     out.reverse()
-    return {"runs": out, "dismissed": len(dismissed)}
+    return {"runs": out, "dismissed": excluded}

@@ -14,15 +14,28 @@ _TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set"}
 _TIMELINE_CAP = 40
 
 
-def _absorbed_ts(evs) -> set:
-    """Timestamps consolidated away by prior dreaming passes (see
+def _absorbed_keys(evs) -> set:
+    """Identity keys of events consolidated away by prior dreaming passes (see
     consolidate.py): the originals stay in the append-only ledger, but the
-    briefing shows only each cluster's survivor."""
+    briefing shows only each cluster's survivor. Keys are precise
+    (ts, type, fingerprint) tuples — a bare timestamp would also hide
+    unrelated same-second events — plus legacy bare timestamps from the
+    feature's first payload shape."""
     out: set = set()
     for ev in evs:
-        if ev.type == "memory_consolidated" and isinstance(ev.payload, dict):
-            out.update(ev.payload.get("absorbed_ts") or [])
+        if ev.type != "memory_consolidated" or not isinstance(ev.payload, dict):
+            continue
+        for entry in ev.payload.get("absorbed") or []:
+            if isinstance(entry, (list, tuple)) and len(entry) == 3:
+                out.add(tuple(entry))
+        out.update(ev.payload.get("absorbed_ts") or [])   # legacy shape
     return out
+
+
+def _is_absorbed(ev, keys) -> bool:
+    text = _payload_text(ev.payload)
+    return ((ev.ts, ev.type, dedupe.text_fingerprint(text)) in keys
+            or ev.ts in keys)
 
 
 def _collapsed_entries(evs, types, cap=None, absorbed=None):
@@ -39,7 +52,8 @@ def _collapsed_entries(evs, types, cap=None, absorbed=None):
     items = [
         {"type": ev.type, "project": None,
          "text": _payload_text(ev.payload), "_ev": ev}
-        for ev in evs if ev.type in types and ev.ts not in absorbed
+        for ev in evs
+        if ev.type in types and not _is_absorbed(ev, absorbed)
     ]
     items.reverse()
     reps = dedupe.collapse(items)
@@ -85,7 +99,7 @@ def _payload_text(payload) -> str:
 
 def build_briefing(evs) -> str:
     """Build a Markdown briefing string from a list of Event objects (deterministic)."""
-    absorbed = _absorbed_ts(evs)
+    absorbed = _absorbed_keys(evs)
     lines = ["# PROJECT BRIEFING", ""]
 
     # --- Current state ---

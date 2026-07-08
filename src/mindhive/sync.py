@@ -1,7 +1,8 @@
 # src/mindhive/sync.py
 from pathlib import Path
 from . import projector, incidents, events as ev_mod
-from .briefing import briefing as build_briefing_file, headline
+from .briefing import (briefing as build_briefing_file, headline,
+                       _absorbed_keys, _is_absorbed)
 
 # Caps for the compact MEMORY.md digest (KTD8): the file auto-loads into every
 # session, so each list section is bounded. Full history stays on disk
@@ -57,11 +58,15 @@ def _payload_text(payload) -> str:
     return str(payload)
 
 
-def _caveat_lines(evs, cap=LESSONS_CAP) -> list:
+def _caveat_lines(evs, cap=LESSONS_CAP, absorbed=None) -> list:
     """Capped lessons/caveats for the digest: events tagged `pinned` always
     come first and survive the cap (safety-critical caveats must not rotate out
-    as newer lessons accumulate — KTD8); the remainder fills by recency."""
-    caveats = [ev for ev in evs if ev.type == "caveat"]
+    as newer lessons accumulate — KTD8); the remainder fills by recency.
+    Consolidation-absorbed events are excluded so the digest and the briefing
+    agree on which memos are visible post-consolidation."""
+    absorbed = absorbed if absorbed is not None else set()
+    caveats = [ev for ev in evs if ev.type == "caveat"
+               and not _is_absorbed(ev, absorbed)]
     pinned = [ev for ev in caveats if "pinned" in (ev.tags or [])]
     rest = [ev for ev in caveats if "pinned" not in (ev.tags or [])]
     rest.reverse()                                  # newest first
@@ -69,8 +74,10 @@ def _caveat_lines(evs, cap=LESSONS_CAP) -> list:
     return [f"- {headline(_payload_text(ev.payload))}" for ev in chosen]
 
 
-def _decision_lines(evs, cap=DECISIONS_CAP) -> list:
-    decisions = [ev for ev in evs if ev.type == "decision"]
+def _decision_lines(evs, cap=DECISIONS_CAP, absorbed=None) -> list:
+    absorbed = absorbed if absorbed is not None else set()
+    decisions = [ev for ev in evs if ev.type == "decision"
+                 and not _is_absorbed(ev, absorbed)]
     decisions.reverse()                             # newest first
     return [f"- {headline(_payload_text(ev.payload))}" for ev in decisions[:cap]]
 
@@ -114,12 +121,13 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     if rules_block:
         sections.append(rules_block + "\n")
 
-    lessons = _caveat_lines(evs)
+    absorbed = _absorbed_keys(evs)
+    lessons = _caveat_lines(evs, absorbed=absorbed)
     if lessons:
         sections.append("## Lessons & caveats\n")
         sections.append("\n".join(lessons) + "\n")
 
-    decisions = _decision_lines(evs)
+    decisions = _decision_lines(evs, absorbed=absorbed)
     if decisions:
         sections.append("## Key decisions\n")
         sections.append("\n".join(decisions) + "\n")

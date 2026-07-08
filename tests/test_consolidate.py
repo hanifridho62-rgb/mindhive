@@ -18,7 +18,10 @@ def test_consolidate_merges_near_duplicates_only():
     cons = [e for e in events.read_all("test") if e.type == "memory_consolidated"]
     assert len(cons) == 1
     assert cons[0].payload["type"] == "caveat"
-    assert cons[0].payload["absorbed_ts"] == ["2026-07-07T10:01:00Z"]
+    absorbed = cons[0].payload["absorbed"]
+    assert len(absorbed) == 1
+    assert absorbed[0][0] == "2026-07-07T10:01:00Z"     # (ts, type, fingerprint)
+    assert absorbed[0][1] == "caveat"
     assert cons[0].payload["survivor_ts"] == "2026-07-07T10:02:00Z"
 
 
@@ -83,3 +86,52 @@ def test_chain_verifies_after_consolidation():
     from mindhive import projector
     projector.project("test")
     assert chain.verify("test")["ok"] is True
+
+
+def test_same_second_events_are_not_collaterally_hidden():
+    # two DIFFERENT memos sharing one second: absorbing one must not hide the
+    # other (identity is ts+type+fingerprint, not bare ts)
+    events.append_event("caveat", {"text": "duplicate memo body"},
+                        ts="2026-07-07T10:01:00Z", project="test")
+    events.append_event("caveat", {"text": "totally unrelated other note"},
+                        ts="2026-07-07T10:01:00Z", project="test")
+    events.append_event("caveat", {"text": "duplicate memo body"},
+                        ts="2026-07-07T10:02:00Z", project="test")
+    consolidate.consolidate(project="test", cooldown_hours=0)
+    text = build_briefing(events.read_all("test"))
+    assert "totally unrelated other note" in text
+    assert text.count("duplicate memo body") == 2      # survivor: timeline+lessons
+
+
+def test_pinned_events_never_enter_a_cluster():
+    events.append_event("caveat", {"text": "never touch the live trading lock"},
+                        ts="2026-07-07T10:01:00Z", tags=["pinned"], project="test")
+    events.append_event("caveat", {"text": "never touch the live trading lock"},
+                        ts="2026-07-07T10:02:00Z", project="test")
+    res = consolidate.consolidate(project="test", cooldown_hours=0)
+    # the pinned original is protected content: it is neither survivor nor
+    # absorbed, so the only cluster candidate is a lone unpinned twin -> no-op
+    assert res == {"consolidated": 0, "absorbed": 0}
+
+
+def test_opposite_polarity_memos_never_merge():
+    events.append_event("caveat", {"text": "deploy the parser to production"},
+                        ts="2026-07-07T10:01:00Z", project="test")
+    events.append_event("caveat", {"text": "do not deploy the parser to production"},
+                        ts="2026-07-07T10:02:00Z", project="test")
+    res = consolidate.consolidate(project="test", cooldown_hours=0)
+    assert res == {"consolidated": 0, "absorbed": 0}
+    text = build_briefing(events.read_all("test"))
+    assert "do not deploy" in text
+
+
+def test_memory_md_digest_excludes_absorbed(tmp_path):
+    from mindhive import sync as sync_mod
+    events.append_event("caveat", {"text": "watch the flaky reconnect path"},
+                        ts="2026-07-07T10:01:00Z", project="test")
+    events.append_event("caveat", {"text": "watch a flaky reconnect path"},
+                        ts="2026-07-07T10:02:00Z", project="test")
+    consolidate.consolidate(project="test", cooldown_hours=0)
+    dest = sync_mod.sync("C:/proj", project="test", home=tmp_path / "home")
+    content = dest.read_text(encoding="utf-8")
+    assert content.count("flaky reconnect") == 1       # digest shows the survivor once

@@ -54,14 +54,21 @@ def run_history(evs) -> list[dict]:
     return [runs[r] for r in order if runs[r]["reason"]]
 
 
+# Only this many most-recent comparable runs inform the starting tier: an
+# ancient light-tier success must not outweigh what has happened since (the
+# ratchet/poisoning failure mode), and the floor re-learns as work evolves.
+HISTORY_WINDOW = 10
+
+
 def pick_initial_tier(size: str, history=None) -> str:
-    """Starting tier for a run: the lowest tier that COMPLETED a
-    comparable-size run wins (measured evidence beats the static guess); when
-    the static tier's most recent comparable run tripped the breaker instead,
-    start one tier up. No history -> the static size mapping."""
+    """Starting tier for a run: within the recent comparable window, the
+    lowest tier that COMPLETED a run wins (measured evidence beats the static
+    guess); when the static tier's most recent comparable run tripped the
+    breaker instead, start one tier up. No history -> the static size mapping."""
     static = _STATIC_TIER.get(size, "mid")
     comparable = [h for h in (history or [])
                   if h.get("size") == size and h.get("tier") in TIERS]
+    comparable = comparable[-HISTORY_WINDOW:]
     completed = [h["tier"] for h in comparable if h.get("reason") == "completed"]
     if completed:
         return min(completed, key=TIERS.index)

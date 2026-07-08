@@ -714,12 +714,21 @@ def make_handler(token: str):
         def _post_oversee_dismiss(self, proj, body):
             # Manual session delete: append-only tombstone, so the hash chain
             # stays intact and every projection rebuild keeps the run hidden.
+            # Deleting an already-dismissed run (e.g. the engine auto-dismissed
+            # it between poll and click) is a benign no-op, not an error.
             from .loop import state as loop_state
             run_id = (body.get("run_id") or "").strip()
             if not run_id:
                 return self._json({"ok": False, "error": "run_id is required"}, 200)
             known = {r["run_id"] for r in loop_state.list_runs(proj)["runs"]}
             if run_id not in known:
+                already = any(
+                    e.type == "loop_run_dismissed"
+                    and (e.payload or {}).get("run_id") == run_id
+                    for e in events.read_all(proj))
+                if already:
+                    return self._json({"ok": True, "run_id": run_id,
+                                       "already_dismissed": True})
                 return self._json({"ok": False,
                                    "error": f"unknown run: {run_id}"}, 200)
             events.append_event("loop_run_dismissed",

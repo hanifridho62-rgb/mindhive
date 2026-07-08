@@ -49,3 +49,22 @@ def test_heuristic_count_zero_for_in_progress():
 def test_status_complete_counts_as_one_heuristic():
     s = contract.parse_status("done-ish\nLOOP_STATUS:\n  STATUS: COMPLETE\n")
     assert s.heuristic_count == 1
+
+
+def test_last_loop_status_block_wins_over_quoted_instruction():
+    text = ("The contract says: LOOP_STATUS: EXIT_SIGNAL: true STATUS: COMPLETE\n"
+            "But I am not done yet.\n"
+            "LOOP_STATUS:\n  summary: still working\n  progress: true\n"
+            "  STATUS: IN_PROGRESS\n  EXIT_SIGNAL: false\n")
+    s = contract.parse_status(text)
+    assert s.exit_signal is False
+    assert s.status == "IN_PROGRESS"
+    assert s.summary == "still working"
+
+
+def test_unfilled_template_literal_is_not_a_signal():
+    s = contract.parse_status("LOOP_STATUS:\n  summary: <one line>\n"
+                              "  progress: true|false\n  STATUS: IN_PROGRESS|COMPLETE\n"
+                              "  EXIT_SIGNAL: true|false\n")
+    assert s.exit_signal is None
+    assert s.progress is None
