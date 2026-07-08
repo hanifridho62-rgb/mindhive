@@ -294,3 +294,46 @@ def test_successful_call_breaks_streak_and_restores():
                               {"x": _fstat(6, 3, fail_streak=0)},
                               incidents=incidents, needs=[])
     assert _names(out) == ["x"]
+
+
+# --------------------------------------------------------------------------
+# brief_line — the shared one-line renderer that surfaces intended use so an
+# agent grasps a skill's scope from the recommendation itself.
+# --------------------------------------------------------------------------
+
+def test_brief_line_measured_carries_provenance_and_intended_use():
+    out = recommend.recommend(
+        [_skill("proven", "Fix failing pytest suite runs quickly.")],
+        {"proven": _stat(4, 4)}, needs=NEEDS)
+    line = recommend.brief_line(out["recommendations"][0])
+    assert line.startswith("proven — ")
+    assert "measured 4/4 completion" in line
+    assert "(measured)" in line
+    assert "intended use: Fix failing pytest suite runs quickly." in line
+
+
+def test_brief_line_estimated_never_called_keeps_estimated_label():
+    out = recommend.recommend([_skill("newbie", "Handles beta deployments.")],
+                              {}, needs=[])
+    line = recommend.brief_line(out["recommendations"][0])
+    assert "never called — breadth-estimated" in line
+    assert "(estimated)" in line          # an estimate must never read as measured
+    assert "intended use: Handles beta deployments." in line
+
+
+def test_brief_line_truncates_long_intended_use():
+    long_desc = "word " * 100
+    entry = {"name": "verbose", "reason": "never called — breadth-estimated",
+             "provenance": "estimated", "description": long_desc}
+    line = recommend.brief_line(entry, width=40)
+    used = line.split("intended use: ", 1)[1]
+    assert used.endswith("…")
+    assert len(used) <= 40
+
+
+def test_brief_line_omits_clause_when_description_empty():
+    entry = {"name": "bare", "reason": "never called — breadth-estimated",
+             "provenance": "estimated", "description": "   "}
+    line = recommend.brief_line(entry)
+    assert "intended use:" not in line
+    assert line == "bare — never called — breadth-estimated (estimated)"

@@ -163,3 +163,24 @@ def test_cli_skills_recommend_brief_honors_top(capsys, monkeypatch):
     assert ret == 0
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
     assert len(lines) == 2                 # --top overrides the default 3-cap
+
+
+def test_cli_skills_recommend_brief_surfaces_intended_use(capsys, monkeypatch):
+    from mindhive import plugins
+    monkeypatch.setattr(plugins, "live_inventory", lambda: _FAKE_INVENTORY)
+    ret = cli_mod.main(["skills", "recommend", "--brief"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    # each brief line still fits ONE line and carries the skill's intended use
+    assert "intended use: Use when tests fail in the suite." in out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert 1 <= len(lines) <= 3
+
+
+def test_cli_skills_recommend_full_surfaces_intended_use(capsys, monkeypatch):
+    from mindhive import plugins
+    monkeypatch.setattr(plugins, "live_inventory", lambda: _FAKE_INVENTORY)
+    ret = cli_mod.main(["skills", "recommend"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "intended use: Use when tests fail in the suite." in out

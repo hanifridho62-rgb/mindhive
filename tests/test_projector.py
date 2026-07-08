@@ -174,6 +174,24 @@ def test_state_contains_suggested_skills_when_recommend_yields(monkeypatch):
     assert state.index("_events:") < state.index("# SUGGESTED SKILLS")
 
 
+def test_suggested_skills_block_surfaces_intended_use_and_nudge(monkeypatch):
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _fake_inventory([
+                            ("alpha-skill", "Use when testing alpha code paths")]))
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    state = _state()
+    # the intended use (skill description) rides in the block so the agent
+    # grasps scope without opening the skill
+    assert "intended use: Use when testing alpha code paths" in state
+    # the adherence nudge is present and is NOT a bullet (must not count as a rec)
+    assert "Consult each skill's intended use before invoking" in state
+    block = state.split("# SUGGESTED SKILLS", 1)[1]
+    bullets = [ln for ln in block.splitlines() if ln.startswith("- ")]
+    assert len(bullets) == 1
+
+
 def test_suggested_skills_block_bounded_to_three(monkeypatch):
     six = [(f"skill-{i:02d}", f"totally distinct purpose number {i}")
            for i in range(6)]

@@ -53,6 +53,7 @@ EXPLORE_NEED_MIN = 0.2      # need_match at/above which measuring is worth it
 SIMILARITY_THRESHOLD = 0.3  # description-keyword Jaccard for overlap grouping
 AUTO_MIN_RATE = 0.8         # measured completion rate needed for auto execution
 DISCONTINUE_STREAK = 3      # trailing failures that, with an active rule, stop a skill
+INTENDED_USE_WIDTH = 140    # chars of a skill's intended use surfaced in a brief line
 
 _WORD = re.compile(r"[a-z0-9]+")
 _STOP = {
@@ -174,6 +175,31 @@ def _reason(measured: bool, st: dict, calls: int, nm: float, penalty: float) -> 
     if penalty > 0:
         base += ", open skill incident"
     return base
+
+
+def _truncate(text, width: int) -> str:
+    """Collapse whitespace and cap ``text`` at ``width`` chars, adding an
+    ellipsis on overflow. Deterministic — no locale/word-boundary heuristics."""
+    s = " ".join(str(text or "").split())
+    if len(s) <= width:
+        return s
+    return s[:max(0, width - 1)].rstrip() + "…"
+
+
+def brief_line(entry, width: int = INTENDED_USE_WIDTH) -> str:
+    """One compact line for a scored :func:`recommend` entry: name, reason, and
+    provenance, then the skill's *intended use* (its description) truncated to
+    ``width``. Surfacing the intended use lets an agent reading MEMORY.md grasp
+    a skill's scope without opening it; the clause is omitted when the
+    description is empty. Provenance stays verbatim so an estimate never reads
+    as measured. Shared by the projector's SUGGESTED SKILLS block and
+    ``hive skills recommend --brief`` so the two surfaces cannot drift."""
+    line = (f"{entry.get('name', '')} — {entry.get('reason', '')} "
+            f"({entry.get('provenance', '')})")
+    desc = _truncate(entry.get("description", ""), width)
+    if desc:
+        line += f" · intended use: {desc}"
+    return line
 
 
 def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:

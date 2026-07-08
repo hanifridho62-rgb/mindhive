@@ -63,14 +63,20 @@ def suggested_skills_block(project=None, evs=None) -> str:
     dependency on the plugins/recommend stack (and no import cycles)."""
     try:
         from . import plugins as plugins_mod
+        from . import recommend as recommend_mod
         payload = plugins_mod.recommend_for(project=project, evs=evs,
                                             top=SUGGEST_CAP)
         recs = (payload.get("recommendations") or [])[:SUGGEST_CAP]
         if not recs:
             return ""
-        lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)"]
+        # The nudge line makes intended-use adherence explicit; it is not a
+        # bullet, so it never counts against SUGGEST_CAP. brief_line carries
+        # each skill's intended use so the agent grasps scope from the block.
+        lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)",
+                 "_Consult each skill's intended use before invoking — match the "
+                 "task to the skill's stated scope._"]
         for e in recs:
-            lines.append(f"- {e['name']} — {e['reason']} ({e['provenance']})")
+            lines.append(f"- {recommend_mod.brief_line(e)}")
         return "\n".join(lines)
     except Exception:
         return ""
