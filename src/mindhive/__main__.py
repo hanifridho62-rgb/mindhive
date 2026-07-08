@@ -47,10 +47,18 @@ def cmd_append(args) -> int | None:
 
 
 def cmd_hook(args) -> int | None:
-    from . import hookcapture
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if args.stage == "post_tool_use":
+        from . import hookcapture
         print(json.dumps(hookcapture.record_post_tool_use(raw)))
+    elif args.stage == "pre_tool_use":
+        # Deny the ineffective tool form for enabled-enforcement signatures.
+        # Print ONLY on a deny (stdout is the hook's decision channel); an allow
+        # prints nothing so the hook stays a silent no-op.
+        from . import enforce
+        decision = enforce.hook_decision(raw)
+        if decision:
+            print(json.dumps(decision))
     return None
 
 
@@ -610,6 +618,30 @@ def cmd_rules_reconcile(args) -> int | None:
     return None
 
 
+def cmd_rules_enforce(args) -> int | None:
+    """Manage the PreToolUse enforcement manifest — the enforce rung of the
+    nudge->enforce ladder. Default action prints the manifest."""
+    from . import enforce
+    if args.suggest:
+        print(json.dumps({"suggested": enforce.suggest(project=args.project)}))
+        return None
+    if args.enable:
+        print(json.dumps(enforce.set_enabled(args.project, args.enable, True)))
+        return None
+    if args.disable:
+        print(json.dumps(enforce.set_enabled(args.project, args.disable, False)))
+        return None
+    man = enforce.load_manifest(args.project)
+    if not man:
+        print("(no enforcement manifest — run `hive rules enforce --suggest`)")
+        return None
+    for sig, entry in sorted(man.items()):
+        state = "ENABLED " if entry.get("enabled") else "disabled"
+        matcher = "ok" if sig in enforce.MATCHERS else "MISSING-matcher"
+        print(f"  [{state}] {sig}  ({matcher})")
+    return None
+
+
 def cmd_rules_audit(args) -> int | None:
     from . import incidents as inc
     res = inc.audit(project=args.project)
@@ -654,7 +686,7 @@ def _build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_append)
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
-    hk.add_argument("stage", choices=["post_tool_use"],
+    hk.add_argument("stage", choices=["post_tool_use", "pre_tool_use"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -911,6 +943,16 @@ def _build_parser() -> argparse.ArgumentParser:
     rc = rsub.add_parser("reconcile", help="record human edits as rule_revised events")
     rc.add_argument("--project", default=None)
     rc.set_defaults(func=cmd_rules_reconcile)
+    ren = rsub.add_parser("enforce",
+                          help="manage the PreToolUse enforcement manifest (nudge->enforce ladder)")
+    ren.add_argument("--project", default=None)
+    ren.add_argument("--suggest", action="store_true",
+                     help="add disabled stubs for ruled signatures recurring past the threshold")
+    ren.add_argument("--enable", metavar="SIG", default=None,
+                     help="turn on enforcement for a signature")
+    ren.add_argument("--disable", metavar="SIG", default=None,
+                     help="turn off enforcement for a signature")
+    ren.set_defaults(func=cmd_rules_enforce)
 
     return p
 
