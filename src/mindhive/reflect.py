@@ -111,11 +111,7 @@ def read_marker(project=None) -> dict:
 def write_marker(project=None, data=None) -> None:
     """Atomic marker write (temp file + os.replace) so a concurrent reader —
     another session_end batch, the health notice — never sees a torn file."""
-    p = _marker_path(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data or {}, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    paths.write_text_atomic(_marker_path(project), json.dumps(data or {}, indent=2))
 
 
 _GATE_STALE_SECS = 600.0        # a crashed batch may hold the gate ~10 min max

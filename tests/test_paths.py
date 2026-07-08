@@ -64,3 +64,24 @@ def test_is_freshly_minted(tmp_path, monkeypatch):
     # An explicit MINDHIVE_PROJECT pin silences the signal.
     monkeypatch.setenv("MINDHIVE_PROJECT", "whatever")
     assert paths.is_freshly_minted("brave-brattain-28ae65") is False
+
+
+def test_write_text_atomic_writes_content(tmp_path):
+    p = tmp_path / "sub" / "file.json"        # parent does not exist yet
+    paths.write_text_atomic(p, "hello")
+    assert p.read_text(encoding="utf-8") == "hello"
+
+
+def test_write_text_atomic_overwrites_existing(tmp_path):
+    p = tmp_path / "file.txt"
+    p.write_text("old", encoding="utf-8")
+    paths.write_text_atomic(p, "new")
+    assert p.read_text(encoding="utf-8") == "new"
+
+
+def test_write_text_atomic_leaves_no_tmp_file(tmp_path):
+    p = tmp_path / "file.txt"
+    paths.write_text_atomic(p, "data")
+    # The temp file is renamed onto the target — nothing should linger.
+    assert [q.name for q in tmp_path.iterdir()] == ["file.txt"]
+    assert not (tmp_path / "file.txt.tmp").exists()
