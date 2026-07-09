@@ -45,11 +45,38 @@ def test_line_stats_unknown_when_underivable():
     assert hookcapture.line_stats("Edit", {}) == (None, None)
 
 
+def test_line_stats_falls_back_on_malformed_hunk_lines():
+    """A hunk whose "lines" is not a list (e.g. a string) must not be iterated
+    char-by-char — the patch is unusable, so fall back to the strings."""
+    resp = {"structuredPatch": [{"lines": "+not-a-list"}]}
+    inp = {"old_string": "a", "new_string": "a\nb"}
+    assert hookcapture.line_stats("Edit", inp, resp) == (2, 1)
+
+
 def test_zero_change_edit_is_skipped():
     payload = {"tool_name": "Edit",
                "tool_input": {"file_path": "a.py", "old_string": "", "new_string": ""},
                "tool_response": {"structuredPatch": []}}
     assert hookcapture.extract_events(payload) == []
+
+
+def test_zero_change_structured_patch_is_skipped():
+    """A non-empty structuredPatch whose hunks net to +0 -0 (context-only
+    lines) exercises the patch-counting loop, not the string fallback."""
+    payload = {"tool_name": "Edit",
+               "tool_input": {"file_path": "a.py"},
+               "tool_response": {"structuredPatch": [
+                   {"lines": [" context one", " context two"]}]}}
+    assert hookcapture.extract_events(payload) == []
+
+
+def test_pure_deletion_is_not_skipped():
+    payload = {"tool_name": "Edit",
+               "tool_input": {"file_path": "a.py",
+                              "old_string": "one\ntwo", "new_string": ""}}
+    out = hookcapture.extract_events(payload)
+    assert out == [("file_touched",
+                    {"text": "a.py", "tool": "Edit", "plus": 0, "minus": 2})]
 
 
 def test_edit_payload_carries_plus_minus():

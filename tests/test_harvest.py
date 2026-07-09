@@ -469,6 +469,11 @@ def test_harvest_skips_zero_change_edit():
     assert harvest._items_from_obj(o) == []
 
 
+def test_harvest_drops_whitespace_only_description():
+    o = json.loads(_tooluse("Bash", {"command": "ls", "description": "   "}))
+    assert harvest._items_from_obj(o) == [{"kind": "command_run", "value": "ls"}]
+
+
 def test_event_for_item_passes_extra_keys_but_text_is_unchanged():
     etype, payload, tags = harvest._event_for_item(
         {"kind": "file_touched", "value": "src/a.py",

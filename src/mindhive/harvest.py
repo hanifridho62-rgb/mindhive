@@ -132,10 +132,11 @@ def _items_from_obj(o) -> list:
                 elif name in ("Bash", "PowerShell"):
                     cmd = inp.get("command")
                     if cmd:
-                        item = {"kind": "command_run", "value": cmd[:180]}
+                        item = {"kind": "command_run",
+                                "value": cmd[:hookcapture.CMD_MAX]}
                         desc = inp.get("description")
                         if isinstance(desc, str) and desc.strip():
-                            item["desc"] = desc.strip()[:120]
+                            item["desc"] = desc.strip()[:hookcapture.DESC_MAX]
                         items.append(item)
         # Capture Claude's prose response too, so the OUTPUT enters the hive
         # alongside the prompt. Tool-only turns have no text and are skipped.

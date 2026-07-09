@@ -16,25 +16,35 @@ from . import events, paths
 # back-harvest agree on what each tool means.
 _FILE_TOOLS = ("Edit", "Write", "NotebookEdit")
 _CMD_TOOLS = ("Bash", "PowerShell")
-_CMD_MAX = 180
-_DESC_MAX = 120
+# Shared truncation caps — harvest.py reuses these so both capture paths
+# truncate identically (the dedup key depends on identical text).
+CMD_MAX = 180
+DESC_MAX = 120
 
 
 def line_stats(tool, inp, resp=None):
     """(plus, minus) line counts for a file-tool call, or (None, None) when
     they can't be derived. Prefers the exact structuredPatch from the tool
     response; falls back to new/old string line counts, then Write content.
+    The old/new-string fallback may overcount when old_string/new_string
+    include unchanged context lines carried for uniqueness.
     Unknown is NOT zero — callers only skip on a computed (0, 0)."""
     patch = resp.get("structuredPatch") if isinstance(resp, dict) else None
     if isinstance(patch, list) and patch:
-        plus = minus = 0
-        for hunk in patch:
-            for ln in (hunk.get("lines") or []) if isinstance(hunk, dict) else []:
-                if isinstance(ln, str) and ln.startswith("+"):
-                    plus += 1
-                elif isinstance(ln, str) and ln.startswith("-"):
-                    minus += 1
-        return plus, minus
+        # Only trust the patch when every hunk's "lines" is a real list — a
+        # malformed value (e.g. a string) would otherwise be iterated
+        # char-by-char and silently misreport counts. Malformed -> treat the
+        # whole patch as unusable and fall through to the string fallbacks.
+        hunk_lines = [h.get("lines") if isinstance(h, dict) else None for h in patch]
+        if all(isinstance(ls, list) for ls in hunk_lines):
+            plus = minus = 0
+            for ls in hunk_lines:
+                for ln in ls:
+                    if isinstance(ln, str) and ln.startswith("+"):
+                        plus += 1
+                    elif isinstance(ln, str) and ln.startswith("-"):
+                        minus += 1
+            return plus, minus
     old, new = inp.get("old_string"), inp.get("new_string")
     if isinstance(old, str) and isinstance(new, str):
         return len(new.splitlines()), len(old.splitlines())
@@ -72,10 +82,10 @@ def extract_events(payload) -> list:
         cmd = inp.get("command")
         if not cmd:
             return []
-        p = {"text": cmd[:_CMD_MAX]}
+        p = {"text": cmd[:CMD_MAX]}
         desc = inp.get("description")
         if isinstance(desc, str) and desc.strip():
-            p["desc"] = desc.strip()[:_DESC_MAX]
+            p["desc"] = desc.strip()[:DESC_MAX]
         return [("command_run", p)]
     return []
 
