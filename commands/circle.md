@@ -12,6 +12,10 @@ gate, and a circuit breaker.
 > It spawns a **separate, headless** Claude that edits files on its own
 > (`permission_mode = "acceptEdits"` by default). Confirm the goal before launching.
 
+`/circle` is the loop **primitive**, not the centralized work pipeline — that
+pipeline lives only in **`/mindhive-orchestrator`** (which may drive this loop as
+one execution engine).
+
 Extra flags passed by the user: `$ARGUMENTS`
 
 Run everything through the project venv:

@@ -29,6 +29,15 @@ def test_circle_slash_command_exists_and_drives_loop():
     assert "mindhive loop" in text
 
 
+def test_circle_is_the_loop_primitive_not_the_pipeline():
+    # /circle was decoupled from the centralized pipeline: it is the loop
+    # primitive, and the pipeline lives only in /mindhive-orchestrator.
+    for f in (_SKILL, _COMMAND):
+        text = f.read_text(encoding="utf-8")
+        assert "primitive" in text.lower()
+        assert "mindhive-orchestrator" in text
+
+
 def test_plugin_manifest_valid():
     data = json.loads(_PLUGIN.read_text(encoding="utf-8"))
     assert data["name"] == "mindhive"

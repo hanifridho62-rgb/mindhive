@@ -34,3 +34,11 @@ def test_engineering_loop_wires_the_invoke_and_improvement_channel():
     text = _SKILL.read_text(encoding="utf-8")
     assert "skills invoke" in text            # drives skills through MindHive
     assert "skill:" in text or "Improvements" in text   # failure→learning loop
+
+
+def test_engineering_loop_is_subordinate_to_the_orchestrator():
+    # Decoupled from the centralized pipeline: it is a subordinate execution
+    # engine the /mindhive-orchestrator pipeline may drive, not a pipeline itself.
+    text = _SKILL.read_text(encoding="utf-8")
+    assert "subordinate" in text.lower()
+    assert "mindhive-orchestrator" in text
