@@ -195,6 +195,45 @@ telemetry backing (e.g., a first-time skill's probability of success) must be
 labeled `(est.)`. Never present a model estimate as a measured rate. This mirrors
 ULT-IDEA's demand for evidence over vibes, applied to skill selection.
 
+### The local dashboard — MindHive's functions with a live face
+
+Everything the CLI exposes, the **local dashboard** exposes as a live control
+panel: `python -m mindhive dashboard` opens it in the browser (fixed port
+`54461` by default, so the URL is stable across runs; it also auto-launches on
+`hive loop`). The dashboard is not a separate system — every view is a window
+onto the same ledger the CLI reads, so anything you learn there you can also
+fetch headlessly. Use it whenever the user benefits from *watching* the run
+instead of reading terminal output.
+
+How each dashboard function maps to this skill's phases:
+
+| Dashboard view / action | Backing API | What it gives the orchestrator | Phase it serves |
+|-------------------------|-------------|--------------------------------|-----------------|
+| **Overview / State / Briefing** | `/api/overview`, `/api/state`, `/api/briefing` | The human-visible mirror of the recall preflight — current status, active work, constraints | Preflight, Phase 1 |
+| **Memory & Recall** | `/api/memory`, `/api/recall` | Interactive ledger search — the same results as `recall`, browsable | Preflight, Phase 3 cross-reference |
+| **Graph** | `/api/graph` | Visual knowledge graph — connected decisions and files at a glance | Phase 1/2 (blast radius) |
+| **Improvements** | `/api/improvements`, `/api/rules/reflect`, `/api/rules/reflect_one`, `/api/rules/dismiss` | The learned-lessons panel: every prevention rule, its incident history, and one-click reflection over un-reflected incidents | Phase S learn-gate, Phase L |
+| **Skill & Plugin panel** | `/api/skills/detail`, `/api/skills/status`, `/api/skills/history`, `/api/skills/stats`, `/api/skills/recommend`, `/api/plugins/inventory`, `/api/plugins/recommend` | The skill database with **green/red indicators per skill**, call history, measured completion rates, and plugin suitability — the visual mirror of Phase S telemetry | Phase S selection |
+| **Invoke** | `/api/skills/invoke` | Run any installed skill from the dashboard and watch its outcome recorded | Phase X execution |
+| **Sessions / Oversee** | `/api/sessions`, `/api/oversee` | What past sessions did; judgment-error oversight | Phase L, retrospectives |
+| **Maintenance actions** | `/api/append`, `/api/sync`, `/api/harvest`, `/api/export`, `/api/selftest`, `/api/verify` | Log-back, briefing refresh, transcript harvest, handoff export, health checks — the Phase L toolbox with buttons | Phase L, handoff |
+
+**When to open it.** Launch the dashboard when: (a) Phase X runs through the
+invoke channel or `/circle` and the user wants live green/red status; (b) the
+Phase S matrix would benefit from the user *seeing* the skill database
+(history, stats, red indicators) rather than trusting a table you typed; (c)
+Phase L reflection is due and the Improvements view's one-click reflect is
+faster than the CLI loop. Otherwise stay headless — the CLI answers everything
+the dashboard shows.
+
+**Learning from mistakes, visibly.** The dashboard is where MindHive's learning
+loop is easiest to inspect: a skill that fails turns **red** in the Skill &
+Plugin panel and stays red until it succeeds again; its failure becomes an
+incident in the Improvements view; reflection turns the incident into a
+prevention rule; and the next run's preflight injects that rule. When you tell
+the user "this skill failed last time and here's the lesson," the dashboard is
+the place they can verify the claim with their own eyes.
+
 ---
 
 ## <a name="catalog"></a>What This Skill Is — Capability Catalog
