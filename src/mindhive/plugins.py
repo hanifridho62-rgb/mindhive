@@ -183,6 +183,53 @@ def score(plugin: dict) -> dict:
     }
 
 
+MIN_CALLS_FOR_GATE = 3     # history needed before the demotion gate may fire
+DEMOTE_BELOW = 0.4         # success rate under this -> demoted
+
+
+def call_counts(project=None) -> dict:
+    """{skill_name: {"ok": n, "fail": n}} — every occurrence of the same
+    ledger events call_status() reads, not just the most recent one."""
+    counts: dict = {}
+    for e in ev_mod.read_all(project):
+        if e.type == "invoke_result":
+            name = e.payload.get("name")
+            if name:
+                counts.setdefault(name, {"ok": 0, "fail": 0})["ok"] += 1
+        elif e.type == "tool_failed":
+            sig = e.payload.get("signature", "")
+            if isinstance(sig, str) and sig.startswith("skill:"):
+                counts.setdefault(sig[len("skill:"):],
+                                  {"ok": 0, "fail": 0})["fail"] += 1
+    return counts
+
+
+def effectiveness(plugin: dict, counts: dict) -> dict:
+    """Aggregate measured effectiveness for one plugin's skills.
+
+    Laplace-smoothed success rate: (ok+1)/(ok+fail+2) — 0.5 (neutral) with no
+    history, so unproven plugins are neither boosted nor punished. The gate
+    only fires on real evidence: >= MIN_CALLS_FOR_GATE calls with a rate
+    under DEMOTE_BELOW."""
+    ok = fail = 0
+    for s in plugin.get("skills", []):
+        c = counts.get(s.get("name"))
+        if c:
+            ok += c["ok"]
+            fail += c["fail"]
+    calls = ok + fail
+    rate = (ok + 1) / (calls + 2)
+    demoted = calls >= MIN_CALLS_FOR_GATE and rate < DEMOTE_BELOW
+    return {
+        "calls": calls, "ok": ok, "fail": fail,
+        "success_rate": round(rate, 3),
+        "demoted": demoted,
+        "demote_reason": (f"{fail} fail / {calls} calls "
+                          f"(rate {rate:.0%} < {DEMOTE_BELOW:.0%})"
+                          if demoted else ""),
+    }
+
+
 def _public(plugin: dict, free: bool, reason: str) -> dict:
     """Strip private (_-prefixed) scan fields; attach free flag + score."""
     out = {
@@ -215,17 +262,26 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
             paid_plugins.append({"name": pub["name"], "version": pub["version"],
                                  "free_reason": reason})
 
-    ranked = sorted(
-        free_plugins,
-        key=lambda p: (-p["score"]["breadth_score"], p["name"]),
-    )
+    counts = call_counts()
+    for pub in free_plugins:
+        eff = effectiveness(pub, counts)
+        pub["score"]["effectiveness"] = eff
+        pub["score"]["rank_score"] = round(
+            pub["score"]["breadth_score"] * eff["success_rate"], 2)
+    ranked = sorted(free_plugins,
+                    key=lambda p: p["score"]["rank_score"], reverse=True)
+    recommended = [p for p in ranked
+                   if not p["score"]["effectiveness"]["demoted"]][:top_n]
+    demoted = [{"name": p["name"],
+                "reason": p["score"]["effectiveness"]["demote_reason"]}
+               for p in ranked if p["score"]["effectiveness"]["demoted"]]
     recommendations = [
         {
             "name": p["name"],
             "breadth_score": p["score"]["breadth_score"],
             "note": CURATED_NOTES.get(p["name"], ""),
         }
-        for p in ranked[:top_n]
+        for p in recommended
     ]
 
     return {
@@ -242,6 +298,7 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
         "free_plugins": ranked,
         "paid_plugins": sorted(paid_plugins, key=lambda p: p["name"]),
         "recommendations": recommendations,
+        "demoted": demoted,
     }
 
 
