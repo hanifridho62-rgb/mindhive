@@ -11,7 +11,9 @@ from mindhive import hookcapture, events, paths
 def test_extract_file_touched_for_edit_write_notebook():
     for tool in ("Edit", "Write", "NotebookEdit"):
         payload = {"tool_name": tool, "tool_input": {"file_path": "src/foo.py"}}
-        assert hookcapture.extract_events(payload) == [("file_touched", "src/foo.py")]
+        out = hookcapture.extract_events(payload)
+        # No old/new strings and no patch -> stats unknown, event still logged.
+        assert out == [("file_touched", {"text": "src/foo.py", "tool": tool})]
 
 
 def test_extract_command_run_truncated_to_180():
@@ -19,7 +21,53 @@ def test_extract_command_run_truncated_to_180():
     payload = {"tool_name": "Bash", "tool_input": {"command": long_cmd}}
     out = hookcapture.extract_events(payload)
     assert out[0][0] == "command_run"
-    assert len(out[0][1]) == 180
+    assert len(out[0][1]["text"]) == 180
+
+
+def test_line_stats_prefers_structured_patch():
+    resp = {"structuredPatch": [
+        {"lines": ["-old line", "+new line", "+added", " context"]},
+        {"lines": ["-gone"]},
+    ]}
+    assert hookcapture.line_stats("Edit", {}, resp) == (2, 2)
+
+
+def test_line_stats_falls_back_to_old_new_strings():
+    inp = {"old_string": "a\nb", "new_string": "a\nb\nc"}
+    assert hookcapture.line_stats("Edit", inp) == (3, 2)
+
+
+def test_line_stats_write_uses_content_line_count():
+    assert hookcapture.line_stats("Write", {"content": "x\ny\nz"}) == (3, 0)
+
+
+def test_line_stats_unknown_when_underivable():
+    assert hookcapture.line_stats("Edit", {}) == (None, None)
+
+
+def test_zero_change_edit_is_skipped():
+    payload = {"tool_name": "Edit",
+               "tool_input": {"file_path": "a.py", "old_string": "", "new_string": ""},
+               "tool_response": {"structuredPatch": []}}
+    assert hookcapture.extract_events(payload) == []
+
+
+def test_edit_payload_carries_plus_minus():
+    payload = {"tool_name": "Edit",
+               "tool_input": {"file_path": "a.py",
+                              "old_string": "one\ntwo", "new_string": "one\ntwo\nthree"}}
+    out = hookcapture.extract_events(payload)
+    assert out == [("file_touched",
+                    {"text": "a.py", "tool": "Edit", "plus": 3, "minus": 2})]
+
+
+def test_command_payload_carries_description():
+    payload = {"tool_name": "Bash",
+               "tool_input": {"command": "pytest -q",
+                              "description": "Run full test suite"}}
+    out = hookcapture.extract_events(payload)
+    assert out == [("command_run",
+                    {"text": "pytest -q", "desc": "Run full test suite"})]
 
 
 def test_extract_ignores_unknown_tools_and_missing_fields():
