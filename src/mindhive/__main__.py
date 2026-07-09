@@ -268,7 +268,7 @@ def cmd_skills_list(args) -> int | None:
 
 def cmd_skills_invoke(args) -> int | None:
     """Call ANY installed skill through MindHive (headless claude), recording the
-    outcome. Returns exit 1 on failure so /circle and /mindhive can gate on it."""
+    outcome. Returns exit 1 on failure so /circle and /mindhive-orchestrator can gate on it."""
     from . import invoker
     res = invoker.invoke_skill(args.name, plugin=args.plugin)
     status = "ok" if res["ok"] else "FAILED"
@@ -656,7 +656,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pla.set_defaults(func=cmd_plugins_autoscan)
     plsub.add_parser("recommend", help="print the latest catalog's top recommendations").set_defaults(func=cmd_plugins_recommend)
 
-    # --- skills: the invoke channel /mindhive and /circle drive ---
+    # --- skills: the invoke channel /mindhive-orchestrator and /circle drive ---
     sk = sub.add_parser("skills", help="list, invoke, or check status of installed skills")
     sksub = sk.add_subparsers(dest="skills_cmd", required=True)
     skl = sksub.add_parser("list", help="list installed plugins + skills (live)")
