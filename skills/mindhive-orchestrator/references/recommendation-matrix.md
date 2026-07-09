@@ -1,7 +1,10 @@
 # Recommendation Matrix
 
-Phase 2 of the orchestrator produces one matrix **per candidate skill**. The
-matrix makes skill selection explicit and auditable instead of a hidden guess.
+**Phase S (Skill Selection)** of the orchestrator produces one matrix covering the
+shortlisted **candidate skills**. The matrix makes skill selection explicit and
+auditable instead of a hidden guess. It is anchored on measured MindHive telemetry
+(`skills stats`, `skills status`) wherever that data exists, and labels every
+unmeasured probability `(est.)`.
 
 ## Sourcing candidates (hard rules)
 
