@@ -133,6 +133,226 @@ reading the code is a first-class way to honor this directive.
 > preserved in full; the `⬡` callouts are the *additions* that wire each phase into
 > the ledger, the plugin database, and the learning loop.
 
+## The MindHive command cookbook — recipes you'll actually run
+
+The prime directive and the `⬡` hooks tell you *when* to reach for MindHive; this
+cookbook tells you *exactly what to type and how to read the result*. Every recipe is
+`intent → command → what the output looks like → how to act on it`, using the Step 0
+prefix you resolved. Treat this as the operational layer of the fusion: it is what
+makes "recall before you ask" and "pick the right skill from data" concrete instead of
+aspirational. Load `references/mindhive-functions.md` for the exhaustive flag-level
+reference; this section is the working subset you use on almost every run.
+
+### Recall recipes (Phase 1 — spend these before you ask a single question)
+
+**Orient yourself in the project's current reality.**
+```
+python -m mindhive state
+```
+Prints `STATE.md`: active task, last verified, next step, open questions, deferred
+items, and the last decision. *Act on it:* if the "Active task" or "Open questions"
+already frame the idea the user just gave you, acknowledge that and build on it rather
+than re-interviewing from zero. If STATE shows a reflection-health warning, note it —
+the learning loop may be degraded and you should lean on `rules summaries` manually.
+
+**Pull prior decisions/caveats/failures on the idea's topic (literal).**
+```
+python -m mindhive recall "attendance marking offline sync"
+```
+Returns ranked ledger hits, each a filename with a `[score N]` and a snippet. *Act on
+it:* a high-scoring `decision` snippet frequently answers a Phase-1 gap outright ("we
+already decided CSV-only export") — quote it and skip that question. A `caveat` snippet
+is a landmine map: it tells you what broke last time.
+
+**When literal recall is thin, switch to meaning-based.**
+```
+python -m mindhive recall "how do we notify people" --semantic
+```
+Semantic recall matches on meaning, not keywords — use it when the idea's vocabulary
+differs from how the ledger phrased the same concept. *Act on it:* same as literal, but
+trust slightly lower scores since matches are conceptual.
+
+**Map the blast radius when the idea touches an existing subsystem.**
+```
+python -m mindhive graph related "orchestrator" --depth 1
+```
+Returns a JSON list of connected nodes (decisions and files) with a `via` field showing
+*why* each is connected. *Act on it:* this is the fastest route to "what does the code
+already do here" — it answers the Counterfactual Gap (Phase 1.2) and pre-loads the
+cross-reference step (Phase 3.2) before you read a single file. Increase `--depth` to 2
+to widen the neighborhood when the subsystem is central.
+
+**Read the full briefing when STATE is too terse.**
+```
+python -m mindhive briefing
+```
+Builds and prints the richer digest. *Act on it:* use at the very start of a Deep-scope
+idea where you need the whole project picture, not just the one-screen STATE.
+
+### Skill-selection recipes (Phase 2 — grounding the Recommendation Matrix in data)
+
+**List what is actually installed and callable (the source of truth for candidate names).**
+```
+python -m mindhive skills list
+```
+Prints `N plugins · M skills`, then each plugin with its skill count. Add `--json` for
+machine-readable detail. *Act on it:* **only** propose candidate skills whose names
+appear here. This is the anti-hallucination guard — never score a skill you can't see in
+this list.
+
+**Get the breadth-scored, free-first recommendation.**
+```
+python -m mindhive plugins recommend
+```
+Prints the top plugins by breadth score with curated notes (e.g. `compound-engineering
+[score 52]`). *Act on it:* use the score to break ties in the Suitability column — a
+broadly-capable plugin is a safer default than a narrow one when both fit. If the
+catalog is empty or stale, run `python -m mindhive plugins autoscan` first (a cheap
+no-op when fresh).
+
+**Check a candidate skill's green/red track record before you commit to it.**
+```
+python -m mindhive skills status
+```
+Prints `skill: ok|fail` per skill from the ledger's recorded invocations. *Act on it:*
+prefer green skills; when a candidate shows `fail`, drop its Success-probability estimate
+in the matrix and read its lesson (next recipe) before deciding.
+
+**Read the prevention rule behind a red skill (close the loop before repeating it).**
+```
+python -m mindhive rules show "skill:<name>"
+```
+Prints that skill's incident record — root cause, occurrences, and the active prevention
+rule. *Act on it:* apply the rule (e.g. "call it with `--plugin` to disambiguate") and
+say so in the matrix verdict, or route around the skill with a reason.
+
+### Learning-loop recipes (before risky work, and after every run)
+
+**Scan the project's accumulated lessons before executing in a known-risky area.**
+```
+python -m mindhive rules summaries
+```
+Prints one digest line per incident: `<count>x [status] {category} <signature>` followed
+by the lesson. Add `--json` for the raw records (root cause, lesson, prevention rule,
+category, active rule) — the exact data the dashboard **Improvements** view renders.
+*Act on it:* a recurring `active` signature is a ready-made Phase-3.1 "Failure Case"
+scenario and a constraint on how you execute. For example, the `edit:not-read` rule
+means: Read every file before you Edit it.
+
+**See raw incident signatures ranked by how often they've bitten.**
+```
+python -m mindhive failures list
+```
+Prints `<count>x [active|candidate] <signature>`. *Act on it:* `active` (past the
+recurrence threshold) signatures are real patterns; `candidate` ones are still forming.
+
+**After the run, write durable lessons back (only when something memorable happened).**
+```
+python -m mindhive append caveat  "Store shim broke `python -m mindhive`; used venv" --tags orchestrator
+python -m mindhive append experiment_result "graph related pre-answered the counterfactual gap; skipped 2 questions" --tags orchestrator
+python -m mindhive append decision "Validated idea: CSV-only export, Standard scope" --tags orchestrator,preference
+python -m mindhive sync
+```
+*Act on it:* pick the type by what happened — `caveat` for a mistake/dead-end,
+`experiment_result` for a better path found, `decision` for a locked choice or new
+preference. Then `sync` so the next session's auto-loaded briefing reflects it. A smooth,
+unremarkable run writes nothing.
+
+### Handoff & safety recipes
+
+**Export a portable snapshot at a context handoff (~50%).**
+```
+python -m mindhive export --recent 20
+```
+Writes `handoff.md`. *Act on it:* follow the sequence in `references/handoff-protocol.md`
+— export, append the open threads as a caveat, `sync`, then print resume instructions.
+
+**Never** run `gc --prune` or `loop --force` to defeat the `~/.mindhive/LIVE_LOCK`
+guard on the user's behalf; those are refused while V17 is live-trading for a reason.
+
+## Operating from the local dashboard — the visual companion to the CLI
+
+Everything above is also drivable from one window. When the user would rather *watch*
+than read terminal output — or when a run should be observable live — bring up the
+dashboard and narrate from it.
+
+**Launch it.**
+```
+python -m mindhive dashboard
+```
+Starts a localhost web app bound to `127.0.0.1` on the fixed port `54461` (stable URL;
+pass `--port 0` for an ephemeral port, `--no-browser` to not auto-open). A real
+`loop`/`/circle` run opens it automatically so the autonomous loop can be watched.
+
+**The views the orchestrator leans on:**
+
+- **Skills & plugins** — a live inventory driven by Claude's own `installed_plugins.json`,
+  so installing/removing a plugin updates it instantly. Each skill has a click-through
+  detail pane (intended-use first), a **▶ call this skill** button (the visual twin of
+  `skills invoke`), and a **green/red** last-call indicator (the visual twin of
+  `skills status`). Opening this view auto-runs the stale-gated `plugins autoscan`, so
+  the Recommendation Matrix's catalog is always fresh. *Use it in Phase 2* to let the
+  user see the candidate skills and their track records while you present the matrix.
+
+- **Memory → Improvements** — the human face of the learning loop: recurring failures
+  rendered as lessons (root cause → prevention rule), each dismissible per card. The
+  **Reflect (learn from failures)** button (Heavy) turns unreflected incidents into
+  lessons via the `claude` CLI — the visual twin of `rules reflect`. *Use it in Phase 3/
+  execution* to show the user why a red skill is red, or to trigger reflection after a
+  batch of failures.
+
+- **Plugins scan** — a button that forces a catalog refresh from the panel (the twin of
+  `plugins scan`).
+
+**When to prefer the dashboard over the CLI:** when the value is *seeing* the memory or
+the skill track record (a graph, a green/red wall, an Improvements list) rather than
+reading a snippet. The dashboard and the CLI are the same data through two surfaces —
+this is the agent-user **parity** principle (Phase 2, Principle 1) embodied in MindHive
+itself, and it's why the ULT-IDEA "Visual Companion" step (1.3) can often point at the
+dashboard instead of building a throwaway mockup.
+
+## The learning loop in depth — how the orchestrator gets smarter every run
+
+The single most important thing the MindHive substrate adds to ULT-IDEA is that the
+whole pipeline **improves without a code change** — Principle 5 (Improvement Over Time)
+applied to the orchestrator itself. Here is the arc, end to end, so you can reason about
+where a given command sits in it:
+
+1. **Capture (live + backfill).** During a session, a Claude Code PostToolUse hook pipes
+   each tool result to `python -m mindhive hook post_tool_use`, which records tool calls
+   and failures into the ledger in real time. Anything the live hook misses is backfilled
+   later by `python -m mindhive failures capture --transcripts <dir>` / `harvest`. This is
+   why `recall`, `state`, and `skills status` have fresh data to serve.
+
+2. **Accumulate into signatures.** Repeated failures collapse into a *signature* (e.g.
+   `edit:not-read`, or `skill:<name>` for a failed skill invocation). `failures list` and
+   `rules list` show these ranked by occurrence; once a signature crosses the recurrence
+   threshold it flips from `candidate` to `active`.
+
+3. **Reflect into a prevention rule.** `rules reflect` (or the dashboard **Reflect**
+   button) distills each active signature into a durable lesson: root cause + a concrete
+   prevention rule + a category. `rules summaries` reads these back; `rules show
+   "<signature>"` prints one in full.
+
+4. **Inject the rule into the next run.** The active rules ride along in the auto-loaded
+   briefing (after `sync`) and via `rules inject`. This is how a mistake made once becomes
+   a constraint the orchestrator honors thereafter — for instance, the `edit:not-read`
+   rule is exactly why this skill Reads a file before Editing it.
+
+5. **Gate execution on the record.** A failed `skills invoke` writes a `tool_failed` event
+   with a `skill:<name>` signature and turns that skill's dashboard indicator red, so the
+   next Recommendation Matrix scores it lower and `rules show` explains why. A skill that
+   fails **teaches the system a rule that protects the next run.**
+
+**Worked micro-example.** Suppose an execution skill `foo:bar` fails twice. `skills status`
+now shows `foo:bar: fail`; `failures list` shows `2x [active] skill:foo:bar`. You run
+`rules reflect`, then `rules show "skill:foo:bar"` and read: *"root cause: invoked without
+`--plugin`, name collided; rule: always pass `--plugin foo`."* On the next `/mindhive`
+run that would use `foo:bar`, the matrix flags it red, you apply the rule, invoke it as
+`skills invoke bar --plugin foo`, it succeeds, and the indicator returns to green. No code
+changed — the orchestrator simply got smarter. **This loop is the reason the fusion is
+more than ULT-IDEA-with-a-memory: it is ULT-IDEA on a substrate that compounds.**
+
 ---
 ---
 
@@ -1663,6 +1883,113 @@ so the next `/mindhive` is smarter:
 Only append when something **memorable** actually happened. A smooth, unremarkable run
 writes nothing — do not create noise events. End by running `python -m mindhive sync`
 so next session's briefing reflects the new lessons.
+
+## A complete worked example — `/mindhive` from idea to learned lesson
+
+To show the fusion end-to-end, here is a full run. The user types:
+
+> `/mindhive add a "resend verification email" button to the account settings page`
+
+This walks through every seam — Step 0, the recall preflight, the ULT-IDEA canvas gates,
+the Recommendation Matrix, execution, and the learning write-back — with the actual
+commands and how each result changes what you do. It is illustrative, not a script to
+run verbatim; adapt the queries and skill names to the real idea and the live registry.
+
+### 0. Resolve the interpreter (Step 0), then preflight (Requirement 1)
+
+```
+python -m mindhive state        # → "Python was not found" (Store shim) → fall through
+C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive state   # → prints STATE.md ✓
+```
+The venv form works, so that prefix is used for everything below. STATE shows the active
+task and no open questions about email — nothing pre-answered yet. Now recall the topic:
+
+```
+… -m mindhive recall "verification email resend"
+… -m mindhive recall "email delivery" --semantic
+… -m mindhive graph related "account settings" --depth 1
+```
+Suppose `recall` returns a `caveat` snippet: *"SMTP provider rate-limits resends to 1/min;
+a prior naive resend button triggered a lockout."* and `graph related` returns the file
+`account/settings_view.py` plus a decision *"verification tokens expire in 30 min."*
+**This is the whole point of the fusion:** before asking the user anything, you already
+know (a) there is a rate-limit landmine, (b) which file owns the behavior, and (c) the
+token lifetime. You will *not* ask "how often can users resend?" — the ledger answered it.
+
+### 1. ULT-IDEA canvas — validate, don't just build
+
+- **Diagnose scope (1.0):** a single button on an existing page → **Lightweight system.**
+  Skip Phase 2's full review; do a brief Phase 2.5; run Phase 3. Ask the user only the one
+  genuinely user-owned question the ledger didn't settle (e.g. *"Should the button be
+  disabled with a countdown after a send, or show a 'try again in 1 min' message?"*),
+  leading with your recommended answer (countdown — it makes the rate-limit visible).
+- **Five-gap pressure test (1.2):** Evidence and Counterfactual are already filled from
+  recall (there was a prior attempt; the current workaround is "email support"). You
+  confirm the Specificity and Attachment gaps briefly with the user.
+- **Requirements doc (1.6):** write it, calling out the rate-limit as a hard constraint and
+  the 30-min token expiry as a dependency — both lifted from the ledger, not guessed.
+- **Phase 2.5 (brief):** approval gate = "sending an email is High-stakes / Hard-to-reverse
+  → the button must debounce and respect the 1/min server limit." Context injection: none new.
+- **Phase 3:** sharpen "resend" (does it mint a *new* token or re-send the *existing* one?
+  → new token, old invalidated — lock it in CONTEXT.md). Cross-reference the code:
+  `graph related` already handed you `account/settings_view.py`; open it and confirm the
+  existing send path. Testing strategy: capability (button sends), edge case (spam-click →
+  one email, countdown shown), integration (new token validates, old one 401s).
+- **HARD-GATE:** present the spec, get explicit approval. **No skill is invoked before this.**
+
+### 2. Recommendation Matrix — grounded in the plugin/skill DB
+
+```
+… -m mindhive skills list           # candidate names must come from here
+… -m mindhive plugins recommend     # breadth scores to break ties
+… -m mindhive skills status         # green/red track record
+```
+You shortlist from what's actually installed and score each:
+
+| Skill | Suitability | Compat | Success (est.) | Risk | Speed | Cost | Verdict |
+|-------|-------------|--------|----------------|------|-------|------|---------|
+| `compound-engineering:ce-work` | High | High | 85% (est.) | Local | Moderate | Heavy | **Use** — executes the small change |
+| `compound-engineering:ce-code-review` | High | High | 88% (est.) | None | Fast | Moderate | **Use as follow-up** — verify the debounce |
+| `security-scanning:security-sast` | Medium | High | 80% (est.) | None | Moderate | Moderate | **Use as follow-up** — it touches auth tokens |
+
+If `skills status` had shown `ce-work: fail`, you'd run
+`… -m mindhive rules show "skill:compound-engineering:ce-work"`, apply its rule, and note
+that in the verdict. Present the matrix; the user approves the selection.
+
+### 3. Execute, then chain
+
+Invoke the chosen skill (Skill tool in-session, or through MindHive when it should be
+driven headlessly and watched on the dashboard):
+```
+… -m mindhive skills invoke ce-work --plugin compound-engineering    # exit 0 = ok
+```
+Because the change touches auth tokens and sends email, you proactively recommend the
+follow-up chain from Step B: a **code-review** pass (verify the debounce and the
+old-token invalidation) and a **security** pass (token minting). Each with a one-line
+rationale. The user picks both; you invoke them the same way and gate on exit codes.
+
+### 4. Log the learnings back
+
+The run surfaced one genuinely memorable thing — the ledger's rate-limit caveat saved a
+re-discovery — and one new preference. Write them and sync:
+```
+… -m mindhive append experiment_result "recall surfaced the SMTP 1/min rate-limit caveat; designed the debounce up front instead of hitting the lockout again" --tags orchestrator,email
+… -m mindhive append decision "Preference: resend mints a new token and invalidates the old one" --tags orchestrator,preference
+… -m mindhive sync
+```
+Now the *next* `/mindhive` that touches email starts one step smarter — which is exactly
+the compounding the fusion exists to produce. Had the run been unremarkable, you'd write
+nothing.
+
+### What this example demonstrates about the fusion
+
+- **Requirement 1 in action:** three preflight commands answered three interview questions
+  *before* the user was asked anything.
+- **The plugin/skill DB, not intuition,** produced the candidate list and the tie-breaks.
+- **The learning loop** both *fed* the run (the rate-limit caveat) and was *fed by* it (the
+  new preference) — the arc from "The learning loop in depth" closed in a single session.
+- **ULT-IDEA's rigor was untouched:** scope diagnosis, five gaps, HARD-GATE, CONTEXT.md,
+  and testing all ran; MindHive just made each step faster and memory-aware.
 
 ## Context management: monitor and hand off at ~50%
 
