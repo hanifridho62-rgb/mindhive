@@ -122,7 +122,8 @@ watched live.
 | Command | For what |
 |---------|----------|
 | `loop [init\|status] [--dry-run] [--live] [--force] [--no-dashboard]` | Run an autonomous Claude Code loop until done (the engine behind `/circle`); memory-seeded each iteration, budget/context gated. |
-| `harvest [--transcripts DIR --project P \| --catch-up]` | Capture events from Claude Code transcripts (no hooks needed). |
+| `hook post_tool_use` (reads stdin) | The **live** capture path: a Claude Code PostToolUse hook pipes its JSON payload here and MindHive records the tool call/failure into the ledger in real time. This is what silently populates the memory the orchestrator recalls from — you rarely call it by hand, but it's why the ledger is fresh. |
+| `harvest [--transcripts DIR --project P \| --catch-up]` | The **backfill** capture path (complement to `hook`): scan Claude Code transcripts and record sessions the live hook missed — no hooks needed. |
 | `autosync [register …]` / `autosync` | Registry-driven harvest + project + briefing + graph + sync for registered projects. |
 | `review queue/clear/show` | The thermo-nuclear review queue for touched source files. |
 | `embed [--force]` · `gc [--prune …]` · `selftest` | Build the vector index; store hygiene; run the test suite. |
