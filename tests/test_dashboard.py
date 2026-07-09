@@ -1318,3 +1318,13 @@ def test_task_detail_degrades_without_transcript(dashboard_server):
     assert status == 200
     obj = json.loads(body)
     assert obj["error"] == "transcript_unavailable" and obj["items"] == []
+
+
+def test_root_page_includes_task_cards_fragments(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "renderTaskCards" in body        # injected JS arrived
+    assert ".tcard" in body                 # injected CSS arrived
+    assert "__TASKS_JS__" not in body       # placeholders were replaced
+    assert "__TASKS_CSS__" not in body

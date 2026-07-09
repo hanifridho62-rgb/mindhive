@@ -522,7 +522,11 @@ def make_handler(token: str):
             parsed = urlparse(self.path)
             route = parsed.path
             if route == "/":
-                return self._send(200, render_page(token), "text/html; charset=utf-8")
+                return self._send(200,
+                                  render_page(token,
+                                              tasks_css=taskview.CARDS_CSS,
+                                              tasks_js=taskview.CARDS_JS),
+                                  "text/html; charset=utf-8")
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             handler = self._GET_ROUTES.get(route)

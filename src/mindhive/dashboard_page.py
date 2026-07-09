@@ -9,7 +9,7 @@ document string. No sibling-module dependencies."""
 import json
 
 
-def render_page(token: str) -> str:
+def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -89,6 +89,7 @@ def render_page(token: str) -> str:
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
+  /*__TASKS_CSS__*/
 </style></head>
 <body>
 <header>
@@ -562,18 +563,8 @@ def render_page(token: str) -> str:
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }
 
-  // --- Sessions: the episode layer; click one to scope Memory to it ---
-  async function renderSessions(){
-    const items = await apiGet('/api/sessions');
-    if (!items.length) { showText('No sessions yet.'); return; }
-    showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
-      + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
-          + '<div class="file">'+(PROJECT==='*' && s.project ? esc(s.project)+' · ' : '')+esc(s.session_id)+'</div>'
-          + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
-          + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
-      + '</ul>');
-    view.querySelectorAll('.sessrow').forEach(el => el.onclick = () => openSession(el.dataset.sid));
-  }
+  // --- Sessions: rendered by the notification-center fragment (taskview.py).
+  async function renderSessions(){ return renderTaskCards(); }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
@@ -899,7 +890,11 @@ def render_page(token: str) -> str:
     run(label+' running…', async () => showText(await apiPost(path, body)));
   }
 
+  //__TASKS_JS__
+
   // populate the project picker, then land on the overview
   (async () => { await loadProjects(); showOverview(); })();
 </script>
-</body></html>""".replace("__TOKEN__", json.dumps(token))
+</body></html>""".replace("__TOKEN__", json.dumps(token)) \
+    .replace("/*__TASKS_CSS__*/", tasks_css) \
+    .replace("//__TASKS_JS__", tasks_js)
