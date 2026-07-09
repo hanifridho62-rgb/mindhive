@@ -138,6 +138,11 @@ def _items_from_obj(o) -> list:
                         if isinstance(desc, str) and desc.strip():
                             item["desc"] = desc.strip()[:hookcapture.DESC_MAX]
                         items.append(item)
+                elif name == "Skill":
+                    sk = inp.get("skill")
+                    if isinstance(sk, str) and sk.strip():
+                        items.append({"kind": "invoke_result",
+                                      "value": sk.strip()})
         # Capture Claude's prose response too, so the OUTPUT enters the hive
         # alongside the prompt. Tool-only turns have no text and are skipped.
         resp = _user_text(content).strip()
@@ -235,6 +240,9 @@ def _event_for_item(item):
         if "desc" in item:
             payload["desc"] = item["desc"]
         return "command_run", payload, ["harvest", "auto"]
+    if kind == "invoke_result":
+        return "invoke_result", {"text": item["value"],
+                                 "name": item["value"]}, ["harvest", "auto"]
     if kind == "memo":
         return item["memo_type"], {"text": item["value"]}, ["harvest", "memo"]
     if kind == "user_prompt":

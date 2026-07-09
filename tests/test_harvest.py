@@ -484,3 +484,19 @@ def test_event_for_item_passes_extra_keys_but_text_is_unchanged():
     etype2, payload2, _ = harvest._event_for_item(
         {"kind": "command_run", "value": "pytest -q", "desc": "Run tests"})
     assert payload2 == {"text": "pytest -q", "desc": "Run tests"}
+
+
+# --- Skill invocation capture (SE Task 2: retroactive back-fill) ---
+
+def test_harvest_captures_skill_invocations():
+    o = json.loads(_tooluse("Skill", {"skill": "mindhive:circle"}))
+    assert harvest._items_from_obj(o) == [
+        {"kind": "invoke_result", "value": "mindhive:circle"}]
+
+
+def test_event_for_item_maps_invoke_result():
+    etype, payload, tags = harvest._event_for_item(
+        {"kind": "invoke_result", "value": "mindhive:circle"})
+    assert etype == "invoke_result"
+    assert payload == {"text": "mindhive:circle", "name": "mindhive:circle"}
+    assert tags == ["harvest", "auto"]
