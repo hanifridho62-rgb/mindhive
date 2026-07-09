@@ -60,9 +60,9 @@ This skill is the fusion of two disciplines:
 7. [Phase 1: Explore (Validate Idea)](#phase-1)
 8. [Phase 2: Agent-Native Architecture Review (If System)](#phase-2)
 9. [Phase 2.5: Architecture Decision Checkpoint](#phase-2-5)
-10. [Phase S: Skill Selection & Recommendation Matrix](#phase-s)
-11. [Phase X: Execute & Chain](#phase-x)
-12. [Phase 3: Interrogate & Sharpen](#phase-3)
+10. [Phase 3: Interrogate & Sharpen](#phase-3)
+11. [Phase S: Skill Selection & Recommendation Matrix](#phase-s)
+12. [Phase X: Execute & Chain](#phase-x)
 13. [Phase L: Learning Loop & Log-Back](#phase-l)
 14. [Communication Rules](#communication-rules)
 15. [Anti-Leak Protection](#anti-leak)
@@ -431,18 +431,7 @@ START: User presents an idea  (/mindhive [idea])
    ├─ append decision for each locked choice (memory)
    └─ LOCK ARCHITECTURE DECISIONS
   ↓
-6. PHASE S: SKILL SELECTION & RECOMMENDATION MATRIX   ◄── orchestrator core
-   ├─ skills list / status / stats  (live inventory + measured telemetry)
-   ├─ score 2-4 candidates on 7 parameters
-   ├─ before a red skill: rules show "skill:<name>", apply the lesson
-   └─ present matrix, get selection approval
-  ↓
-7. PHASE X: EXECUTE & CHAIN
-   ├─ invoke selected skill(s) (Skill tool, or skills invoke for headless)
-   ├─ record outcome (skills record --ok/--fail)
-   └─ chain follow-up quality passes with a rationale each
-  ↓
-8. PHASE 3: INTERROGATE & SHARPEN (Always)
+6. PHASE 3: INTERROGATE & SHARPEN (Always)   ◄── completes the design; clears Anti-Leak HARD-GATE #2
    ├─ Eliminate fuzzy language → canonical terms
    ├─ Test with 3-5 concrete scenarios + edge cases
    ├─ Cross-reference with code AND the ledger
@@ -450,6 +439,17 @@ START: User presents an idea  (/mindhive [idea])
    ├─ Write ADRs (only if 3-part test passes)
    ├─ Define testing strategy (what proves this works)
    └─ USER FINAL APPROVAL of complete spec
+  ↓
+7. PHASE S: SKILL SELECTION & RECOMMENDATION MATRIX   ◄── orchestrator core (design is now locked)
+   ├─ skills list / status / stats  (live inventory + measured telemetry)
+   ├─ score 2-4 candidates on 7 parameters
+   ├─ before a red skill: rules show "skill:<name>", apply the lesson
+   └─ present matrix, get selection approval
+  ↓
+8. PHASE X: EXECUTE & CHAIN   ◄── implementation begins only after the gate cleared in Phase 3
+   ├─ invoke selected skill(s) (Skill tool, or skills invoke for headless)
+   ├─ record outcome (skills record --ok/--fail)
+   └─ chain follow-up quality passes with a rationale each
   ↓
 9. PHASE L: LEARNING LOOP & LOG-BACK
    ├─ record mistakes/inefficiencies/preferences (append caveat/experiment_result/decision)
@@ -1176,160 +1176,6 @@ context layer.
 
 ---
 
-## <a name="phase-s"></a>Phase S: Skill Selection & Recommendation Matrix
-
-This is the orchestrator's core contribution to the fusion: once the design is
-validated and (for systems) the architecture is locked, choose the **skills**
-that will execute the work — deliberately, auditably, and anchored on measured
-outcomes rather than a hidden guess.
-
-**Run this phase when** the validated idea implies execution (building code,
-running a migration, producing an artifact) and installed skills can do that
-work. For pure design-and-handoff engagements (the user only wanted the spec),
-skip Phase S and Phase X and go straight to Phase 3.
-
-### S.0 Read the live inventory and measured telemetry
-
-Before scoring anything, gather ground truth:
-
-- `python -m mindhive skills list` — the live, registry-truth inventory of
-  installed plugins and skills. This is what is *actually* callable right now.
-- `python -m mindhive skills status` — the green/red last-call outcome per skill.
-  Green = last invocation succeeded; red = last invocation failed.
-- `python -m mindhive skills stats` — per-skill completion-rate telemetry from the
-  ledger. This is *measured* signal; use it to anchor the success-probability
-  column.
-- `python -m mindhive skills recommend` — a deterministic most-needed-skills
-  ranking derived from measured data, useful as a sanity check on your shortlist.
-
-**Hard sourcing rule.** Candidate skills come from the session's available-skills
-list (and `skills list`), **verbatim**. Never present a skill name that is not in
-that inventory — no remembered names, no guesses, no "there's probably a skill
-for X." The available-skills list is the only authoritative runtime registry.
-
-### S.1 Score 2–4 candidates on seven parameters
-
-Shortlist 2–4 genuinely plausible candidates (do not pad the matrix). For each,
-run `python -m mindhive recall "<skill name>"` (add `--semantic` if literal
-recall is thin) to surface prior outcomes with that skill, and let the ledger
-history inform the scores. Score each on all seven parameters using the anchored
-scales in
-[references/recommendation-matrix.md](references/recommendation-matrix.md):
-
-| Parameter | Meaning |
-|-----------|---------|
-| **Suitability** | How well the skill matches *this* task (High / Medium / Low) |
-| **Compatibility** | Fit with the stack and the other skills in the chain (High / Medium / Low) |
-| **Probability of success** | A % — anchored on `skills stats` when measured, else labeled `(est.)` |
-| **Risk level** | Worst-case blast radius (None / Local / Repo-wide / Destructive) |
-| **Execution speed** | Fast / Moderate / Slow |
-| **Resource cost** | Light / Moderate / Heavy |
-| **Final verdict** | Use / Use as follow-up / Hold / Skip, plus one clause of why |
-
-Render the comparison as a compact table (scans fastest):
-
-```markdown
-| Skill | Suitability | Compatibility | Success | Risk | Speed | Cost | Verdict |
-|-------|-------------|---------------|---------|------|-------|------|---------|
-| ce-plan | High | High | 90% (est.) | None | Moderate | Moderate | **Use** — built for structured planning |
-| ce-work | High | High | 85% (measured) | Local | Moderate | Heavy | **Use** — executes the plan |
-| ce-code-review | High | High | 88% (measured) | None | Fast | Moderate | **Use as follow-up** — verify before ship |
-```
-
-### S.2 The learn-from-mistakes gate
-
-**Before recommending or invoking any candidate that shows `fail` (red) in
-`skills status`, read its prevention lesson and apply it:**
-
-```bash
-python -m mindhive rules show "skill:<name>"
-```
-
-The lesson tells you *why* it failed last time and the prevention rule to apply.
-Prefer skills showing green; treat red as "fix or avoid, with a reason." This is
-the learning loop closing on the selection side — the system already paid for the
-failure, so you don't repeat it. If the ledger shows a past failure with a
-candidate, reflect it in the score and say so in the verdict clause; do not bury
-known history.
-
-### S.3 Present and get approval
-
-Present the matrix, state your recommended selection in one or two sentences, and
-get the user's approval (or revision) before executing. If no candidate scores
-well, say the idea may need a different route (e.g., `/ce-brainstorm` or
-`/ce-plan` first) rather than forcing a weak recommendation.
-
-**Honesty guardrails.** Every percentage without measured backing carries
-`(est.)`. Never present an estimate as a measured success rate — `skills stats`
-provides real completion rates for skills that have been measured; everything
-else is a model estimate and must be labeled as such.
-
----
-
-## <a name="phase-x"></a>Phase X: Execute & Chain
-
-With the selection approved, execute — then chain the quality passes that turn a
-first draft into finished work.
-
-### X.0 Two invocation channels
-
-- **In-agent Skill tool (default on interactive surfaces).** Invoke the selected
-  skill directly with the Skill/Task primitive. This is the normal path in Claude
-  Code, Cowork, and NewTask when you are driving interactively.
-- **The MindHive invoke channel (`skills invoke`).** When execution should be
-  driven by MindHive itself — inside `/circle`, a headless run, or when the
-  dashboard shows live status — call
-  `python -m mindhive skills invoke <name> [--plugin <p>]`. It runs the skill via
-  a headless `claude` and records the outcome. Exit code is `0` on success and
-  `1` on failure, so you can gate the next step on it.
-
-Use the in-agent channel by default; use the invoke channel when you need
-recorded, exit-code-gated, headless execution.
-
-### X.1 Record the outcome (feed the learning loop)
-
-Every execution writes an outcome so the next run is smarter:
-
-```bash
-# success:
-python -m mindhive skills record <name> --ok --note "<what it produced>"
-# failure:
-python -m mindhive skills record <name> --fail --note "<how it failed>"
-```
-
-A `--fail` writes a `tool_failed` event with a `skill:<name>` signature, which
-flows automatically into the incidents → reflect → Improvements pipeline. So a
-skill that fails or returns poorly **teaches the system a prevention rule**, and
-its dashboard indicator turns red until it succeeds again. (When you use
-`skills invoke`, the outcome is recorded for you; use `skills record` for
-in-agent Skill-tool executions you want reflected in telemetry.)
-
-### X.2 Chain the follow-up quality passes
-
-When execution finishes, **do not stop** — proactively recommend the follow-up
-chain that guarantees quality. Resolve every skill name against the
-available-skills list; give a one-line **rationale** for each (why it refines the
-architecture or de-risks the deployment). Recommend; let the user choose which to
-chain.
-
-| Work just done | Recommended follow-up (resolve against available-skills list) | Rationale |
-|----------------|---------------------------------------------------------------|-----------|
-| New/changed code | a code-review skill (e.g. `compound-engineering:ce-code-review`), then `compound-engineering:ce-simplify-code` | Catch correctness bugs, then delete needless complexity |
-| Auth / payments / input handling / external APIs | a security skill (e.g. `security-scanning:security-sast`, `compound-engineering:ce-security-reviewer`) | High blast-radius surfaces earn an explicit security pass |
-| Bug-shaped or flaky behavior | `compound-engineering:ce-debug`, `superpowers:systematic-debugging` | Root-cause it instead of patching symptoms |
-| UI / frontend | `compound-engineering:ce-test-browser`, `ui-design:accessibility-audit` | Prove it works in a real browser and is accessible |
-| About to ship | `compound-engineering:ce-commit-push-pr` | Land it cleanly with a proper PR |
-
-### X.3 Green/red and self-healing
-
-Prefer skills showing green in `skills status`. Before invoking a red one, apply
-its prevention rule (`rules show "skill:<name>"`). Every failed invoke is a
-`tool_failed` event feeding the incidents → reflect → Improvements pipeline — the
-system self-heals by learning a rule from each failure. Treat a red indicator as
-"fix or avoid, with a reason," never as "run it again and hope."
-
----
-
 ## <a name="phase-3"></a>Phase 3: Interrogate & Sharpen (Mandatory for All Projects)
 
 **Objective:** Eliminate ambiguity, test edge cases, lock down terminology, define testing strategy, and prepare for handoff to implementation.
@@ -1587,6 +1433,169 @@ Ask the user to sign off on the complete spec:
 
 Wait for explicit approval. Document their sign-off.
 
+**▸ Where this leads.** This sign-off is the moment the Anti-Leak HARD-GATE #2
+clears — the full design (Phases 1, 2, 2.5, and 3) is now sound. Route from here:
+for a **design-and-handoff** engagement, hand off to IMPLEMENTATION-READINESS and
+proceed to Phase L. For an **execute** engagement, continue to **Phase S (Skill
+Selection)** — only now, with the gate cleared, may skills be selected and
+invoked.
+
+---
+
+## <a name="phase-s"></a>Phase S: Skill Selection & Recommendation Matrix
+
+This is the orchestrator's core contribution to the fusion: once the design is
+validated, sharpened through Phase 3, and (for systems) the architecture is
+locked — so the Anti-Leak HARD-GATE has cleared — choose the **skills** that will
+execute the work, deliberately, auditably, and anchored on measured outcomes
+rather than a hidden guess.
+
+**Run this phase when** the validated idea implies execution (building code,
+running a migration, producing an artifact) and installed skills can do that
+work. For pure design-and-handoff engagements (the user only wanted the spec),
+skip Phase S and Phase X — the workflow is already complete at the end of
+Phase 3; hand off to IMPLEMENTATION-READINESS and proceed to Phase L.
+
+### S.0 Read the live inventory and measured telemetry
+
+Before scoring anything, gather ground truth:
+
+- `python -m mindhive skills list` — the live, registry-truth inventory of
+  installed plugins and skills. This is what is *actually* callable right now.
+- `python -m mindhive skills status` — the green/red last-call outcome per skill.
+  Green = last invocation succeeded; red = last invocation failed.
+- `python -m mindhive skills stats` — per-skill completion-rate telemetry from the
+  ledger. This is *measured* signal; use it to anchor the success-probability
+  column.
+- `python -m mindhive skills recommend` — a deterministic most-needed-skills
+  ranking derived from measured data, useful as a sanity check on your shortlist.
+
+**Hard sourcing rule.** Candidate skills come from the session's available-skills
+list (and `skills list`), **verbatim**. Never present a skill name that is not in
+that inventory — no remembered names, no guesses, no "there's probably a skill
+for X." The available-skills list is the only authoritative runtime registry.
+
+### S.1 Score 2–4 candidates on seven parameters
+
+Shortlist 2–4 genuinely plausible candidates (do not pad the matrix). For each,
+run `python -m mindhive recall "<skill name>"` (add `--semantic` if literal
+recall is thin) to surface prior outcomes with that skill, and let the ledger
+history inform the scores. Score each on all seven parameters using the anchored
+scales in
+[references/recommendation-matrix.md](references/recommendation-matrix.md):
+
+| Parameter | Meaning |
+|-----------|---------|
+| **Suitability** | How well the skill matches *this* task (High / Medium / Low) |
+| **Compatibility** | Fit with the stack and the other skills in the chain (High / Medium / Low) |
+| **Probability of success** | A % — anchored on `skills stats` when measured, else labeled `(est.)` |
+| **Risk level** | Worst-case blast radius (None / Local / Repo-wide / Destructive) |
+| **Execution speed** | Fast / Moderate / Slow |
+| **Resource cost** | Light / Moderate / Heavy |
+| **Final verdict** | Use / Use as follow-up / Hold / Skip, plus one clause of why |
+
+Render the comparison as a compact table (scans fastest):
+
+```markdown
+| Skill | Suitability | Compatibility | Success | Risk | Speed | Cost | Verdict |
+|-------|-------------|---------------|---------|------|-------|------|---------|
+| ce-plan | High | High | 90% (est.) | None | Moderate | Moderate | **Use** — built for structured planning |
+| ce-work | High | High | 85% (measured) | Local | Moderate | Heavy | **Use** — executes the plan |
+| ce-code-review | High | High | 88% (measured) | None | Fast | Moderate | **Use as follow-up** — verify before ship |
+```
+
+### S.2 The learn-from-mistakes gate
+
+**Before recommending or invoking any candidate that shows `fail` (red) in
+`skills status`, read its prevention lesson and apply it:**
+
+```bash
+python -m mindhive rules show "skill:<name>"
+```
+
+The lesson tells you *why* it failed last time and the prevention rule to apply.
+Prefer skills showing green; treat red as "fix or avoid, with a reason." This is
+the learning loop closing on the selection side — the system already paid for the
+failure, so you don't repeat it. If the ledger shows a past failure with a
+candidate, reflect it in the score and say so in the verdict clause; do not bury
+known history.
+
+### S.3 Present and get approval
+
+Present the matrix, state your recommended selection in one or two sentences, and
+get the user's approval (or revision) before executing. If no candidate scores
+well, say the idea may need a different route (e.g., `/ce-brainstorm` or
+`/ce-plan` first) rather than forcing a weak recommendation.
+
+**Honesty guardrails.** Every percentage without measured backing carries
+`(est.)`. Never present an estimate as a measured success rate — `skills stats`
+provides real completion rates for skills that have been measured; everything
+else is a model estimate and must be labeled as such.
+
+---
+
+## <a name="phase-x"></a>Phase X: Execute & Chain
+
+With the selection approved, execute — then chain the quality passes that turn a
+first draft into finished work.
+
+### X.0 Two invocation channels
+
+- **In-agent Skill tool (default on interactive surfaces).** Invoke the selected
+  skill directly with the Skill/Task primitive. This is the normal path in Claude
+  Code, Cowork, and NewTask when you are driving interactively.
+- **The MindHive invoke channel (`skills invoke`).** When execution should be
+  driven by MindHive itself — inside `/circle`, a headless run, or when the
+  dashboard shows live status — call
+  `python -m mindhive skills invoke <name> [--plugin <p>]`. It runs the skill via
+  a headless `claude` and records the outcome. Exit code is `0` on success and
+  `1` on failure, so you can gate the next step on it.
+
+Use the in-agent channel by default; use the invoke channel when you need
+recorded, exit-code-gated, headless execution.
+
+### X.1 Record the outcome (feed the learning loop)
+
+Every execution writes an outcome so the next run is smarter:
+
+```bash
+# success:
+python -m mindhive skills record <name> --ok --note "<what it produced>"
+# failure:
+python -m mindhive skills record <name> --fail --note "<how it failed>"
+```
+
+A `--fail` writes a `tool_failed` event with a `skill:<name>` signature, which
+flows automatically into the incidents → reflect → Improvements pipeline. So a
+skill that fails or returns poorly **teaches the system a prevention rule**, and
+its dashboard indicator turns red until it succeeds again. (When you use
+`skills invoke`, the outcome is recorded for you; use `skills record` for
+in-agent Skill-tool executions you want reflected in telemetry.)
+
+### X.2 Chain the follow-up quality passes
+
+When execution finishes, **do not stop** — proactively recommend the follow-up
+chain that guarantees quality. Resolve every skill name against the
+available-skills list; give a one-line **rationale** for each (why it refines the
+architecture or de-risks the deployment). Recommend; let the user choose which to
+chain.
+
+| Work just done | Recommended follow-up (resolve against available-skills list) | Rationale |
+|----------------|---------------------------------------------------------------|-----------|
+| New/changed code | a code-review skill (e.g. `compound-engineering:ce-code-review`), then `compound-engineering:ce-simplify-code` | Catch correctness bugs, then delete needless complexity |
+| Auth / payments / input handling / external APIs | a security skill (e.g. `security-scanning:security-sast`, `compound-engineering:ce-security-reviewer`) | High blast-radius surfaces earn an explicit security pass |
+| Bug-shaped or flaky behavior | `compound-engineering:ce-debug`, `superpowers:systematic-debugging` | Root-cause it instead of patching symptoms |
+| UI / frontend | `compound-engineering:ce-test-browser`, `ui-design:accessibility-audit` | Prove it works in a real browser and is accessible |
+| About to ship | `compound-engineering:ce-commit-push-pr` | Land it cleanly with a proper PR |
+
+### X.3 Green/red and self-healing
+
+Prefer skills showing green in `skills status`. Before invoking a red one, apply
+its prevention rule (`rules show "skill:<name>"`). Every failed invoke is a
+`tool_failed` event feeding the incidents → reflect → Improvements pipeline — the
+system self-heals by learning a rule from each failure. Treat a red indicator as
+"fix or avoid, with a reason," never as "run it again and hope."
+
 ---
 
 ## <a name="phase-l"></a>Phase L: Learning Loop & Log-Back
@@ -1726,9 +1735,11 @@ reply. See [Compatibility & Portability](#compat).
 **This applies to EVERY project, regardless of perceived simplicity.**
 
 Only after all gates have been passed should the conversation move to
-implementation-focused tools, deployment, or coding — which in this fused skill
-means **Phase X (Execute & Chain)**. Phase S (skill selection) may be prepared in
-parallel with Phase 3, but no skill is *invoked* until this HARD-GATE clears.
+implementation-focused tools, deployment, or coding. This is exactly why the flow
+places **Phase 3 (Interrogate & Sharpen) before Phase S and Phase X**: Phase 3
+closes gate item 6, so the HARD-GATE has already cleared by the time skills are
+selected (Phase S) and invoked (Phase X). No skill is invoked until the design is
+sound — the ordering enforces it rather than relying on a caveat.
 
 **Two gates, one discipline.** HARD-GATE #1 (recall before you ask) governs the
 *front* of the workflow; HARD-GATE #2 (no implementation before approval) governs
@@ -1899,8 +1910,8 @@ mark.
 
 ### When to check
 
-Check at **every phase boundary** (preflight→1, 1→2, 2→2.5, 2.5→S, S→X, X→3,
-3→L), never mid-question. Phase boundaries are cheap, natural pause points;
+Check at **every phase boundary** (preflight→1, 1→2, 2→2.5, 2.5→3, 3→S, S→X,
+X→L), never mid-question. Phase boundaries are cheap, natural pause points;
 interrupting an interview question to talk about context would be worse than the
 problem.
 
