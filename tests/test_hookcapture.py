@@ -103,6 +103,21 @@ def test_extract_ignores_unknown_tools_and_missing_fields():
     assert hookcapture.extract_events({}) == []
 
 
+def test_extract_skill_invocation_as_invoke_result():
+    payload = {"tool_name": "Skill",
+               "tool_input": {"skill": "superpowers:brainstorming",
+                              "args": "topic x"}}
+    out = hookcapture.extract_events(payload)
+    assert out == [("invoke_result",
+                    {"text": "superpowers:brainstorming",
+                     "name": "superpowers:brainstorming"})]
+
+
+def test_extract_skill_without_name_is_ignored():
+    assert hookcapture.extract_events(
+        {"tool_name": "Skill", "tool_input": {}}) == []
+
+
 def test_record_appends_events_with_session_and_auto_tag():
     raw = json.dumps({"session_id": "sess-1", "tool_name": "Edit",
                       "tool_input": {"file_path": "a/b.py"}})

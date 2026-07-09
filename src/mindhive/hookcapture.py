@@ -87,6 +87,15 @@ def extract_events(payload) -> list:
         if isinstance(desc, str) and desc.strip():
             p["desc"] = desc.strip()[:DESC_MAX]
         return [("command_run", p)]
+    if tool == "Skill":
+        name = inp.get("skill")
+        if isinstance(name, str) and name.strip():
+            name = name.strip()
+            # PostToolUse fires after the tool ran; a skill whose execution
+            # later fails still surfaces via the tool_failed pipeline, so this
+            # records the invocation outcome the green/red view reads.
+            return [("invoke_result", {"text": name, "name": name})]
+        return []
     return []
 
 
