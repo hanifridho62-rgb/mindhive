@@ -68,12 +68,60 @@ def test_complexity_blank_lines_do_not_count():
     assert clusters.file_complexity("a = 1\n\n\nb = 2\n") == 2  # two non-blank LOC
 
 
+def test_complexity_tab_indentation_matches_four_space_equivalent():
+    # documented tabs=4-columns/4 normalization: a tab-indented file must score
+    # the same nesting depth as its 4-space-indented twin (Go/JS/Make use tabs)
+    tabbed = "def f():\n\tif x:\n\t\treturn 1\n"
+    spaced = "def f():\n    if x:\n        return 1\n"
+    assert clusters.file_complexity(tabbed) == clusters.file_complexity(spaced)
+
+
 # --- git_churn: guarded, never raises ---------------------------------------
 
 def test_git_churn_returns_zero_when_git_missing(monkeypatch):
     import shutil
     monkeypatch.setattr(shutil, "which", lambda _name: None)  # git "not on PATH"
     assert clusters.git_churn("anything.py", root=".") == 0
+
+
+def test_git_churn_counts_commit_lines_when_git_present(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/git")
+
+    class _R:
+        returncode = 0
+        stdout = "abc111 first\ndef222 second\n\n999aaa third\n"  # blank line ignored
+
+    monkeypatch.setattr(clusters.subprocess, "run", lambda *a, **k: _R())
+    assert clusters.git_churn("some/file.py", root=".") == 3
+
+
+def test_git_churn_returns_zero_on_nonzero_returncode(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/git")
+
+    class _R:
+        returncode = 128
+        stdout = "fatal: not a git repo\n"
+
+    monkeypatch.setattr(clusters.subprocess, "run", lambda *a, **k: _R())
+    assert clusters.git_churn("some/file.py", root=".") == 0
+
+
+def test_build_use_git_folds_churn_into_complexity(monkeypatch, tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("x = 1\n")
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/git")
+
+    class _R:
+        returncode = 0
+        stdout = "c1 a\nc2 b\n"          # churn weight = 2
+
+    monkeypatch.setattr(clusters.subprocess, "run", lambda *a, **k: _R())
+    without = clusters.build(root=tmp_path)["clusters"]["pkg"]["weight"]
+    withg = clusters.build(root=tmp_path, use_git=True)["clusters"]["pkg"]["weight"]
+    assert withg == without + 2          # --git churn is actually applied
 
 
 # --- shard_plan: file-ownership-safe, balanced partition --------------------
@@ -134,6 +182,18 @@ def test_shard_plan_empty_is_empty():
     assert clusters.shard_plan({}, {}, lanes=3) == []
 
 
+def test_shard_plan_zero_weight_clusters_still_fill_requested_lanes():
+    # dirs of all-blank files are weight-0 clusters; they must spread across the
+    # requested lanes, not clump into lane 0 and collapse the lane count.
+    clus = {"a": ["a/1.py"], "b": ["b/1.py"], "c": ["c/1.py"], "d": ["d/1.py"]}
+    weights = {"a": 10, "b": 0, "c": 0, "d": 0}
+    plan = clusters.shard_plan(clus, weights, lanes=4)
+    assert len(plan) == 4                                   # all four lanes used
+    assert all(lane["files"] for lane in plan)              # none empty
+    every = sorted(f for fs in clus.values() for f in fs)
+    assert sorted(f for lane in plan for f in lane["files"]) == every  # no loss
+
+
 # --- build + sidecar round-trip ---------------------------------------------
 
 def test_build_and_store_writes_roundtrippable_sidecar(tmp_path):
@@ -152,3 +212,17 @@ def test_build_and_store_writes_roundtrippable_sidecar(tmp_path):
 
 def test_latest_returns_none_before_any_build():
     assert clusters.latest() is None
+
+
+def test_latest_returns_none_on_corrupt_sidecar():
+    from mindhive import paths
+    p = paths.project_dir() / "cluster_db.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{ this is not valid json", encoding="utf-8")
+    assert clusters.latest() is None                    # graceful, not a crash
+
+
+def test_build_on_empty_repo_yields_no_lanes(tmp_path):
+    payload = clusters.build(root=tmp_path)             # no source files at all
+    assert payload["counts"] == {"files": 0, "clusters": 0, "lanes": 0}
+    assert payload["shard_plan"] == []

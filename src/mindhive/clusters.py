@@ -205,8 +205,12 @@ def shard_plan(clusters: dict[str, list[str]], weights: dict[str, int],
     plan = [{"lane": i, "clusters": [], "files": [], "est_complexity": 0}
             for i in range(n)]
     for key in ordered:
-        # lightest lane wins; tie-break on lane index for determinism
-        target = min(plan, key=lambda ln: (ln["est_complexity"], ln["lane"]))
+        # lightest lane wins; then the lane with the fewest clusters (so
+        # zero-weight clusters — e.g. dirs of empty files — spread across the
+        # empty lanes instead of clumping into lane 0 and collapsing the
+        # requested lane count); then lane index for determinism.
+        target = min(plan, key=lambda ln: (ln["est_complexity"],
+                                           len(ln["clusters"]), ln["lane"]))
         target["clusters"].append(key)
         target["files"].extend(clusters[key])
         target["est_complexity"] += int(weights.get(key, 0))

@@ -53,3 +53,15 @@ def test_clusters_show_before_build_is_graceful(capsys):
     ret = cli_mod.main(["clusters", "show"])
     assert ret == 0
     assert "no cluster_db yet" in capsys.readouterr().out
+
+
+def test_clusters_show_after_build_prints_clusters(tmp_path, capsys):
+    _seed_repo(tmp_path)
+    cli_mod.main(["clusters", "build", "--root", str(tmp_path)])
+    capsys.readouterr()                                    # drain the build output
+    ret = cli_mod.main(["clusters", "show"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "cluster DB from" in out
+    assert "weight" in out and "files" in out              # per-cluster detail line
+    assert "pkg" in out                                    # a real cluster key
