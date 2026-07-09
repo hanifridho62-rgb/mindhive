@@ -1254,3 +1254,67 @@ def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
     status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
     assert obj["reflected"] == 1 and obj["failed"] == 2
     assert obj["pending"] == 0                    # attempted-but-failed is not pending
+
+
+# --------------------------------------------------------------------------
+# Sessions notification center: /api/sessions activity+status, /api/task,
+# /api/task_detail
+# --------------------------------------------------------------------------
+
+
+def _seed_session(project="dashproj", sid="sess-t1"):
+    from mindhive import events
+    events.append_event("file_touched",
+                        {"text": "src/a.py", "plus": 5, "minus": 2, "tool": "Edit"},
+                        session_id=sid, project=project)
+    events.append_event("command_run",
+                        {"text": "pytest -q", "desc": "Run tests"},
+                        session_id=sid, project=project)
+    events.append_event("caveat", {"text": "plan FIRST"},
+                        session_id=sid, project=project)
+
+
+def test_sessions_carry_activity_and_status(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    status, body = _get(base, "/api/sessions?project=dashproj", token)
+    assert status == 200
+    (s,) = json.loads(body)
+    assert s["status"] in ("ongoing", "completed")
+    assert s["activity"]["files"] == 1
+    assert s["activity"]["plus"] == 5 and s["activity"]["minus"] == 2
+    assert s["activity"]["commands"] == 1 and s["activity"]["notes"] == 1
+
+
+def test_task_endpoint_returns_capped_rows(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    status, body = _get(base, "/api/task?project=dashproj&session=sess-t1", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["total"] == 3 and obj["truncated"] == 0
+    assert [r["kind"] for r in obj["items"]] == ["touched", "ran", "caveat"]
+
+
+def test_task_endpoint_hivemind_requires_session_project(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    try:
+        _get(base, "/api/task?project=*&session=sess-t1", token)
+        assert False, "expected 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+    status, body = _get(
+        base, "/api/task?project=*&session=sess-t1&session_project=dashproj",
+        token)
+    assert status == 200
+    assert json.loads(body)["total"] == 3
+
+
+def test_task_detail_degrades_without_transcript(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(
+        base, "/api/task_detail?project=dashproj&session=no-such-sess", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["error"] == "transcript_unavailable" and obj["items"] == []
