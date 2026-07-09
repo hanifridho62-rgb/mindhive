@@ -80,6 +80,11 @@ signature gates the rebuild). Every entry is:
   flows into the **Improvements** loop, so a bad call becomes a prevention rule
   the next run can consult. All installed skills are callable this way, not a
   hand-picked subset.
+- **Effectiveness-aware ranking.** Skill invocations are captured live (and
+  back-filled from transcripts), so recommendations blend coverage with a
+  measured success rate. A skill with ≥3 calls and <40 % success is demoted:
+  listed with its failure reason instead of recommended. No history = neutral
+  (unproven skills are neither boosted nor punished).
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:
