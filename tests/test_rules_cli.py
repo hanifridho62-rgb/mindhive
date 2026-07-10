@@ -89,8 +89,10 @@ _GOOD = ('{"root_cause": "rc", "lesson": "le", '
 
 
 def _seed_unreflected(n, project="test"):
+    # raw:* signatures: no deterministic fallback, so a failing runner leaves
+    # them unreflected — which the failing-runner CLI test depends on.
     for i in range(n):
-        sig = f"pymodule:batch{i}"
+        sig = f"raw:batch{i}"
         for s in ("s1", "s2"):
             events.append_event("tool_failed",
                                 {"text": "boom", "signature": sig, "action": "x"},

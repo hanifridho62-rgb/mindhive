@@ -477,25 +477,40 @@ def make_handler(token: str):
 
         def _get_skills_status(self, proj, am, qs):
             # status: green/red last outcome per skill; counts: total invokes —
-            # both derived from the ledger in a single pass
-            return self._json(plugins_mod.call_stats(project=proj))
+            # both derived from the ledger in a single pass. HIVE MIND merges
+            # every namespace's ledger, mirroring /api/improvements — skills
+            # telemetry must not read "*" as a literal (empty) namespace.
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_stats(project=proj, evs=evs))
 
         def _get_skills_history(self, proj, am, qs):
             name = (qs.get("name") or [""])[0]
             limit = int((qs.get("limit") or ["20"])[0])
-            return self._json(plugins_mod.call_history(name, project=proj, limit=limit))
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_history(name, project=proj,
+                                                       limit=limit, evs=evs))
 
         def _get_skills_stats(self, proj, am, qs):
             # per-skill completion-rate telemetry aggregated from the ledger
             # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
-            return self._json({"stats": plugins_mod.skill_stats(project=proj)})
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json({"stats": plugins_mod.skill_stats(project=proj,
+                                                                evs=evs)})
 
         def _get_skills_recommend(self, proj, am, qs):
             # deterministic most-needed-skills ranking (U6/KTD6): one ledger
-            # read feeds both the stats and the need extraction
+            # read feeds both the stats and the need extraction. HIVE MIND
+            # merges events AND incident summaries across every namespace.
             top = (qs.get("top") or [None])[0]
+            evs = summ = None
+            if am:
+                from . import incidents
+                evs = [e for _, e in all_event_pairs()]
+                summ = [s for n in _all_projects()
+                        for s in incidents.summaries(project=n)]
             return self._json(plugins_mod.recommend_for(
-                project=proj, top=int(top) if top else None))
+                project=proj, evs=evs, top=int(top) if top else None,
+                incident_summaries=summ))
 
         def _get_oversee(self, proj, am, qs):
             # Oversee: every kind of live Claude work — hive loop runs AND

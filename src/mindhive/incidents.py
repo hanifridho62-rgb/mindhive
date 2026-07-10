@@ -480,7 +480,8 @@ def _active_rule_for(signature, project):
 
 def promote(signature, project=None) -> dict:
     """Append a signature's Active rule to the canonical SOUL.md and mark the
-    incident promoted. The only write to canonical memory (human-invoked)."""
+    incident promoted. The only write to canonical memory — invoked by a human
+    or by auto_promote once a rule has proven itself."""
     rule = _active_rule_for(signature, project)
     if not rule:
         return {"promoted": False, "reason": "no active rule"}
@@ -495,6 +496,56 @@ def promote(signature, project=None) -> dict:
                         tags=["promote"], project=project)
     globals()["project"](project)          # re-project -> status promoted
     return {"promoted": True}
+
+
+def auto_promote(project=None, evs=None) -> dict:
+    """Self-acting promotion — the 'permanent SOP' rung of the learning loop.
+
+    Any ACTIVE rule whose lesson classifies as ``resolved`` (at the recurrence
+    threshold, rule present, tested after activation, zero leaks) has proven it
+    actually changes behavior, so it graduates into SOUL.md without waiting for
+    a human. This is what makes improvements self-sustaining: capture ->
+    reflect -> inject -> prove -> promote, with no manual step anywhere.
+    Idempotent (``promote`` refuses already-promoted signatures). Returns
+    ``{"promoted": [signatures]}``. Pass evs to reuse a read_all() result."""
+    stats = signal_stats(project, evs=evs)
+    done = []
+    for s in summaries(project):
+        if s.get("status") != "active":
+            continue
+        sig = s.get("signature", "")
+        if classify_resolution(s, stats.get(sig, {})) != "resolved":
+            continue
+        if promote(sig, project=project).get("promoted"):
+            done.append(sig)
+    return {"promoted": done}
+
+
+SOUL_CAP = 10   # max promoted rules injected per session (newest first)
+
+
+def soul_block(project=None) -> str:
+    """Canonical operating rules (promoted SOPs) for session-start injection.
+
+    This is the permanence mechanism promote() was missing a consumer for:
+    SOUL.md was written but nothing ever read it back into a session, so a
+    'promoted' rule was effectively archived, not permanent. Injecting the
+    block through STATE.md (the single delivery choke point) makes promotion
+    mean what it says. Empty string when no rules were ever promoted."""
+    try:
+        text = soul_path(project).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    rules = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- ")]
+    if not rules:
+        return ""
+    lines = ["# SOUL — permanent operating rules (proven; always follow)"]
+    shown = rules[-SOUL_CAP:]
+    lines += shown
+    cut = len(rules) - len(shown)
+    if cut > 0:
+        lines.append(f"+{cut} more in SOUL.md")
+    return "\n".join(lines)
 
 
 def demote(signature, project=None) -> dict:
@@ -543,7 +594,7 @@ def _raw_excerpt(section: str) -> str:
 
 
 _LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted",
-                    "rule_revised", "rule_expired"}
+                    "rule_revised", "rule_expired", "rule_enforced"}
 
 
 def signal_stats(project=None, evs=None) -> dict:

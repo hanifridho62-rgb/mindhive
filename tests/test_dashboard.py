@@ -247,7 +247,7 @@ def test_skills_history_endpoint_returns_list(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
     seen = {}
     monkeypatch.setattr(plugins_mod, "call_history",
-        lambda name, project=None, limit=20: seen.update(name=name, limit=limit)
+        lambda name, project=None, limit=20, evs=None: seen.update(name=name, limit=limit)
         or [{"ts": "t", "ok": True, "text": "x", "session": "s"}])
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/history?name=foo&limit=7", token)
@@ -275,8 +275,8 @@ def test_page_has_call_history_hook(dashboard_server):
 def test_skills_status_endpoint_returns_status_and_counts(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
     monkeypatch.setattr(plugins_mod, "call_stats",
-        lambda project=None: {"status": {"a": "ok", "b": "fail"},
-                              "counts": {"a": 2, "b": 1}})
+        lambda project=None, evs=None: {"status": {"a": "ok", "b": "fail"},
+                                        "counts": {"a": 2, "b": 1}})
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/status", token)
     assert status == 200

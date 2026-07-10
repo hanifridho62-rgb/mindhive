@@ -57,8 +57,16 @@ def test_reflect_incident_writes_auto_and_sets_active(tmp_path):
 
 
 def test_reflect_incident_noop_on_empty_verdict(tmp_path):
-    _seed_active_incident()
-    res = reflect.reflect_incident("pymodule:mindhive", project="test",
+    # raw:* has no deterministic fallback (unknown root cause), so a garbage
+    # model response still yields no verdict — curated families now fall back
+    # instead (see test_learning_autonomy.py).
+    for s in ("s1", "s2"):
+        events.append_event("tool_failed",
+                            {"text": "weird failure", "signature": "raw:feedbeef01",
+                             "action": "x"},
+                            session_id=s, tags=["auto", "failure"], project="test")
+    incidents.project(project="test", threshold=2)
+    res = reflect.reflect_incident("raw:feedbeef01", project="test",
                                    runner=lambda p, timeout_s=120: "garbage")
     assert res["reflected"] is False
 
@@ -70,8 +78,11 @@ _GOOD = ('{"root_cause": "rc", "lesson": "le", '
 
 
 def _seed_unreflected(n):
+    # raw:* signatures on purpose: no deterministic fallback, so a failing
+    # runner really does leave the incident unreflected (what the cooldown,
+    # rollback, and error-marker tests below exercise).
     for i in range(n):
-        sig = f"pymodule:batch{i}"
+        sig = f"raw:batch{i}"
         for s in ("s1", "s2"):
             events.append_event("tool_failed",
                                 {"text": "boom", "signature": sig, "action": "x"},
