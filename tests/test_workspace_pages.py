@@ -30,6 +30,8 @@ def test_token_cannot_break_out_of_script_block():
     for render in (render_parallel, render_swarm):
         html = render("</script><script>alert(1)")
         assert "</script><script>" not in html
+        # positive assertion: the "<" was escaped, not just reshuffled
+        assert "\\u003c/script>" in html
 
 
 # --- R4: shared dashboard palette ----------------------------------------------
@@ -38,6 +40,7 @@ def test_parallel_uses_shared_dashboard_palette():
     assert "#0e1116" in PARALLEL          # shared page background
     assert "#30363d" in PARALLEL          # shared border
     assert "#161b22" in PARALLEL          # shared panel surface
+    assert "#58a6ff" in PARALLEL          # shared accent (focus ring)
     assert "#11131a" not in PARALLEL      # old blue-tinted base is gone
     assert "#2a2f3d" not in PARALLEL      # old border is gone
 
@@ -46,14 +49,19 @@ def test_swarm_uses_shared_dashboard_palette():
     assert "#0e1116" in SWARM
     assert "#30363d" in SWARM
     assert "#161b22" in SWARM
+    assert "#58a6ff" in SWARM
     assert "#0b0f0c" not in SWARM         # old green-tinted base is gone
     assert "#26301f" not in SWARM
 
 
 def test_swarm_keeps_role_identity_colors():
-    # the palette swap must not flatten the role colors
-    assert "#ff7b54" in SWARM             # coordinator
-    assert "#7ee787" in SWARM             # builder
+    # the palette swap must not flatten the role styling: pin the ROLE_STYLE
+    # map entries themselves — the bare role words also appear in labels and
+    # hint text, so word-presence alone would pass with the styling deleted
+    assert "coordinator: '#ff7b54'" in SWARM
+    assert "builder: '#7ee787'" in SWARM
+    assert "scout: '#e8b64c'" in SWARM
+    assert "reviewer: '#f0883e'" in SWARM
 
 
 # --- R5: 16 panes, split in any direction --------------------------------------

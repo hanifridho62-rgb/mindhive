@@ -36,6 +36,7 @@ _PAGE = """<!doctype html>
   button.stop { color:#ff8a8a; border-color:#5a2e2e; }
   input, select { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
+  input:focus, select:focus { outline:none; border-color:#58a6ff; }
   #wrap { flex:1 1 auto; display:flex; min-height:0; }
   #stage { flex:1; position:relative; overflow:hidden; cursor:grab;
     background-image: radial-gradient(#21262d 1px, transparent 1px);
@@ -156,15 +157,18 @@ _PAGE = """<!doctype html>
   }
   function quick(text){ document.getElementById('cmd').value = text; sendCmd(); }
   // "@Name rest of command" targets that agent (longest case-insensitive name
-  // match wins, so "Builder 10" beats "Builder 1"); "@all" fans out. Returns
-  // null when the text has no mention or nothing matches — caller falls back
-  // to the dropdown target.
+  // match wins, so "Builder 10" beats "Builder 1"). "@all" is reserved and
+  // always fans out, shadowing any agent literally named "all". Matching is
+  // scoped to swarm agents — the same set paint() draws and the dropdown
+  // lists — so a mention can never target a MindParallel pane the dropdown
+  // doesn't show. Returns null when the text has no mention or nothing
+  // matches — caller falls back to the dropdown target.
   function resolveMention(text){
     if (text[0] !== '@') return null;
     const rest = text.slice(1);
     if (/^all(\\s|$)/i.test(rest)) return {target:'all', text: rest.slice(3).trim()};
     let best = null;
-    AGENTS.forEach(a => {
+    AGENTS.filter(a => a.swarm).forEach(a => {
       const nm = a.name || '';
       if (nm && rest.toLowerCase().startsWith(nm.toLowerCase())
           && (rest.length === nm.length || rest[nm.length] === ' ')
@@ -179,10 +183,12 @@ _PAGE = """<!doctype html>
     if (m && !m.text) { toast('add a command after the @mention', true); return; }
     const tsel = document.getElementById('target');
     const target = m ? m.target : tsel.value;
-    if (m && [...tsel.options].some(o => o.value === m.target)) tsel.value = m.target;
     const res = await apiPost('/api/workspace/command',
       {target: target, text: m ? m.text : raw});
     if (res.ok) { inp.value = '';
+      // sync the dropdown only after the send succeeded, so a failed send
+      // doesn't silently switch the persistent target
+      if (m && [...tsel.options].some(o => o.value === m.target)) tsel.value = m.target;
       toast(res.sent != null ? 'sent to '+res.sent+' agent(s)'
         + (res.busy ? ' ('+res.busy+' busy)' : '') : 'sent'); }
     else toast(res.error||'failed', true);
@@ -314,6 +320,6 @@ _PAGE = """<!doctype html>
 
 
 def render_swarm(token: str) -> str:
-    # <-escape so a token containing "</script>" can't break out of the
-    # inline <script> block (same hardening as the graph view).
+    # Escape every "<" in the JSON-encoded token so neither "</script>" nor
+    # "<!--" can break out of the inline <script> block.
     return _PAGE.replace("__TOKEN__", json.dumps(token).replace("<", "\\u003c"))

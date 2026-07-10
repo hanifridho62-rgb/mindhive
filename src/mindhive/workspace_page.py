@@ -32,6 +32,7 @@ _PAGE = """<!doctype html>
   button.warn:hover { color:#ff8a8a; }
   input, select, textarea { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:#58a6ff; }
   #main { flex:1 1 auto; display:flex; min-height:0; }
   #side { width:230px; flex:0 0 auto; background:#161b22; border-right:1px solid #30363d;
     padding:10px; overflow-y:auto; }
@@ -452,6 +453,6 @@ _PAGE = """<!doctype html>
 
 
 def render_parallel(token: str) -> str:
-    # <-escape so a token containing "</script>" can't break out of the
-    # inline <script> block (same hardening as the graph view).
+    # Escape every "<" in the JSON-encoded token so neither "</script>" nor
+    # "<!--" can break out of the inline <script> block.
     return _PAGE.replace("__TOKEN__", json.dumps(token).replace("<", "\\u003c"))
