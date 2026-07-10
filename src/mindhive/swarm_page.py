@@ -19,56 +19,56 @@ _PAGE = """<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin:0; font:13px/1.45 system-ui, sans-serif; color:#d8e0d8; height:100vh;
-    display:flex; flex-direction:column; overflow:hidden; background:#0b0f0c; }
+  body { margin:0; font:13px/1.45 system-ui, sans-serif; color:#e6edf3; height:100vh;
+    display:flex; flex-direction:column; overflow:hidden; background:#0e1116; }
   header { display:flex; align-items:center; gap:10px; padding:8px 14px;
-    background:#10150f; border-bottom:1px solid #26301f; flex:0 0 auto; }
+    background:#161b22; border-bottom:1px solid #30363d; flex:0 0 auto; }
   header .logo { color:#e8b64c; font-weight:700; letter-spacing:1px; font-size:13px; }
   header input { flex:1; min-width:120px; }
   header .n { width:44px; }
   .badge { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid #3d6; }
   .badge.run { color:#7ee787; border-color:#2ea043; animation:pulse 1.4s infinite; }
-  .badge.idle { color:#8a93a6; border-color:#3a4054; }
+  .badge.idle { color:#8b949e; border-color:#3a4054; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-  button { background:#18201a; color:#d8e0d8; border:1px solid #2e3b2a; border-radius:6px;
+  button { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px;
     padding:4px 10px; cursor:pointer; font:inherit; }
-  button:hover { background:#22301f; }
+  button:hover { background:#30363d; }
   button.stop { color:#ff8a8a; border-color:#5a2e2e; }
-  input, select { background:#0d120e; color:#d8e0d8; border:1px solid #2e3b2a;
+  input, select { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
   #wrap { flex:1 1 auto; display:flex; min-height:0; }
   #stage { flex:1; position:relative; overflow:hidden; cursor:grab;
-    background-image: radial-gradient(#1c2618 1px, transparent 1px);
+    background-image: radial-gradient(#21262d 1px, transparent 1px);
     background-size: 26px 26px; }
   #stage.panning { cursor:grabbing; }
   #world { position:absolute; left:0; top:0; transform-origin:0 0; }
   svg#edges { position:absolute; left:0; top:0; overflow:visible; pointer-events:none; }
   .chip { position:absolute; transform:translate(-50%,-50%); white-space:nowrap;
     border:1px solid; border-radius:4px; padding:3px 10px; font-size:12px; cursor:pointer;
-    background:#0e130ecc; display:flex; align-items:center; gap:6px; }
+    background:#161b22cc; display:flex; align-items:center; gap:6px; }
   .chip:hover { filter:brightness(1.3); }
   .chip.sel { box-shadow:0 0 0 2px #fff5; }
   .chip .dot { width:7px; height:7px; border-radius:50%; background:#3a4054; }
   .chip .dot.running { background:#e0b341; animation:pulse 1s infinite; }
   .chip .dot.done { background:#46c46a; } .chip .dot.error { background:#ff6b6b; }
-  #insp { width:340px; flex:0 0 auto; background:#10150f; border-left:1px solid #26301f;
+  #insp { width:340px; flex:0 0 auto; background:#161b22; border-left:1px solid #30363d;
     padding:12px; overflow-y:auto; display:none; }
   #insp h2 { margin:0 0 6px; font-size:14px; }
-  #insp pre { white-space:pre-wrap; word-break:break-word; background:#0b0f0c;
-    border:1px solid #26301f; border-radius:6px; padding:8px;
+  #insp pre { white-space:pre-wrap; word-break:break-word; background:#0e1116;
+    border:1px solid #30363d; border-radius:6px; padding:8px;
     font:11.5px/1.5 ui-monospace, Consolas, monospace; max-height:60vh; overflow-y:auto; }
   #hint { position:absolute; bottom:56px; left:50%; transform:translateX(-50%);
-    color:#6b7862; font-size:11.5px; }
+    color:#8b949e; font-size:11.5px; }
   #cmdbar { flex:0 0 auto; display:flex; gap:8px; padding:10px 14px; align-items:center;
-    background:#10150f; border-top:1px solid #26301f; }
+    background:#161b22; border-top:1px solid #30363d; }
   #cmdbar select { color:#e8b64c; }
   #cmdbar input { flex:1; }
   .quick { font-size:11px; }
   #toast { position:fixed; top:52px; left:50%; transform:translateX(-50%);
-    background:#18201a; border:1px solid #3d6; border-radius:8px; padding:5px 14px;
+    background:#21262d; border:1px solid #3d6; border-radius:8px; padding:5px 14px;
     display:none; z-index:9; }
   #empty { position:absolute; inset:0; display:flex; align-items:center;
-    justify-content:center; color:#6b7862; text-align:center; }
+    justify-content:center; color:#8b949e; text-align:center; }
 </style></head>
 <body>
 <header>
@@ -98,7 +98,7 @@ _PAGE = """<!doctype html>
       <button onclick="stopSel()">&#9632; stop</button>
       <button onclick="closeInsp()">&#10005;</button>
     </div>
-    <div id="imeta" style="color:#8a9682;font-size:11.5px;margin-bottom:8px"></div>
+    <div id="imeta" style="color:#8b949e;font-size:11.5px;margin-bottom:8px"></div>
     <pre id="iout"></pre>
   </div>
 </div>
@@ -155,11 +155,33 @@ _PAGE = """<!doctype html>
     await apiPost('/api/workspace/mission_stop', {});
   }
   function quick(text){ document.getElementById('cmd').value = text; sendCmd(); }
+  // "@Name rest of command" targets that agent (longest case-insensitive name
+  // match wins, so "Builder 10" beats "Builder 1"); "@all" fans out. Returns
+  // null when the text has no mention or nothing matches — caller falls back
+  // to the dropdown target.
+  function resolveMention(text){
+    if (text[0] !== '@') return null;
+    const rest = text.slice(1);
+    if (/^all(\\s|$)/i.test(rest)) return {target:'all', text: rest.slice(3).trim()};
+    let best = null;
+    AGENTS.forEach(a => {
+      const nm = a.name || '';
+      if (nm && rest.toLowerCase().startsWith(nm.toLowerCase())
+          && (rest.length === nm.length || rest[nm.length] === ' ')
+          && (!best || nm.length > best.nm.length)) best = {nm: nm, id: a.id};
+    });
+    return best ? {target: best.id, text: rest.slice(best.nm.length).trim()} : null;
+  }
   async function sendCmd(){
     const inp = document.getElementById('cmd');
-    const text = inp.value.trim(); if (!text) return;
+    const raw = inp.value.trim(); if (!raw) return;
+    const m = resolveMention(raw);
+    if (m && !m.text) { toast('add a command after the @mention', true); return; }
+    const tsel = document.getElementById('target');
+    const target = m ? m.target : tsel.value;
+    if (m && [...tsel.options].some(o => o.value === m.target)) tsel.value = m.target;
     const res = await apiPost('/api/workspace/command',
-      {target: document.getElementById('target').value, text: text});
+      {target: target, text: m ? m.text : raw});
     if (res.ok) { inp.value = '';
       toast(res.sent != null ? 'sent to '+res.sent+' agent(s)'
         + (res.busy ? ' ('+res.busy+' busy)' : '') : 'sent'); }
@@ -292,4 +314,6 @@ _PAGE = """<!doctype html>
 
 
 def render_swarm(token: str) -> str:
-    return _PAGE.replace("__TOKEN__", json.dumps(token))
+    # <-escape so a token containing "</script>" can't break out of the
+    # inline <script> block (same hardening as the graph view).
+    return _PAGE.replace("__TOKEN__", json.dumps(token).replace("<", "\\u003c"))

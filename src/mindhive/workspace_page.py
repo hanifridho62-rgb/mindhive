@@ -20,22 +20,22 @@ _PAGE = """<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin:0; font:13px/1.45 system-ui, sans-serif; background:#11131a; color:#e6e8ef;
+  body { margin:0; font:13px/1.45 system-ui, sans-serif; background:#0e1116; color:#e6edf3;
     height:100vh; display:flex; flex-direction:column; overflow:hidden; }
   header { display:flex; align-items:center; gap:12px; padding:8px 14px;
-    background:#171a23; border-bottom:1px solid #2a2f3d; flex:0 0 auto; }
+    background:#161b22; border-bottom:1px solid #30363d; flex:0 0 auto; }
   header h1 { margin:0; font-size:14px; letter-spacing:1px; }
-  header .lbl { color:#9aa3b8; font-size:12px; }
-  button { background:#1d2230; color:#e6e8ef; border:1px solid #2a2f3d; border-radius:6px;
+  header .lbl { color:#8b949e; font-size:12px; }
+  button { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px;
     padding:4px 10px; cursor:pointer; font:inherit; }
-  button:hover { background:#262d3d; }
+  button:hover { background:#30363d; }
   button.warn:hover { color:#ff8a8a; }
-  input, select, textarea { background:#0c0e14; color:#e6e8ef; border:1px solid #2a2f3d;
+  input, select, textarea { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
   #main { flex:1 1 auto; display:flex; min-height:0; }
-  #side { width:230px; flex:0 0 auto; background:#141722; border-right:1px solid #2a2f3d;
+  #side { width:230px; flex:0 0 auto; background:#161b22; border-right:1px solid #30363d;
     padding:10px; overflow-y:auto; }
-  #side h3 { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:#6b7488;
+  #side h3 { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:#8b949e;
     margin:12px 2px 6px; }
   .skchip { display:block; cursor:grab; color:#9ecbff; background:#12182a;
     border:1px solid #2a3550; border-radius:6px; padding:3px 8px; margin:4px 0;
@@ -47,10 +47,10 @@ _PAGE = """<!doctype html>
   .split { display:flex; flex:1; min-width:0; min-height:0; gap:6px; }
   .split.v { flex-direction:column; }
   .pane { flex:1; min-width:0; min-height:0; display:flex; flex-direction:column;
-    background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; overflow:hidden; }
+    background:#0e1116; border:1px solid #30363d; border-radius:8px; overflow:hidden; }
   .pane.drop { border-color:#3d6; box-shadow:0 0 0 1px #3d6 inset; }
   .phead { display:flex; align-items:center; gap:6px; padding:3px 8px;
-    background:#171a23; border-bottom:1px solid #2a2f3d; flex:0 0 auto; font-size:12px; }
+    background:#161b22; border-bottom:1px solid #30363d; flex:0 0 auto; font-size:12px; }
   .phead .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .phead .sp { flex:1; }
   .phead button { padding:0 6px; font-size:11px; border-radius:4px; }
@@ -60,24 +60,24 @@ _PAGE = """<!doctype html>
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   .pout { flex:1; overflow-y:auto; padding:8px 10px; margin:0; white-space:pre-wrap;
     word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
-  .pin { display:flex; gap:6px; padding:6px; border-top:1px solid #2a2f3d; flex:0 0 auto; }
+  .pin { display:flex; gap:6px; padding:6px; border-top:1px solid #30363d; flex:0 0 auto; }
   .pin input { flex:1; min-width:0; }
-  .spawn { margin:auto; text-align:center; color:#9aa3b8; }
+  .spawn { margin:auto; text-align:center; color:#8b949e; }
   .spawn input, .spawn select { display:block; margin:6px auto; width:180px; }
-  #board { flex:0 0 auto; border-top:1px solid #2a2f3d; background:#141722;
+  #board { flex:0 0 auto; border-top:1px solid #30363d; background:#161b22;
     padding:8px 12px; max-height:34vh; overflow-y:auto; }
   #board.hidden { display:none; }
   #cols { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
-  .col { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:8px;
+  .col { background:#0e1116; border:1px solid #30363d; border-radius:8px; padding:8px;
     min-height:70px; }
-  .col h4 { margin:0 0 6px; font-size:11px; text-transform:uppercase; color:#6b7488; }
-  .card { background:#1d2230; border:1px solid #2a2f3d; border-radius:6px; padding:6px 8px;
+  .col h4 { margin:0 0 6px; font-size:11px; text-transform:uppercase; color:#8b949e; }
+  .card { background:#21262d; border:1px solid #30363d; border-radius:6px; padding:6px 8px;
     margin:5px 0; cursor:grab; font-size:12px; }
-  .card .who { color:#9aa3b8; font-size:11px; }
+  .card .who { color:#8b949e; font-size:11px; }
   .card button { font-size:11px; padding:0 6px; margin-left:6px; }
   .col.drop { border-color:#3d6; }
   #toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
-    background:#1d2230; border:1px solid #3d6; border-radius:8px; padding:6px 14px;
+    background:#21262d; border:1px solid #3d6; border-radius:8px; padding:6px 14px;
     display:none; z-index:9; }
   .err { color:#ff8a8a; }
 </style></head>
@@ -452,4 +452,6 @@ _PAGE = """<!doctype html>
 
 
 def render_parallel(token: str) -> str:
-    return _PAGE.replace("__TOKEN__", json.dumps(token))
+    # <-escape so a token containing "</script>" can't break out of the
+    # inline <script> block (same hardening as the graph view).
+    return _PAGE.replace("__TOKEN__", json.dumps(token).replace("<", "\\u003c"))
