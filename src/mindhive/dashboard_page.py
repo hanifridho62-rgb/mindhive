@@ -74,6 +74,7 @@ def render_page(token: str) -> str:
   .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
   .legitem:hover { background:#1b2540; }
   .legitem.on { background:#233; outline:1px solid #3d6; }
+  .callcount { font-size:11px; color:#9aa3b8; margin-left:3px; }
   .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid #2a5;
     color:#9f9; border-radius:6px; font-size:11px; padding:0 7px; }
   .callbtn:hover { background:#1b3a26; color:#dfffe6; }
@@ -332,6 +333,7 @@ def render_page(token: str) -> str:
   let IMP_QUERY = '';
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
+  let IMP_RES = 'all';             // resolution filter set by the legend glyphs
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -350,10 +352,20 @@ def render_page(token: str) -> str:
     const g = IMP_GLYPHS[res] || IMP_GLYPHS.watching;
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
+  // legend glyphs double as one-click resolution filters (click again to
+  // clear) — the same mechanism as the Skills & plugins status legend.
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
-      .map(r => glyphSpan(r)+IMP_GLYPHS[r][2]).join(' \\u00b7 ')+'</div>';
+      .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
+        + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>';
   }
+  function setImpRes(r){
+    IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  // unknown resolutions render as the watching glyph, so filter them the same way
+  function resKey(a){ return IMP_GLYPHS[a.resolution] ? a.resolution : 'watching'; }
   // --- efficiency strip: failure rate (tool_failed per 100 tool actions) vs
   // the previous day / week / month / 3 months. Tiles render placeholders
   // until stats arrive, and dispositions instead of fake percentages.
@@ -491,12 +503,14 @@ def render_page(token: str) -> str:
     }
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
-      (IMP_STATUS==='all' || a.status===IMP_STATUS)
+      (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    const notes = manual.filter(m => !q
+    // manual notes carry no resolution, so an active glyph filter shows lessons only
+    const notes = (IMP_RES==='all' ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -643,6 +657,7 @@ def render_page(token: str) -> str:
   // you typed and picked, exactly like the Improvements view.
   let PLUG_INV = {plugins: [], local_skills: [], counts: {}};
   let PLUG_STATUS = {};             // {skillName: 'ok'|'fail'} last call outcome
+  let PLUG_COUNTS = {};             // {skillName: total invoke count}
   let PLUG_RANKING = null;
   let PLUG_QUERY = '';
   let PLUG_STATUSF = 'all';         // all | ok | fail | uncalled
@@ -713,13 +728,24 @@ def render_page(token: str) -> str:
       trigger: s.trigger || '', status: PLUG_STATUS[s.name] || 'uncalled'})));
     return out;
   }
+  // invoke-count badge right after the skill name — how many times it has been
+  // called through MindHive (ok + failed), so callability reads off the top list.
+  function callCount(name){
+    const n = PLUG_COUNTS[name] || 0;
+    return n ? '<span class="callcount" title="invoked '+n+' time'+(n===1?'':'s')
+      + ' via MindHive">'+n+'\\u00d7</span>' : '';
+  }
   const skillChip = (name, plugin) => statusDot(name) + '<span class="skchip" onclick="showSkillDetail('
       + escAttr(JSON.stringify(name)) + ',' + escAttr(JSON.stringify(plugin||null)) + ')">'
-      + esc(name)+'</span>';
+      + esc(name)+'</span>'+callCount(name);
   async function renderPlugins(){
     const res = await apiGet('/api/plugins/inventory');
     PLUG_INV = res.inventory || {plugins: [], local_skills: [], counts: {}};
-    try { PLUG_STATUS = await apiGet('/api/skills/status') || {}; } catch(_){}
+    try {
+      const st = await apiGet('/api/skills/status') || {};
+      PLUG_STATUS = st.status || {};
+      PLUG_COUNTS = st.counts || {};
+    } catch(_){}
     paintPlugins();
   }
   function paintPlugins(){
@@ -815,7 +841,7 @@ def render_page(token: str) -> str:
       const plug = d.source && d.source !== 'local' ? d.source : null;
       showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back to skills &amp; plugins</button>'
         + '<button onclick="invokeSkill('+escAttr(JSON.stringify(d.name))+','+escAttr(JSON.stringify(plug))+')">'
-        + '\\u25b6 call this skill</button>'+statusDot(d.name)+'</div>'
+        + '\\u25b6 call this skill</button>'+statusDot(d.name)+callCount(d.name)+'</div>'
         + '<h2 class="h">'+esc(d.name)+'</h2>'
         + '<div class="skmeta"><b>Intended use</b><div class="snip">'+esc(d.intended_use || '—')+'</div></div>'
         + '<div class="skmeta"><b>Added</b> <span class="lbl">'+esc(d.added_at || 'unknown')
@@ -834,6 +860,7 @@ def render_page(token: str) -> str:
     run('calling '+name+'…', async () => {
       const res = await apiPost('/api/skills/invoke', {name: name, plugin: plugin});
       PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+      PLUG_COUNTS[name] = (PLUG_COUNTS[name]||0)+1;
       const head = res.ok ? '<span class="ok">\\u2714 '+esc(name)+' succeeded</span>'
                           : '<span class="err">\\u2716 '+esc(name)+' failed (exit '+esc(res.exit)+')</span>';
       showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '

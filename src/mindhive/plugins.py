@@ -414,24 +414,36 @@ def skill_detail(name: str, plugin: str | None = None, claude_dir=None) -> dict 
     }
 
 
-def call_status(project=None) -> dict:
-    """Last-outcome per skill from the ledger: ``{name: "ok"|"fail"}``.
+def call_stats(project=None) -> dict:
+    """Per-skill call stats from one ledger pass:
+    ``{"status": {name: "ok"|"fail"}, "counts": {name: total_calls}}``.
 
     Reads ``invoke_result`` (ok) and ``tool_failed`` with a ``skill:<name>``
-    signature (fail). ``read_all`` is time-then-append ordered, so iterating and
-    overwriting leaves each skill at its most recent call — the green/red the
-    dashboard paints. Skills never called are simply absent (rendered grey)."""
+    signature (fail) — one invoke writes exactly one of the two, so counting
+    both event types yields the total number of calls. ``read_all`` is
+    time-then-append ordered, so overwriting leaves each skill's status at its
+    most recent call — the green/red the dashboard paints. Skills never called
+    are simply absent (rendered grey, no count badge)."""
     status: dict[str, str] = {}
+    counts: dict[str, int] = {}
     for e in ev_mod.read_all(project):
         if e.type == "invoke_result":
             name = e.payload.get("name")
             if name:
                 status[name] = "ok"
+                counts[name] = counts.get(name, 0) + 1
         elif e.type == "tool_failed":
             sig = e.payload.get("signature", "")
             if isinstance(sig, str) and sig.startswith("skill:"):
-                status[sig[len("skill:"):]] = "fail"
-    return status
+                name = sig[len("skill:"):]
+                status[name] = "fail"
+                counts[name] = counts.get(name, 0) + 1
+    return {"status": status, "counts": counts}
+
+
+def call_status(project=None) -> dict:
+    """Last-outcome per skill: ``{name: "ok"|"fail"}`` (see ``call_stats``)."""
+    return call_stats(project)["status"]
 
 
 def call_history(name, project=None, limit=20) -> list[dict]:

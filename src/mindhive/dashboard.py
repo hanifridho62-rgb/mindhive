@@ -476,8 +476,9 @@ def make_handler(token: str):
             return self._json(detail)
 
         def _get_skills_status(self, proj, am, qs):
-            # green/red per skill = last recorded call outcome from the ledger
-            return self._json(plugins_mod.call_status(project=proj))
+            # status: green/red last outcome per skill; counts: total invokes —
+            # both derived from the ledger in a single pass
+            return self._json(plugins_mod.call_stats(project=proj))
 
         def _get_skills_history(self, proj, am, qs):
             name = (qs.get("name") or [""])[0]
