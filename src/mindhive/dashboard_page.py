@@ -114,6 +114,9 @@ def render_page(token: str) -> str:
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
     <button onclick="showPlugins()">Skills &amp; plugins</button>
+    <div class="group">Workspace</div>
+    <button onclick="showWorkspace('parallel')">MindParallel</button>
+    <button onclick="showWorkspace('swarm')">MindSwarm</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -621,6 +624,15 @@ def render_page(token: str) -> str:
   function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
     const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
   }); }
+
+  // Workspace views (MindParallel / MindSwarm) are full pages served by the
+  // server and loaded by URL — srcdoc must be cleared first or it wins over src.
+  function showWorkspace(view){
+    controls.innerHTML=''; liveFn = null;
+    only(graph);
+    graph.removeAttribute('srcdoc');
+    graph.src = u(withProj('/api/workspace/'+view));
+  }
 
   function showAppend(){
     liveFn = null;
