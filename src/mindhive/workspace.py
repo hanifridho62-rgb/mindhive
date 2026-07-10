@@ -450,6 +450,18 @@ def load_board() -> dict:
     return {"tasks": []}
 
 
+def _write_board_locked(tasks: list) -> None:
+    """Atomic write (temp + replace): a concurrent reader — the dashboard's
+    board poll, or another thread's load_board — must never catch the file
+    mid-truncate and see an empty board. Caller holds _BOARD_LOCK."""
+    p = _board_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, p)
+
+
 def save_board(board: dict) -> dict:
     tasks = []
     for t in (board or {}).get("tasks", []):
@@ -462,21 +474,20 @@ def save_board(board: dict) -> dict:
                       else "backlog",
                       "agent_id": t.get("agent_id")})
     with _BOARD_LOCK:
-        p = _board_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False, indent=1),
-                     encoding="utf-8")
+        _write_board_locked(tasks)
     return {"ok": True, "tasks": tasks}
 
 
 def _board_finish(task_id, done: bool) -> None:
+    # The whole read-modify-write stays under the lock so two runs finishing
+    # at once can't interleave and drop each other's card release.
     with _BOARD_LOCK:
         board = load_board()
         for t in board["tasks"]:
             if t.get("id") == task_id:
                 t["status"] = "done" if done else "backlog"
                 t["agent_id"] = None
-    save_board(board)
+        _write_board_locked(board["tasks"])
 
 
 def board_dispatch(manager: Manager, task_id, agent_id=None) -> dict:
