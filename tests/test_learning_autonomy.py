@@ -316,3 +316,20 @@ def test_skills_stats_endpoint_aggregates_hive_mind():
         assert len(hist) == 1 and hist[0]["ok"] is True
     finally:
         server.shutdown()
+
+
+# --- failures: bare-exit-code noise filter ----------------------------------------
+
+def test_bare_exit_code_failures_are_noise():
+    from mindhive import failures
+
+    def line(text):
+        return {"message": {"content": [
+            {"type": "tool_result", "is_error": True, "tool_use_id": "t1",
+             "content": text}]},
+            "toolUseResult": {"stderr": ""}}
+
+    assert failures.extract_failures(line("Exit code 1")) == []
+    assert failures.extract_failures(line("exit code 255")) == []
+    real = failures.extract_failures(line("Exit code 1\nTraceback ..."))
+    assert len(real) == 1                      # exit code WITH detail still counts
