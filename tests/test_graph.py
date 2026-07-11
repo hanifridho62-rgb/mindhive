@@ -224,6 +224,50 @@ def test_load_or_build_evs_factory_lazy_on_hit():
     assert calls["n"] == 1
 
 
+def test_build_stamps_algorithm_version():
+    """build() records the algorithm version in the result and on disk, so a
+    later load can tell a fresh cache apart from one built by an older
+    algorithm (e.g. before the shares_tag cap)."""
+    import mindhive.graph as gmod
+    g = gmod.build(project=None, _evs=_make_evs())
+    assert g["version"] == gmod.GRAPH_BUILD_VERSION
+    on_disk = json.loads((paths.project_dir(None) / "graph.json").read_text(encoding="utf-8"))
+    assert on_disk["version"] == gmod.GRAPH_BUILD_VERSION
+
+
+def test_load_or_build_rejects_versionless_cache():
+    """A fresh-mtime graph.json with NO version (built by the pre-cap algorithm)
+    must be rebuilt, not served — otherwise a dormant project whose events never
+    change keeps serving a stale giant forever."""
+    import mindhive.graph as gmod
+    _write_events(_make_evs())
+    gfile = paths.project_dir(None) / "graph.json"
+    gfile.parent.mkdir(parents=True, exist_ok=True)
+    # a versionless cache carrying a sentinel a real build never produces
+    gfile.write_text(json.dumps(
+        {"nodes": [{"id": "STALE_SENTINEL", "type": "tag", "label": "x"}], "edges": []}),
+        encoding="utf-8")
+    _make_cache_fresh()                        # newer than the events
+    g = gmod.load_or_build(project=None)
+    assert "STALE_SENTINEL" not in {n["id"] for n in g["nodes"]}   # rebuilt, not served
+    assert g.get("version") == gmod.GRAPH_BUILD_VERSION
+
+
+def test_load_or_build_rejects_outdated_version_cache():
+    """A fresh cache stamped with an older algorithm version is rebuilt."""
+    import mindhive.graph as gmod
+    _write_events(_make_evs())
+    gfile = paths.project_dir(None) / "graph.json"
+    gfile.write_text(json.dumps(
+        {"version": gmod.GRAPH_BUILD_VERSION - 1,
+         "nodes": [{"id": "OLD_SENTINEL", "type": "tag", "label": "x"}], "edges": []}),
+        encoding="utf-8")
+    _make_cache_fresh()
+    g = gmod.load_or_build(project=None)
+    assert "OLD_SENTINEL" not in {n["id"] for n in g["nodes"]}
+    assert g["version"] == gmod.GRAPH_BUILD_VERSION
+
+
 def test_distinct_events_same_ts_type_do_not_collide():
     """Two different events sharing a timestamp AND type must not overwrite each
     other — the node id includes a payload hash to keep them distinct."""
