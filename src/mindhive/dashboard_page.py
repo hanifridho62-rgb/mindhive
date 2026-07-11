@@ -621,9 +621,23 @@ def render_page(token: str) -> str:
     });
   }
 
-  function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
-    const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
-  }); }
+  // Graph is a one-shot heavy render (not live-refreshed): fetch once and hand
+  // the self-contained page to the iframe. Semantic links are the expensive,
+  // opt-in build (an embedding search per event) so they stay off by default;
+  // ticking the box reloads with ?semantic=1.
+  function showGraph(){
+    liveFn = null;
+    let semantic = false;
+    controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
+      + '<input type="checkbox" id="gsem"> semantic links</label>';
+    const load = () => run('building graph', async () => {
+      const html = await apiGet('/api/graph' + (semantic ? '?semantic=1' : ''));
+      only(graph); graph.srcdoc = html;
+    });
+    const cb = document.getElementById('gsem');
+    if (cb) cb.addEventListener('change', () => { semantic = cb.checked; load(); });
+    load();
+  }
 
   // Workspace views (MindParallel / MindSwarm) are full pages served by the
   // server and loaded by URL — srcdoc must be cleared first or it wins over src.
