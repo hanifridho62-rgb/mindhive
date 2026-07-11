@@ -7,6 +7,16 @@ from . import events as ev_mod, paths
 
 SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES
 
+# shares_tag guards against a quadratic edge explosion. A tag shared by many
+# events — a mega-hub like "auto"/"harvest" that tags nearly everything — would
+# emit len(bucket)*(len(bucket)-1)/2 edges (hundreds of thousands on a large
+# namespace) that carry NO discriminating signal (co-membership in a ubiquitous
+# tag says nothing) and exert ZERO layout force in the renderer. Those edges
+# alone ballooned graph.json to ~60 MB and crashed the browser tab (one SVG
+# element per edge). Skip pairing inside any bucket past this size; the events
+# stay connected through the shared tag node either way.
+SHARES_TAG_MAX_BUCKET = 24
+
 
 def _ev_id(ev) -> str:
     # Include a short hash of the payload so two DISTINCT events that share the
@@ -139,6 +149,8 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
             tag_to_idx[tag].append(idx)  # appended in ascending idx order
     seen_tag_pairs: set[tuple[int, int]] = set()
     for idxs in tag_to_idx.values():
+        if len(idxs) > SHARES_TAG_MAX_BUCKET:
+            continue  # mega-hub tag: skip the O(n^2) pairing (see constant above)
         for x in range(len(idxs)):
             for y in range(x + 1, len(idxs)):
                 i, j = idxs[x], idxs[y]  # i < j (idxs ascending)
@@ -193,6 +205,51 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     tmp.replace(gfile)
 
     return result
+
+
+def _events_mtime(project=None) -> float:
+    """Newest modification time across the project's event segments (0.0 when
+    there are none). A cheap freshness signal — one stat per segment, never a
+    read — used to decide whether the persisted graph.json is still current."""
+    d = paths.events_dir(project)
+    if not d.exists():
+        return 0.0
+    try:
+        return max((seg.stat().st_mtime for seg in d.glob("*.jsonl")), default=0.0)
+    except OSError:
+        return 0.0
+
+
+def load_or_build(project=None, *, semantic: bool = False,
+                  source_mtime: float | None = None, build_evs=None) -> dict:
+    """Read path for graph viewers: return the persisted graph.json when it is
+    at least as fresh as the event source, otherwise (re)build it.
+
+    autosync already rebuilds graph.json whenever a project gains events, so a
+    warm cache is the common case — serving it costs one stat + one read instead
+    of a full rebuild + 60 MB serialize + disk write on every open.
+
+    - ``semantic`` graphs are never cached: the persisted graph is the
+      deterministic one autosync maintains (no embedding-derived edges), so a
+      semantic view is always built on demand.
+    - ``source_mtime`` overrides the freshness signal for callers whose events
+      span multiple namespaces (the HIVE MIND aggregate has no single event
+      log); otherwise the project's own segments are used.
+    - ``build_evs`` is a zero-arg factory for the events list, invoked ONLY on a
+      cache miss so a large aggregate read is skipped whenever the cache hits.
+    """
+    if not semantic:
+        import json
+        gfile = paths.project_dir(project) / "graph.json"
+        if gfile.exists():
+            fresh_since = _events_mtime(project) if source_mtime is None else source_mtime
+            try:
+                if gfile.stat().st_mtime >= fresh_since:
+                    return json.loads(gfile.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass  # missing/corrupt cache -> fall through and rebuild
+    evs = build_evs() if build_evs is not None else None
+    return build(project=project, semantic=semantic, _evs=evs)
 
 
 def related(query: str, project=None, depth: int = 1) -> list[dict]:
