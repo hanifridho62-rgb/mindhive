@@ -75,6 +75,7 @@ def render_page(token: str) -> str:
   .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
   .legitem:hover { background:#1b2540; }
   .legitem.on { background:#233; outline:1px solid #3d6; }
+  .callcount { font-size:11px; color:#9aa3b8; margin-left:3px; }
   .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid #2a5;
     color:#9f9; border-radius:6px; font-size:11px; padding:0 7px; }
   .callbtn:hover { background:#1b3a26; color:#dfffe6; }
@@ -114,6 +115,9 @@ def render_page(token: str) -> str:
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
     <button onclick="showSkillPanel()">Skill &amp; Plugin</button>
+    <div class="group">Workspace</div>
+    <button onclick="showWorkspace('parallel')">MindParallel</button>
+    <button onclick="showWorkspace('swarm')">MindSwarm</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -333,6 +337,7 @@ def render_page(token: str) -> str:
   let IMP_QUERY = '';
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
+  let IMP_RES = 'all';             // resolution filter set by the legend glyphs
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -351,10 +356,20 @@ def render_page(token: str) -> str:
     const g = IMP_GLYPHS[res] || IMP_GLYPHS.watching;
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
+  // legend glyphs double as one-click resolution filters (click again to
+  // clear) — the same mechanism as the Skills & plugins status legend.
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
-      .map(r => glyphSpan(r)+IMP_GLYPHS[r][2]).join(' \\u00b7 ')+'</div>';
+      .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
+        + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>';
   }
+  function setImpRes(r){
+    IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  // unknown resolutions render as the watching glyph, so filter them the same way
+  function resKey(a){ return IMP_GLYPHS[a.resolution] ? a.resolution : 'watching'; }
   // --- efficiency strip: failure rate (tool_failed per 100 tool actions) vs
   // the previous day / week / month / 3 months. Tiles render placeholders
   // until stats arrive, and dispositions instead of fake percentages.
@@ -492,12 +507,14 @@ def render_page(token: str) -> str:
     }
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
-      (IMP_STATUS==='all' || a.status===IMP_STATUS)
+      (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    const notes = manual.filter(m => !q
+    // manual notes carry no resolution, so an active glyph filter shows lessons only
+    const notes = (IMP_RES==='all' ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -608,6 +625,15 @@ def render_page(token: str) -> str:
   function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
     const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
   }); }
+
+  // Workspace views (MindParallel / MindSwarm) are full pages served by the
+  // server and loaded by URL — srcdoc must be cleared first or it wins over src.
+  function showWorkspace(view){
+    controls.innerHTML=''; liveFn = null;
+    only(graph);
+    graph.removeAttribute('srcdoc');
+    graph.src = u(withProj('/api/workspace/'+view));
+  }
 
   function showAppend(){
     liveFn = null;

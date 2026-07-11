@@ -272,13 +272,36 @@ def test_page_has_call_history_hook(dashboard_server):
         assert needle in body, f"missing call-history hook: {needle}"
 
 
-def test_skills_status_endpoint_returns_map(dashboard_server, monkeypatch):
+def test_skills_status_endpoint_returns_status_and_counts(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
-    monkeypatch.setattr(plugins_mod, "call_status", lambda project=None: {"a": "ok", "b": "fail"})
+    monkeypatch.setattr(plugins_mod, "call_stats",
+        lambda project=None: {"status": {"a": "ok", "b": "fail"},
+                              "counts": {"a": 2, "b": 1}})
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/status", token)
     assert status == 200
-    assert json.loads(body) == {"a": "ok", "b": "fail"}
+    assert json.loads(body) == {"status": {"a": "ok", "b": "fail"},
+                                "counts": {"a": 2, "b": 1}}
+
+
+def test_page_has_invoke_count_hooks(dashboard_server):
+    """Per-skill call telemetry is surfaced. The Skill & Plugin rebuild (U7)
+    replaced the old name-adjacent count badge with a richer metrics line
+    (calls / ok / fail / completion rate) rendered from PLUG_STATS via
+    skMetrics — the invoke-count intent is preserved and enriched."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("PLUG_STATS", "skMetrics"):
+        assert needle in body, f"missing per-skill telemetry hook: {needle}"
+
+
+def test_page_has_clickable_improvements_legend(dashboard_server):
+    """Improvements legend glyphs filter by resolution on click, like the
+    Skills legend's one-click status filters."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("setImpRes", "IMP_RES"):
+        assert needle in body, f"missing improvements legend filter hook: {needle}"
 
 
 def test_skills_stats_endpoint_returns_stats_keyed_by_skill(dashboard_server):

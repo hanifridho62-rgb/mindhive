@@ -21,18 +21,34 @@ _TEMPLATE = """<!DOCTYPE html>
   #stage { flex: 1; position: relative; }
   svg { width: 100%; height: 100%; display: block; cursor: grab; }
   svg.panning { cursor: grabbing; }
-  .edge { stroke: #30363d; stroke-width: 1; fill: none; }
+  .edge { stroke: #2b3038; stroke-width: 1; fill: none; }
   /* semantic_near edges (embedding-derived) read as dashed violet so they are
      visually separable from the solid grey structural edges. */
   .edge.semantic { stroke: #a371f7; stroke-dasharray: 4 3; stroke-opacity: 0.5; }
-  .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
-  .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
+  /* Obsidian-style: muted grey discs sized by connectivity, with the event
+     kind carried on a colored ring so the legend still reads true. */
+  .node circle { fill: #3d4450; stroke-width: 1.5; cursor: pointer; }
+  .node circle:hover { fill: #566070; }
+  .node.sel circle { fill: #e6edf3; }
+  .node text { fill: #99a3b0; font-size: 10.5px; pointer-events: none; }
+  .node.faded circle { opacity: 0.12; }
+  .node.faded text { opacity: 0.12; }
   .hoverlabel { font-size: 11px; pointer-events: none; paint-order: stroke;
     stroke: #0e1116; stroke-width: 3px; fill: #e6edf3; }
   .node.dim circle, .edge.dim { opacity: 0.15; }
   #panel { width: 320px; background: #161b22; border-left: 1px solid #30363d;
     padding: 16px; overflow-y: auto; }
+  #panel .phead { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: #8b949e; margin: 0 0 10px; }
   #panel h2 { font-size: 15px; margin: 0 0 4px; word-break: break-word; }
+  #panel .meta { color: #8b949e; font-size: 11.5px; margin: 4px 0 10px; }
+  #panel .meta b { color: #c9d1d9; font-weight: 600; }
+  #panel .navitem { cursor: pointer; }
+  #panel .navitem:hover { color: #58a6ff; }
+  #searchwrap { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); }
+  #search { background: #161b22cc; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 8px; padding: 5px 12px; font: inherit; width: 230px; }
+  #search:focus { outline: none; border-color: #58a6ff; }
   #panel .type { display: inline-block; padding: 2px 8px; border-radius: 10px;
     font-size: 11px; margin-bottom: 12px; }
   #panel h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
@@ -69,11 +85,12 @@ _TEMPLATE = """<!DOCTYPE html>
   <div id="stage">
     <svg id="svg"></svg>
     <div id="legend"></div>
-    <button id="fitbtn" title="Fit graph to window">Fit</button>
+    <div id="searchwrap"><input id="search" type="search" placeholder="&#128269; Search graph"></div>
+    <button id="fitbtn" title="Fit graph to window">Reset view</button>
     <button id="artbtn" title="Toggle pinwheel view">Pinwheel</button>
     <div id="hint">drag nodes &middot; scroll to zoom &middot; drag background to pan &middot; click a node</div>
   </div>
-  <div id="panel"><div id="empty">Click a node to inspect it.</div></div>
+  <div id="panel"><div class="phead">Inspector</div><div id="empty">Click a node to inspect it.</div></div>
 </div>
 <script id="graph-data" type="application/json">__GRAPH_JSON__</script>
 <script>
@@ -282,16 +299,25 @@ _RENDERER_JS = r"""
   // they overlapped into an unreadable smear anyway). Event/file labels show on
   // hover via one shared element, and in full in the side panel on click.
   function hasLabel(n) { return n.type === "session" || n.type === "tag"; }
+  // Obsidian-style sizing: the disc grows with connectivity (sqrt-damped so a
+  // mega-hub tag doesn't dwarf the canvas) and stays muted grey (CSS fill);
+  // the kind color moves to the ring (stroke) so the legend still reads true.
+  var degree = {};
+  data.edges.forEach(function (e) {
+    degree[e.src] = (degree[e.src] || 0) + 1;
+    degree[e.dst] = (degree[e.dst] || 0) + 1;
+  });
   var nodeEls = nodes.map(function (n) {
     var g = document.createElementNS(NS, "g");
     g.setAttribute("class", "node");
     var c = document.createElementNS(NS, "circle");
-    c.setAttribute("r", n.type === "session" ? 9 : 6);
-    c.setAttribute("fill", nodeColor(n));
+    n.r = Math.min(16, 4 + Math.sqrt(degree[n.id] || 0) * 1.7);
+    c.setAttribute("r", n.r.toFixed(1));
+    c.setAttribute("stroke", nodeColor(n));
     g.appendChild(c);
     if (hasLabel(n)) {
       var t = document.createElementNS(NS, "text");
-      t.setAttribute("x", 9); t.setAttribute("y", 4);
+      t.setAttribute("x", (n.r + 3).toFixed(1)); t.setAttribute("y", 4);
       t.textContent = canvasLabel(n);
       g.appendChild(t);
     }
@@ -315,7 +341,7 @@ _RENDERER_JS = r"""
   hoverLabel.style.display = "none";
   graphLayer.appendChild(hoverLabel);
   function showHover(n) {
-    hoverLabel.setAttribute("x", n.x + 9); hoverLabel.setAttribute("y", n.y + 4);
+    hoverLabel.setAttribute("x", n.x + (n.r || 6) + 3); hoverLabel.setAttribute("y", n.y + 4);
     hoverLabel.textContent = canvasLabel(n);
     hoverLabel.style.display = "";
   }
@@ -341,6 +367,35 @@ _RENDERER_JS = r"""
   }
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
+  function centerOn(n) {          // pan (keep zoom) so the node sits mid-stage
+    view.x = W / 2 - view.k * n.x;
+    view.y = H / 2 - view.k * n.y;
+    applyView();
+  }
+
+  // Search: fade every node that doesn't match (label, payload text, or kind);
+  // Enter jumps to and selects the first match. Clearing the box restores all.
+  var searchBox = document.getElementById("search");
+  function nodeMatches(n, q) {
+    return ((n.label || "") + " " + (n.text || "") + " " + nodeKey(n))
+      .toLowerCase().indexOf(q) !== -1;
+  }
+  if (searchBox) {
+    searchBox.addEventListener("input", function () {
+      var q = searchBox.value.trim().toLowerCase();
+      nodes.forEach(function (n, i) {
+        nodeEls[i].classList.toggle("faded", !!q && !nodeMatches(n, q));
+      });
+    });
+    searchBox.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter") return;
+      var q = searchBox.value.trim().toLowerCase();
+      if (!q) return;
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodeMatches(nodes[i], q)) { centerOn(nodes[i]); select(nodes[i]); break; }
+      }
+    });
+  }
 
   // --- Pinwheel art view (node-based, living) ------------------------------
   // Each session is a petal: a smooth spiral "blade", all P blades identical and
@@ -471,7 +526,8 @@ _RENDERER_JS = r"""
       hideHover(); artLayer.style.display = "";
       if (artbtn) artbtn.textContent = "Graph";
       if (typeof panel !== "undefined" && panel) {
-        panel.innerHTML = "<div id=empty>A living pinwheel — click a node to inspect it.</div>";
+        panel.innerHTML = "<div class=phead>Inspector</div>" +
+          "<div id=empty>A living pinwheel — click a node to inspect it.</div>";
       }
       kickArt();
     } else {
@@ -640,9 +696,13 @@ _RENDERER_JS = r"""
     // lives in a scrollable body block below so big payloads stay readable.
     var firstLine = n.text ? String(n.text).split("\n")[0] : "";
     var title = firstLine ? snippet(firstLine, 70) : (n.text ? snippet(n.text, 70) : n.label);
-    var html = "<h2>" + esc(title) + "</h2>";
+    var html = "<div class=phead>Inspector</div><h2>" + esc(title) + "</h2>";
     html += "<span class=type style=\"background:" + color + "33;color:" + color +
       "\">" + esc(kindLabel) + "</span>";
+    html += "<div class=meta><b>" + others.length + "</b> connection" +
+      (others.length === 1 ? "" : "s") +
+      (tags.length ? " · <b>" + tags.length + "</b> tag" +
+        (tags.length === 1 ? "" : "s") : "") + "</div>";
     if (ts) html += "<div class=rel>" + esc(ts) + "</div>";
     if (n.text) html += "<div class=body>" + esc(n.text) + "</div>";
     if (tags.length) {
@@ -656,15 +716,25 @@ _RENDERER_JS = r"""
       ? "<ul>" + others.map(function (c) {
           var node = byId[c.id];
           var label = node ? canvasLabel(node) : c.id;
-          return "<li>" + esc(label) + " <span class=rel>(" + esc(c.rel) +
+          return "<li" + (node ? " class=navitem data-id=\"" + esc(c.id) + "\"" : "")
+            + ">" + esc(label) + " <span class=rel>(" + esc(c.rel) +
             ")</span></li>";
         }).join("") + "</ul>"
       : "<p class=rel>No other connections.</p>";
     panel.innerHTML = html;
+    // The connected list doubles as a graph browser: click an entry to pan to
+    // and select that node.
+    panel.querySelectorAll(".navitem").forEach(function (el) {
+      el.addEventListener("click", function () {
+        var t = byId[el.getAttribute("data-id")];
+        if (t) { centerOn(t); select(t); }
+      });
+    });
 
     nodeEls.forEach(function (el, i) {
       var keep = nodes[i] === n || conns.some(function (c) { return c.id === nodes[i].id; });
       el.classList.toggle("dim", !keep);
+      el.classList.toggle("sel", nodes[i] === n);
     });
     edgeEls.forEach(function (el, i) {
       var e = edges[i];
@@ -672,8 +742,11 @@ _RENDERER_JS = r"""
     });
   }
   svg.addEventListener("click", function () {
-    panel.innerHTML = "<div id=empty>Click a node to inspect it.</div>";
-    nodeEls.forEach(function (el) { el.classList.remove("dim"); });
+    panel.innerHTML = "<div class=phead>Inspector</div>" +
+      "<div id=empty>Click a node to inspect it.</div>";
+    nodeEls.forEach(function (el) {
+      el.classList.remove("dim"); el.classList.remove("sel");
+    });
     edgeEls.forEach(function (el) { el.classList.remove("dim"); });
   });
 
@@ -684,7 +757,8 @@ _RENDERER_JS = r"""
   }
 
   if (!nodes.length) {
-    panel.innerHTML = "<div id=empty>This graph has no nodes yet.<br>" +
+    panel.innerHTML = "<div class=phead>Inspector</div>" +
+      "<div id=empty>This graph has no nodes yet.<br>" +
       "Append some memory events, then reopen.</div>";
   }
 })();

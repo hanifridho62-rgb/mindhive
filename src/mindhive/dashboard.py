@@ -23,8 +23,11 @@ from . import export as export_mod
 from . import events, projector
 from . import dedupe
 from . import sync as sync_mod
+from . import workspace as workspace_mod
 from .briefing import briefing as build_briefing
 from .dashboard_page import render_page
+from .workspace_page import render_parallel
+from .swarm_page import render_swarm
 
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
@@ -476,8 +479,9 @@ def make_handler(token: str):
             return self._json(detail)
 
         def _get_skills_status(self, proj, am, qs):
-            # green/red per skill = last recorded call outcome from the ledger
-            return self._json(plugins_mod.call_status(project=proj))
+            # status: green/red last outcome per skill; counts: total invokes —
+            # both derived from the ledger in a single pass
+            return self._json(plugins_mod.call_stats(project=proj))
 
         def _get_skills_history(self, proj, am, qs):
             name = (qs.get("name") or [""])[0]
@@ -495,6 +499,22 @@ def make_handler(token: str):
             top = (qs.get("top") or [None])[0]
             return self._json(plugins_mod.recommend_for(
                 project=proj, top=int(top) if top else None))
+
+        def _get_workspace(self, proj, am, qs):
+            # /api/workspace/<action>: the two iframe pages render HTML; every
+            # other action is JSON, delegated to workspace.api_get. HIVE MIND
+            # (am) falls back to the default project — workspace agents always
+            # need a concrete namespace to log their I/O into.
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            if action in ("parallel", "swarm"):
+                html = render_parallel(token) if action == "parallel" else render_swarm(token)
+                return self._send(200, html, "text/html; charset=utf-8")
+            return self._json(workspace_mod.api_get(
+                action, proj=default_project() if am else proj, qs=qs))
+
+        def _post_workspace(self, proj, body):
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            return self._json(workspace_mod.api_post(action, proj=proj, body=body))
 
         def _get_export(self, proj, am, qs):
             path = export_mod.export()
@@ -758,6 +778,9 @@ def make_handler(token: str):
             "/api/skills/recommend": _get_skills_recommend,
             "/api/export": _get_export,
         }
+        for _p in ("parallel", "swarm", "agents", "output", "profiles", "board"):
+            _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
+        del _p
         _POST_ROUTES = {
             "/api/harvest": _post_harvest,
             "/api/append": _post_append,
@@ -772,6 +795,11 @@ def make_handler(token: str):
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/selftest": _post_selftest,
         }
+        for _p in ("spawn", "send", "stop", "remove", "profile_add",
+                   "profile_remove", "board_save", "board_dispatch",
+                   "mission", "mission_stop", "command"):
+            _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
+        del _p
 
     return DashboardHandler
 
