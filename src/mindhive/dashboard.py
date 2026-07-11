@@ -781,9 +781,9 @@ def make_handler(token: str):
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/selftest": _post_selftest,
         }
-        for _p in ("spawn", "send", "stop", "remove", "profile_add",
-                   "profile_remove", "board_save", "board_dispatch",
-                   "mission", "mission_stop", "command"):
+        for _p in ("spawn", "send", "stop", "remove", "clear_idle",
+                   "profile_add", "profile_remove", "board_save",
+                   "board_dispatch", "mission", "mission_stop", "command"):
             _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
         del _p
 

@@ -323,6 +323,62 @@ def test_stop_and_remove():
     assert h.mgr.list()["agents"] == []
 
 
+def test_clear_idle_removes_only_settled_non_swarm_agents():
+    h = Harness()
+    running = h.mgr.spawn(name="Busy")["agent"]["id"]
+    done = h.mgr.spawn(name="Done")["agent"]["id"]
+    idle = h.mgr.spawn(name="Fresh")["agent"]["id"]
+    swarm = h.mgr.spawn(name="Crew", role="builder", swarm=True)["agent"]["id"]
+    h.mgr.send(done, "work")
+    _wait_settled(_agent_obj(h, done))
+    _agent_obj(h, running).status = "running"    # simulate an in-flight run
+    res = h.mgr.clear_idle()
+    assert res["ok"] and res["removed"] == 2     # done + fresh idle
+    left = {a["id"] for a in h.mgr.list()["agents"]}
+    assert left == {running, swarm}              # running and swarm survive
+
+
+def test_api_post_clear_idle_dispatches():
+    res = workspace.api_post("clear_idle")
+    assert res["ok"] and res["removed"] == 0     # empty singleton fleet
+
+
+def test_reader_records_skills_used_and_run_stats():
+    lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s1", "model": "m"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "ce-plan"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "Skill", "input": {}},
+            {"type": "tool_use", "name": "Skill", "input": "not-a-dict"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "ce-plan"}},
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "ce-work"}}]}}),
+        json.dumps({"type": "result", "subtype": "success", "result": "ok",
+                    "num_turns": 4, "total_cost_usd": 0.5, "session_id": "s1"}),
+    ]
+    h = Harness(lines=lines)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    # deduped, in first-use order; malformed and non-Skill blocks ignored
+    assert a.skills_used == ["ce-plan", "ce-work"]
+    assert a.last_turns == 4
+    assert a.last_cost == 0.5
+    snap = a.snapshot()
+    assert snap["skills_used"] == ["ce-plan", "ce-work"]
+    assert snap["last_turns"] == 4 and snap["last_cost"] == 0.5
+
+
+def test_fresh_agent_exposes_empty_run_stats():
+    h = Harness()
+    snap = h.mgr.spawn(name="A")["agent"]
+    assert snap["skills_used"] == []
+    assert snap["last_turns"] is None and snap["last_cost"] is None
+
+
 def test_agent_scrollback_is_capped():
     a = workspace.Agent("A")
     for i in range(workspace.MAX_LINES + 50):

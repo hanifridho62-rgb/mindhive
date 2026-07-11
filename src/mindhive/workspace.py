@@ -190,6 +190,9 @@ class Agent:
         self.lines: list = []
         self.session_id = None          # claude session for --resume continuity
         self.task_id = None             # kanban card being executed, if any
+        self.skills_used: list = []     # Skill tool invocations, ordered, deduped
+        self.last_turns = None          # num_turns of the most recent run
+        self.last_cost = None           # total_cost_usd of the most recent run
         self.created = _now_iso()
         self.proc = None
         self._timer = None
@@ -199,6 +202,8 @@ class Agent:
                 "profile": self.profile, "project": self.project,
                 "swarm": self.swarm, "status": self.status,
                 "session_id": self.session_id, "task_id": self.task_id,
+                "skills_used": list(self.skills_used),
+                "last_turns": self.last_turns, "last_cost": self.last_cost,
                 "created": self.created, "lines": len(self.lines)}
 
     def emit(self, line: str) -> None:
@@ -261,6 +266,17 @@ class Manager:
             a.status = "stopped"
             a.emit("■ stopped by user")
         return {"ok": True}
+
+    def clear_idle(self) -> dict:
+        """Remove every settled MindParallel agent (not running, not swarm) —
+        the one-click cull behind the dashboard's Clear idle button. Swarm
+        agents are left to the mission_stop lifecycle."""
+        with self._lock:
+            ids = [a.id for a in self.agents.values()
+                   if a.status != "running" and not a.swarm]
+        for i in ids:
+            self.remove(i)
+        return {"ok": True, "removed": len(ids)}
 
     def output(self, agent_id, since=0) -> dict:
         a = self.get(agent_id)
@@ -332,9 +348,25 @@ class Manager:
                     continue
                 if obj.get("type") == "system" and obj.get("session_id"):
                     a.session_id = obj["session_id"]
+                if obj.get("type") == "assistant":
+                    # record Skill tool invocations so the UI can show which
+                    # skills this agent has used (deduped, in first-use order)
+                    for block in (obj.get("message") or {}).get("content") or []:
+                        if not (isinstance(block, dict)
+                                and block.get("type") == "tool_use"
+                                and block.get("name") == "Skill"):
+                            continue
+                        inp = block.get("input")
+                        skill = inp.get("skill") if isinstance(inp, dict) else None
+                        if skill and str(skill) not in a.skills_used:
+                            a.skills_used.append(str(skill))
                 if obj.get("type") == "result":
                     saw_result = True
                     result_text = obj.get("result") or ""
+                    if obj.get("num_turns") is not None:
+                        a.last_turns = obj.get("num_turns")
+                    if obj.get("total_cost_usd") is not None:
+                        a.last_cost = obj.get("total_cost_usd")
                     if obj.get("session_id"):
                         a.session_id = obj["session_id"]
                 for line in render_stream_event(obj):
@@ -552,6 +584,8 @@ def api_post(action, proj=None, body=None) -> dict:
         return MANAGER.stop(body.get("id"))
     if action == "remove":
         return MANAGER.remove(body.get("id"))
+    if action == "clear_idle":
+        return MANAGER.clear_idle()
     if action == "profile_add":
         return save_profile(body.get("name", ""), body.get("config_dir", ""))
     if action == "profile_remove":
