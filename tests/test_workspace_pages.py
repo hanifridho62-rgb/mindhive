@@ -123,11 +123,15 @@ def test_parallel_skill_drop_stages_instead_of_running():
     assert "board_dispatch" in drop               # kanban cards still dispatch
 
 
-def test_parallel_run_composes_the_staged_recipe():
-    assert "composePrompt" in PARALLEL
-    assert "'Use the ' + s.name + ' skill'" in PARALLEL
-    assert "Follow the skill(s) to completion." in PARALLEL
+def test_parallel_run_posts_recipe_to_server_composer():
+    # composition moved server-side: Run posts the staged chips + command to
+    # run_recipe, which enriches them with MindHive history before launching
+    assert "/api/workspace/run_recipe" in PARALLEL
+    assert "skills: STAGED[agentId] || []" in PARALLEL
+    assert "composePrompt" not in PARALLEL        # no client-side composer left
     assert 'data-r="run"' in PARALLEL
+    # the consumed recipe clears so the next Run can't double-invoke it
+    assert "delete STAGED[agentId]" in PARALLEL
 
 
 def test_parallel_recipe_is_persistent_and_chips_removable():
@@ -244,3 +248,24 @@ def test_swarm_inspector_shows_skills_used_and_run_info():
     assert "iskills" in SWARM
     assert "last_turns" in SWARM
     assert "last_cost" in SWARM
+
+
+# --- model picker + account auth (2026-07-11 auth/skills round) --------------------
+
+def test_parallel_offers_model_picker():
+    assert 'data-r="model"' in PARALLEL
+    assert "/api/workspace/set_model" in PARALLEL
+    assert "modelOptions" in PARALLEL
+    assert '"__custom"' in PARALLEL               # free-typed model ids allowed
+
+
+def test_parallel_shows_profile_auth_health():
+    assert "/api/workspace/auth" in PARALLEL
+    for state in ("ok", "expired", "none"):
+        assert ".adot." + state in PARALLEL       # green / amber / red dots
+
+
+def test_parallel_has_login_and_trust_buttons():
+    assert "/api/workspace/profile_login" in PARALLEL
+    assert "/api/workspace/profile_trust" in PARALLEL
+    assert "loginProfile" in PARALLEL and "trustProfile" in PARALLEL

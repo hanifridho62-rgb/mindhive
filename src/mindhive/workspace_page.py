@@ -55,6 +55,11 @@ _PAGE = """<!doctype html>
   .skchip:hover { background:#1b2540; }
   .prof { display:flex; align-items:center; gap:6px; margin:4px 0; font-size:12px; }
   .prof .name { flex:1; overflow:hidden; text-overflow:ellipsis; }
+  .prof button { padding:0 5px; font-size:10px; }
+  .adot { width:8px; height:8px; border-radius:50%; background:#3a4054; flex:0 0 auto; }
+  .adot.ok { background:#46c46a; } .adot.expired { background:#e0b341; }
+  .adot.none { background:#ff6b6b; } .adot.unknown { background:#8b949e; }
+  .pin select { max-width:110px; font-size:11px; }
   #grid { flex:1 1 auto; display:flex; min-width:0; padding:6px; gap:0; }
   #grid.tabs { flex-direction:column; padding:0 6px 6px; }
   #tabbar { display:flex; gap:4px; padding:6px 0 0; overflow-x:auto; flex:0 0 auto; }
@@ -187,13 +192,6 @@ _PAGE = """<!doctype html>
   catch(_) { STAGED = {}; }
   function saveStaged(){ localStorage.setItem('mh_ws_staged', JSON.stringify(STAGED)); }
   function stageKey(n){ return n.agent || n.pid; }
-  function composePrompt(staged, cmd){
-    const parts = staged.map(s => 'Use the ' + s.name + ' skill'
-      + (s.plugin ? ' (from the ' + s.plugin + ' plugin)' : '') + '.');
-    if (cmd) parts.push(cmd);
-    else if (parts.length) parts.push('Follow the skill(s) to completion.');
-    return parts.join('\\n');
-  }
 
   // --- split-tree layout: leaf {t:'leaf', agent, pid} / split {t:'split', dir, a, b}
   let LAYOUT = null;
@@ -343,7 +341,8 @@ _PAGE = """<!doctype html>
     if (!n.agent) {
       return head + '<div class="spawn"><div>empty pane</div>'
         + '<input data-r="nmIn" placeholder="agent name" value="Claude '+(PSEQ)+'">'
-        + '<select data-r="prof"></select>'
+        + '<select data-r="prof" title="account profile"></select>'
+        + '<select data-r="model" title="model for this agent"></select>'
         + '<button data-r="spawn">Spawn agent</button>'
         + '<div class="recipe" data-r="recipe"></div>'
         + '<button data-r="run" style="margin-top:4px">&#9654; Spawn &amp; Run</button>'
@@ -352,12 +351,31 @@ _PAGE = """<!doctype html>
     }
     return head + '<pre class="pout" data-r="out"></pre>'
       + '<div class="recipe" data-r="recipe"></div>'
-      + '<div class="pin"><input data-r="in" placeholder="command for this agent&hellip; (Enter runs)">'
+      + '<div class="pin"><select data-r="model" title="model for the next run"></select>'
+      + '<input data-r="in" placeholder="command for this agent&hellip; (Enter runs)">'
       + '<button data-r="run" title="run the staged skills + command">&#9654; Run</button></div>';
   }
-  async function spawnAgent(name, profile){
+  function modelOptions(sel, current){
+    current = current || '';
+    const opts = MODELS.map(m => '<option value="'+esc(m.id)+'">'
+      + esc(m.label)+'</option>');
+    if (!MODELS.some(m => m.id === current))       // keep a free-typed id visible
+      opts.push('<option value="'+esc(current)+'">'+esc(current)+'</option>');
+    opts.push('<option value="__custom">custom&hellip;</option>');
+    sel.innerHTML = opts.join('');
+    sel.value = current;
+  }
+  function pickedModel(sel){
+    if (sel.value !== '__custom') return sel.value;
+    return (prompt('model id (as the claude CLI --model flag accepts)') || '').trim();
+  }
+  function modelLabel(id){
+    const m = MODELS.find(m => m.id === id);
+    return m ? m.label : id;
+  }
+  async function spawnAgent(name, profile, model){
     const res = await apiPost('/api/workspace/spawn',
-      {name: name, role: 'agent', profile: profile || 'default'});
+      {name: name, role: 'agent', profile: profile || 'default', model: model || ''});
     if (!res.ok) { toast(res.error||'spawn failed', true); return null; }
     AGENTS[res.agent.id] = res.agent;   // seed so paint doesn't see "vanished"
     return res.agent;
@@ -386,12 +404,26 @@ _PAGE = """<!doctype html>
     if (!n.agent) {
       const sel = q('prof');
       sel.innerHTML = PROFILES.map(pr => '<option>'+esc(pr.name)+'</option>').join('');
+      modelOptions(q('model'), '');
       q('spawn').onclick = async () => {
-        const agent = await spawnAgent(q('nmIn').value, sel.value);
+        const agent = await spawnAgent(q('nmIn').value, sel.value,
+                                       pickedModel(q('model')));
         if (!agent) return;
         adoptSpawn(n, agent); buildGrid();
       };
     } else {
+      const msel = q('model');
+      modelOptions(msel, (AGENTS[n.agent]||{}).model || '');
+      msel.onchange = async () => {
+        const res = await apiPost('/api/workspace/set_model',
+          {id:n.agent, model: pickedModel(msel)});
+        if (!res.ok) { toast(res.error||'failed', true);
+          modelOptions(msel, (AGENTS[n.agent]||{}).model || ''); return; }
+        AGENTS[n.agent] = res.agent;
+        modelOptions(msel, res.agent.model);   // reflect a custom-typed id
+        toast('model \\u2192 ' + (res.agent.model ? modelLabel(res.agent.model)
+                                                  : 'account default'));
+      };
       const inp = q('in');
       inp.addEventListener('keydown', e => { if (e.key === 'Enter') runPane(n, p); });
     }
@@ -412,7 +444,9 @@ _PAGE = """<!doctype html>
     const run = p.querySelector('[data-r="run"]');
     if (run && !n.agent) run.style.display = sk.length ? '' : 'none';
   }
-  // one Run = one composed prompt: every staged skill plus the typed command
+  // one Run = one server-composed pipeline: the staged skills + the typed
+  // command go to run_recipe, which enriches them with MindHive's learned
+  // history (skill health, prevention rules, ledger recall) before launching
   async function runPane(n, p){
     const q = r => p.querySelector('[data-r="'+r+'"]');
     const cmd = (q('in') ? q('in').value : '').trim();
@@ -422,17 +456,19 @@ _PAGE = """<!doctype html>
     const wasEmpty = !n.agent;
     if (wasEmpty) {
       const agent = await spawnAgent(q('nmIn') ? q('nmIn').value : '',
-                                     q('prof') ? q('prof').value : 'default');
+                                     q('prof') ? q('prof').value : 'default',
+                                     q('model') ? pickedModel(q('model')) : '');
       if (!agent) return;
       adoptSpawn(n, agent);
     }
     // hold the id locally: a concurrent repaint may reset n.agent, and the
     // send must still reach the agent that was just spawned
     const agentId = n.agent;
-    const res = await apiPost('/api/workspace/send',
-      {id:agentId, prompt: composePrompt(STAGED[agentId] || [], cmd)});
-    if (!res.ok) { toast(res.error||'send failed', true);
+    const res = await apiPost('/api/workspace/run_recipe',
+      {id:agentId, skills: STAGED[agentId] || [], command: cmd});
+    if (!res.ok) { toast(res.error||'run failed', true);
       if (wasEmpty) buildGrid(); return; }
+    delete STAGED[agentId]; saveStaged();   // recipe consumed by this run
     if (q('in')) q('in').value = '';
     toast('run started');
     if (wasEmpty) buildGrid(); else paintRecipe(p, n);
@@ -517,6 +553,7 @@ _PAGE = """<!doctype html>
       const nm = pane.el.querySelector('[data-r="nm"]');
       const dot = pane.el.querySelector('[data-r="dot"]');
       if (nm) nm.textContent = a.name + ' \\u00b7 ' + a.profile
+        + (a.model ? ' \\u00b7 ' + modelLabel(a.model) : '')
         + (a.role !== 'agent' ? ' \\u00b7 ' + a.role : '')
         + (a.last_turns != null ? ' \\u00b7 ' + a.last_turns + ' turns' : '')
         + (a.last_cost != null ? ' \\u00b7 $' + (+a.last_cost).toFixed(2) : '');
@@ -596,19 +633,51 @@ _PAGE = """<!doctype html>
     }));
   }
 
-  // --- profiles ---
+  // --- profiles (accounts): auth health + login/trust per profile ---
   let PROFILES = [{name:'default'}];
+  let MODELS = [{id:'', label:'account default'}];
+  let AUTH = {};
   async function loadProfiles(){
     try {
       const res = await api('/api/workspace/profiles');
       PROFILES = res.profiles || PROFILES;
-      document.getElementById('profs').innerHTML = PROFILES.map(p =>
-        '<div class="prof"><span class="name" title="'+esc(p.config_dir||'system default')
-        +'">'+esc(p.name)+'</span>'
+      if (res.models && res.models.length) MODELS = res.models;
+      paintProfiles();
+      loadAuth();
+    } catch(_){}
+  }
+  async function loadAuth(){
+    try {
+      const res = await api('/api/workspace/auth');
+      AUTH = {};
+      (res.auth||[]).forEach(a => AUTH[a.profile] = a);
+      paintProfiles();
+    } catch(_){}
+  }
+  function paintProfiles(){
+    document.getElementById('profs').innerHTML = PROFILES.map(p => {
+      const a = AUTH[p.name] || {state:'unknown', detail:'checking\\u2026'};
+      return '<div class="prof">'
+        + '<span class="adot '+esc(a.state)+'" title="'+esc(a.detail)+'"></span>'
+        + '<span class="name" title="'+esc(p.config_dir||'system default')
+        + ' \\u2014 '+esc(a.detail)+'">'+esc(p.name)+'</span>'
+        + '<button title="open a login console for this account (type /login there)"'
+        + ' onclick="loginProfile(\\''+esc(p.name)+'\\')">login</button>'
+        + '<button title="pre-accept the workspace trust dialog for this project"'
+        + ' onclick="trustProfile(\\''+esc(p.name)+'\\')">trust</button>'
         + (p.name==='default' ? '' :
            '<button class="warn" onclick="rmProfile(\\''+esc(p.name)+'\\')">&#10005;</button>')
-        +'</div>').join('');
-    } catch(_){}
+        + '</div>';
+    }).join('');
+  }
+  async function loginProfile(name){
+    const res = await apiPost('/api/workspace/profile_login', {name:name});
+    toast(res.ok ? res.detail : (res.error||'failed'), !res.ok);
+    setTimeout(loadAuth, 15000);   // re-check after the user logs in
+  }
+  async function trustProfile(name){
+    const res = await apiPost('/api/workspace/profile_trust', {name:name});
+    toast(res.ok ? res.detail : (res.error||'failed'), !res.ok);
   }
   async function addProfile(){
     const res = await apiPost('/api/workspace/profile_add',
@@ -680,6 +749,7 @@ _PAGE = """<!doctype html>
 
   // boot
   loadLayout(); buildGrid(); loadProfiles(); loadSkills(); loadBoard();
+  setInterval(loadAuth, 30000);        // auth health drifts (token expiry)
   (async function loop(){ await poll(); POLLED = true; setTimeout(loop, 1000); })();
 </script>
 </body></html>"""
