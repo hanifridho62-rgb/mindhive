@@ -84,6 +84,25 @@ def test_parallel_skill_drag_payload_and_source():
     assert "dragstart" in PARALLEL
 
 
+def test_parallel_spawn_seeds_agents_before_repaint():
+    # regression: dropping a skill on an empty pane spawned an agent, but the
+    # stale AGENTS map made the repaint treat it as vanished, null the pane,
+    # and the follow-up send failed with "unknown agent" — both spawn paths
+    # (drop and the Spawn button) must seed AGENTS with the fresh agent
+    assert PARALLEL.count("AGENTS[res.agent.id] = res.agent") == 2
+
+
+def test_parallel_drop_send_uses_pinned_agent_id():
+    # the send after an auto-spawn must not re-read the mutable layout node
+    assert "const agentId = n.agent" in PARALLEL
+    assert "{id:agentId," in PARALLEL
+
+
+def test_parallel_pane_reset_needs_two_consecutive_misses():
+    # one stale poll (request in flight during the spawn) must not wipe a pane
+    assert "MISSES[n.agent] < 2" in PARALLEL
+
+
 # --- R7: kanban dispatches agents -----------------------------------------------
 
 def test_parallel_kanban_columns_and_dispatch():

@@ -256,6 +256,7 @@ _PAGE = """<!doctype html>
         const res = await apiPost('/api/workspace/spawn',
           {name: q('nmIn').value, role: 'agent', profile: sel.value});
         if (!res.ok) { toast(res.error||'spawn failed', true); return; }
+        AGENTS[res.agent.id] = res.agent;   // seed so paint doesn't see "vanished"
         n.agent = res.agent.id; saveLayout(); buildGrid();
       };
     } else {
@@ -279,16 +280,20 @@ _PAGE = """<!doctype html>
       const res = await apiPost('/api/workspace/spawn',
         {name:'Claude '+PSEQ, role:'agent', profile:'default'});
       if (!res.ok) { toast(res.error||'spawn failed', true); return; }
+      AGENTS[res.agent.id] = res.agent;   // seed so paint doesn't see "vanished"
       n.agent = res.agent.id; saveLayout(); buildGrid();
     }
+    // hold the id locally: a concurrent repaint may reset n.agent, and the
+    // follow-up send must still reach the agent that was just spawned
+    const agentId = n.agent;
     if (data.kind === 'skill') {
       const src = data.plugin ? ' (from the '+data.plugin+' plugin)' : '';
-      const res = await apiPost('/api/workspace/send', {id:n.agent,
+      const res = await apiPost('/api/workspace/send', {id:agentId,
         prompt:'Use the '+data.name+' skill'+src+' now. Follow it to completion.'});
       toast(res.ok ? data.name+' \\u2192 pane' : (res.error||'busy'), !res.ok);
     } else if (data.kind === 'task') {
       const res = await apiPost('/api/workspace/board_dispatch',
-        {task_id:data.id, agent_id:n.agent});
+        {task_id:data.id, agent_id:agentId});
       toast(res.ok ? 'card dispatched' : (res.error||'dispatch failed'), !res.ok);
       loadBoard();
     }
@@ -320,11 +325,23 @@ _PAGE = """<!doctype html>
       }
     } catch(_){}
   }
+  // A just-spawned agent can be missing from one poll cycle: a request already
+  // in flight when the spawn landed returns a list without it, and treating
+  // that single stale miss as "vanished" wiped the pane and made the follow-up
+  // skill/card send fail with "unknown agent". Reset a pane only after two
+  // consecutive polls agree the agent is gone.
+  let MISSES = {};
   function paintAgents(){
     leaves(LAYOUT).forEach(n => {
       const pane = PANES[n.pid]; if (!pane) return;
-      if (n.agent && !AGENTS[n.agent] && POLLED) { n.agent = null; saveLayout();
-        buildGrid(); return; }   // agent vanished server-side — reset pane
+      if (n.agent && !AGENTS[n.agent] && POLLED) {
+        MISSES[n.agent] = (MISSES[n.agent] || 0) + 1;
+        if (MISSES[n.agent] < 2) return;
+        delete MISSES[n.agent];
+        n.agent = null; saveLayout();
+        buildGrid(); return;     // agent vanished server-side — reset pane
+      }
+      if (n.agent) delete MISSES[n.agent];
       const a = n.agent && AGENTS[n.agent]; if (!a) return;
       const nm = pane.el.querySelector('[data-r="nm"]');
       const dot = pane.el.querySelector('[data-r="dot"]');
