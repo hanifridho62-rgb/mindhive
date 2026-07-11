@@ -17,6 +17,15 @@ SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES
 # stay connected through the shared tag node either way.
 SHARES_TAG_MAX_BUCKET = 24
 
+# Algorithm/schema version stamped into every persisted graph.json. Bump this
+# whenever the graph-building logic changes in a way that should invalidate old
+# caches (the shares_tag cap was such a change). load_or_build treats any cache
+# whose "version" != this — including a pre-cap cache with no version key — as
+# stale and rebuilds it. Without this, a dormant project whose events never
+# change would keep serving a graph built by the OLD algorithm forever, because
+# the mtime freshness check alone can't see that the code changed.
+GRAPH_BUILD_VERSION = 2
+
 
 def _ev_id(ev) -> str:
     # Include a short hash of the payload so two DISTINCT events that share the
@@ -191,6 +200,7 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
             pass  # deps missing / LIVE_LOCK / not embedded -> deterministic edges only
 
     result = {
+        "version": GRAPH_BUILD_VERSION,
         "nodes": sorted(nodes.values(), key=lambda n: n["id"]),
         "edges": edges,
     }
@@ -245,7 +255,13 @@ def load_or_build(project=None, *, semantic: bool = False,
             fresh_since = _events_mtime(project) if source_mtime is None else source_mtime
             try:
                 if gfile.stat().st_mtime >= fresh_since:
-                    return json.loads(gfile.read_text(encoding="utf-8"))
+                    cached = json.loads(gfile.read_text(encoding="utf-8"))
+                    # Serve only a cache built by the CURRENT algorithm. A missing
+                    # or older "version" means the file was built before a
+                    # cache-invalidating change (e.g. pre-cap), so rebuild even
+                    # though its mtime looks fresh.
+                    if cached.get("version") == GRAPH_BUILD_VERSION:
+                        return cached
             except (OSError, ValueError):
                 pass  # missing/corrupt cache -> fall through and rebuild
     evs = build_evs() if build_evs is not None else None
