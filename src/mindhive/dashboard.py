@@ -446,15 +446,27 @@ def make_handler(token: str):
             return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
 
         def _get_graph(self, proj, am, qs):
-            # semantic=True folds the embedding-derived semantic_near edges into
-            # the interactive graph (degrades to deterministic edges if
-            # embeddings/deps are absent). Cost scales with ledger size, so a
-            # large namespace's graph takes longer to build on demand.
+            # Serve the persisted graph.json when it is still fresh (autosync
+            # keeps it current), rebuilding only when events actually changed —
+            # so re-opening the Graph tab is a cheap cache read, not a full
+            # rebuild + 60 MB serialize + disk write. Semantic edges fold in the
+            # embedding-derived semantic_near links but cost an embedding search
+            # per event, so they are the opt-in path (?semantic=1), never the
+            # default load.
+            semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
             if am:
-                evs = [e for _, e in all_event_pairs()]
-                html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs, semantic=True))
+                # HIVE MIND aggregates every namespace; freshness is the newest
+                # event across all of them (a cheap stat sweep), and the full
+                # aggregate log is only read on a cache miss.
+                src_mtime = max((graph_mod._events_mtime(n) for n in _all_projects()),
+                                default=0.0)
+                graph = graph_mod.load_or_build(
+                    project=HIVEMIND_PROJECT, semantic=semantic,
+                    source_mtime=src_mtime,
+                    build_evs=lambda: [e for _, e in all_event_pairs()])
             else:
-                html = graphview.render_html(graph_mod.build(proj, semantic=True))
+                graph = graph_mod.load_or_build(proj, semantic=semantic)
+            html = graphview.render_html(graph)
             return self._send(200, html, "text/html; charset=utf-8")
 
         def _get_plugins_recommend(self, proj, am, qs):

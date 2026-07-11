@@ -116,6 +116,158 @@ def test_build_shares_tag_edges():
     assert found
 
 
+def test_shares_tag_skips_mega_hub_bucket():
+    """A tag shared by more than SHARES_TAG_MAX_BUCKET semantic events is a
+    mega-hub with no discriminating signal; pairing inside it would emit an
+    O(n^2) edge explosion. Those pairs must be skipped, while a small, specific
+    co-tag bucket still gets its shares_tag edge."""
+    from mindhive.graph import SHARES_TAG_MAX_BUCKET
+
+    hub_n = SHARES_TAG_MAX_BUCKET + 5
+    evs = [
+        events.Event(ts=f"2026-06-20T10:{i:02d}:00Z", session_id="s",
+                     type="decision", payload={"text": f"d{i}"}, tags=["auto"])
+        for i in range(hub_n)
+    ]
+    # two of the hub events ALSO share a small, specific tag
+    evs[0].tags.append("narrow")
+    evs[1].tags.append("narrow")
+
+    g = build(project=None, _evs=evs)
+    shares = [(e["src"], e["dst"]) for e in g["edges"] if e["rel"] == "shares_tag"]
+    # The mega-hub "auto" (hub_n events) contributes nothing quadratic...
+    assert len(shares) == 1
+    # ...but the narrow two-event co-tag survives.
+    pair = {_ev_id(evs[0]), _ev_id(evs[1])}
+    assert {shares[0][0], shares[0][1]} == pair
+
+
+def _write_events(evs):
+    for e in evs:
+        events.append_event(e.type, e.payload, session_id=e.session_id,
+                            tags=e.tags, ts=e.ts)
+
+
+def _make_cache_fresh():
+    """Stamp graph.json newer than the event segments so the cache reads fresh."""
+    import os
+    import time
+    gfile = paths.project_dir(None) / "graph.json"
+    future = time.time() + 10
+    os.utime(gfile, (future, future))
+    return gfile
+
+
+def test_load_or_build_serves_fresh_cache(monkeypatch):
+    """When graph.json is at least as fresh as the event log, load_or_build
+    returns the cached graph WITHOUT rebuilding."""
+    import mindhive.graph as gmod
+
+    _write_events(_make_evs())
+    gmod.build(project=None)          # persist a real graph.json
+    _make_cache_fresh()
+
+    monkeypatch.setattr(gmod, "build", lambda *a, **k:
+                        (_ for _ in ()).throw(AssertionError("rebuilt on a fresh cache")))
+    g = gmod.load_or_build(project=None)
+    assert "session:sess1" in {n["id"] for n in g["nodes"]}
+
+
+def test_load_or_build_rebuilds_when_stale(monkeypatch):
+    """A graph.json older than the event segments must be rebuilt."""
+    import os
+    import mindhive.graph as gmod
+
+    _write_events(_make_evs())
+    gmod.build(project=None)
+    os.utime(paths.project_dir(None) / "graph.json", (1, 1))  # ancient -> stale
+
+    calls = {"n": 0}
+    real = gmod.build
+    monkeypatch.setattr(gmod, "build",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), real(*a, **k))[1])
+    gmod.load_or_build(project=None)
+    assert calls["n"] == 1
+
+
+def test_load_or_build_semantic_bypasses_cache(monkeypatch):
+    """Semantic graphs are never served from the deterministic cache."""
+    import mindhive.graph as gmod
+
+    _write_events(_make_evs())
+    gmod.build(project=None)
+    _make_cache_fresh()               # a fresh cache exists...
+
+    calls = {"n": 0}
+    real = gmod.build
+    monkeypatch.setattr(gmod, "build",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), real(*a, **k))[1])
+    gmod.load_or_build(project=None, semantic=True)
+    assert calls["n"] == 1            # ...yet semantic still rebuilds
+
+
+def test_load_or_build_evs_factory_lazy_on_hit():
+    """build_evs is invoked only on a cache miss, never on a hit — so the
+    (potentially large) aggregate read is skipped when the cache is warm."""
+    import mindhive.graph as gmod
+
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        return _make_evs()
+
+    gmod.load_or_build(project=None, build_evs=factory)   # miss -> builds + persists
+    assert calls["n"] == 1
+    _make_cache_fresh()
+    gmod.load_or_build(project=None, build_evs=factory)   # hit -> factory untouched
+    assert calls["n"] == 1
+
+
+def test_build_stamps_algorithm_version():
+    """build() records the algorithm version in the result and on disk, so a
+    later load can tell a fresh cache apart from one built by an older
+    algorithm (e.g. before the shares_tag cap)."""
+    import mindhive.graph as gmod
+    g = gmod.build(project=None, _evs=_make_evs())
+    assert g["version"] == gmod.GRAPH_BUILD_VERSION
+    on_disk = json.loads((paths.project_dir(None) / "graph.json").read_text(encoding="utf-8"))
+    assert on_disk["version"] == gmod.GRAPH_BUILD_VERSION
+
+
+def test_load_or_build_rejects_versionless_cache():
+    """A fresh-mtime graph.json with NO version (built by the pre-cap algorithm)
+    must be rebuilt, not served — otherwise a dormant project whose events never
+    change keeps serving a stale giant forever."""
+    import mindhive.graph as gmod
+    _write_events(_make_evs())
+    gfile = paths.project_dir(None) / "graph.json"
+    gfile.parent.mkdir(parents=True, exist_ok=True)
+    # a versionless cache carrying a sentinel a real build never produces
+    gfile.write_text(json.dumps(
+        {"nodes": [{"id": "STALE_SENTINEL", "type": "tag", "label": "x"}], "edges": []}),
+        encoding="utf-8")
+    _make_cache_fresh()                        # newer than the events
+    g = gmod.load_or_build(project=None)
+    assert "STALE_SENTINEL" not in {n["id"] for n in g["nodes"]}   # rebuilt, not served
+    assert g.get("version") == gmod.GRAPH_BUILD_VERSION
+
+
+def test_load_or_build_rejects_outdated_version_cache():
+    """A fresh cache stamped with an older algorithm version is rebuilt."""
+    import mindhive.graph as gmod
+    _write_events(_make_evs())
+    gfile = paths.project_dir(None) / "graph.json"
+    gfile.write_text(json.dumps(
+        {"version": gmod.GRAPH_BUILD_VERSION - 1,
+         "nodes": [{"id": "OLD_SENTINEL", "type": "tag", "label": "x"}], "edges": []}),
+        encoding="utf-8")
+    _make_cache_fresh()
+    g = gmod.load_or_build(project=None)
+    assert "OLD_SENTINEL" not in {n["id"] for n in g["nodes"]}
+    assert g["version"] == gmod.GRAPH_BUILD_VERSION
+
+
 def test_distinct_events_same_ts_type_do_not_collide():
     """Two different events sharing a timestamp AND type must not overwrite each
     other — the node id includes a payload hash to keep them distinct."""
