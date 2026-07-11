@@ -154,6 +154,21 @@ per-card dismiss button). The **Reflect (learn from failures)** button (Heavy)
 turns recurring unreflected incidents into lessons via the `claude` CLI, a
 small bounded batch per click.
 
+**Workspace: MindParallel & MindSwarm.** The **Workspace** group runs real
+Claude Code agents from the dashboard, all feeding the same hive memory.
+**MindParallel** is a grid of up to 16 panes — each pane is a headless `claude`
+session (follow-ups resume the same session), with named **profiles** mapping
+panes to different `CLAUDE_CONFIG_DIR`s so multiple accounts run side by side,
+and a kanban board whose cards dispatch their prompt to a free pane and move
+backlog → running → done with the run. **MindSwarm** launches a mission crew —
+a coordinator plus builders, scouts, and reviewers — where every agent's system
+prompt tells it to read and write the shared Mind Hive ledger (`hive recall` /
+`hive append`), so what one agent learns the next one starts with; a command
+bar directs any single agent or the whole swarm. Every exchange lands in the
+ledger as `user_prompt` / `assistant_response` events (failures as
+`tool_failed` with signature `workspace:<role>`), so workspace activity flows
+into Memory, the graph, and the Improvements loop automatically.
+
 **Self-healing capture.** The server runs a background loop that periodically
 **auto-harvests** any session the live hooks missed — so the store stays current
 even in environments where the hooks never fire (e.g. the Agent SDK harness).
