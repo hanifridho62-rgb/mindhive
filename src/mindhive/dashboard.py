@@ -764,7 +764,8 @@ def make_handler(token: str):
             "/api/skills/history": _get_skills_history,
             "/api/export": _get_export,
         }
-        for _p in ("parallel", "swarm", "agents", "output", "profiles", "board"):
+        for _p in ("parallel", "swarm", "agents", "output", "profiles",
+                   "auth", "board"):
             _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
         del _p
         _POST_ROUTES = {
@@ -781,9 +782,10 @@ def make_handler(token: str):
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/selftest": _post_selftest,
         }
-        for _p in ("spawn", "send", "stop", "remove", "profile_add",
-                   "profile_remove", "board_save", "board_dispatch",
-                   "mission", "mission_stop", "command"):
+        for _p in ("spawn", "send", "run_recipe", "set_model", "stop",
+                   "remove", "clear_idle", "profile_add", "profile_remove",
+                   "profile_login", "profile_trust", "board_save",
+                   "board_dispatch", "mission", "mission_stop", "command"):
             _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
         del _p
 

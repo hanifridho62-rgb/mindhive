@@ -6,6 +6,7 @@ against a FakeProc that replays canned stream-json lines — no real `claude`
 subprocess is ever launched.
 """
 import json
+import threading
 import time
 
 import pytest
@@ -142,6 +143,15 @@ def test_profile_save_load_remove_roundtrip():
 def test_profile_rejects_empty_and_default_names():
     assert not workspace.save_profile("", "x")["ok"]
     assert not workspace.save_profile("default", "x")["ok"]
+
+
+def test_profile_rejects_shell_metachar_names():
+    # profile names reach a Windows `cmd /k` string in profile_login, so
+    # save_profile must reject anything with shell metacharacters
+    for bad in ('x & calc', 'a|b', 'p"q', 'a>b', 'a<b', 'a&&b'):
+        res = workspace.save_profile(bad, "C:/x")
+        assert not res["ok"], f"{bad!r} should be rejected"
+    assert workspace.save_profile("work-2.prod acct", "C:/x")["ok"]
 
 
 def test_profile_env_applies_config_dir():
@@ -323,6 +333,62 @@ def test_stop_and_remove():
     assert h.mgr.list()["agents"] == []
 
 
+def test_clear_idle_removes_only_settled_non_swarm_agents():
+    h = Harness()
+    running = h.mgr.spawn(name="Busy")["agent"]["id"]
+    done = h.mgr.spawn(name="Done")["agent"]["id"]
+    idle = h.mgr.spawn(name="Fresh")["agent"]["id"]
+    swarm = h.mgr.spawn(name="Crew", role="builder", swarm=True)["agent"]["id"]
+    h.mgr.send(done, "work")
+    _wait_settled(_agent_obj(h, done))
+    _agent_obj(h, running).status = "running"    # simulate an in-flight run
+    res = h.mgr.clear_idle()
+    assert res["ok"] and res["removed"] == 2     # done + fresh idle
+    left = {a["id"] for a in h.mgr.list()["agents"]}
+    assert left == {running, swarm}              # running and swarm survive
+
+
+def test_api_post_clear_idle_dispatches():
+    res = workspace.api_post("clear_idle")
+    assert res["ok"] and res["removed"] == 0     # empty singleton fleet
+
+
+def test_reader_records_skills_used_and_run_stats():
+    lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s1", "model": "m"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "ce-plan"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "Skill", "input": {}},
+            {"type": "tool_use", "name": "Skill", "input": "not-a-dict"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "ce-plan"}},
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "ce-work"}}]}}),
+        json.dumps({"type": "result", "subtype": "success", "result": "ok",
+                    "num_turns": 4, "total_cost_usd": 0.5, "session_id": "s1"}),
+    ]
+    h = Harness(lines=lines)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    # deduped, in first-use order; malformed and non-Skill blocks ignored
+    assert a.skills_used == ["ce-plan", "ce-work"]
+    assert a.last_turns == 4
+    assert a.last_cost == 0.5
+    snap = a.snapshot()
+    assert snap["skills_used"] == ["ce-plan", "ce-work"]
+    assert snap["last_turns"] == 4 and snap["last_cost"] == 0.5
+
+
+def test_fresh_agent_exposes_empty_run_stats():
+    h = Harness()
+    snap = h.mgr.spawn(name="A")["agent"]
+    assert snap["skills_used"] == []
+    assert snap["last_turns"] is None and snap["last_cost"] is None
+
+
 def test_agent_scrollback_is_capped():
     a = workspace.Agent("A")
     for i in range(workspace.MAX_LINES + 50):
@@ -380,6 +446,223 @@ def test_command_targets_one_agent_or_whole_swarm():
     assert res["ok"]
     assert len(h.calls) == n_calls + 3
     assert not h.mgr.command("all", " ")["ok"]
+
+
+# --- model picker -----------------------------------------------------------------
+
+def test_spawn_with_model_passes_model_flag():
+    h = Harness()
+    res = h.mgr.spawn(name="A", model="claude-opus-4-8")
+    assert res["ok"] and res["agent"]["model"] == "claude-opus-4-8"
+    aid = res["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    argv = h.calls[0][0]
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+
+
+def test_default_model_omits_model_flag():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    assert "--model" not in h.calls[0][0]
+
+
+def test_set_model_updates_idle_agent_and_rejects_busy(monkeypatch):
+    h = Harness()
+    monkeypatch.setattr(workspace, "MANAGER", h.mgr)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    res = workspace.api_post("set_model",
+                             body={"id": aid, "model": "claude-sonnet-5"})
+    assert res["ok"] and res["agent"]["model"] == "claude-sonnet-5"
+    _agent_obj(h, aid).status = "running"
+    res = workspace.api_post("set_model", body={"id": aid, "model": ""})
+    assert not res["ok"] and "busy" in res["error"]
+    assert not workspace.api_post("set_model", body={"id": "nope"})["ok"]
+
+
+def test_profiles_api_ships_model_choices():
+    res = workspace.api_get("profiles")
+    assert res["ok"]
+    ids = [m["id"] for m in res["models"]]
+    assert "" in ids and "claude-fable-5" in ids and "claude-opus-4-8" in ids
+
+
+# --- auth / login / trust -----------------------------------------------------------
+
+def _auth_profile(tmp_path, expires_in_s):
+    cfg = tmp_path / "cfg"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"expiresAt": (time.time() + expires_in_s) * 1000,
+                           "subscriptionType": "max"}}), encoding="utf-8")
+    workspace.save_profile("authp", str(cfg))
+    return cfg
+
+
+def test_auth_status_ok_expired_and_none(tmp_path):
+    cfg = _auth_profile(tmp_path, expires_in_s=3600)
+    st = workspace.profile_auth_status("authp")
+    assert st["state"] == "ok" and "max" in st["detail"]
+    (cfg / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"expiresAt": 1000}}), encoding="utf-8")
+    assert workspace.profile_auth_status("authp")["state"] == "expired"
+    (cfg / ".credentials.json").unlink()
+    assert workspace.profile_auth_status("authp")["state"] == "none"
+    # state file with an account but no readable token store -> unknown
+    (cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"e": "x"}}),
+                                      encoding="utf-8")
+    assert workspace.profile_auth_status("authp")["state"] == "unknown"
+
+
+def test_auth_api_reports_every_profile(tmp_path):
+    _auth_profile(tmp_path, expires_in_s=3600)
+    res = workspace.api_get("auth")
+    assert res["ok"]
+    by_name = {a["profile"]: a for a in res["auth"]}
+    assert "default" in by_name
+    assert by_name["authp"]["state"] == "ok"
+
+
+def test_profile_trust_writes_both_slash_spellings(tmp_path):
+    cfg = _auth_profile(tmp_path, expires_in_s=3600)
+    res = workspace.profile_trust("authp", r"C:\proj\demo")
+    assert res["ok"]
+    st = json.loads((cfg / ".claude.json").read_text(encoding="utf-8"))
+    assert st["projects"]["C:\\proj\\demo"]["hasTrustDialogAccepted"] is True
+    assert st["projects"]["C:/proj/demo"]["hasTrustDialogAccepted"] is True
+    # existing entries keep their other keys
+    res = workspace.profile_trust("authp", r"C:\proj\demo")
+    assert res["ok"]
+
+
+def test_profile_trust_concurrent_writes_do_not_clobber(tmp_path):
+    # two folders trusted at once must both survive — the read-modify-write is
+    # serialized under _TRUST_LOCK so neither overwrites the other's key
+    _auth_profile(tmp_path, expires_in_s=3600)
+    cfg = tmp_path / "cfg"
+    folders = [f"C:/proj/demo{i}" for i in range(12)]
+    threads = [threading.Thread(target=workspace.profile_trust,
+                                args=("authp", f)) for f in folders]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    st = json.loads((cfg / ".claude.json").read_text(encoding="utf-8"))
+    for f in folders:
+        assert st["projects"][f]["hasTrustDialogAccepted"] is True
+
+
+def test_profile_login_rejects_unknown_and_unsafe_profiles(monkeypatch):
+    # never launch a console for a name that isn't a saved profile — the name
+    # is interpolated into the cmd string, so an unchecked value is injection
+    launched = []
+    monkeypatch.setattr(workspace.subprocess, "Popen",
+                        lambda *a, **k: launched.append(a) or object())
+    assert not workspace.profile_login("no-such-profile")["ok"]
+    assert not workspace.profile_login('x & calc')["ok"]
+    assert launched == []                    # nothing was spawned
+
+
+def test_profile_login_passes_config_dir_via_env_not_shell(tmp_path, monkeypatch):
+    workspace.save_profile("envp", r"C:\cfg\envp")
+    captured = {}
+
+    def fake_popen(argv, *a, **kw):
+        captured["argv"] = argv
+        captured["env"] = kw.get("env") or {}
+        return object()
+    monkeypatch.setattr(workspace.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(workspace.subprocess, "CREATE_NEW_CONSOLE", 16,
+                        raising=False)
+    res = workspace.profile_login("envp")
+    assert res["ok"]
+    # config dir rides in the child env, never as a shell `set` command
+    assert captured["env"].get("CLAUDE_CONFIG_DIR") == r"C:\cfg\envp"
+    assert "set " not in " ".join(captured["argv"])
+
+
+# --- recipe runs ---------------------------------------------------------------------
+
+def _stub_history(monkeypatch, status=None, lessons=None, hits=None):
+    from mindhive import plugins as plugins_mod, incidents as inc, recall as rec
+    monkeypatch.setattr(plugins_mod, "call_status",
+                        lambda project=None: status or {})
+    monkeypatch.setattr(inc, "summaries", lambda project=None: lessons or [])
+    monkeypatch.setattr(rec, "recall",
+                        lambda q, project=None, limit=10, **kw: hits or [])
+
+
+def test_compose_recipe_prompt_orders_skills_and_injects_history(monkeypatch):
+    _stub_history(
+        monkeypatch,
+        status={"ce-plan": "ok", "ce-debug": "fail"},
+        lessons=[{"signature": "skill:ce-debug",
+                  "lesson": "always reproduce before fixing"}],
+        hits=[{"snippet": "decision: panes stage skills until Run"}])
+    prompt = workspace.compose_recipe_prompt(
+        [{"name": "ce-plan", "plugin": "compound-engineering"},
+         {"name": "ce-debug", "plugin": None}],
+        "fix the login flow")
+    assert prompt.index("1. Use the ce-plan skill (from the "
+                        "compound-engineering plugin).") \
+        < prompt.index("2. Use the ce-debug skill.")
+    assert "exactly once, in the order listed" in prompt
+    assert "COMMAND: fix the login flow" in prompt
+    assert "ce-debug: last outcome fail" in prompt
+    assert "always reproduce before fixing" in prompt
+    assert "panes stage skills until Run" in prompt
+
+
+def test_compose_recipe_survives_broken_history_sources(monkeypatch):
+    from mindhive import plugins as plugins_mod, incidents as inc, recall as rec
+
+    def boom(*a, **kw):
+        raise RuntimeError("subsystem down")
+    monkeypatch.setattr(plugins_mod, "call_status", boom)
+    monkeypatch.setattr(inc, "summaries", boom)
+    monkeypatch.setattr(rec, "recall", boom)
+    prompt = workspace.compose_recipe_prompt([{"name": "ce-plan"}], "do it")
+    assert "Use the ce-plan skill" in prompt
+    assert "COMMAND: do it" in prompt
+
+
+def test_run_recipe_sends_enriched_prompt_with_primer(monkeypatch):
+    _stub_history(monkeypatch)
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    res = workspace.run_recipe(h.mgr, aid,
+                               [{"name": "ce-plan"}], "build the thing")
+    assert res["ok"]
+    _wait_settled(_agent_obj(h, aid))
+    argv = h.calls[0][0]
+    prompt = argv[argv.index("-p") + 1]
+    assert "Use the ce-plan skill" in prompt
+    assert "COMMAND: build the thing" in prompt
+    sysp = argv[argv.index("--append-system-prompt") + 1]
+    assert "MindHive integration" in sysp
+    assert "rules summaries" in sysp
+
+
+def test_run_recipe_rejects_empty_and_unknown(monkeypatch):
+    _stub_history(monkeypatch)
+    h = Harness()
+    assert not workspace.run_recipe(h.mgr, "nope", [], "")["ok"]
+    res = workspace.run_recipe(h.mgr, "nope", [{"name": "x"}], "go")
+    assert not res["ok"] and "unknown agent" in res["error"]
+
+
+def test_run_recipe_api_action(monkeypatch):
+    _stub_history(monkeypatch)
+    h = Harness()
+    monkeypatch.setattr(workspace, "MANAGER", h.mgr)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    res = workspace.api_post("run_recipe",
+                             body={"id": aid, "skills": [{"name": "ce-plan"}],
+                                   "command": "go"})
+    assert res["ok"]
+    _wait_settled(_agent_obj(h, aid))
 
 
 # --- dashboard API dispatch ------------------------------------------------------

@@ -45,8 +45,9 @@ _PAGE = """<!doctype html>
   #world { position:absolute; left:0; top:0; transform-origin:0 0; }
   svg#edges { position:absolute; left:0; top:0; overflow:visible; pointer-events:none; }
   .chip { position:absolute; transform:translate(-50%,-50%); white-space:nowrap;
-    border:1px solid; border-radius:4px; padding:3px 10px; font-size:12px; cursor:pointer;
-    background:#161b22cc; display:flex; align-items:center; gap:6px; }
+    border:1px solid; border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer;
+    background:#161b22cc; display:flex; flex-direction:column; align-items:center; gap:2px; }
+  .chip .row { display:flex; align-items:center; gap:6px; }
   .chip:hover { filter:brightness(1.3); }
   .chip.sel { box-shadow:0 0 0 2px #fff5; }
   .chip .dot { width:7px; height:7px; border-radius:50%; background:#3a4054; }
@@ -99,7 +100,8 @@ _PAGE = """<!doctype html>
       <button onclick="stopSel()">&#9632; stop</button>
       <button onclick="closeInsp()">&#10005;</button>
     </div>
-    <div id="imeta" style="color:#8b949e;font-size:11.5px;margin-bottom:8px"></div>
+    <div id="imeta" style="color:#8b949e;font-size:11.5px;margin-bottom:4px"></div>
+    <div id="iskills" style="color:#9ecbff;font-size:11.5px;margin-bottom:8px"></div>
     <pre id="iout"></pre>
   </div>
 </div>
@@ -119,6 +121,43 @@ _PAGE = """<!doctype html>
     agent: '#8ab4f8' };
   const ROLE_ICON = { coordinator:'&#9819;', builder:'&#128295;', scout:'&#128269;',
     reviewer:'&#128065;', agent:'&#9679;' };
+  // 6 pixel cats (white, calico, orange, grey tabby, siamese, black) drawn as
+  // inline SVG rect grids — no image files, so the page stays offline-self-
+  // contained. A node's cat is picked deterministically from its agent id:
+  // random per new node, stable across refreshes. Grid chars: b body, p patch,
+  // e eye, n nose, . empty.
+  const CAT_GRID = [
+    '.b........b.',
+    '.bb......bb.',
+    '.bpb....bpb.',
+    '.bbbbbbbbbb.',
+    'bbbbbbbbbbbb',
+    'bbeebbbbeebb',
+    'bbbbbnnbbbbb',
+    '.bbbbbbbbbb.',
+    '.bpbbbbbbpb.',
+    '.bbbbbbbbbb.',
+    '.bbbbbbbbbb.',
+    '..bb.bb.bb..'];
+  const CAT_PALETTES = [
+    {name:'white',   b:'#f2f2f0', p:'#e3e3df', e:'#4aa3ff'},
+    {name:'calico',  b:'#f2f2f0', p:'#e8863a', e:'#3fb950'},
+    {name:'orange',  b:'#e8863a', p:'#c9641f', e:'#3fb950'},
+    {name:'tabby',   b:'#9aa2ad', p:'#6b7280', e:'#e8b64c'},
+    {name:'siamese', b:'#e8dcc8', p:'#5b4636', e:'#58a6ff'},
+    {name:'black',   b:'#262a33', p:'#16181d', e:'#e8b64c'}];
+  function catFor(id){ return (parseInt(String(id).slice(0,4), 16) || 0) % 6; }
+  function catSVG(idx, size){
+    const c = CAT_PALETTES[idx % 6];
+    const fill = {b:c.b, p:c.p, e:c.e, n:'#ff8fb3'};
+    let rects = '';
+    CAT_GRID.forEach((row, y) => { for (let x = 0; x < row.length; x++) {
+      const col = fill[row[x]];
+      if (col) rects += '<rect x="'+x+'" y="'+y+'" width="1" height="1" fill="'+col+'"/>';
+    }});
+    return '<svg viewBox="0 0 12 12" width="'+size+'" height="'+size
+      + '" shape-rendering="crispEdges">'+rects+'</svg>';
+  }
   function api(path){ return fetch(withP(path) + (path.includes('?')?'&':'?') + 'token='
       + encodeURIComponent(TOKEN), {headers:{'X-Hive-Token':TOKEN}}).then(r=>r.json()); }
   function apiPost(path, body){
@@ -238,8 +277,9 @@ _PAGE = """<!doctype html>
       const p = pos[a.id] || {x:0, y:0}, col = ROLE_STYLE[a.role] || '#888';
       return '<div class="chip'+(SEL===a.id?' sel':'')+'" data-id="'+a.id
         +'" style="left:'+p.x+'px;top:'+p.y+'px;border-color:'+col+';color:'+col+'">'
-        + (ROLE_ICON[a.role]||'') + ' ' + esc(a.name)
-        + ' <span class="dot '+a.status+'"></span></div>';
+        + catSVG(catFor(a.id), 30)
+        + '<span class="row">'+(ROLE_ICON[a.role]||'') + ' ' + esc(a.name)
+        + ' <span class="dot '+a.status+'"></span></span></div>';
     }).join('');
     chips.querySelectorAll('.chip').forEach(el =>
       el.onclick = ev => { ev.stopPropagation(); inspect(el.dataset.id); });
@@ -271,7 +311,11 @@ _PAGE = """<!doctype html>
     document.getElementById('iname').textContent = a.name;
     document.getElementById('imeta').textContent =
       a.role + ' \\u00b7 ' + a.profile + ' \\u00b7 ' + a.status
-      + (a.session_id ? ' \\u00b7 session ' + a.session_id.slice(0,8) : '');
+      + (a.session_id ? ' \\u00b7 session ' + a.session_id.slice(0,8) : '')
+      + (a.last_turns != null ? ' \\u00b7 ' + a.last_turns + ' turns' : '')
+      + (a.last_cost != null ? ' \\u00b7 $' + (+a.last_cost).toFixed(4) : '');
+    document.getElementById('iskills').textContent =
+      'skills used: ' + ((a.skills_used || []).join(', ') || '\\u2014');
     const o = await api('/api/workspace/output?id='+SEL+'&since='+CURSOR);
     if (!o.ok) return;
     const pre = document.getElementById('iout');
