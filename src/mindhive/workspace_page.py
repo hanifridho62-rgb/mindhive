@@ -366,6 +366,11 @@ _PAGE = """<!doctype html>
     // migrate any recipe staged on the empty pane to the new agent id
     if (STAGED[n.pid]) { STAGED[agent.id] = STAGED[n.pid];
       delete STAGED[n.pid]; saveStaged(); }
+    // a poll's adoptOrphans may have claimed this just-spawned agent for
+    // another empty leaf while the spawn POST was in flight — unclaim it so
+    // two panes never share one agent
+    if (VIEW === 'splits') leaves(LAYOUT).forEach(l => {
+      if (l.agent === agent.id) l.agent = null; });
     n.agent = agent.id;
     if (VIEW === 'tabs') { ACTIVE = agent.id;
       localStorage.setItem('mh_ws_tab', ACTIVE); }

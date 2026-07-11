@@ -274,9 +274,16 @@ class Manager:
         with self._lock:
             ids = [a.id for a in self.agents.values()
                    if a.status != "running" and not a.swarm]
+        removed = 0
         for i in ids:
+            a = self.get(i)
+            # re-check right before removal: an agent snapshotted as settled
+            # may have started a run since — never kill a live run
+            if a is None or a.status == "running":
+                continue
             self.remove(i)
-        return {"ok": True, "removed": len(ids)}
+            removed += 1
+        return {"ok": True, "removed": removed}
 
     def output(self, agent_id, since=0) -> dict:
         a = self.get(agent_id)

@@ -156,6 +156,9 @@ def test_parallel_adopts_orphaned_agents():
     assert "adoptOrphans" in PARALLEL
     # adoption is splits-only (tabs render from server truth by construction)
     assert "VIEW !== 'splits' || !POLLED" in PARALLEL
+    # a just-spawned agent already claimed by adoption is unclaimed before the
+    # spawning pane takes it — two panes must never share one agent
+    assert "l.agent === agent.id" in PARALLEL
 
 
 def test_parallel_clear_idle_button():
