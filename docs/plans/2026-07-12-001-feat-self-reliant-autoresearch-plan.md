@@ -2,7 +2,7 @@
 title: "feat: Self-Reliant — autonomous autoresearch section for MindHive"
 date: 2026-07-12
 type: feat
-status: planned
+status: executed 2026-07-12 (U2–U11 shipped on branch claude/phase-2-roadmap-1cfa15; U1 bring-up remains manual-gated)
 depth: deep
 deepened: 2026-07-12
 origin: in-conversation brainstorm (2026-07-12); no docs/brainstorms doc
