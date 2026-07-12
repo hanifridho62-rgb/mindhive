@@ -373,6 +373,35 @@ def test_controller_agent_turn_timeout_aborts_and_continues(tmp_path):
     assert ctl.status()["reason"] == "cap"
 
 
+def test_controller_malformed_caps_rejected_structurally(tmp_path):
+    ctl = _controller(tmp_path)
+    res = ctl.start("g", max_experiments="lots")
+    assert res["ok"] is False and "number" in res["error"]
+    assert ctl.status()["state"] == "idle"      # state never flipped
+    res = ctl.start("g", time_budget_s="soon")
+    assert res["ok"] is False
+    assert ctl.start("g", max_experiments=1)["ok"]   # still startable
+    _wait_ended(ctl)
+
+
+def test_controller_uninjected_leaderboard_is_per_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(research.paths, "store_home", lambda: tmp_path)
+    (tmp_path / "train.py").write_text("x = 1\n", encoding="utf-8")
+    ctl = research.ResearchController(
+        trainer_cmd=_cmd("--mode", "ok", "--seconds", "0.05"),
+        agent_factory=lambda profile: StubResearcher(),
+        train_path=tmp_path / "train.py",
+        append_event=None, preflight=lambda profile: [],
+        cap_s=20, turn_timeout_s=10)
+    assert ctl.start("g", max_experiments=1)["ok"]
+    _wait_ended(ctl)
+    first = ctl.leaderboard.path
+    assert ctl.start("g2", max_experiments=1)["ok"]
+    _wait_ended(ctl)
+    assert ctl.leaderboard.path != first        # fresh store per run
+    assert len(ctl.leaderboard.all()) == 1      # not mixed with run 1
+
+
 def test_controller_unknown_agent_error_stops_conservatively(tmp_path):
     researcher = StubResearcher(results=[{"ok": False, "error": "boom"}])
     ctl = _controller(tmp_path, researcher=researcher)

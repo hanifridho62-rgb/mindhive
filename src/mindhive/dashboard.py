@@ -24,10 +24,12 @@ from . import events, projector
 from . import dedupe
 from . import sync as sync_mod
 from . import workspace as workspace_mod
+from . import research as research_mod
 from .briefing import briefing as build_briefing
 from .dashboard_page import render_page
 from .workspace_page import render_parallel
 from .swarm_page import render_swarm
+from .research_page import render_research
 
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
@@ -516,6 +518,22 @@ def make_handler(token: str):
             action = urlparse(self.path).path.rsplit("/", 1)[-1]
             return self._json(workspace_mod.api_post(action, proj=proj, body=body))
 
+        def _get_research(self, proj, am, qs):
+            # /api/research/<action>: "page" renders the Self-Reliant iframe
+            # view; everything else is JSON via research.api_get. Like the
+            # workspace, HIVE MIND falls back to the default project so run
+            # events land in a concrete namespace.
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            if action == "page":
+                return self._send(200, render_research(token),
+                                  "text/html; charset=utf-8")
+            return self._json(research_mod.api_get(
+                action, proj=default_project() if am else proj, qs=qs))
+
+        def _post_research(self, proj, body):
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            return self._json(research_mod.api_post(action, proj=proj, body=body))
+
         def _get_export(self, proj, am, qs):
             path = export_mod.export()
             data = path.read_bytes()
@@ -780,6 +798,9 @@ def make_handler(token: str):
                    "auth", "board"):
             _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
         del _p
+        for _p in ("page", "status", "leaderboard", "output"):
+            _GET_ROUTES[f"/api/research/{_p}"] = _get_research
+        del _p
         _POST_ROUTES = {
             "/api/harvest": _post_harvest,
             "/api/append": _post_append,
@@ -799,6 +820,9 @@ def make_handler(token: str):
                    "profile_login", "profile_trust", "board_save",
                    "board_dispatch", "mission", "mission_stop", "command"):
             _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
+        del _p
+        for _p in ("start", "stop"):
+            _POST_ROUTES[f"/api/research/{_p}"] = _post_research
         del _p
 
     return DashboardHandler

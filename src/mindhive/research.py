@@ -16,8 +16,12 @@ tested without WSL or a GPU:
   * ``Leaderboard`` persists experiments atomically and answers "ranked" and
     "best so far".
 
-The autonomous controller, program.md composition, dashboard section, and event
-write-back land in later units and build on these primitives.
+On top of those primitives sit ``compose_program`` (the researcher's steering
+document, U6), ``ResearchController`` (the autonomous loop with its terminator
+matrix, flywheel write-back, skill attribution, and profile failover — U5, U9,
+U10, U11), and the production wiring: the WSL trainer command, the Start
+preflight gate, the Manager-backed researcher agent, and the dashboard's
+``api_get``/``api_post`` dispatch consumed by /api/research/*.
 """
 from __future__ import annotations
 
@@ -379,6 +383,10 @@ class ResearchController:
         self._trainer_cmd = trainer_cmd
         self._factory = agent_factory
         self._train_path = train_path
+        # An injected leaderboard is pinned (tests assert on it); without one,
+        # each start() re-points at a per-run store (plan U4), so "best of run"
+        # never mixes tonight's experiments with last night's.
+        self._lb_injected = leaderboard is not None
         self.leaderboard = leaderboard or Leaderboard()
         self._append = append_event
         self._preflight = preflight if preflight is not None else default_preflight
@@ -430,9 +438,25 @@ class ResearchController:
         goal = (goal or "").strip()
         if not goal:
             return {"ok": False, "error": "research goal is empty"}
+        # Parse the caps BEFORE any state transition: a malformed body must be
+        # a structured rejection, never a 500 with the state stuck on running.
+        try:
+            max_exp = int(max_experiments) if max_experiments else None
+            budget = float(time_budget_s) if time_budget_s else None
+        except (TypeError, ValueError):
+            return {"ok": False, "error":
+                    "max_experiments and time_budget_s must be numbers"}
         with self._lock:
             if self._state == "running":
                 return {"ok": False, "error": "a run is already active — Stop it first"}
+            # a just-stopped run's loop thread may still be finishing; let it
+            # write its final state before this run overwrites it
+            t = self._thread
+            if t is not None and t.is_alive():
+                t.join(5)
+                if t.is_alive():
+                    return {"ok": False, "error":
+                            "previous run is still winding down — retry in a moment"}
             failures = self._preflight(profile or "default")
             if failures:
                 return {"ok": False, "error": "preflight failed: " + "; ".join(failures)}
@@ -441,11 +465,12 @@ class ResearchController:
         self._reason = None
         self._count = 0
         self.run_id = secrets.token_hex(4)
+        if not self._lb_injected:
+            self.leaderboard = Leaderboard(leaderboard_path(self.run_id))
         self._goal = goal
         self._skills = _clean_skills(skills)
-        self._max = int(max_experiments) if max_experiments else None
-        self._deadline = (time.monotonic() + float(time_budget_s)
-                          if time_budget_s else None)
+        self._max = max_exp
+        self._deadline = time.monotonic() + budget if budget else None
         self._failover = bool(failover)
         self._profile = profile or "default"
         self._used_profiles = {self._profile}
