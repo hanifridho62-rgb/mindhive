@@ -1,5 +1,6 @@
 # tests/test_dashboard.py
 import json
+import socket
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
@@ -679,6 +680,7 @@ def test_launch_background_spawns_dashboard_subprocess(monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "tok-abc")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
     res = dashboard.launch_background()
     assert res["launched"] is True
@@ -705,6 +707,7 @@ def test_launch_background_uses_platform_detach_flags(monkeypatch):
     import os as _os
     captured = {}
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen",
                         lambda argv, **kw: captured.update(kw=kw) or type("P", (), {"pid": 1})())
     dashboard.launch_background()
@@ -719,10 +722,61 @@ def test_launch_background_is_non_fatal_on_spawn_failure(monkeypatch):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen", boom)
     res = dashboard.launch_background()
     assert res["launched"] is False
     assert "cannot spawn" in res["reason"]
+
+    # --- single-instance guard: only ever one dashboard pid ------------------
+
+
+def test_instance_running_true_when_a_server_is_listening(dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+    assert dashboard._instance_running(port) is True
+
+
+def test_instance_running_false_when_nothing_listening():
+    # bind an ephemeral port, close it, then probe: nothing is accepting there
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    free_port = s.getsockname()[1]
+    s.close()
+    assert dashboard._instance_running(free_port) is False
+
+
+def test_instance_running_false_for_ephemeral_port_zero():
+    assert dashboard._instance_running(0) is False
+
+
+def test_launch_background_skips_spawn_when_already_running(monkeypatch, dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+    spawned = {"called": False}
+
+    def fake_popen(argv, **kw):
+        spawned["called"] = True
+        return type("P", (), {"pid": 1})()
+
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
+    res = dashboard.launch_background(port=port)
+    assert res["launched"] is False
+    assert res["already_running"] is True
+    assert spawned["called"] is False   # the whole point: no second pid
+
+
+def test_serve_returns_early_without_binding_when_already_running(monkeypatch, dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+
+    def boom(*a, **k):
+        raise AssertionError("serve() must not bind a second server")
+
+    # if the guard fails, serve() would try to bind and hit this
+    monkeypatch.setattr(dashboard, "ThreadingHTTPServer", boom)
+    dashboard.serve(port=port, open_browser=False)   # returns cleanly via the probe
 
 
 # --------------------------------------------------------------------------
