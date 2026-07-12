@@ -153,6 +153,28 @@ def test_leaderboard_empty(tmp_path):
     assert lb.best() is None
 
 
+# --- U1 bring-up pinning: trainer command + cap/budget relationship ----------
+
+def test_wsl_trainer_cmd_defaults_to_uv(monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_TRAIN_CMD", raising=False)
+    argv = research.wsl_trainer_cmd()
+    assert argv[:3] == ["wsl", "bash", "-lc"]
+    assert "uv run train.py" in argv[3]
+
+
+def test_wsl_trainer_cmd_honors_env_override(monkeypatch):
+    monkeypatch.setenv("MINDHIVE_RESEARCH_TRAIN_CMD", "echo custom")
+    assert research.wsl_trainer_cmd()[3] == "echo custom"
+
+
+def test_outer_cap_exceeds_inner_training_budget():
+    """train.py's internal 5-minute budget EXCLUDES startup/compilation, so the
+    outer watchdog default must leave headroom or every healthy real run would
+    be killed as 'timeout' (plan KTD2)."""
+    assert research.INNER_BUDGET_S == 300
+    assert research.EXPERIMENT_CAP_S > research.INNER_BUDGET_S
+
+
 # --- U6: program composition -------------------------------------------------
 
 def test_compose_program_lists_skills_in_order_and_goal():

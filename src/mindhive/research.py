@@ -38,9 +38,14 @@ from pathlib import Path
 
 from . import paths
 
-# The plan's hard contract: one training run is capped at 5 minutes wall-clock
-# regardless of hardware (KTD2, R2). Overridable via env for tuning/tests.
-EXPERIMENT_CAP_S = int(os.environ.get("MINDHIVE_RESEARCH_CAP_S", "300"))
+# The product contract: one TRAINING run gets a 5-minute budget regardless of
+# hardware (origin R2) — that budget lives inside autoresearch's train.py and
+# EXCLUDES startup/compilation. The outer watchdog below therefore must exceed
+# the inner budget by a startup/compile margin, or every healthy real run would
+# be killed as 'timeout' before its budget completed (U1 plan KTD2). The margin
+# default is provisional until the bring-up run pins the measured startup time.
+INNER_BUDGET_S = 300
+EXPERIMENT_CAP_S = int(os.environ.get("MINDHIVE_RESEARCH_CAP_S", "480"))
 
 _IS_WIN = os.name == "nt"
 
@@ -710,11 +715,12 @@ AUTORESEARCH_DIR = os.environ.get("MINDHIVE_AUTORESEARCH_DIR", "~/autoresearch")
 
 
 def wsl_trainer_cmd(iteration=0) -> list:
-    """argv for one training run inside WSL. The exact venv/entrypoint is a
-    U1 execution-time discovery; override via MINDHIVE_RESEARCH_TRAIN_CMD."""
+    """argv for one training run inside WSL. autoresearch is a uv project —
+    `uv run train.py` resolves the locked environment (pinned by the U1
+    bring-up); override via MINDHIVE_RESEARCH_TRAIN_CMD."""
     inner = os.environ.get(
         "MINDHIVE_RESEARCH_TRAIN_CMD",
-        f"cd {AUTORESEARCH_DIR} && .venv/bin/python train.py")
+        f"cd {AUTORESEARCH_DIR} && uv run train.py")
     return ["wsl", "bash", "-lc", inner]
 
 
