@@ -18,9 +18,18 @@ automatically:
 bash scripts/self_reliant/bring_up.sh
 ```
 
-The script is idempotent: clone → venv → CUDA torch → deps → data prep → one
-5-minute verification run. Success = a `val_bpb` line in the output and GPU
-utilization in `nvidia-smi`.
+The script is idempotent: uv install → clone → `uv sync` (locked deps, CUDA
+torch included) → `uv run prepare.py` (dataset + tokenizer, one-time) → one
+bounded `uv run train.py` verification. Success = a `val_bpb` line in the
+output and GPU utilization in `nvidia-smi`.
+
+autoresearch is a **uv project** (`pyproject.toml` + `uv.lock`) — never install
+deps by hand; `uv sync` reproduces upstream's tested environment exactly.
+
+**Cap vs. budget:** `train.py`'s internal 5-minute budget *excludes*
+startup/compilation, so MindHive's outer watchdog default is higher
+(`MINDHIVE_RESEARCH_CAP_S=480`) — the outer cap only guards against hangs; the
+inner budget is what keeps experiments comparable.
 
 ## Preflight
 
@@ -52,9 +61,10 @@ first real bring-up, pin here and in the constant:
 | variable | default | meaning |
 |---|---|---|
 | `MINDHIVE_AUTORESEARCH_DIR` | `~/autoresearch` | WSL checkout the agent mutates |
-| `MINDHIVE_RESEARCH_TRAIN_CMD` | `cd $DIR && .venv/bin/python train.py` | inner WSL training command |
-| `MINDHIVE_RESEARCH_CAP_S` | `300` | per-experiment wall-clock cap |
+| `MINDHIVE_RESEARCH_TRAIN_CMD` | `cd $DIR && uv run train.py` | inner WSL training command |
+| `MINDHIVE_RESEARCH_CAP_S` | `480` | outer watchdog (must exceed the inner 300s budget + startup) |
 | `MINDHIVE_RESEARCH_TURN_TIMEOUT_S` | `600` | bound on one researcher edit-turn |
+| `MINDHIVE_BRINGUP_TIMEOUT` | `900` | bound on bring_up.sh's verification run |
 
 ## Operating the section
 
