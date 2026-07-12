@@ -814,6 +814,42 @@ def test_serve_returns_early_without_binding_when_already_running(monkeypatch, d
     monkeypatch.setattr(dashboard, "ThreadingHTTPServer", boom)
     dashboard.serve(port=port, open_browser=False)   # returns cleanly via the probe
 
+    # --- open_panel(): the `mind hive` shortcut — launch-or-focus -------------
+
+
+def test_open_panel_launches_when_nothing_running(monkeypatch):
+    opened = {"called": False}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": True, "url": "http://x/?token=t", "pid": 1})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda *a, **k: opened.update(called=True))
+    msg = dashboard.open_panel()
+    assert msg == "MIND HIVE dashboard: http://x/?token=t"
+    assert opened["called"] is False   # the detached child opens its own browser
+
+
+def test_open_panel_opens_browser_when_already_running(monkeypatch):
+    opened = {}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": False, "already_running": True,
+                                           "url": "http://x/?token=t", "reason": "already running"})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda url, *a, **k: opened.update(url=url))
+    msg = dashboard.open_panel()
+    assert opened["url"] == "http://x/?token=t"     # seamless: browser lands on the live panel
+    assert "already running" in msg and "http://x/?token=t" in msg
+
+
+def test_open_panel_reports_failure_without_opening_browser(monkeypatch):
+    opened = {"called": False}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": False, "reason": "cannot spawn"})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda *a, **k: opened.update(called=True))
+    msg = dashboard.open_panel()
+    assert msg == "dashboard: not launched (cannot spawn)"
+    assert opened["called"] is False
+
 
 # --------------------------------------------------------------------------
 # /api/improvements: lessons learned (auto incidents + manual caveats)
