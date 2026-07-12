@@ -971,6 +971,27 @@ def launch_background(port: int | None = None) -> dict:
     return {"launched": True, "url": url, "pid": proc.pid}
 
 
+def open_panel(port: int | None = None) -> str:
+    """Bring the dashboard to the foreground for the `mind hive` shortcut.
+
+    Launch it detached if nothing is running; if one is already up, open its
+    stable URL in the browser so the user lands straight on the live panel —
+    seamless, and never blocking the terminal. Returns a one-line status for the
+    shell to print. On a fresh launch the detached child opens its own browser,
+    so we don't double-open here."""
+    res = launch_background(port)
+    url = res.get("url")
+    if res.get("launched"):
+        return f"MIND HIVE dashboard: {url}"
+    if res.get("already_running"):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return f"MIND HIVE dashboard already running — opening {url}"
+    return f"dashboard: not launched ({res.get('reason')})"
+
+
 def serve(port: int | None = None, open_browser: bool = True,
           token: str | None = None) -> None:
     """Start the dashboard on a fixed port with a persisted token so the URL is
