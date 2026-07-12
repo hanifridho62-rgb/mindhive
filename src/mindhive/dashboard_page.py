@@ -117,6 +117,7 @@ def render_page(token: str) -> str:
     <div class="group">Workspace</div>
     <button onclick="showWorkspace('parallel')">MindParallel</button>
     <button onclick="showWorkspace('swarm')">MindSwarm</button>
+    <button onclick="showWorkspace('research')">Self-Reliant</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -639,13 +640,15 @@ def render_page(token: str) -> str:
     load();
   }
 
-  // Workspace views (MindParallel / MindSwarm) are full pages served by the
-  // server and loaded by URL — srcdoc must be cleared first or it wins over src.
+  // Workspace views (MindParallel / MindSwarm / Self-Reliant) are full pages
+  // served by the server and loaded by URL — srcdoc must be cleared first or
+  // it wins over src. 'research' lives under its own /api/research family.
   function showWorkspace(view){
     controls.innerHTML=''; liveFn = null;
     only(graph);
     graph.removeAttribute('srcdoc');
-    graph.src = u(withProj('/api/workspace/'+view));
+    graph.src = u(withProj(view === 'research' ? '/api/research/page'
+                                               : '/api/workspace/'+view));
   }
 
   function showAppend(){
