@@ -385,6 +385,8 @@ def cmd_loop(args) -> int | None:
             res = _dashboard.launch_background()
             if res.get("launched"):
                 print(f"dashboard: {res['url']}")
+            elif res.get("already_running"):
+                print(f"dashboard: already running — {res['url']}")
             else:
                 print(f"dashboard: not launched ({res.get('reason')})", file=sys.stderr)
         except Exception as e:  # never let the dashboard disturb the loop

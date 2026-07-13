@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -911,6 +912,27 @@ def stable_url(port: int | None = None, token: str | None = None) -> str:
     return f"http://127.0.0.1:{port}/?token={token}"
 
 
+def _instance_running(port: int | None, host: str = "127.0.0.1",
+                      timeout: float = 0.3) -> bool:
+    """True when a dashboard is already listening on host:port.
+
+    Deliberately a client *connect* probe, not a bind-test: on Windows
+    SO_REUSEADDR lets a second bind to an in-use port SUCCEED (hijack
+    semantics), so a bind-based "is it free?" check wrongly reports free and a
+    duplicate pid gets spawned. Connecting is unambiguous — it succeeds only
+    when something is actually accepting there. Port 0 (ephemeral) is always a
+    fresh server, so it is never "already running"."""
+    if not port:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
 def launch_background(port: int | None = None) -> dict:
     """Spawn `hive dashboard` as a *detached* background process so a caller
     (e.g. the autonomous loop) can bring the panel up without blocking on
@@ -924,6 +946,12 @@ def launch_background(port: int | None = None) -> dict:
     {"launched": False, "reason": ...} when the spawn could not start.
     """
     url = stable_url(port)
+    # Single-instance guard: never spawn a second pid when one is already
+    # serving. The loop calls this on every run, so without the check repeated
+    # runs would pile up detached dashboards.
+    if _instance_running(DEFAULT_PORT if port is None else port):
+        return {"launched": False, "already_running": True, "url": url,
+                "reason": "already running"}
     argv = [sys.executable, "-m", "mindhive", "dashboard"]
     if port is not None:
         argv += ["--port", str(port)]
@@ -943,6 +971,27 @@ def launch_background(port: int | None = None) -> dict:
     return {"launched": True, "url": url, "pid": proc.pid}
 
 
+def open_panel(port: int | None = None) -> str:
+    """Bring the dashboard to the foreground for the `mind hive` shortcut.
+
+    Launch it detached if nothing is running; if one is already up, open its
+    stable URL in the browser so the user lands straight on the live panel —
+    seamless, and never blocking the terminal. Returns a one-line status for the
+    shell to print. On a fresh launch the detached child opens its own browser,
+    so we don't double-open here."""
+    res = launch_background(port)
+    url = res.get("url")
+    if res.get("launched"):
+        return f"MIND HIVE dashboard: {url}"
+    if res.get("already_running"):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return f"MIND HIVE dashboard already running — opening {url}"
+    return f"dashboard: not launched ({res.get('reason')})"
+
+
 def serve(port: int | None = None, open_browser: bool = True,
           token: str | None = None) -> None:
     """Start the dashboard on a fixed port with a persisted token so the URL is
@@ -958,6 +1007,17 @@ def serve(port: int | None = None, open_browser: bool = True,
     if port is None:
         port = DEFAULT_PORT
     token = token or load_or_create_token()
+    # Single-instance guard (primary): if a dashboard is already serving this
+    # fixed port, reopen its URL instead of starting a second pid. A connect
+    # probe is reliable on Windows, where SO_REUSEADDR would otherwise let the
+    # bind below succeed and leave a duplicate server. The OSError path stays as
+    # a fallback for the rare probe-then-bind race. port=0 skips the probe.
+    if _instance_running(port):
+        url = f"http://127.0.0.1:{port}/?token={token}"
+        print(f"MIND HIVE dashboard already running — opening {url}", flush=True)
+        if open_browser:
+            webbrowser.open(url)
+        return
     handler = make_handler(token)
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), handler)
