@@ -38,9 +38,16 @@ from pathlib import Path
 
 from . import paths
 
-# The plan's hard contract: one training run is capped at 5 minutes wall-clock
-# regardless of hardware (KTD2, R2). Overridable via env for tuning/tests.
-EXPERIMENT_CAP_S = int(os.environ.get("MINDHIVE_RESEARCH_CAP_S", "300"))
+# The product contract: one TRAINING run gets a 5-minute budget regardless of
+# hardware (origin R2) — that budget lives inside autoresearch's train.py and
+# EXCLUDES startup/compilation. The outer watchdog below therefore must exceed
+# the inner budget by a startup/compile margin, or every healthy real run would
+# be killed as 'timeout' before its budget completed (U1 plan KTD2). Measured
+# on the real bring-up (RTX 3050, WSL2): training 313.8s, total 746.3s —
+# startup/compile ≈ 432s, and every agent edit to train.py re-triggers compile,
+# so the margin never amortizes away. 900s = 300 budget + ~450 startup + slack.
+INNER_BUDGET_S = 300
+EXPERIMENT_CAP_S = int(os.environ.get("MINDHIVE_RESEARCH_CAP_S", "900"))
 
 _IS_WIN = os.name == "nt"
 
@@ -201,18 +208,26 @@ def diff_summary(before: str, after: str, max_lines: int = 8) -> str:
 
 # --- U6: program.md composition ---------------------------------------------
 
-# Small-GPU preset bounds for the RTX 3050 Laptop (6 GB VRAM). Placeholder
-# knob values until U1's real bring-up pins them against autoresearch's actual
-# train.py; the *shape* (name -> stated bound) is the contract compose_program
-# renders. Overridden per-run by passing `preset=`.
+# Small-GPU preset bounds for the RTX 3050 Laptop (6 GB VRAM), pinned against
+# autoresearch's real train.py by the U1 bring-up run (2026-07-12): DEPTH=8 +
+# DEVICE_BATCH_SIZE=16 reached val_bpb 1.8587 at peak VRAM 6150 MB — the
+# ceiling. Knob names are train.py's actual constants. Rendered verbatim into
+# the researcher's program as hard constraints; override per-run via `preset=`.
 SMALL_GPU_PRESET = {
-    "hardware": "RTX 3050 Laptop, 6 GB VRAM — not an H100; OOM is likely "
-                "above these bounds",
-    "batch_size": "keep the micro-batch small (<= 8); prefer gradient "
-                  "accumulation over bigger batches",
-    "sequence_len": "<= 512",
-    "model size": "reduce depth/width well below autoresearch defaults",
-    "precision": "prefer bf16/fp16 mixed precision",
+    "hardware": "RTX 3050 Laptop, 6 GB VRAM — not an H100. Verified baseline: "
+                "DEPTH=8 + DEVICE_BATCH_SIZE=16 fits at peak_vram 6150 MB "
+                "(the ceiling); upstream's DEVICE_BATCH_SIZE=128 OOMs.",
+    "DEVICE_BATCH_SIZE": "8 is the safe baseline at DEPTH 8; 16 fits only with "
+                         "nothing else on the GPU (peak 6150/6144 MB — one "
+                         "real run at 16 OOM'd from ambient VRAM use). Lower "
+                         "THIS first when memory is tight — TOTAL_BATCH_SIZE "
+                         "stays fixed via gradient accumulation, so "
+                         "comparability is preserved.",
+    "DEPTH": "8 fits with zero headroom; raising DEPTH requires lowering "
+             "DEVICE_BATCH_SIZE at the same time (activations dominate VRAM).",
+    "throughput": "~27K tok/sec, ~20 s/optimizer-step at the baseline — the "
+                  "300 s budget is ~27 steps; keep eval cadence cheap.",
+    "precision": "bf16 autocast is train.py's default — do not add fp32 paths.",
 }
 
 # KTD11 — the iteration contract the researcher agent must follow. One
@@ -220,11 +235,14 @@ SMALL_GPU_PRESET = {
 # the agent never runs training itself, so the 5-minute watchdog stays
 # authoritative.
 _ITERATION_CONTRACT = (
-    "Iteration contract — follow it exactly: edit train.py ONLY. Do not run "
-    "training, do not launch any training command, and do not edit other "
-    "files. When your edit is ready, end your turn; MindHive will run the "
-    "5-minute capped experiment itself and hand you the score in the next "
-    "prompt."
+    "Iteration contract — follow it exactly: edit train.py ONLY, using your "
+    "file-editing tool, then end your turn immediately. Do not run training "
+    "or any other command, and do not edit other files. You are headless — "
+    "there is NO operator: never ask permission, never propose a script for "
+    "someone else to run, never end your turn with a question. MindHive "
+    "itself runs the 5-minute capped experiment after your turn and hands "
+    "you the score in the next prompt; one small edit per turn is the whole "
+    "job."
 )
 
 
@@ -240,7 +258,8 @@ def _clean_skills(skills) -> list:
     return out
 
 
-def compose_program(goal, skills=None, primed=None, preset=None, prior=None) -> dict:
+def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
+                    train_path=None) -> dict:
     """The researcher agent's steering document (program.md text) plus its
     system-prompt addition — a pure function of its inputs (U6).
 
@@ -276,6 +295,15 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None) -> 
                      + (f", val_bpb {score}" if score is not None else ", no score")
                      + (f" — change: {prior['change']}" if prior.get("change") else "")
                      + ". Iterate on this result.")
+        if prior.get("change") == "no change":
+            parts.append("Your previous turn made NO edit to train.py — the "
+                         "experiment trained an unchanged file, which wastes "
+                         "the whole 5-minute budget. This turn you MUST make "
+                         "an actual edit before ending your turn.")
+    if train_path:
+        parts.append(f"train.py location: {train_path} — edit exactly this "
+                     "file; it lives inside WSL, outside your working "
+                     "directory.")
     parts.append(_ITERATION_CONTRACT)
     return {"program": "\n\n".join(parts),
             "system": _ITERATION_CONTRACT}
@@ -552,8 +580,16 @@ class ResearchController:
                     reason = "time"
                     return
                 composed = compose_program(self._goal, self._skills,
-                                           self._primed, self._preset, prior)
+                                           self._primed, self._preset, prior,
+                                           train_path=(str(self._train_path)
+                                                       if self._train_path else None))
+                # snapshot BEFORE the edit-turn: the turn is what changes
+                # train.py, so a post-turn "before" reads the edited file and
+                # every agent edit would record as "no change"
+                before = snapshot_text(self._train_path) if self._train_path else ""
                 turn = self._run_turn(composed["program"])
+                for ln in turn.get("lines") or []:
+                    self.emit(f"  agent: {ln}")   # why it edited (or didn't)
                 if self._stop_flag.is_set():
                     reason = "stopped"
                     return
@@ -579,7 +615,6 @@ class ResearchController:
                               + str(turn.get("error") or "unknown error"))
                     reason = "error"
                     return
-                before = snapshot_text(self._train_path) if self._train_path else ""
                 res = run_experiment(self._trainer_argv(self._count),
                                      cap_s=self._cap_s,
                                      on_spawn=self._track_proc)
@@ -710,11 +745,12 @@ AUTORESEARCH_DIR = os.environ.get("MINDHIVE_AUTORESEARCH_DIR", "~/autoresearch")
 
 
 def wsl_trainer_cmd(iteration=0) -> list:
-    """argv for one training run inside WSL. The exact venv/entrypoint is a
-    U1 execution-time discovery; override via MINDHIVE_RESEARCH_TRAIN_CMD."""
+    """argv for one training run inside WSL. autoresearch is a uv project —
+    `uv run train.py` resolves the locked environment (pinned by the U1
+    bring-up); override via MINDHIVE_RESEARCH_TRAIN_CMD."""
     inner = os.environ.get(
         "MINDHIVE_RESEARCH_TRAIN_CMD",
-        f"cd {AUTORESEARCH_DIR} && .venv/bin/python train.py")
+        f"cd {AUTORESEARCH_DIR} && uv run train.py")
     return ["wsl", "bash", "-lc", inner]
 
 
@@ -728,6 +764,22 @@ def kill_wsl_training() -> None:
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+def wsl_train_py_windows_path():
+    """The Windows-visible (\\\\wsl$\\...) path of the WSL checkout's train.py,
+    via wslpath — the researcher agent runs on Windows and must be pointed at
+    the exact file. None when WSL/the checkout is unavailable (preflight will
+    refuse the run anyway)."""
+    try:
+        p = subprocess.run(
+            ["wsl", "bash", "-lc", f"wslpath -w {AUTORESEARCH_DIR}/train.py"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (p.stdout or "").strip()
+        return out if p.returncode == 0 and out else None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _wsl_ok(cmd: str, timeout=20) -> bool:
@@ -776,11 +828,14 @@ class ManagerResearcher:
     conversation. Stop kills the agent's in-flight CLI run."""
 
     def __init__(self, profile="default", manager=None, model=None,
-                 system_extra="", poll_s=1.0):
+                 system_extra="", poll_s=1.0, add_dir=None):
         from . import workspace
         self._mgr = manager or workspace.MANAGER
         self._poll_s = poll_s
         self._system_extra = system_extra
+        # the autoresearch checkout lives OUTSIDE the agent's cwd (\\wsl$ …);
+        # granted per-turn via --add-dir or its edits are silently blocked
+        self._add_dirs = [add_dir] if add_dir else []
         res = self._mgr.spawn(name="Self-Reliant researcher", role="agent",
                               profile=profile, model=model)
         if not res.get("ok"):
@@ -789,7 +844,8 @@ class ManagerResearcher:
 
     def turn(self, prompt) -> dict:
         res = self._mgr.send(self.agent_id, prompt,
-                             extra_system=self._system_extra or None)
+                             extra_system=self._system_extra or None,
+                             add_dirs=self._add_dirs)
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error")}
         while True:
@@ -799,12 +855,14 @@ class ManagerResearcher:
             if a.status != "running":
                 break
             time.sleep(self._poll_s)
+        lines = list(a.lines[-12:])         # reply tail for the run log
         if a.status == "done":
-            return {"ok": True}
+            return {"ok": True, "lines": lines}
         tail = " ".join(a.lines[-30:]).lower()
         if any(m in tail for m in _USAGE_MARKERS):
-            return {"ok": False, "usage_exhausted": True}
-        return {"ok": False, "error": f"researcher run ended '{a.status}'"}
+            return {"ok": False, "usage_exhausted": True, "lines": lines}
+        return {"ok": False, "error": f"researcher run ended '{a.status}'",
+                "lines": lines}
 
     def stop(self) -> None:
         try:
@@ -839,10 +897,13 @@ def get_controller() -> ResearchController:
     with _CTL_LOCK:
         if CONTROLLER is None:
             from . import events as ev_mod, workspace
+            tp = wsl_train_py_windows_path()
+            train_dir = str(Path(tp).parent) if tp else None
             CONTROLLER = ResearchController(
                 trainer_cmd=wsl_trainer_cmd,
-                agent_factory=lambda profile: ManagerResearcher(profile=profile),
-                leaderboard=Leaderboard(),
+                agent_factory=lambda profile: ManagerResearcher(
+                    profile=profile, add_dir=train_dir),
+                train_path=tp,
                 append_event=ev_mod.append_event,
                 preflight=default_preflight,
                 profiles=[e["name"] for e in workspace.load_profiles()],

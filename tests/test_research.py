@@ -153,6 +153,100 @@ def test_leaderboard_empty(tmp_path):
     assert lb.best() is None
 
 
+# --- U1 bring-up pinning: trainer command + cap/budget relationship ----------
+
+def test_wsl_trainer_cmd_defaults_to_uv(monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_TRAIN_CMD", raising=False)
+    argv = research.wsl_trainer_cmd()
+    assert argv[:3] == ["wsl", "bash", "-lc"]
+    assert "uv run train.py" in argv[3]
+
+
+def test_wsl_trainer_cmd_honors_env_override(monkeypatch):
+    monkeypatch.setenv("MINDHIVE_RESEARCH_TRAIN_CMD", "echo custom")
+    assert research.wsl_trainer_cmd()[3] == "echo custom"
+
+
+def test_outer_cap_exceeds_inner_training_budget():
+    """train.py's internal 5-minute budget EXCLUDES startup/compilation, so the
+    outer watchdog default must leave headroom or every healthy real run would
+    be killed as 'timeout' (plan KTD2). Measured real run: 746.3s total for a
+    313.8s training — startup/compile ≈ 432s and recurs on every train.py edit."""
+    assert research.INNER_BUDGET_S == 300
+    assert research.EXPERIMENT_CAP_S >= research.INNER_BUDGET_S + 450
+
+
+FIXTURE = Path(__file__).resolve().parents[1] / "scripts" / "self_reliant" \
+    / "fixtures" / "train_output_sample.txt"
+
+
+def test_parse_val_bpb_against_real_captured_output():
+    """Characterization pin: the fixture is the tail of a REAL autoresearch run
+    on the RTX 3050 (bring-up 2026-07-12). The final-summary format is
+    'val_bpb:          1.858687' — colon + aligned whitespace."""
+    text = FIXTURE.read_text(encoding="utf-8")
+    assert research.parse_val_bpb(text) == pytest.approx(1.858687)
+
+
+def test_compose_program_names_train_py_location_when_given():
+    prog = research.compose_program(
+        "g", train_path=r"\\wsl$\Ubuntu\home\u\autoresearch\train.py")["program"]
+    assert r"\\wsl$\Ubuntu\home\u\autoresearch\train.py" in prog
+    # and stays silent when unknown (tests / stub runs)
+    assert "location:" not in research.compose_program("g")["program"]
+
+
+def test_compose_program_demands_edit_after_no_change_turn():
+    prior = {"val_bpb": 1.86, "status": "ok", "change": "no change"}
+    prog = research.compose_program("g", prior=prior)["program"]
+    assert "MUST make" in prog and "actual edit" in prog
+    prior2 = {"val_bpb": 1.86, "status": "ok", "change": "-lr 0.1; +lr 0.2"}
+    assert "MUST make" not in research.compose_program("g", prior=prior2)["program"]
+
+
+def test_controller_records_agent_edit_in_change_summary(tmp_path):
+    """The before-snapshot must be taken BEFORE the agent's edit-turn — taken
+    after it, both snapshots see the edited file and every real agent edit
+    records as 'no change' (observed in acceptance run ed247590)."""
+    train_py = tmp_path / "train.py"
+    train_py.write_text("TOTAL_BATCH_SIZE = 2**19\n", encoding="utf-8")
+
+    class EditingResearcher(StubResearcher):
+        def turn(self, prompt):
+            super().turn(prompt)
+            train_py.write_text("TOTAL_BATCH_SIZE = 2**18\n", encoding="utf-8")
+            return {"ok": True}
+
+    ctl = _controller(tmp_path, researcher=EditingResearcher())
+    assert ctl.start("g", max_experiments=1)["ok"]
+    _wait_ended(ctl)
+    rec = ctl.leaderboard.all()[0]
+    assert "2**18" in rec["change"]
+    assert rec["change"] != "no change"
+
+
+def test_controller_logs_agent_reply_lines(tmp_path):
+    class TalkativeResearcher(StubResearcher):
+        def turn(self, prompt):
+            super().turn(prompt)
+            return {"ok": True, "lines": ["reading train.py", "raised lr to 0.05"]}
+
+    ctl = _controller(tmp_path, researcher=TalkativeResearcher())
+    assert ctl.start("g", max_experiments=1)["ok"]
+    _wait_ended(ctl)
+    joined = "\n".join(ctl.lines)
+    assert "agent: raised lr to 0.05" in joined
+
+
+def test_preset_pins_real_train_py_knobs():
+    """The preset speaks train.py's actual constant names so the researcher's
+    guidance maps 1:1 onto the file it edits."""
+    for knob in ("DEVICE_BATCH_SIZE", "DEPTH"):
+        assert knob in research.SMALL_GPU_PRESET
+    prog = research.compose_program("g", preset=research.SMALL_GPU_PRESET)["program"]
+    assert "DEVICE_BATCH_SIZE" in prog and "6 GB" in prog
+
+
 # --- U6: program composition -------------------------------------------------
 
 def test_compose_program_lists_skills_in_order_and_goal():

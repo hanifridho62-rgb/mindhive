@@ -452,7 +452,7 @@ class Manager:
                 "status": a.status}
 
     # --- one run = one headless claude call ---------------------------------
-    def send(self, agent_id, prompt, extra_system=None) -> dict:
+    def send(self, agent_id, prompt, extra_system=None, add_dirs=None) -> dict:
         a = self.get(agent_id)
         if a is None:
             return {"ok": False, "error": "unknown agent"}
@@ -462,6 +462,10 @@ class Manager:
             return {"ok": False, "error": f"{a.name} is busy — wait or stop it"}
         argv = [claude_cli.resolve_exe(), "--output-format", "stream-json",
                 "--verbose", "--permission-mode", "acceptEdits"]
+        # extra workspace roots (e.g. Self-Reliant's \\wsl$ autoresearch dir) —
+        # without --add-dir the CLI's boundary silently blocks out-of-cwd edits
+        for d in add_dirs or []:
+            argv += ["--add-dir", str(d)]
         if a.session_id:
             argv += ["--resume", a.session_id]
         if a.model:
