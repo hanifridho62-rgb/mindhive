@@ -117,6 +117,21 @@ def test_diff_summary_no_change():
     assert research.diff_summary("x = 1\n", "x = 1\n") == "no change"
 
 
+def test_diff_summary_unreadable_snapshot_is_not_no_change():
+    # An unreadable train.py must never masquerade as "no change" — run
+    # ed247590 recorded "no change" while the score moved 1.859 -> 1.576.
+    for before, after in ((None, "x = 1\n"), ("x = 1\n", None), (None, None)):
+        s = research.diff_summary(before, after)
+        assert s != "no change" and "unknown" in s
+
+
+def test_snapshot_text_unreadable_returns_none(tmp_path):
+    assert research.snapshot_text(tmp_path / "missing.py") is None
+    p = tmp_path / "t.py"
+    p.write_text("x = 1\n", encoding="utf-8")
+    assert research.snapshot_text(p) == "x = 1\n"
+
+
 # --- U4: leaderboard -------------------------------------------------------
 
 def _rec(score, status="ok", **extra):

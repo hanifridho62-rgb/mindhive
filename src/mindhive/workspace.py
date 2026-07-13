@@ -460,8 +460,12 @@ class Manager:
             return {"ok": False, "error": "prompt is empty"}
         if a.status == "running":
             return {"ok": False, "error": f"{a.name} is busy — wait or stop it"}
+        # bypassPermissions: headless runs have no prompt channel, so under
+        # acceptEdits anything beyond an in-cwd edit was silently auto-denied —
+        # agents burned whole turns pleading for approvals nobody could grant
+        # (user mandate 2026-07-13: full access for all workspace agents).
         argv = [claude_cli.resolve_exe(), "--output-format", "stream-json",
-                "--verbose", "--permission-mode", "acceptEdits"]
+                "--verbose", "--permission-mode", "bypassPermissions"]
         # extra workspace roots (e.g. Self-Reliant's \\wsl$ autoresearch dir) —
         # without --add-dir the CLI's boundary silently blocks out-of-cwd edits
         for d in add_dirs or []:

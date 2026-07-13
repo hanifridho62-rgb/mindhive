@@ -181,19 +181,24 @@ def parse_val_bpb(text):
     return last
 
 
-def snapshot_text(path) -> str:
+def snapshot_text(path):
     """Read ``train.py`` (or any file) for a pre/post experiment snapshot.
-    Missing/unreadable file reads as empty rather than raising."""
+    Missing/unreadable reads as ``None`` — never as empty text, or a run whose
+    train.py sits on a flaky ``\\\\wsl$`` mount would diff ""-vs-"" and record
+    a false "no change" even when the researcher's edit moved the score."""
     try:
         return Path(path).read_text(encoding="utf-8")
     except OSError:
-        return ""
+        return None
 
 
-def diff_summary(before: str, after: str, max_lines: int = 8) -> str:
+def diff_summary(before, after, max_lines: int = 8) -> str:
     """A concise one-line summary of the change from ``before`` to ``after``
     (added/removed lines only), for the leaderboard and the event write-back.
-    ``"no change"`` when the texts are identical."""
+    ``"no change"`` when the texts are identical; an unreadable snapshot
+    (``None``) is reported as unknown rather than claimed as no change."""
+    if before is None or after is None:
+        return "change unknown (train.py snapshot unreadable)"
     before_l = (before or "").splitlines()
     after_l = (after or "").splitlines()
     changed = [ln for ln in difflib.unified_diff(before_l, after_l, lineterm="")
