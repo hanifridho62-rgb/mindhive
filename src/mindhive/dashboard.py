@@ -400,6 +400,8 @@ def make_handler(token: str):
                         first_seen=st.get("first_seen"),
                         last_seen=st.get("last_seen"),
                         leaks=st.get("leaks", 0),
+                        reroutes=st.get("reroutes", 0),
+                        last_reroute=st.get("last_reroute"),
                         resolution=incidents.classify_resolution(s, st)))
                 for e in evs:
                     if e.type != "caveat":
@@ -735,6 +737,33 @@ def make_handler(token: str):
             finally:
                 _REFLECT_LOCK.release()
 
+        def _post_rules_resolve(self, proj, body):
+            # Active resolution over the red (unresolved) set: reflect
+            # incidents with no rule yet, reroute leaking auto rules to the
+            # best distinct alternative route (human rules are never touched).
+            # Same clamp + lock discipline as the Reflect endpoint — each red
+            # incident can cost a 120s claude call.
+            import shutil
+            from . import resolve as resolve_mod
+            try:
+                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            except (TypeError, ValueError):
+                return self._json({"ok": False,
+                                   "error": "limit must be an integer"}, 200)
+            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "resolution already running"}, 200)
+            try:
+                res = resolve_mod.resolve_batch(project=proj, limit=limit)
+                done = res.get("rerouted", 0) + res.get("reflected", 0)
+                if res.get("failed") and not done and not shutil.which("claude"):
+                    return self._json({"ok": False, "error":
+                        "claude CLI unavailable — resolution needs it on PATH"}, 200)
+                return self._json(dict(res, ok=True))
+            finally:
+                _REFLECT_LOCK.release()
+
         def _post_rules_reflect_one(self, proj, body):
             # Reflect ONE named failure signature on demand — the "reflect this
             # failure" action on a failed skill call. Unlike the batch endpoint,
@@ -889,6 +918,7 @@ def make_handler(token: str):
             "/api/plugins/autoscan": _post_plugins_autoscan,
             "/api/rules/reflect": _post_rules_reflect,
             "/api/rules/reflect_one": _post_rules_reflect_one,
+            "/api/rules/resolve": _post_rules_resolve,
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/oversee/dismiss": _post_oversee_dismiss,
             "/api/selftest": _post_selftest,

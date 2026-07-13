@@ -146,6 +146,67 @@ def test_rules_reflect_cli_failing_runner_exits_zero(tmp_path, capsys, monkeypat
     assert not m.get("cooldown_started")                # window not consumed
 
 
+# --- rules resolve: active resolution over the red set -----------------------
+
+_ROUTES = ('{"routes": [{"prevention_rule": "take the alternative route", '
+           '"rationale": "different mechanism", "confidence": 0.9}]}')
+
+
+def _seed_leaking(sig="raw:leaky", project="test"):
+    from mindhive import paths as paths_mod
+    for s, ts in (("s1", "2026-07-01T10:00:00Z"), ("s2", "2026-07-01T11:00:00Z")):
+        events.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=s, tags=["auto", "failure"], ts=ts,
+                            project=project)
+    incidents.audit(project=project, threshold=2)
+    incidents.project(project=project, threshold=2)
+    path = (paths_mod.project_dir(project) / "rules" / "incidents"
+            / f"{incidents._safe_name(sig)}.md")
+    path.write_text(incidents._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Prevention rule: the failed rule"), encoding="utf-8")
+    incidents.project(project=project, threshold=2)
+    events.append_event("tool_failed",
+                        {"text": "boom", "signature": sig, "action": "x"},
+                        session_id="s3", tags=["auto", "failure"],
+                        ts="2026-07-01T12:00:00Z", project=project)   # leak
+
+
+def test_rules_resolve_cli_list_prints_red_set(tmp_path, capsys):
+    _seed_leaking()
+    assert cli.main(["rules", "resolve", "--project", "test", "--list"]) == 0
+    reds = _json.loads(capsys.readouterr().out)
+    assert [r["signature"] for r in reds] == ["raw:leaky"]
+    assert reds[0]["leaks"] == 1
+
+
+def test_rules_resolve_cli_reroutes_leaking_rule(tmp_path, capsys, monkeypatch):
+    from mindhive import reflect as reflect_mod
+    _seed_leaking()
+    monkeypatch.setattr(reflect_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES)
+    assert cli.main(["rules", "resolve", "--project", "test"]) == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["rerouted"] == 1 and out["pending"] == 0
+    rec = [r for r in incidents.summaries(project="test")
+           if r["signature"] == "raw:leaky"][0]
+    assert rec["active_rule"] == "take the alternative route"
+
+
+def test_rules_resolve_cli_failing_runner_exits_zero(tmp_path, capsys, monkeypatch):
+    from mindhive import reflect as reflect_mod
+    _seed_leaking()
+
+    def boom(prompt, timeout_s=120):
+        raise RuntimeError("auth expired")
+
+    monkeypatch.setattr(reflect_mod, "_claude_runner", boom)
+    assert cli.main(["rules", "resolve", "--project", "test"]) == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["rerouted"] == 0 and out["failed"] == 1
+
+
 def test_rules_reflect_all_projects_skips_live_lock(tmp_path, capsys, monkeypatch):
     from mindhive import reflect as reflect_mod
     store = paths.store_home()

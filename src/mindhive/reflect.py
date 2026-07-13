@@ -366,24 +366,42 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
             return {"reflected": 0, "attempted": 0, "skipped": "cooldown"}
         incidents.audit(project=project)
         incidents.project(project=project)
-        targets = [r["signature"] for r in incidents.summaries(project=project)
+        targets = [(r["signature"], "reflect")
+                   for r in incidents.summaries(project=project)
                    if r["status"] == "active" and r["rule_source"] == "none"]
+        # Active resolution: red leaking AUTO rules get an alternative route
+        # in the same bounded, cooldown-gated pass (attempt-capped; human
+        # rules are authoritative and never rerouted). Lazy import — resolve
+        # imports this module at load time.
+        from . import resolve as resolve_mod
+        seen = {sig for sig, _ in targets}
+        for r in resolve_mod.red_summaries(project):
+            if r.get("rule_source") == "auto" and r["signature"] not in seen \
+                    and int(r.get("reroutes") or 0) < incidents.MAX_REROUTES:
+                targets.append((r["signature"], "reroute"))
         targets = targets[:max(0, int(limit))]
         if not targets:
             return {"reflected": 0, "attempted": 0, "skipped": "nothing to reflect"}
         now = ev_mod.now_iso()
         marker.update({"cooldown_started": now, "last_attempt": now})
         write_marker(project, marker)       # consume the window BEFORE the first call
-    done, last_error = 0, ""
-    for signature in targets:
+    done, rerouted, last_error = 0, 0, ""
+    for signature, mode in targets:
         try:
-            res = reflect_incident(signature, project=project, runner=runner)
+            if mode == "reroute":
+                r = resolve_mod.reroute_incident(signature, project=project,
+                                                 runner=runner)
+                ok = bool(r.get("resolved"))
+            else:
+                r = reflect_incident(signature, project=project, runner=runner)
+                ok = bool(r.get("reflected"))
         except Exception as e:              # runner blew up: record class, keep going
-            res = {"reflected": False, "reason": type(e).__name__}
-        if res.get("reflected"):
+            r, ok = {"reason": type(e).__name__}, False
+        if ok:
             done += 1
+            rerouted += mode == "reroute"
         else:
-            last_error = res.get("reason") or "unknown"
+            last_error = r.get("reason") or "unknown"
     marker = read_marker(project)
     if done:
         marker["last_success"] = ev_mod.now_iso()
@@ -395,10 +413,18 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
             incidents.auto_promote(project=project)
         except Exception:
             pass
+        try:
+            # Nudge->enforce ladder: a rerouted signature with a matcher may
+            # have crossed the leak threshold — flip the hard-force rung too.
+            from . import enforce
+            enforce.auto_escalate(project=project)
+        except Exception:
+            pass
         _refresh_projections(project)       # rules land in the very next session
     else:
         if marker.get("cooldown_started") == now:    # CAS: our write, roll it back
             marker["cooldown_started"] = prev_cooldown
         marker["last_error"] = last_error
         write_marker(project, marker)
-    return {"reflected": done, "attempted": len(targets)}
+    return {"reflected": done - rerouted, "rerouted": rerouted,
+            "attempted": len(targets)}
