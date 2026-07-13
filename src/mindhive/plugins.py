@@ -414,7 +414,7 @@ def skill_detail(name: str, plugin: str | None = None, claude_dir=None) -> dict 
     }
 
 
-def call_stats(project=None) -> dict:
+def call_stats(project=None, evs=None) -> dict:
     """Per-skill call stats from one ledger pass:
     ``{"status": {name: "ok"|"fail"}, "counts": {name: total_calls}}``.
 
@@ -423,10 +423,14 @@ def call_stats(project=None) -> dict:
     both event types yields the total number of calls. ``read_all`` is
     time-then-append ordered, so overwriting leaves each skill's status at its
     most recent call — the green/red the dashboard paints. Skills never called
-    are simply absent (rendered grey, no count badge)."""
+    are simply absent (rendered grey, no count badge). Pass evs (any
+    chronological event list, e.g. a HIVE MIND merge across namespaces) to
+    reuse a read_all() result instead of reading one project."""
     status: dict[str, str] = {}
     counts: dict[str, int] = {}
-    for e in ev_mod.read_all(project):
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    for e in evs:
         if e.type == "invoke_result":
             name = e.payload.get("name")
             if name:
@@ -446,15 +450,18 @@ def call_status(project=None) -> dict:
     return call_stats(project)["status"]
 
 
-def call_history(name, project=None, limit=20) -> list[dict]:
+def call_history(name, project=None, limit=20, evs=None) -> list[dict]:
     """Past invoke outcomes for one skill, newest first: a list of
     ``{ts, ok, text, session}``. Reads the same ``invoke_result`` / ``tool_failed``
     events ``call_status`` derives from, but keeps every occurrence so the
     dashboard can show a skill's call log. ``read_all`` is chronological, so
-    reversing yields newest-first with append order preserved on ties."""
+    reversing yields newest-first with append order preserved on ties. Pass evs
+    to reuse a pre-read (possibly multi-namespace) event list."""
     sig = f"skill:{name}"
     out = []
-    for e in ev_mod.read_all(project):
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    for e in evs:
         if e.type == "invoke_result" and e.payload.get("name") == name:
             out.append({"ts": e.ts, "ok": True,
                         "text": e.payload.get("text", ""), "session": e.session_id})
@@ -563,7 +570,7 @@ def _dedup_calls(calls: list[dict]) -> list[dict]:
 def skill_stats(project=None, evs=None) -> dict:
     """Per-skill telemetry counters from the ledger, keyed by skill name:
     ``{calls, ok, fail, completion_rate, last_outcome, last_used, streak,
-    provenance, sources}``.
+    fail_streak, provenance, sources}``.
 
     The rate is a COMPLETION rate (ran without a tool error), never a success
     rate (KTD5); it is None when a skill has zero calls. ``provenance`` breaks
@@ -578,14 +585,16 @@ def skill_stats(project=None, evs=None) -> dict:
         s = out.setdefault(c["name"], {
             "calls": 0, "ok": 0, "fail": 0, "completion_rate": None,
             "last_outcome": None, "last_used": None, "streak": 0,
-            "provenance": {}, "sources": []})
+            "fail_streak": 0, "provenance": {}, "sources": []})
         s["calls"] += 1
         if c["ok"]:
             s["ok"] += 1
             s["streak"] += 1
+            s["fail_streak"] = 0
         else:
             s["fail"] += 1
             s["streak"] = 0
+            s["fail_streak"] += 1
         s["last_outcome"] = "ok" if c["ok"] else "fail"
         s["last_used"] = c["ts"]
         s["provenance"][c["provenance"]] = s["provenance"].get(c["provenance"], 0) + 1
@@ -598,21 +607,24 @@ def skill_stats(project=None, evs=None) -> dict:
     return out
 
 
-def recommend_for(project=None, evs=None, top=None) -> dict:
+def recommend_for(project=None, evs=None, top=None, incident_summaries=None) -> dict:
     """One-stop deterministic most-needed-skills ranking (KTD6): read the
     ledger once, flatten the live inventory, aggregate skill stats, extract
     needs from incident summaries, and rank. The single implementation behind
     `hive skills recommend`, the dashboard endpoint, and the projector's
-    suggested-skills block. Pass evs to reuse an events.read_all() result.
-    Imports are lazy so plugins keeps no hard dependency on incidents/recommend
-    (and no import cycles)."""
+    suggested-skills block. Pass evs to reuse an events.read_all() result and
+    incident_summaries to override the per-project incidents read (the HIVE
+    MIND view passes a merge across every namespace). Imports are lazy so
+    plugins keeps no hard dependency on incidents/recommend (and no import
+    cycles)."""
     from . import incidents as incidents_mod
     from . import recommend as recommend_mod
     if evs is None:
         evs = ev_mod.read_all(project)
     skills = recommend_mod.flatten_inventory(live_inventory()["inventory"])
     stats = skill_stats(project=project, evs=evs)
-    summaries = incidents_mod.summaries(project)
+    summaries = (incident_summaries if incident_summaries is not None
+                 else incidents_mod.summaries(project))
     needs = recommend_mod.extract_needs(summaries, evs)
     return recommend_mod.recommend(skills, stats, incidents=summaries,
                                    needs=needs, top=top)

@@ -758,3 +758,19 @@ def test_ensure_fresh_force_rescans_even_when_fresh(tmp_path, monkeypatch):
     first = plugins.ensure_fresh(cache_dir=tmp_path / "nope")          # fresh snapshot exists
     res = plugins.ensure_fresh(cache_dir=tmp_path / "nope", force=True)
     assert res["scanned"] is True
+
+
+def test_skill_stats_fail_streak_tracks_trailing_failures():
+    from mindhive import events as ev
+    ev.append_event("invoke_result", {"name": "s", "exit": 0},
+                    ts="2026-07-07T10:00:00Z", session_id="sess0", project="test")
+    for i in (1, 2):
+        ev.append_event("tool_failed", {"signature": "skill:s"},
+                        ts=f"2026-07-07T10:0{i}:00Z",
+                        session_id=f"sess{i}", project="test")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["fail_streak"] == 2 and st["streak"] == 0
+    ev.append_event("invoke_result", {"name": "s", "exit": 0},
+                    ts="2026-07-07T10:09:00Z", session_id="sess9", project="test")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["fail_streak"] == 0 and st["streak"] == 1

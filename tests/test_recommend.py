@@ -208,3 +208,89 @@ def test_every_entry_and_alternative_carries_provenance():
         assert e["provenance"] in ("measured", "estimated")
         for alt in e["alternatives"]:
             assert alt["provenance"] in ("measured", "estimated")
+
+
+# --- learning-gated execution: mode, categories, discontinuation (U6+U7) ---
+
+def _fstat(calls, ok, fail_streak=0, agent_assessed=0, last=None):
+    s = _stat(calls, ok)
+    s["fail_streak"] = fail_streak
+    if last:
+        s["last_outcome"] = last
+    if agent_assessed:
+        s["provenance"] = {"invoke": calls - agent_assessed,
+                           "agent-assessed": agent_assessed}
+    return s
+
+
+def test_proven_skill_earns_auto_mode():
+    out = recommend.score_skill(_skill("a", "d"), {"a": _fstat(5, 5)})
+    assert out["execution_mode"] == "auto"
+
+
+def test_open_incident_forces_suggest_mode():
+    out = recommend.score_skill(_skill("a", "d"), {"a": _fstat(5, 5)},
+                                open_incidents={"a": 1})
+    assert out["execution_mode"] == "suggest"
+
+
+def test_unproven_skill_is_suggest_only():
+    # 2 calls at 100% is below MEASURED_MIN_CALLS — never-used/unproven
+    # skills must not run automatically
+    assert recommend.score_skill(_skill("a", "d"),
+                                 {"a": _fstat(2, 2)})["execution_mode"] == "suggest"
+    assert recommend.score_skill(_skill("a", "d"), {})["execution_mode"] == "suggest"
+
+
+def test_low_rate_is_suggest_only():
+    out = recommend.score_skill(_skill("a", "d"), {"a": _fstat(5, 3)})
+    assert out["execution_mode"] == "suggest"      # 0.6 < AUTO_MIN_RATE
+
+
+def test_outcome_categories():
+    assert recommend.outcome_category(None) is None
+    assert recommend.outcome_category(_fstat(3, 2, last="fail")) == "failure"
+    assert recommend.outcome_category(_fstat(4, 4, agent_assessed=2)) == "supervision-needed"
+    assert recommend.outcome_category(_fstat(4, 4)) == "no-intervention-needed"
+    assert recommend.outcome_category(_fstat(1, 1)) == "success"
+
+
+def test_discontinued_with_active_rule_and_streak():
+    incidents = [{"signature": "skill:x", "status": "active",
+                  "active_rule": "never run x without a dry-run first"}]
+    out = recommend.recommend([_skill("x", "d")],
+                              {"x": _fstat(5, 2, fail_streak=3, last="fail")},
+                              incidents=incidents, needs=[])
+    assert _names(out) == []
+    assert out["discontinued"][0]["name"] == "x"
+    assert "dry-run" in out["discontinued"][0]["rule"]
+    assert out["coverage"]["total"] == 1
+
+
+def test_streak_below_threshold_stays_recommended():
+    incidents = [{"signature": "skill:x", "status": "active",
+                  "active_rule": "rule text"}]
+    out = recommend.recommend([_skill("x", "d")],
+                              {"x": _fstat(5, 3, fail_streak=2, last="fail")},
+                              incidents=incidents, needs=[])
+    assert _names(out) == ["x"]
+    assert out["discontinued"] == []
+
+
+def test_dismissed_rule_does_not_discontinue():
+    incidents = [{"signature": "skill:x", "status": "demoted",
+                  "active_rule": "rule text"}]
+    out = recommend.recommend([_skill("x", "d")],
+                              {"x": _fstat(5, 2, fail_streak=4, last="fail")},
+                              incidents=incidents, needs=[])
+    assert _names(out) == ["x"]
+
+
+def test_successful_call_breaks_streak_and_restores():
+    # fail_streak resets to 0 after an ok call → skill returns to the ranking
+    incidents = [{"signature": "skill:x", "status": "active",
+                  "active_rule": "rule text"}]
+    out = recommend.recommend([_skill("x", "d")],
+                              {"x": _fstat(6, 3, fail_streak=0)},
+                              incidents=incidents, needs=[])
+    assert _names(out) == ["x"]

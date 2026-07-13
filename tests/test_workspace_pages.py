@@ -87,9 +87,13 @@ def test_parallel_skill_drag_payload_and_source():
 def test_parallel_spawn_seeds_agents_before_repaint():
     # regression: dropping a skill on an empty pane spawned an agent, but the
     # stale AGENTS map made the repaint treat it as vanished, null the pane,
-    # and the follow-up send failed with "unknown agent" — both spawn paths
-    # (drop and the Spawn button) must seed AGENTS with the fresh agent
-    assert PARALLEL.count("AGENTS[res.agent.id] = res.agent") == 2
+    # and the follow-up send failed with "unknown agent" — every spawn path
+    # goes through the one spawnAgent helper, which seeds AGENTS itself
+    assert PARALLEL.count("AGENTS[res.agent.id] = res.agent") == 1
+    assert "async function spawnAgent" in PARALLEL
+    # spawn button, card drop on an empty pane, and Run on an empty pane all
+    # use the helper
+    assert PARALLEL.count("await spawnAgent(") >= 3
 
 
 def test_parallel_drop_send_uses_pinned_agent_id():
@@ -101,6 +105,76 @@ def test_parallel_drop_send_uses_pinned_agent_id():
 def test_parallel_pane_reset_needs_two_consecutive_misses():
     # one stale poll (request in flight during the spawn) must not wipe a pane
     assert "MISSES[n.agent] < 2" in PARALLEL
+
+
+# --- stage-then-run (2026-07-11 plan R1) -----------------------------------------
+
+def _drop_handler():
+    # the onDrop function body sits between its declaration and the live-agent
+    # section comment — slice it out so we can assert on the drop path alone
+    return PARALLEL.split("async function onDrop", 1)[1] \
+                   .split("// --- live agent state", 1)[0]
+
+
+def test_parallel_skill_drop_stages_instead_of_running():
+    drop = _drop_handler()
+    assert "STAGED[key]" in drop                  # skill drops stage…
+    assert "/api/workspace/send" not in drop      # …and never send directly
+    assert "board_dispatch" in drop               # kanban cards still dispatch
+
+
+def test_parallel_run_posts_recipe_to_server_composer():
+    # composition moved server-side: Run posts the staged chips + command to
+    # run_recipe, which enriches them with MindHive history before launching
+    assert "/api/workspace/run_recipe" in PARALLEL
+    assert "skills: STAGED[agentId] || []" in PARALLEL
+    assert "composePrompt" not in PARALLEL        # no client-side composer left
+    assert 'data-r="run"' in PARALLEL
+    # the consumed recipe clears so the next Run can't double-invoke it
+    assert "delete STAGED[agentId]" in PARALLEL
+
+
+def test_parallel_recipe_is_persistent_and_chips_removable():
+    assert "mh_ws_staged" in PARALLEL
+    assert 'title="unstage"' in PARALLEL
+
+
+# --- tabs view (2026-07-11 plan R2) -----------------------------------------------
+
+def test_parallel_has_tab_view_toggle():
+    assert "toggleView" in PARALLEL
+    assert "mh_ws_view" in PARALLEL               # view choice persists
+    assert "mh_ws_tab" in PARALLEL                # active tab persists
+    assert "tabbar" in PARALLEL
+
+
+def test_parallel_tab_spawn_offers_account_profiles():
+    # the + tab reuses the empty-pane spawn form, which lists PROFILES
+    assert "PROFILES.map(pr =>" in PARALLEL
+    assert "tab-new" in PARALLEL
+
+
+# --- orphan adoption + clear idle (2026-07-11 plan R3) ----------------------------
+
+def test_parallel_adopts_orphaned_agents():
+    assert "adoptOrphans" in PARALLEL
+    # adoption is splits-only (tabs render from server truth by construction)
+    assert "VIEW !== 'splits' || !POLLED" in PARALLEL
+    # a just-spawned agent already claimed by adoption is unclaimed before the
+    # spawning pane takes it — two panes must never share one agent
+    assert "l.agent === agent.id" in PARALLEL
+
+
+def test_parallel_clear_idle_button():
+    assert "/api/workspace/clear_idle" in PARALLEL
+    assert "Clear idle" in PARALLEL
+
+
+# --- run data reflected in the pane header (2026-07-11 plan R5) --------------------
+
+def test_parallel_shows_last_run_stats():
+    assert "last_turns" in PARALLEL
+    assert "last_cost" in PARALLEL
 
 
 # --- R7: kanban dispatches agents -----------------------------------------------
@@ -147,3 +221,51 @@ def test_swarm_parses_at_mentions():
     # typed "@Name <text>" resolves the named agent; longest name match wins
     assert "resolveMention" in SWARM
     assert "best.nm.length" in SWARM
+
+
+# --- cat nodes (2026-07-11 plan R4) ------------------------------------------------
+
+def test_swarm_nodes_are_pixel_cat_sprites():
+    assert "catSVG" in SWARM
+    assert "CAT_PALETTES" in SWARM
+    assert "crispEdges" in SWARM                  # pixel-art rendering
+    for cat in ("white", "calico", "orange", "tabby", "siamese", "black"):
+        assert cat in SWARM
+
+
+def test_swarm_cat_choice_is_deterministic_from_agent_id():
+    # random per new node but stable across refreshes: derived from the id,
+    # never from Math.random
+    assert "parseInt(String(id).slice(0,4), 16)" in SWARM
+    assert "% 6" in SWARM
+    assert "Math.random" not in SWARM
+
+
+# --- node inspector: skills used + run info (2026-07-11 plan R5) -------------------
+
+def test_swarm_inspector_shows_skills_used_and_run_info():
+    assert "skills_used" in SWARM
+    assert "iskills" in SWARM
+    assert "last_turns" in SWARM
+    assert "last_cost" in SWARM
+
+
+# --- model picker + account auth (2026-07-11 auth/skills round) --------------------
+
+def test_parallel_offers_model_picker():
+    assert 'data-r="model"' in PARALLEL
+    assert "/api/workspace/set_model" in PARALLEL
+    assert "modelOptions" in PARALLEL
+    assert '"__custom"' in PARALLEL               # free-typed model ids allowed
+
+
+def test_parallel_shows_profile_auth_health():
+    assert "/api/workspace/auth" in PARALLEL
+    for state in ("ok", "expired", "none"):
+        assert ".adot." + state in PARALLEL       # green / amber / red dots
+
+
+def test_parallel_has_login_and_trust_buttons():
+    assert "/api/workspace/profile_login" in PARALLEL
+    assert "/api/workspace/profile_trust" in PARALLEL
+    assert "loginProfile" in PARALLEL and "trustProfile" in PARALLEL

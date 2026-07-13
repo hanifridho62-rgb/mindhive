@@ -13,7 +13,10 @@ import os
 import shutil
 import subprocess
 
-MODEL = "claude-sonnet-4-6"
+# Use the CLI's rolling alias, not a dated id: `--model sonnet` always resolves
+# to the current Sonnet, so the reflection engine never silently 404s the way a
+# pinned "claude-sonnet-4-6" would once that snapshot is retired.
+MODEL = "sonnet"
 
 
 def resolve_exe(cmd: str = "claude") -> str:

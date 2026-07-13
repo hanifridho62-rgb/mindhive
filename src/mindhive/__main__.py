@@ -47,10 +47,18 @@ def cmd_append(args) -> int | None:
 
 
 def cmd_hook(args) -> int | None:
-    from . import hookcapture
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if args.stage == "post_tool_use":
+        from . import hookcapture
         print(json.dumps(hookcapture.record_post_tool_use(raw)))
+    elif args.stage == "pre_tool_use":
+        # Deny the ineffective tool form for enabled-enforcement signatures.
+        # Print ONLY on a deny (stdout is the hook's decision channel); an allow
+        # prints nothing so the hook stays a silent no-op.
+        from . import enforce
+        decision = enforce.hook_decision(raw)
+        if decision:
+            print(json.dumps(decision))
     return None
 
 
@@ -427,8 +435,16 @@ def cmd_loop(args) -> int | None:
         tasks = loop_task.load_tasks(loop_dir)
         ctx = loop_prompt.build_loop_context(_bb(events.read_all()))
         tp = loop_prompt.build_task_prompt(tasks, [])
+        from .loop import router as loop_router
+        req = loop_task.required_remaining_count(tasks.fix_plan)
+        size = loop_router.size_class(req, len(tasks.prompt))
+        tier = (loop_router.pick_initial_tier(
+                    size, loop_router.run_history(events.read_all()))
+                if cfg.model is None else None)
         print("DRY-RUN — would run claude with:")
-        print(f"  required items remaining: {loop_task.required_remaining_count(tasks.fix_plan)}")
+        print(f"  required items remaining: {req}")
+        print(f"  model routing: " + (f"size={size} -> tier={tier}"
+              if tier else f"pinned model {cfg.model} (routing bypassed)"))
         print(f"  context_window={cfg.context_window} smart_zone_ratio={cfg.smart_zone_ratio}")
         print(f"  allowed_tools={cfg.allowed_tools}")
         print(f"  permission_mode={cfg.permission_mode or '(allowedTools only)'}")
@@ -458,6 +474,8 @@ def cmd_loop(args) -> int | None:
             res = _dashboard.launch_background()
             if res.get("launched"):
                 print(f"dashboard: {res['url']}")
+            elif res.get("already_running"):
+                print(f"dashboard: already running — {res['url']}")
             else:
                 print(f"dashboard: not launched ({res.get('reason')})", file=sys.stderr)
         except Exception as e:  # never let the dashboard disturb the loop
@@ -486,6 +504,22 @@ def cmd_flag(args) -> int | None:
     incidents_mod.audit(project=args.project)
     incidents_mod.project(project=args.project)
     print(f"flagged {signature} @ {ev.ts}")
+    return None
+
+
+def cmd_consolidate(args) -> int | None:
+    """One bounded memory-consolidation ("dreaming") pass: merge near-duplicate
+    semantic memories into survivors, exclude the absorbed originals from the
+    briefing/MEMORY.md digest, keep everything in the append-only chain."""
+    from . import consolidate as consolidate_mod
+    try:
+        res = consolidate_mod.consolidate(
+            project=args.project, limit=args.limit,
+            cooldown_hours=args.cooldown_hours, force=args.force)
+    except RuntimeError as e:       # LIVE_LOCK guard
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(res))
     return None
 
 
@@ -580,9 +614,53 @@ def cmd_rules_reflect(args) -> int | None:
     return 0
 
 
+def cmd_rules_resolve(args) -> int | None:
+    """Active resolution over the red (unresolved) set: reflect rule-less
+    incidents, reroute leaking auto rules to the best alternative route.
+    --list prints the red set without spending any tokens."""
+    from . import resolve as resolve_mod
+    if args.list:
+        from . import incidents as inc
+        inc.audit(project=args.project)
+        inc.project(project=args.project)
+        print(json.dumps(resolve_mod.red_summaries(args.project), indent=2))
+        return 0
+    try:
+        res = resolve_mod.resolve_batch(project=args.project, limit=args.limit)
+    except Exception as e:              # hook-safe: JSON + exit 0, never a traceback
+        res = {"rerouted": 0, "reflected": 0,
+               "error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(res))
+    return 0
+
+
 def cmd_rules_reconcile(args) -> int | None:
     from . import incidents as inc
     print(json.dumps(inc.reconcile(project=args.project)))
+    return None
+
+
+def cmd_rules_enforce(args) -> int | None:
+    """Manage the PreToolUse enforcement manifest — the enforce rung of the
+    nudge->enforce ladder. Default action prints the manifest."""
+    from . import enforce
+    if args.suggest:
+        print(json.dumps({"suggested": enforce.suggest(project=args.project)}))
+        return None
+    if args.enable:
+        print(json.dumps(enforce.set_enabled(args.project, args.enable, True)))
+        return None
+    if args.disable:
+        print(json.dumps(enforce.set_enabled(args.project, args.disable, False)))
+        return None
+    man = enforce.load_manifest(args.project)
+    if not man:
+        print("(no enforcement manifest — run `hive rules enforce --suggest`)")
+        return None
+    for sig, entry in sorted(man.items()):
+        state = "ENABLED " if entry.get("enabled") else "disabled"
+        matcher = "ok" if sig in enforce.MATCHERS else "MISSING-matcher"
+        print(f"  [{state}] {sig}  ({matcher})")
     return None
 
 
@@ -630,7 +708,7 @@ def _build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_append)
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
-    hk.add_argument("stage", choices=["post_tool_use"],
+    hk.add_argument("stage", choices=["post_tool_use", "pre_tool_use"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -652,6 +730,19 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--limit", type=int, default=10)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_recall)
+
+    cons = sub.add_parser("consolidate",
+                          help="dreaming pass: merge near-duplicate memories "
+                               "into survivors (append-only, bounded)")
+    cons.add_argument("--project", default=None)
+    cons.add_argument("--limit", type=int, default=3,
+                      help="max duplicate clusters merged per pass")
+    cons.add_argument("--cooldown-hours", dest="cooldown_hours", type=float,
+                      default=6.0, help="skip when a pass ran within this window "
+                                        "(0 disables)")
+    cons.add_argument("--force", action="store_true",
+                      help="override the LIVE_LOCK guard")
+    cons.set_defaults(func=cmd_consolidate)
 
     gc = sub.add_parser("gc", help="store hygiene: report sizes; prune junk (opt-in)")
     gc.add_argument("target", nargs="?", default=None,
@@ -857,6 +948,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="drain every registered namespace (manual backlog drain; "
                          "never invoked from hooks; LIVE_LOCK-named namespaces skipped)")
     rr.set_defaults(func=cmd_rules_reflect)
+    rrs = rsub.add_parser("resolve",
+                          help="actively resolve red (unresolved) rules: reflect "
+                               "missing ones, reroute leaking ones to the best "
+                               "alternative route")
+    rrs.add_argument("--project", default=None)
+    rrs.add_argument("--limit", type=int, default=3,
+                     help="max red incidents to resolve this pass (default: 3)")
+    rrs.add_argument("--list", action="store_true",
+                     help="print the red set as JSON without resolving anything")
+    rrs.set_defaults(func=cmd_rules_resolve)
     ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
     ra.add_argument("--project", default=None)
     ra.set_defaults(func=cmd_rules_audit)
@@ -874,6 +975,16 @@ def _build_parser() -> argparse.ArgumentParser:
     rc = rsub.add_parser("reconcile", help="record human edits as rule_revised events")
     rc.add_argument("--project", default=None)
     rc.set_defaults(func=cmd_rules_reconcile)
+    ren = rsub.add_parser("enforce",
+                          help="manage the PreToolUse enforcement manifest (nudge->enforce ladder)")
+    ren.add_argument("--project", default=None)
+    ren.add_argument("--suggest", action="store_true",
+                     help="add disabled stubs for ruled signatures recurring past the threshold")
+    ren.add_argument("--enable", metavar="SIG", default=None,
+                     help="turn on enforcement for a signature")
+    ren.add_argument("--disable", metavar="SIG", default=None,
+                     help="turn off enforcement for a signature")
+    ren.set_defaults(func=cmd_rules_enforce)
 
     return p
 

@@ -168,14 +168,47 @@ def _ts_secs(ts) -> float | None:
         return None
 
 
+# Reroute attempts per signature before active resolution gives up and hands
+# the incident to a human (flag: reroute_exhausted). Lives here (not resolve.py)
+# because _status_and_flag renders the flag during every projection rebuild.
+MAX_REROUTES = 3
+
+
+def _latest_reroute(project, signature, evs=None):
+    """(ts, session_id) of the most recent rule_rerouted event for a signature,
+    or (None, None). A reroute replaces a failed rule with an alternative route,
+    so it re-anchors leak/exposure accounting (see signal_stats)."""
+    ts = sess = None
+    for ev in (evs if evs is not None else events.read_all(project)):
+        if ev.type == "rule_rerouted" and isinstance(ev.payload, dict) \
+                and ev.payload.get("signature") == signature:
+            if ts is None or ev.ts > ts:
+                ts, sess = ev.ts, ev.session_id
+    return ts, sess
+
+
+def reroute_count(project=None, signature=None, evs=None) -> int:
+    """How many times a signature's rule has been rerouted (alternative route
+    deployed after the previous rule leaked)."""
+    return sum(1 for ev in (evs if evs is not None else events.read_all(project))
+               if ev.type == "rule_rerouted" and isinstance(ev.payload, dict)
+               and ev.payload.get("signature") == signature)
+
+
 def leaks(project=None, signature=None) -> int:
     """Count tool_failed events for a signature that occurred AFTER its rule
-    activated — i.e. the same error recurred despite an active rule."""
+    activated — i.e. the same error recurred despite an active rule. A reroute
+    re-anchors the count: only failures after the latest rule_rerouted (from a
+    session other than the one that deployed the route) count, so the new route
+    gets a fair chance to prove itself."""
     act = _activation_ts(project, signature)
     if not act:
         return 0
+    r_ts, r_sess = _latest_reroute(project, signature)
+    anchor, skip = (r_ts, r_sess) if (r_ts and r_ts > act) else (act, None)
     evs = _failures_by_sig(project).get(signature, [])
-    return sum(1 for e in evs if e.ts > act)
+    return sum(1 for e in evs
+               if e.ts > anchor and (skip is None or e.session_id != skip))
 
 
 def _status_and_flag(project, signature, rec, threshold, source):
@@ -193,10 +226,17 @@ def _status_and_flag(project, signature, rec, threshold, source):
         return "candidate", ""
     if _has_lifecycle(project, "rule_demoted", signature):
         return "demoted", ""
+    # leaks() is reroute-anchored, so deploying an alternative route resets the
+    # count and un-demotes an auto rule that leaked under its OLD text — the
+    # new route re-enters injection and gets its own chance to hold.
     lk = leaks(project, signature)
+    exhausted = (source == "auto" and lk >= 1
+                 and reroute_count(project, signature) >= MAX_REROUTES)
     if source == "auto" and lk >= LEAK_LIMIT:
-        return "demoted", ""
+        return "demoted", ("reroute_exhausted" if exhausted else "")
     flag = "needs_review" if source == "human" and lk >= 1 else ""
+    if exhausted:
+        flag = "reroute_exhausted"
     return "active", flag
 
 
@@ -455,9 +495,20 @@ def inject(project=None, evs=None) -> str:
         by_sig[it[0]][-1].ts if by_sig.get(it[0]) else ""), reverse=True)
     ranked.sort(key=lambda it: -len(by_sig.get(it[0], [])))
     shown = ranked[:INJECT_CAP]
+    # A rerouted rule replaced one that demonstrably failed — mark it so the
+    # model treats the chosen route as mandatory, not advisory.
+    rr_counts = {}
+    for ev in (evs if evs is not None else events.read_all(project)):
+        if ev.type == "rule_rerouted" and isinstance(ev.payload, dict):
+            s = ev.payload.get("signature")
+            if s:
+                rr_counts[s] = rr_counts.get(s, 0) + 1
     lines = ["# PREVENTION RULES (machine-learned — avoid repeating these)"]
     for signature, rule in shown:
-        lines.append(f"- [{signature}] {rule}")
+        n = rr_counts.get(signature, 0)
+        mark = (f" (rerouted ×{n} — the previous rule failed; "
+                "follow this route exactly)" if n else "")
+        lines.append(f"- [{signature}]{mark} {rule}")
     cut = len(ranked) - len(shown)
     if cut > 0:
         lines.append(f"+{cut} more: hive rules list")
@@ -480,7 +531,8 @@ def _active_rule_for(signature, project):
 
 def promote(signature, project=None) -> dict:
     """Append a signature's Active rule to the canonical SOUL.md and mark the
-    incident promoted. The only write to canonical memory (human-invoked)."""
+    incident promoted. The only write to canonical memory — invoked by a human
+    or by auto_promote once a rule has proven itself."""
     rule = _active_rule_for(signature, project)
     if not rule:
         return {"promoted": False, "reason": "no active rule"}
@@ -495,6 +547,56 @@ def promote(signature, project=None) -> dict:
                         tags=["promote"], project=project)
     globals()["project"](project)          # re-project -> status promoted
     return {"promoted": True}
+
+
+def auto_promote(project=None, evs=None) -> dict:
+    """Self-acting promotion — the 'permanent SOP' rung of the learning loop.
+
+    Any ACTIVE rule whose lesson classifies as ``resolved`` (at the recurrence
+    threshold, rule present, tested after activation, zero leaks) has proven it
+    actually changes behavior, so it graduates into SOUL.md without waiting for
+    a human. This is what makes improvements self-sustaining: capture ->
+    reflect -> inject -> prove -> promote, with no manual step anywhere.
+    Idempotent (``promote`` refuses already-promoted signatures). Returns
+    ``{"promoted": [signatures]}``. Pass evs to reuse a read_all() result."""
+    stats = signal_stats(project, evs=evs)
+    done = []
+    for s in summaries(project):
+        if s.get("status") != "active":
+            continue
+        sig = s.get("signature", "")
+        if classify_resolution(s, stats.get(sig, {})) != "resolved":
+            continue
+        if promote(sig, project=project).get("promoted"):
+            done.append(sig)
+    return {"promoted": done}
+
+
+SOUL_CAP = 10   # max promoted rules injected per session (newest first)
+
+
+def soul_block(project=None) -> str:
+    """Canonical operating rules (promoted SOPs) for session-start injection.
+
+    This is the permanence mechanism promote() was missing a consumer for:
+    SOUL.md was written but nothing ever read it back into a session, so a
+    'promoted' rule was effectively archived, not permanent. Injecting the
+    block through STATE.md (the single delivery choke point) makes promotion
+    mean what it says. Empty string when no rules were ever promoted."""
+    try:
+        text = soul_path(project).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    rules = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- ")]
+    if not rules:
+        return ""
+    lines = ["# SOUL — permanent operating rules (proven; always follow)"]
+    shown = rules[-SOUL_CAP:]
+    lines += shown
+    cut = len(rules) - len(shown)
+    if cut > 0:
+        lines.append(f"+{cut} more in SOUL.md")
+    return "\n".join(lines)
 
 
 def demote(signature, project=None) -> dict:
@@ -543,7 +645,8 @@ def _raw_excerpt(section: str) -> str:
 
 
 _LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted",
-                    "rule_revised", "rule_expired"}
+                    "rule_revised", "rule_expired", "rule_enforced",
+                    "rule_rerouted"}
 
 
 def signal_stats(project=None, evs=None) -> dict:
@@ -554,13 +657,18 @@ def signal_stats(project=None, evs=None) -> dict:
     Leaks count failures after the rule's activation ts from a session other
     than the one containing the threshold-crossing failure — prevention rules
     inject at session start, so same-session recurrences predate the rule
-    being in play. Exposure is whether any non-lifecycle activity arrived from
-    a different session after activation, i.e. whether the rule has had a
-    chance to prove itself. Pass evs to reuse an events.read_all() result."""
+    being in play. A rule_rerouted event re-anchors both leaks and exposure at
+    the reroute (excluding the rerouting session the same way), so a freshly
+    deployed alternative route starts with a clean slate and can classify
+    resolved once it holds. Exposure is whether any non-lifecycle activity
+    arrived from a different session after the anchor, i.e. whether the rule
+    has had a chance to prove itself. Pass evs to reuse an events.read_all()
+    result."""
     if evs is None:
         evs = events.read_all(project)
     fails = {}                          # sig -> [(ts, session_id), ...] in ts order
     act_ts = {}                         # sig -> first rule_activated ts
+    reroutes = {}                       # sig -> {n, ts, sess} (latest reroute)
     demoted = set()                     # sigs with an explicit rule_demoted event
     sess_last = {}                      # session_id -> latest activity ts
     for ev in evs:
@@ -575,23 +683,45 @@ def signal_stats(project=None, evs=None) -> dict:
             fails.setdefault(s, []).append((ev.ts, ev.session_id))
         elif ev.type == "rule_activated" and s not in act_ts:
             act_ts[s] = ev.ts
+        elif ev.type == "rule_rerouted":
+            rr = reroutes.setdefault(s, {"n": 0, "ts": None, "sess": None})
+            rr["n"] += 1
+            if rr["ts"] is None or (ev.ts or "") > rr["ts"]:
+                rr["ts"], rr["sess"] = ev.ts, ev.session_id
         elif ev.type == "rule_demoted":
             demoted.add(s)
     out = {}
     for s, hits in fails.items():
         act = act_ts.get(s)
-        act_sess = next((sess for ts, sess in hits if ts == act), None) if act else None
+        rr = reroutes.get(s) or {}
+        if act and rr.get("ts") and rr["ts"] > act:
+            anchor, anchor_sess = rr["ts"], rr.get("sess")
+        else:
+            anchor = act
+            anchor_sess = next(
+                (sess for ts, sess in hits if ts == act), None) if act else None
         leaks = sum(1 for ts, sess in hits
+                    if ts > anchor and sess != anchor_sess) if anchor else 0
+        # total_leaks ignores the reroute anchor (cumulative since activation):
+        # the nudge->enforce ladder keys on it so rerouting cannot postpone
+        # auto-enforcement for matcher-covered signatures.
+        act_sess = next(
+            (sess for ts, sess in hits if ts == act), None) if act else None
+        total = sum(1 for ts, sess in hits
                     if ts > act and sess != act_sess) if act else 0
-        exposure = bool(act) and any(
-            last > act and sess != act_sess for sess, last in sess_last.items())
+        exposure = bool(anchor) and any(
+            last > anchor and sess != anchor_sess
+            for sess, last in sess_last.items())
         out[s] = {
             "first_seen": hits[0][0],
             "last_seen": hits[-1][0],
             "event_occurrences": len(hits),
             "leaks": leaks,
+            "total_leaks": total,
             "exposure": exposure,
             "dismissed": s in demoted,
+            "reroutes": rr.get("n", 0),
+            "last_reroute": rr.get("ts"),
         }
     return out
 

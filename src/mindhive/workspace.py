@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -32,9 +33,28 @@ import time
 
 from . import claude_cli, events as ev_mod, paths
 
+# Profile names end up interpolated into a Windows `cmd /k` string by
+# profile_login, so restrict them to an identifier-safe charset — no shell
+# metacharacters (& | < > " etc.) can reach the console. Enforced at save time
+# and re-checked before any login launch.
+_SAFE_PROFILE = re.compile(r"^[A-Za-z0-9 _.\-]{1,64}$")
+
 MAX_AGENTS = 16
 MAX_LINES = 4000                 # per-agent scrollback cap (oldest dropped)
 RUN_TIMEOUT_S = int(os.environ.get("MINDHIVE_WS_TIMEOUT", "1800"))
+
+# Per-pane model picker: the ids the headless CLI's --model flag accepts.
+# "" = account default (no flag). The UI also allows a free-typed id, so new
+# models work without a code change.
+MODEL_CHOICES = [
+    {"id": "", "label": "account default"},
+    {"id": "claude-fable-5", "label": "Fable 5"},
+    {"id": "claude-opus-4-8", "label": "Opus 4.8"},
+    {"id": "claude-opus-4-7", "label": "Opus 4.7"},
+    {"id": "claude-opus-4-6", "label": "Opus 4.6"},
+    {"id": "claude-sonnet-5", "label": "Sonnet 5"},
+    {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5"},
+]
 
 # Role lenses for MindSwarm agents. Every lens ends with the shared-memory
 # contract so each agent reads and writes the same Mind Hive graph.
@@ -93,6 +113,9 @@ def save_profile(name: str, config_dir: str) -> dict:
     name = (name or "").strip()
     if not name or name == "default":
         return {"ok": False, "error": "profile needs a unique name (not 'default')"}
+    if not _SAFE_PROFILE.match(name):
+        return {"ok": False, "error": "profile name may use only letters, "
+                "digits, space, dot, dash, underscore"}
     others = [e for e in load_profiles()
               if e["name"] not in ("default", name)]
     others.append({"name": name, "config_dir": (config_dir or "").strip()})
@@ -115,6 +138,136 @@ def _profile_env(profile: str | None) -> dict:
         if e["name"] == profile and e["config_dir"]:
             env["CLAUDE_CONFIG_DIR"] = e["config_dir"]
     return env
+
+
+def _profile_config_dir(profile: str | None) -> str:
+    """The profile's CLAUDE_CONFIG_DIR override, or "" for the system default."""
+    for e in load_profiles():
+        if e["name"] == profile and e["config_dir"]:
+            return e["config_dir"]
+    return ""
+
+
+def _profile_paths(profile: str | None):
+    """(credentials.json, .claude.json) for a profile. With no override the CLI
+    keeps credentials in ~/.claude/ but its state file at ~/.claude.json; with
+    CLAUDE_CONFIG_DIR set, both live inside that directory."""
+    from pathlib import Path
+    cfg = _profile_config_dir(profile)
+    if cfg:
+        base = Path(cfg)
+        return base / ".credentials.json", base / ".claude.json"
+    return Path.home() / ".claude" / ".credentials.json", Path.home() / ".claude.json"
+
+
+def profile_auth_status(profile: str = "default") -> dict:
+    """File-based auth health for one profile — a heuristic that never spends
+    tokens: read the OAuth expiry from the profile's credential store. An
+    expired token is exactly what a headless run's 401 looks like."""
+    creds_path, state_path = _profile_paths(profile)
+    out = {"profile": profile, "state": "none",
+           "detail": "no credentials — Login to connect an account"}
+    try:
+        oauth = json.loads(creds_path.read_text(encoding="utf-8")) \
+            .get("claudeAiOauth") or {}
+        exp = float(oauth.get("expiresAt") or 0) / 1000.0
+        sub = oauth.get("subscriptionType") or "account"
+        if exp > time.time():
+            out.update(state="ok", detail=f"logged in ({sub})")
+        else:
+            out.update(state="expired",
+                       detail="OAuth token expired — headless runs will 401; "
+                              "Login to refresh")
+    except (OSError, ValueError):
+        pass
+    if out["state"] == "none":
+        try:
+            st = json.loads(state_path.read_text(encoding="utf-8"))
+            if st.get("oauthAccount") or st.get("primaryApiKey"):
+                out.update(state="unknown",
+                           detail="account configured but token store unreadable")
+        except (OSError, ValueError):
+            pass
+    if out["state"] == "none" and os.environ.get("ANTHROPIC_API_KEY"):
+        out.update(state="ok", detail="ANTHROPIC_API_KEY set")
+    return out
+
+
+def auth_status_all() -> dict:
+    return {"ok": True,
+            "auth": [profile_auth_status(e["name"]) for e in load_profiles()]}
+
+
+def profile_login(profile: str = "default") -> dict:
+    """Open a console on the user's desktop running the interactive `claude`
+    CLI under this profile's CLAUDE_CONFIG_DIR. Logging in is the user's own
+    act (OAuth in their browser) — MindHive only opens the right door."""
+    profile = (profile or "default").strip()
+    # Only launch for a real, name-validated profile: the name is interpolated
+    # into the cmd string below, so an unchecked value (e.g. 'x & calc') would
+    # be shell injection. 'default' plus save_profile's charset guard mean any
+    # name reaching here is already safe, but re-check rather than trust it.
+    if profile != "default" and not any(
+            e["name"] == profile for e in load_profiles()):
+        return {"ok": False, "error": f"unknown profile: {profile}"}
+    if not _SAFE_PROFILE.match(profile):
+        return {"ok": False, "error": "profile name has unsafe characters"}
+    new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    if not new_console:
+        return {"ok": False, "error":
+                "interactive login console is Windows-only — run `claude` "
+                "with CLAUDE_CONFIG_DIR set and type /login"}
+    exe = claude_cli.resolve_exe()
+    # Pass CLAUDE_CONFIG_DIR through the child environment, never as a shell
+    # `set` command — a config_dir with shell metacharacters can't reach cmd.
+    env = _profile_env(profile)
+    cmdline = (f'echo [MindHive] profile "{profile}" - type /login to '
+               f'authenticate, then accept the trust dialog && "{exe}"')
+    try:
+        subprocess.Popen(["cmd", "/k", cmdline], env=env,
+                         creationflags=new_console)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "detail":
+            f"login console opened for profile {profile} — type /login there"}
+
+
+_TRUST_LOCK = threading.Lock()
+
+
+def profile_trust(profile: str = "default", folder: str = "") -> dict:
+    """Pre-accept the workspace-trust dialog for `folder` in the profile's
+    .claude.json, so headless runs stop ignoring .claude/settings.local.json
+    permissions. Both slash spellings are written — the CLI looks projects up
+    by the literal cwd string.
+
+    The whole read-modify-write runs under _TRUST_LOCK: two dashboard requests
+    trusting different folders at once would otherwise each load the file, add
+    only their own key, and the second write would drop the first's."""
+    folder = (folder or "").strip() or os.getcwd()
+    _, state_path = _profile_paths(profile)
+    with _TRUST_LOCK:
+        try:
+            st = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            st = {}
+        if not isinstance(st, dict):
+            return {"ok": False, "error": f"unreadable state file: {state_path}"}
+        projects = st.setdefault("projects", {})
+        for key in {folder, folder.replace("\\", "/"), folder.replace("/", "\\")}:
+            entry = projects.get(key)
+            if isinstance(entry, dict):
+                entry["hasTrustDialogAccepted"] = True
+            else:
+                projects[key] = {"hasTrustDialogAccepted": True}
+        tmp = state_path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, state_path)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+    return {"ok": True, "detail": f"trusted {folder} for profile {profile}"}
 
 
 def _folder_for_project(proj: str | None) -> str:
@@ -179,17 +332,21 @@ class Agent:
     """One workspace agent: identity + scrollback + the current run."""
 
     def __init__(self, name, role="agent", profile="default", project=None,
-                 swarm=False):
+                 swarm=False, model=None):
         self.id = secrets.token_hex(4)
         self.name = name or role.title()
         self.role = role if role in ROLE_LENSES else "agent"
         self.profile = profile or "default"
+        self.model = (model or "").strip()      # "" = account default
         self.project = project
         self.swarm = swarm
         self.status = "idle"            # idle | running | done | error | stopped
         self.lines: list = []
         self.session_id = None          # claude session for --resume continuity
         self.task_id = None             # kanban card being executed, if any
+        self.skills_used: list = []     # Skill tool invocations, ordered, deduped
+        self.last_turns = None          # num_turns of the most recent run
+        self.last_cost = None           # total_cost_usd of the most recent run
         self.created = _now_iso()
         self.proc = None
         self._timer = None
@@ -197,8 +354,11 @@ class Agent:
     def snapshot(self) -> dict:
         return {"id": self.id, "name": self.name, "role": self.role,
                 "profile": self.profile, "project": self.project,
+                "model": self.model,
                 "swarm": self.swarm, "status": self.status,
                 "session_id": self.session_id, "task_id": self.task_id,
+                "skills_used": list(self.skills_used),
+                "last_turns": self.last_turns, "last_cost": self.last_cost,
                 "created": self.created, "lines": len(self.lines)}
 
     def emit(self, line: str) -> None:
@@ -228,14 +388,15 @@ class Manager:
         return self.agents.get(agent_id)
 
     def spawn(self, name=None, role="agent", profile="default", project=None,
-              prompt=None, swarm=False) -> dict:
+              prompt=None, swarm=False, model=None) -> dict:
         with self._lock:
             if len(self.agents) >= MAX_AGENTS:
                 return {"ok": False, "error": f"agent cap reached ({MAX_AGENTS})"}
             a = Agent(name, role=role, profile=profile, project=project,
-                      swarm=swarm)
+                      swarm=swarm, model=model)
             self.agents[a.id] = a
-        a.emit(f"· {a.name} ready · role {a.role} · profile {a.profile}")
+        a.emit(f"· {a.name} ready · role {a.role} · profile {a.profile}"
+               + (f" · model {a.model}" if a.model else ""))
         if prompt:
             res = self.send(a.id, prompt)
             if not res.get("ok"):
@@ -262,6 +423,24 @@ class Manager:
             a.emit("■ stopped by user")
         return {"ok": True}
 
+    def clear_idle(self) -> dict:
+        """Remove every settled MindParallel agent (not running, not swarm) —
+        the one-click cull behind the dashboard's Clear idle button. Swarm
+        agents are left to the mission_stop lifecycle."""
+        with self._lock:
+            ids = [a.id for a in self.agents.values()
+                   if a.status != "running" and not a.swarm]
+        removed = 0
+        for i in ids:
+            a = self.get(i)
+            # re-check right before removal: an agent snapshotted as settled
+            # may have started a run since — never kill a live run
+            if a is None or a.status == "running":
+                continue
+            self.remove(i)
+            removed += 1
+        return {"ok": True, "removed": removed}
+
     def output(self, agent_id, since=0) -> dict:
         a = self.get(agent_id)
         if a is None:
@@ -273,7 +452,7 @@ class Manager:
                 "status": a.status}
 
     # --- one run = one headless claude call ---------------------------------
-    def send(self, agent_id, prompt) -> dict:
+    def send(self, agent_id, prompt, extra_system=None, add_dirs=None) -> dict:
         a = self.get(agent_id)
         if a is None:
             return {"ok": False, "error": "unknown agent"}
@@ -281,13 +460,25 @@ class Manager:
             return {"ok": False, "error": "prompt is empty"}
         if a.status == "running":
             return {"ok": False, "error": f"{a.name} is busy — wait or stop it"}
+        # bypassPermissions: headless runs have no prompt channel, so under
+        # acceptEdits anything beyond an in-cwd edit was silently auto-denied —
+        # agents burned whole turns pleading for approvals nobody could grant
+        # (user mandate 2026-07-13: full access for all workspace agents).
         argv = [claude_cli.resolve_exe(), "--output-format", "stream-json",
-                "--verbose", "--permission-mode", "acceptEdits"]
+                "--verbose", "--permission-mode", "bypassPermissions"]
+        # extra workspace roots (e.g. Self-Reliant's \\wsl$ autoresearch dir) —
+        # without --add-dir the CLI's boundary silently blocks out-of-cwd edits
+        for d in add_dirs or []:
+            argv += ["--add-dir", str(d)]
         if a.session_id:
             argv += ["--resume", a.session_id]
+        if a.model:
+            argv += ["--model", a.model]
         lens = ROLE_LENSES.get(a.role, "")
-        if a.role != "agent":
-            argv += ["--append-system-prompt", lens + _SHARED_MEMORY]
+        sys_extra = (lens + _SHARED_MEMORY if a.role != "agent" else "") \
+            + (extra_system or "")
+        if sys_extra:
+            argv += ["--append-system-prompt", sys_extra]
         argv += ["-p", prompt]
         env = _profile_env(a.profile)
         cwd = _folder_for_project(a.project)
@@ -332,9 +523,25 @@ class Manager:
                     continue
                 if obj.get("type") == "system" and obj.get("session_id"):
                     a.session_id = obj["session_id"]
+                if obj.get("type") == "assistant":
+                    # record Skill tool invocations so the UI can show which
+                    # skills this agent has used (deduped, in first-use order)
+                    for block in (obj.get("message") or {}).get("content") or []:
+                        if not (isinstance(block, dict)
+                                and block.get("type") == "tool_use"
+                                and block.get("name") == "Skill"):
+                            continue
+                        inp = block.get("input")
+                        skill = inp.get("skill") if isinstance(inp, dict) else None
+                        if skill and str(skill) not in a.skills_used:
+                            a.skills_used.append(str(skill))
                 if obj.get("type") == "result":
                     saw_result = True
                     result_text = obj.get("result") or ""
+                    if obj.get("num_turns") is not None:
+                        a.last_turns = obj.get("num_turns")
+                    if obj.get("total_cost_usd") is not None:
+                        a.last_cost = obj.get("total_cost_usd")
                     if obj.get("session_id"):
                         a.session_id = obj["session_id"]
                 for line in render_stream_event(obj):
@@ -429,6 +636,115 @@ class Manager:
             sent += 1 if r.get("ok") else 0
             busy += 0 if r.get("ok") else 1
         return {"ok": True, "sent": sent, "busy": busy}
+
+
+# --- recipe runs: staged skills + command -> one enriched pipeline prompt --
+# The MindHive capability primer rides along as system prompt so a pane agent
+# knows the memory system's surface area without burning turns discovering it.
+MINDHIVE_PRIMER = (
+    "MindHive integration: this machine runs the MindHive shared-memory "
+    "system. Its full function surface is the `python -m mindhive` CLI — "
+    "recall \"<terms>\" (query the ledger; add --semantic for meaning-based), "
+    "append decision|experiment_result|caveat \"<one line>\" --tags workspace "
+    "(commit a lesson), skills list / skills status / skills invoke <name> "
+    "(the live skill registry, per-skill green/red health, and the recorded "
+    "invoke channel), rules summaries (Improvements: prevention rules learned "
+    "from past failures), graph related \"<entity>\", state, and briefing. "
+    "Before acting, recall relevant history; when a skill shows a failing "
+    "status or a prevention rule, apply the lesson instead of repeating the "
+    "mistake; when you finish something durable, append it."
+)
+
+_NO_OVERLAP = (
+    "Invoke each staged skill via the Skill tool exactly once, in the order "
+    "listed. Do not re-run a skill and do not let two skills repeat the same "
+    "work: carry each skill's output forward as the next skill's input, and "
+    "when two skills would cover the same step, do that step once and reuse "
+    "the result. The COMMAND below is the single source of intent — every "
+    "skill serves it; when skills disagree, the command wins."
+)
+
+
+def _clean_skills(skills) -> list:
+    out = []
+    for s in skills or []:
+        if isinstance(s, dict) and s.get("name"):
+            out.append({"name": str(s["name"])[:120],
+                        "plugin": (str(s["plugin"])[:120]
+                                   if s.get("plugin") else None)})
+    return out
+
+
+def _recipe_context(skills, command, project=None) -> str:
+    """Learned-history block for a recipe: per-skill health + Improvements
+    prevention rules, then top ledger recall hits for the command. Every
+    source is best-effort — a broken subsystem must never block a run."""
+    lines = []
+    try:
+        from . import plugins as plugins_mod
+        status = plugins_mod.call_status(project) or {}
+    except Exception:
+        status = {}
+    try:
+        from . import incidents as inc
+        recs = {r.get("signature"): r for r in inc.summaries(project)}
+    except Exception:
+        recs = {}
+    for s in skills:
+        nm = s["name"]
+        st = status.get(nm)
+        rec = recs.get(f"skill:{nm}") or {}
+        lesson = rec.get("lesson") or rec.get("active_rule") or ""
+        if st or lesson:
+            lines.append(f"- skill {nm}: last outcome {st or 'unrecorded'}"
+                         + (f" — prevention rule: {lesson}" if lesson else ""))
+    query = (command or "").strip() or " ".join(s["name"] for s in skills)
+    try:
+        from . import recall as recall_mod
+        for hit in (recall_mod.recall(query, project=project, limit=3) or [])[:3]:
+            snip = (hit.get("snippet") or "").strip()
+            if snip:
+                lines.append("- ledger: " + snip[:180])
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+def compose_recipe_prompt(skills, command, project=None) -> str:
+    """One prompt from staged skills + a command, enriched with MindHive's
+    learned history. Pure function of its inputs (plus the ledger) — the UI's
+    Run button posts the staged chips here instead of composing client-side."""
+    skills = _clean_skills(skills)
+    command = (command or "").strip()
+    parts = []
+    if skills:
+        parts.append("Execute this staged recipe as ONE coherent pipeline:")
+        for i, s in enumerate(skills, 1):
+            src = f" (from the {s['plugin']} plugin)" if s.get("plugin") else ""
+            parts.append(f"{i}. Use the {s['name']} skill{src}.")
+        parts.append(_NO_OVERLAP)
+    if command:
+        parts.append("COMMAND: " + command)
+    elif skills:
+        parts.append("Follow the skill(s) to completion.")
+    ctx = _recipe_context(skills, command, project)
+    if ctx:
+        parts.append("Learned history from MindHive — honor it:\n" + ctx)
+    return "\n\n".join(parts)
+
+
+def run_recipe(manager: "Manager", agent_id, skills, command,
+               project=None) -> dict:
+    """The explicit ▶ Run: compose the enriched pipeline prompt and send it,
+    with the MindHive primer appended to the agent's system prompt."""
+    skills = _clean_skills(skills)
+    if not skills and not (command or "").strip():
+        return {"ok": False, "error": "stage a skill or type a command first"}
+    a = manager.get(agent_id)
+    if a is None:
+        return {"ok": False, "error": "unknown agent"}
+    prompt = compose_recipe_prompt(skills, command, project=project or a.project)
+    return manager.send(agent_id, prompt, extra_system=" " + MINDHIVE_PRIMER)
 
 
 # --- kanban board: cards that dispatch agents ------------------------------
@@ -533,7 +849,10 @@ def api_get(action, proj=None, qs=None) -> dict:
         return MANAGER.output((qs.get("id") or [""])[0],
                               since=int((qs.get("since") or ["0"])[0]))
     if action == "profiles":
-        return {"ok": True, "profiles": load_profiles()}
+        return {"ok": True, "profiles": load_profiles(),
+                "models": MODEL_CHOICES}
+    if action == "auth":
+        return auth_status_all()
     if action == "board":
         return load_board()
     return {"ok": False, "error": "not found"}
@@ -545,17 +864,38 @@ def api_post(action, proj=None, body=None) -> dict:
         return MANAGER.spawn(name=body.get("name"),
                              role=body.get("role", "agent"),
                              profile=body.get("profile", "default"),
-                             project=proj, prompt=body.get("prompt"))
+                             project=proj, prompt=body.get("prompt"),
+                             model=body.get("model"))
     if action == "send":
         return MANAGER.send(body.get("id"), body.get("prompt", ""))
+    if action == "run_recipe":
+        return run_recipe(MANAGER, body.get("id"), body.get("skills"),
+                          body.get("command", ""), project=proj)
+    if action == "set_model":
+        a = MANAGER.get(body.get("id"))
+        if a is None:
+            return {"ok": False, "error": "unknown agent"}
+        if a.status == "running":
+            return {"ok": False, "error": f"{a.name} is busy — model applies "
+                                          "to the next run; stop it first"}
+        a.model = (body.get("model") or "").strip()
+        a.emit(f"· model → {a.model or 'account default'}")
+        return {"ok": True, "agent": a.snapshot()}
     if action == "stop":
         return MANAGER.stop(body.get("id"))
     if action == "remove":
         return MANAGER.remove(body.get("id"))
+    if action == "clear_idle":
+        return MANAGER.clear_idle()
     if action == "profile_add":
         return save_profile(body.get("name", ""), body.get("config_dir", ""))
     if action == "profile_remove":
         return remove_profile(body.get("name", ""))
+    if action == "profile_login":
+        return profile_login(body.get("name", "default"))
+    if action == "profile_trust":
+        return profile_trust(body.get("name", "default"),
+                             body.get("folder") or _folder_for_project(proj))
     if action == "board_save":
         return save_board(body.get("board") or {"tasks": body.get("tasks", [])})
     if action == "board_dispatch":

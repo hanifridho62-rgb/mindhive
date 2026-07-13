@@ -63,6 +63,15 @@ def signature(error_text) -> str:
     if "exceeds maximum allowed size" in low:
         return "read:file-too-large"
 
+    # Windows-locked git-worktree removal: `git worktree remove` prints
+    # "error: failed to delete '<path>': Permission denied" when a process,
+    # editor, or AV still holds a handle inside the tree. One root cause, one fix
+    # (remove --force + retry, never cd into the doomed tree), so it earns its own
+    # signature instead of vanishing into the raw: first-line-hash bucket where it
+    # was previously invisible and unfixable.
+    if "failed to delete" in low and "permission denied" in low:
+        return "git:worktree-locked"
+
     # Fallback: hash the first line with volatile bits (numbers, paths) masked so
     # the same error with different line numbers/paths still collapses together.
     first = next((ln for ln in t.splitlines() if ln.strip()), "")

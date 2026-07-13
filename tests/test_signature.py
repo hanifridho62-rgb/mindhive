@@ -74,3 +74,12 @@ def test_behavioral_families_take_priority_over_fallback():
     for err in ("File has not been read yet", "String to replace not found",
                 "Ripgrep search timed out", "exceeds maximum allowed size"):
         assert not signature(err).startswith("raw:")
+
+
+def test_worktree_permission_denied_is_classified_not_raw():
+    err = ("Exit code 255\nerror: failed to delete "
+           "'C:/Users/hanif/mindhive/.claude/worktrees/upbeat-kare-03fe27': "
+           "Permission denied")
+    sig = signature(err)
+    assert sig == "git:worktree-locked"
+    assert not sig.startswith("raw:")           # no longer lost in the junk bucket

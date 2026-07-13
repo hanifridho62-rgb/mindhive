@@ -32,9 +32,17 @@ _REJECTION = (
     "the user chose not to",
 )
 
+# A failure whose ENTIRE text is a bare exit code carries no root cause at all
+# (the real error went to the console, not stderr). It buckets into one giant
+# raw:* signature that can never be reflected or resolved — pure noise that
+# drowned the Improvements view (one such bucket reached 49+ occurrences).
+_EXIT_ONLY = re.compile(r"^exit code \d+\.?$", re.IGNORECASE)
+
 
 def _is_infra_noise(text: str) -> bool:
-    low = (text or "").lower()
+    low = (text or "").lower().strip()
+    if _EXIT_ONLY.match(low):
+        return True
     return any(n in low for n in _INFRA_NOISE)
 
 

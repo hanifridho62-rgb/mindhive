@@ -88,6 +88,9 @@ def render_page(token: str) -> str:
   .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
   .glyph.watch { color:#e0b341; } .glyph.dis { color:#8a93a6; }
   .legend { font-size:12px; color:#9aa3b8; margin:2px 0 10px; }
+  .ovdone { color:#46c46a; font-weight:600; }
+  .ovpend { color:#8a93a6; }
+  .ovspin { color:#e0b341; display:inline-block; animation: pulse 1.6s infinite; }
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
@@ -105,6 +108,8 @@ def render_page(token: str) -> str:
 <main>
   <nav>
     <button onclick="showOverview()">Overview</button>
+    <div class="group">Work</div>
+    <button onclick="showOversee()">Oversee</button>
     <div class="group">Memory</div>
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
@@ -118,6 +123,7 @@ def render_page(token: str) -> str:
     <div class="group">Workspace</div>
     <button onclick="showWorkspace('parallel')">MindParallel</button>
     <button onclick="showWorkspace('swarm')">MindSwarm</button>
+    <button onclick="showWorkspace('research')">Self-Reliant</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -129,6 +135,7 @@ def render_page(token: str) -> str:
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
     <button onclick="runReflect()">Reflect (learn from failures)</button>
+    <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -219,7 +226,9 @@ def render_page(token: str) -> str:
   }
   async function apiPost(path, body){
     const b = Object.assign({}, body || {});
-    if (PROJECT) b.project = PROJECT;
+    // a caller-supplied project wins (e.g. HIVE MIND rows acting on their own
+    // namespace); otherwise scope to the picker like every other call
+    if (PROJECT && !b.project) b.project = PROJECT;
     const r = await fetch(u(withProj(path)), { method:'POST', headers:{ 'Content-Type':'application/json',
       'X-Hive-Token': TOKEN }, body: JSON.stringify(b) });
     return r.json();
@@ -457,6 +466,11 @@ def render_page(token: str) -> str:
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (a.reroutes) p += ' <span class="pill" title="a previous rule failed; an '
+      + 'alternative route was deployed">rerouted \\u00d7'+a.reroutes+'</span>';
+    if (a.flag === 'reroute_exhausted')
+      p += ' <span class="pill" title="all automatic reroute attempts spent \\u2014 '
+        + 'needs a human rule">reroute exhausted</span>';
     if (!a.active_rule) p += (a.status === 'candidate'
       ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
       : ' <span class="pill">not yet reflected</span>');
@@ -473,7 +487,9 @@ def render_page(token: str) -> str:
          : '');
     let body = '';
     if (a.first_seen) body += '<div class="snip dup">first seen '+esc(a.first_seen)
-      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the rule activated' : '')
+      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the '
+         + (a.reroutes ? 'route deployed' : 'rule activated') : '')
+      + (a.last_reroute ? ' \\u00b7 route deployed '+esc(a.last_reroute) : '')
       + '</div>';
     if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
     if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
@@ -561,6 +577,24 @@ def render_page(token: str) -> str:
       await renderImprovements();
     });
   }
+  // Active resolution: reroute red rules whose nudge failed (and reflect the
+  // rule-less ones) so they can turn green. Same Heavy confirm + inline
+  // banner mechanism as Reflect.
+  async function runResolve(){
+    if(!confirm('Resolve red (find alternative routes for failed rules, reflect '
+      + 'missing ones) \\u2014 runs the claude CLI once per red lesson '
+      + '(a few per click). Continue?')) return;
+    liveFn = renderImprovements;
+    await run('resolving\\u2026', async () => {
+      const res = await apiPost('/api/rules/resolve', {});
+      IMP_BANNER = res.ok
+        ? ('Resolve: '+(res.rerouted||0)+' rerouted \\u00b7 '+(res.reflected||0)
+           +' reflected \\u00b7 '+(res.failed||0)+' failed \\u00b7 '
+           +(res.pending||0)+' still red')
+        : (res.error || 'resolution failed');
+      await renderImprovements();
+    });
+  }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
   function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
@@ -576,6 +610,8 @@ def render_page(token: str) -> str:
       + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
       + '<label>sort <select id="impsort" onchange="onImpSort(this.value)">'+sortOpts+'</select></label>'
       + '<button id="impdir" onclick="toggleImpDir()">'+impDirLabel()+'</button>'
+      + '<button onclick="runResolve()" title="reroute red rules whose nudge '
+      + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }
@@ -594,6 +630,105 @@ def render_page(token: str) -> str:
   }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
+
+  // --- Oversee: live Claude work — loop runs AND interactive sessions ---
+  // Cards mirror the Improvements view (glyph + pills + expandable body);
+  // expansion state survives the live refresh via OV_EXPANDED. The expanded
+  // detail is a Claude-style task checklist (\\u2713 done, pulsing \\u25d0
+  // doing, \\u25cb pending) in the hive palette.
+  let OV_DATA = null;
+  const OV_EXPANDED = new Set();
+  function ovStatus(r){
+    if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
+    if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
+    if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
+    if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
+    return ['\\u25a0', 'snone', r.status || 'ended'];
+  }
+  function ovRow(glyph, cls, text, dim){
+    return '<div class="snip'+(dim?' dup':'')+'"><span class="'+cls+'">'+glyph
+      + '</span> '+esc(text)+'</div>';
+  }
+  function ovGroup(items, glyph, cls, dim){
+    return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
+  }
+  function ovCard(r, showProj){
+    const st = ovStatus(r);
+    const open = OV_EXPANDED.has(r.run_id);
+    const head = '<span class="statusDot '+st[1]+'">'+st[0]+'</span>'
+      + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
+      + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
+      + esc(r.title || r.run_id)+'</span>'
+      + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
+      + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
+    const chat = r.kind === 'chat';
+    const pills = '<span class="pill">'+esc(st[2])+'</span> '
+      + '<span class="pill">'+(r.iterations||0)+(chat
+          ? ' command'+((r.iterations||0)===1?'':'s')
+          : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
+      + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
+      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
+                    + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
+    let body = '';
+    if (open){
+      body += ovGroup(r.done, '\\u2713', 'ovdone');
+      if (r.doing) body += ovRow('\\u25d0', 'ovspin', r.doing);
+      body += ovGroup(r.planned, '\\u25cb', 'ovpend')
+            + ovGroup(r.not_yet, '\\u25cb', 'ovpend', true);
+      body += '<div class="snip dup">started '+esc(r.started||'')
+            + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
+    }
+    return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
+      + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
+  }
+  function paintOversee(){
+    if (!OV_DATA) return;
+    // Online/offline strip: shown ONLY while Claude is working on a session.
+    const online = OV_DATA.any_online
+      ? '<div class="row"><span class="pill" style="color:#46c46a;border-color:#2a5">'
+        + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
+      : '';
+    if (!OV_DATA.runs.length){
+      showHTML(online + '<h2 class="h">No work sessions \\u2014 interactive '
+        + 'Claude sessions appear here as their telemetry flows, and '
+        + '<code>hive loop</code> runs join them. Finished sessions are '
+        + 'removed automatically.</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(online
+      + '<h2 class="h">'+OV_DATA.runs.length+' work session'
+      + (OV_DATA.runs.length===1?'':'s')
+      + (OV_DATA.dismissed ? ' <span class="dup">\\u00b7 '+OV_DATA.dismissed
+         +' finished &amp; removed</span>' : '')+'</h2>'
+      + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>');
+    view.querySelectorAll('.ovtitle').forEach(el => el.onclick = () => {
+      const rid = el.closest('li').dataset.rid;
+      if (OV_EXPANDED.has(rid)) OV_EXPANDED.delete(rid); else OV_EXPANDED.add(rid);
+      paintOversee();
+    });
+    view.querySelectorAll('.ovdel').forEach(el => el.onclick = (ev) => {
+      ev.stopPropagation(); deleteRun(el.dataset.rid, el.dataset.proj);
+    });
+  }
+  async function renderOversee(){
+    const res = await apiGet('/api/oversee');
+    if (!res || res.ok === false) throw new Error((res && res.error) || 'oversee fetch failed');
+    OV_DATA = res;
+    paintOversee();
+  }
+  async function deleteRun(rid, proj){
+    if (!confirm('Delete this session from Oversee? Its events stay in the '
+        + 'ledger (append-only), it just stops being shown.')) return;
+    await run('deleting session\\u2026', async () => {
+      const body = {run_id: rid};
+      if (PROJECT === '*' && proj) body.project = proj;
+      const res = await apiPost('/api/oversee/dismiss', body);
+      if (!res.ok) { showText(res); return; }
+      await renderOversee();
+    });
+  }
+  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }
@@ -622,17 +757,33 @@ def render_page(token: str) -> str:
     });
   }
 
-  function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
-    const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
-  }); }
+  // Graph is a one-shot heavy render (not live-refreshed): fetch once and hand
+  // the self-contained page to the iframe. Semantic links are the expensive,
+  // opt-in build (an embedding search per event) so they stay off by default;
+  // ticking the box reloads with ?semantic=1.
+  function showGraph(){
+    liveFn = null;
+    let semantic = false;
+    controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
+      + '<input type="checkbox" id="gsem"> semantic links</label>';
+    const load = () => run('building graph', async () => {
+      const html = await apiGet('/api/graph' + (semantic ? '?semantic=1' : ''));
+      only(graph); graph.srcdoc = html;
+    });
+    const cb = document.getElementById('gsem');
+    if (cb) cb.addEventListener('change', () => { semantic = cb.checked; load(); });
+    load();
+  }
 
-  // Workspace views (MindParallel / MindSwarm) are full pages served by the
-  // server and loaded by URL — srcdoc must be cleared first or it wins over src.
+  // Workspace views (MindParallel / MindSwarm / Self-Reliant) are full pages
+  // served by the server and loaded by URL — srcdoc must be cleared first or
+  // it wins over src. 'research' lives under its own /api/research family.
   function showWorkspace(view){
     controls.innerHTML=''; liveFn = null;
     only(graph);
     graph.removeAttribute('srcdoc');
-    graph.src = u(withProj('/api/workspace/'+view));
+    graph.src = u(withProj(view === 'research' ? '/api/research/page'
+                                               : '/api/workspace/'+view));
   }
 
   function showAppend(){
@@ -667,6 +818,7 @@ def render_page(token: str) -> str:
   // IMP_EXPANDED.
   let PLUG_INV = {plugins: [], local_skills: [], counts: {}};
   let PLUG_STATUS = {};             // /api/skills/status: {name: 'ok'|'fail'}
+  let PLUG_COUNTS = {};             // /api/skills/status: {name: total invoke count}
   let PLUG_STATS = {};              // /api/skills/stats: per-skill telemetry
   let PLUG_REC = {coverage: {measured: 0, total: 0}, recommendations: []};
   let PLUG_RULES = {};              // 'skill:<name>' -> improvements auto lesson
@@ -782,6 +934,15 @@ def render_page(token: str) -> str:
       if (sig.indexOf('skill:') === 0 && !(sig in PLUG_RULES)) PLUG_RULES[sig] = a;
     });
   }
+  // invoke-count badge right after the skill name — how many times this skill
+  // has been called through MindHive (ok + failed), so callability reads off
+  // the card list without expanding. Counts come from /api/skills/status;
+  // per-skill telemetry (stats.calls) is the fallback when counts lag a poll.
+  function callCount(name){
+    const n = PLUG_COUNTS[name] || (PLUG_STATS[name] && PLUG_STATS[name].calls) || 0;
+    return n ? '<span class="callcount" title="invoked '+n+' time'+(n===1?'':'s')
+      + ' via MindHive">'+n+'\\u00d7</span>' : '';
+  }
   // one poll cycle = one parallel fetch burst: inventory + status + stats +
   // recommend + improvements (for the skill:* prevention-rule index) + the
   // call history of every expanded card. Auxiliary fetches degrade to their
@@ -802,7 +963,7 @@ def render_page(token: str) -> str:
       apiGet('/api/skills/history?name='+encodeURIComponent(n)+'&limit=25').catch(() => null))));
     if (gen !== PLUG_GEN) return;   // a newer cycle owns the caches now
     PLUG_INV = (res[0] && res[0].inventory) || {plugins: [], local_skills: [], counts: {}};
-    if (res[1]) PLUG_STATUS = res[1];
+    if (res[1]) { PLUG_STATUS = res[1].status || {}; PLUG_COUNTS = res[1].counts || {}; }
     if (res[2] && res[2].stats) PLUG_STATS = res[2].stats;
     if (res[3] && res[3].recommendations) PLUG_REC = res[3];
     if (res[4] && res[4].auto) indexSkillRules(res[4].auto);
@@ -874,9 +1035,19 @@ def render_page(token: str) -> str:
       + '" data-plugin="'+escAttr(e.plugin||'')+'" '
       + 'title="run this skill via a headless Claude">\\u25b6 call</button>';
   }
+  function modePill(mode){
+    if (mode === 'auto')
+      return ' <span class="pill" style="color:#46c46a;border-color:#2a5" '
+        + 'title="proven track record \\u2014 may be applied automatically">auto</span>';
+    return ' <span class="pill est" title="unproven \\u2014 suggested only, '
+      + 'needs your approval before it runs">suggest</span>';
+  }
   function skBadges(e){
     let b = ' \\u00b7 <span class="pill">'+esc(e.plugin||'local')+'</span>';
     if (e.estimated) b += ' <span class="pill est" title="score used the description-breadth prior \\u2014 no measured completion rate yet">estimated</span>';
+    if (e.rec && e.rec.execution_mode) b += modePill(e.rec.execution_mode);
+    if (e.rec && e.rec.outcome_category)
+      b += ' <span class="pill">'+esc(e.rec.outcome_category)+'</span>';
     if (e.rec && e.rec.try_to_measure) b += ' <span class="pill est">try to measure</span>';
     if (e.missing) b += ' <span class="err">plugin missing on disk</span>';
     return b;
@@ -887,7 +1058,7 @@ def render_page(token: str) -> str:
       + '<div class="file skhead" data-name="'+escAttr(e.name)+'" data-plugin="'
       + escAttr(e.plugin||'')+'" style="cursor:pointer" title="click to '
       + (open?'collapse':'expand')+'">'
-      + statusDot(e.status)+esc(e.name)+skBadges(e)+callBtn(e)+'</div>';
+      + statusDot(e.status)+esc(e.name)+callCount(e.name)+skBadges(e)+callBtn(e)+'</div>';
     if (!open)
       return html + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '') + '</li>';
     html += skDescription(e.name) + skMetrics(e.stats) + skNeeded(e.name);
@@ -909,22 +1080,39 @@ def render_page(token: str) -> str:
   }
   function recSection(byName){
     const recs = (PLUG_REC.recommendations || []).slice(0, PLUG_REC_TOP);
-    if (!recs.length) return '';
-    return '<h2 class="h">Recommended now</h2><ul class="hits">'
-      + recs.map(r => {
-          const e = byName[r.name];
-          return '<li><div class="file">'+statusDot(e ? e.status : 'uncalled')
-            + recChip(r.name)
-            + ' \\u00b7 <span class="pill'+(r.provenance==='estimated'?' est':'')+'">'+esc(r.provenance)+'</span>'
-            + ' \\u00b7 score '+esc(r.score)
-            + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
-            + (e ? callBtn(e) : '')+'</div>'
-            + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
-            + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
-                + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
-                    + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
-            + '</li>';
-        }).join('')+'</ul>';
+    let html = '';
+    if (recs.length){
+      html += '<h2 class="h">Recommended now</h2><ul class="hits">'
+        + recs.map(r => {
+            const e = byName[r.name];
+            return '<li><div class="file">'+statusDot(e ? e.status : 'uncalled')
+              + recChip(r.name)
+              + ' \\u00b7 <span class="pill'+(r.provenance==='estimated'?' est':'')+'">'+esc(r.provenance)+'</span>'
+              + modePill(r.execution_mode)
+              + ' \\u00b7 score '+esc(r.score)
+              + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
+              + (e ? callBtn(e) : '')+'</div>'
+              + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
+                  + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
+                      + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
+              + '</li>';
+          }).join('')+'</ul>';
+    }
+    // Discontinued: skills stopped by the improvements linkage (active
+    // prevention rule + failure streak) — shown with WHY so recovery is clear.
+    const disc = PLUG_REC.discontinued || [];
+    if (disc.length){
+      html += '<h2 class="h">Discontinued <span class="lbl">excluded until the '
+        + 'incident resolves or a successful call breaks the streak</span></h2>'
+        + '<ul class="hits">'+disc.map(d =>
+            '<li><div class="file"><span class="statusDot sbad">\\u2716</span>'
+            + recChip(d.name)+' \\u00b7 <span class="pill">'+d.fail_streak
+            + ' consecutive failures</span></div>'
+            + '<div class="snip"><b>Rule:</b> '+esc(d.rule)+'</div></li>').join('')
+        + '</ul>';
+    }
+    return html;
   }
   // Plugins section = a COMPACT INDEX, not a second card render: name, version,
   // aggregate dot (any fail → red, else any ok → green), and skill-name chips
@@ -1054,6 +1242,7 @@ def render_page(token: str) -> str:
     catch(e){ res = {ok: false, excerpt: String((e && e.message) || e)}; }
     PLUG_LASTCALL[name] = res;
     PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+    PLUG_COUNTS[name] = (PLUG_COUNTS[name]||0)+1;
     PLUG_CALLING.delete(name);
     PLUG_GEN++;   // invalidate any in-flight poll so it can't clobber the fresh result
     try {
