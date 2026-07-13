@@ -235,11 +235,14 @@ SMALL_GPU_PRESET = {
 # the agent never runs training itself, so the 5-minute watchdog stays
 # authoritative.
 _ITERATION_CONTRACT = (
-    "Iteration contract — follow it exactly: edit train.py ONLY. Do not run "
-    "training, do not launch any training command, and do not edit other "
-    "files. When your edit is ready, end your turn; MindHive will run the "
-    "5-minute capped experiment itself and hand you the score in the next "
-    "prompt."
+    "Iteration contract — follow it exactly: edit train.py ONLY, using your "
+    "file-editing tool, then end your turn immediately. Do not run training "
+    "or any other command, and do not edit other files. You are headless — "
+    "there is NO operator: never ask permission, never propose a script for "
+    "someone else to run, never end your turn with a question. MindHive "
+    "itself runs the 5-minute capped experiment after your turn and hands "
+    "you the score in the next prompt; one small edit per turn is the whole "
+    "job."
 )
 
 
@@ -580,6 +583,10 @@ class ResearchController:
                                            self._primed, self._preset, prior,
                                            train_path=(str(self._train_path)
                                                        if self._train_path else None))
+                # snapshot BEFORE the edit-turn: the turn is what changes
+                # train.py, so a post-turn "before" reads the edited file and
+                # every agent edit would record as "no change"
+                before = snapshot_text(self._train_path) if self._train_path else ""
                 turn = self._run_turn(composed["program"])
                 for ln in turn.get("lines") or []:
                     self.emit(f"  agent: {ln}")   # why it edited (or didn't)
@@ -608,7 +615,6 @@ class ResearchController:
                               + str(turn.get("error") or "unknown error"))
                     reason = "error"
                     return
-                before = snapshot_text(self._train_path) if self._train_path else ""
                 res = run_experiment(self._trainer_argv(self._count),
                                      cap_s=self._cap_s,
                                      on_spawn=self._track_proc)

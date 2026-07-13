@@ -204,6 +204,27 @@ def test_compose_program_demands_edit_after_no_change_turn():
     assert "MUST make" not in research.compose_program("g", prior=prior2)["program"]
 
 
+def test_controller_records_agent_edit_in_change_summary(tmp_path):
+    """The before-snapshot must be taken BEFORE the agent's edit-turn — taken
+    after it, both snapshots see the edited file and every real agent edit
+    records as 'no change' (observed in acceptance run ed247590)."""
+    train_py = tmp_path / "train.py"
+    train_py.write_text("TOTAL_BATCH_SIZE = 2**19\n", encoding="utf-8")
+
+    class EditingResearcher(StubResearcher):
+        def turn(self, prompt):
+            super().turn(prompt)
+            train_py.write_text("TOTAL_BATCH_SIZE = 2**18\n", encoding="utf-8")
+            return {"ok": True}
+
+    ctl = _controller(tmp_path, researcher=EditingResearcher())
+    assert ctl.start("g", max_experiments=1)["ok"]
+    _wait_ended(ctl)
+    rec = ctl.leaderboard.all()[0]
+    assert "2**18" in rec["change"]
+    assert rec["change"] != "no change"
+
+
 def test_controller_logs_agent_reply_lines(tmp_path):
     class TalkativeResearcher(StubResearcher):
         def turn(self, prompt):
