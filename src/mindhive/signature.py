@@ -8,7 +8,28 @@ recurrence, dedup, and rules key off. Two failures with the same root cause
 import hashlib
 import re
 
+_SLUG = re.compile(r"[^a-z0-9]+")
+
 _NO_MODULE = re.compile(r"No module named '([^']+)'")
+
+
+def slug(text, max_len: int = 48) -> str:
+    """Lowercase-hyphenated bounded slug for a signature component (e.g. the
+    context stem of a judgment signature). Never empty."""
+    s = _SLUG.sub("-", str(text or "").lower()).strip("-")
+    return s[:max_len].rstrip("-") or "unknown"
+
+
+def slug_id(text, max_len: int = 40) -> str:
+    """Collision-resistant signature component: a readable slug prefix plus a
+    short content hash. Two distinct texts never share a component — even when
+    their slugs would truncate to the same prefix, or when the text is
+    non-latin and slugs to nothing (which would otherwise collapse every such
+    text onto the shared ``unknown`` bucket). Deterministic and stdlib-only."""
+    raw = str(text or "")
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:6]
+    prefix = _SLUG.sub("-", raw.lower()).strip("-")[:max_len].rstrip("-")
+    return f"{prefix}-{h}" if prefix else h
 _PS_TERM = re.compile(r"The term '([^']+)'")
 _PS_NOTRECOG = re.compile(r"'([^']+)' is not recognized")
 
@@ -41,6 +62,15 @@ def signature(error_text) -> str:
         return "tool:ripgrep-timeout"
     if "exceeds maximum allowed size" in low:
         return "read:file-too-large"
+
+    # Windows-locked git-worktree removal: `git worktree remove` prints
+    # "error: failed to delete '<path>': Permission denied" when a process,
+    # editor, or AV still holds a handle inside the tree. One root cause, one fix
+    # (remove --force + retry, never cd into the doomed tree), so it earns its own
+    # signature instead of vanishing into the raw: first-line-hash bucket where it
+    # was previously invisible and unfixable.
+    if "failed to delete" in low and "permission denied" in low:
+        return "git:worktree-locked"
 
     # Fallback: hash the first line with volatile bits (numbers, paths) masked so
     # the same error with different line numbers/paths still collapses together.

@@ -35,3 +35,11 @@ def test_overrides_from_toml(tmp_path):
 def test_cooldown_seconds_derived(tmp_path):
     cfg = config.load_config(tmp_path / "missing.toml")
     assert cfg.cooldown_seconds == 30 * 60
+
+
+def test_min_completion_heuristics_default_and_override(tmp_path):
+    from mindhive.loop import config as cfg_mod
+    assert cfg_mod.LoopConfig().min_completion_heuristics == 2
+    p = tmp_path / "loop.toml"
+    p.write_text("[loop]\nmin_completion_heuristics = 0\n", encoding="utf-8")
+    assert cfg_mod.load_config(p).min_completion_heuristics == 0

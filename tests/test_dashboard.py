@@ -1,5 +1,6 @@
 # tests/test_dashboard.py
 import json
+import socket
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
@@ -166,14 +167,15 @@ def test_plugins_inventory_requires_token(dashboard_server):
         assert e.code == 403
 
 
-def test_page_has_skills_and_plugins_view(dashboard_server):
-    """The nav entry is renamed and the view is wired to the live engine."""
+def test_page_has_skill_and_plugin_view(dashboard_server):
+    """The nav entry carries the Skill & Plugin panel wired to the live engine."""
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert status == 200
-    assert "Skills &amp; plugins" in body
-    for needle in ("renderPlugins", "/api/plugins/inventory"):
-        assert needle in body, f"missing skills&plugins hook: {needle}"
+    assert "Skill &amp; Plugin" in body
+    for needle in ("renderPlugins", "showSkillPanel", "Recommended now",
+                   "/api/plugins/inventory", "/api/skills/recommend"):
+        assert needle in body, f"missing skill&plugin hook: {needle}"
 
 
 def test_skills_detail_endpoint_returns_intended_use_body_and_date(dashboard_server, monkeypatch):
@@ -246,7 +248,7 @@ def test_skills_history_endpoint_returns_list(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
     seen = {}
     monkeypatch.setattr(plugins_mod, "call_history",
-        lambda name, project=None, limit=20: seen.update(name=name, limit=limit)
+        lambda name, project=None, limit=20, evs=None: seen.update(name=name, limit=limit)
         or [{"ts": "t", "ok": True, "text": "x", "session": "s"}])
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/history?name=foo&limit=7", token)
@@ -271,13 +273,68 @@ def test_page_has_call_history_hook(dashboard_server):
         assert needle in body, f"missing call-history hook: {needle}"
 
 
-def test_skills_status_endpoint_returns_map(dashboard_server, monkeypatch):
+def test_skills_status_endpoint_returns_status_and_counts(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
-    monkeypatch.setattr(plugins_mod, "call_status", lambda project=None: {"a": "ok", "b": "fail"})
+    monkeypatch.setattr(plugins_mod, "call_stats",
+        lambda project=None, evs=None: {"status": {"a": "ok", "b": "fail"},
+                                        "counts": {"a": 2, "b": 1}})
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/status", token)
     assert status == 200
-    assert json.loads(body) == {"a": "ok", "b": "fail"}
+    assert json.loads(body) == {"status": {"a": "ok", "b": "fail"},
+                                "counts": {"a": 2, "b": 1}}
+
+
+def test_page_has_invoke_count_hooks(dashboard_server):
+    """Skill names carry a per-skill invoke-count badge in the top list."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("PLUG_COUNTS", "callcount"):
+        assert needle in body, f"missing invoke-count hook: {needle}"
+
+
+def test_page_has_clickable_improvements_legend(dashboard_server):
+    """Improvements legend glyphs filter by resolution on click, like the
+    Skills legend's one-click status filters."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("setImpRes", "IMP_RES"):
+        assert needle in body, f"missing improvements legend filter hook: {needle}"
+
+
+def test_skills_stats_endpoint_returns_stats_keyed_by_skill(dashboard_server):
+    from mindhive import events
+    events.append_event("invoke_result", {"name": "a", "ok": True, "text": ""},
+                        session_id="s", ts="2026-07-01T10:00:00Z", project="test")
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/stats?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["stats"]["a"]["calls"] == 1
+    assert obj["stats"]["a"]["completion_rate"] == 1.0
+
+
+def test_skills_stats_endpoint_unknown_project_is_empty_not_500(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/stats?project=no-such-ns", token)
+    assert status == 200
+    assert json.loads(body) == {"stats": {}}
+
+
+def test_skills_recommend_endpoint_returns_ranked_payload(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    monkeypatch.setattr(plugins_mod, "live_inventory", lambda: {
+        "changed": True, "signature": "x", "inventory": {
+            "plugins": [{"name": "p", "skills": [
+                {"name": "tester", "trigger": "Use when tests fail."}]}],
+            "local_skills": [], "counts": {}}})
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/recommend?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert "coverage" in obj and "recommendations" in obj
+    assert obj["recommendations"][0]["name"] == "tester"
+    assert obj["recommendations"][0]["provenance"] in ("measured", "estimated")
 
 
 def test_page_has_invoke_and_status_hooks(dashboard_server):
@@ -659,6 +716,7 @@ def test_launch_background_spawns_dashboard_subprocess(monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "tok-abc")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
     res = dashboard.launch_background()
     assert res["launched"] is True
@@ -685,6 +743,7 @@ def test_launch_background_uses_platform_detach_flags(monkeypatch):
     import os as _os
     captured = {}
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen",
                         lambda argv, **kw: captured.update(kw=kw) or type("P", (), {"pid": 1})())
     dashboard.launch_background()
@@ -699,10 +758,97 @@ def test_launch_background_is_non_fatal_on_spawn_failure(monkeypatch):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen", boom)
     res = dashboard.launch_background()
     assert res["launched"] is False
     assert "cannot spawn" in res["reason"]
+
+    # --- single-instance guard: only ever one dashboard pid ------------------
+
+
+def test_instance_running_true_when_a_server_is_listening(dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+    assert dashboard._instance_running(port) is True
+
+
+def test_instance_running_false_when_nothing_listening():
+    # bind an ephemeral port, close it, then probe: nothing is accepting there
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    free_port = s.getsockname()[1]
+    s.close()
+    assert dashboard._instance_running(free_port) is False
+
+
+def test_instance_running_false_for_ephemeral_port_zero():
+    assert dashboard._instance_running(0) is False
+
+
+def test_launch_background_skips_spawn_when_already_running(monkeypatch, dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+    spawned = {"called": False}
+
+    def fake_popen(argv, **kw):
+        spawned["called"] = True
+        return type("P", (), {"pid": 1})()
+
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
+    res = dashboard.launch_background(port=port)
+    assert res["launched"] is False
+    assert res["already_running"] is True
+    assert spawned["called"] is False   # the whole point: no second pid
+
+
+def test_serve_returns_early_without_binding_when_already_running(monkeypatch, dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+
+    def boom(*a, **k):
+        raise AssertionError("serve() must not bind a second server")
+
+    # if the guard fails, serve() would try to bind and hit this
+    monkeypatch.setattr(dashboard, "ThreadingHTTPServer", boom)
+    dashboard.serve(port=port, open_browser=False)   # returns cleanly via the probe
+
+    # --- open_panel(): the `mind hive` shortcut — launch-or-focus -------------
+
+
+def test_open_panel_launches_when_nothing_running(monkeypatch):
+    opened = {"called": False}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": True, "url": "http://x/?token=t", "pid": 1})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda *a, **k: opened.update(called=True))
+    msg = dashboard.open_panel()
+    assert msg == "MIND HIVE dashboard: http://x/?token=t"
+    assert opened["called"] is False   # the detached child opens its own browser
+
+
+def test_open_panel_opens_browser_when_already_running(monkeypatch):
+    opened = {}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": False, "already_running": True,
+                                           "url": "http://x/?token=t", "reason": "already running"})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda url, *a, **k: opened.update(url=url))
+    msg = dashboard.open_panel()
+    assert opened["url"] == "http://x/?token=t"     # seamless: browser lands on the live panel
+    assert "already running" in msg and "http://x/?token=t" in msg
+
+
+def test_open_panel_reports_failure_without_opening_browser(monkeypatch):
+    opened = {"called": False}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": False, "reason": "cannot spawn"})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda *a, **k: opened.update(called=True))
+    msg = dashboard.open_panel()
+    assert msg == "dashboard: not launched (cannot spawn)"
+    assert opened["called"] is False
 
 
 # --------------------------------------------------------------------------
@@ -1254,3 +1400,116 @@ def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
     status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
     assert obj["reflected"] == 1 and obj["failed"] == 2
     assert obj["pending"] == 0                    # attempted-but-failed is not pending
+
+
+# --- Oversee: work sessions view (U3/U4) ---------------------------------
+
+def _seed_loop_run(run_id, hour, reason=None, title="Fix the parser"):
+    ev_mod.append_event("loop_run_start",
+                        {"run_id": run_id, "title": title, "goal_dir": "d"},
+                        ts=f"2026-07-07T{hour:02d}:00:00Z", project="test")
+    ev_mod.append_event("loop_iteration",
+                        {"run_id": run_id, "iteration": 1, "summary": "working",
+                         "cost_usd": 0.1, "total_tokens": 100},
+                        ts=f"2026-07-07T{hour:02d}:01:00Z", project="test")
+    if reason:
+        ev_mod.append_event("loop_run_end", {"run_id": run_id, "reason": reason},
+                            ts=f"2026-07-07T{hour:02d}:02:00Z", project="test")
+
+
+def test_oversee_lists_runs_and_online_flag(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)                     # running (no end event)
+    status, body = _get(base, "/api/oversee?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert [r["run_id"] for r in obj["runs"]] == ["run1"]
+    r = obj["runs"][0]
+    assert r["status"] == "running"
+    assert r["title"] == "working"                 # latest summary supersedes
+    # events are seeded in the past, so the heartbeat window has lapsed
+    assert r["online"] is False and obj["any_online"] is False
+
+
+def test_oversee_dismiss_removes_run(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10, reason="max_iterations")
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert status == 200 and obj == {"ok": True, "run_id": "run1"}
+    tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
+    assert tombs and tombs[0].payload["cause"] == "manual"
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    assert obj["runs"] == [] and obj["dismissed"] == 1
+
+
+def test_oversee_dismiss_unknown_or_missing_run_rejected(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "nope"}, token)
+    assert status == 200 and obj["ok"] is False
+    status, obj = _post(base, "/api/oversee/dismiss", {"project": "test"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert not [e for e in ev_mod.read_all("test")
+                if e.type == "loop_run_dismissed"]
+
+
+def test_oversee_dismiss_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "*", "run_id": "run1"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "read-only" in obj["error"]
+
+
+def test_oversee_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/oversee")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_page_has_oversee_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "showOversee" in body and "Oversee" in body
+    assert "/api/oversee" in body and "deleteRun" in body
+
+
+def test_oversee_double_dismiss_is_idempotent(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10, reason="max_iterations")
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert obj == {"ok": True, "run_id": "run1"}
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj.get("already_dismissed") is True
+    tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
+    assert len(tombs) == 1                             # no duplicate tombstone
+
+
+def test_oversee_includes_interactive_sessions(dashboard_server):
+    base, token = dashboard_server
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("session_start", {}, session_id="chat-1", ts=ts, project="test")
+    ev_mod.append_event("user_prompt", {"text": "live chat work"},
+                        session_id="chat-1", ts=ts, project="test")
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    kinds = {r["run_id"]: r["kind"] for r in obj["runs"]}
+    assert kinds.get("chat-1") == "chat"
+    chat = [r for r in obj["runs"] if r["run_id"] == "chat-1"][0]
+    assert chat["title"] == "live chat work"
+    assert chat["online"] is True and obj["any_online"] is True
+    # manual delete works for chat sessions through the same endpoint
+    status, res = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "chat-1"}, token)
+    assert res["ok"] is True

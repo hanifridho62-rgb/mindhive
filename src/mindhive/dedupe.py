@@ -29,6 +29,15 @@ _WORD = re.compile(r"[a-z0-9]+")
 DEFAULT_THRESHOLD = 0.85
 
 
+def text_fingerprint(text) -> str:
+    """Short, deterministic content hash of a memo's normalized text. Used to
+    identify a specific event beyond its second-resolution timestamp (two
+    events can share a ts; ts+type+fingerprint is unambiguous)."""
+    import hashlib
+    norm = " ".join(str(text or "").lower().split())
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
 def normalize(text) -> frozenset:
     """Lowercase, strip punctuation, drop stopwords; return the token set.
 

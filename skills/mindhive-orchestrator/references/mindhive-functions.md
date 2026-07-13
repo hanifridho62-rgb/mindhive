@@ -78,12 +78,16 @@ before executing; feed after executing.
 
 | Command | When to use / for what | Why |
 |---------|------------------------|-----|
-| `skills status` | Phase 2/3, before invoking a candidate skill. Green/red last-call outcome per skill, from the ledger. | Prefer green skills; treat red as "fix or avoid, with a reason." A track record you can gate on. |
+| `skills status` | Phase 2/3, before invoking a candidate skill. Green/red *last-call* outcome per skill, from the ledger. | Prefer green skills; treat red as "fix or avoid, with a reason." The binary track record you can gate on. |
+| `skills stats [--json]` | Phase 2, to fill the Recommendation Matrix. Per-skill **completion-rate telemetry**: calls, ok/fail, completion %, last outcome, last used. | The *measured* rate behind the green/red dot — a low rate or open incident argues substitute; a strong rate argues retry-on-blip. |
+| `skills recommend [--json] [--top N] [--brief]` | Phase 2, to rank candidates from data. Deterministic most-needed ranking with per-entry `execution_mode` (`auto`/`suggest`) and a `discontinued` list. `--brief` = ≤3 one-liners (the block STATE.md embeds). | Grounds selection in measured need, not intuition; tells you which skills may auto-apply vs must be proposed. |
+| `skills record <name> --ok\|--fail [--note "…"]` | Immediately after an *in-session* skill finishes (not via `invoke`). Write-through of an `agent-assessed` outcome. | Keeps the measured completion rates honest for skills you drove in-session; skipping one starves the next matrix. |
 | `skills invoke <name> [--plugin P]` | Phase 3 execution *through* MindHive (headless `claude`). Exit `0` = ok, `1` = fail. | Lets you gate the next step on real success/failure, and every call is recorded — so the system learns which invocations work. |
+| `flag "<text>" [--category T]` | When *you* (not a tool) made a judgment error — a wrong call, a missed constraint. Active as a prevention rule from the **first** occurrence (unlike tool failures, which need recurrence). | Lets the orchestrator record its own mistakes so the next run is warned — self-correction, not just tool-failure capture. |
 | `rules summaries [--project P] [--json]` | Before executing in a known-risky area, or to review lessons. Structured lesson records: root cause, lesson, prevention rule, category, active rule — the same data the dashboard **Improvements** view shows. | Turns accumulated failures into "here's the effective way / the syntax that works" guidance, headless-readable. |
 | `rules show "<signature>"` | When a specific skill/tool shows `fail` in `skills status`. Prints that one incident record + its prevention rule. | **Before invoking a skill that shows red, read its lesson and apply the prevention rule** — this is the learning loop closing. |
 | `rules list` / `failures list` | To see incident signatures ranked by occurrence (`candidate` vs `active`). | Situational awareness of what keeps breaking. |
-| `rules reflect [--project P]` | Manually turn recurring unreflected incidents into lessons (needs `claude` CLI auth). | The reflection stage — recurring failure → durable prevention rule. |
+| `rules reflect [--limit N] [--cooldown-hours H] [--all-projects] [--project P]` | Manually turn recurring unreflected incidents into lessons (needs `claude` CLI auth). Bounded: default 3 per batch, 6h cooldown (`--cooldown-hours 0` disables); `--all-projects` drains every registered namespace. | The reflection stage — recurring failure → durable prevention rule. |
 | `rules inject [--project P]` | To print the active prevention-rules block for injection. | Puts learned rules in front of the next run. |
 | `failures capture --transcripts DIR [--project P]` | After a session, to scan a transcript dir and store `tool_failed` events. | Feeds the incidents → reflect → Improvements pipeline. |
 | `rules promote/demote "<sig>"` · `rules audit` · `rules reconcile` | Rule lifecycle management (promote into canonical `SOUL.md`, stamp activations, record human edits). | Curating the rule set over time. |
@@ -125,7 +129,8 @@ watched live.
 | `hook post_tool_use` (reads stdin) | The **live** capture path: a Claude Code PostToolUse hook pipes its JSON payload here and MindHive records the tool call/failure into the ledger in real time. This is what silently populates the memory the orchestrator recalls from — you rarely call it by hand, but it's why the ledger is fresh. |
 | `harvest [--transcripts DIR --project P \| --catch-up]` | The **backfill** capture path (complement to `hook`): scan Claude Code transcripts and record sessions the live hook missed — no hooks needed. |
 | `autosync [register …]` / `autosync` | Registry-driven harvest + project + briefing + graph + sync for registered projects. |
-| `review queue/clear/show` | The thermo-nuclear review queue for touched source files. |
+| `review queue [--session id] / clear / show` | The thermo-nuclear review queue for touched source files (run by `session_end`). |
+| `consolidate [--limit N] [--cooldown-hours H] [--force]` | One bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/`MEMORY.md` digest. Append-only — originals stay in the hash chain; `verify` stays green. |
 | `embed [--force]` · `gc [--prune …]` · `selftest` | Build the vector index; store hygiene; run the test suite. |
 
 ---
@@ -135,6 +140,8 @@ watched live.
 - Destructive store ops (`gc --prune`) and `loop` runs are refused while the V17
   live-trading `~/.mindhive/LIVE_LOCK` guard is set. Never pass `--force` to defeat
   that guard on the user's behalf.
-- Every percentage the orchestrator emits is a **model estimate** (`(est.)`), not a
-  measured success rate — the green/red status in `skills status` is the only real
-  per-skill telemetry, and it's binary last-call, not a rate.
+- Per-skill effectiveness comes from the **measured telemetry backend** — `skills stats`
+  (completion rate) and `skills recommend` (ranking + `execution_mode`), with `skills
+  status` as the binary last-call view. A percentage is a **model estimate** (`estimated`)
+  only for a never-called skill; never present an estimate as a measured rate, and never
+  present an `agent-assessed` `skills record` grade as measured task effectiveness.

@@ -63,6 +63,15 @@ Each iteration walks the six stages. Recall before, append after, every stage.
   tool). Prefer skills whose `skills status` shows **green**; if a needed skill
   shows **red**, read its lesson (`rules show "skill:<name>"`) and apply the
   prevention rule before invoking it.
+- **Learning-gated tool selection:** consult `skills recommend --json` —
+  `execution_mode: auto` skills (proven track record) may be applied without
+  asking; `suggest` skills (unproven / never used) are proposed first; skills
+  in the `discontinued` list are never invoked — use their listed alternatives
+  and surface the prevention rule that stopped them.
+- **Parallel whenever independent:** when the plan's units touch disjoint
+  files, fan them out (subagents or concurrent `hive loop` runs, each visible
+  in the dashboard's Oversee section); keep genuinely dependent stages
+  sequential with an evaluation checkpoint at each boundary.
 - `append experiment_result "work: <what changed>"` when something notable held.
 
 ### 3. REVIEW

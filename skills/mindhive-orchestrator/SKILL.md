@@ -215,8 +215,29 @@ no-op when fresh).
 python -m mindhive skills status
 ```
 Prints `skill: ok|fail` per skill from the ledger's recorded invocations. *Act on it:*
-prefer green skills; when a candidate shows `fail`, drop its Success-probability estimate
-in the matrix and read its lesson (next recipe) before deciding.
+prefer green skills; when a candidate shows `fail`, drop its estimate and read its lesson
+(below) before deciding. `status` is the binary last-call view; for the *rate* behind it,
+use `skills stats` (next).
+
+**Pull the measured completion-rate telemetry (the matrix's real backbone).**
+```
+python -m mindhive skills stats --json
+python -m mindhive skills recommend --json     # or: --top 3 --brief
+```
+`stats` returns per-skill calls / ok / fail / last outcome / last used; `recommend`
+returns the deterministic most-needed ranking with an `execution_mode` (`auto` vs
+`suggest`) and any `discontinued` list. *Act on it:* fill the Recommendation Matrix from
+these measured rates (label a percentage `estimated` only for a never-called skill);
+apply `auto`-mode skills without a blocking question, propose `suggest`-mode ones and
+wait; never invoke a `discontinued` skill.
+
+**Record an in-session skill outcome so the telemetry stays honest.**
+```
+python -m mindhive skills record <name> --ok|--fail [--note "..."]
+```
+*Act on it:* immediately after an executed skill finishes, write its outcome through —
+these `agent-assessed` records feed the measured rates the next matrix runs on. Skipping
+one starves the next run's ranking.
 
 **Read the prevention rule behind a red skill (close the loop before repeating it).**
 ```
@@ -1812,22 +1833,44 @@ canvas gates; it runs only after they clear.*
 
 Once the spec is approved, propose the most appropriate skills to execute it.
 **Load `references/recommendation-matrix.md`** and produce a matrix per candidate
-skill covering: suitability, compatibility, probability of success, risk level,
+skill covering: suitability, compatibility, **measured completion rate**, risk level,
 execution speed, resource cost, and a final verdict.
 
-- Resolve candidate skill names **verbatim from `python -m mindhive skills list`**
-  (the live registry) or the session's available-skills list — never recommend a
-  skill name that is not present there.
-- Ground breadth/suitability in `python -m mindhive plugins recommend` (the
-  breadth-scored, free-first catalog).
-- For each candidate, run `python -m mindhive recall "<skill name>"` and check
-  `python -m mindhive skills status` to surface prior outcomes and green/red history —
-  and let that inform the scores. **If a candidate shows red, read its lesson with
-  `rules show "skill:<name>"` and reflect it in the verdict.**
-- Label every probability/percentage as a **model estimate `(est.)`** — the only real
-  per-skill telemetry is the binary green/red last-call status.
-- Present the matrix, state your recommended selection, and get the user's approval
-  (or revision) before executing.
+- **Pull the measured telemetry first — this step is mandatory:** run
+  `python -m mindhive skills stats --json` and `python -m mindhive skills recommend --json`,
+  and fill the matrix from the measured completion rates and provenance they return.
+  Model-estimated percentages are allowed **only** for never-called skills, and every
+  such figure MUST be labeled `estimated`. (`skills status` still gives the binary
+  green/red last-call view; `skills stats` gives the completion-rate history behind it.)
+- **Provenance vocabulary (use it verbatim in the matrix):** `measured` (completion rate
+  from enough recorded calls), `estimated` (breadth prior for a never-called skill),
+  `agent-assessed` (`skills record` self-grades — never present these as measured task
+  effectiveness).
+- Resolve candidate skill names **verbatim from `python -m mindhive skills list`** (the
+  live registry) or the session's available-skills list — never recommend a skill name
+  that is not present there. Ground breadth/suitability for never-called skills in
+  `python -m mindhive plugins recommend` (the breadth-scored, free-first catalog).
+- For each candidate, run `python -m mindhive recall "<skill name>"` to surface prior
+  outcomes, and **if it shows red or has an open incident, read its lesson with
+  `rules show "skill:<name>"`** and reflect it in the verdict.
+- **Overlap tie-break** (matches the engine in `src/mindhive/recommend.py`): when two
+  skills overlap for one need, prefer (1) the higher **measured completion rate** —
+  measured always beats unmeasured; (2) **description clarity** — an explicit "use when"
+  trigger, then the shorter, less ambiguous description; (3) the longer **failure-free
+  completion streak**. List the losers as alternatives, not separate recommendations.
+- **Execution mode (learning-gated, from `skills recommend --json`):** every entry
+  carries `execution_mode`. `auto` = proven track record (measured ≥3 calls, completion
+  rate ≥ 0.8, no open incident) — apply it during the task without asking. `suggest` =
+  unproven (above all a never-used skill) — propose it and wait for the user's approval
+  before invoking. Never auto-apply a `suggest`-mode skill, and say which mode applied.
+- **Discontinued skills:** the payload's `discontinued` list names skills stopped by the
+  improvements linkage (an active `skill:*` prevention rule plus a trailing failure
+  streak). Do not invoke or recommend them; if one would otherwise be the best fit,
+  surface its rule text and offer the alternatives. They return when the incident
+  resolves or a successful call breaks the streak.
+- Present the matrix, state your recommended selection, and get the user's approval (or
+  revision) before executing — `auto`-mode selections may proceed without a blocking
+  question, but still announce them.
 
 ## Step B — Execute, then chain
 
@@ -1854,15 +1897,19 @@ execution should be driven by MindHive itself (e.g. inside `/circle` or a headle
 where the dashboard shows live status), use the invoke channel instead of only the
 in-agent Skill tool:
 
-- **List what's callable:** `python -m mindhive skills list` — the live, registry-truth
-  inventory (updates the instant a plugin is installed/removed).
-- **Call any skill:** `python -m mindhive skills invoke <name> [--plugin <p>]` — runs it
-  via a headless `claude` and records the outcome. Exit code is `0` on success, `1` on
-  failure, so you can gate the next step on it.
-- **Check health first:** `python -m mindhive skills status` shows the last outcome per
-  skill (`ok`/`fail`). **Before invoking a skill that shows `fail`, read its Improvements
-  lesson** (`python -m mindhive rules show "skill:<name>"`) and apply the prevention rule
-  — this is the learning loop closing.
+- **List what's callable:** `python -m mindhive skills list` — the live,
+  registry-truth inventory (updates the instant a plugin is installed/removed).
+- **Call any skill:** `python -m mindhive skills invoke <name> [--plugin <p>]`
+  — runs it via a headless `claude` and records the outcome. Exit code is `0`
+  on success, `1` on failure, so you can gate the next step on it.
+- **Check health first:** `python -m mindhive skills status` shows the last
+  outcome per skill (`ok`/`fail`). **Before deciding retry-vs-substitute on a
+  skill that shows `fail`, read its Improvements lesson**
+  (`python -m mindhive rules show "skill:<name>"`) **and consult its measured
+  record** (`python -m mindhive skills stats --json`) — a one-off blip on a
+  strong completion rate argues retry; a low rate or an open `skill:*` incident
+  argues substituting the next-ranked alternative. This is the learning loop
+  closing.
 
 Every failed invoke is written as a `tool_failed` event with a `skill:<name>`
 signature, which flows automatically into the incidents → reflect → Improvements
@@ -1940,21 +1987,25 @@ token lifetime. You will *not* ask "how often can users resend?" — the ledger 
 ### 2. Recommendation Matrix — grounded in the plugin/skill DB
 
 ```
-… -m mindhive skills list           # candidate names must come from here
-… -m mindhive plugins recommend     # breadth scores to break ties
-… -m mindhive skills status         # green/red track record
+… -m mindhive skills list              # candidate names must come from here
+… -m mindhive skills stats --json      # measured completion rates (the matrix backbone)
+… -m mindhive skills recommend --json  # ranking + execution_mode + discontinued list
+… -m mindhive plugins recommend        # breadth prior, for never-called skills only
 ```
-You shortlist from what's actually installed and score each:
+You shortlist from what's actually installed and score each — the Completion column is
+`measured` where telemetry exists and `estimated` only for a never-called skill:
 
-| Skill | Suitability | Compat | Success (est.) | Risk | Speed | Cost | Verdict |
-|-------|-------------|--------|----------------|------|-------|------|---------|
-| `compound-engineering:ce-work` | High | High | 85% (est.) | Local | Moderate | Heavy | **Use** — executes the small change |
-| `compound-engineering:ce-code-review` | High | High | 88% (est.) | None | Fast | Moderate | **Use as follow-up** — verify the debounce |
-| `security-scanning:security-sast` | Medium | High | 80% (est.) | None | Moderate | Moderate | **Use as follow-up** — it touches auth tokens |
+| Skill | Suitability | Compat | Completion | Mode | Risk | Speed | Cost | Verdict |
+|-------|-------------|--------|------------|------|------|-------|------|---------|
+| `compound-engineering:ce-work` | High | High | 0.86 (measured, 14 calls) | `auto` | Local | Moderate | Heavy | **Use** — proven; apply without a blocking question |
+| `compound-engineering:ce-code-review` | High | High | 0.90 (measured, 22 calls) | `auto` | None | Fast | Moderate | **Use as follow-up** — verify the debounce |
+| `security-scanning:security-sast` | Medium | High | 75% (estimated) | `suggest` | None | Moderate | Moderate | **Use as follow-up** — never-called here, so propose and wait |
 
-If `skills status` had shown `ce-work: fail`, you'd run
-`… -m mindhive rules show "skill:compound-engineering:ce-work"`, apply its rule, and note
-that in the verdict. Present the matrix; the user approves the selection.
+If `skills stats` had shown `ce-work` with a low rate or an open incident, you'd run
+`… -m mindhive rules show "skill:compound-engineering:ce-work"`, and either apply its rule
+(one-off blip on a strong rate → retry) or substitute the next-ranked alternative (low
+rate → switch). Present the matrix; `auto`-mode picks proceed announced, `suggest`-mode
+picks wait for the user's approval.
 
 ### 3. Execute, then chain
 
@@ -1991,6 +2042,52 @@ nothing.
 - **ULT-IDEA's rigor was untouched:** scope diagnosis, five gaps, HARD-GATE, CONTEXT.md,
   and testing all ran; MindHive just made each step faster and memory-aware.
 
+## Parallel dispatch and dynamic workflows
+
+The orchestrator is the top orchestration layer: it groups the work, classifies
+each piece's complexity, and then **executes in parallel whenever the pieces
+are independent** — sequential execution is reserved for genuinely dependent
+stages, never chosen out of convenience.
+
+- **Fan out independent tasks.** When selected work splits into units that
+  touch disjoint files/modules (e.g. refactor one module, run integration
+  tests, audit security in another), dispatch them concurrently — subagents
+  via the platform's subagent primitive (`Agent`/`Task` in Claude Code), or
+  concurrent `hive loop` runs (one task dir per unit; every run shows up
+  separately in the dashboard's **Oversee** section). Before fanning out,
+  check the units' file sets for overlap — overlapping units run sequentially.
+- **Dependent stages get evaluation checkpoints.** When stage 2 needs stage
+  1's output, run them in order and verify each boundary: build/tests pass,
+  the artifact exists, the assumption still holds. On failure, **read the
+  failure log (stack trace) yourself, re-verify your assumptions, and fix it
+  without new instructions from the user** — the loop's circuit breaker and
+  budget gates bound the retries, so never bounce the first hurdle back to
+  the user.
+- **Model routing applies per unit:** lightweight analysis does not need a
+  flagship model — `hive loop` routes tiers automatically when no model is
+  pinned; match that spirit when choosing subagent models.
+
+## Non-conflict protocol (coordinator, not competitor)
+
+The orchestrator is the session's **primary coordinator**. It never
+re-implements another skill's job — planning, coding, review, and debugging
+belong to the skills it selects and chains.
+
+- **When another skill is already active or invoked in the session**, the
+  orchestrator restricts itself to **selection, sequencing, and ledger
+  write-back**. It does not duplicate, wrap, or second-guess the running
+  skill's work.
+- **Single-writer rule:** only the orchestrator appends `decision` /
+  `experiment_result` events about skill choice. Executed skills own their own
+  domain events; the orchestrator owns the record of *why* a skill was picked.
+- **Real-time write-through (the learning loop's heartbeat):** IMMEDIATELY
+  after each executed skill completes, record the outcome —
+  `python -m mindhive skills record <name> --ok|--fail [--note "..."]` —
+  before starting the next step. These records feed the measured completion
+  rates Phase 2 runs on; skipping one starves the next run's matrix.
+- After recording, re-surface what to run next from refreshed data:
+  `python -m mindhive skills recommend --top 3 --brief`.
+
 ## Context management: monitor and hand off at ~50%
 
 At **every phase boundary** (including the canvas phase boundaries), estimate context
@@ -2009,7 +2106,10 @@ PreCompact hook remains the hard backstop; this heuristic is a courtesy checkpoi
 - It never disturbs the V17 live-trading setup or the `~/.mindhive/LIVE_LOCK` guard — if
   a chained skill would run the loop, that skill's own guards apply, and you never pass
   `--force` to defeat the guard on the user's behalf.
-- Percentages in the matrix are honest model estimates, not measured rates. The only
-  real per-skill signal is the binary green/red `skills status`.
+- Matrix percentages come from the **measured telemetry backend**
+  (`python -m mindhive skills stats --json` / `skills recommend --json`). A model
+  estimate appears only for a never-called skill and is always labeled `estimated` —
+  never presented as a measured rate. (`skills status` remains the binary green/red
+  last-call view; `skills stats` is the completion-rate telemetry.)
 - **ULT-IDEA is preserved in full** in the canvas above; the MindHive integration is
   additive (`⬡` hooks + this execution layer). Nothing from ULT-IDEA was removed.

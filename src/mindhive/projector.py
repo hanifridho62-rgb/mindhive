@@ -1,8 +1,10 @@
 # src/mindhive/projector.py
 import hashlib
-from . import paths, events, chain, review
+from . import paths, events, chain, review, incidents, reflect
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
+
+SUGGEST_CAP = 3  # max suggested-skill lines embedded in STATE.md (R9)
 
 
 def _short(s: str) -> str:
@@ -13,7 +15,7 @@ def _ts_compact(ts: str) -> str:
     return ts.replace("-", "").replace(":", "").replace("T", "-").rstrip("Z")
 
 
-def build_state(evs, pending=None) -> str:
+def build_state(evs, pending=None, health_note="") -> str:
     latest_state = None
     last_decision = None
     for ev in evs:
@@ -28,6 +30,11 @@ def build_state(evs, pending=None) -> str:
     note = review.notice(pending)
     if note:
         out.append(note)
+    # Reflection-health warning (one line, KTD3): auto-reflection failing for
+    # too long must be visible, not silent.
+    if health_note:
+        out.append(health_note)
+        out.append("")
     out.append(f"**Active task:** {s.get('task', '(none)')}")
     out.append(f"**Last verified:** {s.get('verified', '(none)')}")
     out.append(f"**Next step:** {s.get('next_step', '(none)')}")
@@ -46,6 +53,75 @@ def build_state(evs, pending=None) -> str:
     out.append("")
     out.append(f"_events: {len(evs)}_")
     return "\n".join(out) + "\n"
+
+
+def suggested_skills_block(project=None, evs=None) -> str:
+    """Compact suggested-skills block (<= SUGGEST_CAP lines, same brief format
+    as `hive skills recommend --brief`) refreshed at every projection rebuild
+    (R9). Empty string on ANY failure — a recommendation problem must never
+    break the state build. Imports are lazy so projector keeps no hard
+    dependency on the plugins/recommend stack (and no import cycles).
+
+    Entries are DIRECTIVES, not FYI: a proven skill (execution_mode auto —
+    measured completion >= the auto gate, no open incident) is injected as a
+    MUST-USE line the agent is expected to follow; an unmeasured need-match
+    (try_to_measure) is injected as an explicit instruction to invoke it via
+    the Skill tool so the call gets measured. That closes the loop the
+    suggestion-only wording left open: recommendations existed but nothing
+    ever compelled an invocation, so nothing ever became measured."""
+    try:
+        from . import plugins as plugins_mod
+        payload = plugins_mod.recommend_for(project=project, evs=evs,
+                                            top=SUGGEST_CAP)
+        recs = (payload.get("recommendations") or [])[:SUGGEST_CAP]
+        if not recs:
+            return ""
+        lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)"]
+        for e in recs:
+            if e.get("execution_mode") == "auto":
+                lines.append(
+                    f"- MUST USE: {e['name']} — {e['reason']}. Proven skill: "
+                    "when its trigger matches the task at hand, invoke it via "
+                    "the Skill tool before starting that work.")
+            elif e.get("try_to_measure"):
+                lines.append(
+                    f"- TRY & MEASURE: {e['name']} — {e['reason']}. If it fits "
+                    "the current task, invoke it via the Skill tool (not "
+                    "ad-hoc) so its completion rate gets measured.")
+            else:
+                lines.append(f"- {e['name']} — {e['reason']} ({e['provenance']})")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def compose_state(evs, project=None, include_rules=True, suggestions=None) -> str:
+    """Full STATE.md text: the state body (with any reflection-health notice)
+    plus the capped prevention-rules block appended when non-empty (KTD2 —
+    STATE.md is the single delivery choke point for rules), plus the compact
+    suggested-skills block (R9). sync embeds the include_rules=False variant so
+    rules appear exactly once in MEMORY.md; suggestions ride the embedded state
+    body in both variants (they exist nowhere else in MEMORY.md).
+
+    ``suggestions``: None -> compute the suggested-skills block here; an
+    explicit str (possibly "") -> use as-is, so a caller composing the state
+    twice per pass (sync) runs the recommend chain exactly once."""
+    body = build_state(evs, pending=review.load_pending(project),
+                       health_note=reflect.health_note(project))
+    if include_rules:
+        # Promoted (proven-permanent) rules ride FIRST — SOUL.md is only
+        # meaningful if every session actually re-reads it.
+        soul = incidents.soul_block(project)
+        if soul:
+            body = body + "\n" + soul + "\n"
+        block = incidents.inject(project, evs=evs)
+        if block:
+            body = body + "\n" + block + "\n"
+    sugg = (suggested_skills_block(project, evs=evs)
+            if suggestions is None else suggestions)
+    if sugg:
+        body = body + "\n" + sugg + "\n"
+    return body
 
 
 def build_ledger_entries(evs):
@@ -70,16 +146,17 @@ def build_index(entries) -> dict:
     return idx
 
 
-def project(project=None, evs=None) -> dict:
-    # Accept pre-read events so a caller (e.g. sync) that already has them need
-    # not read the whole event log again.
+def project(project=None, evs=None, suggestions=None) -> dict:
+    # Accept pre-read events (and a pre-computed suggested-skills block) so a
+    # caller (e.g. sync) that already has them need not recompute either.
     if evs is None:
         evs = events.read_all(project)
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
 
     tmp = pdir / "STATE.md.tmp"
-    tmp.write_text(build_state(evs, pending=review.load_pending(project)), encoding="utf-8")
+    tmp.write_text(compose_state(evs, project, suggestions=suggestions),
+                   encoding="utf-8")
     tmp.replace(pdir / "STATE.md")
 
     ldir = pdir / "LEDGER"
