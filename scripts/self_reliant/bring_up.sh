@@ -34,6 +34,18 @@ else
     command -v uv >/dev/null || { echo "uv install failed"; exit 1; }
 fi
 
+step "1b/6 C compiler (triton JIT-compiles its CUDA utils at runtime)"
+# Discovered in the first real bring-up: torch.compile -> triton needs a host C
+# compiler; a bare WSL Ubuntu ships without one and training dies with
+# "Failed to find C compiler" after ~75s of startup.
+if command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1; then
+    echo "compiler present: $(command -v gcc || command -v cc)"
+else
+    echo "no C compiler — install one first:  sudo apt-get install -y gcc"
+    echo "(or from Windows:  wsl -u root bash -lc 'apt-get update && apt-get install -y gcc')"
+    exit 1
+fi
+
 step "2/6 clone $REPO -> $DIR"
 if [ -d "$DIR/.git" ]; then
     echo "already cloned"
