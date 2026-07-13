@@ -565,6 +565,17 @@ class ResearchController:
                 and not self._stop_flag.is_set():
             t.join(0.05)
         if t.is_alive():
+            # The turn crossed its wall-clock budget, but the underlying agent
+            # run is still in flight — abandoning the worker thread alone leaves
+            # it running. On the production ManagerResearcher that orphans the
+            # workspace agent (status stays "running"); the NEXT turn's send()
+            # then rejects with "… is busy", which the loop treats as terminal
+            # and the whole run dies. Stop the in-flight run so the next turn
+            # starts against a settled agent.
+            try:
+                self._researcher.stop()
+            except Exception:
+                pass
             return {"ok": False, "aborted": True}
         res = box.get("res")
         return res if isinstance(res, dict) else \
