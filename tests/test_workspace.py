@@ -260,6 +260,23 @@ def test_send_runs_and_logs_both_sides_of_the_exchange():
     assert h.events[1][1]["text"] == "all done"
 
 
+def test_send_add_dirs_grants_out_of_cwd_access():
+    """Self-Reliant's researcher edits train.py OUTSIDE its working directory
+    (a \\\\wsl$ path) — without --add-dir the CLI's workspace boundary silently
+    blocks the edit and the agent ends its turn having changed nothing
+    (observed in the first real acceptance run)."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "edit it", add_dirs=[r"\\wsl.localhost\Ubuntu\home\u\autoresearch"])
+    argv = h.calls[0][0]
+    assert argv[argv.index("--add-dir") + 1] == \
+        r"\\wsl.localhost\Ubuntu\home\u\autoresearch"
+    # and absent when not requested
+    _wait_settled(_agent_obj(h, aid))
+    h.mgr.send(aid, "again")
+    assert "--add-dir" not in h.calls[1][0]
+
+
 def test_send_rejects_empty_unknown_and_busy():
     h = Harness()
     aid = h.mgr.spawn(name="A")["agent"]["id"]

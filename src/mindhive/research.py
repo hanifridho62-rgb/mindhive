@@ -812,11 +812,14 @@ class ManagerResearcher:
     conversation. Stop kills the agent's in-flight CLI run."""
 
     def __init__(self, profile="default", manager=None, model=None,
-                 system_extra="", poll_s=1.0):
+                 system_extra="", poll_s=1.0, add_dir=None):
         from . import workspace
         self._mgr = manager or workspace.MANAGER
         self._poll_s = poll_s
         self._system_extra = system_extra
+        # the autoresearch checkout lives OUTSIDE the agent's cwd (\\wsl$ …);
+        # granted per-turn via --add-dir or its edits are silently blocked
+        self._add_dirs = [add_dir] if add_dir else []
         res = self._mgr.spawn(name="Self-Reliant researcher", role="agent",
                               profile=profile, model=model)
         if not res.get("ok"):
@@ -825,7 +828,8 @@ class ManagerResearcher:
 
     def turn(self, prompt) -> dict:
         res = self._mgr.send(self.agent_id, prompt,
-                             extra_system=self._system_extra or None)
+                             extra_system=self._system_extra or None,
+                             add_dirs=self._add_dirs)
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error")}
         while True:
@@ -875,10 +879,13 @@ def get_controller() -> ResearchController:
     with _CTL_LOCK:
         if CONTROLLER is None:
             from . import events as ev_mod, workspace
+            tp = wsl_train_py_windows_path()
+            train_dir = str(Path(tp).parent) if tp else None
             CONTROLLER = ResearchController(
                 trainer_cmd=wsl_trainer_cmd,
-                agent_factory=lambda profile: ManagerResearcher(profile=profile),
-                train_path=wsl_train_py_windows_path(),
+                agent_factory=lambda profile: ManagerResearcher(
+                    profile=profile, add_dir=train_dir),
+                train_path=tp,
                 append_event=ev_mod.append_event,
                 preflight=default_preflight,
                 profiles=[e["name"] for e in workspace.load_profiles()],
