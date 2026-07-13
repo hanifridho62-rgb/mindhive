@@ -196,6 +196,27 @@ def test_compose_program_names_train_py_location_when_given():
     assert "location:" not in research.compose_program("g")["program"]
 
 
+def test_compose_program_demands_edit_after_no_change_turn():
+    prior = {"val_bpb": 1.86, "status": "ok", "change": "no change"}
+    prog = research.compose_program("g", prior=prior)["program"]
+    assert "MUST make" in prog and "actual edit" in prog
+    prior2 = {"val_bpb": 1.86, "status": "ok", "change": "-lr 0.1; +lr 0.2"}
+    assert "MUST make" not in research.compose_program("g", prior=prior2)["program"]
+
+
+def test_controller_logs_agent_reply_lines(tmp_path):
+    class TalkativeResearcher(StubResearcher):
+        def turn(self, prompt):
+            super().turn(prompt)
+            return {"ok": True, "lines": ["reading train.py", "raised lr to 0.05"]}
+
+    ctl = _controller(tmp_path, researcher=TalkativeResearcher())
+    assert ctl.start("g", max_experiments=1)["ok"]
+    _wait_ended(ctl)
+    joined = "\n".join(ctl.lines)
+    assert "agent: raised lr to 0.05" in joined
+
+
 def test_preset_pins_real_train_py_knobs():
     """The preset speaks train.py's actual constant names so the researcher's
     guidance maps 1:1 onto the file it edits."""

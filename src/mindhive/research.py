@@ -217,9 +217,12 @@ SMALL_GPU_PRESET = {
     "hardware": "RTX 3050 Laptop, 6 GB VRAM — not an H100. Verified baseline: "
                 "DEPTH=8 + DEVICE_BATCH_SIZE=16 fits at peak_vram 6150 MB "
                 "(the ceiling); upstream's DEVICE_BATCH_SIZE=128 OOMs.",
-    "DEVICE_BATCH_SIZE": "<= 16 at DEPTH 8. Lower THIS first when memory is "
-                         "tight — TOTAL_BATCH_SIZE stays fixed via gradient "
-                         "accumulation, so comparability is preserved.",
+    "DEVICE_BATCH_SIZE": "8 is the safe baseline at DEPTH 8; 16 fits only with "
+                         "nothing else on the GPU (peak 6150/6144 MB — one "
+                         "real run at 16 OOM'd from ambient VRAM use). Lower "
+                         "THIS first when memory is tight — TOTAL_BATCH_SIZE "
+                         "stays fixed via gradient accumulation, so "
+                         "comparability is preserved.",
     "DEPTH": "8 fits with zero headroom; raising DEPTH requires lowering "
              "DEVICE_BATCH_SIZE at the same time (activations dominate VRAM).",
     "throughput": "~27K tok/sec, ~20 s/optimizer-step at the baseline — the "
@@ -289,6 +292,11 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
                      + (f", val_bpb {score}" if score is not None else ", no score")
                      + (f" — change: {prior['change']}" if prior.get("change") else "")
                      + ". Iterate on this result.")
+        if prior.get("change") == "no change":
+            parts.append("Your previous turn made NO edit to train.py — the "
+                         "experiment trained an unchanged file, which wastes "
+                         "the whole 5-minute budget. This turn you MUST make "
+                         "an actual edit before ending your turn.")
     if train_path:
         parts.append(f"train.py location: {train_path} — edit exactly this "
                      "file; it lives inside WSL, outside your working "
@@ -573,6 +581,8 @@ class ResearchController:
                                            train_path=(str(self._train_path)
                                                        if self._train_path else None))
                 turn = self._run_turn(composed["program"])
+                for ln in turn.get("lines") or []:
+                    self.emit(f"  agent: {ln}")   # why it edited (or didn't)
                 if self._stop_flag.is_set():
                     reason = "stopped"
                     return
@@ -839,12 +849,14 @@ class ManagerResearcher:
             if a.status != "running":
                 break
             time.sleep(self._poll_s)
+        lines = list(a.lines[-12:])         # reply tail for the run log
         if a.status == "done":
-            return {"ok": True}
+            return {"ok": True, "lines": lines}
         tail = " ".join(a.lines[-30:]).lower()
         if any(m in tail for m in _USAGE_MARKERS):
-            return {"ok": False, "usage_exhausted": True}
-        return {"ok": False, "error": f"researcher run ended '{a.status}'"}
+            return {"ok": False, "usage_exhausted": True, "lines": lines}
+        return {"ok": False, "error": f"researcher run ended '{a.status}'",
+                "lines": lines}
 
     def stop(self) -> None:
         try:
