@@ -2,7 +2,7 @@
 title: "feat: Self-Reliant U1 — real autoresearch bring-up + pin execution-time discoveries"
 date: 2026-07-12
 type: feat
-status: planned
+status: executed 2026-07-13 (U1-U4 complete; acceptance run 72c3c8a9 — agent-edited TOTAL_BATCH_SIZE, val_bpb 1.5858 beat the 1.8587 baseline)
 depth: standard
 origin: docs/plans/2026-07-12-001-feat-self-reliant-autoresearch-plan.md (U1, manual-gated; U2–U11 shipped as PR #49, merge c62cbade)
 ---
