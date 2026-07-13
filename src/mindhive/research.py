@@ -467,7 +467,8 @@ class ResearchController:
 
     # --- lifecycle -----------------------------------------------------------
     def start(self, goal, skills=None, max_experiments=None, time_budget_s=None,
-              failover=False, profile="default", primed=None, preset=None) -> dict:
+              failover=False, profile="default", primed=None, preset=None,
+              model=None) -> dict:
         goal = (goal or "").strip()
         if not goal:
             return {"ok": False, "error": "research goal is empty"}
@@ -506,13 +507,16 @@ class ResearchController:
         self._deadline = time.monotonic() + budget if budget else None
         self._failover = bool(failover)
         self._profile = profile or "default"
+        # "" / whitespace => account default (no --model flag), so the researcher
+        # runs on whatever the chosen account defaults to (mirrors MindParallel).
+        self._model = (model or "").strip() or None
         self._used_profiles = {self._profile}
         self._primed = list(primed or [])
         self._preset = preset if preset is not None else SMALL_GPU_PRESET
         self._best_score = None          # running best within THIS run (U10)
         self._tally = {}
         try:
-            self._researcher = self._factory(self._profile)
+            self._researcher = self._factory(self._profile, self._model)
         except Exception as e:
             self._state = "idle"
             return {"ok": False, "error": f"could not start researcher agent: {e}"}
@@ -611,7 +615,7 @@ class ResearchController:
                                   f"failing over to {nxt}")
                         self._profile = nxt
                         self._used_profiles.add(nxt)
-                        self._researcher = self._factory(nxt)
+                        self._researcher = self._factory(nxt, self._model)
                         continue
                     reason = "usage"
                     return
@@ -906,8 +910,8 @@ def get_controller() -> ResearchController:
             train_dir = str(Path(tp).parent) if tp else None
             CONTROLLER = ResearchController(
                 trainer_cmd=wsl_trainer_cmd,
-                agent_factory=lambda profile: ManagerResearcher(
-                    profile=profile, add_dir=train_dir),
+                agent_factory=lambda profile, model=None: ManagerResearcher(
+                    profile=profile, model=model, add_dir=train_dir),
                 train_path=tp,
                 append_event=ev_mod.append_event,
                 preflight=default_preflight,
@@ -942,6 +946,7 @@ def api_post(action, proj=None, body=None) -> dict:
                          time_budget_s=body.get("time_budget_s"),
                          failover=bool(body.get("failover")),
                          profile=body.get("profile", "default"),
+                         model=body.get("model"),
                          primed=_primed_learnings(goal, proj))
     if action == "stop":
         return ctl.stop()
