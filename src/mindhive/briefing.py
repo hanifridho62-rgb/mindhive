@@ -14,7 +14,31 @@ _TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set"}
 _TIMELINE_CAP = 40
 
 
-def _collapsed_entries(evs, types, cap=None):
+def _absorbed_keys(evs) -> set:
+    """Identity keys of events consolidated away by prior dreaming passes (see
+    consolidate.py): the originals stay in the append-only ledger, but the
+    briefing shows only each cluster's survivor. Keys are precise
+    (ts, type, fingerprint) tuples — a bare timestamp would also hide
+    unrelated same-second events — plus legacy bare timestamps from the
+    feature's first payload shape."""
+    out: set = set()
+    for ev in evs:
+        if ev.type != "memory_consolidated" or not isinstance(ev.payload, dict):
+            continue
+        for entry in ev.payload.get("absorbed") or []:
+            if isinstance(entry, (list, tuple)) and len(entry) == 3:
+                out.add(tuple(entry))
+        out.update(ev.payload.get("absorbed_ts") or [])   # legacy shape
+    return out
+
+
+def _is_absorbed(ev, keys) -> bool:
+    text = _payload_text(ev.payload)
+    return ((ev.ts, ev.type, dedupe.text_fingerprint(text)) in keys
+            or ev.ts in keys)
+
+
+def _collapsed_entries(evs, types, cap=None, absorbed=None):
     """Collapse near-duplicate events of *types* into representatives.
 
     Returns a list of ``(Event, occurrences)`` newest-first. Display-time only:
@@ -24,10 +48,12 @@ def _collapsed_entries(evs, types, cap=None):
     entries when given.
     """
     # dedupe.collapse expects newest-first; read_all yields oldest-first.
+    absorbed = absorbed if absorbed is not None else set()
     items = [
         {"type": ev.type, "project": None,
          "text": _payload_text(ev.payload), "_ev": ev}
-        for ev in evs if ev.type in types
+        for ev in evs
+        if ev.type in types and not _is_absorbed(ev, absorbed)
     ]
     items.reverse()
     reps = dedupe.collapse(items)
@@ -73,6 +99,7 @@ def _payload_text(payload) -> str:
 
 def build_briefing(evs) -> str:
     """Build a Markdown briefing string from a list of Event objects (deterministic)."""
+    absorbed = _absorbed_keys(evs)
     lines = ["# PROJECT BRIEFING", ""]
 
     # --- Current state ---
@@ -102,7 +129,8 @@ def build_briefing(evs) -> str:
     # --- Timeline (deduped, most-recent-first, capped) ---
     lines.append("## Timeline (deduped — most recent first)")
     lines.append("")
-    for ev, n in _collapsed_entries(evs, _TIMELINE_TYPES, cap=_TIMELINE_CAP):
+    for ev, n in _collapsed_entries(evs, _TIMELINE_TYPES, cap=_TIMELINE_CAP,
+                                    absorbed=absorbed):
         hl = headline(_payload_text(ev.payload))
         lines.append(f"- {ev.ts} [{ev.type}] {hl}{_count_suffix(n)}")
     lines.append("")
@@ -110,14 +138,16 @@ def build_briefing(evs) -> str:
     # --- Key decisions ---
     lines.append("## Key decisions")
     lines.append("")
-    for ev, n in _collapsed_entries(evs, {"decision"}, cap=_TIMELINE_CAP):
+    for ev, n in _collapsed_entries(evs, {"decision"}, cap=_TIMELINE_CAP,
+                                    absorbed=absorbed):
         lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
     lines.append("")
 
     # --- Lessons & caveats ---
     lines.append("## Lessons & caveats")
     lines.append("")
-    for ev, n in _collapsed_entries(evs, {"caveat"}, cap=_TIMELINE_CAP):
+    for ev, n in _collapsed_entries(evs, {"caveat"}, cap=_TIMELINE_CAP,
+                                    absorbed=absorbed):
         lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
     lines.append("")
 

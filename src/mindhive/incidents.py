@@ -6,6 +6,7 @@ canonical truth; these files are the human-editable workspace/projection. Plan 1
 writes the immutable Raw Signal and frontmatter; the Auto/Human evaluation
 sections are stubs that Plan 2 populates.
 """
+import calendar
 import os
 import re
 import threading
@@ -14,7 +15,16 @@ from contextlib import contextmanager
 from . import events, paths
 
 THRESHOLD = 2                       # recurrence gate N (D2)
+DECAY_DAYS = 14                     # candidate staleness horizon (KTD4 decay)
+_FLAG_PREFIX = "judgment:flag:"     # explicit human self-flags (hive flag)
 _SAFE = re.compile(r"[^a-z0-9]+")
+
+
+def _threshold_for(signature, threshold=THRESHOLD) -> int:
+    """Explicit judgment flags are rare, high-value, and human-initiated — they
+    activate at the first occurrence. Everything else (including
+    judgment:rejected:*) keeps the recurrence gate."""
+    return 1 if str(signature).startswith(_FLAG_PREFIX) else threshold
 
 # Serializes every writer of an incident .md file. The dashboard runs the
 # auto-harvest thread (calls project()) alongside request threads (reflect →
@@ -98,10 +108,11 @@ def _atomic_write(path, text) -> None:
 LEAK_LIMIT = 2
 
 
-def _failures_by_sig(project) -> dict:
-    """signature -> list of tool_failed Events, in ts order (read_all is sorted)."""
+def _failures_by_sig(project, evs=None) -> dict:
+    """signature -> list of tool_failed Events, in ts order (read_all is sorted).
+    Pass evs to reuse an events.read_all() result."""
     out = {}
-    for ev in events.read_all(project):
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type != "tool_failed":
             continue
         s = ev.payload.get("signature") if isinstance(ev.payload, dict) else None
@@ -110,20 +121,51 @@ def _failures_by_sig(project) -> dict:
     return out
 
 
-def _has_lifecycle(project, etype, signature) -> bool:
-    for ev in events.read_all(project):
+def _has_lifecycle(project, etype, signature, evs=None) -> bool:
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == etype and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
             return True
     return False
 
 
-def _activation_ts(project, signature) -> str | None:
-    for ev in events.read_all(project):
+def _activation_ts(project, signature, evs=None) -> str | None:
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_activated" and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
             return ev.ts
     return None
+
+
+def _latest_expiry_ts(project, signature, evs=None) -> str | None:
+    """ts of the most recent rule_expired event for a signature, or None.
+    Occurrences for status purposes count only failures after this point, so
+    re-entry after decay starts a fresh candidate→active climb. Pass evs to
+    reuse an events.read_all() result."""
+    latest = None
+    for ev in (evs if evs is not None else events.read_all(project)):
+        if ev.type == "rule_expired" and isinstance(ev.payload, dict) \
+                and ev.payload.get("signature") == signature:
+            if latest is None or ev.ts > latest:
+                latest = ev.ts
+    return latest
+
+
+def _live_failures(project, signature, failures, evs=None) -> list:
+    """The status-relevant slice of a signature's failures: everything after
+    the latest rule_expired, or all of them when it never expired. ``failures``
+    is that signature's tool_failed list; ``evs`` optionally reuses the full
+    events.read_all() result for the expiry lookup."""
+    exp = _latest_expiry_ts(project, signature, evs=evs)
+    return [e for e in failures if e.ts > exp] if exp else failures
+
+
+def _ts_secs(ts) -> float | None:
+    """Epoch seconds for a store ISO timestamp, or None when unparseable."""
+    try:
+        return calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
 
 
 def leaks(project=None, signature=None) -> int:
@@ -139,7 +181,15 @@ def leaks(project=None, signature=None) -> int:
 def _status_and_flag(project, signature, rec, threshold, source):
     if _has_lifecycle(project, "rule_promoted", signature):
         return "promoted", ""
-    if rec["occurrences"] < threshold:
+    occurrences = rec["occurrences"]
+    if _latest_expiry_ts(project, signature) is not None:
+        # Post-expiry occurrences only: 0 -> expired (stays expired across a
+        # full project() rebuild), 1 -> candidate again, threshold -> active.
+        occurrences = len(_live_failures(
+            project, signature, _failures_by_sig(project).get(signature, [])))
+        if occurrences == 0:
+            return "expired", ""
+    if occurrences < _threshold_for(signature, threshold):
         return "candidate", ""
     if _has_lifecycle(project, "rule_demoted", signature):
         return "demoted", ""
@@ -150,18 +200,32 @@ def _status_and_flag(project, signature, rec, threshold, source):
     return "active", flag
 
 
-def audit(project=None, threshold=THRESHOLD) -> dict:
+def audit(project=None, threshold=THRESHOLD, now=None) -> dict:
     """Emit a one-time rule_activated event (stamped at the threshold-crossing
-    failure's ts) for any signature that has reached the recurrence threshold and
-    isn't activated yet. Idempotent."""
-    activated = 0
+    failure's ts) for any signature that has reached its recurrence threshold
+    (judgment:flag:* activates at 1) and isn't activated yet. Also decays stale
+    noise: a candidate with exactly one live occurrence whose latest failure is
+    older than DECAY_DAYS gains a rule_expired lifecycle event — except
+    judgment:flag:* incidents, which never expire. Idempotent: an expiry zeroes
+    the live count, so re-running appends nothing new."""
+    activated = expired = 0
+    now_secs = _ts_secs(now) if now else time.time()
     for signature, evs in _failures_by_sig(project).items():
-        if len(evs) >= threshold and not _has_lifecycle(project, "rule_activated", signature):
-            crossing_ts = evs[threshold - 1].ts
+        live = _live_failures(project, signature, evs)
+        thr = _threshold_for(signature, threshold)
+        if len(live) >= thr and not _has_lifecycle(project, "rule_activated", signature):
+            crossing_ts = live[thr - 1].ts
             events.append_event("rule_activated", {"signature": signature},
                                 tags=["lifecycle"], ts=crossing_ts, project=project)
             activated += 1
-    return {"activated": activated}
+        elif len(live) == 1 and not signature.startswith(_FLAG_PREFIX):
+            last = _ts_secs(live[-1].ts)
+            if last is not None and now_secs is not None \
+                    and (now_secs - last) > DECAY_DAYS * 86400:
+                events.append_event("rule_expired", {"signature": signature},
+                                    tags=["lifecycle"], project=project)
+                expired += 1
+    return {"activated": activated, "expired": expired}
 
 
 def _safe_name(signature: str) -> str:
@@ -369,15 +433,34 @@ def _active_rules(project) -> list:
     return out
 
 
-def inject(project=None) -> str:
+# Hard cap on injected rules (KTD2): the block rides into every session via
+# STATE.md and the native MEMORY.md digest, so a backlog drain that activates
+# dozens of rules must not be able to blow the per-session context budget.
+INJECT_CAP = 10
+
+
+def inject(project=None, evs=None) -> str:
     """The machine-learned prevention-rules block for session-start injection.
-    Empty string when there is nothing active to inject."""
+    Empty string when there is nothing active to inject. Capped at INJECT_CAP
+    rules ranked by occurrences then recency, with a `+N more` trailer when
+    rules were cut. Pass evs to reuse an events.read_all() result."""
     rules = _active_rules(project)
     if not rules:
         return ""
+    by_sig = _failures_by_sig(project, evs=evs)
+    # Rank: occurrences desc, then last-failure recency desc. Two passes with a
+    # stable sort (ts desc first, then occurrences desc) instead of one mixed key
+    # because an ISO ts string cannot be negated.
+    ranked = sorted(rules, key=lambda it: (
+        by_sig[it[0]][-1].ts if by_sig.get(it[0]) else ""), reverse=True)
+    ranked.sort(key=lambda it: -len(by_sig.get(it[0], [])))
+    shown = ranked[:INJECT_CAP]
     lines = ["# PREVENTION RULES (machine-learned — avoid repeating these)"]
-    for signature, rule in rules:
+    for signature, rule in shown:
         lines.append(f"- [{signature}] {rule}")
+    cut = len(ranked) - len(shown)
+    if cut > 0:
+        lines.append(f"+{cut} more: hive rules list")
     return "\n".join(lines)
 
 
@@ -397,7 +480,8 @@ def _active_rule_for(signature, project):
 
 def promote(signature, project=None) -> dict:
     """Append a signature's Active rule to the canonical SOUL.md and mark the
-    incident promoted. The only write to canonical memory (human-invoked)."""
+    incident promoted. The only write to canonical memory — invoked by a human
+    or by auto_promote once a rule has proven itself."""
     rule = _active_rule_for(signature, project)
     if not rule:
         return {"promoted": False, "reason": "no active rule"}
@@ -412,6 +496,56 @@ def promote(signature, project=None) -> dict:
                         tags=["promote"], project=project)
     globals()["project"](project)          # re-project -> status promoted
     return {"promoted": True}
+
+
+def auto_promote(project=None, evs=None) -> dict:
+    """Self-acting promotion — the 'permanent SOP' rung of the learning loop.
+
+    Any ACTIVE rule whose lesson classifies as ``resolved`` (at the recurrence
+    threshold, rule present, tested after activation, zero leaks) has proven it
+    actually changes behavior, so it graduates into SOUL.md without waiting for
+    a human. This is what makes improvements self-sustaining: capture ->
+    reflect -> inject -> prove -> promote, with no manual step anywhere.
+    Idempotent (``promote`` refuses already-promoted signatures). Returns
+    ``{"promoted": [signatures]}``. Pass evs to reuse a read_all() result."""
+    stats = signal_stats(project, evs=evs)
+    done = []
+    for s in summaries(project):
+        if s.get("status") != "active":
+            continue
+        sig = s.get("signature", "")
+        if classify_resolution(s, stats.get(sig, {})) != "resolved":
+            continue
+        if promote(sig, project=project).get("promoted"):
+            done.append(sig)
+    return {"promoted": done}
+
+
+SOUL_CAP = 10   # max promoted rules injected per session (newest first)
+
+
+def soul_block(project=None) -> str:
+    """Canonical operating rules (promoted SOPs) for session-start injection.
+
+    This is the permanence mechanism promote() was missing a consumer for:
+    SOUL.md was written but nothing ever read it back into a session, so a
+    'promoted' rule was effectively archived, not permanent. Injecting the
+    block through STATE.md (the single delivery choke point) makes promotion
+    mean what it says. Empty string when no rules were ever promoted."""
+    try:
+        text = soul_path(project).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    rules = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- ")]
+    if not rules:
+        return ""
+    lines = ["# SOUL — permanent operating rules (proven; always follow)"]
+    shown = rules[-SOUL_CAP:]
+    lines += shown
+    cut = len(rules) - len(shown)
+    if cut > 0:
+        lines.append(f"+{cut} more in SOUL.md")
+    return "\n".join(lines)
 
 
 def demote(signature, project=None) -> dict:
@@ -459,7 +593,8 @@ def _raw_excerpt(section: str) -> str:
     return m.group(1).strip().strip("`") if m else ""
 
 
-_LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted", "rule_revised"}
+_LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted",
+                    "rule_revised", "rule_expired", "rule_enforced"}
 
 
 def signal_stats(project=None, evs=None) -> dict:
@@ -523,7 +658,7 @@ def classify_resolution(summary: dict, stats: dict) -> str:
         return "dismissed"
     occurrences = max(int(summary.get("occurrences") or 0),
                       int(stats.get("event_occurrences") or 0))
-    if occurrences < THRESHOLD:
+    if occurrences < _threshold_for(summary.get("signature", "")):
         return "watching"
     if summary.get("rule_source") in (None, "", "none"):
         return "unresolved"
@@ -542,11 +677,12 @@ def _as_int(v) -> int:
         return 0
 
 
-def summaries(project=None) -> list:
+def summaries(project=None, include_expired=False) -> list:
     """Structured lesson dicts for every incident record — the dashboard's
     Improvements view reads these. One dict per record: frontmatter status
     fields plus the parsed Auto Evaluation verdict (empty strings until the
-    reflection pass fills it) and the derived active rule."""
+    reflection pass fills it) and the derived active rule. Decayed (expired)
+    records are excluded by default; pass include_expired=True to see them."""
     out = []
     d = _incident_dir(project)
     if not d.exists():
@@ -558,6 +694,8 @@ def summaries(project=None) -> list:
             continue
         fm = _frontmatter(text)
         if not fm.get("signature"):
+            continue
+        if fm.get("status") == "expired" and not include_expired:
             continue
         secs = _split_sections(text)
         auto = secs.get("Auto Evaluation", "")

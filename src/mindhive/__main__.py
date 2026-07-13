@@ -47,10 +47,18 @@ def cmd_append(args) -> int | None:
 
 
 def cmd_hook(args) -> int | None:
-    from . import hookcapture
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if args.stage == "post_tool_use":
+        from . import hookcapture
         print(json.dumps(hookcapture.record_post_tool_use(raw)))
+    elif args.stage == "pre_tool_use":
+        # Deny the ineffective tool form for enabled-enforcement signatures.
+        # Print ONLY on a deny (stdout is the hook's decision channel); an allow
+        # prints nothing so the hook stays a silent no-op.
+        from . import enforce
+        decision = enforce.hook_decision(raw)
+        if decision:
+            print(json.dumps(decision))
     return None
 
 
@@ -270,7 +278,7 @@ def cmd_skills_invoke(args) -> int | None:
     """Call ANY installed skill through MindHive (headless claude), recording the
     outcome. Returns exit 1 on failure so /circle and /mindhive can gate on it."""
     from . import invoker
-    res = invoker.invoke_skill(args.name, plugin=args.plugin)
+    res = invoker.invoke_skill(args.name, plugin=args.plugin, project=args.project)
     status = "ok" if res["ok"] else "FAILED"
     print(f"skill {args.name}: {status} (exit {res['exit']})")
     if res.get("excerpt"):
@@ -285,6 +293,79 @@ def cmd_skills_status(args) -> int | None:
         print("(no skill calls recorded yet)")
     for name, s in sorted(status.items()):
         print(f"  {name}: {s}")
+    return None
+
+
+def cmd_skills_stats(args) -> int | None:
+    from . import plugins as plugins_mod
+    stats = plugins_mod.skill_stats(project=args.project)
+    if args.json:
+        print(json.dumps(stats, indent=2))
+        return None
+    if not stats:
+        print("(no skill telemetry yet)")
+        return None
+    for name, s in sorted(stats.items()):
+        rate = (f"{s['completion_rate'] * 100:.0f}%"
+                if s["completion_rate"] is not None else "-")
+        print(f"  {name}: {s['calls']} calls · {s['ok']} ok · {s['fail']} fail "
+              f"· completion {rate} · last {s['last_outcome']} @ {s['last_used']}")
+    return None
+
+
+def cmd_skills_record(args) -> int | None:
+    """Explicit skill-outcome write-through for the orchestrator/agent (KTD5):
+    --ok appends an invoke_result, --fail a tool_failed with a skill:<name>
+    signature (feeding the incident pipeline unchanged). Both carry
+    agent-assessed provenance so self-grades never masquerade as measured."""
+    note = args.note or ""
+    if args.ok:
+        ev = events.append_event(
+            "invoke_result",
+            {"name": args.name, "plugin": args.plugin, "ok": True, "text": note,
+             "provenance": "agent-assessed"},
+            tags=["skill", "record", "agent-assessed"], project=args.project)
+        print(f"recorded ok for {args.name} @ {ev.ts}")
+    else:
+        signature = f"skill:{args.name}"
+        ev = events.append_event(
+            "tool_failed",
+            {"text": note or f"skill {args.name} failed (agent-assessed)",
+             "signature": signature,
+             "action": f"skills record {args.name} --fail",
+             "provenance": "agent-assessed"},
+            tags=["skill", "record", "agent-assessed", "failure"],
+            project=args.project)
+        print(f"recorded fail for {args.name} ({signature}) @ {ev.ts}")
+    return None
+
+
+def cmd_skills_recommend(args) -> int | None:
+    """Deterministic most-needed-skills ranking (KTD6). One ledger read feeds
+    both the telemetry stats and the need extraction, so --brief stays cheap
+    enough for a session-start hook."""
+    from . import plugins as plugins_mod
+    payload = plugins_mod.recommend_for(project=args.project, top=args.top)
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return None
+    recs = payload["recommendations"]
+    if args.brief:
+        for e in recs[:(args.top or 3)]:
+            print(f"{e['name']} — {e['reason']} ({e['provenance']})")
+        return None
+    cov = payload["coverage"]
+    print(f"measured {cov['measured']} of {cov['total']} skills")
+    if not recs:
+        print("(no skills in inventory)")
+        return None
+    for i, e in enumerate(recs, 1):
+        print(f"  {i}. {e['name']}  [score {e['score']:g}, {e['provenance']}]"
+              f"{'  (try to measure)' if e.get('try_to_measure') else ''}")
+        print(f"       {e['reason']}")
+        for a in e.get("alternatives", []):
+            flag = " — try to measure" if a.get("try_to_measure") else ""
+            print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
     return None
 
 
@@ -354,8 +435,16 @@ def cmd_loop(args) -> int | None:
         tasks = loop_task.load_tasks(loop_dir)
         ctx = loop_prompt.build_loop_context(_bb(events.read_all()))
         tp = loop_prompt.build_task_prompt(tasks, [])
+        from .loop import router as loop_router
+        req = loop_task.required_remaining_count(tasks.fix_plan)
+        size = loop_router.size_class(req, len(tasks.prompt))
+        tier = (loop_router.pick_initial_tier(
+                    size, loop_router.run_history(events.read_all()))
+                if cfg.model is None else None)
         print("DRY-RUN — would run claude with:")
-        print(f"  required items remaining: {loop_task.required_remaining_count(tasks.fix_plan)}")
+        print(f"  required items remaining: {req}")
+        print(f"  model routing: " + (f"size={size} -> tier={tier}"
+              if tier else f"pinned model {cfg.model} (routing bypassed)"))
         print(f"  context_window={cfg.context_window} smart_zone_ratio={cfg.smart_zone_ratio}")
         print(f"  allowed_tools={cfg.allowed_tools}")
         print(f"  permission_mode={cfg.permission_mode or '(allowedTools only)'}")
@@ -399,6 +488,41 @@ def cmd_loop(args) -> int | None:
     return 0 if result["reason"] in ("completed",) else 1
 
 
+def cmd_flag(args) -> int | None:
+    """Self-flag a judgment error (KTD4): appends a tool_failed event carrying a
+    judgment:flag:<slug> signature, so the entire existing incident projection
+    works unchanged — no new event type. Flags activate at occurrence 1."""
+    from . import incidents as incidents_mod, signature as sig_mod
+    signature = f"judgment:flag:{sig_mod.slug_id(args.text)}"
+    tags = ["judgment"] + ([args.category] if args.category else [])
+    ev = events.append_event(
+        "tool_failed",
+        {"text": args.text, "signature": signature, "action": "hive flag"},
+        tags=tags, project=args.project)
+    # Advance the lifecycle immediately (mirrors failures capture): flags cross
+    # their threshold of 1 on the spot, so the incident is active right away.
+    incidents_mod.audit(project=args.project)
+    incidents_mod.project(project=args.project)
+    print(f"flagged {signature} @ {ev.ts}")
+    return None
+
+
+def cmd_consolidate(args) -> int | None:
+    """One bounded memory-consolidation ("dreaming") pass: merge near-duplicate
+    semantic memories into survivors, exclude the absorbed originals from the
+    briefing/MEMORY.md digest, keep everything in the append-only chain."""
+    from . import consolidate as consolidate_mod
+    try:
+        res = consolidate_mod.consolidate(
+            project=args.project, limit=args.limit,
+            cooldown_hours=args.cooldown_hours, force=args.force)
+    except RuntimeError as e:       # LIVE_LOCK guard
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(res))
+    return None
+
+
 def cmd_failures_capture(args) -> int | None:
     from . import failures as failures_mod, incidents as incidents_mod
     res = failures_mod.capture_dir(args.transcripts, project=args.project)
@@ -418,7 +542,8 @@ def cmd_failures_list(args) -> int | None:
         print("(no failures captured yet)")
         return None
     for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
-        status = "active" if rec["occurrences"] >= incidents_mod.THRESHOLD else "candidate"
+        status = ("active" if rec["occurrences"] >= incidents_mod._threshold_for(signature)
+                  else "candidate")
         print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
     return None
 
@@ -430,7 +555,8 @@ def cmd_rules_list(args) -> int | None:
         print("(no incidents yet)")
         return None
     for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
-        status = "active" if rec["occurrences"] >= inc.THRESHOLD else "candidate"
+        status = ("active" if rec["occurrences"] >= inc._threshold_for(signature)
+                  else "candidate")
         print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
     return None
 
@@ -462,21 +588,59 @@ def cmd_rules_show(args) -> int | None:
     return None
 
 
+def _safe_reflect_batch(reflect_mod, project, args) -> dict:
+    """One namespace's bounded reflection pass, never raising — session_end
+    spawns this command fire-and-forget, so a failing runner must map to a JSON
+    result and exit 0, not a traceback."""
+    try:
+        return reflect_mod.reflect_batch(project=project, limit=args.limit,
+                                         cooldown_hours=args.cooldown_hours)
+    except Exception as e:
+        return {"reflected": 0, "attempted": 0,
+                "error": f"{type(e).__name__}: {e}"}
+
+
 def cmd_rules_reflect(args) -> int | None:
-    from . import reflect as reflect_mod, incidents as inc
-    acc = inc._collect(args.project)
-    done = 0
-    for signature, rec in acc.items():
-        if rec["occurrences"] >= inc.THRESHOLD:      # active only
-            if reflect_mod.reflect_incident(signature, project=args.project).get("reflected"):
-                done += 1
-    print(json.dumps({"reflected": done}))
-    return None
+    from . import reflect as reflect_mod
+    if args.all_projects:
+        # One-time supervised backlog drain over registered namespaces — run
+        # manually, never from hooks. LIVE_LOCK is honored inside reflect_batch
+        # (whole-token namespace match), so both entry points share one check.
+        results = {name: _safe_reflect_batch(reflect_mod, name, args)
+                   for name in sorted(paths.known_projects())}
+        print(json.dumps(results))
+        return 0
+    print(json.dumps(_safe_reflect_batch(reflect_mod, args.project, args)))
+    return 0
 
 
 def cmd_rules_reconcile(args) -> int | None:
     from . import incidents as inc
     print(json.dumps(inc.reconcile(project=args.project)))
+    return None
+
+
+def cmd_rules_enforce(args) -> int | None:
+    """Manage the PreToolUse enforcement manifest — the enforce rung of the
+    nudge->enforce ladder. Default action prints the manifest."""
+    from . import enforce
+    if args.suggest:
+        print(json.dumps({"suggested": enforce.suggest(project=args.project)}))
+        return None
+    if args.enable:
+        print(json.dumps(enforce.set_enabled(args.project, args.enable, True)))
+        return None
+    if args.disable:
+        print(json.dumps(enforce.set_enabled(args.project, args.disable, False)))
+        return None
+    man = enforce.load_manifest(args.project)
+    if not man:
+        print("(no enforcement manifest — run `hive rules enforce --suggest`)")
+        return None
+    for sig, entry in sorted(man.items()):
+        state = "ENABLED " if entry.get("enabled") else "disabled"
+        matcher = "ok" if sig in enforce.MATCHERS else "MISSING-matcher"
+        print(f"  [{state}] {sig}  ({matcher})")
     return None
 
 
@@ -524,7 +688,7 @@ def _build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_append)
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
-    hk.add_argument("stage", choices=["post_tool_use"],
+    hk.add_argument("stage", choices=["post_tool_use", "pre_tool_use"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -546,6 +710,19 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--limit", type=int, default=10)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_recall)
+
+    cons = sub.add_parser("consolidate",
+                          help="dreaming pass: merge near-duplicate memories "
+                               "into survivors (append-only, bounded)")
+    cons.add_argument("--project", default=None)
+    cons.add_argument("--limit", type=int, default=3,
+                      help="max duplicate clusters merged per pass")
+    cons.add_argument("--cooldown-hours", dest="cooldown_hours", type=float,
+                      default=6.0, help="skip when a pass ran within this window "
+                                        "(0 disables)")
+    cons.add_argument("--force", action="store_true",
+                      help="override the LIVE_LOCK guard")
+    cons.set_defaults(func=cmd_consolidate)
 
     gc = sub.add_parser("gc", help="store hygiene: report sizes; prune junk (opt-in)")
     gc.add_argument("target", nargs="?", default=None,
@@ -626,8 +803,31 @@ def _build_parser() -> argparse.ArgumentParser:
     ski = sksub.add_parser("invoke", help="call a skill via headless claude and record the outcome")
     ski.add_argument("name", help="skill name (as shown by `skills list`)")
     ski.add_argument("--plugin", default=None, help="owning plugin, when disambiguation is needed")
+    ski.add_argument("--project", default=None, help="target namespace")
     ski.set_defaults(func=cmd_skills_invoke)
     sksub.add_parser("status", help="green/red last-call outcome per skill").set_defaults(func=cmd_skills_status)
+    sks = sksub.add_parser("stats", help="per-skill completion-rate telemetry from the ledger")
+    sks.add_argument("--json", action="store_true", help="emit the raw stats JSON")
+    sks.add_argument("--project", default=None, help="target namespace")
+    sks.set_defaults(func=cmd_skills_stats)
+    skr = sksub.add_parser("record",
+                           help="record a skill outcome (agent-assessed write-through)")
+    skr.add_argument("name", help="skill name")
+    outcome = skr.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("--ok", action="store_true", help="the skill completed")
+    outcome.add_argument("--fail", action="store_true", help="the skill failed")
+    skr.add_argument("--note", default="", help="one-line context for the outcome")
+    skr.add_argument("--plugin", default=None, help="owning plugin, if known")
+    skr.add_argument("--project", default=None, help="target namespace")
+    skr.set_defaults(func=cmd_skills_record)
+    skc = sksub.add_parser("recommend",
+                           help="deterministic most-needed-skills ranking from measured data")
+    skc.add_argument("--json", action="store_true", help="emit the full ranked payload")
+    skc.add_argument("--top", type=int, default=None, help="limit to the top N entries")
+    skc.add_argument("--brief", action="store_true",
+                     help="<= 3 one-line suggestions (fast; for the session hook)")
+    skc.add_argument("--project", default=None, help="target namespace")
+    skc.set_defaults(func=cmd_skills_recommend)
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
@@ -682,6 +882,14 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(also disabled by MINDHIVE_LOOP_DASHBOARD=0)")
     lp.set_defaults(func=cmd_loop)
 
+    # --- flag (Learning Loop judgment-error capture, KTD4) ---
+    fg = sub.add_parser("flag", help="self-flag a judgment error (active at 1 occurrence)")
+    fg.add_argument("text", help="one line: what was misjudged")
+    fg.add_argument("--category", default=None,
+                    help="optional category tag (e.g. git, scope, permissions)")
+    fg.add_argument("--project", default=None, help="target namespace")
+    fg.set_defaults(func=cmd_flag)
+
     # --- failures (Learning Loop capture stage) ---
     fp = sub.add_parser("failures", help="capture tool failures + list incidents")
     fsub = fp.add_subparsers(dest="failures_cmd", required=True)
@@ -708,8 +916,17 @@ def _build_parser() -> argparse.ArgumentParser:
     rsh.add_argument("signature")
     rsh.add_argument("--project", default=None)
     rsh.set_defaults(func=cmd_rules_show)
-    rr = rsub.add_parser("reflect", help="run the reflection pass over active incidents")
+    rr = rsub.add_parser("reflect",
+                         help="bounded reflection pass over active un-reflected incidents")
     rr.add_argument("--project", default=None)
+    rr.add_argument("--limit", type=int, default=3,
+                    help="max incidents to reflect this batch (default: 3)")
+    rr.add_argument("--cooldown-hours", type=float, default=6.0, dest="cooldown_hours",
+                    help="skip when the last batch started within this window "
+                         "(default: 6; pass 0 to disable)")
+    rr.add_argument("--all-projects", dest="all_projects", action="store_true",
+                    help="drain every registered namespace (manual backlog drain; "
+                         "never invoked from hooks; LIVE_LOCK-named namespaces skipped)")
     rr.set_defaults(func=cmd_rules_reflect)
     ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
     ra.add_argument("--project", default=None)
@@ -728,6 +945,16 @@ def _build_parser() -> argparse.ArgumentParser:
     rc = rsub.add_parser("reconcile", help="record human edits as rule_revised events")
     rc.add_argument("--project", default=None)
     rc.set_defaults(func=cmd_rules_reconcile)
+    ren = rsub.add_parser("enforce",
+                          help="manage the PreToolUse enforcement manifest (nudge->enforce ladder)")
+    ren.add_argument("--project", default=None)
+    ren.add_argument("--suggest", action="store_true",
+                     help="add disabled stubs for ruled signatures recurring past the threshold")
+    ren.add_argument("--enable", metavar="SIG", default=None,
+                     help="turn on enforcement for a signature")
+    ren.add_argument("--disable", metavar="SIG", default=None,
+                     help="turn off enforcement for a signature")
+    ren.set_defaults(func=cmd_rules_enforce)
 
     return p
 

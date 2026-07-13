@@ -495,13 +495,60 @@ def make_handler(token: str):
 
         def _get_skills_status(self, proj, am, qs):
             # status: green/red last outcome per skill; counts: total invokes —
-            # both derived from the ledger in a single pass
-            return self._json(plugins_mod.call_stats(project=proj))
+            # both derived from the ledger in a single pass. HIVE MIND merges
+            # every namespace's ledger, mirroring /api/improvements — skills
+            # telemetry must not read "*" as a literal (empty) namespace.
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_stats(project=proj, evs=evs))
 
         def _get_skills_history(self, proj, am, qs):
             name = (qs.get("name") or [""])[0]
             limit = int((qs.get("limit") or ["20"])[0])
-            return self._json(plugins_mod.call_history(name, project=proj, limit=limit))
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_history(name, project=proj,
+                                                       limit=limit, evs=evs))
+
+        def _get_skills_stats(self, proj, am, qs):
+            # per-skill completion-rate telemetry aggregated from the ledger
+            # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json({"stats": plugins_mod.skill_stats(project=proj,
+                                                                evs=evs)})
+
+        def _get_skills_recommend(self, proj, am, qs):
+            # deterministic most-needed-skills ranking (U6/KTD6): one ledger
+            # read feeds both the stats and the need extraction. HIVE MIND
+            # merges events AND incident summaries across every namespace.
+            top = (qs.get("top") or [None])[0]
+            evs = summ = None
+            if am:
+                from . import incidents
+                evs = [e for _, e in all_event_pairs()]
+                summ = [s for n in _all_projects()
+                        for s in incidents.summaries(project=n)]
+            return self._json(plugins_mod.recommend_for(
+                project=proj, evs=evs, top=int(top) if top else None,
+                incident_summaries=summ))
+
+        def _get_oversee(self, proj, am, qs):
+            # Oversee: every kind of live Claude work — hive loop runs AND
+            # interactive sessions (straight from hook telemetry, no /circle
+            # needed). Dismissed/finished/stale entries are already excluded
+            # by the projections.
+            from . import oversee as oversee_mod
+            from .loop import state as loop_state
+            names = _all_projects() if am else [proj]
+            runs, dismissed = [], 0
+            for n in names:
+                evs = events.read_all(n)
+                res = loop_state.list_runs(n)
+                for r in res["runs"] + oversee_mod.interactive_sessions(n, evs=evs):
+                    r["project"] = n
+                    runs.append(r)
+                dismissed += res["dismissed"]
+            runs.sort(key=lambda r: r.get("started") or "", reverse=True)
+            return self._json({"runs": runs, "dismissed": dismissed,
+                               "any_online": any(r["online"] for r in runs)})
 
         def _get_workspace(self, proj, am, qs):
             # /api/workspace/<action>: the two iframe pages render HTML; every
@@ -733,6 +780,32 @@ def make_handler(token: str):
             incidents.demote(sig, project=proj)
             return self._json({"ok": True, "signature": sig})
 
+        def _post_oversee_dismiss(self, proj, body):
+            # Manual session delete: append-only tombstone, so the hash chain
+            # stays intact and every projection rebuild keeps the run hidden.
+            # Deleting an already-dismissed run (e.g. the engine auto-dismissed
+            # it between poll and click) is a benign no-op, not an error.
+            from . import oversee as oversee_mod
+            from .loop import state as loop_state
+            run_id = (body.get("run_id") or "").strip()
+            if not run_id:
+                return self._json({"ok": False, "error": "run_id is required"}, 200)
+            known = {r["run_id"] for r in loop_state.list_runs(proj)["runs"]}
+            known |= {s["run_id"] for s in oversee_mod.interactive_sessions(proj)}
+            if run_id not in known:
+                already = any(
+                    e.type == "loop_run_dismissed"
+                    and (e.payload or {}).get("run_id") == run_id
+                    for e in events.read_all(proj))
+                if already:
+                    return self._json({"ok": True, "run_id": run_id,
+                                       "already_dismissed": True})
+                return self._json({"ok": False,
+                                   "error": f"unknown run: {run_id}"}, 200)
+            events.append_event("loop_run_dismissed",
+                                {"run_id": run_id, "cause": "manual"}, project=proj)
+            return self._json({"ok": True, "run_id": run_id})
+
         def _post_selftest(self, proj, body):
             from . import selftest as selftest_mod
             code = selftest_mod.run()
@@ -786,6 +859,7 @@ def make_handler(token: str):
             "/api/memory": _get_memory,
             "/api/improvements": _get_improvements,
             "/api/sessions": _get_sessions,
+            "/api/oversee": _get_oversee,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
             "/api/plugins/recommend": _get_plugins_recommend,
@@ -793,6 +867,8 @@ def make_handler(token: str):
             "/api/skills/detail": _get_skills_detail,
             "/api/skills/status": _get_skills_status,
             "/api/skills/history": _get_skills_history,
+            "/api/skills/stats": _get_skills_stats,
+            "/api/skills/recommend": _get_skills_recommend,
             "/api/export": _get_export,
         }
         for _p in ("parallel", "swarm", "agents", "output", "profiles",
@@ -814,6 +890,7 @@ def make_handler(token: str):
             "/api/rules/reflect": _post_rules_reflect,
             "/api/rules/reflect_one": _post_rules_reflect_one,
             "/api/rules/dismiss": _post_rules_dismiss,
+            "/api/oversee/dismiss": _post_oversee_dismiss,
             "/api/selftest": _post_selftest,
         }
         for _p in ("spawn", "send", "run_recipe", "set_model", "stop",

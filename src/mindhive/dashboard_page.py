@@ -58,6 +58,7 @@ def render_page(token: str) -> str:
   .types { margin-top:14px; display:flex; flex-wrap:wrap; gap:8px; }
   .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
   .pill b { color:#fff; }
+  .pill.est { color:#e0b341; border-color:#5a4a1f; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -87,6 +88,9 @@ def render_page(token: str) -> str:
   .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
   .glyph.watch { color:#e0b341; } .glyph.dis { color:#8a93a6; }
   .legend { font-size:12px; color:#9aa3b8; margin:2px 0 10px; }
+  .ovdone { color:#46c46a; font-weight:600; }
+  .ovpend { color:#8a93a6; }
+  .ovspin { color:#e0b341; display:inline-block; animation: pulse 1.6s infinite; }
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
@@ -104,6 +108,8 @@ def render_page(token: str) -> str:
 <main>
   <nav>
     <button onclick="showOverview()">Overview</button>
+    <div class="group">Work</div>
+    <button onclick="showOversee()">Oversee</button>
     <div class="group">Memory</div>
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
@@ -113,7 +119,7 @@ def render_page(token: str) -> str:
     <button onclick="showBriefing()">Briefing</button>
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
-    <button onclick="showPlugins()">Skills &amp; plugins</button>
+    <button onclick="showSkillPanel()">Skill &amp; Plugin</button>
     <div class="group">Workspace</div>
     <button onclick="showWorkspace('parallel')">MindParallel</button>
     <button onclick="showWorkspace('swarm')">MindSwarm</button>
@@ -219,7 +225,9 @@ def render_page(token: str) -> str:
   }
   async function apiPost(path, body){
     const b = Object.assign({}, body || {});
-    if (PROJECT) b.project = PROJECT;
+    // a caller-supplied project wins (e.g. HIVE MIND rows acting on their own
+    // namespace); otherwise scope to the picker like every other call
+    if (PROJECT && !b.project) b.project = PROJECT;
     const r = await fetch(u(withProj(path)), { method:'POST', headers:{ 'Content-Type':'application/json',
       'X-Hive-Token': TOKEN }, body: JSON.stringify(b) });
     return r.json();
@@ -594,6 +602,105 @@ def render_page(token: str) -> str:
   }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
+
+  // --- Oversee: live Claude work — loop runs AND interactive sessions ---
+  // Cards mirror the Improvements view (glyph + pills + expandable body);
+  // expansion state survives the live refresh via OV_EXPANDED. The expanded
+  // detail is a Claude-style task checklist (\\u2713 done, pulsing \\u25d0
+  // doing, \\u25cb pending) in the hive palette.
+  let OV_DATA = null;
+  const OV_EXPANDED = new Set();
+  function ovStatus(r){
+    if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
+    if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
+    if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
+    if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
+    return ['\\u25a0', 'snone', r.status || 'ended'];
+  }
+  function ovRow(glyph, cls, text, dim){
+    return '<div class="snip'+(dim?' dup':'')+'"><span class="'+cls+'">'+glyph
+      + '</span> '+esc(text)+'</div>';
+  }
+  function ovGroup(items, glyph, cls, dim){
+    return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
+  }
+  function ovCard(r, showProj){
+    const st = ovStatus(r);
+    const open = OV_EXPANDED.has(r.run_id);
+    const head = '<span class="statusDot '+st[1]+'">'+st[0]+'</span>'
+      + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
+      + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
+      + esc(r.title || r.run_id)+'</span>'
+      + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
+      + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
+    const chat = r.kind === 'chat';
+    const pills = '<span class="pill">'+esc(st[2])+'</span> '
+      + '<span class="pill">'+(r.iterations||0)+(chat
+          ? ' command'+((r.iterations||0)===1?'':'s')
+          : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
+      + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
+      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
+                    + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
+    let body = '';
+    if (open){
+      body += ovGroup(r.done, '\\u2713', 'ovdone');
+      if (r.doing) body += ovRow('\\u25d0', 'ovspin', r.doing);
+      body += ovGroup(r.planned, '\\u25cb', 'ovpend')
+            + ovGroup(r.not_yet, '\\u25cb', 'ovpend', true);
+      body += '<div class="snip dup">started '+esc(r.started||'')
+            + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
+    }
+    return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
+      + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
+  }
+  function paintOversee(){
+    if (!OV_DATA) return;
+    // Online/offline strip: shown ONLY while Claude is working on a session.
+    const online = OV_DATA.any_online
+      ? '<div class="row"><span class="pill" style="color:#46c46a;border-color:#2a5">'
+        + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
+      : '';
+    if (!OV_DATA.runs.length){
+      showHTML(online + '<h2 class="h">No work sessions \\u2014 interactive '
+        + 'Claude sessions appear here as their telemetry flows, and '
+        + '<code>hive loop</code> runs join them. Finished sessions are '
+        + 'removed automatically.</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(online
+      + '<h2 class="h">'+OV_DATA.runs.length+' work session'
+      + (OV_DATA.runs.length===1?'':'s')
+      + (OV_DATA.dismissed ? ' <span class="dup">\\u00b7 '+OV_DATA.dismissed
+         +' finished &amp; removed</span>' : '')+'</h2>'
+      + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>');
+    view.querySelectorAll('.ovtitle').forEach(el => el.onclick = () => {
+      const rid = el.closest('li').dataset.rid;
+      if (OV_EXPANDED.has(rid)) OV_EXPANDED.delete(rid); else OV_EXPANDED.add(rid);
+      paintOversee();
+    });
+    view.querySelectorAll('.ovdel').forEach(el => el.onclick = (ev) => {
+      ev.stopPropagation(); deleteRun(el.dataset.rid, el.dataset.proj);
+    });
+  }
+  async function renderOversee(){
+    const res = await apiGet('/api/oversee');
+    if (!res || res.ok === false) throw new Error((res && res.error) || 'oversee fetch failed');
+    OV_DATA = res;
+    paintOversee();
+  }
+  async function deleteRun(rid, proj){
+    if (!confirm('Delete this session from Oversee? Its events stay in the '
+        + 'ledger (append-only), it just stops being shown.')) return;
+    await run('deleting session\\u2026', async () => {
+      const body = {run_id: rid};
+      if (PROJECT === '*' && proj) body.project = proj;
+      const res = await apiPost('/api/oversee/dismiss', body);
+      if (!res.ok) { showText(res); return; }
+      await renderOversee();
+    });
+  }
+  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }
@@ -672,181 +779,206 @@ def render_page(token: str) -> str:
     });
   }
 
-  // Skills & plugins: the live list re-renders every LIVE_MS via liveFn, and
-  // the server rebuilds only when its cheap disk signature changes — so an
-  // install, uninstall, or local-panel skill delete shows up within seconds
-  // at near-zero polling cost. The free/paid ranking stays below the list,
-  // fed by the stale-gated evaluation sidecar (autoscan kicked on view open;
-  // the Heavy "Plugins scan" button still forces a full re-evaluation).
-  // --- Skills & plugins: same mechanism as Improvements ---
-  // PLUG_INV/PLUG_STATUS/PLUG_RANKING are the cache; renderPlugins fetches them,
-  // paintPlugins filters/sorts/renders instantly (no round-trip). Query + the
-  // filter/sort selects live OUTSIDE the view (in the controls bar) so the 2.5s
-  // live refresh — which only rewrites #view via paintPlugins — preserves what
-  // you typed and picked, exactly like the Improvements view.
+  // --- Skill & Plugin: the viewing panel over the skill database (U7) ---
+  // Same mechanism as Improvements: renderPlugins fetches everything one poll
+  // cycle needs in a single parallel burst, paintPlugins filters/renders
+  // instantly from the in-memory caches. Query + filters live OUTSIDE the view
+  // (in the controls bar) so the 2.5s live refresh — which only rewrites
+  // #view — preserves what you typed and picked. Cards render COLLAPSED by
+  // default (300+ skills must not paint as a wall of open cards); the expanded
+  // set is keyed by skill name and survives every repaint, exactly like
+  // IMP_EXPANDED.
   let PLUG_INV = {plugins: [], local_skills: [], counts: {}};
-  let PLUG_STATUS = {};             // {skillName: 'ok'|'fail'} last call outcome
-  let PLUG_COUNTS = {};             // {skillName: total invoke count}
-  let PLUG_RANKING = null;
+  let PLUG_STATUS = {};             // /api/skills/status: {name: 'ok'|'fail'}
+  let PLUG_COUNTS = {};             // /api/skills/status: {name: total invoke count}
+  let PLUG_STATS = {};              // /api/skills/stats: per-skill telemetry
+  let PLUG_REC = {coverage: {measured: 0, total: 0}, recommendations: []};
+  let PLUG_RULES = {};              // 'skill:<name>' -> improvements auto lesson
   let PLUG_QUERY = '';
   let PLUG_STATUSF = 'all';         // all | ok | fail | uncalled
-  let PLUG_MARKET = 'all';          // marketplace/source filter
+  let PLUG_SRC = 'all';             // source plugin filter ('local' = standalone)
+  let PLUG_MEASURED = false;        // measured-only toggle
   let PLUG_SORT = 'status';         // status | name | source
   let PLUG_DIR = 'asc';             // toggle reverses the active order
-  // green when the last headless call succeeded, red when it failed, grey when
-  // never called. A skill name calls invokeSkill(name, plugin) to run it.
-  function statusDot(name){
-    const s = PLUG_STATUS[name];
-    const cls = s === 'ok' ? 'sok' : (s === 'fail' ? 'sbad' : 'snone');
-    const title = s === 'ok' ? 'last call succeeded'
-      : (s === 'fail' ? 'last call FAILED — see Improvements' : 'never called');
+  const PLUG_EXPANDED = new Set();  // expanded cards, keyed by skill name
+  const PLUG_DETAILS = {};          // name -> /api/skills/detail payload (lazy)
+  const PLUG_HIST = {};             // name -> /api/skills/history list
+  const PLUG_LASTCALL = {};         // name -> last invoke result from this tab
+  const PLUG_REFLECT = {};          // name -> last reflect_one result line
+  const PLUG_CALLING = new Set();   // in-flight invokes (button spinner state)
+  const PLUG_REFLECTING = new Set();  // in-flight reflect_one calls
+  let PLUG_GEN = 0;                 // poll generation: stale fetches discard themselves
+  function statusDot(status){
+    const cls = status === 'ok' ? 'sok' : (status === 'fail' ? 'sbad' : 'snone');
+    const title = status === 'ok' ? 'last call succeeded'
+      : (status === 'fail' ? 'last call FAILED \\u2014 see Needed changes' : 'never called');
     return '<span class="statusDot '+cls+'" title="'+title+'">\\u25cf</span>';
   }
   const PLUG_STATUS_LEGEND = {
     ok:       ['sok',  'green \\u2014 last call succeeded'],
-    fail:     ['sbad', 'red \\u2014 last call failed (feeds Improvements)'],
+    fail:     ['sbad', 'red \\u2014 last call failed'],
     uncalled: ['snone','grey \\u2014 never called']};
-  // legend items double as one-click status filters (click again to clear) —
-  // the active filter is highlighted so the legend and the dropdown stay in sync.
+  // legend items double as one-click status filters (click again to clear);
+  // the trailing badge explains `estimated` provenance, which isn't a filter.
   function plugLegend(){
     return '<div class="legend">'+['ok','fail','uncalled'].map(k =>
       '<span class="legitem'+(PLUG_STATUSF===k?' on':'')+'" title="click to filter" '
       + 'onclick="setPlugStatus('+escAttr(JSON.stringify(k))+')">'
       + '<span class="statusDot '+PLUG_STATUS_LEGEND[k][0]+'">\\u25cf</span>'
-      + PLUG_STATUS_LEGEND[k][1]+'</span>').join(' \\u00b7 ')+'</div>';
+      + PLUG_STATUS_LEGEND[k][1]+'</span>').join(' \\u00b7 ')
+      + ' \\u00b7 <span class="pill est">estimated</span> ranked by description breadth, not measured calls'
+      + '</div>';
   }
   function setPlugStatus(k){
     PLUG_STATUSF = (PLUG_STATUSF === k) ? 'all' : k;   // toggle off when re-clicked
     const sel = document.getElementById('plugstatus'); if (sel) sel.value = PLUG_STATUSF;
     paintPlugins();
   }
-  // stats strip — three count tiles, rendered on every branch incl. empty states
+  // stat strip: plugin/skill counts, measured coverage from the recommend
+  // payload, and the overall completion rate — one cheap pass over the stats
+  // map, shown honestly ('—' until anything has been called at all).
   function plugStrip(){
     const c = PLUG_INV.counts || {};
+    const cov = PLUG_REC.coverage || {};
+    let calls = 0, ok = 0;
+    Object.values(PLUG_STATS).forEach(s => { calls += s.calls||0; ok += s.ok||0; });
+    const rate = calls ? Math.round(ok/calls*100)+'%' : '\\u2014';
     return '<div class="cards" style="margin-bottom:12px">'
       + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
       + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
-      + '<div class="card"><div class="big">'+(c.local_skills ?? 0)+'</div><div class="lbl">local skills</div></div>'
+      + '<div class="card"><div class="big">'+(cov.measured ?? 0)+' of '+(cov.total ?? (c.skills_total ?? 0))+'</div><div class="lbl">measured (\\u22653 calls)</div></div>'
+      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">completion rate \\u00b7 '+ok+'/'+calls+' calls</div></div>'
       + '</div>';
   }
   const PLUG_SORT_LABELS = {
     status: ['needs-attention first', 'healthy first'],
     name:   ['name A\\u2192Z', 'name Z\\u2192A'],
-    source: ['by source A\\u2192Z', 'by source Z\\u2192A']};
+    source: ['by plugin A\\u2192Z', 'by plugin Z\\u2192A']};
   const PLUG_STATUS_RANK = {fail: 0, uncalled: 1, ok: 2};
   function plugDirLabel(){ return PLUG_SORT_LABELS[PLUG_SORT][PLUG_DIR==='asc' ? 0 : 1]; }
   function syncPlugDirBtn(){ const b = document.getElementById('plugdir'); if (b) b.textContent = plugDirLabel(); }
+  function onPlugSort(v){ PLUG_SORT = v; syncPlugDirBtn(); paintPlugins(); }
+  function togglePlugDir(){ PLUG_DIR = PLUG_DIR==='asc' ? 'desc' : 'asc'; syncPlugDirBtn(); paintPlugins(); }
   function plugCompare(a, b){
     let c;
     if (PLUG_SORT === 'name') c = (a.name||'').localeCompare(b.name||'');
     else if (PLUG_SORT === 'source')
-      c = (a.source||'').localeCompare(b.source||'') || (a.name||'').localeCompare(b.name||'');
+      c = (a.plugin||'local').localeCompare(b.plugin||'local') || (a.name||'').localeCompare(b.name||'');
     else c = (PLUG_STATUS_RANK[a.status] ?? 1)-(PLUG_STATUS_RANK[b.status] ?? 1)
       || (a.name||'').localeCompare(b.name||'');
     return PLUG_DIR === 'asc' ? c : -c;
   }
-  // one flat, filterable entry per skill (local + every plugin's skills), each
-  // carrying its call status — the primary card list, analogous to lessons.
+  // one flat entry per installed skill, joined with its telemetry and its
+  // recommend-engine entry (primary or alternative) — the SINGLE in-memory
+  // object list both the Recommended-now section and the full card list render
+  // from, so a Call from either place updates both on the same repaint.
+  function plugRecIndex(){
+    const map = {};
+    (PLUG_REC.recommendations || []).forEach(r => {
+      if (!(r.name in map)) map[r.name] = r;
+      (r.alternatives || []).forEach(a => { if (!(a.name in map)) map[a.name] = a; });
+    });
+    return map;
+  }
   function plugSkillEntries(){
+    const missing = new Set((PLUG_INV.plugins||[]).filter(p => p.present === false).map(p => p.name));
+    const recMap = plugRecIndex();
     const out = [];
-    (PLUG_INV.local_skills || []).forEach(s => out.push({
-      name: s.name, plugin: null, source: 'local', marketplace: 'local',
-      trigger: s.trigger || '', status: PLUG_STATUS[s.name] || 'uncalled'}));
-    (PLUG_INV.plugins || []).forEach(p => (p.skills || []).forEach(s => out.push({
-      name: s.name, plugin: p.name, source: p.name, marketplace: p.marketplace,
-      trigger: s.trigger || '', status: PLUG_STATUS[s.name] || 'uncalled'})));
+    const push = (name, plugin, trigger) => {
+      const st = PLUG_STATS[name] || null;
+      const rec = recMap[name] || null;
+      out.push({name: name, plugin: plugin, trigger: trigger || '',
+        status: (st && st.last_outcome) || PLUG_STATUS[name] || 'uncalled',
+        stats: st, rec: rec,
+        estimated: !!(rec && rec.provenance === 'estimated'),
+        measured: rec ? rec.provenance === 'measured'
+                      : !!(st && st.calls >= 3 && st.completion_rate != null),
+        missing: plugin ? missing.has(plugin) : false});
+    };
+    (PLUG_INV.local_skills || []).forEach(s => push(s.name, null, s.trigger));
+    (PLUG_INV.plugins || []).forEach(p => (p.skills || []).forEach(s => push(s.name, p.name, s.trigger)));
     return out;
   }
-  // invoke-count badge right after the skill name — how many times it has been
-  // called through MindHive (ok + failed), so callability reads off the top list.
+  function indexSkillRules(auto){
+    PLUG_RULES = {};
+    (auto || []).forEach(a => {
+      const sig = a.signature || '';
+      if (sig.indexOf('skill:') === 0 && !(sig in PLUG_RULES)) PLUG_RULES[sig] = a;
+    });
+  }
+  // invoke-count badge right after the skill name — how many times this skill
+  // has been called through MindHive (ok + failed), so callability reads off
+  // the card list without expanding. Counts come from /api/skills/status;
+  // per-skill telemetry (stats.calls) is the fallback when counts lag a poll.
   function callCount(name){
-    const n = PLUG_COUNTS[name] || 0;
+    const n = PLUG_COUNTS[name] || (PLUG_STATS[name] && PLUG_STATS[name].calls) || 0;
     return n ? '<span class="callcount" title="invoked '+n+' time'+(n===1?'':'s')
       + ' via MindHive">'+n+'\\u00d7</span>' : '';
   }
-  const skillChip = (name, plugin) => statusDot(name) + '<span class="skchip" onclick="showSkillDetail('
-      + escAttr(JSON.stringify(name)) + ',' + escAttr(JSON.stringify(plugin||null)) + ')">'
-      + esc(name)+'</span>'+callCount(name);
+  // one poll cycle = one parallel fetch burst: inventory + status + stats +
+  // recommend + improvements (for the skill:* prevention-rule index) + the
+  // call history of every expanded card. Auxiliary fetches degrade to their
+  // last good cache so a single flaky endpoint can't blank the view.
+  // Each cycle stamps a generation before fetching; a cycle that resolves
+  // after a newer one started (or after invokeSkill wrote fresher data)
+  // discards its results — no cache writes, no paint.
   async function renderPlugins(){
-    const res = await apiGet('/api/plugins/inventory');
-    PLUG_INV = res.inventory || {plugins: [], local_skills: [], counts: {}};
-    try {
-      const st = await apiGet('/api/skills/status') || {};
-      PLUG_STATUS = st.status || {};
-      PLUG_COUNTS = st.counts || {};
-    } catch(_){}
-    paintPlugins();
+    const gen = ++PLUG_GEN;
+    const expanded = Array.from(PLUG_EXPANDED);
+    const res = await Promise.all([
+      apiGet('/api/plugins/inventory'),
+      apiGet('/api/skills/status').catch(() => null),
+      apiGet('/api/skills/stats').catch(() => null),
+      apiGet('/api/skills/recommend').catch(() => null),
+      apiGet('/api/improvements').catch(() => null),
+    ].concat(expanded.map(n =>
+      apiGet('/api/skills/history?name='+encodeURIComponent(n)+'&limit=25').catch(() => null))));
+    if (gen !== PLUG_GEN) return;   // a newer cycle owns the caches now
+    PLUG_INV = (res[0] && res[0].inventory) || {plugins: [], local_skills: [], counts: {}};
+    if (res[1]) { PLUG_STATUS = res[1].status || {}; PLUG_COUNTS = res[1].counts || {}; }
+    if (res[2] && res[2].stats) PLUG_STATS = res[2].stats;
+    if (res[3] && res[3].recommendations) PLUG_REC = res[3];
+    if (res[4] && res[4].auto) indexSkillRules(res[4].auto);
+    expanded.forEach((n, i) => { if (res[5+i]) PLUG_HIST[n] = res[5+i]; });
+    if (liveFn === renderPlugins) paintPlugins();
   }
-  function paintPlugins(){
-    const markets = [...new Set((PLUG_INV.plugins||[]).map(p=>p.marketplace).filter(Boolean))];
-    if (PLUG_INV.local_skills && PLUG_INV.local_skills.length) markets.push('local');
-    fillSelect('plugmarket', markets, PLUG_MARKET);
-    const strip = plugStrip() + plugLegend();
-    const q = PLUG_QUERY.trim().toLowerCase();
-    const skills = plugSkillEntries().filter(e =>
-        (PLUG_STATUSF==='all' || e.status===PLUG_STATUSF)
-        && (PLUG_MARKET==='all' || e.marketplace===PLUG_MARKET)
-        && (!q || ((e.name||'')+' '+(e.source||'')+' '+(e.trigger||'')).toLowerCase().includes(q)))
-      .sort(plugCompare);
-    const plugins = (PLUG_INV.plugins||[]).filter(p =>
-        (PLUG_MARKET==='all' || p.marketplace===PLUG_MARKET)
-        && (!q || ((p.name||'')+' '+(p.marketplace||'')+' '+(p.version||'')).toLowerCase().includes(q)))
-      .sort((a,b)=>{ const c=(a.name||'').localeCompare(b.name||''); return PLUG_DIR==='asc'?c:-c; });
-    if (!skills.length && !plugins.length) {
-      showHTML(strip + '<h2 class="h">'
-        + ((PLUG_INV.plugins||[]).length || (PLUG_INV.local_skills||[]).length
-           ? 'No skills or plugins match your filters.'
-           : 'No skills or plugins installed.')+'</h2>');
-      return;
-    }
-    let html = strip;
-    // Skills and plugins share ONE combined heading — a plugin is a container of
-    // skills, so they read as a single "Skills & Plugins" surface rather than two
-    // disconnected sections with a standalone "Plugins" banner.
-    html += '<h2 class="h">Skills &amp; Plugins <span class="lbl">'
-      + skills.length+' skill'+(skills.length===1?'':'s')
-      + ' \\u00b7 '+plugins.length+' plugin'+(plugins.length===1?'':'s')+'</span></h2>';
-    html += skills.length
-      ? '<ul class="hits">'+skills.map(e => '<li><div class="file">'+skillChip(e.name, e.plugin)
-          + ' \\u00b7 <span class="pill">'+esc(e.source)+'</span>'
-          + '<button class="mini callbtn" title="run this skill via a headless Claude" '
-          + 'onclick="invokeSkill('+escAttr(JSON.stringify(e.name))+','+escAttr(JSON.stringify(e.plugin))+')">\\u25b6 call</button>'
-          + '</div>'
-          + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '')+'</li>').join('')+'</ul>'
-      : '<div class="dup">none match</div>';
-    // Light divider inside the same section (not a second heading) so the plugin
-    // rows stay visually grouped under the one combined banner above.
-    html += '<div class="lbl" style="margin-top:16px;margin-bottom:6px">plugins</div>';
-    html += plugins.length
-      ? '<ul class="hits">'+plugins.map(p => '<li><div class="file">'+esc(p.name)+' '+esc(p.version)
-          + ' \\u00b7 '+esc(p.marketplace)
-          + (p.present === false ? ' \\u00b7 <span class="err">missing on disk</span>' : '')
-          + ' \\u00b7 '+p.skills.length+' skill'+(p.skills.length===1?'':'s')+'</div>'
-          + (p.skills.length ? '<div class="snip">'+p.skills.map(s=>skillChip(s.name, p.name)).join(' ')+'</div>' : '')
-          + '</li>').join('')+'</ul>'
-      : '<div class="dup">none match</div>';
-    if (PLUG_RANKING && (PLUG_RANKING.recommendations || []).length){
-      html += '<h2 class="h" style="margin-top:16px">Recommended (free, by breadth)</h2><ul class="hits">'
-        + PLUG_RANKING.recommendations.map(r => '<li><div class="file">'+esc(r.name)
-            + ' \\u00b7 score '+esc(r.breadth_score)+'</div>'
-            + (r.note ? '<div class="snip">'+esc(r.note)+'</div>' : '')+'</li>').join('')
-        + '</ul>';
-    }
-    showHTML(html);
-    // click a skill's trigger line to expand/collapse it (mirrors note rows)
-    view.querySelectorAll('.hits .snip.one').forEach(el =>
-      el.onclick = () => el.classList.toggle('one'));
+  function fmtRate(r){ return r == null ? '\\u2014' : Math.round(r*100)+'%'; }
+  function skMetrics(st){
+    if (!st || !st.calls)
+      return '<div class="skmeta"><b>Metrics</b> <span class="lbl">\\u2014 (uncalled)</span></div>';
+    return '<div class="skmeta"><b>Metrics</b> <span class="lbl">'
+      + st.calls+' call'+(st.calls===1?'':'s')+' \\u00b7 '+(st.ok||0)+' ok \\u00b7 '
+      + (st.fail||0)+' fail \\u00b7 completion '+fmtRate(st.completion_rate)
+      + ' \\u00b7 last outcome '+esc(st.last_outcome||'\\u2014')
+      + ' \\u00b7 last used '+esc(st.last_used||'\\u2014')+'</span></div>';
   }
-  function onPlugSearch(v){ PLUG_QUERY = v; paintPlugins(); }
-  function onPlugStatus(v){ PLUG_STATUSF = v; paintPlugins(); }
-  function onPlugMarket(v){ PLUG_MARKET = v; paintPlugins(); }
-  function onPlugSort(v){ PLUG_SORT = v; syncPlugDirBtn(); paintPlugins(); }
-  function togglePlugDir(){ PLUG_DIR = PLUG_DIR==='asc' ? 'desc' : 'asc'; syncPlugDirBtn(); paintPlugins(); }
+  // "Needed changes" = the active prevention rule reflected from this skill's
+  // skill:<name> incident (R6); an unreflected incident is named as such.
+  function skNeeded(name){
+    const r = PLUG_RULES['skill:'+name];
+    if (!r) return '';
+    if (r.active_rule)
+      return '<div class="skmeta"><b>Needed changes</b><div class="snip">'+esc(r.active_rule)+'</div>'
+        + (r.lesson ? '<div class="snip dup">Lesson: '+esc(r.lesson)+'</div>' : '')+'</div>';
+    return '<div class="skmeta"><b>Needed changes</b> <span class="lbl">failure recorded '
+      + (r.occurrences||1)+'\\u00d7 \\u2014 not yet reflected into a rule</span></div>';
+  }
+  function skDescription(name){
+    const d = PLUG_DETAILS[name];
+    if (!d) return '<div class="skmeta"><span class="lbl">loading description\\u2026</span></div>';
+    if (d.missing) return '<div class="skmeta"><span class="lbl">no SKILL.md found for this skill</span></div>';
+    return '<div class="skmeta"><b>Intended use</b><div class="snip">'+esc(d.intended_use||'\\u2014')+'</div></div>'
+      + '<div class="skmeta"><b>Added</b> <span class="lbl">'+esc(d.added_at||'unknown')
+      + (d.source ? ' \\u00b7 '+esc(d.source) : '')+'</span></div>'
+      + '<div class="skmeta"><b>Full description</b><pre class="skbody">'+esc(d.body||'')+'</pre></div>';
+  }
   // Call history: every past invoke of this skill (green ✔ / red ✖), newest
-  // first, from the same ledger events that drive the status dot — so the detail
-  // panel shows not just the LAST outcome but the whole record of calls.
+  // first, from the same ledger events that drive the status dot. null/undefined
+  // means "not fetched yet" — distinct from an empty (never called) history.
   function callHistoryHTML(hist){
-    if (!hist || !hist.length)
+    if (hist == null)
+      return '<div class="skmeta"><b>Call history</b> <span class="lbl">loading\\u2026</span></div>';
+    if (!hist.length)
       return '<div class="skmeta"><b>Call history</b> <span class="lbl">never called</span></div>';
     return '<div class="skmeta"><b>Call history</b> <span class="lbl">'+hist.length
       + ' call'+(hist.length===1?'':'s')+'</span><ul class="hits">'
@@ -856,90 +988,286 @@ def render_page(token: str) -> str:
           + (h.text ? '<div class="snip one">'+esc(h.text)+'</div>' : '')+'</li>').join('')
       + '</ul></div>';
   }
-  // Click-through detail: intended use at the very top, then when it was added,
-  // then the full SKILL.md body. Pauses the live refresh so the panel you're
-  // reading isn't wiped by the 2.5s inventory poll.
-  async function showSkillDetail(name, plugin){
-    liveFn = null;
-    const q = '/api/skills/detail?name='+encodeURIComponent(name)
-      + (plugin ? '&plugin='+encodeURIComponent(plugin) : '');
-    run('loading '+name, async () => {
-      const hq = '/api/skills/history?name='+encodeURIComponent(name)+'&limit=25';
-      const [d, hist] = await Promise.all([apiGet(q), apiGet(hq).catch(()=>[])]);
-      if (!d || d.ok === false){ showText('No detail found for “'+name+'”.'); return; }
-      const plug = d.source && d.source !== 'local' ? d.source : null;
-      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back to skills &amp; plugins</button>'
-        + '<button onclick="invokeSkill('+escAttr(JSON.stringify(d.name))+','+escAttr(JSON.stringify(plug))+')">'
-        + '\\u25b6 call this skill</button>'+statusDot(d.name)+callCount(d.name)+'</div>'
-        + '<h2 class="h">'+esc(d.name)+'</h2>'
-        + '<div class="skmeta"><b>Intended use</b><div class="snip">'+esc(d.intended_use || '—')+'</div></div>'
-        + '<div class="skmeta"><b>Added</b> <span class="lbl">'+esc(d.added_at || 'unknown')
-        + (d.source ? ' \\u00b7 '+esc(d.source) : '')+'</span></div>'
-        + callHistoryHTML(hist || [])
-        + '<div class="skmeta"><b>Full description</b><pre class="skbody">'+esc(d.body || '')+'</pre></div>');
-    });
+  function lastCallHTML(name){
+    const lc = PLUG_LASTCALL[name];
+    if (!lc) return '';
+    return '<div class="skmeta"><b>Last call (this tab)</b> '
+      + (lc.ok ? '<span class="ok">\\u2714 ok</span>'
+               : '<span class="err">\\u2716 failed'+(lc.exit != null ? ' (exit '+esc(lc.exit)+')' : '')+'</span>')
+      + '<pre class="skbody">'+esc(lc.excerpt||'(no output)')+'</pre></div>';
   }
-  // Call a skill headlessly via MindHive. Each call spawns a full `claude`, so
-  // it's gated behind an explicit confirm. The dot turns green on success, red
-  // on failure; a failure is recorded as an incident and flows into the
-  // Improvements loop so the system learns from bad calls.
-  function invokeSkill(name, plugin){
-    if(!confirm('Call the "'+name+'" skill now? This runs a headless Claude and can take a while.')) return;
-    controls.innerHTML=''; liveFn = null;
-    run('calling '+name+'…', async () => {
-      const res = await apiPost('/api/skills/invoke', {name: name, plugin: plugin});
-      PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
-      PLUG_COUNTS[name] = (PLUG_COUNTS[name]||0)+1;
-      const head = res.ok ? '<span class="ok">\\u2714 '+esc(name)+' succeeded</span>'
-                          : '<span class="err">\\u2716 '+esc(name)+' failed (exit '+esc(res.exit)+')</span>';
-      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '
-        + '<button onclick="showImprovements(true)">open Improvements</button>'
-        + (res.ok ? '' : ' <button onclick="reflectFailure('+escAttr(JSON.stringify(name))+')">'
-            + '\\u21bb reflect this failure</button>')+'</div>'
-        + '<h2 class="h">'+head+'</h2>'
-        + '<div class="skmeta"><b>Output</b><pre class="skbody">'+esc(res.excerpt || '(no output)')+'</pre></div>'
-        + (res.ok ? '' : '<div class="lbl">This failure was recorded. Click \\u201creflect this failure\\u201d to learn a prevention rule from it now, or let it feed the Improvements loop on recurrence.</div>'));
-    });
+  // Call button states: suppressed for skills of a plugin that's missing on
+  // disk, spinner while ITS invoke is in flight (state lives in PLUG_CALLING
+  // so the 2.5s repaint can't wipe it), normal otherwise.
+  function callBtn(e){
+    if (e.missing) return '';
+    if (PLUG_CALLING.has(e.name))
+      return '<button class="mini callbtn" disabled>\\u27f3 calling\\u2026</button>';
+    return '<button class="mini callbtn skcall" data-name="'+escAttr(e.name)
+      + '" data-plugin="'+escAttr(e.plugin||'')+'" '
+      + 'title="run this skill via a headless Claude">\\u25b6 call</button>';
   }
-  // Learn from a single failed call on demand: reflect the skill:<name> incident
-  // into a prevention rule immediately (bypassing the recurrence gate), so the
-  // system adapts from one mistake instead of waiting for it to recur. Spawns
-  // the claude CLI once, so it's behind a confirm.
-  function reflectFailure(name){
-    if(!confirm('Reflect the "'+name+'" failure into a prevention rule now? Runs the claude CLI once.')) return;
-    controls.innerHTML=''; liveFn = null;
-    run('reflecting '+name+'\\u2026', async () => {
-      const res = await apiPost('/api/rules/reflect_one', {signature: 'skill:'+name});
-      const head = res.ok
-        ? '<span class="ok">\\u2714 learned a prevention rule for '+esc(name)+'</span>'
-        : '<span class="err">\\u2716 '+esc(res.error || 'reflection failed')+'</span>';
-      showHTML('<div class="row"><button onclick="showPlugins()">\\u2190 back</button> '
-        + '<button onclick="showImprovements(true)">open Improvements</button></div>'
-        + '<h2 class="h">'+head+'</h2>'
-        + (res.ok ? '<div class="lbl">See it in the Improvements view — its lesson and prevention rule are now recorded.</div>' : ''));
-    });
+  function modePill(mode){
+    if (mode === 'auto')
+      return ' <span class="pill" style="color:#46c46a;border-color:#2a5" '
+        + 'title="proven track record \\u2014 may be applied automatically">auto</span>';
+    return ' <span class="pill est" title="unproven \\u2014 suggested only, '
+      + 'needs your approval before it runs">suggest</span>';
   }
-  function showPlugins(){
+  function skBadges(e){
+    let b = ' \\u00b7 <span class="pill">'+esc(e.plugin||'local')+'</span>';
+    if (e.estimated) b += ' <span class="pill est" title="score used the description-breadth prior \\u2014 no measured completion rate yet">estimated</span>';
+    if (e.rec && e.rec.execution_mode) b += modePill(e.rec.execution_mode);
+    if (e.rec && e.rec.outcome_category)
+      b += ' <span class="pill">'+esc(e.rec.outcome_category)+'</span>';
+    if (e.rec && e.rec.try_to_measure) b += ' <span class="pill est">try to measure</span>';
+    if (e.missing) b += ' <span class="err">plugin missing on disk</span>';
+    return b;
+  }
+  function skillCard(e){
+    const open = PLUG_EXPANDED.has(e.name);
+    let html = '<li class="skrow" data-name="'+escAttr(e.name)+'">'
+      + '<div class="file skhead" data-name="'+escAttr(e.name)+'" data-plugin="'
+      + escAttr(e.plugin||'')+'" style="cursor:pointer" title="click to '
+      + (open?'collapse':'expand')+'">'
+      + statusDot(e.status)+esc(e.name)+callCount(e.name)+skBadges(e)+callBtn(e)+'</div>';
+    if (!open)
+      return html + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '') + '</li>';
+    html += skDescription(e.name) + skMetrics(e.stats) + skNeeded(e.name);
+    if (e.status === 'fail' && !e.missing)
+      html += '<div class="skmeta">'+(PLUG_REFLECTING.has(e.name)
+        ? '<button class="mini" disabled>\\u27f3 reflecting\\u2026</button>'
+        : '<button class="mini skreflect" data-name="'+escAttr(e.name)+'">\\u21bb reflect this failure into a rule</button>')
+        + (PLUG_REFLECT[e.name] ? ' <span class="pill">'+esc(PLUG_REFLECT[e.name])+'</span>' : '')+'</div>';
+    return html + lastCallHTML(e.name) + callHistoryHTML(PLUG_HIST[e.name]) + '</li>';
+  }
+  // Recommended now: the deterministic engine's ranked output (U6), rendered
+  // from the same entry objects as the full list below. Primaries carry their
+  // alternatives (overlap-group losers) and try-to-measure exploration flags,
+  // every one labeled with measured/estimated provenance.
+  const PLUG_REC_TOP = 5;
+  function recChip(name){
+    return '<span class="skchip" data-jump="'+escAttr(name)
+      + '" title="jump to this skill\\u2019s card">'+esc(name)+'</span>';
+  }
+  function recSection(byName){
+    const recs = (PLUG_REC.recommendations || []).slice(0, PLUG_REC_TOP);
+    let html = '';
+    if (recs.length){
+      html += '<h2 class="h">Recommended now</h2><ul class="hits">'
+        + recs.map(r => {
+            const e = byName[r.name];
+            return '<li><div class="file">'+statusDot(e ? e.status : 'uncalled')
+              + recChip(r.name)
+              + ' \\u00b7 <span class="pill'+(r.provenance==='estimated'?' est':'')+'">'+esc(r.provenance)+'</span>'
+              + modePill(r.execution_mode)
+              + ' \\u00b7 score '+esc(r.score)
+              + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
+              + (e ? callBtn(e) : '')+'</div>'
+              + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
+                  + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
+                      + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
+              + '</li>';
+          }).join('')+'</ul>';
+    }
+    // Discontinued: skills stopped by the improvements linkage (active
+    // prevention rule + failure streak) — shown with WHY so recovery is clear.
+    const disc = PLUG_REC.discontinued || [];
+    if (disc.length){
+      html += '<h2 class="h">Discontinued <span class="lbl">excluded until the '
+        + 'incident resolves or a successful call breaks the streak</span></h2>'
+        + '<ul class="hits">'+disc.map(d =>
+            '<li><div class="file"><span class="statusDot sbad">\\u2716</span>'
+            + recChip(d.name)+' \\u00b7 <span class="pill">'+d.fail_streak
+            + ' consecutive failures</span></div>'
+            + '<div class="snip"><b>Rule:</b> '+esc(d.rule)+'</div></li>').join('')
+        + '</ul>';
+    }
+    return html;
+  }
+  // Plugins section = a COMPACT INDEX, not a second card render: name, version,
+  // aggregate dot (any fail → red, else any ok → green), and skill-name chips
+  // that jump to the skill's card above. Missing-on-disk plugins keep their err
+  // badge (their skills have no cards — the registry lists them but the disk
+  // scan found nothing to call).
+  function aggDot(names, statusByName){
+    const sts = names.map(n => statusByName[n] || 'uncalled');
+    return statusDot(sts.includes('fail') ? 'fail' : (sts.includes('ok') ? 'ok' : 'uncalled'));
+  }
+  function pluginIndex(entries){
+    const statusByName = {};
+    entries.forEach(e => {
+      if (!(e.name in statusByName) || e.status === 'fail') statusByName[e.name] = e.status;
+    });
+    const rows = (PLUG_INV.plugins || []).map(p => {
+      const names = (p.skills || []).map(s => s.name);
+      return '<li><div class="file">'+aggDot(names, statusByName)+esc(p.name)+' '+esc(p.version)
+        + ' \\u00b7 '+esc(p.marketplace)
+        + (p.present === false ? ' \\u00b7 <span class="err">missing on disk</span>' : '')
+        + ' \\u00b7 '+names.length+' skill'+(names.length===1?'':'s')+'</div>'
+        + (names.length ? '<div class="snip">'+names.map(recChip).join(' ')+'</div>' : '')
+        + '</li>';
+    });
+    const loc = (PLUG_INV.local_skills || []).map(s => s.name);
+    if (loc.length)
+      rows.push('<li><div class="file">'+aggDot(loc, statusByName)
+        + 'local skills \\u00b7 '+loc.length+' skill'+(loc.length===1?'':'s')+'</div>'
+        + '<div class="snip">'+loc.map(recChip).join(' ')+'</div></li>');
+    if (!rows.length) return '';
+    return '<div class="lbl" style="margin-top:16px;margin-bottom:6px">plugins '
+      + '\\u2014 click a skill name to jump to its card</div><ul class="hits">'+rows.join('')+'</ul>';
+  }
+  function paintPlugins(){
+    const entries = plugSkillEntries();
+    const byName = {};
+    entries.forEach(e => { if (!(e.name in byName)) byName[e.name] = e; });
+    fillSelect('plugmarket', [...new Set(entries.map(e => e.plugin || 'local'))], PLUG_SRC);
+    const strip = plugStrip() + plugLegend();
+    if (!entries.length){
+      showHTML(strip + '<h2 class="h">No skills or plugins installed.</h2>');
+      return;
+    }
+    const q = PLUG_QUERY.trim().toLowerCase();
+    // search matches name + short description + plugin name (Improvements'
+    // query pattern); default sort = needs attention: fail → uncalled → ok.
+    const list = entries.filter(e =>
+        (PLUG_STATUSF === 'all' || e.status === PLUG_STATUSF)
+        && (PLUG_SRC === 'all' || (e.plugin || 'local') === PLUG_SRC)
+        && (!PLUG_MEASURED || e.measured)
+        && (!q || ((e.name||'')+' '+(e.trigger||'')+' '+(e.plugin||'local')).toLowerCase().includes(q)))
+      .sort(plugCompare);
+    let html = strip + recSection(byName);
+    html += '<h2 class="h">All skills <span class="lbl">'+list.length+' of '
+      + entries.length+' shown</span></h2>';
+    html += list.length
+      ? '<ul class="hits">'+list.map(skillCard).join('')+'</ul>'
+      : '<div class="dup">none match your filters</div>';
+    html += pluginIndex(entries);
+    showHTML(html);
+    view.querySelectorAll('.skhead').forEach(el =>
+      el.onclick = () => toggleSkill(el.dataset.name, el.dataset.plugin || null));
+    view.querySelectorAll('.skcall').forEach(el =>
+      el.onclick = ev => { ev.stopPropagation(); invokeSkill(el.dataset.name, el.dataset.plugin || null); });
+    view.querySelectorAll('.skreflect').forEach(el =>
+      el.onclick = ev => { ev.stopPropagation(); reflectFailure(el.dataset.name); });
+    view.querySelectorAll('[data-jump]').forEach(el =>
+      el.onclick = ev => { ev.stopPropagation(); jumpToSkill(el.dataset.jump); });
+  }
+  // Expanding a card shows the skill detail IN the card: the SKILL.md body and
+  // the call history load lazily on first expand and are cached; the history
+  // cache is then refreshed on every poll while the card stays open.
+  function showSkillDetail(name, plugin){
+    PLUG_EXPANDED.add(name);
+    if (!PLUG_DETAILS[name]){
+      const q = '/api/skills/detail?name='+encodeURIComponent(name)
+        + (plugin ? '&plugin='+encodeURIComponent(plugin) : '');
+      apiGet(q).then(d => {
+        PLUG_DETAILS[name] = (d && d.ok !== false) ? d : {missing: true};
+        if (liveFn === renderPlugins) paintPlugins();
+      }).catch(() => {});
+    }
+    if (!PLUG_HIST[name]){
+      apiGet('/api/skills/history?name='+encodeURIComponent(name)+'&limit=25')
+        .then(h => { PLUG_HIST[name] = h || []; if (liveFn === renderPlugins) paintPlugins(); })
+        .catch(() => {});
+    }
+    paintPlugins();
+  }
+  function toggleSkill(name, plugin){
+    if (PLUG_EXPANDED.has(name)){ PLUG_EXPANDED.delete(name); paintPlugins(); return; }
+    showSkillDetail(name, plugin);
+  }
+  // jump target for recommendation + plugin-index chips: expand the card and
+  // scroll to it; if the current filters hide it, reset them first.
+  function jumpToSkill(name){
+    const entry = plugSkillEntries().find(e => e.name === name);
+    showSkillDetail(name, entry ? entry.plugin : null);
+    let el = Array.from(view.querySelectorAll('.skrow')).find(li => li.dataset.name === name);
+    if (!el){
+      PLUG_QUERY = ''; PLUG_STATUSF = 'all'; PLUG_SRC = 'all'; PLUG_MEASURED = false;
+      syncPlugControls();
+      paintPlugins();
+      el = Array.from(view.querySelectorAll('.skrow')).find(li => li.dataset.name === name);
+    }
+    if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
+  }
+  function syncPlugControls(){
+    const q = document.getElementById('plugq'); if (q) q.value = PLUG_QUERY;
+    const st = document.getElementById('plugstatus'); if (st) st.value = PLUG_STATUSF;
+    const pl = document.getElementById('plugmarket'); if (pl) pl.value = PLUG_SRC;
+    const m = document.getElementById('plugmeasured'); if (m) m.checked = PLUG_MEASURED;
+  }
+  // Call a skill headlessly and update its card IN PLACE: the button carries a
+  // spinner (state in PLUG_CALLING so live repaints keep it), then the card's
+  // dot/metrics/history refresh — never a full-view result screen, which would
+  // lose scroll and filter state. No global busy state either: each call
+  // spawns a full `claude` and can take minutes, and the panel must keep
+  // live-updating around it.
+  async function invokeSkill(name, plugin){
+    if (PLUG_CALLING.has(name)) return;
+    if (!confirm('Call the "'+name+'" skill now? This runs a headless Claude and can take a while.')) return;
+    PLUG_CALLING.add(name);
+    if (liveFn === renderPlugins) paintPlugins();
+    let res;
+    try { res = await apiPost('/api/skills/invoke', {name: name, plugin: plugin || null}); }
+    catch(e){ res = {ok: false, excerpt: String((e && e.message) || e)}; }
+    PLUG_LASTCALL[name] = res;
+    PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+    PLUG_COUNTS[name] = (PLUG_COUNTS[name]||0)+1;
+    PLUG_CALLING.delete(name);
+    PLUG_GEN++;   // invalidate any in-flight poll so it can't clobber the fresh result
+    try {
+      const r = await Promise.all([
+        apiGet('/api/skills/stats').catch(() => null),
+        apiGet('/api/skills/history?name='+encodeURIComponent(name)+'&limit=25').catch(() => null)]);
+      if (r[0] && r[0].stats) PLUG_STATS = r[0].stats;
+      if (r[1]) PLUG_HIST[name] = r[1];
+    } catch(_){}
+    if (liveFn === renderPlugins) paintPlugins();
+  }
+  // Learn from a failed call on demand: reflect the skill:<name> incident into
+  // a prevention rule immediately (bypassing the recurrence gate). Spawns the
+  // claude CLI once, so it's behind a confirm; the result lands in the card's
+  // Needed-changes area in place.
+  async function reflectFailure(name){
+    if (PLUG_REFLECTING.has(name)) return;
+    if (!confirm('Reflect the "'+name+'" failure into a prevention rule now? Runs the claude CLI once.')) return;
+    PLUG_REFLECTING.add(name);
+    if (liveFn === renderPlugins) paintPlugins();
+    let res;
+    try { res = await apiPost('/api/rules/reflect_one', {signature: 'skill:'+name}); }
+    catch(e){ res = {ok: false, error: String((e && e.message) || e)}; }
+    PLUG_REFLECT[name] = res.ok ? 'rule learned \\u2014 see Needed changes'
+                                : (res.error || 'reflection failed');
+    PLUG_REFLECTING.delete(name);
+    try {
+      const imp = await apiGet('/api/improvements');
+      if (imp && imp.auto) indexSkillRules(imp.auto);
+    } catch(_){}
+    if (liveFn === renderPlugins) paintPlugins();
+  }
+  function onPlugSearch(v){ PLUG_QUERY = v; paintPlugins(); }
+  function onPlugStatus(v){ PLUG_STATUSF = v; paintPlugins(); }
+  function onPlugSrc(v){ PLUG_SRC = v; paintPlugins(); }
+  function onPlugMeasured(v){ PLUG_MEASURED = v; paintPlugins(); }
+  function showSkillPanel(){
     const statusOpts = [['all','all'],['fail','red (failed)'],['uncalled','grey (uncalled)'],['ok','green (ok)']]
       .map(kv => '<option value="'+kv[0]+'"'+(PLUG_STATUSF===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
-    const sortOpts = [['status','needs attention'],['name','name'],['source','source']]
+    const sortOpts = [['status','needs attention'],['name','name'],['source','plugin']]
       .map(kv => '<option value="'+kv[0]+'"'+(PLUG_SORT===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
     controls.innerHTML = '<div class="row">'
-      + '<input id="plugq" placeholder="search skills &amp; plugins\\u2026" style="min-width:240px" '
+      + '<input id="plugq" placeholder="search skills\\u2026" style="min-width:240px" '
       + 'value="'+escAttr(PLUG_QUERY)+'" oninput="onPlugSearch(this.value)">'
+      + '<label>plugin <select id="plugmarket" onchange="onPlugSrc(this.value)"></select></label>'
       + '<label>status <select id="plugstatus" onchange="onPlugStatus(this.value)">'+statusOpts+'</select></label>'
-      + '<label>marketplace <select id="plugmarket" onchange="onPlugMarket(this.value)"></select></label>'
+      + '<label><input type="checkbox" id="plugmeasured"'+(PLUG_MEASURED?' checked':'')
+      + ' onchange="onPlugMeasured(this.checked)"> measured only</label>'
       + '<label>sort <select id="plugsort" onchange="onPlugSort(this.value)">'+sortOpts+'</select></label>'
       + '<button id="plugdir" onclick="togglePlugDir()">'+plugDirLabel()+'</button>'
       + '</div>';
     liveFn = renderPlugins;
-    run('loading skills & plugins', async () => {
-      await renderPlugins();                        // the live list paints first
-      apiPost('/api/plugins/autoscan', {})          // ranking refreshes stale-gated
-        .then(() => apiGet('/api/plugins/recommend'))
-        .then(cat => { PLUG_RANKING = cat; if (liveFn === renderPlugins) paintPlugins(); })
-        .catch(()=>{});
-    });
+    run('loading skill & plugin', renderPlugins);
   }
   function doExport(){ window.location = u('/api/export'); }
 
