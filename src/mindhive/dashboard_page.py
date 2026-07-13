@@ -135,6 +135,7 @@ def render_page(token: str) -> str:
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
     <button onclick="runReflect()">Reflect (learn from failures)</button>
+    <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -465,6 +466,11 @@ def render_page(token: str) -> str:
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (a.reroutes) p += ' <span class="pill" title="a previous rule failed; an '
+      + 'alternative route was deployed">rerouted \\u00d7'+a.reroutes+'</span>';
+    if (a.flag === 'reroute_exhausted')
+      p += ' <span class="pill" title="all automatic reroute attempts spent \\u2014 '
+        + 'needs a human rule">reroute exhausted</span>';
     if (!a.active_rule) p += (a.status === 'candidate'
       ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
       : ' <span class="pill">not yet reflected</span>');
@@ -481,7 +487,9 @@ def render_page(token: str) -> str:
          : '');
     let body = '';
     if (a.first_seen) body += '<div class="snip dup">first seen '+esc(a.first_seen)
-      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the rule activated' : '')
+      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the '
+         + (a.reroutes ? 'route deployed' : 'rule activated') : '')
+      + (a.last_reroute ? ' \\u00b7 route deployed '+esc(a.last_reroute) : '')
       + '</div>';
     if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
     if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
@@ -569,6 +577,24 @@ def render_page(token: str) -> str:
       await renderImprovements();
     });
   }
+  // Active resolution: reroute red rules whose nudge failed (and reflect the
+  // rule-less ones) so they can turn green. Same Heavy confirm + inline
+  // banner mechanism as Reflect.
+  async function runResolve(){
+    if(!confirm('Resolve red (find alternative routes for failed rules, reflect '
+      + 'missing ones) \\u2014 runs the claude CLI once per red lesson '
+      + '(a few per click). Continue?')) return;
+    liveFn = renderImprovements;
+    await run('resolving\\u2026', async () => {
+      const res = await apiPost('/api/rules/resolve', {});
+      IMP_BANNER = res.ok
+        ? ('Resolve: '+(res.rerouted||0)+' rerouted \\u00b7 '+(res.reflected||0)
+           +' reflected \\u00b7 '+(res.failed||0)+' failed \\u00b7 '
+           +(res.pending||0)+' still red')
+        : (res.error || 'resolution failed');
+      await renderImprovements();
+    });
+  }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
   function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
@@ -584,6 +610,8 @@ def render_page(token: str) -> str:
       + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
       + '<label>sort <select id="impsort" onchange="onImpSort(this.value)">'+sortOpts+'</select></label>'
       + '<button id="impdir" onclick="toggleImpDir()">'+impDirLabel()+'</button>'
+      + '<button onclick="runResolve()" title="reroute red rules whose nudge '
+      + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }

@@ -218,7 +218,10 @@ def auto_escalate(project=None) -> list:
             continue
         if row.get("rule_source") in (None, "", "none"):
             continue
-        if int((stats.get(sig) or {}).get("leaks") or 0) < incidents.LEAK_LIMIT:
+        # Cumulative since activation (total_leaks): a reroute re-anchors the
+        # classification leak count, but must not postpone the hard-force rung.
+        st = stats.get(sig) or {}
+        if int(st.get("total_leaks") or st.get("leaks") or 0) < incidents.LEAK_LIMIT:
             continue
         entry = man.get(sig) if isinstance(man.get(sig), dict) else {}
         if entry.get("enabled") or entry.get("pinned"):

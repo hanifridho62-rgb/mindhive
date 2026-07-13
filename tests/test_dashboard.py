@@ -1048,6 +1048,88 @@ def test_reflect_rejected_for_hivemind(dashboard_server):
 
 
 # --------------------------------------------------------------------------
+# POST /api/rules/resolve: active resolution over the red (unresolved) set
+# --------------------------------------------------------------------------
+_ROUTES_JSON = ('{"routes": [{"prevention_rule": "take the alternative route", '
+                '"rationale": "different mechanism", "confidence": 0.9}]}')
+
+
+def _seed_leaking_incident(project, sig="raw:leaky"):
+    for s, ts in (("s1", "2026-07-01T10:00:00Z"), ("s2", "2026-07-01T11:00:00Z")):
+        ev_mod.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=s, tags=["auto", "failure"], ts=ts,
+                            project=project)
+    inc_mod.audit(project=project)
+    inc_mod.project(project=project)
+    path = (hp.project_dir(project) / "rules" / "incidents"
+            / f"{inc_mod._safe_name(sig)}.md")
+    path.write_text(inc_mod._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Prevention rule: the failed rule"), encoding="utf-8")
+    inc_mod.project(project=project)
+    ev_mod.append_event("tool_failed",
+                        {"text": "boom", "signature": sig, "action": "x"},
+                        session_id="s3", tags=["auto", "failure"],
+                        ts="2026-07-01T12:00:00Z", project=project)   # leak
+
+
+def test_resolve_reroutes_leaking_rule(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_leaking_incident("test")
+    monkeypatch.setattr(refl_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES_JSON)
+    status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj["rerouted"] == 1 and obj["pending"] == 0
+    rec = [r for r in inc_mod.summaries(project="test")
+           if r["signature"] == "raw:leaky"][0]
+    assert rec["active_rule"] == "take the alternative route"
+    # the reroute re-anchors leak accounting: the lesson is no longer red
+    st = inc_mod.signal_stats("test")["raw:leaky"]
+    assert st["leaks"] == 0 and st["reroutes"] == 1
+
+
+def test_resolve_rejects_concurrent_run(dashboard_server):
+    base, token = dashboard_server
+    assert dash_mod._REFLECT_LOCK.acquire(blocking=False)
+    try:
+        status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
+        assert status == 200
+        assert obj["ok"] is False and "already running" in obj["error"]
+    finally:
+        dash_mod._REFLECT_LOCK.release()
+
+
+def test_resolve_noop_on_empty_store(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/resolve", {"project": "bare"}, token)
+    assert obj["ok"] is True and obj["rerouted"] == 0 and obj["red"] == 0
+
+
+def test_improvements_payload_carries_reroute_fields(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_leaking_incident("test", sig="raw:routed")
+    monkeypatch.setattr(refl_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES_JSON)
+    from mindhive import resolve as resolve_mod
+    assert resolve_mod.reroute_incident("raw:routed",
+                                        project="test")["resolved"] is True
+    status, body = _get(base, "/api/improvements?project=test", token)
+    obj = json.loads(body)
+    card = [a for a in obj["auto"] if a["signature"] == "raw:routed"][0]
+    assert card["reroutes"] == 1 and card["last_reroute"]
+    assert card["resolution"] == "watching"        # fresh route, not yet proven
+
+
+def test_page_has_resolve_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("/api/rules/resolve", "runResolve", "resolve red"):
+        assert needle in body, f"missing resolve hook: {needle}"
+
+
+# --------------------------------------------------------------------------
 # POST /api/rules/reflect_one: on-demand reflection of ONE failure signature —
 # lets a single skill-call failure be learned from immediately (the UI's
 # "reflect this failure" action), bypassing the recurrence-threshold gate.

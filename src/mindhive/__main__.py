@@ -614,6 +614,26 @@ def cmd_rules_reflect(args) -> int | None:
     return 0
 
 
+def cmd_rules_resolve(args) -> int | None:
+    """Active resolution over the red (unresolved) set: reflect rule-less
+    incidents, reroute leaking auto rules to the best alternative route.
+    --list prints the red set without spending any tokens."""
+    from . import resolve as resolve_mod
+    if args.list:
+        from . import incidents as inc
+        inc.audit(project=args.project)
+        inc.project(project=args.project)
+        print(json.dumps(resolve_mod.red_summaries(args.project), indent=2))
+        return 0
+    try:
+        res = resolve_mod.resolve_batch(project=args.project, limit=args.limit)
+    except Exception as e:              # hook-safe: JSON + exit 0, never a traceback
+        res = {"rerouted": 0, "reflected": 0,
+               "error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(res))
+    return 0
+
+
 def cmd_rules_reconcile(args) -> int | None:
     from . import incidents as inc
     print(json.dumps(inc.reconcile(project=args.project)))
@@ -928,6 +948,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="drain every registered namespace (manual backlog drain; "
                          "never invoked from hooks; LIVE_LOCK-named namespaces skipped)")
     rr.set_defaults(func=cmd_rules_reflect)
+    rrs = rsub.add_parser("resolve",
+                          help="actively resolve red (unresolved) rules: reflect "
+                               "missing ones, reroute leaking ones to the best "
+                               "alternative route")
+    rrs.add_argument("--project", default=None)
+    rrs.add_argument("--limit", type=int, default=3,
+                     help="max red incidents to resolve this pass (default: 3)")
+    rrs.add_argument("--list", action="store_true",
+                     help="print the red set as JSON without resolving anything")
+    rrs.set_defaults(func=cmd_rules_resolve)
     ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
     ra.add_argument("--project", default=None)
     ra.set_defaults(func=cmd_rules_audit)
