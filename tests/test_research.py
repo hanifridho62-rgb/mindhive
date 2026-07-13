@@ -482,6 +482,50 @@ def test_controller_agent_turn_timeout_aborts_and_continues(tmp_path):
     assert ctl.status()["reason"] == "cap"
 
 
+def test_controller_aborted_turn_stops_agent_so_next_turn_is_not_busy(tmp_path):
+    """A timed-out turn abandons its worker thread, but the real agent run is
+    still in flight. The production ManagerResearcher/Manager enforce one run
+    at a time: the next send() rejects with '… is busy' until the prior run is
+    stopped. StubResearcher does not model that constraint, so this test uses a
+    researcher that does — reproducing the field failure where an aborted turn
+    orphans the agent and the whole run then dies 'is busy'. The abort MUST
+    stop the in-flight agent so the next turn starts clean."""
+
+    class BusyModelingResearcher:
+        def __init__(self):
+            self.prompts = []
+            self.stopped = False
+            self._inflight = False          # a still-running prior run
+            self._release = threading.Event()
+
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            if self._inflight:              # mirrors Manager.send's busy guard
+                return {"ok": False,
+                        "error": "Self-Reliant researcher is busy — "
+                                 "wait or stop it"}
+            if len(self.prompts) == 1:
+                self._inflight = True       # go in-flight, then hang past the
+                self._release.wait(5)       # turn timeout; stop() releases us
+                return {"ok": True}
+            return {"ok": True}
+
+        def stop(self):                     # killing the run frees the agent
+            self.stopped = True
+            self._inflight = False
+            self._release.set()
+
+    researcher = BusyModelingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher, turn_timeout_s=0.3)
+    assert ctl.start("g", max_experiments=2)["ok"]
+    _wait_ended(ctl)
+    records = ctl.leaderboard.all()
+    assert records[0]["status"] == "aborted"
+    assert records[-1]["status"] == "ok"    # recovered — did not die 'is busy'
+    assert ctl.status()["reason"] == "cap"
+    assert researcher.stopped               # the abort stopped the orphan
+
+
 def test_controller_malformed_caps_rejected_structurally(tmp_path):
     ctl = _controller(tmp_path)
     res = ctl.start("g", max_experiments="lots")
