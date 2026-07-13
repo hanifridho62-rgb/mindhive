@@ -43,6 +43,12 @@ _PAGE = """<!doctype html>
     border:1px solid #2a3550; border-radius:6px; padding:3px 8px; margin:4px 0;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
   .skchip:hover { background:#1b2540; }
+  .prof { display:flex; align-items:center; gap:6px; margin:4px 0; font-size:12px; }
+  .prof .name { flex:1; overflow:hidden; text-overflow:ellipsis; }
+  .prof button { padding:0 5px; font-size:10px; }
+  .adot { width:8px; height:8px; border-radius:50%; background:#3a4054; flex:0 0 auto; }
+  .adot.ok { background:#46c46a; } .adot.expired { background:#e0b341; }
+  .adot.none { background:#ff6b6b; } .adot.unknown { background:#8b949e; }
   #center { flex:1 1 auto; display:flex; flex-direction:column; min-width:0; padding:10px;
     gap:10px; overflow-y:auto; }
   .panel { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px; }
@@ -90,6 +96,14 @@ _PAGE = """<!doctype html>
     <div class="lbl" style="margin-top:10px">Staged skills are strategy guidance for the
       researcher agent — they steer how it edits train.py, they never execute
       inside the training loop.</div>
+    <h3>Accounts</h3>
+    <div id="profs"></div>
+    <input id="pname" placeholder="account name" style="width:100%;margin-top:4px">
+    <input id="pdir" placeholder="CLAUDE_CONFIG_DIR path" style="width:100%;margin-top:4px">
+    <button style="margin-top:4px" onclick="addProfile()">Add account</button>
+    <div class="lbl" style="margin-top:6px">Each account is a separate Claude Code login
+      (its own CLAUDE_CONFIG_DIR). Add one, then <b>login</b> to authenticate it in a
+      console. The run below runs under whichever account you pick.</div>
   </div>
   <div id="center">
     <div class="panel">
@@ -101,9 +115,12 @@ _PAGE = """<!doctype html>
           placeholder="&infin;"></label>
         <label class="lbl">time budget (min) <input id="capt" type="number" min="1"
           placeholder="&infin;"></label>
-        <label class="lbl">profile <select id="prof"></select></label>
+        <label class="lbl">account <select id="prof"></select></label>
+        <label class="lbl" title="the model the researcher agent edits train.py with;
+          'account default' forces no --model flag">model
+          <select id="model" onchange="onModelChange()"></select></label>
         <label class="lbl" title="on usage exhaustion, continue under the next
-          authenticated profile"><input id="failover" type="checkbox"> account failover</label>
+          authenticated account"><input id="failover" type="checkbox"> account failover</label>
         <span style="flex:1"></span>
         <button class="go" id="startbtn" onclick="startRun()">&#9654; Start</button>
         <button class="warn" onclick="stopRun()">&#9632; Stop</button>
@@ -199,12 +216,84 @@ _PAGE = """<!doctype html>
         {kind:'skill', name:s.name, plugin:s.plugin}));
     }));
   }
+  // --- accounts (profiles) + model picker: one account = one Claude Code login
+  // (its own CLAUDE_CONFIG_DIR); reuse the tested /api/workspace/* routes so the
+  // whole switching flow lives in-section. The run picks one account + model. ---
+  let PROFILES = [{name:'default'}];
+  let MODELS = [{id:'', label:'account default'}];
+  let AUTH = {};
+  function modelOptions(sel, current){
+    current = current || '';
+    const opts = MODELS.map(m => '<option value="'+esc(m.id)+'">'+esc(m.label)+'</option>');
+    if (!MODELS.some(m => m.id === current))       // keep a free-typed id visible
+      opts.push('<option value="'+esc(current)+'">'+esc(current)+'</option>');
+    opts.push('<option value="__custom">custom&hellip;</option>');
+    sel.innerHTML = opts.join('');
+    sel.value = current;
+  }
+  function onModelChange(){
+    const sel = document.getElementById('model');
+    let v = sel.value;
+    if (v === '__custom') {
+      v = (prompt('model id (as the claude CLI --model flag accepts)') || '').trim();
+      modelOptions(sel, v);          // pin the free-typed id as the selection
+    }
+    localStorage.setItem('mh_sr_model', v);
+  }
   async function loadProfiles(){
     try {
       const res = await api('/api/workspace/profiles');
-      document.getElementById('prof').innerHTML = (res.profiles||[{name:'default'}])
-        .map(p => '<option>'+esc(p.name)+'</option>').join('');
+      PROFILES = res.profiles || PROFILES;
+      if (res.models && res.models.length) MODELS = res.models;
+      document.getElementById('prof').innerHTML =
+        PROFILES.map(p => '<option>'+esc(p.name)+'</option>').join('');
+      modelOptions(document.getElementById('model'),
+                   localStorage.getItem('mh_sr_model') || '');
+      paintProfiles(); loadAuth();
     } catch(_){}
+  }
+  async function loadAuth(){
+    try {
+      const res = await api('/api/workspace/auth');
+      AUTH = {}; (res.auth||[]).forEach(a => AUTH[a.profile] = a);
+      paintProfiles();
+    } catch(_){}
+  }
+  function paintProfiles(){
+    document.getElementById('profs').innerHTML = PROFILES.map(p => {
+      const a = AUTH[p.name] || {state:'unknown', detail:'checking\\u2026'};
+      return '<div class="prof">'
+        + '<span class="adot '+esc(a.state)+'" title="'+esc(a.detail)+'"></span>'
+        + '<span class="name" title="'+esc(p.config_dir||'system default')
+        + ' \\u2014 '+esc(a.detail)+'">'+esc(p.name)+'</span>'
+        + '<button title="open a login console for this account (type /login there)"'
+        + ' onclick="loginProfile(\\''+esc(p.name)+'\\')">login</button>'
+        + '<button title="pre-accept the workspace trust dialog for this project"'
+        + ' onclick="trustProfile(\\''+esc(p.name)+'\\')">trust</button>'
+        + (p.name==='default' ? '' :
+           '<button class="warn" onclick="rmProfile(\\''+esc(p.name)+'\\')">&#10005;</button>')
+        + '</div>';
+    }).join('');
+  }
+  async function loginProfile(name){
+    const res = await apiPost('/api/workspace/profile_login', {name:name});
+    toast(res.ok ? res.detail : (res.error||'failed'), !res.ok);
+    setTimeout(loadAuth, 15000);   // re-check after the user logs in
+  }
+  async function trustProfile(name){
+    const res = await apiPost('/api/workspace/profile_trust', {name:name});
+    toast(res.ok ? res.detail : (res.error||'failed'), !res.ok);
+  }
+  async function addProfile(){
+    const res = await apiPost('/api/workspace/profile_add',
+      {name: document.getElementById('pname').value,
+       config_dir: document.getElementById('pdir').value});
+    if (!res.ok) { toast(res.error||'failed', true); return; }
+    document.getElementById('pname').value=''; document.getElementById('pdir').value='';
+    loadProfiles();
+  }
+  async function rmProfile(name){
+    await apiPost('/api/workspace/profile_remove', {name:name}); loadProfiles();
   }
 
   // --- start / stop ---
@@ -218,7 +307,8 @@ _PAGE = """<!doctype html>
       max_experiments: capn,
       time_budget_s: capt ? capt * 60 : null,
       failover: document.getElementById('failover').checked,
-      profile: document.getElementById('prof').value || 'default'});
+      profile: document.getElementById('prof').value || 'default',
+      model: (m => m === '__custom' ? '' : m)(document.getElementById('model').value)});
     if (!res.ok) { toast(res.error || 'start failed', true); return; }
     toast('run ' + res.run_id + ' started');
   }

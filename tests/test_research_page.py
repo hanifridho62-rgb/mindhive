@@ -73,6 +73,28 @@ def test_page_states_explicit_start_and_guidance_contract():
     assert "guidance" in PAGE
 
 
+def test_page_has_model_picker_fed_by_profiles_models():
+    # the researcher's model is switchable per run; the option list is the
+    # same MODEL_CHOICES the workspace already serves via /api/workspace/profiles
+    assert 'id="model"' in PAGE
+    assert "res.models" in PAGE               # reads the served model list
+    assert "mh_sr_model" in PAGE              # last pick remembered across runs
+
+
+def test_page_start_posts_model():
+    assert "/api/research/start" in PAGE
+    assert "model:" in PAGE                   # model sent in the start body
+
+
+def test_page_has_accounts_panel_reusing_workspace_endpoints():
+    # full account switching in-section, reusing the tested workspace routes
+    assert "Accounts" in PAGE
+    for ep in ("/api/workspace/profile_add", "/api/workspace/profile_login",
+               "/api/workspace/profile_trust", "/api/workspace/profile_remove",
+               "/api/workspace/auth"):
+        assert ep in PAGE
+
+
 # --- U8: routes ---------------------------------------------------------------
 
 @pytest.fixture
@@ -95,7 +117,7 @@ def server(tmp_path):
     ctl = research.ResearchController(
         trainer_cmd=[sys.executable, str(MOCK), "--mode", "ok",
                      "--seconds", "0.05"],
-        agent_factory=lambda profile: StubResearcher(),
+        agent_factory=lambda profile, model=None: StubResearcher(),
         train_path=tmp_path / "train.py",
         leaderboard=research.Leaderboard(tmp_path / "lb.json"),
         append_event=lambda *a, **k: None,

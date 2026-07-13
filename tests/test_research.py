@@ -366,7 +366,7 @@ def _controller(tmp_path, trainer=None, researcher=None, ledger=None,
     kw.setdefault("turn_timeout_s", 10)
     return research.ResearchController(
         trainer_cmd=trainer or _cmd("--mode", "ok", "--seconds", "0.05"),
-        agent_factory=factory or (lambda profile: researcher),
+        agent_factory=factory or (lambda profile, model=None: researcher),
         train_path=train_py,
         leaderboard=research.Leaderboard(tmp_path / "lb.json"),
         append_event=ledger if ledger is not None else FakeLedger(),
@@ -498,7 +498,7 @@ def test_controller_uninjected_leaderboard_is_per_run(tmp_path, monkeypatch):
     (tmp_path / "train.py").write_text("x = 1\n", encoding="utf-8")
     ctl = research.ResearchController(
         trainer_cmd=_cmd("--mode", "ok", "--seconds", "0.05"),
-        agent_factory=lambda profile: StubResearcher(),
+        agent_factory=lambda profile, model=None: StubResearcher(),
         train_path=tmp_path / "train.py",
         append_event=None, preflight=lambda profile: [],
         cap_s=20, turn_timeout_s=10)
@@ -608,7 +608,7 @@ def test_attribution_none_without_skills_or_improvement(tmp_path):
 def _failover_setup(tmp_path, auth_map, results_by_profile):
     made = {}
 
-    def factory(profile):
+    def factory(profile, model=None):
         made[profile] = StubResearcher(results=results_by_profile.get(profile))
         return made[profile]
 
@@ -647,3 +647,68 @@ def test_failover_off_usage_always_ends(tmp_path):
     _wait_ended(ctl)
     assert ctl.status()["reason"] == "usage"
     assert "B" not in made
+
+
+# --- model selection: the researcher agent's --model flow -------------------
+
+def test_start_passes_model_to_agent_factory(tmp_path):
+    seen = {}
+
+    def factory(profile, model=None):
+        seen["model"] = model
+        return StubResearcher()
+
+    ctl = _controller(tmp_path, factory=factory)
+    assert ctl.start("g", max_experiments=1, model="claude-opus-4-8")["ok"]
+    _wait_ended(ctl)
+    assert seen["model"] == "claude-opus-4-8"
+
+
+def test_start_blank_model_normalises_to_none(tmp_path):
+    # "" / whitespace means "account default": the factory must see None so no
+    # --model flag is forced, exactly like omitting the field.
+    seen = {}
+
+    def factory(profile, model=None):
+        seen["model"] = model
+        return StubResearcher()
+
+    ctl = _controller(tmp_path, factory=factory)
+    assert ctl.start("g", max_experiments=1, model="   ")["ok"]
+    _wait_ended(ctl)
+    assert seen["model"] is None
+
+
+def test_failover_preserves_model(tmp_path):
+    # a mid-run failover to the next account must keep the chosen model.
+    seen = {}
+
+    def factory(profile, model=None):
+        seen[profile] = model
+        results = [{"ok": False, "usage_exhausted": True}] if profile == "A" else None
+        return StubResearcher(results=results)
+
+    ctl = _controller(tmp_path, factory=factory, profiles=["A", "B"],
+                      auth_status=lambda p: {"state": "ok"})
+    assert ctl.start("g", max_experiments=2, failover=True,
+                     profile="A", model="claude-sonnet-5")["ok"]
+    _wait_ended(ctl)
+    assert seen["A"] == "claude-sonnet-5"
+    assert seen["B"] == "claude-sonnet-5"
+
+
+def test_api_post_start_threads_model(tmp_path, monkeypatch):
+    seen = {}
+
+    def factory(profile, model=None):
+        seen["model"] = model
+        return StubResearcher()
+
+    ctl = _controller(tmp_path, factory=factory)
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1,
+                                           "model": "claude-haiku-4-5-20251001"})
+    assert res["ok"]
+    _wait_ended(ctl)
+    assert seen["model"] == "claude-haiku-4-5-20251001"
