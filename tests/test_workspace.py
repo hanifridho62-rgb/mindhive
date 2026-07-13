@@ -277,6 +277,41 @@ def test_send_add_dirs_grants_out_of_cwd_access():
     assert "--add-dir" not in h.calls[1][0]
 
 
+def test_send_tool_restriction_renders_allow_and_deny_lists():
+    """allowed_tools/disallowed_tools become --allowedTools/--disallowedTools so
+    Self-Reliant's learn mode can spawn a read-only agent that cannot reach
+    git/gh — the enforced no-GitHub boundary. Absent by default (back-compat)."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "analyze", allowed_tools=["Read", "Grep", "Glob"],
+               disallowed_tools=["Bash(git:*)", "Bash(gh:*)"])
+    argv = h.calls[0][0]
+    assert argv[argv.index("--allowedTools") + 1] == "Read,Grep,Glob"
+    assert argv[argv.index("--disallowedTools") + 1] == "Bash(git:*),Bash(gh:*)"
+    # absent when not requested
+    _wait_settled(_agent_obj(h, aid))
+    h.mgr.send(aid, "again")
+    assert "--allowedTools" not in h.calls[1][0]
+    assert "--disallowedTools" not in h.calls[1][0]
+
+
+def test_reader_captures_last_result_text():
+    """The reader exposes the run's final result text as agent.last_result so a
+    caller (Self-Reliant learn mode) can persist it as a learning."""
+    h = Harness(lines=_stream_lines(result="lower lr to 0.03 next"))
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    assert a.last_result == "lower lr to 0.03 next"
+
+
+def test_fresh_agent_has_empty_last_result():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    assert _agent_obj(h, aid).last_result == ""
+
+
 def test_send_rejects_empty_unknown_and_busy():
     h = Harness()
     aid = h.mgr.spawn(name="A")["agent"]["id"]
