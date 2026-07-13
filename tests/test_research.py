@@ -170,9 +170,39 @@ def test_wsl_trainer_cmd_honors_env_override(monkeypatch):
 def test_outer_cap_exceeds_inner_training_budget():
     """train.py's internal 5-minute budget EXCLUDES startup/compilation, so the
     outer watchdog default must leave headroom or every healthy real run would
-    be killed as 'timeout' (plan KTD2)."""
+    be killed as 'timeout' (plan KTD2). Measured real run: 746.3s total for a
+    313.8s training — startup/compile ≈ 432s and recurs on every train.py edit."""
     assert research.INNER_BUDGET_S == 300
-    assert research.EXPERIMENT_CAP_S > research.INNER_BUDGET_S
+    assert research.EXPERIMENT_CAP_S >= research.INNER_BUDGET_S + 450
+
+
+FIXTURE = Path(__file__).resolve().parents[1] / "scripts" / "self_reliant" \
+    / "fixtures" / "train_output_sample.txt"
+
+
+def test_parse_val_bpb_against_real_captured_output():
+    """Characterization pin: the fixture is the tail of a REAL autoresearch run
+    on the RTX 3050 (bring-up 2026-07-12). The final-summary format is
+    'val_bpb:          1.858687' — colon + aligned whitespace."""
+    text = FIXTURE.read_text(encoding="utf-8")
+    assert research.parse_val_bpb(text) == pytest.approx(1.858687)
+
+
+def test_compose_program_names_train_py_location_when_given():
+    prog = research.compose_program(
+        "g", train_path=r"\\wsl$\Ubuntu\home\u\autoresearch\train.py")["program"]
+    assert r"\\wsl$\Ubuntu\home\u\autoresearch\train.py" in prog
+    # and stays silent when unknown (tests / stub runs)
+    assert "location:" not in research.compose_program("g")["program"]
+
+
+def test_preset_pins_real_train_py_knobs():
+    """The preset speaks train.py's actual constant names so the researcher's
+    guidance maps 1:1 onto the file it edits."""
+    for knob in ("DEVICE_BATCH_SIZE", "DEPTH"):
+        assert knob in research.SMALL_GPU_PRESET
+    prog = research.compose_program("g", preset=research.SMALL_GPU_PRESET)["program"]
+    assert "DEVICE_BATCH_SIZE" in prog and "6 GB" in prog
 
 
 # --- U6: program composition -------------------------------------------------

@@ -27,9 +27,11 @@ autoresearch is a **uv project** (`pyproject.toml` + `uv.lock`) — never instal
 deps by hand; `uv sync` reproduces upstream's tested environment exactly.
 
 **Cap vs. budget:** `train.py`'s internal 5-minute budget *excludes*
-startup/compilation, so MindHive's outer watchdog default is higher
-(`MINDHIVE_RESEARCH_CAP_S=480`) — the outer cap only guards against hangs; the
-inner budget is what keeps experiments comparable.
+startup/compilation — measured 432 s of startup/compile on this machine, and it
+recurs on every `train.py` edit. MindHive's outer watchdog default is therefore
+`MINDHIVE_RESEARCH_CAP_S=900`; the outer cap only guards against hangs, while
+the inner budget is what keeps experiments comparable. Real throughput is
+~4–5 experiments/hour on this laptop (12/hour assumed H100-class startup).
 
 ## Preflight
 
@@ -49,12 +51,23 @@ means the best `val_bpb` a 3050 reaches in 5 minutes. OOM above the bounds is
 an expected, logged failure — the loop continues (R10).
 
 Current bounds live in `research.SMALL_GPU_PRESET` and are rendered verbatim
-into the researcher's program. **Execution-time discovery (U1):** after the
-first real bring-up, pin here and in the constant:
+into the researcher's program. **Pinned by the real bring-up (2026-07-12):**
 
-- [ ] the exact knobs `train.py` exposes (depth / width / batch / seq-len / eval cadence)
-- [ ] the exact `val_bpb` log-line format (pin `research._VAL_BPB_RE` against a captured sample)
-- [ ] the largest non-OOM config found, as the preset's hard bounds
+- [x] knobs `train.py` exposes: `DEPTH` (8), `DEVICE_BATCH_SIZE` (128 → 16 here),
+  `TOTAL_BATCH_SIZE` (2**19, held by gradient accumulation), `ASPECT_RATIO` (64),
+  `HEAD_DIM` (128), `WINDOW_PATTERN`, per-group LRs — all module constants,
+  "edit these directly, no CLI flags needed"
+- [x] `val_bpb` format: final summary block `val_bpb:          1.858687`
+  (colon + aligned whitespace) — characterized in
+  `scripts/self_reliant/fixtures/train_output_sample.txt`
+- [x] largest non-OOM config: `DEPTH=8` + `DEVICE_BATCH_SIZE=16` → val_bpb
+  1.8587, peak VRAM 6150 MB (the ceiling), ~27K tok/sec, 27 steps in the 300 s
+  budget; startup/compile ≈ 432 s (recurs on every train.py edit — the compile
+  cache invalidates)
+
+Prerequisite discovered the hard way: **triton needs a host C compiler**
+(`sudo apt-get install -y gcc`) — a bare WSL Ubuntu ships without one and
+training dies after ~75 s with "Failed to find C compiler".
 
 ## Environment knobs
 
@@ -62,7 +75,7 @@ first real bring-up, pin here and in the constant:
 |---|---|---|
 | `MINDHIVE_AUTORESEARCH_DIR` | `~/autoresearch` | WSL checkout the agent mutates |
 | `MINDHIVE_RESEARCH_TRAIN_CMD` | `cd $DIR && uv run train.py` | inner WSL training command |
-| `MINDHIVE_RESEARCH_CAP_S` | `480` | outer watchdog (must exceed the inner 300s budget + startup) |
+| `MINDHIVE_RESEARCH_CAP_S` | `900` | outer watchdog (300s budget + ~450s measured startup/compile + slack) |
 | `MINDHIVE_RESEARCH_TURN_TIMEOUT_S` | `600` | bound on one researcher edit-turn |
 | `MINDHIVE_BRINGUP_TIMEOUT` | `900` | bound on bring_up.sh's verification run |
 

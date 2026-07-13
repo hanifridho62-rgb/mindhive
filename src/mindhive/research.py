@@ -42,10 +42,12 @@ from . import paths
 # hardware (origin R2) — that budget lives inside autoresearch's train.py and
 # EXCLUDES startup/compilation. The outer watchdog below therefore must exceed
 # the inner budget by a startup/compile margin, or every healthy real run would
-# be killed as 'timeout' before its budget completed (U1 plan KTD2). The margin
-# default is provisional until the bring-up run pins the measured startup time.
+# be killed as 'timeout' before its budget completed (U1 plan KTD2). Measured
+# on the real bring-up (RTX 3050, WSL2): training 313.8s, total 746.3s —
+# startup/compile ≈ 432s, and every agent edit to train.py re-triggers compile,
+# so the margin never amortizes away. 900s = 300 budget + ~450 startup + slack.
 INNER_BUDGET_S = 300
-EXPERIMENT_CAP_S = int(os.environ.get("MINDHIVE_RESEARCH_CAP_S", "480"))
+EXPERIMENT_CAP_S = int(os.environ.get("MINDHIVE_RESEARCH_CAP_S", "900"))
 
 _IS_WIN = os.name == "nt"
 
@@ -206,18 +208,23 @@ def diff_summary(before: str, after: str, max_lines: int = 8) -> str:
 
 # --- U6: program.md composition ---------------------------------------------
 
-# Small-GPU preset bounds for the RTX 3050 Laptop (6 GB VRAM). Placeholder
-# knob values until U1's real bring-up pins them against autoresearch's actual
-# train.py; the *shape* (name -> stated bound) is the contract compose_program
-# renders. Overridden per-run by passing `preset=`.
+# Small-GPU preset bounds for the RTX 3050 Laptop (6 GB VRAM), pinned against
+# autoresearch's real train.py by the U1 bring-up run (2026-07-12): DEPTH=8 +
+# DEVICE_BATCH_SIZE=16 reached val_bpb 1.8587 at peak VRAM 6150 MB — the
+# ceiling. Knob names are train.py's actual constants. Rendered verbatim into
+# the researcher's program as hard constraints; override per-run via `preset=`.
 SMALL_GPU_PRESET = {
-    "hardware": "RTX 3050 Laptop, 6 GB VRAM — not an H100; OOM is likely "
-                "above these bounds",
-    "batch_size": "keep the micro-batch small (<= 8); prefer gradient "
-                  "accumulation over bigger batches",
-    "sequence_len": "<= 512",
-    "model size": "reduce depth/width well below autoresearch defaults",
-    "precision": "prefer bf16/fp16 mixed precision",
+    "hardware": "RTX 3050 Laptop, 6 GB VRAM — not an H100. Verified baseline: "
+                "DEPTH=8 + DEVICE_BATCH_SIZE=16 fits at peak_vram 6150 MB "
+                "(the ceiling); upstream's DEVICE_BATCH_SIZE=128 OOMs.",
+    "DEVICE_BATCH_SIZE": "<= 16 at DEPTH 8. Lower THIS first when memory is "
+                         "tight — TOTAL_BATCH_SIZE stays fixed via gradient "
+                         "accumulation, so comparability is preserved.",
+    "DEPTH": "8 fits with zero headroom; raising DEPTH requires lowering "
+             "DEVICE_BATCH_SIZE at the same time (activations dominate VRAM).",
+    "throughput": "~27K tok/sec, ~20 s/optimizer-step at the baseline — the "
+                  "300 s budget is ~27 steps; keep eval cadence cheap.",
+    "precision": "bf16 autocast is train.py's default — do not add fp32 paths.",
 }
 
 # KTD11 — the iteration contract the researcher agent must follow. One
@@ -245,7 +252,8 @@ def _clean_skills(skills) -> list:
     return out
 
 
-def compose_program(goal, skills=None, primed=None, preset=None, prior=None) -> dict:
+def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
+                    train_path=None) -> dict:
     """The researcher agent's steering document (program.md text) plus its
     system-prompt addition — a pure function of its inputs (U6).
 
@@ -281,6 +289,10 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None) -> 
                      + (f", val_bpb {score}" if score is not None else ", no score")
                      + (f" — change: {prior['change']}" if prior.get("change") else "")
                      + ". Iterate on this result.")
+    if train_path:
+        parts.append(f"train.py location: {train_path} — edit exactly this "
+                     "file; it lives inside WSL, outside your working "
+                     "directory.")
     parts.append(_ITERATION_CONTRACT)
     return {"program": "\n\n".join(parts),
             "system": _ITERATION_CONTRACT}
@@ -557,7 +569,9 @@ class ResearchController:
                     reason = "time"
                     return
                 composed = compose_program(self._goal, self._skills,
-                                           self._primed, self._preset, prior)
+                                           self._primed, self._preset, prior,
+                                           train_path=(str(self._train_path)
+                                                       if self._train_path else None))
                 turn = self._run_turn(composed["program"])
                 if self._stop_flag.is_set():
                     reason = "stopped"
@@ -736,6 +750,22 @@ def kill_wsl_training() -> None:
         pass
 
 
+def wsl_train_py_windows_path():
+    """The Windows-visible (\\\\wsl$\\...) path of the WSL checkout's train.py,
+    via wslpath — the researcher agent runs on Windows and must be pointed at
+    the exact file. None when WSL/the checkout is unavailable (preflight will
+    refuse the run anyway)."""
+    try:
+        p = subprocess.run(
+            ["wsl", "bash", "-lc", f"wslpath -w {AUTORESEARCH_DIR}/train.py"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (p.stdout or "").strip()
+        return out if p.returncode == 0 and out else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _wsl_ok(cmd: str, timeout=20) -> bool:
     try:
         p = subprocess.run(["wsl", "bash", "-lc", cmd], capture_output=True,
@@ -848,7 +878,7 @@ def get_controller() -> ResearchController:
             CONTROLLER = ResearchController(
                 trainer_cmd=wsl_trainer_cmd,
                 agent_factory=lambda profile: ManagerResearcher(profile=profile),
-                leaderboard=Leaderboard(),
+                train_path=wsl_train_py_windows_path(),
                 append_event=ev_mod.append_event,
                 preflight=default_preflight,
                 profiles=[e["name"] for e in workspace.load_profiles()],
