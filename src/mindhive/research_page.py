@@ -76,6 +76,8 @@ _PAGE = """<!doctype html>
   td.st-crash, td.st-timeout, td.st-aborted { color:#ff8a8a; }
   #log { flex:1 1 auto; min-height:120px; overflow-y:auto; margin:0; white-space:pre-wrap;
     word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
+  #learn { max-height:240px; overflow-y:auto; margin:0; white-space:pre-wrap;
+    word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
   #toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
     background:#21262d; border:1px solid #3d6; border-radius:8px; padding:6px 14px;
     display:none; z-index:9; }
@@ -111,6 +113,13 @@ _PAGE = """<!doctype html>
         placeholder="research goal, e.g. reach the lowest val_bpb a 6 GB RTX 3050 can hit in 5 minutes"></textarea>
       <div id="recipe"></div>
       <div class="row">
+        <label class="lbl" title="learn: the agent analyzes train.py + history and
+          records learnings for you to act on with Claude Code (read-only, never
+          touches GitHub). improve: the agent edits train.py and runs experiments.">mode
+          <select id="mode">
+            <option value="learn">learn (analyze &amp; record)</option>
+            <option value="improve">improve (edit &amp; run)</option>
+          </select></label>
         <label class="lbl">max experiments <input id="capn" type="number" min="1"
           placeholder="&infin;"></label>
         <label class="lbl">time budget (min) <input id="capt" type="number" min="1"
@@ -131,6 +140,11 @@ _PAGE = """<!doctype html>
       <span class="lbl" id="bestline"></span>
       <table><thead><tr><th>#</th><th>val_bpb</th><th>status</th><th>change</th>
         <th>skills</th></tr></thead><tbody id="lb"></tbody></table>
+    </div>
+    <div class="panel" id="learnpanel" style="display:none">
+      <b style="font-size:12px">LEARNINGS</b>
+      <span class="lbl">analysis reports from this run — act on them with Claude Code</span>
+      <pre id="learn"></pre>
     </div>
     <div class="panel" style="flex:1 1 auto; display:flex; flex-direction:column; min-height:0">
       <b style="font-size:12px; flex:0 0 auto">RUN LOG</b>
@@ -308,6 +322,7 @@ _PAGE = """<!doctype html>
       time_budget_s: capt ? capt * 60 : null,
       failover: document.getElementById('failover').checked,
       profile: document.getElementById('prof').value || 'default',
+      mode: document.getElementById('mode').value || 'learn',
       model: (m => m === '__custom' ? '' : m)(document.getElementById('model').value)});
     if (!res.ok) { toast(res.error || 'start failed', true); return; }
     toast('run ' + res.run_id + ' started');
@@ -331,6 +346,14 @@ _PAGE = """<!doctype html>
       document.getElementById('startbtn').disabled = st.state === 'running';
       const lb = await api('/api/research/leaderboard');
       paintBoard(lb);
+      if (st.mode === 'learn') {
+        const lr = await api('/api/research/learnings');
+        const txt = (lr.ok && lr.learnings) || '';
+        document.getElementById('learnpanel').style.display = txt ? '' : 'none';
+        document.getElementById('learn').textContent = txt;
+      } else {
+        document.getElementById('learnpanel').style.display = 'none';
+      }
       const o = await api('/api/research/output?since=' + CURSOR);
       if (o.ok && o.lines && o.lines.length) {
         const log = document.getElementById('log');

@@ -308,6 +308,52 @@ def test_compose_program_iteration_contract_and_prior_result():
     assert "1.31" in prog and "lr 0.01 -> 0.02" in prog
 
 
+def test_compose_program_learn_mode_is_read_only_and_no_github():
+    out = research.compose_program(
+        "g", train_path=r"\\wsl$\u\train.py", mode="learn")
+    prog, system = out["program"], out["system"]
+    low = prog.lower()
+    assert "analyze-and-learn" in low or "read-only" in low
+    assert "never touch github" in low
+    assert "learning report" in low and "ranked hypotheses" in low.lower()
+    assert "read exactly this file" in low and "do not edit" in low
+    # the improve-mode edit contract must NOT leak into learn mode
+    assert "edit train.py only" not in low
+    assert system == research._ANALYSIS_CONTRACT
+
+
+def test_compose_program_learn_mode_suppresses_no_edit_nudge():
+    prior = {"val_bpb": 1.86, "status": "ok", "change": "no change"}
+    prog = research.compose_program("g", prior=prior, mode="learn")["program"]
+    assert "MUST make" not in prog          # scolding an analyst is nonsense
+
+
+def test_compose_program_improve_mode_is_unchanged_default():
+    """mode defaults to improve and renders byte-identical to the explicit
+    call — protects every existing caller and test (R6)."""
+    default = research.compose_program(
+        "g", train_path=r"\\wsl$\u\train.py")
+    explicit = research.compose_program(
+        "g", train_path=r"\\wsl$\u\train.py", mode="improve")
+    assert default == explicit
+    assert default["system"] == research._ITERATION_CONTRACT
+    assert "edit exactly this" in default["program"]
+
+
+def test_compose_program_learn_mode_grounds_analysis_in_history():
+    """Learn mode is told to study 'the experiment history' — so the composed
+    program must actually contain the leaderboard records (R2)."""
+    history = [{"status": "ok", "val_bpb": 1.58, "change": "lr 0.03"},
+               {"status": "oom", "val_bpb": None, "change": "batch 2**19"}]
+    prog = research.compose_program("g", mode="learn", history=history)["program"]
+    assert "Experiment history" in prog
+    assert "val_bpb 1.58" in prog and "lr 0.03" in prog
+    assert "oom" in prog
+    # improve mode never renders the history block
+    assert "Experiment history" not in research.compose_program(
+        "g", mode="improve", history=history)["program"]
+
+
 def test_leaderboard_concurrent_appends_no_loss(tmp_path):
     path = tmp_path / "lb.json"
 
@@ -524,6 +570,179 @@ def test_controller_aborted_turn_stops_agent_so_next_turn_is_not_busy(tmp_path):
     assert records[-1]["status"] == "ok"    # recovered — did not die 'is busy'
     assert ctl.status()["reason"] == "cap"
     assert researcher.stopped               # the abort stopped the orphan
+
+
+# --- U2: ManagerResearcher forwards the no-GitHub tool policy ----------------
+
+class _FakeAgent:
+    def __init__(self):
+        self.status = "done"
+        self.lines = ["report line"]
+        self.last_result = "hypothesis: lower lr"
+
+
+class _FakeManager:
+    """Captures the kwargs ManagerResearcher passes to send()."""
+
+    def __init__(self):
+        self.sent = []
+
+    def spawn(self, **kw):
+        return {"ok": True, "agent": {"id": "a1"}}
+
+    def send(self, agent_id, prompt, **kw):
+        self.sent.append(kw)
+        return {"ok": True}
+
+    def get(self, agent_id):
+        return _FakeAgent()
+
+
+def test_manager_researcher_forwards_tool_policy_and_report():
+    mgr = _FakeManager()
+    r = research.ManagerResearcher(
+        manager=mgr, allowed_tools=research.SELF_RELIANT_ALLOWED_TOOLS,
+        disallowed_tools=research.GITHUB_DENY)
+    out = r.turn("analyze train.py")
+    assert out["ok"] and out["report"] == "hypothesis: lower lr"
+    kw = mgr.sent[0]
+    assert kw["allowed_tools"] == research.SELF_RELIANT_ALLOWED_TOOLS
+    assert kw["disallowed_tools"] == research.GITHUB_DENY
+
+
+def test_manager_researcher_default_tool_policy_is_none():
+    mgr = _FakeManager()
+    r = research.ManagerResearcher(manager=mgr)
+    r.turn("go")
+    kw = mgr.sent[0]
+    assert kw["allowed_tools"] is None and kw["disallowed_tools"] is None
+
+
+# --- U4: learn mode — analyze-and-learn, no training -------------------------
+
+class ReportingResearcher(StubResearcher):
+    def turn(self, prompt):
+        self.prompts.append(prompt)
+        return {"ok": True, "report": f"hypothesis {len(self.prompts)}"}
+
+
+def test_controller_learn_mode_persists_learnings_without_training(tmp_path):
+    calls = {"n": 0}
+
+    def trainer(i):
+        calls["n"] += 1                          # must never fire in learn mode
+        return _cmd("--mode", "ok", "--seconds", "0.05")
+
+    ledger = FakeLedger()
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher, trainer=trainer,
+                      ledger=ledger)
+    assert ctl.start("lower val_bpb", max_experiments=2, mode="learn")["ok"]
+    _wait_ended(ctl)
+    st = ctl.status()
+    assert st["reason"] == "cap" and st["mode"] == "learn"
+    assert st["experiments"] == 2
+    assert calls["n"] == 0                        # the trainer never ran
+    assert ctl.leaderboard.all() == []            # learn mode records no experiments
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 2
+    assert "self-reliant" in learnings[0]["tags"]
+    assert "learning" in learnings[0]["tags"]
+    assert "hypothesis 1" in learnings[0]["payload"]["report"]
+    art = ctl._learnings_path()
+    assert art.exists() and "hypothesis 1" in art.read_text(encoding="utf-8")
+
+
+def test_controller_learn_mode_aborted_turn_counts_and_continues(tmp_path):
+    class SlowThenReport(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                time.sleep(5)                    # exceeds turn_timeout_s
+            return {"ok": True, "report": "insight"}
+
+    ledger = FakeLedger()
+    researcher = SlowThenReport()
+    ctl = _controller(tmp_path, researcher=researcher, ledger=ledger,
+                      turn_timeout_s=0.3)
+    assert ctl.start("g", max_experiments=2, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["reason"] == "cap"
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 1                    # aborted round wrote no learning
+    assert researcher.stopped                     # abort stopped the in-flight agent
+
+
+def test_controller_learn_mode_sets_read_only_tool_policy(tmp_path):
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher)
+    assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert researcher.allowed_tools == research.SELF_RELIANT_ALLOWED_TOOLS
+    assert researcher.disallowed_tools == research.GITHUB_DENY
+
+
+def test_controller_improve_mode_denies_github_but_stays_editable(tmp_path):
+    researcher = StubResearcher()
+    ctl = _controller(tmp_path, researcher=researcher)
+    assert ctl.start("g", max_experiments=1)["ok"]   # default improve
+    _wait_ended(ctl)
+    assert researcher.allowed_tools is None           # not read-only — can Edit
+    assert researcher.disallowed_tools == research.GITHUB_DENY
+
+
+def test_controller_learn_mode_skips_empty_and_duplicate_reports(tmp_path):
+    """Empty and unchanged reports must not flood the ledger or poison future
+    recall — the round still counts toward the cap, but nothing is recorded."""
+    class Scripted(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            reports = ["", "same insight", "same insight", "fresh insight"]
+            return {"ok": True, "report": reports[len(self.prompts) - 1]}
+
+    ledger = FakeLedger()
+    ctl = _controller(tmp_path, researcher=Scripted(), ledger=ledger)
+    assert ctl.start("g", max_experiments=4, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["experiments"] == 4          # all 4 rounds counted
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 2                        # empty + duplicate skipped
+    reports = [e["payload"]["report"] for e in learnings]
+    assert reports == ["same insight", "fresh insight"]
+
+
+def test_controller_learn_mode_uncapped_falls_back_to_default_rounds(tmp_path):
+    """An uncapped, unbudgeted learn run would loop forever (identical state);
+    it must terminate at the default round cap instead."""
+    class Varying(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            return {"ok": True, "report": f"insight {len(self.prompts)}"}
+
+    ctl = _controller(tmp_path, researcher=Varying())
+    assert ctl.start("g", mode="learn")["ok"]         # no cap, no budget
+    _wait_ended(ctl)
+    st = ctl.status()
+    assert st["reason"] == "cap"
+    assert st["experiments"] == research._DEFAULT_LEARN_ROUNDS
+
+
+def test_controller_learn_mode_fails_closed_if_policy_cannot_be_set(tmp_path):
+    """If the no-GitHub boundary can't be applied, a learn run must refuse to
+    start rather than silently run as an unrestricted agent."""
+    class Unsettable(StubResearcher):
+        @property
+        def allowed_tools(self):
+            return None
+
+        @allowed_tools.setter
+        def allowed_tools(self, v):
+            raise RuntimeError("cannot restrict this researcher")
+
+    ctl = _controller(tmp_path, researcher=Unsettable())
+    res = ctl.start("g", max_experiments=1, mode="learn")
+    assert res["ok"] is False
+    assert ctl.status()["state"] == "idle"            # never went live
 
 
 def test_controller_malformed_caps_rejected_structurally(tmp_path):
@@ -756,3 +975,55 @@ def test_api_post_start_threads_model(tmp_path, monkeypatch):
     assert res["ok"]
     _wait_ended(ctl)
     assert seen["model"] == "claude-haiku-4-5-20251001"
+
+
+# --- U5: mode threads through the start API; learnings are readable ----------
+
+def test_api_post_start_threads_learn_mode(tmp_path, monkeypatch):
+    ctl = _controller(tmp_path, researcher=ReportingResearcher())
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1,
+                                           "mode": "learn"})
+    assert res["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["mode"] == "learn"
+    # the learnings the run persisted are readable through the GET API
+    out = research.api_get("learnings")
+    assert out["ok"] and "hypothesis 1" in out["learnings"]
+
+
+def test_api_post_start_defaults_to_improve_mode(tmp_path, monkeypatch):
+    ctl = _controller(tmp_path)
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1})
+    assert res["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["mode"] == "improve"
+    assert research.api_get("learnings")["learnings"] == ""
+
+
+# --- U6: GitHub-boundary regression guard -------------------------------------
+# Locks the boundary so a future edit cannot silently reopen it (R4/R5).
+
+def test_github_boundary_regression_guard():
+    # (a) the learn-mode allowlist is exactly the read-only trio — no shell
+    # (Bash), no Skill (which could shell out) => git/gh are unreachable
+    assert research.SELF_RELIANT_ALLOWED_TOOLS == ["Read", "Grep", "Glob"]
+    lowered = [t.lower() for t in research.SELF_RELIANT_ALLOWED_TOOLS]
+    assert "bash" not in lowered and "skill" not in lowered
+    assert all("git" not in t and t != "gh" for t in lowered)
+    # (b) the deny list blocks git, gh, and the GitHub MCP in every mode
+    assert "Bash(git:*)" in research.GITHUB_DENY
+    assert "Bash(gh:*)" in research.GITHUB_DENY
+    assert "mcp__github__*" in research.GITHUB_DENY
+    # (c) the learn contract states the boundary in prose (defense in depth)
+    composed = research.compose_program("g", mode="learn")
+    assert "NEVER touch GitHub" in composed["program"]
+    assert "NEVER touch GitHub" in composed["system"]
+    assert "edit train.py ONLY" not in composed["program"]
+    # (d) the research module itself never shells out to git/gh
+    src = Path(research.__file__.replace(".pyc", ".py")).read_text(encoding="utf-8")
+    for forbidden in ("git push", "gh pr", "gh repo", "gh api", "gh auth"):
+        assert forbidden not in src, f"forbidden GitHub invocation: {forbidden!r}"
