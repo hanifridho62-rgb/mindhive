@@ -491,12 +491,16 @@ def test_event_for_item_passes_extra_keys_but_text_is_unchanged():
 def test_harvest_captures_skill_invocations():
     o = json.loads(_tooluse("Skill", {"skill": "mindhive:circle"}))
     assert harvest._items_from_obj(o) == [
-        {"kind": "invoke_result", "value": "mindhive:circle"}]
+        {"kind": "skill_used",
+         "value": {"name": "circle", "plugin": "mindhive", "ok": True,
+                   "text": "harvested Skill tool call"}}]
 
 
-def test_event_for_item_maps_invoke_result():
+def test_event_for_item_maps_skill_used():
+    value = {"name": "circle", "plugin": "mindhive", "ok": True,
+             "text": "harvested Skill tool call"}
     etype, payload, tags = harvest._event_for_item(
-        {"kind": "invoke_result", "value": "mindhive:circle"})
-    assert etype == "invoke_result"
-    assert payload == {"text": "mindhive:circle", "name": "mindhive:circle"}
-    assert tags == ["harvest", "auto"]
+        {"kind": "skill_used", "value": value})
+    assert etype == "skill_used"
+    assert payload == value
+    assert tags == ["harvest", "auto", "skill"]

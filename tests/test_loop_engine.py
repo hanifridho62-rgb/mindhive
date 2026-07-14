@@ -37,7 +37,7 @@ def test_loop_completes_on_dual_condition(tmp_path, monkeypatch):
     # iteration 2 checks the box and exits.
     drv = FakeDriver([
         _result("working\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n"),
-        _result("done\nLOOP_STATUS:\n  progress: true\n  STATUS: COMPLETE\n  EXIT_SIGNAL: true\n"),
+        _result("All tasks have been completed.\nLOOP_STATUS:\n  progress: true\n  STATUS: COMPLETE\n  EXIT_SIGNAL: true\n"),
     ])
 
     # the engine re-reads fix_plan each iteration; simulate the box being checked
@@ -77,7 +77,7 @@ def test_loop_context_resets_when_window_half_full(tmp_path, monkeypatch):
     drv = FakeDriver([
         _result("a\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n",
                 occupancy=120000, session="big"),
-        _result("b\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: true\n  STATUS: COMPLETE\n",
+        _result("All tasks have been completed.\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: true\n  STATUS: COMPLETE\n",
                 occupancy=1000, session="fresh"),
     ])
     cfg = config.LoopConfig(max_iterations=5)
@@ -132,3 +132,97 @@ def _fake_clock():
         t["v"] += 1.0
         return t["v"]
     return now
+
+
+def test_completed_run_is_auto_dismissed(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    (loop_dir / "fix_plan.md").write_text("- [x] step one\n", encoding="utf-8")
+    drv = FakeDriver([
+        _result("All tasks have been completed.\nLOOP_STATUS:\n  progress: true\n"
+                "  STATUS: COMPLETE\n  EXIT_SIGNAL: true\n"),
+    ])
+    cfg = config.LoopConfig(max_iterations=5)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: True)
+    assert result["reason"] == "completed"
+    dismissals = [e for e in events.read_all() if e.type == "loop_run_dismissed"]
+    assert len(dismissals) == 1
+    assert dismissals[0].payload["cause"] == "completed"
+    assert dismissals[0].payload["run_id"] == result["run_id"]
+
+
+def test_breaker_tripped_run_is_auto_dismissed(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    timeout = DriverResult(text="", usage=Usage(), session_id=None, num_turns=0,
+                           rate_limited=False, error="timeout")
+    drv = FakeDriver([timeout] * 10)
+    cfg = config.LoopConfig(max_iterations=20, no_progress_threshold=3,
+                            same_error_threshold=3)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: False)
+    assert result["reason"] == "breaker_open"
+    dismissals = [e for e in events.read_all() if e.type == "loop_run_dismissed"]
+    assert len(dismissals) == 1
+    assert dismissals[0].payload["cause"] == "breaker"
+
+
+def test_max_iterations_run_is_not_dismissed(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    drv = FakeDriver([_result("noop\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n")
+                      for _ in range(3)])
+    cfg = config.LoopConfig(max_iterations=3)
+    engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                    now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                    progress_fn=lambda i: True)
+    assert not [e for e in events.read_all() if e.type == "loop_run_dismissed"]
+
+
+def test_loop_events_carry_run_id_and_title(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    drv = FakeDriver([_result("noop\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n")])
+    cfg = config.LoopConfig(max_iterations=1)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: True)
+    rid = result["run_id"]
+    evs = events.read_all()
+    start = next(e for e in evs if e.type == "loop_run_start")
+    assert start.payload["run_id"] == rid
+    assert start.payload["title"] == "Build it"
+    assert all(e.payload.get("run_id") == rid for e in evs
+               if e.type in ("loop_iteration", "loop_run_end"))
+
+
+def test_interrupted_run_still_gets_a_run_end(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+
+    class ExplodingDriver:
+        def run(self, prompt, loop_context, **kw):
+            raise KeyboardInterrupt
+
+    cfg = config.LoopConfig(max_iterations=5)
+    import pytest
+    with pytest.raises(KeyboardInterrupt):
+        engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg,
+                        driver=ExplodingDriver(), now_fn=_fake_clock(),
+                        sleep_fn=lambda s: None, progress_fn=lambda i: True)
+    ends = [e for e in events.read_all() if e.type == "loop_run_end"]
+    assert ends and ends[-1].payload["reason"] == "interrupted"
+
+
+def test_heuristic_blocked_iteration_does_not_trip_breaker(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    (loop_dir / "fix_plan.md").write_text("- [x] step one\n", encoding="utf-8")
+    # agent asserts EXIT_SIGNAL: true every time but never restates completion
+    # in prose (0 heuristics): blocked by the corroboration gate, files never
+    # change — yet this is a responsive agent, so the breaker must NOT open
+    blocked = _result("ok then\nLOOP_STATUS:\n  progress: true\n"
+                      "  EXIT_SIGNAL: true\n")
+    drv = FakeDriver([blocked] * 6)
+    cfg = config.LoopConfig(max_iterations=6, no_progress_threshold=3)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: False)
+    assert result["reason"] == "max_iterations"       # ran out, not breaker_open

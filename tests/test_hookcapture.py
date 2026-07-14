@@ -103,21 +103,6 @@ def test_extract_ignores_unknown_tools_and_missing_fields():
     assert hookcapture.extract_events({}) == []
 
 
-def test_extract_skill_invocation_as_invoke_result():
-    payload = {"tool_name": "Skill",
-               "tool_input": {"skill": "superpowers:brainstorming",
-                              "args": "topic x"}}
-    out = hookcapture.extract_events(payload)
-    assert out == [("invoke_result",
-                    {"text": "superpowers:brainstorming",
-                     "name": "superpowers:brainstorming"})]
-
-
-def test_extract_skill_without_name_is_ignored():
-    assert hookcapture.extract_events(
-        {"tool_name": "Skill", "tool_input": {}}) == []
-
-
 def test_record_appends_events_with_session_and_auto_tag():
     raw = json.dumps({"session_id": "sess-1", "tool_name": "Edit",
                       "tool_input": {"file_path": "a/b.py"}})
@@ -129,6 +114,66 @@ def test_record_appends_events_with_session_and_auto_tag():
     assert evs[0].session_id == "sess-1"
     assert "auto" in evs[0].tags
     assert evs[0].payload.get("text") == "a/b.py"
+
+
+def test_extract_skill_used_from_skill_tool_payload():
+    """Pins the expected Skill-tool PostToolUse shape: name from
+    tool_input.skill (plugin:skill namespacing split), ok from the
+    tool_response error markers, text a short excerpt."""
+    payload = {"tool_name": "Skill",
+               "tool_input": {"skill": "compound-engineering:ce-plan", "args": ""},
+               "tool_response": {"content": "planned the work", "is_error": False}}
+    assert hookcapture.extract_events(payload) == [
+        ("skill_used", {"name": "ce-plan", "ok": True,
+                        "text": "planned the work",
+                        "plugin": "compound-engineering"})]
+
+
+def test_extract_skill_used_error_marks_fail():
+    payload = {"tool_name": "Skill", "tool_input": {"skill": "ce-plan"},
+               "tool_response": {"is_error": True, "error": "boom"}}
+    [(etype, p)] = hookcapture.extract_events(payload)
+    assert etype == "skill_used"
+    assert p["name"] == "ce-plan"
+    assert p["ok"] is False
+    assert p["text"] == "boom"
+    assert "plugin" not in p             # non-namespaced name -> no plugin field
+
+
+def test_extract_skill_used_error_key_alone_marks_fail():
+    payload = {"tool_name": "Skill", "tool_input": {"skill": "x"},
+               "tool_response": {"error": "not found"}}
+    [(_, p)] = hookcapture.extract_events(payload)
+    assert p["ok"] is False
+
+
+def test_extract_skill_missing_name_is_noop():
+    assert hookcapture.extract_events({"tool_name": "Skill",
+                                       "tool_input": {}}) == []
+    assert hookcapture.extract_events({"tool_name": "Skill",
+                                       "tool_input": {"skill": "   "}}) == []
+
+
+def test_extract_skill_response_content_blocks_and_truncation():
+    payload = {"tool_name": "Skill", "tool_input": {"skill": "s"},
+               "tool_response": {"content": [{"type": "text", "text": "y" * 500}]}}
+    [(_, p)] = hookcapture.extract_events(payload)
+    assert p["ok"] is True
+    assert len(p["text"]) == 200
+
+
+def test_record_skill_payload_appends_skill_used_event():
+    raw = json.dumps({"session_id": "s1", "tool_name": "Skill",
+                      "tool_input": {"skill": "superpowers:brainstorming"},
+                      "tool_response": {"is_error": False}})
+    res = hookcapture.record_post_tool_use(raw, project="test")
+    assert res["appended"] == 1
+    ev = events.read_all("test")[0]
+    assert ev.type == "skill_used"
+    assert ev.payload["name"] == "brainstorming"
+    assert ev.payload["plugin"] == "superpowers"
+    assert ev.payload["ok"] is True
+    assert "auto" in ev.tags
 
 
 def test_malformed_payload_is_logged_not_raised():

@@ -38,3 +38,10 @@ def test_cli_directives_prints_spec(capsys):
     out = capsys.readouterr().out
     assert "MINDHIVE ASSISTANT" in out
     assert "confirm with the user first" in out
+
+
+def test_directives_prohibit_memory_meta_comments():
+    text = directives.directives()
+    assert "Memory voice" in text
+    assert "based on my memory" in text
+    assert "as we discussed" in text

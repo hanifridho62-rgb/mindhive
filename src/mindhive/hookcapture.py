@@ -20,6 +20,7 @@ _CMD_TOOLS = ("Bash", "PowerShell")
 # truncate identically (the dedup key depends on identical text).
 CMD_MAX = 180
 DESC_MAX = 120
+_SKILL_TEXT_MAX = 200
 
 
 def line_stats(tool, inp, resp=None):
@@ -53,12 +54,66 @@ def line_stats(tool, inp, resp=None):
     return None, None
 
 
+def _response_ok(resp) -> bool:
+    """False only on explicit error markers in a Skill tool_response envelope
+    (``is_error``/``isError`` truthy, or a non-empty ``error`` value)."""
+    if isinstance(resp, dict):
+        if resp.get("is_error") or resp.get("isError"):
+            return False
+        if resp.get("error"):
+            return False
+    return True
+
+
+def _response_text(resp) -> str:
+    """Best-effort short text from a Skill tool_response: a plain string, the
+    first non-empty string field, or joined ``text`` parts of a content-block
+    list. Empty string when nothing readable is found."""
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        for key in ("text", "result", "output", "error", "content"):
+            v = resp.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+            if isinstance(v, list):
+                parts = [b.get("text", "") for b in v
+                         if isinstance(b, dict) and isinstance(b.get("text"), str)]
+                joined = " ".join(x for x in parts if x).strip()
+                if joined:
+                    return joined
+    return ""
+
+
+def _skill_payload(inp, resp) -> dict | None:
+    """Build the ``skill_used`` event payload from a Skill-tool PostToolUse
+    payload: ``{name, plugin?, ok, text}``. The skill name comes from
+    ``tool_input`` (``plugin:skill`` namespacing is split into the two fields);
+    ``ok`` reflects the tool_response error markers. None when unparseable."""
+    raw = None
+    for key in ("skill", "name", "skill_name"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            raw = v.strip()
+            break
+    if not raw:
+        return None
+    plugin, _, name = raw.rpartition(":")
+    out = {"name": name or raw, "ok": _response_ok(resp),
+           "text": _response_text(resp).strip()[:_SKILL_TEXT_MAX]}
+    if plugin:
+        out["plugin"] = plugin
+    return out
+
+
 def extract_events(payload) -> list:
     """Pure extraction: map one PostToolUse payload to ``(type, payload)``
     pairs. The payload's ``text`` field is byte-identical to the historical
     value (path / command[:180]) — harvest's dedup key depends on it. Extra
-    keys (plus/minus/tool/desc) ride alongside. A file change that computes
-    to +0 −0 is not a change and is skipped (locked design rule).
+    keys (plus/minus/tool/desc) ride alongside, and the Skill tool yields a
+    structured ``skill_used`` payload (``{name, plugin?, ok, text}``). A file
+    change that computes to +0 −0 is not a change and is skipped (locked
+    design rule).
 
     Returns ``[]`` for unknown tools or missing fields — never raises on a
     well-formed dict with absent keys.
@@ -88,14 +143,8 @@ def extract_events(payload) -> list:
             p["desc"] = desc.strip()[:DESC_MAX]
         return [("command_run", p)]
     if tool == "Skill":
-        name = inp.get("skill")
-        if isinstance(name, str) and name.strip():
-            name = name.strip()
-            # PostToolUse fires after the tool ran; a skill whose execution
-            # later fails still surfaces via the tool_failed pipeline, so this
-            # records the invocation outcome the green/red view reads.
-            return [("invoke_result", {"text": name, "name": name})]
-        return []
+        skill = _skill_payload(inp, payload.get("tool_response"))
+        return [("skill_used", skill)] if skill else []
     return []
 
 
