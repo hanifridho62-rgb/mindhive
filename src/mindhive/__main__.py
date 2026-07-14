@@ -345,6 +345,7 @@ def cmd_skills_recommend(args) -> int | None:
     both the telemetry stats and the need extraction, so --brief stays cheap
     enough for a session-start hook."""
     from . import plugins as plugins_mod
+    from . import recommend as recommend_mod
     payload = plugins_mod.recommend_for(project=args.project, top=args.top)
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -352,7 +353,7 @@ def cmd_skills_recommend(args) -> int | None:
     recs = payload["recommendations"]
     if args.brief:
         for e in recs[:(args.top or 3)]:
-            print(f"{e['name']} — {e['reason']} ({e['provenance']})")
+            print(recommend_mod.brief_line(e))
         return None
     cov = payload["coverage"]
     print(f"measured {cov['measured']} of {cov['total']} skills")
@@ -363,6 +364,11 @@ def cmd_skills_recommend(args) -> int | None:
         print(f"  {i}. {e['name']}  [score {e['score']:g}, {e['provenance']}]"
               f"{'  (try to measure)' if e.get('try_to_measure') else ''}")
         print(f"       {e['reason']}")
+        # Full width (no truncation) but the SAME empty/whitespace handling as
+        # brief_line, so an empty description never prints a dangling clause.
+        use = recommend_mod._truncate(e.get("description"))
+        if use:
+            print(f"       intended use: {use}")
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")

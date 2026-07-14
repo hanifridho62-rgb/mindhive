@@ -862,11 +862,19 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     let calls = 0, ok = 0;
     Object.values(PLUG_STATS).forEach(s => { calls += s.calls||0; ok += s.ok||0; });
     const rate = calls ? Math.round(ok/calls*100)+'%' : '\\u2014';
+    const measured = cov.measured ?? 0;
+    const total = cov.total ?? (c.skills_total ?? 0);
+    // Cold-start honesty: before any skill has been called, show WHY the tiles
+    // read zero rather than a bare '0/0' that looks broken.
+    const rateLbl = calls ? ('completion rate \\u00b7 '+ok+'/'+calls+' calls')
+                          : 'completion rate \\u00b7 no calls recorded yet';
+    const measuredLbl = measured ? 'measured (\\u22653 calls)'
+                                 : 'measured \\u00b7 call skills to start measuring';
     return '<div class="cards" style="margin-bottom:12px">'
       + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
       + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
-      + '<div class="card"><div class="big">'+(cov.measured ?? 0)+' of '+(cov.total ?? (c.skills_total ?? 0))+'</div><div class="lbl">measured (\\u22653 calls)</div></div>'
-      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">completion rate \\u00b7 '+ok+'/'+calls+' calls</div></div>'
+      + '<div class="card"><div class="big">'+measured+' of '+total+'</div><div class="lbl">'+measuredLbl+'</div></div>'
+      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">'+rateLbl+'</div></div>'
       + '</div>';
   }
   const PLUG_SORT_LABELS = {
@@ -1084,6 +1092,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
               + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
               + (e ? callBtn(e) : '')+'</div>'
               + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + (r.description ? '<div class="snip">intended use: '+esc(r.description)+'</div>' : '')
               + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
                   + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
                       + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
