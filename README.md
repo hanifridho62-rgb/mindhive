@@ -87,6 +87,11 @@ signature gates the rebuild). Every entry is:
   flows into the **Improvements** loop, so a bad call becomes a prevention rule
   the next run can consult. All installed skills are callable this way, not a
   hand-picked subset.
+- **Effectiveness-aware ranking.** Skill invocations are captured live (and
+  back-filled from transcripts), so recommendations blend coverage with a
+  measured success rate. A skill with ≥3 calls and <40 % success is demoted:
+  listed with its failure reason instead of recommended. No history = neutral
+  (unproven skills are neither boosted nor punished).
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:
@@ -200,7 +205,17 @@ Within a project the panel keeps three layers distinct so intent and context
 stay legible:
 - **Memory** — the semantic events you/Claude author (decision, caveat,
   experiment_result, next_step, open_question, state_set): the intent layer.
-- **Sessions** — each append stream (`session_id`); click one to scope Memory to it.
+- **Sessions — notification center.** Every session renders as a collapsible
+  task card: status badge (`● ongoing` / `✓ completed`), a summary chip
+  ("edited 8 files (+120 −44) · ran 3 commands · 1 note"), and expandable
+  rows for touched files (+N −M line stats), commands (with descriptions),
+  notes/caveats, failures, and loop iterations (progress · breaker · tokens ·
+  cost). Expanding a file or command row fetches the full diff or command
+  output lazily from the Claude Code transcript — nothing heavy is stored in
+  the ledger, and sessions whose transcript is gone degrade to a notice.
+  The history is append-only and deliberately has no delete button; expanded
+  cards show the last 100 actions (older rows stay in the ledger). Zero-change
+  file writes (+0 −0) are not logged.
 - **session / auto** — deterministic telemetry (file_touched, command_run,
   session_start/end, …), counted separately on the Overview so it never drowns
   out the memory.

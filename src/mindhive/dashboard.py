@@ -23,6 +23,7 @@ from . import invoker as invoker_mod
 from . import export as export_mod
 from . import events, projector
 from . import dedupe
+from . import taskview
 from . import sync as sync_mod
 from . import workspace as workspace_mod
 from . import research as research_mod
@@ -423,9 +424,11 @@ def make_handler(token: str):
                 key = (name, e.session_id)
                 s = by.get(key)
                 if s is None:
-                    s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
-                                   "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
+                    s = by[key] = {"session_id": e.session_id, "project": name,
+                                   "events": 0, "memory": 0,
+                                   "first_ts": e.ts, "last_ts": e.ts, "_evs": []}
                 s["events"] += 1
+                s["_evs"].append(e)
                 if e.type in events.MEMORY_VIEW_TYPES:
                     s["memory"] += 1
                 if e.ts and e.ts < s["first_ts"]:
@@ -433,7 +436,26 @@ def make_handler(token: str):
                 if e.ts and e.ts > s["last_ts"]:
                     s["last_ts"] = e.ts
             out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
+            for s in out:
+                s["activity"] = taskview.tally(s.pop("_evs"))
+                s["status"] = taskview.status_of(s["last_ts"])
             return self._json(out)
+
+        def _get_task(self, proj, am, qs):
+            sid = (qs.get("session") or [""])[0]
+            # In HIVE MIND mode each card carries its own project — a concrete
+            # namespace is required to read the right ledger.
+            tproj = (qs.get("session_project") or [None])[0]
+            if am and not tproj:
+                return self._json({"ok": False,
+                                   "error": "session_project required"}, 400)
+            evs = [e for e in events.read_all(tproj or proj)
+                   if e.session_id == sid]
+            return self._json(taskview.items(evs))
+
+        def _get_task_detail(self, proj, am, qs):
+            sid = (qs.get("session") or [""])[0]
+            return self._json(taskview.detail(sid))
 
         def _get_recall(self, proj, am, qs):
             q = (qs.get("q") or [""])[0]
@@ -600,7 +622,11 @@ def make_handler(token: str):
             parsed = urlparse(self.path)
             route = parsed.path
             if route == "/":
-                return self._send(200, render_page(token), "text/html; charset=utf-8")
+                return self._send(200,
+                                  render_page(token,
+                                              tasks_css=taskview.CARDS_CSS,
+                                              tasks_js=taskview.CARDS_JS),
+                                  "text/html; charset=utf-8")
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             handler = self._GET_ROUTES.get(route)
@@ -888,6 +914,8 @@ def make_handler(token: str):
             "/api/memory": _get_memory,
             "/api/improvements": _get_improvements,
             "/api/sessions": _get_sessions,
+            "/api/task": _get_task,
+            "/api/task_detail": _get_task_detail,
             "/api/oversee": _get_oversee,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
