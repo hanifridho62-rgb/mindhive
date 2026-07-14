@@ -308,18 +308,47 @@ def test_compose_program_iteration_contract_and_prior_result():
     assert "1.31" in prog and "lr 0.01 -> 0.02" in prog
 
 
-def test_compose_program_learn_mode_is_read_only_and_no_github():
+def test_compose_program_learn_mode_is_read_only_and_writes_a_prd():
     out = research.compose_program(
         "g", train_path=r"\\wsl$\u\train.py", mode="learn")
     prog, system = out["program"], out["system"]
     low = prog.lower()
-    assert "analyze-and-learn" in low or "read-only" in low
+    assert "read-only" in low
     assert "never touch github" in low
-    assert "learning report" in low and "ranked hypotheses" in low.lower()
+    # the output is now a buildable PRD ending in an SOP, not a loose report
+    assert "prd" in low and "product requirement document" in low
+    assert "sop" in low
+    # the machine-readable card header the parser keys on
+    assert "title:" in low and "summary:" in low
     assert "read exactly this file" in low and "do not edit" in low
     # the improve-mode edit contract must NOT leak into learn mode
     assert "edit train.py only" not in low
     assert system == research._ANALYSIS_CONTRACT
+
+
+def test_compose_program_learn_mode_sop_draws_on_installed_inventory():
+    """The SOP must be composed from real installed skills/plugins, named
+    verbatim — the inventory is rendered into the program in learn mode only."""
+    inv = [{"name": "ce-plan", "plugin": "compound-engineering"},
+           {"name": "tdd-cycle", "plugin": "tdd-workflows"}]
+    prog = research.compose_program("g", mode="learn", inventory=inv)["program"]
+    assert "ce-plan" in prog and "compound-engineering" in prog
+    assert "tdd-cycle" in prog
+    assert "verbatim" in prog.lower()
+    # improve mode never renders the installed-inventory block
+    assert "ce-plan" not in research.compose_program(
+        "g", mode="improve", inventory=inv)["program"]
+
+
+def test_compose_program_learn_mode_frames_staged_skills_as_sop_primary():
+    """Staged skills are the SOP's primary building blocks in learn mode, not
+    edit guidance — the improve-mode 'steer your edits' framing must not leak."""
+    staged = [{"name": "ce-code-review", "plugin": "compound-engineering"}]
+    prog = research.compose_program("g", skills=staged, mode="learn")["program"]
+    low = prog.lower()
+    assert "ce-code-review" in prog
+    assert "primary" in low and "sop" in low
+    assert "steer" not in low
 
 
 def test_compose_program_learn_mode_suppresses_no_edit_nudge():
@@ -352,6 +381,26 @@ def test_compose_program_learn_mode_grounds_analysis_in_history():
     # improve mode never renders the history block
     assert "Experiment history" not in research.compose_program(
         "g", mode="improve", history=history)["program"]
+
+
+def test_parse_prd_extracts_title_summary_and_strips_header():
+    report = ("TITLE: Add a KV-cache to the eval loop\n"
+              "SUMMARY: Cache attention keys/values so eval is cheaper\n\n"
+              "# PRD\n1. Problem ...")
+    prd = research.parse_prd(report, 3, goal="lower val_bpb")
+    assert prd["n"] == 3
+    assert prd["title"] == "Add a KV-cache to the eval loop"
+    assert prd["summary"] == "Cache attention keys/values so eval is cheaper"
+    assert prd["body"].startswith("# PRD")
+    # the header lines are lifted into title/summary, not duplicated in the body
+    assert "TITLE:" not in prd["body"] and "SUMMARY:" not in prd["body"]
+
+
+def test_parse_prd_falls_back_when_headers_missing():
+    prd = research.parse_prd("Just some analysis text.\nMore.", 1)
+    assert prd["title"] == "PRD 1"
+    assert prd["summary"] == "Just some analysis text."
+    assert prd["body"] == "Just some analysis text.\nMore."
 
 
 def test_leaderboard_concurrent_appends_no_loss(tmp_path):
@@ -651,6 +700,39 @@ def test_controller_learn_mode_persists_learnings_without_training(tmp_path):
     assert "hypothesis 1" in learnings[0]["payload"]["report"]
     art = ctl._learnings_path()
     assert art.exists() and "hypothesis 1" in art.read_text(encoding="utf-8")
+
+
+def test_controller_learn_mode_stores_structured_prds(tmp_path):
+    """Each analysis turn's report is parsed into a structured PRD record the
+    UI renders as a card (title + one-line summary + full body)."""
+    class PRDStub(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            n = len(self.prompts)
+            return {"ok": True, "report":
+                    f"TITLE: Build thing {n}\nSUMMARY: does thing {n}\n\n"
+                    f"# PRD\nbody {n}"}
+
+    ctl = _controller(tmp_path, researcher=PRDStub())
+    assert ctl.start("g", max_experiments=2, mode="learn")["ok"]
+    _wait_ended(ctl)
+    prds = ctl.prds()
+    assert [p["title"] for p in prds] == ["Build thing 1", "Build thing 2"]
+    assert prds[0]["summary"] == "does thing 1"
+    assert "body 1" in prds[0]["body"]
+
+
+def test_controller_learn_mode_feeds_installed_inventory_into_sop(tmp_path):
+    """The controller hands the installed-skills inventory to the researcher so
+    the SOP can be composed from real skills/plugins (staged-first, all
+    allowed)."""
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher,
+                      skills_inventory=lambda: [
+                          {"name": "ce-plan", "plugin": "compound-engineering"}])
+    assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert "ce-plan" in researcher.prompts[0]
 
 
 def test_controller_learn_mode_aborted_turn_counts_and_continues(tmp_path):
@@ -991,6 +1073,28 @@ def test_api_post_start_threads_learn_mode(tmp_path, monkeypatch):
     # the learnings the run persisted are readable through the GET API
     out = research.api_get("learnings")
     assert out["ok"] and "hypothesis 1" in out["learnings"]
+
+
+def test_api_get_prds_returns_structured_records(tmp_path, monkeypatch):
+    """/api/research/prds serves the parsed PRD cards the Self-Reliant page
+    renders and links back to Memory."""
+    class PRDStub(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            return {"ok": True, "report":
+                    "TITLE: Ship the thing\nSUMMARY: builds the thing\n\n# PRD"}
+
+    ctl = _controller(tmp_path, researcher=PRDStub())
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1,
+                                           "mode": "learn"})
+    assert res["ok"]
+    _wait_ended(ctl)
+    out = research.api_get("prds")
+    assert out["ok"]
+    assert out["prds"][0]["title"] == "Ship the thing"
+    assert out["prds"][0]["summary"] == "builds the thing"
 
 
 def test_api_post_start_defaults_to_improve_mode(tmp_path, monkeypatch):

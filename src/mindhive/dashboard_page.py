@@ -832,6 +832,18 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
                                                : '/api/workspace/'+view));
   }
 
+  // Self-Reliant (an iframe) can ask the parent to open the Memory view filtered
+  // to a PRD's backing events — the section's link into the memory it wrote. Only
+  // trust messages from our own iframe on the same origin (never arbitrary posts).
+  window.addEventListener('message', function(ev){
+    if (ev.origin !== location.origin) return;
+    if (!graph || ev.source !== graph.contentWindow) return;
+    const d = ev.data;
+    if (!d || d.type !== 'mh-self-reliant' || d.action !== 'show-memory') return;
+    MEM_QUERY = String(d.query == null ? '' : d.query).slice(0, 200);
+    showMemory();
+  });
+
   function showAppend(){
     liveFn = null;
     controls.innerHTML = '<div class="row"><select id="etype">'
