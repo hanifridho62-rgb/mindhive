@@ -31,7 +31,16 @@ SOFT_MIN = 2
 MIN_CONTENT_WORDS = 4     # fewer content words than this reads as "too short"
 SHORT_PROMPT_WORDS = 15   # dangling references only matter in short prompts
 LEAD_WINDOW = 6           # a pronoun this early usually has no antecedent
+# assess() runs on EVERY prompt; past this size the text is treated as clear
+# without scanning. Vagueness is a property of short prompts by definition,
+# and the cap bounds the target regexes' worst-case backtracking (a pasted
+# 100KB unbroken run of dots measured ~100s unscanned-capped vs ~ms capped).
+PROMPT_SCAN_CAP = 2000
 
+# Deliberately a separate tokenizer from recommend._keywords: that one scores
+# skill DESCRIPTIONS (where "use"/"when" are noise), this one scores typed
+# PROMPTS (where politeness words like "please" are the noise). Keep the two
+# vocabularies independent so tuning one never silently shifts the other.
 _WORD = re.compile(r"[a-z0-9]+")
 _STOP = {
     "and", "any", "are", "can", "each", "for", "from", "has", "have", "how",
@@ -42,7 +51,9 @@ _STOP = {
 # Concrete-target signals: a prompt naming any of these is specific enough
 # that the vagueness dimensions stand down.
 _TARGET_RES = (
-    re.compile(r"[\w./\\-]+\.[A-Za-z]{1,4}\b"),      # file path / extension
+    # file path / extension; the lookahead keeps prose abbreviations
+    # (e.g., i.e., etc., vs.) from reading as a concrete file target
+    re.compile(r"\b(?!(?:e\.g|i\.e|etc|vs)\b)[\w./\\-]{2,}\.[A-Za-z]{1,4}\b"),
     re.compile(r"`[^`]+`"),                          # backtick span
     # double quotes only: two apostrophes ("don't … it's") must not read as a
     # quoted span and silently suppress the gate
@@ -63,13 +74,18 @@ _AMBIGUITY_MARKERS = {
 }
 _LEAD_PRONOUNS = {"it", "this", "that", "them"}
 
-_METHOD_SKIP_PHRASES = (
-    "skip the plan", "no plan", "without a plan", "skip planning",
+# Imperative method-skip phrases only, word-bounded. Descriptive state
+# ("the module has no tests", "there is no plan yet") is what a prompt may
+# legitimately REPORT — only an instruction to skip the method is a finding —
+# and word boundaries keep innocent containing strings ("casino plan") from
+# firing the hard gate.
+_METHOD_SKIP_RES = tuple(re.compile(r"\b" + re.escape(p) + r"\b") for p in (
+    "skip the plan", "without a plan", "skip planning",
     "just do it", "just wing it", "quick and dirty",
-    "skip tests", "without tests", "no tests", "skip the tests",
+    "skip tests", "without tests", "skip the tests",
     "don't test", "dont test", "no need to test",
-    "skip review", "no review", "skip the review",
-)
+    "skip review", "skip the review",
+))
 
 # Quality-gap dimensions. ``need`` is the remediation-need text a skill
 # description must match to fill the dimension (curated, like
@@ -142,8 +158,12 @@ def assess(text: str) -> dict:
     if is_machine_prompt(text):
         return {"skip": True, "clear": True, "findings": []}
     t = str(text or "")
+    if len(t) > PROMPT_SCAN_CAP:
+        return {"skip": False, "clear": True, "findings": []}
     low = " ".join(t.lower().split())
-    words = low.split()
+    # Regex tokens (not whitespace split) everywhere, so punctuation never
+    # hides a word from a check ("it, please fix" must still lead with "it").
+    tokens = _WORD.findall(low)
     content = _content_words(t)
     target = _has_target(t)
     findings = []
@@ -154,14 +174,14 @@ def assess(text: str) -> dict:
 
     if len(content) < MIN_CONTENT_WORDS and not target:
         hit("too-short")
-    if not target and any(w in _VAGUE_VERBS for w in _WORD.findall(low)):
+    if not target and any(w in _VAGUE_VERBS for w in tokens):
         hit("vague-verb")
-    if (not target and len(words) < SHORT_PROMPT_WORDS
-            and any(w in _LEAD_PRONOUNS for w in words[:LEAD_WINDOW])):
+    if (not target and len(tokens) < SHORT_PROMPT_WORDS
+            and any(w in _LEAD_PRONOUNS for w in tokens[:LEAD_WINDOW])):
         hit("dangling-reference")
-    if any(w in _AMBIGUITY_MARKERS for w in _WORD.findall(low)):
+    if any(w in _AMBIGUITY_MARKERS for w in tokens):
         hit("ambiguity-markers")
-    if any(p in low for p in _METHOD_SKIP_PHRASES):
+    if any(rx.search(low) for rx in _METHOD_SKIP_RES):
         hit("method-skip")
 
     hard = any(f["hard"] for f in findings)
@@ -172,12 +192,20 @@ def assess(text: str) -> dict:
 
 # --- training: pick each dimension's skill from measured ledger data ----------
 
-def _pick_skill(need: str, skills, stats) -> dict | None:
+def _pick_skill(need: str, skills, stats, open_incidents=None,
+                skill_rules=None) -> dict | None:
     """Best inventory skill for one dimension's need text. Deterministic
     tie-break chain (recommend-engine order): measured beats unmeasured →
     higher completion rate → stronger need match → shorter description →
-    name. None when nothing in the inventory matches the need at all."""
+    name. None when nothing in the inventory matches the need at all.
+
+    Mirrors the recommend engine's learning gates: a skill discontinued by
+    the improvements linkage (active ``skill:*`` rule + DISCONTINUE_STREAK
+    trailing failures) is excluded entirely, and ``must`` wording — like
+    execution_mode auto — additionally requires no open skill incident."""
     from . import recommend
+    open_inc = open_incidents or {}
+    rules = skill_rules or {}
     best = None
     best_key = None
     for s in sorted((skills or []), key=lambda s: str(s.get("name", ""))):
@@ -190,6 +218,9 @@ def _pick_skill(need: str, skills, stats) -> dict | None:
         st = (stats or {}).get(name) or {}
         calls = int(st.get("calls") or 0)
         rate = st.get("completion_rate")
+        fail_streak = int(st.get("fail_streak") or 0)
+        if rules.get(name) and fail_streak >= recommend.DISCONTINUE_STREAK:
+            continue                     # discontinued — never recommend it
         measured = calls >= recommend.MEASURED_MIN_CALLS and rate is not None
         key = (1 if measured else 0, rate if measured else -1.0, nm,
                -len(str(s.get("description") or "")))
@@ -205,6 +236,7 @@ def _pick_skill(need: str, skills, stats) -> dict | None:
                 "need_match": nm,
                 "directive": ("must" if measured
                               and (rate or 0.0) >= recommend.AUTO_MIN_RATE
+                              and not open_inc.get(name)
                               else "try"),
             }
     return best
@@ -230,16 +262,22 @@ def observed_counts(evs) -> dict:
     return {"prompts_scanned": scanned, "by_dimension": counts}
 
 
-def train(skills, stats, evs=None, now=None) -> dict:
+def train(skills, stats, evs=None, now=None, incident_summaries=None) -> dict:
     """Pure trainer: derive the full trigger manifest from a flattened skill
-    inventory, per-skill telemetry, and (optionally) the event history used
-    for observed counts. Dimensions no inventory skill matches are omitted —
-    the gate stays silent for them rather than inventing a directive."""
+    inventory, per-skill telemetry, (optionally) the event history used for
+    observed counts, and (optionally) incident summaries powering the
+    recommend-engine learning gates. Dimensions no inventory skill matches
+    are omitted — the gate stays silent for them rather than inventing a
+    directive."""
     from . import events as ev_mod
+    from . import recommend
     observed = observed_counts(evs)
+    open_inc = recommend.open_skill_incidents(incident_summaries)
+    skill_rules = recommend.active_skill_rules(incident_summaries)
     rules = {}
     for dim, spec in DIMENSIONS.items():
-        pick = _pick_skill(spec["need"], skills, stats)
+        pick = _pick_skill(spec["need"], skills, stats,
+                           open_incidents=open_inc, skill_rules=skill_rules)
         if pick is None:
             continue
         rules[dim] = dict(pick, label=spec["label"], remedy=spec["remedy"],
@@ -276,7 +314,9 @@ def load_manifest(project=None) -> dict:
 def _write_manifest(project, data) -> None:
     p = _manifest_path(project)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
+    # Per-writer tmp name: two concurrent session-start trainers must never
+    # interleave into one tmp file before the atomic rename.
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, p)
 
@@ -299,28 +339,48 @@ def train_and_store(project=None, max_age_hours: float = 0.0) -> dict:
     stale-gated: a fresh manifest is returned untouched, so session hooks can
     fire this on every start for free."""
     from . import events as ev_mod
+    from . import incidents as incidents_mod
     from . import plugins, recommend
     if max_age_hours > 0:
         existing = load_manifest(project)
         age = _age_hours(str(existing.get("trained_at", "")))
-        if age is not None and age < max_age_hours:
+        # A negative age (future trained_at from a clock rollback or a
+        # hand-edited manifest) must count as stale, not freeze the gate.
+        if age is not None and 0 <= age < max_age_hours:
             return {"trained": False, "age_hours": age, "manifest": existing}
     evs = ev_mod.read_all(project)
     skills = recommend.flatten_inventory(plugins.live_inventory()["inventory"])
     stats = plugins.skill_stats(project=project, evs=evs)
-    manifest = train(skills, stats, evs=evs)
+    manifest = train(skills, stats, evs=evs,
+                     incident_summaries=incidents_mod.summaries(project))
     _write_manifest(project, manifest)
-    ev_mod.append_event(
-        "trigger_trained",
-        {"text": (f"trained {manifest['coverage']['rules']} prompt-quality "
-                  f"trigger rule(s) from {manifest['coverage']['skills_total']} "
-                  f"skills"),
-         "rules": {d: r["skill"] for d, r in manifest["rules"].items()}},
-        tags=["trigger", "train"], project=project)
+    # Best-effort audit: the manifest is the source of truth; a failed append
+    # must not crash the detached background trainer after a good write.
+    # session_id "manual": the detached session-start trainer inherits the
+    # live session's MINDHIVE_SESSION, and letting it append to that session's
+    # segment file would race the session's own hook captures.
+    try:
+        ev_mod.append_event(
+            "trigger_trained",
+            {"text": (f"trained {manifest['coverage']['rules']} prompt-quality "
+                      f"trigger rule(s) from "
+                      f"{manifest['coverage']['skills_total']} skills"),
+             "rules": {d: r["skill"] for d, r in manifest["rules"].items()}},
+            session_id="manual", tags=["trigger", "train"], project=project)
+    except Exception:
+        pass
     return {"trained": True, "age_hours": 0.0, "manifest": manifest}
 
 
 # --- the hook: assess the prompt, render directives ----------------------------
+
+def _safe_text(value, width: int = 80) -> str:
+    """Whitespace-collapsed, length-capped rendering of an inventory-supplied
+    string. Skill/plugin names come from local SKILL.md frontmatter and flow
+    verbatim into agent-steering context — a newline or essay-sized name must
+    not be able to smuggle extra directive lines into the injection."""
+    return " ".join(str(value or "").split())[:width]
+
 
 def render_context(findings, rules) -> str:
     """The additionalContext block for a failed gate: what looked
@@ -337,15 +397,17 @@ def render_context(findings, rules) -> str:
         if r["skill"] in seen:
             continue
         seen.add(r["skill"])
-        where = f" ({r['plugin']})" if r.get("plugin") else ""
+        skill = _safe_text(r["skill"])
+        plugin = _safe_text(r.get("plugin"))
+        where = f" ({plugin})" if plugin else ""
         if r.get("directive") == "must":
             lines.append(
-                f"- MUST USE: {r['skill']}{where} via the Skill tool — "
+                f"- MUST USE: {skill}{where} via the Skill tool — "
                 f"measured {r.get('ok', 0)}/{r.get('calls', 0)} completion; "
                 f"{r.get('remedy', '')}.")
         else:
             lines.append(
-                f"- TRY & MEASURE: {r['skill']}{where} via the Skill tool (not "
+                f"- TRY & MEASURE: {skill}{where} via the Skill tool (not "
                 f"ad-hoc) so its completion rate gets measured; "
                 f"{r.get('remedy', '')}.")
     if len(lines) == 1:
