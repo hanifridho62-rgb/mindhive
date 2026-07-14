@@ -76,8 +76,21 @@ _PAGE = """<!doctype html>
   td.st-crash, td.st-timeout, td.st-aborted { color:#ff8a8a; }
   #log { flex:1 1 auto; min-height:120px; overflow-y:auto; margin:0; white-space:pre-wrap;
     word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
-  #learn { max-height:240px; overflow-y:auto; margin:0; white-space:pre-wrap;
-    word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
+  #prds { display:flex; flex-direction:column; gap:6px; margin-top:6px; }
+  .prd { border:1px solid #30363d; border-radius:6px; background:#0e1116; }
+  .prd > .head { display:flex; flex-direction:column; gap:2px; padding:7px 10px; cursor:pointer; }
+  .prd > .head:hover { background:#161b22; }
+  .prd .title { color:#e6edf3; font-weight:600; font-size:12px; }
+  .prd .title::before { content:'\\25B8 '; color:#8b949e; }
+  .prd.open .title::before { content:'\\25BE '; }
+  .prd .sum { color:#8b949e; font-size:11px; }
+  .prd .body { display:none; border-top:1px solid #21262d; padding:8px 10px; }
+  .prd.open .body { display:block; }
+  .prd pre { margin:0 0 8px; white-space:pre-wrap; word-break:break-word; max-height:320px;
+    overflow:auto; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
+  .prd .mem { margin-top:6px; }
+  .prd .mem .hit { color:#9ecbff; font-size:11px; margin:3px 0; padding-left:8px;
+    border-left:2px solid #2a3550; white-space:pre-wrap; word-break:break-word; }
   #toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
     background:#21262d; border:1px solid #3d6; border-radius:8px; padding:6px 14px;
     display:none; z-index:9; }
@@ -113,11 +126,13 @@ _PAGE = """<!doctype html>
         placeholder="research goal, e.g. reach the lowest val_bpb a 6 GB RTX 3050 can hit in 5 minutes"></textarea>
       <div id="recipe"></div>
       <div class="row">
-        <label class="lbl" title="learn: the agent analyzes train.py + history and
-          records learnings for you to act on with Claude Code (read-only, never
-          touches GitHub). improve: the agent edits train.py and runs experiments.">mode
+        <label class="lbl" title="PRD: the agent studies train.py + history and writes a
+          buildable Product Requirement Document — description, requirements, and an SOP
+          composed from your installed skills — for you to build in a fresh Claude Code
+          session (read-only, never touches GitHub). improve: the agent edits train.py and
+          runs experiments.">mode
           <select id="mode">
-            <option value="learn">learn (analyze &amp; record)</option>
+            <option value="learn">PRD (spec &amp; SOP)</option>
             <option value="improve">improve (edit &amp; run)</option>
           </select></label>
         <label class="lbl">max experiments <input id="capn" type="number" min="1"
@@ -141,10 +156,11 @@ _PAGE = """<!doctype html>
       <table><thead><tr><th>#</th><th>val_bpb</th><th>status</th><th>change</th>
         <th>skills</th></tr></thead><tbody id="lb"></tbody></table>
     </div>
-    <div class="panel" id="learnpanel" style="display:none">
-      <b style="font-size:12px">LEARNINGS</b>
-      <span class="lbl">analysis reports from this run — act on them with Claude Code</span>
-      <pre id="learn"></pre>
+    <div class="panel" id="prdpanel" style="display:none">
+      <b style="font-size:12px">PRDS — WHAT TO BUILD NEXT</b>
+      <span class="lbl">read-only PRDs from this run — press one to reveal its memory,
+        then build it in a fresh Claude Code session</span>
+      <div id="prds"></div>
     </div>
     <div class="panel" style="flex:1 1 auto; display:flex; flex-direction:column; min-height:0">
       <b style="font-size:12px; flex:0 0 auto">RUN LOG</b>
@@ -347,12 +363,10 @@ _PAGE = """<!doctype html>
       const lb = await api('/api/research/leaderboard');
       paintBoard(lb);
       if (st.mode === 'learn') {
-        const lr = await api('/api/research/learnings');
-        const txt = (lr.ok && lr.learnings) || '';
-        document.getElementById('learnpanel').style.display = txt ? '' : 'none';
-        document.getElementById('learn').textContent = txt;
+        const pr = await api('/api/research/prds');
+        paintPRDs((pr.ok && pr.prds) || []);
       } else {
-        document.getElementById('learnpanel').style.display = 'none';
+        document.getElementById('prdpanel').style.display = 'none';
       }
       const o = await api('/api/research/output?since=' + CURSOR);
       if (o.ok && o.lines && o.lines.length) {
@@ -376,6 +390,53 @@ _PAGE = """<!doctype html>
       + '<td title="'+esc(e.change||'')+'">'+esc((e.change||'').slice(0,90))+'</td>'
       + '<td>'+esc((e.skills||[]).join(', '))+'</td></tr>').join('')
       || '<tr><td colspan="5" class="lbl">no experiments yet \\u2014 Start a run</td></tr>';
+  }
+
+  // --- PRD cards: each PRD-mode run yields buildable specs. Press a card to
+  // expand the full PRD; 'show memory' recalls its backing ledger events inline,
+  // and 'View in Memory' asks the parent dashboard to open the Memory section
+  // filtered to it — so Self-Reliant stays connected to the memory it wrote. ---
+  let PRD_OPEN = {};                 // title -> expanded, so a repaint keeps state
+  function paintPRDs(prds){
+    const panel = document.getElementById('prdpanel');
+    panel.style.display = prds.length ? '' : 'none';
+    if (!prds.length) return;
+    const box = document.getElementById('prds');
+    box.innerHTML = prds.map((p,i) => {
+      const key = p.title || ('PRD ' + (p.n||i+1));
+      const open = PRD_OPEN[key] ? ' open' : '';
+      return '<div class="prd'+open+'" data-key="'+esc(key)+'">'
+        + '<div class="head"><span class="title">'+esc(p.title||('PRD '+(p.n||i+1)))
+        + '</span><span class="sum">'+esc(p.summary||'')+'</span></div>'
+        + '<div class="body"><pre>'+esc(p.body||'')+'</pre>'
+        + '<div class="acts"><button class="mem-btn">show memory</button> '
+        + '<button class="jump-btn">View in Memory \\u2192</button></div>'
+        + '<div class="mem"></div></div></div>';
+    }).join('');
+    box.querySelectorAll('.prd').forEach(card => {
+      const key = card.dataset.key;
+      card.querySelector('.head').onclick = () => {
+        PRD_OPEN[key] = !PRD_OPEN[key]; card.classList.toggle('open');
+      };
+      card.querySelector('.mem-btn').onclick = () => showBacking(card, key);
+      card.querySelector('.jump-btn').onclick = () => jumpToMemory(key);
+    });
+  }
+  async function showBacking(card, query){
+    const mem = card.querySelector('.mem');
+    mem.innerHTML = '<span class="lbl">recalling\\u2026</span>';
+    try {
+      const hits = await api('/api/recall?q='+encodeURIComponent(query)+'&semantic=0');
+      mem.innerHTML = (hits && hits.length)
+        ? hits.slice(0,5).map(h => '<div class="hit">'+esc((h.snippet||'').slice(0,240))
+            +'</div>').join('')
+        : '<span class="lbl">no backing memory yet</span>';
+    } catch(_) { mem.innerHTML = '<span class="lbl">recall failed</span>'; }
+  }
+  function jumpToMemory(query){
+    try { window.parent.postMessage(
+      {type:'mh-self-reliant', action:'show-memory', query:query}, location.origin); }
+    catch(_) { toast('could not open Memory', true); }
   }
 
   // boot

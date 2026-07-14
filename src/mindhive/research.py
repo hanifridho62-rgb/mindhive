@@ -250,23 +250,41 @@ _ITERATION_CONTRACT = (
     "job."
 )
 
-# The learn-mode contract: the agent analyzes and reports, it does not mutate.
-# The report is captured and persisted as a durable learning so a human working
-# with Claude Code makes the actual improvement. The GitHub clause is stated
-# here as well as enforced at spawn (read-only allowlist) — defense in depth.
+# The PRD contract: the read-only mode does not mutate anything — it produces a
+# Product Requirement Document that a *future* Claude session builds directly.
+# Its final section is an SOP whose every step names a real installed skill or
+# plugin (staged-first, all allowed), so a complete build procedure is assembled
+# from existing skills. Each PRD is captured and persisted as memory so the
+# Self-Reliant section stays connected to the memory it wrote. The GitHub clause
+# is stated here as well as enforced at spawn (read-only allowlist) — defense in
+# depth. (The symbol keeps its historical name to avoid churn in callers/tests.)
 _ANALYSIS_CONTRACT = (
-    "Analysis contract — follow it exactly: you are read-only. Do NOT edit "
+    "PRD contract — follow it exactly: you are READ-ONLY. Do NOT edit "
     "train.py or any file, and do NOT run training or any other command. You "
     "must NEVER touch GitHub — no git, no gh, no pushes, no commits, no remote "
     "operations of any kind. Read train.py and the experiment history, then "
-    "produce a structured learning report with these sections: Observations "
-    "(what the current config and history show), What worked / regressed, "
-    "Ranked hypotheses (most promising first, with why), and Recommended edits "
-    "(concrete changes a human using Claude Code should apply next). You are "
-    "headless — there is NO operator: never ask permission and never end your "
-    "turn with a question. End your turn when the report is written; MindHive "
-    "persists it as a learning for the next prompt."
+    "write ONE Product Requirement Document (PRD) that a future Claude session "
+    "can build directly, with no further clarification. Begin the PRD with two "
+    "machine-readable header lines, exactly:\n"
+    "TITLE: <one line naming what will be built>\n"
+    "SUMMARY: <one sentence describing what is being built and why>\n"
+    "Then the PRD body, with these sections in this order every time: "
+    "(1) Problem & context — grounded in the experiment history above; "
+    "(2) Goal & success metric — the target val_bpb; "
+    "(3) Requirements; "
+    "(4) SOP — a numbered build procedure where EACH step names a real "
+    "installed skill or plugin from the lists above, verbatim, and says what "
+    "it does in that step (prefer the staged primary skills; you may also use "
+    "any other installed skill); "
+    "(5) Acceptance criteria & verification. "
+    "You are headless — there is NO operator: never ask permission and never "
+    "end your turn with a question. End your turn when the PRD is written; "
+    "MindHive persists it as memory for the next session."
 )
+
+# Cap on how many installed skills are rendered into a learn-mode program, so a
+# machine with hundreds of plugins does not blow up the researcher's prompt.
+_MAX_INVENTORY = 150
 
 
 def _clean_skills(skills) -> list:
@@ -282,7 +300,8 @@ def _clean_skills(skills) -> list:
 
 
 def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
-                    train_path=None, mode="improve", history=None) -> dict:
+                    train_path=None, mode="improve", history=None,
+                    inventory=None) -> dict:
     """The researcher agent's steering document (program.md text) plus its
     system-prompt addition — a pure function of its inputs (U6).
 
@@ -291,32 +310,52 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     ``preset`` is a name->bound mapping stated as hard constraints; ``prior``
     is the previous experiment's record so the agent iterates on feedback.
     ``mode`` is ``improve`` (the agent edits train.py) or ``learn`` (the agent
-    analyzes and reports; it never edits). ``history`` is the leaderboard's
-    ranked experiment records — supplied in learn mode so the analysis is
-    grounded in real past results rather than train.py alone (R2).
+    writes a PRD; it never edits). ``history`` is the leaderboard's ranked
+    experiment records — supplied in learn mode so the PRD is grounded in real
+    past results rather than train.py alone (R2). ``inventory`` is the flat
+    ``[{name, plugin}]`` of installed skills/plugins, rendered in learn mode so
+    the PRD's SOP is composed from real, verbatim skill names.
     """
     learn = mode == "learn"
     skills = _clean_skills(skills)
     if learn:
         parts = [f"RESEARCH GOAL: {(goal or '').strip()}",
-                 "You are the Self-Reliant researcher in analyze-and-learn "
-                 "mode. Study train.py and the experiment history and produce "
-                 "learnings that a human using Claude Code will act on — the "
+                 "You are the Self-Reliant PRD author. Study train.py and the "
+                 "experiment history and write ONE Product Requirement Document "
+                 "(PRD) that a future Claude session can build directly — the "
                  "objective is the lowest val_bpb (lower is better) on this "
-                 "machine, but you do not edit anything yourself."]
+                 "machine, but you do not build or edit anything yourself. The "
+                 "PRD must end in an SOP composed from the installed skills and "
+                 "plugins listed below."]
     else:
         parts = [f"RESEARCH GOAL: {(goal or '').strip()}",
                  "You are the Self-Reliant researcher. Optimize train.py so a "
                  "5-minute training run reaches the lowest possible val_bpb "
                  "(lower is better) on this machine."]
     if skills:
-        lines = ["Strategy guidance from the staged skills, in order — steer "
-                 "your edits with them (they are guidance, not commands to "
-                 "execute):"]
+        if learn:
+            header = ("Primary skills for the SOP — these are staged into this "
+                      "run; prefer them as SOP steps and name them verbatim:")
+        else:
+            header = ("Strategy guidance from the staged skills, in order — "
+                      "steer your edits with them (they are guidance, not "
+                      "commands to execute):")
+        lines = [header]
         for i, s in enumerate(skills, 1):
             src = f" (from the {s['plugin']} plugin)" if s.get("plugin") else ""
             lines.append(f"{i}. {s['name']}{src}")
         parts.append("\n".join(lines))
+    if learn and inventory:
+        inv = _clean_skills(inventory)
+        if inv:
+            lines = ["Installed skills & plugins available for the SOP — build "
+                     "each SOP step from these, names verbatim:"]
+            for s in inv[:_MAX_INVENTORY]:
+                src = f" ({s['plugin']})" if s.get("plugin") else " (local)"
+                lines.append(f"- {s['name']}{src}")
+            if len(inv) > _MAX_INVENTORY:
+                lines.append(f"- … (+{len(inv) - _MAX_INVENTORY} more installed)")
+            parts.append("\n".join(lines))
     if preset:
         bounds = "\n".join(f"- {k}: {v}" for k, v in preset.items())
         parts.append("Hard constraints from the small-GPU preset — configs "
@@ -360,6 +399,46 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     contract = _ANALYSIS_CONTRACT if learn else _ITERATION_CONTRACT
     parts.append(contract)
     return {"program": "\n\n".join(parts), "system": contract}
+
+
+# --- PRD parsing: report -> card fields (title + summary + body) -------------
+
+_PRD_TITLE_RE = re.compile(r"^\s*title\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_PRD_SUMMARY_RE = re.compile(r"^\s*summary\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def parse_prd(report, n, goal="") -> dict:
+    """Split one PRD-mode report into the card fields the Self-Reliant page
+    renders. The agent is asked to lead with ``TITLE:`` / ``SUMMARY:`` header
+    lines; when it complies those become the card's heading and one-line
+    description, and they are stripped from ``body`` so the expanded card reads
+    cleanly. A noncompliant turn still yields a usable card — the title falls
+    back to ``PRD <n>`` and the summary to the first meaningful body line."""
+    report = (report or "").strip()
+    lines = report.splitlines()
+    title = summary = ""
+    # header lines are only honored at the very top, before the PRD body
+    while lines and (not lines[0].strip()
+                     or _PRD_TITLE_RE.match(lines[0])
+                     or _PRD_SUMMARY_RE.match(lines[0])):
+        tm = _PRD_TITLE_RE.match(lines[0])
+        sm = _PRD_SUMMARY_RE.match(lines[0])
+        if tm and not title:
+            title = tm.group(1).strip()
+        elif sm and not summary:
+            summary = sm.group(1).strip()
+        lines.pop(0)
+    body = "\n".join(lines).strip()
+    if not title:
+        title = f"PRD {n}"
+    if not summary:
+        for ln in body.splitlines():
+            s = ln.strip().lstrip("#").strip()
+            if s:
+                summary = s
+                break
+    return {"n": n, "title": title[:200], "summary": summary[:300],
+            "body": body, "goal": goal}
 
 
 # --- U4: leaderboard -------------------------------------------------------
@@ -460,7 +539,7 @@ class ResearchController:
     def __init__(self, trainer_cmd=None, agent_factory=None, train_path=None,
                  leaderboard=None, append_event=None, preflight=None,
                  cap_s=None, turn_timeout_s=None, profiles=None,
-                 auth_status=None, on_kill=None):
+                 auth_status=None, on_kill=None, skills_inventory=None):
         self._trainer_cmd = trainer_cmd
         self._factory = agent_factory
         self._train_path = train_path
@@ -476,6 +555,9 @@ class ResearchController:
         self._profiles = list(profiles or [])
         self._auth_status = auth_status
         self._on_kill = on_kill          # extra cleanup after a training kill
+        # provider of the installed-skills inventory ([{name, plugin}]) for the
+        # PRD SOP (learn mode only); injected so tests need no plugins backend
+        self._skills_inventory = skills_inventory
         self._lock = threading.Lock()
         self._stop_flag = threading.Event()
         self._thread = None
@@ -508,6 +590,16 @@ class ResearchController:
             return self._learnings_path().read_text(encoding="utf-8")
         except (OSError, ValueError):
             return ""
+
+    def prds(self) -> list:
+        """The current run's parsed PRD cards ({n, title, summary, body, goal},
+        insertion order) — the structured form the Self-Reliant page renders as
+        cards and links back to Memory. Empty for a non-learn run."""
+        try:
+            data = json.loads(self._prds_path().read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
 
     def status(self) -> dict:
         best = self.leaderboard.best()
@@ -680,13 +772,20 @@ class ResearchController:
                 if self._deadline is not None and time.monotonic() >= self._deadline:
                     reason = "time"
                     return
+                inv = None
+                if self._mode == "learn" and self._skills_inventory is not None:
+                    try:
+                        inv = self._skills_inventory()
+                    except Exception:
+                        inv = None            # a plugins read must never end a run
                 composed = compose_program(self._goal, self._skills,
                                            self._primed, self._preset, prior,
                                            train_path=(str(self._train_path)
                                                        if self._train_path else None),
                                            mode=self._mode,
                                            history=(self.leaderboard.ranked()
-                                                    if self._mode == "learn" else None))
+                                                    if self._mode == "learn" else None),
+                                           inventory=inv)
                 # snapshot BEFORE the edit-turn: the turn is what changes
                 # train.py, so a post-turn "before" reads the edited file and
                 # every agent edit would record as "no change". Learn mode never
@@ -799,6 +898,13 @@ class ResearchController:
         rid = self.run_id or "run"
         return p.with_name(f"{p.stem}_{rid}_learnings.md")
 
+    def _prds_path(self) -> Path:
+        # structured sibling of the markdown artifact: the parsed PRD cards the
+        # page renders, keyed on run_id for the same isolation reason.
+        p = self.leaderboard.path
+        rid = self.run_id or "run"
+        return p.with_name(f"{p.stem}_{rid}_prds.json")
+
     def _record_learning(self, report) -> None:
         """Persist one analysis turn's report so a human with Claude Code can
         recall and act on it: a ledger event tagged self-reliant + learning,
@@ -829,6 +935,20 @@ class ResearchController:
             # the ledger event above is the durable record; surface the artifact
             # failure in the run log instead of silently dropping it
             self.emit(f"· learning {self._count} ledgered, but its artifact "
+                      f"write failed: {e}")
+        # structured PRD store (title + summary + body) for the page's cards,
+        # written atomically alongside the markdown artifact
+        try:
+            prds = self.prds()
+            prds.append(parse_prd(report, self._count, self._goal))
+            pj = self._prds_path()
+            pj.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pj.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(prds, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, pj)
+        except OSError as e:
+            self.emit(f"· PRD {self._count} ledgered, but its card-store "
                       f"write failed: {e}")
 
     def _credit_skills(self, score) -> None:
@@ -1088,6 +1208,28 @@ CONTROLLER: ResearchController | None = None
 _CTL_LOCK = threading.Lock()
 
 
+def installed_skill_inventory() -> list:
+    """Flat ``[{name, plugin}]`` of every installed skill/plugin, so the PRD's
+    SOP is composed from real, verbatim skill names (same inventory the page's
+    skills sidebar drags from). Best-effort — a plugins read failure yields an
+    empty list, never a crash of the run."""
+    try:
+        from . import plugins
+        inv = plugins.inventory()
+    except Exception:
+        return []
+    out = []
+    for s in inv.get("local_skills") or []:
+        if s.get("name"):
+            out.append({"name": s["name"], "plugin": None})
+    for p in inv.get("plugins") or []:
+        pname = p.get("name")
+        for s in p.get("skills") or []:
+            if s.get("name"):
+                out.append({"name": s["name"], "plugin": pname})
+    return out
+
+
 def get_controller() -> ResearchController:
     global CONTROLLER
     with _CTL_LOCK:
@@ -1104,7 +1246,8 @@ def get_controller() -> ResearchController:
                 preflight=default_preflight,
                 profiles=[e["name"] for e in workspace.load_profiles()],
                 auth_status=workspace.profile_auth_status,
-                on_kill=kill_wsl_training)
+                on_kill=kill_wsl_training,
+                skills_inventory=installed_skill_inventory)
         return CONTROLLER
 
 
@@ -1122,6 +1265,8 @@ def api_get(action, proj=None, qs=None) -> dict:
         return ctl.output(since=int((qs.get("since") or ["0"])[0]))
     if action == "learnings":
         return {"ok": True, "learnings": ctl.learnings_text()}
+    if action == "prds":
+        return {"ok": True, "prds": ctl.prds()}
     return {"ok": False, "error": "not found"}
 
 

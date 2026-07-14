@@ -15,9 +15,11 @@ import pytest
 
 from mindhive import dashboard, research
 from mindhive.research_page import render_research
+from mindhive.dashboard_page import render_page
 
 MOCK = Path(__file__).resolve().parents[1] / "scripts" / "self_reliant" / "mock_trainer.py"
 PAGE = render_research("tok-123")
+PARENT = render_page("tok-parent")
 
 
 class _ReportingStub:
@@ -25,6 +27,17 @@ class _ReportingStub:
 
     def turn(self, prompt):
         return {"ok": True, "report": "lower the lr to 0.03 next run"}
+
+    def stop(self):
+        pass
+
+
+class _PRDStub:
+    """A PRD-mode researcher that returns a PRD (TITLE:/SUMMARY: header + body)."""
+
+    def turn(self, prompt):
+        return {"ok": True, "report":
+                "TITLE: Ship the widget\nSUMMARY: builds the widget\n\n# PRD\nbody"}
 
     def stop(self):
         pass
@@ -96,18 +109,47 @@ def test_page_start_posts_model():
     assert "model:" in PAGE                   # model sent in the start body
 
 
-def test_page_has_mode_selector_posting_learn_and_improve():
-    # the learn/improve choice is a start-form control sent in the body (U5)
+def test_page_has_mode_selector_posting_prd_and_improve():
+    # the PRD/improve choice is a start-form control sent in the body (U5).
+    # the read-only mode is relabeled 'PRD' but still posts value="learn".
     assert 'id="mode"' in PAGE
     assert "mode:" in PAGE                     # mode sent in the start body
-    assert "learn (analyze" in PAGE
+    assert 'value="learn"' in PAGE            # PRD mode still posts learn
+    assert "PRD" in PAGE
     assert "improve (edit" in PAGE
 
 
-def test_page_has_learnings_panel_reading_the_learnings_route():
-    assert 'id="learnpanel"' in PAGE
-    assert "/api/research/learnings" in PAGE
-    assert "LEARNINGS" in PAGE
+def test_page_has_prd_panel_reading_the_prds_route():
+    assert 'id="prdpanel"' in PAGE
+    assert "/api/research/prds" in PAGE
+    assert "PRD" in PAGE
+
+
+def test_page_prd_card_press_shows_backing_memory_via_recall():
+    # pressing a PRD card recalls its backing ledger events inline — the
+    # section is connected to the memory it wrote
+    assert "/api/recall?q=" in PAGE
+
+
+def test_page_prd_card_jumps_to_memory_section_via_postmessage():
+    # 'View in Memory' asks the parent dashboard to open the Memory view
+    # filtered to this PRD's events
+    assert "postMessage" in PAGE
+    assert "mh-self-reliant" in PAGE
+    assert "show-memory" in PAGE
+    assert "View in Memory" in PAGE
+
+
+def test_parent_opens_memory_when_self_reliant_requests_it():
+    # the parent listens for the Self-Reliant iframe's jump-to-memory message,
+    # validates it is from our iframe on the same origin, then opens the
+    # filtered Memory view
+    assert "addEventListener('message'" in PARENT
+    assert "mh-self-reliant" in PARENT
+    assert "show-memory" in PARENT
+    assert "contentWindow" in PARENT          # only accept our iframe's messages
+    assert "location.origin" in PARENT        # same-origin guard
+    assert "showMemory()" in PARENT
 
 
 def test_page_has_accounts_panel_reusing_workspace_endpoints():
@@ -224,6 +266,24 @@ def test_research_learnings_route_reachable_and_serves_reports(server):
     assert obj["ok"] and "lower the lr" in obj["learnings"]
     _, sbody = _get(base, "/api/research/status", token)
     assert json.loads(sbody)["mode"] == "learn"  # status drives the panel
+
+
+def test_research_prds_route_reachable_and_serves_cards(server):
+    # regression guard mirroring the learnings-route test: /api/research/prds
+    # must be a registered GET route (a missing entry returns 404 and leaves the
+    # PRD panel permanently empty). A PRD run persists cards the route then serves.
+    base, token, ctl = server
+    ctl._factory = lambda profile, model=None: _PRDStub()
+    status, res = _post(base, "/api/research/start", token,
+                        {"goal": "spec it", "max_experiments": 1, "mode": "learn"})
+    assert status == 200 and res["ok"]
+    assert ctl.wait(30)
+    status, body = _get(base, "/api/research/prds", token)
+    assert status == 200                         # route registered (not 404)
+    obj = json.loads(body)
+    assert obj["ok"]
+    assert obj["prds"][0]["title"] == "Ship the widget"
+    assert obj["prds"][0]["summary"] == "builds the widget"
 
 
 def test_research_stop_halts_active_run(server):
