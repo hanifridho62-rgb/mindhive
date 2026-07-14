@@ -1,6 +1,7 @@
 # src/mindhive/dashboard.py
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import secrets
@@ -274,10 +275,19 @@ def make_handler(token: str):
             # constant-time compare to avoid leaking the token via timing
             return secrets.compare_digest(str(supplied), str(token))
 
+        # Compress bodies above one MTU when the client accepts gzip — the
+        # page is ~72KB (→ ~22KB) and the Improvements/graph JSON payloads
+        # shrink similarly; below the threshold the header overhead wins.
+        GZIP_MIN_BYTES = 1400
+
         def _send(self, code, body, ctype="application/json; charset=utf-8"):
             data = body.encode("utf-8") if isinstance(body, str) else body
+            accepts = "gzip" in (self.headers.get("Accept-Encoding") or "")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if accepts and len(data) >= self.GZIP_MIN_BYTES:
+                data = gzip.compress(data, 6)
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -396,6 +406,7 @@ def make_handler(token: str):
                 stats_map = incidents.signal_stats(n, evs=evs)
                 for s in incidents.summaries(n):
                     st = stats_map.get(s["signature"], {})
+                    resolution = incidents.classify_resolution(s, st)
                     auto.append(dict(
                         s, project=n, source="auto",
                         first_seen=st.get("first_seen"),
@@ -403,7 +414,8 @@ def make_handler(token: str):
                         leaks=st.get("leaks", 0),
                         reroutes=st.get("reroutes", 0),
                         last_reroute=st.get("last_reroute"),
-                        resolution=incidents.classify_resolution(s, st)))
+                        resolution=resolution,
+                        **incidents.classify_triage(resolution, s)))
                 for e in evs:
                     if e.type != "caveat":
                         continue

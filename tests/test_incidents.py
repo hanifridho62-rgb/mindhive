@@ -663,3 +663,44 @@ def test_reflected_judgment_incident_injects_alongside_technical():
     block = incidents.inject(project="test")
     assert "[judgment:flag:pushed-to-master] never push to master" in block
     assert "[pymodule:mindhive] run with -m" in block
+
+
+# --- classify_triage: the who-acts mark on every Improvements card -----------
+
+def test_triage_unresolved_no_rule_is_for_claude():
+    t = incidents.classify_triage("unresolved", {"rule_source": "none"})
+    assert t["triage"] == "claude"
+    assert "no rule yet" in t["triage_hint"]
+
+
+def test_triage_unresolved_leaking_rule_is_for_claude():
+    t = incidents.classify_triage("unresolved", {"rule_source": "auto"})
+    assert t["triage"] == "claude"
+    assert "leak" in t["triage_hint"]
+
+
+def test_triage_watching_and_resolved_are_dismissible():
+    w = incidents.classify_triage("watching", {"rule_source": "none"})
+    r = incidents.classify_triage("resolved", {"rule_source": "auto"})
+    assert w["triage"] == r["triage"] == "dismiss"
+    assert "noise" in w["triage_hint"]
+    assert "holding" in r["triage_hint"]
+
+
+def test_triage_dismissed_carries_no_mark():
+    assert incidents.classify_triage("dismissed", {}) == {
+        "triage": "", "triage_hint": ""}
+
+
+# --- single-pass rebuild: evs threading must not change any status -----------
+
+def test_project_with_evs_matches_fresh_read(tmp_path, monkeypatch):
+    _add_failure_ts("pymodule:evs", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:evs", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    fresh = incidents.load("pymodule:evs", project="test")
+    evs = events.read_all("test")
+    incidents.project(project="test", threshold=2, evs=evs)
+    assert incidents.load("pymodule:evs", project="test") == fresh
+    assert fresh["status"] == "active"
