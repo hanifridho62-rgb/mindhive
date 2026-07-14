@@ -59,6 +59,14 @@ def cmd_hook(args) -> int | None:
         decision = enforce.hook_decision(raw)
         if decision:
             print(json.dumps(decision))
+    elif args.stage == "user_prompt_submit":
+        # Prompt-quality gate: inject skill-trigger directives when the typed
+        # prompt is underspecified. Print ONLY when the gate fires (stdout is
+        # the hook's context channel); a clear prompt prints nothing.
+        from . import promptgate
+        context = promptgate.hook_context(raw)
+        if context:
+            print(json.dumps(context))
     return None
 
 
@@ -709,6 +717,56 @@ def cmd_rules_demote(args) -> int | None:
     return None
 
 
+def cmd_triggers_train(args) -> int | None:
+    from . import promptgate
+    res = promptgate.train_and_store(project=args.project,
+                                     max_age_hours=args.max_age_hours)
+    cov = res["manifest"].get("coverage", {})
+    verb = "trained" if res["trained"] else \
+        f"fresh (age {res['age_hours']:.1f}h) — kept"
+    print(f"{verb} {cov.get('rules', 0)} trigger rule(s) "
+          f"({cov.get('measured_rules', 0)} measured) from "
+          f"{cov.get('skills_total', 0)} skills, "
+          f"{cov.get('prompts_scanned', 0)} past prompts scanned")
+    return None
+
+
+def cmd_triggers_list(args) -> int | None:
+    from . import promptgate
+    man = promptgate.load_manifest(args.project)
+    if args.json:
+        print(json.dumps(man, indent=2))
+        return None
+    rules = man.get("rules") or {}
+    if not rules:
+        print("(no trigger manifest — run `hive triggers train`)")
+        return None
+    print(f"trained {man.get('trained_at', '?')}")
+    for dim, r in sorted(rules.items()):
+        rate = r.get("completion_rate")
+        rate_s = f"{r.get('ok', 0)}/{r.get('calls', 0)}" if rate is not None else "—"
+        print(f"  [{r.get('directive', 'try'):4}] {dim}: {r.get('skill', '')} "
+              f"({r.get('provenance', '')}, {rate_s}, "
+              f"observed {r.get('observed', 0)}x in history)")
+    return None
+
+
+def cmd_triggers_check(args) -> int | None:
+    from . import promptgate
+    verdict = promptgate.assess(args.prompt)
+    if verdict["skip"]:
+        print("skipped: not a human-typed prompt")
+        return None
+    if verdict["clear"]:
+        print("clear: the gate would not fire")
+        return None
+    print("fires: " + "; ".join(f["dimension"] for f in verdict["findings"]))
+    man = promptgate.load_manifest(args.project)
+    context = promptgate.render_context(verdict["findings"], man.get("rules"))
+    print(context if context else "(no trained rule covers these dimensions)")
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -725,7 +783,8 @@ def _build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_append)
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
-    hk.add_argument("stage", choices=["post_tool_use", "pre_tool_use"],
+    hk.add_argument("stage",
+                    choices=["post_tool_use", "pre_tool_use", "user_prompt_submit"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -1002,6 +1061,30 @@ def _build_parser() -> argparse.ArgumentParser:
     ren.add_argument("--disable", metavar="SIG", default=None,
                      help="turn off enforcement for a signature")
     ren.set_defaults(func=cmd_rules_enforce)
+
+    # --- triggers (prompt-quality gate: train/list/check the manifest) ---
+    tg = sub.add_parser("triggers",
+                        help="prompt-quality trigger rules (UserPromptSubmit gate)")
+    tgsub = tg.add_subparsers(dest="triggers_cmd", required=True)
+    tgt = tgsub.add_parser("train",
+                           help="derive trigger rules from the inventory + ledger "
+                                "and store rules/triggers.json")
+    tgt.add_argument("--project", default=None)
+    tgt.add_argument("--max-age-hours", type=float, default=0.0,
+                     dest="max_age_hours",
+                     help="stale-gate: skip when the manifest is younger than "
+                          "this (0 = always retrain)")
+    tgt.set_defaults(func=cmd_triggers_train)
+    tgl = tgsub.add_parser("list", help="print the trained trigger rules")
+    tgl.add_argument("--project", default=None)
+    tgl.add_argument("--json", action="store_true", help="emit the raw manifest")
+    tgl.set_defaults(func=cmd_triggers_list)
+    tgc = tgsub.add_parser("check",
+                           help="assess one prompt offline and show what the "
+                                "gate would inject")
+    tgc.add_argument("prompt")
+    tgc.add_argument("--project", default=None)
+    tgc.set_defaults(func=cmd_triggers_check)
 
     return p
 
