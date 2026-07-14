@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -23,8 +24,13 @@ from . import export as export_mod
 from . import events, projector
 from . import dedupe
 from . import sync as sync_mod
+from . import workspace as workspace_mod
+from . import research as research_mod
 from .briefing import briefing as build_briefing
 from .dashboard_page import render_page
+from .workspace_page import render_parallel
+from .swarm_page import render_swarm
+from .research_page import render_research
 
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
@@ -394,6 +400,8 @@ def make_handler(token: str):
                         first_seen=st.get("first_seen"),
                         last_seen=st.get("last_seen"),
                         leaks=st.get("leaks", 0),
+                        reroutes=st.get("reroutes", 0),
+                        last_reroute=st.get("last_reroute"),
                         resolution=incidents.classify_resolution(s, st)))
                 for e in evs:
                     if e.type != "caveat":
@@ -443,15 +451,27 @@ def make_handler(token: str):
             return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
 
         def _get_graph(self, proj, am, qs):
-            # semantic=True folds the embedding-derived semantic_near edges into
-            # the interactive graph (degrades to deterministic edges if
-            # embeddings/deps are absent). Cost scales with ledger size, so a
-            # large namespace's graph takes longer to build on demand.
+            # Serve the persisted graph.json when it is still fresh (autosync
+            # keeps it current), rebuilding only when events actually changed —
+            # so re-opening the Graph tab is a cheap cache read, not a full
+            # rebuild + 60 MB serialize + disk write. Semantic edges fold in the
+            # embedding-derived semantic_near links but cost an embedding search
+            # per event, so they are the opt-in path (?semantic=1), never the
+            # default load.
+            semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
             if am:
-                evs = [e for _, e in all_event_pairs()]
-                html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs, semantic=True))
+                # HIVE MIND aggregates every namespace; freshness is the newest
+                # event across all of them (a cheap stat sweep), and the full
+                # aggregate log is only read on a cache miss.
+                src_mtime = max((graph_mod._events_mtime(n) for n in _all_projects()),
+                                default=0.0)
+                graph = graph_mod.load_or_build(
+                    project=HIVEMIND_PROJECT, semantic=semantic,
+                    source_mtime=src_mtime,
+                    build_evs=lambda: [e for _, e in all_event_pairs()])
             else:
-                html = graphview.render_html(graph_mod.build(proj, semantic=True))
+                graph = graph_mod.load_or_build(proj, semantic=semantic)
+            html = graphview.render_html(graph)
             return self._send(200, html, "text/html; charset=utf-8")
 
         def _get_plugins_recommend(self, proj, am, qs):
@@ -476,25 +496,41 @@ def make_handler(token: str):
             return self._json(detail)
 
         def _get_skills_status(self, proj, am, qs):
-            # green/red per skill = last recorded call outcome from the ledger
-            return self._json(plugins_mod.call_status(project=proj))
+            # status: green/red last outcome per skill; counts: total invokes —
+            # both derived from the ledger in a single pass. HIVE MIND merges
+            # every namespace's ledger, mirroring /api/improvements — skills
+            # telemetry must not read "*" as a literal (empty) namespace.
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_stats(project=proj, evs=evs))
 
         def _get_skills_history(self, proj, am, qs):
             name = (qs.get("name") or [""])[0]
             limit = int((qs.get("limit") or ["20"])[0])
-            return self._json(plugins_mod.call_history(name, project=proj, limit=limit))
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_history(name, project=proj,
+                                                       limit=limit, evs=evs))
 
         def _get_skills_stats(self, proj, am, qs):
             # per-skill completion-rate telemetry aggregated from the ledger
             # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
-            return self._json({"stats": plugins_mod.skill_stats(project=proj)})
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json({"stats": plugins_mod.skill_stats(project=proj,
+                                                                evs=evs)})
 
         def _get_skills_recommend(self, proj, am, qs):
             # deterministic most-needed-skills ranking (U6/KTD6): one ledger
-            # read feeds both the stats and the need extraction
+            # read feeds both the stats and the need extraction. HIVE MIND
+            # merges events AND incident summaries across every namespace.
             top = (qs.get("top") or [None])[0]
+            evs = summ = None
+            if am:
+                from . import incidents
+                evs = [e for _, e in all_event_pairs()]
+                summ = [s for n in _all_projects()
+                        for s in incidents.summaries(project=n)]
             return self._json(plugins_mod.recommend_for(
-                project=proj, top=int(top) if top else None))
+                project=proj, evs=evs, top=int(top) if top else None,
+                incident_summaries=summ))
 
         def _get_oversee(self, proj, am, qs):
             # Oversee: every kind of live Claude work — hive loop runs AND
@@ -515,6 +551,38 @@ def make_handler(token: str):
             runs.sort(key=lambda r: r.get("started") or "", reverse=True)
             return self._json({"runs": runs, "dismissed": dismissed,
                                "any_online": any(r["online"] for r in runs)})
+
+        def _get_workspace(self, proj, am, qs):
+            # /api/workspace/<action>: the two iframe pages render HTML; every
+            # other action is JSON, delegated to workspace.api_get. HIVE MIND
+            # (am) falls back to the default project — workspace agents always
+            # need a concrete namespace to log their I/O into.
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            if action in ("parallel", "swarm"):
+                html = render_parallel(token) if action == "parallel" else render_swarm(token)
+                return self._send(200, html, "text/html; charset=utf-8")
+            return self._json(workspace_mod.api_get(
+                action, proj=default_project() if am else proj, qs=qs))
+
+        def _post_workspace(self, proj, body):
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            return self._json(workspace_mod.api_post(action, proj=proj, body=body))
+
+        def _get_research(self, proj, am, qs):
+            # /api/research/<action>: "page" renders the Self-Reliant iframe
+            # view; everything else is JSON via research.api_get. Like the
+            # workspace, HIVE MIND falls back to the default project so run
+            # events land in a concrete namespace.
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            if action == "page":
+                return self._send(200, render_research(token),
+                                  "text/html; charset=utf-8")
+            return self._json(research_mod.api_get(
+                action, proj=default_project() if am else proj, qs=qs))
+
+        def _post_research(self, proj, body):
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            return self._json(research_mod.api_post(action, proj=proj, body=body))
 
         def _get_export(self, proj, am, qs):
             path = export_mod.export()
@@ -669,6 +737,33 @@ def make_handler(token: str):
             finally:
                 _REFLECT_LOCK.release()
 
+        def _post_rules_resolve(self, proj, body):
+            # Active resolution over the red (unresolved) set: reflect
+            # incidents with no rule yet, reroute leaking auto rules to the
+            # best distinct alternative route (human rules are never touched).
+            # Same clamp + lock discipline as the Reflect endpoint — each red
+            # incident can cost a 120s claude call.
+            import shutil
+            from . import resolve as resolve_mod
+            try:
+                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            except (TypeError, ValueError):
+                return self._json({"ok": False,
+                                   "error": "limit must be an integer"}, 200)
+            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "resolution already running"}, 200)
+            try:
+                res = resolve_mod.resolve_batch(project=proj, limit=limit)
+                done = res.get("rerouted", 0) + res.get("reflected", 0)
+                if res.get("failed") and not done and not shutil.which("claude"):
+                    return self._json({"ok": False, "error":
+                        "claude CLI unavailable — resolution needs it on PATH"}, 200)
+                return self._json(dict(res, ok=True))
+            finally:
+                _REFLECT_LOCK.release()
+
         def _post_rules_reflect_one(self, proj, body):
             # Reflect ONE named failure signature on demand — the "reflect this
             # failure" action on a failed skill call. Unlike the batch endpoint,
@@ -805,6 +900,13 @@ def make_handler(token: str):
             "/api/skills/recommend": _get_skills_recommend,
             "/api/export": _get_export,
         }
+        for _p in ("parallel", "swarm", "agents", "output", "profiles",
+                   "auth", "board"):
+            _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
+        del _p
+        for _p in ("page", "status", "leaderboard", "output", "learnings"):
+            _GET_ROUTES[f"/api/research/{_p}"] = _get_research
+        del _p
         _POST_ROUTES = {
             "/api/harvest": _post_harvest,
             "/api/append": _post_append,
@@ -816,10 +918,20 @@ def make_handler(token: str):
             "/api/plugins/autoscan": _post_plugins_autoscan,
             "/api/rules/reflect": _post_rules_reflect,
             "/api/rules/reflect_one": _post_rules_reflect_one,
+            "/api/rules/resolve": _post_rules_resolve,
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/oversee/dismiss": _post_oversee_dismiss,
             "/api/selftest": _post_selftest,
         }
+        for _p in ("spawn", "send", "run_recipe", "set_model", "stop",
+                   "remove", "clear_idle", "profile_add", "profile_remove",
+                   "profile_login", "profile_trust", "board_save",
+                   "board_dispatch", "mission", "mission_stop", "command"):
+            _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
+        del _p
+        for _p in ("start", "stop"):
+            _POST_ROUTES[f"/api/research/{_p}"] = _post_research
+        del _p
 
     return DashboardHandler
 
@@ -907,6 +1019,27 @@ def stable_url(port: int | None = None, token: str | None = None) -> str:
     return f"http://127.0.0.1:{port}/?token={token}"
 
 
+def _instance_running(port: int | None, host: str = "127.0.0.1",
+                      timeout: float = 0.3) -> bool:
+    """True when a dashboard is already listening on host:port.
+
+    Deliberately a client *connect* probe, not a bind-test: on Windows
+    SO_REUSEADDR lets a second bind to an in-use port SUCCEED (hijack
+    semantics), so a bind-based "is it free?" check wrongly reports free and a
+    duplicate pid gets spawned. Connecting is unambiguous — it succeeds only
+    when something is actually accepting there. Port 0 (ephemeral) is always a
+    fresh server, so it is never "already running"."""
+    if not port:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
 def launch_background(port: int | None = None) -> dict:
     """Spawn `hive dashboard` as a *detached* background process so a caller
     (e.g. the autonomous loop) can bring the panel up without blocking on
@@ -920,6 +1053,12 @@ def launch_background(port: int | None = None) -> dict:
     {"launched": False, "reason": ...} when the spawn could not start.
     """
     url = stable_url(port)
+    # Single-instance guard: never spawn a second pid when one is already
+    # serving. The loop calls this on every run, so without the check repeated
+    # runs would pile up detached dashboards.
+    if _instance_running(DEFAULT_PORT if port is None else port):
+        return {"launched": False, "already_running": True, "url": url,
+                "reason": "already running"}
     argv = [sys.executable, "-m", "mindhive", "dashboard"]
     if port is not None:
         argv += ["--port", str(port)]
@@ -939,6 +1078,27 @@ def launch_background(port: int | None = None) -> dict:
     return {"launched": True, "url": url, "pid": proc.pid}
 
 
+def open_panel(port: int | None = None) -> str:
+    """Bring the dashboard to the foreground for the `mind hive` shortcut.
+
+    Launch it detached if nothing is running; if one is already up, open its
+    stable URL in the browser so the user lands straight on the live panel —
+    seamless, and never blocking the terminal. Returns a one-line status for the
+    shell to print. On a fresh launch the detached child opens its own browser,
+    so we don't double-open here."""
+    res = launch_background(port)
+    url = res.get("url")
+    if res.get("launched"):
+        return f"MIND HIVE dashboard: {url}"
+    if res.get("already_running"):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return f"MIND HIVE dashboard already running — opening {url}"
+    return f"dashboard: not launched ({res.get('reason')})"
+
+
 def serve(port: int | None = None, open_browser: bool = True,
           token: str | None = None) -> None:
     """Start the dashboard on a fixed port with a persisted token so the URL is
@@ -954,6 +1114,17 @@ def serve(port: int | None = None, open_browser: bool = True,
     if port is None:
         port = DEFAULT_PORT
     token = token or load_or_create_token()
+    # Single-instance guard (primary): if a dashboard is already serving this
+    # fixed port, reopen its URL instead of starting a second pid. A connect
+    # probe is reliable on Windows, where SO_REUSEADDR would otherwise let the
+    # bind below succeed and leave a duplicate server. The OSError path stays as
+    # a fallback for the rare probe-then-bind race. port=0 skips the probe.
+    if _instance_running(port):
+        url = f"http://127.0.0.1:{port}/?token={token}"
+        print(f"MIND HIVE dashboard already running — opening {url}", flush=True)
+        if open_browser:
+            webbrowser.open(url)
+        return
     handler = make_handler(token)
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), handler)

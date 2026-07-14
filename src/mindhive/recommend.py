@@ -190,6 +190,15 @@ def _truncate(text, width=None) -> str:
     return s[:max(0, width - 1)].rstrip() + "…"
 
 
+def intended_use_clause(entry, width: int = INTENDED_USE_WIDTH) -> str:
+    """`` · intended use: …`` clause for a scored entry, or ``""`` when the
+    description is empty/whitespace. Shared by :func:`brief_line` and the
+    projector's directive lines so every surface renders (and omits) the
+    intended use identically."""
+    desc = _truncate(entry.get("description", ""), width)
+    return f" · intended use: {desc}" if desc else ""
+
+
 def brief_line(entry, width: int = INTENDED_USE_WIDTH) -> str:
     """One compact line for a scored :func:`recommend` entry: name, reason, and
     provenance, then the skill's *intended use* (its description) truncated to
@@ -198,12 +207,8 @@ def brief_line(entry, width: int = INTENDED_USE_WIDTH) -> str:
     description is empty. Provenance stays verbatim so an estimate never reads
     as measured. Shared by the projector's SUGGESTED SKILLS block and
     ``hive skills recommend --brief`` so the two surfaces cannot drift."""
-    line = (f"{entry.get('name', '')} — {entry.get('reason', '')} "
-            f"({entry.get('provenance', '')})")
-    desc = _truncate(entry.get("description", ""), width)
-    if desc:
-        line += f" · intended use: {desc}"
-    return line
+    return (f"{entry.get('name', '')} — {entry.get('reason', '')} "
+            f"({entry.get('provenance', '')})" + intended_use_clause(entry, width))
 
 
 def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:

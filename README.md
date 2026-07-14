@@ -11,7 +11,8 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive rules summaries [--project P] [--json]` — structured lesson records (root cause, lesson, prevention rule, category, active rule) for every incident — the same data the dashboard **Improvements** view shows, for agents working headless. `--json` emits the raw list
-- `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks
+- `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks. The same pass also **reroutes** red leaking rules (below)
+- `hive rules resolve [--limit N] [--list]` — active resolution over the **red (unresolved) set**: incidents with no rule are reflected; a leaking **auto** rule is replaced with the best distinct alternative route (model-ranked, deterministic-fallback aware, capped at 3 attempts per signature — then flagged `reroute_exhausted` for a human). The `rule_rerouted` event re-anchors leak counting, so a route that holds turns green (resolved) and auto-promotes to SOUL.md. Human rules are never rerouted. `--list` prints the red set without spending tokens
 - `hive flag "<text>" [--category tag]` — self-flag a judgment error (wrong call, not a tool failure); active as a prevention rule from the first occurrence
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
@@ -153,6 +154,21 @@ or recurring), amber ● (watching / not yet tested), gray ○ (dismissed via th
 per-card dismiss button). The **Reflect (learn from failures)** button (Heavy)
 turns recurring unreflected incidents into lessons via the `claude` CLI, a
 small bounded batch per click.
+
+**Workspace: MindParallel & MindSwarm.** The **Workspace** group runs real
+Claude Code agents from the dashboard, all feeding the same hive memory.
+**MindParallel** is a grid of up to 16 panes — each pane is a headless `claude`
+session (follow-ups resume the same session), with named **profiles** mapping
+panes to different `CLAUDE_CONFIG_DIR`s so multiple accounts run side by side,
+and a kanban board whose cards dispatch their prompt to a free pane and move
+backlog → running → done with the run. **MindSwarm** launches a mission crew —
+a coordinator plus builders, scouts, and reviewers — where every agent's system
+prompt tells it to read and write the shared Mind Hive ledger (`hive recall` /
+`hive append`), so what one agent learns the next one starts with; a command
+bar directs any single agent or the whole swarm. Every exchange lands in the
+ledger as `user_prompt` / `assistant_response` events (failures as
+`tool_failed` with signature `workspace:<role>`), so workspace activity flows
+into Memory, the graph, and the Improvements loop automatically.
 
 **Self-healing capture.** The server runs a background loop that periodically
 **auto-harvests** any session the live hooks missed — so the store stays current

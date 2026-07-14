@@ -75,6 +75,7 @@ def render_page(token: str) -> str:
   .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
   .legitem:hover { background:#1b2540; }
   .legitem.on { background:#233; outline:1px solid #3d6; }
+  .callcount { font-size:11px; color:#9aa3b8; margin-left:3px; }
   .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid #2a5;
     color:#9f9; border-radius:6px; font-size:11px; padding:0 7px; }
   .callbtn:hover { background:#1b3a26; color:#dfffe6; }
@@ -119,6 +120,10 @@ def render_page(token: str) -> str:
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
     <button onclick="showSkillPanel()">Skill &amp; Plugin</button>
+    <div class="group">Workspace</div>
+    <button onclick="showWorkspace('parallel')">MindParallel</button>
+    <button onclick="showWorkspace('swarm')">MindSwarm</button>
+    <button onclick="showWorkspace('research')">Self-Reliant</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -130,6 +135,7 @@ def render_page(token: str) -> str:
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
     <button onclick="runReflect()">Reflect (learn from failures)</button>
+    <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -340,6 +346,7 @@ def render_page(token: str) -> str:
   let IMP_QUERY = '';
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
+  let IMP_RES = 'all';             // resolution filter set by the legend glyphs
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -358,10 +365,20 @@ def render_page(token: str) -> str:
     const g = IMP_GLYPHS[res] || IMP_GLYPHS.watching;
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
+  // legend glyphs double as one-click resolution filters (click again to
+  // clear) — the same mechanism as the Skills & plugins status legend.
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
-      .map(r => glyphSpan(r)+IMP_GLYPHS[r][2]).join(' \\u00b7 ')+'</div>';
+      .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
+        + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>';
   }
+  function setImpRes(r){
+    IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  // unknown resolutions render as the watching glyph, so filter them the same way
+  function resKey(a){ return IMP_GLYPHS[a.resolution] ? a.resolution : 'watching'; }
   // --- efficiency strip: failure rate (tool_failed per 100 tool actions) vs
   // the previous day / week / month / 3 months. Tiles render placeholders
   // until stats arrive, and dispositions instead of fake percentages.
@@ -449,6 +466,11 @@ def render_page(token: str) -> str:
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (a.reroutes) p += ' <span class="pill" title="a previous rule failed; an '
+      + 'alternative route was deployed">rerouted \\u00d7'+a.reroutes+'</span>';
+    if (a.flag === 'reroute_exhausted')
+      p += ' <span class="pill" title="all automatic reroute attempts spent \\u2014 '
+        + 'needs a human rule">reroute exhausted</span>';
     if (!a.active_rule) p += (a.status === 'candidate'
       ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
       : ' <span class="pill">not yet reflected</span>');
@@ -465,7 +487,9 @@ def render_page(token: str) -> str:
          : '');
     let body = '';
     if (a.first_seen) body += '<div class="snip dup">first seen '+esc(a.first_seen)
-      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the rule activated' : '')
+      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the '
+         + (a.reroutes ? 'route deployed' : 'rule activated') : '')
+      + (a.last_reroute ? ' \\u00b7 route deployed '+esc(a.last_reroute) : '')
       + '</div>';
     if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
     if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
@@ -499,12 +523,14 @@ def render_page(token: str) -> str:
     }
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
-      (IMP_STATUS==='all' || a.status===IMP_STATUS)
+      (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    const notes = manual.filter(m => !q
+    // manual notes carry no resolution, so an active glyph filter shows lessons only
+    const notes = (IMP_RES==='all' ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -551,6 +577,24 @@ def render_page(token: str) -> str:
       await renderImprovements();
     });
   }
+  // Active resolution: reroute red rules whose nudge failed (and reflect the
+  // rule-less ones) so they can turn green. Same Heavy confirm + inline
+  // banner mechanism as Reflect.
+  async function runResolve(){
+    if(!confirm('Resolve red (find alternative routes for failed rules, reflect '
+      + 'missing ones) \\u2014 runs the claude CLI once per red lesson '
+      + '(a few per click). Continue?')) return;
+    liveFn = renderImprovements;
+    await run('resolving\\u2026', async () => {
+      const res = await apiPost('/api/rules/resolve', {});
+      IMP_BANNER = res.ok
+        ? ('Resolve: '+(res.rerouted||0)+' rerouted \\u00b7 '+(res.reflected||0)
+           +' reflected \\u00b7 '+(res.failed||0)+' failed \\u00b7 '
+           +(res.pending||0)+' still red')
+        : (res.error || 'resolution failed');
+      await renderImprovements();
+    });
+  }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
   function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
@@ -566,6 +610,8 @@ def render_page(token: str) -> str:
       + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
       + '<label>sort <select id="impsort" onchange="onImpSort(this.value)">'+sortOpts+'</select></label>'
       + '<button id="impdir" onclick="toggleImpDir()">'+impDirLabel()+'</button>'
+      + '<button onclick="runResolve()" title="reroute red rules whose nudge '
+      + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }
@@ -711,9 +757,34 @@ def render_page(token: str) -> str:
     });
   }
 
-  function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
-    const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
-  }); }
+  // Graph is a one-shot heavy render (not live-refreshed): fetch once and hand
+  // the self-contained page to the iframe. Semantic links are the expensive,
+  // opt-in build (an embedding search per event) so they stay off by default;
+  // ticking the box reloads with ?semantic=1.
+  function showGraph(){
+    liveFn = null;
+    let semantic = false;
+    controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
+      + '<input type="checkbox" id="gsem"> semantic links</label>';
+    const load = () => run('building graph', async () => {
+      const html = await apiGet('/api/graph' + (semantic ? '?semantic=1' : ''));
+      only(graph); graph.srcdoc = html;
+    });
+    const cb = document.getElementById('gsem');
+    if (cb) cb.addEventListener('change', () => { semantic = cb.checked; load(); });
+    load();
+  }
+
+  // Workspace views (MindParallel / MindSwarm / Self-Reliant) are full pages
+  // served by the server and loaded by URL — srcdoc must be cleared first or
+  // it wins over src. 'research' lives under its own /api/research family.
+  function showWorkspace(view){
+    controls.innerHTML=''; liveFn = null;
+    only(graph);
+    graph.removeAttribute('srcdoc');
+    graph.src = u(withProj(view === 'research' ? '/api/research/page'
+                                               : '/api/workspace/'+view));
+  }
 
   function showAppend(){
     liveFn = null;
@@ -747,6 +818,7 @@ def render_page(token: str) -> str:
   // IMP_EXPANDED.
   let PLUG_INV = {plugins: [], local_skills: [], counts: {}};
   let PLUG_STATUS = {};             // /api/skills/status: {name: 'ok'|'fail'}
+  let PLUG_COUNTS = {};             // /api/skills/status: {name: total invoke count}
   let PLUG_STATS = {};              // /api/skills/stats: per-skill telemetry
   let PLUG_REC = {coverage: {measured: 0, total: 0}, recommendations: []};
   let PLUG_RULES = {};              // 'skill:<name>' -> improvements auto lesson
@@ -870,6 +942,15 @@ def render_page(token: str) -> str:
       if (sig.indexOf('skill:') === 0 && !(sig in PLUG_RULES)) PLUG_RULES[sig] = a;
     });
   }
+  // invoke-count badge right after the skill name — how many times this skill
+  // has been called through MindHive (ok + failed), so callability reads off
+  // the card list without expanding. Counts come from /api/skills/status;
+  // per-skill telemetry (stats.calls) is the fallback when counts lag a poll.
+  function callCount(name){
+    const n = PLUG_COUNTS[name] || (PLUG_STATS[name] && PLUG_STATS[name].calls) || 0;
+    return n ? '<span class="callcount" title="invoked '+n+' time'+(n===1?'':'s')
+      + ' via MindHive">'+n+'\\u00d7</span>' : '';
+  }
   // one poll cycle = one parallel fetch burst: inventory + status + stats +
   // recommend + improvements (for the skill:* prevention-rule index) + the
   // call history of every expanded card. Auxiliary fetches degrade to their
@@ -890,7 +971,7 @@ def render_page(token: str) -> str:
       apiGet('/api/skills/history?name='+encodeURIComponent(n)+'&limit=25').catch(() => null))));
     if (gen !== PLUG_GEN) return;   // a newer cycle owns the caches now
     PLUG_INV = (res[0] && res[0].inventory) || {plugins: [], local_skills: [], counts: {}};
-    if (res[1]) PLUG_STATUS = res[1];
+    if (res[1]) { PLUG_STATUS = res[1].status || {}; PLUG_COUNTS = res[1].counts || {}; }
     if (res[2] && res[2].stats) PLUG_STATS = res[2].stats;
     if (res[3] && res[3].recommendations) PLUG_REC = res[3];
     if (res[4] && res[4].auto) indexSkillRules(res[4].auto);
@@ -985,7 +1066,7 @@ def render_page(token: str) -> str:
       + '<div class="file skhead" data-name="'+escAttr(e.name)+'" data-plugin="'
       + escAttr(e.plugin||'')+'" style="cursor:pointer" title="click to '
       + (open?'collapse':'expand')+'">'
-      + statusDot(e.status)+esc(e.name)+skBadges(e)+callBtn(e)+'</div>';
+      + statusDot(e.status)+esc(e.name)+callCount(e.name)+skBadges(e)+callBtn(e)+'</div>';
     if (!open)
       return html + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '') + '</li>';
     html += skDescription(e.name) + skMetrics(e.stats) + skNeeded(e.name);
@@ -1170,6 +1251,7 @@ def render_page(token: str) -> str:
     catch(e){ res = {ok: false, excerpt: String((e && e.message) || e)}; }
     PLUG_LASTCALL[name] = res;
     PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+    PLUG_COUNTS[name] = (PLUG_COUNTS[name]||0)+1;
     PLUG_CALLING.delete(name);
     PLUG_GEN++;   // invalidate any in-flight poll so it can't clobber the fresh result
     try {

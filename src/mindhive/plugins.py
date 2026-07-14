@@ -414,35 +414,54 @@ def skill_detail(name: str, plugin: str | None = None, claude_dir=None) -> dict 
     }
 
 
-def call_status(project=None) -> dict:
-    """Last-outcome per skill from the ledger: ``{name: "ok"|"fail"}``.
+def call_stats(project=None, evs=None) -> dict:
+    """Per-skill call stats from one ledger pass:
+    ``{"status": {name: "ok"|"fail"}, "counts": {name: total_calls}}``.
 
     Reads ``invoke_result`` (ok) and ``tool_failed`` with a ``skill:<name>``
-    signature (fail). ``read_all`` is time-then-append ordered, so iterating and
-    overwriting leaves each skill at its most recent call — the green/red the
-    dashboard paints. Skills never called are simply absent (rendered grey)."""
+    signature (fail) — one invoke writes exactly one of the two, so counting
+    both event types yields the total number of calls. ``read_all`` is
+    time-then-append ordered, so overwriting leaves each skill's status at its
+    most recent call — the green/red the dashboard paints. Skills never called
+    are simply absent (rendered grey, no count badge). Pass evs (any
+    chronological event list, e.g. a HIVE MIND merge across namespaces) to
+    reuse a read_all() result instead of reading one project."""
     status: dict[str, str] = {}
-    for e in ev_mod.read_all(project):
+    counts: dict[str, int] = {}
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    for e in evs:
         if e.type == "invoke_result":
             name = e.payload.get("name")
             if name:
                 status[name] = "ok"
+                counts[name] = counts.get(name, 0) + 1
         elif e.type == "tool_failed":
             sig = e.payload.get("signature", "")
             if isinstance(sig, str) and sig.startswith("skill:"):
-                status[sig[len("skill:"):]] = "fail"
-    return status
+                name = sig[len("skill:"):]
+                status[name] = "fail"
+                counts[name] = counts.get(name, 0) + 1
+    return {"status": status, "counts": counts}
 
 
-def call_history(name, project=None, limit=20) -> list[dict]:
+def call_status(project=None) -> dict:
+    """Last-outcome per skill: ``{name: "ok"|"fail"}`` (see ``call_stats``)."""
+    return call_stats(project)["status"]
+
+
+def call_history(name, project=None, limit=20, evs=None) -> list[dict]:
     """Past invoke outcomes for one skill, newest first: a list of
     ``{ts, ok, text, session}``. Reads the same ``invoke_result`` / ``tool_failed``
     events ``call_status`` derives from, but keeps every occurrence so the
     dashboard can show a skill's call log. ``read_all`` is chronological, so
-    reversing yields newest-first with append order preserved on ties."""
+    reversing yields newest-first with append order preserved on ties. Pass evs
+    to reuse a pre-read (possibly multi-namespace) event list."""
     sig = f"skill:{name}"
     out = []
-    for e in ev_mod.read_all(project):
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    for e in evs:
         if e.type == "invoke_result" and e.payload.get("name") == name:
             out.append({"ts": e.ts, "ok": True,
                         "text": e.payload.get("text", ""), "session": e.session_id})
@@ -588,21 +607,24 @@ def skill_stats(project=None, evs=None) -> dict:
     return out
 
 
-def recommend_for(project=None, evs=None, top=None) -> dict:
+def recommend_for(project=None, evs=None, top=None, incident_summaries=None) -> dict:
     """One-stop deterministic most-needed-skills ranking (KTD6): read the
     ledger once, flatten the live inventory, aggregate skill stats, extract
     needs from incident summaries, and rank. The single implementation behind
     `hive skills recommend`, the dashboard endpoint, and the projector's
-    suggested-skills block. Pass evs to reuse an events.read_all() result.
-    Imports are lazy so plugins keeps no hard dependency on incidents/recommend
-    (and no import cycles)."""
+    suggested-skills block. Pass evs to reuse an events.read_all() result and
+    incident_summaries to override the per-project incidents read (the HIVE
+    MIND view passes a merge across every namespace). Imports are lazy so
+    plugins keeps no hard dependency on incidents/recommend (and no import
+    cycles)."""
     from . import incidents as incidents_mod
     from . import recommend as recommend_mod
     if evs is None:
         evs = ev_mod.read_all(project)
     skills = recommend_mod.flatten_inventory(live_inventory()["inventory"])
     stats = skill_stats(project=project, evs=evs)
-    summaries = incidents_mod.summaries(project)
+    summaries = (incident_summaries if incident_summaries is not None
+                 else incidents_mod.summaries(project))
     needs = recommend_mod.extract_needs(summaries, evs)
     return recommend_mod.recommend(skills, stats, incidents=summaries,
                                    needs=needs, top=top)

@@ -60,7 +60,15 @@ def suggested_skills_block(project=None, evs=None) -> str:
     as `hive skills recommend --brief`) refreshed at every projection rebuild
     (R9). Empty string on ANY failure — a recommendation problem must never
     break the state build. Imports are lazy so projector keeps no hard
-    dependency on the plugins/recommend stack (and no import cycles)."""
+    dependency on the plugins/recommend stack (and no import cycles).
+
+    Entries are DIRECTIVES, not FYI: a proven skill (execution_mode auto —
+    measured completion >= the auto gate, no open incident) is injected as a
+    MUST-USE line the agent is expected to follow; an unmeasured need-match
+    (try_to_measure) is injected as an explicit instruction to invoke it via
+    the Skill tool so the call gets measured. That closes the loop the
+    suggestion-only wording left open: recommendations existed but nothing
+    ever compelled an invocation, so nothing ever became measured."""
     try:
         from . import plugins as plugins_mod
         from . import recommend as recommend_mod
@@ -70,13 +78,26 @@ def suggested_skills_block(project=None, evs=None) -> str:
         if not recs:
             return ""
         # The nudge line makes intended-use adherence explicit; it is not a
-        # bullet, so it never counts against SUGGEST_CAP. brief_line carries
-        # each skill's intended use so the agent grasps scope from the block.
+        # bullet, so it never counts against SUGGEST_CAP. Every tier carries
+        # the skill's intended use (via intended_use_clause / brief_line) so
+        # the agent grasps scope from the block alone.
         lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)",
                  "_Consult each skill's intended use before invoking — match the "
                  "task to the skill's stated scope._"]
         for e in recs:
-            lines.append(f"- {recommend_mod.brief_line(e)}")
+            use = recommend_mod.intended_use_clause(e)
+            if e.get("execution_mode") == "auto":
+                lines.append(
+                    f"- MUST USE: {e['name']} — {e['reason']}. Proven skill: "
+                    "when its trigger matches the task at hand, invoke it via "
+                    f"the Skill tool before starting that work.{use}")
+            elif e.get("try_to_measure"):
+                lines.append(
+                    f"- TRY & MEASURE: {e['name']} — {e['reason']}. If it fits "
+                    "the current task, invoke it via the Skill tool (not "
+                    f"ad-hoc) so its completion rate gets measured.{use}")
+            else:
+                lines.append(f"- {recommend_mod.brief_line(e)}")
         return "\n".join(lines)
     except Exception:
         return ""
@@ -96,6 +117,11 @@ def compose_state(evs, project=None, include_rules=True, suggestions=None) -> st
     body = build_state(evs, pending=review.load_pending(project),
                        health_note=reflect.health_note(project))
     if include_rules:
+        # Promoted (proven-permanent) rules ride FIRST — SOUL.md is only
+        # meaningful if every session actually re-reads it.
+        soul = incidents.soul_block(project)
+        if soul:
+            body = body + "\n" + soul + "\n"
         block = incidents.inject(project, evs=evs)
         if block:
             body = body + "\n" + block + "\n"

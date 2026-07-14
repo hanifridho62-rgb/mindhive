@@ -57,8 +57,16 @@ def test_reflect_incident_writes_auto_and_sets_active(tmp_path):
 
 
 def test_reflect_incident_noop_on_empty_verdict(tmp_path):
-    _seed_active_incident()
-    res = reflect.reflect_incident("pymodule:mindhive", project="test",
+    # raw:* has no deterministic fallback (unknown root cause), so a garbage
+    # model response still yields no verdict — curated families now fall back
+    # instead (see test_learning_autonomy.py).
+    for s in ("s1", "s2"):
+        events.append_event("tool_failed",
+                            {"text": "weird failure", "signature": "raw:feedbeef01",
+                             "action": "x"},
+                            session_id=s, tags=["auto", "failure"], project="test")
+    incidents.project(project="test", threshold=2)
+    res = reflect.reflect_incident("raw:feedbeef01", project="test",
                                    runner=lambda p, timeout_s=120: "garbage")
     assert res["reflected"] is False
 
@@ -70,8 +78,11 @@ _GOOD = ('{"root_cause": "rc", "lesson": "le", '
 
 
 def _seed_unreflected(n):
+    # raw:* signatures on purpose: no deterministic fallback, so a failing
+    # runner really does leave the incident unreflected (what the cooldown,
+    # rollback, and error-marker tests below exercise).
     for i in range(n):
-        sig = f"pymodule:batch{i}"
+        sig = f"raw:batch{i}"
         for s in ("s1", "s2"):
             events.append_event("tool_failed",
                                 {"text": "boom", "signature": sig, "action": "x"},
@@ -164,6 +175,44 @@ def test_reflect_batch_noop_when_nothing_active_unreflected():
     assert res["skipped"] == "nothing to reflect"
     assert calls["n"] == 0
     assert reflect.read_marker("test") == {}   # nothing-to-do writes no marker
+
+
+def test_reflect_batch_reroutes_red_leaking_rules_in_same_pass():
+    # one unreflected incident + one whose auto rule leaked: the same bounded
+    # pass reflects the first and reroutes the second (active resolution).
+    _seed_unreflected(1)                            # raw:batch0, no rule yet
+    sig = "raw:leaky"
+    for s, ts in (("s1", "2026-07-01T10:00:00Z"), ("s2", "2026-07-01T11:00:00Z")):
+        events.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=s, tags=["auto", "failure"], ts=ts,
+                            project="test")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    path = paths.project_dir("test") / "rules" / "incidents" / "raw-leaky.md"
+    path.write_text(incidents._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Prevention rule: the failed rule"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+    events.append_event("tool_failed",
+                        {"text": "boom", "signature": sig, "action": "x"},
+                        session_id="s3", tags=["auto", "failure"],
+                        ts="2026-07-01T12:00:00Z", project="test")   # leak
+
+    def stub(prompt, timeout_s=120):
+        if "FAILED RULES" in prompt:                # the reroute prompt
+            return ('{"routes": [{"prevention_rule": "alt route", '
+                    '"rationale": "different mechanism", "confidence": 0.9}]}')
+        return _GOOD
+
+    res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
+                                runner=stub)
+    assert res["reflected"] == 1 and res["rerouted"] == 1
+    assert res["attempted"] == 2
+    rec = {r["signature"]: r for r in incidents.summaries(project="test")}
+    assert rec["raw:leaky"]["active_rule"] == "alt route"
+    m = reflect.read_marker("test")
+    assert m["last_success"] and m["last_error"] == ""
 
 
 def test_write_marker_is_atomic_and_always_valid_json():

@@ -662,6 +662,25 @@ def test_skill_stats_completion_rate_labels():
     assert "completion_rate" in st and st["completion_rate"] == 1.0
 
 
+def test_call_stats_empty_ledger():
+    assert plugins.call_stats(project="test") == {"status": {}, "counts": {}}
+
+
+def test_call_stats_counts_every_invoke_and_keeps_last_status():
+    invoker.invoke_skill("x", runner=_fail_runner, project="test")
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    invoker.invoke_skill("y", runner=_fail_runner, project="test")
+    st = plugins.call_stats(project="test")
+    assert st["counts"] == {"x": 3, "y": 1}
+    assert st["status"] == {"x": "ok", "y": "fail"}
+
+
+def test_call_status_agrees_with_call_stats():
+    invoker.invoke_skill("z", runner=_fail_runner, project="test")
+    assert plugins.call_status(project="test") == plugins.call_stats(project="test")["status"]
+
+
 def test_strip_frontmatter_returns_body_only():
     body = plugins._strip_frontmatter(
         "---\nname: x\ndescription: d\n---\n\n# Title\n\nParagraph.\n")

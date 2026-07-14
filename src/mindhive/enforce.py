@@ -173,14 +173,69 @@ def suggest(project=None) -> list:
 
 def set_enabled(project, signature, enabled: bool) -> dict:
     """Enable or disable enforcement for one signature. Refuses a signature with
-    no matcher (there would be nothing to enforce)."""
+    no matcher (there would be nothing to enforce). A human toggle PINS the
+    entry: auto_escalate never overrides an explicit human decision."""
     if signature not in MATCHERS:
         return {"error": f"no enforcement matcher for '{signature}'",
                 "known": sorted(MATCHERS)}
     man = load_manifest(project)
     entry = man.get(signature) if isinstance(man.get(signature), dict) else {}
     entry["enabled"] = bool(enabled)
+    entry["pinned"] = True
     entry.setdefault("reason", "")
     man[signature] = entry
     _write_manifest(project, man)
     return {"signature": signature, "enabled": bool(enabled)}
+
+
+def auto_escalate(project=None) -> list:
+    """The self-acting rung the ladder was missing: when a signature has an
+    enforcement matcher, an active prevention rule, AND the rule has leaked
+    (recurred from another session after activation) at least
+    ``incidents.LEAK_LIMIT`` times, the nudge has demonstrably failed — so
+    enforcement flips ON without waiting for a human. Matchers are fail-open
+    pure predicates, so the worst a wrong auto-enable can do is deny one tool
+    call with an explanation of the effective method.
+
+    Entries a human explicitly toggled (``pinned``) are never overridden.
+    Returns the signatures newly auto-enabled."""
+    from . import events, incidents
+    man = load_manifest(project)
+    stats = incidents.signal_stats(project)
+    enabled = []
+    for row in incidents.summaries(project=project):
+        sig = row.get("signature")
+        # "demoted" is included deliberately: an auto rule that leaked twice is
+        # auto-demoted from injection at the same LEAK_LIMIT — for a signature
+        # WITH a matcher that is precisely the moment to switch from nudging
+        # to forcing, not to give up.
+        if sig not in MATCHERS or row.get("status") not in ("active", "demoted"):
+            continue
+        # An EXPLICIT human demote (rule_demoted event -> dismissed) means "this
+        # rule is wrong" — never force it. Auto-demotion writes no event and
+        # stays eligible.
+        if (stats.get(sig) or {}).get("dismissed"):
+            continue
+        if row.get("rule_source") in (None, "", "none"):
+            continue
+        # Cumulative since activation (total_leaks): a reroute re-anchors the
+        # classification leak count, but must not postpone the hard-force rung.
+        st = stats.get(sig) or {}
+        if int(st.get("total_leaks") or st.get("leaks") or 0) < incidents.LEAK_LIMIT:
+            continue
+        entry = man.get(sig) if isinstance(man.get(sig), dict) else {}
+        if entry.get("enabled") or entry.get("pinned"):
+            continue
+        entry.update({"enabled": True, "auto_enabled": True})
+        entry.setdefault("reason", "")
+        man[sig] = entry
+        enabled.append(sig)
+    if enabled:
+        _write_manifest(project, man)
+        for sig in enabled:
+            events.append_event(
+                "rule_enforced",
+                {"signature": sig, "text": "auto-escalated: nudge leaked "
+                 f">= {incidents.LEAK_LIMIT}x with an active rule"},
+                tags=["lifecycle", "enforce"], project=project)
+    return enabled
