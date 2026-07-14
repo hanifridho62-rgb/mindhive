@@ -340,6 +340,20 @@ def test_compose_program_improve_mode_is_unchanged_default():
     assert "edit exactly this" in default["program"]
 
 
+def test_compose_program_learn_mode_grounds_analysis_in_history():
+    """Learn mode is told to study 'the experiment history' — so the composed
+    program must actually contain the leaderboard records (R2)."""
+    history = [{"status": "ok", "val_bpb": 1.58, "change": "lr 0.03"},
+               {"status": "oom", "val_bpb": None, "change": "batch 2**19"}]
+    prog = research.compose_program("g", mode="learn", history=history)["program"]
+    assert "Experiment history" in prog
+    assert "val_bpb 1.58" in prog and "lr 0.03" in prog
+    assert "oom" in prog
+    # improve mode never renders the history block
+    assert "Experiment history" not in research.compose_program(
+        "g", mode="improve", history=history)["program"]
+
+
 def test_leaderboard_concurrent_appends_no_loss(tmp_path):
     path = tmp_path / "lb.json"
 
@@ -635,8 +649,7 @@ def test_controller_learn_mode_persists_learnings_without_training(tmp_path):
     assert "self-reliant" in learnings[0]["tags"]
     assert "learning" in learnings[0]["tags"]
     assert "hypothesis 1" in learnings[0]["payload"]["report"]
-    art = ctl.leaderboard.path.with_name(
-        ctl.leaderboard.path.stem + "_learnings.md")
+    art = ctl._learnings_path()
     assert art.exists() and "hypothesis 1" in art.read_text(encoding="utf-8")
 
 
@@ -676,6 +689,60 @@ def test_controller_improve_mode_denies_github_but_stays_editable(tmp_path):
     _wait_ended(ctl)
     assert researcher.allowed_tools is None           # not read-only — can Edit
     assert researcher.disallowed_tools == research.GITHUB_DENY
+
+
+def test_controller_learn_mode_skips_empty_and_duplicate_reports(tmp_path):
+    """Empty and unchanged reports must not flood the ledger or poison future
+    recall — the round still counts toward the cap, but nothing is recorded."""
+    class Scripted(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            reports = ["", "same insight", "same insight", "fresh insight"]
+            return {"ok": True, "report": reports[len(self.prompts) - 1]}
+
+    ledger = FakeLedger()
+    ctl = _controller(tmp_path, researcher=Scripted(), ledger=ledger)
+    assert ctl.start("g", max_experiments=4, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["experiments"] == 4          # all 4 rounds counted
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 2                        # empty + duplicate skipped
+    reports = [e["payload"]["report"] for e in learnings]
+    assert reports == ["same insight", "fresh insight"]
+
+
+def test_controller_learn_mode_uncapped_falls_back_to_default_rounds(tmp_path):
+    """An uncapped, unbudgeted learn run would loop forever (identical state);
+    it must terminate at the default round cap instead."""
+    class Varying(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            return {"ok": True, "report": f"insight {len(self.prompts)}"}
+
+    ctl = _controller(tmp_path, researcher=Varying())
+    assert ctl.start("g", mode="learn")["ok"]         # no cap, no budget
+    _wait_ended(ctl)
+    st = ctl.status()
+    assert st["reason"] == "cap"
+    assert st["experiments"] == research._DEFAULT_LEARN_ROUNDS
+
+
+def test_controller_learn_mode_fails_closed_if_policy_cannot_be_set(tmp_path):
+    """If the no-GitHub boundary can't be applied, a learn run must refuse to
+    start rather than silently run as an unrestricted agent."""
+    class Unsettable(StubResearcher):
+        @property
+        def allowed_tools(self):
+            return None
+
+        @allowed_tools.setter
+        def allowed_tools(self, v):
+            raise RuntimeError("cannot restrict this researcher")
+
+    ctl = _controller(tmp_path, researcher=Unsettable())
+    res = ctl.start("g", max_experiments=1, mode="learn")
+    assert res["ok"] is False
+    assert ctl.status()["state"] == "idle"            # never went live
 
 
 def test_controller_malformed_caps_rejected_structurally(tmp_path):
@@ -941,9 +1008,11 @@ def test_api_post_start_defaults_to_improve_mode(tmp_path, monkeypatch):
 # Locks the boundary so a future edit cannot silently reopen it (R4/R5).
 
 def test_github_boundary_regression_guard():
-    # (a) the learn-mode allowlist grants no shell: no Bash => git/gh unreachable
+    # (a) the learn-mode allowlist is exactly the read-only trio — no shell
+    # (Bash), no Skill (which could shell out) => git/gh are unreachable
+    assert research.SELF_RELIANT_ALLOWED_TOOLS == ["Read", "Grep", "Glob"]
     lowered = [t.lower() for t in research.SELF_RELIANT_ALLOWED_TOOLS]
-    assert "bash" not in lowered
+    assert "bash" not in lowered and "skill" not in lowered
     assert all("git" not in t and t != "gh" for t in lowered)
     # (b) the deny list blocks git, gh, and the GitHub MCP in every mode
     assert "Bash(git:*)" in research.GITHUB_DENY

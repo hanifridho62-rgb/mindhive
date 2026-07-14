@@ -288,11 +288,25 @@ def test_send_tool_restriction_renders_allow_and_deny_lists():
     argv = h.calls[0][0]
     assert argv[argv.index("--allowedTools") + 1] == "Read,Grep,Glob"
     assert argv[argv.index("--disallowedTools") + 1] == "Bash(git:*),Bash(gh:*)"
+    # CRITICAL: an allowlist DROPS bypassPermissions — otherwise the CLI would
+    # auto-approve every tool and the allowlist (the boundary) would be inert
+    assert "bypassPermissions" not in argv
     # absent when not requested
     _wait_settled(_agent_obj(h, aid))
     h.mgr.send(aid, "again")
     assert "--allowedTools" not in h.calls[1][0]
     assert "--disallowedTools" not in h.calls[1][0]
+
+
+def test_send_without_allowlist_keeps_bypass_permissions():
+    """No allowlist (improve mode / ordinary workspace agents) keeps the
+    bypassPermissions posture so out-of-cwd edits are auto-approved."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "edit train.py")
+    argv = h.calls[0][0]
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
 
 
 def test_reader_captures_last_result_text():

@@ -462,18 +462,23 @@ class Manager:
             return {"ok": False, "error": "prompt is empty"}
         if a.status == "running":
             return {"ok": False, "error": f"{a.name} is busy — wait or stop it"}
-        # bypassPermissions: headless runs have no prompt channel, so under
-        # acceptEdits anything beyond an in-cwd edit was silently auto-denied —
-        # agents burned whole turns pleading for approvals nobody could grant
-        # (user mandate 2026-07-13: full access for all workspace agents).
         argv = [claude_cli.resolve_exe(), "--output-format", "stream-json",
-                "--verbose", "--permission-mode", "bypassPermissions"]
-        # Tool restriction (opt-in): --allowedTools narrows the toolset to an
-        # allowlist; --disallowedTools is a hard deny that wins even under
-        # bypassPermissions. Self-Reliant's learn mode uses a read-only allowlist
-        # so the agent cannot reach git/gh — the enforced no-GitHub boundary.
+                "--verbose"]
+        # Permission posture. Default is bypassPermissions: headless runs have
+        # no prompt channel, so under acceptEdits anything beyond an in-cwd edit
+        # was silently auto-denied — agents burned whole turns pleading for
+        # approvals nobody could grant (user mandate 2026-07-13: full access for
+        # all workspace agents). BUT bypassPermissions approves EVERY tool,
+        # which would make an --allowedTools restriction inert. So when a caller
+        # passes an allowlist (Self-Reliant's read-only learn mode), we drop
+        # bypassPermissions: with the default posture and no prompt channel,
+        # tools outside the allowlist are auto-denied — the allowlist becomes
+        # the real, enforced boundary (no Bash ⇒ no git/gh). --disallowedTools
+        # is layered on as defense-in-depth in both postures.
         if allowed_tools:
             argv += ["--allowedTools", ",".join(str(t) for t in allowed_tools)]
+        else:
+            argv += ["--permission-mode", "bypassPermissions"]
         if disallowed_tools:
             argv += ["--disallowedTools",
                      ",".join(str(t) for t in disallowed_tools)]

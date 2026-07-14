@@ -282,7 +282,7 @@ def _clean_skills(skills) -> list:
 
 
 def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
-                    train_path=None, mode="improve") -> dict:
+                    train_path=None, mode="improve", history=None) -> dict:
     """The researcher agent's steering document (program.md text) plus its
     system-prompt addition — a pure function of its inputs (U6).
 
@@ -291,7 +291,9 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     ``preset`` is a name->bound mapping stated as hard constraints; ``prior``
     is the previous experiment's record so the agent iterates on feedback.
     ``mode`` is ``improve`` (the agent edits train.py) or ``learn`` (the agent
-    analyzes and reports; it never edits).
+    analyzes and reports; it never edits). ``history`` is the leaderboard's
+    ranked experiment records — supplied in learn mode so the analysis is
+    grounded in real past results rather than train.py alone (R2).
     """
     learn = mode == "learn"
     skills = _clean_skills(skills)
@@ -322,6 +324,16 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     if primed:
         parts.append("Past learnings from MindHive — honor them:\n"
                      + "\n".join(f"- {p}" for p in primed))
+    if learn and history:
+        lines = ["Experiment history on this machine (best val_bpb first) — "
+                 "ground your analysis in these real results, not train.py "
+                 "alone:"]
+        for h in history:
+            score = h.get("val_bpb")
+            lines.append(f"- {h.get('status', '?')}"
+                         + (f" val_bpb {score}" if score is not None else " (no score)")
+                         + (f" — {h['change']}" if h.get("change") else ""))
+        parts.append("\n".join(lines))
     if prior:
         score = prior.get("val_bpb")
         parts.append("Previous experiment: status "
@@ -475,6 +487,7 @@ class ResearchController:
         self.run_id = None
         self._goal = ""
         self._mode = "improve"           # improve (edit) | learn (analyze)
+        self._last_report = ""           # last recorded learn report (dedup)
         self.lines: list = []
 
     # --- observability -------------------------------------------------------
@@ -560,13 +573,19 @@ class ResearchController:
         self._preset = preset if preset is not None else SMALL_GPU_PRESET
         self._best_score = None          # running best within THIS run (U10)
         self._tally = {}
+        self._last_report = ""            # dedup guard for learn-mode reports
         self._mode = "learn" if mode == "learn" else "improve"
+        # an uncapped learn run re-analyzes identical state forever; give it a
+        # default round cap when the caller set neither cap nor budget
+        if (self._mode == "learn" and self._max is None
+                and self._deadline is None):
+            self._max = _DEFAULT_LEARN_ROUNDS
         try:
             self._researcher = self._factory(self._profile, self._model)
+            self._apply_tool_policy(self._researcher)
         except Exception as e:
             self._state = "idle"
             return {"ok": False, "error": f"could not start researcher agent: {e}"}
-        self._apply_tool_policy(self._researcher)
         self.emit(f"· run {self.run_id} started ({self._mode}) — goal: {goal}"
                   + (f" · cap {self._max}" if self._max else " · unbounded"))
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -635,13 +654,17 @@ class ResearchController:
     def _apply_tool_policy(self, researcher) -> None:
         """Enforce the no-GitHub boundary on the researcher agent: learn mode is
         read-only (allowlist ⇒ no Bash ⇒ no git/gh); every mode denies git/gh.
-        A stub researcher simply ignores these attributes."""
+        In learn mode the boundary is load-bearing, so if it cannot be set the
+        run fails closed (raises) rather than silently proceeding as an
+        unrestricted agent — a failure to restrict must never be invisible."""
         allowed = SELF_RELIANT_ALLOWED_TOOLS if self._mode == "learn" else None
         try:
             researcher.allowed_tools = allowed
             researcher.disallowed_tools = GITHUB_DENY
-        except Exception:
-            pass
+        except Exception as e:
+            self.emit(f"✖ could not apply the no-GitHub tool policy: {e}")
+            if self._mode == "learn":
+                raise
 
     def _loop(self) -> None:
         prior = None
@@ -661,7 +684,9 @@ class ResearchController:
                                            self._primed, self._preset, prior,
                                            train_path=(str(self._train_path)
                                                        if self._train_path else None),
-                                           mode=self._mode)
+                                           mode=self._mode,
+                                           history=(self.leaderboard.ranked()
+                                                    if self._mode == "learn" else None))
                 # snapshot BEFORE the edit-turn: the turn is what changes
                 # train.py, so a post-turn "before" reads the edited file and
                 # every agent edit would record as "no change". Learn mode never
@@ -676,9 +701,10 @@ class ResearchController:
                     return
                 if turn.get("aborted"):
                     if self._mode == "learn":
-                        self._count += 1     # count toward the cap; no artifact
-                        self.emit(f"#{self._count} analysis turn timed out "
-                                  "— retrying")
+                        self._count += 1     # a round happened; counts to the cap
+                        will_retry = self._max is None or self._count < self._max
+                        self.emit(f"#{self._count} analysis turn timed out"
+                                  + (" — retrying" if will_retry else ""))
                     else:
                         self._record({"status": "aborted", "val_bpb": None,
                                       "change": "", "duration_s": 0.0,
@@ -705,7 +731,9 @@ class ResearchController:
                 if self._mode == "learn":
                     # analyze-and-learn: persist the agent's report as a durable
                     # learning; never run training (an unchanged file would just
-                    # retrain the baseline and waste the budget).
+                    # retrain the baseline and waste the budget). The round
+                    # counts toward the cap whether or not the report is kept.
+                    self._count += 1
                     self._record_learning(turn.get("report", ""))
                     prior = None
                     continue
@@ -764,21 +792,31 @@ class ResearchController:
 
     # --- learn mode: durable, recallable learnings (R3) ----------------------
     def _learnings_path(self) -> Path:
+        # per-run artifact: keying on run_id (not just the leaderboard stem)
+        # keeps one run's reports from accumulating onto a prior run's file
+        # when the leaderboard path is pinned/shared across runs.
         p = self.leaderboard.path
-        return p.with_name(p.stem + "_learnings.md")
+        rid = self.run_id or "run"
+        return p.with_name(f"{p.stem}_{rid}_learnings.md")
 
     def _record_learning(self, report) -> None:
         """Persist one analysis turn's report so a human with Claude Code can
         recall and act on it: a ledger event tagged self-reliant + learning,
         and an append to the per-run learnings artifact beside the leaderboard.
-        Learn mode never touches the leaderboard."""
-        self._count += 1
+        Learn mode never touches the leaderboard. The round has already been
+        counted by the caller; empty or unchanged reports are skipped so they
+        never flood the ledger or poison future _primed_learnings recall."""
         report = (report or "").strip()
-        self.emit(f"#{self._count} learning recorded"
-                  + (f" · {len(report)} chars" if report else " · (empty)"))
+        if not report or report == self._last_report:
+            self.emit("· analysis round produced "
+                      + ("an empty report" if not report else "no new insight")
+                      + " — not recorded")
+            return
+        self._last_report = report
+        self.emit(f"#{self._count} learning recorded · {len(report)} chars")
         self._log("learning", {
             "text": f"Self-Reliant learning {self._count} (goal: {self._goal}):"
-                    f"\n{report or '(no report)'}",
+                    f"\n{report}",
             "goal": self._goal, "report": report},
             extra_tags=["learning"])
         try:
@@ -786,9 +824,12 @@ class ResearchController:
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8") as f:
                 f.write(f"\n\n## Learning {self._count} — {self._goal}\n\n"
-                        + (report or "(no report)") + "\n")
-        except OSError:
-            pass                          # the artifact must never crash the loop
+                        + report + "\n")
+        except OSError as e:
+            # the ledger event above is the durable record; surface the artifact
+            # failure in the run log instead of silently dropping it
+            self.emit(f"· learning {self._count} ledgered, but its artifact "
+                      f"write failed: {e}")
 
     def _credit_skills(self, score) -> None:
         """U10 presence-correlation: every staged skill on a new-best experiment
@@ -943,12 +984,26 @@ _USAGE_MARKERS = ("usage limit", "rate limit", "out of usage",
                   "hit your limit", "session limit", "quota")
 
 
-# The GitHub boundary: the Self-Reliant agent must never reach git/gh. learn
-# mode spawns read-only (allowlist below ⇒ no Bash ⇒ git/gh unreachable);
-# GITHUB_DENY is defense-in-depth applied to every mode (deny rules win even
-# under bypassPermissions), so improve mode can Edit train.py but not push.
-SELF_RELIANT_ALLOWED_TOOLS = ["Read", "Grep", "Glob", "Skill"]
+# The GitHub boundary. Learn mode spawns read-only: the allowlist below is the
+# ENFORCED gate — workspace.send() drops bypassPermissions whenever an allowlist
+# is present, so with no prompt channel any tool outside it (no Bash ⇒ no
+# git/gh) is auto-denied. The set is deliberately minimal (Read/Grep/Glob only);
+# Skill is intentionally excluded because it could shell out and widen a
+# "read-only" turn. GITHUB_DENY layers on top as defense-in-depth: for learn it
+# is redundant with the allowlist; for improve mode — which keeps
+# bypassPermissions so it can Edit train.py — it is a best-effort deny against
+# literal git/gh invocations, NOT a hard guarantee (a shell can reach the same
+# binaries by other spellings). A hard improve-mode boundary (no-Bash / egress
+# controls) is deferred follow-up.
+SELF_RELIANT_ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
 GITHUB_DENY = ["Bash(git:*)", "Bash(gh:*)", "mcp__github__*"]
+
+# Learn rounds re-analyze the same state (there is no fresh experiment between
+# them), so an uncapped learn run would loop and burn account usage forever.
+# When the caller sets neither a round cap nor a time budget, fall back to this
+# many analysis rounds. Improve runs gather new data each round and stay
+# unbounded by default.
+_DEFAULT_LEARN_ROUNDS = 5
 
 
 class ManagerResearcher:

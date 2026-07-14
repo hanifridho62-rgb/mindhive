@@ -351,6 +351,8 @@ _PAGE = """<!doctype html>
         const txt = (lr.ok && lr.learnings) || '';
         document.getElementById('learnpanel').style.display = txt ? '' : 'none';
         document.getElementById('learn').textContent = txt;
+      } else {
+        document.getElementById('learnpanel').style.display = 'none';
       }
       const o = await api('/api/research/output?since=' + CURSOR);
       if (o.ok && o.lines && o.lines.length) {

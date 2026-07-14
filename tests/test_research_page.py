@@ -20,6 +20,16 @@ MOCK = Path(__file__).resolve().parents[1] / "scripts" / "self_reliant" / "mock_
 PAGE = render_research("tok-123")
 
 
+class _ReportingStub:
+    """A learn-mode researcher that returns an analysis report each turn."""
+
+    def turn(self, prompt):
+        return {"ok": True, "report": "lower the lr to 0.03 next run"}
+
+    def stop(self):
+        pass
+
+
 # --- U7: page contract --------------------------------------------------------
 
 def test_page_embeds_token_as_json():
@@ -84,6 +94,20 @@ def test_page_has_model_picker_fed_by_profiles_models():
 def test_page_start_posts_model():
     assert "/api/research/start" in PAGE
     assert "model:" in PAGE                   # model sent in the start body
+
+
+def test_page_has_mode_selector_posting_learn_and_improve():
+    # the learn/improve choice is a start-form control sent in the body (U5)
+    assert 'id="mode"' in PAGE
+    assert "mode:" in PAGE                     # mode sent in the start body
+    assert "learn (analyze" in PAGE
+    assert "improve (edit" in PAGE
+
+
+def test_page_has_learnings_panel_reading_the_learnings_route():
+    assert 'id="learnpanel"' in PAGE
+    assert "/api/research/learnings" in PAGE
+    assert "LEARNINGS" in PAGE
 
 
 def test_page_has_accounts_panel_reusing_workspace_endpoints():
@@ -182,6 +206,24 @@ def test_research_start_malformed_body_structured_error(server):
     status, res = _post(base, "/api/research/start", token, {"goal": ""})
     assert status == 200
     assert res["ok"] is False and "goal" in res["error"]
+
+
+def test_research_learnings_route_reachable_and_serves_reports(server):
+    # regression guard: /api/research/learnings must be a registered GET route
+    # (a missing entry returned 404 and left the LEARNINGS panel permanently
+    # empty). A learn run persists reports the route then serves.
+    base, token, ctl = server
+    ctl._factory = lambda profile, model=None: _ReportingStub()
+    status, res = _post(base, "/api/research/start", token,
+                        {"goal": "analyze", "max_experiments": 1, "mode": "learn"})
+    assert status == 200 and res["ok"]
+    assert ctl.wait(30)
+    status, body = _get(base, "/api/research/learnings", token)
+    assert status == 200                         # route registered (was 404)
+    obj = json.loads(body)
+    assert obj["ok"] and "lower the lr" in obj["learnings"]
+    _, sbody = _get(base, "/api/research/status", token)
+    assert json.loads(sbody)["mode"] == "learn"  # status drives the panel
 
 
 def test_research_stop_halts_active_run(server):

@@ -904,7 +904,7 @@ def make_handler(token: str):
                    "auth", "board"):
             _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
         del _p
-        for _p in ("page", "status", "leaderboard", "output"):
+        for _p in ("page", "status", "leaderboard", "output", "learnings"):
             _GET_ROUTES[f"/api/research/{_p}"] = _get_research
         del _p
         _POST_ROUTES = {
