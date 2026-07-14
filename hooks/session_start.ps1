@@ -24,4 +24,8 @@ try {
 # warm store this is a near-instant no-op. Manual 'hive plugins scan' / the
 # dashboard buttons still force a full rescan anytime.
 try { Start-Process -FilePath $py -ArgumentList '-m','mindhive','plugins','autoscan' -WindowStyle Hidden } catch {}
+# Keep the prompt-quality trigger rules fresh the same way: detached and
+# stale-gated (24h), so the UserPromptSubmit gate always has a recent manifest
+# without ever training inline with a prompt.
+try { Start-Process -FilePath $py -ArgumentList '-m','mindhive','triggers','train','--max-age-hours','24' -WindowStyle Hidden } catch {}
 exit 0
