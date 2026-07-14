@@ -81,3 +81,16 @@ promotion. Within an incident, the Human Evaluation outranks the machine's.**
   is the universal signal.
 - **Reflection inline in the PostToolUse hook:** rejected — an LLM call would blow
   the <1s hook budget and risk hangs; deferral costs nothing here.
+
+## Addendum (2026-07-06): candidate decay
+
+The quarantine store now decays stale noise via `rule_expired` lifecycle events
+(appended by `rules audit`, consistent with §6's append-only discipline): a
+**candidate** with exactly one live occurrence whose latest failure is older
+than 14 days expires. Only un-activated, single-occurrence *technical*
+signatures qualify — active rules, promoted rules, human-sourced rules, and
+`judgment:flag:*` incidents are **never** auto-expired. An expiry zeroes the
+live count rather than erasing history, so a signature that recurs after decay
+restarts a fresh candidate→active climb. Human authority in demotion is
+unchanged: expiry prunes candidates that never earned a rule; it cannot touch
+anything a human wrote or approved.

@@ -38,3 +38,14 @@ def test_load_tasks_missing_files_are_empty(tmp_path):
     t = task.load_tasks(d)
     assert t.prompt == ""
     assert t.fix_plan == ""
+
+
+def test_plan_items_groups_done_planned_not_yet():
+    items = task.plan_items(FIX_PLAN)
+    assert items["done"] == ["Write the README"]
+    assert items["planned"] == ["Build the parser", "Add tests"]
+    assert items["not_yet"] == ["Add a GUI"]
+
+
+def test_plan_items_empty_plan():
+    assert task.plan_items("") == {"done": [], "planned": [], "not_yet": []}

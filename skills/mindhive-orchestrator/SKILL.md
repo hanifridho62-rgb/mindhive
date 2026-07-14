@@ -1503,11 +1503,22 @@ Before scoring anything, gather ground truth:
   installed plugins and skills. This is what is *actually* callable right now.
 - `python -m mindhive skills status` — the green/red last-call outcome per skill.
   Green = last invocation succeeded; red = last invocation failed.
-- `python -m mindhive skills stats` — per-skill completion-rate telemetry from the
-  ledger. This is *measured* signal; use it to anchor the success-probability
-  column.
-- `python -m mindhive skills recommend` — a deterministic most-needed-skills
-  ranking derived from measured data, useful as a sanity check on your shortlist.
+- `python -m mindhive skills stats --json` — per-skill calls, ok/fail, completion
+  rate, last outcome, and streak from the ledger. **Pulling this measured
+  telemetry is mandatory before scoring anything** — fill the matrix from the
+  measured completion rates it returns, never from remembered impressions.
+- `python -m mindhive skills recommend --json` — the deterministic ranking
+  (scored in `src/mindhive/recommend.py`), with `measured|estimated` provenance
+  and an `execution_mode` on every entry plus measured coverage
+  (`N of M skills measured`). Anchor your shortlist on it, not just sanity-check
+  against it.
+
+**Provenance vocabulary (use it verbatim in the matrix):** `measured`
+(completion rate from enough recorded calls), `estimated` (breadth prior for a
+never-called skill), `agent-assessed` (`skills record` self-grades — never
+present these as measured task effectiveness). Model-estimated percentages are
+allowed **only** for never-called skills, and every such figure MUST be labeled
+`estimated`.
 
 **Hard sourcing rule.** Candidate skills come from the session's available-skills
 list (and `skills list`), **verbatim**. Never present a skill name that is not in
@@ -1527,7 +1538,7 @@ scales in
 |-----------|---------|
 | **Suitability** | How well the skill matches *this* task (High / Medium / Low) |
 | **Compatibility** | Fit with the stack and the other skills in the chain (High / Medium / Low) |
-| **Probability of success** | A % — anchored on `skills stats` when measured, else labeled `(est.)` |
+| **Completion rate** | The **measured** rate from `skills stats --json` with call count (e.g. `4/5 (measured)`); a model estimate labeled `estimated` only for a never-called skill |
 | **Risk level** | Worst-case blast radius (None / Local / Repo-wide / Destructive) |
 | **Execution speed** | Fast / Moderate / Slow |
 | **Resource cost** | Light / Moderate / Heavy |
@@ -1536,12 +1547,21 @@ scales in
 Render the comparison as a compact table (scans fastest):
 
 ```markdown
-| Skill | Suitability | Compatibility | Success | Risk | Speed | Cost | Verdict |
-|-------|-------------|---------------|---------|------|-------|------|---------|
-| ce-plan | High | High | 90% (est.) | None | Moderate | Moderate | **Use** — built for structured planning |
-| ce-work | High | High | 85% (measured) | Local | Moderate | Heavy | **Use** — executes the plan |
-| ce-code-review | High | High | 88% (measured) | None | Fast | Moderate | **Use as follow-up** — verify before ship |
+| Skill | Suitability | Compatibility | Completion rate | Risk | Speed | Cost | Verdict |
+|-------|-------------|---------------|-----------------|------|-------|------|---------|
+| ce-plan | High | High | 5/5 (measured) | None | Moderate | Moderate | **Use** — built for structured planning |
+| ce-work | High | High | 3/4 (measured) | Local | Moderate | Heavy | **Use** — executes the plan |
+| ce-code-review | High | High | 80% (estimated — never called) | None | Fast | Moderate | **Use as follow-up** — verify before ship |
 ```
+
+**Overlap tie-break** (matches the engine in `src/mindhive/recommend.py`): when
+two skills overlap for one need, emit **one** recommendation and prefer (1) the
+higher **measured completion rate** — measured always beats unmeasured; (2)
+**description clarity** — an explicit "use when" trigger, then the shorter, less
+ambiguous description; (3) the longer **failure-free completion streak**. List
+the losers as alternatives, not as separate recommendations — `skills recommend
+--json` already applies this chain (`alternatives` on each entry); do not
+override its winner without saying why.
 
 ### S.2 The learn-from-mistakes gate
 
@@ -1566,10 +1586,25 @@ get the user's approval (or revision) before executing. If no candidate scores
 well, say the idea may need a different route (e.g., `/ce-brainstorm` or
 `/ce-plan` first) rather than forcing a weak recommendation.
 
-**Honesty guardrails.** Every percentage without measured backing carries
-`(est.)`. Never present an estimate as a measured success rate — `skills stats`
-provides real completion rates for skills that have been measured; everything
-else is a model estimate and must be labeled as such.
+**Execution mode (learning-gated, from `skills recommend --json`):** every entry
+carries `execution_mode`. `auto` = proven track record (measured ≥3 calls,
+completion rate ≥ 0.8, no open incident) — apply it during the task without
+asking; `auto`-mode selections may proceed without a blocking question, but
+still announce them. `suggest` = unproven (above all a never-used skill) —
+propose it and wait for the user's approval before invoking. Never auto-apply a
+`suggest`-mode skill, and say which mode applied when presenting the matrix.
+
+**Discontinued skills:** the payload's `discontinued` list names skills stopped
+by the improvements linkage (an active `skill:*` prevention rule plus a trailing
+failure streak). Do not invoke or recommend them; if one would otherwise be the
+best fit, surface its rule text and offer the alternatives instead. They return
+when the incident resolves or a successful call breaks the streak.
+
+**Honesty guardrails.** Every figure carries its provenance — `measured`,
+`estimated`, or `agent-assessed`. Never present an estimate or an agent-assessed
+self-grade as a measured rate — `skills stats --json` provides real completion
+rates for skills that have been measured; everything else is a model estimate
+and must be labeled `estimated`.
 
 ---
 
@@ -1629,11 +1664,62 @@ chain.
 
 ### X.3 Green/red and self-healing
 
-Prefer skills showing green in `skills status`. Before invoking a red one, apply
-its prevention rule (`rules show "skill:<name>"`). Every failed invoke is a
+Prefer skills showing green in `skills status`. **Before deciding
+retry-vs-substitute on a skill that shows `fail`, read its Improvements lesson**
+(`python -m mindhive rules show "skill:<name>"`) **and consult its measured
+record** (`python -m mindhive skills stats --json`) — a one-off blip on a strong
+completion rate argues retry; a low rate or an open `skill:*` incident argues
+substituting the next-ranked alternative. Every failed invoke is a
 `tool_failed` event feeding the incidents → reflect → Improvements pipeline — the
 system self-heals by learning a rule from each failure. Treat a red indicator as
-"fix or avoid, with a reason," never as "run it again and hope."
+"fix or avoid, with a reason," never as "run it again and hope." This is the
+learning loop closing.
+
+### X.4 Parallel dispatch and dynamic workflows
+
+The orchestrator is the top orchestration layer: it groups the work, classifies
+each piece's complexity, and then **executes in parallel whenever the pieces
+are independent** — sequential execution is reserved for genuinely dependent
+stages, never chosen out of convenience.
+
+- **Fan out independent tasks.** When selected work splits into units that
+  touch disjoint files/modules (e.g. refactor one module, run integration
+  tests, audit security in another), dispatch them concurrently — subagents
+  via the platform's subagent primitive (`Agent`/`Task` in Claude Code), or
+  concurrent `hive loop` runs (one task dir per unit; every run shows up
+  separately in the dashboard's **Oversee** section). Before fanning out,
+  check the units' file sets for overlap — overlapping units run sequentially.
+- **Dependent stages get evaluation checkpoints.** When stage 2 needs stage
+  1's output, run them in order and verify each boundary: build/tests pass,
+  the artifact exists, the assumption still holds. On failure, **read the
+  failure log (stack trace) yourself, re-verify your assumptions, and fix it
+  without new instructions from the user** — the loop's circuit breaker and
+  budget gates bound the retries, so never bounce the first hurdle back to
+  the user.
+- **Model routing applies per unit:** lightweight analysis does not need a
+  flagship model — `hive loop` routes tiers automatically when no model is
+  pinned; match that spirit when choosing subagent models.
+
+### X.5 Non-conflict protocol (coordinator, not competitor)
+
+The orchestrator is the session's **primary coordinator**. It never
+re-implements another skill's job — planning, coding, review, and debugging
+belong to the skills it selects and chains.
+
+- **When another skill is already active or invoked in the session**, the
+  orchestrator restricts itself to **selection, sequencing, and ledger
+  write-back**. It does not duplicate, wrap, or second-guess the running
+  skill's work.
+- **Single-writer rule:** only the orchestrator appends `decision` /
+  `experiment_result` events about skill choice. Executed skills own their own
+  domain events; the orchestrator owns the record of *why* a skill was picked.
+- **Real-time write-through (the learning loop's heartbeat):** IMMEDIATELY
+  after each executed skill completes, record the outcome —
+  `python -m mindhive skills record <name> --ok|--fail [--note "..."]` —
+  before starting the next step. These records feed the measured completion
+  rates Phase S runs on; skipping one starves the next run's matrix.
+- After recording, re-surface what to run next from refreshed data:
+  `python -m mindhive skills recommend --top 3 --brief`.
 
 ---
 
@@ -2068,9 +2154,10 @@ present and degrades cleanly where it is not. Full matrix:
   install or author new skills.
 - It never disturbs the V17 live-trading setup or the `~/.mindhive/LIVE_LOCK`
   guard — if a chained skill would run the loop, that skill's own guards apply.
-- Percentages in the Recommendation Matrix are honest model estimates labeled
-  `(est.)` unless anchored on measured `skills stats`. Building a richer per-skill
-  success-rate backend beyond `skills stats` is deferred follow-up work.
+- Matrix percentages come from the measured telemetry backend
+  (`hive skills stats --json` / `hive skills recommend --json`). A model
+  estimate appears only for a never-called skill and is always labeled
+  `estimated` — never presented as a measured rate.
 - ULT-IDEA content is preserved in full from the source skill; the MindHive weave
   adds memory grounding, skill selection, execution chaining, and a learning loop
   without removing any of ULT-IDEA's rigor.
@@ -2079,4 +2166,4 @@ present and degrades cleanly where it is not. Full matrix:
 
 **Version:** MindHive Orchestrator v1.0 (ULT-IDEA v2.0 fused with the MindHive memory spine)
 
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-07-14

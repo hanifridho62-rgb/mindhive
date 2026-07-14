@@ -13,10 +13,12 @@ DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
     "session_start", "session_end", "compaction",
     "plugin_catalog", "user_prompt", "assistant_response",
-    "loop_run_start", "loop_iteration", "loop_run_end",
+    "loop_run_start", "loop_iteration", "loop_run_end", "loop_run_dismissed",
     "tool_failed", "rule_revised",
-    "rule_activated", "rule_promoted", "rule_demoted",
-    "invoke_requested", "invoke_result",
+    "rule_activated", "rule_promoted", "rule_demoted", "rule_expired",
+    "rule_enforced", "rule_rerouted",
+    "invoke_requested", "invoke_result", "skill_used",
+    "memory_consolidated",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 

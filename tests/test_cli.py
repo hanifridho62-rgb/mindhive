@@ -93,6 +93,31 @@ def test_state_warns_on_freshly_minted_namespace(tmp_path, monkeypatch, capsys):
     assert "no memory for detected project" in err.lower()
 
 
+def test_flag_creates_judgment_incident_active_at_one(capsys):
+    ret = cli_mod.main(["flag", "committed to master without permission"])
+    assert ret == 0
+    out = capsys.readouterr().out
+    evs = [e for e in events.read_all() if e.type == "tool_failed"]
+    assert len(evs) == 1
+    sig = evs[0].payload["signature"]
+    # readable slug prefix + collision-resistant content hash (sig.slug_id)
+    assert sig.startswith("judgment:flag:committed-to-master-without-permission-")
+    assert sig in out
+    assert evs[0].payload["text"] == "committed to master without permission"
+    assert "judgment" in evs[0].tags
+    from mindhive import incidents
+    rec = incidents.load(sig, project="test")
+    assert rec["status"] == "active"           # flags activate at 1 occurrence
+    assert rec["occurrences"] == 1
+
+
+def test_flag_category_adds_tag():
+    ret = cli_mod.main(["flag", "merged without approval", "--category", "git"])
+    assert ret == 0
+    ev = [e for e in events.read_all() if e.type == "tool_failed"][0]
+    assert "judgment" in ev.tags and "git" in ev.tags
+
+
 def test_project_on_corrupt_log_exits_cleanly(tmp_path, capsys):
     """A corrupt event-log line must surface as a clean CLI error (exit 1), not a
     raw traceback. read_all still fails loud — the CLI just frames it."""
@@ -105,3 +130,17 @@ def test_project_on_corrupt_log_exits_cleanly(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "corrupt event log" in err.lower()
     assert "Traceback" not in err
+
+
+def test_cli_consolidate_runs_and_reports(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
+    from mindhive import events
+    events.append_event("caveat", {"text": "repeat me please"},
+                        ts="2026-07-07T10:01:00Z", project="test")
+    events.append_event("caveat", {"text": "repeat me please"},
+                        ts="2026-07-07T10:02:00Z", project="test")
+    ret = cli_mod.main(["consolidate", "--project", "test", "--cooldown-hours", "0"])
+    assert ret in (None, 0)
+    out = capsys.readouterr().out
+    assert '"consolidated": 1' in out

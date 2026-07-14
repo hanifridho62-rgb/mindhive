@@ -1,4 +1,5 @@
 # pre_compact — mark compaction + fold reminder. Hang-proof, never blocks.
+if ($env:MINDHIVE_HEADLESS -eq "1") { exit 0 }   # headless reflection session: no recursion, no phantom events
 $ErrorActionPreference = "SilentlyContinue"
 $py = "C:\Users\hanif\mindhive\.venv\Scripts\python.exe"
 $sid = "unknown"
