@@ -59,6 +59,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
   .pill b { color:#fff; }
   .pill.est { color:#e0b341; border-color:#5a4a1f; }
+  .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
+  .pill.tridism { color:#8a93a6; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -348,6 +350,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
   let IMP_RES = 'all';             // resolution filter set by the legend glyphs
+  let IMP_TRIAGE = 'all';          // who-acts filter: all | claude | dismiss
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -367,15 +370,37 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
   // legend glyphs double as one-click resolution filters (click again to
-  // clear) — the same mechanism as the Skills & plugins status legend.
+  // clear) — the same mechanism as the Skills & plugins status legend. The
+  // second row is the WHO-ACTS axis: every card is marked either "for
+  // Claude" (pending agent work) or "dismissible" (clear it manually).
+  const TRIAGE_LEGEND = {
+    claude:  ['for Claude', 'pending agent work \\u2014 hand these to Claude to root-cause and fix'],
+    dismiss: ['dismissible', 'no agent work needed \\u2014 clear these manually with dismiss']};
+  function triagePill(t, hint){
+    if (t === 'claude')
+      return '<span class="pill triclaude" title="'+escAttr(hint||TRIAGE_LEGEND.claude[1])
+        + '">\\u26a1 for Claude</span>';
+    if (t === 'dismiss')
+      return '<span class="pill tridism" title="'+escAttr(hint||TRIAGE_LEGEND.dismiss[1])
+        + '">dismissible</span>';
+    return '';
+  }
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
       .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
         + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
-        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>';
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>'
+      + '<div class="legend">'+['claude','dismiss']
+      .map(t => '<span class="legitem'+(IMP_TRIAGE===t?' on':'')+'" title="click to filter \\u2014 '
+        + escAttr(TRIAGE_LEGEND[t][1])+'" onclick="setImpTriage('+escAttr(JSON.stringify(t))+')">'
+        + triagePill(t)+' '+TRIAGE_LEGEND[t][1]+'</span>').join(' \\u00b7 ')+'</div>';
   }
   function setImpRes(r){
     IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  function setImpTriage(t){
+    IMP_TRIAGE = (IMP_TRIAGE === t) ? 'all' : t;
     paintImprovements();
   }
   // unknown resolutions render as the watching glyph, so filter them the same way
@@ -463,7 +488,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (el.innerHTML !== html) el.innerHTML = html;
   }
   function lessonPills(a){
-    let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
+    let p = triagePill(a.triage, a.triage_hint);
+    p += (p ? ' ' : '') + '<span class="pill">'+esc(a.status||'?')+'</span>';
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
@@ -477,12 +503,38 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       : ' <span class="pill">not yet reflected</span>');
     return p;
   }
+  // A ready-to-paste prompt for a for-Claude card, so "hand it to Claude"
+  // is one click instead of hand-assembling context from the card.
+  function claudePrompt(a){
+    return 'MindHive incident `'+(a.signature||'')+'` ('+(a.occurrences||0)
+      + 'x, '+(a.resolution||'')+'). '
+      + (a.excerpt ? 'Error: '+a.excerpt+' ' : '')
+      + (a.lesson ? 'Lesson so far: '+a.lesson+' ' : '')
+      + (a.active_rule ? 'Current rule (leaking): '+a.active_rule+' ' : 'No rule yet. ')
+      + 'Please root-cause this and fix it (or write/repair the prevention rule).';
+  }
+  async function copyPrompt(btn){
+    const a = (IMP_ITEMS.auto||[]).find(x => x.signature === btn.dataset.sig);
+    if (!a) return;
+    try { await navigator.clipboard.writeText(claudePrompt(a)); }
+    catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = claudePrompt(a); document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    const old = btn.textContent; btn.textContent = 'copied \\u2713';
+    setTimeout(() => { btn.textContent = old; }, 1200);
+  }
   function lessonCard(a, showProj){
     const head = glyphSpan(a.resolution)
       + (showProj && a.project ? esc(a.project)+' \\u00b7 ' : '')
       + esc(a.signature)+' \\u00b7 '+(a.occurrences||0)+'\\u00d7 \\u00b7 '
       + (a.sessions||0)+' session'+((a.sessions||0)===1?'':'s')
       + (a.last_seen ? ' \\u00b7 last seen '+esc(a.last_seen) : '')
+      + (a.triage === 'claude'
+         ? '<button class="mini copybtn" data-sig="'+escAttr(a.signature)
+           + '" title="copy a ready-to-paste prompt for Claude">copy prompt</button>'
+         : '')
       + (a.resolution !== 'dismissed'
          ? '<button class="mini dismissbtn" data-sig="'+escAttr(a.signature)+'">dismiss</button>'
          : '');
@@ -525,13 +577,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
       (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_TRIAGE==='all' || a.triage===IMP_TRIAGE)
       && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    // manual notes carry no resolution, so an active glyph filter shows lessons only
-    const notes = (IMP_RES==='all' ? manual : []).filter(m => !q
+    // manual notes carry no resolution/triage, so any active filter shows lessons only
+    const notes = ((IMP_RES==='all' && IMP_TRIAGE==='all') ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -559,6 +612,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     });
     view.querySelectorAll('.dismissbtn').forEach(el =>
       el.onclick = (ev) => { ev.stopPropagation(); dismissLesson(el.dataset.sig); });
+    view.querySelectorAll('.copybtn').forEach(el =>
+      el.onclick = (ev) => { ev.stopPropagation(); copyPrompt(el); });
   }
   // Reflect keeps the Heavy confirm (token spend) but lands back on the
   // Improvements view with an inline result banner instead of confirmAction's
