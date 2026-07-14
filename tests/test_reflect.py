@@ -151,7 +151,9 @@ def test_reflect_batch_runner_exception_recorded_without_raising():
     res = reflect.reflect_batch(project="test", limit=3, cooldown_hours=6,
                                 runner=boom)
     assert res["reflected"] == 0
-    assert reflect.read_marker("test")["last_error"] == "RuntimeError"
+    # the marker carries the exception's MESSAGE (the real cause), not the
+    # class name — "RuntimeError" tells the health banner nothing actionable
+    assert reflect.read_marker("test")["last_error"] == "auth expired"
 
 
 def test_reflect_batch_success_refreshes_state_projection():
@@ -314,3 +316,37 @@ def test_run_headless_pins_headless_env(monkeypatch):
     claude_cli.run_headless("hello")
     assert captured["env"] is not None
     assert captured["env"]["MINDHIVE_HEADLESS"] == "1"
+
+
+# --- honest failure causes: the marker must carry the REAL error --------------
+
+def test_claude_runner_raises_with_envelope_error(monkeypatch):
+    monkeypatch.setattr(reflect.claude_cli, "run_headless",
+                        lambda p, timeout_s=120: {"exit": 1, "stdout":
+                            '{"is_error": true, "api_error_status": 429, '
+                            '"result": "weekly limit hit"}'})
+    import pytest
+    with pytest.raises(RuntimeError, match="429: weekly limit hit"):
+        reflect._claude_runner("prompt")
+
+
+def test_claude_runner_raises_on_missing_cli(monkeypatch):
+    monkeypatch.setattr(reflect.claude_cli, "run_headless",
+                        lambda p, timeout_s=120: {"exit": 127, "stdout": ""})
+    import pytest
+    with pytest.raises(RuntimeError, match="not found"):
+        reflect._claude_runner("prompt")
+
+
+def test_reflect_incident_records_real_cause_not_class_name():
+    """A raising runner's message must reach the health marker verbatim —
+    'empty verdict' hid a 429 quota exhaustion behind an auth-shaped banner."""
+    _seed_unreflected(1)
+
+    def quota_runner(prompt, timeout_s=120):
+        raise RuntimeError("429: weekly limit hit")
+
+    res = reflect.reflect_batch(project="test", limit=1, cooldown_hours=6,
+                                runner=quota_runner)
+    assert res["reflected"] == 0
+    assert reflect.read_marker("test")["last_error"] == "429: weekly limit hit"
