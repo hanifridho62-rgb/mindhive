@@ -1669,3 +1669,52 @@ def test_oversee_includes_interactive_sessions(dashboard_server):
     status, res = _post(base, "/api/oversee/dismiss",
                         {"project": "test", "run_id": "chat-1"}, token)
     assert res["ok"] is True
+
+
+# --- gzip: responses compress when the client accepts it --------------------
+
+def _get_gzip(base, path, token=None):
+    req = urllib.request.Request(base + path)
+    if token:
+        req.add_header("X-Hive-Token", token)
+    req.add_header("Accept-Encoding", "gzip")
+    with urllib.request.urlopen(req) as r:
+        return r.status, r.headers.get("Content-Encoding"), r.read()
+
+
+def test_page_gzips_when_accepted(dashboard_server):
+    import gzip as _gz
+    base, token = dashboard_server
+    status, enc, body = _get_gzip(base, "/")
+    assert status == 200 and enc == "gzip"
+    assert b"MIND HIVE" in _gz.decompress(body) or b"showOversee" in _gz.decompress(body)
+    # a client that doesn't accept gzip still gets identity (existing _get path)
+    status, plain = _get(base, "/")
+    assert status == 200 and "showOversee" in plain
+
+
+def test_small_json_stays_identity(dashboard_server):
+    base, token = dashboard_server
+    status, enc, body = _get_gzip(base, "/api/state?project=test", token)
+    assert status == 200
+    # STATE payload for an empty test store is tiny -> below the gzip floor
+    assert enc is None or len(body) >= 1400
+
+
+# --- Improvements triage marks (who acts: claude vs dismiss) -----------------
+
+def test_improvements_carry_triage_marks(dashboard_server):
+    from mindhive import events as ev, incidents as inc
+    base, token = dashboard_server
+    for s in ("s1", "s2"):
+        ev.append_event("tool_failed",
+                        {"text": "boom", "signature": "raw:tri1", "action": "x"},
+                        session_id=s, project="test")
+    inc.project(project="test", threshold=2)
+    status, body = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    (a,) = [x for x in json.loads(body)["auto"] if x["signature"] == "raw:tri1"]
+    # active with no rule -> unresolved -> pending agent work
+    assert a["resolution"] == "unresolved"
+    assert a["triage"] == "claude"
+    assert a["triage_hint"]

@@ -570,20 +570,31 @@ def cmd_rules_list(args) -> int | None:
 def cmd_rules_summaries(args) -> int | None:
     """Structured lesson records (the same shape the dashboard Improvements view
     reads) for an agent working from the CLI. --json emits the raw list; the
-    default is a human-readable digest per signature."""
+    default is a human-readable digest per signature. Both carry resolution +
+    triage (who should act: claude vs dismiss) — CLI/HTTP parity with the
+    dashboard's Improvements cards."""
+    from . import events as ev_mod
     from . import incidents as inc
-    recs = inc.summaries(args.project)
+    stats = inc.signal_stats(args.project, evs=ev_mod.read_all(args.project))
+    recs = []
+    for r in inc.summaries(args.project):
+        st = stats.get(r["signature"], {})
+        resolution = inc.classify_resolution(r, st)
+        recs.append(dict(r, resolution=resolution,
+                         **inc.classify_triage(resolution, r)))
     if args.json:
         print(json.dumps(recs, indent=2))
         return None
     if not recs:
         print("(no incidents yet)")
         return None
+    marks = {"claude": "-> FIX WITH CLAUDE", "dismiss": "-> ok to dismiss", "": ""}
     for r in sorted(recs, key=lambda r: -r.get("occurrences", 0)):
         lesson = r.get("lesson") or r.get("active_rule") or "(not yet reflected)"
         cat = f" {{{r['category']}}}" if r.get("category") else ""
         print(f"{r.get('occurrences', 0):>3}x  [{r.get('status', '?'):9}]{cat} "
-              f"{r.get('signature', '')}\n       {lesson}")
+              f"{r.get('signature', '')}  {marks.get(r.get('triage'), '')}"
+              f"\n       {lesson}")
     return None
 
 

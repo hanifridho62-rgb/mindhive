@@ -204,3 +204,21 @@ def test_transient_infra_error_still_produces_nothing(tmp_path):
     res = failures.capture_dir(str(tdir), project="test")
     assert res["new_failures"] == 0
     assert [e for e in events.read_all("test") if e.type == "tool_failed"] == []
+
+
+def test_enforcement_denial_is_not_a_failure():
+    """The PreToolUse enforcement hook's own deny text must not be re-captured
+    as a new incident — that is the learning loop eating its own output (a
+    grep-unscoped deny once became raw:bc40af13ca)."""
+    from mindhive import enforce
+    line = _tool_result_line(
+        True, content_text=f"{enforce.ENFORCED_MARK} This Grep is unscoped — "
+                           "re-run it bounded.")
+    assert failures.extract_failures(line) == []
+
+
+def test_permission_gate_prompt_is_not_a_failure():
+    line = _tool_result_line(
+        True, content_text="Claude requested permissions to read from "
+                           "C:/somewhere, but you haven't granted it yet.")
+    assert failures.extract_failures(line) == []

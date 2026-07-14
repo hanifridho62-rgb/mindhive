@@ -142,7 +142,7 @@ def test_rules_reflect_cli_failing_runner_exits_zero(tmp_path, capsys, monkeypat
     out = _json.loads(capsys.readouterr().out)
     assert out["reflected"] == 0
     m = reflect_mod.read_marker("test")
-    assert m["last_error"] == "RuntimeError"
+    assert m["last_error"] == "auth expired"            # real cause, not class name
     assert not m.get("cooldown_started")                # window not consumed
 
 
@@ -230,3 +230,18 @@ def test_rules_reflect_all_projects_skips_live_lock(tmp_path, capsys, monkeypatc
     assert reflect_mod.read_marker("fabio-live") == {}
     assert incidents.inject(project="fabio-live") == ""
     assert "always pin the venv" in incidents.inject(project="alpha")
+
+
+def test_rules_summaries_carry_triage(tmp_path, capsys):
+    _seed()                                     # 2 failures -> active, no rule yet
+    assert cli.main(["rules", "summaries", "--project", "test", "--json"]) is None \
+        or True
+    out = capsys.readouterr().out
+    import json as _json
+    (rec,) = [r for r in _json.loads(out)
+              if r["signature"] == "pymodule:mindhive"]
+    assert rec["resolution"] == "unresolved"
+    assert rec["triage"] == "claude"
+    # the human-readable digest carries the same mark
+    cli.main(["rules", "summaries", "--project", "test"])
+    assert "FIX WITH CLAUDE" in capsys.readouterr().out

@@ -22,9 +22,17 @@ _CMD_TOOLS = ("Bash", "PowerShell")
 # user rejections/denials are NOT noise — they are judgment signal (KTD4) and
 # become `judgment:rejected:<tool>:<context-stem>` events in capture_dir.
 # Both sets matched case-insensitively as substrings.
+#
+# "[mindhive-rule]" is our OWN PreToolUse enforcement hook denying a call —
+# the rule WORKING, not a new failure (see enforce.ENFORCED_MARK). "requested
+# permissions" is the harness's permission gate mid-prompt — workflow, not a
+# coding mistake (an explicit denial still lands via _REJECTION as judgment
+# signal). Both previously hashed into unreflectable raw:* incidents.
 _INFRA_NOISE = (
     "auto mode cannot determine the safety",
     "is temporarily unavailable",
+    "[mindhive-rule]",
+    "requested permissions",
 )
 _REJECTION = (
     "the user doesn't want to proceed",
