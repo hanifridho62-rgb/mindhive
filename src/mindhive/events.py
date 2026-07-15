@@ -8,6 +8,10 @@ from . import paths
 SEMANTIC_TYPES = {
     "decision", "experiment_result", "caveat",
     "next_step", "open_question", "state_set",
+    # Mandatory code change-log: human-written, categorized explanation of a
+    # change-set touching mindhive's own code (see changelog.py). Semantic so
+    # it rides the LEDGER, hash chain, and Memory view like decisions do.
+    "code_change",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",

@@ -40,6 +40,18 @@ def cmd_append(args) -> int | None:
         print("error: provide a payload argument or use --stdin", file=sys.stderr)
         return 2
     payload = json.loads(raw) if args.json else {"text": raw}
+    if args.type == "code_change":
+        # The change-log is only mandatory if the generic append path can't
+        # smuggle an uncategorized/unexplained entry past it. The event store
+        # itself stays type-agnostic — the contract is enforced here, at the
+        # one surface that accepts an arbitrary type+payload from the user.
+        from . import changelog as changelog_mod
+        try:
+            changelog_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f'error: {e} (use: hive log <category> "...")',
+                  file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -205,6 +217,45 @@ def cmd_review_clear(args) -> int | None:
 def cmd_review_show(args) -> int | None:
     from . import review as review_mod
     print(json.dumps(review_mod.load_pending(), indent=2))
+    return None
+
+
+def cmd_log_add(args) -> int | None:
+    from . import changelog as changelog_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        ev = changelog_mod.record(args.category, args.explanation,
+                                  files=args.files or None, session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"logged {ev.payload['category']} covering "
+          f"{len(ev.payload['files'])} file(s) @ {ev.ts}")
+    return None
+
+
+def cmd_log_queue(args) -> int | None:
+    from . import changelog as changelog_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    marker = changelog_mod.queue(events.read_all(), session_id=sid)
+    if marker:
+        print(f"queued {len(marker['files'])} unlogged source file(s) — a "
+              "change-log entry is required: hive log <category> \"…\"")
+    else:
+        print("no unlogged code changes")
+    return None
+
+
+def cmd_log_show(args) -> int | None:
+    from . import changelog as changelog_mod
+    print(json.dumps(changelog_mod.entries(events.read_all()),
+                     indent=2, ensure_ascii=False))
+    return None
+
+
+def cmd_log_pending(args) -> int | None:
+    from . import changelog as changelog_mod
+    print(json.dumps(changelog_mod.load_pending(), indent=2))
     return None
 
 
@@ -854,6 +905,25 @@ def _build_parser() -> argparse.ArgumentParser:
     rvq.set_defaults(func=cmd_review_queue)
     rvsub.add_parser("clear", help="clear the pending-review marker (after the review runs)").set_defaults(func=cmd_review_clear)
     rvsub.add_parser("show", help="print the pending-review marker, if any").set_defaults(func=cmd_review_show)
+
+    # --- log (mandatory code change-log) ---
+    from .changelog import CATEGORIES as _LOG_CATS
+    lg = sub.add_parser("log", help="mandatory code change-log (code_change events)")
+    lgsub = lg.add_subparsers(dest="log_cmd", required=True)
+    for _cat in _LOG_CATS:
+        lc = lgsub.add_parser(_cat, help=f"record a {_cat} entry for the current change-set")
+        lc.add_argument("explanation", help="brief explanation of what changed (mandatory)")
+        lc.add_argument("--files", nargs="*", default=None,
+                        help="affected files (default: pending marker, then session, then git)")
+        lc.add_argument("--session", default=None,
+                        help="session id (default: $MINDHIVE_SESSION)")
+        lc.set_defaults(func=cmd_log_add, category=_cat)
+    lgq = lgsub.add_parser("queue", help="queue this session's unlogged source files (run by session_end)")
+    lgq.add_argument("--session", default=None,
+                     help="session id to queue (default: $MINDHIVE_SESSION)")
+    lgq.set_defaults(func=cmd_log_queue)
+    lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
+    lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")

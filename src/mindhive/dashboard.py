@@ -453,6 +453,29 @@ def make_handler(token: str):
                 s["status"] = taskview.status_of(s["last_ts"])
             return self._json(out)
 
+        def _get_changelog(self, proj, am, qs):
+            # Mandatory code change-log. Shape and ordering delegate to
+            # changelog.entries() — one source of truth, so this view can
+            # never disagree with `hive log show`. The pending marker is a
+            # per-project sidecar, so HIVE MIND shows entries without a
+            # pending banner; categories ride along so the UI never hardcodes
+            # the taxonomy.
+            from . import changelog as changelog_mod
+            if am:
+                rows = []
+                for n in _all_projects():
+                    rows.extend(changelog_mod.entries(events.read_all(n),
+                                                      project=n))
+                rows.sort(key=lambda r: r["ts"] or "", reverse=True)
+                pending = None
+            else:
+                rows = changelog_mod.entries(events.read_all(proj),
+                                             project=proj)
+                pending = changelog_mod.load_pending(proj)
+            return self._json({"entries": rows,
+                               "categories": list(changelog_mod.CATEGORIES),
+                               "pending": pending})
+
         def _get_task(self, proj, am, qs):
             sid = (qs.get("session") or [""])[0]
             # In HIVE MIND mode each card carries its own project — a concrete
@@ -929,6 +952,7 @@ def make_handler(token: str):
             "/api/task": _get_task,
             "/api/task_detail": _get_task_detail,
             "/api/oversee": _get_oversee,
+            "/api/changelog": _get_changelog,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
             "/api/plugins/recommend": _get_plugins_recommend,
