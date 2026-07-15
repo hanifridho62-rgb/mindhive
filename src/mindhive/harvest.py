@@ -7,7 +7,7 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from . import events, paths
+from . import events, hookcapture, paths
 
 
 def _harvest_lock_path() -> Path:
@@ -165,11 +165,22 @@ def _items_from_obj(o) -> list:
                 if name in ("Edit", "Write", "NotebookEdit"):
                     fp = inp.get("file_path")
                     if fp:
-                        items.append({"kind": "file_touched", "value": fp})
+                        plus, minus = hookcapture.line_stats(name, inp)
+                        item = {"kind": "file_touched", "value": fp, "tool": name}
+                        if plus is not None:
+                            if plus == 0 and minus == 0:
+                                continue      # +0 −0 is not a change (locked rule)
+                            item["plus"], item["minus"] = plus, minus
+                        items.append(item)
                 elif name in ("Bash", "PowerShell"):
                     cmd = inp.get("command")
                     if cmd:
-                        items.append({"kind": "command_run", "value": cmd[:180]})
+                        item = {"kind": "command_run",
+                                "value": cmd[:hookcapture.CMD_MAX]}
+                        desc = inp.get("description")
+                        if isinstance(desc, str) and desc.strip():
+                            item["desc"] = desc.strip()[:hookcapture.DESC_MAX]
+                        items.append(item)
                 elif name == "Skill":
                     skill = _skill_from_tool_use(inp)
                     if skill:
@@ -273,9 +284,16 @@ def _event_for_item(item):
     """Map a parsed transcript item to (event_type, payload, tags)."""
     kind = item["kind"]
     if kind == "file_touched":
-        return "file_touched", {"text": item["value"]}, ["harvest", "auto"]
+        payload = {"text": item["value"]}
+        for k in ("plus", "minus", "tool"):
+            if k in item:
+                payload[k] = item[k]
+        return "file_touched", payload, ["harvest", "auto"]
     if kind == "command_run":
-        return "command_run", {"text": item["value"]}, ["harvest", "auto"]
+        payload = {"text": item["value"]}
+        if "desc" in item:
+            payload["desc"] = item["desc"]
+        return "command_run", payload, ["harvest", "auto"]
     if kind == "memo":
         return item["memo_type"], {"text": item["value"]}, ["harvest", "memo"]
     if kind == "user_prompt":

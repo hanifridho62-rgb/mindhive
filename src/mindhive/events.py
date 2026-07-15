@@ -16,7 +16,7 @@ DETERMINISTIC_TYPES = {
     "loop_run_start", "loop_iteration", "loop_run_end", "loop_run_dismissed",
     "tool_failed", "rule_revised",
     "rule_activated", "rule_promoted", "rule_demoted", "rule_expired",
-    "rule_enforced",
+    "rule_enforced", "rule_rerouted", "trigger_trained",
     "invoke_requested", "invoke_result", "skill_used",
     "memory_consolidated",
 }

@@ -16,9 +16,42 @@ from . import events, paths
 # back-harvest agree on what each tool means.
 _FILE_TOOLS = ("Edit", "Write", "NotebookEdit")
 _CMD_TOOLS = ("Bash", "PowerShell")
-_SKILL_TOOL = "Skill"
-_CMD_MAX = 180
+# Shared truncation caps — harvest.py reuses these so both capture paths
+# truncate identically (the dedup key depends on identical text).
+CMD_MAX = 180
+DESC_MAX = 120
 _SKILL_TEXT_MAX = 200
+
+
+def line_stats(tool, inp, resp=None):
+    """(plus, minus) line counts for a file-tool call, or (None, None) when
+    they can't be derived. Prefers the exact structuredPatch from the tool
+    response; falls back to new/old string line counts, then Write content.
+    The old/new-string fallback may overcount when old_string/new_string
+    include unchanged context lines carried for uniqueness.
+    Unknown is NOT zero — callers only skip on a computed (0, 0)."""
+    patch = resp.get("structuredPatch") if isinstance(resp, dict) else None
+    if isinstance(patch, list) and patch:
+        # Only trust the patch when every hunk's "lines" is a real list — a
+        # malformed value (e.g. a string) would otherwise be iterated
+        # char-by-char and silently misreport counts. Malformed -> treat the
+        # whole patch as unusable and fall through to the string fallbacks.
+        hunk_lines = [h.get("lines") if isinstance(h, dict) else None for h in patch]
+        if all(isinstance(ls, list) for ls in hunk_lines):
+            plus = minus = 0
+            for ls in hunk_lines:
+                for ln in ls:
+                    if isinstance(ln, str) and ln.startswith("+"):
+                        plus += 1
+                    elif isinstance(ln, str) and ln.startswith("-"):
+                        minus += 1
+            return plus, minus
+    old, new = inp.get("old_string"), inp.get("new_string")
+    if isinstance(old, str) and isinstance(new, str):
+        return len(new.splitlines()), len(old.splitlines())
+    if tool == "Write" and isinstance(inp.get("content"), str):
+        return len(inp["content"].splitlines()), 0
+    return None, None
 
 
 def _response_ok(resp) -> bool:
@@ -74,9 +107,13 @@ def _skill_payload(inp, resp) -> dict | None:
 
 
 def extract_events(payload) -> list:
-    """Pure extraction: map one PostToolUse payload to ``(type, value)`` pairs.
-    ``value`` is a string for file/command tools and a payload dict for the
-    Skill tool (``skill_used`` carries structured fields, not just text).
+    """Pure extraction: map one PostToolUse payload to ``(type, payload)``
+    pairs. The payload's ``text`` field is byte-identical to the historical
+    value (path / command[:180]) — harvest's dedup key depends on it. Extra
+    keys (plus/minus/tool/desc) ride alongside, and the Skill tool yields a
+    structured ``skill_used`` payload (``{name, plugin?, ok, text}``). A file
+    change that computes to +0 −0 is not a change and is skipped (locked
+    design rule).
 
     Returns ``[]`` for unknown tools or missing fields — never raises on a
     well-formed dict with absent keys.
@@ -87,11 +124,25 @@ def extract_events(payload) -> list:
     inp = payload.get("tool_input") or {}
     if tool in _FILE_TOOLS:
         path = inp.get("file_path")
-        return [("file_touched", path)] if path else []
+        if not path:
+            return []
+        plus, minus = line_stats(tool, inp, payload.get("tool_response"))
+        p = {"text": path, "tool": tool}
+        if plus is not None:
+            if plus == 0 and minus == 0:
+                return []
+            p["plus"], p["minus"] = plus, minus
+        return [("file_touched", p)]
     if tool in _CMD_TOOLS:
         cmd = inp.get("command")
-        return [("command_run", cmd[:_CMD_MAX])] if cmd else []
-    if tool == _SKILL_TOOL:
+        if not cmd:
+            return []
+        p = {"text": cmd[:CMD_MAX]}
+        desc = inp.get("description")
+        if isinstance(desc, str) and desc.strip():
+            p["desc"] = desc.strip()[:DESC_MAX]
+        return [("command_run", p)]
+    if tool == "Skill":
         skill = _skill_payload(inp, payload.get("tool_response"))
         return [("skill_used", skill)] if skill else []
     return []
@@ -126,9 +177,8 @@ def record_post_tool_use(raw: str, project=None, now=None) -> dict:
         payload = json.loads(raw)
         sid = payload.get("session_id") if isinstance(payload, dict) else None
         appended = 0
-        for etype, value in extract_events(payload):
-            body = value if isinstance(value, dict) else {"text": value}
-            events.append_event(etype, body, session_id=sid,
+        for etype, ep in extract_events(payload):
+            events.append_event(etype, ep, session_id=sid,
                                 tags=["auto"], ts=now, project=project)
             appended += 1
         return {"appended": appended}

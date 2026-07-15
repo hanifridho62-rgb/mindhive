@@ -71,25 +71,33 @@ def suggested_skills_block(project=None, evs=None) -> str:
     ever compelled an invocation, so nothing ever became measured."""
     try:
         from . import plugins as plugins_mod
+        from . import recommend as recommend_mod
         payload = plugins_mod.recommend_for(project=project, evs=evs,
                                             top=SUGGEST_CAP)
         recs = (payload.get("recommendations") or [])[:SUGGEST_CAP]
         if not recs:
             return ""
-        lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)"]
+        # The nudge line makes intended-use adherence explicit; it is not a
+        # bullet, so it never counts against SUGGEST_CAP. Every tier carries
+        # the skill's intended use (via intended_use_clause / brief_line) so
+        # the agent grasps scope from the block alone.
+        lines = ["# SUGGESTED SKILLS (deterministic — hive skills recommend)",
+                 "_Consult each skill's intended use before invoking — match the "
+                 "task to the skill's stated scope._"]
         for e in recs:
+            use = recommend_mod.intended_use_clause(e)
             if e.get("execution_mode") == "auto":
                 lines.append(
                     f"- MUST USE: {e['name']} — {e['reason']}. Proven skill: "
                     "when its trigger matches the task at hand, invoke it via "
-                    "the Skill tool before starting that work.")
+                    f"the Skill tool before starting that work.{use}")
             elif e.get("try_to_measure"):
                 lines.append(
                     f"- TRY & MEASURE: {e['name']} — {e['reason']}. If it fits "
                     "the current task, invoke it via the Skill tool (not "
-                    "ad-hoc) so its completion rate gets measured.")
+                    f"ad-hoc) so its completion rate gets measured.{use}")
             else:
-                lines.append(f"- {e['name']} — {e['reason']} ({e['provenance']})")
+                lines.append(f"- {recommend_mod.brief_line(e)}")
         return "\n".join(lines)
     except Exception:
         return ""

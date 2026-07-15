@@ -51,7 +51,7 @@ this machine) → else `hive state`. If no shell exists, read `STATE.md`/`CONTEX
 
 Throughout, monitor context at each phase boundary and offer a **Handoff** at roughly
 50% per the skill's handoff protocol. Works in Claude Code, Cowork, and NewTask — see
-the skill's `references/cross-platform.md` for how asking and command-running adapt per
+the skill's `references/compatibility.md` for how asking and command-running adapt per
 surface.
 
 If `$ARGUMENTS` is empty, ask the user for the idea before starting.

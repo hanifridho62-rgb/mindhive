@@ -9,7 +9,7 @@ document string. No sibling-module dependencies."""
 import json
 
 
-def render_page(token: str) -> str:
+def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -59,6 +59,8 @@ def render_page(token: str) -> str:
   .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
   .pill b { color:#fff; }
   .pill.est { color:#e0b341; border-color:#5a4a1f; }
+  .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
+  .pill.tridism { color:#8a93a6; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -94,6 +96,7 @@ def render_page(token: str) -> str:
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
+  /*__TASKS_CSS__*/
 </style></head>
 <body>
 <header>
@@ -135,6 +138,7 @@ def render_page(token: str) -> str:
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
     <button onclick="runReflect()">Reflect (learn from failures)</button>
+    <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -346,6 +350,7 @@ def render_page(token: str) -> str:
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
   let IMP_RES = 'all';             // resolution filter set by the legend glyphs
+  let IMP_TRIAGE = 'all';          // who-acts filter: all | claude | dismiss
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -365,15 +370,37 @@ def render_page(token: str) -> str:
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
   // legend glyphs double as one-click resolution filters (click again to
-  // clear) — the same mechanism as the Skills & plugins status legend.
+  // clear) — the same mechanism as the Skills & plugins status legend. The
+  // second row is the WHO-ACTS axis: every card is marked either "for
+  // Claude" (pending agent work) or "dismissible" (clear it manually).
+  const TRIAGE_LEGEND = {
+    claude:  ['for Claude', 'pending agent work \\u2014 hand these to Claude to root-cause and fix'],
+    dismiss: ['dismissible', 'no agent work needed \\u2014 clear these manually with dismiss']};
+  function triagePill(t, hint){
+    if (t === 'claude')
+      return '<span class="pill triclaude" title="'+escAttr(hint||TRIAGE_LEGEND.claude[1])
+        + '">\\u26a1 for Claude</span>';
+    if (t === 'dismiss')
+      return '<span class="pill tridism" title="'+escAttr(hint||TRIAGE_LEGEND.dismiss[1])
+        + '">dismissible</span>';
+    return '';
+  }
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
       .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
         + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
-        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>';
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>'
+      + '<div class="legend">'+['claude','dismiss']
+      .map(t => '<span class="legitem'+(IMP_TRIAGE===t?' on':'')+'" title="click to filter \\u2014 '
+        + escAttr(TRIAGE_LEGEND[t][1])+'" onclick="setImpTriage('+escAttr(JSON.stringify(t))+')">'
+        + triagePill(t)+' '+TRIAGE_LEGEND[t][1]+'</span>').join(' \\u00b7 ')+'</div>';
   }
   function setImpRes(r){
     IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  function setImpTriage(t){
+    IMP_TRIAGE = (IMP_TRIAGE === t) ? 'all' : t;
     paintImprovements();
   }
   // unknown resolutions render as the watching glyph, so filter them the same way
@@ -461,14 +488,42 @@ def render_page(token: str) -> str:
     if (el.innerHTML !== html) el.innerHTML = html;
   }
   function lessonPills(a){
-    let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
+    let p = triagePill(a.triage, a.triage_hint);
+    p += (p ? ' ' : '') + '<span class="pill">'+esc(a.status||'?')+'</span>';
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (a.reroutes) p += ' <span class="pill" title="a previous rule failed; an '
+      + 'alternative route was deployed">rerouted \\u00d7'+a.reroutes+'</span>';
+    if (a.flag === 'reroute_exhausted')
+      p += ' <span class="pill" title="all automatic reroute attempts spent \\u2014 '
+        + 'needs a human rule">reroute exhausted</span>';
     if (!a.active_rule) p += (a.status === 'candidate'
       ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
       : ' <span class="pill">not yet reflected</span>');
     return p;
+  }
+  // A ready-to-paste prompt for a for-Claude card, so "hand it to Claude"
+  // is one click instead of hand-assembling context from the card.
+  function claudePrompt(a){
+    return 'MindHive incident `'+(a.signature||'')+'` ('+(a.occurrences||0)
+      + 'x, '+(a.resolution||'')+'). '
+      + (a.excerpt ? 'Error: '+a.excerpt+' ' : '')
+      + (a.lesson ? 'Lesson so far: '+a.lesson+' ' : '')
+      + (a.active_rule ? 'Current rule (leaking): '+a.active_rule+' ' : 'No rule yet. ')
+      + 'Please root-cause this and fix it (or write/repair the prevention rule).';
+  }
+  async function copyPrompt(btn){
+    const a = (IMP_ITEMS.auto||[]).find(x => x.signature === btn.dataset.sig);
+    if (!a) return;
+    try { await navigator.clipboard.writeText(claudePrompt(a)); }
+    catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = claudePrompt(a); document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    const old = btn.textContent; btn.textContent = 'copied \\u2713';
+    setTimeout(() => { btn.textContent = old; }, 1200);
   }
   function lessonCard(a, showProj){
     const head = glyphSpan(a.resolution)
@@ -476,12 +531,18 @@ def render_page(token: str) -> str:
       + esc(a.signature)+' \\u00b7 '+(a.occurrences||0)+'\\u00d7 \\u00b7 '
       + (a.sessions||0)+' session'+((a.sessions||0)===1?'':'s')
       + (a.last_seen ? ' \\u00b7 last seen '+esc(a.last_seen) : '')
+      + (a.triage === 'claude'
+         ? '<button class="mini copybtn" data-sig="'+escAttr(a.signature)
+           + '" title="copy a ready-to-paste prompt for Claude">copy prompt</button>'
+         : '')
       + (a.resolution !== 'dismissed'
          ? '<button class="mini dismissbtn" data-sig="'+escAttr(a.signature)+'">dismiss</button>'
          : '');
     let body = '';
     if (a.first_seen) body += '<div class="snip dup">first seen '+esc(a.first_seen)
-      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the rule activated' : '')
+      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the '
+         + (a.reroutes ? 'route deployed' : 'rule activated') : '')
+      + (a.last_reroute ? ' \\u00b7 route deployed '+esc(a.last_reroute) : '')
       + '</div>';
     if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
     if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
@@ -516,13 +577,14 @@ def render_page(token: str) -> str:
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
       (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_TRIAGE==='all' || a.triage===IMP_TRIAGE)
       && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    // manual notes carry no resolution, so an active glyph filter shows lessons only
-    const notes = (IMP_RES==='all' ? manual : []).filter(m => !q
+    // manual notes carry no resolution/triage, so any active filter shows lessons only
+    const notes = ((IMP_RES==='all' && IMP_TRIAGE==='all') ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -550,6 +612,8 @@ def render_page(token: str) -> str:
     });
     view.querySelectorAll('.dismissbtn').forEach(el =>
       el.onclick = (ev) => { ev.stopPropagation(); dismissLesson(el.dataset.sig); });
+    view.querySelectorAll('.copybtn').forEach(el =>
+      el.onclick = (ev) => { ev.stopPropagation(); copyPrompt(el); });
   }
   // Reflect keeps the Heavy confirm (token spend) but lands back on the
   // Improvements view with an inline result banner instead of confirmAction's
@@ -569,6 +633,24 @@ def render_page(token: str) -> str:
       await renderImprovements();
     });
   }
+  // Active resolution: reroute red rules whose nudge failed (and reflect the
+  // rule-less ones) so they can turn green. Same Heavy confirm + inline
+  // banner mechanism as Reflect.
+  async function runResolve(){
+    if(!confirm('Resolve red (find alternative routes for failed rules, reflect '
+      + 'missing ones) \\u2014 runs the claude CLI once per red lesson '
+      + '(a few per click). Continue?')) return;
+    liveFn = renderImprovements;
+    await run('resolving\\u2026', async () => {
+      const res = await apiPost('/api/rules/resolve', {});
+      IMP_BANNER = res.ok
+        ? ('Resolve: '+(res.rerouted||0)+' rerouted \\u00b7 '+(res.reflected||0)
+           +' reflected \\u00b7 '+(res.failed||0)+' failed \\u00b7 '
+           +(res.pending||0)+' still red')
+        : (res.error || 'resolution failed');
+      await renderImprovements();
+    });
+  }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
   function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
@@ -584,22 +666,14 @@ def render_page(token: str) -> str:
       + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
       + '<label>sort <select id="impsort" onchange="onImpSort(this.value)">'+sortOpts+'</select></label>'
       + '<button id="impdir" onclick="toggleImpDir()">'+impDirLabel()+'</button>'
+      + '<button onclick="runResolve()" title="reroute red rules whose nudge '
+      + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }
 
-  // --- Sessions: the episode layer; click one to scope Memory to it ---
-  async function renderSessions(){
-    const items = await apiGet('/api/sessions');
-    if (!items.length) { showText('No sessions yet.'); return; }
-    showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
-      + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
-          + '<div class="file">'+(PROJECT==='*' && s.project ? esc(s.project)+' · ' : '')+esc(s.session_id)+'</div>'
-          + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
-          + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
-      + '</ul>');
-    view.querySelectorAll('.sessrow').forEach(el => el.onclick = () => openSession(el.dataset.sid));
-  }
+  // --- Sessions: rendered by the notification-center fragment (taskview.py).
+  async function renderSessions(){ return renderTaskCards(); }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
@@ -758,6 +832,18 @@ def render_page(token: str) -> str:
                                                : '/api/workspace/'+view));
   }
 
+  // Self-Reliant (an iframe) can ask the parent to open the Memory view filtered
+  // to a PRD's backing events — the section's link into the memory it wrote. Only
+  // trust messages from our own iframe on the same origin (never arbitrary posts).
+  window.addEventListener('message', function(ev){
+    if (ev.origin !== location.origin) return;
+    if (!graph || ev.source !== graph.contentWindow) return;
+    const d = ev.data;
+    if (!d || d.type !== 'mh-self-reliant' || d.action !== 'show-memory') return;
+    MEM_QUERY = String(d.query == null ? '' : d.query).slice(0, 200);
+    showMemory();
+  });
+
   function showAppend(){
     liveFn = null;
     controls.innerHTML = '<div class="row"><select id="etype">'
@@ -843,11 +929,19 @@ def render_page(token: str) -> str:
     let calls = 0, ok = 0;
     Object.values(PLUG_STATS).forEach(s => { calls += s.calls||0; ok += s.ok||0; });
     const rate = calls ? Math.round(ok/calls*100)+'%' : '\\u2014';
+    const measured = cov.measured ?? 0;
+    const total = cov.total ?? (c.skills_total ?? 0);
+    // Cold-start honesty: before any skill has been called, show WHY the tiles
+    // read zero rather than a bare '0/0' that looks broken.
+    const rateLbl = calls ? ('completion rate \\u00b7 '+ok+'/'+calls+' calls')
+                          : 'completion rate \\u00b7 no calls recorded yet';
+    const measuredLbl = measured ? 'measured (\\u22653 calls)'
+                                 : 'measured \\u00b7 call skills to start measuring';
     return '<div class="cards" style="margin-bottom:12px">'
       + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
       + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
-      + '<div class="card"><div class="big">'+(cov.measured ?? 0)+' of '+(cov.total ?? (c.skills_total ?? 0))+'</div><div class="lbl">measured (\\u22653 calls)</div></div>'
-      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">completion rate \\u00b7 '+ok+'/'+calls+' calls</div></div>'
+      + '<div class="card"><div class="big">'+measured+' of '+total+'</div><div class="lbl">'+measuredLbl+'</div></div>'
+      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">'+rateLbl+'</div></div>'
       + '</div>';
   }
   const PLUG_SORT_LABELS = {
@@ -1065,6 +1159,7 @@ def render_page(token: str) -> str:
               + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
               + (e ? callBtn(e) : '')+'</div>'
               + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + (r.description ? '<div class="snip">intended use: '+esc(r.description)+'</div>' : '')
               + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
                   + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
                       + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
@@ -1283,7 +1378,11 @@ def render_page(token: str) -> str:
     run(label+' running…', async () => showText(await apiPost(path, body)));
   }
 
+  //__TASKS_JS__
+
   // populate the project picker, then land on the overview
   (async () => { await loadProjects(); showOverview(); })();
 </script>
-</body></html>""".replace("__TOKEN__", json.dumps(token))
+</body></html>""".replace("__TOKEN__", json.dumps(token)) \
+    .replace("/*__TASKS_CSS__*/", tasks_css) \
+    .replace("//__TASKS_JS__", tasks_js)

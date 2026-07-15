@@ -250,6 +250,42 @@ _ITERATION_CONTRACT = (
     "job."
 )
 
+# The PRD contract: the read-only mode does not mutate anything — it produces a
+# Product Requirement Document that a *future* Claude session builds directly.
+# Its final section is an SOP whose every step names a real installed skill or
+# plugin (staged-first, all allowed), so a complete build procedure is assembled
+# from existing skills. Each PRD is captured and persisted as memory so the
+# Self-Reliant section stays connected to the memory it wrote. The GitHub clause
+# is stated here as well as enforced at spawn (read-only allowlist) — defense in
+# depth. (The symbol keeps its historical name to avoid churn in callers/tests.)
+_ANALYSIS_CONTRACT = (
+    "PRD contract — follow it exactly: you are READ-ONLY. Do NOT edit "
+    "train.py or any file, and do NOT run training or any other command. You "
+    "must NEVER touch GitHub — no git, no gh, no pushes, no commits, no remote "
+    "operations of any kind. Read train.py and the experiment history, then "
+    "write ONE Product Requirement Document (PRD) that a future Claude session "
+    "can build directly, with no further clarification. Begin the PRD with two "
+    "machine-readable header lines, exactly:\n"
+    "TITLE: <one line naming what will be built>\n"
+    "SUMMARY: <one sentence describing what is being built and why>\n"
+    "Then the PRD body, with these sections in this order every time: "
+    "(1) Problem & context — grounded in the experiment history above; "
+    "(2) Goal & success metric — the target val_bpb; "
+    "(3) Requirements; "
+    "(4) SOP — a numbered build procedure where EACH step names a real "
+    "installed skill or plugin from the lists above, verbatim, and says what "
+    "it does in that step (prefer the staged primary skills; you may also use "
+    "any other installed skill); "
+    "(5) Acceptance criteria & verification. "
+    "You are headless — there is NO operator: never ask permission and never "
+    "end your turn with a question. End your turn when the PRD is written; "
+    "MindHive persists it as memory for the next session."
+)
+
+# Cap on how many installed skills are rendered into a learn-mode program, so a
+# machine with hundreds of plugins does not blow up the researcher's prompt.
+_MAX_INVENTORY = 150
+
 
 def _clean_skills(skills) -> list:
     """Mirror of workspace._clean_skills, local so research.py stays free of a
@@ -264,7 +300,8 @@ def _clean_skills(skills) -> list:
 
 
 def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
-                    train_path=None) -> dict:
+                    train_path=None, mode="improve", history=None,
+                    inventory=None) -> dict:
     """The researcher agent's steering document (program.md text) plus its
     system-prompt addition — a pure function of its inputs (U6).
 
@@ -272,20 +309,53 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     ``primed`` is a list of past-learning strings recalled from the ledger;
     ``preset`` is a name->bound mapping stated as hard constraints; ``prior``
     is the previous experiment's record so the agent iterates on feedback.
+    ``mode`` is ``improve`` (the agent edits train.py) or ``learn`` (the agent
+    writes a PRD; it never edits). ``history`` is the leaderboard's ranked
+    experiment records — supplied in learn mode so the PRD is grounded in real
+    past results rather than train.py alone (R2). ``inventory`` is the flat
+    ``[{name, plugin}]`` of installed skills/plugins, rendered in learn mode so
+    the PRD's SOP is composed from real, verbatim skill names.
     """
+    learn = mode == "learn"
     skills = _clean_skills(skills)
-    parts = [f"RESEARCH GOAL: {(goal or '').strip()}",
-             "You are the Self-Reliant researcher. Optimize train.py so a "
-             "5-minute training run reaches the lowest possible val_bpb "
-             "(lower is better) on this machine."]
+    if learn:
+        parts = [f"RESEARCH GOAL: {(goal or '').strip()}",
+                 "You are the Self-Reliant PRD author. Study train.py and the "
+                 "experiment history and write ONE Product Requirement Document "
+                 "(PRD) that a future Claude session can build directly — the "
+                 "objective is the lowest val_bpb (lower is better) on this "
+                 "machine, but you do not build or edit anything yourself. The "
+                 "PRD must end in an SOP composed from the installed skills and "
+                 "plugins listed below."]
+    else:
+        parts = [f"RESEARCH GOAL: {(goal or '').strip()}",
+                 "You are the Self-Reliant researcher. Optimize train.py so a "
+                 "5-minute training run reaches the lowest possible val_bpb "
+                 "(lower is better) on this machine."]
     if skills:
-        lines = ["Strategy guidance from the staged skills, in order — steer "
-                 "your edits with them (they are guidance, not commands to "
-                 "execute):"]
+        if learn:
+            header = ("Primary skills for the SOP — these are staged into this "
+                      "run; prefer them as SOP steps and name them verbatim:")
+        else:
+            header = ("Strategy guidance from the staged skills, in order — "
+                      "steer your edits with them (they are guidance, not "
+                      "commands to execute):")
+        lines = [header]
         for i, s in enumerate(skills, 1):
             src = f" (from the {s['plugin']} plugin)" if s.get("plugin") else ""
             lines.append(f"{i}. {s['name']}{src}")
         parts.append("\n".join(lines))
+    if learn and inventory:
+        inv = _clean_skills(inventory)
+        if inv:
+            lines = ["Installed skills & plugins available for the SOP — build "
+                     "each SOP step from these, names verbatim:"]
+            for s in inv[:_MAX_INVENTORY]:
+                src = f" ({s['plugin']})" if s.get("plugin") else " (local)"
+                lines.append(f"- {s['name']}{src}")
+            if len(inv) > _MAX_INVENTORY:
+                lines.append(f"- … (+{len(inv) - _MAX_INVENTORY} more installed)")
+            parts.append("\n".join(lines))
     if preset:
         bounds = "\n".join(f"- {k}: {v}" for k, v in preset.items())
         parts.append("Hard constraints from the small-GPU preset — configs "
@@ -293,6 +363,16 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     if primed:
         parts.append("Past learnings from MindHive — honor them:\n"
                      + "\n".join(f"- {p}" for p in primed))
+    if learn and history:
+        lines = ["Experiment history on this machine (best val_bpb first) — "
+                 "ground your analysis in these real results, not train.py "
+                 "alone:"]
+        for h in history:
+            score = h.get("val_bpb")
+            lines.append(f"- {h.get('status', '?')}"
+                         + (f" val_bpb {score}" if score is not None else " (no score)")
+                         + (f" — {h['change']}" if h.get("change") else ""))
+        parts.append("\n".join(lines))
     if prior:
         score = prior.get("val_bpb")
         parts.append("Previous experiment: status "
@@ -300,18 +380,65 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
                      + (f", val_bpb {score}" if score is not None else ", no score")
                      + (f" — change: {prior['change']}" if prior.get("change") else "")
                      + ". Iterate on this result.")
-        if prior.get("change") == "no change":
+        # the no-edit nudge is an improve-mode concern only — in learn mode not
+        # editing is the whole point, so never scold the agent for it
+        if not learn and prior.get("change") == "no change":
             parts.append("Your previous turn made NO edit to train.py — the "
                          "experiment trained an unchanged file, which wastes "
                          "the whole 5-minute budget. This turn you MUST make "
                          "an actual edit before ending your turn.")
     if train_path:
-        parts.append(f"train.py location: {train_path} — edit exactly this "
-                     "file; it lives inside WSL, outside your working "
-                     "directory.")
-    parts.append(_ITERATION_CONTRACT)
-    return {"program": "\n\n".join(parts),
-            "system": _ITERATION_CONTRACT}
+        if learn:
+            parts.append(f"train.py location: {train_path} — read exactly this "
+                         "file; it lives inside WSL, outside your working "
+                         "directory. Do not edit it.")
+        else:
+            parts.append(f"train.py location: {train_path} — edit exactly this "
+                         "file; it lives inside WSL, outside your working "
+                         "directory.")
+    contract = _ANALYSIS_CONTRACT if learn else _ITERATION_CONTRACT
+    parts.append(contract)
+    return {"program": "\n\n".join(parts), "system": contract}
+
+
+# --- PRD parsing: report -> card fields (title + summary + body) -------------
+
+_PRD_TITLE_RE = re.compile(r"^\s*title\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_PRD_SUMMARY_RE = re.compile(r"^\s*summary\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def parse_prd(report, n, goal="") -> dict:
+    """Split one PRD-mode report into the card fields the Self-Reliant page
+    renders. The agent is asked to lead with ``TITLE:`` / ``SUMMARY:`` header
+    lines; when it complies those become the card's heading and one-line
+    description, and they are stripped from ``body`` so the expanded card reads
+    cleanly. A noncompliant turn still yields a usable card — the title falls
+    back to ``PRD <n>`` and the summary to the first meaningful body line."""
+    report = (report or "").strip()
+    lines = report.splitlines()
+    title = summary = ""
+    # header lines are only honored at the very top, before the PRD body
+    while lines and (not lines[0].strip()
+                     or _PRD_TITLE_RE.match(lines[0])
+                     or _PRD_SUMMARY_RE.match(lines[0])):
+        tm = _PRD_TITLE_RE.match(lines[0])
+        sm = _PRD_SUMMARY_RE.match(lines[0])
+        if tm and not title:
+            title = tm.group(1).strip()
+        elif sm and not summary:
+            summary = sm.group(1).strip()
+        lines.pop(0)
+    body = "\n".join(lines).strip()
+    if not title:
+        title = f"PRD {n}"
+    if not summary:
+        for ln in body.splitlines():
+            s = ln.strip().lstrip("#").strip()
+            if s:
+                summary = s
+                break
+    return {"n": n, "title": title[:200], "summary": summary[:300],
+            "body": body, "goal": goal}
 
 
 # --- U4: leaderboard -------------------------------------------------------
@@ -412,7 +539,7 @@ class ResearchController:
     def __init__(self, trainer_cmd=None, agent_factory=None, train_path=None,
                  leaderboard=None, append_event=None, preflight=None,
                  cap_s=None, turn_timeout_s=None, profiles=None,
-                 auth_status=None, on_kill=None):
+                 auth_status=None, on_kill=None, skills_inventory=None):
         self._trainer_cmd = trainer_cmd
         self._factory = agent_factory
         self._train_path = train_path
@@ -428,6 +555,9 @@ class ResearchController:
         self._profiles = list(profiles or [])
         self._auth_status = auth_status
         self._on_kill = on_kill          # extra cleanup after a training kill
+        # provider of the installed-skills inventory ([{name, plugin}]) for the
+        # PRD SOP (learn mode only); injected so tests need no plugins backend
+        self._skills_inventory = skills_inventory
         self._lock = threading.Lock()
         self._stop_flag = threading.Event()
         self._thread = None
@@ -438,6 +568,8 @@ class ResearchController:
         self._count = 0
         self.run_id = None
         self._goal = ""
+        self._mode = "improve"           # improve (edit) | learn (analyze)
+        self._last_report = ""           # last recorded learn report (dedup)
         self.lines: list = []
 
     # --- observability -------------------------------------------------------
@@ -451,11 +583,29 @@ class ResearchController:
         return {"ok": True, "lines": self.lines[since:], "next": len(self.lines),
                 "status": self._state}
 
+    def learnings_text(self) -> str:
+        """The current run's accumulated learn-mode report artifact, or empty
+        when the run is not a learn run / has produced nothing yet."""
+        try:
+            return self._learnings_path().read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return ""
+
+    def prds(self) -> list:
+        """The current run's parsed PRD cards ({n, title, summary, body, goal},
+        insertion order) — the structured form the Self-Reliant page renders as
+        cards and links back to Memory. Empty for a non-learn run."""
+        try:
+            data = json.loads(self._prds_path().read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
     def status(self) -> dict:
         best = self.leaderboard.best()
         return {"state": self._state, "reason": self._reason,
                 "experiments": self._count, "goal": self._goal,
-                "run_id": self.run_id,
+                "run_id": self.run_id, "mode": self._mode,
                 "best": best.get("val_bpb") if best else None}
 
     def wait(self, timeout=None) -> bool:
@@ -467,7 +617,8 @@ class ResearchController:
 
     # --- lifecycle -----------------------------------------------------------
     def start(self, goal, skills=None, max_experiments=None, time_budget_s=None,
-              failover=False, profile="default", primed=None, preset=None) -> dict:
+              failover=False, profile="default", primed=None, preset=None,
+              model=None, mode="improve") -> dict:
         goal = (goal or "").strip()
         if not goal:
             return {"ok": False, "error": "research goal is empty"}
@@ -506,17 +657,28 @@ class ResearchController:
         self._deadline = time.monotonic() + budget if budget else None
         self._failover = bool(failover)
         self._profile = profile or "default"
+        # "" / whitespace => account default (no --model flag), so the researcher
+        # runs on whatever the chosen account defaults to (mirrors MindParallel).
+        self._model = (model or "").strip() or None
         self._used_profiles = {self._profile}
         self._primed = list(primed or [])
         self._preset = preset if preset is not None else SMALL_GPU_PRESET
         self._best_score = None          # running best within THIS run (U10)
         self._tally = {}
+        self._last_report = ""            # dedup guard for learn-mode reports
+        self._mode = "learn" if mode == "learn" else "improve"
+        # an uncapped learn run re-analyzes identical state forever; give it a
+        # default round cap when the caller set neither cap nor budget
+        if (self._mode == "learn" and self._max is None
+                and self._deadline is None):
+            self._max = _DEFAULT_LEARN_ROUNDS
         try:
-            self._researcher = self._factory(self._profile)
+            self._researcher = self._factory(self._profile, self._model)
+            self._apply_tool_policy(self._researcher)
         except Exception as e:
             self._state = "idle"
             return {"ok": False, "error": f"could not start researcher agent: {e}"}
-        self.emit(f"· run {self.run_id} started — goal: {goal}"
+        self.emit(f"· run {self.run_id} started ({self._mode}) — goal: {goal}"
                   + (f" · cap {self._max}" if self._max else " · unbounded"))
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -561,6 +723,17 @@ class ResearchController:
                 and not self._stop_flag.is_set():
             t.join(0.05)
         if t.is_alive():
+            # The turn crossed its wall-clock budget, but the underlying agent
+            # run is still in flight — abandoning the worker thread alone leaves
+            # it running. On the production ManagerResearcher that orphans the
+            # workspace agent (status stays "running"); the NEXT turn's send()
+            # then rejects with "… is busy", which the loop treats as terminal
+            # and the whole run dies. Stop the in-flight run so the next turn
+            # starts against a settled agent.
+            try:
+                self._researcher.stop()
+            except Exception:
+                pass
             return {"ok": False, "aborted": True}
         res = box.get("res")
         return res if isinstance(res, dict) else \
@@ -569,6 +742,21 @@ class ResearchController:
     def _trainer_argv(self, iteration) -> list:
         cmd = self._trainer_cmd
         return list(cmd(iteration)) if callable(cmd) else list(cmd or [])
+
+    def _apply_tool_policy(self, researcher) -> None:
+        """Enforce the no-GitHub boundary on the researcher agent: learn mode is
+        read-only (allowlist ⇒ no Bash ⇒ no git/gh); every mode denies git/gh.
+        In learn mode the boundary is load-bearing, so if it cannot be set the
+        run fails closed (raises) rather than silently proceeding as an
+        unrestricted agent — a failure to restrict must never be invisible."""
+        allowed = SELF_RELIANT_ALLOWED_TOOLS if self._mode == "learn" else None
+        try:
+            researcher.allowed_tools = allowed
+            researcher.disallowed_tools = GITHUB_DENY
+        except Exception as e:
+            self.emit(f"✖ could not apply the no-GitHub tool policy: {e}")
+            if self._mode == "learn":
+                raise
 
     def _loop(self) -> None:
         prior = None
@@ -584,14 +772,26 @@ class ResearchController:
                 if self._deadline is not None and time.monotonic() >= self._deadline:
                     reason = "time"
                     return
+                inv = None
+                if self._mode == "learn" and self._skills_inventory is not None:
+                    try:
+                        inv = self._skills_inventory()
+                    except Exception:
+                        inv = None            # a plugins read must never end a run
                 composed = compose_program(self._goal, self._skills,
                                            self._primed, self._preset, prior,
                                            train_path=(str(self._train_path)
-                                                       if self._train_path else None))
+                                                       if self._train_path else None),
+                                           mode=self._mode,
+                                           history=(self.leaderboard.ranked()
+                                                    if self._mode == "learn" else None),
+                                           inventory=inv)
                 # snapshot BEFORE the edit-turn: the turn is what changes
                 # train.py, so a post-turn "before" reads the edited file and
-                # every agent edit would record as "no change"
-                before = snapshot_text(self._train_path) if self._train_path else ""
+                # every agent edit would record as "no change". Learn mode never
+                # edits, so it takes no snapshot.
+                before = (snapshot_text(self._train_path)
+                          if self._train_path and self._mode != "learn" else "")
                 turn = self._run_turn(composed["program"])
                 for ln in turn.get("lines") or []:
                     self.emit(f"  agent: {ln}")   # why it edited (or didn't)
@@ -599,9 +799,15 @@ class ResearchController:
                     reason = "stopped"
                     return
                 if turn.get("aborted"):
-                    self._record({"status": "aborted", "val_bpb": None,
-                                  "change": "", "duration_s": 0.0,
-                                  "output": "agent turn exceeded the timeout"})
+                    if self._mode == "learn":
+                        self._count += 1     # a round happened; counts to the cap
+                        will_retry = self._max is None or self._count < self._max
+                        self.emit(f"#{self._count} analysis turn timed out"
+                                  + (" — retrying" if will_retry else ""))
+                    else:
+                        self._record({"status": "aborted", "val_bpb": None,
+                                      "change": "", "duration_s": 0.0,
+                                      "output": "agent turn exceeded the timeout"})
                     prior = None
                     continue
                 if turn.get("usage_exhausted"):
@@ -611,7 +817,8 @@ class ResearchController:
                                   f"failing over to {nxt}")
                         self._profile = nxt
                         self._used_profiles.add(nxt)
-                        self._researcher = self._factory(nxt)
+                        self._researcher = self._factory(nxt, self._model)
+                        self._apply_tool_policy(self._researcher)
                         continue
                     reason = "usage"
                     return
@@ -620,6 +827,15 @@ class ResearchController:
                               + str(turn.get("error") or "unknown error"))
                     reason = "error"
                     return
+                if self._mode == "learn":
+                    # analyze-and-learn: persist the agent's report as a durable
+                    # learning; never run training (an unchanged file would just
+                    # retrain the baseline and waste the budget). The round
+                    # counts toward the cap whether or not the report is kept.
+                    self._count += 1
+                    self._record_learning(turn.get("report", ""))
+                    prior = None
+                    continue
                 res = run_experiment(self._trainer_argv(self._count),
                                      cap_s=self._cap_s,
                                      on_spawn=self._track_proc)
@@ -672,6 +888,68 @@ class ResearchController:
             self._best_score = score
             self._credit_skills(score)
         return rec
+
+    # --- learn mode: durable, recallable learnings (R3) ----------------------
+    def _learnings_path(self) -> Path:
+        # per-run artifact: keying on run_id (not just the leaderboard stem)
+        # keeps one run's reports from accumulating onto a prior run's file
+        # when the leaderboard path is pinned/shared across runs.
+        p = self.leaderboard.path
+        rid = self.run_id or "run"
+        return p.with_name(f"{p.stem}_{rid}_learnings.md")
+
+    def _prds_path(self) -> Path:
+        # structured sibling of the markdown artifact: the parsed PRD cards the
+        # page renders, keyed on run_id for the same isolation reason.
+        p = self.leaderboard.path
+        rid = self.run_id or "run"
+        return p.with_name(f"{p.stem}_{rid}_prds.json")
+
+    def _record_learning(self, report) -> None:
+        """Persist one analysis turn's report so a human with Claude Code can
+        recall and act on it: a ledger event tagged self-reliant + learning,
+        and an append to the per-run learnings artifact beside the leaderboard.
+        Learn mode never touches the leaderboard. The round has already been
+        counted by the caller; empty or unchanged reports are skipped so they
+        never flood the ledger or poison future _primed_learnings recall."""
+        report = (report or "").strip()
+        if not report or report == self._last_report:
+            self.emit("· analysis round produced "
+                      + ("an empty report" if not report else "no new insight")
+                      + " — not recorded")
+            return
+        self._last_report = report
+        self.emit(f"#{self._count} learning recorded · {len(report)} chars")
+        self._log("learning", {
+            "text": f"Self-Reliant learning {self._count} (goal: {self._goal}):"
+                    f"\n{report}",
+            "goal": self._goal, "report": report},
+            extra_tags=["learning"])
+        try:
+            p = self._learnings_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(f"\n\n## Learning {self._count} — {self._goal}\n\n"
+                        + report + "\n")
+        except OSError as e:
+            # the ledger event above is the durable record; surface the artifact
+            # failure in the run log instead of silently dropping it
+            self.emit(f"· learning {self._count} ledgered, but its artifact "
+                      f"write failed: {e}")
+        # structured PRD store (title + summary + body) for the page's cards,
+        # written atomically alongside the markdown artifact
+        try:
+            prds = self.prds()
+            prds.append(parse_prd(report, self._count, self._goal))
+            pj = self._prds_path()
+            pj.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pj.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(prds, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, pj)
+        except OSError as e:
+            self.emit(f"· PRD {self._count} ledgered, but its card-store "
+                      f"write failed: {e}")
 
     def _credit_skills(self, score) -> None:
         """U10 presence-correlation: every staged skill on a new-best experiment
@@ -826,18 +1104,46 @@ _USAGE_MARKERS = ("usage limit", "rate limit", "out of usage",
                   "hit your limit", "session limit", "quota")
 
 
+# The GitHub boundary. Learn mode spawns read-only: the allowlist below is the
+# ENFORCED gate — workspace.send() drops bypassPermissions whenever an allowlist
+# is present, so with no prompt channel any tool outside it (no Bash ⇒ no
+# git/gh) is auto-denied. The set is deliberately minimal (Read/Grep/Glob only);
+# Skill is intentionally excluded because it could shell out and widen a
+# "read-only" turn. GITHUB_DENY layers on top as defense-in-depth: for learn it
+# is redundant with the allowlist; for improve mode — which keeps
+# bypassPermissions so it can Edit train.py — it is a best-effort deny against
+# literal git/gh invocations, NOT a hard guarantee (a shell can reach the same
+# binaries by other spellings). A hard improve-mode boundary (no-Bash / egress
+# controls) is deferred follow-up.
+SELF_RELIANT_ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
+GITHUB_DENY = ["Bash(git:*)", "Bash(gh:*)", "mcp__github__*"]
+
+# Learn rounds re-analyze the same state (there is no fresh experiment between
+# them), so an uncapped learn run would loop and burn account usage forever.
+# When the caller sets neither a round cap nor a time budget, fall back to this
+# many analysis rounds. Improve runs gather new data each round and stay
+# unbounded by default.
+_DEFAULT_LEARN_ROUNDS = 5
+
+
 class ManagerResearcher:
     """The production researcher brain: one headless-claude workspace agent on
     the shared Manager. Manager.send is asynchronous, so a turn = send + poll
     until the agent settles; --resume continuity keeps the whole run one
-    conversation. Stop kills the agent's in-flight CLI run."""
+    conversation. Stop kills the agent's in-flight CLI run.
+
+    ``allowed_tools``/``disallowed_tools`` (set by the controller per mode) are
+    forwarded to every send, enforcing the no-GitHub boundary at the CLI."""
 
     def __init__(self, profile="default", manager=None, model=None,
-                 system_extra="", poll_s=1.0, add_dir=None):
+                 system_extra="", poll_s=1.0, add_dir=None,
+                 allowed_tools=None, disallowed_tools=None):
         from . import workspace
         self._mgr = manager or workspace.MANAGER
         self._poll_s = poll_s
         self._system_extra = system_extra
+        self.allowed_tools = allowed_tools
+        self.disallowed_tools = disallowed_tools
         # the autoresearch checkout lives OUTSIDE the agent's cwd (\\wsl$ …);
         # granted per-turn via --add-dir or its edits are silently blocked
         self._add_dirs = [add_dir] if add_dir else []
@@ -850,7 +1156,9 @@ class ManagerResearcher:
     def turn(self, prompt) -> dict:
         res = self._mgr.send(self.agent_id, prompt,
                              extra_system=self._system_extra or None,
-                             add_dirs=self._add_dirs)
+                             add_dirs=self._add_dirs,
+                             allowed_tools=self.allowed_tools,
+                             disallowed_tools=self.disallowed_tools)
         if not res.get("ok"):
             return {"ok": False, "error": res.get("error")}
         while True:
@@ -862,7 +1170,10 @@ class ManagerResearcher:
             time.sleep(self._poll_s)
         lines = list(a.lines[-12:])         # reply tail for the run log
         if a.status == "done":
-            return {"ok": True, "lines": lines}
+            # report = the agent's final message; learn mode persists it as a
+            # learning, improve mode ignores it
+            return {"ok": True, "lines": lines,
+                    "report": getattr(a, "last_result", "") or ""}
         tail = " ".join(a.lines[-30:]).lower()
         if any(m in tail for m in _USAGE_MARKERS):
             return {"ok": False, "usage_exhausted": True, "lines": lines}
@@ -897,6 +1208,28 @@ CONTROLLER: ResearchController | None = None
 _CTL_LOCK = threading.Lock()
 
 
+def installed_skill_inventory() -> list:
+    """Flat ``[{name, plugin}]`` of every installed skill/plugin, so the PRD's
+    SOP is composed from real, verbatim skill names (same inventory the page's
+    skills sidebar drags from). Best-effort — a plugins read failure yields an
+    empty list, never a crash of the run."""
+    try:
+        from . import plugins
+        inv = plugins.inventory()
+    except Exception:
+        return []
+    out = []
+    for s in inv.get("local_skills") or []:
+        if s.get("name"):
+            out.append({"name": s["name"], "plugin": None})
+    for p in inv.get("plugins") or []:
+        pname = p.get("name")
+        for s in p.get("skills") or []:
+            if s.get("name"):
+                out.append({"name": s["name"], "plugin": pname})
+    return out
+
+
 def get_controller() -> ResearchController:
     global CONTROLLER
     with _CTL_LOCK:
@@ -906,14 +1239,15 @@ def get_controller() -> ResearchController:
             train_dir = str(Path(tp).parent) if tp else None
             CONTROLLER = ResearchController(
                 trainer_cmd=wsl_trainer_cmd,
-                agent_factory=lambda profile: ManagerResearcher(
-                    profile=profile, add_dir=train_dir),
+                agent_factory=lambda profile, model=None: ManagerResearcher(
+                    profile=profile, model=model, add_dir=train_dir),
                 train_path=tp,
                 append_event=ev_mod.append_event,
                 preflight=default_preflight,
                 profiles=[e["name"] for e in workspace.load_profiles()],
                 auth_status=workspace.profile_auth_status,
-                on_kill=kill_wsl_training)
+                on_kill=kill_wsl_training,
+                skills_inventory=installed_skill_inventory)
         return CONTROLLER
 
 
@@ -929,6 +1263,10 @@ def api_get(action, proj=None, qs=None) -> dict:
                 "best": ctl.leaderboard.best(), "tally": ctl.skill_tally()}
     if action == "output":
         return ctl.output(since=int((qs.get("since") or ["0"])[0]))
+    if action == "learnings":
+        return {"ok": True, "learnings": ctl.learnings_text()}
+    if action == "prds":
+        return {"ok": True, "prds": ctl.prds()}
     return {"ok": False, "error": "not found"}
 
 
@@ -942,6 +1280,8 @@ def api_post(action, proj=None, body=None) -> dict:
                          time_budget_s=body.get("time_budget_s"),
                          failover=bool(body.get("failover")),
                          profile=body.get("profile", "default"),
+                         model=body.get("model"),
+                         mode=body.get("mode", "improve"),
                          primed=_primed_learnings(goal, proj))
     if action == "stop":
         return ctl.stop()

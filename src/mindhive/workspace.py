@@ -347,6 +347,7 @@ class Agent:
         self.skills_used: list = []     # Skill tool invocations, ordered, deduped
         self.last_turns = None          # num_turns of the most recent run
         self.last_cost = None           # total_cost_usd of the most recent run
+        self.last_result = ""           # final result text of the most recent run
         self.created = _now_iso()
         self.proc = None
         self._timer = None
@@ -452,7 +453,8 @@ class Manager:
                 "status": a.status}
 
     # --- one run = one headless claude call ---------------------------------
-    def send(self, agent_id, prompt, extra_system=None, add_dirs=None) -> dict:
+    def send(self, agent_id, prompt, extra_system=None, add_dirs=None,
+             allowed_tools=None, disallowed_tools=None) -> dict:
         a = self.get(agent_id)
         if a is None:
             return {"ok": False, "error": "unknown agent"}
@@ -460,12 +462,26 @@ class Manager:
             return {"ok": False, "error": "prompt is empty"}
         if a.status == "running":
             return {"ok": False, "error": f"{a.name} is busy — wait or stop it"}
-        # bypassPermissions: headless runs have no prompt channel, so under
-        # acceptEdits anything beyond an in-cwd edit was silently auto-denied —
-        # agents burned whole turns pleading for approvals nobody could grant
-        # (user mandate 2026-07-13: full access for all workspace agents).
         argv = [claude_cli.resolve_exe(), "--output-format", "stream-json",
-                "--verbose", "--permission-mode", "bypassPermissions"]
+                "--verbose"]
+        # Permission posture. Default is bypassPermissions: headless runs have
+        # no prompt channel, so under acceptEdits anything beyond an in-cwd edit
+        # was silently auto-denied — agents burned whole turns pleading for
+        # approvals nobody could grant (user mandate 2026-07-13: full access for
+        # all workspace agents). BUT bypassPermissions approves EVERY tool,
+        # which would make an --allowedTools restriction inert. So when a caller
+        # passes an allowlist (Self-Reliant's read-only learn mode), we drop
+        # bypassPermissions: with the default posture and no prompt channel,
+        # tools outside the allowlist are auto-denied — the allowlist becomes
+        # the real, enforced boundary (no Bash ⇒ no git/gh). --disallowedTools
+        # is layered on as defense-in-depth in both postures.
+        if allowed_tools:
+            argv += ["--allowedTools", ",".join(str(t) for t in allowed_tools)]
+        else:
+            argv += ["--permission-mode", "bypassPermissions"]
+        if disallowed_tools:
+            argv += ["--disallowedTools",
+                     ",".join(str(t) for t in disallowed_tools)]
         # extra workspace roots (e.g. Self-Reliant's \\wsl$ autoresearch dir) —
         # without --add-dir the CLI's boundary silently blocks out-of-cwd edits
         for d in add_dirs or []:
@@ -538,6 +554,7 @@ class Manager:
                 if obj.get("type") == "result":
                     saw_result = True
                     result_text = obj.get("result") or ""
+                    a.last_result = result_text
                     if obj.get("num_turns") is not None:
                         a.last_turns = obj.get("num_turns")
                     if obj.get("total_cost_usd") is not None:

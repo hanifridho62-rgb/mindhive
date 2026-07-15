@@ -59,6 +59,14 @@ def cmd_hook(args) -> int | None:
         decision = enforce.hook_decision(raw)
         if decision:
             print(json.dumps(decision))
+    elif args.stage == "user_prompt_submit":
+        # Prompt-quality gate: inject skill-trigger directives when the typed
+        # prompt is underspecified. Print ONLY when the gate fires (stdout is
+        # the hook's context channel); a clear prompt prints nothing.
+        from . import promptgate
+        context = promptgate.hook_context(raw)
+        if context:
+            print(json.dumps(context))
     return None
 
 
@@ -345,6 +353,7 @@ def cmd_skills_recommend(args) -> int | None:
     both the telemetry stats and the need extraction, so --brief stays cheap
     enough for a session-start hook."""
     from . import plugins as plugins_mod
+    from . import recommend as recommend_mod
     payload = plugins_mod.recommend_for(project=args.project, top=args.top)
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -352,7 +361,7 @@ def cmd_skills_recommend(args) -> int | None:
     recs = payload["recommendations"]
     if args.brief:
         for e in recs[:(args.top or 3)]:
-            print(f"{e['name']} — {e['reason']} ({e['provenance']})")
+            print(recommend_mod.brief_line(e))
         return None
     cov = payload["coverage"]
     print(f"measured {cov['measured']} of {cov['total']} skills")
@@ -363,6 +372,11 @@ def cmd_skills_recommend(args) -> int | None:
         print(f"  {i}. {e['name']}  [score {e['score']:g}, {e['provenance']}]"
               f"{'  (try to measure)' if e.get('try_to_measure') else ''}")
         print(f"       {e['reason']}")
+        # Full width (no truncation) but the SAME empty/whitespace handling as
+        # brief_line, so an empty description never prints a dangling clause.
+        use = recommend_mod._truncate(e.get("description"))
+        if use:
+            print(f"       intended use: {use}")
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
@@ -564,20 +578,31 @@ def cmd_rules_list(args) -> int | None:
 def cmd_rules_summaries(args) -> int | None:
     """Structured lesson records (the same shape the dashboard Improvements view
     reads) for an agent working from the CLI. --json emits the raw list; the
-    default is a human-readable digest per signature."""
+    default is a human-readable digest per signature. Both carry resolution +
+    triage (who should act: claude vs dismiss) — CLI/HTTP parity with the
+    dashboard's Improvements cards."""
+    from . import events as ev_mod
     from . import incidents as inc
-    recs = inc.summaries(args.project)
+    stats = inc.signal_stats(args.project, evs=ev_mod.read_all(args.project))
+    recs = []
+    for r in inc.summaries(args.project):
+        st = stats.get(r["signature"], {})
+        resolution = inc.classify_resolution(r, st)
+        recs.append(dict(r, resolution=resolution,
+                         **inc.classify_triage(resolution, r)))
     if args.json:
         print(json.dumps(recs, indent=2))
         return None
     if not recs:
         print("(no incidents yet)")
         return None
+    marks = {"claude": "-> FIX WITH CLAUDE", "dismiss": "-> ok to dismiss", "": ""}
     for r in sorted(recs, key=lambda r: -r.get("occurrences", 0)):
         lesson = r.get("lesson") or r.get("active_rule") or "(not yet reflected)"
         cat = f" {{{r['category']}}}" if r.get("category") else ""
         print(f"{r.get('occurrences', 0):>3}x  [{r.get('status', '?'):9}]{cat} "
-              f"{r.get('signature', '')}\n       {lesson}")
+              f"{r.get('signature', '')}  {marks.get(r.get('triage'), '')}"
+              f"\n       {lesson}")
     return None
 
 
@@ -611,6 +636,26 @@ def cmd_rules_reflect(args) -> int | None:
         print(json.dumps(results))
         return 0
     print(json.dumps(_safe_reflect_batch(reflect_mod, args.project, args)))
+    return 0
+
+
+def cmd_rules_resolve(args) -> int | None:
+    """Active resolution over the red (unresolved) set: reflect rule-less
+    incidents, reroute leaking auto rules to the best alternative route.
+    --list prints the red set without spending any tokens."""
+    from . import resolve as resolve_mod
+    if args.list:
+        from . import incidents as inc
+        inc.audit(project=args.project)
+        inc.project(project=args.project)
+        print(json.dumps(resolve_mod.red_summaries(args.project), indent=2))
+        return 0
+    try:
+        res = resolve_mod.resolve_batch(project=args.project, limit=args.limit)
+    except Exception as e:              # hook-safe: JSON + exit 0, never a traceback
+        res = {"rerouted": 0, "reflected": 0,
+               "error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(res))
     return 0
 
 
@@ -672,6 +717,56 @@ def cmd_rules_demote(args) -> int | None:
     return None
 
 
+def cmd_triggers_train(args) -> int | None:
+    from . import promptgate
+    res = promptgate.train_and_store(project=args.project,
+                                     max_age_hours=args.max_age_hours)
+    cov = res["manifest"].get("coverage", {})
+    verb = "trained" if res["trained"] else \
+        f"fresh (age {res['age_hours']:.1f}h) — kept"
+    print(f"{verb} {cov.get('rules', 0)} trigger rule(s) "
+          f"({cov.get('measured_rules', 0)} measured) from "
+          f"{cov.get('skills_total', 0)} skills, "
+          f"{cov.get('prompts_scanned', 0)} past prompts scanned")
+    return None
+
+
+def cmd_triggers_list(args) -> int | None:
+    from . import promptgate
+    man = promptgate.load_manifest(args.project)
+    if args.json:
+        print(json.dumps(man, indent=2))
+        return None
+    rules = man.get("rules") or {}
+    if not rules:
+        print("(no trigger manifest — run `hive triggers train`)")
+        return None
+    print(f"trained {man.get('trained_at', '?')}")
+    for dim, r in sorted(rules.items()):
+        rate = r.get("completion_rate")
+        rate_s = f"{r.get('ok', 0)}/{r.get('calls', 0)}" if rate is not None else "—"
+        print(f"  [{r.get('directive', 'try'):4}] {dim}: {r.get('skill', '')} "
+              f"({r.get('provenance', '')}, {rate_s}, "
+              f"observed {r.get('observed', 0)}x in history)")
+    return None
+
+
+def cmd_triggers_check(args) -> int | None:
+    from . import promptgate
+    verdict = promptgate.assess(args.prompt)
+    if verdict["skip"]:
+        print("skipped: not a human-typed prompt")
+        return None
+    if verdict["clear"]:
+        print("clear: the gate would not fire")
+        return None
+    print("fires: " + "; ".join(f["dimension"] for f in verdict["findings"]))
+    man = promptgate.load_manifest(args.project)
+    context = promptgate.render_context(verdict["findings"], man.get("rules"))
+    print(context if context else "(no trained rule covers these dimensions)")
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -688,7 +783,8 @@ def _build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_append)
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
-    hk.add_argument("stage", choices=["post_tool_use", "pre_tool_use"],
+    hk.add_argument("stage",
+                    choices=["post_tool_use", "pre_tool_use", "user_prompt_submit"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -928,6 +1024,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="drain every registered namespace (manual backlog drain; "
                          "never invoked from hooks; LIVE_LOCK-named namespaces skipped)")
     rr.set_defaults(func=cmd_rules_reflect)
+    rrs = rsub.add_parser("resolve",
+                          help="actively resolve red (unresolved) rules: reflect "
+                               "missing ones, reroute leaking ones to the best "
+                               "alternative route")
+    rrs.add_argument("--project", default=None)
+    rrs.add_argument("--limit", type=int, default=3,
+                     help="max red incidents to resolve this pass (default: 3)")
+    rrs.add_argument("--list", action="store_true",
+                     help="print the red set as JSON without resolving anything")
+    rrs.set_defaults(func=cmd_rules_resolve)
     ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
     ra.add_argument("--project", default=None)
     ra.set_defaults(func=cmd_rules_audit)
@@ -955,6 +1061,30 @@ def _build_parser() -> argparse.ArgumentParser:
     ren.add_argument("--disable", metavar="SIG", default=None,
                      help="turn off enforcement for a signature")
     ren.set_defaults(func=cmd_rules_enforce)
+
+    # --- triggers (prompt-quality gate: train/list/check the manifest) ---
+    tg = sub.add_parser("triggers",
+                        help="prompt-quality trigger rules (UserPromptSubmit gate)")
+    tgsub = tg.add_subparsers(dest="triggers_cmd", required=True)
+    tgt = tgsub.add_parser("train",
+                           help="derive trigger rules from the inventory + ledger "
+                                "and store rules/triggers.json")
+    tgt.add_argument("--project", default=None)
+    tgt.add_argument("--max-age-hours", type=float, default=0.0,
+                     dest="max_age_hours",
+                     help="stale-gate: skip when the manifest is younger than "
+                          "this (0 = always retrain)")
+    tgt.set_defaults(func=cmd_triggers_train)
+    tgl = tgsub.add_parser("list", help="print the trained trigger rules")
+    tgl.add_argument("--project", default=None)
+    tgl.add_argument("--json", action="store_true", help="emit the raw manifest")
+    tgl.set_defaults(func=cmd_triggers_list)
+    tgc = tgsub.add_parser("check",
+                           help="assess one prompt offline and show what the "
+                                "gate would inject")
+    tgc.add_argument("prompt")
+    tgc.add_argument("--project", default=None)
+    tgc.set_defaults(func=cmd_triggers_check)
 
     return p
 

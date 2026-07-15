@@ -1048,6 +1048,88 @@ def test_reflect_rejected_for_hivemind(dashboard_server):
 
 
 # --------------------------------------------------------------------------
+# POST /api/rules/resolve: active resolution over the red (unresolved) set
+# --------------------------------------------------------------------------
+_ROUTES_JSON = ('{"routes": [{"prevention_rule": "take the alternative route", '
+                '"rationale": "different mechanism", "confidence": 0.9}]}')
+
+
+def _seed_leaking_incident(project, sig="raw:leaky"):
+    for s, ts in (("s1", "2026-07-01T10:00:00Z"), ("s2", "2026-07-01T11:00:00Z")):
+        ev_mod.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=s, tags=["auto", "failure"], ts=ts,
+                            project=project)
+    inc_mod.audit(project=project)
+    inc_mod.project(project=project)
+    path = (hp.project_dir(project) / "rules" / "incidents"
+            / f"{inc_mod._safe_name(sig)}.md")
+    path.write_text(inc_mod._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Prevention rule: the failed rule"), encoding="utf-8")
+    inc_mod.project(project=project)
+    ev_mod.append_event("tool_failed",
+                        {"text": "boom", "signature": sig, "action": "x"},
+                        session_id="s3", tags=["auto", "failure"],
+                        ts="2026-07-01T12:00:00Z", project=project)   # leak
+
+
+def test_resolve_reroutes_leaking_rule(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_leaking_incident("test")
+    monkeypatch.setattr(refl_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES_JSON)
+    status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj["rerouted"] == 1 and obj["pending"] == 0
+    rec = [r for r in inc_mod.summaries(project="test")
+           if r["signature"] == "raw:leaky"][0]
+    assert rec["active_rule"] == "take the alternative route"
+    # the reroute re-anchors leak accounting: the lesson is no longer red
+    st = inc_mod.signal_stats("test")["raw:leaky"]
+    assert st["leaks"] == 0 and st["reroutes"] == 1
+
+
+def test_resolve_rejects_concurrent_run(dashboard_server):
+    base, token = dashboard_server
+    assert dash_mod._REFLECT_LOCK.acquire(blocking=False)
+    try:
+        status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
+        assert status == 200
+        assert obj["ok"] is False and "already running" in obj["error"]
+    finally:
+        dash_mod._REFLECT_LOCK.release()
+
+
+def test_resolve_noop_on_empty_store(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/resolve", {"project": "bare"}, token)
+    assert obj["ok"] is True and obj["rerouted"] == 0 and obj["red"] == 0
+
+
+def test_improvements_payload_carries_reroute_fields(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_leaking_incident("test", sig="raw:routed")
+    monkeypatch.setattr(refl_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES_JSON)
+    from mindhive import resolve as resolve_mod
+    assert resolve_mod.reroute_incident("raw:routed",
+                                        project="test")["resolved"] is True
+    status, body = _get(base, "/api/improvements?project=test", token)
+    obj = json.loads(body)
+    card = [a for a in obj["auto"] if a["signature"] == "raw:routed"][0]
+    assert card["reroutes"] == 1 and card["last_reroute"]
+    assert card["resolution"] == "watching"        # fresh route, not yet proven
+
+
+def test_page_has_resolve_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("/api/rules/resolve", "runResolve", "resolve red"):
+        assert needle in body, f"missing resolve hook: {needle}"
+
+
+# --------------------------------------------------------------------------
 # POST /api/rules/reflect_one: on-demand reflection of ONE failure signature —
 # lets a single skill-call failure be learned from immediately (the UI's
 # "reflect this failure" action), bypassing the recurrence-threshold gate.
@@ -1402,6 +1484,80 @@ def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
     assert obj["pending"] == 0                    # attempted-but-failed is not pending
 
 
+# --------------------------------------------------------------------------
+# Sessions notification center: /api/sessions activity+status, /api/task,
+# /api/task_detail
+# --------------------------------------------------------------------------
+
+
+def _seed_session(project="dashproj", sid="sess-t1"):
+    from mindhive import events
+    events.append_event("file_touched",
+                        {"text": "src/a.py", "plus": 5, "minus": 2, "tool": "Edit"},
+                        session_id=sid, project=project)
+    events.append_event("command_run",
+                        {"text": "pytest -q", "desc": "Run tests"},
+                        session_id=sid, project=project)
+    events.append_event("caveat", {"text": "plan FIRST"},
+                        session_id=sid, project=project)
+
+
+def test_sessions_carry_activity_and_status(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    status, body = _get(base, "/api/sessions?project=dashproj", token)
+    assert status == 200
+    (s,) = json.loads(body)
+    assert s["status"] in ("ongoing", "completed")
+    assert s["activity"]["files"] == 1
+    assert s["activity"]["plus"] == 5 and s["activity"]["minus"] == 2
+    assert s["activity"]["commands"] == 1 and s["activity"]["notes"] == 1
+
+
+def test_task_endpoint_returns_capped_rows(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    status, body = _get(base, "/api/task?project=dashproj&session=sess-t1", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["total"] == 3 and obj["truncated"] == 0
+    assert [r["kind"] for r in obj["items"]] == ["touched", "ran", "caveat"]
+
+
+def test_task_endpoint_hivemind_requires_session_project(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    try:
+        _get(base, "/api/task?project=*&session=sess-t1", token)
+        assert False, "expected 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+    status, body = _get(
+        base, "/api/task?project=*&session=sess-t1&session_project=dashproj",
+        token)
+    assert status == 200
+    assert json.loads(body)["total"] == 3
+
+
+def test_task_detail_degrades_without_transcript(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(
+        base, "/api/task_detail?project=dashproj&session=no-such-sess", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["error"] == "transcript_unavailable" and obj["items"] == []
+
+
+def test_root_page_includes_task_cards_fragments(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "renderTaskCards" in body        # injected JS arrived
+    assert ".tcard" in body                 # injected CSS arrived
+    assert "__TASKS_JS__" not in body       # placeholders were replaced
+    assert "__TASKS_CSS__" not in body
+
+
 # --- Oversee: work sessions view (U3/U4) ---------------------------------
 
 def _seed_loop_run(run_id, hour, reason=None, title="Fix the parser"):
@@ -1513,3 +1669,52 @@ def test_oversee_includes_interactive_sessions(dashboard_server):
     status, res = _post(base, "/api/oversee/dismiss",
                         {"project": "test", "run_id": "chat-1"}, token)
     assert res["ok"] is True
+
+
+# --- gzip: responses compress when the client accepts it --------------------
+
+def _get_gzip(base, path, token=None):
+    req = urllib.request.Request(base + path)
+    if token:
+        req.add_header("X-Hive-Token", token)
+    req.add_header("Accept-Encoding", "gzip")
+    with urllib.request.urlopen(req) as r:
+        return r.status, r.headers.get("Content-Encoding"), r.read()
+
+
+def test_page_gzips_when_accepted(dashboard_server):
+    import gzip as _gz
+    base, token = dashboard_server
+    status, enc, body = _get_gzip(base, "/")
+    assert status == 200 and enc == "gzip"
+    assert b"MIND HIVE" in _gz.decompress(body) or b"showOversee" in _gz.decompress(body)
+    # a client that doesn't accept gzip still gets identity (existing _get path)
+    status, plain = _get(base, "/")
+    assert status == 200 and "showOversee" in plain
+
+
+def test_small_json_stays_identity(dashboard_server):
+    base, token = dashboard_server
+    status, enc, body = _get_gzip(base, "/api/state?project=test", token)
+    assert status == 200
+    # STATE payload for an empty test store is tiny -> below the gzip floor
+    assert enc is None or len(body) >= 1400
+
+
+# --- Improvements triage marks (who acts: claude vs dismiss) -----------------
+
+def test_improvements_carry_triage_marks(dashboard_server):
+    from mindhive import events as ev, incidents as inc
+    base, token = dashboard_server
+    for s in ("s1", "s2"):
+        ev.append_event("tool_failed",
+                        {"text": "boom", "signature": "raw:tri1", "action": "x"},
+                        session_id=s, project="test")
+    inc.project(project="test", threshold=2)
+    status, body = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    (a,) = [x for x in json.loads(body)["auto"] if x["signature"] == "raw:tri1"]
+    # active with no rule -> unresolved -> pending agent work
+    assert a["resolution"] == "unresolved"
+    assert a["triage"] == "claude"
+    assert a["triage_hint"]

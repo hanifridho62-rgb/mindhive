@@ -49,10 +49,22 @@ def parse_reflection(text: str) -> dict:
 
 
 def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
-    """Default runner: one-shot headless `claude` call, returns the result text
-    (empty on any spawn failure or an is_error envelope)."""
-    return claude_cli.result_text(
-        claude_cli.run_headless(prompt, timeout_s=timeout_s)["stdout"])
+    """Default runner: one-shot headless `claude` call, returns the result text.
+    Raises RuntimeError carrying the REAL failure cause (quota/auth message,
+    spawn failure) so the health marker can report it — a bare "empty verdict"
+    hid a 429 weekly-limit exhaustion behind an auth-shaped warning for days."""
+    r = claude_cli.run_headless(prompt, timeout_s=timeout_s)
+    text = claude_cli.result_text(r["stdout"])
+    if text:
+        return text
+    err = claude_cli.error_text(r["stdout"])
+    if not err and r["exit"] == 127:
+        err = "claude CLI not found"
+    elif not err and r["exit"] == 124:
+        err = f"claude CLI timed out after {timeout_s}s"
+    if err:
+        raise RuntimeError(err)
+    return ""
 
 
 from . import incidents
@@ -178,9 +190,9 @@ def reflect_incident(signature, project=None, runner=_claude_runner) -> dict:
     fail_reason = "empty verdict"
     try:
         verdict = parse_reflection(runner(build_prompt(signature, raw, [])))
-    except Exception as e:         # keep the class for the health marker
+    except Exception as e:         # keep the real cause for the health marker
         verdict = {}
-        fail_reason = type(e).__name__
+        fail_reason = (str(e).strip() or type(e).__name__)[:160]
     if not verdict.get("prevention_rule"):
         verdict = fallback_verdict(signature)
     if not verdict.get("prevention_rule"):
@@ -309,8 +321,8 @@ def health_note(project=None) -> str:
     err = m.get("last_error") or "unknown"
     return (f"⚠ Reflection health: auto-reflection is failing (last error: {err}; "
             f"last attempt {m.get('last_attempt')}, last success "
-            f"{m.get('last_success') or 'never'}). Check `claude` CLI auth, then "
-            f"run `hive rules reflect`.")
+            f"{m.get('last_success') or 'never'}). Check `claude` CLI auth/quota, "
+            f"then run `hive rules reflect`.")
 
 
 def _refresh_projections(project=None) -> None:
@@ -366,24 +378,42 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
             return {"reflected": 0, "attempted": 0, "skipped": "cooldown"}
         incidents.audit(project=project)
         incidents.project(project=project)
-        targets = [r["signature"] for r in incidents.summaries(project=project)
+        targets = [(r["signature"], "reflect")
+                   for r in incidents.summaries(project=project)
                    if r["status"] == "active" and r["rule_source"] == "none"]
+        # Active resolution: red leaking AUTO rules get an alternative route
+        # in the same bounded, cooldown-gated pass (attempt-capped; human
+        # rules are authoritative and never rerouted). Lazy import — resolve
+        # imports this module at load time.
+        from . import resolve as resolve_mod
+        seen = {sig for sig, _ in targets}
+        for r in resolve_mod.red_summaries(project):
+            if r.get("rule_source") == "auto" and r["signature"] not in seen \
+                    and int(r.get("reroutes") or 0) < incidents.MAX_REROUTES:
+                targets.append((r["signature"], "reroute"))
         targets = targets[:max(0, int(limit))]
         if not targets:
             return {"reflected": 0, "attempted": 0, "skipped": "nothing to reflect"}
         now = ev_mod.now_iso()
         marker.update({"cooldown_started": now, "last_attempt": now})
         write_marker(project, marker)       # consume the window BEFORE the first call
-    done, last_error = 0, ""
-    for signature in targets:
+    done, rerouted, last_error = 0, 0, ""
+    for signature, mode in targets:
         try:
-            res = reflect_incident(signature, project=project, runner=runner)
+            if mode == "reroute":
+                r = resolve_mod.reroute_incident(signature, project=project,
+                                                 runner=runner)
+                ok = bool(r.get("resolved"))
+            else:
+                r = reflect_incident(signature, project=project, runner=runner)
+                ok = bool(r.get("reflected"))
         except Exception as e:              # runner blew up: record class, keep going
-            res = {"reflected": False, "reason": type(e).__name__}
-        if res.get("reflected"):
+            r, ok = {"reason": type(e).__name__}, False
+        if ok:
             done += 1
+            rerouted += mode == "reroute"
         else:
-            last_error = res.get("reason") or "unknown"
+            last_error = r.get("reason") or "unknown"
     marker = read_marker(project)
     if done:
         marker["last_success"] = ev_mod.now_iso()
@@ -395,10 +425,18 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
             incidents.auto_promote(project=project)
         except Exception:
             pass
+        try:
+            # Nudge->enforce ladder: a rerouted signature with a matcher may
+            # have crossed the leak threshold — flip the hard-force rung too.
+            from . import enforce
+            enforce.auto_escalate(project=project)
+        except Exception:
+            pass
         _refresh_projections(project)       # rules land in the very next session
     else:
         if marker.get("cooldown_started") == now:    # CAS: our write, roll it back
             marker["cooldown_started"] = prev_cooldown
         marker["last_error"] = last_error
         write_marker(project, marker)
-    return {"reflected": done, "attempted": len(targets)}
+    return {"reflected": done - rerouted, "rerouted": rerouted,
+            "attempted": len(targets)}

@@ -11,7 +11,8 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive rules summaries [--project P] [--json]` — structured lesson records (root cause, lesson, prevention rule, category, active rule) for every incident — the same data the dashboard **Improvements** view shows, for agents working headless. `--json` emits the raw list
-- `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks
+- `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks. The same pass also **reroutes** red leaking rules (below)
+- `hive rules resolve [--limit N] [--list]` — active resolution over the **red (unresolved) set**: incidents with no rule are reflected; a leaking **auto** rule is replaced with the best distinct alternative route (model-ranked, deterministic-fallback aware, capped at 3 attempts per signature — then flagged `reroute_exhausted` for a human). The `rule_rerouted` event re-anchors leak counting, so a route that holds turns green (resolved) and auto-promotes to SOUL.md. Human rules are never rerouted. `--list` prints the red set without spending tokens
 - `hive flag "<text>" [--category tag]` — self-flag a judgment error (wrong call, not a tool failure); active as a prevention rule from the first occurrence
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
@@ -86,6 +87,11 @@ signature gates the rebuild). Every entry is:
   flows into the **Improvements** loop, so a bad call becomes a prevention rule
   the next run can consult. All installed skills are callable this way, not a
   hand-picked subset.
+- **Effectiveness-aware ranking.** Skill invocations are captured live (and
+  back-filled from transcripts), so recommendations blend coverage with a
+  measured success rate. A skill with ≥3 calls and <40 % success is demoted:
+  listed with its failure reason instead of recommended. No history = neutral
+  (unproven skills are neither boosted nor punished).
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:
@@ -199,7 +205,17 @@ Within a project the panel keeps three layers distinct so intent and context
 stay legible:
 - **Memory** — the semantic events you/Claude author (decision, caveat,
   experiment_result, next_step, open_question, state_set): the intent layer.
-- **Sessions** — each append stream (`session_id`); click one to scope Memory to it.
+- **Sessions — notification center.** Every session renders as a collapsible
+  task card: status badge (`● ongoing` / `✓ completed`), a summary chip
+  ("edited 8 files (+120 −44) · ran 3 commands · 1 note"), and expandable
+  rows for touched files (+N −M line stats), commands (with descriptions),
+  notes/caveats, failures, and loop iterations (progress · breaker · tokens ·
+  cost). Expanding a file or command row fetches the full diff or command
+  output lazily from the Claude Code transcript — nothing heavy is stored in
+  the ledger, and sessions whose transcript is gone degrade to a notice.
+  The history is append-only and deliberately has no delete button; expanded
+  cards show the last 100 actions (older rows stay in the ledger). Zero-change
+  file writes (+0 −0) are not logged.
 - **session / auto** — deterministic telemetry (file_touched, command_run,
   session_start/end, …), counted separately on the Overview so it never drowns
   out the memory.

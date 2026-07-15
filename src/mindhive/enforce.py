@@ -118,6 +118,14 @@ def evaluate(tool_name, tool_input, project=None, manifest=None) -> str | None:
     return None
 
 
+# Stable marker on every deny reason this hook emits. The denial surfaces in
+# the transcript as an is_error tool_result; without the marker the failure
+# capture re-ingests our own enforcement text as a brand-new raw:* incident —
+# the learning loop eating its own output (this happened: raw:bc40af13ca was
+# the grep-unscoped deny text). failures.py treats the marker as non-failure.
+ENFORCED_MARK = "[mindhive-rule]"
+
+
 def hook_decision(raw: str, project=None) -> dict:
     """Parse a PreToolUse payload (JSON on the hook's stdin) and return the hook's
     output: a deny decision when a matcher fires, or {} (allow) otherwise. Never
@@ -136,7 +144,7 @@ def hook_decision(raw: str, project=None) -> dict:
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
+        "permissionDecisionReason": f"{ENFORCED_MARK} {reason}",
     }}
 
 
@@ -218,7 +226,10 @@ def auto_escalate(project=None) -> list:
             continue
         if row.get("rule_source") in (None, "", "none"):
             continue
-        if int((stats.get(sig) or {}).get("leaks") or 0) < incidents.LEAK_LIMIT:
+        # Cumulative since activation (total_leaks): a reroute re-anchors the
+        # classification leak count, but must not postpone the hard-force rung.
+        st = stats.get(sig) or {}
+        if int(st.get("total_leaks") or st.get("leaks") or 0) < incidents.LEAK_LIMIT:
             continue
         entry = man.get(sig) if isinstance(man.get(sig), dict) else {}
         if entry.get("enabled") or entry.get("pinned"):

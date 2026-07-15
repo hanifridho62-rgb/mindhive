@@ -1,415 +1,292 @@
 ---
 name: mindhive-orchestrator
 description: >-
-  Turn an idea into rigorously validated, executed, and learned-from work. Use
-  when the user types /mindhive [idea], asks to "orchestrate this idea", "turn
-  this idea into a spec/design", "ult-idea this", "pick the right skill for
-  this", "plan and build X the MindHive way", or wants an idea taken from
-  validation → design → skill selection → execution → learning. Runs the full
-  ULT-IDEA design canvas on top of MindHive's memory: recalls from the ledger
-  (or reads the code) before it asks, scores candidate skills against the live
-  plugin/skill registry, executes through the invoke channel with green/red
-  self-healing, and logs lessons back. Works in Claude Code, Cowork, and NewTask.
+  Turn a raw idea into a rigorously validated, implementation-ready design and
+  then into executed, quality-checked work — on a MindHive memory spine. This is
+  the ULT-IDEA workflow (five-gap product pressure test, agent-native
+  architecture review, architecture-decision checkpoint, fuzzy-language
+  elimination, testing strategy, anti-leak gating, ruthless YAGNI) fused with the
+  MindHive orchestrator (recall-before-ask preflight, scored skill Recommendation
+  Matrix, invoke-channel execution with green/red status, and a learning loop
+  that turns every mistake into a prevention rule). Use when the user types
+  /mindhive [idea] or /mindhive-orchestrator [idea], or asks to "orchestrate this
+  idea", "pressure-test and build X the MindHive way", "take this from idea to
+  implementation-ready", "validate this idea before we build", or "pick the right
+  skill for this". Before asking the user anything, it recalls from the MindHive
+  ledger and explores the codebase; it scores candidate skills with an explicit
+  matrix; it chains follow-up quality passes; and it logs what it learned back
+  into MindHive. Works in Claude Code, Claude Cowork, and Claude NewTask, and
+  degrades gracefully to stateless ULT-IDEA rigor when the MindHive CLI is absent.
 ---
 
-# MindHive Orchestrator — ULT-IDEA on a memory + learning + execution substrate
-
-Typing **`/mindhive [idea]`** runs the full **ULT-IDEA** design discipline — idea
-validation, agent-native architecture review, and ruthless sharpening into an
-implementation-ready spec — **fused with the MindHive system** so every step is
-memory-informed, every skill choice is data-grounded, every execution is
-green/red self-healing, and every lesson is written back for next time.
-
-> **The fusion in one line:** ULT-IDEA is the **canvas** (how you think an idea
-> into a sharp, validated spec); MindHive is the **substrate underneath it** — the
-> ledger you recall from before you ask, the plugin/skill database you pick tools
-> from, the learning loop that remembers which tools and syntax actually work, and
-> the dashboard that shows it all live. Neither is diminished: ULT-IDEA keeps 100%
-> of its rigor and gains a memory; MindHive gains a world-class front end.
-
-This skill does **not** re-implement planning, coding, or review — it runs the
-ULT-IDEA canvas to produce a validated spec, then **selects and chains** the skills
-already installed on this machine to execute it, seeded by MindHive memory at every
-step, and learning from every run.
-
-## What MindHive contributes to the canvas
-
-| ULT-IDEA needs to… | MindHive provides | Commands |
-|--------------------|-------------------|----------|
-| Not re-ask what's already decided | The **ledger**: state, recall, knowledge graph | `state`, `recall`, `graph related` |
-| Pick the right execution skill | The **plugin/skill database** (breadth-scored, free-first) + live registry | `plugins recommend`, `skills list` |
-| Know which tools/syntax actually work | The **learning loop**: green/red status + prevention rules distilled from past failures | `skills status`, `rules summaries`, `rules show` |
-| Execute and gate on real success | The **invoke channel** (headless, recorded, self-healing) | `skills invoke` |
-| Show the human what's happening | The **local dashboard** (Skills & plugins + Memory→Improvements) | `dashboard` |
-| Carry lessons forward | **Append + sync** durable learnings | `append`, `sync` |
-
-## Runs everywhere (Claude Code · Cowork · NewTask)
-
-The pipeline is identical on every surface; only *how you ask a blocking question*
-and *how you run a MindHive command* flex. Detect what's available, use it, degrade
-gracefully — never abort because one mechanism is missing. **Load
-`references/cross-platform.md`** for the detection order and the no-shell fallback.
-The essentials:
-
-- **Ask a question:** `AskUserQuestion` in Claude Code (load via `ToolSearch`
-  `select:AskUserQuestion` if needed); the surface's native blocking UI in Cowork;
-  and in a headless NewTask, lean on recall + code reading and record assumptions
-  with `append caveat` instead of blocking.
-- **Run a command:** the `Bash`/`PowerShell` tool. Detect the interpreter once (see
-  the syntax block below) and reuse it. If **no shell** exists, honor the prime
-  directive by reading `MEMORY.md`/`STATE.md`/`CONTEXT.md` and the project code
-  directly — reading the code is always available.
-
-## MindHive command syntax you will use
-
-The canonical syntax throughout this skill is **`python -m mindhive <cmd>`**. But
-before you run *any* MindHive command, **Step 0: resolve the working interpreter
-once** — this is what makes the integration seamless instead of silently failing.
-
-**Step 0 — probe, then reuse.** Run the first form that returns *real* output (not the
-Windows Store shim message), and use that exact prefix for every command afterward:
-
-1. `python -m mindhive state` — the canonical form. Use it if it prints `STATE.md`.
-2. `C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive state` — the project
-   venv. **On this machine this is the known-good form** (verified): the bare `python`
-   here is the Microsoft Store *app-execution alias*, which prints "Python was not
-   found" **and exits 0 without running** — so treat that message as failure and fall
-   through to the venv. `hive` is not on PATH here.
-3. `hive state` — the console-script shortcut, on machines where it's installed.
-
-Wherever this skill writes `python -m mindhive …`, substitute the prefix Step 0
-resolved (on this machine: `C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive …`).
-If none of the three works (no shell at all), drop to the no-shell fallback in
-`references/cross-platform.md` — read `STATE.md`/`CONTEXT.md`/`MEMORY.md` and the code
-directly. Never let the shim message stall the run.
-
-The **three preflight commands** you run before the interview (Requirement 1 — recall
-before you ask), using the Step 0 prefix:
-
-1. `python -m mindhive state` — current project status, active work, existing constraints.
-2. `python -m mindhive recall "<key term from the idea>"` — previous decisions, warnings, failures on this topic. Add `--semantic` for meaning-based matching when literal recall is limited.
-3. `python -m mindhive graph related "<main entity>"` — decisions and related files, when the idea touches an existing subsystem.
-
-The **full function catalog** — every command grouped by memory / plugin-DB /
-learning-loop / dashboard, each with *when, for what, and why* — lives in
-**`references/mindhive-functions.md`**. Load it whenever you need a capability beyond
-the preflight (e.g. checking a skill's green/red history before invoking it).
-
-## When to use this skill — conditions, tasks, why
-
-So Claude knows exactly when this fused skill fires and what it's for:
-
-| Condition / trigger | Task it's for | Why this skill (not something narrower) |
-|---------------------|---------------|-----------------------------------------|
-| User types `/mindhive [idea]` or "orchestrate this idea" | Any idea that must become executed, quality-checked work | You get validation + memory + skill selection + execution + learning in one pipeline |
-| "Turn this into a spec", "ult-idea this", "design X the MindHive way" | Idea → implementation-ready spec with the rigor gates | The ULT-IDEA canvas runs in full, now recall-informed |
-| "Which skill should I use for this?" | Choosing among installed skills/plugins | The Recommendation Matrix scores candidates against the live registry + ledger history |
-| A vague or unproven idea | Pressure-testing before investing | The five-gap product test rejects or sharpens weak ideas early |
-| Building an agent-facing system/tool | Ensuring agent-native architecture | Phase 2 + 2.5 enforce parity, granularity, composability, and lock decisions |
-| Work in an area that's bitten you before | Avoiding known failures | The learning loop surfaces prevention rules before you repeat the mistake |
-
-**Do NOT** use this for a pure one-line mechanical edit with no design surface, or to
-install/author new skills (this orchestrates skills already installed). For those,
-act directly or use `writing-skills`.
-
-## Prime directive: recall (or read the code) before you ask — Requirement 1
-
-**Before any interview question, you are required to check the MindHive ledger *or*
-the project code.** Run the recall preflight and let its results pre-answer or skip
-questions:
-
-1. `python -m mindhive state` — current project state, active work, standing constraints.
-2. `python -m mindhive recall "<key terms from the idea>"` — prior decisions, caveats, failures on this topic. Add `--semantic` for meaning-based matches when literal recall is thin.
-3. `python -m mindhive graph related "<main entity>"` — connected decisions and files, when the idea touches an existing subsystem.
-
-**Crucial rule:** if a question can be answered by exploring the codebase or the
-ledger, explore instead of asking. Only genuinely user-owned decisions — scope,
-priorities, taste, product intent — reach the user. When the CLI can't run (see
-cross-platform), read `STATE.md`/`CONTEXT.md`/`MEMORY.md` and the source directly:
-reading the code is a first-class way to honor this directive.
-
-> **⬡ MindHive hook —** every "See also" in the canvas below points to an ULT-IDEA
-> companion doc *and*, where relevant, a MindHive command. The canvas text is
-> preserved in full; the `⬡` callouts are the *additions* that wire each phase into
-> the ledger, the plugin database, and the learning loop.
-
-## The MindHive command cookbook — recipes you'll actually run
-
-The prime directive and the `⬡` hooks tell you *when* to reach for MindHive; this
-cookbook tells you *exactly what to type and how to read the result*. Every recipe is
-`intent → command → what the output looks like → how to act on it`, using the Step 0
-prefix you resolved. Treat this as the operational layer of the fusion: it is what
-makes "recall before you ask" and "pick the right skill from data" concrete instead of
-aspirational. Load `references/mindhive-functions.md` for the exhaustive flag-level
-reference; this section is the working subset you use on almost every run.
-
-### Recall recipes (Phase 1 — spend these before you ask a single question)
-
-**Orient yourself in the project's current reality.**
-```
-python -m mindhive state
-```
-Prints `STATE.md`: active task, last verified, next step, open questions, deferred
-items, and the last decision. *Act on it:* if the "Active task" or "Open questions"
-already frame the idea the user just gave you, acknowledge that and build on it rather
-than re-interviewing from zero. If STATE shows a reflection-health warning, note it —
-the learning loop may be degraded and you should lean on `rules summaries` manually.
-
-**Pull prior decisions/caveats/failures on the idea's topic (literal).**
-```
-python -m mindhive recall "attendance marking offline sync"
-```
-Returns ranked ledger hits, each a filename with a `[score N]` and a snippet. *Act on
-it:* a high-scoring `decision` snippet frequently answers a Phase-1 gap outright ("we
-already decided CSV-only export") — quote it and skip that question. A `caveat` snippet
-is a landmine map: it tells you what broke last time.
-
-**When literal recall is thin, switch to meaning-based.**
-```
-python -m mindhive recall "how do we notify people" --semantic
-```
-Semantic recall matches on meaning, not keywords — use it when the idea's vocabulary
-differs from how the ledger phrased the same concept. *Act on it:* same as literal, but
-trust slightly lower scores since matches are conceptual.
-
-**Map the blast radius when the idea touches an existing subsystem.**
-```
-python -m mindhive graph related "orchestrator" --depth 1
-```
-Returns a JSON list of connected nodes (decisions and files) with a `via` field showing
-*why* each is connected. *Act on it:* this is the fastest route to "what does the code
-already do here" — it answers the Counterfactual Gap (Phase 1.2) and pre-loads the
-cross-reference step (Phase 3.2) before you read a single file. Increase `--depth` to 2
-to widen the neighborhood when the subsystem is central.
-
-**Read the full briefing when STATE is too terse.**
-```
-python -m mindhive briefing
-```
-Builds and prints the richer digest. *Act on it:* use at the very start of a Deep-scope
-idea where you need the whole project picture, not just the one-screen STATE.
-
-### Skill-selection recipes (Phase 2 — grounding the Recommendation Matrix in data)
-
-**List what is actually installed and callable (the source of truth for candidate names).**
-```
-python -m mindhive skills list
-```
-Prints `N plugins · M skills`, then each plugin with its skill count. Add `--json` for
-machine-readable detail. *Act on it:* **only** propose candidate skills whose names
-appear here. This is the anti-hallucination guard — never score a skill you can't see in
-this list.
-
-**Get the breadth-scored, free-first recommendation.**
-```
-python -m mindhive plugins recommend
-```
-Prints the top plugins by breadth score with curated notes (e.g. `compound-engineering
-[score 52]`). *Act on it:* use the score to break ties in the Suitability column — a
-broadly-capable plugin is a safer default than a narrow one when both fit. If the
-catalog is empty or stale, run `python -m mindhive plugins autoscan` first (a cheap
-no-op when fresh).
-
-**Check a candidate skill's green/red track record before you commit to it.**
-```
-python -m mindhive skills status
-```
-Prints `skill: ok|fail` per skill from the ledger's recorded invocations. *Act on it:*
-prefer green skills; when a candidate shows `fail`, drop its estimate and read its lesson
-(below) before deciding. `status` is the binary last-call view; for the *rate* behind it,
-use `skills stats` (next).
-
-**Pull the measured completion-rate telemetry (the matrix's real backbone).**
-```
-python -m mindhive skills stats --json
-python -m mindhive skills recommend --json     # or: --top 3 --brief
-```
-`stats` returns per-skill calls / ok / fail / last outcome / last used; `recommend`
-returns the deterministic most-needed ranking with an `execution_mode` (`auto` vs
-`suggest`) and any `discontinued` list. *Act on it:* fill the Recommendation Matrix from
-these measured rates (label a percentage `estimated` only for a never-called skill);
-apply `auto`-mode skills without a blocking question, propose `suggest`-mode ones and
-wait; never invoke a `discontinued` skill.
-
-**Record an in-session skill outcome so the telemetry stays honest.**
-```
-python -m mindhive skills record <name> --ok|--fail [--note "..."]
-```
-*Act on it:* immediately after an executed skill finishes, write its outcome through —
-these `agent-assessed` records feed the measured rates the next matrix runs on. Skipping
-one starves the next run's ranking.
-
-**Read the prevention rule behind a red skill (close the loop before repeating it).**
-```
-python -m mindhive rules show "skill:<name>"
-```
-Prints that skill's incident record — root cause, occurrences, and the active prevention
-rule. *Act on it:* apply the rule (e.g. "call it with `--plugin` to disambiguate") and
-say so in the matrix verdict, or route around the skill with a reason.
-
-### Learning-loop recipes (before risky work, and after every run)
-
-**Scan the project's accumulated lessons before executing in a known-risky area.**
-```
-python -m mindhive rules summaries
-```
-Prints one digest line per incident: `<count>x [status] {category} <signature>` followed
-by the lesson. Add `--json` for the raw records (root cause, lesson, prevention rule,
-category, active rule) — the exact data the dashboard **Improvements** view renders.
-*Act on it:* a recurring `active` signature is a ready-made Phase-3.1 "Failure Case"
-scenario and a constraint on how you execute. For example, the `edit:not-read` rule
-means: Read every file before you Edit it.
-
-**See raw incident signatures ranked by how often they've bitten.**
-```
-python -m mindhive failures list
-```
-Prints `<count>x [active|candidate] <signature>`. *Act on it:* `active` (past the
-recurrence threshold) signatures are real patterns; `candidate` ones are still forming.
-
-**After the run, write durable lessons back (only when something memorable happened).**
-```
-python -m mindhive append caveat  "Store shim broke `python -m mindhive`; used venv" --tags orchestrator
-python -m mindhive append experiment_result "graph related pre-answered the counterfactual gap; skipped 2 questions" --tags orchestrator
-python -m mindhive append decision "Validated idea: CSV-only export, Standard scope" --tags orchestrator,preference
-python -m mindhive sync
-```
-*Act on it:* pick the type by what happened — `caveat` for a mistake/dead-end,
-`experiment_result` for a better path found, `decision` for a locked choice or new
-preference. Then `sync` so the next session's auto-loaded briefing reflects it. A smooth,
-unremarkable run writes nothing.
-
-### Handoff & safety recipes
-
-**Export a portable snapshot at a context handoff (~50%).**
-```
-python -m mindhive export --recent 20
-```
-Writes `handoff.md`. *Act on it:* follow the sequence in `references/handoff-protocol.md`
-— export, append the open threads as a caveat, `sync`, then print resume instructions.
-
-**Never** run `gc --prune` or `loop --force` to defeat the `~/.mindhive/LIVE_LOCK`
-guard on the user's behalf; those are refused while V17 is live-trading for a reason.
-
-## Operating from the local dashboard — the visual companion to the CLI
-
-Everything above is also drivable from one window. When the user would rather *watch*
-than read terminal output — or when a run should be observable live — bring up the
-dashboard and narrate from it.
-
-**Launch it.**
-```
-python -m mindhive dashboard
-```
-Starts a localhost web app bound to `127.0.0.1` on the fixed port `54461` (stable URL;
-pass `--port 0` for an ephemeral port, `--no-browser` to not auto-open). A real
-`loop`/`/circle` run opens it automatically so the autonomous loop can be watched.
-
-**The views the orchestrator leans on:**
-
-- **Skills & plugins** — a live inventory driven by Claude's own `installed_plugins.json`,
-  so installing/removing a plugin updates it instantly. Each skill has a click-through
-  detail pane (intended-use first), a **▶ call this skill** button (the visual twin of
-  `skills invoke`), and a **green/red** last-call indicator (the visual twin of
-  `skills status`). Opening this view auto-runs the stale-gated `plugins autoscan`, so
-  the Recommendation Matrix's catalog is always fresh. *Use it in Phase 2* to let the
-  user see the candidate skills and their track records while you present the matrix.
-
-- **Memory → Improvements** — the human face of the learning loop: recurring failures
-  rendered as lessons (root cause → prevention rule), each dismissible per card. The
-  **Reflect (learn from failures)** button (Heavy) turns unreflected incidents into
-  lessons via the `claude` CLI — the visual twin of `rules reflect`. *Use it in Phase 3/
-  execution* to show the user why a red skill is red, or to trigger reflection after a
-  batch of failures.
-
-- **Plugins scan** — a button that forces a catalog refresh from the panel (the twin of
-  `plugins scan`).
-
-**When to prefer the dashboard over the CLI:** when the value is *seeing* the memory or
-the skill track record (a graph, a green/red wall, an Improvements list) rather than
-reading a snippet. The dashboard and the CLI are the same data through two surfaces —
-this is the agent-user **parity** principle (Phase 2, Principle 1) embodied in MindHive
-itself, and it's why the ULT-IDEA "Visual Companion" step (1.3) can often point at the
-dashboard instead of building a throwaway mockup.
-
-## The learning loop in depth — how the orchestrator gets smarter every run
-
-The single most important thing the MindHive substrate adds to ULT-IDEA is that the
-whole pipeline **improves without a code change** — Principle 5 (Improvement Over Time)
-applied to the orchestrator itself. Here is the arc, end to end, so you can reason about
-where a given command sits in it:
-
-1. **Capture (live + backfill).** During a session, a Claude Code PostToolUse hook pipes
-   each tool result to `python -m mindhive hook post_tool_use`, which records tool calls
-   and failures into the ledger in real time. Anything the live hook misses is backfilled
-   later by `python -m mindhive failures capture --transcripts <dir>` / `harvest`. This is
-   why `recall`, `state`, and `skills status` have fresh data to serve.
-
-2. **Accumulate into signatures.** Repeated failures collapse into a *signature* (e.g.
-   `edit:not-read`, or `skill:<name>` for a failed skill invocation). `failures list` and
-   `rules list` show these ranked by occurrence; once a signature crosses the recurrence
-   threshold it flips from `candidate` to `active`.
-
-3. **Reflect into a prevention rule.** `rules reflect` (or the dashboard **Reflect**
-   button) distills each active signature into a durable lesson: root cause + a concrete
-   prevention rule + a category. `rules summaries` reads these back; `rules show
-   "<signature>"` prints one in full.
-
-4. **Inject the rule into the next run.** The active rules ride along in the auto-loaded
-   briefing (after `sync`) and via `rules inject`. This is how a mistake made once becomes
-   a constraint the orchestrator honors thereafter — for instance, the `edit:not-read`
-   rule is exactly why this skill Reads a file before Editing it.
-
-5. **Gate execution on the record.** A failed `skills invoke` writes a `tool_failed` event
-   with a `skill:<name>` signature and turns that skill's dashboard indicator red, so the
-   next Recommendation Matrix scores it lower and `rules show` explains why. A skill that
-   fails **teaches the system a rule that protects the next run.**
-
-**Worked micro-example.** Suppose an execution skill `foo:bar` fails twice. `skills status`
-now shows `foo:bar: fail`; `failures list` shows `2x [active] skill:foo:bar`. You run
-`rules reflect`, then `rules show "skill:foo:bar"` and read: *"root cause: invoked without
-`--plugin`, name collided; rule: always pass `--plugin foo`."* On the next `/mindhive`
-run that would use `foo:bar`, the matrix flags it red, you apply the rule, invoke it as
-`skills invoke bar --plugin foo`, it succeeds, and the indicator returns to green. No code
-changed — the orchestrator simply got smarter. **This loop is the reason the fusion is
-more than ULT-IDEA-with-a-memory: it is ULT-IDEA on a substrate that compounds.**
-
----
----
-
-# ▓▓▓ THE MAIN CANVAS: ULT-IDEA ▓▓▓
-
-*Everything from here to the "After the canvas" section is the complete ULT-IDEA
-skill, preserved in full. The `⬡ MindHive hook` callouts are additive — they detail
-how each step draws on the MindHive system so the command executes clearly and
-efficiently. Nothing in ULT-IDEA is removed; only augmented.*
-
-## ULT-IDEA: Enhanced Complete Idea → Design → Implementation-Ready Spec Workflow
-
-**Transform rough ideas into rigorously validated designs with built-in guardrails against implementation leaks, vague language, unexamined assumptions, and architectural misalignment. Includes agent-native architecture discipline and testing strategy.**
+# MindHive Orchestrator — ULT-IDEA rigor on a memory spine
+
+**Transform rough ideas into rigorously validated designs — and then into
+executed, quality-checked work — with built-in guardrails against implementation
+leaks, vague language, unexamined assumptions, and architectural misalignment.
+Every stage is seeded by MindHive memory: the ledger is consulted before the user
+is ever asked a question, candidate skills are scored against measured telemetry,
+and every run teaches the system a durable lesson.**
+
+This skill is the fusion of two disciplines:
+
+- **ULT-IDEA** — the idea → design → implementation-ready spec workflow. It
+  supplies the *thinking rigor*: validate the idea against five gaps, review
+  agent-native architecture, lock architecture decisions, sharpen every term,
+  define a testing strategy, and refuse to leak into implementation before the
+  design is approved.
+- **The MindHive Orchestrator** — the *memory and execution substrate*. It
+  supplies recall-before-ask preflight, a scored skill Recommendation Matrix,
+  the invoke channel that drives any installed skill with green/red status, and
+  a learning loop (failures → prevention rules → improvements) that makes the
+  next run smarter than this one.
+
+> **What this does:** it recalls what the project already decided, interviews you
+> only about what the ledger can't answer, pressure-tests the idea, reviews the
+> architecture, recommends the best skills with a scored matrix, executes through
+> them, chains quality passes, and writes lessons back to the MindHive ledger.
+> ULT-IDEA is the canvas; MindHive is the memory the canvas is painted on.
 
 ---
 
 ## Table of Contents
 
-1. [Overview & North Star](#overview)
-2. [Anti-Pattern Doctrine](#anti-pattern)
-3. [High-Level Process Flow](#process-flow)
-4. [Phase 1: Explore (Validate Idea)](#phase-1)
-5. [Phase 2: Agent-Native Architecture Review (If System)](#phase-2)
-6. [Phase 2.5: Architecture Decision Checkpoint (New)](#phase-2-5)
-7. [Phase 3: Interrogate & Sharpen](#phase-3)
-8. [Communication Rules](#communication-rules)
-9. [Anti-Leak Protection](#anti-leak)
-10. [Ruthless YAGNI](#yagni)
-11. [Completion Criteria](#completion)
-12. [Troubleshooting & Edge Cases](#edge-cases)
+1. [Prime Directive: Recall Before You Ask](#prime-directive)
+2. [MindHive Function-Call Syntax](#syntax)
+3. [What This Skill Is — Capability Catalog](#catalog)
+4. [Overview & North Star](#overview)
+5. [Anti-Pattern Doctrine](#anti-pattern)
+6. [High-Level Process Flow](#process-flow)
+7. [Phase 1: Explore (Validate Idea)](#phase-1)
+8. [Phase 2: Agent-Native Architecture Review (If System)](#phase-2)
+9. [Phase 2.5: Architecture Decision Checkpoint](#phase-2-5)
+10. [Phase 3: Interrogate & Sharpen](#phase-3)
+11. [Phase S: Skill Selection & Recommendation Matrix](#phase-s)
+12. [Phase X: Execute & Chain](#phase-x)
+13. [Phase L: Learning Loop & Log-Back](#phase-l)
+14. [Communication Rules](#communication-rules)
+15. [Anti-Leak Protection](#anti-leak)
+16. [Ruthless YAGNI](#yagni)
+17. [Completion Criteria](#completion)
+18. [Troubleshooting & Edge Cases](#edge-cases)
+19. [Context Handoff at ~50%](#handoff)
+20. [Compatibility & Portability](#compat)
+21. [Integration Map](#integration-map)
+
+---
+
+## <a name="prime-directive"></a>Prime Directive: Recall Before You Ask — HARD-GATE #1
+
+**Before you ask the user a single question — before Phase 1's first word — you
+must consult the MindHive ledger and the project's own code.** This is not a
+suggestion; it is a gate with the same force as the Anti-Leak HARD-GATE that
+forbids implementation before design approval. ULT-IDEA without memory re-asks
+questions the project already answered and repeats mistakes the project already
+learned from. MindHive exists so that never happens again.
+
+**The recall preflight (run first, always):**
+
+1. `python -m mindhive state` — current project status, active work, and standing
+   constraints. This tells you what the project is *currently doing* so your
+   questions don't relitigate settled scope.
+2. `python -m mindhive recall "<key terms from the idea>"` — prior decisions,
+   caveats, and failures on this topic. Add `--semantic` for meaning-based
+   matches when literal recall is thin.
+3. `python -m mindhive graph related "<main entity>"` — connected decisions and
+   files, when the idea touches an existing subsystem. The graph surfaces the
+   blast radius: which other decisions and files your idea will bump into.
+4. `python -m mindhive rules inject` — the active prevention rules for this
+   project. These are lessons the system already paid for; honor them from the
+   first keystroke instead of rediscovering them the hard way.
+
+**The crucial rule:** *if a question can be answered by exploring the codebase or
+the ledger, explore instead of asking.* Only genuinely user-owned decisions —
+scope, priorities, taste, product intent — reach the user. When the ledger
+already settled something, say so and move on:
+
+> "The ledger shows you settled on single-school scope here (decision from
+> 2026-06-30), so I'll assume that unless you tell me otherwise."
+
+**Why this is a gate, not a nicety.** The five-gap pressure test, the
+architecture review, and the skill Recommendation Matrix are all *sharper* when
+they start from what the project already knows. Recall is not a preamble you can
+skip when you're in a hurry — skipping it is how you waste the user's time asking
+what they already told you, and how you re-run a skill that the ledger shows fails
+on this exact task. Run the preflight. Let its results pre-answer or skip
+questions. Then begin ULT-IDEA.
+
+**If MindHive is unavailable** (a Claude surface without the CLI installed — see
+[Compatibility & Portability](#compat)), announce it once —
+"MindHive memory unavailable — running ULT-IDEA in stateless mode" — and proceed
+with full ULT-IDEA rigor, substituting in-conversation reasoning and direct
+codebase exploration for ledger recall. The gate still holds in spirit: explore
+the code before asking what the code can answer.
+
+---
+
+## <a name="syntax"></a>MindHive Function-Call Syntax
+
+Every MindHive capability is reached through one command surface. Learn the
+invocation form once; it is used at every phase below.
+
+### Invocation resolution (three portable forms)
+
+MindHive commands run through the project's Python module. Resolve the
+invocation in this order and use the first that works:
+
+1. **Preferred:** `python -m mindhive <command>` — works whenever the active
+   interpreter has MindHive installed.
+2. **Alias:** `hive <command>` — works when the console-script entry point is on
+   `PATH`.
+3. **Explicit venv fallback (this machine):**
+   `C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive <command>` — use
+   when neither of the above resolves but the project venv exists.
+
+Throughout this document commands are written as `python -m mindhive …` for
+brevity; substitute whichever form resolves in your environment.
+
+**Degradation contract:** if none of the three resolve, MindHive is not available
+on this surface. Announce stateless mode once and continue with ULT-IDEA rigor.
+Never hard-fail the workflow because a memory command was missing — the idea
+still deserves to be validated.
+
+### The three commands you run before asking anything
+
+These are the preflight from the Prime Directive — the ones you will run most:
+
+| Command | Returns | Use when |
+|---------|---------|----------|
+| `python -m mindhive state` | Current project status, active work, standing constraints (STATE.md) | Always, first — before Phase 1 |
+| `python -m mindhive recall "<term>"` | Prior decisions, caveats, failures on a topic (add `--semantic` for meaning-based) | Always, and again per gap/term/skill |
+| `python -m mindhive graph related "<entity>"` | Connected decisions and files (add `--depth N`) | When the idea touches an existing subsystem |
+
+### The broader surface that makes execution effective and efficient
+
+You do not need every command every run. Reach for these when the phase calls
+for them (the full catalog with flags lives in
+[references/mindhive-command-catalog.md](references/mindhive-command-catalog.md)):
+
+| Command | What it gives you | Phase it serves |
+|---------|-------------------|-----------------|
+| `python -m mindhive briefing` | The auto-loaded session briefing (STATE + recent decisions + open threads) | Preflight, orientation |
+| `python -m mindhive rules inject` | The active prevention-rules block for this project | Preflight (HARD-GATE #1) |
+| `python -m mindhive rules summaries` | Structured lesson records (what was learned, per signature) | Skill selection, learning loop |
+| `python -m mindhive rules show "skill:<name>"` | The prevention lesson for a specific skill that has failed before | Before invoking a red skill |
+| `python -m mindhive skills list` | Live inventory of installed plugins + skills (registry truth) | Skill selection |
+| `python -m mindhive skills status` | Green/red last-call outcome per skill | Skill selection |
+| `python -m mindhive skills stats` | Per-skill completion-rate telemetry from the ledger | Skill selection (score anchoring) |
+| `python -m mindhive skills invoke <name>` | Runs a skill via headless claude, records the outcome (exit 0 ok / 1 fail) | Execution (the invoke channel) |
+| `python -m mindhive skills record <name> --ok\|--fail --note "…"` | Writes an agent-assessed outcome into the ledger | Execution, learning loop |
+| `python -m mindhive skills recommend` | Deterministic most-needed-skills ranking from measured data | Skill selection |
+| `python -m mindhive plugins recommend` | Top free plugins by breadth score (which plugin suits the work) | Architecture, skill selection |
+| `python -m mindhive plugins scan` | Refreshes the plugin catalog snapshot | When the catalog is stale |
+| `python -m mindhive append <type> "<text>" --tags …` | Appends a `decision`, `caveat`, or `experiment_result` event | Architecture lock, learning loop |
+| `python -m mindhive flag "<text>" --category …` | Self-flags a judgment error (active at first occurrence) | Learning loop |
+| `python -m mindhive graph build` | Rebuilds the knowledge graph (`--semantic` for meaning links) | When related is stale |
+| `python -m mindhive dashboard` | Opens the web control panel for all features | Live monitoring of a run |
+| `python -m mindhive export --recent N` | Writes `handoff.md` — the portable state snapshot | Context handoff |
+| `python -m mindhive sync` | Refreshes the native MEMORY.md briefing for the next session | End of run |
+| `python -m mindhive consolidate` | Dreaming pass: merges near-duplicate memories | Housekeeping (bounded) |
+| `python -m mindhive verify` | Verifies the tamper-evident hash chain | Integrity check |
+
+**Honesty about telemetry.** `skills stats` and `skills status` are *measured*
+from the ledger — use them as hard signal. Anything you estimate that has no
+telemetry backing (e.g., a first-time skill's probability of success) must be
+labeled `(est.)`. Never present a model estimate as a measured rate. This mirrors
+ULT-IDEA's demand for evidence over vibes, applied to skill selection.
+
+### The local dashboard — MindHive's functions with a live face
+
+Everything the CLI exposes, the **local dashboard** exposes as a live control
+panel: `python -m mindhive dashboard` opens it in the browser (fixed port
+`54461` by default, so the URL is stable across runs; it also auto-launches on
+`hive loop`). The dashboard is not a separate system — every view is a window
+onto the same ledger the CLI reads, so anything you learn there you can also
+fetch headlessly. Use it whenever the user benefits from *watching* the run
+instead of reading terminal output.
+
+How each dashboard function maps to this skill's phases:
+
+| Dashboard view / action | Backing API | What it gives the orchestrator | Phase it serves |
+|-------------------------|-------------|--------------------------------|-----------------|
+| **Overview / State / Briefing** | `/api/overview`, `/api/state`, `/api/briefing` | The human-visible mirror of the recall preflight — current status, active work, constraints | Preflight, Phase 1 |
+| **Memory & Recall** | `/api/memory`, `/api/recall` | Interactive ledger search — the same results as `recall`, browsable | Preflight, Phase 3 cross-reference |
+| **Graph** | `/api/graph` | Visual knowledge graph — connected decisions and files at a glance | Phase 1/2 (blast radius) |
+| **Improvements** | `/api/improvements`, `/api/rules/reflect`, `/api/rules/reflect_one`, `/api/rules/dismiss` | The learned-lessons panel: every prevention rule, its incident history, and one-click reflection over un-reflected incidents | Phase S learn-gate, Phase L |
+| **Skill & Plugin panel** | `/api/skills/detail`, `/api/skills/status`, `/api/skills/history`, `/api/skills/stats`, `/api/skills/recommend`, `/api/plugins/inventory`, `/api/plugins/recommend` | The skill database with **green/red indicators per skill**, call history, measured completion rates, and plugin suitability — the visual mirror of Phase S telemetry | Phase S selection |
+| **Invoke** | `/api/skills/invoke` | Run any installed skill from the dashboard and watch its outcome recorded | Phase X execution |
+| **Sessions / Oversee** | `/api/sessions`, `/api/oversee` | What past sessions did; judgment-error oversight | Phase L, retrospectives |
+| **Maintenance actions** | `/api/append`, `/api/sync`, `/api/harvest`, `/api/export`, `/api/selftest`, `/api/verify` | Log-back, briefing refresh, transcript harvest, handoff export, health checks — the Phase L toolbox with buttons | Phase L, handoff |
+
+**When to open it.** Launch the dashboard when: (a) Phase X runs through the
+invoke channel or `/circle` and the user wants live green/red status; (b) the
+Phase S matrix would benefit from the user *seeing* the skill database
+(history, stats, red indicators) rather than trusting a table you typed; (c)
+Phase L reflection is due and the Improvements view's one-click reflect is
+faster than the CLI loop. Otherwise stay headless — the CLI answers everything
+the dashboard shows.
+
+**Learning from mistakes, visibly.** The dashboard is where MindHive's learning
+loop is easiest to inspect: a skill that fails turns **red** in the Skill &
+Plugin panel and stays red until it succeeds again; its failure becomes an
+incident in the Improvements view; reflection turns the incident into a
+prevention rule; and the next run's preflight injects that rule. When you tell
+the user "this skill failed last time and here's the lesson," the dashboard is
+the place they can verify the claim with their own eyes.
+
+---
+
+## <a name="catalog"></a>What This Skill Is — Capability Catalog
+
+Claude should understand *when* to fire this skill, *for what* it fires, and
+*why* — so it selects the skill deliberately, not by accident. The deep catalog
+lives in [references/skill-catalog.md](references/skill-catalog.md); the summary:
+
+**Under what conditions it fires**
+
+- The user types `/mindhive [idea]` or `/mindhive-orchestrator [idea]`.
+- The user asks to "orchestrate this idea", "pressure-test / validate this idea
+  before building", "take this from idea to implementation-ready", "build X the
+  MindHive way", or "pick the right skill for this".
+- A rough idea arrives that would benefit from validation *and* memory-grounded
+  execution — i.e., most non-trivial feature ideas in a project that runs
+  MindHive.
+
+**For what tasks**
+
+- **Idea validation** — the five-gap product pressure test (Phase 1).
+- **Architecture rigor** — agent-native review + architecture-decision
+  checkpoint (Phases 2 / 2.5).
+- **Skill selection** — scored Recommendation Matrix over installed skills,
+  anchored on measured telemetry (Phase S).
+- **Execution & chaining** — invoke the selected skills, chain quality passes
+  (Phase X).
+- **Language sharpening** — eliminate fuzzy terms, define the testing strategy
+  (Phase 3).
+- **Learning** — turn every mistake into a prevention rule, log lessons back
+  (Phase L).
+
+**Why (the thesis)**
+
+Memory-grounded rigor beats cold re-asking. ULT-IDEA alone forgets; the
+orchestrator alone under-validates. Fused, the workflow starts from what the
+project already knows, refuses to leak into code before the design is sound,
+picks skills by measured outcomes, and gets smarter every run.
+
+**When *not* to fire it**
+
+- The task is a trivial, well-understood edit with no idea to validate and no
+  skill to select — just do it (or route to `ce-work` / a direct edit).
+- The user explicitly wants only the autonomous loop (`/circle`) or only the
+  fused plan→work→review loop (`/engineering-loop`) — those are siblings, not
+  this skill.
 
 ---
 
 ## <a name="overview"></a>Overview & North Star
 
-**ULT-IDEA** is a skill that embodies rigorous thinking at every stage of idea development. It exists to eliminate waste caused by:
+**ULT-IDEA** is a skill that embodies rigorous thinking at every stage of idea
+development. It exists to eliminate waste caused by:
 - **Unvalidated assumptions** — "We think there's a problem, but is there real proof?"
 - **Fuzzy language** — "Account" means three different things; which one is correct?
 - **Premature implementation** — Starting to code before the spec is clear
@@ -417,7 +294,12 @@ efficiently. Nothing in ULT-IDEA is removed; only augmented.*
 - **Misaligned architecture** — Building systems that require code changes to add new features
 - **Architectural mismatch** — Tool design that locks in behavior instead of enabling it
 
-**Three core movements drive the skill:**
+MindHive adds a sixth waste this fusion eliminates:
+- **Amnesia** — Re-deciding what was already decided, re-asking what was already
+  answered, and repeating mistakes the project already learned from. The recall
+  preflight and the learning loop close this gap.
+
+**Four core movements drive the skill** (ULT-IDEA's three, plus memory):
 
 ### Movement 1: Validate the Idea Itself (Phase 1)
 **Question:** Does this problem exist? Is the user real? Can you build the simplest version?
@@ -431,15 +313,11 @@ Before proposing any design, rigorously test the idea against five critical gaps
 
 If gaps exist, fill them. If evidence is weak, reject the idea or demand proof first.
 
-**See also:** [product-implications.md](./product-implications.md) for progressive disclosure, latent demand discovery, and approval frameworks that emerge from validated ideas.
+**▸ MindHive weave:** each gap is checked against the ledger before it is asked.
+Recall may already hold the evidence, the specific user, or a prior durability
+decision — surface that instead of re-asking.
 
-> **⬡ MindHive hook — validate with memory, not just intuition.** Before you decide
-> the Evidence Gap is unfilled, run `recall "<problem>"` and `recall "<problem>" --semantic`:
-> the ledger may already hold the evidence (a prior `experiment_result`, a user
-> decision, a caveat about a failed attempt). Prior art in the ledger *is* evidence.
-> If the idea touches an existing subsystem, `graph related "<entity>"` shows what's
-> already been decided and which files are in the blast radius — that often answers
-> the Counterfactual Gap ("what do they do today") directly from the code.
+**See also:** [product-implications.md](product-implications.md) for progressive disclosure, latent demand discovery, and approval frameworks that emerge from validated ideas.
 
 ### Movement 2: Ensure Smart Architecture (Phase 2 + Phase 2.5)
 **Question:** If building a system, does it follow agent-native principles? Are tool designs sound?
@@ -459,19 +337,16 @@ And in Phase 2.5, make explicit decisions about:
 
 For non-software projects (curricula, sermon series, organizational processes), Phases 2 and 2.5 are skipped, but the guardrails about clarity and durability still apply.
 
-**See also:**
-- [mcp-tool-design.md](./mcp-tool-design.md) for tool primitives vs workflows, CRUD completeness, dynamic capability discovery
-- [action-parity-discipline.md](./action-parity-discipline.md) for maintaining agent-user parity
-- [architecture-patterns.md](./architecture-patterns.md) for event-driven, unified orchestrator, approval gates, model tier selection
-- [files-universal-interface.md](./files-universal-interface.md) for file organization and shared workspace
-- [shared-workspace-architecture.md](./shared-workspace-architecture.md) for agent-user collaboration patterns
+**▸ MindHive weave:** consult `plugins recommend` to see which installed plugin
+fits the emerging system, and `append decision` to log each locked architecture
+choice so the next run inherits it.
 
-> **⬡ MindHive hook — MindHive is itself an agent-native system; mirror its patterns.**
-> The five principles here are the exact principles MindHive was built on (primitive
-> CLI commands, agent-user parity via `skills invoke`, composability). When reviewing
-> architecture, `recall "architecture decision"` and `graph related "<subsystem>"`
-> surface prior agent-native rulings already made in this project so your review is
-> consistent with them rather than re-deciding.
+**See also:**
+- [mcp-tool-design.md](mcp-tool-design.md) for tool primitives vs workflows, CRUD completeness, dynamic capability discovery
+- [action-parity-discipline.md](action-parity-discipline.md) for maintaining agent-user parity
+- [architecture-patterns.md](architecture-patterns.md) for event-driven, unified orchestrator, approval gates, model tier selection
+- [files-universal-interface.md](files-universal-interface.md) for file organization and shared workspace
+- [shared-workspace-architecture.md](shared-workspace-architecture.md) for agent-user collaboration patterns
 
 ### Movement 3: Eliminate Fuzzy Language & Plan Implementation (Phase 3)
 **Question:** Does every term mean exactly one thing? Are we ready to implement?
@@ -483,15 +358,30 @@ Interrogate the design by:
 - **Recording decisions** — CONTEXT.md (glossary) and ADRs (hard reversals) capture what was decided and why
 - **Planning testing** — Define what tests prove this works (capability tests, parity tests, integration tests)
 
-**See also:**
-- [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md) and [ADR-FORMAT.md](./ADR-FORMAT.md) for templates
-- [agent-native-testing.md](./agent-native-testing.md) for testing strategy and capability verification
-- [IMPLEMENTATION-READINESS.md](./IMPLEMENTATION-READINESS.md) for the handoff from design to implementation
+**▸ MindHive weave:** cross-reference the *ledger* as well as the code —
+`recall` and `graph related` catch idea-vs-decision contradictions, not just
+idea-vs-code. Log canonical terms and hard reversals with `append decision` so
+sharpened language persists.
 
-> **⬡ MindHive hook — "cross-referencing reality" IS a MindHive query.** `recall` over
-> the ledger and `graph related` over the code graph are the mechanized form of
-> Phase 3's cross-reference-with-code step. Use them to catch the contradiction
-> before you design new code (see Phase 3.2).
+**See also:**
+- [CONTEXT-FORMAT.md](references/context-format.md) and [ADR-FORMAT.md](references/adr-format.md) for templates
+- [agent-native-testing.md](agent-native-testing.md) for testing strategy and capability verification
+- [IMPLEMENTATION-READINESS.md](IMPLEMENTATION-READINESS.md) for the handoff from design to implementation
+
+### Movement 4: Remember, Select, and Learn (Prime Directive + Phases S / X / L)
+**Question:** What does the project already know, which skills execute this best, and what did this run teach us?
+
+- **Remember** — the recall preflight (`state` / `recall` / `graph related` /
+  `rules inject`) runs before any question, so the workflow starts informed.
+- **Select** — the Recommendation Matrix (Phase S) scores candidate skills on
+  seven parameters, anchored on measured `skills stats` and `skills status`.
+- **Execute & chain** — Phase X invokes the chosen skills and chains quality
+  passes.
+- **Learn** — Phase L turns every mistake into a prevention rule and logs
+  durable lessons back, so the next `/mindhive` is smarter.
+
+This is the movement ULT-IDEA lacks and MindHive supplies. It wraps the other
+three: memory informs the front, learning captures the back.
 
 ---
 
@@ -518,6 +408,11 @@ A one-page todo feature. A config change. A single sermon outline. All of them.
 >
 > Once we answer these, we can design smartly. And for a system that agents might use, we need to ensure parity—the agent can mark attendance, not just the UI."
 
+**▸ MindHive weave:** before you even ask the five questions above, run
+`recall "attendance tracking"` and `graph related "attendance"`. If the ledger
+already holds the evidence or the prior decision, the "simple" project just got
+simpler — you skip straight to what's genuinely unresolved.
+
 ### The Rule
 
 **No implementation begins until:**
@@ -533,12 +428,14 @@ A one-page todo feature. A config change. A single sermon outline. All of them.
 ## <a name="process-flow"></a>High-Level Process Flow
 
 ```
-START: User presents an idea
+START: User presents an idea  (/mindhive [idea])
   ↓
-0. MINDHIVE PREFLIGHT (Requirement 1 — always, before any question)
+0. RECALL PREFLIGHT (HARD-GATE #1)   ◄── run BEFORE any question
    ├─ python -m mindhive state
-   ├─ python -m mindhive recall "<key terms>"  (+ --semantic if thin)
-   └─ python -m mindhive graph related "<main entity>"  (if touches a subsystem)
+   ├─ python -m mindhive recall "<key terms>"  (--semantic if thin)
+   ├─ python -m mindhive graph related "<entity>"  (if touches a subsystem)
+   └─ python -m mindhive rules inject
+       └─ pre-answer / skip questions the ledger already settled
   ↓
 1. DIAGNOSE PROJECT TYPE
    └─ Ask: Lightweight / Standard / Deep scope?
@@ -547,6 +444,7 @@ START: User presents an idea
 2. PHASE 1: EXPLORE (Always)
    ├─ Understand the idea (purpose, constraints, success criteria)
    ├─ Test against 5 gaps (Evidence, Specificity, Counterfactual, Attachment, Durability)
+   │    └─ each gap checks the ledger first
    ├─ Offer Visual Companion (if UI/spatial design involved)
    ├─ Propose 2-3 approaches with trade-offs
    ├─ Present design & get approval (section by section)
@@ -563,38 +461,46 @@ START: User presents an idea
    ├─ Validate 5 principles (Parity, Granularity, Composability, Emergent, Improvement)
    ├─ Detect missing tool parity, bloated tools, locked-in behavior
    ├─ Detect CRUD completeness gaps (can agent create AND update AND delete?)
+   ├─ Consult plugins recommend (which plugin suits the system)
    ├─ Propose fixes
    └─ Update design if scope changes
   ↓
-5. PHASE 2.5: ARCHITECTURE DECISION CHECKPOINT (New - if system)
-   ├─ Workspace architecture (shared vs separate)
-   ├─ Tool design strategy (primitives vs domain tools)
-   ├─ Approval gates (what needs user sign-off)
-   ├─ Implementation pattern (event-driven, orchestrator, etc.)
-   ├─ Storage & file organization
-   ├─ Context injection strategy
-   ├─ Model tier selection (if agent-powered)
-   ├─ Mobile considerations (if iOS/Android)
+5. PHASE 2.5: ARCHITECTURE DECISION CHECKPOINT (if system)
+   ├─ Workspace / tools / approval gates / pattern / storage / context / model tier / mobile
+   ├─ append decision for each locked choice (memory)
    └─ LOCK ARCHITECTURE DECISIONS
   ↓
-6. PHASE 3: INTERROGATE & SHARPEN (Always)
+6. PHASE 3: INTERROGATE & SHARPEN (Always)   ◄── completes the design; clears Anti-Leak HARD-GATE #2
    ├─ Eliminate fuzzy language → canonical terms
    ├─ Test with 3-5 concrete scenarios + edge cases
-   ├─ Cross-reference with code (if exists) — via recall / graph related
+   ├─ Cross-reference with code AND the ledger
    ├─ Update CONTEXT.md (inline, real-time)
    ├─ Write ADRs (only if 3-part test passes)
    ├─ Define testing strategy (what proves this works)
    └─ USER FINAL APPROVAL of complete spec
   ↓
-7. (MINDHIVE) RECOMMENDATION MATRIX → EXECUTE → CHAIN → LEARN
-   ├─ Score candidate skills (grounded in `skills list` + ledger history)
-   ├─ Execute via Skill tool or `skills invoke` (green/red, self-healing)
-   ├─ Chain follow-up quality passes
-   └─ Append durable learnings + `sync`
+7. PHASE S: SKILL SELECTION & RECOMMENDATION MATRIX   ◄── orchestrator core (design is now locked)
+   ├─ skills list / status / stats  (live inventory + measured telemetry)
+   ├─ score 2-4 candidates on 7 parameters
+   ├─ before a red skill: rules show "skill:<name>", apply the lesson
+   └─ present matrix, get selection approval
   ↓
-END: Spec + CONTEXT.md + ADRs + Testing Strategy ready for IMPLEMENTATION-READINESS,
-     executed through the chosen skills, with lessons written back to the ledger
+8. PHASE X: EXECUTE & CHAIN   ◄── implementation begins only after the gate cleared in Phase 3
+   ├─ invoke selected skill(s) (Skill tool, or skills invoke for headless)
+   ├─ record outcome (skills record --ok/--fail)
+   └─ chain follow-up quality passes with a rationale each
+  ↓
+9. PHASE L: LEARNING LOOP & LOG-BACK
+   ├─ record mistakes/inefficiencies/preferences (append caveat/experiment_result/decision)
+   ├─ failures → rules → improvements (the loop closes)
+   └─ python -m mindhive sync  (next session inherits the lessons)
+  ↓
+END: Spec + CONTEXT.md + ADRs + Testing Strategy + executed work + logged lessons
 ```
+
+**Context handoff** runs continuously in the background: at every phase boundary,
+estimate context consumption and offer a clean handoff at roughly 50% (see
+[Context Handoff at ~50%](#handoff)).
 
 ---
 
@@ -602,11 +508,14 @@ END: Spec + CONTEXT.md + ADRs + Testing Strategy ready for IMPLEMENTATION-READIN
 
 Phase 1 answers the question: **"Is this idea valid, and what is the simplest design that solves it?"**
 
-> **⬡ MindHive hook — run the preflight before 1.0.** Do the three preflight commands
-> now (`state`, `recall`, `graph related`). Carry their findings into every step
-> below: when a diagnostic or gap question is already answered by the ledger or the
-> code, *state what you found and skip the question* ("The ledger shows you settled on
-> X here, so I'll assume that unless you say otherwise").
+**▸ MindHive preflight for this idea (run before 1.0).** You already ran the
+recall preflight from the Prime Directive. Now translate its results into a
+question-suppression list: which of the questions below has the ledger already
+answered? Note them explicitly ("state shows active work on X; recall shows a
+prior decision on Y"). Every question you can answer from `state`, `recall`,
+`graph related`, or direct codebase exploration is a question you do **not** ask
+the user. Only scope, priorities, taste, and product intent survive to the
+interview.
 
 ### 1.0 Project Diagnosis: Classify Scope
 
@@ -637,6 +546,10 @@ Phase 1 answers the question: **"Is this idea valid, and what is the simplest de
 > - Organization-wide curriculum redesign
 > - Multi-agent system with complex interactions
 
+**▸ MindHive weave:** `state` often answers this before you ask. If active work
+and constraints indicate the scope, lead with your inference: "Based on the
+ledger this looks Standard — a new workflow on the existing system. Correct?"
+
 **Special Rule: Subsystem Decomposition**
 
 If the user describes multiple independent subsystems:
@@ -660,6 +573,10 @@ Ask questions **one at a time**. Focus on three dimensions:
 - "Who benefits from this? Be specific—describe one person."
 - "How will you know this succeeded? What changes?"
 
+**▸ MindHive weave:** run `recall "<purpose keywords>"` first. If the ledger holds
+a prior problem statement or a stated goal, present it: "You previously framed
+this as X — still the pain point?" instead of asking cold.
+
 **1.1.2 Constraints**
 - What are the boundaries? What's off-limits?
 - Budget, timeline, audience, technical limits?
@@ -670,6 +587,10 @@ Ask questions **one at a time**. Focus on three dimensions:
 - "Are there any hard constraints—budget, timeline, platform, people—we need to work within?"
 - "What can't we change, even if we wanted to?"
 - "Who else needs to approve this, and what are their constraints?"
+
+**▸ MindHive weave:** `state` lists standing constraints and `graph related`
+surfaces which existing systems the idea touches. Read those before asking — many
+constraints are already recorded.
 
 **1.1.3 Success**
 - How will you measure success?
@@ -685,16 +606,11 @@ Ask questions **one at a time**. Focus on three dimensions:
 
 **Guiding principle:** Ask about **WHAT** is needed, never **HOW** to build it. Implementation decisions (database schema, programming language, library choice, folder structure, tool design) are forbidden here.
 
-> **⬡ MindHive hook — constraints often already live in `state`.** Standing
-> constraints (the V17 `LIVE_LOCK`, platform/OS realities, prior scope rulings) are
-> in `STATE.md` and the ledger. Pull the "Constraints" dimension from there first and
-> only ask the user for constraints memory doesn't already hold.
-
 ### 1.2 Test Against the Five Gaps: Product Pressure Test
 
 **Objective:** Rigorously validate the idea before investing in design.
 
-Once you believe you understand the idea, interrogate it systematically. For each gap, ask a clarifying question and listen for weakness.
+Once you believe you understand the idea, interrogate it systematically. For each gap, ask a clarifying question and listen for weakness. **For each gap, check the ledger before you ask** — the evidence, the specific user, or a prior decision may already be recorded.
 
 #### Gap 1: Evidence Gap
 **Question:** Is there real, concrete proof the problem exists?
@@ -708,6 +624,9 @@ Not "we think there's a problem." Real evidence: time wasted, money spent, workf
 
 **Red flag:** Vague answers like "people struggle with this" or "I feel like this would be useful." Demand proof.
 
+**▸ MindHive weave:** `recall "<problem> evidence"` — a prior run may already have
+captured the proof. If it did, cite it and move on.
+
 #### Gap 2: Specificity Gap
 **Question:** Who is the specific user? Can you name them? How does their life change?
 
@@ -719,6 +638,9 @@ Not "teachers" or "students." Specific: "Mrs. Rodriguez, a 9th-grade math teache
 - "If we built this, how would their 9am Tuesday look different?"
 
 **Red flag:** Abstract personas or "anyone who needs to" answers. Push for concreteness.
+
+**▸ MindHive weave:** `recall "<user / persona>"` — the specific user may already
+be defined in the ledger from prior product work.
 
 #### Gap 3: Counterfactual Gap
 **Question:** What do they do *right now* without this solution? What's their workaround?
@@ -758,14 +680,10 @@ For small one-time initiatives (sermon series, one classroom module), durability
 
 **Red flag:** Design that's fragile to market changes or assumes constant growth.
 
-**See also:** [product-implications.md](./product-implications.md) for how validated ideas enable progressive disclosure, latent demand discovery, and approval workflows.
+**▸ MindHive weave:** `graph related "<subsystem>"` surfaces prior durability
+decisions on connected components — reuse them rather than re-deriving.
 
-> **⬡ MindHive hook — the ledger is the fastest way to fill the gaps.** For each gap,
-> a targeted `recall` frequently returns the answer without asking: Evidence →
-> `recall "<problem> evidence"`; Counterfactual → read the current code path with the
-> file tools or `graph related "<entity>"`; Durability → `recall "<domain> risk"` for
-> prior caveats about fragility. Ask the user only for the genuinely user-owned
-> residue (taste, priorities, product intent) after memory and code are exhausted.
+**See also:** [product-implications.md](product-implications.md) for how validated ideas enable progressive disclosure, latent demand discovery, and approval workflows.
 
 ### 1.3 Offer Visual Companion (If Applicable)
 
@@ -784,12 +702,10 @@ Wait for explicit response. **Do not proceed with other content until they respo
 
 **Test:** Would they understand this better by seeing it than reading it?
 
-> **⬡ MindHive hook — MindHive already has a local visual surface.** The MindHive
-> **dashboard** (`python -m mindhive dashboard`, localhost, fixed port 54461) is a
-> ready-made local URL for showing the knowledge graph (`graph export --open`), the
-> Skills & plugins inventory, and the Improvements view. When the visual you want to
-> show is *about the project's memory or skill choices*, prefer the dashboard over
-> building a throwaway mockup.
+**▸ Portability note:** the visual companion opens a local browser URL. On Claude
+surfaces without local browser access (some Cowork / NewTask sandboxes), fall
+back to terminal descriptions or inline diagrams — see
+[Compatibility & Portability](#compat).
 
 ### 1.4 Propose 2-3 Approaches With Trade-Offs
 
@@ -834,11 +750,9 @@ Wait for explicit response. **Do not proceed with other content until they respo
 
 **Key principle:** All three approaches are legitimate. The trade-offs depend on their constraints. Your job is to illuminate the choice, not make it for them.
 
-> **⬡ MindHive hook — let past outcomes weight the recommendation.** Before you name
-> the recommended approach, `recall "<approach keyword>"` for prior successes or
-> dead-ends with each shape. If the ledger shows a previous approach failed here, say
-> so and let it lower that approach's standing — memory-weighted recommendations beat
-> intuition-only ones.
+**▸ MindHive weave:** `recall "<approach / technology>"` per candidate approach.
+If a prior run tried an approach and it failed or succeeded, that history belongs
+in the trade-offs — lead with it.
 
 ### 1.5 Present the Design & Get Section-by-Section Approval
 
@@ -925,11 +839,10 @@ Ask the user to review the written spec:
 
 Wait for approval. Only proceed once they confirm.
 
-> **⬡ MindHive hook — record the validated idea as a decision.** Once the user
-> approves the requirements doc, that is a memorable event. Append it:
-> `python -m mindhive append decision "Validated idea: <one line> — scope <L/S/D>, chosen approach <X>" --tags orchestrator,ult-idea`.
-> This makes the next `/mindhive` recall-aware of what was already validated here.
-> (Only append on approval — not for every discarded draft.)
+**▸ MindHive weave:** once the spec is approved, log the decision that the
+requirements are locked: `python -m mindhive append decision "Requirements
+approved for <project>: <one-line summary>" --tags orchestrator,requirements`.
+The next run's recall preflight will surface it.
 
 ---
 
@@ -943,6 +856,11 @@ Wait for approval. Only proceed once they confirm.
 **Skip this phase if:** The project is non-technical (curriculum design, sermon series, organizational process, etc.).
 
 **Objective:** Ensure the system design follows five agent-native principles, enabling long-term flexibility and feature growth without code rewrites.
+
+**▸ MindHive weave:** run `python -m mindhive plugins recommend` before you
+review. The plugin catalog shows which installed plugins fit the emerging
+system's shape; a strong match may supply primitives you'd otherwise design from
+scratch. `plugins scan` refreshes the catalog when it's stale.
 
 ### 2.0 Agent-Native Architecture: Five Principles
 
@@ -964,13 +882,7 @@ Agent-native systems treat agents (AI or automation) as first-class citizens. Fe
 
 **Fix:** Add the missing tool. Now the agent can export reports; a prompt can automate report generation.
 
-**See also:** [action-parity-discipline.md](./action-parity-discipline.md) for maintaining parity over time, and the Parity Audit workflow.
-
-> **⬡ MindHive hook — MindHive is the reference implementation of parity.** Every
-> dashboard action has a CLI/agent equivalent (the **▶ call this skill** button ==
-> `skills invoke`; the Reflect button == `rules reflect`; scan == `plugins scan`).
-> Use that as the bar: if your design can't express a user action as a command, it
-> has a parity gap.
+**See also:** [action-parity-discipline.md](action-parity-discipline.md) for maintaining parity over time, and the Parity Audit workflow.
 
 #### Principle 2: Granularity
 **Statement:** Tools are atomic primitives (CRUD: Create, Read, Update, Delete) and small. Features emerge from prompts composing primitives, not from large specialized tools.
@@ -995,7 +907,7 @@ To add a new report type, just write a new prompt. No code changes.
 
 **Fix:** Break specialized tools into primitives. Composability increases, flexibility skyrockets.
 
-**See also:** [mcp-tool-design.md](./mcp-tool-design.md) for tool naming, input design, and CRUD completeness. [from-primitives-to-domain-tools.md](./from-primitives-to-domain-tools.md) for when to add domain tools deliberately.
+**See also:** [mcp-tool-design.md](mcp-tool-design.md) for tool naming, input design, and CRUD completeness. [from-primitives-to-domain-tools.md](from-primitives-to-domain-tools.md) for when to add domain tools deliberately.
 
 #### Principle 3: Composability
 **Statement:** New features are written as prompts using existing tools, not as code changes to the architecture.
@@ -1025,7 +937,7 @@ To add a new report type, just write a new prompt. No code changes.
 
 **Fix:** If gaps are apparent, add missing primitives or reconsider tool specificity. Emergent capability indicates a healthy, flexible system.
 
-**See also:** [product-implications.md](./product-implications.md) for latent demand discovery and how agent usage reveals what users actually need.
+**See also:** [product-implications.md](product-implications.md) for latent demand discovery and how agent usage reveals what users actually need.
 
 #### Principle 5: Improvement Over Time
 **Statement:** The app gets better through accumulated context (e.g., a `context.md` file that grows) and prompt refinement, without code releases.
@@ -1043,13 +955,13 @@ To add a new report type, just write a new prompt. No code changes.
 
 **Fix:** Ensure the system has injection points for context (configuration, rules, user preferences) that the agent prompt can reference.
 
-**See also:** [system-prompt-design.md](./system-prompt-design.md) and [dynamic-context-injection.md](./dynamic-context-injection.md) for how to structure prompts and context.
+**▸ MindHive is itself a worked example of Principle 5.** Its learning loop
+(failures → rules → improvements) is exactly "the app gets better through
+accumulated context, without code releases." When you design a system's
+improvement mechanism, MindHive's `rules inject` / `rules promote` pattern is a
+reference implementation.
 
-> **⬡ MindHive hook — "improvement over time" is literally the MindHive learning loop.**
-> Principle 5 is what `failures capture → rules reflect → rules inject` implements: the
-> system gets better by accumulating lessons (prevention rules), not by shipping code.
-> When you design for improvement-over-time, design a `context.md`/rules store that an
-> agent can read and append — exactly like MindHive's incident/rules store.
+**See also:** [system-prompt-design.md](system-prompt-design.md) and [dynamic-context-injection.md](dynamic-context-injection.md) for how to structure prompts and context.
 
 ### 2.1 Detect Gaps & Propose Fixes
 
@@ -1071,7 +983,7 @@ For each principle that fails, diagnose and fix:
 
 ---
 
-## <a name="phase-2-5"></a>Phase 2.5: Architecture Decision Checkpoint (New)
+## <a name="phase-2-5"></a>Phase 2.5: Architecture Decision Checkpoint
 
 **Apply this phase if and only if:**
 - The project is a system (software, multi-agent workflow), AND
@@ -1082,11 +994,9 @@ For each principle that fails, diagnose and fix:
 
 **Deliverable:** An "ARCHITECTURE.md" document that locks these decisions. Do not proceed to Phase 3 until decisions are explicit.
 
-> **⬡ MindHive hook — recall prior architecture rulings before deciding.** Run
-> `recall "architecture decision"` and `recall "workspace"` / `recall "approval gate"`
-> before this checkpoint. This project's ledger already carries agent-native
-> decisions (e.g. the shared-workspace ruling); reuse them so ARCHITECTURE.md is
-> consistent with what's been decided, and only re-open a decision deliberately.
+**▸ MindHive weave:** each locked decision below gets an `append decision` so the
+architecture survives across sessions:
+`python -m mindhive append decision "<the choice + one-clause why>" --tags orchestrator,architecture`.
 
 ### 2.5.0 Workspace Architecture
 
@@ -1108,7 +1018,7 @@ For each principle that fails, diagnose and fix:
 
 **Decision Point:** Which approach fits this project?
 
-**See also:** [files-universal-interface.md](./files-universal-interface.md) and [shared-workspace-architecture.md](./shared-workspace-architecture.md)
+**See also:** [files-universal-interface.md](files-universal-interface.md) and [shared-workspace-architecture.md](shared-workspace-architecture.md)
 
 ### 2.5.1 Tool Design Strategy
 
@@ -1132,7 +1042,11 @@ For each principle that fails, diagnose and fix:
 - Phase 1 (Emerging): Which patterns might call for domain tools?
 - Phase 2+ (Optimized): Which operations might graduate to optimized code?
 
-**See also:** [from-primitives-to-domain-tools.md](./from-primitives-to-domain-tools.md) and [mcp-tool-design.md](./mcp-tool-design.md)
+**▸ MindHive weave:** run `python -m mindhive plugins recommend` here — a
+cataloged plugin may already ship the primitives you're about to design. Prefer
+reuse over reinvention; note the chosen plugin in the Tool Roadmap.
+
+**See also:** [from-primitives-to-domain-tools.md](from-primitives-to-domain-tools.md) and [mcp-tool-design.md](mcp-tool-design.md)
 
 ### 2.5.2 Approval Gates
 
@@ -1149,13 +1063,7 @@ Use the **Stakes/Reversibility Matrix:**
 
 **Action:** List high-stakes operations and their approval requirements.
 
-**See also:** [architecture-patterns.md](./architecture-patterns.md) for approval gate implementation and [product-implications.md](./product-implications.md) for approval and agency patterns.
-
-> **⬡ MindHive hook — MindHive already encodes real approval gates; match them.**
-> Destructive store ops (`gc --prune`) and autonomous `loop` runs are refused while
-> the V17 `~/.mindhive/LIVE_LOCK` is set. That is a "High stakes / Hard reversibility
-> → explicit approval (or hard refusal)" gate in production. Model your gates on it,
-> and never design a flow that defeats that guard.
+**See also:** [architecture-patterns.md](architecture-patterns.md) for approval gate implementation and [product-implications.md](product-implications.md) for approval and agency patterns.
 
 ### 2.5.3 Implementation Pattern
 
@@ -1181,7 +1089,7 @@ Use the **Stakes/Reversibility Matrix:**
 
 **Action:** Choose one pattern. Document how it applies to this project.
 
-**See also:** [architecture-patterns.md](./architecture-patterns.md) for complete pattern catalog.
+**See also:** [architecture-patterns.md](architecture-patterns.md) for complete pattern catalog.
 
 ### 2.5.4 Storage & File Organization
 
@@ -1202,7 +1110,7 @@ Documents/
 
 **Action:** Document the file structure for this project.
 
-**See also:** [files-universal-interface.md](./files-universal-interface.md) for patterns and the context.md pattern.
+**See also:** [files-universal-interface.md](files-universal-interface.md) for patterns and the context.md pattern.
 
 ### 2.5.5 Context Injection Strategy
 
@@ -1224,12 +1132,12 @@ Documents/
 
 **Action:** Choose strategy. Document what goes where.
 
-**See also:** [dynamic-context-injection.md](./dynamic-context-injection.md) and [files-universal-interface.md](./files-universal-interface.md) for context.md pattern.
+**▸ MindHive is the reference for Option B/C.** Its `MEMORY.md` briefing + `state`
++ `rules inject` are exactly the persistent-context and hybrid patterns. If this
+project is MindHive-adjacent, lean on that machinery instead of building a new
+context layer.
 
-> **⬡ MindHive hook — MindHive's injection strategy is the hybrid, working.** Static
-> guidance lives in `SOUL.md`/the skill; dynamic learned state lives in the ledger and
-> is injected via `sync` → native `MEMORY.md` (auto-loaded) and `rules inject`. If you
-> pick Option C, you can literally reuse this machinery instead of inventing one.
+**See also:** [dynamic-context-injection.md](dynamic-context-injection.md) and [files-universal-interface.md](files-universal-interface.md) for context.md pattern.
 
 ### 2.5.6 Model Tier Selection
 
@@ -1244,7 +1152,7 @@ Documents/
 
 **Action:** Map each agent type to a model tier.
 
-**See also:** [architecture-patterns.md](./architecture-patterns.md) for model tier selection.
+**See also:** [architecture-patterns.md](architecture-patterns.md) for model tier selection.
 
 ### 2.5.7 Mobile Considerations (If Applicable)
 
@@ -1258,7 +1166,7 @@ Documents/
 
 **Action:** Document mobile-specific architecture.
 
-**See also:** [mobile-patterns.md](./mobile-patterns.md) for iOS-specific patterns (iCloud sync, background execution, permissions, cost awareness).
+**See also:** [mobile-patterns.md](mobile-patterns.md) for iOS-specific patterns (iCloud sync, background execution, permissions, cost awareness).
 
 ### 2.5.8 ARCHITECTURE.md Deliverable
 
@@ -1302,11 +1210,8 @@ Documents/
 
 > "Architecture decisions documented. Please review: Do these choices align with your vision? Should we proceed with Phase 3 interrogation and testing?"
 
-> **⬡ MindHive hook — persist the hard calls.** After approval, append the
-> irreversible choices as decisions so they survive into the next session:
-> `python -m mindhive append decision "ARCH: <choice> because <reason>" --tags orchestrator,architecture`.
-> A Phase 3.5 ADR still gets written for the truly hard-to-reverse ones — the ledger
-> entry is the searchable index; the ADR is the full record.
+**▸ MindHive weave:** after approval, log the lock:
+`python -m mindhive append decision "Architecture locked for <project>: <pattern + workspace + tool strategy>" --tags orchestrator,architecture`.
 
 ---
 
@@ -1365,10 +1270,11 @@ Once they choose, update CONTEXT.md immediately:
 
 **Rule:** If a term could reasonably mean two different things, sharpen it. Document it. Move on.
 
-> **⬡ MindHive hook — the ledger is a pre-seeded glossary.** `recall "<term>"` before
-> you propose a definition: the project may already have locked that term. Reusing the
-> established definition keeps CONTEXT.md consistent with the code and prevents the
-> same word meaning two things across two features.
+**▸ MindHive weave:** the project may already have a canonical definition. Run
+`recall "<term>"` before you propose a new one — if the ledger (or a repo
+`CONTEXT.md`) already defines "Account," reuse that definition rather than minting
+a conflicting one. When you resolve a new term, log it:
+`python -m mindhive append decision "Canonical term: <term> = <definition>" --tags orchestrator,context`.
 
 ### 3.1 Test With Concrete Scenarios: Edge Cases & Reality Checks
 
@@ -1407,14 +1313,9 @@ For each core behavior in the design, invent 3–5 concrete scenarios that probe
 
 **Update the spec:** If a scenario reveals an edge case the design doesn't address, add it to the "Error Handling" section or "Out of Scope" section.
 
-> **⬡ MindHive hook — mine past failures for the edge cases you'd miss.**
-> `rules summaries` and `failures list` show what has actually broken in this project.
-> A recurring `tool_failed` signature is a ready-made "Failure Case" scenario — pull
-> real incidents in as scenarios instead of inventing only hypothetical ones.
+### 3.2 Cross-Reference With Code and the Ledger (If They Exist)
 
-### 3.2 Cross-Reference With Code (If It Exists)
-
-**Principle:** Words must match reality. If the code does something different than the design says, surfacing the contradiction forces resolution.
+**Principle:** Words must match reality. If the code does something different than the design says, surfacing the contradiction forces resolution. The *ledger* is a second source of reality: a prior decision may contradict the current idea just as the code can.
 
 **How it works:**
 
@@ -1422,9 +1323,12 @@ If the system exists (you're designing a redesign or extension):
 
 1. Read the relevant code
 2. Compare what the user described to what the code actually does
-3. Call out contradictions
+3. **Also cross-reference the ledger:** run `recall "<claim>"` and
+   `graph related "<entity>"` to catch idea-vs-*decision* contradictions, not just
+   idea-vs-code
+4. Call out contradictions
 
-**Example:**
+**Example (code contradiction):**
 
 User says: "We support partial order cancellation."
 
@@ -1436,13 +1340,18 @@ You respond:
 > - B) Partial is not supported yet (out of scope for this project)?
 > - C) Partial is supported via a different code path?"
 
-Resolve the contradiction before proceeding. Document the resolution.
+**Example (ledger contradiction):**
 
-> **⬡ MindHive hook — `graph related` accelerates the cross-reference.** Before reading
-> files blind, `graph related "<entity>"` returns the decisions and files connected to
-> the thing you're changing — the fastest path to the relevant code and the reasons
-> behind it. Pair it with `recall "<feature>"` to catch a design claim the ledger
-> already contradicts (e.g. "we decided *against* partial cancellation in <date>").
+User says: "Let's store attendance in a new separate service."
+
+`recall "attendance storage"` returns a decision from last month: "Attendance
+stays in the monolith DB — a separate service was rejected for latency." You
+surface it:
+> "The ledger shows a decision from 2026-06-10 that rejected a separate
+> attendance service for latency reasons. Has that changed, or should we stay in
+> the monolith DB?"
+
+Resolve the contradiction before proceeding. Document the resolution.
 
 ### 3.3 Update CONTEXT.md In Real-Time
 
@@ -1486,13 +1395,7 @@ Resolve the contradiction before proceeding. Document the resolution.
 ...
 ```
 
-**See also:** [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md) for comprehensive template and examples.
-
-> **⬡ MindHive hook — this project already has a `CONTEXT.md`.** MindHive keeps a
-> repo-root `CONTEXT.md` as its domain glossary. When you sharpen a term, update *that*
-> file (or the project's designated one) rather than starting a parallel glossary, and
-> optionally mirror the definition into the ledger with `append decision "TERM: …"` so
-> `recall` finds it later.
+**See also:** [CONTEXT-FORMAT.md](references/context-format.md) for comprehensive template and examples.
 
 ### 3.4 Define Testing Strategy
 
@@ -1532,13 +1435,7 @@ Resolve the contradiction before proceeding. Document the resolution.
 - Export → file available in specified location
 ```
 
-**See also:** [agent-native-testing.md](./agent-native-testing.md) for complete testing framework.
-
-> **⬡ MindHive hook — MindHive ships its own verification you can chain.** `selftest`
-> runs the suite; `skills status` tells you which execution skills are green before you
-> rely on them; a thermo-nuclear `review queue` can be queued for touched files. Fold
-> these into the testing strategy so "what proves this works" includes the project's
-> existing gates, not just new tests.
+**See also:** [agent-native-testing.md](agent-native-testing.md) for complete testing framework.
 
 ### 3.5 Write ADRs Sparingly: Three-Part Test
 
@@ -1552,7 +1449,13 @@ Resolve the contradiction before proceeding. Document the resolution.
 
 **If any condition is missing, skip the ADR.**
 
-**See also:** [ADR-FORMAT.md](./ADR-FORMAT.md) for template and examples.
+**▸ MindHive weave:** an ADR-worthy decision (hard to reverse, surprising, real
+trade-off) is exactly the kind of thing the ledger should also hold. When you
+write an ADR, mirror its headline into the ledger:
+`python -m mindhive append decision "<ADR headline>" --tags orchestrator,adr` so
+the next run's recall surfaces it even before anyone opens the ADR file.
+
+**See also:** [ADR-FORMAT.md](references/adr-format.md) for template and examples.
 
 ### 3.6 User Final Approval
 
@@ -1569,10 +1472,319 @@ Ask the user to sign off on the complete spec:
 
 Wait for explicit approval. Document their sign-off.
 
-> **⬡ MindHive hook — approval is the gate into the execution pipeline.** This sign-off
-> is exactly the Anti-Leak HARD-GATE clearing. On approval, the run moves out of the
-> ULT-IDEA canvas and into **"After the canvas: execute through MindHive"** below — the
-> Recommendation Matrix, invoke-channel execution, and learning write-back.
+**▸ Where this leads.** This sign-off is the moment the Anti-Leak HARD-GATE #2
+clears — the full design (Phases 1, 2, 2.5, and 3) is now sound. Route from here:
+for a **design-and-handoff** engagement, hand off to IMPLEMENTATION-READINESS and
+proceed to Phase L. For an **execute** engagement, continue to **Phase S (Skill
+Selection)** — only now, with the gate cleared, may skills be selected and
+invoked.
+
+---
+
+## <a name="phase-s"></a>Phase S: Skill Selection & Recommendation Matrix
+
+This is the orchestrator's core contribution to the fusion: once the design is
+validated, sharpened through Phase 3, and (for systems) the architecture is
+locked — so the Anti-Leak HARD-GATE has cleared — choose the **skills** that will
+execute the work, deliberately, auditably, and anchored on measured outcomes
+rather than a hidden guess.
+
+**Run this phase when** the validated idea implies execution (building code,
+running a migration, producing an artifact) and installed skills can do that
+work. For pure design-and-handoff engagements (the user only wanted the spec),
+skip Phase S and Phase X — the workflow is already complete at the end of
+Phase 3; hand off to IMPLEMENTATION-READINESS and proceed to Phase L.
+
+### S.0 Read the live inventory and measured telemetry
+
+Before scoring anything, gather ground truth:
+
+- `python -m mindhive skills list` — the live, registry-truth inventory of
+  installed plugins and skills. This is what is *actually* callable right now.
+- `python -m mindhive skills status` — the green/red last-call outcome per skill.
+  Green = last invocation succeeded; red = last invocation failed.
+- `python -m mindhive skills stats --json` — per-skill calls, ok/fail, completion
+  rate, last outcome, and streak from the ledger. **Pulling this measured
+  telemetry is mandatory before scoring anything** — fill the matrix from the
+  measured completion rates it returns, never from remembered impressions.
+- `python -m mindhive skills recommend --json` — the deterministic ranking
+  (scored in `src/mindhive/recommend.py`), with `measured|estimated` provenance
+  and an `execution_mode` on every entry plus measured coverage
+  (`N of M skills measured`). Anchor your shortlist on it, not just sanity-check
+  against it.
+
+**Provenance vocabulary (use it verbatim in the matrix):** `measured`
+(completion rate from enough recorded calls), `estimated` (breadth prior for a
+never-called skill), `agent-assessed` (`skills record` self-grades — never
+present these as measured task effectiveness). Model-estimated percentages are
+allowed **only** for never-called skills, and every such figure MUST be labeled
+`estimated`.
+
+**Hard sourcing rule.** Candidate skills come from the session's available-skills
+list (and `skills list`), **verbatim**. Never present a skill name that is not in
+that inventory — no remembered names, no guesses, no "there's probably a skill
+for X." The available-skills list is the only authoritative runtime registry.
+
+### S.1 Score 2–4 candidates on seven parameters
+
+Shortlist 2–4 genuinely plausible candidates (do not pad the matrix). For each,
+run `python -m mindhive recall "<skill name>"` (add `--semantic` if literal
+recall is thin) to surface prior outcomes with that skill, and let the ledger
+history inform the scores. Score each on all seven parameters using the anchored
+scales in
+[references/recommendation-matrix.md](references/recommendation-matrix.md):
+
+| Parameter | Meaning |
+|-----------|---------|
+| **Suitability** | How well the skill matches *this* task (High / Medium / Low) |
+| **Compatibility** | Fit with the stack and the other skills in the chain (High / Medium / Low) |
+| **Completion rate** | The **measured** rate from `skills stats --json` with call count (e.g. `4/5 (measured)`); a model estimate labeled `estimated` only for a never-called skill |
+| **Risk level** | Worst-case blast radius (None / Local / Repo-wide / Destructive) |
+| **Execution speed** | Fast / Moderate / Slow |
+| **Resource cost** | Light / Moderate / Heavy |
+| **Final verdict** | Use / Use as follow-up / Hold / Skip, plus one clause of why |
+
+Render the comparison as a compact table (scans fastest):
+
+```markdown
+| Skill | Suitability | Compatibility | Completion rate | Risk | Speed | Cost | Verdict |
+|-------|-------------|---------------|-----------------|------|-------|------|---------|
+| ce-plan | High | High | 5/5 (measured) | None | Moderate | Moderate | **Use** — built for structured planning |
+| ce-work | High | High | 3/4 (measured) | Local | Moderate | Heavy | **Use** — executes the plan |
+| ce-code-review | High | High | 80% (estimated — never called) | None | Fast | Moderate | **Use as follow-up** — verify before ship |
+```
+
+**Overlap tie-break** (matches the engine in `src/mindhive/recommend.py`): when
+two skills overlap for one need, emit **one** recommendation and prefer (1) the
+higher **measured completion rate** — measured always beats unmeasured; (2)
+**description clarity** — an explicit "use when" trigger, then the shorter, less
+ambiguous description; (3) the longer **failure-free completion streak**. List
+the losers as alternatives, not as separate recommendations — `skills recommend
+--json` already applies this chain (`alternatives` on each entry); do not
+override its winner without saying why.
+
+### S.2 The learn-from-mistakes gate
+
+**Before recommending or invoking any candidate that shows `fail` (red) in
+`skills status`, read its prevention lesson and apply it:**
+
+```bash
+python -m mindhive rules show "skill:<name>"
+```
+
+The lesson tells you *why* it failed last time and the prevention rule to apply.
+Prefer skills showing green; treat red as "fix or avoid, with a reason." This is
+the learning loop closing on the selection side — the system already paid for the
+failure, so you don't repeat it. If the ledger shows a past failure with a
+candidate, reflect it in the score and say so in the verdict clause; do not bury
+known history.
+
+### S.3 Present and get approval
+
+Present the matrix, state your recommended selection in one or two sentences, and
+get the user's approval (or revision) before executing. If no candidate scores
+well, say the idea may need a different route (e.g., `/ce-brainstorm` or
+`/ce-plan` first) rather than forcing a weak recommendation.
+
+**Execution mode (learning-gated, from `skills recommend --json`):** every entry
+carries `execution_mode`. `auto` = proven track record (measured ≥3 calls,
+completion rate ≥ 0.8, no open incident) — apply it during the task without
+asking; `auto`-mode selections may proceed without a blocking question, but
+still announce them. `suggest` = unproven (above all a never-used skill) —
+propose it and wait for the user's approval before invoking. Never auto-apply a
+`suggest`-mode skill, and say which mode applied when presenting the matrix.
+
+**Discontinued skills:** the payload's `discontinued` list names skills stopped
+by the improvements linkage (an active `skill:*` prevention rule plus a trailing
+failure streak). Do not invoke or recommend them; if one would otherwise be the
+best fit, surface its rule text and offer the alternatives instead. They return
+when the incident resolves or a successful call breaks the streak.
+
+**Honesty guardrails.** Every figure carries its provenance — `measured`,
+`estimated`, or `agent-assessed`. Never present an estimate or an agent-assessed
+self-grade as a measured rate — `skills stats --json` provides real completion
+rates for skills that have been measured; everything else is a model estimate
+and must be labeled `estimated`.
+
+---
+
+## <a name="phase-x"></a>Phase X: Execute & Chain
+
+With the selection approved, execute — then chain the quality passes that turn a
+first draft into finished work.
+
+### X.0 Two invocation channels
+
+- **In-agent Skill tool (default on interactive surfaces).** Invoke the selected
+  skill directly with the Skill/Task primitive. This is the normal path in Claude
+  Code, Cowork, and NewTask when you are driving interactively.
+- **The MindHive invoke channel (`skills invoke`).** When execution should be
+  driven by MindHive itself — inside `/circle`, a headless run, or when the
+  dashboard shows live status — call
+  `python -m mindhive skills invoke <name> [--plugin <p>]`. It runs the skill via
+  a headless `claude` and records the outcome. Exit code is `0` on success and
+  `1` on failure, so you can gate the next step on it.
+
+Use the in-agent channel by default; use the invoke channel when you need
+recorded, exit-code-gated, headless execution.
+
+### X.1 Record the outcome (feed the learning loop)
+
+Every execution writes an outcome so the next run is smarter:
+
+```bash
+# success:
+python -m mindhive skills record <name> --ok --note "<what it produced>"
+# failure:
+python -m mindhive skills record <name> --fail --note "<how it failed>"
+```
+
+A `--fail` writes a `tool_failed` event with a `skill:<name>` signature, which
+flows automatically into the incidents → reflect → Improvements pipeline. So a
+skill that fails or returns poorly **teaches the system a prevention rule**, and
+its dashboard indicator turns red until it succeeds again. (When you use
+`skills invoke`, the outcome is recorded for you; use `skills record` for
+in-agent Skill-tool executions you want reflected in telemetry.)
+
+### X.2 Chain the follow-up quality passes
+
+When execution finishes, **do not stop** — proactively recommend the follow-up
+chain that guarantees quality. Resolve every skill name against the
+available-skills list; give a one-line **rationale** for each (why it refines the
+architecture or de-risks the deployment). Recommend; let the user choose which to
+chain.
+
+| Work just done | Recommended follow-up (resolve against available-skills list) | Rationale |
+|----------------|---------------------------------------------------------------|-----------|
+| New/changed code | a code-review skill (e.g. `compound-engineering:ce-code-review`), then `compound-engineering:ce-simplify-code` | Catch correctness bugs, then delete needless complexity |
+| Auth / payments / input handling / external APIs | a security skill (e.g. `security-scanning:security-sast`, `compound-engineering:ce-security-reviewer`) | High blast-radius surfaces earn an explicit security pass |
+| Bug-shaped or flaky behavior | `compound-engineering:ce-debug`, `superpowers:systematic-debugging` | Root-cause it instead of patching symptoms |
+| UI / frontend | `compound-engineering:ce-test-browser`, `ui-design:accessibility-audit` | Prove it works in a real browser and is accessible |
+| About to ship | `compound-engineering:ce-commit-push-pr` | Land it cleanly with a proper PR |
+
+### X.3 Green/red and self-healing
+
+Prefer skills showing green in `skills status`. **Before deciding
+retry-vs-substitute on a skill that shows `fail`, read its Improvements lesson**
+(`python -m mindhive rules show "skill:<name>"`) **and consult its measured
+record** (`python -m mindhive skills stats --json`) — a one-off blip on a strong
+completion rate argues retry; a low rate or an open `skill:*` incident argues
+substituting the next-ranked alternative. Every failed invoke is a
+`tool_failed` event feeding the incidents → reflect → Improvements pipeline — the
+system self-heals by learning a rule from each failure. Treat a red indicator as
+"fix or avoid, with a reason," never as "run it again and hope." This is the
+learning loop closing.
+
+### X.4 Parallel dispatch and dynamic workflows
+
+The orchestrator is the top orchestration layer: it groups the work, classifies
+each piece's complexity, and then **executes in parallel whenever the pieces
+are independent** — sequential execution is reserved for genuinely dependent
+stages, never chosen out of convenience.
+
+- **Fan out independent tasks.** When selected work splits into units that
+  touch disjoint files/modules (e.g. refactor one module, run integration
+  tests, audit security in another), dispatch them concurrently — subagents
+  via the platform's subagent primitive (`Agent`/`Task` in Claude Code), or
+  concurrent `hive loop` runs (one task dir per unit; every run shows up
+  separately in the dashboard's **Oversee** section). Before fanning out,
+  check the units' file sets for overlap — overlapping units run sequentially.
+- **Dependent stages get evaluation checkpoints.** When stage 2 needs stage
+  1's output, run them in order and verify each boundary: build/tests pass,
+  the artifact exists, the assumption still holds. On failure, **read the
+  failure log (stack trace) yourself, re-verify your assumptions, and fix it
+  without new instructions from the user** — the loop's circuit breaker and
+  budget gates bound the retries, so never bounce the first hurdle back to
+  the user.
+- **Model routing applies per unit:** lightweight analysis does not need a
+  flagship model — `hive loop` routes tiers automatically when no model is
+  pinned; match that spirit when choosing subagent models.
+
+### X.5 Non-conflict protocol (coordinator, not competitor)
+
+The orchestrator is the session's **primary coordinator**. It never
+re-implements another skill's job — planning, coding, review, and debugging
+belong to the skills it selects and chains.
+
+- **When another skill is already active or invoked in the session**, the
+  orchestrator restricts itself to **selection, sequencing, and ledger
+  write-back**. It does not duplicate, wrap, or second-guess the running
+  skill's work.
+- **Single-writer rule:** only the orchestrator appends `decision` /
+  `experiment_result` events about skill choice. Executed skills own their own
+  domain events; the orchestrator owns the record of *why* a skill was picked.
+- **Real-time write-through (the learning loop's heartbeat):** IMMEDIATELY
+  after each executed skill completes, record the outcome —
+  `python -m mindhive skills record <name> --ok|--fail [--note "..."]` —
+  before starting the next step. These records feed the measured completion
+  rates Phase S runs on; skipping one starves the next run's matrix.
+- After recording, re-surface what to run next from refreshed data:
+  `python -m mindhive skills recommend --top 3 --brief`.
+
+---
+
+## <a name="phase-l"></a>Phase L: Learning Loop & Log-Back
+
+After the workflow concludes — whether it ended at an approved spec (design-only)
+or ran through execution (Phase X) — evaluate the run and write durable lessons
+back so the next `/mindhive` is smarter. This is the movement that makes the
+system compound.
+
+### L.0 What to log (only when something memorable happened)
+
+- **Mistake or dead-end hit** →
+  `python -m mindhive append caveat "<one line>" --tags orchestrator`
+- **Inefficiency / better path discovered** →
+  `python -m mindhive append experiment_result "<one line>" --tags orchestrator`
+- **New stated preference** →
+  `python -m mindhive append decision "<one line>" --tags orchestrator,preference`
+
+Only append when something **memorable** actually happened. A smooth,
+unremarkable run writes nothing — do not create noise events. This mirrors
+ULT-IDEA's YAGNI: don't manufacture ledger entries for a future that never comes.
+
+### L.1 The failure → rule → improvement loop
+
+The learning loop is largely automatic. Every `tool_failed` event (from a
+`skills record --fail`, a `skills invoke` failure, or a `hive flag`) carries a
+signature that flows into the incidents pipeline:
+
+```
+tool_failed(signature) ──► incidents accumulate ──► rules reflect
+       └─► a prevention rule is written ──► rules inject surfaces it next run
+```
+
+You can drive or inspect this loop from the CLI:
+
+- `python -m mindhive flag "<what was misjudged>" --category <cat>` — self-flag a
+  judgment error; it activates at the first occurrence.
+- `python -m mindhive rules summaries` — read the structured lesson records (the
+  same shape the dashboard's Improvements view shows).
+- `python -m mindhive rules show "<signature>"` — read one incident's full lesson.
+- `python -m mindhive rules inject` — the active prevention-rules block (also part
+  of the preflight).
+- `python -m mindhive rules promote "<signature>"` — promote a proven rule into
+  canonical guidance.
+
+**This is how the fused skill "learns which tools work, effective syntax,
+successful commands, and the most effective way":** successful executions raise a
+skill's measured completion rate (`skills stats`); failures write prevention
+rules that the next run's preflight injects. The system's judgment improves
+without a code release — Principle 5 (Improvement Over Time) applied to the
+orchestrator itself.
+
+### L.2 Refresh the briefing
+
+End by refreshing the auto-loaded briefing so the next session inherits
+everything this run learned:
+
+```bash
+python -m mindhive sync
+```
+
+If the user's Opus budget is nearly spent, also run
+`python -m mindhive export --recent 20` for a portable handoff (see
+[Context Handoff at ~50%](#handoff)).
 
 ---
 
@@ -1616,16 +1828,25 @@ You: "Can you tell me about one specific person who would use it?"
 ❌ "Should we use a SQL database or NoSQL?"
 ✅ "What data needs to persist between sessions?"
 
-> **⬡ MindHive hook — ask through the platform's blocking-question tool.** In Claude
-> Code use `AskUserQuestion` (one question, lead with your recommended answer). The
-> "one question per turn" and "make decisions visible" rules pair with the prime
-> directive: state what the ledger/code already told you *before* the question, so the
-> user only adjudicates the genuinely-open part. See `references/cross-platform.md` for
-> the per-surface asking mechanism.
+### Lead With the Ledger's Answer
+**When the recall preflight already answered a question, don't ask it — state
+what you found and confirm.** This is the MindHive addition to the communication
+rules: every question you ask should be one the ledger and codebase genuinely
+could not answer.
+
+✅ "The ledger shows you settled on single-school scope. I'll assume that unless
+you say otherwise."
+
+### Ask One Question at a Time via the Blocking Tool
+Use the platform's blocking-question tool so the user answers before you proceed:
+`AskUserQuestion` in Claude Code (load its schema via `ToolSearch` with
+`select:AskUserQuestion` first if needed). On surfaces without a blocking-question
+tool, fall back to a single numbered-options question in chat and wait for the
+reply. See [Compatibility & Portability](#compat).
 
 ---
 
-## <a name="anti-leak"></a>Anti-Leak Protection: The HARD-GATE
+## <a name="anti-leak"></a>Anti-Leak Protection: The HARD-GATE — HARD-GATE #2
 
 **You cannot invoke any implementation skill, write code, or suggest technical architecture until:**
 
@@ -1638,14 +1859,17 @@ You: "Can you tell me about one specific person who would use it?"
 
 **This applies to EVERY project, regardless of perceived simplicity.**
 
-Only after all gates have been passed should the conversation move to implementation-focused tools, deployment, or coding.
+Only after all gates have been passed should the conversation move to
+implementation-focused tools, deployment, or coding. This is exactly why the flow
+places **Phase 3 (Interrogate & Sharpen) before Phase S and Phase X**: Phase 3
+closes gate item 6, so the HARD-GATE has already cleared by the time skills are
+selected (Phase S) and invoked (Phase X). No skill is invoked until the design is
+sound — the ordering enforces it rather than relying on a caveat.
 
-> **⬡ MindHive hook — the HARD-GATE governs the invoke channel too.** Do not run
-> `skills invoke`, a code-writing skill, or `loop`/`/circle` until these six gates
-> clear. Recall, `state`, `graph related`, `plugins recommend`, and `skills list` are
-> *reads* — safe and encouraged before the gate. Execution (`skills invoke`,
-> code-writing skills) is *forbidden* until the gate clears. This keeps MindHive's
-> power on the right side of the leak protection.
+**Two gates, one discipline.** HARD-GATE #1 (recall before you ask) governs the
+*front* of the workflow; HARD-GATE #2 (no implementation before approval) governs
+the *back*. Together they bracket the rigor: start from what's known, don't build
+until it's sound.
 
 ---
 
@@ -1691,11 +1915,11 @@ In Phase 1.5, explicitly call out what's NOT being built:
 
 This prevents scope creep and sets expectations.
 
-> **⬡ MindHive hook — YAGNI governs skill selection, not just features.** In the
-> Recommendation Matrix, apply the same discipline: shortlist 2–4 genuinely plausible
-> skills, not every skill that *could* touch the task. A padded chain is speculative
-> complexity in execution form. `plugins recommend` breadth-scores toward the smallest
-> set that covers the work.
+**▸ MindHive weave — YAGNI for memory too.** Apply the same ruthlessness to
+ledger writes (Phase L): only append when something memorable happened, and only
+recommend skills that measured telemetry or clear suitability justifies. A matrix
+padded with skills you'd never pick, or a ledger full of noise events, is the
+same speculative complexity YAGNI forbids — just in the memory layer.
 
 ---
 
@@ -1712,14 +1936,13 @@ This prevents scope creep and sets expectations.
 - [ ] **Testing is planned** — Capability, parity, edge case, integration tests defined
 - [ ] **Zero scope creep** — Out of scope list is explicit and approved
 - [ ] **Ready for implementation** — Implementation team can read spec once and execute
+- [ ] **(If executed) Skills selected and run** — Recommendation Matrix approved, work executed, quality chain offered
+- [ ] **Lessons logged** — Memorable mistakes/inefficiencies/preferences appended; `sync` run so the next session inherits them
 
-**Terminal State:** User confirms spec is ready. All deliverables handed off. Next phase is IMPLEMENTATION-READINESS (see separate document).
-
-> **⬡ MindHive hook — in the fused pipeline, "complete" extends one step further.** The
-> ULT-IDEA terminal state (approved spec) is the *handoff into execution*, not the end
-> of the `/mindhive` run. The run is complete when the spec is executed through the
-> chosen skills **and** the learnings are written back (`append` + `sync`). See "After
-> the canvas" below.
+**Terminal State:** User confirms spec (and, if executed, the work) is ready. All
+deliverables handed off. Next phase is IMPLEMENTATION-READINESS (see separate
+document) for design-only engagements, or the offered follow-up chain for
+executed ones.
 
 ---
 
@@ -1775,341 +1998,172 @@ Every system needs Phase 2.5. Even "simple" apps have:
 
 Lightweight projects can do Phase 2.5 briefly (1 hour). But do it.
 
-> **⬡ MindHive hook — one more edge case: the CLI won't run.** If `python -m mindhive`
-> only prints the Windows Store shim message, switch to the venv interpreter
-> (`.venv\Scripts\python.exe -m mindhive`). If no shell exists at all, honor the prime
-> directive by reading `STATE.md`/`CONTEXT.md`/`MEMORY.md` and the code directly, note
-> the fallback once, and continue. Never let a missing CLI become an excuse to ask the
-> user everything. See `references/cross-platform.md`.
+### "MindHive Isn't Installed on This Surface"
+
+Run the degradation contract: announce "MindHive memory unavailable — running
+ULT-IDEA in stateless mode" once, then proceed with full ULT-IDEA rigor. Explore
+the codebase directly in place of `recall`/`graph related`. Skip Phases S/X/L's
+MindHive-specific commands, but still offer the follow-up quality chain (X.2)
+using the in-agent Skill tool. The idea still gets validated; only the memory
+grounding is absent.
+
+### "A Recommended Skill Shows Red (fail) in `skills status`"
+
+Do not invoke it blindly. Run `rules show "skill:<name>"`, read the prevention
+lesson, and either apply the fix or pick a green alternative — stating why in the
+matrix verdict. A red skill is "fix or avoid, with a reason," never "run it again
+and hope."
+
+### "The Ledger Contradicts the User"
+
+Surface it, don't override it silently. Cite the decision (with its date) and ask
+which is current — the recorded decision or the new direction. Then log the
+resolution so the contradiction doesn't recur.
+
+### "Context Is Getting Long Mid-Workflow"
+
+Offer a handoff at the next phase boundary rather than pushing on into a degraded
+window — see [Context Handoff at ~50%](#handoff).
 
 ---
 
-## Integration Map: Which Supporting Document for What?
+## <a name="handoff"></a>Context Handoff at ~50%
+
+Long runs degrade or hit an abrupt compaction mid-task. To keep quality high,
+monitor context consumption and offer a clean handoff at roughly the halfway
+mark.
+
+### When to check
+
+Check at **every phase boundary** (preflight→1, 1→2, 2→2.5, 2.5→3, 3→S, S→X,
+X→L), never mid-question. Phase boundaries are cheap, natural pause points;
+interrupting an interview question to talk about context would be worse than the
+problem.
+
+### Heuristic signals (there is no exact token meter in-session)
+
+Treat the estimate as crossing ~50% when several of these are true:
+
+- Many tool calls have accumulated this session (dozens of reads/edits/greps).
+- Several large files or reference docs have been read in full.
+- Multiple pipeline phases are complete and the transcript is long.
+- The harness has emitted a compaction or "context is getting long" notice — this
+  is the **hard backstop**; treat it as ≥50% regardless of the proxies.
+
+### The alert (ask, don't force)
+
+When the estimate crosses the threshold, halt and say, in substance:
+
+> Heads up — we're about halfway through the context window. To keep quality high
+> I can **hand off** now: I'll export a portable summary, log the open threads to
+> MindHive, and give you a one-line command to resume this exact work in a fresh
+> session. Want me to hand off, or push on here?
+
+Wait for the user's choice. If they decline, resume where it left off and
+re-check at the next phase boundary.
+
+### Approved-handoff sequence
+
+On approval, run in order:
+
+1. `python -m mindhive export --recent 20` — writes `handoff.md`, the durable
+   portable summary of recent state.
+2. `python -m mindhive append caveat "Handoff mid-/mindhive: <what's done, what's next>" --tags orchestrator,handoff`
+3. `python -m mindhive sync` — refresh the briefing for the next session.
+4. Print resume instructions:
+   > Handed off. In a fresh session:
+   > 1. `python -m mindhive state` (auto-loads; confirms context restored)
+   > 2. open `handoff.md` for the full snapshot
+   > 3. re-run `/mindhive <the remaining scope>` to continue where we stopped.
+
+Do not begin new pipeline work after a handoff — end this session cleanly so the
+next one starts fresh. Full protocol:
+[references/handoff-protocol.md](references/handoff-protocol.md).
+
+---
+
+## <a name="compat"></a>Compatibility & Portability — Claude Code, Cowork, NewTask
+
+This skill is written to run on **all parts of Claude**. The ULT-IDEA rigor is
+pure prose and runs anywhere; the MindHive machinery layers on where the CLI is
+present and degrades cleanly where it is not. Full matrix:
+[references/compatibility.md](references/compatibility.md).
+
+### The two portability seams
+
+1. **The MindHive CLI.** Present when `python -m mindhive`, `hive`, or the venv
+   path resolves. Absent in sandboxes without the local install. **Contract:** if
+   absent, announce stateless mode once and run full ULT-IDEA rigor; never
+   hard-fail. Every `python -m mindhive …` block in this document is best-effort.
+2. **The blocking-question tool.** Used to ask one question at a time and wait.
+
+| Surface | Blocking-question tool | Skill invocation | MindHive CLI | Visual companion |
+|---------|------------------------|------------------|--------------|------------------|
+| **Claude Code** | `AskUserQuestion` (load schema via `ToolSearch select:AskUserQuestion`) | `Skill` tool + `skills invoke` | Usually present (local) | Local browser URL |
+| **Claude Cowork** | Platform blocking prompt; else numbered options in chat | Platform skill primitive; in-agent only if no CLI | Often absent → stateless mode | Fall back to inline diagrams / text |
+| **Claude NewTask** | Platform blocking prompt; else numbered options in chat | Platform skill primitive; in-agent only if no CLI | Often absent → stateless mode | Fall back to inline diagrams / text |
+
+### Portability rules
+
+- **Never hard-depend on a specific tool name.** Where `AskUserQuestion` is
+  unavailable, ask a single numbered-options question in chat and wait for the
+  reply. Where the `Skill` tool is unavailable, describe the follow-up chain and
+  let the user trigger it.
+- **Keep frontmatter minimal.** Only `name` + `description` — the lowest common
+  denominator every surface parses. Platform-variant mechanics live in this
+  section and inline, never in frontmatter.
+- **Degrade, don't disable.** The order of graceful degradation is: full fusion
+  (CLI + blocking tool + Skill tool) → ULT-IDEA + in-agent skill chaining (no
+  CLI) → pure ULT-IDEA rigor (no CLI, no skill primitive). Each rung still
+  delivers a validated idea.
+- **Announce the mode once, at the top of the run,** so the user knows whether
+  memory grounding is active. Don't repeat the announcement every phase.
+
+---
+
+## <a name="integration-map"></a>Integration Map: Which Supporting Document for What?
 
 | Need | See |
 |------|-----|
-| Tool design discipline | [mcp-tool-design.md](./mcp-tool-design.md) |
-| Action parity audit | [action-parity-discipline.md](./action-parity-discipline.md) |
-| Architecture patterns | [architecture-patterns.md](./architecture-patterns.md) |
-| File organization | [files-universal-interface.md](./files-universal-interface.md) |
-| Shared workspace | [shared-workspace-architecture.md](./shared-workspace-architecture.md) |
-| Context injection | [dynamic-context-injection.md](./dynamic-context-injection.md) |
-| System prompts | [system-prompt-design.md](./system-prompt-design.md) |
-| From primitives to domain tools | [from-primitives-to-domain-tools.md](./from-primitives-to-domain-tools.md) |
-| Mobile (iOS) | [mobile-patterns.md](./mobile-patterns.md) |
-| Agent execution | [agent-execution-patterns.md](./agent-execution-patterns.md) |
-| Testing strategy | [agent-native-testing.md](./agent-native-testing.md) |
-| Product implications | [product-implications.md](./product-implications.md) |
-| CONTEXT.md template | [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md) |
-| ADR template | [ADR-FORMAT.md](./ADR-FORMAT.md) |
-| Implementation handoff | [IMPLEMENTATION-READINESS.md](./IMPLEMENTATION-READINESS.md) |
-
-> **⬡ MindHive hook — the MindHive-side references.** Alongside the ULT-IDEA companions
-> above, this fused skill adds: **`references/mindhive-functions.md`** (the full
-> command catalog — when/for-what/why), **`references/recommendation-matrix.md`** (the
-> scored skill-selection method), **`references/handoff-protocol.md`** (context handoff
-> at ~50%), and **`references/cross-platform.md`** (Claude Code / Cowork / NewTask
-> compatibility). The ULT-IDEA companion `.md` files (mcp-tool-design, etc.) ship with
-> the ULT-IDEA knowledge base; load them on demand for the deep-dive they name.
+| Tool design discipline | [mcp-tool-design.md](mcp-tool-design.md) |
+| Action parity audit | [action-parity-discipline.md](action-parity-discipline.md) |
+| Architecture patterns | [architecture-patterns.md](architecture-patterns.md) |
+| File organization | [files-universal-interface.md](files-universal-interface.md) |
+| Shared workspace | [shared-workspace-architecture.md](shared-workspace-architecture.md) |
+| Context injection | [dynamic-context-injection.md](dynamic-context-injection.md) |
+| System prompts | [system-prompt-design.md](system-prompt-design.md) |
+| From primitives to domain tools | [from-primitives-to-domain-tools.md](from-primitives-to-domain-tools.md) |
+| Mobile (iOS) | [mobile-patterns.md](mobile-patterns.md) |
+| Agent execution | [agent-execution-patterns.md](agent-execution-patterns.md) |
+| Testing strategy | [agent-native-testing.md](agent-native-testing.md) |
+| Product implications | [product-implications.md](product-implications.md) |
+| CONTEXT.md template | [references/context-format.md](references/context-format.md) |
+| ADR template | [references/adr-format.md](references/adr-format.md) |
+| Implementation handoff | [IMPLEMENTATION-READINESS.md](IMPLEMENTATION-READINESS.md) |
+| **Recommendation Matrix scales** | [references/recommendation-matrix.md](references/recommendation-matrix.md) |
+| **Full MindHive command catalog** | [references/mindhive-command-catalog.md](references/mindhive-command-catalog.md) |
+| **This skill's capability catalog** | [references/skill-catalog.md](references/skill-catalog.md) |
+| **Cross-surface compatibility** | [references/compatibility.md](references/compatibility.md) |
+| **Context handoff protocol** | [references/handoff-protocol.md](references/handoff-protocol.md) |
 
 ---
 
-**Version:** ULT-IDEA v2.0 (Enhanced with Architecture, Testing, and Implementation Readiness) — fused into MindHive Orchestrator
+## Notes
 
-**Last Updated:** 2026-06-30 (ULT-IDEA core) · fused 2026-07-09
+- This skill orchestrates skills already installed on this machine; it does not
+  install or author new skills.
+- It never disturbs the V17 live-trading setup or the `~/.mindhive/LIVE_LOCK`
+  guard — if a chained skill would run the loop, that skill's own guards apply.
+- Matrix percentages come from the measured telemetry backend
+  (`hive skills stats --json` / `hive skills recommend --json`). A model
+  estimate appears only for a never-called skill and is always labeled
+  `estimated` — never presented as a measured rate.
+- ULT-IDEA content is preserved in full from the source skill; the MindHive weave
+  adds memory grounding, skill selection, execution chaining, and a learning loop
+  without removing any of ULT-IDEA's rigor.
 
 ---
----
 
-# ▓▓▓ AFTER THE CANVAS: EXECUTE THROUGH MINDHIVE ▓▓▓
+**Version:** MindHive Orchestrator v1.0 (ULT-IDEA v2.0 fused with the MindHive memory spine)
 
-*The ULT-IDEA canvas ends at an approved, implementation-ready spec (its terminal
-state). In the fused `/mindhive` pipeline that approval is the gate into execution.
-What follows is the MindHive orchestration layer — it turns the validated spec into
-finished, quality-checked work and writes the lessons back. It never re-opens the
-canvas gates; it runs only after they clear.*
-
-## Step A — Recommendation Matrix (the plugin/skill database picks the skills)
-
-Once the spec is approved, propose the most appropriate skills to execute it.
-**Load `references/recommendation-matrix.md`** and produce a matrix per candidate
-skill covering: suitability, compatibility, **measured completion rate**, risk level,
-execution speed, resource cost, and a final verdict.
-
-- **Pull the measured telemetry first — this step is mandatory:** run
-  `python -m mindhive skills stats --json` and `python -m mindhive skills recommend --json`,
-  and fill the matrix from the measured completion rates and provenance they return.
-  Model-estimated percentages are allowed **only** for never-called skills, and every
-  such figure MUST be labeled `estimated`. (`skills status` still gives the binary
-  green/red last-call view; `skills stats` gives the completion-rate history behind it.)
-- **Provenance vocabulary (use it verbatim in the matrix):** `measured` (completion rate
-  from enough recorded calls), `estimated` (breadth prior for a never-called skill),
-  `agent-assessed` (`skills record` self-grades — never present these as measured task
-  effectiveness).
-- Resolve candidate skill names **verbatim from `python -m mindhive skills list`** (the
-  live registry) or the session's available-skills list — never recommend a skill name
-  that is not present there. Ground breadth/suitability for never-called skills in
-  `python -m mindhive plugins recommend` (the breadth-scored, free-first catalog).
-- For each candidate, run `python -m mindhive recall "<skill name>"` to surface prior
-  outcomes, and **if it shows red or has an open incident, read its lesson with
-  `rules show "skill:<name>"`** and reflect it in the verdict.
-- **Overlap tie-break** (matches the engine in `src/mindhive/recommend.py`): when two
-  skills overlap for one need, prefer (1) the higher **measured completion rate** —
-  measured always beats unmeasured; (2) **description clarity** — an explicit "use when"
-  trigger, then the shorter, less ambiguous description; (3) the longer **failure-free
-  completion streak**. List the losers as alternatives, not separate recommendations.
-- **Execution mode (learning-gated, from `skills recommend --json`):** every entry
-  carries `execution_mode`. `auto` = proven track record (measured ≥3 calls, completion
-  rate ≥ 0.8, no open incident) — apply it during the task without asking. `suggest` =
-  unproven (above all a never-used skill) — propose it and wait for the user's approval
-  before invoking. Never auto-apply a `suggest`-mode skill, and say which mode applied.
-- **Discontinued skills:** the payload's `discontinued` list names skills stopped by the
-  improvements linkage (an active `skill:*` prevention rule plus a trailing failure
-  streak). Do not invoke or recommend them; if one would otherwise be the best fit,
-  surface its rule text and offer the alternatives. They return when the incident
-  resolves or a successful call breaks the streak.
-- Present the matrix, state your recommended selection, and get the user's approval (or
-  revision) before executing — `auto`-mode selections may proceed without a blocking
-  question, but still announce them.
-
-## Step B — Execute, then chain
-
-Execute through the selected skill(s) by invoking them with the Skill tool (or, when
-the run should be MindHive-driven, `skills invoke` — see Step C). When execution
-finishes, **do not stop** — proactively recommend the follow-up chain that
-guarantees quality:
-
-| Work just done | Recommended follow-up skills (resolve against `skills list`) |
-|----------------|--------------------------------------------------------------|
-| New/changed code | a code-review skill (e.g. `compound-engineering:ce-code-review`), `compound-engineering:ce-simplify-code` |
-| Auth / payments / input handling / external APIs | a security skill (e.g. `security-scanning:security-sast`, `compound-engineering:ce-security-reviewer`) |
-| Bug-shaped or flaky behavior | `compound-engineering:ce-debug`, `superpowers:systematic-debugging` |
-| UI / frontend | `compound-engineering:ce-test-browser`, `ui-design:accessibility-audit` |
-| About to ship | `compound-engineering:ce-commit-push-pr` |
-
-Give a one-line **rationale** for each follow-up (why it refines the architecture or
-de-risks the deployment). Recommend; let the user choose which to chain.
-
-## Step C — Invoke through MindHive (green/red + self-healing)
-
-Any installed skill is callable **through MindHive**, not just a hand-picked few. When
-execution should be driven by MindHive itself (e.g. inside `/circle` or a headless run
-where the dashboard shows live status), use the invoke channel instead of only the
-in-agent Skill tool:
-
-- **List what's callable:** `python -m mindhive skills list` — the live,
-  registry-truth inventory (updates the instant a plugin is installed/removed).
-- **Call any skill:** `python -m mindhive skills invoke <name> [--plugin <p>]`
-  — runs it via a headless `claude` and records the outcome. Exit code is `0`
-  on success, `1` on failure, so you can gate the next step on it.
-- **Check health first:** `python -m mindhive skills status` shows the last
-  outcome per skill (`ok`/`fail`). **Before deciding retry-vs-substitute on a
-  skill that shows `fail`, read its Improvements lesson**
-  (`python -m mindhive rules show "skill:<name>"`) **and consult its measured
-  record** (`python -m mindhive skills stats --json`) — a one-off blip on a
-  strong completion rate argues retry; a low rate or an open `skill:*` incident
-  argues substituting the next-ranked alternative. This is the learning loop
-  closing.
-
-Every failed invoke is written as a `tool_failed` event with a `skill:<name>`
-signature, which flows automatically into the incidents → reflect → Improvements
-pipeline. So a skill that fails or returns poorly **teaches the system a prevention
-rule**, and its dashboard indicator turns red until it succeeds again. Prefer skills
-showing green; treat red as "fix or avoid, with a reason." Point the user to the
-**dashboard** (`python -m mindhive dashboard`, Skills & plugins view) to watch this live.
-
-## Step D — Log the learnings back into MindHive
-
-After the workflow concludes, evaluate the run and write durable lessons to the ledger
-so the next `/mindhive` is smarter:
-
-- Mistake or dead-end hit → `python -m mindhive append caveat "<one line>" --tags orchestrator`
-- Inefficiency / better path discovered → `python -m mindhive append experiment_result "<one line>" --tags orchestrator`
-- New stated preference → `python -m mindhive append decision "<one line>" --tags orchestrator,preference`
-
-Only append when something **memorable** actually happened. A smooth, unremarkable run
-writes nothing — do not create noise events. End by running `python -m mindhive sync`
-so next session's briefing reflects the new lessons.
-
-## A complete worked example — `/mindhive` from idea to learned lesson
-
-To show the fusion end-to-end, here is a full run. The user types:
-
-> `/mindhive add a "resend verification email" button to the account settings page`
-
-This walks through every seam — Step 0, the recall preflight, the ULT-IDEA canvas gates,
-the Recommendation Matrix, execution, and the learning write-back — with the actual
-commands and how each result changes what you do. It is illustrative, not a script to
-run verbatim; adapt the queries and skill names to the real idea and the live registry.
-
-### 0. Resolve the interpreter (Step 0), then preflight (Requirement 1)
-
-```
-python -m mindhive state        # → "Python was not found" (Store shim) → fall through
-C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive state   # → prints STATE.md ✓
-```
-The venv form works, so that prefix is used for everything below. STATE shows the active
-task and no open questions about email — nothing pre-answered yet. Now recall the topic:
-
-```
-… -m mindhive recall "verification email resend"
-… -m mindhive recall "email delivery" --semantic
-… -m mindhive graph related "account settings" --depth 1
-```
-Suppose `recall` returns a `caveat` snippet: *"SMTP provider rate-limits resends to 1/min;
-a prior naive resend button triggered a lockout."* and `graph related` returns the file
-`account/settings_view.py` plus a decision *"verification tokens expire in 30 min."*
-**This is the whole point of the fusion:** before asking the user anything, you already
-know (a) there is a rate-limit landmine, (b) which file owns the behavior, and (c) the
-token lifetime. You will *not* ask "how often can users resend?" — the ledger answered it.
-
-### 1. ULT-IDEA canvas — validate, don't just build
-
-- **Diagnose scope (1.0):** a single button on an existing page → **Lightweight system.**
-  Skip Phase 2's full review; do a brief Phase 2.5; run Phase 3. Ask the user only the one
-  genuinely user-owned question the ledger didn't settle (e.g. *"Should the button be
-  disabled with a countdown after a send, or show a 'try again in 1 min' message?"*),
-  leading with your recommended answer (countdown — it makes the rate-limit visible).
-- **Five-gap pressure test (1.2):** Evidence and Counterfactual are already filled from
-  recall (there was a prior attempt; the current workaround is "email support"). You
-  confirm the Specificity and Attachment gaps briefly with the user.
-- **Requirements doc (1.6):** write it, calling out the rate-limit as a hard constraint and
-  the 30-min token expiry as a dependency — both lifted from the ledger, not guessed.
-- **Phase 2.5 (brief):** approval gate = "sending an email is High-stakes / Hard-to-reverse
-  → the button must debounce and respect the 1/min server limit." Context injection: none new.
-- **Phase 3:** sharpen "resend" (does it mint a *new* token or re-send the *existing* one?
-  → new token, old invalidated — lock it in CONTEXT.md). Cross-reference the code:
-  `graph related` already handed you `account/settings_view.py`; open it and confirm the
-  existing send path. Testing strategy: capability (button sends), edge case (spam-click →
-  one email, countdown shown), integration (new token validates, old one 401s).
-- **HARD-GATE:** present the spec, get explicit approval. **No skill is invoked before this.**
-
-### 2. Recommendation Matrix — grounded in the plugin/skill DB
-
-```
-… -m mindhive skills list              # candidate names must come from here
-… -m mindhive skills stats --json      # measured completion rates (the matrix backbone)
-… -m mindhive skills recommend --json  # ranking + execution_mode + discontinued list
-… -m mindhive plugins recommend        # breadth prior, for never-called skills only
-```
-You shortlist from what's actually installed and score each — the Completion column is
-`measured` where telemetry exists and `estimated` only for a never-called skill:
-
-| Skill | Suitability | Compat | Completion | Mode | Risk | Speed | Cost | Verdict |
-|-------|-------------|--------|------------|------|------|-------|------|---------|
-| `compound-engineering:ce-work` | High | High | 0.86 (measured, 14 calls) | `auto` | Local | Moderate | Heavy | **Use** — proven; apply without a blocking question |
-| `compound-engineering:ce-code-review` | High | High | 0.90 (measured, 22 calls) | `auto` | None | Fast | Moderate | **Use as follow-up** — verify the debounce |
-| `security-scanning:security-sast` | Medium | High | 75% (estimated) | `suggest` | None | Moderate | Moderate | **Use as follow-up** — never-called here, so propose and wait |
-
-If `skills stats` had shown `ce-work` with a low rate or an open incident, you'd run
-`… -m mindhive rules show "skill:compound-engineering:ce-work"`, and either apply its rule
-(one-off blip on a strong rate → retry) or substitute the next-ranked alternative (low
-rate → switch). Present the matrix; `auto`-mode picks proceed announced, `suggest`-mode
-picks wait for the user's approval.
-
-### 3. Execute, then chain
-
-Invoke the chosen skill (Skill tool in-session, or through MindHive when it should be
-driven headlessly and watched on the dashboard):
-```
-… -m mindhive skills invoke ce-work --plugin compound-engineering    # exit 0 = ok
-```
-Because the change touches auth tokens and sends email, you proactively recommend the
-follow-up chain from Step B: a **code-review** pass (verify the debounce and the
-old-token invalidation) and a **security** pass (token minting). Each with a one-line
-rationale. The user picks both; you invoke them the same way and gate on exit codes.
-
-### 4. Log the learnings back
-
-The run surfaced one genuinely memorable thing — the ledger's rate-limit caveat saved a
-re-discovery — and one new preference. Write them and sync:
-```
-… -m mindhive append experiment_result "recall surfaced the SMTP 1/min rate-limit caveat; designed the debounce up front instead of hitting the lockout again" --tags orchestrator,email
-… -m mindhive append decision "Preference: resend mints a new token and invalidates the old one" --tags orchestrator,preference
-… -m mindhive sync
-```
-Now the *next* `/mindhive` that touches email starts one step smarter — which is exactly
-the compounding the fusion exists to produce. Had the run been unremarkable, you'd write
-nothing.
-
-### What this example demonstrates about the fusion
-
-- **Requirement 1 in action:** three preflight commands answered three interview questions
-  *before* the user was asked anything.
-- **The plugin/skill DB, not intuition,** produced the candidate list and the tie-breaks.
-- **The learning loop** both *fed* the run (the rate-limit caveat) and was *fed by* it (the
-  new preference) — the arc from "The learning loop in depth" closed in a single session.
-- **ULT-IDEA's rigor was untouched:** scope diagnosis, five gaps, HARD-GATE, CONTEXT.md,
-  and testing all ran; MindHive just made each step faster and memory-aware.
-
-## Parallel dispatch and dynamic workflows
-
-The orchestrator is the top orchestration layer: it groups the work, classifies
-each piece's complexity, and then **executes in parallel whenever the pieces
-are independent** — sequential execution is reserved for genuinely dependent
-stages, never chosen out of convenience.
-
-- **Fan out independent tasks.** When selected work splits into units that
-  touch disjoint files/modules (e.g. refactor one module, run integration
-  tests, audit security in another), dispatch them concurrently — subagents
-  via the platform's subagent primitive (`Agent`/`Task` in Claude Code), or
-  concurrent `hive loop` runs (one task dir per unit; every run shows up
-  separately in the dashboard's **Oversee** section). Before fanning out,
-  check the units' file sets for overlap — overlapping units run sequentially.
-- **Dependent stages get evaluation checkpoints.** When stage 2 needs stage
-  1's output, run them in order and verify each boundary: build/tests pass,
-  the artifact exists, the assumption still holds. On failure, **read the
-  failure log (stack trace) yourself, re-verify your assumptions, and fix it
-  without new instructions from the user** — the loop's circuit breaker and
-  budget gates bound the retries, so never bounce the first hurdle back to
-  the user.
-- **Model routing applies per unit:** lightweight analysis does not need a
-  flagship model — `hive loop` routes tiers automatically when no model is
-  pinned; match that spirit when choosing subagent models.
-
-## Non-conflict protocol (coordinator, not competitor)
-
-The orchestrator is the session's **primary coordinator**. It never
-re-implements another skill's job — planning, coding, review, and debugging
-belong to the skills it selects and chains.
-
-- **When another skill is already active or invoked in the session**, the
-  orchestrator restricts itself to **selection, sequencing, and ledger
-  write-back**. It does not duplicate, wrap, or second-guess the running
-  skill's work.
-- **Single-writer rule:** only the orchestrator appends `decision` /
-  `experiment_result` events about skill choice. Executed skills own their own
-  domain events; the orchestrator owns the record of *why* a skill was picked.
-- **Real-time write-through (the learning loop's heartbeat):** IMMEDIATELY
-  after each executed skill completes, record the outcome —
-  `python -m mindhive skills record <name> --ok|--fail [--note "..."]` —
-  before starting the next step. These records feed the measured completion
-  rates Phase 2 runs on; skipping one starves the next run's matrix.
-- After recording, re-surface what to run next from refreshed data:
-  `python -m mindhive skills recommend --top 3 --brief`.
-
-## Context management: monitor and hand off at ~50%
-
-At **every phase boundary** (including the canvas phase boundaries), estimate context
-consumption heuristically (tool-call volume, files read, phases completed, any harness
-compaction notices). When the estimate reaches roughly **50%** of the window, **halt,
-alert the user, and request permission to hand off** — do not silently push on. **Load
-`references/handoff-protocol.md`** for the alert wording and the approved-handoff
-sequence (`export` → append open threads → print resume instructions). The existing
-PreCompact hook remains the hard backstop; this heuristic is a courtesy checkpoint.
-
-## Notes & guardrails
-
-- This skill runs the ULT-IDEA canvas to produce a validated spec, then **orchestrates
-  skills already installed on this machine** to execute it. It does not install or
-  author new skills.
-- It never disturbs the V17 live-trading setup or the `~/.mindhive/LIVE_LOCK` guard — if
-  a chained skill would run the loop, that skill's own guards apply, and you never pass
-  `--force` to defeat the guard on the user's behalf.
-- Matrix percentages come from the **measured telemetry backend**
-  (`python -m mindhive skills stats --json` / `skills recommend --json`). A model
-  estimate appears only for a never-called skill and is always labeled `estimated` —
-  never presented as a measured rate. (`skills status` remains the binary green/red
-  last-call view; `skills stats` is the completion-rate telemetry.)
-- **ULT-IDEA is preserved in full** in the canvas above; the MindHive integration is
-  additive (`⬡` hooks + this execution layer). Nothing from ULT-IDEA was removed.
+**Last Updated:** 2026-07-14
