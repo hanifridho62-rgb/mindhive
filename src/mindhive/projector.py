@@ -1,6 +1,6 @@
 # src/mindhive/projector.py
 import hashlib
-from . import paths, events, chain, review, incidents, reflect
+from . import paths, events, chain, review, changelog, incidents, reflect
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
@@ -15,7 +15,7 @@ def _ts_compact(ts: str) -> str:
     return ts.replace("-", "").replace(":", "").replace("T", "-").rstrip("Z")
 
 
-def build_state(evs, pending=None, health_note="") -> str:
+def build_state(evs, pending=None, health_note="", changelog_pending=None) -> str:
     latest_state = None
     last_decision = None
     for ev in evs:
@@ -30,6 +30,11 @@ def build_state(evs, pending=None, health_note="") -> str:
     note = review.notice(pending)
     if note:
         out.append(note)
+    # Unlogged-code-changes gate rides just below it: the change-log entry is
+    # mandatory before the work is called done (see changelog.py).
+    cl_note = changelog.notice(changelog_pending)
+    if cl_note:
+        out.append(cl_note)
     # Reflection-health warning (one line, KTD3): auto-reflection failing for
     # too long must be visible, not silent.
     if health_note:
@@ -115,7 +120,8 @@ def compose_state(evs, project=None, include_rules=True, suggestions=None) -> st
     explicit str (possibly "") -> use as-is, so a caller composing the state
     twice per pass (sync) runs the recommend chain exactly once."""
     body = build_state(evs, pending=review.load_pending(project),
-                       health_note=reflect.health_note(project))
+                       health_note=reflect.health_note(project),
+                       changelog_pending=changelog.load_pending(project))
     if include_rules:
         # Promoted (proven-permanent) rules ride FIRST — SOUL.md is only
         # meaningful if every session actually re-reads it.
@@ -138,6 +144,12 @@ def build_ledger_entries(evs):
         if ev.type not in LEDGER_TYPES:
             continue
         body = ev.payload.get("text", "") if isinstance(ev.payload, dict) else str(ev.payload)
+        if ev.type == "code_change" and isinstance(ev.payload, dict):
+            # An audit entry is more than its prose: category and affected
+            # files must survive into the projected LEDGER/export markdown.
+            files = ev.payload.get("files") or []
+            body = (f"[{ev.payload.get('category', '')}] {body}\n\n**Files:**\n"
+                    + "\n".join(f"- {f}" for f in files))
         fname = f"{_ts_compact(ev.ts)}-{ev.type}-{_short(ev.ts + ev.type + body)}.md"
         content = (f"---\nts: {ev.ts}\ntype: {ev.type}\n"
                    f"tags: {','.join(ev.tags)}\nsession: {ev.session_id}\n---\n\n{body}\n")

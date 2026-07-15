@@ -89,6 +89,51 @@ def test_graph_endpoint_returns_html(dashboard_server):
     assert "<html" in body.lower() and '<svg id="svg">' in body
 
 
+def test_changelog_endpoint_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/changelog")  # no token
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_changelog_endpoint_returns_entries_and_pending(dashboard_server):
+    from mindhive import changelog, events
+    base, token = dashboard_server
+    # empty store: no entries, no pending marker; categories always served
+    # so the UI never hardcodes the taxonomy
+    status, body = _get(base, "/api/changelog", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["entries"] == [] and obj["pending"] is None
+    assert obj["categories"] == ["update", "minor_change", "deletion",
+                                 "reduction", "major_change", "replacement"]
+    # one recorded entry + a pending marker for an unlogged touch
+    changelog.record("replacement", "swapped the exporter implementation",
+                     files=["src/mindhive/export.py"], session_id="s1")
+    events.append_event("file_touched", {"text": "/repo/src/mindhive/late.py"},
+                        session_id="s2", ts="2026-07-15T11:00:00Z")
+    changelog.queue(events.read_all(), session_id="s2")
+    status, body = _get(base, "/api/changelog", token)
+    obj = json.loads(body)
+    assert len(obj["entries"]) == 1
+    e = obj["entries"][0]
+    assert e["category"] == "replacement"
+    assert e["files"] == ["src/mindhive/export.py"]
+    assert obj["pending"]["files"] == ["/repo/src/mindhive/late.py"]
+
+
+def test_served_page_contains_log_view_hook(dashboard_server):
+    # The CLAUDE.md restart check greps the served page for view hooks —
+    # showLog must be present alongside showOversee.
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "showLog" in body
+    assert "/api/changelog" in body
+
+
 def test_overview_endpoint_returns_stats(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/api/overview", token)

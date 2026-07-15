@@ -28,6 +28,10 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive review queue [--session id]` — queue the session's touched source files for a thermo-nuclear review (run by `session_end`; writes the pending-review marker)
 - `hive review show` — print the pending-review marker, if any
 - `hive review clear` — clear the pending-review marker once the review has run
+- `hive log <category> "<explanation>"` — record a **mandatory** code change-log entry for the current change-set (categories: `update`, `minor_change`, `deletion`, `reduction`, `major_change`, `replacement`; files auto-detected, `--files` to override). Entries are `code_change` events shown in the dashboard's **Log** section
+- `hive log queue [--session id]` — queue the session's unlogged source files (run by `session_end`; writes the pending-changelog marker whose notice blocks STATE.md until the entry is recorded)
+- `hive log show` — print change-log entries, newest first
+- `hive log pending` — print the pending unlogged-changes marker, if any
 - `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain

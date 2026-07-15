@@ -117,6 +117,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
     <button onclick="showImprovements(true)">Improvements</button>
+    <button onclick="showLog()">Log</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -776,6 +777,40 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
+
+  // --- mandatory code change-log (Log view) ---
+  function logBadge(cat){
+    const colors = {update:'#4a90d9', minor_change:'#6aa84f', deletion:'#d94a4a',
+                    reduction:'#d9a44a', major_change:'#b04ad9', replacement:'#4ad9c8'};
+    const c = colors[cat] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(cat||'?')+'</span>';
+  }
+  async function renderLog(){
+    const res = await apiGet('/api/changelog');
+    if (!res || !Array.isArray(res.entries)) throw new Error((res && res.error) || 'changelog fetch failed');
+    const pend = res.pending && res.pending.files && res.pending.files.length
+      ? '<div class="row"><span class="pill" style="color:#e0a030;border-color:#a67a20">'
+        + '\\u26a0 ' + res.pending.files.length + ' unlogged file(s) \\u2014 record the mandatory entry: '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code></span></div>'
+      : '';
+    if (!res.entries.length){
+      showHTML(pend + '<h2 class="h">No change-log entries yet \\u2014 every change to '
+        + 'mindhive code must be recorded with '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code> ('
+        + esc((res.categories || []).join(', ')) + ').</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(pend + '<h2 class="h">'+res.entries.length+' change-log entr'
+      + (res.entries.length===1?'y':'ies')+'</h2>'
+      + '<ul class="hits">' + res.entries.map(e =>
+        '<li><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
+        + ((e.files||[]).length ? '<div class="snip">'+(e.files||[]).map(esc).join(' \\u00b7 ')+'</div>' : '')
+        + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+        + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
+      + '</ul>');
+  }
+  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }
   function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
