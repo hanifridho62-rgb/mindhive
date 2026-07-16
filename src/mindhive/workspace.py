@@ -198,10 +198,79 @@ def auth_status_all() -> dict:
             "auth": [profile_auth_status(e["name"]) for e in load_profiles()]}
 
 
+# --- authoritative auth: ask the CLI itself (no tokens spent) ---------------
+# `claude auth status --json` answers from the CLI's own credential machinery,
+# so "ok" here means a headless run will actually authenticate — including the
+# case the file heuristic can't see: an expired access token the CLI refreshes
+# transparently on use. It costs a subprocess (~1-2s), so verify_auth() caches
+# it and the cheap file heuristic stays the polling path.
+
+AUTH_VERIFY_TIMEOUT_S = 20
+_AUTH_CACHE: dict = {}               # profile -> (checked_epoch, status dict)
+_AUTH_CACHE_TTL_S = 60.0
+_AUTH_CACHE_LOCK = threading.Lock()
+
+
+def cli_auth_status(profile: str = "default",
+                    timeout_s: float = AUTH_VERIFY_TIMEOUT_S) -> dict:
+    """Ground-truth auth for one profile via ``claude auth status --json``
+    under its CLAUDE_CONFIG_DIR. States: ``ok`` (logged in, with the account
+    email + plan), ``none`` (not logged in), ``error`` (CLI missing/timed
+    out/unparseable — the caller falls back to the file heuristic)."""
+    env = _profile_env(profile)
+    env["MINDHIVE_HEADLESS"] = "1"    # hooks must never fire off a status probe
+    try:
+        proc = subprocess.run(
+            [claude_cli.resolve_exe(), "auth", "status", "--json"],
+            capture_output=True, text=True, timeout=timeout_s, env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        st = json.loads((proc.stdout or "").strip())
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return {"profile": profile, "state": "error", "source": "cli",
+                "detail": f"could not verify with the claude CLI: {e}"}
+    if not isinstance(st, dict):
+        return {"profile": profile, "state": "error", "source": "cli",
+                "detail": "claude auth status returned no JSON object"}
+    if st.get("loggedIn"):
+        email = str(st.get("email") or "")
+        sub = str(st.get("subscriptionType") or "account")
+        return {"profile": profile, "state": "ok", "source": "cli",
+                "email": email, "subscription": sub,
+                "detail": f"connected as {email or 'account'} ({sub})"}
+    return {"profile": profile, "state": "none", "source": "cli",
+            "detail": "not logged in — press Connect to sign in via "
+                      "your browser"}
+
+
+def verify_auth(profile: str = "default", force: bool = False) -> dict:
+    """Authoritative, cached verification: the CLI itself always answers (it
+    can refresh a refreshable token and it knows the account identity, so
+    "connected as <email>" renders in every state — a file-heuristic fast path
+    would drop the email whenever the credential file happened to look fresh).
+    The file heuristic is only the fallback when the CLI is unavailable. The
+    verdict is cached for ``_AUTH_CACHE_TTL_S`` so the dashboard can call this
+    freely; ``force`` skips the cache (the re-check after a Connect click)."""
+    with _AUTH_CACHE_LOCK:
+        hit = _AUTH_CACHE.get(profile)
+        if hit and not force and time.time() - hit[0] < _AUTH_CACHE_TTL_S:
+            return dict(hit[1])
+    out = cli_auth_status(profile)
+    if out["state"] == "error":
+        # CLI unavailable — the file heuristic is the best remaining answer,
+        # with the CLI failure noted so the UI can say why identity is missing
+        out = dict(profile_auth_status(profile), source="file",
+                   cli_error=out["detail"])
+    with _AUTH_CACHE_LOCK:
+        _AUTH_CACHE[profile] = (time.time(), dict(out))
+    return dict(out)
+
+
 def profile_login(profile: str = "default") -> dict:
-    """Open a console on the user's desktop running the interactive `claude`
-    CLI under this profile's CLAUDE_CONFIG_DIR. Logging in is the user's own
-    act (OAuth in their browser) — MindHive only opens the right door."""
+    """Zero-typing sign-in: open a console running ``claude auth login`` under
+    this profile's CLAUDE_CONFIG_DIR. The CLI drives the OAuth flow itself —
+    the browser opens on the claude.ai account the user is already signed into
+    and one Approve click connects it. Nothing to type, no /login. Logging in
+    stays the user's own act; MindHive only starts the flow."""
     profile = (profile or "default").strip()
     # Only launch for a real, name-validated profile: the name is interpolated
     # into the cmd string below, so an unchecked value (e.g. 'x & calc') would
@@ -215,21 +284,26 @@ def profile_login(profile: str = "default") -> dict:
     new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     if not new_console:
         return {"ok": False, "error":
-                "interactive login console is Windows-only — run `claude` "
-                "with CLAUDE_CONFIG_DIR set and type /login"}
+                "browser sign-in console is Windows-only — run `claude auth "
+                "login` with CLAUDE_CONFIG_DIR set instead"}
     exe = claude_cli.resolve_exe()
     # Pass CLAUDE_CONFIG_DIR through the child environment, never as a shell
     # `set` command — a config_dir with shell metacharacters can't reach cmd.
     env = _profile_env(profile)
-    cmdline = (f'echo [MindHive] profile "{profile}" - type /login to '
-               f'authenticate, then accept the trust dialog && "{exe}"')
+    cmdline = (f'echo [MindHive] connecting account "{profile}" - your browser '
+               f'will open; approve the sign-in there (nothing to type here) '
+               f'&& "{exe}" auth login')
     try:
         subprocess.Popen(["cmd", "/k", cmdline], env=env,
                          creationflags=new_console)
     except OSError as e:
         return {"ok": False, "error": str(e)}
+    # a fresh login invalidates whatever verify_auth remembered
+    with _AUTH_CACHE_LOCK:
+        _AUTH_CACHE.pop(profile, None)
     return {"ok": True, "detail":
-            f"login console opened for profile {profile} — type /login there"}
+            f"browser sign-in started for {profile} — approve it in the "
+            "browser, nothing to type"}
 
 
 _TRUST_LOCK = threading.Lock()
@@ -910,6 +984,12 @@ def api_post(action, proj=None, body=None) -> dict:
         return remove_profile(body.get("name", ""))
     if action == "profile_login":
         return profile_login(body.get("name", "default"))
+    if action == "auth_verify":
+        # POST (not GET): may spawn one `claude auth status` subprocess. The
+        # 60s cache absorbs page-load bursts; force=true is the post-Connect
+        # re-check.
+        return {"ok": True, **verify_auth(body.get("name", "default"),
+                                          force=bool(body.get("force")))}
     if action == "profile_trust":
         return profile_trust(body.get("name", "default"),
                              body.get("folder") or _folder_for_project(proj))

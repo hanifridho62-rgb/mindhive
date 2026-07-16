@@ -64,8 +64,15 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 "total_cost_usd": 0.0, "total_tokens": 0, "last_event_ts": e.ts,
                 "ended": False, "doing": None, "done": [], "planned": [],
                 "not_yet": [], "files": [], "task": "",
+                # provenance: Self-Reliant runs log into research-<id> streams;
+                # the label rides the card so Oversee shows whose work this is
+                # (filled by the per-event pass below — same idiom as
+                # dashboard._get_sessions)
+                "origin": None,
             }
             order.append(sid)
+        if not s["origin"]:              # any event may carry the tag
+            s["origin"] = ev_mod.origin_of(sid, e.tags)
         if e.type in _ACTIVITY_TYPES or e.type == "session_end":
             s["last_event_ts"] = e.ts
         if e.type == "session_end":
@@ -114,7 +121,12 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             continue
         s["online"] = (now - last) < online_seconds
         if not s["title"]:
-            s["title"] = s["task"] or f"session {sid[:12]}"
+            # research streams have no user_prompt to title from — name the run
+            s["title"] = s["task"] or (
+                f"Self-Reliant run {sid[len(ev_mod.SELF_RELIANT_SESSION_PREFIX):]}"
+                if s.get("origin") == ev_mod.SELF_RELIANT_TAG
+                and sid.startswith(ev_mod.SELF_RELIANT_SESSION_PREFIX)
+                else f"session {sid[:12]}")
         files = s.pop("files")
         s["done"] = s["done"][-_DONE_CAP:] + [f"touched {p}" for p in files[-_DONE_CAP:]]
         s["planned"] = s["planned"][-_DONE_CAP:]

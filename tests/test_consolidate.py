@@ -125,6 +125,14 @@ def test_opposite_polarity_memos_never_merge():
     assert "do not deploy" in text
 
 
+def test_audit_artifact_types_are_exempt_from_consolidation():
+    # change-log entries and Self-Reliant PRDs are audit trails: two
+    # similar-sounding entries are genuinely distinct and must never merge
+    assert "code_change" not in consolidate.CONSOLIDATE_TYPES
+    assert "learning" not in consolidate.CONSOLIDATE_TYPES
+    assert "learning" in events.SEMANTIC_TYPES
+
+
 def test_memory_md_digest_excludes_absorbed(tmp_path):
     from mindhive import sync as sync_mod
     events.append_event("caveat", {"text": "watch the flaky reconnect path"},
