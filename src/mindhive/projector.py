@@ -1,6 +1,6 @@
 # src/mindhive/projector.py
 import hashlib
-from . import paths, events, chain, review, changelog, incidents, reflect
+from . import paths, events, chain, review, changelog, incidents, reflect, sop
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
@@ -131,6 +131,13 @@ def compose_state(evs, project=None, include_rules=True, suggestions=None) -> st
         block = incidents.inject(project, evs=evs)
         if block:
             body = body + "\n" + block + "\n"
+    # SOPs ride BOTH variants (unlike rules): sync embeds the
+    # include_rules=False state body into MEMORY.md and appends the rules
+    # block separately, so gating SOPs on include_rules would drop them from
+    # the one file every session auto-loads.
+    sop_block = sop.block(evs)
+    if sop_block:
+        body = body + "\n" + sop_block + "\n"
     sugg = (suggested_skills_block(project, evs=evs)
             if suggestions is None else suggestions)
     if sugg:
@@ -150,6 +157,10 @@ def build_ledger_entries(evs):
             files = ev.payload.get("files") or []
             body = (f"[{ev.payload.get('category', '')}] {body}\n\n**Files:**\n"
                     + "\n".join(f"- {f}" for f in files))
+        elif ev.type == "sop" and isinstance(ev.payload, dict):
+            # Action, id, and title must survive into the LEDGER entry so
+            # keyword recall can find a procedure by any of them.
+            body = sop.ledger_body(ev.payload)
         fname = f"{_ts_compact(ev.ts)}-{ev.type}-{_short(ev.ts + ev.type + body)}.md"
         content = (f"---\nts: {ev.ts}\ntype: {ev.type}\n"
                    f"tags: {','.join(ev.tags)}\nsession: {ev.session_id}\n---\n\n{body}\n")
