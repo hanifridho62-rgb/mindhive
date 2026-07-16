@@ -153,15 +153,18 @@ def test_gate_survives_unrelated_later_session(tmp_path):
 
 
 def test_carried_over_debt_clears_once_covered(tmp_path):
-    # A carried-forward file drops out when an entry recorded after the
+    # A carried-forward file drops out when an entry recorded at-or-after the
     # marker's creation covers it — even if the covering entry was appended
-    # without record() (which clears the marker itself).
+    # without record() (which clears the marker itself). The covering ts is
+    # derived from the marker, not a wall-clock literal: markers stamp real
+    # now(), so a hardcoded date ages out and starts failing once the suite
+    # runs past it.
     a = _touch("src/mindhive/a.py", tmp_path, session="s1")
-    changelog.queue(events.read_all(), session_id="s1")
+    marker = changelog.queue(events.read_all(), session_id="s1")
     events.append_event("code_change",
                         {"text": "covered by a later direct entry",
                          "category": "update", "files": [a]},
-                        session_id="manual", ts="2026-07-15T23:59:00Z")
+                        session_id="manual", ts=marker["created_at"])
     assert changelog.queue(events.read_all(), session_id="s2") is None
     assert changelog.load_pending() is None
 

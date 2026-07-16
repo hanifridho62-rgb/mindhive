@@ -1763,3 +1763,99 @@ def test_improvements_carry_triage_marks(dashboard_server):
     assert a["resolution"] == "unresolved"
     assert a["triage"] == "claude"
     assert a["triage_hint"]
+
+
+# --- Self-Reliant provenance labels across the four sections ------------------
+
+def test_memory_items_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("learning", {"text": "Self-Reliant learning 1: PRD"},
+                    session_id="research-ab12cd34",
+                    tags=["self-reliant", "learning"], project="test")
+    ev.append_event("decision", {"text": "plain decision"},
+                    session_id="sess-1", project="test")
+    status, body = _get(base, "/api/memory?project=test", token)
+    items = {m["text"]: m for m in json.loads(body)}
+    assert items["Self-Reliant learning 1: PRD"]["origin"] == "self-reliant"
+    assert items["plain decision"]["origin"] is None
+
+
+def test_sessions_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("experiment_result", {"text": "Self-Reliant experiment 1"},
+                    session_id="research-ab12cd34", tags=["self-reliant"],
+                    project="test")
+    ev.append_event("decision", {"text": "one"}, session_id="sess-1",
+                    project="test")
+    status, body = _get(base, "/api/sessions?project=test", token)
+    sessions = {s["session_id"]: s for s in json.loads(body)}
+    assert sessions["research-ab12cd34"]["origin"] == "self-reliant"
+    assert sessions["sess-1"]["origin"] is None
+
+
+def test_improvements_manual_notes_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("caveat", {"text": "self-reliant caveat"},
+                    session_id="research-ab12cd34", tags=["self-reliant"],
+                    project="test")
+    ev.append_event("caveat", {"text": "ordinary caveat"},
+                    session_id="sess-1", project="test")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    notes = {m["text"]: m for m in json.loads(body)["manual"]}
+    assert notes["self-reliant caveat"]["origin"] == "self-reliant"
+    assert notes["ordinary caveat"]["origin"] is None
+
+
+def test_oversee_labels_self_reliant_runs(dashboard_server):
+    base, token = dashboard_server
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("experiment_result", {"text": "Self-Reliant experiment"},
+                        session_id="research-ab12cd34", tags=["self-reliant"],
+                        ts=ts, project="test")
+    status, body = _get(base, "/api/oversee?project=test", token)
+    runs = {r["run_id"]: r for r in json.loads(body)["runs"]}
+    sr = runs["research-ab12cd34"]
+    assert sr["origin"] == "self-reliant"
+    assert sr["title"] == "Self-Reliant run ab12cd34"
+
+
+def test_page_renders_self_reliant_badge_everywhere(dashboard_server):
+    # one shared badge helper, wired into Memory, Improvements, Oversee and
+    # the Sessions cards fragment (taskview CARDS_JS is injected into the page)
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert ".pill.sr" in body                     # badge style
+    assert body.count("srPill(") >= 5             # helper + 4 call sites
+    assert "srPill(s.origin)" in body             # sessions fragment wired
+
+
+def test_research_sources_route_reports_allowlist(dashboard_server, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    from mindhive import research
+    base, token = dashboard_server
+    status, body = _get(base, "/api/research/sources", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["ok"] and obj["enabled"]
+    assert obj["domains"] == research.TRUSTED_SOURCE_DOMAINS
+
+
+def test_workspace_auth_verify_route_registered(dashboard_server, monkeypatch):
+    from mindhive import workspace
+    base, token = dashboard_server
+    monkeypatch.setattr(workspace, "verify_auth",
+                        lambda name="default", force=False:
+                        {"profile": name, "state": "ok", "detail": "connected"})
+    status, res = _post(base, "/api/workspace/auth_verify",
+                        {"name": "default"}, token)
+    assert status == 200 and res["ok"] and res["state"] == "ok"
+    # machine-level check: exempt from the HIVE MIND read-only guard
+    status, res = _post(base, "/api/workspace/auth_verify",
+                        {"name": "default", "project": "*"}, token)
+    assert status == 200 and res["ok"] and res["state"] == "ok"

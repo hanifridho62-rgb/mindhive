@@ -61,6 +61,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   .pill.est { color:#e0b341; border-color:#5a4a1f; }
   .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
   .pill.tridism { color:#8a93a6; }
+  .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -220,6 +221,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   let PROJECT = localStorage.getItem('mh_project') || '';
   let SESSION = null;
   function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+  // Provenance badge: rendered wherever a row/card carries origin:'self-reliant'
+  // (server-computed by events.origin_of, so Memory / Sessions / Improvements /
+  // Oversee can never disagree about what a Self-Reliant run produced).
+  function srPill(o){
+    return o === 'self-reliant'
+      ? ' <span class="pill sr" title="produced by a Self-Reliant run">\\u2726 self-reliant</span>'
+      : '';
+  }
   function withProj(path){
     return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
   }
@@ -320,6 +329,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
           + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
           + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
+          + srPill(m.origin)
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
   }
@@ -557,6 +567,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return '<li class="noterow" data-key="'+escAttr(noteKey(m))+'" style="cursor:pointer"><div class="file">'
       + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
       + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + srPill(m.origin)
       + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
       + '</div><div class="snip'+(open?'':' one')+'">'+esc(m.text||'')+'</div></li>';
   }
@@ -706,6 +717,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
       + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
       + esc(r.title || r.run_id)+'</span>'
+      + srPill(r.origin)
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
     const chat = r.kind === 'chat';

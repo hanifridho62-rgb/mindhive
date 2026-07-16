@@ -385,7 +385,8 @@ def make_handler(token: str):
             return self._json(dedupe.collapse([
                 {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
                  "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                 "tags": e.tags}
+                 "tags": e.tags,
+                 "origin": events.origin_of(e.session_id, e.tags)}
                 for n, e in rows
             ]))
 
@@ -422,6 +423,7 @@ def make_handler(token: str):
                     manual.append({
                         "ts": e.ts, "type": e.type, "session": e.session_id,
                         "project": n, "source": "manual", "tags": e.tags,
+                        "origin": events.origin_of(e.session_id, e.tags),
                         "text": (e.payload.get("text", "")
                                  if isinstance(e.payload, dict) else str(e.payload)),
                     })
@@ -438,9 +440,12 @@ def make_handler(token: str):
                 if s is None:
                     s = by[key] = {"session_id": e.session_id, "project": name,
                                    "events": 0, "memory": 0,
+                                   "origin": None,
                                    "first_ts": e.ts, "last_ts": e.ts, "_evs": []}
                 s["events"] += 1
                 s["_evs"].append(e)
+                if not s["origin"]:
+                    s["origin"] = events.origin_of(e.session_id, e.tags)
                 if e.type in events.MEMORY_VIEW_TYPES:
                     s["memory"] += 1
                 if e.ts and e.ts < s["first_ts"]:
@@ -918,12 +923,14 @@ def make_handler(token: str):
                     if route == "/api/project":
                         res = {n: projector.project(n) for n in _all_projects()}
                         return self._json({"ok": True, "result": res})
-                    # selftest + harvest + plugin scans are global (machine-wide,
-                    # not tied to one project); every other mutating action needs
-                    # a concrete target. The plugin handlers substitute the
-                    # default project for storage when in all-mode.
+                    # selftest + harvest + plugin scans + auth verification are
+                    # global (machine-wide, not tied to one project); every other
+                    # mutating action needs a concrete target. The plugin
+                    # handlers substitute the default project for storage when
+                    # in all-mode.
                     if route not in ("/api/selftest", "/api/harvest",
-                                     "/api/plugins/scan", "/api/plugins/autoscan"):
+                                     "/api/plugins/scan", "/api/plugins/autoscan",
+                                     "/api/workspace/auth_verify"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)
@@ -969,7 +976,7 @@ def make_handler(token: str):
             _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
         del _p
         for _p in ("page", "status", "leaderboard", "output", "learnings",
-                   "prds"):
+                   "prds", "sources"):
             _GET_ROUTES[f"/api/research/{_p}"] = _get_research
         del _p
         _POST_ROUTES = {
@@ -990,8 +997,9 @@ def make_handler(token: str):
         }
         for _p in ("spawn", "send", "run_recipe", "set_model", "stop",
                    "remove", "clear_idle", "profile_add", "profile_remove",
-                   "profile_login", "profile_trust", "board_save",
-                   "board_dispatch", "mission", "mission_stop", "command"):
+                   "profile_login", "profile_trust", "auth_verify",
+                   "board_save", "board_dispatch", "mission", "mission_stop",
+                   "command"):
             _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
         del _p
         for _p in ("start", "stop"):

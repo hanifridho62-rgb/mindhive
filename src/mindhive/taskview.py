@@ -388,6 +388,7 @@ CARDS_JS = """
       + '<div class="thead">'+badge
       + '<span class="tsid">'+(PROJECT==='*'&&s.project ? esc(s.project)+' \\u00b7 ' : '')
       + esc(s.session_id)+'</span>'
+      + srPill(s.origin)
       + '<span class="tchip">'+chipText(s.activity||{})+'</span>'
       + '<span class="tspan">'+esc(s.first_ts||'')+' \\u2192 '+esc(s.last_ts||'')+'</span>'
       + '</div>' + body + '</div>';
