@@ -29,14 +29,31 @@ def test_run_headless_builds_argv_with_resolved_exe(monkeypatch):
     captured = {}
     monkeypatch.setattr(shutil, "which",
                         lambda name: "C:/npm/claude.CMD" if name == "claude" else None)
-    monkeypatch.setattr(claude_cli.subprocess, "run",
-                        lambda argv, **kw: captured.update(argv=argv) or _Proc())
+    monkeypatch.setattr(
+        claude_cli.subprocess, "run",
+        lambda argv, **kw: captured.update(argv=argv, kw=kw) or _Proc())
     out = claude_cli.run_headless("do x")
     assert out == {"exit": 0, "stdout": '{"is_error": false, "result": "hi"}'}
     argv = captured["argv"]
     assert argv[0] == "C:/npm/claude.CMD"           # resolved, not bare "claude"
-    assert "-p" in argv and "do x" in argv
+    assert argv[-1] == "-p"
     assert "--output-format" in argv and "json" in argv
+    # The prompt rides stdin, never argv.
+    assert "do x" not in argv
+    assert captured["kw"]["input"] == "do x"
+
+
+def test_run_headless_feeds_long_prompt_via_stdin(monkeypatch):
+    """cmd.exe (hosting the Windows .CMD shim) dies at ~8k chars of command
+    line — a long prompt must never appear in argv."""
+    captured = {}
+    monkeypatch.setattr(
+        claude_cli.subprocess, "run",
+        lambda argv, **kw: captured.update(argv=argv, kw=kw) or _Proc())
+    big = "x" * 20000
+    claude_cli.run_headless(big)
+    assert all(big not in str(part) for part in captured["argv"])
+    assert captured["kw"]["input"] == big
 
 
 def test_run_headless_maps_missing_cli_to_127(monkeypatch):

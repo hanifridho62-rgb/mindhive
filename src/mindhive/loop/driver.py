@@ -39,8 +39,14 @@ def preflight(cmd: str = "claude") -> bool:
     return shutil.which(cmd) is not None
 
 
-def build_argv(cmd, prompt, loop_context, allowed_tools, output_format,
+def build_argv(cmd, loop_context, allowed_tools, output_format,
                session_id, model, permission_mode):
+    """The prompt is deliberately NOT part of argv — it is fed to the CLI via
+    stdin (see CLIDriver.run). On Windows `claude` is a .CMD shim hosted by
+    cmd.exe, which rejects command lines past ~8k chars ("The command line is
+    too long."); the memory-seeded iteration prompt is unbounded and blew that
+    limit. loop_context stays in argv: it is built from the capped briefing
+    sections, so its size is bounded by design."""
     argv = [cmd, "--output-format", output_format]
     if model:
         argv += ["--model", model]
@@ -56,7 +62,7 @@ def build_argv(cmd, prompt, loop_context, allowed_tools, output_format,
         # most-recent session in the directory).
         argv += ["--resume", session_id]
     argv += ["--append-system-prompt", loop_context]
-    argv += ["-p", prompt]
+    argv += ["-p"]      # print mode; the prompt itself arrives on stdin
     return argv
 
 
@@ -104,11 +110,12 @@ class CLIDriver:
     def run(self, prompt, loop_context, *, allowed_tools, session_id,
             model, permission_mode, timeout_s, live=False) -> DriverResult:
         output_format = "stream-json" if live else "json"
-        argv = build_argv(self.cmd, prompt, loop_context, allowed_tools,
+        argv = build_argv(self.cmd, loop_context, allowed_tools,
                           output_format, session_id, model, permission_mode)
         try:
             proc = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_s,
+                input=prompt,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired:

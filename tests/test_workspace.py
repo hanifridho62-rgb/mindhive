@@ -16,11 +16,26 @@ from mindhive import workspace
 
 # --- fakes ------------------------------------------------------------------
 
+class _FakeStdin:
+    """Records what the Manager feeds the run via stdin (the prompt)."""
+
+    def __init__(self):
+        self.data = ""
+        self.closed = False
+
+    def write(self, s):
+        self.data += s
+
+    def close(self):
+        self.closed = True
+
+
 class FakeProc:
     """Stands in for the claude subprocess: replays lines, then exits."""
 
     def __init__(self, lines, code=0):
         self.stdout = iter(lines)
+        self.stdin = _FakeStdin()
         self._code = code
         self._done = False
         self.killed = False
@@ -54,13 +69,16 @@ class Harness:
 
     def __init__(self, lines=None, code=0):
         self.calls = []          # one (argv, env, cwd) per spawn
+        self.procs = []          # the FakeProc of each spawn (stdin = prompt)
         self.events = []         # one (etype, payload, kwargs) per ledger write
         self._lines = lines if lines is not None else _stream_lines()
         self._code = code
 
         def spawn(argv, env, cwd):
             self.calls.append((argv, env, cwd))
-            return FakeProc(list(self._lines), code=self._code)
+            proc = FakeProc(list(self._lines), code=self._code)
+            self.procs.append(proc)
+            return proc
 
         def append(etype, payload, **kw):
             self.events.append((etype, payload, kw))
@@ -76,6 +94,16 @@ def _wait_settled(agent, timeout=5.0):
             return
         time.sleep(0.01)
     raise AssertionError(f"agent never settled (status={agent.status})")
+
+
+def _wait_stdin(proc, timeout=5.0) -> str:
+    """Block until the stdin feeder thread has delivered the prompt."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.stdin.closed:
+            return proc.stdin.data
+        time.sleep(0.01)
+    raise AssertionError("prompt was never fed to stdin")
 
 
 def _agent_obj(h, agent_id):
@@ -258,6 +286,22 @@ def test_send_runs_and_logs_both_sides_of_the_exchange():
     etypes = [e[0] for e in h.events]
     assert etypes == ["user_prompt", "assistant_response"]
     assert h.events[1][1]["text"] == "all done"
+
+
+def test_send_feeds_prompt_via_stdin_never_argv():
+    """Regression: the researcher's composed programs run to tens of KB, and
+    cmd.exe (hosting the Windows .CMD claude shim) rejects command lines past
+    ~8k chars — the run died with 'The command line is too long.' The prompt
+    must ride stdin; only bounded flags stay in argv."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    big = "x" * 20000
+    assert h.mgr.send(aid, big)["ok"]
+    argv = h.calls[0][0]
+    assert argv[-1] == "-p"
+    assert all(big not in str(part) for part in argv)
+    assert _wait_stdin(h.procs[0]) == big
+    _wait_settled(_agent_obj(h, aid))
 
 
 def test_send_add_dirs_grants_out_of_cwd_access():
@@ -474,9 +518,9 @@ def test_mission_spawns_coordinator_and_crew():
     assert roles == ["builder", "builder", "coordinator", "reviewer", "scout"]
     assert h.mgr.mission["mission"] == "ship the feature"
     assert h.mgr.mission["coordinator"] == res["agents"][0]["id"]
-    # every swarm agent got the mission as its first prompt
-    for argv, _env, _cwd in h.calls:
-        assert "MISSION: ship the feature" in argv[argv.index("-p") + 1]
+    # every swarm agent got the mission as its first prompt (fed via stdin)
+    for proc in h.procs:
+        assert "MISSION: ship the feature" in _wait_stdin(proc)
 
 
 def test_mission_rejects_empty_and_overflow():
@@ -814,7 +858,7 @@ def test_run_recipe_sends_enriched_prompt_with_primer(monkeypatch):
     assert res["ok"]
     _wait_settled(_agent_obj(h, aid))
     argv = h.calls[0][0]
-    prompt = argv[argv.index("-p") + 1]
+    prompt = _wait_stdin(h.procs[0])
     assert "Use the ce-plan skill" in prompt
     assert "COMMAND: build the thing" in prompt
     sysp = argv[argv.index("--append-system-prompt") + 1]
