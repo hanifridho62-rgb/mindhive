@@ -22,9 +22,17 @@ _CMD_TOOLS = ("Bash", "PowerShell")
 # user rejections/denials are NOT noise — they are judgment signal (KTD4) and
 # become `judgment:rejected:<tool>:<context-stem>` events in capture_dir.
 # Both sets matched case-insensitively as substrings.
+#
+# "[mindhive-rule]" is our OWN PreToolUse enforcement hook denying a call —
+# the rule WORKING, not a new failure (see enforce.ENFORCED_MARK). "requested
+# permissions" is the harness's permission gate mid-prompt — workflow, not a
+# coding mistake (an explicit denial still lands via _REJECTION as judgment
+# signal). Both previously hashed into unreflectable raw:* incidents.
 _INFRA_NOISE = (
     "auto mode cannot determine the safety",
     "is temporarily unavailable",
+    "[mindhive-rule]",
+    "requested permissions",
 )
 _REJECTION = (
     "the user doesn't want to proceed",
@@ -32,9 +40,17 @@ _REJECTION = (
     "the user chose not to",
 )
 
+# A failure whose ENTIRE text is a bare exit code carries no root cause at all
+# (the real error went to the console, not stderr). It buckets into one giant
+# raw:* signature that can never be reflected or resolved — pure noise that
+# drowned the Improvements view (one such bucket reached 49+ occurrences).
+_EXIT_ONLY = re.compile(r"^exit code \d+\.?$", re.IGNORECASE)
+
 
 def _is_infra_noise(text: str) -> bool:
-    low = (text or "").lower()
+    low = (text or "").lower().strip()
+    if _EXIT_ONLY.match(low):
+        return True
     return any(n in low for n in _INFRA_NOISE)
 
 

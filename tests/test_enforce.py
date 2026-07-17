@@ -156,3 +156,13 @@ def test_suggest_is_idempotent(monkeypatch):
     ])
     assert enforce.suggest("test") == ["git:worktree-locked"]
     assert enforce.suggest("test") == []              # already present, not re-added
+
+
+def test_hook_decision_reason_carries_enforced_mark():
+    """Every deny reason is tagged so the failure capture can recognize our own
+    enforcement echo and not re-ingest it as a new raw:* incident."""
+    enforce.set_enabled("test", "tool:ripgrep-timeout", True)
+    raw = json.dumps({"tool_name": "Grep", "tool_input": {"pattern": "x"}})
+    out = enforce.hook_decision(raw, project="test")
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason.startswith(enforce.ENFORCED_MARK)

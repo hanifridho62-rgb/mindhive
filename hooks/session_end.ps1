@@ -18,6 +18,10 @@ try {
     # the next session_start injects). Cheap, LLM-free; the review itself runs in
     # the next interactive session. See docs/adr/0004-*.
     & $py -m mindhive review queue --session $sid | Out-Null
+    # Queue the mandatory change-log gate the same way: unlogged source files
+    # become a pending marker whose notice rides STATE.md until `hive log
+    # <category> "…"` records the entry (see changelog.py).
+    & $py -m mindhive log queue --session $sid | Out-Null
     & $py -m mindhive project | Out-Null
     & $py -m mindhive briefing | Out-Null
     & $py -m mindhive graph build | Out-Null

@@ -49,13 +49,123 @@ def parse_reflection(text: str) -> dict:
 
 
 def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
-    """Default runner: one-shot headless `claude` call, returns the result text
-    (empty on any spawn failure or an is_error envelope)."""
-    return claude_cli.result_text(
-        claude_cli.run_headless(prompt, timeout_s=timeout_s)["stdout"])
+    """Default runner: one-shot headless `claude` call, returns the result text.
+    Raises RuntimeError carrying the REAL failure cause (quota/auth message,
+    spawn failure) so the health marker can report it — a bare "empty verdict"
+    hid a 429 weekly-limit exhaustion behind an auth-shaped warning for days."""
+    r = claude_cli.run_headless(prompt, timeout_s=timeout_s)
+    text = claude_cli.result_text(r["stdout"])
+    if text:
+        return text
+    err = claude_cli.error_text(r["stdout"])
+    if not err and r["exit"] == 127:
+        err = "claude CLI not found"
+    elif not err and r["exit"] == 124:
+        err = f"claude CLI timed out after {timeout_s}s"
+    if err:
+        raise RuntimeError(err)
+    return ""
 
 
 from . import incidents
+
+
+# --- deterministic fallback verdicts -----------------------------------------
+# The model runner is the preferred reflection engine, but it dies whole-hog on
+# an expired `claude` CLI auth (401 -> empty verdict) — which silently froze
+# the learning loop for weeks. For CURATED signature families the prevention
+# rule is mechanical and known in advance, so a template verdict is strictly
+# better than no verdict. Families with genuinely unknown root causes (raw:*,
+# judgment:*) get NO fallback — fabricating rules there would mislead.
+
+def _fb(root, lesson, rule, cat):
+    return {"root_cause": root, "lesson": lesson + " (deterministic fallback rule)",
+            "prevention_rule": rule, "task_category": cat}
+
+
+_FALLBACK_EXACT = {
+    "edit:not-read": _fb(
+        "Edit/Write was attempted on a file never Read in this session — the "
+        "harness read-gate rejects it.",
+        "A Glob or Grep hit does not satisfy the read-gate; only Read does.",
+        "Before any Edit or Write, call Read on that exact absolute path in "
+        "this session first; when editing several files, Read them all up "
+        "front in one batch, then edit.", "tool_use"),
+    "edit:string-not-found": _fb(
+        "Edit's old_string did not match the file — it was paraphrased or the "
+        "file changed after the last Read.",
+        "old_string must be copied verbatim from a fresh Read, including "
+        "whitespace and indentation.",
+        "Re-Read the target file immediately before each Edit and copy "
+        "old_string exactly from that read; if the edit still fails, shrink "
+        "old_string to a smaller unique snippet.", "tool_use"),
+    "tool:ripgrep-timeout": _fb(
+        "An unscoped Grep searched the whole tree from the root and timed out.",
+        "Unbounded repo-wide searches are the known slow path here.",
+        "Always bound Grep with a path, glob, or type filter — never run an "
+        "unscoped repo-wide pattern.", "tool_use"),
+    "read:file-too-large": _fb(
+        "Read was called on a file exceeding the harness size limit.",
+        "Whole-file reads of large artifacts always fail; ranged reads do not.",
+        "Read large files in bounded chunks using offset and limit instead of "
+        "one whole-file Read.", "tool_use"),
+    "git:worktree-locked": _fb(
+        "git worktree remove failed with Permission denied — a process still "
+        "held a handle inside the tree (common on Windows).",
+        "Plain worktree removal is unreliable on Windows while editors/AV "
+        "hold handles.",
+        "Use `git worktree remove --force <path>` from OUTSIDE the target "
+        "tree, never cd into the tree being removed, then run "
+        "`git worktree prune`.", "git_merge"),
+    "pysyntax:unterminated-string": _fb(
+        "Generated Python contained an unterminated string literal.",
+        "Multi-line strings need triple quotes or a heredoc, not escaped "
+        "single-line quoting.",
+        "Balance every quote before executing generated Python; prefer "
+        "triple-quoted strings or a heredoc for multi-line text.", "syntax"),
+    "pysyntax:other": _fb(
+        "Generated Python failed to parse (SyntaxError).",
+        "Executing unchecked generated code wastes a failure cycle.",
+        "Syntax-check generated Python (py_compile or an import smoke test) "
+        "before executing it.", "syntax"),
+}
+
+
+def fallback_verdict(signature: str) -> dict:
+    """Deterministic verdict for a curated signature family, or {} when the
+    family is unknown (raw:*/judgment:*/anything unrecognized) — the fallback
+    must never fabricate a rule for a root cause it cannot actually know."""
+    sig = str(signature or "")
+    if sig in _FALLBACK_EXACT:
+        return dict(_FALLBACK_EXACT[sig])
+    if sig.startswith("pymodule:"):
+        pkg = sig[len("pymodule:"):] or "the missing package"
+        return _fb(
+            f"Code imported '{pkg}' but it is not installed in the "
+            "environment that ran it.",
+            "Environment-dependent imports must be verified before use.",
+            f"Before running code that imports '{pkg}', verify it is "
+            "installed in the target environment (quick import check) and "
+            "install it or guard the import if not.", "dependency")
+    if sig.startswith("pscmd:"):
+        cmd = sig[len("pscmd:"):] or "that command"
+        return _fb(
+            f"'{cmd}' is not recognized by Windows PowerShell — it is a "
+            "Unix/other-shell command or is not on PATH.",
+            "PowerShell and POSIX shells do not share a command vocabulary.",
+            f"Do not call '{cmd}' in PowerShell — use the PowerShell-native "
+            "equivalent, or run it through the Bash tool instead.", "tool_use")
+    if sig.startswith("skill:"):
+        name = sig[len("skill:"):] or "that skill"
+        return _fb(
+            f"Invoking the '{name}' skill failed.",
+            "A skill that keeps failing must stop being auto-invoked until "
+            "the failure is understood.",
+            f"Before invoking '{name}' again, confirm it exists in the "
+            "installed inventory and its required inputs are provided; after "
+            "repeated failures, stop auto-invoking it and investigate.",
+            "tool_use")
+    return {}
 
 
 def _auto_section(verdict: dict) -> str:
@@ -67,16 +177,26 @@ def _auto_section(verdict: dict) -> str:
 
 def reflect_incident(signature, project=None, runner=_claude_runner) -> dict:
     """Reflect one incident: build a prompt from its Raw Signal, run the model,
-    write the Auto Evaluation section, and re-derive the Active rule."""
+    write the Auto Evaluation section, and re-derive the Active rule. When the
+    model runner fails or returns nothing usable (dead CLI, 401, timeout), a
+    deterministic fallback verdict covers the curated signature families so
+    the learning loop keeps moving without manual input."""
     d = incidents._incident_dir(project)
     path = d / f"{incidents._safe_name(signature)}.md"
     if not path.exists():
         return {"reflected": False, "reason": "no such incident"}
     secs = incidents._split_sections(path.read_text(encoding="utf-8"))
     raw = secs.get("Raw Signal", "")
-    verdict = parse_reflection(runner(build_prompt(signature, raw, [])))
+    fail_reason = "empty verdict"
+    try:
+        verdict = parse_reflection(runner(build_prompt(signature, raw, [])))
+    except Exception as e:         # keep the real cause for the health marker
+        verdict = {}
+        fail_reason = (str(e).strip() or type(e).__name__)[:160]
     if not verdict.get("prevention_rule"):
-        return {"reflected": False, "reason": "empty verdict"}
+        verdict = fallback_verdict(signature)
+    if not verdict.get("prevention_rule"):
+        return {"reflected": False, "reason": fail_reason}
     # Hold the incident write guard across re-read → replace → write → project so
     # no other writer — another thread OR another process (a `hive rules reflect`
     # CLI run, a second dashboard) — can clobber this verdict mid-flight. The
@@ -197,8 +317,8 @@ def health_note(project=None) -> str:
     err = m.get("last_error") or "unknown"
     return (f"⚠ Reflection health: auto-reflection is failing (last error: {err}; "
             f"last attempt {m.get('last_attempt')}, last success "
-            f"{m.get('last_success') or 'never'}). Check `claude` CLI auth, then "
-            f"run `hive rules reflect`.")
+            f"{m.get('last_success') or 'never'}). Check `claude` CLI auth/quota, "
+            f"then run `hive rules reflect`.")
 
 
 def _refresh_projections(project=None) -> None:
@@ -254,33 +374,65 @@ def reflect_batch(project=None, limit=3, cooldown_hours=6.0, runner=None) -> dic
             return {"reflected": 0, "attempted": 0, "skipped": "cooldown"}
         incidents.audit(project=project)
         incidents.project(project=project)
-        targets = [r["signature"] for r in incidents.summaries(project=project)
+        targets = [(r["signature"], "reflect")
+                   for r in incidents.summaries(project=project)
                    if r["status"] == "active" and r["rule_source"] == "none"]
+        # Active resolution: red leaking AUTO rules get an alternative route
+        # in the same bounded, cooldown-gated pass (attempt-capped; human
+        # rules are authoritative and never rerouted). Lazy import — resolve
+        # imports this module at load time.
+        from . import resolve as resolve_mod
+        seen = {sig for sig, _ in targets}
+        for r in resolve_mod.red_summaries(project):
+            if r.get("rule_source") == "auto" and r["signature"] not in seen \
+                    and int(r.get("reroutes") or 0) < incidents.MAX_REROUTES:
+                targets.append((r["signature"], "reroute"))
         targets = targets[:max(0, int(limit))]
         if not targets:
             return {"reflected": 0, "attempted": 0, "skipped": "nothing to reflect"}
         now = ev_mod.now_iso()
         marker.update({"cooldown_started": now, "last_attempt": now})
         write_marker(project, marker)       # consume the window BEFORE the first call
-    done, last_error = 0, ""
-    for signature in targets:
+    done, rerouted, last_error = 0, 0, ""
+    for signature, mode in targets:
         try:
-            res = reflect_incident(signature, project=project, runner=runner)
+            if mode == "reroute":
+                r = resolve_mod.reroute_incident(signature, project=project,
+                                                 runner=runner)
+                ok = bool(r.get("resolved"))
+            else:
+                r = reflect_incident(signature, project=project, runner=runner)
+                ok = bool(r.get("reflected"))
         except Exception as e:              # runner blew up: record class, keep going
-            res = {"reflected": False, "reason": type(e).__name__}
-        if res.get("reflected"):
+            r, ok = {"reason": type(e).__name__}, False
+        if ok:
             done += 1
+            rerouted += mode == "reroute"
         else:
-            last_error = res.get("reason") or "unknown"
+            last_error = r.get("reason") or "unknown"
     marker = read_marker(project)
     if done:
         marker["last_success"] = ev_mod.now_iso()
         marker["last_error"] = ""
         write_marker(project, marker)
+        try:
+            # A just-written rule whose signature already has post-activation
+            # exposure and zero leaks is proven on arrival — promote it now.
+            incidents.auto_promote(project=project)
+        except Exception:
+            pass
+        try:
+            # Nudge->enforce ladder: a rerouted signature with a matcher may
+            # have crossed the leak threshold — flip the hard-force rung too.
+            from . import enforce
+            enforce.auto_escalate(project=project)
+        except Exception:
+            pass
         _refresh_projections(project)       # rules land in the very next session
     else:
         if marker.get("cooldown_started") == now:    # CAS: our write, roll it back
             marker["cooldown_started"] = prev_cooldown
         marker["last_error"] = last_error
         write_marker(project, marker)
-    return {"reflected": done, "attempted": len(targets)}
+    return {"reflected": done - rerouted, "rerouted": rerouted,
+            "attempted": len(targets)}

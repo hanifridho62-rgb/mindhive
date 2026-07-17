@@ -107,3 +107,41 @@ def test_list_runs_progress_groups(tmp_path):
     assert "scaffold" in r["done"]
     assert r["planned"] == ["wire API"]
     assert r["not_yet"] == ["polish"]
+
+
+def test_dismissed_live_run_resurfaces_on_new_events():
+    _seed_run("aaa", 10)                                   # running
+    events.append_event("loop_run_dismissed", {"run_id": "aaa", "cause": "manual"},
+                        ts="2026-07-07T10:05:00Z")
+    hidden = state.list_runs("test", now_fn=lambda: _epoch("2026-07-07T10:06:00Z"))
+    assert hidden["runs"] == [] and hidden["dismissed"] == 1
+    # the run was actually still alive: a later iteration resurfaces it
+    events.append_event("loop_iteration", {"run_id": "aaa", "iteration": 2,
+                        "summary": "still going", "cost_usd": 0.1, "total_tokens": 50},
+                        ts="2026-07-07T10:07:00Z")
+    res = state.list_runs("test", now_fn=lambda: _epoch("2026-07-07T10:08:00Z"))
+    assert [r["run_id"] for r in res["runs"]] == ["aaa"]
+    assert res["dismissed"] == 0
+
+
+def test_online_window_uses_per_run_heartbeat():
+    events.append_event("loop_run_start",
+                        {"run_id": "aaa", "title": "T", "goal_dir": "d",
+                         "heartbeat_seconds": 3600},        # 60-min iterations
+                        ts="2026-07-07T10:00:00Z")
+    events.append_event("loop_iteration", {"run_id": "aaa", "iteration": 1,
+                        "summary": "s", "cost_usd": 0.1, "total_tokens": 10},
+                        ts="2026-07-07T10:01:00Z")
+    # 40 min after the last event: stale under the 16-min default, alive
+    # under the run's own 60-min window
+    res = state.list_runs("test", now_fn=lambda: _epoch("2026-07-07T10:41:00Z"))
+    assert res["runs"][0]["online"] is True
+
+
+def test_fix_plan_read_requires_hive_loop_dir(tmp_path):
+    stray = tmp_path / "not-a-loop-dir"
+    stray.mkdir()
+    (stray / "fix_plan.md").write_text("- [ ] should not be read\n", encoding="utf-8")
+    _seed_run("aaa", 10, goal_dir=str(stray))
+    res = state.list_runs("test", now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))
+    assert res["runs"][0]["planned"] == []

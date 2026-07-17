@@ -8,6 +8,20 @@ from . import paths
 SEMANTIC_TYPES = {
     "decision", "experiment_result", "caveat",
     "next_step", "open_question", "state_set",
+    # Mandatory code change-log: human-written, categorized explanation of a
+    # change-set touching mindhive's own code (see changelog.py). Semantic so
+    # it rides the LEDGER, hash chain, and Memory view like decisions do.
+    "code_change",
+    # Self-Reliant learn-mode report (a PRD the researcher wrote — see
+    # research._record_learning). Registered here so the write is accepted:
+    # before this entry, append_event rejected the type and _log's crash guard
+    # swallowed the error, silently dropping every PRD from the ledger.
+    "learning",
+    # Managed standard operating procedure lifecycle (add/update/delete — see
+    # sop.py). Semantic so the registry rides the LEDGER, hash chain, Memory
+    # view, and keyword recall; the current SOP set is a deterministic fold
+    # projected into STATE.md / MEMORY.md.
+    "sop",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
@@ -16,6 +30,7 @@ DETERMINISTIC_TYPES = {
     "loop_run_start", "loop_iteration", "loop_run_end", "loop_run_dismissed",
     "tool_failed", "rule_revised",
     "rule_activated", "rule_promoted", "rule_demoted", "rule_expired",
+    "rule_enforced", "rule_rerouted", "trigger_trained",
     "invoke_requested", "invoke_result", "skill_used",
     "memory_consolidated",
 }
@@ -27,6 +42,27 @@ VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 # LEDGER, the hash-chained intent layer, and the knowledge graph — but are shown
 # in the Memory view so the full exchange is visible in the hive.
 MEMORY_VIEW_TYPES = SEMANTIC_TYPES | {"user_prompt", "assistant_response"}
+
+# --- provenance: which outputs came from a Self-Reliant run ------------------
+# Self-Reliant stamps everything it writes twice: every event is tagged
+# SELF_RELIANT_TAG at append time, and every run logs into its own
+# "research-<run_id>" session stream. origin_of() is the ONE rule that turns
+# either mark into the display label, so the Memory / Sessions / Improvements /
+# Oversee sections can never disagree about what a run produced.
+SELF_RELIANT_TAG = "self-reliant"
+SELF_RELIANT_SESSION_PREFIX = "research-"
+
+
+def origin_of(session_id, tags=None):
+    """Provenance label for an event or session: ``"self-reliant"`` when it was
+    produced by a Self-Reliant run, else ``None``. Computed at read time from
+    the append-time marks — the append-only ledger is never migrated."""
+    if tags and SELF_RELIANT_TAG in tags:
+        return SELF_RELIANT_TAG
+    if isinstance(session_id, str) and \
+            session_id.startswith(SELF_RELIANT_SESSION_PREFIX):
+        return SELF_RELIANT_TAG
+    return None
 
 
 @dataclass

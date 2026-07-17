@@ -528,6 +528,44 @@ def test_call_history_empty_for_uncalled_skill():
 
 
 # --------------------------------------------------------------------------
+# Effectiveness scoring + demotion gate
+# --------------------------------------------------------------------------
+
+def test_call_counts_tallies_every_occurrence(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    from mindhive import events
+    for _ in range(3):
+        events.append_event("invoke_result", {"name": "a:x", "text": "a:x"},
+                            project="p")
+    events.append_event("tool_failed", {"signature": "skill:a:x"}, project="p")
+    assert plugins.call_counts(project="p") == {"a:x": {"ok": 3, "fail": 1}}
+
+
+def test_effectiveness_neutral_without_history():
+    plugin = {"skills": [{"name": "a:x", "trigger": "t"}]}
+    eff = plugins.effectiveness(plugin, {})
+    assert eff["calls"] == 0
+    assert eff["success_rate"] == 0.5      # Laplace prior, neutral
+    assert eff["demoted"] is False
+
+
+def test_effectiveness_demotes_repeat_failures():
+    plugin = {"skills": [{"name": "a:x", "trigger": "t"}]}
+    counts = {"a:x": {"ok": 0, "fail": 4}}
+    eff = plugins.effectiveness(plugin, counts)
+    assert eff["calls"] == 4
+    assert eff["demoted"] is True
+    assert "fail" in eff["demote_reason"]
+
+
+def test_effectiveness_scales_rank_score():
+    plugin = {"skills": [{"name": "a:x", "trigger": "t"}]}
+    good = plugins.effectiveness(plugin, {"a:x": {"ok": 8, "fail": 0}})
+    bad = plugins.effectiveness(plugin, {"a:x": {"ok": 0, "fail": 8}})
+    assert good["success_rate"] > 0.8 and bad["success_rate"] < 0.2
+
+
+# --------------------------------------------------------------------------
 # skill_stats — per-skill telemetry over skill_used / invoke_result /
 # tool_failed(skill:*) with passive-vs-explicit dedup (U5, KTD5)
 # --------------------------------------------------------------------------
@@ -660,6 +698,25 @@ def test_skill_stats_completion_rate_labels():
     _invoked_ok("s", "2026-07-01T10:00:00Z")
     st = plugins.skill_stats(project="test")["s"]
     assert "completion_rate" in st and st["completion_rate"] == 1.0
+
+
+def test_call_stats_empty_ledger():
+    assert plugins.call_stats(project="test") == {"status": {}, "counts": {}}
+
+
+def test_call_stats_counts_every_invoke_and_keeps_last_status():
+    invoker.invoke_skill("x", runner=_fail_runner, project="test")
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    invoker.invoke_skill("y", runner=_fail_runner, project="test")
+    st = plugins.call_stats(project="test")
+    assert st["counts"] == {"x": 3, "y": 1}
+    assert st["status"] == {"x": "ok", "y": "fail"}
+
+
+def test_call_status_agrees_with_call_stats():
+    invoker.invoke_skill("z", runner=_fail_runner, project="test")
+    assert plugins.call_status(project="test") == plugins.call_stats(project="test")["status"]
 
 
 def test_strip_frontmatter_returns_body_only():

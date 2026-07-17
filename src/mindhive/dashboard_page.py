@@ -9,7 +9,7 @@ document string. No sibling-module dependencies."""
 import json
 
 
-def render_page(token: str) -> str:
+def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -59,6 +59,9 @@ def render_page(token: str) -> str:
   .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
   .pill b { color:#fff; }
   .pill.est { color:#e0b341; border-color:#5a4a1f; }
+  .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
+  .pill.tridism { color:#8a93a6; }
+  .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -75,6 +78,7 @@ def render_page(token: str) -> str:
   .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
   .legitem:hover { background:#1b2540; }
   .legitem.on { background:#233; outline:1px solid #3d6; }
+  .callcount { font-size:11px; color:#9aa3b8; margin-left:3px; }
   .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid #2a5;
     color:#9f9; border-radius:6px; font-size:11px; padding:0 7px; }
   .callbtn:hover { background:#1b3a26; color:#dfffe6; }
@@ -87,9 +91,13 @@ def render_page(token: str) -> str:
   .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
   .glyph.watch { color:#e0b341; } .glyph.dis { color:#8a93a6; }
   .legend { font-size:12px; color:#9aa3b8; margin:2px 0 10px; }
+  .ovdone { color:#46c46a; font-weight:600; }
+  .ovpend { color:#8a93a6; }
+  .ovspin { color:#e0b341; display:inline-block; animation: pulse 1.6s infinite; }
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
+  /*__TASKS_CSS__*/
 </style></head>
 <body>
 <header>
@@ -110,12 +118,18 @@ def render_page(token: str) -> str:
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
     <button onclick="showImprovements(true)">Improvements</button>
+    <button onclick="showLog()">Log</button>
+    <button onclick="showSops()">SOP</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
     <button onclick="showRecall()">Recall</button>
     <button onclick="showGraph()">Graph</button>
     <button onclick="showSkillPanel()">Skill &amp; Plugin</button>
+    <div class="group">Workspace</div>
+    <button onclick="showWorkspace('parallel')">MindParallel</button>
+    <button onclick="showWorkspace('swarm')">MindSwarm</button>
+    <button onclick="showWorkspace('research')">Self-Reliant</button>
     <div class="group">Actions</div>
     <button onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
@@ -127,6 +141,7 @@ def render_page(token: str) -> str:
     <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
     <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
     <button onclick="runReflect()">Reflect (learn from failures)</button>
+    <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <section class="panel">
@@ -207,6 +222,14 @@ def render_page(token: str) -> str:
   let PROJECT = localStorage.getItem('mh_project') || '';
   let SESSION = null;
   function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+  // Provenance badge: rendered wherever a row/card carries origin:'self-reliant'
+  // (server-computed by events.origin_of, so Memory / Sessions / Improvements /
+  // Oversee can never disagree about what a Self-Reliant run produced).
+  function srPill(o){
+    return o === 'self-reliant'
+      ? ' <span class="pill sr" title="produced by a Self-Reliant run">\\u2726 self-reliant</span>'
+      : '';
+  }
   function withProj(path){
     return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
   }
@@ -307,6 +330,7 @@ def render_page(token: str) -> str:
           + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
           + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
+          + srPill(m.origin)
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
   }
@@ -337,6 +361,8 @@ def render_page(token: str) -> str:
   let IMP_QUERY = '';
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
+  let IMP_RES = 'all';             // resolution filter set by the legend glyphs
+  let IMP_TRIAGE = 'all';          // who-acts filter: all | claude | dismiss
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -355,10 +381,42 @@ def render_page(token: str) -> str:
     const g = IMP_GLYPHS[res] || IMP_GLYPHS.watching;
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
+  // legend glyphs double as one-click resolution filters (click again to
+  // clear) — the same mechanism as the Skills & plugins status legend. The
+  // second row is the WHO-ACTS axis: every card is marked either "for
+  // Claude" (pending agent work) or "dismissible" (clear it manually).
+  const TRIAGE_LEGEND = {
+    claude:  ['for Claude', 'pending agent work \\u2014 hand these to Claude to root-cause and fix'],
+    dismiss: ['dismissible', 'no agent work needed \\u2014 clear these manually with dismiss']};
+  function triagePill(t, hint){
+    if (t === 'claude')
+      return '<span class="pill triclaude" title="'+escAttr(hint||TRIAGE_LEGEND.claude[1])
+        + '">\\u26a1 for Claude</span>';
+    if (t === 'dismiss')
+      return '<span class="pill tridism" title="'+escAttr(hint||TRIAGE_LEGEND.dismiss[1])
+        + '">dismissible</span>';
+    return '';
+  }
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
-      .map(r => glyphSpan(r)+IMP_GLYPHS[r][2]).join(' \\u00b7 ')+'</div>';
+      .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
+        + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>'
+      + '<div class="legend">'+['claude','dismiss']
+      .map(t => '<span class="legitem'+(IMP_TRIAGE===t?' on':'')+'" title="click to filter \\u2014 '
+        + escAttr(TRIAGE_LEGEND[t][1])+'" onclick="setImpTriage('+escAttr(JSON.stringify(t))+')">'
+        + triagePill(t)+' '+TRIAGE_LEGEND[t][1]+'</span>').join(' \\u00b7 ')+'</div>';
   }
+  function setImpRes(r){
+    IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  function setImpTriage(t){
+    IMP_TRIAGE = (IMP_TRIAGE === t) ? 'all' : t;
+    paintImprovements();
+  }
+  // unknown resolutions render as the watching glyph, so filter them the same way
+  function resKey(a){ return IMP_GLYPHS[a.resolution] ? a.resolution : 'watching'; }
   // --- efficiency strip: failure rate (tool_failed per 100 tool actions) vs
   // the previous day / week / month / 3 months. Tiles render placeholders
   // until stats arrive, and dispositions instead of fake percentages.
@@ -442,14 +500,42 @@ def render_page(token: str) -> str:
     if (el.innerHTML !== html) el.innerHTML = html;
   }
   function lessonPills(a){
-    let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
+    let p = triagePill(a.triage, a.triage_hint);
+    p += (p ? ' ' : '') + '<span class="pill">'+esc(a.status||'?')+'</span>';
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
+    if (a.reroutes) p += ' <span class="pill" title="a previous rule failed; an '
+      + 'alternative route was deployed">rerouted \\u00d7'+a.reroutes+'</span>';
+    if (a.flag === 'reroute_exhausted')
+      p += ' <span class="pill" title="all automatic reroute attempts spent \\u2014 '
+        + 'needs a human rule">reroute exhausted</span>';
     if (!a.active_rule) p += (a.status === 'candidate'
       ? ' <span class="pill">seen '+(a.occurrences||1)+'\\u00d7 \\u2014 reflects if it recurs</span>'
       : ' <span class="pill">not yet reflected</span>');
     return p;
+  }
+  // A ready-to-paste prompt for a for-Claude card, so "hand it to Claude"
+  // is one click instead of hand-assembling context from the card.
+  function claudePrompt(a){
+    return 'MindHive incident `'+(a.signature||'')+'` ('+(a.occurrences||0)
+      + 'x, '+(a.resolution||'')+'). '
+      + (a.excerpt ? 'Error: '+a.excerpt+' ' : '')
+      + (a.lesson ? 'Lesson so far: '+a.lesson+' ' : '')
+      + (a.active_rule ? 'Current rule (leaking): '+a.active_rule+' ' : 'No rule yet. ')
+      + 'Please root-cause this and fix it (or write/repair the prevention rule).';
+  }
+  async function copyPrompt(btn){
+    const a = (IMP_ITEMS.auto||[]).find(x => x.signature === btn.dataset.sig);
+    if (!a) return;
+    try { await navigator.clipboard.writeText(claudePrompt(a)); }
+    catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = claudePrompt(a); document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    const old = btn.textContent; btn.textContent = 'copied \\u2713';
+    setTimeout(() => { btn.textContent = old; }, 1200);
   }
   function lessonCard(a, showProj){
     const head = glyphSpan(a.resolution)
@@ -457,12 +543,18 @@ def render_page(token: str) -> str:
       + esc(a.signature)+' \\u00b7 '+(a.occurrences||0)+'\\u00d7 \\u00b7 '
       + (a.sessions||0)+' session'+((a.sessions||0)===1?'':'s')
       + (a.last_seen ? ' \\u00b7 last seen '+esc(a.last_seen) : '')
+      + (a.triage === 'claude'
+         ? '<button class="mini copybtn" data-sig="'+escAttr(a.signature)
+           + '" title="copy a ready-to-paste prompt for Claude">copy prompt</button>'
+         : '')
       + (a.resolution !== 'dismissed'
          ? '<button class="mini dismissbtn" data-sig="'+escAttr(a.signature)+'">dismiss</button>'
          : '');
     let body = '';
     if (a.first_seen) body += '<div class="snip dup">first seen '+esc(a.first_seen)
-      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the rule activated' : '')
+      + ((a.leaks||0) ? ' \\u00b7 recurred '+a.leaks+'\\u00d7 since the '
+         + (a.reroutes ? 'route deployed' : 'rule activated') : '')
+      + (a.last_reroute ? ' \\u00b7 route deployed '+esc(a.last_reroute) : '')
       + '</div>';
     if (a.lesson) body += '<div class="snip"><b>Lesson:</b> '+esc(a.lesson)+'</div>';
     if (a.active_rule) body += '<div class="snip"><b>Rule:</b> '+esc(a.active_rule)+'</div>';
@@ -476,6 +568,7 @@ def render_page(token: str) -> str:
     return '<li class="noterow" data-key="'+escAttr(noteKey(m))+'" style="cursor:pointer"><div class="file">'
       + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
       + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + srPill(m.origin)
       + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
       + '</div><div class="snip'+(open?'':' one')+'">'+esc(m.text||'')+'</div></li>';
   }
@@ -496,12 +589,15 @@ def render_page(token: str) -> str:
     }
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
-      (IMP_STATUS==='all' || a.status===IMP_STATUS)
+      (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_TRIAGE==='all' || a.triage===IMP_TRIAGE)
+      && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    const notes = manual.filter(m => !q
+    // manual notes carry no resolution/triage, so any active filter shows lessons only
+    const notes = ((IMP_RES==='all' && IMP_TRIAGE==='all') ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -529,6 +625,8 @@ def render_page(token: str) -> str:
     });
     view.querySelectorAll('.dismissbtn').forEach(el =>
       el.onclick = (ev) => { ev.stopPropagation(); dismissLesson(el.dataset.sig); });
+    view.querySelectorAll('.copybtn').forEach(el =>
+      el.onclick = (ev) => { ev.stopPropagation(); copyPrompt(el); });
   }
   // Reflect keeps the Heavy confirm (token spend) but lands back on the
   // Improvements view with an inline result banner instead of confirmAction's
@@ -548,6 +646,24 @@ def render_page(token: str) -> str:
       await renderImprovements();
     });
   }
+  // Active resolution: reroute red rules whose nudge failed (and reflect the
+  // rule-less ones) so they can turn green. Same Heavy confirm + inline
+  // banner mechanism as Reflect.
+  async function runResolve(){
+    if(!confirm('Resolve red (find alternative routes for failed rules, reflect '
+      + 'missing ones) \\u2014 runs the claude CLI once per red lesson '
+      + '(a few per click). Continue?')) return;
+    liveFn = renderImprovements;
+    await run('resolving\\u2026', async () => {
+      const res = await apiPost('/api/rules/resolve', {});
+      IMP_BANNER = res.ok
+        ? ('Resolve: '+(res.rerouted||0)+' rerouted \\u00b7 '+(res.reflected||0)
+           +' reflected \\u00b7 '+(res.failed||0)+' failed \\u00b7 '
+           +(res.pending||0)+' still red')
+        : (res.error || 'resolution failed');
+      await renderImprovements();
+    });
+  }
   function onImpSearch(v){ IMP_QUERY = v; paintImprovements(); }
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
   function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
@@ -563,40 +679,37 @@ def render_page(token: str) -> str:
       + '<label>category <select id="impcat" onchange="onImpCat(this.value)"></select></label>'
       + '<label>sort <select id="impsort" onchange="onImpSort(this.value)">'+sortOpts+'</select></label>'
       + '<button id="impdir" onclick="toggleImpDir()">'+impDirLabel()+'</button>'
+      + '<button onclick="runResolve()" title="reroute red rules whose nudge '
+      + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }
 
-  // --- Sessions: the episode layer; click one to scope Memory to it ---
-  async function renderSessions(){
-    const items = await apiGet('/api/sessions');
-    if (!items.length) { showText('No sessions yet.'); return; }
-    showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
-      + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
-          + '<div class="file">'+(PROJECT==='*' && s.project ? esc(s.project)+' · ' : '')+esc(s.session_id)+'</div>'
-          + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
-          + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
-      + '</ul>');
-    view.querySelectorAll('.sessrow').forEach(el => el.onclick = () => openSession(el.dataset.sid));
-  }
+  // --- Sessions: rendered by the notification-center fragment (taskview.py).
+  async function renderSessions(){ return renderTaskCards(); }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
-  // --- Oversee: live Claude work sessions (hive loop runs) -------------
+  // --- Oversee: live Claude work — loop runs AND interactive sessions ---
   // Cards mirror the Improvements view (glyph + pills + expandable body);
-  // expansion state survives the live refresh via OV_EXPANDED.
+  // expansion state survives the live refresh via OV_EXPANDED. The expanded
+  // detail is a Claude-style task checklist (\\u2713 done, pulsing \\u25d0
+  // doing, \\u25cb pending) in the hive palette.
   let OV_DATA = null;
   const OV_EXPANDED = new Set();
   function ovStatus(r){
+    if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
     if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
     if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
     return ['\\u25a0', 'snone', r.status || 'ended'];
   }
-  function ovGroup(label, items){
-    if (!items || !items.length) return '';
-    return '<div class="snip"><b>'+label+':</b></div>'
-      + items.map(x => '<div class="snip dup">\\u2022 '+esc(x)+'</div>').join('');
+  function ovRow(glyph, cls, text, dim){
+    return '<div class="snip'+(dim?' dup':'')+'"><span class="'+cls+'">'+glyph
+      + '</span> '+esc(text)+'</div>';
+  }
+  function ovGroup(items, glyph, cls, dim){
+    return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
   }
   function ovCard(r, showProj){
     const st = ovStatus(r);
@@ -605,17 +718,23 @@ def render_page(token: str) -> str:
       + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
       + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
       + esc(r.title || r.run_id)+'</span>'
+      + srPill(r.origin)
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
+    const chat = r.kind === 'chat';
     const pills = '<span class="pill">'+esc(st[2])+'</span> '
-      + '<span class="pill">'+(r.iterations||0)+' iteration'+((r.iterations||0)===1?'':'s')+'</span> '
-      + '<span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>'
-      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">online</span>' : '');
+      + '<span class="pill">'+(r.iterations||0)+(chat
+          ? ' command'+((r.iterations||0)===1?'':'s')
+          : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
+      + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
+      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
+                    + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';
     if (open){
-      if (r.doing) body += '<div class="snip"><b>Doing:</b> '+esc(r.doing)+'</div>';
-      body += ovGroup('Done', r.done) + ovGroup('Planned', r.planned)
-            + ovGroup('Not yet', r.not_yet);
+      body += ovGroup(r.done, '\\u2713', 'ovdone');
+      if (r.doing) body += ovRow('\\u25d0', 'ovspin', r.doing);
+      body += ovGroup(r.planned, '\\u25cb', 'ovpend')
+            + ovGroup(r.not_yet, '\\u25cb', 'ovpend', true);
       body += '<div class="snip dup">started '+esc(r.started||'')
             + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
     }
@@ -630,8 +749,10 @@ def render_page(token: str) -> str:
         + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
       : '';
     if (!OV_DATA.runs.length){
-      showHTML(online + '<h2 class="h">No work sessions \\u2014 start one with '
-        + '<code>hive loop</code>. Finished sessions are removed automatically.</h2>');
+      showHTML(online + '<h2 class="h">No work sessions \\u2014 interactive '
+        + 'Claude sessions appear here as their telemetry flows, and '
+        + '<code>hive loop</code> runs join them. Finished sessions are '
+        + 'removed automatically.</h2>');
       return;
     }
     const showProj = (PROJECT === '*');
@@ -670,6 +791,75 @@ def render_page(token: str) -> str:
   function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
+  // --- mandatory code change-log (Log view) ---
+  function logBadge(cat){
+    const colors = {update:'#4a90d9', minor_change:'#6aa84f', deletion:'#d94a4a',
+                    reduction:'#d9a44a', major_change:'#b04ad9', replacement:'#4ad9c8'};
+    const c = colors[cat] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(cat||'?')+'</span>';
+  }
+  async function renderLog(){
+    const res = await apiGet('/api/changelog');
+    if (!res || !Array.isArray(res.entries)) throw new Error((res && res.error) || 'changelog fetch failed');
+    const pend = res.pending && res.pending.files && res.pending.files.length
+      ? '<div class="row"><span class="pill" style="color:#e0a030;border-color:#a67a20">'
+        + '\\u26a0 ' + res.pending.files.length + ' unlogged file(s) \\u2014 record the mandatory entry: '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code></span></div>'
+      : '';
+    if (!res.entries.length){
+      showHTML(pend + '<h2 class="h">No change-log entries yet \\u2014 every change to '
+        + 'mindhive code must be recorded with '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code> ('
+        + esc((res.categories || []).join(', ')) + ').</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(pend + '<h2 class="h">'+res.entries.length+' change-log entr'
+      + (res.entries.length===1?'y':'ies')+'</h2>'
+      + '<ul class="hits">' + res.entries.map(e =>
+        '<li><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
+        + ((e.files||[]).length ? '<div class="snip">'+(e.files||[]).map(esc).join(' \\u00b7 ')+'</div>' : '')
+        + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+        + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
+      + '</ul>');
+  }
+  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog); }
+
+  function sopBadge(action){
+    const colors = {add:'#6aa84f', update:'#4a90d9', 'delete':'#d94a4a'};
+    const c = colors[action] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(action||'?')+'</span>';
+  }
+  async function renderSops(){
+    const res = await apiGet('/api/sops');
+    if (!res || !Array.isArray(res.active)) throw new Error((res && res.error) || 'sop fetch failed');
+    const showProj = (PROJECT === '*');
+    if (!res.active.length && !res.history.length){
+      showHTML('<h2 class="h">No SOPs yet \\u2014 record standing procedures with '
+        + '<code>hive sop add &lt;id&gt; --title "\\u2026" --file &lt;body.md&gt;</code>. '
+        + 'Active SOPs auto-load into every session via STATE.md / MEMORY.md.</h2>');
+      return;
+    }
+    const act = res.active.map((r, i) =>
+      '<li><div class="file">SOP '+(i+1)+': '+esc(r.title)
+      + ' <span class="pill">'+esc(r.sop_id)+' v'+r.version+'</span>'
+      + (showProj && r.project ? ' <span class="pill">'+esc(r.project)+'</span>' : '')
+      + '</div><div class="snip" style="white-space:pre-wrap">'+esc(r.text)+'</div>'
+      + '<div class="snip dup">created '+esc(r.created||'')+' \\u00b7 updated '+esc(r.updated||'')+'</div></li>').join('');
+    const hist = res.history.map(e =>
+      '<li><div class="file">'+sopBadge(e.action)+' '+esc(e.sop_id)
+      + (e.title ? ' \\u2014 '+esc(e.title) : '') + '</div>'
+      + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+      + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') + '</div></li>').join('');
+    showHTML('<h2 class="h">'+res.active.length+' active SOP'
+      + (res.active.length===1?'':'s')+' (auto-loaded each session)</h2>'
+      + '<ul class="hits">'+act+'</ul>'
+      + '<h2 class="h">History ('+res.history.length+' lifecycle event'
+      + (res.history.length===1?'':'s')+')</h2>'
+      + '<ul class="hits">'+hist+'</ul>');
+  }
+  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops); }
+
   async function renderState(){ showText(await apiGet('/api/state')); }
   function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
   function showBriefing(){ controls.innerHTML=''; liveFn = null; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
@@ -696,9 +886,46 @@ def render_page(token: str) -> str:
     });
   }
 
-  function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
-    const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
-  }); }
+  // Graph is a one-shot heavy render (not live-refreshed): fetch once and hand
+  // the self-contained page to the iframe. Semantic links are the expensive,
+  // opt-in build (an embedding search per event) so they stay off by default;
+  // ticking the box reloads with ?semantic=1.
+  function showGraph(){
+    liveFn = null;
+    let semantic = false;
+    controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
+      + '<input type="checkbox" id="gsem"> semantic links</label>';
+    const load = () => run('building graph', async () => {
+      const html = await apiGet('/api/graph' + (semantic ? '?semantic=1' : ''));
+      only(graph); graph.srcdoc = html;
+    });
+    const cb = document.getElementById('gsem');
+    if (cb) cb.addEventListener('change', () => { semantic = cb.checked; load(); });
+    load();
+  }
+
+  // Workspace views (MindParallel / MindSwarm / Self-Reliant) are full pages
+  // served by the server and loaded by URL — srcdoc must be cleared first or
+  // it wins over src. 'research' lives under its own /api/research family.
+  function showWorkspace(view){
+    controls.innerHTML=''; liveFn = null;
+    only(graph);
+    graph.removeAttribute('srcdoc');
+    graph.src = u(withProj(view === 'research' ? '/api/research/page'
+                                               : '/api/workspace/'+view));
+  }
+
+  // Self-Reliant (an iframe) can ask the parent to open the Memory view filtered
+  // to a PRD's backing events — the section's link into the memory it wrote. Only
+  // trust messages from our own iframe on the same origin (never arbitrary posts).
+  window.addEventListener('message', function(ev){
+    if (ev.origin !== location.origin) return;
+    if (!graph || ev.source !== graph.contentWindow) return;
+    const d = ev.data;
+    if (!d || d.type !== 'mh-self-reliant' || d.action !== 'show-memory') return;
+    MEM_QUERY = String(d.query == null ? '' : d.query).slice(0, 200);
+    showMemory();
+  });
 
   function showAppend(){
     liveFn = null;
@@ -732,6 +959,7 @@ def render_page(token: str) -> str:
   // IMP_EXPANDED.
   let PLUG_INV = {plugins: [], local_skills: [], counts: {}};
   let PLUG_STATUS = {};             // /api/skills/status: {name: 'ok'|'fail'}
+  let PLUG_COUNTS = {};             // /api/skills/status: {name: total invoke count}
   let PLUG_STATS = {};              // /api/skills/stats: per-skill telemetry
   let PLUG_REC = {coverage: {measured: 0, total: 0}, recommendations: []};
   let PLUG_RULES = {};              // 'skill:<name>' -> improvements auto lesson
@@ -784,11 +1012,19 @@ def render_page(token: str) -> str:
     let calls = 0, ok = 0;
     Object.values(PLUG_STATS).forEach(s => { calls += s.calls||0; ok += s.ok||0; });
     const rate = calls ? Math.round(ok/calls*100)+'%' : '\\u2014';
+    const measured = cov.measured ?? 0;
+    const total = cov.total ?? (c.skills_total ?? 0);
+    // Cold-start honesty: before any skill has been called, show WHY the tiles
+    // read zero rather than a bare '0/0' that looks broken.
+    const rateLbl = calls ? ('completion rate \\u00b7 '+ok+'/'+calls+' calls')
+                          : 'completion rate \\u00b7 no calls recorded yet';
+    const measuredLbl = measured ? 'measured (\\u22653 calls)'
+                                 : 'measured \\u00b7 call skills to start measuring';
     return '<div class="cards" style="margin-bottom:12px">'
       + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
       + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
-      + '<div class="card"><div class="big">'+(cov.measured ?? 0)+' of '+(cov.total ?? (c.skills_total ?? 0))+'</div><div class="lbl">measured (\\u22653 calls)</div></div>'
-      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">completion rate \\u00b7 '+ok+'/'+calls+' calls</div></div>'
+      + '<div class="card"><div class="big">'+measured+' of '+total+'</div><div class="lbl">'+measuredLbl+'</div></div>'
+      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">'+rateLbl+'</div></div>'
       + '</div>';
   }
   const PLUG_SORT_LABELS = {
@@ -847,6 +1083,15 @@ def render_page(token: str) -> str:
       if (sig.indexOf('skill:') === 0 && !(sig in PLUG_RULES)) PLUG_RULES[sig] = a;
     });
   }
+  // invoke-count badge right after the skill name — how many times this skill
+  // has been called through MindHive (ok + failed), so callability reads off
+  // the card list without expanding. Counts come from /api/skills/status;
+  // per-skill telemetry (stats.calls) is the fallback when counts lag a poll.
+  function callCount(name){
+    const n = PLUG_COUNTS[name] || (PLUG_STATS[name] && PLUG_STATS[name].calls) || 0;
+    return n ? '<span class="callcount" title="invoked '+n+' time'+(n===1?'':'s')
+      + ' via MindHive">'+n+'\\u00d7</span>' : '';
+  }
   // one poll cycle = one parallel fetch burst: inventory + status + stats +
   // recommend + improvements (for the skill:* prevention-rule index) + the
   // call history of every expanded card. Auxiliary fetches degrade to their
@@ -867,7 +1112,7 @@ def render_page(token: str) -> str:
       apiGet('/api/skills/history?name='+encodeURIComponent(n)+'&limit=25').catch(() => null))));
     if (gen !== PLUG_GEN) return;   // a newer cycle owns the caches now
     PLUG_INV = (res[0] && res[0].inventory) || {plugins: [], local_skills: [], counts: {}};
-    if (res[1]) PLUG_STATUS = res[1];
+    if (res[1]) { PLUG_STATUS = res[1].status || {}; PLUG_COUNTS = res[1].counts || {}; }
     if (res[2] && res[2].stats) PLUG_STATS = res[2].stats;
     if (res[3] && res[3].recommendations) PLUG_REC = res[3];
     if (res[4] && res[4].auto) indexSkillRules(res[4].auto);
@@ -962,7 +1207,7 @@ def render_page(token: str) -> str:
       + '<div class="file skhead" data-name="'+escAttr(e.name)+'" data-plugin="'
       + escAttr(e.plugin||'')+'" style="cursor:pointer" title="click to '
       + (open?'collapse':'expand')+'">'
-      + statusDot(e.status)+esc(e.name)+skBadges(e)+callBtn(e)+'</div>';
+      + statusDot(e.status)+esc(e.name)+callCount(e.name)+skBadges(e)+callBtn(e)+'</div>';
     if (!open)
       return html + (e.trigger ? '<div class="snip one">'+esc(e.trigger)+'</div>' : '') + '</li>';
     html += skDescription(e.name) + skMetrics(e.stats) + skNeeded(e.name);
@@ -997,6 +1242,7 @@ def render_page(token: str) -> str:
               + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
               + (e ? callBtn(e) : '')+'</div>'
               + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + (r.description ? '<div class="snip">intended use: '+esc(r.description)+'</div>' : '')
               + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
                   + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
                       + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
@@ -1146,6 +1392,7 @@ def render_page(token: str) -> str:
     catch(e){ res = {ok: false, excerpt: String((e && e.message) || e)}; }
     PLUG_LASTCALL[name] = res;
     PLUG_STATUS[name] = res.ok ? 'ok' : 'fail';
+    PLUG_COUNTS[name] = (PLUG_COUNTS[name]||0)+1;
     PLUG_CALLING.delete(name);
     PLUG_GEN++;   // invalidate any in-flight poll so it can't clobber the fresh result
     try {
@@ -1214,7 +1461,11 @@ def render_page(token: str) -> str:
     run(label+' running…', async () => showText(await apiPost(path, body)));
   }
 
+  //__TASKS_JS__
+
   // populate the project picker, then land on the overview
   (async () => { await loadProjects(); showOverview(); })();
 </script>
-</body></html>""".replace("__TOKEN__", json.dumps(token))
+</body></html>""".replace("__TOKEN__", json.dumps(token)) \
+    .replace("/*__TASKS_CSS__*/", tasks_css) \
+    .replace("//__TASKS_JS__", tasks_js)

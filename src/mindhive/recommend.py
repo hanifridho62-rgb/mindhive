@@ -53,6 +53,7 @@ EXPLORE_NEED_MIN = 0.2      # need_match at/above which measuring is worth it
 SIMILARITY_THRESHOLD = 0.3  # description-keyword Jaccard for overlap grouping
 AUTO_MIN_RATE = 0.8         # measured completion rate needed for auto execution
 DISCONTINUE_STREAK = 3      # trailing failures that, with an active rule, stop a skill
+INTENDED_USE_WIDTH = 140    # chars of a skill's intended use surfaced in a brief line
 
 _WORD = re.compile(r"[a-z0-9]+")
 _STOP = {
@@ -176,6 +177,40 @@ def _reason(measured: bool, st: dict, calls: int, nm: float, penalty: float) -> 
     return base
 
 
+def _truncate(text, width=None) -> str:
+    """Collapse whitespace; when ``width`` is set, cap ``text`` at ``width``
+    chars with an ellipsis on overflow. ``width=None`` collapses only — the CLI
+    full view uses this to render the untruncated intended use while sharing the
+    same empty/whitespace handling as the truncating surfaces (so an empty
+    description never leaves a dangling clause on any surface). Deterministic —
+    no locale/word-boundary heuristics."""
+    s = " ".join(str(text or "").split())
+    if width is None or len(s) <= width:
+        return s
+    return s[:max(0, width - 1)].rstrip() + "…"
+
+
+def intended_use_clause(entry, width: int = INTENDED_USE_WIDTH) -> str:
+    """`` · intended use: …`` clause for a scored entry, or ``""`` when the
+    description is empty/whitespace. Shared by :func:`brief_line` and the
+    projector's directive lines so every surface renders (and omits) the
+    intended use identically."""
+    desc = _truncate(entry.get("description", ""), width)
+    return f" · intended use: {desc}" if desc else ""
+
+
+def brief_line(entry, width: int = INTENDED_USE_WIDTH) -> str:
+    """One compact line for a scored :func:`recommend` entry: name, reason, and
+    provenance, then the skill's *intended use* (its description) truncated to
+    ``width``. Surfacing the intended use lets an agent reading MEMORY.md grasp
+    a skill's scope without opening it; the clause is omitted when the
+    description is empty. Provenance stays verbatim so an estimate never reads
+    as measured. Shared by the projector's SUGGESTED SKILLS block and
+    ``hive skills recommend --brief`` so the two surfaces cannot drift."""
+    return (f"{entry.get('name', '')} — {entry.get('reason', '')} "
+            f"({entry.get('provenance', '')})" + intended_use_clause(entry, width))
+
+
 def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
     """One scored entry for a skill. ``stats`` is the plugins.skill_stats dict;
     ``open_incidents`` the open_skill_incidents map."""
@@ -271,6 +306,9 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
     rules = active_skill_rules(incidents)
     entries = [score_skill(s, stats, needs=needs, open_incidents=open_inc)
                for s in (skills or []) if s.get("name")]
+    # Coverage counts the whole inventory — measured before the discontinued
+    # split, since a discontinued skill is (by construction) a measured one.
+    measured_n = sum(1 for e in entries if e["provenance"] == "measured")
     discontinued = []
     active = []
     for e in entries:
@@ -298,7 +336,6 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
         recs.append(primary)
     recs.sort(key=lambda e: e["name"])
     recs.sort(key=lambda e: -e["score"])
-    measured_n = sum(1 for e in entries if e["provenance"] == "measured")
     if top is not None:
         recs = recs[:max(0, int(top))]
     return {"coverage": {"measured": measured_n,

@@ -11,9 +11,10 @@ LOOP_STATUS:
 
 Set EXIT_SIGNAL: true ONLY when the ENTIRE task is finished and verified.
 If more work remains, set EXIT_SIGNAL: false even if this iteration went well.
-When the entire task IS finished, also say so plainly in prose before the
-block (e.g. "All tasks have been completed; nothing remains.") — the exit
-gate requires the prose statement AND the structured signal to agree.
+When the entire task IS finished, also state that outcome plainly in your own
+words in the prose before the block — describe what is complete and confirm
+no work remains. The exit gate requires your prose account and the structured
+signal to agree; a bare signal without the prose statement will not end the run.
 """
 
 
