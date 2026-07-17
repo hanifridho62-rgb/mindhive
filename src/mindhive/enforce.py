@@ -25,7 +25,6 @@ fail-open by construction — any error, missing manifest, or unknown signature
 means *allow*, so a bug in this module can never block a real tool call.
 """
 import json
-import os
 
 from . import paths
 
@@ -90,11 +89,10 @@ def load_manifest(project=None) -> dict:
 
 
 def _write_manifest(project, data) -> None:
-    p = _manifest_path(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, p)
+    paths.write_text_atomic(
+        _manifest_path(project),
+        json.dumps(data, indent=2, sort_keys=True),
+    )
 
 
 def evaluate(tool_name, tool_input, project=None, manifest=None) -> str | None:

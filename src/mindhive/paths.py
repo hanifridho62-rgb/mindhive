@@ -14,6 +14,22 @@ def store_home() -> Path:
     return Path(os.environ.get("MINDHIVE_HOME", str(Path.home() / ".mindhive")))
 
 
+def write_text_atomic(path, text: str) -> None:
+    """Write ``text`` to ``path`` via a temp file + ``os.replace`` so a
+    concurrent reader always sees either the whole old file or the whole new
+    file, never a torn, half-written one.
+
+    Creates the parent directory if missing (``mkdir -p``), so callers do not
+    need their own mkdir. JSON callers serialize (``json.dumps`` / canonical
+    JSON) themselves and pass the resulting string. ``path`` may be a str or a
+    ``Path``."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def normalize(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug or "default"

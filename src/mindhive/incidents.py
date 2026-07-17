@@ -100,9 +100,7 @@ def _write_guard(project):
 def _atomic_write(path, text) -> None:
     """Write via a temp file + os.replace so a concurrent reader (the 2.5s
     Improvements poll) always sees a whole file, never a torn one."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    paths.write_text_atomic(path, text)
 
 
 LEAK_LIMIT = 2
