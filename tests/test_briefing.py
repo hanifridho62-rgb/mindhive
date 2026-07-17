@@ -3,12 +3,7 @@ from mindhive import events, paths
 from mindhive.briefing import headline, build_briefing, briefing
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
-def test_headline_strips_frontmatter(tmp_path, monkeypatch):
+def test_headline_strips_frontmatter():
     text = "---\nts: 2026-01-01\ntype: decision\n---\n\nReal content here"
     assert headline(text) == "Real content here"
 
@@ -40,8 +35,7 @@ def test_headline_skips_blank_lines_after_frontmatter():
     assert headline(text) == "Actual content"
 
 
-def test_build_briefing_current_state(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_current_state():
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="state_set",
                      payload={"task": "Build MIND HIVE", "verified": "tests green",
@@ -59,8 +53,7 @@ def test_build_briefing_current_state(tmp_path, monkeypatch):
     assert "D1" in out
 
 
-def test_build_briefing_no_state_set(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_no_state_set():
     evs = [
         events.Event(ts="2026-06-20T10:00:00Z", session_id="s", type="decision",
                      payload={"text": "Use Python"}, tags=[]),
@@ -69,8 +62,7 @@ def test_build_briefing_no_state_set(tmp_path, monkeypatch):
     assert "(no state_set yet)" in out
 
 
-def test_build_briefing_timeline_full_coverage(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_timeline_lists_distinct_semantic_events():
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="decision",
                      payload={"text": "Decision A"}, tags=[]),
@@ -82,18 +74,57 @@ def test_build_briefing_timeline_full_coverage(tmp_path, monkeypatch):
                      payload={"task": "x"}, tags=[]),
     ]
     out = build_briefing(evs)
-    # Timeline section must have ALL 3 non-state_set semantic events
+    # Distinct (non-duplicate) semantic events all survive dedup; state_set is
+    # excluded from the timeline.
     assert "## Timeline" in out
     assert "Decision A" in out
     assert "Caveat B" in out
     assert "Experiment C" in out
-    # state_set excluded from timeline
-    lines = [l for l in out.splitlines() if l.startswith("- ") and "[" in l]
+    timeline = out[out.index("## Timeline"):out.index("## Key decisions")]
+    lines = [l for l in timeline.splitlines() if l.startswith("- ") and "[" in l]
     assert len(lines) == 3
 
 
-def test_build_briefing_key_decisions(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_dedups_repeated_caveats():
+    # Eight verbatim repeats of the same caveat — the real-world bloat case.
+    evs = [
+        events.Event(ts=f"2026-06-20T09:0{i}:00Z", session_id="s", type="caveat",
+                     payload={"text": "Decide per question: browser or terminal"},
+                     tags=[])
+        for i in range(8)
+    ]
+    out = build_briefing(evs)
+    # A caveat legitimately appears in both the Timeline and the Lessons
+    # sections — but within EACH it collapses from 8 verbatim repeats to a
+    # single representative carrying the occurrence count.
+    tl_idx = out.index("## Timeline")
+    lc_idx = out.index("## Lessons")
+    timeline = out[tl_idx:lc_idx]
+    lessons = out[lc_idx:]
+    assert timeline.count("Decide per question: browser or terminal") == 1
+    assert lessons.count("Decide per question: browser or terminal") == 1
+    assert timeline.count("(×8)") == 1
+    assert lessons.count("(×8)") == 1
+
+
+def test_build_briefing_timeline_capped():
+    from mindhive.briefing import _TIMELINE_CAP
+    evs = [
+        events.Event(ts=f"2026-06-20T09:{i:02d}:00Z", session_id="s",
+                     type="decision", payload={"text": f"Distinct decision {i}"},
+                     tags=[])
+        for i in range(_TIMELINE_CAP + 10)
+    ]
+    out = build_briefing(evs)
+    timeline_lines = [l for l in out.splitlines()
+                      if l.startswith("- ") and "[decision]" in l]
+    assert len(timeline_lines) == _TIMELINE_CAP
+    # The cap keeps the most recent entries.
+    assert f"Distinct decision {_TIMELINE_CAP + 9}" in out
+    assert "Distinct decision 0" not in out
+
+
+def test_build_briefing_key_decisions():
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="decision",
                      payload={"text": "Use TDD"}, tags=[]),
@@ -110,8 +141,7 @@ def test_build_briefing_key_decisions(tmp_path, monkeypatch):
     assert "Fragile" not in kd_section
 
 
-def test_build_briefing_caveats(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_caveats():
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="caveat",
                      payload={"text": "Watch out"}, tags=[]),
@@ -121,8 +151,7 @@ def test_build_briefing_caveats(tmp_path, monkeypatch):
     assert "Watch out" in out
 
 
-def test_build_briefing_activity_counts(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_activity_counts():
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="session_start",
                      payload={}, tags=[]),
@@ -142,8 +171,7 @@ def test_build_briefing_activity_counts(tmp_path, monkeypatch):
     assert "src/bar.py" in out
 
 
-def test_build_briefing_event_count_footer(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_build_briefing_event_count_footer():
     evs = [
         events.Event(ts="2026-06-20T09:00:00Z", session_id="s", type="decision",
                      payload={"text": "x"}, tags=[]),
@@ -152,8 +180,7 @@ def test_build_briefing_event_count_footer(tmp_path, monkeypatch):
     assert "_events: 1_" in out
 
 
-def test_briefing_function_writes_file(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_briefing_function_writes_file():
     events.append_event("decision", {"text": "wrote a file"},
                         session_id="s", ts="2026-06-20T09:00:00Z")
     p = briefing()
@@ -163,8 +190,7 @@ def test_briefing_function_writes_file(tmp_path, monkeypatch):
     assert "# PROJECT BRIEFING" in content
 
 
-def test_briefing_deterministic(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_briefing_deterministic():
     events.append_event("decision", {"text": "deterministic"},
                         session_id="s", ts="2026-06-20T09:00:00Z")
     p1 = briefing()

@@ -23,10 +23,12 @@ class _FakeCollection:
     def __init__(self):
         self.added = {}
         self.deleted = []
-        self._query_result = {"documents": [[]], "ids": [[]]}
+        self._query_result = {"documents": [[]], "ids": [[]], "distances": [[]]}
 
-    def set_query_result(self, docs, ids):
-        self._query_result = {"documents": [docs], "ids": [ids]}
+    def set_query_result(self, docs, ids, distances=None):
+        self._query_result = {"documents": [docs], "ids": [ids],
+                              "distances": [distances if distances is not None
+                                            else [0.0] * len(docs)]}
 
     def delete(self, ids=None):
         self.deleted = ids
@@ -120,12 +122,27 @@ def test_semantic_recall_returns_recall_compatible_shape(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     col = _FakeCollection()
     col.set_query_result(docs=["hello   world   doc"],
-                         ids=["20260101-000000-decision-abcd1234.md"])
+                         ids=["20260101-000000-decision-abcd1234.md"],
+                         distances=[0.25])
     _stub_backend(monkeypatch, col)
     hits = vectors.semantic_recall("hello", limit=1)
     assert len(hits) == 1
     h = hits[0]
-    assert set(h.keys()) == {"file", "snippet"}     # same keys as recall.recall
+    # Same file/snippet/score shape as recall.recall (score lets callers rank
+    # and threshold). Score is similarity = 1 - cosine distance.
+    assert set(h.keys()) == {"file", "snippet", "score"}
     assert h["file"] == "20260101-000000-decision-abcd1234.md"
     assert "/" not in h["file"] and "\\" not in h["file"]
     assert h["snippet"] == "hello world doc"        # whitespace collapsed
+    assert h["score"] == 0.75                        # 1 - 0.25
+
+
+def test_semantic_recall_score_none_when_distances_absent(tmp_path, monkeypatch):
+    """Defensive: some chroma configs omit distances; score is None, not a crash."""
+    _isolate(tmp_path, monkeypatch)
+    col = _FakeCollection()
+    col._query_result = {"documents": [["a doc"]],
+                         "ids": [["20260101-000000-decision-abcd1234.md"]]}
+    _stub_backend(monkeypatch, col)
+    hits = vectors.semantic_recall("a", limit=1)
+    assert hits[0]["score"] is None

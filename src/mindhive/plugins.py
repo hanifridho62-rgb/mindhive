@@ -8,6 +8,7 @@ plain dicts that the event store and graph projection consume.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -82,6 +83,16 @@ def _parse_frontmatter(text: str) -> dict:
         if m:
             out[m.group(1).lower()] = m.group(2).strip().strip('"').strip("'")
     return out
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Return the markdown body with any leading `---` frontmatter block removed."""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            nl = text.find("\n", end + 1)
+            text = text[nl + 1:] if nl != -1 else ""
+    return text.strip()
 
 
 def _semver_key(version: str):
@@ -172,6 +183,49 @@ def score(plugin: dict) -> dict:
     }
 
 
+MIN_CALLS_FOR_GATE = 3     # history needed before the demotion gate may fire
+DEMOTE_BELOW = 0.4         # success rate under this -> demoted
+
+
+def call_counts(project=None) -> dict:
+    """{skill_name: {"ok": n, "fail": n}} — every deduplicated skill call,
+    from the same normalized sources skill_stats reads (passive ``skill_used``
+    captures, explicit ``invoke_result``, and ``tool_failed`` with a
+    ``skill:*`` signature), so the effectiveness gate sees hook-captured usage
+    without double-counting explicitly recorded executions."""
+    counts: dict = {}
+    for c in _dedup_calls(_skill_calls(ev_mod.read_all(project))):
+        slot = counts.setdefault(c["name"], {"ok": 0, "fail": 0})
+        slot["ok" if c["ok"] else "fail"] += 1
+    return counts
+
+
+def effectiveness(plugin: dict, counts: dict) -> dict:
+    """Aggregate measured effectiveness for one plugin's skills.
+
+    Laplace-smoothed success rate: (ok+1)/(ok+fail+2) — 0.5 (neutral) with no
+    history, so unproven plugins are neither boosted nor punished. The gate
+    only fires on real evidence: >= MIN_CALLS_FOR_GATE calls with a rate
+    under DEMOTE_BELOW."""
+    ok = fail = 0
+    for s in plugin.get("skills", []):
+        c = counts.get(s.get("name"))
+        if c:
+            ok += c["ok"]
+            fail += c["fail"]
+    calls = ok + fail
+    rate = (ok + 1) / (calls + 2)
+    demoted = calls >= MIN_CALLS_FOR_GATE and rate < DEMOTE_BELOW
+    return {
+        "calls": calls, "ok": ok, "fail": fail,
+        "success_rate": round(rate, 3),
+        "demoted": demoted,
+        "demote_reason": (f"{fail} fail / {calls} calls "
+                          f"(rate {rate:.0%} < {DEMOTE_BELOW:.0%})"
+                          if demoted else ""),
+    }
+
+
 def _public(plugin: dict, free: bool, reason: str) -> dict:
     """Strip private (_-prefixed) scan fields; attach free flag + score."""
     out = {
@@ -204,17 +258,26 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
             paid_plugins.append({"name": pub["name"], "version": pub["version"],
                                  "free_reason": reason})
 
-    ranked = sorted(
-        free_plugins,
-        key=lambda p: (-p["score"]["breadth_score"], p["name"]),
-    )
+    counts = call_counts()
+    for pub in free_plugins:
+        eff = effectiveness(pub, counts)
+        pub["score"]["effectiveness"] = eff
+        pub["score"]["rank_score"] = round(
+            pub["score"]["breadth_score"] * eff["success_rate"], 2)
+    ranked = sorted(free_plugins,
+                    key=lambda p: p["score"]["rank_score"], reverse=True)
+    recommended = [p for p in ranked
+                   if not p["score"]["effectiveness"]["demoted"]][:top_n]
+    demoted = [{"name": p["name"],
+                "reason": p["score"]["effectiveness"]["demote_reason"]}
+               for p in ranked if p["score"]["effectiveness"]["demoted"]]
     recommendations = [
         {
             "name": p["name"],
             "breadth_score": p["score"]["breadth_score"],
             "note": CURATED_NOTES.get(p["name"], ""),
         }
-        for p in ranked[:top_n]
+        for p in recommended
     ]
 
     return {
@@ -231,7 +294,393 @@ def evaluate(cache_dir=None, top_n: int = 5) -> dict:
         "free_plugins": ranked,
         "paid_plugins": sorted(paid_plugins, key=lambda p: p["name"]),
         "recommendations": recommendations,
+        "demoted": demoted,
     }
+
+
+# --------------------------------------------------------------------------
+# Live inventory — registry-driven view of what is installed RIGHT NOW.
+# The cache-walking scan() above keeps powering the free/paid evaluation, but
+# the cache can lag reality (uninstalled plugins leave folders behind). The
+# inventory instead trusts installed_plugins.json — the file Claude itself
+# rewrites on every install/uninstall (including local-panel uploads) — plus
+# the standalone ~/.claude/skills directory.
+# --------------------------------------------------------------------------
+
+def _claude_dir(claude_dir=None) -> Path:
+    return Path(claude_dir) if claude_dir else (Path.home() / ".claude")
+
+
+def _read_registry(claude_dir=None) -> dict:
+    data = _read_json(_claude_dir(claude_dir) / "plugins" / "installed_plugins.json")
+    plugs = (data or {}).get("plugins")
+    return plugs if isinstance(plugs, dict) else {}
+
+
+def inventory(claude_dir=None) -> dict:
+    """Snapshot of every installed plugin (with its skills) + local skills."""
+    plugins_out = []
+    for key, entries in sorted(_read_registry(claude_dir).items()):
+        name, _, marketplace = key.rpartition("@")
+        if not name:                       # malformed key like "justaname"
+            name, marketplace = marketplace, ""
+        # several scopes may hold the same plugin — newest version wins
+        entry = max((e for e in entries if isinstance(e, dict)),
+                    key=lambda e: _semver_key(str(e.get("version", ""))),
+                    default=None)
+        if entry is None:
+            continue
+        install = Path(str(entry.get("installPath", "")))
+        present = install.is_dir()
+        manifest = _read_json(install / ".claude-plugin" / "plugin.json") or {}
+        plugins_out.append({
+            "marketplace": marketplace,
+            "name": name,
+            "version": str(entry.get("version", "")),
+            "scope": entry.get("scope", ""),
+            "description": manifest.get("description", ""),
+            "present": present,
+            "skills": _skills_for(install) if present else [],
+        })
+    plugins_out.sort(key=lambda p: (p["marketplace"], p["name"]))
+    # ~/.claude/skills/*/SKILL.md has the same layout as a plugin's skills dir,
+    # so the one canonical reader covers standalone local skills too
+    local = _skills_for(_claude_dir(claude_dir))
+    plugin_skills = sum(len(p["skills"]) for p in plugins_out)
+    return {
+        "generated_at": ev_mod.now_iso(),
+        "plugins": plugins_out,
+        "local_skills": local,
+        "counts": {
+            "plugins": len(plugins_out),
+            "plugin_skills": plugin_skills,
+            "local_skills": len(local),
+            "skills_total": plugin_skills + len(local),
+        },
+    }
+
+
+def inventory_signature(claude_dir=None) -> str:
+    """Cheap fingerprint of everything the inventory depends on. Any install,
+    uninstall, or skill add/delete changes it; identical disk state yields an
+    identical signature, so pollers can skip the full rescan."""
+    root = _claude_dir(claude_dir)
+    parts = []
+
+    def stat_of(p: Path):
+        try:
+            st = p.stat()
+            parts.append(f"{p}|{st.st_mtime_ns}|{st.st_size}")
+        except OSError:
+            parts.append(f"{p}|missing")
+
+    stat_of(root / "plugins" / "installed_plugins.json")
+    for skill_md in sorted((root / "skills").glob("*/SKILL.md")):
+        stat_of(skill_md)
+    # the set of SKILL.md paths inside each installed plugin catches a skill
+    # folder deleted from an install without any registry change
+    for entries in _read_registry(claude_dir).values():
+        for e in entries:
+            if isinstance(e, dict) and e.get("installPath"):
+                sdir = Path(str(e["installPath"])) / "skills"
+                parts.extend(str(p) for p in sorted(sdir.glob("*/SKILL.md")))
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+# per-claude-dir cache: signature of the last build -> its inventory payload
+_INV_CACHE: dict[str, tuple[str, dict]] = {}
+
+
+def live_inventory(claude_dir=None) -> dict:
+    """Signature-gated inventory: rebuild only when the disk actually changed.
+    Cheap enough for the dashboard to poll every couple of seconds."""
+    key = str(_claude_dir(claude_dir))
+    sig = inventory_signature(claude_dir)
+    cached = _INV_CACHE.get(key)
+    if cached and cached[0] == sig:
+        return {"changed": False, "signature": sig, "inventory": cached[1]}
+    payload = inventory(claude_dir)
+    _INV_CACHE[key] = (sig, payload)
+    return {"changed": True, "signature": sig, "inventory": payload}
+
+
+def _newest_entry(entries: list) -> dict | None:
+    return max((e for e in entries if isinstance(e, dict)),
+               key=lambda e: _semver_key(str(e.get("version", ""))), default=None)
+
+
+def _find_skill_md(sdir: Path, name: str) -> Path | None:
+    """The SKILL.md under sdir whose frontmatter name (or folder) matches name."""
+    for skill_md in sorted(sdir.glob("*/SKILL.md")):
+        fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+        if name in ((fm.get("name") or ""), skill_md.parent.name):
+            return skill_md
+    return None
+
+
+def _mtime_iso(path: Path) -> str:
+    import time
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime))
+    except OSError:
+        return ""
+
+
+def skill_detail(name: str, plugin: str | None = None, claude_dir=None) -> dict | None:
+    """Full click-through detail for one skill: intended use (its description),
+    when it was added, and the full SKILL.md body. Returns None if not found.
+
+    A plugin skill dates from the registry's ``installedAt``; a standalone local
+    skill dates from its SKILL.md mtime (there is no registry row for it)."""
+    if plugin:
+        for key, entries in _read_registry(claude_dir).items():
+            pname, _, _mkt = key.rpartition("@")
+            if (pname or _mkt) != plugin:
+                continue
+            entry = _newest_entry(entries)
+            if not entry:
+                return None
+            install = Path(str(entry.get("installPath", "")))
+            skill_md = _find_skill_md(install / "skills", name)
+            if not skill_md:
+                return None
+            fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+            return {
+                "name": fm.get("name") or skill_md.parent.name,
+                "intended_use": fm.get("description", ""),
+                "added_at": str(entry.get("installedAt", "")),
+                "body": _strip_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore")),
+                "source": plugin,
+            }
+        return None
+
+    skill_md = _find_skill_md(_claude_dir(claude_dir) / "skills", name)
+    if not skill_md:
+        return None
+    fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+    return {
+        "name": fm.get("name") or skill_md.parent.name,
+        "intended_use": fm.get("description", ""),
+        "added_at": _mtime_iso(skill_md),
+        "body": _strip_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore")),
+        "source": "local",
+    }
+
+
+def call_stats(project=None, evs=None) -> dict:
+    """Per-skill call stats from one ledger pass:
+    ``{"status": {name: "ok"|"fail"}, "counts": {name: total_calls}}``.
+
+    Reads ``invoke_result`` (ok) and ``tool_failed`` with a ``skill:<name>``
+    signature (fail) — one invoke writes exactly one of the two, so counting
+    both event types yields the total number of calls. ``read_all`` is
+    time-then-append ordered, so overwriting leaves each skill's status at its
+    most recent call — the green/red the dashboard paints. Skills never called
+    are simply absent (rendered grey, no count badge). Pass evs (any
+    chronological event list, e.g. a HIVE MIND merge across namespaces) to
+    reuse a read_all() result instead of reading one project."""
+    status: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    for e in evs:
+        if e.type == "invoke_result":
+            name = e.payload.get("name")
+            if name:
+                status[name] = "ok"
+                counts[name] = counts.get(name, 0) + 1
+        elif e.type == "tool_failed":
+            sig = e.payload.get("signature", "")
+            if isinstance(sig, str) and sig.startswith("skill:"):
+                name = sig[len("skill:"):]
+                status[name] = "fail"
+                counts[name] = counts.get(name, 0) + 1
+    return {"status": status, "counts": counts}
+
+
+def call_status(project=None) -> dict:
+    """Last-outcome per skill: ``{name: "ok"|"fail"}`` (see ``call_stats``)."""
+    return call_stats(project)["status"]
+
+
+def call_history(name, project=None, limit=20, evs=None) -> list[dict]:
+    """Past invoke outcomes for one skill, newest first: a list of
+    ``{ts, ok, text, session}``. Reads the same ``invoke_result`` / ``tool_failed``
+    events ``call_status`` derives from, but keeps every occurrence so the
+    dashboard can show a skill's call log. ``read_all`` is chronological, so
+    reversing yields newest-first with append order preserved on ties. Pass evs
+    to reuse a pre-read (possibly multi-namespace) event list."""
+    sig = f"skill:{name}"
+    out = []
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    for e in evs:
+        if e.type == "invoke_result" and e.payload.get("name") == name:
+            out.append({"ts": e.ts, "ok": True,
+                        "text": e.payload.get("text", ""), "session": e.session_id})
+        elif e.type == "tool_failed" and e.payload.get("signature") == sig:
+            out.append({"ts": e.ts, "ok": False,
+                        "text": e.payload.get("text", ""), "session": e.session_id})
+    out.reverse()
+    return out[:max(0, limit)]
+
+
+# A passive `skill_used` capture and an explicit record (invoke_result or a
+# `skills record` tool_failed) can describe the SAME execution — hookcapture
+# sees the Skill tool fire while the agent/orchestrator writes its own verdict
+# moments later. Within this window (same skill, same session) the explicit
+# record wins and the pair counts once.
+DEDUP_WINDOW_SECS = 120
+
+
+def _stat_secs(ts):
+    """Epoch seconds for a store ISO timestamp, or None when unparseable."""
+    import calendar
+    import time as _time
+    try:
+        return calendar.timegm(_time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _skill_calls(evs) -> list[dict]:
+    """Normalize the three skill-telemetry event sources into one call list
+    (chronological — read_all is already ordered): ``skill_used`` (passive hook
+    capture), ``invoke_result`` (ok), and ``tool_failed`` with a ``skill:*``
+    signature (fail). Explicit records tagged ``agent-assessed`` keep that
+    provenance (KTD5 — self-grades are never presented as measured)."""
+    calls = []
+    for e in evs:
+        p = e.payload if isinstance(e.payload, dict) else {}
+        if e.type == "skill_used":
+            name = p.get("name")
+            if not name:
+                continue
+            calls.append({"name": name, "ts": e.ts, "ok": bool(p.get("ok", True)),
+                          "session": e.session_id, "explicit": False,
+                          "provenance": "passive", "source": "skill_used"})
+        elif e.type == "invoke_result":
+            name = p.get("name")
+            if not name:
+                continue
+            prov = "agent-assessed" if "agent-assessed" in (e.tags or []) else "invoke"
+            calls.append({"name": name, "ts": e.ts, "ok": True,
+                          "session": e.session_id, "explicit": True,
+                          "provenance": prov, "source": "invoke_result"})
+        elif e.type == "tool_failed":
+            sig = p.get("signature", "")
+            if not (isinstance(sig, str) and sig.startswith("skill:")):
+                continue
+            prov = "agent-assessed" if "agent-assessed" in (e.tags or []) else "invoke"
+            calls.append({"name": sig[len("skill:"):], "ts": e.ts, "ok": False,
+                          "session": e.session_id, "explicit": True,
+                          "provenance": prov, "source": "tool_failed"})
+    return calls
+
+
+def _dedup_calls(calls: list[dict]) -> list[dict]:
+    """Drop each passive capture that an explicit record already covers: same
+    skill, same session, timestamps within DEDUP_WINDOW_SECS. Explicit records
+    whose session is "manual" or None act as a session WILDCARD (skill name +
+    time window only): agent-run `skills record` CLI writes carry session
+    "manual" (events.py stamps it when MINDHIVE_SESSION is unset) while the
+    passive hook capture of the same execution carries the real hook session
+    id, so a same-session precondition would never pair them. Greedy 1:1
+    pairing — one explicit record retires at most one passive capture, so two
+    genuine executions never collapse into one."""
+    _WILDCARD = (None, "manual")
+    explicit_pool: dict[tuple, list[dict]] = {}
+    wildcard_pool: dict[str, list[dict]] = {}
+    for c in calls:
+        if c["explicit"]:
+            if c["session"] in _WILDCARD:
+                wildcard_pool.setdefault(c["name"], []).append(c)
+            else:
+                explicit_pool.setdefault((c["name"], c["session"]), []).append(c)
+    paired: set[int] = set()
+    kept = []
+    for c in calls:
+        if not c["explicit"]:
+            cs = _stat_secs(c["ts"])
+            mate = None
+            candidates = (explicit_pool.get((c["name"], c["session"]), [])
+                          + wildcard_pool.get(c["name"], []))
+            for x in candidates:
+                if id(x) in paired:
+                    continue
+                xs = _stat_secs(x["ts"])
+                if cs is not None and xs is not None \
+                        and abs(cs - xs) <= DEDUP_WINDOW_SECS:
+                    mate = x
+                    break
+            if mate is not None:
+                paired.add(id(mate))
+                continue                    # explicit record wins; passive drops
+        kept.append(c)
+    return kept
+
+
+def skill_stats(project=None, evs=None) -> dict:
+    """Per-skill telemetry counters from the ledger, keyed by skill name:
+    ``{calls, ok, fail, completion_rate, last_outcome, last_used, streak,
+    fail_streak, provenance, sources}``.
+
+    The rate is a COMPLETION rate (ran without a tool error), never a success
+    rate (KTD5); it is None when a skill has zero calls. ``provenance`` breaks
+    calls down by capture path (``passive`` hook capture / ``invoke`` channel /
+    ``agent-assessed`` `skills record` write-throughs); ``streak`` is the
+    trailing run of failure-free calls (the completion record the recommend
+    tie-break reads). Pass evs to reuse an events.read_all() result."""
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    out: dict[str, dict] = {}
+    for c in _dedup_calls(_skill_calls(evs)):
+        s = out.setdefault(c["name"], {
+            "calls": 0, "ok": 0, "fail": 0, "completion_rate": None,
+            "last_outcome": None, "last_used": None, "streak": 0,
+            "fail_streak": 0, "provenance": {}, "sources": []})
+        s["calls"] += 1
+        if c["ok"]:
+            s["ok"] += 1
+            s["streak"] += 1
+            s["fail_streak"] = 0
+        else:
+            s["fail"] += 1
+            s["streak"] = 0
+            s["fail_streak"] += 1
+        s["last_outcome"] = "ok" if c["ok"] else "fail"
+        s["last_used"] = c["ts"]
+        s["provenance"][c["provenance"]] = s["provenance"].get(c["provenance"], 0) + 1
+        if c["source"] not in s["sources"]:
+            s["sources"].append(c["source"])
+    for s in out.values():
+        if s["calls"]:
+            s["completion_rate"] = s["ok"] / s["calls"]
+        s["sources"].sort()
+    return out
+
+
+def recommend_for(project=None, evs=None, top=None, incident_summaries=None) -> dict:
+    """One-stop deterministic most-needed-skills ranking (KTD6): read the
+    ledger once, flatten the live inventory, aggregate skill stats, extract
+    needs from incident summaries, and rank. The single implementation behind
+    `hive skills recommend`, the dashboard endpoint, and the projector's
+    suggested-skills block. Pass evs to reuse an events.read_all() result and
+    incident_summaries to override the per-project incidents read (the HIVE
+    MIND view passes a merge across every namespace). Imports are lazy so
+    plugins keeps no hard dependency on incidents/recommend (and no import
+    cycles)."""
+    from . import incidents as incidents_mod
+    from . import recommend as recommend_mod
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    skills = recommend_mod.flatten_inventory(live_inventory()["inventory"])
+    stats = skill_stats(project=project, evs=evs)
+    summaries = (incident_summaries if incident_summaries is not None
+                 else incidents_mod.summaries(project))
+    needs = recommend_mod.extract_needs(summaries, evs)
+    return recommend_mod.recommend(skills, stats, incidents=summaries,
+                                   needs=needs, top=top)
 
 
 def _catalog_path(project=None) -> Path:

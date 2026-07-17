@@ -39,6 +39,30 @@ The goal of the current work: linking memory-graph nodes to the code-graph
 entities they concern, so the hive mind retrieves a decision/caveat *attached to
 the specific function or module it was about* — not just "some file was touched."
 
+### Storage backend
+The substrate a MIND HIVE event store reads from and writes to. Two exist: the
+**file backend** (`~/.mindhive/<project>/events/*.jsonl`, the original) and the
+**Postgres backend** (the `event_log`/`event_chain`/`event_graph` tables in the
+CC-v3 `continuous_claude` database). The chain, projector, and graph logic is
+**backend-agnostic**: it operates on a list of `Event`s regardless of where they
+came from. See `docs/adr/0006`.
+
+### Read-canonical mirror
+A stage in which the Postgres backend is the canonical source for *reading* and
+*verifying* events, while the **file backend remains the live writer**. Events are
+migrated file → Postgres and proven equal, but capture (hooks) still writes files.
+The opposite is **write-canonical**, where Postgres becomes the live writer and
+the files are retired. The program moves read-canonical (Phase A) → write-canonical
+(Phase B); this staged cutover is the chosen path over a single big-bang flip. See
+`docs/adr/0006`.
+
+### Golden parity gate
+The migration acceptance test: for a given project the chain head computed from
+the Postgres backend must be **byte-identical** to the head computed from the file
+backend, and `verify` must return `ok`. Because the chain hashes only the five
+MH-hashed fields (`ts, session_id, type, payload, tags`) in canonical order, equal
+heads prove no event was lost or reordered in migration. The gate is per-project.
+
 ### Edge provenance (EXTRACTED / INFERRED / AMBIGUOUS)
 A tag on every graph edge recording how it was derived. **EXTRACTED** =
 deterministic (tree-sitter AST facts; event-derived links) — trustworthy as

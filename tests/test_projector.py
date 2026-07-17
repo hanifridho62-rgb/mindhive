@@ -1,12 +1,8 @@
 # tests/test_projector.py
 from mindhive import events, projector, paths
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
-def test_state_reflects_latest_state_set(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_state_reflects_latest_state_set():
     events.append_event("state_set",
                         {"task": "OLD", "next_step": "x", "open_questions": []},
                         session_id="s", ts="2026-06-20T09:00:00Z")
@@ -25,8 +21,7 @@ def test_state_reflects_latest_state_set(tmp_path, monkeypatch):
     assert "perp feed?" in state
     assert "default OFF" in state
 
-def test_ledger_one_file_per_semantic_event(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_ledger_one_file_per_semantic_event():
     events.append_event("decision", {"text": "d1"}, session_id="s",
                         ts="2026-06-20T10:00:00Z", tags=["strategy"])
     events.append_event("caveat", {"text": "c1"}, session_id="s",
@@ -38,8 +33,7 @@ def test_ledger_one_file_per_semantic_event(tmp_path, monkeypatch):
     files = list(ldir.glob("*.md"))
     assert len(files) == 2  # deterministic events are NOT ledger entries
 
-def test_projection_is_idempotent(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_projection_is_idempotent():
     events.append_event("decision", {"text": "d1"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
     projector.project()
@@ -48,8 +42,7 @@ def test_projection_is_idempotent(tmp_path, monkeypatch):
     second = (paths.project_dir() / "STATE.md").read_text(encoding="utf-8")
     assert first == second
 
-def test_index_maps_tags(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_index_maps_tags():
     events.append_event("decision", {"text": "d1"}, session_id="s",
                         ts="2026-06-20T10:00:00Z", tags=["ofi"])
     projector.project()
@@ -57,3 +50,172 @@ def test_index_maps_tags(tmp_path, monkeypatch):
     idx = json.loads((paths.project_dir() / "index.json").read_text(encoding="utf-8"))
     assert "ofi" in idx["by_tag"]
     assert "decision" in idx["by_type"]
+
+
+# --- prevention-rules delivery via STATE.md (KTD2) ---------------------------
+
+from mindhive import incidents, reflect
+
+
+def _seed_reflected_rules(n):
+    """n active incidents with reflected rules; later indices are more recent."""
+    for i in range(n):
+        sig = f"pymodule:sig{i:02d}"
+        for s, ts in (("s1", f"2026-07-01T10:{i:02d}:00Z"),
+                      ("s2", f"2026-07-02T10:{i:02d}:00Z")):
+            events.append_event("tool_failed",
+                                {"text": "boom", "signature": sig, "action": "x"},
+                                session_id=s, tags=["auto", "failure"],
+                                ts=ts, project="test")
+    incidents.project(project="test", threshold=2)
+    d = paths.project_dir("test") / "rules" / "incidents"
+    for i in range(n):
+        path = d / f"{incidents._safe_name(f'pymodule:sig{i:02d}')}.md"
+        path.write_text(incidents._replace_section(
+            path.read_text(encoding="utf-8"), "Auto Evaluation",
+            f"- Prevention rule: avoid failure {i:02d}"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+
+
+def _state() -> str:
+    return (paths.project_dir() / "STATE.md").read_text(encoding="utf-8")
+
+
+def test_state_appends_rules_block_when_reflected_active():
+    _seed_reflected_rules(1)
+    projector.project()
+    state = _state()
+    assert "# PREVENTION RULES" in state
+    assert "avoid failure 00" in state
+    # rules ride AFTER the state body
+    assert state.index("_events:") < state.index("# PREVENTION RULES")
+
+
+def test_state_omits_rules_header_when_inject_empty():
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    assert "PREVENTION RULES" not in _state()
+
+
+def test_state_rules_block_bounded_with_trailer():
+    _seed_reflected_rules(12)
+    projector.project()
+    state = _state()
+    assert state.count("- [pymodule:sig") == incidents.INJECT_CAP
+    assert "+2 more: hive rules list" in state
+    assert "avoid failure 11" in state        # most recent kept
+    assert "avoid failure 00" not in state    # oldest cut
+
+
+def test_rule_demoted_after_leaks_disappears_from_next_state_build():
+    def fail(session, ts):
+        events.append_event("tool_failed",
+                            {"text": "boom", "signature": "pymodule:leaky",
+                             "action": "x"},
+                            session_id=session, tags=["auto", "failure"],
+                            ts=ts, project="test")
+    fail("s1", "2026-07-01T10:00:00Z")
+    fail("s2", "2026-07-01T11:00:00Z")            # activation crossing
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-leaky.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", "- Prevention rule: stop leaking"),
+                    encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+    projector.project()
+    assert "stop leaking" in _state()
+    # two post-activation recurrences -> auto rule demoted on re-projection
+    fail("s3", "2026-07-01T12:00:00Z")
+    fail("s4", "2026-07-01T13:00:00Z")
+    incidents.project(project="test", threshold=2)
+    projector.project()
+    assert "stop leaking" not in _state()
+    assert "PREVENTION RULES" not in _state()
+
+
+def test_state_carries_reflection_health_warning():
+    reflect.write_marker("test", {"last_attempt": "2026-07-05T10:00:00Z",
+                                  "last_success": "2026-07-01T10:00:00Z",
+                                  "last_error": "empty verdict"})
+    projector.project()
+    state = _state()
+    assert "Reflection health" in state
+    assert "empty verdict" in state
+
+
+# --- suggested-skills block embedded in STATE.md (R9) -------------------------
+
+from mindhive import plugins
+
+
+def _fake_inventory(skills):
+    """A plugins.live_inventory()-shaped payload with one test plugin."""
+    return {"inventory": {
+        "plugins": [{"name": "testplug",
+                     "skills": [{"name": n, "trigger": d} for n, d in skills]}],
+        "local_skills": []}}
+
+
+def test_state_contains_suggested_skills_when_recommend_yields(monkeypatch):
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _fake_inventory([
+                            ("alpha-skill", "use when testing alpha paths"),
+                            ("beta-skill", "handles beta deployments")]))
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    state = _state()
+    assert "# SUGGESTED SKILLS" in state
+    assert "alpha-skill" in state
+    assert "(estimated)" in state          # never-called -> estimated provenance
+    # block rides AFTER the state body
+    assert state.index("_events:") < state.index("# SUGGESTED SKILLS")
+
+
+def test_suggested_skills_block_surfaces_intended_use_and_nudge(monkeypatch):
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _fake_inventory([
+                            ("alpha-skill", "Use when testing alpha code paths")]))
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    state = _state()
+    # the intended use (skill description) rides in the block so the agent
+    # grasps scope without opening the skill
+    assert "intended use: Use when testing alpha code paths" in state
+    # the adherence nudge is present and is NOT a bullet (must not count as a rec)
+    assert "Consult each skill's intended use before invoking" in state
+    block = state.split("# SUGGESTED SKILLS", 1)[1]
+    bullets = [ln for ln in block.splitlines() if ln.startswith("- ")]
+    assert len(bullets) == 1
+
+
+def test_suggested_skills_block_bounded_to_three(monkeypatch):
+    six = [(f"skill-{i:02d}", f"totally distinct purpose number {i}")
+           for i in range(6)]
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _fake_inventory(six))
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()
+    state = _state()
+    block = state.split("# SUGGESTED SKILLS", 1)[1]
+    bullets = [ln for ln in block.splitlines() if ln.startswith("- ")]
+    assert len(bullets) == projector.SUGGEST_CAP == 3
+
+
+def test_recommend_failure_skips_block_state_still_builds(monkeypatch):
+    from mindhive import recommend as recommend_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("recommend broke")
+
+    monkeypatch.setattr(recommend_mod, "recommend", boom)
+    events.append_event("decision", {"text": "d1"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    projector.project()   # must not raise
+    state = _state()
+    assert "SUGGESTED SKILLS" not in state
+    assert "d1" in state                   # state body intact
