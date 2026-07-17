@@ -42,3 +42,11 @@ def test_engineering_loop_is_subordinate_to_the_orchestrator():
     text = _SKILL.read_text(encoding="utf-8")
     assert "subordinate" in text.lower()
     assert "mindhive-orchestrator" in text
+
+
+def test_loop_is_learning_gated_and_parallel_aware():
+    text = _SKILL.read_text(encoding="utf-8")
+    assert "execution_mode" in text
+    assert "discontinued" in text
+    assert "Parallel whenever independent" in text
+    assert "Oversee" in text

@@ -11,6 +11,9 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive state` — print the live STATE.md
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive rules summaries [--project P] [--json]` — structured lesson records (root cause, lesson, prevention rule, category, active rule) for every incident — the same data the dashboard **Improvements** view shows, for agents working headless. `--json` emits the raw list
+- `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks. The same pass also **reroutes** red leaking rules (below)
+- `hive rules resolve [--limit N] [--list]` — active resolution over the **red (unresolved) set**: incidents with no rule are reflected; a leaking **auto** rule is replaced with the best distinct alternative route (model-ranked, deterministic-fallback aware, capped at 3 attempts per signature — then flagged `reroute_exhausted` for a human). The `rule_rerouted` event re-anchors leak counting, so a route that holds turns green (resolved) and auto-promotes to SOUL.md. Human rules are never rerouted. `--list` prints the red set without spending tokens
+- `hive flag "<text>" [--category tag]` — self-flag a judgment error (wrong call, not a tool failure); active as a prevention rule from the first occurrence
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
@@ -19,15 +22,23 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive skills list [--json]` — list every installed plugin + skill from the live registry (updates the instant one is installed/removed)
 - `hive skills invoke <name> [--plugin p]` — call any installed skill through MindHive via a headless `claude`; records the outcome and exits non-zero on failure so callers can gate on it
 - `hive skills status` — green/red last-call outcome per skill from the ledger
+- `hive skills stats [--json]` — per-skill completion-rate telemetry from the ledger (calls, ok/fail, last outcome, last used)
+- `hive skills record <name> --ok|--fail [--note "…"]` — record an agent-assessed skill outcome directly (write-through for skills driven in-session rather than via `invoke`)
+- `hive skills recommend [--json|--top N|--brief]` — deterministic most-needed-skills ranking from measured data; `--brief` prints ≤3 one-liners (the same block STATE.md embeds at every projection rebuild)
 - `hive review queue [--session id]` — queue the session's touched source files for a thermo-nuclear review (run by `session_end`; writes the pending-review marker)
 - `hive review show` — print the pending-review marker, if any
 - `hive review clear` — clear the pending-review marker once the review has run
+- `hive log <category> "<explanation>"` — record a **mandatory** code change-log entry for the current change-set (categories: `update`, `minor_change`, `deletion`, `reduction`, `major_change`, `replacement`; files auto-detected, `--files` to override). Entries are `code_change` events shown in the dashboard's **Log** section
+- `hive log queue [--session id]` — queue the session's unlogged source files (run by `session_end`; writes the pending-changelog marker whose notice blocks STATE.md until the entry is recorded)
+- `hive log show` — print change-log entries, newest first
+- `hive log pending` — print the pending unlogged-changes marker, if any
+- `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain
 - `hive embed [--force]` — build the on-demand vector index
 - `hive selftest` — run the test suite
 - `hive loop init` — scaffold `.hive-loop/` (PROMPT.md, fix_plan.md, AGENT.md, loop.toml) and check the `claude` CLI
-- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate, and a circuit breaker. A real run also **auto-opens the web dashboard** so you can watch it live — opt out with `--no-dashboard` or `MINDHIVE_LOOP_DASHBOARD=0`
+- `hive loop` — run an autonomous Claude Code loop in the current project until the task is done; memory-seeded each iteration, with real token/cost budget gating, a context smart-zone reset at half the window, a dual-condition exit gate (the explicit `EXIT_SIGNAL: true` **plus** ≥2 natural-language completion signals in the reply — `[loop] min_completion_heuristics` in loop.toml, `0` restores explicit-only), and a circuit breaker (3 no-progress / 5 same-error iterations). When no `[model].model` is pinned, iterations **route to a model tier** (light/mid/heavy, `[model.tiers]` in loop.toml): small tasks start light, a failed or no-progress iteration escalates one tier, and the starting tier is learned from what completed comparable-size runs in the ledger. A real run also **auto-opens the web dashboard** so you can watch it live — opt out with `--no-dashboard` or `MINDHIVE_LOOP_DASHBOARD=0`
 - `hive loop status` — summarize the last loop run
 - `hive loop --dry-run` — show prompts + projected budget/context math without calling the CLI (no dashboard is opened)
 - **`/mindhive-orchestrator <idea>`** — the **single centralized pipeline**: turns an idea into finished, quality-checked work through a **ten-stage sequential, dynamic** workflow — brainstorm → plan → observation → understand-and-converge → PRD → recommendation matrix → kanban → execution → quality assessment → learning. Its **main execution engine is restricted to the `superpowers` and `compound-engineering` plugins** (either may run, or both combined); every other installed skill is a **complement** that only raises quality. It **recalls before it asks**, and advances **dynamically** — auto-advancing when intent is clear from recall + codebase, pausing to converge with you only when a scope/architecture/risk fork is genuinely unresolved. At execution it fans work out to **parallel sub-agents** over a **file-complexity cluster database** (`hive clusters`). This is the **only** trigger for the pipeline. Shipped in the plugin (`commands/mindhive-orchestrator.md` + `skills/mindhive-orchestrator/`).
@@ -81,6 +92,11 @@ signature gates the rebuild). Every entry is:
   flows into the **Improvements** loop, so a bad call becomes a prevention rule
   the next run can consult. All installed skills are callable this way, not a
   hand-picked subset.
+- **Effectiveness-aware ranking.** Skill invocations are captured live (and
+  back-filled from transcripts), so recommendations blend coverage with a
+  measured success rate. A skill with ≥3 calls and <40 % success is demoted:
+  listed with its failure reason instead of recommended. No history = neutral
+  (unproven skills are neither boosted nor punished).
 
 ## PowerShell 5.1 note
 Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via stdin:
@@ -98,6 +114,35 @@ exists (V17 is trading). Override with `--force` only when the box is idle.
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into
 any model/client. It is deterministic and costs no API tokens.
+
+## Oversee: live work sessions
+
+The dashboard's **Oversee** view (Work group) shows every kind of live Claude
+work for the selected project as a titled card:
+
+- **`hive loop` runs** — titled by a one-line summary of what the run is doing
+  (the latest iteration summary, seeded from PROMPT.md).
+- **Interactive Claude sessions** — no `/circle` or loop needed: the moment a
+  session's hook telemetry flows (prompts, file touches, commands), it appears,
+  titled by your latest prompt.
+
+Click a title to expand the progress detail, rendered as a Claude-style task
+checklist in the hive palette: green **✓** done lines (past iteration
+summaries / checked fix_plan items / decisions and touched files), a pulsing
+**◐** for what's happening right now, and gray **○** pending lines (unchecked
+required items, next steps; Future/Optional items dimmed). While anything is
+live, an **online — Claude is working** strip shows at the top (loop heartbeat
+= one iteration timeout; chat heartbeat = tool events within ~3 minutes); it
+disappears when nothing is working.
+
+Sessions are **removed automatically** when a loop run ends through the dual-
+condition exit gate (graceful exit) or the circuit breaker trips, when an
+interactive session ends, or when a chat session goes idle past ~6 hours. Any
+card can be deleted manually with its **delete** button. Deletion is an
+append-only `loop_run_dismissed` tombstone — the events stay in the hash chain
+(the archive), so `hive verify` never breaks — and a session that was actually
+still alive resurfaces on its next event instead of burning tokens out of
+sight.
 
 ## Desktop control panel
 
@@ -119,6 +164,21 @@ or recurring), amber ● (watching / not yet tested), gray ○ (dismissed via th
 per-card dismiss button). The **Reflect (learn from failures)** button (Heavy)
 turns recurring unreflected incidents into lessons via the `claude` CLI, a
 small bounded batch per click.
+
+**Workspace: MindParallel & MindSwarm.** The **Workspace** group runs real
+Claude Code agents from the dashboard, all feeding the same hive memory.
+**MindParallel** is a grid of up to 16 panes — each pane is a headless `claude`
+session (follow-ups resume the same session), with named **profiles** mapping
+panes to different `CLAUDE_CONFIG_DIR`s so multiple accounts run side by side,
+and a kanban board whose cards dispatch their prompt to a free pane and move
+backlog → running → done with the run. **MindSwarm** launches a mission crew —
+a coordinator plus builders, scouts, and reviewers — where every agent's system
+prompt tells it to read and write the shared Mind Hive ledger (`hive recall` /
+`hive append`), so what one agent learns the next one starts with; a command
+bar directs any single agent or the whole swarm. Every exchange lands in the
+ledger as `user_prompt` / `assistant_response` events (failures as
+`tool_failed` with signature `workspace:<role>`), so workspace activity flows
+into Memory, the graph, and the Improvements loop automatically.
 
 **Self-healing capture.** The server runs a background loop that periodically
 **auto-harvests** any session the live hooks missed — so the store stays current
@@ -150,7 +210,17 @@ Within a project the panel keeps three layers distinct so intent and context
 stay legible:
 - **Memory** — the semantic events you/Claude author (decision, caveat,
   experiment_result, next_step, open_question, state_set): the intent layer.
-- **Sessions** — each append stream (`session_id`); click one to scope Memory to it.
+- **Sessions — notification center.** Every session renders as a collapsible
+  task card: status badge (`● ongoing` / `✓ completed`), a summary chip
+  ("edited 8 files (+120 −44) · ran 3 commands · 1 note"), and expandable
+  rows for touched files (+N −M line stats), commands (with descriptions),
+  notes/caveats, failures, and loop iterations (progress · breaker · tokens ·
+  cost). Expanding a file or command row fetches the full diff or command
+  output lazily from the Claude Code transcript — nothing heavy is stored in
+  the ledger, and sessions whose transcript is gone degrade to a notice.
+  The history is append-only and deliberately has no delete button; expanded
+  cards show the last 100 actions (older rows stay in the ledger). Zero-change
+  file writes (+0 −0) are not logged.
 - **session / auto** — deterministic telemetry (file_touched, command_run,
   session_start/end, …), counted separately on the Overview so it never drowns
   out the memory.

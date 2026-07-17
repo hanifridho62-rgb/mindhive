@@ -2,6 +2,7 @@
 # Harvests Claude Code transcripts -> rebuilds projections -> syncs native MEMORY.md
 # for every registered project. Never blocks; safe to run on a schedule.
 # Uses pythonw.exe (windowless) so no console window flashes on each run.
+if ($env:MINDHIVE_HEADLESS -eq "1") { exit 0 }   # headless reflection session: no recursion, no phantom events
 $ErrorActionPreference = "SilentlyContinue"
 & "C:\Users\hanif\mindhive\.venv\Scripts\pythonw.exe" -m mindhive autosync | Out-Null
 exit 0

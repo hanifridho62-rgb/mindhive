@@ -65,7 +65,7 @@ gate rule.
 3. **Observation** — recon the codebase and the ledger (`hive recall`/`state`/`graph`, plus the plugins' research agents). Ground the plan in what actually exists.
 4. **Understand & converge** — resolve the open scope/architecture/risk forks with the user, but only the ones recall + codebase couldn't (this is the dynamic gate in action).
 5. **PRD** — the requirements document the brainstorm/plan already emits (`docs/brainstorms/*-requirements.md`, `docs/plans/*-plan.md`) is the product-requirements artifact; do not re-author intent.
-6. **Recommendation Matrix** — score the candidate execution skills. **Load `references/recommendation-matrix.md`** and present the matrix, then get approval on the selection.
+6. **Recommendation Matrix** — score the candidate execution skills from measured telemetry. **Load `references/recommendation-matrix.md`**, apply the learning-gated selection rules below, present the matrix, then get approval on the selection.
 7. **Kanban** — turn the plan's Implementation Units into a work board (`TaskCreate`/`TaskList`), dependency-ordered.
 8. **Execution** — `compound-engineering:ce-work` drives the board; for independent work, fan out to **parallel sub-agents** (see the next section).
 9. **Quality assessment** — `compound-engineering:ce-code-review` + `ce-simplify-code` + `ce-test-browser` + `superpowers:verification-before-completion`. A failed verify loops back to stage 8, not forward.
@@ -88,6 +88,36 @@ codebase answerability, scope/architecture/risk clarity):
 The gate **converges; it never hard-stops**. Full rule in
 `references/pipeline-stages.md`.
 
+## Learning-gated selection: telemetry, execution modes, discontinued skills
+
+Score the stage-6 matrix from measured ground truth, never remembered
+impressions:
+
+- `python -m mindhive skills stats --json` — per-skill calls, ok/fail, completion
+  rate, last outcome, and streak from the ledger. **Pulling this measured
+  telemetry is mandatory before scoring anything.**
+- `python -m mindhive skills recommend --json` — the deterministic ranking, with
+  `measured|estimated` provenance and an `execution_mode` on every entry plus
+  measured coverage. Anchor the shortlist on it.
+
+Every recommend entry carries `execution_mode`. `auto` = proven track record
+(measured ≥3 calls, completion rate ≥ 0.8, no open incident) — apply it during
+the task without a blocking question, but still announce it. `suggest` =
+unproven (above all a never-used skill) — propose it and wait for the user's
+approval before invoking. Never auto-apply a `suggest`-mode skill, and say which
+mode applied when presenting the matrix.
+
+**Discontinued skills:** the payload's `discontinued` list names skills stopped
+by the improvements linkage (an active `skill:*` prevention rule plus a trailing
+failure streak). Do not invoke or recommend them; if one would otherwise be the
+best fit, surface its rule text and offer the alternatives instead. They return
+when the incident resolves or a successful call breaks the streak.
+
+**Honesty guardrails.** Every figure carries its provenance — `measured`,
+`estimated`, or `agent-assessed` (`skills record` self-grades). Never present an
+estimate or a self-grade as a measured rate; model-estimated percentages are
+allowed only for never-called skills and must be labeled `estimated`.
+
 ## Parallel multi-agent execution (the "like Fable 5" upper layer)
 
 At the execution stage, classify the codebase and fan work out to parallel
@@ -106,6 +136,23 @@ for the full protocol. In short:
 
 MindHive plans the shards (deterministic Python); the agent runtime spawns the
 sub-agents. Python never spawns agents.
+
+**Parallel dispatch rules (dynamic workflows):**
+
+- **Fan out independent tasks.** Dispatch units that touch disjoint files
+  concurrently — sub-agents via the platform's subagent primitive, or concurrent
+  `hive loop` runs (one task dir per unit; every run shows up separately in the
+  dashboard's **Oversee** section). Before fanning out, check the units' file
+  sets for overlap — overlapping units run sequentially.
+- **Dependent stages get evaluation checkpoints.** When stage 2 needs stage 1's
+  output, run them in order and verify each boundary: build/tests pass, the
+  artifact exists, the assumption still holds. On failure, **read the failure
+  log (stack trace) yourself, re-verify your assumptions, and fix it without new
+  instructions from the user** — the loop's circuit breaker and budget gates
+  bound the retries, so never bounce the first hurdle back to the user.
+- **Model routing applies per unit:** lightweight analysis does not need a
+  flagship model — `hive loop` routes tiers automatically when no model is
+  pinned; match that spirit when choosing sub-agent models.
 
 ## Stage 10 — log the learnings back into MindHive
 
@@ -131,7 +178,15 @@ dashboard shows live status), any installed skill is callable **through MindHive
   runs it via a headless `claude` and records the outcome (exit `0` ok / `1` fail).
 - **Check health first:** `python -m mindhive skills status`. Before invoking a
   skill showing `fail`, read its lesson (`python -m mindhive rules show
-  "skill:<name>"`) and apply the prevention rule — the learning loop closing.
+  "skill:<name>"`) **and consult its measured record** (`skills stats --json`) —
+  a one-off blip on a strong completion rate argues retry; a low rate or an open
+  `skill:*` incident argues substituting the next-ranked alternative.
+- **Record outcomes in real time (the learning loop's heartbeat):** immediately
+  after each executed skill completes, run
+  `python -m mindhive skills record <name> --ok|--fail [--note "…"]`
+  (agent-assessed provenance) before starting the next step — these records feed
+  the measured completion rates the next matrix runs on; skipping one starves
+  the learning loop.
 
 Every failed invoke becomes a `skill:<name>` `tool_failed` event that flows into
 the incidents → reflect → Improvements pipeline, so a bad call **teaches the
@@ -155,5 +210,6 @@ checkpoint.
   install or author new skills.
 - It never disturbs the V17 live-trading setup or the `~/.mindhive/LIVE_LOCK`
   guard — if a chained skill would run the loop, that skill's own guards apply.
-- Percentages in the matrix are honest model estimates, not measured rates.
-  Building a real per-skill success-rate backend is deferred follow-up work.
+- Matrix figures carry provenance: measured completion rates come from
+  `skills stats --json`; model estimates appear only for never-called skills and
+  are always labeled `estimated`.

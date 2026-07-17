@@ -9,10 +9,14 @@ richer argv (stream-json, --resume, --permission-mode, --allowedTools), so its
 runner stays its own.
 """
 import json
+import os
 import shutil
 import subprocess
 
-MODEL = "claude-sonnet-4-6"
+# Use the CLI's rolling alias, not a dated id: `--model sonnet` always resolves
+# to the current Sonnet, so the reflection engine never silently 404s the way a
+# pinned "claude-sonnet-4-6" would once that snapshot is retired.
+MODEL = "sonnet"
 
 
 def resolve_exe(cmd: str = "claude") -> str:
@@ -27,8 +31,13 @@ def run_headless(prompt: str, model: str = MODEL, timeout_s: int = 180) -> dict:
     ``{"exit": int, "stdout": str}``. Spawn failures map to conventional exit
     codes (127 not-found, 124 timeout) so callers treat them uniformly."""
     argv = [resolve_exe(), "--output-format", "json", "--model", model, "-p", prompt]
+    # Recursion guard (KTD3): every hooks/*.ps1 exits immediately when this
+    # variable is set, so a headless session spawned here can never re-fire the
+    # hooks (no reflect->session_end->reflect loop, no phantom session events).
+    env = dict(os.environ, MINDHIVE_HEADLESS="1")
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                              env=env,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {"exit": proc.returncode, "stdout": proc.stdout or ""}
     except FileNotFoundError:
@@ -56,3 +65,18 @@ def result_text(stdout: str) -> str:
     """The model's result text, or "" when the envelope is missing or is_error."""
     obj = _parse(stdout)
     return "" if obj is None or obj.get("is_error") else (obj.get("result", "") or "")
+
+
+def error_text(stdout: str) -> str:
+    """Why an is_error envelope failed, for health reporting: the api status
+    plus the CLI's own message (e.g. "429: You've hit your weekly limit …").
+    Empty string when the envelope is missing or not an error — the envelope's
+    error message must never be mistaken for model output."""
+    obj = _parse(stdout)
+    if obj is None or not obj.get("is_error"):
+        return ""
+    status = obj.get("api_error_status")
+    msg = str(obj.get("result") or obj.get("error") or "").strip()
+    if status and msg:
+        return f"{status}: {msg}"
+    return msg or (f"api error {status}" if status else "is_error envelope")

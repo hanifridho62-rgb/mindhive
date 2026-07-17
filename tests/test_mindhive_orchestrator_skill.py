@@ -95,3 +95,19 @@ def test_marketplace_version_matches_plugin():
         f"marketplace.json pins {entry['version']} but plugin.json is "
         f"{plugin['version']} — bump both together"
     )
+
+
+def test_skill_consumes_learning_gated_execution_modes():
+    text = _SKILL.read_text(encoding="utf-8")
+    assert "execution_mode" in text
+    assert "`auto`" in text and "`suggest`" in text
+    assert "discontinued" in text
+    assert "Never auto-apply" in text
+
+
+def test_skill_documents_parallel_dispatch_and_checkpoints():
+    text = _SKILL.read_text(encoding="utf-8")
+    assert "Parallel dispatch" in text
+    assert "evaluation checkpoint" in text.lower()
+    assert "Oversee" in text
+    assert "stack trace" in text        # read failure logs, fix without new instructions

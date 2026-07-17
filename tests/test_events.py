@@ -75,6 +75,18 @@ def test_rule_revised_is_a_valid_deterministic_type():
     assert ev.type == "rule_revised"
 
 
+def test_skill_used_is_a_valid_deterministic_type():
+    # U5: without this registration append_event raises and every Skill-tool
+    # capture would be silently dropped to hooks_errors.log
+    assert "skill_used" in events.DETERMINISTIC_TYPES
+    assert "skill_used" not in events.SEMANTIC_TYPES
+    ev = events.append_event("skill_used",
+                             {"name": "ce-plan", "plugin": "compound-engineering",
+                              "ok": True, "text": "done"},
+                             session_id="s1", tags=["auto"], project="test")
+    assert ev.type == "skill_used"
+
+
 def test_lifecycle_event_types_are_valid():
     for t in ("rule_activated", "rule_promoted", "rule_demoted"):
         assert t in events.DETERMINISTIC_TYPES
@@ -82,3 +94,36 @@ def test_lifecycle_event_types_are_valid():
     ev = events.append_event("rule_promoted", {"signature": "pymodule:x"},
                              session_id="s", tags=["promote"], project="test")
     assert ev.type == "rule_promoted"
+
+
+def test_loop_run_dismissed_is_valid_deterministic_type():
+    assert "loop_run_dismissed" in events.DETERMINISTIC_TYPES
+    assert "loop_run_dismissed" not in events.SEMANTIC_TYPES
+    ev = events.append_event("loop_run_dismissed",
+                             {"run_id": "abc123", "cause": "manual"},
+                             session_id="s", project="test")
+    assert ev.type == "loop_run_dismissed"
+
+
+def test_learning_is_a_valid_semantic_type():
+    # regression guard: research._record_learning appends type "learning";
+    # before it was registered, append_event rejected it and the controller's
+    # crash guard silently dropped every PRD from the ledger
+    assert "learning" in events.SEMANTIC_TYPES
+    assert "learning" in events.MEMORY_VIEW_TYPES
+    ev = events.append_event("learning", {"text": "Self-Reliant learning 1",
+                                          "report": "PRD body"},
+                             session_id="research-ab12cd34",
+                             tags=["self-reliant", "learning"], project="test")
+    assert ev.type == "learning"
+
+
+def test_origin_of_marks_self_reliant_output():
+    # tag mark (append-time) and session mark (research-<run_id> stream) both
+    # resolve to the one provenance label; everything else stays unlabeled
+    assert events.origin_of("research-ab12cd34") == "self-reliant"
+    assert events.origin_of("sess-1", ["self-reliant"]) == "self-reliant"
+    assert events.origin_of("sess-1", ["swarm"]) is None
+    assert events.origin_of("sess-1") is None
+    assert events.origin_of(None) is None
+    assert events.origin_of("researchy-session") is None   # prefix, not substring

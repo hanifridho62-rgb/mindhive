@@ -1,5 +1,6 @@
 # tests/test_dashboard.py
 import json
+import socket
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
@@ -88,6 +89,51 @@ def test_graph_endpoint_returns_html(dashboard_server):
     assert "<html" in body.lower() and '<svg id="svg">' in body
 
 
+def test_changelog_endpoint_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/changelog")  # no token
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_changelog_endpoint_returns_entries_and_pending(dashboard_server):
+    from mindhive import changelog, events
+    base, token = dashboard_server
+    # empty store: no entries, no pending marker; categories always served
+    # so the UI never hardcodes the taxonomy
+    status, body = _get(base, "/api/changelog", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["entries"] == [] and obj["pending"] is None
+    assert obj["categories"] == ["update", "minor_change", "deletion",
+                                 "reduction", "major_change", "replacement"]
+    # one recorded entry + a pending marker for an unlogged touch
+    changelog.record("replacement", "swapped the exporter implementation",
+                     files=["src/mindhive/export.py"], session_id="s1")
+    events.append_event("file_touched", {"text": "/repo/src/mindhive/late.py"},
+                        session_id="s2", ts="2026-07-15T11:00:00Z")
+    changelog.queue(events.read_all(), session_id="s2")
+    status, body = _get(base, "/api/changelog", token)
+    obj = json.loads(body)
+    assert len(obj["entries"]) == 1
+    e = obj["entries"][0]
+    assert e["category"] == "replacement"
+    assert e["files"] == ["src/mindhive/export.py"]
+    assert obj["pending"]["files"] == ["/repo/src/mindhive/late.py"]
+
+
+def test_served_page_contains_log_view_hook(dashboard_server):
+    # The CLAUDE.md restart check greps the served page for view hooks —
+    # showLog must be present alongside showOversee.
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "showLog" in body
+    assert "/api/changelog" in body
+
+
 def test_overview_endpoint_returns_stats(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/api/overview", token)
@@ -166,14 +212,15 @@ def test_plugins_inventory_requires_token(dashboard_server):
         assert e.code == 403
 
 
-def test_page_has_skills_and_plugins_view(dashboard_server):
-    """The nav entry is renamed and the view is wired to the live engine."""
+def test_page_has_skill_and_plugin_view(dashboard_server):
+    """The nav entry carries the Skill & Plugin panel wired to the live engine."""
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert status == 200
-    assert "Skills &amp; plugins" in body
-    for needle in ("renderPlugins", "/api/plugins/inventory"):
-        assert needle in body, f"missing skills&plugins hook: {needle}"
+    assert "Skill &amp; Plugin" in body
+    for needle in ("renderPlugins", "showSkillPanel", "Recommended now",
+                   "/api/plugins/inventory", "/api/skills/recommend"):
+        assert needle in body, f"missing skill&plugin hook: {needle}"
 
 
 def test_skills_detail_endpoint_returns_intended_use_body_and_date(dashboard_server, monkeypatch):
@@ -246,7 +293,7 @@ def test_skills_history_endpoint_returns_list(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
     seen = {}
     monkeypatch.setattr(plugins_mod, "call_history",
-        lambda name, project=None, limit=20: seen.update(name=name, limit=limit)
+        lambda name, project=None, limit=20, evs=None: seen.update(name=name, limit=limit)
         or [{"ts": "t", "ok": True, "text": "x", "session": "s"}])
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/history?name=foo&limit=7", token)
@@ -271,13 +318,71 @@ def test_page_has_call_history_hook(dashboard_server):
         assert needle in body, f"missing call-history hook: {needle}"
 
 
-def test_skills_status_endpoint_returns_map(dashboard_server, monkeypatch):
+def test_skills_status_endpoint_returns_status_and_counts(dashboard_server, monkeypatch):
     from mindhive import plugins as plugins_mod
-    monkeypatch.setattr(plugins_mod, "call_status", lambda project=None: {"a": "ok", "b": "fail"})
+    monkeypatch.setattr(plugins_mod, "call_stats",
+        lambda project=None, evs=None: {"status": {"a": "ok", "b": "fail"},
+                                        "counts": {"a": 2, "b": 1}})
     base, token = dashboard_server
     status, body = _get(base, "/api/skills/status", token)
     assert status == 200
-    assert json.loads(body) == {"a": "ok", "b": "fail"}
+    assert json.loads(body) == {"status": {"a": "ok", "b": "fail"},
+                                "counts": {"a": 2, "b": 1}}
+
+
+def test_page_has_invoke_count_hooks(dashboard_server):
+    """Per-skill call telemetry is surfaced. The Skill & Plugin rebuild (U7)
+    replaced the old name-adjacent count badge with a richer metrics line
+    (calls / ok / fail / completion rate) rendered from PLUG_STATS via
+    skMetrics — the invoke-count intent is preserved and enriched."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("PLUG_STATS", "skMetrics"):
+        assert needle in body, f"missing per-skill telemetry hook: {needle}"
+
+
+def test_page_has_clickable_improvements_legend(dashboard_server):
+    """Improvements legend glyphs filter by resolution on click, like the
+    Skills legend's one-click status filters."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("setImpRes", "IMP_RES"):
+        assert needle in body, f"missing improvements legend filter hook: {needle}"
+
+
+def test_skills_stats_endpoint_returns_stats_keyed_by_skill(dashboard_server):
+    from mindhive import events
+    events.append_event("invoke_result", {"name": "a", "ok": True, "text": ""},
+                        session_id="s", ts="2026-07-01T10:00:00Z", project="test")
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/stats?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["stats"]["a"]["calls"] == 1
+    assert obj["stats"]["a"]["completion_rate"] == 1.0
+
+
+def test_skills_stats_endpoint_unknown_project_is_empty_not_500(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/stats?project=no-such-ns", token)
+    assert status == 200
+    assert json.loads(body) == {"stats": {}}
+
+
+def test_skills_recommend_endpoint_returns_ranked_payload(dashboard_server, monkeypatch):
+    from mindhive import plugins as plugins_mod
+    monkeypatch.setattr(plugins_mod, "live_inventory", lambda: {
+        "changed": True, "signature": "x", "inventory": {
+            "plugins": [{"name": "p", "skills": [
+                {"name": "tester", "trigger": "Use when tests fail."}]}],
+            "local_skills": [], "counts": {}}})
+    base, token = dashboard_server
+    status, body = _get(base, "/api/skills/recommend?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert "coverage" in obj and "recommendations" in obj
+    assert obj["recommendations"][0]["name"] == "tester"
+    assert obj["recommendations"][0]["provenance"] in ("measured", "estimated")
 
 
 def test_page_has_invoke_and_status_hooks(dashboard_server):
@@ -659,6 +764,7 @@ def test_launch_background_spawns_dashboard_subprocess(monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "tok-abc")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
     res = dashboard.launch_background()
     assert res["launched"] is True
@@ -685,6 +791,7 @@ def test_launch_background_uses_platform_detach_flags(monkeypatch):
     import os as _os
     captured = {}
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen",
                         lambda argv, **kw: captured.update(kw=kw) or type("P", (), {"pid": 1})())
     dashboard.launch_background()
@@ -699,10 +806,97 @@ def test_launch_background_is_non_fatal_on_spawn_failure(monkeypatch):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard, "_instance_running", lambda *a, **k: False)
     monkeypatch.setattr(dashboard.subprocess, "Popen", boom)
     res = dashboard.launch_background()
     assert res["launched"] is False
     assert "cannot spawn" in res["reason"]
+
+    # --- single-instance guard: only ever one dashboard pid ------------------
+
+
+def test_instance_running_true_when_a_server_is_listening(dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+    assert dashboard._instance_running(port) is True
+
+
+def test_instance_running_false_when_nothing_listening():
+    # bind an ephemeral port, close it, then probe: nothing is accepting there
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    free_port = s.getsockname()[1]
+    s.close()
+    assert dashboard._instance_running(free_port) is False
+
+
+def test_instance_running_false_for_ephemeral_port_zero():
+    assert dashboard._instance_running(0) is False
+
+
+def test_launch_background_skips_spawn_when_already_running(monkeypatch, dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+    spawned = {"called": False}
+
+    def fake_popen(argv, **kw):
+        spawned["called"] = True
+        return type("P", (), {"pid": 1})()
+
+    monkeypatch.setattr(dashboard, "load_or_create_token", lambda: "t")
+    monkeypatch.setattr(dashboard.subprocess, "Popen", fake_popen)
+    res = dashboard.launch_background(port=port)
+    assert res["launched"] is False
+    assert res["already_running"] is True
+    assert spawned["called"] is False   # the whole point: no second pid
+
+
+def test_serve_returns_early_without_binding_when_already_running(monkeypatch, dashboard_server):
+    base, _ = dashboard_server
+    port = int(base.rsplit(":", 1)[1])
+
+    def boom(*a, **k):
+        raise AssertionError("serve() must not bind a second server")
+
+    # if the guard fails, serve() would try to bind and hit this
+    monkeypatch.setattr(dashboard, "ThreadingHTTPServer", boom)
+    dashboard.serve(port=port, open_browser=False)   # returns cleanly via the probe
+
+    # --- open_panel(): the `mind hive` shortcut — launch-or-focus -------------
+
+
+def test_open_panel_launches_when_nothing_running(monkeypatch):
+    opened = {"called": False}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": True, "url": "http://x/?token=t", "pid": 1})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda *a, **k: opened.update(called=True))
+    msg = dashboard.open_panel()
+    assert msg == "MIND HIVE dashboard: http://x/?token=t"
+    assert opened["called"] is False   # the detached child opens its own browser
+
+
+def test_open_panel_opens_browser_when_already_running(monkeypatch):
+    opened = {}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": False, "already_running": True,
+                                           "url": "http://x/?token=t", "reason": "already running"})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda url, *a, **k: opened.update(url=url))
+    msg = dashboard.open_panel()
+    assert opened["url"] == "http://x/?token=t"     # seamless: browser lands on the live panel
+    assert "already running" in msg and "http://x/?token=t" in msg
+
+
+def test_open_panel_reports_failure_without_opening_browser(monkeypatch):
+    opened = {"called": False}
+    monkeypatch.setattr(dashboard, "launch_background",
+                        lambda port=None: {"launched": False, "reason": "cannot spawn"})
+    monkeypatch.setattr(dashboard.webbrowser, "open",
+                        lambda *a, **k: opened.update(called=True))
+    msg = dashboard.open_panel()
+    assert msg == "dashboard: not launched (cannot spawn)"
+    assert opened["called"] is False
 
 
 # --------------------------------------------------------------------------
@@ -899,6 +1093,88 @@ def test_reflect_rejected_for_hivemind(dashboard_server):
     status, obj = _post(base, "/api/rules/reflect", {"project": "*"}, token)
     assert status == 200
     assert obj["ok"] is False and "read-only" in obj["error"]
+
+
+# --------------------------------------------------------------------------
+# POST /api/rules/resolve: active resolution over the red (unresolved) set
+# --------------------------------------------------------------------------
+_ROUTES_JSON = ('{"routes": [{"prevention_rule": "take the alternative route", '
+                '"rationale": "different mechanism", "confidence": 0.9}]}')
+
+
+def _seed_leaking_incident(project, sig="raw:leaky"):
+    for s, ts in (("s1", "2026-07-01T10:00:00Z"), ("s2", "2026-07-01T11:00:00Z")):
+        ev_mod.append_event("tool_failed",
+                            {"text": "boom", "signature": sig, "action": "x"},
+                            session_id=s, tags=["auto", "failure"], ts=ts,
+                            project=project)
+    inc_mod.audit(project=project)
+    inc_mod.project(project=project)
+    path = (hp.project_dir(project) / "rules" / "incidents"
+            / f"{inc_mod._safe_name(sig)}.md")
+    path.write_text(inc_mod._replace_section(
+        path.read_text(encoding="utf-8"), "Auto Evaluation",
+        "- Prevention rule: the failed rule"), encoding="utf-8")
+    inc_mod.project(project=project)
+    ev_mod.append_event("tool_failed",
+                        {"text": "boom", "signature": sig, "action": "x"},
+                        session_id="s3", tags=["auto", "failure"],
+                        ts="2026-07-01T12:00:00Z", project=project)   # leak
+
+
+def test_resolve_reroutes_leaking_rule(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_leaking_incident("test")
+    monkeypatch.setattr(refl_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES_JSON)
+    status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj["rerouted"] == 1 and obj["pending"] == 0
+    rec = [r for r in inc_mod.summaries(project="test")
+           if r["signature"] == "raw:leaky"][0]
+    assert rec["active_rule"] == "take the alternative route"
+    # the reroute re-anchors leak accounting: the lesson is no longer red
+    st = inc_mod.signal_stats("test")["raw:leaky"]
+    assert st["leaks"] == 0 and st["reroutes"] == 1
+
+
+def test_resolve_rejects_concurrent_run(dashboard_server):
+    base, token = dashboard_server
+    assert dash_mod._REFLECT_LOCK.acquire(blocking=False)
+    try:
+        status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
+        assert status == 200
+        assert obj["ok"] is False and "already running" in obj["error"]
+    finally:
+        dash_mod._REFLECT_LOCK.release()
+
+
+def test_resolve_noop_on_empty_store(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/rules/resolve", {"project": "bare"}, token)
+    assert obj["ok"] is True and obj["rerouted"] == 0 and obj["red"] == 0
+
+
+def test_improvements_payload_carries_reroute_fields(dashboard_server, monkeypatch):
+    base, token = dashboard_server
+    _seed_leaking_incident("test", sig="raw:routed")
+    monkeypatch.setattr(refl_mod, "_claude_runner",
+                        lambda prompt, timeout_s=120: _ROUTES_JSON)
+    from mindhive import resolve as resolve_mod
+    assert resolve_mod.reroute_incident("raw:routed",
+                                        project="test")["resolved"] is True
+    status, body = _get(base, "/api/improvements?project=test", token)
+    obj = json.loads(body)
+    card = [a for a in obj["auto"] if a["signature"] == "raw:routed"][0]
+    assert card["reroutes"] == 1 and card["last_reroute"]
+    assert card["resolution"] == "watching"        # fresh route, not yet proven
+
+
+def test_page_has_resolve_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    for needle in ("/api/rules/resolve", "runResolve", "resolve red"):
+        assert needle in body, f"missing resolve hook: {needle}"
 
 
 # --------------------------------------------------------------------------
@@ -1254,3 +1530,335 @@ def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
     status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
     assert obj["reflected"] == 1 and obj["failed"] == 2
     assert obj["pending"] == 0                    # attempted-but-failed is not pending
+
+
+# --------------------------------------------------------------------------
+# Sessions notification center: /api/sessions activity+status, /api/task,
+# /api/task_detail
+# --------------------------------------------------------------------------
+
+
+def _seed_session(project="dashproj", sid="sess-t1"):
+    from mindhive import events
+    events.append_event("file_touched",
+                        {"text": "src/a.py", "plus": 5, "minus": 2, "tool": "Edit"},
+                        session_id=sid, project=project)
+    events.append_event("command_run",
+                        {"text": "pytest -q", "desc": "Run tests"},
+                        session_id=sid, project=project)
+    events.append_event("caveat", {"text": "plan FIRST"},
+                        session_id=sid, project=project)
+
+
+def test_sessions_carry_activity_and_status(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    status, body = _get(base, "/api/sessions?project=dashproj", token)
+    assert status == 200
+    (s,) = json.loads(body)
+    assert s["status"] in ("ongoing", "completed")
+    assert s["activity"]["files"] == 1
+    assert s["activity"]["plus"] == 5 and s["activity"]["minus"] == 2
+    assert s["activity"]["commands"] == 1 and s["activity"]["notes"] == 1
+
+
+def test_task_endpoint_returns_capped_rows(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    status, body = _get(base, "/api/task?project=dashproj&session=sess-t1", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["total"] == 3 and obj["truncated"] == 0
+    assert [r["kind"] for r in obj["items"]] == ["touched", "ran", "caveat"]
+
+
+def test_task_endpoint_hivemind_requires_session_project(dashboard_server):
+    base, token = dashboard_server
+    _seed_session()
+    try:
+        _get(base, "/api/task?project=*&session=sess-t1", token)
+        assert False, "expected 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+    status, body = _get(
+        base, "/api/task?project=*&session=sess-t1&session_project=dashproj",
+        token)
+    assert status == 200
+    assert json.loads(body)["total"] == 3
+
+
+def test_task_detail_degrades_without_transcript(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(
+        base, "/api/task_detail?project=dashproj&session=no-such-sess", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["error"] == "transcript_unavailable" and obj["items"] == []
+
+
+def test_root_page_includes_task_cards_fragments(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "renderTaskCards" in body        # injected JS arrived
+    assert ".tcard" in body                 # injected CSS arrived
+    assert "__TASKS_JS__" not in body       # placeholders were replaced
+    assert "__TASKS_CSS__" not in body
+
+
+# --- Oversee: work sessions view (U3/U4) ---------------------------------
+
+def _seed_loop_run(run_id, hour, reason=None, title="Fix the parser"):
+    ev_mod.append_event("loop_run_start",
+                        {"run_id": run_id, "title": title, "goal_dir": "d"},
+                        ts=f"2026-07-07T{hour:02d}:00:00Z", project="test")
+    ev_mod.append_event("loop_iteration",
+                        {"run_id": run_id, "iteration": 1, "summary": "working",
+                         "cost_usd": 0.1, "total_tokens": 100},
+                        ts=f"2026-07-07T{hour:02d}:01:00Z", project="test")
+    if reason:
+        ev_mod.append_event("loop_run_end", {"run_id": run_id, "reason": reason},
+                            ts=f"2026-07-07T{hour:02d}:02:00Z", project="test")
+
+
+def test_oversee_lists_runs_and_online_flag(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)                     # running (no end event)
+    status, body = _get(base, "/api/oversee?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert [r["run_id"] for r in obj["runs"]] == ["run1"]
+    r = obj["runs"][0]
+    assert r["status"] == "running"
+    assert r["title"] == "working"                 # latest summary supersedes
+    # events are seeded in the past, so the heartbeat window has lapsed
+    assert r["online"] is False and obj["any_online"] is False
+
+
+def test_oversee_dismiss_removes_run(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10, reason="max_iterations")
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert status == 200 and obj == {"ok": True, "run_id": "run1"}
+    tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
+    assert tombs and tombs[0].payload["cause"] == "manual"
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    assert obj["runs"] == [] and obj["dismissed"] == 1
+
+
+def test_oversee_dismiss_unknown_or_missing_run_rejected(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "nope"}, token)
+    assert status == 200 and obj["ok"] is False
+    status, obj = _post(base, "/api/oversee/dismiss", {"project": "test"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert not [e for e in ev_mod.read_all("test")
+                if e.type == "loop_run_dismissed"]
+
+
+def test_oversee_dismiss_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "*", "run_id": "run1"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "read-only" in obj["error"]
+
+
+def test_oversee_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/oversee")
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_page_has_oversee_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "showOversee" in body and "Oversee" in body
+    assert "/api/oversee" in body and "deleteRun" in body
+
+
+def test_oversee_double_dismiss_is_idempotent(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10, reason="max_iterations")
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert obj == {"ok": True, "run_id": "run1"}
+    status, obj = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "run1"}, token)
+    assert status == 200
+    assert obj["ok"] is True and obj.get("already_dismissed") is True
+    tombs = [e for e in ev_mod.read_all("test") if e.type == "loop_run_dismissed"]
+    assert len(tombs) == 1                             # no duplicate tombstone
+
+
+def test_oversee_includes_interactive_sessions(dashboard_server):
+    base, token = dashboard_server
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("session_start", {}, session_id="chat-1", ts=ts, project="test")
+    ev_mod.append_event("user_prompt", {"text": "live chat work"},
+                        session_id="chat-1", ts=ts, project="test")
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    kinds = {r["run_id"]: r["kind"] for r in obj["runs"]}
+    assert kinds.get("chat-1") == "chat"
+    chat = [r for r in obj["runs"] if r["run_id"] == "chat-1"][0]
+    assert chat["title"] == "live chat work"
+    assert chat["online"] is True and obj["any_online"] is True
+    # manual delete works for chat sessions through the same endpoint
+    status, res = _post(base, "/api/oversee/dismiss",
+                        {"project": "test", "run_id": "chat-1"}, token)
+    assert res["ok"] is True
+
+
+# --- gzip: responses compress when the client accepts it --------------------
+
+def _get_gzip(base, path, token=None):
+    req = urllib.request.Request(base + path)
+    if token:
+        req.add_header("X-Hive-Token", token)
+    req.add_header("Accept-Encoding", "gzip")
+    with urllib.request.urlopen(req) as r:
+        return r.status, r.headers.get("Content-Encoding"), r.read()
+
+
+def test_page_gzips_when_accepted(dashboard_server):
+    import gzip as _gz
+    base, token = dashboard_server
+    status, enc, body = _get_gzip(base, "/")
+    assert status == 200 and enc == "gzip"
+    assert b"MIND HIVE" in _gz.decompress(body) or b"showOversee" in _gz.decompress(body)
+    # a client that doesn't accept gzip still gets identity (existing _get path)
+    status, plain = _get(base, "/")
+    assert status == 200 and "showOversee" in plain
+
+
+def test_small_json_stays_identity(dashboard_server):
+    base, token = dashboard_server
+    status, enc, body = _get_gzip(base, "/api/state?project=test", token)
+    assert status == 200
+    # STATE payload for an empty test store is tiny -> below the gzip floor
+    assert enc is None or len(body) >= 1400
+
+
+# --- Improvements triage marks (who acts: claude vs dismiss) -----------------
+
+def test_improvements_carry_triage_marks(dashboard_server):
+    from mindhive import events as ev, incidents as inc
+    base, token = dashboard_server
+    for s in ("s1", "s2"):
+        ev.append_event("tool_failed",
+                        {"text": "boom", "signature": "raw:tri1", "action": "x"},
+                        session_id=s, project="test")
+    inc.project(project="test", threshold=2)
+    status, body = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    (a,) = [x for x in json.loads(body)["auto"] if x["signature"] == "raw:tri1"]
+    # active with no rule -> unresolved -> pending agent work
+    assert a["resolution"] == "unresolved"
+    assert a["triage"] == "claude"
+    assert a["triage_hint"]
+
+
+# --- Self-Reliant provenance labels across the four sections ------------------
+
+def test_memory_items_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("learning", {"text": "Self-Reliant learning 1: PRD"},
+                    session_id="research-ab12cd34",
+                    tags=["self-reliant", "learning"], project="test")
+    ev.append_event("decision", {"text": "plain decision"},
+                    session_id="sess-1", project="test")
+    status, body = _get(base, "/api/memory?project=test", token)
+    items = {m["text"]: m for m in json.loads(body)}
+    assert items["Self-Reliant learning 1: PRD"]["origin"] == "self-reliant"
+    assert items["plain decision"]["origin"] is None
+
+
+def test_sessions_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("experiment_result", {"text": "Self-Reliant experiment 1"},
+                    session_id="research-ab12cd34", tags=["self-reliant"],
+                    project="test")
+    ev.append_event("decision", {"text": "one"}, session_id="sess-1",
+                    project="test")
+    status, body = _get(base, "/api/sessions?project=test", token)
+    sessions = {s["session_id"]: s for s in json.loads(body)}
+    assert sessions["research-ab12cd34"]["origin"] == "self-reliant"
+    assert sessions["sess-1"]["origin"] is None
+
+
+def test_improvements_manual_notes_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("caveat", {"text": "self-reliant caveat"},
+                    session_id="research-ab12cd34", tags=["self-reliant"],
+                    project="test")
+    ev.append_event("caveat", {"text": "ordinary caveat"},
+                    session_id="sess-1", project="test")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    notes = {m["text"]: m for m in json.loads(body)["manual"]}
+    assert notes["self-reliant caveat"]["origin"] == "self-reliant"
+    assert notes["ordinary caveat"]["origin"] is None
+
+
+def test_oversee_labels_self_reliant_runs(dashboard_server):
+    base, token = dashboard_server
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("experiment_result", {"text": "Self-Reliant experiment"},
+                        session_id="research-ab12cd34", tags=["self-reliant"],
+                        ts=ts, project="test")
+    status, body = _get(base, "/api/oversee?project=test", token)
+    runs = {r["run_id"]: r for r in json.loads(body)["runs"]}
+    sr = runs["research-ab12cd34"]
+    assert sr["origin"] == "self-reliant"
+    assert sr["title"] == "Self-Reliant run ab12cd34"
+
+
+def test_page_renders_self_reliant_badge_everywhere(dashboard_server):
+    # one shared badge helper, wired into Memory, Improvements, Oversee and
+    # the Sessions cards fragment (taskview CARDS_JS is injected into the page)
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert ".pill.sr" in body                     # badge style
+    assert body.count("srPill(") >= 5             # helper + 4 call sites
+    assert "srPill(s.origin)" in body             # sessions fragment wired
+
+
+def test_research_sources_route_reports_allowlist(dashboard_server, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    from mindhive import research
+    base, token = dashboard_server
+    status, body = _get(base, "/api/research/sources", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["ok"] and obj["enabled"]
+    assert obj["domains"] == research.TRUSTED_SOURCE_DOMAINS
+
+
+def test_workspace_auth_verify_route_registered(dashboard_server, monkeypatch):
+    from mindhive import workspace
+    base, token = dashboard_server
+    monkeypatch.setattr(workspace, "verify_auth",
+                        lambda name="default", force=False:
+                        {"profile": name, "state": "ok", "detail": "connected"})
+    status, res = _post(base, "/api/workspace/auth_verify",
+                        {"name": "default"}, token)
+    assert status == 200 and res["ok"] and res["state"] == "ok"
+    # machine-level check: exempt from the HIVE MIND read-only guard
+    status, res = _post(base, "/api/workspace/auth_verify",
+                        {"name": "default", "project": "*"}, token)
+    assert status == 200 and res["ok"] and res["state"] == "ok"

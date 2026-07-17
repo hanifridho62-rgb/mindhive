@@ -222,6 +222,45 @@ def test_inject_empty_when_no_active_rules():
     assert incidents.inject(project="test") == ""
 
 
+def test_inject_caps_at_limit_ranked_by_occurrences_then_recency():
+    # 12 active reflected rules: sig00..sig11, later index = more recent last
+    # failure; sig05 gets a third occurrence so it outranks everything.
+    for i in range(12):
+        sig = f"pymodule:sig{i:02d}"
+        _add_failure_ts(sig, "x", "s1", f"2026-07-01T10:{i:02d}:00Z")
+        _add_failure_ts(sig, "y", "s2", f"2026-07-02T10:{i:02d}:00Z")
+    _add_failure_ts("pymodule:sig05", "z", "s3", "2026-07-01T09:00:00Z")
+    incidents.project(project="test", threshold=2)
+    d = paths.project_dir("test") / "rules" / "incidents"
+    for i in range(12):
+        path = d / f"pymodule-sig{i:02d}.md"
+        path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                        "Auto Evaluation", f"- Prevention rule: avoid {i:02d}"),
+                        encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+
+    block = incidents.inject(project="test")
+    lines = [ln for ln in block.splitlines() if ln.startswith("- [")]
+    assert len(lines) == incidents.INJECT_CAP
+    assert block.splitlines()[-1] == "+2 more: hive rules list"
+    assert lines[0].startswith("- [pymodule:sig05]")   # 3 occurrences ranks first
+    assert "avoid 11" in block                         # recent kept
+    assert "avoid 00" not in block                     # two oldest cut
+    assert "avoid 01" not in block
+
+
+def test_inject_accepts_prefetched_events():
+    _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.project(project="test", threshold=2)
+    path = (paths.project_dir("test") / "rules" / "incidents" / "pymodule-mindhive.md")
+    path.write_text(incidents._replace_section(path.read_text(encoding="utf-8"),
+                    "Auto Evaluation", "- Prevention rule: run with -m"), encoding="utf-8")
+    incidents.project(project="test", threshold=2)
+    evs = events.read_all("test")
+    assert incidents.inject(project="test", evs=evs) == incidents.inject(project="test")
+
+
 def test_promote_appends_to_soul_and_marks_promoted():
     _add_failure_ts("pymodule:mindhive", "x", "s1", "2026-07-01T10:00:00Z")
     _add_failure_ts("pymodule:mindhive", "y", "s2", "2026-07-01T11:00:00Z")
@@ -529,3 +568,139 @@ def test_project_does_not_leak_lock_or_tmp_into_summaries():
     d = incidents._incident_dir("test")
     assert not incidents._incidents_lock_path("test").exists()
     assert not list(d.glob("*.tmp"))
+
+
+# --- judgment capture + candidate decay (U4) ---
+
+
+def _rel_ts(offset_secs):
+    """Store-format ts at now + offset (negative = past) — decay tests must not
+    go stale as the calendar advances, so they use relative timestamps."""
+    return _time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          _time.gmtime(_time.time() + offset_secs))
+
+
+def test_judgment_flag_active_at_one_occurrence():
+    sig = "judgment:flag:committed-to-master"
+    _add_failure_ts(sig, "hive flag", "s1", "2026-07-01T10:00:00Z")
+    res = incidents.audit(project="test", threshold=2)
+    assert res["activated"] == 1
+    incidents.project(project="test", threshold=2)
+    rec = incidents.load(sig, project="test")
+    assert rec["status"] == "active"
+    assert rec["occurrences"] == 1
+
+
+def test_stale_single_candidate_expires_and_stays_expired_across_rebuild():
+    _add_failure_ts("pymodule:stale", "x", "s1", _rel_ts(-20 * 86400))
+    res = incidents.audit(project="test", threshold=2)
+    assert res["expired"] == 1
+    exps = [e for e in events.read_all("test") if e.type == "rule_expired"]
+    assert len(exps) == 1
+    assert exps[0].payload["signature"] == "pymodule:stale"
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:stale", project="test")["status"] == "expired"
+    # idempotent: the expiry zeroes the live count, no second event
+    assert incidents.audit(project="test", threshold=2)["expired"] == 0
+    # a full projection rebuild re-derives expired from the event, not state
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:stale", project="test")["status"] == "expired"
+
+
+def test_judgment_flag_of_same_age_does_not_expire():
+    sig = "judgment:flag:old-but-gold"
+    _add_failure_ts(sig, "hive flag", "s1", _rel_ts(-20 * 86400))
+    res = incidents.audit(project="test", threshold=2)
+    assert res["expired"] == 0
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(sig, project="test")["status"] == "active"
+
+
+def test_recent_single_candidate_does_not_expire():
+    _add_failure_ts("pymodule:fresh", "x", "s1", _rel_ts(-3600))
+    assert incidents.audit(project="test", threshold=2)["expired"] == 0
+
+
+def test_reentry_after_expiry_counts_occurrences_from_expiry():
+    _add_failure_ts("pymodule:re", "x", "s1", _rel_ts(-20 * 86400))
+    assert incidents.audit(project="test", threshold=2)["expired"] == 1
+    # 1 post-expiry occurrence -> candidate again, not active
+    _add_failure_ts("pymodule:re", "y", "s2", _rel_ts(60))
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:re", project="test")["status"] == "candidate"
+    assert incidents.audit(project="test", threshold=2)["activated"] == 0
+    # 2 post-expiry occurrences -> active
+    _add_failure_ts("pymodule:re", "z", "s3", _rel_ts(120))
+    assert incidents.audit(project="test", threshold=2)["activated"] == 1
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:re", project="test")["status"] == "active"
+
+
+def test_expired_excluded_from_inject_and_default_summaries():
+    _add_failure_ts("pymodule:stale", "x", "s1", _rel_ts(-20 * 86400))
+    incidents.project(project="test", threshold=2)
+    _write_auto("pymodule:stale", "- Prevention rule: avoid staleness")
+    incidents.audit(project="test", threshold=2)          # decays it
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:stale", project="test")["status"] == "expired"
+    assert incidents.inject(project="test") == ""
+    assert incidents.summaries(project="test") == []
+    kept = incidents.summaries(project="test", include_expired=True)
+    assert [r["signature"] for r in kept] == ["pymodule:stale"]
+
+
+def test_reflected_judgment_incident_injects_alongside_technical():
+    _add_failure_ts("judgment:flag:pushed-to-master", "hive flag", "s1",
+                    "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "x", "s2", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:mindhive", "y", "s3", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    _write_auto("judgment:flag:pushed-to-master",
+                "- Prevention rule: never push to master without explicit ok")
+    _write_auto("pymodule:mindhive", "- Prevention rule: run with -m")
+    incidents.project(project="test", threshold=2)
+    block = incidents.inject(project="test")
+    assert "[judgment:flag:pushed-to-master] never push to master" in block
+    assert "[pymodule:mindhive] run with -m" in block
+
+
+# --- classify_triage: the who-acts mark on every Improvements card -----------
+
+def test_triage_unresolved_no_rule_is_for_claude():
+    t = incidents.classify_triage("unresolved", {"rule_source": "none"})
+    assert t["triage"] == "claude"
+    assert "no rule yet" in t["triage_hint"]
+
+
+def test_triage_unresolved_leaking_rule_is_for_claude():
+    t = incidents.classify_triage("unresolved", {"rule_source": "auto"})
+    assert t["triage"] == "claude"
+    assert "leak" in t["triage_hint"]
+
+
+def test_triage_watching_and_resolved_are_dismissible():
+    w = incidents.classify_triage("watching", {"rule_source": "none"})
+    r = incidents.classify_triage("resolved", {"rule_source": "auto"})
+    assert w["triage"] == r["triage"] == "dismiss"
+    assert "noise" in w["triage_hint"]
+    assert "holding" in r["triage_hint"]
+
+
+def test_triage_dismissed_carries_no_mark():
+    assert incidents.classify_triage("dismissed", {}) == {
+        "triage": "", "triage_hint": ""}
+
+
+# --- single-pass rebuild: evs threading must not change any status -----------
+
+def test_project_with_evs_matches_fresh_read(tmp_path, monkeypatch):
+    _add_failure_ts("pymodule:evs", "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts("pymodule:evs", "y", "s2", "2026-07-01T11:00:00Z")
+    incidents.audit(project="test", threshold=2)
+    incidents.project(project="test", threshold=2)
+    fresh = incidents.load("pymodule:evs", project="test")
+    evs = events.read_all("test")
+    incidents.project(project="test", threshold=2, evs=evs)
+    assert incidents.load("pymodule:evs", project="test") == fresh
+    assert fresh["status"] == "active"

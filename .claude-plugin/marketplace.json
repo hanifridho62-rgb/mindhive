@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "mindhive",
-      "description": "MindHive — /mindhive-orchestrator is the single centralized pipeline: a ten-stage sequential, dynamic workflow (brainstorm → plan → observation → understand → PRD → matrix → kanban → execution → quality → learning) with the superpowers + compound-engineering plugins as its only execution backbone and a parallel sub-agent layer over a file-complexity cluster database (hive clusters); /circle drives the headless Claude Code CLI until a task is done (budget-gated, circuit-broken) — the loop primitive; /engineering-loop is a subordinate circle+lfg execution engine the orchestrator may drive.",
+      "description": "MindHive — /circle drives the headless Claude Code CLI until a task is done (budget-gated, circuit-broken) — the loop primitive; /mindhive orchestrates an idea end-to-end with ULT-IDEA rigor on a memory spine (recall-before-ask preflight, five-gap idea pressure test, agent-native architecture review, scored skill Recommendation Matrix, follow-up chaining, learnings logged back — portable across Claude Code, Cowork, and NewTask); /mindhive-orchestrator is the single centralized pipeline: a ten-stage sequential, dynamic workflow (brainstorm → plan → observation → understand → PRD → matrix → kanban → execution → quality → learning) with the superpowers + compound-engineering plugins as its execution backbone and a parallel sub-agent layer over a file-complexity cluster database (hive clusters); /engineering-loop fuses circle+lfg into a memory-driven plan→work→review→fix→verify→learn loop, with any skill callable through MindHive (green/red) and failures feeding an improvement loop.",
       "version": "0.4.0",
       "source": "./",
       "author": {

@@ -68,3 +68,22 @@ def test_result_text_extracts_result_but_empty_on_error():
     assert claude_cli.result_text('{"is_error": false, "result": "the text"}') == "the text"
     assert claude_cli.result_text('{"is_error": true, "result": "boom"}') == ""
     assert claude_cli.result_text("not json") == ""
+
+
+def test_error_text_carries_status_and_message():
+    out = ('{"is_error": true, "api_error_status": 429, '
+           '"result": "You\'ve hit your weekly limit"}')
+    assert claude_cli.error_text(out) == "429: You've hit your weekly limit"
+
+
+def test_error_text_message_only_and_status_only():
+    assert claude_cli.error_text('{"is_error": true, "result": "boom"}') == "boom"
+    assert claude_cli.error_text(
+        '{"is_error": true, "api_error_status": 500, "result": ""}') == "api error 500"
+    assert claude_cli.error_text('{"is_error": true}') == "is_error envelope"
+
+
+def test_error_text_empty_on_success_or_garbage():
+    # a success envelope's result must never be reported as an error cause
+    assert claude_cli.error_text('{"is_error": false, "result": "fine"}') == ""
+    assert claude_cli.error_text("not json") == ""

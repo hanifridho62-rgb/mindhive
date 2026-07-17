@@ -527,6 +527,198 @@ def test_call_history_empty_for_uncalled_skill():
     assert plugins.call_history("never-called", project="test") == []
 
 
+# --------------------------------------------------------------------------
+# Effectiveness scoring + demotion gate
+# --------------------------------------------------------------------------
+
+def test_call_counts_tallies_every_occurrence(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
+    from mindhive import events
+    for _ in range(3):
+        events.append_event("invoke_result", {"name": "a:x", "text": "a:x"},
+                            project="p")
+    events.append_event("tool_failed", {"signature": "skill:a:x"}, project="p")
+    assert plugins.call_counts(project="p") == {"a:x": {"ok": 3, "fail": 1}}
+
+
+def test_effectiveness_neutral_without_history():
+    plugin = {"skills": [{"name": "a:x", "trigger": "t"}]}
+    eff = plugins.effectiveness(plugin, {})
+    assert eff["calls"] == 0
+    assert eff["success_rate"] == 0.5      # Laplace prior, neutral
+    assert eff["demoted"] is False
+
+
+def test_effectiveness_demotes_repeat_failures():
+    plugin = {"skills": [{"name": "a:x", "trigger": "t"}]}
+    counts = {"a:x": {"ok": 0, "fail": 4}}
+    eff = plugins.effectiveness(plugin, counts)
+    assert eff["calls"] == 4
+    assert eff["demoted"] is True
+    assert "fail" in eff["demote_reason"]
+
+
+def test_effectiveness_scales_rank_score():
+    plugin = {"skills": [{"name": "a:x", "trigger": "t"}]}
+    good = plugins.effectiveness(plugin, {"a:x": {"ok": 8, "fail": 0}})
+    bad = plugins.effectiveness(plugin, {"a:x": {"ok": 0, "fail": 8}})
+    assert good["success_rate"] > 0.8 and bad["success_rate"] < 0.2
+
+
+# --------------------------------------------------------------------------
+# skill_stats — per-skill telemetry over skill_used / invoke_result /
+# tool_failed(skill:*) with passive-vs-explicit dedup (U5, KTD5)
+# --------------------------------------------------------------------------
+
+def _used(name, ts, ok=True, session="sess"):
+    events.append_event("skill_used", {"name": name, "ok": ok, "text": ""},
+                        session_id=session, ts=ts, project="test")
+
+
+def _invoked_ok(name, ts, session="sess", tags=("invoke", "skill")):
+    events.append_event("invoke_result",
+                        {"name": name, "plugin": None, "ok": True, "text": ""},
+                        session_id=session, ts=ts, tags=list(tags), project="test")
+
+
+def _failed(name, ts, session="sess", tags=("invoke", "skill", "failure")):
+    events.append_event("tool_failed",
+                        {"text": "boom", "signature": f"skill:{name}"},
+                        session_id=session, ts=ts, tags=list(tags), project="test")
+
+
+def test_skill_stats_empty_store_is_empty_dict():
+    assert plugins.skill_stats(project="test") == {}
+
+
+def test_skill_stats_unknown_project_is_empty_dict_not_error():
+    assert plugins.skill_stats(project="no-such-namespace") == {}
+
+
+def test_skill_stats_merge_two_ok_invokes_one_fail():
+    # 2 ok invokes + 1 skill fail -> calls 3, completion_rate 2/3, last fail
+    _invoked_ok("s", "2026-07-01T10:00:00Z")
+    _invoked_ok("s", "2026-07-01T11:00:00Z")
+    _failed("s", "2026-07-01T12:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 3 and st["ok"] == 2 and st["fail"] == 1
+    assert abs(st["completion_rate"] - 2 / 3) < 1e-9
+    assert st["last_outcome"] == "fail"
+    assert st["last_used"] == "2026-07-01T12:00:00Z"
+    assert st["sources"] == ["invoke_result", "tool_failed"]
+
+
+def test_skill_stats_counts_passive_skill_used():
+    _used("s", "2026-07-01T10:00:00Z")
+    _used("s", "2026-07-01T11:00:00Z", ok=False)
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 2 and st["ok"] == 1 and st["fail"] == 1
+    assert st["provenance"] == {"passive": 2}
+    assert st["sources"] == ["skill_used"]
+
+
+def test_skill_stats_dedup_explicit_record_wins():
+    # passive ok capture + agent-assessed fail record for the SAME execution
+    # (same skill, same session, within the window) -> one call, fail outcome
+    _used("s", "2026-07-01T10:00:00Z")
+    events.append_event("tool_failed",
+                        {"text": "agent says it failed", "signature": "skill:s",
+                         "provenance": "agent-assessed"},
+                        session_id="sess", ts="2026-07-01T10:01:00Z",
+                        tags=["skill", "record", "agent-assessed"], project="test")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 1 and st["fail"] == 1 and st["ok"] == 0
+    assert st["last_outcome"] == "fail"
+    assert st["provenance"] == {"agent-assessed": 1}
+
+
+def test_skill_stats_no_dedup_outside_window():
+    _used("s", "2026-07-01T10:00:00Z")
+    _invoked_ok("s", "2026-07-01T11:00:00Z")     # an hour later: two executions
+    assert plugins.skill_stats(project="test")["s"]["calls"] == 2
+
+
+def test_skill_stats_no_dedup_across_sessions():
+    _used("s", "2026-07-01T10:00:00Z", session="a")
+    _invoked_ok("s", "2026-07-01T10:00:30Z", session="b")
+    assert plugins.skill_stats(project="test")["s"]["calls"] == 2
+
+
+def test_skill_stats_dedup_manual_session_is_wildcard():
+    # agent-run `skills record` carries session "manual" while the passive
+    # hook capture of the SAME execution carries the real hook session id;
+    # "manual" pairs as a session wildcard -> one call, explicit outcome wins
+    _used("s", "2026-07-01T10:00:00Z", session="real-hook-sid")
+    _failed("s", "2026-07-01T10:01:00Z", session="manual",
+            tags=("skill", "record", "agent-assessed"))
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 1 and st["fail"] == 1 and st["ok"] == 0
+    assert st["last_outcome"] == "fail"
+    assert st["provenance"] == {"agent-assessed": 1}
+
+
+def test_skill_stats_manual_wildcard_still_respects_window():
+    _used("s", "2026-07-01T10:00:00Z", session="real-hook-sid")
+    _invoked_ok("s", "2026-07-01T11:00:00Z", session="manual")
+    assert plugins.skill_stats(project="test")["s"]["calls"] == 2
+
+
+def test_skill_stats_one_explicit_retires_one_passive_only():
+    # two passive captures + one explicit in the window -> 2 calls, not 1
+    _used("s", "2026-07-01T10:00:00Z")
+    _used("s", "2026-07-01T10:00:20Z")
+    _invoked_ok("s", "2026-07-01T10:00:40Z")
+    assert plugins.skill_stats(project="test")["s"]["calls"] == 2
+
+
+def test_skill_stats_provenance_breakdown_includes_agent_assessed():
+    _used("s", "2026-07-01T09:00:00Z")
+    _invoked_ok("s", "2026-07-01T10:00:00Z")
+    events.append_event("invoke_result",
+                        {"name": "s", "plugin": None, "ok": True, "text": "",
+                         "provenance": "agent-assessed"},
+                        session_id="sess", ts="2026-07-01T11:00:00Z",
+                        tags=["skill", "record", "agent-assessed"], project="test")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["provenance"] == {"passive": 1, "invoke": 1, "agent-assessed": 1}
+
+
+def test_skill_stats_streak_is_trailing_failure_free_run():
+    _invoked_ok("s", "2026-07-01T10:00:00Z")
+    _invoked_ok("s", "2026-07-01T11:00:00Z")
+    _failed("s", "2026-07-01T12:00:00Z")
+    _invoked_ok("s", "2026-07-01T13:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 4
+    assert st["streak"] == 1
+
+
+def test_skill_stats_completion_rate_labels():
+    # the field is completion_rate (KTD5) — never "rate"/"success"
+    _invoked_ok("s", "2026-07-01T10:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert "completion_rate" in st and st["completion_rate"] == 1.0
+
+
+def test_call_stats_empty_ledger():
+    assert plugins.call_stats(project="test") == {"status": {}, "counts": {}}
+
+
+def test_call_stats_counts_every_invoke_and_keeps_last_status():
+    invoker.invoke_skill("x", runner=_fail_runner, project="test")
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    invoker.invoke_skill("x", runner=_ok_runner, project="test")
+    invoker.invoke_skill("y", runner=_fail_runner, project="test")
+    st = plugins.call_stats(project="test")
+    assert st["counts"] == {"x": 3, "y": 1}
+    assert st["status"] == {"x": "ok", "y": "fail"}
+
+
+def test_call_status_agrees_with_call_stats():
+    invoker.invoke_skill("z", runner=_fail_runner, project="test")
+    assert plugins.call_status(project="test") == plugins.call_stats(project="test")["status"]
+
+
 def test_strip_frontmatter_returns_body_only():
     body = plugins._strip_frontmatter(
         "---\nname: x\ndescription: d\n---\n\n# Title\n\nParagraph.\n")
@@ -604,3 +796,19 @@ def test_ensure_fresh_force_rescans_even_when_fresh(tmp_path, monkeypatch):
     first = plugins.ensure_fresh(cache_dir=tmp_path / "nope")          # fresh snapshot exists
     res = plugins.ensure_fresh(cache_dir=tmp_path / "nope", force=True)
     assert res["scanned"] is True
+
+
+def test_skill_stats_fail_streak_tracks_trailing_failures():
+    from mindhive import events as ev
+    ev.append_event("invoke_result", {"name": "s", "exit": 0},
+                    ts="2026-07-07T10:00:00Z", session_id="sess0", project="test")
+    for i in (1, 2):
+        ev.append_event("tool_failed", {"signature": "skill:s"},
+                        ts=f"2026-07-07T10:0{i}:00Z",
+                        session_id=f"sess{i}", project="test")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["fail_streak"] == 2 and st["streak"] == 0
+    ev.append_event("invoke_result", {"name": "s", "exit": 0},
+                    ts="2026-07-07T10:09:00Z", session_id="sess9", project="test")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["fail_streak"] == 0 and st["streak"] == 1
