@@ -1719,6 +1719,78 @@ def test_oversee_includes_interactive_sessions(dashboard_server):
     assert res["ok"] is True
 
 
+# --- Oversee roadmap: plan attach, card-less plans, page hooks --------------
+
+def _seed_roadmap(plan_id, hour, interrupted=False):
+    ev_mod.append_event("roadmap",
+                        {"action": "set", "plan_id": plan_id,
+                         "prompt": "Build the parser fix",
+                         "steps": [{"text": "a", "status": "done"},
+                                   {"text": "b", "status": "active"}]},
+                        ts=f"2026-07-07T{hour:02d}:00:30Z", project="test")
+    if interrupted:
+        ev_mod.append_event("roadmap",
+                            {"action": "interrupt", "plan_id": plan_id,
+                             "cause": "usage_limit"},
+                            ts=f"2026-07-07T{hour:02d}:03:00Z", project="test")
+
+
+def test_oversee_attaches_roadmap_to_matching_run(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)
+    _seed_roadmap("run1", 10)
+    status, body = _get(base, "/api/oversee?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    r = obj["runs"][0]
+    assert r["roadmap"]["plan_id"] == "run1"
+    assert r["roadmap"]["prompt"] == "Build the parser fix"
+    assert r["roadmap"]["progress"] == {"done": 1, "total": 2}
+    assert obj["plans"] == []      # bound to a live card -> never duplicated
+
+
+def test_oversee_runs_without_a_plan_carry_no_roadmap(dashboard_server):
+    base, token = dashboard_server
+    _seed_loop_run("run1", 10)
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    assert "roadmap" not in obj["runs"][0]
+    assert obj["plans"] == []
+
+
+def test_oversee_surfaces_cardless_interrupted_plans(dashboard_server):
+    # The out-of-usage marker outlives its run: a plan whose run/session has
+    # left the board still arrives via the top-level plans list.
+    base, token = dashboard_server
+    _seed_roadmap("ghost-plan", 10, interrupted=True)
+    status, body = _get(base, "/api/oversee?project=test", token)
+    obj = json.loads(body)
+    assert [p["plan_id"] for p in obj["plans"]] == ["ghost-plan"]
+    p = obj["plans"][0]
+    assert p["status"] == "interrupted" and p["cause"] == "usage_limit"
+    assert p["project"] == "test"
+    assert obj["runs"] == []
+
+
+def test_page_has_roadmap_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "rmPanel" in body and "rmFromCard" in body and "rmPlanCard" in body
+    assert "RM_OPEN" in body and "RM_NODE_OPEN" in body
+    assert ".rmstep" in body and ".rmbar" in body and ".rmnode" in body
+    assert ">roadmap</button>" in body
+
+
+def test_memory_view_renders_roadmap_body(dashboard_server):
+    # roadmap payloads have no "text" — the Memory view must render the
+    # self-describing LEDGER body, never a blank plan row.
+    base, token = dashboard_server
+    _seed_roadmap("ghost-plan", 10)
+    status, body = _get(base, "/api/memory?project=test", token)
+    rows = [r for r in json.loads(body) if r["type"] == "roadmap"]
+    assert rows and "Build the parser fix" in rows[0]["text"]
+
+
 # --- gzip: responses compress when the client accepts it --------------------
 
 def _get_gzip(base, path, token=None):

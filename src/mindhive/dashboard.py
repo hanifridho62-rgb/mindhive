@@ -372,6 +372,7 @@ def make_handler(token: str):
             # the semantic subset only — the intent/context layer. Build the
             # (project, Event) rows once so the projection + dedupe.collapse lives
             # in a single place instead of once per am / single-project branch.
+            from . import roadmap as roadmap_mod
             session = (qs.get("session") or [None])[0]
             limit = int((qs.get("limit") or ["200"])[0])
             rows = [(n, e) for n, e in event_pairs(proj, am)
@@ -379,13 +380,22 @@ def make_handler(token: str):
             if session:
                 rows = [(n, e) for n, e in rows if e.session_id == session]
             rows = list(reversed(rows))[:limit]      # newest first
+
+            def _text(e):
+                if not isinstance(e.payload, dict):
+                    return str(e.payload)
+                if e.type == "roadmap":
+                    # roadmap payloads are structured (no "text"): render the
+                    # same self-describing body the LEDGER projection uses so
+                    # the Memory view never shows a blank plan row.
+                    return roadmap_mod.ledger_body(e.payload)
+                return e.payload.get("text", "")
             # Collapse near-duplicate memories by meaning (same type + project),
             # keeping the newest; display-time only, ledger untouched.
             # similar_count rides along for the UI hint.
             return self._json(dedupe.collapse([
                 {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
-                 "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                 "tags": e.tags,
+                 "text": _text(e), "tags": e.tags,
                  "origin": events.origin_of(e.session_id, e.tags)}
                 for n, e in rows
             ]))
@@ -620,20 +630,36 @@ def make_handler(token: str):
             # Oversee: every kind of live Claude work — hive loop runs AND
             # interactive sessions (straight from hook telemetry, no /circle
             # needed). Dismissed/finished/stale entries are already excluded
-            # by the projections.
+            # by the projections. Each card carries its roadmap plan (the ask
+            # + plan steps + progress, see roadmap.py) when one exists for its
+            # run/session id; plans with no live card — notably interrupted
+            # ones whose run already left the board — ride the top-level
+            # ``plans`` list so a roadmap is never orphaned.
             from . import oversee as oversee_mod
+            from . import roadmap as roadmap_mod
             from .loop import state as loop_state
             names = _all_projects() if am else [proj]
-            runs, dismissed = [], 0
+            runs, plans, dismissed = [], [], 0
             for n in names:
                 evs = events.read_all(n)
                 res = loop_state.list_runs(n)
+                rmap = roadmap_mod.fold(evs)
+                live_ids = set()
                 for r in res["runs"] + oversee_mod.interactive_sessions(n, evs=evs):
                     r["project"] = n
+                    plan = rmap.get(r["run_id"])
+                    if plan is not None and plan["status"] != "completed":
+                        r["roadmap"] = plan
+                    live_ids.add(r["run_id"])
                     runs.append(r)
+                for p in roadmap_mod.plans(evs):
+                    if p["plan_id"] not in live_ids:
+                        plans.append(dict(p, project=n))
                 dismissed += res["dismissed"]
             runs.sort(key=lambda r: r.get("started") or "", reverse=True)
+            plans.sort(key=lambda p: p.get("updated") or "", reverse=True)
             return self._json({"runs": runs, "dismissed": dismissed,
+                               "plans": plans,
                                "any_online": any(r["online"] for r in runs)})
 
         def _get_workspace(self, proj, am, qs):

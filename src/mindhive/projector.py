@@ -1,6 +1,7 @@
 # src/mindhive/projector.py
 import hashlib
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
+from . import roadmap
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
@@ -35,6 +36,12 @@ def build_state(evs, pending=None, health_note="", changelog_pending=None) -> st
     cl_note = changelog.notice(changelog_pending)
     if cl_note:
         out.append(cl_note)
+    # Interrupted-plan marker (out-of-usage): the original ask + plan progress
+    # ride the top of STATE.md so the next session resumes with the big
+    # picture instead of starting cold (see roadmap.py). Pure fold over evs.
+    rm_note = roadmap.notice(evs)
+    if rm_note:
+        out.append(rm_note)
     # Reflection-health warning (one line, KTD3): auto-reflection failing for
     # too long must be visible, not silent.
     if health_note:
@@ -161,6 +168,10 @@ def build_ledger_entries(evs):
             # Action, id, and title must survive into the LEDGER entry so
             # keyword recall can find a procedure by any of them.
             body = sop.ledger_body(ev.payload)
+        elif ev.type == "roadmap" and isinstance(ev.payload, dict):
+            # Plan id, prompt, and step text must survive so keyword recall
+            # finds a plan by what was asked or what it contains.
+            body = roadmap.ledger_body(ev.payload)
         fname = f"{_ts_compact(ev.ts)}-{ev.type}-{_short(ev.ts + ev.type + body)}.md"
         content = (f"---\nts: {ev.ts}\ntype: {ev.type}\n"
                    f"tags: {','.join(ev.tags)}\nsession: {ev.session_id}\n---\n\n{body}\n")

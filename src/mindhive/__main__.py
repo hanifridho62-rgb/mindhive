@@ -62,6 +62,17 @@ def cmd_append(args) -> int | None:
             print(f"error: {e} (use: hive sop add|update|delete …)",
                   file=sys.stderr)
             return 2
+    elif args.type == "roadmap":
+        # And for the roadmap registry: a malformed lifecycle event would
+        # corrupt no fold (reads are total) but would still be dead weight in
+        # the chain — reject it at the one arbitrary-payload surface.
+        from . import roadmap as roadmap_mod
+        try:
+            roadmap_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f"error: {e} (use: hive roadmap set|step|interrupt|"
+                  f"resume|complete …)", file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -352,6 +363,118 @@ def cmd_sop_show(args) -> int | None:
     print("\nhistory (newest first):")
     for e in hist:
         print(f"  {e['ts']}  {e['action']:6s}  session {e['session']}")
+    return None
+
+
+def _roadmap_steps(args) -> list:
+    """Resolve `roadmap set` steps from repeatable --step flags plus an
+    optional --file (one step per line) — multi-line plans are painful to
+    quote on Windows, mirroring the sop --file escape hatch."""
+    steps = list(args.step or [])
+    if args.file:
+        from pathlib import Path
+        steps += [ln.strip()
+                  for ln in Path(args.file).read_text(encoding="utf-8").splitlines()
+                  if ln.strip()]
+    return steps
+
+
+def _cmd_roadmap_write(args, action) -> int | None:
+    from . import roadmap as roadmap_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        kwargs = {}
+        if action == "set":
+            kwargs.update(prompt=args.prompt, title=args.title,
+                          steps=_roadmap_steps(args))
+        elif action == "step":
+            kwargs.update(index=args.index, status=args.status,
+                          note=args.note)
+        elif action == "interrupt":
+            kwargs.update(cause=args.cause, note=args.note)
+        ev = roadmap_mod.record(action, args.plan_id, session_id=sid,
+                                **kwargs)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"roadmap {action}: {args.plan_id} @ {ev.ts}")
+    return None
+
+
+def cmd_roadmap_set(args) -> int | None:
+    return _cmd_roadmap_write(args, "set")
+
+
+def cmd_roadmap_step(args) -> int | None:
+    return _cmd_roadmap_write(args, "step")
+
+
+def cmd_roadmap_interrupt(args) -> int | None:
+    return _cmd_roadmap_write(args, "interrupt")
+
+
+def cmd_roadmap_resume(args) -> int | None:
+    return _cmd_roadmap_write(args, "resume")
+
+
+def cmd_roadmap_complete(args) -> int | None:
+    return _cmd_roadmap_write(args, "complete")
+
+
+def cmd_roadmap_list(args) -> int | None:
+    from . import roadmap as roadmap_mod
+    recs = roadmap_mod.plans(events.read_all(getattr(args, "project", None)),
+                             include_completed=args.all)
+    if args.json:
+        print(json.dumps(recs, indent=2, ensure_ascii=False))
+        return None
+    if not recs:
+        print('(no roadmaps — declare one: hive roadmap set <id> '
+              '--prompt "…" --step "…")')
+        return None
+    marks = {"active": ">", "interrupted": "!", "completed": "x"}
+    for i, r in enumerate(recs, 1):
+        p = r["progress"]
+        print(f"  {i}. {marks.get(r['status'], '?')} "
+              f"[{r['plan_id']} v{r['version']}] "
+              f"{r['title'] or r['prompt'][:60]}  "
+              f"{p['done']}/{p['total']} done  ({r['status']})")
+    print(f"\n{len(recs)} roadmap(s)")
+    return None
+
+
+def cmd_roadmap_show(args) -> int | None:
+    from . import roadmap as roadmap_mod
+    evs = events.read_all(getattr(args, "project", None))
+    rec = roadmap_mod.get(evs, args.plan_id)
+    hist = [{"ts": e.ts, "session": e.session_id,
+             "action": (e.payload or {}).get("action", "")}
+            for e in evs
+            if e.type == "roadmap" and isinstance(e.payload, dict)
+            and e.payload.get("plan_id") == args.plan_id]
+    if args.json:
+        print(json.dumps({"plan": rec, "history": hist},
+                         indent=2, ensure_ascii=False))
+        return None
+    if rec is None:
+        print(f"error: no roadmap '{args.plan_id}' in the ledger",
+              file=sys.stderr)
+        return 2
+    p = rec["progress"]
+    print(f"roadmap {rec['plan_id']} v{rec['version']} — "
+          f"{rec['title'] or '(untitled)'}  [{rec['status']}]")
+    print(f"asked: {rec['prompt']}")
+    if rec["status"] == "interrupted":
+        print(f"interrupted {rec['interrupted_at']} (cause: {rec['cause']})")
+    print(f"progress: {p['done']}/{p['total']} steps done\n")
+    glyphs = {"done": "[x]", "active": "[>]", "pending": "[ ]",
+              "skipped": "[-]"}
+    for i, s in enumerate(rec["steps"]):
+        note = f"  — {s['note']}" if s.get("note") else ""
+        print(f"  {i}. {glyphs[s['status']]} {s['text']}{note}")
+    print("\nhistory (oldest first):")
+    for e in hist:
+        print(f"  {e['ts']}  {e['action']:9s}  session {e['session']}")
     return None
 
 
@@ -1099,6 +1222,59 @@ def _build_parser() -> argparse.ArgumentParser:
     sos.add_argument("--project", default=None)
     sos.add_argument("--json", action="store_true")
     sos.set_defaults(func=cmd_sop_show)
+
+    # --- roadmap (event-sourced plan registry + interruption markers) ---
+    from .roadmap import STATUSES as _RM_STATUSES
+    rm = sub.add_parser("roadmap", help="roadmaps: the ask, the plan, and "
+                        "per-step progress (interrupted plans surface in "
+                        "STATE.md and Oversee)")
+    rmsub = rm.add_subparsers(dest="roadmap_cmd", required=True)
+    rms = rmsub.add_parser("set", help="declare (or replace) a plan")
+    rms.add_argument("plan_id", help="stable kebab-case id, e.g. a run id")
+    rms.add_argument("--prompt", required=True,
+                     help="the original ask this plan was built from")
+    rms.add_argument("--title", default=None)
+    rms.add_argument("--step", action="append", default=None,
+                     help="one plan step (repeatable, in order)")
+    rms.add_argument("--file", default=None,
+                     help="read steps from a file, one per line")
+    rms.add_argument("--session", default=None)
+    rms.set_defaults(func=cmd_roadmap_set)
+    rmp = rmsub.add_parser("step", help="update one step's status")
+    rmp.add_argument("plan_id")
+    rmp.add_argument("index", type=int, help="0-based step index")
+    rmp.add_argument("--status", required=True, choices=_RM_STATUSES)
+    rmp.add_argument("--note", default=None)
+    rmp.add_argument("--session", default=None)
+    rmp.set_defaults(func=cmd_roadmap_step)
+    rmi = rmsub.add_parser("interrupt", help="mark the plan interrupted "
+                           "(records the out-of-usage marker)")
+    rmi.add_argument("plan_id")
+    rmi.add_argument("--cause", required=True,
+                     help="why work stopped, e.g. usage_limit")
+    rmi.add_argument("--note", default=None)
+    rmi.add_argument("--session", default=None)
+    rmi.set_defaults(func=cmd_roadmap_interrupt)
+    rmr = rmsub.add_parser("resume", help="pick an interrupted plan back up")
+    rmr.add_argument("plan_id")
+    rmr.add_argument("--session", default=None)
+    rmr.set_defaults(func=cmd_roadmap_resume)
+    rmc = rmsub.add_parser("complete", help="mark the plan finished")
+    rmc.add_argument("plan_id")
+    rmc.add_argument("--session", default=None)
+    rmc.set_defaults(func=cmd_roadmap_complete)
+    rml = rmsub.add_parser("list", help="list roadmaps")
+    rml.add_argument("--project", default=None)
+    rml.add_argument("--json", action="store_true")
+    rml.add_argument("--all", action="store_true",
+                     help="include completed roadmaps")
+    rml.set_defaults(func=cmd_roadmap_list)
+    rmw = rmsub.add_parser("show", help="print one roadmap in full, "
+                           "with history")
+    rmw.add_argument("plan_id")
+    rmw.add_argument("--project", default=None)
+    rmw.add_argument("--json", action="store_true")
+    rmw.set_defaults(func=cmd_roadmap_show)
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")

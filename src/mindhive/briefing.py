@@ -5,7 +5,10 @@ from . import events as ev_mod, paths, projector, dedupe, sop as sop_mod
 
 
 SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES  # decision, experiment_result, caveat, next_step, open_question, state_set
-_TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set"}
+# roadmap events carry structured payloads (no "text") and their delivery is
+# the STATE.md interrupted-plan notice + Oversee — a timeline line would be a
+# blank headline eating the cap.
+_TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set", "roadmap"}
 
 # Cap on how many distinct (post-dedup) entries each list section emits. The
 # briefing is wrapped verbatim into the native MEMORY.md that auto-loads every

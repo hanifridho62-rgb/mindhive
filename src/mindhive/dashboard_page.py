@@ -94,6 +94,26 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   .ovdone { color:#46c46a; font-weight:600; }
   .ovpend { color:#8a93a6; }
   .ovspin { color:#e0b341; display:inline-block; animation: pulse 1.6s infinite; }
+  /* Interactive roadmap panel (Oversee): ask + progress bar + stepper */
+  .rmwrap { margin:8px 0 4px; padding:8px 10px; background:#141824;
+    border:1px solid #2a2f3d; border-radius:8px; }
+  .rmask { margin-bottom:6px; }
+  .rmint { color:#e0b341; font-size:12px; margin:2px 0 6px; }
+  .rmbar { height:6px; background:#1d2230; border-radius:999px; overflow:hidden; }
+  .rmfill { height:100%; background:#46c46a; border-radius:999px;
+    transition:width .4s; }
+  .rmstep { position:relative; padding:3px 0 3px 22px; cursor:pointer; }
+  .rmstep::before { content:''; position:absolute; left:7px; top:0; bottom:0;
+    width:2px; background:#2a2f3d; }
+  .rmstep.rmfirst::before { top:50%; }
+  .rmstep.rmlast::before { bottom:50%; }
+  .rmnode { position:absolute; left:0; width:16px; text-align:center;
+    background:#141824; }
+  .rmnode.rmdone { color:#46c46a; }
+  .rmnode.rmactive { color:#e0b341; animation: pulse 1.6s infinite; }
+  .rmnode.rmpend { color:#8a93a6; }
+  .rmnode.rmskip { color:#555c6e; }
+  .rmdetail { color:#9aa3b8; font-size:11px; margin:2px 0; }
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
@@ -697,6 +717,11 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // doing, \\u25cb pending) in the hive palette.
   let OV_DATA = null;
   const OV_EXPANDED = new Set();
+  // Interactive roadmap panel state: which cards have the roadmap open, and
+  // which step nodes are expanded — both Sets so the 2.5 s live refresh
+  // never collapses what the user is reading (same idiom as OV_EXPANDED).
+  const RM_OPEN = new Set();
+  const RM_NODE_OPEN = new Set();
   function ovStatus(r){
     if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
@@ -711,6 +736,71 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function ovGroup(items, glyph, cls, dim){
     return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
   }
+  // The roadmap panel's data source (KTD5): an explicit roadmap plan when
+  // the ledger has one for this run/session id — it carries the true
+  // original ask and step statuses — else a client-side synthesis from the
+  // card's own progress groups, so the roadmap button is never dead.
+  function rmFromCard(r){
+    const steps = [];
+    (r.done || []).forEach(t => steps.push({text:t, status:'done', note:''}));
+    if (r.doing) steps.push({text:r.doing, status:'active', note:''});
+    (r.planned || []).forEach(t => steps.push({text:t, status:'pending', note:''}));
+    (r.not_yet || []).forEach(t => steps.push({text:t, status:'skipped', note:''}));
+    const done = steps.filter(s => s.status === 'done').length;
+    return {plan_id:r.run_id, prompt:r.title || r.run_id, title:'',
+            status:'active', cause:'', synthesized:true, steps:steps,
+            progress:{done:done, total:steps.length}};
+  }
+  function rmGlyph(st){
+    if (st === 'done') return ['\\u2714', 'rmdone'];
+    if (st === 'active') return ['\\u25d0', 'rmactive'];
+    if (st === 'skipped') return ['\\u25cb', 'rmskip'];
+    return ['\\u25cb', 'rmpend'];
+  }
+  function rmPanel(rm, rid){
+    const steps = rm.steps || [];
+    const p = rm.progress || {done:0, total:steps.length};
+    const pct = p.total ? Math.round(100 * p.done / p.total) : 0;
+    let html = '<div class="rmwrap">'
+      + '<div class="rmask"><span class="dup">Asked:</span> '
+      + esc(rm.prompt || '')+'</div>';
+    if (rm.status === 'interrupted'){
+      html += '<div class="rmint">\\u26a0 interrupted'
+        + (rm.cause ? ' \\u2014 '+esc(rm.cause) : '')
+        + ' \\u00b7 resume: <code>hive roadmap resume '+esc(rm.plan_id)
+        + '</code></div>';
+    }
+    html += '<div class="rmbar"><div class="rmfill" style="width:'+pct+'%"></div></div>'
+      + '<div class="dup" style="font-size:11px;margin:2px 0 6px">'
+      + p.done+'/'+p.total+' steps done \\u00b7 '+pct+'%'
+      + (rm.synthesized ? ' \\u00b7 live view \\u2014 no declared roadmap' : '')
+      + '</div>';
+    html += steps.map((s, i) => {
+      const g = rmGlyph(s.status);
+      const key = rid+':'+i;
+      const edge = (i === 0 ? ' rmfirst' : '') + (i === steps.length-1 ? ' rmlast' : '');
+      return '<div class="rmstep'+edge+'" data-key="'+escAttr(key)
+        + '" title="click for step detail">'
+        + '<span class="rmnode '+g[1]+'">'+g[0]+'</span>'
+        + '<span'+(s.status === 'skipped' ? ' class="dup"' : '')+'>'+esc(s.text)+'</span>'
+        + (RM_NODE_OPEN.has(key)
+            ? '<div class="rmdetail">status: '+esc(s.status)
+              + (s.note ? ' \\u00b7 '+esc(s.note) : '')+'</div>' : '')
+        + '</div>';
+    }).join('');
+    return html + '</div>';
+  }
+  // Interrupted (or card-less) plans keep their roadmap on the board even
+  // after the run/session that owned them left it — the out-of-usage marker.
+  function rmPlanCard(p, showProj){
+    const bad = p.status === 'interrupted';
+    return '<li><div class="file"><span class="statusDot '+(bad?'sbad':'snone')+'">'
+      + (bad ? '\\u26a0' : '\\u25c9')+'</span> '
+      + (showProj && p.project ? esc(p.project)+' \\u00b7 ' : '')
+      + esc(p.title || p.plan_id)
+      + ' <span class="pill">'+esc(p.status)+'</span></div>'
+      + rmPanel(p, 'plan-'+p.plan_id)+'</li>';
+  }
   function ovCard(r, showProj){
     const st = ovStatus(r);
     const open = OV_EXPANDED.has(r.run_id);
@@ -719,6 +809,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
       + esc(r.title || r.run_id)+'</span>'
       + srPill(r.origin)
+      + '<button class="mini ovrm" data-rid="'+escAttr(r.run_id)
+      + '" title="the ask, the plan, and how far along it is">roadmap</button>'
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
     const chat = r.kind === 'chat';
@@ -738,6 +830,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       body += '<div class="snip dup">started '+esc(r.started||'')
             + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
     }
+    if (RM_OPEN.has(r.run_id)){
+      body += rmPanel(r.roadmap || rmFromCard(r), r.run_id);
+    }
     return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
       + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
   }
@@ -748,20 +843,30 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       ? '<div class="row"><span class="pill" style="color:#46c46a;border-color:#2a5">'
         + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
       : '';
-    if (!OV_DATA.runs.length){
+    const showProj = (PROJECT === '*');
+    // Card-less roadmaps (interrupted markers, plans whose run left the
+    // board) render above the session list so resumable work stays visible.
+    const plans = OV_DATA.plans || [];
+    const strip = plans.length
+      ? '<h2 class="h">'+plans.length+' roadmap'
+        + (plans.length===1?'':'s')+' awaiting resume</h2>'
+        + '<ul class="hits">'+plans.map(p => rmPlanCard(p, showProj)).join('')+'</ul>'
+      : '';
+    if (!OV_DATA.runs.length && !plans.length){
       showHTML(online + '<h2 class="h">No work sessions \\u2014 interactive '
         + 'Claude sessions appear here as their telemetry flows, and '
         + '<code>hive loop</code> runs join them. Finished sessions are '
         + 'removed automatically.</h2>');
       return;
     }
-    const showProj = (PROJECT === '*');
-    showHTML(online
-      + '<h2 class="h">'+OV_DATA.runs.length+' work session'
-      + (OV_DATA.runs.length===1?'':'s')
-      + (OV_DATA.dismissed ? ' <span class="dup">\\u00b7 '+OV_DATA.dismissed
-         +' finished &amp; removed</span>' : '')+'</h2>'
-      + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>');
+    showHTML(online + strip
+      + (OV_DATA.runs.length
+        ? '<h2 class="h">'+OV_DATA.runs.length+' work session'
+          + (OV_DATA.runs.length===1?'':'s')
+          + (OV_DATA.dismissed ? ' <span class="dup">\\u00b7 '+OV_DATA.dismissed
+             +' finished &amp; removed</span>' : '')+'</h2>'
+          + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>'
+        : ''));
     view.querySelectorAll('.ovtitle').forEach(el => el.onclick = () => {
       const rid = el.closest('li').dataset.rid;
       if (OV_EXPANDED.has(rid)) OV_EXPANDED.delete(rid); else OV_EXPANDED.add(rid);
@@ -769,6 +874,18 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     });
     view.querySelectorAll('.ovdel').forEach(el => el.onclick = (ev) => {
       ev.stopPropagation(); deleteRun(el.dataset.rid, el.dataset.proj);
+    });
+    view.querySelectorAll('.ovrm').forEach(el => el.onclick = (ev) => {
+      ev.stopPropagation();
+      const rid = el.dataset.rid;
+      if (RM_OPEN.has(rid)) RM_OPEN.delete(rid); else RM_OPEN.add(rid);
+      paintOversee();
+    });
+    view.querySelectorAll('.rmstep').forEach(el => el.onclick = (ev) => {
+      ev.stopPropagation();
+      const key = el.dataset.key;
+      if (RM_NODE_OPEN.has(key)) RM_NODE_OPEN.delete(key); else RM_NODE_OPEN.add(key);
+      paintOversee();
     });
   }
   async function renderOversee(){

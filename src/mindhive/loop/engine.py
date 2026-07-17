@@ -15,6 +15,48 @@ from .contract import parse_status
 from .driver import preflight
 
 
+# Run-end reasons that mean "usage ran out mid-plan": the Claude usage/rate
+# limit (api_cap) and the local budget gate (budget_cap). These get the
+# roadmap interruption marker so the next session inherits the big picture.
+USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap")
+
+
+def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
+    """Out-of-usage marker (roadmap.py): persist the initial ask, the plan,
+    and how far it got, as roadmap set + interrupt events. The marker rides
+    STATE.md/MEMORY.md so the next session resumes from the next step instead
+    of starting cold. Best-effort by design — a snapshot failure must never
+    mask the loop_run_end event that closes the run."""
+    try:
+        from .. import roadmap as roadmap_mod
+        tasks = task_mod.load_tasks(loop_dir)
+        lines = tasks.prompt.strip().splitlines()
+        prompt = lines[0].lstrip("# ").strip() if lines else ""
+        if not prompt:
+            return
+        prompt = prompt[:roadmap_mod.MAX_PROMPT_CHARS]
+        steps = roadmap_mod.steps_from_plan_items(
+            task_mod.plan_items(tasks.fix_plan))
+        if not steps:
+            # No fix_plan checklist: the ask itself is the one open step, so
+            # the marker still records what was being built and why it stopped.
+            steps = [{"text": prompt[:roadmap_mod.MAX_STEP_CHARS],
+                      "status": "active"}]
+        set_payload = {"action": "set", "plan_id": run_id, "prompt": prompt,
+                       "title": prompt[:roadmap_mod.MAX_TITLE_CHARS],
+                       "steps": steps}
+        int_payload = {"action": "interrupt", "plan_id": run_id,
+                       "cause": cause}
+        roadmap_mod.validate_payload(set_payload)
+        roadmap_mod.validate_payload(int_payload)
+        events.append_event("roadmap", set_payload, tags=["roadmap"],
+                            project=project)
+        events.append_event("roadmap", int_payload, tags=["roadmap"],
+                            project=project)
+    except Exception:
+        pass
+
+
 def run_loop(project, loop_dir, cfg, driver, *,
              now_fn=time.time, sleep_fn=time.sleep, progress_fn=None,
              live=False, force=False):
@@ -175,6 +217,10 @@ def run_loop(project, loop_dir, cfg, driver, *,
                              "iterations": iteration}, project=project)
         raise
 
+    # Out-of-usage interruption: preserve the plan + progress BEFORE the run
+    # closes, so even a ledger reader that stops at loop_run_end sees the mark.
+    if reason in USAGE_INTERRUPT_REASONS:
+        _snapshot_interrupted_plan(project, run_id, loop_dir, reason)
     events.append_event("loop_run_end",
                         {"run_id": run_id, "reason": reason, "iterations": iteration},
                         project=project)
