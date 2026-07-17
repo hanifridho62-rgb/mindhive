@@ -119,6 +119,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <button onclick="showSessions()">Sessions</button>
     <button onclick="showImprovements(true)">Improvements</button>
     <button onclick="showLog()">Log</button>
+    <button onclick="showSops()">SOP</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -823,6 +824,41 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '</ul>');
   }
   function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog); }
+
+  function sopBadge(action){
+    const colors = {add:'#6aa84f', update:'#4a90d9', 'delete':'#d94a4a'};
+    const c = colors[action] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(action||'?')+'</span>';
+  }
+  async function renderSops(){
+    const res = await apiGet('/api/sops');
+    if (!res || !Array.isArray(res.active)) throw new Error((res && res.error) || 'sop fetch failed');
+    const showProj = (PROJECT === '*');
+    if (!res.active.length && !res.history.length){
+      showHTML('<h2 class="h">No SOPs yet \\u2014 record standing procedures with '
+        + '<code>hive sop add &lt;id&gt; --title "\\u2026" --file &lt;body.md&gt;</code>. '
+        + 'Active SOPs auto-load into every session via STATE.md / MEMORY.md.</h2>');
+      return;
+    }
+    const act = res.active.map((r, i) =>
+      '<li><div class="file">SOP '+(i+1)+': '+esc(r.title)
+      + ' <span class="pill">'+esc(r.sop_id)+' v'+r.version+'</span>'
+      + (showProj && r.project ? ' <span class="pill">'+esc(r.project)+'</span>' : '')
+      + '</div><div class="snip" style="white-space:pre-wrap">'+esc(r.text)+'</div>'
+      + '<div class="snip dup">created '+esc(r.created||'')+' \\u00b7 updated '+esc(r.updated||'')+'</div></li>').join('');
+    const hist = res.history.map(e =>
+      '<li><div class="file">'+sopBadge(e.action)+' '+esc(e.sop_id)
+      + (e.title ? ' \\u2014 '+esc(e.title) : '') + '</div>'
+      + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+      + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') + '</div></li>').join('');
+    showHTML('<h2 class="h">'+res.active.length+' active SOP'
+      + (res.active.length===1?'':'s')+' (auto-loaded each session)</h2>'
+      + '<ul class="hits">'+act+'</ul>'
+      + '<h2 class="h">History ('+res.history.length+' lifecycle event'
+      + (res.history.length===1?'':'s')+')</h2>'
+      + '<ul class="hits">'+hist+'</ul>');
+  }
+  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }
   function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }

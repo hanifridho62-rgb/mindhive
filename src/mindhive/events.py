@@ -17,6 +17,11 @@ SEMANTIC_TYPES = {
     # before this entry, append_event rejected the type and _log's crash guard
     # swallowed the error, silently dropping every PRD from the ledger.
     "learning",
+    # Managed standard operating procedure lifecycle (add/update/delete — see
+    # sop.py). Semantic so the registry rides the LEDGER, hash chain, Memory
+    # view, and keyword recall; the current SOP set is a deterministic fold
+    # projected into STATE.md / MEMORY.md.
+    "sop",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",

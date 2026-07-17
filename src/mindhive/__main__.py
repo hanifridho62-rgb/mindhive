@@ -52,6 +52,16 @@ def cmd_append(args) -> int | None:
             print(f'error: {e} (use: hive log <category> "...")',
                   file=sys.stderr)
             return 2
+    elif args.type == "sop":
+        # Same reasoning for the SOP registry: the raw append path must not
+        # smuggle a malformed lifecycle event past the sop contract.
+        from . import sop as sop_mod
+        try:
+            sop_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f"error: {e} (use: hive sop add|update|delete …)",
+                  file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -256,6 +266,92 @@ def cmd_log_show(args) -> int | None:
 def cmd_log_pending(args) -> int | None:
     from . import changelog as changelog_mod
     print(json.dumps(changelog_mod.load_pending(), indent=2))
+    return None
+
+
+def _sop_body(args) -> str | None:
+    """Resolve an SOP body from --text / --file / --stdin (at most one). A
+    procedure body is usually multi-line markdown, which is painful to pass as
+    a quoted shell argument on Windows — --file and --stdin avoid that."""
+    given = [name for name, val in
+             (("--text", args.text), ("--file", args.file),
+              ("--stdin", args.stdin or None)) if val]
+    if len(given) > 1:
+        raise ValueError("pass only one of --text / --file / --stdin")
+    if args.stdin:
+        return sys.stdin.read()
+    if args.file:
+        from pathlib import Path
+        return Path(args.file).read_text(encoding="utf-8")
+    return args.text
+
+
+def _cmd_sop_write(args, action) -> int | None:
+    from . import sop as sop_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        text = (args.reason if action == "delete" else _sop_body(args))
+        tags = [t for t in (getattr(args, "tags", "") or "").split(",") if t]
+        ev = sop_mod.record(action, args.sop_id,
+                            title=getattr(args, "title", None), text=text,
+                            tags=tags, session_id=sid)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"sop {action}: {args.sop_id} @ {ev.ts}")
+    return None
+
+
+def cmd_sop_add(args) -> int | None:
+    return _cmd_sop_write(args, "add")
+
+
+def cmd_sop_update(args) -> int | None:
+    return _cmd_sop_write(args, "update")
+
+
+def cmd_sop_delete(args) -> int | None:
+    return _cmd_sop_write(args, "delete")
+
+
+def cmd_sop_list(args) -> int | None:
+    from . import sop as sop_mod
+    sops = sop_mod.current(events.read_all(getattr(args, "project", None)))
+    if args.json:
+        print(json.dumps(sops, indent=2, ensure_ascii=False))
+        return None
+    if not sops:
+        print('(no active SOPs — add one: hive sop add <id> --title "…" '
+              '--file <body.md>)')
+        return None
+    for i, r in enumerate(sops, 1):
+        print(f"  {i}. [{r['sop_id']} v{r['version']}] {r['title']}  "
+              f"(updated {r['updated']})")
+    print(f"\n{len(sops)} active SOP(s)")
+    return None
+
+
+def cmd_sop_show(args) -> int | None:
+    from . import sop as sop_mod
+    evs = events.read_all(getattr(args, "project", None))
+    rec = sop_mod.get(evs, args.sop_id)
+    hist = [e for e in sop_mod.entries(evs) if e["sop_id"] == args.sop_id]
+    if args.json:
+        print(json.dumps({"active": rec, "history": hist},
+                         indent=2, ensure_ascii=False))
+        return None
+    if rec is None and not hist:
+        print(f"error: no SOP '{args.sop_id}' in the ledger", file=sys.stderr)
+        return 2
+    if rec is None:
+        print(f"SOP {args.sop_id}: deleted (history below)")
+    else:
+        print(f"SOP {rec['sop_id']} v{rec['version']} — {rec['title']}")
+        print(f"created {rec['created']}  updated {rec['updated']}\n")
+        print(rec["text"])
+    print("\nhistory (newest first):")
+    for e in hist:
+        print(f"  {e['ts']}  {e['action']:6s}  session {e['session']}")
     return None
 
 
@@ -924,6 +1020,44 @@ def _build_parser() -> argparse.ArgumentParser:
     lgq.set_defaults(func=cmd_log_queue)
     lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
     lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
+
+    # --- sop (managed standard operating procedures) ---
+    so = sub.add_parser("sop", help="standard operating procedures "
+                                    "(event-sourced registry, auto-loaded)")
+    sosub = so.add_subparsers(dest="sop_cmd", required=True)
+    soa = sosub.add_parser("add", help="add a new SOP")
+    soa.add_argument("sop_id", help="stable kebab-case id, e.g. memo-hygiene")
+    soa.add_argument("--title", required=True)
+    soa.add_argument("--text", default=None, help="procedure body (inline)")
+    soa.add_argument("--file", default=None, help="read the body from a file")
+    soa.add_argument("--stdin", action="store_true",
+                     help="read the body from stdin")
+    soa.add_argument("--tags", default="")
+    soa.add_argument("--session", default=None)
+    soa.set_defaults(func=cmd_sop_add)
+    sou = sosub.add_parser("update", help="revise an SOP's title and/or body")
+    sou.add_argument("sop_id")
+    sou.add_argument("--title", default=None)
+    sou.add_argument("--text", default=None)
+    sou.add_argument("--file", default=None)
+    sou.add_argument("--stdin", action="store_true")
+    sou.add_argument("--tags", default="")
+    sou.add_argument("--session", default=None)
+    sou.set_defaults(func=cmd_sop_update)
+    sod = sosub.add_parser("delete", help="retire an SOP (append-only tombstone)")
+    sod.add_argument("sop_id")
+    sod.add_argument("--reason", default=None)
+    sod.add_argument("--session", default=None)
+    sod.set_defaults(func=cmd_sop_delete)
+    sol = sosub.add_parser("list", help="list active SOPs")
+    sol.add_argument("--project", default=None)
+    sol.add_argument("--json", action="store_true")
+    sol.set_defaults(func=cmd_sop_list)
+    sos = sosub.add_parser("show", help="print one SOP in full, with history")
+    sos.add_argument("sop_id")
+    sos.add_argument("--project", default=None)
+    sos.add_argument("--json", action="store_true")
+    sos.set_defaults(func=cmd_sop_show)
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")

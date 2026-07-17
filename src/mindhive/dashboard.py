@@ -481,6 +481,28 @@ def make_handler(token: str):
                                "categories": list(changelog_mod.CATEGORIES),
                                "pending": pending})
 
+        def _get_sops(self, proj, am, qs):
+            # Managed SOP registry. Active set and history both delegate to
+            # sop.py (one source of truth for fold/ordering), so this view
+            # can never disagree with `hive sop list` / `hive sop show`.
+            from . import sop as sop_mod
+            if am:
+                active, hist = [], []
+                for n in _all_projects():
+                    evs = events.read_all(n)
+                    for r in sop_mod.current(evs):
+                        active.append(dict(r, project=n))
+                    hist.extend(sop_mod.entries(evs, project=n))
+                active.sort(key=lambda r: (r.get("created") or "",
+                                           r.get("sop_id") or ""))
+                hist.sort(key=lambda r: r["ts"] or "", reverse=True)
+            else:
+                evs = events.read_all(proj)
+                active = sop_mod.current(evs)
+                hist = sop_mod.entries(evs, project=proj)
+            return self._json({"active": active, "history": hist,
+                               "actions": list(sop_mod.ACTIONS)})
+
         def _get_task(self, proj, am, qs):
             sid = (qs.get("session") or [""])[0]
             # In HIVE MIND mode each card carries its own project — a concrete
@@ -960,6 +982,7 @@ def make_handler(token: str):
             "/api/task_detail": _get_task_detail,
             "/api/oversee": _get_oversee,
             "/api/changelog": _get_changelog,
+            "/api/sops": _get_sops,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
             "/api/plugins/recommend": _get_plugins_recommend,
