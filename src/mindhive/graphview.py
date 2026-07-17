@@ -5,8 +5,10 @@ from pathlib import Path
 from . import paths
 
 # Self-contained page: graph data is inlined as JSON; the renderer is a small
-# vanilla-JS SVG force layout. No external (http/https) references, so the file
-# works fully offline in any browser or webview.
+# vanilla-JS SVG engine that arranges the nodes into a seeded "meteor" — a dense
+# glowing head of recent, well-connected memories, a radial spray of filaments,
+# and a comet tail of older nodes streaming down-left. No external (http/https)
+# references, so the file works fully offline in any browser or webview.
 _TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -21,15 +23,34 @@ _TEMPLATE = """<!DOCTYPE html>
   #stage { flex: 1; position: relative; }
   svg { width: 100%; height: 100%; display: block; cursor: grab; }
   svg.panning { cursor: grabbing; }
-  .edge { stroke: #30363d; stroke-width: 1; fill: none; }
-  .node circle { stroke: #0e1116; stroke-width: 1.5; cursor: pointer; }
-  .node text { fill: #c9d1d9; font-size: 11px; pointer-events: none; }
+  .edge { stroke: #2b3038; stroke-width: 1; fill: none; }
+  /* semantic_near edges (embedding-derived) read as dashed violet so they are
+     visually separable from the solid grey structural edges. */
+  .edge.semantic { stroke: #a371f7; stroke-dasharray: 4 3; stroke-opacity: 0.5; }
+  /* Obsidian-style: muted grey discs sized by connectivity, with the event
+     kind carried on a colored ring so the legend still reads true. */
+  .node circle { fill: #3d4450; stroke-width: 1.5; cursor: pointer; }
+  .node circle:hover { fill: #566070; }
+  .node.sel circle { fill: #e6edf3; }
+  .node text { fill: #99a3b0; font-size: 10.5px; pointer-events: none; }
+  .node.faded circle { opacity: 0.12; }
+  .node.faded text { opacity: 0.12; }
   .hoverlabel { font-size: 11px; pointer-events: none; paint-order: stroke;
     stroke: #0e1116; stroke-width: 3px; fill: #e6edf3; }
   .node.dim circle, .edge.dim { opacity: 0.15; }
   #panel { width: 320px; background: #161b22; border-left: 1px solid #30363d;
     padding: 16px; overflow-y: auto; }
+  #panel .phead { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: #8b949e; margin: 0 0 10px; }
   #panel h2 { font-size: 15px; margin: 0 0 4px; word-break: break-word; }
+  #panel .meta { color: #8b949e; font-size: 11.5px; margin: 4px 0 10px; }
+  #panel .meta b { color: #c9d1d9; font-weight: 600; }
+  #panel .navitem { cursor: pointer; }
+  #panel .navitem:hover { color: #58a6ff; }
+  #searchwrap { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); }
+  #search { background: #161b22cc; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 8px; padding: 5px 12px; font: inherit; width: 230px; }
+  #search:focus { outline: none; border-color: #58a6ff; }
   #panel .type { display: inline-block; padding: 2px 8px; border-radius: 10px;
     font-size: 11px; margin-bottom: 12px; }
   #panel h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
@@ -66,11 +87,12 @@ _TEMPLATE = """<!DOCTYPE html>
   <div id="stage">
     <svg id="svg"></svg>
     <div id="legend"></div>
-    <button id="fitbtn" title="Fit graph to window">Fit</button>
+    <div id="searchwrap"><input id="search" type="search" placeholder="&#128269; Search graph"></div>
+    <button id="fitbtn" title="Fit graph to window">Reset view</button>
     <button id="artbtn" title="Toggle pinwheel view">Pinwheel</button>
     <div id="hint">drag nodes &middot; scroll to zoom &middot; drag background to pan &middot; click a node</div>
   </div>
-  <div id="panel"><div id="empty">Click a node to inspect it.</div></div>
+  <div id="panel"><div class="phead">Inspector</div><div id="empty">Click a node to inspect it.</div></div>
 </div>
 <script id="graph-data" type="application/json">__GRAPH_JSON__</script>
 <script>
@@ -115,25 +137,42 @@ _RENDERER_JS = r"""
   var VIBE_AMP = 3.5, VIBE_WAVES = 5, VIBE_SPEED = 5.2, VIBE_PHASE = 0.9,
       VIBE_SAMPLES = 20;
 
-  // Force-layout stability constants. Large memory graphs contain mega-hub tags
-  // (e.g. "harvest"/"auto" tag nearly every event), so one node can be wired to
-  // ~all others. With explicit-Euler integration that concentration of spring
-  // pull, combined with the 1/d^2 repulsion spiking when two hub-siblings briefly
-  // coincide, sends velocities to infinity and the coordinates explode (1e90+),
-  // after which fitView zooms into garbage and the whole graph renders as a
-  // single dot. REPULSE_MINDIST floors the repulsion denominator, SPRING_CAP
-  // bounds the per-edge pull, and MAX_VEL clamps per-axis speed — together they
-  // keep the simulation bounded no matter how dense the hub.
-  var REPULSE_MINDIST2 = 12 * 12, SPRING_CAP = 8, MAX_VEL = 30, COOL_RATE = 0.004;
-
-  // Clustered ("grouped clumps") layout. Spring strength per edge relation:
-  // structural edges (a node and its session/file/next) pull their clump tight;
-  // tag edges pull NOTHING, because the mega-hub tags wire to ~every node and
-  // any pull would drag all clumps back into one blob. Nodes are also held to a
-  // per-group anchor (see below) so each session settles into its own clump.
-  var SPRING_K = { in_session: 0.03, touched: 0.02, next: 0.04,
-                   tagged: 0, shares_tag: 0 };
-  var SPRING_REST = 40, ANCHOR_GRAVITY = 0.06, REPULSE = 900;
+  // ---- Meteor layout ("Sidereal Decay") -----------------------------------
+  // A deterministic, seeded arrangement (no physics): the freshest / most-
+  // connected memories pack into a glowing spherical HEAD, older and leaf
+  // nodes spray outward as fine radial FILAMENTS, and the whole cloud streams
+  // DOWN-LEFT into a tapering comet TAIL. Same seed => same meteor.
+  var META = {
+    seed: 7,
+    headR: 150,          // radius of the dense head, in virtual units
+    tailLen: 1000,       // how far the comet body streams down-tail
+    hairLen: 300,        // length of the radial filament spray
+    tailDir: [-0.70711, 0.70711],  // down-left in screen space (y points down)
+    tailSpread: 1.35,    // angular half-width (rad) of the hairy tail
+    pTailHair: 0.6,      // share of filaments that lean into the tail
+    wRecency: 0.6, wDegree: 0.4    // how "core" a node is: time + connectivity
+  };
+  function hashStr(s) {
+    var h = 2166136261 >>> 0;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i); h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function parseTime(n) {
+    // Event labels look like "type @ 2026-06-23T...": pull the ISO timestamp.
+    var s = String(n.label || ""), i = s.lastIndexOf(" @ ");
+    var v = i >= 0 ? Date.parse(s.slice(i + 3)) : NaN;
+    return isNaN(v) ? null : v;
+  }
 
   // The per-frame edge "buzz" rebuilds every edge as a 20-point polyline each
   // frame, forever. On a big graph (thousands of edges) that animation never
@@ -163,12 +202,35 @@ _RENDERER_JS = r"""
   var NS = "http:" + "//www.w3.org/2000/svg";
   var root = document.createElementNS(NS, "g");
   svg.appendChild(root);
-  // Two layers under the shared pan/zoom transform: the force graph and the
+  // Two layers under the shared pan/zoom transform: the meteor graph and the
   // pinwheel art view. Only one is visible at a time (toggled by #artbtn).
   var graphLayer = document.createElementNS(NS, "g");
   var artLayer = document.createElementNS(NS, "g");
   artLayer.style.display = "none";
   root.appendChild(graphLayer); root.appendChild(artLayer);
+
+  // Soft halo behind the head (origin in virtual space) so the core reads as a
+  // glowing meteor. First child of graphLayer, so edges/nodes appended later
+  // always paint over it; hidden in art mode along with the graph edges.
+  var meteorHalo = (function addGlow() {
+    var defs = document.createElementNS(NS, "defs");
+    var grad = document.createElementNS(NS, "radialGradient");
+    grad.setAttribute("id", "meteor-glow");
+    [["0%", "#e6edff", "0.55"], ["38%", "#9db6ff", "0.16"],
+     ["100%", "#9db6ff", "0"]].forEach(function (st) {
+      var s = document.createElementNS(NS, "stop");
+      s.setAttribute("offset", st[0]);
+      s.setAttribute("stop-color", st[1]);
+      s.setAttribute("stop-opacity", st[2]);
+      grad.appendChild(s);
+    });
+    defs.appendChild(grad); root.appendChild(defs);
+    var halo = document.createElementNS(NS, "circle");
+    halo.setAttribute("cx", "0"); halo.setAttribute("cy", "0");
+    halo.setAttribute("r", "340"); halo.setAttribute("fill", "url(#meteor-glow)");
+    graphLayer.appendChild(halo);
+    return halo;
+  })();
 
   var view = { x: 0, y: 0, k: 1 };
   function applyView() {
@@ -216,21 +278,68 @@ _RENDERER_JS = r"""
     var an = anchors[groupIdx[group[n.id]]];
     var jx = ((i * 71) % 60) - 30, jy = ((i * 37) % 60) - 30;  // break symmetry
     return { id: n.id, type: n.type, label: n.label, kind: n.kind, text: n.text,
-             ax: an.x, ay: an.y, x: an.x + jx, y: an.y + jy, vx: 0, vy: 0 };
+             ax: an.x, ay: an.y, x: an.x + jx, y: an.y + jy, vx: 0, vy: 0,
+             // pinwheel view: px/py = position on the petal, buzz = live jitter,
+             // phase = per-node twinkle offset (golden-ratio spread so no two
+             // neighbours pulse in lockstep — reads like a field of stars).
+             px: null, py: null, buzz: 0, phase: ((i * 0.6180339887) % 1) * 6.2831853 };
   });
   var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
   var edges = data.edges
     .filter(function (e) { return byId[e.src] && byId[e.dst]; })
-    .map(function (e) {
-      var k = SPRING_K[e.rel]; if (k == null) k = 0.01;
-      return { s: byId[e.src], t: byId[e.dst], rel: e.rel, k: k };
-    });
+    .map(function (e) { return { s: byId[e.src], t: byId[e.dst], rel: e.rel }; });
 
   var adj = {};
   data.edges.forEach(function (e) {
     (adj[e.src] = adj[e.src] || []).push({ id: e.dst, rel: e.rel });
     (adj[e.dst] = adj[e.dst] || []).push({ id: e.src, rel: e.rel });
   });
+
+  // Compute coreness (recency + degree) and place every node into the meteor.
+  function layoutMeteor() {
+    var D = META.tailDir, P = [-D[1], D[0]], tailAng = Math.atan2(D[1], D[0]);
+    var tmin = Infinity, tmax = -Infinity, degMax = 1;
+    nodes.forEach(function (n) {
+      n.deg = (adj[n.id] || []).length; if (n.deg > degMax) degMax = n.deg;
+      n.time = parseTime(n);
+      if (n.time != null) {
+        if (n.time < tmin) tmin = n.time;
+        if (n.time > tmax) tmax = n.time;
+      }
+    });
+    var haveTime = tmax >= tmin, span = (tmax - tmin) || 1;
+    // Below headT the node belongs in the round head; above it, the comet body.
+    var headT = 2 * META.headR / (META.tailLen + META.headR);
+    nodes.forEach(function (n) {
+      var recN = (haveTime && n.time != null) ? (n.time - tmin) / span : 0.35;
+      n.core = META.wRecency * recN + META.wDegree * (n.deg / degMax);  // 1 = head
+      // Per-node seeded RNG: stable id hash mixed with the layout seed.
+      var rnd = mulberry32(hashStr(String(n.id)) ^ (Math.imul(META.seed, 2654435761) >>> 0));
+      var t = 1 - n.core, x, y;
+      if (n.deg <= 1 && rnd() < 0.85) {
+        // Radial filament — the meteor's hairy spray, biased into the tail.
+        var ang = rnd() < META.pTailHair
+          ? tailAng + (rnd() + rnd() - 1) * META.tailSpread
+          : rnd() * 2 * Math.PI;
+        var L = META.headR * 0.55 + (0.35 + 0.65 * t) * META.hairLen * Math.sqrt(rnd());
+        x = Math.cos(ang) * L + D[0] * t * META.tailLen * 0.12;
+        y = Math.sin(ang) * L + D[1] * t * META.tailLen * 0.12;
+      } else if (t < headT) {
+        // Dense round head — the glowing core of fresh, well-connected memories.
+        var rr = META.headR * Math.sqrt(rnd()), aa = rnd() * 2 * Math.PI;
+        x = Math.cos(aa) * rr; y = Math.sin(aa) * rr;
+      } else {
+        // Comet body — older memories tapering down the tail (ρ ∝ (1-frac)^0.75).
+        var frac = (t - headT) / (1 - headT);
+        var ax = META.headR + frac * META.tailLen;
+        var rho = META.headR * Math.pow(1 - frac, 0.75);
+        var off = rho * (rnd() + rnd() - 1);   // triangular: denser toward the spine
+        x = D[0] * ax + P[0] * off; y = D[1] * ax + P[1] * off;
+      }
+      n.x = x; n.y = y; n.vx = 0; n.vy = 0;
+    });
+  }
+  layoutMeteor();
 
   // Legend: one row per node kind/type actually present in this graph.
   (function buildLegend() {
@@ -243,16 +352,26 @@ _RENDERER_JS = r"""
       seen[k] = true;
       rows.push({ color: nodeColor(n), label: KIND_LABELS[k] || k });
     });
-    if (!rows.length) { legend.style.display = "none"; return; }
-    legend.innerHTML = rows.map(function (r) {
+    var html = rows.map(function (r) {
       return "<div class=row><span class=dot style=\"background:" + r.color +
         "\"></span>" + esc(r.label) + "</div>";
     }).join("");
+    // Edge legend: only show the semantic-link key when such edges are present,
+    // drawn as a short dashed line so it reads as an edge, not a node kind.
+    if (edges.some(function (e) { return e.rel === "semantic_near"; })) {
+      html += "<div class=row><span style=\"display:inline-block;width:10px;" +
+        "height:0;border-top:2px dashed #a371f7;margin-right:6px\"></span>" +
+        "semantic link</div>";
+    }
+    if (!html) { legend.style.display = "none"; return; }
+    legend.innerHTML = html;
   })();
 
   var edgeEls = edges.map(function (e) {
     var l = document.createElementNS(NS, "path");
-    l.setAttribute("class", "edge");
+    // Geometry is the only attribute the tick loop rewrites, so styling the
+    // semantic class here persists across frames.
+    l.setAttribute("class", e.rel === "semantic_near" ? "edge semantic" : "edge");
     graphLayer.appendChild(l);
     return l;
   });
@@ -262,24 +381,41 @@ _RENDERER_JS = r"""
   // they overlapped into an unreadable smear anyway). Event/file labels show on
   // hover via one shared element, and in full in the side panel on click.
   function hasLabel(n) { return n.type === "session" || n.type === "tag"; }
-  var nodeEls = nodes.map(function (n) {
+  // Obsidian-style sizing: the disc grows with connectivity (sqrt-damped so a
+  // mega-hub tag doesn't dwarf the canvas) and stays muted grey (CSS fill);
+  // the kind color moves to the ring (stroke) so the legend still reads true.
+  var degree = {};
+  data.edges.forEach(function (e) {
+    degree[e.src] = (degree[e.src] || 0) + 1;
+    degree[e.dst] = (degree[e.dst] || 0) + 1;
+  });
+  var nodeEls = nodes.map(function (n, i) {
     var g = document.createElementNS(NS, "g");
     g.setAttribute("class", "node");
     var c = document.createElementNS(NS, "circle");
-    c.setAttribute("r", n.type === "session" ? 9 : 6);
-    c.setAttribute("fill", nodeColor(n));
+    n.r = Math.min(16, 4 + Math.sqrt(degree[n.id] || 0) * 1.7);
+    c.setAttribute("r", n.r.toFixed(1));
+    c.setAttribute("stroke", nodeColor(n));
     g.appendChild(c);
+    // The meteor is static: position each node once at creation (there is no
+    // simulation loop writing transforms every frame anymore).
+    g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    n._i = i;
     if (hasLabel(n)) {
       var t = document.createElementNS(NS, "text");
-      t.setAttribute("x", 9); t.setAttribute("y", 4);
+      t.setAttribute("x", (n.r + 3).toFixed(1)); t.setAttribute("y", 4);
       t.textContent = canvasLabel(n);
       g.appendChild(t);
-    } else {
-      g.addEventListener("mouseover", function () { showHover(n); });
-      g.addEventListener("mouseout", hideHover);
     }
+    g.addEventListener("mouseover", function () {
+      if (artMode) vibrateNode(n, 6);          // ripple a buzz through neighbours
+      else if (!hasLabel(n)) showHover(n);
+    });
+    g.addEventListener("mouseout", function () { if (!artMode) hideHover(); });
     g.addEventListener("mousedown", function (ev) { startDrag(ev, n); });
-    g.addEventListener("click", function (ev) { ev.stopPropagation(); select(n); });
+    g.addEventListener("click", function (ev) {
+      ev.stopPropagation(); if (artMode) vibrateNode(n, 10); select(n);
+    });
     graphLayer.appendChild(g);
     return g;
   });
@@ -291,13 +427,13 @@ _RENDERER_JS = r"""
   hoverLabel.style.display = "none";
   graphLayer.appendChild(hoverLabel);
   function showHover(n) {
-    hoverLabel.setAttribute("x", n.x + 9); hoverLabel.setAttribute("y", n.y + 4);
+    hoverLabel.setAttribute("x", n.x + (n.r || 6) + 3); hoverLabel.setAttribute("y", n.y + 4);
     hoverLabel.textContent = canvasLabel(n);
     hoverLabel.style.display = "";
   }
   function hideHover() { hoverLabel.style.display = "none"; }
 
-  var fitted = false, alpha = 1, running = false;
+  var fitted = false, running = false;
   var BUZZ = edges.length <= BUZZ_MAX_EDGES;   // animate edges only when cheap
   function fitView() {
     if (!nodes.length || artMode) return;
@@ -317,132 +453,199 @@ _RENDERER_JS = r"""
   }
   var fitbtn = document.getElementById("fitbtn");
   if (fitbtn) fitbtn.addEventListener("click", fitView);
+  function centerOn(n) {          // pan (keep zoom) so the node sits mid-stage
+    view.x = W / 2 - view.k * n.x;
+    view.y = H / 2 - view.k * n.y;
+    applyView();
+  }
 
-  // --- Pinwheel art view ---------------------------------------------------
-  // Each session becomes a "petal": a spiral of nested squares that scale and
-  // rotate toward the centre, depth scaled by how many events the session holds.
-  // Petals are clickable — clicking opens that session in the side panel. It's a
-  // second layer under the same pan/zoom, toggled by #artbtn.
-  var artMode = false, artBuilt = false, savedView = null;
+  // Search: fade every node that doesn't match (label, payload text, or kind);
+  // Enter jumps to and selects the first match. Clearing the box restores all.
+  var searchBox = document.getElementById("search");
+  function nodeMatches(n, q) {
+    return ((n.label || "") + " " + (n.text || "") + " " + nodeKey(n))
+      .toLowerCase().indexOf(q) !== -1;
+  }
+  if (searchBox) {
+    searchBox.addEventListener("input", function () {
+      var q = searchBox.value.trim().toLowerCase();
+      nodes.forEach(function (n, i) {
+        nodeEls[i].classList.toggle("faded", !!q && !nodeMatches(n, q));
+      });
+    });
+    searchBox.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter") return;
+      var q = searchBox.value.trim().toLowerCase();
+      if (!q) return;
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodeMatches(nodes[i], q)) { centerOn(nodes[i]); select(nodes[i]); break; }
+      }
+    });
+  }
+
+  // --- Pinwheel art view (node-based, living) ------------------------------
+  // Each session is a petal: a smooth spiral "blade", all P blades identical and
+  // rotated by 2*pi/P so the wheel is perfectly symmetric. The session's own
+  // nodes are laid along its blade at EQUAL ARC-LENGTH spacing — so the gaps
+  // between nodes match and the form reads cleanly. The nodes themselves stay
+  // visible (this isn't decoration drawn over a hidden graph): the whole wheel
+  // drifts slowly like a field of stars, each node twinkles on its own phase,
+  // and a node buzzes when touched or — via hiveVibrate() — when fresh activity
+  // lands on it. Same pan/zoom layer, toggled by #artbtn.
+  var artMode = false, artBuilt = false, savedView = null, spin = 0;
+  var SPIN_RATE = 0.0010;                  // radians/frame: slow, star-like drift
+  var TWINKLE = 0.20, TWINKLE_RATE = 0.0017;
+
   function buildArt() {
-    var groupSize = {};
-    data.nodes.forEach(function (n) { var g = group[n.id]; groupSize[g] = (groupSize[g] || 0) + 1; });
+    var CX = W / 2, CY = H / 2, minDim = Math.min(W, H);
+    var Rc = minDim * 0.40, shrink = 0.16, twist = 2.2 * Math.PI;
+    var petalNodes = {};
+    nodes.forEach(function (n) { (petalNodes[group[n.id]] = petalNodes[group[n.id]] || []).push(n); });
     var petals = groupIds
       .filter(function (g) { return nodeType[g] === "session"; })
-      .map(function (g) { return { id: g, size: groupSize[g] }; })
-      .sort(function (a, b) { return b.size - a.size; });
-    if (!petals.length) return;
-    var P = petals.length, maxSize = petals[0].size;
-    var minDim = Math.min(W, H), CX = W / 2, CY = H / 2;
-    var Rc = minDim * 0.30, h = minDim * 0.165, sk = 0.5, f = 0.84,
-        dTheta = -20 * Math.PI / 180;
-    var base = [[-h, -h], [h, -h], [h, h], [-h, h]].map(function (c) {
-      return [Rc + (c[0] * Math.cos(sk) - c[1] * Math.sin(sk)),
-              c[0] * Math.sin(sk) + c[1] * Math.cos(sk)];
-    });
-    var R = Rc + h * 1.7;
-    var paper = document.createElementNS(NS, "rect");
-    paper.setAttribute("x", CX - R - 24); paper.setAttribute("y", CY - R - 24);
-    paper.setAttribute("width", 2 * (R + 24)); paper.setAttribute("height", 2 * (R + 24));
-    paper.setAttribute("rx", 16); paper.setAttribute("fill", "#eef2fb");
-    artLayer.appendChild(paper);
-    petals.forEach(function (pt, i) {
-      var A = i * 2 * Math.PI / P;
-      var L = Math.max(5, Math.min(18, Math.round(pt.size / maxSize * 18)));
-      var pg = document.createElementNS(NS, "g");
-      pg.setAttribute("cursor", "pointer");
-      var fillsAdded = false;
-      for (var k = 0; k < L; k++) {
-        var s = Math.pow(f, k), ang = A + k * dTheta,
-            ca = Math.cos(ang), sa = Math.sin(ang);
-        var pts = base.map(function (v) {
-          var x = s * (ca * v[0] - sa * v[1]), y = s * (sa * v[0] + ca * v[1]);
-          return (CX + x).toFixed(1) + "," + (CY + y).toFixed(1);
-        }).join(" ");
-        if (!fillsAdded) {
-          var poly = document.createElementNS(NS, "polygon");
-          poly.setAttribute("points", pts);
-          poly.setAttribute("fill", "#e7d391"); poly.setAttribute("fill-opacity", "0.55");
-          poly.setAttribute("stroke", "none");
-          pg.appendChild(poly); fillsAdded = true;
-        }
-        var line = document.createElementNS(NS, "polygon");
-        line.setAttribute("points", pts); line.setAttribute("fill", "none");
-        line.setAttribute("stroke", "#2c3c66"); line.setAttribute("stroke-width", "0.8");
-        line.setAttribute("stroke-opacity", "0.85");
-        pg.appendChild(line);
+      .map(function (g) { return { id: g, nodes: petalNodes[g] || [] }; })
+      .sort(function (a, b) { return b.nodes.length - a.nodes.length; });
+    var P = Math.max(1, petals.length);
+
+    // A blade is a dense polyline (log-spiral). Equal-arc-length sampling along
+    // it is what makes the spacing between nodes symmetric.
+    function rib(A) {
+      var pts = [];
+      for (var s = 0; s <= 1.00001; s += 0.02) {
+        var r = Rc * Math.pow(shrink, s), ang = A + s * twist;
+        pts.push([CX + r * Math.cos(ang), CY + r * Math.sin(ang)]);
       }
-      pg.addEventListener("click", function (ev) {
-        ev.stopPropagation(); if (byId[pt.id]) select(byId[pt.id]);
-      });
-      artLayer.appendChild(pg);
+      return pts;
+    }
+    function cumlen(pts) {
+      var c = [0];
+      for (var i = 1; i < pts.length; i++) {
+        var dx = pts[i][0] - pts[i-1][0], dy = pts[i][1] - pts[i-1][1];
+        c.push(c[i-1] + Math.sqrt(dx*dx + dy*dy));
+      }
+      return c;
+    }
+    function pointAt(pts, c, target) {       // position at arc-length `target`
+      var total = c[c.length-1];
+      if (target <= 0) return pts[0];
+      if (target >= total) return pts[pts.length-1];
+      var lo = 0, hi = c.length-1;
+      while (hi - lo > 1) { var mid = (lo+hi) >> 1; if (c[mid] < target) lo = mid; else hi = mid; }
+      var t = (target - c[lo]) / Math.max(1e-6, c[hi] - c[lo]);
+      return [pts[lo][0] + (pts[hi][0]-pts[lo][0])*t, pts[lo][1] + (pts[hi][1]-pts[lo][1])*t];
+    }
+
+    petals.forEach(function (pt, i) {
+      var A = i * 2 * Math.PI / P, p = rib(A), c = cumlen(p), total = c[c.length-1];
+      var m = pt.nodes.length, poly = [];
+      for (var j = 0; j < m; j++) {
+        var frac = m <= 1 ? 0.04 : (j / (m - 1)) * 0.96 + 0.02;   // even, inset from tips
+        var q = pointAt(p, c, frac * total);
+        pt.nodes[j].px = q[0]; pt.nodes[j].py = q[1];
+        poly.push(q[0].toFixed(1) + "," + q[1].toFixed(1));
+      }
+      var pl = document.createElementNS(NS, "polyline");      // faint blade through the nodes
+      pl.setAttribute("points", poly.join(" "));
+      pl.setAttribute("fill", "none"); pl.setAttribute("stroke", "#3a4a78");
+      pl.setAttribute("stroke-width", "1"); pl.setAttribute("stroke-opacity", "0.45");
+      pl.setAttribute("stroke-linecap", "round"); pl.setAttribute("stroke-linejoin", "round");
+      artLayer.appendChild(pl);
+    });
+
+    // Tag / leftover nodes coil into a tight central knot (the hub).
+    var j = 0;
+    nodes.forEach(function (n) {
+      if (nodeType[group[n.id]] === "session") return;
+      var a = j * 0.7, r = 8 + (j % 24) * 1.4;
+      n.px = CX + Math.cos(a) * r; n.py = CY + Math.sin(a) * r; j++;
     });
     artBuilt = true;
   }
+
+  // Buzz a node and (softer) its neighbours — the "connected to its information"
+  // feel. Also used by hiveVibrate() for live activity (pass 2).
+  function vibrateNode(n, amp) {
+    if (!n) return;
+    n.buzz = Math.max(n.buzz || 0, amp);
+    (adj[n.id] || []).forEach(function (e) {
+      var b = byId[e.id]; if (b) b.buzz = Math.max(b.buzz || 0, amp * 0.5);
+    });
+    if (artMode) kickArt();
+  }
+  // External hook (dashboard, pass 2): hiveVibrate(["id1","id2"], amp).
+  window.hiveVibrate = function (ids, amp) {
+    (ids || []).forEach(function (id) { vibrateNode(byId[id], amp || 8); });
+  };
+
+  var artRunning = false;
+  function artTick(now) {
+    if (!artMode) { artRunning = false; return; }
+    now = now || 0; spin += SPIN_RATE;
+    var CX = W / 2, CY = H / 2, ca = Math.cos(spin), sa = Math.sin(spin);
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i]; if (n.px == null) continue;
+      var dx = n.px - CX, dy = n.py - CY;
+      var x = CX + dx * ca - dy * sa, y = CY + dx * sa + dy * ca;   // slow rotation
+      if (n.buzz > 0.05) {                                          // interaction / live buzz
+        x += Math.sin(now * 0.045 + i * 1.7) * n.buzz;
+        y += Math.cos(now * 0.052 + i * 1.3) * n.buzz;
+        n.buzz *= 0.90;
+      } else { n.buzz = 0; }
+      var el = nodeEls[i];
+      el.setAttribute("transform", "translate(" + x.toFixed(1) + "," + y.toFixed(1) + ")");
+      var tw = 0.8 + 0.2 * Math.sin(now * TWINKLE_RATE + n.phase);  // twinkle
+      var circ = el.firstChild;
+      if (circ && circ.tagName === "circle") circ.setAttribute("opacity", tw.toFixed(2));
+    }
+    requestAnimationFrame(artTick);
+    artRunning = true;
+  }
+  function kickArt() { if (!artRunning) { artRunning = true; requestAnimationFrame(artTick); } }
+
   function setArt(on) {
     artMode = on;
     if (on) {
       if (!artBuilt) buildArt();
       savedView = { x: view.x, y: view.y, k: view.k };
       view.x = 0; view.y = 0; view.k = 1; applyView();
-      graphLayer.style.display = "none"; artLayer.style.display = "";
+      edgeEls.forEach(function (el) { el.style.display = "none"; });   // hide graph edges
+      meteorHalo.style.display = "none";
+      hideHover(); artLayer.style.display = "";
       if (artbtn) artbtn.textContent = "Graph";
-      panel.innerHTML = "<div id=empty>Click a petal to inspect its session.</div>";
+      if (typeof panel !== "undefined" && panel) {
+        panel.innerHTML = "<div class=phead>Inspector</div>" +
+          "<div id=empty>A living pinwheel — click a node to inspect it.</div>";
+      }
+      kickArt();
     } else {
       if (savedView) { view.x = savedView.x; view.y = savedView.y; view.k = savedView.k; applyView(); }
-      artLayer.style.display = "none"; graphLayer.style.display = "";
+      edgeEls.forEach(function (el) { el.style.display = ""; });
+      meteorHalo.style.display = "";
+      artLayer.style.display = "none";
+      nodes.forEach(function (n, i) {
+        var c = nodeEls[i].firstChild; if (c && c.tagName === "circle") c.removeAttribute("opacity");
+        nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+      });
       if (artbtn) artbtn.textContent = "Pinwheel";
+      kick();   // resume the graph render loop (buzz / pending fit)
     }
   }
   var artbtn = document.getElementById("artbtn");
   if (artbtn) artbtn.addEventListener("click", function () { setArt(!artMode); });
 
   function tick(now) {
+    if (artMode) { running = false; return; }   // pinwheel owns the loop in art mode
     now = now || 0;
-    // Once the layout has cooled (alpha 0) and nothing is being dragged, node
-    // positions are frozen — so skip the O(n^2) physics AND the per-node DOM
-    // transforms entirely; only the edge buzz keeps running. This is the single
-    // biggest render saving on large graphs and is visually identical (nothing
-    // was moving). A drag reheats alpha, which resumes the simulation.
-    var simulating = alpha > 0 || dragging;
-    if (simulating) {
-    for (var i = 0; i < nodes.length; i++) {
-      var a = nodes[i];
-      for (var j = i + 1; j < nodes.length; j++) {
-        var b = nodes[j];
-        var dx = a.x - b.x, dy = a.y - b.y;
-        var d2 = dx * dx + dy * dy;
-        if (d2 < REPULSE_MINDIST2) d2 = REPULSE_MINDIST2;  // avoid 1/0 blowup
-        var f = REPULSE / d2;
-        var d = Math.sqrt(d2);
-        a.vx += (dx / d) * f; a.vy += (dy / d) * f;
-        b.vx -= (dx / d) * f; b.vy -= (dy / d) * f;
-      }
-    }
-    edges.forEach(function (e) {
-      if (e.k === 0) return;                  // tag edges don't pull clumps together
-      var dx = e.t.x - e.s.x, dy = e.t.y - e.s.y;
-      var d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-      var f = (d - SPRING_REST) * e.k;
-      if (f > SPRING_CAP) f = SPRING_CAP;            // bound mega-hub pull
-      else if (f < -SPRING_CAP) f = -SPRING_CAP;
-      e.s.vx += (dx / d) * f; e.s.vy += (dy / d) * f;
-      e.t.vx -= (dx / d) * f; e.t.vy -= (dy / d) * f;
-    });
-    nodes.forEach(function (n) {
-      n.vx += (n.ax - n.x) * ANCHOR_GRAVITY; n.vy += (n.ay - n.y) * ANCHOR_GRAVITY;
-      // Clamp per-axis speed: the single guard that keeps explicit-Euler from
-      // diverging on dense hubs. Without it, accumulated velocity explodes.
-      if (n.vx > MAX_VEL) n.vx = MAX_VEL; else if (n.vx < -MAX_VEL) n.vx = -MAX_VEL;
-      if (n.vy > MAX_VEL) n.vy = MAX_VEL; else if (n.vy < -MAX_VEL) n.vy = -MAX_VEL;
-      // Motion is scaled by alpha so the layout cools to a stop (see below).
-      if (n !== dragging) { n.x += n.vx * alpha; n.y += n.vy * alpha; }
-      n.vx *= 0.85; n.vy *= 0.85;
-    });
-    }
+    // No physics: node positions ARE the fixed meteor (computed once in
+    // layoutMeteor). Each frame we only keep the edge "buzz" shimmering along
+    // the filaments — the incandescent-hair effect — and fit-to-window once.
+    // Dragging a node updates its own transform directly (see mousemove); its
+    // incident edges follow here. When the buzz is off (large graphs) the loop
+    // halts once fitted, so zoom/pan then cost nothing until a drag kicks it
+    // (see startDrag).
     // Redraw edges. Small graphs get the animated "buzz" (perpendicular sine,
     // sin(pi*s) envelope pins both endpoints); big graphs get static straight
-    // lines, redrawn only while the layout is still moving.
+    // lines, redrawn only while a drag is moving them.
     if (BUZZ) {
       var t = now / 1000;
       edges.forEach(function (e, i) {
@@ -461,25 +664,18 @@ _RENDERER_JS = r"""
         }
         edgeEls[i].setAttribute("d", d);
       });
-    } else if (simulating) {
+    } else if (dragging || !fitted) {
+      // No buzz: draw straight edges, only while a drag moves them or before
+      // the first fit. Otherwise the loop halts and edges stay put.
       edges.forEach(function (e, i) {
         edgeEls[i].setAttribute("d", "M" + e.s.x.toFixed(1) + " " + e.s.y.toFixed(1) +
           "L" + e.t.x.toFixed(1) + " " + e.t.y.toFixed(1));
       });
     }
-    if (simulating) {
-      nodes.forEach(function (n, i) {
-        nodeEls[i].setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-      });
-    }
-    // Cool the layout each frame; once it has settled (alpha hits 0) the node
-    // positions are frozen, so a single fit-to-window holds instead of going
-    // stale while the simulation keeps drifting (which clipped the graph).
-    alpha = alpha > 0 ? Math.max(0, alpha - COOL_RATE) : 0;
-    if (!fitted && alpha === 0) { fitted = true; fitView(); }
-    // Keep animating only while there's work: the simulation is live, or buzz
-    // is on. Otherwise halt — zoom/pan then cost nothing until a drag kicks us.
-    if (simulating || BUZZ) requestAnimationFrame(tick);
+    if (!fitted) { fitted = true; fitView(); }
+    // Keep animating only while there's work: buzz is on, or a drag is moving
+    // a node. Otherwise halt — zoom/pan then cost nothing until a drag kicks us.
+    if (BUZZ || dragging) requestAnimationFrame(tick);
     else running = false;
   }
   function kick() { if (!running) { running = true; requestAnimationFrame(tick); } }
@@ -489,8 +685,7 @@ _RENDERER_JS = r"""
   function startDrag(ev, n) {
     ev.preventDefault(); ev.stopPropagation();
     dragging = n;
-    alpha = Math.max(alpha, 0.3);  // gently reheat so neighbours respond
-    kick();                        // restart the loop if it had halted
+    kick();   // restart the render loop if it had halted, so edges follow the drag
     var p = toWorld(ev);
     dragOff = { x: p.x - n.x, y: p.y - n.y };
   }
@@ -503,7 +698,12 @@ _RENDERER_JS = r"""
     if (dragging) {
       var p = toWorld(ev);
       dragging.x = p.x - dragOff.x; dragging.y = p.y - dragOff.y;
-      dragging.vx = 0; dragging.vy = 0;
+      // Static layout: move the dragged node's transform directly (the render
+      // loop only redraws its edges). In art mode artTick owns the transforms.
+      if (!artMode) {
+        nodeEls[dragging._i].setAttribute("transform",
+          "translate(" + dragging.x + "," + dragging.y + ")");
+      }
     } else if (panning) {
       view.x = ev.clientX - panning.x; view.y = ev.clientY - panning.y;
       applyView();
@@ -547,9 +747,13 @@ _RENDERER_JS = r"""
     // lives in a scrollable body block below so big payloads stay readable.
     var firstLine = n.text ? String(n.text).split("\n")[0] : "";
     var title = firstLine ? snippet(firstLine, 70) : (n.text ? snippet(n.text, 70) : n.label);
-    var html = "<h2>" + esc(title) + "</h2>";
+    var html = "<div class=phead>Inspector</div><h2>" + esc(title) + "</h2>";
     html += "<span class=type style=\"background:" + color + "33;color:" + color +
       "\">" + esc(kindLabel) + "</span>";
+    html += "<div class=meta><b>" + others.length + "</b> connection" +
+      (others.length === 1 ? "" : "s") +
+      (tags.length ? " · <b>" + tags.length + "</b> tag" +
+        (tags.length === 1 ? "" : "s") : "") + "</div>";
     if (ts) html += "<div class=rel>" + esc(ts) + "</div>";
     if (n.text) html += "<div class=body>" + esc(n.text) + "</div>";
     if (tags.length) {
@@ -563,15 +767,25 @@ _RENDERER_JS = r"""
       ? "<ul>" + others.map(function (c) {
           var node = byId[c.id];
           var label = node ? canvasLabel(node) : c.id;
-          return "<li>" + esc(label) + " <span class=rel>(" + esc(c.rel) +
+          return "<li" + (node ? " class=navitem data-id=\"" + esc(c.id) + "\"" : "")
+            + ">" + esc(label) + " <span class=rel>(" + esc(c.rel) +
             ")</span></li>";
         }).join("") + "</ul>"
       : "<p class=rel>No other connections.</p>";
     panel.innerHTML = html;
+    // The connected list doubles as a graph browser: click an entry to pan to
+    // and select that node.
+    panel.querySelectorAll(".navitem").forEach(function (el) {
+      el.addEventListener("click", function () {
+        var t = byId[el.getAttribute("data-id")];
+        if (t) { centerOn(t); select(t); }
+      });
+    });
 
     nodeEls.forEach(function (el, i) {
       var keep = nodes[i] === n || conns.some(function (c) { return c.id === nodes[i].id; });
       el.classList.toggle("dim", !keep);
+      el.classList.toggle("sel", nodes[i] === n);
     });
     edgeEls.forEach(function (el, i) {
       var e = edges[i];
@@ -579,8 +793,11 @@ _RENDERER_JS = r"""
     });
   }
   svg.addEventListener("click", function () {
-    panel.innerHTML = "<div id=empty>Click a node to inspect it.</div>";
-    nodeEls.forEach(function (el) { el.classList.remove("dim"); });
+    panel.innerHTML = "<div class=phead>Inspector</div>" +
+      "<div id=empty>Click a node to inspect it.</div>";
+    nodeEls.forEach(function (el) {
+      el.classList.remove("dim"); el.classList.remove("sel");
+    });
     edgeEls.forEach(function (el) { el.classList.remove("dim"); });
   });
 
@@ -591,7 +808,8 @@ _RENDERER_JS = r"""
   }
 
   if (!nodes.length) {
-    panel.innerHTML = "<div id=empty>This graph has no nodes yet.<br>" +
+    panel.innerHTML = "<div class=phead>Inspector</div>" +
+      "<div id=empty>This graph has no nodes yet.<br>" +
       "Append some memory events, then reopen.</div>";
   }
 })();
@@ -602,7 +820,7 @@ def render_html(graph: dict) -> str:
     """Return a single self-contained HTML document for the given graph dict.
 
     Pure function: no I/O, no network. The graph is inlined as JSON and rendered
-    by an embedded vanilla-JS SVG force layout.
+    by an embedded vanilla-JS SVG engine as a seeded "meteor" layout.
     """
     graph_json = json.dumps(
         {"nodes": graph.get("nodes", []), "edges": graph.get("edges", [])},

@@ -3,18 +3,24 @@ from dataclasses import dataclass
 
 
 # --- dual-condition exit gate ---
-def should_exit(status, required_remaining: int, json_mode: bool):
-    """Return (should_exit, reason). Stops only when BOTH hold:
+def should_exit(status, required_remaining: int, json_mode: bool,
+                min_heuristics: int = 0):
+    """Return (should_exit, reason). Stops only when ALL hold:
       - explicit EXIT_SIGNAL is true (authoritative), AND
+      - at least ``min_heuristics`` natural-language completion signals
+        corroborate it in the reply text, AND
       - no required fix_plan items remain.
     Explicit EXIT_SIGNAL: false always continues. In JSON mode, a missing
-    explicit signal can never trigger exit (keyword-only exit suppressed)."""
+    explicit signal can never trigger exit (keyword-only exit suppressed).
+    ``min_heuristics=0`` restores the explicit-signal-only gate."""
     if status.exit_signal is False:
         return False, "explicit_continue"
     explicit_done = status.exit_signal is True
     inferred_done = (not json_mode) and status.has_completion_signal
     if not (explicit_done or inferred_done):
         return False, "no_completion_signal"
+    if getattr(status, "heuristic_count", 0) < min_heuristics:
+        return False, "insufficient_completion_heuristics"
     if required_remaining > 0:
         return False, "required_items_remain"
     return True, "completed"

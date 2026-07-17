@@ -76,22 +76,29 @@ def test_render_html_uses_node_kind_and_text():
     assert ".text" in html
 
 
-def test_render_html_freezes_physics_when_settled():
-    # Once cooled (alpha 0) with no drag, the O(n^2) physics + node transforms are
-    # skipped each frame — only the edge buzz keeps running. Big no-op-work saving
-    # on large graphs, no visual change (positions were already frozen).
+def test_render_html_uses_seeded_meteor_layout():
+    # Nodes are arranged into a deterministic, seeded "meteor" (head / filaments /
+    # comet tail) computed once — not an iterative force layout.
     html = graphview.render_html(_graph())
-    assert "alpha > 0 || dragging" in html
+    assert "function layoutMeteor()" in html
+    assert "mulberry32" in html          # seeded RNG => reproducible per seed
+    assert "META" in html and "tailDir" in html
 
 
-def test_render_html_layout_cools_and_fits_on_settle():
-    # Regression: the layout must cool to a stop (alpha) and fit once settled,
-    # not at a fixed frame — otherwise the one-shot fit goes stale while the
-    # simulation keeps drifting and the graph gets clipped off-screen.
+def test_render_html_has_no_iterative_physics():
+    # The O(n^2) repulsion / spring / cooling simulation is gone: positions are
+    # the fixed meteor, so none of the old physics machinery should remain.
     html = graphview.render_html(_graph())
-    assert "alpha" in html
-    assert "alpha === 0" in html
-    assert "frame >= 140" not in html
+    assert "1200 / d2" not in html       # the old inverse-square repulsion
+    assert "alpha" not in html           # no cooling variable anymore
+
+
+def test_render_html_fits_to_window_once():
+    # A single fit-to-window still happens (the meteor is static, so one fit holds
+    # instead of going stale behind a drifting simulation).
+    html = graphview.render_html(_graph())
+    assert "!fitted" in html
+    assert "fitView()" in html
 
 
 def test_render_html_panel_has_prewrap_body():
@@ -112,8 +119,8 @@ def test_render_html_edges_are_vibrating_paths():
 
 
 def test_render_html_edges_vibrate_in_realtime():
-    # The buzz is driven by the frame timestamp and is decoupled from the alpha
-    # cooling, so edges keep moving after the layout settles.
+    # The buzz is driven by the frame timestamp, so the filaments keep shimmering
+    # even though the meteor layout itself is static.
     html = graphview.render_html(_graph())
     assert "VIBE_AMP" in html
     assert "VIBE_SPEED" in html
@@ -129,11 +136,6 @@ def test_render_html_edges_reflect_real_connections():
 
 
 from mindhive import events, paths
-
-
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
 
 def _seed_events():
@@ -152,8 +154,7 @@ def _append_seed_events():
                             tags=ev.tags, ts=ev.ts)
 
 
-def test_export_writes_graph_html(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_writes_graph_html():
     _append_seed_events()
     out = graphview.export(project=None)
     assert out.exists()
@@ -162,8 +163,7 @@ def test_export_writes_graph_html(tmp_path, monkeypatch):
     assert "session:sess1" in html
 
 
-def test_export_builds_graph_if_missing(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_builds_graph_if_missing():
     d = paths.events_dir()
     d.mkdir(parents=True, exist_ok=True)
     for ev in _seed_events():
@@ -174,8 +174,7 @@ def test_export_builds_graph_if_missing(tmp_path, monkeypatch):
     assert (paths.project_dir() / "graph.json").exists()
 
 
-def test_export_honors_out_path(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_honors_out_path(tmp_path):
     from mindhive.graph import build
     build(project=None, _evs=_seed_events())
     target = tmp_path / "custom.html"
@@ -184,9 +183,8 @@ def test_export_honors_out_path(tmp_path, monkeypatch):
     assert target.exists()
 
 
-def test_export_reflects_newly_appended_events(tmp_path, monkeypatch):
+def test_export_reflects_newly_appended_events():
     """A second export must show events appended after the first export."""
-    _setup(tmp_path, monkeypatch)
     events.append_event("decision", {"text": "first decision"},
                         session_id="sess1", tags=["a"], ts="2026-06-20T09:00:00Z")
     graphview.export(project=None)  # first export (builds + persists graph.json)

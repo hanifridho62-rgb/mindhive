@@ -10,3 +10,10 @@ Recall details on demand:  hive recall "<query>"   (add --semantic for meaning-b
 See connections:           hive graph related "<thing>"
 Full current state:        hive state        Full briefing: hive briefing
 Open everything in one window:  hive dashboard   (or double-click MindHive.exe)
+Lessons from past failures:     dashboard -> Memory -> Improvements
+                                (Reflect button turns recurring failures into lessons)
+Run the autonomous loop:        hive loop   (or /circle) — auto-opens the dashboard;
+                                add --no-dashboard to skip it
+Orchestrate an idea end-to-end:  /mindhive <idea> — recall-informed interview,
+                                a scored skill Recommendation Matrix, execution
+                                with follow-up chaining, and learnings logged back.

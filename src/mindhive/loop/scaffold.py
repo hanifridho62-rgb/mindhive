@@ -21,6 +21,9 @@ max_iterations = 50
 max_hours = 8
 allowed_tools = "Write,Read,Edit,Bash(git *),Bash(npm *)"
 iteration_timeout_minutes = 15
+# Headless permission posture: "acceptEdits" auto-approves file edits (safe
+# autonomy), "bypassPermissions" approves any tool, "" relies on allowed_tools.
+permission_mode = "acceptEdits"
 
 [breaker]
 no_progress_threshold = 3

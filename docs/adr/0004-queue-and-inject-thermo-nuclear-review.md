@@ -46,3 +46,16 @@ findings are written back as `caveat` events; the sidecar is deleted once the re
 - The hook stays hang-proof and LLM-free, consistent with every other mindhive hook.
 - Findings compound: repeat offenders (e.g. a file creeping toward 1,000 lines across sessions)
   surface in the briefing trend rather than being re-discovered cold each time.
+
+## Addendum (2026-07-06)
+
+`session_end` now *also* spawns a detached headless **reflection** batch (`rules reflect
+--limit 3 --cooldown-hours 6`) — the very pattern this ADR rejected for the review pipeline.
+The reasoning differs, so both stand: reflection cost is bounded (≤3 incidents per batch, and
+the 6h cooldown is written before the first Claude call, so even a crashed batch can't re-fire
+hot); its output is mechanically delivered — rules land in the quarantine store and are injected
+into STATE.md/MEMORY.md at the next projection, not left in a report nobody opens; and a wrong
+rule's blast radius is contained by ADR-0007's quarantine + demotion machinery. A review has
+none of these properties: it is unbounded reading, its findings need an attentive human, and a
+missed finding has no containment. The queue-and-inject design for the review pipeline is
+unchanged.

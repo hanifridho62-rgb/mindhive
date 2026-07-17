@@ -7,6 +7,25 @@ from . import events as ev_mod, paths
 
 SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES
 
+# shares_tag guards against a quadratic edge explosion. A tag shared by many
+# events — a mega-hub like "auto"/"harvest" that tags nearly everything — would
+# emit len(bucket)*(len(bucket)-1)/2 edges (hundreds of thousands on a large
+# namespace) that carry NO discriminating signal (co-membership in a ubiquitous
+# tag says nothing) and exert ZERO layout force in the renderer. Those edges
+# alone ballooned graph.json to ~60 MB and crashed the browser tab (one SVG
+# element per edge). Skip pairing inside any bucket past this size; the events
+# stay connected through the shared tag node either way.
+SHARES_TAG_MAX_BUCKET = 24
+
+# Algorithm/schema version stamped into every persisted graph.json. Bump this
+# whenever the graph-building logic changes in a way that should invalidate old
+# caches (the shares_tag cap was such a change). load_or_build treats any cache
+# whose "version" != this — including a pre-cap cache with no version key — as
+# stale and rebuilds it. Without this, a dormant project whose events never
+# change would keep serving a graph built by the OLD algorithm forever, because
+# the mtime freshness check alone can't see that the code changed.
+GRAPH_BUILD_VERSION = 2
+
 
 def _ev_id(ev) -> str:
     # Include a short hash of the payload so two DISTINCT events that share the
@@ -137,14 +156,16 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     for idx, ev in enumerate(sem_evs):
         for tag in (ev.tags or []):
             tag_to_idx[tag].append(idx)  # appended in ascending idx order
-    seen_pairs: set[tuple[int, int]] = set()
+    seen_tag_pairs: set[tuple[int, int]] = set()
     for idxs in tag_to_idx.values():
+        if len(idxs) > SHARES_TAG_MAX_BUCKET:
+            continue  # mega-hub tag: skip the O(n^2) pairing (see constant above)
         for x in range(len(idxs)):
             for y in range(x + 1, len(idxs)):
                 i, j = idxs[x], idxs[y]  # i < j (idxs ascending)
-                if (i, j) in seen_pairs:  # dedupe pairs sharing multiple tags
+                if (i, j) in seen_tag_pairs:  # dedupe pairs sharing multiple tags
                     continue
-                seen_pairs.add((i, j))
+                seen_tag_pairs.add((i, j))
                 add_edge(_ev_id(sem_evs[i]), _ev_id(sem_evs[j]), "shares_tag")
 
     # Expand the latest plugin_catalog snapshot (a sidecar file, not a ledger
@@ -160,7 +181,7 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
 
             ledger = build_ledger_entries(evs)  # [(fname, content, ev), ...]
             fname_to_evid = {fn: _ev_id(ev) for fn, _c, ev in ledger}
-            seen_pairs: set[tuple[str, str]] = set()
+            seen_sem_pairs: set[tuple[str, str]] = set()
             for fn, _c, ev in ledger:
                 src_id = _ev_id(ev)
                 body = ev.payload.get("text", "") if isinstance(ev.payload, dict) else str(ev.payload)
@@ -171,14 +192,15 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
                     if not tgt_id or tgt_id == src_id:
                         continue
                     pair = tuple(sorted((src_id, tgt_id)))
-                    if pair in seen_pairs:
+                    if pair in seen_sem_pairs:
                         continue
-                    seen_pairs.add(pair)
+                    seen_sem_pairs.add(pair)
                     add_edge(pair[0], pair[1], "semantic_near")
         except Exception:
             pass  # deps missing / LIVE_LOCK / not embedded -> deterministic edges only
 
     result = {
+        "version": GRAPH_BUILD_VERSION,
         "nodes": sorted(nodes.values(), key=lambda n: n["id"]),
         "edges": edges,
     }
@@ -193,6 +215,57 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     tmp.replace(gfile)
 
     return result
+
+
+def _events_mtime(project=None) -> float:
+    """Newest modification time across the project's event segments (0.0 when
+    there are none). A cheap freshness signal — one stat per segment, never a
+    read — used to decide whether the persisted graph.json is still current."""
+    d = paths.events_dir(project)
+    if not d.exists():
+        return 0.0
+    try:
+        return max((seg.stat().st_mtime for seg in d.glob("*.jsonl")), default=0.0)
+    except OSError:
+        return 0.0
+
+
+def load_or_build(project=None, *, semantic: bool = False,
+                  source_mtime: float | None = None, build_evs=None) -> dict:
+    """Read path for graph viewers: return the persisted graph.json when it is
+    at least as fresh as the event source, otherwise (re)build it.
+
+    autosync already rebuilds graph.json whenever a project gains events, so a
+    warm cache is the common case — serving it costs one stat + one read instead
+    of a full rebuild + 60 MB serialize + disk write on every open.
+
+    - ``semantic`` graphs are never cached: the persisted graph is the
+      deterministic one autosync maintains (no embedding-derived edges), so a
+      semantic view is always built on demand.
+    - ``source_mtime`` overrides the freshness signal for callers whose events
+      span multiple namespaces (the HIVE MIND aggregate has no single event
+      log); otherwise the project's own segments are used.
+    - ``build_evs`` is a zero-arg factory for the events list, invoked ONLY on a
+      cache miss so a large aggregate read is skipped whenever the cache hits.
+    """
+    if not semantic:
+        import json
+        gfile = paths.project_dir(project) / "graph.json"
+        if gfile.exists():
+            fresh_since = _events_mtime(project) if source_mtime is None else source_mtime
+            try:
+                if gfile.stat().st_mtime >= fresh_since:
+                    cached = json.loads(gfile.read_text(encoding="utf-8"))
+                    # Serve only a cache built by the CURRENT algorithm. A missing
+                    # or older "version" means the file was built before a
+                    # cache-invalidating change (e.g. pre-cap), so rebuild even
+                    # though its mtime looks fresh.
+                    if cached.get("version") == GRAPH_BUILD_VERSION:
+                        return cached
+            except (OSError, ValueError):
+                pass  # missing/corrupt cache -> fall through and rebuild
+    evs = build_evs() if build_evs is not None else None
+    return build(project=project, semantic=semantic, _evs=evs)
 
 
 def related(query: str, project=None, depth: int = 1) -> list[dict]:

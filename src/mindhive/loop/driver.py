@@ -30,6 +30,7 @@ class DriverResult:
     session_id: str | None
     num_turns: int
     rate_limited: bool
+    error: str | None = None      # e.g. "timeout", "spawn_failed"; None on success
     raw: dict = field(default_factory=dict)
 
 
@@ -39,12 +40,15 @@ def preflight(cmd: str = "claude") -> bool:
 
 
 def build_argv(cmd, prompt, loop_context, allowed_tools, output_format,
-               session_id, model, effort):
+               session_id, model, permission_mode):
     argv = [cmd, "--output-format", output_format]
     if model:
         argv += ["--model", model]
-    if effort:
-        argv += ["--effort", effort]
+    if permission_mode:
+        # Headless (-p) has no interactive approval; a permission mode lets the
+        # agent actually act (acceptEdits auto-approves file edits). Without it,
+        # only the allowedTools list is permitted and anything else is denied.
+        argv += ["--permission-mode", permission_mode]
     if allowed_tools:
         argv += ["--allowedTools", allowed_tools]
     if session_id:
@@ -91,15 +95,29 @@ class CLIDriver:
     accepts any object with a matching run() for fakes."""
 
     def __init__(self, cmd: str = "claude"):
-        self.cmd = cmd
+        # Resolve to the real executable path so subprocess.run can launch it.
+        # On Windows `claude` is a .CMD shim that the bare name can't start
+        # (WinError 2 -> spawn_failed); shutil.which returns the extensioned
+        # path there and the plain binary on POSIX. Consistent with preflight().
+        self.cmd = shutil.which(cmd) or cmd
 
     def run(self, prompt, loop_context, *, allowed_tools, session_id,
-            model, effort, timeout_s, live=False) -> DriverResult:
+            model, permission_mode, timeout_s, live=False) -> DriverResult:
         output_format = "stream-json" if live else "json"
         argv = build_argv(self.cmd, prompt, loop_context, allowed_tools,
-                          output_format, session_id, model, effort)
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout_s,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+                          output_format, session_id, model, permission_mode)
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout_s,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            # An iteration that overruns iteration_timeout must NOT crash the
+            # whole run. Return a typed error so the engine records it, feeds the
+            # breaker, and drops the (now-unusable) session — gracefully.
+            return DriverResult(text="", usage=Usage(), session_id=None,
+                                num_turns=0, rate_limited=False, error="timeout")
+        except (FileNotFoundError, OSError) as e:
+            return DriverResult(text=str(e), usage=Usage(), session_id=None,
+                                num_turns=0, rate_limited=False, error="spawn_failed")
         return parse_result(proc.stdout or proc.stderr)

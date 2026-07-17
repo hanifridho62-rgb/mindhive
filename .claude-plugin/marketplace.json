@@ -1,0 +1,20 @@
+{
+  "name": "mindhive-dev",
+  "description": "MindHive plugin marketplace — the /circle autonomous loop.",
+  "owner": {
+    "name": "hanifridho62",
+    "email": "hanifridho62@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "mindhive",
+      "description": "MindHive — /circle drives the headless Claude Code CLI until a task is done (budget-gated, circuit-broken); /mindhive orchestrates an idea end-to-end with ULT-IDEA rigor on a memory spine (recall-before-ask preflight, five-gap idea pressure test, agent-native architecture review, scored skill Recommendation Matrix, follow-up chaining, learnings logged back — portable across Claude Code, Cowork, and NewTask); /engineering-loop fuses circle+lfg into a memory-driven plan→work→review→fix→verify→learn loop, with any skill callable through MindHive (green/red) and failures feeding an improvement loop.",
+      "version": "0.4.0",
+      "source": "./",
+      "author": {
+        "name": "hanifridho62",
+        "email": "hanifridho62@gmail.com"
+      }
+    }
+  ]
+}

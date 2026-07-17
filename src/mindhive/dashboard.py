@@ -1,19 +1,53 @@
 # src/mindhive/dashboard.py
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import secrets
+import socket
+import subprocess
+import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from . import paths, chain
+from . import guard
+from . import recall as recall_mod
+from . import graph as graph_mod
+from . import graphview
+from . import plugins as plugins_mod
+from . import invoker as invoker_mod
+from . import export as export_mod
+from . import events, projector
+from . import dedupe
+from . import taskview
+from . import sync as sync_mod
+from . import workspace as workspace_mod
+from . import research as research_mod
+from .briefing import briefing as build_briefing
+from .dashboard_page import render_page
+from .workspace_page import render_parallel
+from .swarm_page import render_swarm
+from .research_page import render_research
 
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
 DEFAULT_PORT = 54461
+
+# One reflection batch at a time: a second Reflect click while one is running
+# would double token spend and race two writers over the same incident files.
+_REFLECT_LOCK = threading.Lock()
+# Serialize headless-invoke calls: each spawns a full `claude` subprocess, so
+# concurrent clicks would fork a fleet of agents. One at a time, like reflect.
+_INVOKE_LOCK = threading.Lock()
+
+# Reflect batch size per request. Each incident is one `claude` CLI call (up
+# to 120s), so an unbounded batch could outlive the browser's fetch timeout.
+REFLECT_BATCH_LIMIT = 3
 
 
 def _token_path():
@@ -43,16 +77,6 @@ def load_or_create_token() -> str:
     except Exception:
         pass
     return tok
-from . import guard
-from . import recall as recall_mod
-from . import graph as graph_mod
-from . import graphview
-from . import plugins as plugins_mod
-from . import export as export_mod
-from . import events, projector
-from . import dedupe
-from . import sync as sync_mod
-from .briefing import briefing as build_briefing
 
 
 # --- project / session / memory separation -------------------------------
@@ -97,6 +121,76 @@ def _project_stats(name: str) -> dict:
             "sessions": len(sessions), "last_ts": evs[-1].ts if evs else None}
 
 
+# --- Improvements efficiency strip ----------------------------------------
+# Failure rate = tool_failed per 100 tool actions. The denominator is tool
+# activity only — user_prompt/assistant_response are logged for every exchange
+# and would make the rate track conversation length instead of tool behavior.
+_TOOL_ACTION_TYPES = ("command_run", "file_touched", "tool_failed")
+_EFF_WINDOWS = (("day", 86400), ("week", 7 * 86400),
+                ("month", 30 * 86400), ("quarter", 90 * 86400))
+LOW_SAMPLE_FLOOR = 20     # tool actions per window below which a % is noise
+
+
+def _iso_utc(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(epoch)) + "Z"
+
+
+def _empty_tallies() -> dict:
+    # window -> [cur_failures, cur_actions, prev_failures, prev_actions]
+    return {key: [0, 0, 0, 0] for key, _ in _EFF_WINDOWS}
+
+
+def _add_tallies(tallies: dict, evs, now: float) -> None:
+    """Accumulate one project's tool-action counts into the window tallies.
+    Called once per project; HIVE MIND sums across projects before rating."""
+    cuts = {key: (_iso_utc(now - span), _iso_utc(now - 2 * span))
+            for key, span in _EFF_WINDOWS}
+    for ev in evs:
+        if ev.type not in _TOOL_ACTION_TYPES or not ev.ts:
+            continue          # guard a null ts (corrupt segment) like signal_stats
+        for key, _ in _EFF_WINDOWS:
+            cur_cut, prev_cut = cuts[key]
+            if ev.ts >= cur_cut:
+                i = 0
+            elif ev.ts >= prev_cut:
+                i = 2
+            else:
+                continue
+            t = tallies[key]
+            t[i + 1] += 1
+            if ev.type == "tool_failed":
+                t[i] += 1
+
+
+def _efficiency(tallies: dict) -> dict:
+    """Rates, deltas, and honesty dispositions per window: an empty current
+    window and thin samples render as neutral states, never fake percents.
+    delta_pct is signed relative change — negative means fewer failures."""
+    out = {}
+    for key, _ in _EFF_WINDOWS:
+        cf, ca, pf, pa = tallies[key]
+        cur_rate = round(cf * 100.0 / ca, 1) if ca else None
+        prev_rate = round(pf * 100.0 / pa, 1) if pa else None
+        row = {"cur_failures": cf, "cur_actions": ca,
+               "prev_failures": pf, "prev_actions": pa,
+               "cur_rate": cur_rate, "prev_rate": prev_rate, "delta_pct": None}
+        if ca == 0:
+            row["disposition"] = "no_current_data"
+        elif pa == 0:
+            row["disposition"] = "no_baseline"
+        elif ca < LOW_SAMPLE_FLOOR or pa < LOW_SAMPLE_FLOOR:
+            row["disposition"] = "low_sample"
+        elif prev_rate == 0 and cur_rate == 0:
+            row["disposition"], row["delta_pct"] = "no_change", 0.0
+        elif prev_rate == 0:
+            row["disposition"] = "regression_from_zero"
+        else:
+            row["delta_pct"] = round((cur_rate - prev_rate) * 100.0 / prev_rate, 1)
+            row["disposition"] = "ok"
+        out[key] = row
+    return out
+
+
 def default_project() -> str:
     """The project the panel opens on: the one with the most events (so a fresh
     launch shows real data, not an empty cwd-derived namespace). Falls back to
@@ -129,6 +223,15 @@ def all_event_pairs() -> list:
             pairs.append((name, ev))
     pairs.sort(key=lambda pe: pe[1].ts or "")
     return pairs
+
+
+def event_pairs(proj: str, am: bool) -> list:
+    """(project_name, Event) for the current selection, oldest→newest — the one
+    place the HIVE MIND (am) fork lives for event-iterating routes. am → every
+    project's events unified; otherwise → just ``proj``'s, each labelled ``proj``."""
+    if am:
+        return all_event_pairs()
+    return [(proj, e) for e in events.read_all(proj)]
 
 
 def _overview_counts(pairs) -> dict:
@@ -172,10 +275,19 @@ def make_handler(token: str):
             # constant-time compare to avoid leaking the token via timing
             return secrets.compare_digest(str(supplied), str(token))
 
+        # Compress bodies above one MTU when the client accepts gzip — the
+        # page is ~72KB (→ ~22KB) and the Improvements/graph JSON payloads
+        # shrink similarly; below the threshold the header overhead wins.
+        GZIP_MIN_BYTES = 1400
+
         def _send(self, code, body, ctype="application/json; charset=utf-8"):
             data = body.encode("utf-8") if isinstance(body, str) else body
+            accepts = "gzip" in (self.headers.get("Accept-Encoding") or "")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if accepts and len(data) >= self.GZIP_MIN_BYTES:
+                data = gzip.compress(data, 6)
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -183,605 +295,741 @@ def make_handler(token: str):
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
 
+        # Bodies are tiny JSON control messages; cap the read so an
+        # unauthenticated caller (do_POST drains the body before the token
+        # check to avoid a WinError 10053 reset) can't force an arbitrarily
+        # large allocation or hold a worker thread on a slow/oversized body.
+        MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > self.MAX_BODY_BYTES:
+                raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
+
+        # --- GET route handlers -------------------------------------------
+        # Each takes (proj, am, qs) and sends its own response. They are wired to
+        # their path in _GET_ROUTES (bottom of the class) and dispatched once by
+        # do_GET, so there is no long if/elif ladder. Routes that iterate events
+        # get their (project, Event) source from event_pairs(), which is the one
+        # place the HIVE MIND (am) fork lives.
+        def _get_projects(self, proj, am, qs):
+            stats = [_project_stats(n) for n in _all_projects()]
+            stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
+            total = {"name": HIVEMIND_LABEL, "id": "*",
+                     "events": sum(s["events"] for s in stats),
+                     "memory": sum(s["memory"] for s in stats),
+                     "auto": sum(s["auto"] for s in stats),
+                     "sessions": sum(s["sessions"] for s in stats)}
+            return self._json({"projects": stats, "hivemind": total,
+                               "default": default_project(), "current": proj})
+
+        def _get_state(self, proj, am, qs):
+            if am:
+                return self._send(200, "HIVE MIND unifies every project — pick a single "
+                                  "project to read its STATE.md.", "text/plain; charset=utf-8")
+            p = paths.project_dir(proj) / "STATE.md"
+            text = p.read_text(encoding="utf-8") if p.exists() else "(no STATE.md — run project)"
+            return self._send(200, text, "text/plain; charset=utf-8")
+
+        def _get_briefing(self, proj, am, qs):
+            if am:
+                return self._send(200, "HIVE MIND unifies every project — pick a single "
+                                  "project for its briefing.", "text/plain; charset=utf-8")
+            bpath = build_briefing(proj)
+            return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
+
+        def _get_verify(self, proj, am, qs):
+            if am:
+                per = {n: _safe_chain_ok(n) for n in _all_projects()}
+                return self._json({"ok": all(per.values()) if per else False, "per_project": per})
+            return self._json(chain.verify(proj))
+
+        def _get_overview(self, proj, am, qs):
+            if am:
+                names = _all_projects()
+                # read each project's log ONCE, then derive stats AND the chain
+                # check from the same events (no second full read)
+                evs_by_proj = {n: events.read_all(n) for n in names}
+                stats = _overview_counts(
+                    ((name, ev.session_id), ev)
+                    for name, evs in evs_by_proj.items() for ev in evs)
+                return self._json({
+                    "project": HIVEMIND_LABEL, "projects": len(names), **stats,
+                    "chain_ok": (all(_safe_chain_ok(n, evs_by_proj[n]) for n in names)
+                                 if names else False),
+                })
+            evs = events.read_all(proj)
+            stats = _overview_counts((ev.session_id, ev) for ev in evs)
+            return self._json({
+                "project": proj, **stats,
+                # reuse the events we just read — no second full read
+                "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
+            })
+
+        def _get_memory(self, proj, am, qs):
+            # the semantic subset only — the intent/context layer. Build the
+            # (project, Event) rows once so the projection + dedupe.collapse lives
+            # in a single place instead of once per am / single-project branch.
+            session = (qs.get("session") or [None])[0]
+            limit = int((qs.get("limit") or ["200"])[0])
+            rows = [(n, e) for n, e in event_pairs(proj, am)
+                    if e.type in events.MEMORY_VIEW_TYPES]
+            if session:
+                rows = [(n, e) for n, e in rows if e.session_id == session]
+            rows = list(reversed(rows))[:limit]      # newest first
+            # Collapse near-duplicate memories by meaning (same type + project),
+            # keeping the newest; display-time only, ledger untouched.
+            # similar_count rides along for the UI hint.
+            return self._json(dedupe.collapse([
+                {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
+                 "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
+                 "tags": e.tags,
+                 "origin": events.origin_of(e.session_id, e.tags)}
+                for n, e in rows
+            ]))
+
+        def _get_improvements(self, proj, am, qs):
+            # Lessons learned: machine-learned incident lessons (auto) plus
+            # user-dictated caveat notes (manual), kept as two shapes so long
+            # status memos can't masquerade as lesson cards. One event pass per
+            # project feeds the caveats, the per-signature enrichment
+            # (timestamps, leaks, resolution glyph), and the efficiency tiles.
+            from . import incidents
+            names = _all_projects() if am else [proj]
+            now = time.time()
+            auto, manual = [], []
+            tallies = _empty_tallies()
+            for n in names:
+                evs = events.read_all(n)
+                _add_tallies(tallies, evs, now)
+                stats_map = incidents.signal_stats(n, evs=evs)
+                for s in incidents.summaries(n):
+                    st = stats_map.get(s["signature"], {})
+                    resolution = incidents.classify_resolution(s, st)
+                    auto.append(dict(
+                        s, project=n, source="auto",
+                        first_seen=st.get("first_seen"),
+                        last_seen=st.get("last_seen"),
+                        leaks=st.get("leaks", 0),
+                        reroutes=st.get("reroutes", 0),
+                        last_reroute=st.get("last_reroute"),
+                        resolution=resolution,
+                        **incidents.classify_triage(resolution, s)))
+                for e in evs:
+                    if e.type != "caveat":
+                        continue
+                    manual.append({
+                        "ts": e.ts, "type": e.type, "session": e.session_id,
+                        "project": n, "source": "manual", "tags": e.tags,
+                        "origin": events.origin_of(e.session_id, e.tags),
+                        "text": (e.payload.get("text", "")
+                                 if isinstance(e.payload, dict) else str(e.payload)),
+                    })
+            auto.sort(key=lambda s: s.get("occurrences", 0), reverse=True)
+            manual.sort(key=lambda m: m.get("ts") or "", reverse=True)
+            return self._json({"auto": auto, "manual": dedupe.collapse(manual),
+                               "stats": _efficiency(tallies)})
+
+        def _get_sessions(self, proj, am, qs):
+            by: dict = {}
+            for name, e in event_pairs(proj, am):
+                key = (name, e.session_id)
+                s = by.get(key)
+                if s is None:
+                    s = by[key] = {"session_id": e.session_id, "project": name,
+                                   "events": 0, "memory": 0,
+                                   "origin": None,
+                                   "first_ts": e.ts, "last_ts": e.ts, "_evs": []}
+                s["events"] += 1
+                s["_evs"].append(e)
+                if not s["origin"]:
+                    s["origin"] = events.origin_of(e.session_id, e.tags)
+                if e.type in events.MEMORY_VIEW_TYPES:
+                    s["memory"] += 1
+                if e.ts and e.ts < s["first_ts"]:
+                    s["first_ts"] = e.ts
+                if e.ts and e.ts > s["last_ts"]:
+                    s["last_ts"] = e.ts
+            out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
+            for s in out:
+                s["activity"] = taskview.tally(s.pop("_evs"))
+                s["status"] = taskview.status_of(s["last_ts"])
+            return self._json(out)
+
+        def _get_changelog(self, proj, am, qs):
+            # Mandatory code change-log. Shape and ordering delegate to
+            # changelog.entries() — one source of truth, so this view can
+            # never disagree with `hive log show`. The pending marker is a
+            # per-project sidecar, so HIVE MIND shows entries without a
+            # pending banner; categories ride along so the UI never hardcodes
+            # the taxonomy.
+            from . import changelog as changelog_mod
+            if am:
+                rows = []
+                for n in _all_projects():
+                    rows.extend(changelog_mod.entries(events.read_all(n),
+                                                      project=n))
+                rows.sort(key=lambda r: r["ts"] or "", reverse=True)
+                pending = None
+            else:
+                rows = changelog_mod.entries(events.read_all(proj),
+                                             project=proj)
+                pending = changelog_mod.load_pending(proj)
+            return self._json({"entries": rows,
+                               "categories": list(changelog_mod.CATEGORIES),
+                               "pending": pending})
+
+        def _get_sops(self, proj, am, qs):
+            # Managed SOP registry. Active set and history both delegate to
+            # sop.py (one source of truth for fold/ordering), so this view
+            # can never disagree with `hive sop list` / `hive sop show`.
+            from . import sop as sop_mod
+            if am:
+                active, hist = [], []
+                for n in _all_projects():
+                    evs = events.read_all(n)
+                    for r in sop_mod.current(evs):
+                        active.append(dict(r, project=n))
+                    hist.extend(sop_mod.entries(evs, project=n))
+                active.sort(key=lambda r: (r.get("created") or "",
+                                           r.get("sop_id") or ""))
+                hist.sort(key=lambda r: r["ts"] or "", reverse=True)
+            else:
+                evs = events.read_all(proj)
+                active = sop_mod.current(evs)
+                hist = sop_mod.entries(evs, project=proj)
+            return self._json({"active": active, "history": hist,
+                               "actions": list(sop_mod.ACTIONS)})
+
+        def _get_task(self, proj, am, qs):
+            sid = (qs.get("session") or [""])[0]
+            # In HIVE MIND mode each card carries its own project — a concrete
+            # namespace is required to read the right ledger.
+            tproj = (qs.get("session_project") or [None])[0]
+            if am and not tproj:
+                return self._json({"ok": False,
+                                   "error": "session_project required"}, 400)
+            evs = [e for e in events.read_all(tproj or proj)
+                   if e.session_id == sid]
+            return self._json(taskview.items(evs))
+
+        def _get_task_detail(self, proj, am, qs):
+            sid = (qs.get("session") or [""])[0]
+            return self._json(taskview.detail(sid))
+
+        def _get_recall(self, proj, am, qs):
+            q = (qs.get("q") or [""])[0]
+            semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
+            limit = int((qs.get("limit") or ["10"])[0])
+            force = (qs.get("force") or ["0"])[0] in ("1", "true")
+            if am:
+                hits = []
+                for n in _all_projects():
+                    for h in recall_mod.recall(q, project=n, semantic=semantic, limit=limit, force=force):
+                        h = dict(h)
+                        h["project"] = n
+                        hits.append(h)
+                return self._json(hits)
+            return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
+
+        def _get_graph(self, proj, am, qs):
+            # Serve the persisted graph.json when it is still fresh (autosync
+            # keeps it current), rebuilding only when events actually changed —
+            # so re-opening the Graph tab is a cheap cache read, not a full
+            # rebuild + 60 MB serialize + disk write. Semantic edges fold in the
+            # embedding-derived semantic_near links but cost an embedding search
+            # per event, so they are the opt-in path (?semantic=1), never the
+            # default load.
+            semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
+            if am:
+                # HIVE MIND aggregates every namespace; freshness is the newest
+                # event across all of them (a cheap stat sweep), and the full
+                # aggregate log is only read on a cache miss.
+                src_mtime = max((graph_mod._events_mtime(n) for n in _all_projects()),
+                                default=0.0)
+                graph = graph_mod.load_or_build(
+                    project=HIVEMIND_PROJECT, semantic=semantic,
+                    source_mtime=src_mtime,
+                    build_evs=lambda: [e for _, e in all_event_pairs()])
+            else:
+                graph = graph_mod.load_or_build(proj, semantic=semantic)
+            html = graphview.render_html(graph)
+            return self._send(200, html, "text/html; charset=utf-8")
+
+        def _get_plugins_recommend(self, proj, am, qs):
+            if am:
+                for n in _all_projects():
+                    cat = plugins_mod.latest_catalog(n)
+                    if cat:
+                        return self._json(cat)
+                return self._json({})
+            return self._json(plugins_mod.latest_catalog(proj) or {})
+
+        def _get_plugins_inventory(self, proj, am, qs):
+            # machine-level (what THIS Claude install has), so project-agnostic
+            return self._json(plugins_mod.live_inventory())
+
+        def _get_skills_detail(self, proj, am, qs):
+            name = (qs.get("name") or [""])[0]
+            plugin = (qs.get("plugin") or [None])[0] or None
+            detail = plugins_mod.skill_detail(name, plugin=plugin)
+            if detail is None:
+                return self._json({"ok": False, "error": "not found"}, 404)
+            return self._json(detail)
+
+        def _get_skills_status(self, proj, am, qs):
+            # status: green/red last outcome per skill; counts: total invokes —
+            # both derived from the ledger in a single pass. HIVE MIND merges
+            # every namespace's ledger, mirroring /api/improvements — skills
+            # telemetry must not read "*" as a literal (empty) namespace.
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_stats(project=proj, evs=evs))
+
+        def _get_skills_history(self, proj, am, qs):
+            name = (qs.get("name") or [""])[0]
+            limit = int((qs.get("limit") or ["20"])[0])
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json(plugins_mod.call_history(name, project=proj,
+                                                       limit=limit, evs=evs))
+
+        def _get_skills_stats(self, proj, am, qs):
+            # per-skill completion-rate telemetry aggregated from the ledger
+            # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
+            evs = [e for _, e in all_event_pairs()] if am else None
+            return self._json({"stats": plugins_mod.skill_stats(project=proj,
+                                                                evs=evs)})
+
+        def _get_skills_recommend(self, proj, am, qs):
+            # deterministic most-needed-skills ranking (U6/KTD6): one ledger
+            # read feeds both the stats and the need extraction. HIVE MIND
+            # merges events AND incident summaries across every namespace.
+            top = (qs.get("top") or [None])[0]
+            evs = summ = None
+            if am:
+                from . import incidents
+                evs = [e for _, e in all_event_pairs()]
+                summ = [s for n in _all_projects()
+                        for s in incidents.summaries(project=n)]
+            return self._json(plugins_mod.recommend_for(
+                project=proj, evs=evs, top=int(top) if top else None,
+                incident_summaries=summ))
+
+        def _get_oversee(self, proj, am, qs):
+            # Oversee: every kind of live Claude work — hive loop runs AND
+            # interactive sessions (straight from hook telemetry, no /circle
+            # needed). Dismissed/finished/stale entries are already excluded
+            # by the projections.
+            from . import oversee as oversee_mod
+            from .loop import state as loop_state
+            names = _all_projects() if am else [proj]
+            runs, dismissed = [], 0
+            for n in names:
+                evs = events.read_all(n)
+                res = loop_state.list_runs(n)
+                for r in res["runs"] + oversee_mod.interactive_sessions(n, evs=evs):
+                    r["project"] = n
+                    runs.append(r)
+                dismissed += res["dismissed"]
+            runs.sort(key=lambda r: r.get("started") or "", reverse=True)
+            return self._json({"runs": runs, "dismissed": dismissed,
+                               "any_online": any(r["online"] for r in runs)})
+
+        def _get_workspace(self, proj, am, qs):
+            # /api/workspace/<action>: the two iframe pages render HTML; every
+            # other action is JSON, delegated to workspace.api_get. HIVE MIND
+            # (am) falls back to the default project — workspace agents always
+            # need a concrete namespace to log their I/O into.
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            if action in ("parallel", "swarm"):
+                html = render_parallel(token) if action == "parallel" else render_swarm(token)
+                return self._send(200, html, "text/html; charset=utf-8")
+            return self._json(workspace_mod.api_get(
+                action, proj=default_project() if am else proj, qs=qs))
+
+        def _post_workspace(self, proj, body):
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            return self._json(workspace_mod.api_post(action, proj=proj, body=body))
+
+        def _get_research(self, proj, am, qs):
+            # /api/research/<action>: "page" renders the Self-Reliant iframe
+            # view; everything else is JSON via research.api_get. Like the
+            # workspace, HIVE MIND falls back to the default project so run
+            # events land in a concrete namespace.
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            if action == "page":
+                return self._send(200, render_research(token),
+                                  "text/html; charset=utf-8")
+            return self._json(research_mod.api_get(
+                action, proj=default_project() if am else proj, qs=qs))
+
+        def _post_research(self, proj, body):
+            action = urlparse(self.path).path.rsplit("/", 1)[-1]
+            return self._json(research_mod.api_post(action, proj=proj, body=body))
+
+        def _get_export(self, proj, am, qs):
+            path = export_mod.export()
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="handoff.md"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
 
         # --- routing ---
         def do_GET(self):
             parsed = urlparse(self.path)
             route = parsed.path
             if route == "/":
-                return self._send(200, render_page(token), "text/html; charset=utf-8")
+                return self._send(200,
+                                  render_page(token,
+                                              tasks_css=taskview.CARDS_CSS,
+                                              tasks_js=taskview.CARDS_JS),
+                                  "text/html; charset=utf-8")
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
+            handler = self._GET_ROUTES.get(route)
+            if handler is None:
+                return self._json({"ok": False, "error": "not found"}, 404)
             qs = parse_qs(parsed.query)
             proj = (qs.get("project") or [None])[0] or default_project()
             am = is_all(proj)
             try:
-                if route == "/api/projects":
-                    stats = [_project_stats(n) for n in _all_projects()]
-                    stats.sort(key=lambda s: (s["events"], s["name"]), reverse=True)
-                    total = {"name": HIVEMIND_LABEL, "id": "*",
-                             "events": sum(s["events"] for s in stats),
-                             "memory": sum(s["memory"] for s in stats),
-                             "auto": sum(s["auto"] for s in stats),
-                             "sessions": sum(s["sessions"] for s in stats)}
-                    return self._json({"projects": stats, "hivemind": total,
-                                       "default": default_project(), "current": proj})
-                if route == "/api/state":
-                    if am:
-                        return self._send(200, "HIVE MIND unifies every project — pick a single "
-                                          "project to read its STATE.md.", "text/plain; charset=utf-8")
-                    p = paths.project_dir(proj) / "STATE.md"
-                    text = p.read_text(encoding="utf-8") if p.exists() else "(no STATE.md — run project)"
-                    return self._send(200, text, "text/plain; charset=utf-8")
-                if route == "/api/briefing":
-                    if am:
-                        return self._send(200, "HIVE MIND unifies every project — pick a single "
-                                          "project for its briefing.", "text/plain; charset=utf-8")
-                    bpath = build_briefing(proj)
-                    return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
-                if route == "/api/verify":
-                    if am:
-                        per = {n: _safe_chain_ok(n) for n in _all_projects()}
-                        return self._json({"ok": all(per.values()) if per else False, "per_project": per})
-                    return self._json(chain.verify(proj))
-                if route == "/api/overview":
-                    if am:
-                        names = _all_projects()
-                        # read each project's log ONCE, then derive stats AND the
-                        # chain check from the same events (no second full read)
-                        evs_by_proj = {n: events.read_all(n) for n in names}
-                        stats = _overview_counts(
-                            ((name, ev.session_id), ev)
-                            for name, evs in evs_by_proj.items() for ev in evs)
-                        return self._json({
-                            "project": HIVEMIND_LABEL, "projects": len(names), **stats,
-                            "chain_ok": (all(_safe_chain_ok(n, evs_by_proj[n]) for n in names)
-                                         if names else False),
-                        })
-                    evs = events.read_all(proj)
-                    stats = _overview_counts((ev.session_id, ev) for ev in evs)
-                    return self._json({
-                        "project": proj, **stats,
-                        # reuse the events we just read — no second full read
-                        "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
-                    })
-                if route == "/api/memory":
-                    # the semantic subset only — the intent/context layer
-                    session = (qs.get("session") or [None])[0]
-                    limit = int((qs.get("limit") or ["200"])[0])
-                    if am:
-                        rows = [(n, e) for n, e in all_event_pairs()
-                                if e.type in events.MEMORY_VIEW_TYPES]
-                        if session:
-                            rows = [(n, e) for n, e in rows if e.session_id == session]
-                        rows = list(reversed(rows))[:limit]
-                        return self._json(dedupe.collapse([
-                            {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
-                             "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                             "tags": e.tags}
-                            for n, e in rows
-                        ]))
-                    evs = [e for e in events.read_all(proj) if e.type in events.MEMORY_VIEW_TYPES]
-                    if session:
-                        evs = [e for e in evs if e.session_id == session]
-                    evs = list(reversed(evs))[:limit]      # newest first
-                    # Collapse near-duplicate memories by meaning (same type +
-                    # project), keeping the newest; display-time only, ledger
-                    # untouched. similar_count rides along for the UI hint.
-                    return self._json(dedupe.collapse([
-                        {"ts": e.ts, "type": e.type, "session": e.session_id, "project": proj,
-                         "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                         "tags": e.tags}
-                        for e in evs
-                    ]))
-                if route == "/api/sessions":
-                    by: dict = {}
-                    src = all_event_pairs() if am else [(proj, e) for e in events.read_all(proj)]
-                    for name, e in src:
-                        key = (name, e.session_id)
-                        s = by.get(key)
-                        if s is None:
-                            s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
-                                           "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
-                        s["events"] += 1
-                        if e.type in events.MEMORY_VIEW_TYPES:
-                            s["memory"] += 1
-                        if e.ts and e.ts < s["first_ts"]:
-                            s["first_ts"] = e.ts
-                        if e.ts and e.ts > s["last_ts"]:
-                            s["last_ts"] = e.ts
-                    out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
-                    return self._json(out)
-                if route == "/api/recall":
-                    q = (qs.get("q") or [""])[0]
-                    semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
-                    limit = int((qs.get("limit") or ["10"])[0])
-                    force = (qs.get("force") or ["0"])[0] in ("1", "true")
-                    if am:
-                        hits = []
-                        for n in _all_projects():
-                            for h in recall_mod.recall(q, project=n, semantic=semantic, limit=limit, force=force):
-                                h = dict(h)
-                                h["project"] = n
-                                hits.append(h)
-                        return self._json(hits)
-                    return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
-                if route == "/api/graph":
-                    if am:
-                        evs = [e for _, e in all_event_pairs()]
-                        html = graphview.render_html(graph_mod.build(project=HIVEMIND_PROJECT, _evs=evs))
-                    else:
-                        html = graphview.render_html(graph_mod.build(proj))
-                    return self._send(200, html, "text/html; charset=utf-8")
-                if route == "/api/plugins/recommend":
-                    if am:
-                        for n in _all_projects():
-                            cat = plugins_mod.latest_catalog(n)
-                            if cat:
-                                return self._json(cat)
-                        return self._json({})
-                    return self._json(plugins_mod.latest_catalog(proj) or {})
-                if route == "/api/export":
-                    path = export_mod.export()
-                    data = path.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/markdown; charset=utf-8")
-                    self.send_header("Content-Disposition", 'attachment; filename="handoff.md"')
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
+                return handler(self, proj, am, qs)
             except Exception as e:  # never crash the server
+                # Unexpected failure -> 500 so monitoring and clients can tell a
+                # server fault apart from a normal empty/negative result. Expected
+                # domain rejections return their own ok:False, 200 inside handlers.
+                return self._json({"ok": False, "error": str(e)}, 500)
+
+        # --- POST route handlers ------------------------------------------
+        # Each takes (proj, body) and sends its own response, wired via
+        # _POST_ROUTES. The HIVE MIND read-only guard and the mutating-action
+        # target check live in do_POST, before dispatch.
+        def _post_harvest(self, proj, body):
+            # self-healing backfill: capture any session the hooks missed
+            res = run_catch_up()
+            return self._json({"ok": True, "result": res})
+
+        def _post_append(self, proj, body):
+            etype = body.get("type")
+            text = body.get("payload", "")
+            tags = [t for t in (body.get("tags") or "").split(",") if t]
+            if not etype:
+                return self._json({"ok": False, "error": "type is required"}, 200)
+            ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
+            projector.project(proj)
+            return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
+
+        def _post_project(self, proj, body):
+            return self._json({"ok": True, "result": projector.project(proj)})
+
+        def _post_sync(self, proj, body):
+            folder = _folder_for_project(proj)
+            path = sync_mod.sync(folder, project=proj)
+            return self._json({"ok": True, "path": str(path), "folder": folder})
+
+        def _post_embed(self, proj, body):
+            force = bool(body.get("force", False))
+            try:
+                guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
+            except RuntimeError as e:
+                # LIVE_LOCK is an expected, safe-to-report rejection — not a
+                # server fault — so keep it ok:False, 200.
                 return self._json({"ok": False, "error": str(e)}, 200)
-            return self._json({"ok": False, "error": "not found"}, 404)
+            from . import vectors
+            return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
+
+        def _post_plugins_scan(self, proj, body):
+            # Plugins/skills are installed machine-wide, so a scan is global. In
+            # HIVE MIND (all-projects) mode there's no concrete namespace to store
+            # the catalog under — fall back to the default project so the snapshot
+            # stays retrievable by the recommend route.
+            if is_all(proj):
+                proj = default_project()
+            result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
+            return self._json({"ok": True, "result": result})
+
+        def _post_skills_invoke(self, proj, body):
+            name = (body.get("name") or "").strip()
+            plugin = (body.get("plugin") or None)
+            if not name:
+                return self._json({"ok": False, "error": "name is required"}, 200)
+            if not _INVOKE_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "another skill call is running"}, 200)
+            try:
+                res = invoker_mod.invoke_skill(name, plugin=plugin, project=proj)
+            finally:
+                _INVOKE_LOCK.release()
+            return self._json({"ok": res["ok"], "name": name, "plugin": plugin,
+                               "exit": res["exit"], "excerpt": res["excerpt"]})
+
+        def _post_plugins_autoscan(self, proj, body):
+            if is_all(proj):                       # global scan; see _post_plugins_scan
+                proj = default_project()
+            res = plugins_mod.ensure_fresh(
+                top_n=int(body.get("top", 5)),
+                max_age_hours=float(body.get("max_age_hours", 24)),
+                force=bool(body.get("force", False)),
+                project=proj,
+            )
+            return self._json({"ok": True, "scanned": res["scanned"],
+                               "age_hours": res["age_hours"], "result": res["payload"]})
+
+        def _post_rules_reflect(self, proj, body):
+            # Reflect a bounded batch of active, not-yet-reflected incidents
+            # into structured lessons. Candidates (below the recurrence
+            # threshold) wait until they recur; already-reflected records are
+            # skipped (the CLI's `hive rules reflect` re-reflects everything —
+            # this endpoint deliberately does not).
+            import shutil
+            from . import incidents, reflect as reflect_mod
+            # Clamp to [0, REFLECT_BATCH_LIMIT]: a direct API caller must not be
+            # able to request an unbounded batch of 120s-per-incident claude
+            # calls while holding _REFLECT_LOCK. Non-numeric is a domain error.
+            try:
+                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            except (TypeError, ValueError):
+                return self._json({"ok": False,
+                                   "error": "limit must be an integer"}, 200)
+            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "reflection already running"}, 200)
+            try:
+                # self-heal a stale or missing incident projection first
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+                eligible = [
+                    s["signature"] for s in incidents.summaries(proj)
+                    if s["status"] == "active" and s["rule_source"] == "none"
+                ]
+                reflected = failed = 0
+                for signature in eligible[:limit]:
+                    if reflect_mod.reflect_incident(signature, project=proj).get("reflected"):
+                        reflected += 1
+                    else:
+                        failed += 1
+                if failed and not reflected and not shutil.which("claude"):
+                    return self._json({"ok": False, "error":
+                        "claude CLI unavailable — reflection needs it on PATH"}, 200)
+                # pending = eligible not yet turned into a lesson: exclude the
+                # ones that failed this round (they were attempted, not skipped).
+                return self._json({"ok": True, "reflected": reflected,
+                                   "failed": failed,
+                                   "pending": max(0, len(eligible) - reflected - failed)})
+            finally:
+                _REFLECT_LOCK.release()
+
+        def _post_rules_resolve(self, proj, body):
+            # Active resolution over the red (unresolved) set: reflect
+            # incidents with no rule yet, reroute leaking auto rules to the
+            # best distinct alternative route (human rules are never touched).
+            # Same clamp + lock discipline as the Reflect endpoint — each red
+            # incident can cost a 120s claude call.
+            import shutil
+            from . import resolve as resolve_mod
+            try:
+                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+            except (TypeError, ValueError):
+                return self._json({"ok": False,
+                                   "error": "limit must be an integer"}, 200)
+            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "resolution already running"}, 200)
+            try:
+                res = resolve_mod.resolve_batch(project=proj, limit=limit)
+                done = res.get("rerouted", 0) + res.get("reflected", 0)
+                if res.get("failed") and not done and not shutil.which("claude"):
+                    return self._json({"ok": False, "error":
+                        "claude CLI unavailable — resolution needs it on PATH"}, 200)
+                return self._json(dict(res, ok=True))
+            finally:
+                _REFLECT_LOCK.release()
+
+        def _post_rules_reflect_one(self, proj, body):
+            # Reflect ONE named failure signature on demand — the "reflect this
+            # failure" action on a failed skill call. Unlike the batch endpoint,
+            # this bypasses the recurrence-threshold gate: the user is explicitly
+            # asking to learn from this single failure now.
+            import shutil
+            from . import incidents, reflect as reflect_mod
+            signature = (body.get("signature") or "").strip()
+            if not signature:
+                return self._json({"ok": False, "error": "signature is required"}, 200)
+            if not _REFLECT_LOCK.acquire(blocking=False):
+                return self._json({"ok": False,
+                                   "error": "reflection already running"}, 200)
+            try:
+                # ensure the incident projection exists (even a single-occurrence
+                # candidate gets a file), then reflect that specific signature.
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+                if not incidents.load(signature, project=proj):
+                    return self._json({"ok": False,
+                                       "error": f"no such incident: {signature}"}, 200)
+                res = reflect_mod.reflect_incident(signature, project=proj)
+                if not res.get("reflected"):
+                    if not shutil.which("claude"):
+                        return self._json({"ok": False, "error":
+                            "claude CLI unavailable — reflection needs it on PATH"}, 200)
+                    return self._json({"ok": False, "signature": signature,
+                        "error": res.get("reason", "reflection produced no rule")}, 200)
+                return self._json({"ok": True, "reflected": True,
+                                   "signature": signature})
+            finally:
+                _REFLECT_LOCK.release()
+
+        def _post_rules_dismiss(self, proj, body):
+            # Explicit demotion from a lesson card — the only way the gray
+            # "dismissed" state is reachable without dropping to the CLI.
+            # demote() appends the rule_demoted event and re-projects the
+            # record, so the next Improvements fetch classifies it dismissed.
+            from . import incidents
+            sig = (body.get("signature") or "").strip()
+            if not sig or not incidents.load(sig, project=proj):
+                return self._json({"ok": False, "error": "unknown signature"}, 200)
+            incidents.demote(sig, project=proj)
+            return self._json({"ok": True, "signature": sig})
+
+        def _post_oversee_dismiss(self, proj, body):
+            # Manual session delete: append-only tombstone, so the hash chain
+            # stays intact and every projection rebuild keeps the run hidden.
+            # Deleting an already-dismissed run (e.g. the engine auto-dismissed
+            # it between poll and click) is a benign no-op, not an error.
+            from . import oversee as oversee_mod
+            from .loop import state as loop_state
+            run_id = (body.get("run_id") or "").strip()
+            if not run_id:
+                return self._json({"ok": False, "error": "run_id is required"}, 200)
+            known = {r["run_id"] for r in loop_state.list_runs(proj)["runs"]}
+            known |= {s["run_id"] for s in oversee_mod.interactive_sessions(proj)}
+            if run_id not in known:
+                already = any(
+                    e.type == "loop_run_dismissed"
+                    and (e.payload or {}).get("run_id") == run_id
+                    for e in events.read_all(proj))
+                if already:
+                    return self._json({"ok": True, "run_id": run_id,
+                                       "already_dismissed": True})
+                return self._json({"ok": False,
+                                   "error": f"unknown run: {run_id}"}, 200)
+            events.append_event("loop_run_dismissed",
+                                {"run_id": run_id, "cause": "manual"}, project=proj)
+            return self._json({"ok": True, "run_id": run_id})
+
+        def _post_selftest(self, proj, body):
+            from . import selftest as selftest_mod
+            code = selftest_mod.run()
+            return self._json({"ok": code == 0, "exit_code": code})
 
         def do_POST(self):
             route = urlparse(self.path).path
+            # Drain the request body BEFORE any early response: replying 403
+            # while the client is still sending aborts the connection on
+            # Windows (WinError 10053) instead of delivering the status.
+            try:
+                body = self._body()
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)}, 500)
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
-                body = self._body()
                 proj = body.get("project") or default_project()
                 if is_all(proj):
                     if route == "/api/project":
                         res = {n: projector.project(n) for n in _all_projects()}
                         return self._json({"ok": True, "result": res})
-                    # selftest + harvest are global (not tied to one project)
-                    if route not in ("/api/selftest", "/api/harvest"):
+                    # selftest + harvest + plugin scans + auth verification are
+                    # global (machine-wide, not tied to one project); every other
+                    # mutating action needs a concrete target. The plugin
+                    # handlers substitute the default project for storage when
+                    # in all-mode.
+                    if route not in ("/api/selftest", "/api/harvest",
+                                     "/api/plugins/scan", "/api/plugins/autoscan",
+                                     "/api/workspace/auth_verify"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)
-                if route == "/api/harvest":
-                    # self-healing backfill: capture any session the hooks missed
-                    res = run_catch_up()
-                    return self._json({"ok": True, "result": res})
-                if route == "/api/append":
-                    etype = body.get("type")
-                    text = body.get("payload", "")
-                    tags = [t for t in (body.get("tags") or "").split(",") if t]
-                    if not etype:
-                        return self._json({"ok": False, "error": "type is required"}, 200)
-                    ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
-                    projector.project(proj)
-                    return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
-                if route == "/api/project":
-                    return self._json({"ok": True, "result": projector.project(proj)})
-                if route == "/api/sync":
-                    folder = _folder_for_project(proj)
-                    path = sync_mod.sync(folder, project=proj)
-                    return self._json({"ok": True, "path": str(path), "folder": folder})
-                if route == "/api/embed":
-                    force = bool(body.get("force", False))
-                    guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
-                    from . import vectors
-                    return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
-                if route == "/api/plugins/scan":
-                    result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
-                    return self._json({"ok": True, "result": result})
-                if route == "/api/plugins/autoscan":
-                    res = plugins_mod.ensure_fresh(
-                        top_n=int(body.get("top", 5)),
-                        max_age_hours=float(body.get("max_age_hours", 24)),
-                        force=bool(body.get("force", False)),
-                        project=proj,
-                    )
-                    return self._json({"ok": True, "scanned": res["scanned"],
-                                       "age_hours": res["age_hours"], "result": res["payload"]})
-                if route == "/api/selftest":
-                    from . import selftest as selftest_mod
-                    code = selftest_mod.run()
-                    return self._json({"ok": code == 0, "exit_code": code})
+                handler = self._POST_ROUTES.get(route)
+                if handler is None:
+                    return self._json({"ok": False, "error": "not found"}, 404)
+                return handler(self, proj, body)
             except Exception as e:
-                return self._json({"ok": False, "error": str(e)}, 200)
-            return self._json({"ok": False, "error": "not found"}, 404)
+                # Unexpected failure -> 500 (see do_GET). The HIVE MIND read-only
+                # guard and the "type is required" check return ok:False, 200
+                # explicitly as expected domain rejections.
+                return self._json({"ok": False, "error": str(e)}, 500)
+
+        # --- route tables (path -> handler) -------------------------------
+        # Defined after the handlers so the names resolve; dispatched once by
+        # do_GET / do_POST in place of a long if/elif ladder.
+        _GET_ROUTES = {
+            "/api/projects": _get_projects,
+            "/api/state": _get_state,
+            "/api/briefing": _get_briefing,
+            "/api/verify": _get_verify,
+            "/api/overview": _get_overview,
+            "/api/memory": _get_memory,
+            "/api/improvements": _get_improvements,
+            "/api/sessions": _get_sessions,
+            "/api/task": _get_task,
+            "/api/task_detail": _get_task_detail,
+            "/api/oversee": _get_oversee,
+            "/api/changelog": _get_changelog,
+            "/api/sops": _get_sops,
+            "/api/recall": _get_recall,
+            "/api/graph": _get_graph,
+            "/api/plugins/recommend": _get_plugins_recommend,
+            "/api/plugins/inventory": _get_plugins_inventory,
+            "/api/skills/detail": _get_skills_detail,
+            "/api/skills/status": _get_skills_status,
+            "/api/skills/history": _get_skills_history,
+            "/api/skills/stats": _get_skills_stats,
+            "/api/skills/recommend": _get_skills_recommend,
+            "/api/export": _get_export,
+        }
+        for _p in ("parallel", "swarm", "agents", "output", "profiles",
+                   "auth", "board"):
+            _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
+        del _p
+        for _p in ("page", "status", "leaderboard", "output", "learnings",
+                   "prds", "sources"):
+            _GET_ROUTES[f"/api/research/{_p}"] = _get_research
+        del _p
+        _POST_ROUTES = {
+            "/api/harvest": _post_harvest,
+            "/api/append": _post_append,
+            "/api/project": _post_project,
+            "/api/sync": _post_sync,
+            "/api/embed": _post_embed,
+            "/api/plugins/scan": _post_plugins_scan,
+            "/api/skills/invoke": _post_skills_invoke,
+            "/api/plugins/autoscan": _post_plugins_autoscan,
+            "/api/rules/reflect": _post_rules_reflect,
+            "/api/rules/reflect_one": _post_rules_reflect_one,
+            "/api/rules/resolve": _post_rules_resolve,
+            "/api/rules/dismiss": _post_rules_dismiss,
+            "/api/oversee/dismiss": _post_oversee_dismiss,
+            "/api/selftest": _post_selftest,
+        }
+        for _p in ("spawn", "send", "run_recipe", "set_model", "stop",
+                   "remove", "clear_idle", "profile_add", "profile_remove",
+                   "profile_login", "profile_trust", "auth_verify",
+                   "board_save", "board_dispatch", "mission", "mission_stop",
+                   "command"):
+            _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
+        del _p
+        for _p in ("start", "stop"):
+            _POST_ROUTES[f"/api/research/{_p}"] = _post_research
+        del _p
 
     return DashboardHandler
-
-
-def render_page(token: str) -> str:
-    return """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MIND HIVE</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background:#11131a; color:#e6e8ef; }
-  header { padding: 12px 20px; background:#171a23; border-bottom:1px solid #2a2f3d;
-    display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:5; }
-  header h1 { margin:0; font-size:17px; letter-spacing:.5px; }
-  header .dot { width:9px; height:9px; border-radius:50%; background:#3a4054; }
-  header .dot.busy { background:#e0b341; animation: pulse 1s infinite; }
-  header .dot.ok { background:#46c46a; }
-  header #status { font-size:12px; color:#9aa3b8; }
-  header #live { font-size:12px; cursor:pointer; user-select:none; margin-left:auto;
-    color:#46c46a; }
-  header #live.paused { color:#6b7488; }
-  header #live .blip { animation: pulse 1.6s infinite; }
-  header #synced { font-size:11px; color:#6b7488; min-width:118px; text-align:right; }
-  header #projwrap { font-size:12px; color:#9aa3b8; display:flex; align-items:center; gap:6px; }
-  header #projwrap select { padding:3px 6px; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-  main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 50px); }
-  nav { background:#141722; border-right:1px solid #2a2f3d; padding:12px; }
-  nav .group { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:#6b7488;
-    margin:14px 6px 4px; }
-  nav button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
-    background:#1d2230; color:#e6e8ef; border:1px solid #2a2f3d; border-radius:6px; cursor:pointer; }
-  nav button:hover:not(:disabled) { background:#262d3d; }
-  nav button:disabled { opacity:.45; cursor:wait; }
-  section.panel { padding:18px 22px; }
-  pre#out { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px;
-    padding:14px; min-height:120px; max-height:62vh; overflow:auto; }
-  iframe#graph { width:100%; height:72vh; border:1px solid #2a2f3d; border-radius:8px; background:#fff; }
-  input, select, textarea { background:#0c0e14; color:#e6e8ef; border:1px solid #2a2f3d;
-    border-radius:6px; padding:6px 8px; font:inherit; }
-  .row { margin:8px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  .hidden { display:none; }
-  .err { color:#ff8a8a; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
-  .card { background:#0c0e14; border:1px solid #2a2f3d; border-radius:10px; padding:14px 16px; }
-  .card .big { font-size:26px; font-weight:600; }
-  .card .lbl { font-size:12px; color:#9aa3b8; margin-top:2px; }
-  .card .big.ok { color:#46c46a; } .card .big.bad { color:#ff8a8a; }
-  .types { margin-top:14px; display:flex; flex-wrap:wrap; gap:8px; }
-  .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
-  .pill b { color:#fff; }
-  .hits { list-style:none; padding:0; margin:0; }
-  .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
-  .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
-  .hits .snip { white-space:pre-wrap; margin-top:4px; }
-  .hits .dup { color:#8a93a6; }
-  h2.h { margin:2px 0 12px; font-size:16px; }
-</style></head>
-<body>
-<header>
-  <h1>MIND HIVE</h1>
-  <span id="busy" class="dot"></span>
-  <span id="status">ready</span>
-  <label id="projwrap" title="Which project's memory to show">project
-    <select id="proj" onchange="onProjChange()"></select></label>
-  <span id="live" title="Real-time updates — click to pause/resume" onclick="toggleLive()"><span class="blip">&#9679;</span> live</span>
-  <span id="synced"></span>
-</header>
-<main>
-  <nav>
-    <button onclick="showOverview()">Overview</button>
-    <div class="group">Memory</div>
-    <button onclick="showMemory()">Memory</button>
-    <button onclick="showSessions()">Sessions</button>
-    <div class="group">View</div>
-    <button onclick="showState()">State</button>
-    <button onclick="showBriefing()">Briefing</button>
-    <button onclick="showRecall()">Recall</button>
-    <button onclick="showGraph()">Graph</button>
-    <button onclick="showPlugins()">Plugins</button>
-    <div class="group">Actions</div>
-    <button onclick="showAppend()">Append memory</button>
-    <button onclick="doExport()">Export handoff.md</button>
-    <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
-    <button onclick="doAction('/api/sync','Sync')">Sync</button>
-    <button onclick="doAction('/api/harvest','Catch up (harvest missed sessions)')">Catch up</button>
-    <button onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
-    <div class="group">Heavy</div>
-    <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
-    <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
-    <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
-  </nav>
-  <section class="panel">
-    <div id="controls"></div>
-    <div id="view"></div>
-    <pre id="out" class="hidden"></pre>
-    <iframe id="graph" class="hidden"></iframe>
-  </section>
-</main>
-<script>
-  const TOKEN = __TOKEN__;
-  const out = document.getElementById('out');
-  const view = document.getElementById('view');
-  const graph = document.getElementById('graph');
-  const controls = document.getElementById('controls');
-  const busyDot = document.getElementById('busy');
-  const statusEl = document.getElementById('status');
-  const navButtons = () => Array.from(document.querySelectorAll('nav button'));
-  const liveEl = document.getElementById('live');
-  const syncedEl = document.getElementById('synced');
-
-  // --- real-time engine ---
-  // liveFn is the silent re-renderer for the current view (null = view isn't
-  // auto-refreshable). A timer re-runs it on an interval, and actions that
-  // mutate memory call refreshLive() so changes appear without a manual click.
-  let liveFn = null;
-  let liveOn = true;
-  const LIVE_MS = 2500;
-  function pad2(n){ return (n<10?'0':'')+n; }
-  function markSynced(){
-    const d = new Date();
-    syncedEl.textContent = 'updated ' + pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());
-  }
-  function toggleLive(){
-    liveOn = !liveOn;
-    liveEl.classList.toggle('paused', !liveOn);
-    liveEl.innerHTML = (liveOn ? '<span class="blip">&#9679;</span> live' : '&#9679; paused');
-    if (liveOn) refreshLive();
-  }
-  // silent refresh: no busy spinner, no nav-disable, errors swallowed so a
-  // transient blip never disrupts what the user is reading.
-  async function refreshLive(){
-    if (!liveOn || !liveFn) return;
-    if (document.hidden) return;
-    if (busyDot.classList.contains('busy')) return;  // don't fight a manual op
-    try { await liveFn(); markSynced(); } catch(_) { /* keep last good view */ }
-  }
-  setInterval(refreshLive, LIVE_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshLive(); });
-
-  function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-  function u(path){ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }
-  function setBusy(on, label){
-    busyDot.className = 'dot' + (on ? ' busy' : '');
-    statusEl.textContent = on ? (label || 'working…') : 'ready';
-    navButtons().forEach(b => b.disabled = on);
-  }
-  // panel switching
-  function only(el){ for (const e of [out, view, graph]) e.classList.toggle('hidden', e !== el); }
-  function showText(v){ only(out); out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
-  function showHTML(html){ only(view); view.innerHTML = html; }
-  function fail(e){
-    only(out);
-    const msg = (e && e.message) || String(e);
-    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
-      out.innerHTML = '<span class="err">Can\\'t reach the MIND HIVE server.</span>\\n\\n'
-        + 'The server has stopped, or this tab is from an earlier run. Re-open '
-        + '<b>MindHive.exe</b> \\u2014 it opens a fresh tab. Each run uses its own one-time '
-        + 'link, so older tabs stop working.';
-    } else {
-      out.innerHTML = '<span class="err">'+ esc(msg) +'</span>';
-    }
-  }
-
-  // --- project / session scoping ---
-  // PROJECT is the selected store namespace ('' = server's default, the
-  // richest one). SESSION optionally narrows the Memory view to one session.
-  let PROJECT = localStorage.getItem('mh_project') || '';
-  let SESSION = null;
-  function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
-  function withProj(path){
-    return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
-  }
-  async function apiGet(path){
-    const r = await fetch(u(withProj(path)), { headers: { 'X-Hive-Token': TOKEN } });
-    const ct = r.headers.get('content-type') || '';
-    return ct.includes('json') ? r.json() : r.text();
-  }
-  async function apiPost(path, body){
-    const b = Object.assign({}, body || {});
-    if (PROJECT) b.project = PROJECT;
-    const r = await fetch(u(withProj(path)), { method:'POST', headers:{ 'Content-Type':'application/json',
-      'X-Hive-Token': TOKEN }, body: JSON.stringify(b) });
-    return r.json();
-  }
-  async function loadProjects(){
-    try {
-      const data = await apiGet('/api/projects');
-      const sel = document.getElementById('proj');
-      const cur = PROJECT || data.current || data.default || '';
-      let html = '';
-      if (data.hivemind) {                       // unified view, always first
-        html += '<option value="*"'+(cur==='*'?' selected':'')+'>'
-              + esc(data.hivemind.name)+' ('+data.hivemind.events+')</option>';
-      }
-      html += (data.projects || []).map(p => '<option value="'+escAttr(p.name)+'"'
-          +(p.name===cur?' selected':'')+'>'+esc(p.name)+' ('+p.events+')</option>').join('');
-      sel.innerHTML = html || '<option value="">(no projects)</option>';
-      PROJECT = cur;
-    } catch(_) { /* keep server default */ }
-  }
-  function onProjChange(){
-    PROJECT = document.getElementById('proj').value;
-    localStorage.setItem('mh_project', PROJECT);
-    SESSION = null;
-    showOverview();
-  }
-  // wrap any async unit of work with busy state + error handling
-  async function run(label, fn){
-    setBusy(true, label);
-    try { await fn(); } catch(e) { fail(e); } finally { setBusy(false); }
-  }
-
-  async function renderOverview(){
-    const o = await apiGet('/api/overview');
-    const chip = o.chain_ok
-      ? '<span class="big ok">OK</span>' : '<span class="big bad">CHECK</span>';
-    const types = Object.entries(o.by_type || {}).sort((a,b)=>b[1]-a[1])
-      .map(([t,n]) => '<span class="pill">'+esc(t)+' <b>'+n+'</b></span>').join('') || '<span class="lbl">no events yet</span>';
-    showHTML(
-      '<h2 class="h">'+esc(o.project)+'</h2>'
-      + '<div class="cards">'
-      + (o.projects != null ? '<div class="card"><div class="big">'+o.projects+'</div><div class="lbl">projects</div></div>' : '')
-      + '<div class="card"><div class="big">'+o.events+'</div><div class="lbl">events</div></div>'
-      + '<div class="card"><div class="big ok">'+(o.memory_events ?? '—')+'</div><div class="lbl">memory</div></div>'
-      + '<div class="card"><div class="big">'+(o.auto_events ?? '—')+'</div><div class="lbl">session / auto</div></div>'
-      + '<div class="card"><div class="big">'+(o.sessions ?? '—')+'</div><div class="lbl">sessions</div></div>'
-      + '<div class="card"><div>'+chip+'</div><div class="lbl">hash chain</div></div>'
-      + '<div class="card"><div class="big" style="font-size:15px">'+esc(o.last_ts || '—')+'</div><div class="lbl">last activity</div></div>'
-      + '</div><div class="types">'+types+'</div>');
-  }
-
-  // --- Memory: the semantic layer (decisions/caveats/…) — intent & context ---
-  // MEM_ITEMS caches the last fetch so search/sort repaint instantly without a
-  // round-trip; MEM_QUERY / MEM_SORT live outside the view so the 2.5s live
-  // refresh (which only rewrites #view) preserves what you typed and picked.
-  let MEM_ITEMS = [];
-  let MEM_QUERY = '';
-  let MEM_SORT = 'new';            // 'new' = newest first, 'old' = oldest first
-  async function renderMemory(){
-    const path = '/api/memory' + (SESSION ? '?session='+encodeURIComponent(SESSION) : '');
-    MEM_ITEMS = await apiGet(path);
-    paintMemory();
-  }
-  function paintMemory(){
-    if (!MEM_ITEMS.length) { showText(SESSION ? 'No memory in this session.'
-      : 'No memory yet — append a decision / caveat / experiment_result / …'); return; }
-    const q = MEM_QUERY.trim().toLowerCase();
-    let items = MEM_ITEMS;
-    if (q) items = items.filter(m => (
-        (m.text||'')+' '+(m.type||'')+' '+(m.session||'')+' '+(m.project||'')
-        +' '+((m.tags||[]).join(' '))).toLowerCase().includes(q));
-    // ts is an ISO timestamp, so a lexical compare orders it chronologically.
-    items = items.slice().sort((a,b) => MEM_SORT==='new'
-      ? String(b.ts||'').localeCompare(String(a.ts||''))
-      : String(a.ts||'').localeCompare(String(b.ts||'')));
-    if (!items.length) { showHTML('<h2 class="h">No memory matches “'+esc(MEM_QUERY)+'”.</h2>'); return; }
-    const showProj = (PROJECT === '*');
-    const total = MEM_ITEMS.length;
-    const head = q ? items.length+' of '+total+' memory item'+(total>1?'s':'')+' match “'+esc(MEM_QUERY)+'”'
-                   : items.length+' memory item'+(items.length>1?'s':'');
-    showHTML('<h2 class="h">'+head
-      + (SESSION ? ' in '+esc(SESSION) : '')+(showProj?' across all projects':'')+'</h2><ul class="hits">'
-      + items.map(m => '<li><div class="file">'
-          + (showProj && m.project ? esc(m.project)+' · ' : '')
-          + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
-          + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
-          + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
-          + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
-      + '</ul>');
-  }
-  function onMemSearch(v){ MEM_QUERY = v; paintMemory(); }
-  function toggleMemSort(){
-    MEM_SORT = MEM_SORT==='new' ? 'old' : 'new';
-    document.getElementById('memsort').textContent = MEM_SORT==='new' ? 'newest first' : 'oldest first';
-    paintMemory();
-  }
-  function showMemory(){
-    controls.innerHTML =
-      (SESSION ? '<div class="row">filtered to session <b>'+esc(SESSION)+'</b> '
-        + '<button onclick="clearSession()">show all</button></div>' : '')
-      + '<div class="row"><input id="memq" placeholder="search memory…" style="min-width:260px" '
-        + 'value="'+escAttr(MEM_QUERY)+'" oninput="onMemSearch(this.value)">'
-      + '<button id="memsort" onclick="toggleMemSort()">'
-        + (MEM_SORT==='new' ? 'newest first' : 'oldest first')+'</button></div>';
-    liveFn = renderMemory; run('loading memory', renderMemory);
-  }
-  function clearSession(){ SESSION = null; showMemory(); }
-
-  // --- Sessions: the episode layer; click one to scope Memory to it ---
-  async function renderSessions(){
-    const items = await apiGet('/api/sessions');
-    if (!items.length) { showText('No sessions yet.'); return; }
-    showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
-      + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
-          + '<div class="file">'+(PROJECT==='*' && s.project ? esc(s.project)+' · ' : '')+esc(s.session_id)+'</div>'
-          + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
-          + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
-      + '</ul>');
-    view.querySelectorAll('.sessrow').forEach(el => el.onclick = () => openSession(el.dataset.sid));
-  }
-  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
-  function openSession(sid){ SESSION = sid; showMemory(); }
-  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
-
-  async function renderState(){ showText(await apiGet('/api/state')); }
-  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
-  function showBriefing(){ controls.innerHTML=''; liveFn = null; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
-
-  function showRecall(){
-    liveFn = null;
-    controls.innerHTML = '<div class="row"><input id="q" placeholder="search query" style="min-width:260px">'
-      + '<label><input type="checkbox" id="sem"> semantic</label>'
-      + '<button onclick="runRecall()">Search</button></div>';
-    showText('Enter a query and search.');
-    const q = document.getElementById('q');
-    q.focus();
-    q.addEventListener('keydown', e => { if (e.key === 'Enter') runRecall(); });
-  }
-  function runRecall(){
-    const q = document.getElementById('q').value;
-    const sem = document.getElementById('sem').checked ? '1' : '0';
-    run('searching', async () => {
-      const hits = await apiGet('/api/recall?q='+encodeURIComponent(q)+'&semantic='+sem);
-      if (!hits.length) { showText('No matches for "'+q+'".'); return; }
-      showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
-        + hits.map(h => '<li><div class="file">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
-        + '</ul>');
-    });
-  }
-
-  function showGraph(){ controls.innerHTML=''; liveFn = null; run('building graph', async () => {
-    const html = await apiGet('/api/graph'); only(graph); graph.srcdoc = html;
-  }); }
-
-  function showAppend(){
-    liveFn = null;
-    controls.innerHTML = '<div class="row"><select id="etype">'
-      + ['decision','caveat','experiment_result','next_step','open_question','state_set']
-        .map(t=>'<option>'+t+'</option>').join('')
-      + '</select></div>'
-      + '<div class="row"><textarea id="etext" rows="3" style="width:min(100%,520px)" placeholder="one line"></textarea></div>'
-      + '<div class="row"><input id="etags" placeholder="tags,comma,separated">'
-      + '<button onclick="runAppend()">Append</button></div>';
-    showText('Fill the form and append a memory event.');
-  }
-  function runAppend(){
-    const body = { type: document.getElementById('etype').value,
-      payload: document.getElementById('etext').value, tags: document.getElementById('etags').value };
-    if (!body.payload.trim()) { showText('Nothing to append — type a line first.'); return; }
-    run('appending', async () => {
-      const res = await apiPost('/api/append', body);
-      if (res.ok) { showOverview(); } else { showText(res); }
-    });
-  }
-
-  // Plugins view auto-refreshes when stale: it asks the server to scan only if
-  // the catalog is missing or >24h old, so just opening the view keeps it current
-  // without forcing a heavy rescan. The Heavy "Plugins scan" button forces one.
-  function showPlugins(){ controls.innerHTML=''; liveFn = null; run('refreshing plugins', async () => {
-    const res = await apiPost('/api/plugins/autoscan', {});
-    const note = res.scanned ? 'scanned just now' : ('catalog fresh ('+(Number(res.age_hours)||0).toFixed(1)+'h old)');
-    showText(note + '\\n\\n' + JSON.stringify(res.result || res, null, 2));
-  }); }
-  function doExport(){ window.location = u('/api/export'); }
-
-  function doAction(path, label, method){
-    controls.innerHTML=''; liveFn = null;
-    run(label+'…', async () => showText(method === 'GET' ? await apiGet(path) : await apiPost(path, {})));
-  }
-  function confirmAction(path, label){
-    if(!confirm(label + ' — this can take a while. Continue?')) return;
-    let body = {};
-    if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
-    controls.innerHTML=''; liveFn = null;
-    run(label+' running…', async () => showText(await apiPost(path, body)));
-  }
-
-  // populate the project picker, then land on the overview
-  (async () => { await loadProjects(); showOverview(); })();
-</script>
-</body></html>""".replace("__TOKEN__", json.dumps(token))
 
 
 def run_catch_up() -> dict:
@@ -858,6 +1106,95 @@ def _auto_harvest_loop(stop_event) -> None:
             pass   # never let the healer disturb the server
 
 
+def stable_url(port: int | None = None, token: str | None = None) -> str:
+    """The dashboard's stable URL for the given (or default) port and token.
+    Kept in one place so the launcher, the server, and any caller all report the
+    identical http://127.0.0.1:<port>/?token=<tok> that a browser will open."""
+    port = DEFAULT_PORT if port is None else port
+    token = token or load_or_create_token()
+    return f"http://127.0.0.1:{port}/?token={token}"
+
+
+def _instance_running(port: int | None, host: str = "127.0.0.1",
+                      timeout: float = 0.3) -> bool:
+    """True when a dashboard is already listening on host:port.
+
+    Deliberately a client *connect* probe, not a bind-test: on Windows
+    SO_REUSEADDR lets a second bind to an in-use port SUCCEED (hijack
+    semantics), so a bind-based "is it free?" check wrongly reports free and a
+    duplicate pid gets spawned. Connecting is unambiguous — it succeeds only
+    when something is actually accepting there. Port 0 (ephemeral) is always a
+    fresh server, so it is never "already running"."""
+    if not port:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def launch_background(port: int | None = None) -> dict:
+    """Spawn `hive dashboard` as a *detached* background process so a caller
+    (e.g. the autonomous loop) can bring the panel up without blocking on
+    serve()'s serve_forever(). The child outlives this process and — thanks to
+    serve()'s fixed-port reuse — a second launch just reopens the same stable URL
+    instead of erroring.
+
+    Best-effort by contract: any spawn failure is swallowed and reported in the
+    return value rather than raised, so a dashboard problem can never abort the
+    caller. Returns {"launched": True, "url": ..., "pid": ...} on success or
+    {"launched": False, "reason": ...} when the spawn could not start.
+    """
+    url = stable_url(port)
+    # Single-instance guard: never spawn a second pid when one is already
+    # serving. The loop calls this on every run, so without the check repeated
+    # runs would pile up detached dashboards.
+    if _instance_running(DEFAULT_PORT if port is None else port):
+        return {"launched": False, "already_running": True, "url": url,
+                "reason": "already running"}
+    argv = [sys.executable, "-m", "mindhive", "dashboard"]
+    if port is not None:
+        argv += ["--port", str(port)]
+    # Detach so the child survives this process and doesn't hold its console.
+    kwargs: dict = {"stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(argv, **kwargs)
+    except Exception as e:   # never let a launch failure disturb the caller
+        return {"launched": False, "reason": str(e)}
+    return {"launched": True, "url": url, "pid": proc.pid}
+
+
+def open_panel(port: int | None = None) -> str:
+    """Bring the dashboard to the foreground for the `mind hive` shortcut.
+
+    Launch it detached if nothing is running; if one is already up, open its
+    stable URL in the browser so the user lands straight on the live panel —
+    seamless, and never blocking the terminal. Returns a one-line status for the
+    shell to print. On a fresh launch the detached child opens its own browser,
+    so we don't double-open here."""
+    res = launch_background(port)
+    url = res.get("url")
+    if res.get("launched"):
+        return f"MIND HIVE dashboard: {url}"
+    if res.get("already_running"):
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return f"MIND HIVE dashboard already running — opening {url}"
+    return f"dashboard: not launched ({res.get('reason')})"
+
+
 def serve(port: int | None = None, open_browser: bool = True,
           token: str | None = None) -> None:
     """Start the dashboard on a fixed port with a persisted token so the URL is
@@ -873,6 +1210,17 @@ def serve(port: int | None = None, open_browser: bool = True,
     if port is None:
         port = DEFAULT_PORT
     token = token or load_or_create_token()
+    # Single-instance guard (primary): if a dashboard is already serving this
+    # fixed port, reopen its URL instead of starting a second pid. A connect
+    # probe is reliable on Windows, where SO_REUSEADDR would otherwise let the
+    # bind below succeed and leave a duplicate server. The OSError path stays as
+    # a fallback for the rare probe-then-bind race. port=0 skips the probe.
+    if _instance_running(port):
+        url = f"http://127.0.0.1:{port}/?token={token}"
+        print(f"MIND HIVE dashboard already running — opening {url}", flush=True)
+        if open_browser:
+            webbrowser.open(url)
+        return
     handler = make_handler(token)
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), handler)
