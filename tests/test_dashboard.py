@@ -331,11 +331,14 @@ def test_skills_status_endpoint_returns_status_and_counts(dashboard_server, monk
 
 
 def test_page_has_invoke_count_hooks(dashboard_server):
-    """Skill names carry a per-skill invoke-count badge in the top list."""
+    """Per-skill call telemetry is surfaced. The Skill & Plugin rebuild (U7)
+    replaced the old name-adjacent count badge with a richer metrics line
+    (calls / ok / fail / completion rate) rendered from PLUG_STATS via
+    skMetrics — the invoke-count intent is preserved and enriched."""
     base, token = dashboard_server
     status, body = _get(base, "/")
-    for needle in ("PLUG_COUNTS", "callcount"):
-        assert needle in body, f"missing invoke-count hook: {needle}"
+    for needle in ("PLUG_STATS", "skMetrics"):
+        assert needle in body, f"missing per-skill telemetry hook: {needle}"
 
 
 def test_page_has_clickable_improvements_legend(dashboard_server):
