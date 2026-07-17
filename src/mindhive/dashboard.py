@@ -1,6 +1,7 @@
 # src/mindhive/dashboard.py
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import secrets
@@ -23,6 +24,7 @@ from . import invoker as invoker_mod
 from . import export as export_mod
 from . import events, projector
 from . import dedupe
+from . import taskview
 from . import sync as sync_mod
 from . import workspace as workspace_mod
 from . import research as research_mod
@@ -273,10 +275,19 @@ def make_handler(token: str):
             # constant-time compare to avoid leaking the token via timing
             return secrets.compare_digest(str(supplied), str(token))
 
+        # Compress bodies above one MTU when the client accepts gzip — the
+        # page is ~72KB (→ ~22KB) and the Improvements/graph JSON payloads
+        # shrink similarly; below the threshold the header overhead wins.
+        GZIP_MIN_BYTES = 1400
+
         def _send(self, code, body, ctype="application/json; charset=utf-8"):
             data = body.encode("utf-8") if isinstance(body, str) else body
+            accepts = "gzip" in (self.headers.get("Accept-Encoding") or "")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if accepts and len(data) >= self.GZIP_MIN_BYTES:
+                data = gzip.compress(data, 6)
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -374,7 +385,8 @@ def make_handler(token: str):
             return self._json(dedupe.collapse([
                 {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
                  "text": e.payload.get("text", "") if isinstance(e.payload, dict) else str(e.payload),
-                 "tags": e.tags}
+                 "tags": e.tags,
+                 "origin": events.origin_of(e.session_id, e.tags)}
                 for n, e in rows
             ]))
 
@@ -395,6 +407,7 @@ def make_handler(token: str):
                 stats_map = incidents.signal_stats(n, evs=evs)
                 for s in incidents.summaries(n):
                     st = stats_map.get(s["signature"], {})
+                    resolution = incidents.classify_resolution(s, st)
                     auto.append(dict(
                         s, project=n, source="auto",
                         first_seen=st.get("first_seen"),
@@ -402,13 +415,15 @@ def make_handler(token: str):
                         leaks=st.get("leaks", 0),
                         reroutes=st.get("reroutes", 0),
                         last_reroute=st.get("last_reroute"),
-                        resolution=incidents.classify_resolution(s, st)))
+                        resolution=resolution,
+                        **incidents.classify_triage(resolution, s)))
                 for e in evs:
                     if e.type != "caveat":
                         continue
                     manual.append({
                         "ts": e.ts, "type": e.type, "session": e.session_id,
                         "project": n, "source": "manual", "tags": e.tags,
+                        "origin": events.origin_of(e.session_id, e.tags),
                         "text": (e.payload.get("text", "")
                                  if isinstance(e.payload, dict) else str(e.payload)),
                     })
@@ -423,9 +438,14 @@ def make_handler(token: str):
                 key = (name, e.session_id)
                 s = by.get(key)
                 if s is None:
-                    s = by[key] = {"session_id": e.session_id, "project": name, "events": 0,
-                                   "memory": 0, "first_ts": e.ts, "last_ts": e.ts}
+                    s = by[key] = {"session_id": e.session_id, "project": name,
+                                   "events": 0, "memory": 0,
+                                   "origin": None,
+                                   "first_ts": e.ts, "last_ts": e.ts, "_evs": []}
                 s["events"] += 1
+                s["_evs"].append(e)
+                if not s["origin"]:
+                    s["origin"] = events.origin_of(e.session_id, e.tags)
                 if e.type in events.MEMORY_VIEW_TYPES:
                     s["memory"] += 1
                 if e.ts and e.ts < s["first_ts"]:
@@ -433,7 +453,71 @@ def make_handler(token: str):
                 if e.ts and e.ts > s["last_ts"]:
                     s["last_ts"] = e.ts
             out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
+            for s in out:
+                s["activity"] = taskview.tally(s.pop("_evs"))
+                s["status"] = taskview.status_of(s["last_ts"])
             return self._json(out)
+
+        def _get_changelog(self, proj, am, qs):
+            # Mandatory code change-log. Shape and ordering delegate to
+            # changelog.entries() — one source of truth, so this view can
+            # never disagree with `hive log show`. The pending marker is a
+            # per-project sidecar, so HIVE MIND shows entries without a
+            # pending banner; categories ride along so the UI never hardcodes
+            # the taxonomy.
+            from . import changelog as changelog_mod
+            if am:
+                rows = []
+                for n in _all_projects():
+                    rows.extend(changelog_mod.entries(events.read_all(n),
+                                                      project=n))
+                rows.sort(key=lambda r: r["ts"] or "", reverse=True)
+                pending = None
+            else:
+                rows = changelog_mod.entries(events.read_all(proj),
+                                             project=proj)
+                pending = changelog_mod.load_pending(proj)
+            return self._json({"entries": rows,
+                               "categories": list(changelog_mod.CATEGORIES),
+                               "pending": pending})
+
+        def _get_sops(self, proj, am, qs):
+            # Managed SOP registry. Active set and history both delegate to
+            # sop.py (one source of truth for fold/ordering), so this view
+            # can never disagree with `hive sop list` / `hive sop show`.
+            from . import sop as sop_mod
+            if am:
+                active, hist = [], []
+                for n in _all_projects():
+                    evs = events.read_all(n)
+                    for r in sop_mod.current(evs):
+                        active.append(dict(r, project=n))
+                    hist.extend(sop_mod.entries(evs, project=n))
+                active.sort(key=lambda r: (r.get("created") or "",
+                                           r.get("sop_id") or ""))
+                hist.sort(key=lambda r: r["ts"] or "", reverse=True)
+            else:
+                evs = events.read_all(proj)
+                active = sop_mod.current(evs)
+                hist = sop_mod.entries(evs, project=proj)
+            return self._json({"active": active, "history": hist,
+                               "actions": list(sop_mod.ACTIONS)})
+
+        def _get_task(self, proj, am, qs):
+            sid = (qs.get("session") or [""])[0]
+            # In HIVE MIND mode each card carries its own project — a concrete
+            # namespace is required to read the right ledger.
+            tproj = (qs.get("session_project") or [None])[0]
+            if am and not tproj:
+                return self._json({"ok": False,
+                                   "error": "session_project required"}, 400)
+            evs = [e for e in events.read_all(tproj or proj)
+                   if e.session_id == sid]
+            return self._json(taskview.items(evs))
+
+        def _get_task_detail(self, proj, am, qs):
+            sid = (qs.get("session") or [""])[0]
+            return self._json(taskview.detail(sid))
 
         def _get_recall(self, proj, am, qs):
             q = (qs.get("q") or [""])[0]
@@ -600,7 +684,11 @@ def make_handler(token: str):
             parsed = urlparse(self.path)
             route = parsed.path
             if route == "/":
-                return self._send(200, render_page(token), "text/html; charset=utf-8")
+                return self._send(200,
+                                  render_page(token,
+                                              tasks_css=taskview.CARDS_CSS,
+                                              tasks_js=taskview.CARDS_JS),
+                                  "text/html; charset=utf-8")
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             handler = self._GET_ROUTES.get(route)
@@ -857,12 +945,14 @@ def make_handler(token: str):
                     if route == "/api/project":
                         res = {n: projector.project(n) for n in _all_projects()}
                         return self._json({"ok": True, "result": res})
-                    # selftest + harvest + plugin scans are global (machine-wide,
-                    # not tied to one project); every other mutating action needs
-                    # a concrete target. The plugin handlers substitute the
-                    # default project for storage when in all-mode.
+                    # selftest + harvest + plugin scans + auth verification are
+                    # global (machine-wide, not tied to one project); every other
+                    # mutating action needs a concrete target. The plugin
+                    # handlers substitute the default project for storage when
+                    # in all-mode.
                     if route not in ("/api/selftest", "/api/harvest",
-                                     "/api/plugins/scan", "/api/plugins/autoscan"):
+                                     "/api/plugins/scan", "/api/plugins/autoscan",
+                                     "/api/workspace/auth_verify"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)
@@ -888,7 +978,11 @@ def make_handler(token: str):
             "/api/memory": _get_memory,
             "/api/improvements": _get_improvements,
             "/api/sessions": _get_sessions,
+            "/api/task": _get_task,
+            "/api/task_detail": _get_task_detail,
             "/api/oversee": _get_oversee,
+            "/api/changelog": _get_changelog,
+            "/api/sops": _get_sops,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
             "/api/plugins/recommend": _get_plugins_recommend,
@@ -904,7 +998,8 @@ def make_handler(token: str):
                    "auth", "board"):
             _GET_ROUTES[f"/api/workspace/{_p}"] = _get_workspace
         del _p
-        for _p in ("page", "status", "leaderboard", "output"):
+        for _p in ("page", "status", "leaderboard", "output", "learnings",
+                   "prds", "sources"):
             _GET_ROUTES[f"/api/research/{_p}"] = _get_research
         del _p
         _POST_ROUTES = {
@@ -925,8 +1020,9 @@ def make_handler(token: str):
         }
         for _p in ("spawn", "send", "run_recipe", "set_model", "stop",
                    "remove", "clear_idle", "profile_add", "profile_remove",
-                   "profile_login", "profile_trust", "board_save",
-                   "board_dispatch", "mission", "mission_stop", "command"):
+                   "profile_login", "profile_trust", "auth_verify",
+                   "board_save", "board_dispatch", "mission", "mission_stop",
+                   "command"):
             _POST_ROUTES[f"/api/workspace/{_p}"] = _post_workspace
         del _p
         for _p in ("start", "stop"):

@@ -45,6 +45,27 @@ alone, that only reflects the PR hasn't merged yet. If a branch genuinely has
 no remote copy, say so plainly and ask before pushing/opening a PR — don't do
 it unilaterally, since the user may still be iterating.
 
+## Every code change MUST get a change-log entry (mandatory)
+
+Any change to `src/mindhive/` or `tests/` — no matter how small — must be
+recorded in the code change-log before the work is called done:
+
+```
+hive log <category> "<brief explanation of what changed>"
+```
+
+Category is one of: `update`, `minor_change`, `deletion`, `reduction`,
+`major_change`, `replacement`. The explanation is a real sentence (min 10
+chars) describing what changed and why; affected files are auto-detected
+(pending marker → session's touched files → git diff), or pass `--files`
+explicitly. Entries are `code_change` events in the ledger and appear in the
+dashboard's **Log** section.
+
+This is enforced: `session_end` queues any unlogged source files into a
+pending marker, and STATE.md/briefing shows a blocking "⚠ Unlogged code
+changes" notice until the entry is recorded. Do not clear the notice any
+other way — write the entry.
+
 ## Any change here must land green
 
 Whenever you touch code in this checkout, run the test suite before calling

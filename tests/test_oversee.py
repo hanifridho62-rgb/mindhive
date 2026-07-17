@@ -85,3 +85,18 @@ def test_semantic_events_and_next_steps_fill_the_checklist():
     assert any("keep the file backend" in d for d in s["done"])
     assert s["planned"] == ["migrate the reader"]
     assert s["doing"] == "migrating the reader now"
+
+
+def test_self_reliant_run_is_labeled_and_titled():
+    # a Self-Reliant run's research-<id> stream carries the provenance label
+    # and a human title (it has no user_prompt to title from)
+    _ev("experiment_result", {"text": "Self-Reliant experiment 1: ok"}, 0,
+        sid="research-ab12cd34")
+    _ev("user_prompt", {"text": "ordinary chat"}, 1, sid="sess-plain")
+    res = oversee.interactive_sessions("test",
+                                       now_fn=lambda: _epoch("2026-07-08T10:02:00Z"))
+    by_id = {r["run_id"]: r for r in res}
+    sr = by_id["research-ab12cd34"]
+    assert sr["origin"] == "self-reliant"
+    assert sr["title"] == "Self-Reliant run ab12cd34"
+    assert by_id["sess-plain"]["origin"] is None

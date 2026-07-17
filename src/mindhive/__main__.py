@@ -40,6 +40,28 @@ def cmd_append(args) -> int | None:
         print("error: provide a payload argument or use --stdin", file=sys.stderr)
         return 2
     payload = json.loads(raw) if args.json else {"text": raw}
+    if args.type == "code_change":
+        # The change-log is only mandatory if the generic append path can't
+        # smuggle an uncategorized/unexplained entry past it. The event store
+        # itself stays type-agnostic — the contract is enforced here, at the
+        # one surface that accepts an arbitrary type+payload from the user.
+        from . import changelog as changelog_mod
+        try:
+            changelog_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f'error: {e} (use: hive log <category> "...")',
+                  file=sys.stderr)
+            return 2
+    elif args.type == "sop":
+        # Same reasoning for the SOP registry: the raw append path must not
+        # smuggle a malformed lifecycle event past the sop contract.
+        from . import sop as sop_mod
+        try:
+            sop_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f"error: {e} (use: hive sop add|update|delete …)",
+                  file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -59,6 +81,14 @@ def cmd_hook(args) -> int | None:
         decision = enforce.hook_decision(raw)
         if decision:
             print(json.dumps(decision))
+    elif args.stage == "user_prompt_submit":
+        # Prompt-quality gate: inject skill-trigger directives when the typed
+        # prompt is underspecified. Print ONLY when the gate fires (stdout is
+        # the hook's context channel); a clear prompt prints nothing.
+        from . import promptgate
+        context = promptgate.hook_context(raw)
+        if context:
+            print(json.dumps(context))
     return None
 
 
@@ -197,6 +227,131 @@ def cmd_review_clear(args) -> int | None:
 def cmd_review_show(args) -> int | None:
     from . import review as review_mod
     print(json.dumps(review_mod.load_pending(), indent=2))
+    return None
+
+
+def cmd_log_add(args) -> int | None:
+    from . import changelog as changelog_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        ev = changelog_mod.record(args.category, args.explanation,
+                                  files=args.files or None, session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"logged {ev.payload['category']} covering "
+          f"{len(ev.payload['files'])} file(s) @ {ev.ts}")
+    return None
+
+
+def cmd_log_queue(args) -> int | None:
+    from . import changelog as changelog_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    marker = changelog_mod.queue(events.read_all(), session_id=sid)
+    if marker:
+        print(f"queued {len(marker['files'])} unlogged source file(s) — a "
+              "change-log entry is required: hive log <category> \"…\"")
+    else:
+        print("no unlogged code changes")
+    return None
+
+
+def cmd_log_show(args) -> int | None:
+    from . import changelog as changelog_mod
+    print(json.dumps(changelog_mod.entries(events.read_all()),
+                     indent=2, ensure_ascii=False))
+    return None
+
+
+def cmd_log_pending(args) -> int | None:
+    from . import changelog as changelog_mod
+    print(json.dumps(changelog_mod.load_pending(), indent=2))
+    return None
+
+
+def _sop_body(args) -> str | None:
+    """Resolve an SOP body from --text / --file / --stdin (at most one). A
+    procedure body is usually multi-line markdown, which is painful to pass as
+    a quoted shell argument on Windows — --file and --stdin avoid that."""
+    given = [name for name, val in
+             (("--text", args.text), ("--file", args.file),
+              ("--stdin", args.stdin or None)) if val]
+    if len(given) > 1:
+        raise ValueError("pass only one of --text / --file / --stdin")
+    if args.stdin:
+        return sys.stdin.read()
+    if args.file:
+        from pathlib import Path
+        return Path(args.file).read_text(encoding="utf-8")
+    return args.text
+
+
+def _cmd_sop_write(args, action) -> int | None:
+    from . import sop as sop_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        text = (args.reason if action == "delete" else _sop_body(args))
+        tags = [t for t in (getattr(args, "tags", "") or "").split(",") if t]
+        ev = sop_mod.record(action, args.sop_id,
+                            title=getattr(args, "title", None), text=text,
+                            tags=tags, session_id=sid)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"sop {action}: {args.sop_id} @ {ev.ts}")
+    return None
+
+
+def cmd_sop_add(args) -> int | None:
+    return _cmd_sop_write(args, "add")
+
+
+def cmd_sop_update(args) -> int | None:
+    return _cmd_sop_write(args, "update")
+
+
+def cmd_sop_delete(args) -> int | None:
+    return _cmd_sop_write(args, "delete")
+
+
+def cmd_sop_list(args) -> int | None:
+    from . import sop as sop_mod
+    sops = sop_mod.current(events.read_all(getattr(args, "project", None)))
+    if args.json:
+        print(json.dumps(sops, indent=2, ensure_ascii=False))
+        return None
+    if not sops:
+        print('(no active SOPs — add one: hive sop add <id> --title "…" '
+              '--file <body.md>)')
+        return None
+    for i, r in enumerate(sops, 1):
+        print(f"  {i}. [{r['sop_id']} v{r['version']}] {r['title']}  "
+              f"(updated {r['updated']})")
+    print(f"\n{len(sops)} active SOP(s)")
+    return None
+
+
+def cmd_sop_show(args) -> int | None:
+    from . import sop as sop_mod
+    evs = events.read_all(getattr(args, "project", None))
+    rec = sop_mod.get(evs, args.sop_id)
+    hist = [e for e in sop_mod.entries(evs) if e["sop_id"] == args.sop_id]
+    if args.json:
+        print(json.dumps({"active": rec, "history": hist},
+                         indent=2, ensure_ascii=False))
+        return None
+    if rec is None and not hist:
+        print(f"error: no SOP '{args.sop_id}' in the ledger", file=sys.stderr)
+        return 2
+    if rec is None:
+        print(f"SOP {args.sop_id}: deleted (history below)")
+    else:
+        print(f"SOP {rec['sop_id']} v{rec['version']} — {rec['title']}")
+        print(f"created {rec['created']}  updated {rec['updated']}\n")
+        print(rec["text"])
+    print("\nhistory (newest first):")
+    for e in hist:
+        print(f"  {e['ts']}  {e['action']:6s}  session {e['session']}")
     return None
 
 
@@ -345,6 +500,7 @@ def cmd_skills_recommend(args) -> int | None:
     both the telemetry stats and the need extraction, so --brief stays cheap
     enough for a session-start hook."""
     from . import plugins as plugins_mod
+    from . import recommend as recommend_mod
     payload = plugins_mod.recommend_for(project=args.project, top=args.top)
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -352,7 +508,7 @@ def cmd_skills_recommend(args) -> int | None:
     recs = payload["recommendations"]
     if args.brief:
         for e in recs[:(args.top or 3)]:
-            print(f"{e['name']} — {e['reason']} ({e['provenance']})")
+            print(recommend_mod.brief_line(e))
         return None
     cov = payload["coverage"]
     print(f"measured {cov['measured']} of {cov['total']} skills")
@@ -363,6 +519,11 @@ def cmd_skills_recommend(args) -> int | None:
         print(f"  {i}. {e['name']}  [score {e['score']:g}, {e['provenance']}]"
               f"{'  (try to measure)' if e.get('try_to_measure') else ''}")
         print(f"       {e['reason']}")
+        # Full width (no truncation) but the SAME empty/whitespace handling as
+        # brief_line, so an empty description never prints a dangling clause.
+        use = recommend_mod._truncate(e.get("description"))
+        if use:
+            print(f"       intended use: {use}")
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
@@ -564,20 +725,31 @@ def cmd_rules_list(args) -> int | None:
 def cmd_rules_summaries(args) -> int | None:
     """Structured lesson records (the same shape the dashboard Improvements view
     reads) for an agent working from the CLI. --json emits the raw list; the
-    default is a human-readable digest per signature."""
+    default is a human-readable digest per signature. Both carry resolution +
+    triage (who should act: claude vs dismiss) — CLI/HTTP parity with the
+    dashboard's Improvements cards."""
+    from . import events as ev_mod
     from . import incidents as inc
-    recs = inc.summaries(args.project)
+    stats = inc.signal_stats(args.project, evs=ev_mod.read_all(args.project))
+    recs = []
+    for r in inc.summaries(args.project):
+        st = stats.get(r["signature"], {})
+        resolution = inc.classify_resolution(r, st)
+        recs.append(dict(r, resolution=resolution,
+                         **inc.classify_triage(resolution, r)))
     if args.json:
         print(json.dumps(recs, indent=2))
         return None
     if not recs:
         print("(no incidents yet)")
         return None
+    marks = {"claude": "-> FIX WITH CLAUDE", "dismiss": "-> ok to dismiss", "": ""}
     for r in sorted(recs, key=lambda r: -r.get("occurrences", 0)):
         lesson = r.get("lesson") or r.get("active_rule") or "(not yet reflected)"
         cat = f" {{{r['category']}}}" if r.get("category") else ""
         print(f"{r.get('occurrences', 0):>3}x  [{r.get('status', '?'):9}]{cat} "
-              f"{r.get('signature', '')}\n       {lesson}")
+              f"{r.get('signature', '')}  {marks.get(r.get('triage'), '')}"
+              f"\n       {lesson}")
     return None
 
 
@@ -692,6 +864,56 @@ def cmd_rules_demote(args) -> int | None:
     return None
 
 
+def cmd_triggers_train(args) -> int | None:
+    from . import promptgate
+    res = promptgate.train_and_store(project=args.project,
+                                     max_age_hours=args.max_age_hours)
+    cov = res["manifest"].get("coverage", {})
+    verb = "trained" if res["trained"] else \
+        f"fresh (age {res['age_hours']:.1f}h) — kept"
+    print(f"{verb} {cov.get('rules', 0)} trigger rule(s) "
+          f"({cov.get('measured_rules', 0)} measured) from "
+          f"{cov.get('skills_total', 0)} skills, "
+          f"{cov.get('prompts_scanned', 0)} past prompts scanned")
+    return None
+
+
+def cmd_triggers_list(args) -> int | None:
+    from . import promptgate
+    man = promptgate.load_manifest(args.project)
+    if args.json:
+        print(json.dumps(man, indent=2))
+        return None
+    rules = man.get("rules") or {}
+    if not rules:
+        print("(no trigger manifest — run `hive triggers train`)")
+        return None
+    print(f"trained {man.get('trained_at', '?')}")
+    for dim, r in sorted(rules.items()):
+        rate = r.get("completion_rate")
+        rate_s = f"{r.get('ok', 0)}/{r.get('calls', 0)}" if rate is not None else "—"
+        print(f"  [{r.get('directive', 'try'):4}] {dim}: {r.get('skill', '')} "
+              f"({r.get('provenance', '')}, {rate_s}, "
+              f"observed {r.get('observed', 0)}x in history)")
+    return None
+
+
+def cmd_triggers_check(args) -> int | None:
+    from . import promptgate
+    verdict = promptgate.assess(args.prompt)
+    if verdict["skip"]:
+        print("skipped: not a human-typed prompt")
+        return None
+    if verdict["clear"]:
+        print("clear: the gate would not fire")
+        return None
+    print("fires: " + "; ".join(f["dimension"] for f in verdict["findings"]))
+    man = promptgate.load_manifest(args.project)
+    context = promptgate.render_context(verdict["findings"], man.get("rules"))
+    print(context if context else "(no trained rule covers these dimensions)")
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -708,7 +930,8 @@ def _build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_append)
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
-    hk.add_argument("stage", choices=["post_tool_use", "pre_tool_use"],
+    hk.add_argument("stage",
+                    choices=["post_tool_use", "pre_tool_use", "user_prompt_submit"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -778,6 +1001,63 @@ def _build_parser() -> argparse.ArgumentParser:
     rvq.set_defaults(func=cmd_review_queue)
     rvsub.add_parser("clear", help="clear the pending-review marker (after the review runs)").set_defaults(func=cmd_review_clear)
     rvsub.add_parser("show", help="print the pending-review marker, if any").set_defaults(func=cmd_review_show)
+
+    # --- log (mandatory code change-log) ---
+    from .changelog import CATEGORIES as _LOG_CATS
+    lg = sub.add_parser("log", help="mandatory code change-log (code_change events)")
+    lgsub = lg.add_subparsers(dest="log_cmd", required=True)
+    for _cat in _LOG_CATS:
+        lc = lgsub.add_parser(_cat, help=f"record a {_cat} entry for the current change-set")
+        lc.add_argument("explanation", help="brief explanation of what changed (mandatory)")
+        lc.add_argument("--files", nargs="*", default=None,
+                        help="affected files (default: pending marker, then session, then git)")
+        lc.add_argument("--session", default=None,
+                        help="session id (default: $MINDHIVE_SESSION)")
+        lc.set_defaults(func=cmd_log_add, category=_cat)
+    lgq = lgsub.add_parser("queue", help="queue this session's unlogged source files (run by session_end)")
+    lgq.add_argument("--session", default=None,
+                     help="session id to queue (default: $MINDHIVE_SESSION)")
+    lgq.set_defaults(func=cmd_log_queue)
+    lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
+    lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
+
+    # --- sop (managed standard operating procedures) ---
+    so = sub.add_parser("sop", help="standard operating procedures "
+                                    "(event-sourced registry, auto-loaded)")
+    sosub = so.add_subparsers(dest="sop_cmd", required=True)
+    soa = sosub.add_parser("add", help="add a new SOP")
+    soa.add_argument("sop_id", help="stable kebab-case id, e.g. memo-hygiene")
+    soa.add_argument("--title", required=True)
+    soa.add_argument("--text", default=None, help="procedure body (inline)")
+    soa.add_argument("--file", default=None, help="read the body from a file")
+    soa.add_argument("--stdin", action="store_true",
+                     help="read the body from stdin")
+    soa.add_argument("--tags", default="")
+    soa.add_argument("--session", default=None)
+    soa.set_defaults(func=cmd_sop_add)
+    sou = sosub.add_parser("update", help="revise an SOP's title and/or body")
+    sou.add_argument("sop_id")
+    sou.add_argument("--title", default=None)
+    sou.add_argument("--text", default=None)
+    sou.add_argument("--file", default=None)
+    sou.add_argument("--stdin", action="store_true")
+    sou.add_argument("--tags", default="")
+    sou.add_argument("--session", default=None)
+    sou.set_defaults(func=cmd_sop_update)
+    sod = sosub.add_parser("delete", help="retire an SOP (append-only tombstone)")
+    sod.add_argument("sop_id")
+    sod.add_argument("--reason", default=None)
+    sod.add_argument("--session", default=None)
+    sod.set_defaults(func=cmd_sop_delete)
+    sol = sosub.add_parser("list", help="list active SOPs")
+    sol.add_argument("--project", default=None)
+    sol.add_argument("--json", action="store_true")
+    sol.set_defaults(func=cmd_sop_list)
+    sos = sosub.add_parser("show", help="print one SOP in full, with history")
+    sos.add_argument("sop_id")
+    sos.add_argument("--project", default=None)
+    sos.add_argument("--json", action="store_true")
+    sos.set_defaults(func=cmd_sop_show)
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")
@@ -985,6 +1265,30 @@ def _build_parser() -> argparse.ArgumentParser:
     ren.add_argument("--disable", metavar="SIG", default=None,
                      help="turn off enforcement for a signature")
     ren.set_defaults(func=cmd_rules_enforce)
+
+    # --- triggers (prompt-quality gate: train/list/check the manifest) ---
+    tg = sub.add_parser("triggers",
+                        help="prompt-quality trigger rules (UserPromptSubmit gate)")
+    tgsub = tg.add_subparsers(dest="triggers_cmd", required=True)
+    tgt = tgsub.add_parser("train",
+                           help="derive trigger rules from the inventory + ledger "
+                                "and store rules/triggers.json")
+    tgt.add_argument("--project", default=None)
+    tgt.add_argument("--max-age-hours", type=float, default=0.0,
+                     dest="max_age_hours",
+                     help="stale-gate: skip when the manifest is younger than "
+                          "this (0 = always retrain)")
+    tgt.set_defaults(func=cmd_triggers_train)
+    tgl = tgsub.add_parser("list", help="print the trained trigger rules")
+    tgl.add_argument("--project", default=None)
+    tgl.add_argument("--json", action="store_true", help="emit the raw manifest")
+    tgl.set_defaults(func=cmd_triggers_list)
+    tgc = tgsub.add_parser("check",
+                           help="assess one prompt offline and show what the "
+                                "gate would inject")
+    tgc.add_argument("prompt")
+    tgc.add_argument("--project", default=None)
+    tgc.set_defaults(func=cmd_triggers_check)
 
     return p
 

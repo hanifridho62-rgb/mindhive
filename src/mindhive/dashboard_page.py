@@ -9,7 +9,7 @@ document string. No sibling-module dependencies."""
 import json
 
 
-def render_page(token: str) -> str:
+def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -59,6 +59,9 @@ def render_page(token: str) -> str:
   .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
   .pill b { color:#fff; }
   .pill.est { color:#e0b341; border-color:#5a4a1f; }
+  .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
+  .pill.tridism { color:#8a93a6; }
+  .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -94,6 +97,7 @@ def render_page(token: str) -> str:
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
+  /*__TASKS_CSS__*/
 </style></head>
 <body>
 <header>
@@ -114,6 +118,8 @@ def render_page(token: str) -> str:
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
     <button onclick="showImprovements(true)">Improvements</button>
+    <button onclick="showLog()">Log</button>
+    <button onclick="showSops()">SOP</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -216,6 +222,14 @@ def render_page(token: str) -> str:
   let PROJECT = localStorage.getItem('mh_project') || '';
   let SESSION = null;
   function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+  // Provenance badge: rendered wherever a row/card carries origin:'self-reliant'
+  // (server-computed by events.origin_of, so Memory / Sessions / Improvements /
+  // Oversee can never disagree about what a Self-Reliant run produced).
+  function srPill(o){
+    return o === 'self-reliant'
+      ? ' <span class="pill sr" title="produced by a Self-Reliant run">\\u2726 self-reliant</span>'
+      : '';
+  }
   function withProj(path){
     return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
   }
@@ -316,6 +330,7 @@ def render_page(token: str) -> str:
           + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
           + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
+          + srPill(m.origin)
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
   }
@@ -347,6 +362,7 @@ def render_page(token: str) -> str:
   let IMP_STATUS = 'all';
   let IMP_CAT = 'all';
   let IMP_RES = 'all';             // resolution filter set by the legend glyphs
+  let IMP_TRIAGE = 'all';          // who-acts filter: all | claude | dismiss
   let IMP_BANNER = '';
   let IMP_SORT = 'critical';       // 'new' | 'critical' | 'freq'
   let IMP_DIR = 'desc';            // toggle reverses the active order
@@ -366,15 +382,37 @@ def render_page(token: str) -> str:
     return '<span class="glyph '+g[1]+'" title="'+escAttr(g[2])+'">'+g[0]+'</span>';
   }
   // legend glyphs double as one-click resolution filters (click again to
-  // clear) — the same mechanism as the Skills & plugins status legend.
+  // clear) — the same mechanism as the Skills & plugins status legend. The
+  // second row is the WHO-ACTS axis: every card is marked either "for
+  // Claude" (pending agent work) or "dismissible" (clear it manually).
+  const TRIAGE_LEGEND = {
+    claude:  ['for Claude', 'pending agent work \\u2014 hand these to Claude to root-cause and fix'],
+    dismiss: ['dismissible', 'no agent work needed \\u2014 clear these manually with dismiss']};
+  function triagePill(t, hint){
+    if (t === 'claude')
+      return '<span class="pill triclaude" title="'+escAttr(hint||TRIAGE_LEGEND.claude[1])
+        + '">\\u26a1 for Claude</span>';
+    if (t === 'dismiss')
+      return '<span class="pill tridism" title="'+escAttr(hint||TRIAGE_LEGEND.dismiss[1])
+        + '">dismissible</span>';
+    return '';
+  }
   function impLegend(){
     return '<div class="legend">'+['resolved','unresolved','watching','dismissed']
       .map(r => '<span class="legitem'+(IMP_RES===r?' on':'')+'" title="click to filter" '
         + 'onclick="setImpRes('+escAttr(JSON.stringify(r))+')">'
-        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>';
+        + glyphSpan(r)+IMP_GLYPHS[r][2]+'</span>').join(' \\u00b7 ')+'</div>'
+      + '<div class="legend">'+['claude','dismiss']
+      .map(t => '<span class="legitem'+(IMP_TRIAGE===t?' on':'')+'" title="click to filter \\u2014 '
+        + escAttr(TRIAGE_LEGEND[t][1])+'" onclick="setImpTriage('+escAttr(JSON.stringify(t))+')">'
+        + triagePill(t)+' '+TRIAGE_LEGEND[t][1]+'</span>').join(' \\u00b7 ')+'</div>';
   }
   function setImpRes(r){
     IMP_RES = (IMP_RES === r) ? 'all' : r;   // toggle off when re-clicked
+    paintImprovements();
+  }
+  function setImpTriage(t){
+    IMP_TRIAGE = (IMP_TRIAGE === t) ? 'all' : t;
     paintImprovements();
   }
   // unknown resolutions render as the watching glyph, so filter them the same way
@@ -462,7 +500,8 @@ def render_page(token: str) -> str:
     if (el.innerHTML !== html) el.innerHTML = html;
   }
   function lessonPills(a){
-    let p = '<span class="pill">'+esc(a.status||'?')+'</span>';
+    let p = triagePill(a.triage, a.triage_hint);
+    p += (p ? ' ' : '') + '<span class="pill">'+esc(a.status||'?')+'</span>';
     if (a.category) p += ' <span class="pill">'+esc(a.category)+'</span>';
     if (a.rule_source && a.rule_source !== 'none')
       p += ' <span class="pill">'+esc(a.rule_source)+'</span>';
@@ -476,12 +515,38 @@ def render_page(token: str) -> str:
       : ' <span class="pill">not yet reflected</span>');
     return p;
   }
+  // A ready-to-paste prompt for a for-Claude card, so "hand it to Claude"
+  // is one click instead of hand-assembling context from the card.
+  function claudePrompt(a){
+    return 'MindHive incident `'+(a.signature||'')+'` ('+(a.occurrences||0)
+      + 'x, '+(a.resolution||'')+'). '
+      + (a.excerpt ? 'Error: '+a.excerpt+' ' : '')
+      + (a.lesson ? 'Lesson so far: '+a.lesson+' ' : '')
+      + (a.active_rule ? 'Current rule (leaking): '+a.active_rule+' ' : 'No rule yet. ')
+      + 'Please root-cause this and fix it (or write/repair the prevention rule).';
+  }
+  async function copyPrompt(btn){
+    const a = (IMP_ITEMS.auto||[]).find(x => x.signature === btn.dataset.sig);
+    if (!a) return;
+    try { await navigator.clipboard.writeText(claudePrompt(a)); }
+    catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = claudePrompt(a); document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    const old = btn.textContent; btn.textContent = 'copied \\u2713';
+    setTimeout(() => { btn.textContent = old; }, 1200);
+  }
   function lessonCard(a, showProj){
     const head = glyphSpan(a.resolution)
       + (showProj && a.project ? esc(a.project)+' \\u00b7 ' : '')
       + esc(a.signature)+' \\u00b7 '+(a.occurrences||0)+'\\u00d7 \\u00b7 '
       + (a.sessions||0)+' session'+((a.sessions||0)===1?'':'s')
       + (a.last_seen ? ' \\u00b7 last seen '+esc(a.last_seen) : '')
+      + (a.triage === 'claude'
+         ? '<button class="mini copybtn" data-sig="'+escAttr(a.signature)
+           + '" title="copy a ready-to-paste prompt for Claude">copy prompt</button>'
+         : '')
       + (a.resolution !== 'dismissed'
          ? '<button class="mini dismissbtn" data-sig="'+escAttr(a.signature)+'">dismiss</button>'
          : '');
@@ -503,6 +568,7 @@ def render_page(token: str) -> str:
     return '<li class="noterow" data-key="'+escAttr(noteKey(m))+'" style="cursor:pointer"><div class="file">'
       + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
       + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + srPill(m.origin)
       + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
       + '</div><div class="snip'+(open?'':' one')+'">'+esc(m.text||'')+'</div></li>';
   }
@@ -524,13 +590,14 @@ def render_page(token: str) -> str:
     const q = IMP_QUERY.trim().toLowerCase();
     const lessons = auto.filter(a =>
       (IMP_RES==='all' || resKey(a)===IMP_RES)
+      && (IMP_TRIAGE==='all' || a.triage===IMP_TRIAGE)
       && (IMP_STATUS==='all' || a.status===IMP_STATUS)
       && (IMP_CAT==='all' || a.category===IMP_CAT)
       && (!q || ((a.signature||'')+' '+(a.lesson||'')+' '+(a.prevention_rule||'')+' '
           +(a.root_cause||'')+' '+(a.excerpt||'')+' '+(a.project||'')).toLowerCase().includes(q)))
       .sort(impCompare);
-    // manual notes carry no resolution, so an active glyph filter shows lessons only
-    const notes = (IMP_RES==='all' ? manual : []).filter(m => !q
+    // manual notes carry no resolution/triage, so any active filter shows lessons only
+    const notes = ((IMP_RES==='all' && IMP_TRIAGE==='all') ? manual : []).filter(m => !q
       || ((m.text||'')+' '+(m.project||'')+' '+((m.tags||[]).join(' '))).toLowerCase().includes(q))
       .sort((a,b) => { const c = String(b.ts||'').localeCompare(String(a.ts||''));
                        return IMP_DIR==='desc' ? c : -c; });
@@ -558,6 +625,8 @@ def render_page(token: str) -> str:
     });
     view.querySelectorAll('.dismissbtn').forEach(el =>
       el.onclick = (ev) => { ev.stopPropagation(); dismissLesson(el.dataset.sig); });
+    view.querySelectorAll('.copybtn').forEach(el =>
+      el.onclick = (ev) => { ev.stopPropagation(); copyPrompt(el); });
   }
   // Reflect keeps the Heavy confirm (token spend) but lands back on the
   // Improvements view with an inline result banner instead of confirmAction's
@@ -616,18 +685,8 @@ def render_page(token: str) -> str:
     liveFn = renderImprovements; run('loading improvements', renderImprovements);
   }
 
-  // --- Sessions: the episode layer; click one to scope Memory to it ---
-  async function renderSessions(){
-    const items = await apiGet('/api/sessions');
-    if (!items.length) { showText('No sessions yet.'); return; }
-    showHTML('<h2 class="h">'+items.length+' session'+(items.length>1?'s':'')+'</h2><ul class="hits">'
-      + items.map(s => '<li class="sessrow" data-sid="'+escAttr(s.session_id)+'" style="cursor:pointer">'
-          + '<div class="file">'+(PROJECT==='*' && s.project ? esc(s.project)+' · ' : '')+esc(s.session_id)+'</div>'
-          + '<div class="snip">'+s.events+' events · '+s.memory+' memory · '
-          + esc(s.first_ts||'')+' → '+esc(s.last_ts||'')+'</div></li>').join('')
-      + '</ul>');
-    view.querySelectorAll('.sessrow').forEach(el => el.onclick = () => openSession(el.dataset.sid));
-  }
+  // --- Sessions: rendered by the notification-center fragment (taskview.py).
+  async function renderSessions(){ return renderTaskCards(); }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
@@ -659,6 +718,7 @@ def render_page(token: str) -> str:
       + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
       + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
       + esc(r.title || r.run_id)+'</span>'
+      + srPill(r.origin)
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
     const chat = r.kind === 'chat';
@@ -731,6 +791,75 @@ def render_page(token: str) -> str:
   function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
 
+  // --- mandatory code change-log (Log view) ---
+  function logBadge(cat){
+    const colors = {update:'#4a90d9', minor_change:'#6aa84f', deletion:'#d94a4a',
+                    reduction:'#d9a44a', major_change:'#b04ad9', replacement:'#4ad9c8'};
+    const c = colors[cat] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(cat||'?')+'</span>';
+  }
+  async function renderLog(){
+    const res = await apiGet('/api/changelog');
+    if (!res || !Array.isArray(res.entries)) throw new Error((res && res.error) || 'changelog fetch failed');
+    const pend = res.pending && res.pending.files && res.pending.files.length
+      ? '<div class="row"><span class="pill" style="color:#e0a030;border-color:#a67a20">'
+        + '\\u26a0 ' + res.pending.files.length + ' unlogged file(s) \\u2014 record the mandatory entry: '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code></span></div>'
+      : '';
+    if (!res.entries.length){
+      showHTML(pend + '<h2 class="h">No change-log entries yet \\u2014 every change to '
+        + 'mindhive code must be recorded with '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code> ('
+        + esc((res.categories || []).join(', ')) + ').</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(pend + '<h2 class="h">'+res.entries.length+' change-log entr'
+      + (res.entries.length===1?'y':'ies')+'</h2>'
+      + '<ul class="hits">' + res.entries.map(e =>
+        '<li><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
+        + ((e.files||[]).length ? '<div class="snip">'+(e.files||[]).map(esc).join(' \\u00b7 ')+'</div>' : '')
+        + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+        + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
+      + '</ul>');
+  }
+  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog); }
+
+  function sopBadge(action){
+    const colors = {add:'#6aa84f', update:'#4a90d9', 'delete':'#d94a4a'};
+    const c = colors[action] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(action||'?')+'</span>';
+  }
+  async function renderSops(){
+    const res = await apiGet('/api/sops');
+    if (!res || !Array.isArray(res.active)) throw new Error((res && res.error) || 'sop fetch failed');
+    const showProj = (PROJECT === '*');
+    if (!res.active.length && !res.history.length){
+      showHTML('<h2 class="h">No SOPs yet \\u2014 record standing procedures with '
+        + '<code>hive sop add &lt;id&gt; --title "\\u2026" --file &lt;body.md&gt;</code>. '
+        + 'Active SOPs auto-load into every session via STATE.md / MEMORY.md.</h2>');
+      return;
+    }
+    const act = res.active.map((r, i) =>
+      '<li><div class="file">SOP '+(i+1)+': '+esc(r.title)
+      + ' <span class="pill">'+esc(r.sop_id)+' v'+r.version+'</span>'
+      + (showProj && r.project ? ' <span class="pill">'+esc(r.project)+'</span>' : '')
+      + '</div><div class="snip" style="white-space:pre-wrap">'+esc(r.text)+'</div>'
+      + '<div class="snip dup">created '+esc(r.created||'')+' \\u00b7 updated '+esc(r.updated||'')+'</div></li>').join('');
+    const hist = res.history.map(e =>
+      '<li><div class="file">'+sopBadge(e.action)+' '+esc(e.sop_id)
+      + (e.title ? ' \\u2014 '+esc(e.title) : '') + '</div>'
+      + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+      + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') + '</div></li>').join('');
+    showHTML('<h2 class="h">'+res.active.length+' active SOP'
+      + (res.active.length===1?'':'s')+' (auto-loaded each session)</h2>'
+      + '<ul class="hits">'+act+'</ul>'
+      + '<h2 class="h">History ('+res.history.length+' lifecycle event'
+      + (res.history.length===1?'':'s')+')</h2>'
+      + '<ul class="hits">'+hist+'</ul>');
+  }
+  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops); }
+
   async function renderState(){ showText(await apiGet('/api/state')); }
   function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
   function showBriefing(){ controls.innerHTML=''; liveFn = null; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
@@ -785,6 +914,18 @@ def render_page(token: str) -> str:
     graph.src = u(withProj(view === 'research' ? '/api/research/page'
                                                : '/api/workspace/'+view));
   }
+
+  // Self-Reliant (an iframe) can ask the parent to open the Memory view filtered
+  // to a PRD's backing events — the section's link into the memory it wrote. Only
+  // trust messages from our own iframe on the same origin (never arbitrary posts).
+  window.addEventListener('message', function(ev){
+    if (ev.origin !== location.origin) return;
+    if (!graph || ev.source !== graph.contentWindow) return;
+    const d = ev.data;
+    if (!d || d.type !== 'mh-self-reliant' || d.action !== 'show-memory') return;
+    MEM_QUERY = String(d.query == null ? '' : d.query).slice(0, 200);
+    showMemory();
+  });
 
   function showAppend(){
     liveFn = null;
@@ -871,11 +1012,19 @@ def render_page(token: str) -> str:
     let calls = 0, ok = 0;
     Object.values(PLUG_STATS).forEach(s => { calls += s.calls||0; ok += s.ok||0; });
     const rate = calls ? Math.round(ok/calls*100)+'%' : '\\u2014';
+    const measured = cov.measured ?? 0;
+    const total = cov.total ?? (c.skills_total ?? 0);
+    // Cold-start honesty: before any skill has been called, show WHY the tiles
+    // read zero rather than a bare '0/0' that looks broken.
+    const rateLbl = calls ? ('completion rate \\u00b7 '+ok+'/'+calls+' calls')
+                          : 'completion rate \\u00b7 no calls recorded yet';
+    const measuredLbl = measured ? 'measured (\\u22653 calls)'
+                                 : 'measured \\u00b7 call skills to start measuring';
     return '<div class="cards" style="margin-bottom:12px">'
       + '<div class="card"><div class="big">'+(c.plugins ?? 0)+'</div><div class="lbl">plugins installed</div></div>'
       + '<div class="card"><div class="big ok">'+(c.skills_total ?? 0)+'</div><div class="lbl">skills total</div></div>'
-      + '<div class="card"><div class="big">'+(cov.measured ?? 0)+' of '+(cov.total ?? (c.skills_total ?? 0))+'</div><div class="lbl">measured (\\u22653 calls)</div></div>'
-      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">completion rate \\u00b7 '+ok+'/'+calls+' calls</div></div>'
+      + '<div class="card"><div class="big">'+measured+' of '+total+'</div><div class="lbl">'+measuredLbl+'</div></div>'
+      + '<div class="card"><div class="big">'+rate+'</div><div class="lbl">'+rateLbl+'</div></div>'
       + '</div>';
   }
   const PLUG_SORT_LABELS = {
@@ -1093,6 +1242,7 @@ def render_page(token: str) -> str:
               + (r.try_to_measure ? ' <span class="pill est">try to measure</span>' : '')
               + (e ? callBtn(e) : '')+'</div>'
               + (r.reason ? '<div class="snip dup">'+esc(r.reason)+'</div>' : '')
+              + (r.description ? '<div class="snip">intended use: '+esc(r.description)+'</div>' : '')
               + ((r.alternatives||[]).length ? '<div class="snip">alternatives: '
                   + r.alternatives.map(a => recChip(a.name)+' <span class="dup">('+esc(a.provenance)
                       + (a.try_to_measure ? ' \\u00b7 try to measure' : '')+')</span>').join(' \\u00b7 ')+'</div>' : '')
@@ -1311,7 +1461,11 @@ def render_page(token: str) -> str:
     run(label+' running…', async () => showText(await apiPost(path, body)));
   }
 
+  //__TASKS_JS__
+
   // populate the project picker, then land on the overview
   (async () => { await loadProjects(); showOverview(); })();
 </script>
-</body></html>""".replace("__TOKEN__", json.dumps(token))
+</body></html>""".replace("__TOKEN__", json.dumps(token)) \
+    .replace("/*__TASKS_CSS__*/", tasks_css) \
+    .replace("//__TASKS_JS__", tasks_js)

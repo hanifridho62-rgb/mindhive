@@ -65,3 +65,18 @@ def result_text(stdout: str) -> str:
     """The model's result text, or "" when the envelope is missing or is_error."""
     obj = _parse(stdout)
     return "" if obj is None or obj.get("is_error") else (obj.get("result", "") or "")
+
+
+def error_text(stdout: str) -> str:
+    """Why an is_error envelope failed, for health reporting: the api status
+    plus the CLI's own message (e.g. "429: You've hit your weekly limit …").
+    Empty string when the envelope is missing or not an error — the envelope's
+    error message must never be mistaken for model output."""
+    obj = _parse(stdout)
+    if obj is None or not obj.get("is_error"):
+        return ""
+    status = obj.get("api_error_status")
+    msg = str(obj.get("result") or obj.get("error") or "").strip()
+    if status and msg:
+        return f"{status}: {msg}"
+    return msg or (f"api error {status}" if status else "is_error envelope")

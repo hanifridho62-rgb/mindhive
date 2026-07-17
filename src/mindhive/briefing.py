@@ -1,7 +1,7 @@
 # src/mindhive/briefing.py
 import re
 from pathlib import Path
-from . import events as ev_mod, paths, projector, dedupe
+from . import events as ev_mod, paths, projector, dedupe, sop as sop_mod
 
 
 SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES  # decision, experiment_result, caveat, next_step, open_question, state_set
@@ -150,6 +150,16 @@ def build_briefing(evs) -> str:
                                     absorbed=absorbed):
         lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
     lines.append("")
+
+    # --- Standard operating procedures (titles only — full text rides the
+    # STATE.md block and `hive sop show`) ---
+    actives = sop_mod.current(evs)
+    if actives:
+        lines.append("## Standard operating procedures (active)")
+        lines.append("")
+        for r in actives:
+            lines.append(f"- `{r['sop_id']}` v{r['version']}: {r['title']}")
+        lines.append("")
 
     # --- Activity ---
     lines.append("## Activity (deterministic)")

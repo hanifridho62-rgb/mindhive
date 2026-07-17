@@ -121,7 +121,25 @@ def _failures_by_sig(project, evs=None) -> dict:
     return out
 
 
-def _has_lifecycle(project, etype, signature, evs=None) -> bool:
+def _lifecycle_index(evs) -> dict:
+    """(etype, signature) -> [Event, ...] in ledger order, covering the rule_*
+    lifecycle events the per-signature status helpers consult. Built ONCE per
+    projection rebuild and threaded through — without it project()/audit()
+    re-scan the whole ledger several times per signature, which measured ~50s
+    on a 6.4k-event store (the dismiss button and the 3s auto-harvest loop
+    both sat on that path)."""
+    idx = {}
+    for ev in evs:
+        if ev.type in _LIFECYCLE_TYPES and isinstance(ev.payload, dict):
+            s = ev.payload.get("signature")
+            if s:
+                idx.setdefault((ev.type, s), []).append(ev)
+    return idx
+
+
+def _has_lifecycle(project, etype, signature, evs=None, life=None) -> bool:
+    if life is not None:
+        return bool(life.get((etype, signature)))
     for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == etype and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
@@ -129,7 +147,10 @@ def _has_lifecycle(project, etype, signature, evs=None) -> bool:
     return False
 
 
-def _activation_ts(project, signature, evs=None) -> str | None:
+def _activation_ts(project, signature, evs=None, life=None) -> str | None:
+    if life is not None:
+        hits = life.get(("rule_activated", signature))
+        return hits[0].ts if hits else None
     for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_activated" and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
@@ -137,11 +158,14 @@ def _activation_ts(project, signature, evs=None) -> str | None:
     return None
 
 
-def _latest_expiry_ts(project, signature, evs=None) -> str | None:
+def _latest_expiry_ts(project, signature, evs=None, life=None) -> str | None:
     """ts of the most recent rule_expired event for a signature, or None.
     Occurrences for status purposes count only failures after this point, so
-    re-entry after decay starts a fresh candidate→active climb. Pass evs to
-    reuse an events.read_all() result."""
+    re-entry after decay starts a fresh candidate→active climb. Pass evs (or a
+    prebuilt ``life`` index) to reuse an events.read_all() result."""
+    if life is not None:
+        hits = life.get(("rule_expired", signature))
+        return max(ev.ts for ev in hits) if hits else None
     latest = None
     for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_expired" and isinstance(ev.payload, dict) \
@@ -151,12 +175,12 @@ def _latest_expiry_ts(project, signature, evs=None) -> str | None:
     return latest
 
 
-def _live_failures(project, signature, failures, evs=None) -> list:
+def _live_failures(project, signature, failures, evs=None, life=None) -> list:
     """The status-relevant slice of a signature's failures: everything after
     the latest rule_expired, or all of them when it never expired. ``failures``
-    is that signature's tool_failed list; ``evs`` optionally reuses the full
-    events.read_all() result for the expiry lookup."""
-    exp = _latest_expiry_ts(project, signature, evs=evs)
+    is that signature's tool_failed list; ``evs``/``life`` optionally reuse a
+    full events.read_all() result / lifecycle index for the expiry lookup."""
+    exp = _latest_expiry_ts(project, signature, evs=evs, life=life)
     return [e for e in failures if e.ts > exp] if exp else failures
 
 
@@ -174,11 +198,16 @@ def _ts_secs(ts) -> float | None:
 MAX_REROUTES = 3
 
 
-def _latest_reroute(project, signature, evs=None):
+def _latest_reroute(project, signature, evs=None, life=None):
     """(ts, session_id) of the most recent rule_rerouted event for a signature,
     or (None, None). A reroute replaces a failed rule with an alternative route,
     so it re-anchors leak/exposure accounting (see signal_stats)."""
     ts = sess = None
+    if life is not None:
+        for ev in life.get(("rule_rerouted", signature)) or []:
+            if ts is None or ev.ts > ts:
+                ts, sess = ev.ts, ev.session_id
+        return ts, sess
     for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_rerouted" and isinstance(ev.payload, dict) \
                 and ev.payload.get("signature") == signature:
@@ -187,51 +216,59 @@ def _latest_reroute(project, signature, evs=None):
     return ts, sess
 
 
-def reroute_count(project=None, signature=None, evs=None) -> int:
+def reroute_count(project=None, signature=None, evs=None, life=None) -> int:
     """How many times a signature's rule has been rerouted (alternative route
     deployed after the previous rule leaked)."""
+    if life is not None:
+        return len(life.get(("rule_rerouted", signature)) or [])
     return sum(1 for ev in (evs if evs is not None else events.read_all(project))
                if ev.type == "rule_rerouted" and isinstance(ev.payload, dict)
                and ev.payload.get("signature") == signature)
 
 
-def leaks(project=None, signature=None) -> int:
+def leaks(project=None, signature=None, by_sig=None, life=None) -> int:
     """Count tool_failed events for a signature that occurred AFTER its rule
     activated — i.e. the same error recurred despite an active rule. A reroute
     re-anchors the count: only failures after the latest rule_rerouted (from a
     session other than the one that deployed the route) count, so the new route
-    gets a fair chance to prove itself."""
-    act = _activation_ts(project, signature)
+    gets a fair chance to prove itself. Pass by_sig/life to reuse a prebuilt
+    _failures_by_sig map and lifecycle index."""
+    act = _activation_ts(project, signature, life=life)
     if not act:
         return 0
-    r_ts, r_sess = _latest_reroute(project, signature)
+    r_ts, r_sess = _latest_reroute(project, signature, life=life)
     anchor, skip = (r_ts, r_sess) if (r_ts and r_ts > act) else (act, None)
-    evs = _failures_by_sig(project).get(signature, [])
+    if by_sig is None:
+        by_sig = _failures_by_sig(project)
+    evs = by_sig.get(signature, [])
     return sum(1 for e in evs
                if e.ts > anchor and (skip is None or e.session_id != skip))
 
 
-def _status_and_flag(project, signature, rec, threshold, source):
-    if _has_lifecycle(project, "rule_promoted", signature):
+def _status_and_flag(project, signature, rec, threshold, source,
+                     by_sig=None, life=None):
+    if by_sig is None:
+        by_sig = _failures_by_sig(project)
+    if _has_lifecycle(project, "rule_promoted", signature, life=life):
         return "promoted", ""
     occurrences = rec["occurrences"]
-    if _latest_expiry_ts(project, signature) is not None:
+    if _latest_expiry_ts(project, signature, life=life) is not None:
         # Post-expiry occurrences only: 0 -> expired (stays expired across a
         # full project() rebuild), 1 -> candidate again, threshold -> active.
         occurrences = len(_live_failures(
-            project, signature, _failures_by_sig(project).get(signature, [])))
+            project, signature, by_sig.get(signature, []), life=life))
         if occurrences == 0:
             return "expired", ""
     if occurrences < _threshold_for(signature, threshold):
         return "candidate", ""
-    if _has_lifecycle(project, "rule_demoted", signature):
+    if _has_lifecycle(project, "rule_demoted", signature, life=life):
         return "demoted", ""
     # leaks() is reroute-anchored, so deploying an alternative route resets the
     # count and un-demotes an auto rule that leaked under its OLD text — the
     # new route re-enters injection and gets its own chance to hold.
-    lk = leaks(project, signature)
+    lk = leaks(project, signature, by_sig=by_sig, life=life)
     exhausted = (source == "auto" and lk >= 1
-                 and reroute_count(project, signature) >= MAX_REROUTES)
+                 and reroute_count(project, signature, life=life) >= MAX_REROUTES)
     if source == "auto" and lk >= LEAK_LIMIT:
         return "demoted", ("reroute_exhausted" if exhausted else "")
     flag = "needs_review" if source == "human" and lk >= 1 else ""
@@ -240,20 +277,26 @@ def _status_and_flag(project, signature, rec, threshold, source):
     return "active", flag
 
 
-def audit(project=None, threshold=THRESHOLD, now=None) -> dict:
+def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
     """Emit a one-time rule_activated event (stamped at the threshold-crossing
     failure's ts) for any signature that has reached its recurrence threshold
     (judgment:flag:* activates at 1) and isn't activated yet. Also decays stale
     noise: a candidate with exactly one live occurrence whose latest failure is
     older than DECAY_DAYS gains a rule_expired lifecycle event — except
     judgment:flag:* incidents, which never expire. Idempotent: an expiry zeroes
-    the live count, so re-running appends nothing new."""
+    the live count, so re-running appends nothing new. Pass evs to reuse an
+    events.read_all() result (one ledger pass total instead of several per
+    signature)."""
     activated = expired = 0
     now_secs = _ts_secs(now) if now else time.time()
-    for signature, evs in _failures_by_sig(project).items():
-        live = _live_failures(project, signature, evs)
+    if evs is None:
+        evs = events.read_all(project)
+    life = _lifecycle_index(evs)
+    for signature, sig_evs in _failures_by_sig(project, evs=evs).items():
+        live = _live_failures(project, signature, sig_evs, life=life)
         thr = _threshold_for(signature, threshold)
-        if len(live) >= thr and not _has_lifecycle(project, "rule_activated", signature):
+        if len(live) >= thr and not _has_lifecycle(
+                project, "rule_activated", signature, life=life):
             crossing_ts = live[thr - 1].ts
             events.append_event("rule_activated", {"signature": signature},
                                 tags=["lifecycle"], ts=crossing_ts, project=project)
@@ -276,10 +319,10 @@ def _incident_dir(project=None):
     return paths.project_dir(project) / "rules" / "incidents"
 
 
-def _collect(project):
+def _collect(project, evs=None):
     """signature -> {occurrences, actions[], excerpt, sessions[]} from events."""
     acc = {}
-    for ev in events.read_all(project):
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type != "tool_failed":
             continue
         p = ev.payload if isinstance(ev.payload, dict) else {}
@@ -388,10 +431,17 @@ sessions: {len(rec['sessions'])}
 """
 
 
-def project(project=None, threshold=THRESHOLD) -> dict:
+def project(project=None, threshold=THRESHOLD, evs=None) -> dict:
     """(Re)write an incident record per signature, preserving the Auto and Human
-    Evaluation sections and re-deriving the Active rule. Returns {records: n}."""
-    acc = _collect(project)
+    Evaluation sections and re-deriving the Active rule. Returns {records: n}.
+    Reads the ledger ONCE and threads the pass through every per-signature
+    status helper — the previous shape re-read the whole ledger several times
+    per signature and took ~50s on the live store."""
+    if evs is None:
+        evs = events.read_all(project)
+    acc = _collect(project, evs=evs)
+    by_sig = _failures_by_sig(project, evs=evs)
+    life = _lifecycle_index(evs)
     d = _incident_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     with _write_guard(project):
@@ -404,19 +454,20 @@ def project(project=None, threshold=THRESHOLD) -> dict:
                 auto_body = secs.get("Auto Evaluation", auto_body) or auto_body
                 human_body = secs.get("Human Evaluation", human_body) or human_body
             active, source = derive_active(auto_body, human_body)
-            status, flag = _status_and_flag(project, signature, rec, threshold, source)
+            status, flag = _status_and_flag(project, signature, rec, threshold,
+                                            source, by_sig=by_sig, life=life)
             _atomic_write(path, _render(signature, rec, status, auto_body,
                                         human_body, active, source, flag))
     return {"records": len(acc)}
 
 
-def _last_revision(project, signature) -> str:
-    """The most recent human rule_revised text for a signature, or ''. """
-    latest = ""
-    for ev in events.read_all(project):
+def _last_revisions(project, evs=None) -> dict:
+    """signature -> most recent human rule_revised text, in one ledger pass."""
+    latest = {}
+    for ev in (evs if evs is not None else events.read_all(project)):
         if ev.type == "rule_revised" and isinstance(ev.payload, dict) \
-                and ev.payload.get("signature") == signature:
-            latest = ev.payload.get("text", "")
+                and ev.payload.get("signature"):
+            latest[ev.payload["signature"]] = ev.payload.get("text", "")
     return latest
 
 
@@ -427,6 +478,7 @@ def reconcile(project=None) -> dict:
     revised = 0
     if not d.exists():
         return {"revised": 0}
+    revisions = _last_revisions(project)
     for path in sorted(d.glob("*.md")):
         text = path.read_text(encoding="utf-8")
         secs = _split_sections(text)
@@ -439,7 +491,7 @@ def reconcile(project=None) -> dict:
         if not signature:
             continue
         human = _human_text(secs.get("Human Evaluation", ""))
-        if human and human != _last_revision(project, signature):
+        if human and human != revisions.get(signature, ""):
             events.append_event("rule_revised",
                                 {"signature": signature, "text": human, "source": "human"},
                                 tags=["reconcile"], project=project)
@@ -746,6 +798,32 @@ def classify_resolution(summary: dict, stats: dict) -> str:
     if not stats.get("exposure"):
         return "watching"
     return "resolved"
+
+
+def classify_triage(resolution: str, summary: dict) -> dict:
+    """Who should act on a lesson card, so the Improvements view can say it
+    outright: ``{"triage": "claude"|"dismiss"|"", "triage_hint": str}``.
+
+    ``claude`` — pending agent work exists: the lesson is unresolved (at
+    threshold with no rule yet, or its rule keeps leaking); hand it to Claude
+    (or the Reflect / resolve-red buttons) to root-cause and fix.
+    ``dismiss`` — no agent work: watching (below threshold / unproven — may
+    just be noise) or resolved (rule active and holding); safe for the user
+    to clear manually with the dismiss button whenever they judge it done.
+    ``""`` — already dismissed; nothing to mark."""
+    if resolution == "dismissed":
+        return {"triage": "", "triage_hint": ""}
+    if resolution == "unresolved":
+        no_rule = summary.get("rule_source") in (None, "", "none")
+        hint = ("no rule yet — run Reflect, or hand this signature to Claude "
+                "to root-cause and fix" if no_rule else
+                "the rule keeps leaking — run resolve red, or ask Claude to "
+                "fix the root cause")
+        return {"triage": "claude", "triage_hint": hint}
+    hint = ("below threshold / unproven — dismiss it if you judge it noise"
+            if resolution == "watching"
+            else "rule active and holding — safe to dismiss whenever you like")
+    return {"triage": "dismiss", "triage_hint": hint}
 
 
 def _as_int(v) -> int:

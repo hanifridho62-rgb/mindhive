@@ -49,10 +49,22 @@ def parse_reflection(text: str) -> dict:
 
 
 def _claude_runner(prompt: str, timeout_s: int = 120) -> str:
-    """Default runner: one-shot headless `claude` call, returns the result text
-    (empty on any spawn failure or an is_error envelope)."""
-    return claude_cli.result_text(
-        claude_cli.run_headless(prompt, timeout_s=timeout_s)["stdout"])
+    """Default runner: one-shot headless `claude` call, returns the result text.
+    Raises RuntimeError carrying the REAL failure cause (quota/auth message,
+    spawn failure) so the health marker can report it — a bare "empty verdict"
+    hid a 429 weekly-limit exhaustion behind an auth-shaped warning for days."""
+    r = claude_cli.run_headless(prompt, timeout_s=timeout_s)
+    text = claude_cli.result_text(r["stdout"])
+    if text:
+        return text
+    err = claude_cli.error_text(r["stdout"])
+    if not err and r["exit"] == 127:
+        err = "claude CLI not found"
+    elif not err and r["exit"] == 124:
+        err = f"claude CLI timed out after {timeout_s}s"
+    if err:
+        raise RuntimeError(err)
+    return ""
 
 
 from . import incidents
@@ -178,9 +190,9 @@ def reflect_incident(signature, project=None, runner=_claude_runner) -> dict:
     fail_reason = "empty verdict"
     try:
         verdict = parse_reflection(runner(build_prompt(signature, raw, [])))
-    except Exception as e:         # keep the class for the health marker
+    except Exception as e:         # keep the real cause for the health marker
         verdict = {}
-        fail_reason = type(e).__name__
+        fail_reason = (str(e).strip() or type(e).__name__)[:160]
     if not verdict.get("prevention_rule"):
         verdict = fallback_verdict(signature)
     if not verdict.get("prevention_rule"):
@@ -309,8 +321,8 @@ def health_note(project=None) -> str:
     err = m.get("last_error") or "unknown"
     return (f"⚠ Reflection health: auto-reflection is failing (last error: {err}; "
             f"last attempt {m.get('last_attempt')}, last success "
-            f"{m.get('last_success') or 'never'}). Check `claude` CLI auth, then "
-            f"run `hive rules reflect`.")
+            f"{m.get('last_success') or 'never'}). Check `claude` CLI auth/quota, "
+            f"then run `hive rules reflect`.")
 
 
 def _refresh_projections(project=None) -> None:

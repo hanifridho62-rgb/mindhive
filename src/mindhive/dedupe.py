@@ -81,6 +81,16 @@ def collapse(items, threshold: float = DEFAULT_THRESHOLD) -> list:
     reps = []          # list of (key, token_set, norm_text, rep_dict)
     out = []
     for item in items:
+        # Audit/registry entries never collapse: two similarly-worded
+        # change-log entries are genuinely distinct changes, and two SOP
+        # lifecycle events (an add and its later update) are distinct steps
+        # of one procedure's history (mirrors the CONSOLIDATE_TYPES
+        # exemption in consolidate.py).
+        if item.get("type") in ("code_change", "sop"):
+            rep = dict(item)
+            rep["similar_count"] = 0
+            out.append(rep)
+            continue
         text = item.get("text", "") or ""
         key = (item.get("type"), item.get("project"))
         toks = normalize(text)

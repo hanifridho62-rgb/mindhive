@@ -308,6 +308,101 @@ def test_compose_program_iteration_contract_and_prior_result():
     assert "1.31" in prog and "lr 0.01 -> 0.02" in prog
 
 
+def test_compose_program_learn_mode_is_read_only_and_writes_a_prd():
+    out = research.compose_program(
+        "g", train_path=r"\\wsl$\u\train.py", mode="learn")
+    prog, system = out["program"], out["system"]
+    low = prog.lower()
+    assert "read-only" in low
+    assert "never touch github" in low
+    # the output is now a buildable PRD ending in an SOP, not a loose report
+    assert "prd" in low and "product requirement document" in low
+    assert "sop" in low
+    # the machine-readable card header the parser keys on
+    assert "title:" in low and "summary:" in low
+    assert "read exactly this file" in low and "do not edit" in low
+    # the improve-mode edit contract must NOT leak into learn mode
+    assert "edit train.py only" not in low
+    assert system == research._ANALYSIS_CONTRACT
+
+
+def test_compose_program_learn_mode_sop_draws_on_installed_inventory():
+    """The SOP must be composed from real installed skills/plugins, named
+    verbatim — the inventory is rendered into the program in learn mode only."""
+    inv = [{"name": "ce-plan", "plugin": "compound-engineering"},
+           {"name": "tdd-cycle", "plugin": "tdd-workflows"}]
+    prog = research.compose_program("g", mode="learn", inventory=inv)["program"]
+    assert "ce-plan" in prog and "compound-engineering" in prog
+    assert "tdd-cycle" in prog
+    assert "verbatim" in prog.lower()
+    # improve mode never renders the installed-inventory block
+    assert "ce-plan" not in research.compose_program(
+        "g", mode="improve", inventory=inv)["program"]
+
+
+def test_compose_program_learn_mode_frames_staged_skills_as_sop_primary():
+    """Staged skills are the SOP's primary building blocks in learn mode, not
+    edit guidance — the improve-mode 'steer your edits' framing must not leak."""
+    staged = [{"name": "ce-code-review", "plugin": "compound-engineering"}]
+    prog = research.compose_program("g", skills=staged, mode="learn")["program"]
+    low = prog.lower()
+    assert "ce-code-review" in prog
+    assert "primary" in low and "sop" in low
+    assert "steer" not in low
+
+
+def test_compose_program_learn_mode_suppresses_no_edit_nudge():
+    prior = {"val_bpb": 1.86, "status": "ok", "change": "no change"}
+    prog = research.compose_program("g", prior=prior, mode="learn")["program"]
+    assert "MUST make" not in prog          # scolding an analyst is nonsense
+
+
+def test_compose_program_improve_mode_is_unchanged_default():
+    """mode defaults to improve and renders byte-identical to the explicit
+    call — protects every existing caller and test (R6)."""
+    default = research.compose_program(
+        "g", train_path=r"\\wsl$\u\train.py")
+    explicit = research.compose_program(
+        "g", train_path=r"\\wsl$\u\train.py", mode="improve")
+    assert default == explicit
+    assert default["system"] == research._ITERATION_CONTRACT
+    assert "edit exactly this" in default["program"]
+
+
+def test_compose_program_learn_mode_grounds_analysis_in_history():
+    """Learn mode is told to study 'the experiment history' — so the composed
+    program must actually contain the leaderboard records (R2)."""
+    history = [{"status": "ok", "val_bpb": 1.58, "change": "lr 0.03"},
+               {"status": "oom", "val_bpb": None, "change": "batch 2**19"}]
+    prog = research.compose_program("g", mode="learn", history=history)["program"]
+    assert "Experiment history" in prog
+    assert "val_bpb 1.58" in prog and "lr 0.03" in prog
+    assert "oom" in prog
+    # improve mode never renders the history block
+    assert "Experiment history" not in research.compose_program(
+        "g", mode="improve", history=history)["program"]
+
+
+def test_parse_prd_extracts_title_summary_and_strips_header():
+    report = ("TITLE: Add a KV-cache to the eval loop\n"
+              "SUMMARY: Cache attention keys/values so eval is cheaper\n\n"
+              "# PRD\n1. Problem ...")
+    prd = research.parse_prd(report, 3, goal="lower val_bpb")
+    assert prd["n"] == 3
+    assert prd["title"] == "Add a KV-cache to the eval loop"
+    assert prd["summary"] == "Cache attention keys/values so eval is cheaper"
+    assert prd["body"].startswith("# PRD")
+    # the header lines are lifted into title/summary, not duplicated in the body
+    assert "TITLE:" not in prd["body"] and "SUMMARY:" not in prd["body"]
+
+
+def test_parse_prd_falls_back_when_headers_missing():
+    prd = research.parse_prd("Just some analysis text.\nMore.", 1)
+    assert prd["title"] == "PRD 1"
+    assert prd["summary"] == "Just some analysis text."
+    assert prd["body"] == "Just some analysis text.\nMore."
+
+
 def test_leaderboard_concurrent_appends_no_loss(tmp_path):
     path = tmp_path / "lb.json"
 
@@ -370,7 +465,7 @@ def _controller(tmp_path, trainer=None, researcher=None, ledger=None,
         train_path=train_py,
         leaderboard=research.Leaderboard(tmp_path / "lb.json"),
         append_event=ledger if ledger is not None else FakeLedger(),
-        preflight=lambda profile: [],
+        preflight=lambda profile, mode: [],
         **kw)
 
 
@@ -398,7 +493,7 @@ def test_controller_start_while_running_rejected(tmp_path):
 
 def test_controller_preflight_failure_rejects_start(tmp_path):
     ctl = _controller(tmp_path)
-    ctl._preflight = lambda profile: ["WSL not reachable"]
+    ctl._preflight = lambda profile, mode: ["WSL not reachable"]
     res = ctl.start("g")
     assert not res["ok"] and "WSL not reachable" in res["error"]
     assert ctl.status()["state"] == "idle"
@@ -526,6 +621,212 @@ def test_controller_aborted_turn_stops_agent_so_next_turn_is_not_busy(tmp_path):
     assert researcher.stopped               # the abort stopped the orphan
 
 
+# --- U2: ManagerResearcher forwards the no-GitHub tool policy ----------------
+
+class _FakeAgent:
+    def __init__(self):
+        self.status = "done"
+        self.lines = ["report line"]
+        self.last_result = "hypothesis: lower lr"
+
+
+class _FakeManager:
+    """Captures the kwargs ManagerResearcher passes to send()."""
+
+    def __init__(self):
+        self.sent = []
+
+    def spawn(self, **kw):
+        return {"ok": True, "agent": {"id": "a1"}}
+
+    def send(self, agent_id, prompt, **kw):
+        self.sent.append(kw)
+        return {"ok": True}
+
+    def get(self, agent_id):
+        return _FakeAgent()
+
+
+def test_manager_researcher_forwards_tool_policy_and_report():
+    mgr = _FakeManager()
+    r = research.ManagerResearcher(
+        manager=mgr, allowed_tools=research.self_reliant_allowed_tools(),
+        disallowed_tools=research.GITHUB_DENY)
+    out = r.turn("analyze train.py")
+    assert out["ok"] and out["report"] == "hypothesis: lower lr"
+    kw = mgr.sent[0]
+    assert kw["allowed_tools"] == research.self_reliant_allowed_tools()
+    assert kw["disallowed_tools"] == research.GITHUB_DENY
+
+
+def test_manager_researcher_default_tool_policy_is_none():
+    mgr = _FakeManager()
+    r = research.ManagerResearcher(manager=mgr)
+    r.turn("go")
+    kw = mgr.sent[0]
+    assert kw["allowed_tools"] is None and kw["disallowed_tools"] is None
+
+
+# --- U4: learn mode — analyze-and-learn, no training -------------------------
+
+class ReportingResearcher(StubResearcher):
+    def turn(self, prompt):
+        self.prompts.append(prompt)
+        return {"ok": True, "report": f"hypothesis {len(self.prompts)}"}
+
+
+def test_controller_learn_mode_persists_learnings_without_training(tmp_path):
+    calls = {"n": 0}
+
+    def trainer(i):
+        calls["n"] += 1                          # must never fire in learn mode
+        return _cmd("--mode", "ok", "--seconds", "0.05")
+
+    ledger = FakeLedger()
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher, trainer=trainer,
+                      ledger=ledger)
+    assert ctl.start("lower val_bpb", max_experiments=2, mode="learn")["ok"]
+    _wait_ended(ctl)
+    st = ctl.status()
+    assert st["reason"] == "cap" and st["mode"] == "learn"
+    assert st["experiments"] == 2
+    assert calls["n"] == 0                        # the trainer never ran
+    assert ctl.leaderboard.all() == []            # learn mode records no experiments
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 2
+    assert "self-reliant" in learnings[0]["tags"]
+    assert "learning" in learnings[0]["tags"]
+    assert "hypothesis 1" in learnings[0]["payload"]["report"]
+    art = ctl._learnings_path()
+    assert art.exists() and "hypothesis 1" in art.read_text(encoding="utf-8")
+
+
+def test_controller_learn_mode_stores_structured_prds(tmp_path):
+    """Each analysis turn's report is parsed into a structured PRD record the
+    UI renders as a card (title + one-line summary + full body)."""
+    class PRDStub(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            n = len(self.prompts)
+            return {"ok": True, "report":
+                    f"TITLE: Build thing {n}\nSUMMARY: does thing {n}\n\n"
+                    f"# PRD\nbody {n}"}
+
+    ctl = _controller(tmp_path, researcher=PRDStub())
+    assert ctl.start("g", max_experiments=2, mode="learn")["ok"]
+    _wait_ended(ctl)
+    prds = ctl.prds()
+    assert [p["title"] for p in prds] == ["Build thing 1", "Build thing 2"]
+    assert prds[0]["summary"] == "does thing 1"
+    assert "body 1" in prds[0]["body"]
+
+
+def test_controller_learn_mode_feeds_installed_inventory_into_sop(tmp_path):
+    """The controller hands the installed-skills inventory to the researcher so
+    the SOP can be composed from real skills/plugins (staged-first, all
+    allowed)."""
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher,
+                      skills_inventory=lambda: [
+                          {"name": "ce-plan", "plugin": "compound-engineering"}])
+    assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert "ce-plan" in researcher.prompts[0]
+
+
+def test_controller_learn_mode_aborted_turn_counts_and_continues(tmp_path):
+    class SlowThenReport(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                time.sleep(5)                    # exceeds turn_timeout_s
+            return {"ok": True, "report": "insight"}
+
+    ledger = FakeLedger()
+    researcher = SlowThenReport()
+    ctl = _controller(tmp_path, researcher=researcher, ledger=ledger,
+                      turn_timeout_s=0.3)
+    assert ctl.start("g", max_experiments=2, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["reason"] == "cap"
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 1                    # aborted round wrote no learning
+    assert researcher.stopped                     # abort stopped the in-flight agent
+
+
+def test_controller_learn_mode_sets_read_only_tool_policy(tmp_path):
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher)
+    assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert researcher.allowed_tools == research.self_reliant_allowed_tools()
+    assert researcher.disallowed_tools == research.GITHUB_DENY
+
+
+def test_controller_improve_mode_denies_github_but_stays_editable(tmp_path):
+    researcher = StubResearcher()
+    ctl = _controller(tmp_path, researcher=researcher)
+    assert ctl.start("g", max_experiments=1)["ok"]   # default improve
+    _wait_ended(ctl)
+    assert researcher.allowed_tools is None           # not read-only — can Edit
+    assert researcher.disallowed_tools == research.GITHUB_DENY
+
+
+def test_controller_learn_mode_skips_empty_and_duplicate_reports(tmp_path):
+    """Empty and unchanged reports must not flood the ledger or poison future
+    recall — the round still counts toward the cap, but nothing is recorded."""
+    class Scripted(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            reports = ["", "same insight", "same insight", "fresh insight"]
+            return {"ok": True, "report": reports[len(self.prompts) - 1]}
+
+    ledger = FakeLedger()
+    ctl = _controller(tmp_path, researcher=Scripted(), ledger=ledger)
+    assert ctl.start("g", max_experiments=4, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["experiments"] == 4          # all 4 rounds counted
+    learnings = [e for e in ledger.events if e["type"] == "learning"]
+    assert len(learnings) == 2                        # empty + duplicate skipped
+    reports = [e["payload"]["report"] for e in learnings]
+    assert reports == ["same insight", "fresh insight"]
+
+
+def test_controller_learn_mode_uncapped_falls_back_to_default_rounds(tmp_path):
+    """An uncapped, unbudgeted learn run would loop forever (identical state);
+    it must terminate at the default round cap instead."""
+    class Varying(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            return {"ok": True, "report": f"insight {len(self.prompts)}"}
+
+    ctl = _controller(tmp_path, researcher=Varying())
+    assert ctl.start("g", mode="learn")["ok"]         # no cap, no budget
+    _wait_ended(ctl)
+    st = ctl.status()
+    assert st["reason"] == "cap"
+    assert st["experiments"] == research._DEFAULT_LEARN_ROUNDS
+
+
+def test_controller_learn_mode_fails_closed_if_policy_cannot_be_set(tmp_path):
+    """If the no-GitHub boundary can't be applied, a learn run must refuse to
+    start rather than silently run as an unrestricted agent."""
+    class Unsettable(StubResearcher):
+        @property
+        def allowed_tools(self):
+            return None
+
+        @allowed_tools.setter
+        def allowed_tools(self, v):
+            raise RuntimeError("cannot restrict this researcher")
+
+    ctl = _controller(tmp_path, researcher=Unsettable())
+    res = ctl.start("g", max_experiments=1, mode="learn")
+    assert res["ok"] is False
+    assert ctl.status()["state"] == "idle"            # never went live
+
+
 def test_controller_malformed_caps_rejected_structurally(tmp_path):
     ctl = _controller(tmp_path)
     res = ctl.start("g", max_experiments="lots")
@@ -544,7 +845,7 @@ def test_controller_uninjected_leaderboard_is_per_run(tmp_path, monkeypatch):
         trainer_cmd=_cmd("--mode", "ok", "--seconds", "0.05"),
         agent_factory=lambda profile, model=None: StubResearcher(),
         train_path=tmp_path / "train.py",
-        append_event=None, preflight=lambda profile: [],
+        append_event=None, preflight=lambda profile, mode: [],
         cap_s=20, turn_timeout_s=10)
     assert ctl.start("g", max_experiments=1)["ok"]
     _wait_ended(ctl)
@@ -756,3 +1057,147 @@ def test_api_post_start_threads_model(tmp_path, monkeypatch):
     assert res["ok"]
     _wait_ended(ctl)
     assert seen["model"] == "claude-haiku-4-5-20251001"
+
+
+# --- U5: mode threads through the start API; learnings are readable ----------
+
+def test_api_post_start_threads_learn_mode(tmp_path, monkeypatch):
+    ctl = _controller(tmp_path, researcher=ReportingResearcher())
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1,
+                                           "mode": "learn"})
+    assert res["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["mode"] == "learn"
+    # the learnings the run persisted are readable through the GET API
+    out = research.api_get("learnings")
+    assert out["ok"] and "hypothesis 1" in out["learnings"]
+
+
+def test_api_get_prds_returns_structured_records(tmp_path, monkeypatch):
+    """/api/research/prds serves the parsed PRD cards the Self-Reliant page
+    renders and links back to Memory."""
+    class PRDStub(StubResearcher):
+        def turn(self, prompt):
+            self.prompts.append(prompt)
+            return {"ok": True, "report":
+                    "TITLE: Ship the thing\nSUMMARY: builds the thing\n\n# PRD"}
+
+    ctl = _controller(tmp_path, researcher=PRDStub())
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1,
+                                           "mode": "learn"})
+    assert res["ok"]
+    _wait_ended(ctl)
+    out = research.api_get("prds")
+    assert out["ok"]
+    assert out["prds"][0]["title"] == "Ship the thing"
+    assert out["prds"][0]["summary"] == "builds the thing"
+
+
+def test_api_post_start_defaults_to_improve_mode(tmp_path, monkeypatch):
+    ctl = _controller(tmp_path)
+    monkeypatch.setattr(research, "CONTROLLER", ctl)
+    monkeypatch.setattr(research, "_primed_learnings", lambda *a, **k: [])
+    res = research.api_post("start", body={"goal": "g", "max_experiments": 1})
+    assert res["ok"]
+    _wait_ended(ctl)
+    assert ctl.status()["mode"] == "improve"
+    assert research.api_get("learnings")["learnings"] == ""
+
+
+# --- U6: GitHub-boundary regression guard -------------------------------------
+# Locks the boundary so a future edit cannot silently reopen it (R4/R5).
+
+def test_github_boundary_regression_guard():
+    # (a) the file-tool base of the learn-mode allowlist is exactly the
+    # read-only trio — no shell (Bash), no Skill (which could shell out)
+    # => git/gh are unreachable
+    assert research.SELF_RELIANT_READONLY_TOOLS == ["Read", "Grep", "Glob"]
+    allowed = research.self_reliant_allowed_tools()
+    lowered = [t.lower() for t in allowed]
+    assert "bash" not in lowered and "skill" not in lowered
+    assert all("git" != t and t != "gh" for t in lowered)
+    # every non-trio entry is read-only web access: WebSearch, or WebFetch
+    # pinned to a single trusted domain — never an unpinned WebFetch
+    for t in allowed:
+        if t in research.SELF_RELIANT_READONLY_TOOLS or t == "WebSearch":
+            continue
+        assert t.startswith("WebFetch(domain:") and t.endswith(")"), t
+        assert t[len("WebFetch(domain:"):-1] in research.TRUSTED_SOURCE_DOMAINS
+    # (b) the deny list blocks git, gh, and the GitHub MCP in every mode
+    assert "Bash(git:*)" in research.GITHUB_DENY
+    assert "Bash(gh:*)" in research.GITHUB_DENY
+    assert "mcp__github__*" in research.GITHUB_DENY
+    # (c) the learn contract states the boundary in prose (defense in depth)
+    composed = research.compose_program("g", mode="learn")
+    assert "NEVER touch GitHub" in composed["program"]
+    assert "NEVER touch GitHub" in composed["system"]
+    assert "edit train.py ONLY" not in composed["program"]
+    # (d) the research module itself never shells out to git/gh
+    src = Path(research.__file__.replace(".pyc", ".py")).read_text(encoding="utf-8")
+    for forbidden in ("git push", "gh pr", "gh repo", "gh api", "gh auth"):
+        assert forbidden not in src, f"forbidden GitHub invocation: {forbidden!r}"
+
+
+def test_trusted_web_sources_kill_switch_and_derivation(monkeypatch):
+    # default: web tools present and derived from the one domain list
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    allowed = research.self_reliant_allowed_tools()
+    assert "WebSearch" in allowed
+    assert f"WebFetch(domain:{research.TRUSTED_SOURCE_DOMAINS[0]})" in allowed
+    assert research.trusted_web_domains() == research.TRUSTED_SOURCE_DOMAINS
+    # kill switch returns learn mode to the offline read-only trio
+    monkeypatch.setenv("MINDHIVE_RESEARCH_WEB", "0")
+    assert research.self_reliant_allowed_tools() == \
+        research.SELF_RELIANT_READONLY_TOOLS
+    assert research.trusted_web_domains() == []
+
+
+def test_compose_program_learn_mode_states_trusted_sources():
+    doms = ["github.com", "arxiv.org"]
+    prog = research.compose_program("g", mode="learn", sources=doms)["program"]
+    assert "Trusted web sources" in prog
+    assert "- github.com" in prog and "- arxiv.org" in prog
+    assert "read-only" in prog
+    # no sources granted -> no section; improve mode never gets one
+    assert "Trusted web sources" not in research.compose_program(
+        "g", mode="learn")["program"]
+    assert "Trusted web sources" not in research.compose_program(
+        "g", sources=doms)["program"]
+
+
+def test_controller_learn_run_grants_trusted_sources(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher)
+    assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert "Trusted web sources" in researcher.prompts[0]
+    assert "github.com" in researcher.prompts[0]
+
+
+def test_default_preflight_learn_mode_skips_gpu_check(monkeypatch):
+    # WSL + checkout reachable, GPU absent, auth ok: improve refuses on the
+    # missing GPU; learn (PRD) mode never trains, so it must start.
+    def fake_wsl_ok(cmd, timeout=20):
+        return "nvidia-smi" not in cmd
+    monkeypatch.setattr(research, "_wsl_ok", fake_wsl_ok)
+    from mindhive import workspace
+    monkeypatch.setattr(workspace, "verify_auth",
+                        lambda profile=None, force=False:
+                        {"state": "ok", "detail": "connected"})
+    assert any("GPU" in f for f in research.default_preflight("default"))
+    assert research.default_preflight("default", mode="learn") == []
+
+
+def test_api_get_sources_reports_the_active_allowlist(monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    res = research.api_get("sources")
+    assert res["ok"] and res["enabled"]
+    assert res["domains"] == research.TRUSTED_SOURCE_DOMAINS
+    monkeypatch.setenv("MINDHIVE_RESEARCH_WEB", "0")
+    res = research.api_get("sources")
+    assert res["ok"] and not res["enabled"] and res["domains"] == []
