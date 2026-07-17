@@ -395,11 +395,30 @@ def render_stream_event(obj: dict) -> list:
 
 
 def _default_spawn(argv, env, cwd):
+    # stdin is a PIPE because the prompt is fed through it (see _feed_stdin) —
+    # never through argv, which cmd.exe (hosting the Windows .CMD shim) caps at
+    # ~8k chars ("The command line is too long.").
     return subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+        stdin=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         env=env, cwd=cwd or None,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _feed_stdin(proc, text) -> None:
+    """Write the prompt to the run's stdin and close it. Runs on its own daemon
+    thread: a prompt larger than the OS pipe buffer would otherwise block
+    send() until the CLI drains it — and would block forever if the CLI died
+    before reading. Tolerates injected fakes without a stdin and processes that
+    exit early (broken pipe)."""
+    stdin = getattr(proc, "stdin", None)
+    if stdin is None:
+        return
+    try:
+        stdin.write(text)
+        stdin.close()
+    except (OSError, ValueError):
+        pass
 
 
 class Agent:
@@ -569,7 +588,10 @@ class Manager:
             + (extra_system or "")
         if sys_extra:
             argv += ["--append-system-prompt", sys_extra]
-        argv += ["-p", prompt]
+        # `-p` alone: the prompt is fed via stdin (_feed_stdin below). The
+        # researcher's composed programs run to tens of KB and blew cmd.exe's
+        # ~8k command-line cap when passed as an argv element.
+        argv += ["-p"]
         env = _profile_env(a.profile)
         cwd = _folder_for_project(a.project)
         try:
@@ -578,6 +600,8 @@ class Manager:
             a.status = "error"
             a.emit(f"✖ could not start claude: {e}")
             return {"ok": False, "error": str(e)}
+        threading.Thread(target=_feed_stdin, args=(a.proc, prompt),
+                         daemon=True).start()
         a.status = "running"
         a.emit(f"❯ {prompt}")
         self._log(a, "user_prompt", {"text": prompt, "agent": a.name,

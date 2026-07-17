@@ -6,7 +6,7 @@ from mindhive.loop import driver
 
 def test_build_argv_uses_resume_not_continue():
     argv = driver.build_argv(
-        cmd="claude", prompt="do x", loop_context="ctx",
+        cmd="claude", loop_context="ctx",
         allowed_tools="Read,Edit", output_format="json",
         session_id="sess-1", model=None, permission_mode=None)
     assert argv[0] == "claude"
@@ -15,12 +15,14 @@ def test_build_argv_uses_resume_not_continue():
     assert "--output-format" in argv and "json" in argv
     assert "--allowedTools" in argv
     assert "--append-system-prompt" in argv
-    assert argv[-2] == "-p" and argv[-1] == "do x"
+    # `-p` is last and bare: the prompt itself is fed via stdin, never argv
+    # (cmd.exe hosting the Windows .CMD shim caps command lines at ~8k chars).
+    assert argv[-1] == "-p"
 
 
 def test_build_argv_emits_permission_mode_not_effort():
     argv = driver.build_argv(
-        cmd="claude", prompt="p", loop_context="c",
+        cmd="claude", loop_context="c",
         allowed_tools="Read", output_format="json",
         session_id=None, model="claude-opus-4-8", permission_mode="acceptEdits")
     assert "--resume" not in argv
@@ -28,6 +30,29 @@ def test_build_argv_emits_permission_mode_not_effort():
     # --effort is NOT a real Claude Code CLI flag; it must never be emitted.
     assert "--effort" not in argv
     assert "--permission-mode" in argv and "acceptEdits" in argv
+
+
+def test_cli_driver_feeds_prompt_via_stdin(monkeypatch):
+    """The iteration prompt is unbounded (memory-seeded); it must reach the CLI
+    on stdin, never in argv."""
+    captured = {}
+
+    class _Proc:
+        stdout = '{"result": "ok", "usage": {}, "num_turns": 1}'
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        captured.update(argv=argv, kw=kw)
+        return _Proc()
+
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+    big = "x" * 20000
+    res = driver.CLIDriver(cmd="claude").run(
+        big, "ctx", allowed_tools="Read", session_id=None,
+        model=None, permission_mode=None, timeout_s=5)
+    assert res.error is None
+    assert all(big not in str(part) for part in captured["argv"])
+    assert captured["kw"]["input"] == big
 
 
 def test_cli_driver_resolves_cmd_via_which(monkeypatch):
