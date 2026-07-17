@@ -2,11 +2,6 @@
 from mindhive import events
 
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
-
-
 def test_loop_types_registered():
     for t in ("loop_run_start", "loop_iteration", "loop_run_end"):
         assert t in events.VALID_TYPES
@@ -14,8 +9,7 @@ def test_loop_types_registered():
         assert t not in events.SEMANTIC_TYPES
 
 
-def test_append_loop_iteration(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_append_loop_iteration():
     ev = events.append_event("loop_iteration", {"iteration": 1, "summary": "did x"},
                              session_id="s", ts="2026-06-24T10:00:00Z")
     assert ev.type == "loop_iteration"

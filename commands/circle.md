@@ -37,7 +37,10 @@ Steps:
 4. **Launch:** run `python -m mindhive loop $ARGUMENTS`. It blocks until the run
    ends and prints `{"reason": …, "iterations": N}`. It refuses to run while
    `~/.mindhive/LIVE_LOCK` exists (V17 trading) unless `--force` is given and the
-   user confirms the box is idle.
+   user confirms the box is idle. On a real run it also **auto-opens the web
+   dashboard** at the stable URL so you can watch the loop live; suppress it with
+   `--no-dashboard` or `MINDHIVE_LOOP_DASHBOARD=0` (never fires on `init`,
+   `status`, or `--dry-run`).
 
 5. **Report:** run `python -m mindhive loop status` and summarize the last run
    (reason, iterations, total cost, total tokens).

@@ -7,7 +7,7 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from . import events, paths
+from . import events, hookcapture, paths
 
 
 def _harvest_lock_path() -> Path:
@@ -74,6 +74,49 @@ def _is_injected_prompt(text: str) -> bool:
     return text.lstrip()[:40].lower().startswith("base directory for this skill:")
 
 
+_CMD_NAME_RE = re.compile(r"<command-name>\s*/?([^<\s]+)\s*</command-name>")
+_SKILL_BODY_MARK = "base directory for this skill:"
+
+
+def _split_skill_name(raw: str) -> dict:
+    """{name, plugin?} from a possibly plugin-namespaced skill reference —
+    mirrors hookcapture._skill_payload so both capture paths agree."""
+    plugin, _, name = str(raw or "").strip().rpartition(":")
+    out = {"name": name or str(raw or "").strip()}
+    if plugin:
+        out["plugin"] = plugin
+    return out
+
+
+def _skill_from_tool_use(inp: dict) -> dict | None:
+    """skill_used payload for a Skill tool_use block, or None. Same field
+    fallbacks as the live hook (tool_input.skill / .name / .skill_name)."""
+    for key in ("skill", "name", "skill_name"):
+        v = (inp or {}).get(key)
+        if isinstance(v, str) and v.strip():
+            out = _split_skill_name(v)
+            out.update({"ok": True, "text": "harvested Skill tool call"})
+            return out
+    return None
+
+
+def _skill_from_command(text: str) -> dict | None:
+    """skill_used payload when a user message is a SLASH-COMMAND skill
+    invocation: it carries a <command-name> tag AND an injected skill body
+    ('Base directory for this skill:'). Slash invocations never fire the
+    Skill tool, so without this the dominant real-world invocation path
+    recorded nothing and every slash-invoked skill stayed 'never called'."""
+    low = (text or "").lower()
+    if _SKILL_BODY_MARK not in low:
+        return None
+    m = _CMD_NAME_RE.search(text or "")
+    if not m:
+        return None
+    out = _split_skill_name(m.group(1))
+    out.update({"ok": True, "text": "harvested slash-command invocation"})
+    return out
+
+
 _MAX_WORDS = 5000
 
 
@@ -122,11 +165,26 @@ def _items_from_obj(o) -> list:
                 if name in ("Edit", "Write", "NotebookEdit"):
                     fp = inp.get("file_path")
                     if fp:
-                        items.append({"kind": "file_touched", "value": fp})
+                        plus, minus = hookcapture.line_stats(name, inp)
+                        item = {"kind": "file_touched", "value": fp, "tool": name}
+                        if plus is not None:
+                            if plus == 0 and minus == 0:
+                                continue      # +0 −0 is not a change (locked rule)
+                            item["plus"], item["minus"] = plus, minus
+                        items.append(item)
                 elif name in ("Bash", "PowerShell"):
                     cmd = inp.get("command")
                     if cmd:
-                        items.append({"kind": "command_run", "value": cmd[:180]})
+                        item = {"kind": "command_run",
+                                "value": cmd[:hookcapture.CMD_MAX]}
+                        desc = inp.get("description")
+                        if isinstance(desc, str) and desc.strip():
+                            item["desc"] = desc.strip()[:hookcapture.DESC_MAX]
+                        items.append(item)
+                elif name == "Skill":
+                    skill = _skill_from_tool_use(inp)
+                    if skill:
+                        items.append({"kind": "skill_used", "value": skill})
         # Capture Claude's prose response too, so the OUTPUT enters the hive
         # alongside the prompt. Tool-only turns have no text and are skipped.
         resp = _user_text(content).strip()
@@ -162,6 +220,10 @@ def _items_from_obj(o) -> list:
             prompt = _clean_prompt(text)
             if prompt:
                 items.append({"kind": "user_prompt", "value": _cap_words(prompt)})
+        # Slash-command skill invocations live in user messages, not tool_use.
+        skill = _skill_from_command(text)
+        if skill:
+            items.append({"kind": "skill_used", "value": skill})
     return items
 
 
@@ -196,8 +258,17 @@ def _hook_captured_sessions(project) -> set:
     return out
 
 
+def _event_key(session_id, etype, payload) -> tuple:
+    """Dedup identity for one event. skill_used keys on the SKILL NAME — its
+    text field differs between the live hook (response excerpt) and harvest
+    (fixed marker), so a text key would double-count the same invocation."""
+    p = payload if isinstance(payload, dict) else {}
+    field = p.get("name") if etype == "skill_used" else p.get("text")
+    return (session_id, etype, field)
+
+
 def _existing_event_keys(project) -> set:
-    """(session_id, type, text) for every event already in the store.
+    """One _event_key per event already in the store.
 
     Used to skip re-adding an event the live hooks already captured WITHOUT
     skipping the whole session — so a session the hooks only partially captured
@@ -205,8 +276,7 @@ def _existing_event_keys(project) -> set:
     instead of being fast-forwarded past forever."""
     keys = set()
     for ev in events.read_all(project):
-        text = ev.payload.get("text") if isinstance(ev.payload, dict) else None
-        keys.add((ev.session_id, ev.type, text))
+        keys.add(_event_key(ev.session_id, ev.type, ev.payload))
     return keys
 
 
@@ -214,15 +284,24 @@ def _event_for_item(item):
     """Map a parsed transcript item to (event_type, payload, tags)."""
     kind = item["kind"]
     if kind == "file_touched":
-        return "file_touched", {"text": item["value"]}, ["harvest", "auto"]
+        payload = {"text": item["value"]}
+        for k in ("plus", "minus", "tool"):
+            if k in item:
+                payload[k] = item[k]
+        return "file_touched", payload, ["harvest", "auto"]
     if kind == "command_run":
-        return "command_run", {"text": item["value"]}, ["harvest", "auto"]
+        payload = {"text": item["value"]}
+        if "desc" in item:
+            payload["desc"] = item["desc"]
+        return "command_run", payload, ["harvest", "auto"]
     if kind == "memo":
         return item["memo_type"], {"text": item["value"]}, ["harvest", "memo"]
     if kind == "user_prompt":
         return "user_prompt", {"text": item["value"]}, ["harvest", "prompt"]
     if kind == "assistant_response":
         return "assistant_response", {"text": item["value"]}, ["harvest", "response"]
+    if kind == "skill_used":
+        return "skill_used", dict(item["value"]), ["harvest", "auto", "skill"]
     return None
 
 
@@ -294,7 +373,7 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                     if is_captured:
                         # Skip what the hooks already wrote for this session, but
                         # let through anything they missed.
-                        key = (sid, etype, payload.get("text"))
+                        key = _event_key(sid, etype, payload)
                         if key in seen_keys:
                             continue
                         seen_keys.add(key)
@@ -307,6 +386,52 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                 skipped += 1
     _save_state(project, state)
     return {"processed_files": files, "new_events": new_events, "skipped_captured": skipped}
+
+
+def backfill_skills(transcript_dir, project, now=None) -> dict:
+    """One-shot skill_used backfill over WHOLE transcripts, ignoring the
+    harvest cursor — skill invocations before this capture path existed live
+    behind cursors the incremental harvest will never revisit. Idempotent: a
+    (session, skill-name) pair that already has ANY skill_used event (hook or
+    harvest) is skipped entirely, so re-runs and hook overlap never double
+    count. Returns {"new_skill_used": n, "files": m}."""
+    seen: set = set()
+    for ev in events.read_all(project):
+        if ev.type == "skill_used" and isinstance(ev.payload, dict) \
+                and ev.payload.get("name"):
+            seen.add((ev.session_id, ev.payload["name"]))
+    d = Path(transcript_dir)
+    new = files = 0
+    if d.exists():
+        for f in sorted(d.glob("*.jsonl")):
+            files += 1
+            sid = f.stem
+            try:
+                lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                line_ts = _normalize_ts(o.get("timestamp")) or now
+                for item in _items_from_obj(o):
+                    if item["kind"] != "skill_used":
+                        continue
+                    payload = dict(item["value"])
+                    key = (sid, payload.get("name"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    events.append_event("skill_used", payload, session_id=sid,
+                                        tags=["harvest", "auto", "skill"],
+                                        ts=line_ts, project=project)
+                    new += 1
+    return {"new_skill_used": new, "files": files}
 
 
 def claude_projects_root() -> Path:
@@ -371,6 +496,9 @@ def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
 
 
 def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
+    # Local import: the Learning-Loop capture stage. Kept local so importing
+    # harvest stays cheap and there is no import-time coupling.
+    from . import failures, incidents
     root = claude_projects_root()
     known = set(existing_projects()) if known_only else None
     per_project: dict = {}
@@ -387,9 +515,34 @@ def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
                 skipped_unknown.add(proj)
                 continue
             r = harvest(d, proj, now=now, skip_captured=skip_captured)
+            # Also capture tool FAILURES and advance the incident lifecycle, so
+            # the Learning Loop self-feeds from the same automatic sweep instead
+            # of requiring a manual `hive failures capture`.
+            fr = failures.capture_dir(str(d), project=proj, now=now)
+            if fr.get("new_failures"):
+                incidents.audit(project=proj)
+                incidents.project(project=proj)
+                # New failures are when leak counts grow — the moment a nudge
+                # can cross the auto-enforcement threshold. Best-effort.
+                try:
+                    from . import enforce
+                    enforce.auto_escalate(project=proj)
+                except Exception:
+                    pass
             if r["new_events"]:
-                acc = per_project.setdefault(proj, {"new_events": 0, "dirs": 0})
+                # New session activity is exactly what creates fresh rule
+                # EXPOSURE, so this is the moment a holding rule can flip to
+                # resolved — graduate it to SOUL.md without human input.
+                # Best-effort: promotion must never break the capture sweep.
+                try:
+                    incidents.auto_promote(project=proj)
+                except Exception:
+                    pass
+            if r["new_events"] or fr.get("new_failures"):
+                acc = per_project.setdefault(
+                    proj, {"new_events": 0, "new_failures": 0, "dirs": 0})
                 acc["new_events"] += r["new_events"]
+                acc["new_failures"] += fr.get("new_failures", 0)
                 acc["dirs"] += 1
                 total_new += r["new_events"]
     return {"projects": per_project, "total_new": total_new,

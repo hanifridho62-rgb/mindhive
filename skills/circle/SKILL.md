@@ -54,6 +54,11 @@ All commands below run via the project venv:
    - It refuses to run while `~/.mindhive/LIVE_LOCK` exists (V17 is trading).
      Only pass `--force` if the user confirms the box is idle.
    - Use `--live` to stream output, `--force` to override the LIVE_LOCK guard.
+   - On a real run it **auto-opens the web dashboard** (a detached background
+     process at the stable URL) so the loop can be watched live. It never fires
+     on `init`, `status`, or `--dry-run`. Opt out with `--no-dashboard` for one
+     run or `MINDHIVE_LOOP_DASHBOARD=0` globally; a dashboard launch failure is
+     reported but never aborts the loop.
 
 5. **Report.** Run `python -m mindhive loop status` and summarize the last run
    (reason, iteration count, total cost, total tokens). The loop also emits

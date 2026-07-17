@@ -1,12 +1,8 @@
 # tests/test_export.py
 from mindhive import events, projector, export, paths
 
-def _setup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
-    monkeypatch.setenv("MINDHIVE_PROJECT", "test")
 
-def test_export_bundles_state_and_ledger(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_bundles_state_and_ledger():
     events.append_event("state_set", {"task": "OFI verdict"},
                         session_id="s", ts="2026-06-20T10:00:00Z")
     events.append_event("decision", {"text": "default OFF"},
@@ -19,8 +15,7 @@ def test_export_bundles_state_and_ledger(tmp_path, monkeypatch):
     assert "OFI verdict" in text
     assert "default OFF" in text
 
-def test_export_custom_out_path(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+def test_export_custom_out_path(tmp_path):
     events.append_event("decision", {"text": "x"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
     projector.project()
