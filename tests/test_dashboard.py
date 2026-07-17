@@ -89,6 +89,51 @@ def test_graph_endpoint_returns_html(dashboard_server):
     assert "<html" in body.lower() and '<svg id="svg">' in body
 
 
+def test_changelog_endpoint_requires_token(dashboard_server):
+    base, token = dashboard_server
+    try:
+        _get(base, "/api/changelog")  # no token
+        assert False, "expected 403"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_changelog_endpoint_returns_entries_and_pending(dashboard_server):
+    from mindhive import changelog, events
+    base, token = dashboard_server
+    # empty store: no entries, no pending marker; categories always served
+    # so the UI never hardcodes the taxonomy
+    status, body = _get(base, "/api/changelog", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["entries"] == [] and obj["pending"] is None
+    assert obj["categories"] == ["update", "minor_change", "deletion",
+                                 "reduction", "major_change", "replacement"]
+    # one recorded entry + a pending marker for an unlogged touch
+    changelog.record("replacement", "swapped the exporter implementation",
+                     files=["src/mindhive/export.py"], session_id="s1")
+    events.append_event("file_touched", {"text": "/repo/src/mindhive/late.py"},
+                        session_id="s2", ts="2026-07-15T11:00:00Z")
+    changelog.queue(events.read_all(), session_id="s2")
+    status, body = _get(base, "/api/changelog", token)
+    obj = json.loads(body)
+    assert len(obj["entries"]) == 1
+    e = obj["entries"][0]
+    assert e["category"] == "replacement"
+    assert e["files"] == ["src/mindhive/export.py"]
+    assert obj["pending"]["files"] == ["/repo/src/mindhive/late.py"]
+
+
+def test_served_page_contains_log_view_hook(dashboard_server):
+    # The CLAUDE.md restart check greps the served page for view hooks —
+    # showLog must be present alongside showOversee.
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "showLog" in body
+    assert "/api/changelog" in body
+
+
 def test_overview_endpoint_returns_stats(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/api/overview", token)
@@ -286,11 +331,14 @@ def test_skills_status_endpoint_returns_status_and_counts(dashboard_server, monk
 
 
 def test_page_has_invoke_count_hooks(dashboard_server):
-    """Skill names carry a per-skill invoke-count badge in the top list."""
+    """Per-skill call telemetry is surfaced. The Skill & Plugin rebuild (U7)
+    replaced the old name-adjacent count badge with a richer metrics line
+    (calls / ok / fail / completion rate) rendered from PLUG_STATS via
+    skMetrics — the invoke-count intent is preserved and enriched."""
     base, token = dashboard_server
     status, body = _get(base, "/")
-    for needle in ("PLUG_COUNTS", "callcount"):
-        assert needle in body, f"missing invoke-count hook: {needle}"
+    for needle in ("PLUG_STATS", "skMetrics"):
+        assert needle in body, f"missing per-skill telemetry hook: {needle}"
 
 
 def test_page_has_clickable_improvements_legend(dashboard_server):
@@ -1718,3 +1766,99 @@ def test_improvements_carry_triage_marks(dashboard_server):
     assert a["resolution"] == "unresolved"
     assert a["triage"] == "claude"
     assert a["triage_hint"]
+
+
+# --- Self-Reliant provenance labels across the four sections ------------------
+
+def test_memory_items_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("learning", {"text": "Self-Reliant learning 1: PRD"},
+                    session_id="research-ab12cd34",
+                    tags=["self-reliant", "learning"], project="test")
+    ev.append_event("decision", {"text": "plain decision"},
+                    session_id="sess-1", project="test")
+    status, body = _get(base, "/api/memory?project=test", token)
+    items = {m["text"]: m for m in json.loads(body)}
+    assert items["Self-Reliant learning 1: PRD"]["origin"] == "self-reliant"
+    assert items["plain decision"]["origin"] is None
+
+
+def test_sessions_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("experiment_result", {"text": "Self-Reliant experiment 1"},
+                    session_id="research-ab12cd34", tags=["self-reliant"],
+                    project="test")
+    ev.append_event("decision", {"text": "one"}, session_id="sess-1",
+                    project="test")
+    status, body = _get(base, "/api/sessions?project=test", token)
+    sessions = {s["session_id"]: s for s in json.loads(body)}
+    assert sessions["research-ab12cd34"]["origin"] == "self-reliant"
+    assert sessions["sess-1"]["origin"] is None
+
+
+def test_improvements_manual_notes_carry_self_reliant_origin(dashboard_server):
+    from mindhive import events as ev
+    base, token = dashboard_server
+    ev.append_event("caveat", {"text": "self-reliant caveat"},
+                    session_id="research-ab12cd34", tags=["self-reliant"],
+                    project="test")
+    ev.append_event("caveat", {"text": "ordinary caveat"},
+                    session_id="sess-1", project="test")
+    status, body = _get(base, "/api/improvements?project=test", token)
+    notes = {m["text"]: m for m in json.loads(body)["manual"]}
+    assert notes["self-reliant caveat"]["origin"] == "self-reliant"
+    assert notes["ordinary caveat"]["origin"] is None
+
+
+def test_oversee_labels_self_reliant_runs(dashboard_server):
+    base, token = dashboard_server
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("experiment_result", {"text": "Self-Reliant experiment"},
+                        session_id="research-ab12cd34", tags=["self-reliant"],
+                        ts=ts, project="test")
+    status, body = _get(base, "/api/oversee?project=test", token)
+    runs = {r["run_id"]: r for r in json.loads(body)["runs"]}
+    sr = runs["research-ab12cd34"]
+    assert sr["origin"] == "self-reliant"
+    assert sr["title"] == "Self-Reliant run ab12cd34"
+
+
+def test_page_renders_self_reliant_badge_everywhere(dashboard_server):
+    # one shared badge helper, wired into Memory, Improvements, Oversee and
+    # the Sessions cards fragment (taskview CARDS_JS is injected into the page)
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert ".pill.sr" in body                     # badge style
+    assert body.count("srPill(") >= 5             # helper + 4 call sites
+    assert "srPill(s.origin)" in body             # sessions fragment wired
+
+
+def test_research_sources_route_reports_allowlist(dashboard_server, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    from mindhive import research
+    base, token = dashboard_server
+    status, body = _get(base, "/api/research/sources", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["ok"] and obj["enabled"]
+    assert obj["domains"] == research.TRUSTED_SOURCE_DOMAINS
+
+
+def test_workspace_auth_verify_route_registered(dashboard_server, monkeypatch):
+    from mindhive import workspace
+    base, token = dashboard_server
+    monkeypatch.setattr(workspace, "verify_auth",
+                        lambda name="default", force=False:
+                        {"profile": name, "state": "ok", "detail": "connected"})
+    status, res = _post(base, "/api/workspace/auth_verify",
+                        {"name": "default"}, token)
+    assert status == 200 and res["ok"] and res["state"] == "ok"
+    # machine-level check: exempt from the HIVE MIND read-only guard
+    status, res = _post(base, "/api/workspace/auth_verify",
+                        {"name": "default", "project": "*"}, token)
+    assert status == 200 and res["ok"] and res["state"] == "ok"

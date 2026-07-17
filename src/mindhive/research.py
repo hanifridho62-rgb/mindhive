@@ -262,7 +262,9 @@ _ANALYSIS_CONTRACT = (
     "PRD contract — follow it exactly: you are READ-ONLY. Do NOT edit "
     "train.py or any file, and do NOT run training or any other command. You "
     "must NEVER touch GitHub — no git, no gh, no pushes, no commits, no remote "
-    "operations of any kind. Read train.py and the experiment history, then "
+    "operations of any kind. (Reading pages with WebSearch/WebFetch from the "
+    "trusted domains listed in your program, when granted, is allowed — it "
+    "changes nothing anywhere.) Read train.py and the experiment history, then "
     "write ONE Product Requirement Document (PRD) that a future Claude session "
     "can build directly, with no further clarification. Begin the PRD with two "
     "machine-readable header lines, exactly:\n"
@@ -301,7 +303,7 @@ def _clean_skills(skills) -> list:
 
 def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
                     train_path=None, mode="improve", history=None,
-                    inventory=None) -> dict:
+                    inventory=None, sources=None) -> dict:
     """The researcher agent's steering document (program.md text) plus its
     system-prompt addition — a pure function of its inputs (U6).
 
@@ -314,7 +316,9 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
     experiment records — supplied in learn mode so the PRD is grounded in real
     past results rather than train.py alone (R2). ``inventory`` is the flat
     ``[{name, plugin}]`` of installed skills/plugins, rendered in learn mode so
-    the PRD's SOP is composed from real, verbatim skill names.
+    the PRD's SOP is composed from real, verbatim skill names. ``sources`` is
+    the trusted-domain list granted to a learn run — stated in the program so
+    the agent knows exactly which web reads its allowlist will permit.
     """
     learn = mode == "learn"
     skills = _clean_skills(skills)
@@ -356,6 +360,13 @@ def compose_program(goal, skills=None, primed=None, preset=None, prior=None,
             if len(inv) > _MAX_INVENTORY:
                 lines.append(f"- … (+{len(inv) - _MAX_INVENTORY} more installed)")
             parts.append("\n".join(lines))
+    if learn and sources:
+        parts.append(
+            "Trusted web sources — your allowlist grants WebSearch plus "
+            "WebFetch on exactly these domains (read-only; any other host is "
+            "auto-denied). Use them to ground the PRD in current, "
+            "authoritative material and cite the URL of anything you rely "
+            "on:\n" + "\n".join(f"- {d}" for d in sources))
     if preset:
         bounds = "\n".join(f"- {k}: {v}" for k, v in preset.items())
         parts.append("Hard constraints from the small-GPU preset — configs "
@@ -525,8 +536,9 @@ class ResearchController:
 
     Everything nondeterministic is injected: ``trainer_cmd`` (argv list, or a
     callable ``iteration -> argv``), ``agent_factory`` (``profile -> researcher``
-    with ``turn(prompt) -> dict`` and ``stop()``), ``preflight`` (``() -> list``
-    of failure strings), ``append_event``, ``auth_status``, and ``profiles`` —
+    with ``turn(prompt) -> dict`` and ``stop()``), ``preflight``
+    (``(profile, mode) -> list`` of failure strings), ``append_event``,
+    ``auth_status``, and ``profiles`` —
     so the full terminator matrix runs against the mock trainer and a stubbed
     agent with no WSL, GPU, or CLI.
 
@@ -641,7 +653,7 @@ class ResearchController:
                 if t.is_alive():
                     return {"ok": False, "error":
                             "previous run is still winding down — retry in a moment"}
-            failures = self._preflight(profile or "default")
+            failures = self._preflight(profile or "default", mode)
             if failures:
                 return {"ok": False, "error": "preflight failed: " + "; ".join(failures)}
             self._state = "running"
@@ -680,6 +692,11 @@ class ResearchController:
             return {"ok": False, "error": f"could not start researcher agent: {e}"}
         self.emit(f"· run {self.run_id} started ({self._mode}) — goal: {goal}"
                   + (f" · cap {self._max}" if self._max else " · unbounded"))
+        if self._mode == "learn":
+            doms = trusted_web_domains()
+            self.emit("· trusted web sources: "
+                      + (", ".join(doms) if doms
+                         else "disabled (MINDHIVE_RESEARCH_WEB=0)"))
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return {"ok": True, "run_id": self.run_id}
@@ -749,7 +766,7 @@ class ResearchController:
         In learn mode the boundary is load-bearing, so if it cannot be set the
         run fails closed (raises) rather than silently proceeding as an
         unrestricted agent — a failure to restrict must never be invisible."""
-        allowed = SELF_RELIANT_ALLOWED_TOOLS if self._mode == "learn" else None
+        allowed = self_reliant_allowed_tools() if self._mode == "learn" else None
         try:
             researcher.allowed_tools = allowed
             researcher.disallowed_tools = GITHUB_DENY
@@ -785,7 +802,9 @@ class ResearchController:
                                            mode=self._mode,
                                            history=(self.leaderboard.ranked()
                                                     if self._mode == "learn" else None),
-                                           inventory=inv)
+                                           inventory=inv,
+                                           sources=(trusted_web_domains()
+                                                    if self._mode == "learn" else None))
                 # snapshot BEFORE the edit-turn: the turn is what changes
                 # train.py, so a post-turn "before" reads the edited file and
                 # every agent edit would record as "no change". Learn mode never
@@ -1075,20 +1094,25 @@ def _wsl_ok(cmd: str, timeout=20) -> bool:
         return False
 
 
-def default_preflight(profile: str = "default") -> list:
+def default_preflight(profile: str = "default", mode: str = "improve") -> list:
     """The production Start gate (U5): refuse to launch an autonomous run with
-    a specific reason instead of failing one experiment at a time."""
+    a specific reason instead of failing one experiment at a time. The gate is
+    mode-aware: learn (PRD) mode reads train.py and never trains, so it needs
+    WSL + the checkout + auth but NOT a visible GPU."""
     if not _wsl_ok("true"):
         return ["WSL is not reachable — check `wsl --status`"]
     fails = []
     if not _wsl_ok(f"test -f {AUTORESEARCH_DIR}/train.py"):
         fails.append(f"autoresearch not found at {AUTORESEARCH_DIR} — run "
                      "scripts/self_reliant/bring_up.sh first")
-    if not _wsl_ok("nvidia-smi -L"):
+    if mode != "learn" and not _wsl_ok("nvidia-smi -L"):
         fails.append("no GPU visible inside WSL (nvidia-smi failed)")
     try:
         from . import workspace
-        st = workspace.profile_auth_status(profile)
+        # verify_auth is CLI-first: an expired-but-refreshable store passes
+        # (the CLI refreshes it on use) instead of blocking the run on a
+        # heuristic 401 prediction.
+        st = workspace.verify_auth(profile)
         if st.get("state") != "ok":
             fails.append(f"researcher profile '{profile}' auth is "
                          f"{st.get('state')} — {st.get('detail')}")
@@ -1104,10 +1128,10 @@ _USAGE_MARKERS = ("usage limit", "rate limit", "out of usage",
                   "hit your limit", "session limit", "quota")
 
 
-# The GitHub boundary. Learn mode spawns read-only: the allowlist below is the
+# The GitHub boundary. Learn mode spawns read-only: the allowlist is the
 # ENFORCED gate — workspace.send() drops bypassPermissions whenever an allowlist
 # is present, so with no prompt channel any tool outside it (no Bash ⇒ no
-# git/gh) is auto-denied. The set is deliberately minimal (Read/Grep/Glob only);
+# git/gh) is auto-denied. The file set is deliberately minimal (Read/Grep/Glob);
 # Skill is intentionally excluded because it could shell out and widen a
 # "read-only" turn. GITHUB_DENY layers on top as defense-in-depth: for learn it
 # is redundant with the allowlist; for improve mode — which keeps
@@ -1115,8 +1139,43 @@ _USAGE_MARKERS = ("usage limit", "rate limit", "out of usage",
 # literal git/gh invocations, NOT a hard guarantee (a shell can reach the same
 # binaries by other spellings). A hard improve-mode boundary (no-Bash / egress
 # controls) is deferred follow-up.
-SELF_RELIANT_ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
+SELF_RELIANT_READONLY_TOOLS = ["Read", "Grep", "Glob"]
 GITHUB_DENY = ["Bash(git:*)", "Bash(gh:*)", "mcp__github__*"]
+
+# Trusted web sources for learn mode. The PRD author may ground its research in
+# the open web, but only read-only and only on this allowlist: WebSearch plus
+# WebFetch pinned per-domain (the CLI's permission grammar rejects any other
+# host). Reading github.com over HTTPS cannot mutate anything, so the no-GitHub
+# WRITE boundary (git/gh/MCP, enforced by the allowlist + GITHUB_DENY) is
+# untouched. Kill switch: MINDHIVE_RESEARCH_WEB=0 returns learn mode to the
+# offline read-only trio.
+TRUSTED_SOURCE_DOMAINS = [
+    "github.com", "raw.githubusercontent.com",
+    "arxiv.org", "pytorch.org", "docs.pytorch.org",
+    "huggingface.co", "docs.python.org", "en.wikipedia.org",
+]
+
+
+def web_sources_enabled() -> bool:
+    return os.environ.get("MINDHIVE_RESEARCH_WEB", "1").lower() \
+        not in ("0", "false", "off", "no")
+
+
+def trusted_web_domains() -> list:
+    """The active trusted-source domains — TRUSTED_SOURCE_DOMAINS, or [] when
+    the kill switch is set. What compose_program tells the agent it may read
+    and what the allowlist actually permits derive from this one list."""
+    return list(TRUSTED_SOURCE_DOMAINS) if web_sources_enabled() else []
+
+
+def self_reliant_allowed_tools() -> list:
+    """The full enforced learn-mode allowlist: the read-only file trio plus
+    the trusted web tools (WebSearch, and WebFetch pinned to each trusted
+    domain). Never contains Bash or Skill — see the boundary note above."""
+    domains = trusted_web_domains()
+    web = (["WebSearch"] + [f"WebFetch(domain:{d})" for d in domains]) \
+        if domains else []
+    return SELF_RELIANT_READONLY_TOOLS + web
 
 # Learn rounds re-analyze the same state (there is no fresh experiment between
 # them), so an uncapped learn run would loop and burn account usage forever.
@@ -1245,7 +1304,7 @@ def get_controller() -> ResearchController:
                 append_event=ev_mod.append_event,
                 preflight=default_preflight,
                 profiles=[e["name"] for e in workspace.load_profiles()],
-                auth_status=workspace.profile_auth_status,
+                auth_status=workspace.verify_auth,
                 on_kill=kill_wsl_training,
                 skills_inventory=installed_skill_inventory)
         return CONTROLLER
@@ -1255,6 +1314,12 @@ def get_controller() -> ResearchController:
 
 def api_get(action, proj=None, qs=None) -> dict:
     qs = qs or {}
+    if action == "sources":
+        # pure config read — must not construct the production controller
+        # (whose bring-up probes WSL); what the learn-mode allowlist will
+        # actually grant, for the page's transparency panel
+        return {"ok": True, "enabled": web_sources_enabled(),
+                "domains": trusted_web_domains()}
     ctl = get_controller()
     if action == "status":
         return {"ok": True, **ctl.status()}

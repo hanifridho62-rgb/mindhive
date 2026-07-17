@@ -21,7 +21,15 @@ import time
 
 from . import dedupe, events as ev_mod, guard, paths, projector
 
-CONSOLIDATE_TYPES = ev_mod.SEMANTIC_TYPES - {"state_set"}
+# code_change is exempt: it is an audit trail (see changelog.py), and two
+# similar-sounding change-log entries are genuinely distinct changes — the
+# dreaming pass must never absorb one into another. learning is exempt for the
+# same reason: each Self-Reliant PRD is a distinct build artifact, and two
+# PRDs about the same goal read similar while prescribing different builds.
+# sop is exempt because the registry fold (sop.py) replays EVERY lifecycle
+# event — absorbing one would silently rewrite the current SOP set.
+CONSOLIDATE_TYPES = ev_mod.SEMANTIC_TYPES - {"state_set", "code_change",
+                                             "learning", "sop"}
 DEFAULT_LIMIT = 3            # clusters merged per pass
 DEFAULT_COOLDOWN_HOURS = 6.0
 _MARKER = "consolidate_marker.json"

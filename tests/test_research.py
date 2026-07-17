@@ -465,7 +465,7 @@ def _controller(tmp_path, trainer=None, researcher=None, ledger=None,
         train_path=train_py,
         leaderboard=research.Leaderboard(tmp_path / "lb.json"),
         append_event=ledger if ledger is not None else FakeLedger(),
-        preflight=lambda profile: [],
+        preflight=lambda profile, mode: [],
         **kw)
 
 
@@ -493,7 +493,7 @@ def test_controller_start_while_running_rejected(tmp_path):
 
 def test_controller_preflight_failure_rejects_start(tmp_path):
     ctl = _controller(tmp_path)
-    ctl._preflight = lambda profile: ["WSL not reachable"]
+    ctl._preflight = lambda profile, mode: ["WSL not reachable"]
     res = ctl.start("g")
     assert not res["ok"] and "WSL not reachable" in res["error"]
     assert ctl.status()["state"] == "idle"
@@ -650,12 +650,12 @@ class _FakeManager:
 def test_manager_researcher_forwards_tool_policy_and_report():
     mgr = _FakeManager()
     r = research.ManagerResearcher(
-        manager=mgr, allowed_tools=research.SELF_RELIANT_ALLOWED_TOOLS,
+        manager=mgr, allowed_tools=research.self_reliant_allowed_tools(),
         disallowed_tools=research.GITHUB_DENY)
     out = r.turn("analyze train.py")
     assert out["ok"] and out["report"] == "hypothesis: lower lr"
     kw = mgr.sent[0]
-    assert kw["allowed_tools"] == research.SELF_RELIANT_ALLOWED_TOOLS
+    assert kw["allowed_tools"] == research.self_reliant_allowed_tools()
     assert kw["disallowed_tools"] == research.GITHUB_DENY
 
 
@@ -760,7 +760,7 @@ def test_controller_learn_mode_sets_read_only_tool_policy(tmp_path):
     ctl = _controller(tmp_path, researcher=researcher)
     assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
     _wait_ended(ctl)
-    assert researcher.allowed_tools == research.SELF_RELIANT_ALLOWED_TOOLS
+    assert researcher.allowed_tools == research.self_reliant_allowed_tools()
     assert researcher.disallowed_tools == research.GITHUB_DENY
 
 
@@ -845,7 +845,7 @@ def test_controller_uninjected_leaderboard_is_per_run(tmp_path, monkeypatch):
         trainer_cmd=_cmd("--mode", "ok", "--seconds", "0.05"),
         agent_factory=lambda profile, model=None: StubResearcher(),
         train_path=tmp_path / "train.py",
-        append_event=None, preflight=lambda profile: [],
+        append_event=None, preflight=lambda profile, mode: [],
         cap_s=20, turn_timeout_s=10)
     assert ctl.start("g", max_experiments=1)["ok"]
     _wait_ended(ctl)
@@ -1112,12 +1112,21 @@ def test_api_post_start_defaults_to_improve_mode(tmp_path, monkeypatch):
 # Locks the boundary so a future edit cannot silently reopen it (R4/R5).
 
 def test_github_boundary_regression_guard():
-    # (a) the learn-mode allowlist is exactly the read-only trio — no shell
-    # (Bash), no Skill (which could shell out) => git/gh are unreachable
-    assert research.SELF_RELIANT_ALLOWED_TOOLS == ["Read", "Grep", "Glob"]
-    lowered = [t.lower() for t in research.SELF_RELIANT_ALLOWED_TOOLS]
+    # (a) the file-tool base of the learn-mode allowlist is exactly the
+    # read-only trio — no shell (Bash), no Skill (which could shell out)
+    # => git/gh are unreachable
+    assert research.SELF_RELIANT_READONLY_TOOLS == ["Read", "Grep", "Glob"]
+    allowed = research.self_reliant_allowed_tools()
+    lowered = [t.lower() for t in allowed]
     assert "bash" not in lowered and "skill" not in lowered
-    assert all("git" not in t and t != "gh" for t in lowered)
+    assert all("git" != t and t != "gh" for t in lowered)
+    # every non-trio entry is read-only web access: WebSearch, or WebFetch
+    # pinned to a single trusted domain — never an unpinned WebFetch
+    for t in allowed:
+        if t in research.SELF_RELIANT_READONLY_TOOLS or t == "WebSearch":
+            continue
+        assert t.startswith("WebFetch(domain:") and t.endswith(")"), t
+        assert t[len("WebFetch(domain:"):-1] in research.TRUSTED_SOURCE_DOMAINS
     # (b) the deny list blocks git, gh, and the GitHub MCP in every mode
     assert "Bash(git:*)" in research.GITHUB_DENY
     assert "Bash(gh:*)" in research.GITHUB_DENY
@@ -1131,3 +1140,64 @@ def test_github_boundary_regression_guard():
     src = Path(research.__file__.replace(".pyc", ".py")).read_text(encoding="utf-8")
     for forbidden in ("git push", "gh pr", "gh repo", "gh api", "gh auth"):
         assert forbidden not in src, f"forbidden GitHub invocation: {forbidden!r}"
+
+
+def test_trusted_web_sources_kill_switch_and_derivation(monkeypatch):
+    # default: web tools present and derived from the one domain list
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    allowed = research.self_reliant_allowed_tools()
+    assert "WebSearch" in allowed
+    assert f"WebFetch(domain:{research.TRUSTED_SOURCE_DOMAINS[0]})" in allowed
+    assert research.trusted_web_domains() == research.TRUSTED_SOURCE_DOMAINS
+    # kill switch returns learn mode to the offline read-only trio
+    monkeypatch.setenv("MINDHIVE_RESEARCH_WEB", "0")
+    assert research.self_reliant_allowed_tools() == \
+        research.SELF_RELIANT_READONLY_TOOLS
+    assert research.trusted_web_domains() == []
+
+
+def test_compose_program_learn_mode_states_trusted_sources():
+    doms = ["github.com", "arxiv.org"]
+    prog = research.compose_program("g", mode="learn", sources=doms)["program"]
+    assert "Trusted web sources" in prog
+    assert "- github.com" in prog and "- arxiv.org" in prog
+    assert "read-only" in prog
+    # no sources granted -> no section; improve mode never gets one
+    assert "Trusted web sources" not in research.compose_program(
+        "g", mode="learn")["program"]
+    assert "Trusted web sources" not in research.compose_program(
+        "g", sources=doms)["program"]
+
+
+def test_controller_learn_run_grants_trusted_sources(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    researcher = ReportingResearcher()
+    ctl = _controller(tmp_path, researcher=researcher)
+    assert ctl.start("g", max_experiments=1, mode="learn")["ok"]
+    _wait_ended(ctl)
+    assert "Trusted web sources" in researcher.prompts[0]
+    assert "github.com" in researcher.prompts[0]
+
+
+def test_default_preflight_learn_mode_skips_gpu_check(monkeypatch):
+    # WSL + checkout reachable, GPU absent, auth ok: improve refuses on the
+    # missing GPU; learn (PRD) mode never trains, so it must start.
+    def fake_wsl_ok(cmd, timeout=20):
+        return "nvidia-smi" not in cmd
+    monkeypatch.setattr(research, "_wsl_ok", fake_wsl_ok)
+    from mindhive import workspace
+    monkeypatch.setattr(workspace, "verify_auth",
+                        lambda profile=None, force=False:
+                        {"state": "ok", "detail": "connected"})
+    assert any("GPU" in f for f in research.default_preflight("default"))
+    assert research.default_preflight("default", mode="learn") == []
+
+
+def test_api_get_sources_reports_the_active_allowlist(monkeypatch):
+    monkeypatch.delenv("MINDHIVE_RESEARCH_WEB", raising=False)
+    res = research.api_get("sources")
+    assert res["ok"] and res["enabled"]
+    assert res["domains"] == research.TRUSTED_SOURCE_DOMAINS
+    monkeypatch.setenv("MINDHIVE_RESEARCH_WEB", "0")
+    res = research.api_get("sources")
+    assert res["ok"] and not res["enabled"] and res["domains"] == []

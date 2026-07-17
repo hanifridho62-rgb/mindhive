@@ -14,6 +14,13 @@ Lessons from past failures:     dashboard -> Memory -> Improvements
                                 (Reflect button turns recurring failures into lessons)
 Run the autonomous loop:        hive loop   (or /circle) — auto-opens the dashboard;
                                 add --no-dashboard to skip it
-Orchestrate an idea end-to-end:  /mindhive <idea> — recall-informed interview,
-                                a scored skill Recommendation Matrix, execution
-                                with follow-up chaining, and learnings logged back.
+Orchestrate an idea end-to-end:  /mindhive-orchestrator <idea> — the one centralized
+                                pipeline: ten sequential stages (brainstorm → plan →
+                                observation → understand → PRD → matrix → kanban →
+                                execution → quality → learning) on a superpowers +
+                                compound-engineering backbone, advancing dynamically
+                                (auto when intent is clear, converge when it isn't) and
+                                fanning execution out to parallel sub-agents.
+Plan parallel work lanes:        hive clusters plan --lanes N — cluster the repo by
+                                module, classify file complexity, and lay out
+                                file-ownership-safe lanes for parallel sub-agents.

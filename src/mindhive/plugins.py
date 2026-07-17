@@ -689,11 +689,8 @@ def _catalog_path(project=None) -> Path:
 
 
 def _write_catalog(payload: dict, project=None) -> None:
-    p = _catalog_path(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(ev_mod.canonical_json(payload), encoding="utf-8")
-    tmp.replace(p)  # atomic overwrite-in-place — no unbounded growth
+    # atomic overwrite-in-place — no unbounded growth
+    paths.write_text_atomic(_catalog_path(project), ev_mod.canonical_json(payload))
 
 
 def scan_and_store(cache_dir=None, top_n: int = 5, project=None) -> dict:

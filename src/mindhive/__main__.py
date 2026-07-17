@@ -40,6 +40,28 @@ def cmd_append(args) -> int | None:
         print("error: provide a payload argument or use --stdin", file=sys.stderr)
         return 2
     payload = json.loads(raw) if args.json else {"text": raw}
+    if args.type == "code_change":
+        # The change-log is only mandatory if the generic append path can't
+        # smuggle an uncategorized/unexplained entry past it. The event store
+        # itself stays type-agnostic — the contract is enforced here, at the
+        # one surface that accepts an arbitrary type+payload from the user.
+        from . import changelog as changelog_mod
+        try:
+            changelog_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f'error: {e} (use: hive log <category> "...")',
+                  file=sys.stderr)
+            return 2
+    elif args.type == "sop":
+        # Same reasoning for the SOP registry: the raw append path must not
+        # smuggle a malformed lifecycle event past the sop contract.
+        from . import sop as sop_mod
+        try:
+            sop_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f"error: {e} (use: hive sop add|update|delete …)",
+                  file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -208,6 +230,131 @@ def cmd_review_show(args) -> int | None:
     return None
 
 
+def cmd_log_add(args) -> int | None:
+    from . import changelog as changelog_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        ev = changelog_mod.record(args.category, args.explanation,
+                                  files=args.files or None, session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"logged {ev.payload['category']} covering "
+          f"{len(ev.payload['files'])} file(s) @ {ev.ts}")
+    return None
+
+
+def cmd_log_queue(args) -> int | None:
+    from . import changelog as changelog_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    marker = changelog_mod.queue(events.read_all(), session_id=sid)
+    if marker:
+        print(f"queued {len(marker['files'])} unlogged source file(s) — a "
+              "change-log entry is required: hive log <category> \"…\"")
+    else:
+        print("no unlogged code changes")
+    return None
+
+
+def cmd_log_show(args) -> int | None:
+    from . import changelog as changelog_mod
+    print(json.dumps(changelog_mod.entries(events.read_all()),
+                     indent=2, ensure_ascii=False))
+    return None
+
+
+def cmd_log_pending(args) -> int | None:
+    from . import changelog as changelog_mod
+    print(json.dumps(changelog_mod.load_pending(), indent=2))
+    return None
+
+
+def _sop_body(args) -> str | None:
+    """Resolve an SOP body from --text / --file / --stdin (at most one). A
+    procedure body is usually multi-line markdown, which is painful to pass as
+    a quoted shell argument on Windows — --file and --stdin avoid that."""
+    given = [name for name, val in
+             (("--text", args.text), ("--file", args.file),
+              ("--stdin", args.stdin or None)) if val]
+    if len(given) > 1:
+        raise ValueError("pass only one of --text / --file / --stdin")
+    if args.stdin:
+        return sys.stdin.read()
+    if args.file:
+        from pathlib import Path
+        return Path(args.file).read_text(encoding="utf-8")
+    return args.text
+
+
+def _cmd_sop_write(args, action) -> int | None:
+    from . import sop as sop_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        text = (args.reason if action == "delete" else _sop_body(args))
+        tags = [t for t in (getattr(args, "tags", "") or "").split(",") if t]
+        ev = sop_mod.record(action, args.sop_id,
+                            title=getattr(args, "title", None), text=text,
+                            tags=tags, session_id=sid)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"sop {action}: {args.sop_id} @ {ev.ts}")
+    return None
+
+
+def cmd_sop_add(args) -> int | None:
+    return _cmd_sop_write(args, "add")
+
+
+def cmd_sop_update(args) -> int | None:
+    return _cmd_sop_write(args, "update")
+
+
+def cmd_sop_delete(args) -> int | None:
+    return _cmd_sop_write(args, "delete")
+
+
+def cmd_sop_list(args) -> int | None:
+    from . import sop as sop_mod
+    sops = sop_mod.current(events.read_all(getattr(args, "project", None)))
+    if args.json:
+        print(json.dumps(sops, indent=2, ensure_ascii=False))
+        return None
+    if not sops:
+        print('(no active SOPs — add one: hive sop add <id> --title "…" '
+              '--file <body.md>)')
+        return None
+    for i, r in enumerate(sops, 1):
+        print(f"  {i}. [{r['sop_id']} v{r['version']}] {r['title']}  "
+              f"(updated {r['updated']})")
+    print(f"\n{len(sops)} active SOP(s)")
+    return None
+
+
+def cmd_sop_show(args) -> int | None:
+    from . import sop as sop_mod
+    evs = events.read_all(getattr(args, "project", None))
+    rec = sop_mod.get(evs, args.sop_id)
+    hist = [e for e in sop_mod.entries(evs) if e["sop_id"] == args.sop_id]
+    if args.json:
+        print(json.dumps({"active": rec, "history": hist},
+                         indent=2, ensure_ascii=False))
+        return None
+    if rec is None and not hist:
+        print(f"error: no SOP '{args.sop_id}' in the ledger", file=sys.stderr)
+        return 2
+    if rec is None:
+        print(f"SOP {args.sop_id}: deleted (history below)")
+    else:
+        print(f"SOP {rec['sop_id']} v{rec['version']} — {rec['title']}")
+        print(f"created {rec['created']}  updated {rec['updated']}\n")
+        print(rec["text"])
+    print("\nhistory (newest first):")
+    for e in hist:
+        print(f"  {e['ts']}  {e['action']:6s}  session {e['session']}")
+    return None
+
+
 def cmd_graph_build(args) -> int | None:
     from . import graph as graph_mod
     result = graph_mod.build(semantic=args.semantic)
@@ -284,7 +431,7 @@ def cmd_skills_list(args) -> int | None:
 
 def cmd_skills_invoke(args) -> int | None:
     """Call ANY installed skill through MindHive (headless claude), recording the
-    outcome. Returns exit 1 on failure so /circle and /mindhive can gate on it."""
+    outcome. Returns exit 1 on failure so /circle and /mindhive-orchestrator can gate on it."""
     from . import invoker
     res = invoker.invoke_skill(args.name, plugin=args.plugin, project=args.project)
     status = "ok" if res["ok"] else "FAILED"
@@ -380,6 +527,47 @@ def cmd_skills_recommend(args) -> int | None:
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
+    return None
+
+
+def cmd_clusters_build(args) -> int | None:
+    """Build the cluster DB (parallel-orchestration layer) and store the sidecar."""
+    from . import clusters as clusters_mod
+    payload = clusters_mod.build_and_store(root=args.root, lanes=args.lanes,
+                                           use_git=args.git)
+    c = payload["counts"]
+    print(f"clustered {c['files']} files into {c['clusters']} clusters "
+          f"-> {c['lanes']} lane(s); stored cluster_db.json")
+    return None
+
+
+def cmd_clusters_show(args) -> int | None:
+    from . import clusters as clusters_mod
+    payload = clusters_mod.latest()
+    if not payload:
+        print("(no cluster_db yet - run: hive clusters build)")
+        return None
+    c = payload["counts"]
+    print(f"cluster DB from {payload.get('generated_at', '?')} "
+          f"({c['files']} files, {c['clusters']} clusters)")
+    for key, info in payload.get("clusters", {}).items():
+        print(f"  {key}  [weight {info['weight']}, {len(info['files'])} files]")
+    return None
+
+
+def cmd_clusters_plan(args) -> int | None:
+    """Print the file-ownership-safe shard plan the orchestrator fans out to
+    parallel sub-agents. Computes fresh (does not require a stored DB)."""
+    from . import clusters as clusters_mod
+    payload = clusters_mod.build(root=args.root, lanes=args.lanes, use_git=args.git)
+    plan = payload["shard_plan"]
+    print(f"{len(plan)} parallel lane(s) for {payload['counts']['files']} files:")
+    for lane in plan:
+        print(f"  lane {lane['lane']}: {len(lane['files'])} files across "
+              f"{len(lane['clusters'])} cluster(s) "
+              f"[est_complexity {lane['est_complexity']}]")
+        for key in lane["clusters"]:
+            print(f"      - {key}")
     return None
 
 
@@ -855,6 +1043,63 @@ def _build_parser() -> argparse.ArgumentParser:
     rvsub.add_parser("clear", help="clear the pending-review marker (after the review runs)").set_defaults(func=cmd_review_clear)
     rvsub.add_parser("show", help="print the pending-review marker, if any").set_defaults(func=cmd_review_show)
 
+    # --- log (mandatory code change-log) ---
+    from .changelog import CATEGORIES as _LOG_CATS
+    lg = sub.add_parser("log", help="mandatory code change-log (code_change events)")
+    lgsub = lg.add_subparsers(dest="log_cmd", required=True)
+    for _cat in _LOG_CATS:
+        lc = lgsub.add_parser(_cat, help=f"record a {_cat} entry for the current change-set")
+        lc.add_argument("explanation", help="brief explanation of what changed (mandatory)")
+        lc.add_argument("--files", nargs="*", default=None,
+                        help="affected files (default: pending marker, then session, then git)")
+        lc.add_argument("--session", default=None,
+                        help="session id (default: $MINDHIVE_SESSION)")
+        lc.set_defaults(func=cmd_log_add, category=_cat)
+    lgq = lgsub.add_parser("queue", help="queue this session's unlogged source files (run by session_end)")
+    lgq.add_argument("--session", default=None,
+                     help="session id to queue (default: $MINDHIVE_SESSION)")
+    lgq.set_defaults(func=cmd_log_queue)
+    lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
+    lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
+
+    # --- sop (managed standard operating procedures) ---
+    so = sub.add_parser("sop", help="standard operating procedures "
+                                    "(event-sourced registry, auto-loaded)")
+    sosub = so.add_subparsers(dest="sop_cmd", required=True)
+    soa = sosub.add_parser("add", help="add a new SOP")
+    soa.add_argument("sop_id", help="stable kebab-case id, e.g. memo-hygiene")
+    soa.add_argument("--title", required=True)
+    soa.add_argument("--text", default=None, help="procedure body (inline)")
+    soa.add_argument("--file", default=None, help="read the body from a file")
+    soa.add_argument("--stdin", action="store_true",
+                     help="read the body from stdin")
+    soa.add_argument("--tags", default="")
+    soa.add_argument("--session", default=None)
+    soa.set_defaults(func=cmd_sop_add)
+    sou = sosub.add_parser("update", help="revise an SOP's title and/or body")
+    sou.add_argument("sop_id")
+    sou.add_argument("--title", default=None)
+    sou.add_argument("--text", default=None)
+    sou.add_argument("--file", default=None)
+    sou.add_argument("--stdin", action="store_true")
+    sou.add_argument("--tags", default="")
+    sou.add_argument("--session", default=None)
+    sou.set_defaults(func=cmd_sop_update)
+    sod = sosub.add_parser("delete", help="retire an SOP (append-only tombstone)")
+    sod.add_argument("sop_id")
+    sod.add_argument("--reason", default=None)
+    sod.add_argument("--session", default=None)
+    sod.set_defaults(func=cmd_sop_delete)
+    sol = sosub.add_parser("list", help="list active SOPs")
+    sol.add_argument("--project", default=None)
+    sol.add_argument("--json", action="store_true")
+    sol.set_defaults(func=cmd_sop_list)
+    sos = sosub.add_parser("show", help="print one SOP in full, with history")
+    sos.add_argument("sop_id")
+    sos.add_argument("--project", default=None)
+    sos.add_argument("--json", action="store_true")
+    sos.set_defaults(func=cmd_sop_show)
+
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")
     gsub = gp.add_subparsers(dest="graph_cmd", required=True)
@@ -890,7 +1135,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pla.set_defaults(func=cmd_plugins_autoscan)
     plsub.add_parser("recommend", help="print the latest catalog's top recommendations").set_defaults(func=cmd_plugins_recommend)
 
-    # --- skills: the invoke channel /mindhive and /circle drive ---
+    # --- skills: the invoke channel /mindhive-orchestrator and /circle drive ---
     sk = sub.add_parser("skills", help="list, invoke, or check status of installed skills")
     sksub = sk.add_subparsers(dest="skills_cmd", required=True)
     skl = sksub.add_parser("list", help="list installed plugins + skills (live)")
@@ -924,6 +1169,23 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="<= 3 one-line suggestions (fast; for the session hook)")
     skc.add_argument("--project", default=None, help="target namespace")
     skc.set_defaults(func=cmd_skills_recommend)
+
+    # --- clusters: parallel-orchestration layer for /mindhive-orchestrator ---
+    cl = sub.add_parser("clusters",
+                        help="cluster the repo, classify file complexity, plan parallel lanes")
+    clsub = cl.add_subparsers(dest="clusters_cmd", required=True)
+    for _name, _help, _fn in (
+        ("build", "cluster the repo + store cluster_db.json", cmd_clusters_build),
+        ("plan", "print the file-ownership-safe parallel shard plan", cmd_clusters_plan),
+    ):
+        _p = clsub.add_parser(_name, help=_help)
+        _p.add_argument("--root", default=None, help="repo root to scan (default: cwd)")
+        _p.add_argument("--lanes", type=int, default=None,
+                        help="number of parallel lanes (default: one per cluster; clamped to [1, n])")
+        _p.add_argument("--git", action="store_true",
+                        help="weight complexity by git churn (opt-in; no-op if git is absent)")
+        _p.set_defaults(func=_fn)
+    clsub.add_parser("show", help="print the latest stored cluster DB").set_defaults(func=cmd_clusters_show)
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")

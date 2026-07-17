@@ -107,8 +107,10 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
             node.update({k: v for k, v in extra.items() if v})
             nodes[nid] = node
 
-    def add_edge(src: str, dst: str, rel: str):
-        edges.append({"src": src, "dst": dst, "rel": rel})
+    def add_edge(src: str, dst: str, rel: str, source: str = "EXTRACTED"):
+        # ADR 0002: every edge carries provenance. Deterministic structural
+        # edges default to EXTRACTED; embedding-derived edges pass INFERRED.
+        edges.append({"src": src, "dst": dst, "rel": rel, "source": source})
 
     # Build nodes and deterministic edges
     for ev in evs:
@@ -195,7 +197,7 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
                     if pair in seen_sem_pairs:
                         continue
                     seen_sem_pairs.add(pair)
-                    add_edge(pair[0], pair[1], "semantic_near")
+                    add_edge(pair[0], pair[1], "semantic_near", source="INFERRED")
         except Exception:
             pass  # deps missing / LIVE_LOCK / not embedded -> deterministic edges only
 

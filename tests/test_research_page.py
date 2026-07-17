@@ -161,6 +161,37 @@ def test_page_has_accounts_panel_reusing_workspace_endpoints():
         assert ep in PAGE
 
 
+def test_page_auto_connects_accounts_without_a_terminal():
+    # zero-terminal login: the page verifies each account with the CLI-backed
+    # auth_verify endpoint on load, shows who is connected, and the connect
+    # button falls back to the browser OAuth flow — never "type /login"
+    assert "/api/workspace/auth_verify" in PAGE
+    assert "verifyAll" in PAGE
+    assert "connectProfile" in PAGE
+    assert "browser" in PAGE
+    assert "/login" not in PAGE
+
+
+def test_page_has_trusted_sources_panel():
+    # transparency: the page shows exactly what a PRD run's allowlist grants
+    assert "Trusted sources" in PAGE
+    assert "/api/research/sources" in PAGE
+    assert "MINDHIVE_RESEARCH_WEB" in PAGE      # the kill switch is explained
+
+
+def test_page_labels_self_reliant_output_and_offers_prd_copy():
+    # every PRD card carries the provenance badge and a copy affordance
+    assert "self-reliant" in PAGE
+    assert "pill sr" in PAGE
+    assert "copyPRD" in PAGE
+    assert "copy-btn" in PAGE
+
+
+def test_page_gates_stop_button_on_run_state():
+    assert 'id="stopbtn"' in PAGE
+    assert "stopbtn').disabled" in PAGE
+
+
 # --- U8: routes ---------------------------------------------------------------
 
 @pytest.fixture
@@ -187,7 +218,7 @@ def server(tmp_path):
         train_path=tmp_path / "train.py",
         leaderboard=research.Leaderboard(tmp_path / "lb.json"),
         append_event=lambda *a, **k: None,
-        preflight=lambda profile: [],
+        preflight=lambda profile, mode: [],
         cap_s=10, turn_timeout_s=5)
     old = research.CONTROLLER
     research.CONTROLLER = ctl

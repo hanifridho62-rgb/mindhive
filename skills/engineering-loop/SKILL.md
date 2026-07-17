@@ -5,19 +5,24 @@ description: >-
   autonomous headless loop) with the compound-engineering lfg pipeline. Use when
   the user types /engineering-loop, asks to "run the full loop", "build this end
   to end and keep going until it's done", or wants a hands-off plan→work→review→
-  fix→verify→learn cycle that is more rigorous than lfg alone. Seeds every stage
+  fix→verify→learn cycle that is more rigorous than lfg alone. It is a
+  subordinate execution engine the /mindhive-orchestrator pipeline may drive at
+  its execution stage — not the centralized pipeline itself. Seeds every stage
   from the MindHive ledger, drives skills through the invoke channel with green/
   red status, and turns every failure into a prevention rule.
 ---
 
 # Engineering Loop — circle × lfg, with a memory spine
 
-This is the **primary autonomous engineering foundation**. It takes `/circle`'s
-bounded headless loop and `compound-engineering:lfg`'s staged pipeline and fuses
-them into one loop that is **more detailed than lfg** because MindHive memory
-sits between every stage: each stage recalls what was learned before it runs and
-appends what it learned after, and any skill/plugin failure is wired straight
-into the improvement loop.
+This is a **subordinate execution engine**, not the centralized pipeline. The one
+centralized pipeline lives in **`/mindhive-orchestrator`**; this loop is one of the
+execution engines that pipeline may drive at its execution stage (and it remains
+directly runnable via `/engineering-loop` for a focused hands-off cycle). It takes
+`/circle`'s bounded headless loop and `compound-engineering:lfg`'s staged pipeline
+and fuses them into one loop that is **more detailed than lfg** because MindHive
+memory sits between every stage: each stage recalls what was learned before it
+runs and appends what it learned after, and any skill/plugin failure is wired
+straight into the improvement loop.
 
 > **What this does:** it drives a full plan → work → review → fix → verify →
 > learn cycle, invoking the right installed skills through MindHive (green on

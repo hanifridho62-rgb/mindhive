@@ -649,6 +649,117 @@ def test_profile_login_passes_config_dir_via_env_not_shell(tmp_path, monkeypatch
     assert "set " not in " ".join(captured["argv"])
 
 
+def test_profile_login_launches_browser_oauth_not_repl(tmp_path, monkeypatch):
+    # zero-typing sign-in: the console runs `claude auth login` (the CLI opens
+    # the browser OAuth itself) — never the bare REPL that needs "/login" typed
+    workspace.save_profile("oauthp", r"C:\cfg\oauthp")
+    captured = {}
+    monkeypatch.setattr(workspace.subprocess, "Popen",
+                        lambda argv, *a, **kw: captured.setdefault("argv", argv)
+                        or object())
+    monkeypatch.setattr(workspace.subprocess, "CREATE_NEW_CONSOLE", 16,
+                        raising=False)
+    res = workspace.profile_login("oauthp")
+    assert res["ok"] and "nothing to type" in res["detail"]
+    cmd = " ".join(captured["argv"])
+    assert "auth login" in cmd
+    assert "/login" not in cmd
+
+
+def test_cli_auth_status_parses_logged_in(monkeypatch):
+    payload = json.dumps({"loggedIn": True, "email": "u@example.com",
+                          "subscriptionType": "pro"})
+
+    def fake_run(argv, **kw):
+        assert argv[1:] == ["auth", "status", "--json"]
+        # hooks must never fire off a status probe
+        assert kw["env"].get("MINDHIVE_HEADLESS") == "1"
+
+        class P:
+            stdout = payload
+        return P()
+
+    monkeypatch.setattr(workspace.subprocess, "run", fake_run)
+    st = workspace.cli_auth_status("default")
+    assert st["state"] == "ok" and st["source"] == "cli"
+    assert st["email"] == "u@example.com" and st["subscription"] == "pro"
+    assert "u@example.com" in st["detail"]
+
+
+def test_cli_auth_status_not_logged_in_and_error(monkeypatch):
+    class P:
+        stdout = json.dumps({"loggedIn": False})
+    monkeypatch.setattr(workspace.subprocess, "run", lambda *a, **k: P())
+    st = workspace.cli_auth_status()
+    assert st["state"] == "none" and "Connect" in st["detail"]
+
+    def boom(*a, **k):
+        raise OSError("cli missing")
+    monkeypatch.setattr(workspace.subprocess, "run", boom)
+    st = workspace.cli_auth_status()
+    assert st["state"] == "error" and "cli missing" in st["detail"]
+
+
+def test_verify_auth_always_answers_with_identity(tmp_path, monkeypatch):
+    # the CLI is the single source of truth even when the credential file
+    # looks fresh — a file fast path would drop the email and the identity
+    # line ("connected as <email>") would silently never render
+    workspace._AUTH_CACHE.clear()
+    _auth_profile(tmp_path, expires_in_s=3600)     # file heuristic says ok
+    monkeypatch.setattr(workspace, "cli_auth_status",
+                        lambda profile, timeout_s=None:
+                        {"profile": profile, "state": "ok", "source": "cli",
+                         "email": "u@example.com", "subscription": "pro",
+                         "detail": "connected as u@example.com (pro)"})
+    st = workspace.verify_auth("authp")
+    assert st["state"] == "ok" and st["source"] == "cli"
+    assert st["email"] == "u@example.com"
+
+
+def test_verify_auth_settles_with_cli_and_caches(tmp_path, monkeypatch):
+    workspace._AUTH_CACHE.clear()
+    workspace.save_profile("clip", str(tmp_path / "empty"))   # no credentials
+    calls = {"n": 0}
+
+    def fake_cli(profile, timeout_s=workspace.AUTH_VERIFY_TIMEOUT_S):
+        calls["n"] += 1
+        return {"profile": profile, "state": "ok", "source": "cli",
+                "email": "u@example.com", "subscription": "pro",
+                "detail": "connected as u@example.com (pro)"}
+
+    monkeypatch.setattr(workspace, "cli_auth_status", fake_cli)
+    st = workspace.verify_auth("clip")
+    assert st["state"] == "ok" and st["email"] == "u@example.com"
+    assert workspace.verify_auth("clip")["state"] == "ok"
+    assert calls["n"] == 1                          # second call was cached
+    workspace.verify_auth("clip", force=True)
+    assert calls["n"] == 2                          # force skips the cache
+
+
+def test_verify_auth_cli_error_falls_back_to_file(tmp_path, monkeypatch):
+    workspace._AUTH_CACHE.clear()
+    cfg = _auth_profile(tmp_path, expires_in_s=3600)
+    (cfg / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"expiresAt": 1000}}), encoding="utf-8")   # expired
+    monkeypatch.setattr(workspace, "cli_auth_status",
+                        lambda profile, timeout_s=None:
+                        {"profile": profile, "state": "error", "source": "cli",
+                         "detail": "cli missing"})
+    st = workspace.verify_auth("authp", force=True)
+    assert st["state"] == "expired" and st["source"] == "file"
+    assert "cli missing" in st["cli_error"]
+
+
+def test_api_post_auth_verify_roundtrip(monkeypatch):
+    monkeypatch.setattr(workspace, "verify_auth",
+                        lambda name="default", force=False:
+                        {"profile": name, "state": "ok",
+                         "detail": "connected", "forced": force})
+    res = workspace.api_post("auth_verify",
+                             body={"name": "default", "force": True})
+    assert res["ok"] and res["state"] == "ok" and res["forced"] is True
+
+
 # --- recipe runs ---------------------------------------------------------------------
 
 def _stub_history(monkeypatch, status=None, lessons=None, hits=None):

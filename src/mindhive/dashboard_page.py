@@ -61,6 +61,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   .pill.est { color:#e0b341; border-color:#5a4a1f; }
   .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
   .pill.tridism { color:#8a93a6; }
+  .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
   .hits { list-style:none; padding:0; margin:0; }
   .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
   .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
@@ -117,6 +118,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <button onclick="showMemory()">Memory</button>
     <button onclick="showSessions()">Sessions</button>
     <button onclick="showImprovements(true)">Improvements</button>
+    <button onclick="showLog()">Log</button>
+    <button onclick="showSops()">SOP</button>
     <div class="group">View</div>
     <button onclick="showState()">State</button>
     <button onclick="showBriefing()">Briefing</button>
@@ -219,6 +222,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   let PROJECT = localStorage.getItem('mh_project') || '';
   let SESSION = null;
   function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+  // Provenance badge: rendered wherever a row/card carries origin:'self-reliant'
+  // (server-computed by events.origin_of, so Memory / Sessions / Improvements /
+  // Oversee can never disagree about what a Self-Reliant run produced).
+  function srPill(o){
+    return o === 'self-reliant'
+      ? ' <span class="pill sr" title="produced by a Self-Reliant run">\\u2726 self-reliant</span>'
+      : '';
+  }
   function withProj(path){
     return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
   }
@@ -319,6 +330,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
           + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
           + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
+          + srPill(m.origin)
           + '</div><div class="snip">'+esc(m.text)+'</div></li>').join('')
       + '</ul>');
   }
@@ -556,6 +568,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return '<li class="noterow" data-key="'+escAttr(noteKey(m))+'" style="cursor:pointer"><div class="file">'
       + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
       + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + srPill(m.origin)
       + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
       + '</div><div class="snip'+(open?'':' one')+'">'+esc(m.text||'')+'</div></li>';
   }
@@ -705,6 +718,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (showProj && r.project ? esc(r.project)+' \\u00b7 ' : '')
       + '<span class="ovtitle" style="cursor:pointer" title="click for progress detail">'
       + esc(r.title || r.run_id)+'</span>'
+      + srPill(r.origin)
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
     const chat = r.kind === 'chat';
@@ -776,6 +790,75 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
   function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
+
+  // --- mandatory code change-log (Log view) ---
+  function logBadge(cat){
+    const colors = {update:'#4a90d9', minor_change:'#6aa84f', deletion:'#d94a4a',
+                    reduction:'#d9a44a', major_change:'#b04ad9', replacement:'#4ad9c8'};
+    const c = colors[cat] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(cat||'?')+'</span>';
+  }
+  async function renderLog(){
+    const res = await apiGet('/api/changelog');
+    if (!res || !Array.isArray(res.entries)) throw new Error((res && res.error) || 'changelog fetch failed');
+    const pend = res.pending && res.pending.files && res.pending.files.length
+      ? '<div class="row"><span class="pill" style="color:#e0a030;border-color:#a67a20">'
+        + '\\u26a0 ' + res.pending.files.length + ' unlogged file(s) \\u2014 record the mandatory entry: '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code></span></div>'
+      : '';
+    if (!res.entries.length){
+      showHTML(pend + '<h2 class="h">No change-log entries yet \\u2014 every change to '
+        + 'mindhive code must be recorded with '
+        + '<code>hive log &lt;category&gt; "brief explanation"</code> ('
+        + esc((res.categories || []).join(', ')) + ').</h2>');
+      return;
+    }
+    const showProj = (PROJECT === '*');
+    showHTML(pend + '<h2 class="h">'+res.entries.length+' change-log entr'
+      + (res.entries.length===1?'y':'ies')+'</h2>'
+      + '<ul class="hits">' + res.entries.map(e =>
+        '<li><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
+        + ((e.files||[]).length ? '<div class="snip">'+(e.files||[]).map(esc).join(' \\u00b7 ')+'</div>' : '')
+        + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+        + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
+      + '</ul>');
+  }
+  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog); }
+
+  function sopBadge(action){
+    const colors = {add:'#6aa84f', update:'#4a90d9', 'delete':'#d94a4a'};
+    const c = colors[action] || '#888';
+    return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(action||'?')+'</span>';
+  }
+  async function renderSops(){
+    const res = await apiGet('/api/sops');
+    if (!res || !Array.isArray(res.active)) throw new Error((res && res.error) || 'sop fetch failed');
+    const showProj = (PROJECT === '*');
+    if (!res.active.length && !res.history.length){
+      showHTML('<h2 class="h">No SOPs yet \\u2014 record standing procedures with '
+        + '<code>hive sop add &lt;id&gt; --title "\\u2026" --file &lt;body.md&gt;</code>. '
+        + 'Active SOPs auto-load into every session via STATE.md / MEMORY.md.</h2>');
+      return;
+    }
+    const act = res.active.map((r, i) =>
+      '<li><div class="file">SOP '+(i+1)+': '+esc(r.title)
+      + ' <span class="pill">'+esc(r.sop_id)+' v'+r.version+'</span>'
+      + (showProj && r.project ? ' <span class="pill">'+esc(r.project)+'</span>' : '')
+      + '</div><div class="snip" style="white-space:pre-wrap">'+esc(r.text)+'</div>'
+      + '<div class="snip dup">created '+esc(r.created||'')+' \\u00b7 updated '+esc(r.updated||'')+'</div></li>').join('');
+    const hist = res.history.map(e =>
+      '<li><div class="file">'+sopBadge(e.action)+' '+esc(e.sop_id)
+      + (e.title ? ' \\u2014 '+esc(e.title) : '') + '</div>'
+      + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+      + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') + '</div></li>').join('');
+    showHTML('<h2 class="h">'+res.active.length+' active SOP'
+      + (res.active.length===1?'':'s')+' (auto-loaded each session)</h2>'
+      + '<ul class="hits">'+act+'</ul>'
+      + '<h2 class="h">History ('+res.history.length+' lifecycle event'
+      + (res.history.length===1?'':'s')+')</h2>'
+      + '<ul class="hits">'+hist+'</ul>');
+  }
+  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops); }
 
   async function renderState(){ showText(await apiGet('/api/state')); }
   function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
