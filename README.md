@@ -32,6 +32,11 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive log queue [--session id]` — queue the session's unlogged source files (run by `session_end`; writes the pending-changelog marker whose notice blocks STATE.md until the entry is recorded)
 - `hive log show` — print change-log entries, newest first
 - `hive log pending` — print the pending unlogged-changes marker, if any
+- `hive roadmap set <id> --prompt "<ask>" --step "…" [--step "…"|--file steps.txt]` — declare a plan as an event-sourced **roadmap**: the original ask, the ordered steps, per-step progress. Each Oversee card gets a **roadmap** button rendering it as an interactive stepper (ask, progress bar, clickable step nodes)
+- `hive roadmap step <id> <index> --status done|active|pending|skipped [--note "…"]` — update one step; marking the active step done auto-advances the pointer to the next pending step
+- `hive roadmap interrupt <id> --cause usage_limit` — the **out-of-usage marker**: flags the plan interrupted so STATE.md (and the auto-loaded MEMORY.md) carries the creation context — the ask, steps done, and the next step — until it is resumed. `hive loop` records this automatically when a run ends on `api_cap` (Claude usage limit) or `budget_cap`
+- `hive roadmap resume <id>` / `hive roadmap complete <id>` — pick an interrupted plan back up / mark it finished (append-only, like everything else)
+- `hive roadmap list [--all]` / `hive roadmap show <id>` — list plans (completed hidden unless `--all`) / print one plan with step statuses and history
 - `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify` — check the hash chain

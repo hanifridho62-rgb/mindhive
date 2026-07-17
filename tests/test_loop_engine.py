@@ -212,6 +212,72 @@ def test_interrupted_run_still_gets_a_run_end(tmp_path, monkeypatch):
     assert ends and ends[-1].payload["reason"] == "interrupted"
 
 
+def test_api_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
+    # Out-of-usage marker: a rate-limited run must leave the initial plan and
+    # its progress in the ledger (roadmap set + interrupt) BEFORE run end, so
+    # the next session inherits the big picture.
+    loop_dir = _setup(tmp_path, monkeypatch)
+    (loop_dir / "fix_plan.md").write_text(
+        "- [x] done step\n- [ ] step one\n- [ ] step two\n"
+        "## Future\n- [ ] someday\n", encoding="utf-8")
+    limited = DriverResult(text="", usage=Usage(input_tokens=1000),
+                           session_id="s1", num_turns=1, rate_limited=True)
+    drv = FakeDriver([limited])
+    cfg = config.LoopConfig(max_iterations=5)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: True)
+    assert result["reason"] == "api_cap"
+    evs = events.read_all()
+    rms = [e for e in evs if e.type == "roadmap"]
+    assert [e.payload["action"] for e in rms] == ["set", "interrupt"]
+    assert all(e.payload["plan_id"] == result["run_id"] for e in rms)
+    assert rms[0].payload["prompt"] == "Build it"
+    assert rms[0].payload["steps"] == [
+        {"text": "done step", "status": "done"},
+        {"text": "step one", "status": "active"},
+        {"text": "step two", "status": "pending"},
+        {"text": "someday", "status": "skipped"},
+    ]
+    assert rms[1].payload["cause"] == "api_cap"
+    types = [e.type for e in evs]
+    assert types.index("roadmap") < types.index("loop_run_end")
+    # and the marker projects into the fold as an interrupted plan
+    from mindhive import roadmap
+    rec = roadmap.get(evs, result["run_id"])
+    assert rec["status"] == "interrupted"
+    assert rec["progress"] == {"done": 1, "total": 4}
+
+
+def test_budget_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    drv = FakeDriver([_result("noop\nLOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n")
+                      for _ in range(3)])
+    cfg = config.LoopConfig(max_iterations=5, window_token_budget=1,
+                            on_cap="stop")
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                             now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                             progress_fn=lambda i: True)
+    assert result["reason"] == "budget_cap"
+    rms = [e for e in events.read_all() if e.type == "roadmap"]
+    assert [e.payload["action"] for e in rms] == ["set", "interrupt"]
+    assert rms[1].payload["cause"] == "budget_cap"
+
+
+def test_non_usage_endings_append_no_roadmap(tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    (loop_dir / "fix_plan.md").write_text("- [x] step one\n", encoding="utf-8")
+    drv = FakeDriver([
+        _result("All tasks have been completed.\nLOOP_STATUS:\n  progress: true\n"
+                "  STATUS: COMPLETE\n  EXIT_SIGNAL: true\n"),
+    ])
+    cfg = config.LoopConfig(max_iterations=5)
+    engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                    now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                    progress_fn=lambda i: True)
+    assert not [e for e in events.read_all() if e.type == "roadmap"]
+
+
 def test_heuristic_blocked_iteration_does_not_trip_breaker(tmp_path, monkeypatch):
     loop_dir = _setup(tmp_path, monkeypatch)
     (loop_dir / "fix_plan.md").write_text("- [x] step one\n", encoding="utf-8")

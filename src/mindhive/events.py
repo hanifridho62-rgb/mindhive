@@ -22,6 +22,12 @@ SEMANTIC_TYPES = {
     # view, and keyword recall; the current SOP set is a deterministic fold
     # projected into STATE.md / MEMORY.md.
     "sop",
+    # Roadmap registry lifecycle (set/step/interrupt/resume/complete — see
+    # roadmap.py): the original ask, the plan built from it, and per-step
+    # progress. Semantic so plans are recallable and chain-verified; an
+    # interrupted plan projects into STATE.md as the out-of-usage marker that
+    # preserves creation context for the next session.
+    "roadmap",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",

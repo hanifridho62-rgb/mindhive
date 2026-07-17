@@ -82,11 +82,11 @@ def collapse(items, threshold: float = DEFAULT_THRESHOLD) -> list:
     out = []
     for item in items:
         # Audit/registry entries never collapse: two similarly-worded
-        # change-log entries are genuinely distinct changes, and two SOP
-        # lifecycle events (an add and its later update) are distinct steps
-        # of one procedure's history (mirrors the CONSOLIDATE_TYPES
+        # change-log entries are genuinely distinct changes, and two SOP or
+        # roadmap lifecycle events (an add and its later update) are distinct
+        # steps of one record's history (mirrors the CONSOLIDATE_TYPES
         # exemption in consolidate.py).
-        if item.get("type") in ("code_change", "sop"):
+        if item.get("type") in ("code_change", "sop", "roadmap"):
             rep = dict(item)
             rep["similar_count"] = 0
             out.append(rep)
