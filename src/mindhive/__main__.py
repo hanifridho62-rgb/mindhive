@@ -431,7 +431,7 @@ def cmd_skills_list(args) -> int | None:
 
 def cmd_skills_invoke(args) -> int | None:
     """Call ANY installed skill through MindHive (headless claude), recording the
-    outcome. Returns exit 1 on failure so /circle and /mindhive can gate on it."""
+    outcome. Returns exit 1 on failure so /circle and /mindhive-orchestrator can gate on it."""
     from . import invoker
     res = invoker.invoke_skill(args.name, plugin=args.plugin, project=args.project)
     status = "ok" if res["ok"] else "FAILED"
@@ -527,6 +527,47 @@ def cmd_skills_recommend(args) -> int | None:
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
+    return None
+
+
+def cmd_clusters_build(args) -> int | None:
+    """Build the cluster DB (parallel-orchestration layer) and store the sidecar."""
+    from . import clusters as clusters_mod
+    payload = clusters_mod.build_and_store(root=args.root, lanes=args.lanes,
+                                           use_git=args.git)
+    c = payload["counts"]
+    print(f"clustered {c['files']} files into {c['clusters']} clusters "
+          f"-> {c['lanes']} lane(s); stored cluster_db.json")
+    return None
+
+
+def cmd_clusters_show(args) -> int | None:
+    from . import clusters as clusters_mod
+    payload = clusters_mod.latest()
+    if not payload:
+        print("(no cluster_db yet - run: hive clusters build)")
+        return None
+    c = payload["counts"]
+    print(f"cluster DB from {payload.get('generated_at', '?')} "
+          f"({c['files']} files, {c['clusters']} clusters)")
+    for key, info in payload.get("clusters", {}).items():
+        print(f"  {key}  [weight {info['weight']}, {len(info['files'])} files]")
+    return None
+
+
+def cmd_clusters_plan(args) -> int | None:
+    """Print the file-ownership-safe shard plan the orchestrator fans out to
+    parallel sub-agents. Computes fresh (does not require a stored DB)."""
+    from . import clusters as clusters_mod
+    payload = clusters_mod.build(root=args.root, lanes=args.lanes, use_git=args.git)
+    plan = payload["shard_plan"]
+    print(f"{len(plan)} parallel lane(s) for {payload['counts']['files']} files:")
+    for lane in plan:
+        print(f"  lane {lane['lane']}: {len(lane['files'])} files across "
+              f"{len(lane['clusters'])} cluster(s) "
+              f"[est_complexity {lane['est_complexity']}]")
+        for key in lane["clusters"]:
+            print(f"      - {key}")
     return None
 
 
@@ -1094,7 +1135,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pla.set_defaults(func=cmd_plugins_autoscan)
     plsub.add_parser("recommend", help="print the latest catalog's top recommendations").set_defaults(func=cmd_plugins_recommend)
 
-    # --- skills: the invoke channel /mindhive and /circle drive ---
+    # --- skills: the invoke channel /mindhive-orchestrator and /circle drive ---
     sk = sub.add_parser("skills", help="list, invoke, or check status of installed skills")
     sksub = sk.add_subparsers(dest="skills_cmd", required=True)
     skl = sksub.add_parser("list", help="list installed plugins + skills (live)")
@@ -1128,6 +1169,23 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="<= 3 one-line suggestions (fast; for the session hook)")
     skc.add_argument("--project", default=None, help="target namespace")
     skc.set_defaults(func=cmd_skills_recommend)
+
+    # --- clusters: parallel-orchestration layer for /mindhive-orchestrator ---
+    cl = sub.add_parser("clusters",
+                        help="cluster the repo, classify file complexity, plan parallel lanes")
+    clsub = cl.add_subparsers(dest="clusters_cmd", required=True)
+    for _name, _help, _fn in (
+        ("build", "cluster the repo + store cluster_db.json", cmd_clusters_build),
+        ("plan", "print the file-ownership-safe parallel shard plan", cmd_clusters_plan),
+    ):
+        _p = clsub.add_parser(_name, help=_help)
+        _p.add_argument("--root", default=None, help="repo root to scan (default: cwd)")
+        _p.add_argument("--lanes", type=int, default=None,
+                        help="number of parallel lanes (default: one per cluster; clamped to [1, n])")
+        _p.add_argument("--git", action="store_true",
+                        help="weight complexity by git churn (opt-in; no-op if git is absent)")
+        _p.set_defaults(func=_fn)
+    clsub.add_parser("show", help="print the latest stored cluster DB").set_defaults(func=cmd_clusters_show)
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")

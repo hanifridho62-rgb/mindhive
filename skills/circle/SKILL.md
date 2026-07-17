@@ -18,6 +18,11 @@ Each iteration is seeded from MindHive memory and bounded by real safeguards
 exit gate, and a circuit breaker). This skill is the human-facing front door to
 that engine — it does **not** re-implement the loop; it drives the CLI.
 
+`/circle` is the loop **primitive**, not the centralized work pipeline. That
+pipeline lives solely in **`/mindhive-orchestrator`**, which may drive this loop as
+one of its execution engines. Running `/circle` on its own is just the loop — no
+brainstorm→plan→review→learn stages attach to it here.
+
 > **What this does:** it spawns a *separate, headless* Claude that edits files on
 > its own (default `permission_mode = "acceptEdits"`). Treat it like handing the
 > keyboard to an unattended agent. Confirm the goal before launching.

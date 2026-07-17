@@ -1,5 +1,5 @@
 # tests/test_cli_skills.py — `hive skills {list,invoke,status}` CLI surface.
-# This is the seam the /mindhive and /circle skills call to drive ANY installed
+# This is the seam the /mindhive-orchestrator and /circle skills call to drive ANY installed
 # skill through MindHive and have the outcome recorded (green/red + learning).
 import json
 from mindhive import __main__ as cli_mod, events
