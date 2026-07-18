@@ -949,6 +949,41 @@ def make_handler(token: str):
                                 {"run_id": run_id, "cause": "manual"}, project=proj)
             return self._json({"ok": True, "run_id": run_id})
 
+        def _get_enrich_settings(self, proj, am, qs):
+            # Prompt enrichment toggle (default ON — see enrich.py). HIVE MIND
+            # reads the default project's setting: the panel is hidden under
+            # "*", but the fetch must still answer coherently.
+            from . import enrich as enrich_mod
+            return self._json(enrich_mod.settings(
+                default_project() if am else proj))
+
+        def _post_enrich_toggle(self, proj, body):
+            # Concrete project required — "*" is already rejected by the
+            # do_POST read-only guard before this handler runs.
+            from . import enrich as enrich_mod
+            enabled = body.get("enabled")
+            if not isinstance(enabled, bool):
+                return self._json({"ok": False,
+                                   "error": "enabled must be true or false"}, 200)
+            st = enrich_mod.set_enabled(enabled, project=proj)
+            return self._json({"ok": True, "settings": st})
+
+        def _post_enrich_preview(self, proj, body):
+            # Deterministic enrichment of one draft prompt. ``record`` appends
+            # the prompt_enriched audit event — set only when the user actually
+            # uses the result (copy), so previews never spam the ledger.
+            from . import enrich as enrich_mod
+            text = body.get("prompt")
+            if not isinstance(text, str) or not text.strip():
+                return self._json({"ok": False, "error": "prompt is required"}, 200)
+            answers = body.get("answers")
+            res = enrich_mod.enrich(
+                text, project=proj,
+                answers=answers if isinstance(answers, dict) else None)
+            if body.get("record"):
+                enrich_mod.record(text, res, project=proj)
+            return self._json({"ok": True, "result": res})
+
         def _post_selftest(self, proj, body):
             from . import selftest as selftest_mod
             code = selftest_mod.run()
@@ -1018,6 +1053,7 @@ def make_handler(token: str):
             "/api/skills/history": _get_skills_history,
             "/api/skills/stats": _get_skills_stats,
             "/api/skills/recommend": _get_skills_recommend,
+            "/api/enrich/settings": _get_enrich_settings,
             "/api/export": _get_export,
         }
         for _p in ("parallel", "swarm", "agents", "output", "profiles",
@@ -1042,6 +1078,8 @@ def make_handler(token: str):
             "/api/rules/resolve": _post_rules_resolve,
             "/api/rules/dismiss": _post_rules_dismiss,
             "/api/oversee/dismiss": _post_oversee_dismiss,
+            "/api/enrich/toggle": _post_enrich_toggle,
+            "/api/enrich/preview": _post_enrich_preview,
             "/api/selftest": _post_selftest,
         }
         for _p in ("spawn", "send", "run_recipe", "set_model", "stop",

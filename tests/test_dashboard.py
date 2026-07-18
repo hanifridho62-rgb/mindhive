@@ -1934,3 +1934,99 @@ def test_workspace_auth_verify_route_registered(dashboard_server, monkeypatch):
     status, res = _post(base, "/api/workspace/auth_verify",
                         {"name": "default", "project": "*"}, token)
     assert status == 200 and res["ok"] and res["state"] == "ok"
+
+
+# --- prompt enrichment (Oversee panel API) ------------------------------------
+
+def _enrich_inventory():
+    return {"changed": True, "signature": "x", "inventory": {
+        "plugins": [{"name": "p", "skills": [
+            {"name": "planner",
+             "trigger": "Create structured plans for multi-step tasks and "
+                        "break down goal requirements"}]}],
+        "local_skills": []}}
+
+
+def test_enrich_settings_default_on(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/api/enrich/settings?project=test", token)
+    assert status == 200
+    obj = json.loads(body)
+    assert obj["enabled"] is True and obj["source"] == "default"
+
+
+def test_enrich_toggle_round_trip_and_audits(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/enrich/toggle",
+                        {"project": "test", "enabled": False}, token)
+    assert status == 200 and obj["ok"] is True
+    assert obj["settings"]["enabled"] is False
+    status, body = _get(base, "/api/enrich/settings?project=test", token)
+    assert json.loads(body)["enabled"] is False
+    toggles = [e for e in ev_mod.read_all("test")
+               if e.type == "enrich_toggled"]
+    assert len(toggles) == 1 and toggles[0].payload["enabled"] is False
+
+
+def test_enrich_toggle_requires_boolean(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/enrich/toggle",
+                        {"project": "test", "enabled": "yes"}, token)
+    assert status == 200 and obj["ok"] is False
+
+
+def test_enrich_toggle_rejected_for_hivemind(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/enrich/toggle",
+                        {"project": "*", "enabled": False}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "read-only" in obj["error"]
+
+
+def test_enrich_preview_returns_package(dashboard_server, monkeypatch):
+    from mindhive import plugins
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _enrich_inventory())
+    ev_mod.append_event("file_touched", {"path": "src/mindhive/dashboard.py"},
+                        project="test")
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/enrich/preview",
+                        {"project": "test",
+                         "prompt": "fix the dashboard poll loop"}, token)
+    assert status == 200 and obj["ok"] is True
+    res = obj["result"]
+    assert res["enabled"] is True
+    assert [s["path"] for s in res["sources"]] == ["src/mindhive/dashboard.py"]
+    assert res["sop"] and res["questions"]
+    assert "## Task" in res["enriched_prompt"]
+    # a plain preview never spams the ledger
+    assert not [e for e in ev_mod.read_all("test")
+                if e.type == "prompt_enriched"]
+
+
+def test_enrich_preview_record_appends_event(dashboard_server, monkeypatch):
+    from mindhive import plugins
+    monkeypatch.setattr(plugins, "live_inventory",
+                        lambda claude_dir=None: _enrich_inventory())
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/enrich/preview",
+                        {"project": "test", "record": True,
+                         "prompt": "fix the dashboard poll loop"}, token)
+    assert obj["ok"] is True
+    recs = [e for e in ev_mod.read_all("test") if e.type == "prompt_enriched"]
+    assert len(recs) == 1 and recs[0].payload["sop_total"] == 6
+
+
+def test_enrich_preview_requires_prompt(dashboard_server):
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/enrich/preview", {"project": "test"},
+                        token)
+    assert status == 200 and obj["ok"] is False
+
+
+def test_page_has_enrich_hooks(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "enPanel" in body and "Prompt enrichment" in body
+    assert "/api/enrich/settings" in body and "/api/enrich/preview" in body
+    assert "/api/enrich/toggle" in body
