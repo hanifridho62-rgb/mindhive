@@ -85,7 +85,9 @@ LEDGER, the hash chain, the Memory view, and keyword recall:
 `compaction`, `plugin_catalog`, `user_prompt`, `assistant_response`,
 `loop_*` (autonomous loop lifecycle), `tool_failed`, `rule_*` (prevention-rule
 lifecycle), `trigger_trained`, `invoke_requested`/`invoke_result`,
-`skill_used`, `memory_consolidated`.
+`skill_used` (`{name, plugin?, ok, text, args?}` — optional `args` is the
+capped invocation ask, the recorded "why" behind Oversee's per-session skill
+trail; contract owned by `hookcapture.py`), `memory_consolidated`.
 
 Registry/audit types are **exempt from merging everywhere**: `code_change`,
 `sop`, `learning` are never absorbed by consolidation (`consolidate.py`) and

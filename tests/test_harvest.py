@@ -2,7 +2,7 @@
 import json
 import os
 import time
-from mindhive import harvest, events, paths
+from mindhive import harvest, hookcapture, events, paths
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -494,6 +494,17 @@ def test_harvest_captures_skill_invocations():
         {"kind": "skill_used",
          "value": {"name": "circle", "plugin": "mindhive", "ok": True,
                    "text": "harvested Skill tool call"}}]
+
+
+def test_harvest_captures_skill_args_like_the_live_hook():
+    """Back-harvest mirrors the live hook's optional capped ``args`` capture,
+    so both paths agree on the skill_used payload shape."""
+    o = json.loads(_tooluse("Skill", {"skill": "mindhive:circle",
+                                      "args": "  spin the loop  " + "y" * 500}))
+    [item] = harvest._items_from_obj(o)
+    v = item["value"]
+    assert v["args"].startswith("spin the loop")
+    assert len(v["args"]) == hookcapture.SKILL_ARGS_MAX
 
 
 def test_event_for_item_maps_skill_used():

@@ -5,8 +5,14 @@ The Oversee dashboard section shows every kind of Claude work: autonomous
 ``hive loop`` runs (projected by ``loop.state.list_runs``) and — this module —
 ordinary interactive sessions, straight from the deterministic telemetry the
 hooks/auto-harvest already capture (session_start/end, file_touched,
-command_run, user_prompt, assistant_response). No slash command or loop is
-needed for a session to appear: if events flow, the session is on the board.
+command_run, user_prompt, assistant_response, skill_used). No slash command or
+loop is needed for a session to appear: if events flow, the session is on the
+board.
+
+Each card also carries a skill trail: which skills the session invoked, when,
+whether they succeeded, and why — where "why" is recorded fact only (the args
+the skill was invoked with, plus the prompt it was serving), never a
+synthesized motive.
 
 Lifecycle mirrors the loop cards: a session leaves the view automatically when
 it finishes (session_end) or goes stale (idle past ACTIVE_WINDOW_SECONDS);
@@ -27,7 +33,7 @@ _DONE_CAP = 8                        # per detail group, keep the card readable
 # telemetry that counts as "the session is doing something"
 _ACTIVITY_TYPES = {
     "session_start", "file_touched", "command_run", "user_prompt",
-    "assistant_response", "compaction",
+    "assistant_response", "compaction", "skill_used",
 } | ev_mod.SEMANTIC_TYPES
 
 
@@ -47,6 +53,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
     sessions: dict[str, dict] = {}
     order: list[str] = []
     dismissed: dict[str, str] = {}
+    prompt_now: dict[str, str] = {}      # latest prompt headline per session
     for e in evs:
         if e.type == "loop_run_dismissed":
             rid = (e.payload or {}).get("run_id")
@@ -63,7 +70,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 "started": e.ts, "status": "running", "iterations": 0,
                 "total_cost_usd": 0.0, "total_tokens": 0, "last_event_ts": e.ts,
                 "ended": False, "doing": None, "done": [], "planned": [],
-                "not_yet": [], "files": [], "task": "",
+                "not_yet": [], "files": [], "task": "", "skills": [],
                 # provenance: Self-Reliant runs log into research-<id> streams;
                 # the label rides the card so Oversee shows whose work this is
                 # (filled by the per-event pass below — same idiom as
@@ -82,6 +89,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             if t:
                 s["title"] = t
                 s["doing"] = t
+                prompt_now[sid] = t
         elif e.type == "assistant_response":
             t = headline(_text(e.payload))
             if t:
@@ -105,6 +113,17 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 s["files"].append(p)
         elif e.type == "command_run":
             s["iterations"] += 1          # activity count for the pill
+        elif e.type == "skill_used" and isinstance(e.payload, dict):
+            name = e.payload.get("name")
+            if name:
+                s["skills"].append({
+                    "name": str(name),
+                    "plugin": str(e.payload.get("plugin") or ""),
+                    "ts": e.ts,
+                    "ok": bool(e.payload.get("ok", True)),
+                    "why": headline(str(e.payload.get("args") or "")),
+                    "during": prompt_now.get(sid, ""),
+                })
 
     now = now_fn()
     out = []
@@ -130,6 +149,8 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
         files = s.pop("files")
         s["done"] = s["done"][-_DONE_CAP:] + [f"touched {p}" for p in files[-_DONE_CAP:]]
         s["planned"] = s["planned"][-_DONE_CAP:]
+        s["skills_total"] = len(s["skills"])
+        s["skills"] = s["skills"][-_DONE_CAP:]
         s.pop("task", None)
         out.append(s)
     out.reverse()
