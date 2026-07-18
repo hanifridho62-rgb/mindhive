@@ -375,3 +375,134 @@ def test_cli_append_enforces_roadmap_contract(capsys):
     assert cli_mod.main(["append", "roadmap", good, "--json"]) == 0
     evs = events.read_all()
     assert len(evs) == 1 and evs[0].type == "roadmap"
+
+
+# --- session auto-sync (TodoWrite -> roadmap) ---------------------------------
+
+SID = "sess-abc-123"
+TODOS = [{"content": "design the data model", "status": "completed"},
+         {"content": "build the fold", "status": "in_progress"},
+         {"content": "render the panel", "status": "pending"}]
+
+
+def test_sync_declares_plan_with_mapped_statuses_and_auto_tag():
+    assert roadmap.sync_from_todos(SID, TODOS) is not None
+    rec = roadmap.get(events.read_all(), SID)
+    assert [s["status"] for s in rec["steps"]] == ["done", "active", "pending"]
+    assert rec["progress"] == {"done": 1, "total": 3}
+    assert roadmap.AUTO_TAG in rec["tags"]
+    assert rec["prompt"] == f"session {SID}"            # no user_prompt yet
+
+
+def test_sync_takes_prompt_from_first_user_prompt_event():
+    events.append_event("user_prompt", {"text": "please fix the roadmap"},
+                        session_id=SID)
+    roadmap.sync_from_todos(SID, TODOS)
+    rec = roadmap.get(events.read_all(), SID)
+    assert rec["prompt"] == "please fix the roadmap"
+    assert rec["title"] == "please fix the roadmap"
+
+
+def test_sync_progress_update_appends_new_version():
+    roadmap.sync_from_todos(SID, TODOS)
+    ev = roadmap.sync_from_todos(
+        SID, [dict(t, status="completed") for t in TODOS])
+    assert ev is not None
+    rec = roadmap.get(events.read_all(), SID)
+    assert rec["version"] == 2
+    assert rec["progress"] == {"done": 3, "total": 3}
+
+
+def test_sync_identical_todos_is_noop():
+    roadmap.sync_from_todos(SID, TODOS)
+    assert roadmap.sync_from_todos(SID, TODOS) is None
+    assert len(events.read_all()) == 1
+
+
+def test_sync_prompt_upgrade_is_material_change():
+    roadmap.sync_from_todos(SID, TODOS)                 # placeholder prompt
+    events.append_event("user_prompt", {"text": "the real ask"},
+                        session_id=SID)
+    assert roadmap.sync_from_todos(SID, TODOS) is not None  # same steps
+    assert roadmap.get(events.read_all(), SID)["prompt"] == "the real ask"
+
+
+def test_sync_never_touches_manual_plans():
+    _set(plan_id=SID, session=SID)                      # human-declared
+    assert roadmap.sync_from_todos(SID, TODOS) is None
+    rec = roadmap.get(events.read_all(), SID)
+    assert [s["text"] for s in rec["steps"]] == STEPS   # untouched
+
+
+def test_sync_skips_bad_session_ids_and_bad_todos():
+    assert roadmap.sync_from_todos("", TODOS) is None
+    assert roadmap.sync_from_todos(None, TODOS) is None
+    assert roadmap.sync_from_todos("Bad_ID", TODOS) is None
+    assert roadmap.sync_from_todos(SID, []) is None
+    assert roadmap.sync_from_todos(SID, "junk") is None
+    assert roadmap.sync_from_todos(
+        SID, [{"content": " ", "status": "pending"},
+              {"content": "x", "status": "odd"}]) is None
+    assert events.read_all() == []
+
+
+def test_sync_truncates_oversized_todos():
+    todos = [{"content": "x" * 500, "status": "pending"}] \
+        + [{"content": f"s{i}", "status": "pending"} for i in range(60)]
+    roadmap.sync_from_todos(SID, todos)
+    rec = roadmap.get(events.read_all(), SID)
+    assert len(rec["steps"]) == roadmap.MAX_STEPS
+    assert len(rec["steps"][0]["text"]) == roadmap.MAX_STEP_CHARS
+
+
+def test_sync_revives_interrupted_plan():
+    roadmap.sync_from_todos(SID, TODOS)
+    roadmap.autoclose_session(SID)                      # -> interrupted
+    assert roadmap.sync_from_todos(
+        SID, [dict(t, status="completed") for t in TODOS]) is not None
+    assert roadmap.get(events.read_all(), SID)["status"] == "active"
+
+
+# --- session-end autoclose -----------------------------------------------------
+
+def test_autoclose_completes_when_every_step_is_closed():
+    roadmap.sync_from_todos(
+        SID, [dict(t, status="completed") for t in TODOS])
+    ev = roadmap.autoclose_session(SID)
+    assert ev.payload["action"] == "complete"
+    assert roadmap.get(events.read_all(), SID)["status"] == "completed"
+    assert roadmap.plans(events.read_all()) == []       # left every view
+
+
+def test_autoclose_interrupts_unfinished_plan_with_state_notice():
+    roadmap.sync_from_todos(SID, TODOS)
+    ev = roadmap.autoclose_session(SID)
+    assert ev.payload["action"] == "interrupt"
+    rec = roadmap.get(events.read_all(), SID)
+    assert rec["status"] == "interrupted"
+    assert rec["cause"] == "session_end"
+    assert "Interrupted plan" in roadmap.notice(events.read_all())
+
+
+def test_autoclose_noop_without_an_auto_owned_open_plan():
+    assert roadmap.autoclose_session(SID) is None       # no plan at all
+    _set(plan_id=SID, session=SID)                      # manual plan
+    assert roadmap.autoclose_session(SID) is None
+    assert roadmap.get(events.read_all(), SID)["status"] == "active"
+
+
+def test_autoclose_is_idempotent():
+    roadmap.sync_from_todos(SID, TODOS)
+    roadmap.autoclose_session(SID)
+    n = len(events.read_all())
+    assert roadmap.autoclose_session(SID) is None       # already interrupted
+    assert len(events.read_all()) == n
+
+
+def test_cli_roadmap_autoclose(capsys, monkeypatch):
+    monkeypatch.delenv("MINDHIVE_SESSION", raising=False)
+    assert cli_mod.main(["roadmap", "autoclose"]) == 0  # no session: silent
+    assert capsys.readouterr().out == ""
+    roadmap.sync_from_todos(SID, TODOS)
+    assert cli_mod.main(["roadmap", "autoclose", "--session", SID]) == 0
+    assert "interrupt" in capsys.readouterr().out

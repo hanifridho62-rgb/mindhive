@@ -187,3 +187,48 @@ def test_malformed_payload_is_logged_not_raised():
 def test_empty_input_is_noop():
     assert hookcapture.record_post_tool_use("", project="test") == {"appended": 0}
     assert hookcapture.record_post_tool_use("   ", project="test") == {"appended": 0}
+
+
+def test_record_todowrite_syncs_session_roadmap():
+    todos = [{"content": "step one", "status": "in_progress"},
+             {"content": "step two", "status": "pending"}]
+    raw = json.dumps({"session_id": "sess-2", "tool_name": "TodoWrite",
+                      "tool_input": {"todos": todos}})
+    res = hookcapture.record_post_tool_use(raw, project="test")
+    assert res == {"appended": 1}
+    [ev] = events.read_all("test")
+    assert ev.type == "roadmap"
+    assert ev.session_id == "sess-2"
+    assert ev.payload["plan_id"] == "sess-2"
+    assert [s["status"] for s in ev.payload["steps"]] == ["active", "pending"]
+    assert "auto" in ev.tags and "roadmap" in ev.tags
+
+
+def test_record_todowrite_with_empty_todos_appends_nothing():
+    raw = json.dumps({"session_id": "sess-2", "tool_name": "TodoWrite",
+                      "tool_input": {"todos": []}})
+    assert hookcapture.record_post_tool_use(raw, project="test") == {"appended": 0}
+    assert events.read_all("test") == []
+
+
+def test_extract_events_still_ignores_todowrite():
+    # The pure mapping stays TodoWrite-free on purpose: harvest.py mirrors it,
+    # and transcript replay must never rewrite the roadmap registry.
+    assert hookcapture.extract_events(
+        {"tool_name": "TodoWrite", "tool_input": {"todos": [
+            {"content": "x", "status": "pending"}]}}) == []
+
+
+def test_record_todowrite_sync_failure_is_logged_not_raised(monkeypatch):
+    from mindhive import roadmap
+
+    def boom(*a, **k):
+        raise RuntimeError("sync exploded")
+    monkeypatch.setattr(roadmap, "sync_from_todos", boom)
+    raw = json.dumps({"session_id": "sess-2", "tool_name": "TodoWrite",
+                      "tool_input": {"todos": [{"content": "x",
+                                                "status": "pending"}]}})
+    res = hookcapture.record_post_tool_use(raw, project="test")
+    assert res == {"appended": 0}                 # capture contract intact
+    log = paths.store_home() / "hooks_errors.log"
+    assert "todo_roadmap" in log.read_text(encoding="utf-8")

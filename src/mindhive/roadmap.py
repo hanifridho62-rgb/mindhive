@@ -292,6 +292,110 @@ def steps_from_plan_items(items) -> list:
     return steps[:MAX_STEPS]
 
 
+# --- session auto-sync (TodoWrite -> roadmap) --------------------------------
+# The deterministic writer behind the Oversee panel for interactive sessions:
+# the session's own TodoWrite telemetry IS its plan + live progress, piped in
+# by the PostToolUse hook (hookcapture.record_post_tool_use). plan_id equals
+# the session id, so the plan rides the session's Oversee card unchanged.
+
+AUTO_TAG = "auto"
+_TODO_STATUS = {"completed": "done", "in_progress": "active",
+                "pending": "pending"}
+
+
+def todos_to_steps(todos) -> list:
+    """Explicit-status steps from a TodoWrite ``todos`` list. Malformed items
+    degrade to nothing rather than raising — the hook path must never fail a
+    session over a payload quirk — and texts are truncated to the contract cap
+    so one oversized todo can't invalidate the whole sync."""
+    steps = []
+    if not isinstance(todos, list):
+        return steps
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        text = str(t.get("content") or "").strip()
+        status = _TODO_STATUS.get(t.get("status"))
+        if text and status:
+            steps.append({"text": text[:MAX_STEP_CHARS], "status": status})
+    return steps[:MAX_STEPS]
+
+
+def _session_prompt(evs, session_id) -> str:
+    """The session's original ask: headline of its first user_prompt event.
+    Capture may lag the first TodoWrite, so a stable placeholder stands in —
+    sync_from_todos treats the later prompt upgrade as a material change."""
+    from .briefing import headline
+    for e in evs:
+        if e.session_id == session_id and e.type == "user_prompt":
+            text = e.payload.get("text", "") if isinstance(e.payload, dict) \
+                else str(e.payload)
+            t = headline(str(text))
+            if t:
+                return t[:MAX_PROMPT_CHARS]
+    return f"session {session_id}"      # ID_RE caps sid at 64 chars — fits
+
+
+def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
+    """Auto-declare/update the session's roadmap from its TodoWrite state.
+    Appends at most one ``set`` per call (the fold's upsert replaces steps
+    wholesale and revives interrupted plans), and only on a material change —
+    identical steps and prompt are a no-op so routine re-writes don't bloat
+    the ledger. Plans not tagged ``auto`` are human-declared and never
+    touched. Returns the appended event, or None when nothing applies."""
+    sid = str(session_id or "")
+    if not ID_RE.match(sid):
+        return None
+    steps = todos_to_steps(todos)
+    if not steps:
+        return None
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    rec = fold(evs).get(sid)
+    if rec is not None and AUTO_TAG not in (rec.get("tags") or []):
+        return None
+    prompt = _session_prompt(evs, sid)
+    if rec is not None and rec["prompt"] == prompt \
+            and [(s["text"], s["status"]) for s in rec["steps"]] \
+            == [(s["text"], s["status"]) for s in steps]:
+        return None
+    payload = {"action": "set", "plan_id": sid, "prompt": prompt,
+               "title": prompt[:MAX_TITLE_CHARS], "steps": steps}
+    validate_payload(payload)
+    return ev_mod.append_event("roadmap", payload, session_id=sid,
+                               tags=["roadmap", AUTO_TAG], ts=ts,
+                               project=project)
+
+
+def autoclose_session(session_id, project=None, evs=None, ts=None):
+    """Session-end lifecycle for auto-synced plans (run by the SessionEnd
+    hook): every step done/skipped -> ``complete`` (earned exit from every
+    view); unfinished steps -> ``interrupt`` with cause ``session_end`` so
+    the STATE.md marker carries the plan's creation context to the next
+    session. Human-declared plans are left alone. Returns the appended
+    event, or None when nothing applies."""
+    sid = str(session_id or "")
+    if not ID_RE.match(sid):
+        return None
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    rec = fold(evs).get(sid)
+    if rec is None or rec["status"] == "completed" \
+            or AUTO_TAG not in (rec.get("tags") or []):
+        return None
+    if any(s["status"] in ("pending", "active") for s in rec["steps"]):
+        if rec["status"] == "interrupted":
+            return None
+        payload = {"action": "interrupt", "plan_id": sid,
+                   "cause": "session_end"}
+    else:
+        payload = {"action": "complete", "plan_id": sid}
+    validate_payload(payload)
+    return ev_mod.append_event("roadmap", payload, session_id=sid,
+                               tags=["roadmap", AUTO_TAG], ts=ts,
+                               project=project)
+
+
 def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
            status=None, note=None, cause=None, tags=None, session_id=None,
            project=None, evs=None):
