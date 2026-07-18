@@ -896,10 +896,17 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<pre class="enout">'+esc(r.enriched_prompt||'')+'</pre>';
   }
   function enPanel(){
-    if (PROJECT === '*') return '';   // needs a concrete project namespace
+    if (PROJECT === '*'){
+      // Never vanish silently: under HIVE MIND the panel stays visible as a
+      // stub saying where the feature lives (enrichment reads ONE project
+      // namespace — ledger, settings sidecar, trained manifest).
+      return '<div id="enpanel" class="enwrap"><div class="file">Enrichment'
+        + ' <span class="dup">pick a concrete project in the header to use '
+        + 'it \\u2014 enrichment works per project</span></div></div>';
+    }
     const on = enOn();
     let html = '<div id="enpanel" class="enwrap"><div class="file">'
-      + 'Prompt enrichment'
+      + 'Enrichment'
       + '<button class="mini" id="entoggle" title="on by default; the choice '
       + 'persists per project">'+(on ? 'on \\u2014 turn off' : 'off \\u2014 turn on')
       + '</button>'
