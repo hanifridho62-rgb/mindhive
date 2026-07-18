@@ -188,13 +188,37 @@ def test_args_why_beats_direction():
     assert s["skills"][0]["why"] == "plan the parser"   # args (the ask) wins
 
 
-def test_intended_use_fills_bare_why():
+def test_intended_use_fills_bare_why_labelled_as_purpose():
     _ev("session_start", {}, 0)
     _ev("skill_used", {"name": "verify"}, 1)            # no args, no direction, no prompt
     s = oversee.interactive_sessions(
         "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"),
         intended_use={"verify": "exercise the real flow end to end"})[0]
-    assert s["skills"][0]["why"] == "exercise the real flow end to end"
+    # labelled as the skill's PURPOSE, never presented as this call's motive
+    assert s["skills"][0]["why"] == "purpose: exercise the real flow end to end"
+
+
+def test_direction_is_consumed_once_not_over_attributed():
+    # one direction must not stamp every later same-skill call — only the next
+    _ev("session_start", {}, 0)
+    _ev("skill_directed", {"skills": [{"name": "ce-plan"}]}, 1)
+    _ev("skill_used", {"name": "ce-plan"}, 2)           # consumes the direction
+    _ev("skill_used", {"name": "ce-plan"}, 3)           # independent later call
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:05:00Z"))[0]
+    whys = [k["why"] for k in s["skills"]]
+    assert whys == ["directed by prompt-gate", ""]      # not both stamped
+
+
+def test_non_list_skills_directed_stays_total():
+    # a present-but-non-list `skills` value must not raise (total-read invariant)
+    for bad in (None, 7, "ce-plan"):
+        events.append_event("skill_directed", {"skills": bad}, session_id="s-bad",
+                            ts="2026-07-08T10:01:00Z", project="test")
+        events.append_event("skill_used", {"name": "ce-plan"}, session_id="s-bad",
+                            ts="2026-07-08T10:02:00Z", project="test")
+        trails = oversee.skill_trails(project="test")   # must not raise
+        assert trails["s-bad"][-1]["why"] == ""         # nothing stamped from junk
 
 
 def test_direction_is_scoped_to_its_session():

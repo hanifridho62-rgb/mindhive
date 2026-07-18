@@ -10,9 +10,10 @@ loop is needed for a session to appear: if events flow, the session is on the
 board.
 
 Each card also carries a skill trail: which skills the session invoked, when,
-whether they succeeded, and why — where "why" is recorded fact only (the args
-the skill was invoked with, plus the prompt it was serving), never a
-synthesized motive.
+whether they succeeded, and why — where "why" is recorded fact, never a
+synthesized motive: the args the skill was invoked with, else a same-session
+prompt-gate direction (consumed once), else the skill's labelled intended-use
+purpose; plus the prompt it was serving ("during").
 
 Lifecycle mirrors the loop cards: a session leaves the view automatically when
 it finishes (session_end) or goes stale (idle past ACTIVE_WINDOW_SECONDS);
@@ -75,19 +76,27 @@ def intended_use_map(now_fn=time.time) -> dict:
 def _skill_why(payload, directed, intended_use) -> str:
     """The recorded "why" for one ``skill_used``, honesty-ordered: the
     invocation args (the ask) -> a same-session prompt-gate direction (causal)
-    -> the skill's intended-use one-liner (its purpose) -> empty. Never a
-    synthesized motive."""
+    -> the skill's intended-use one-liner (labelled as PURPOSE, not motive) ->
+    empty. Never a synthesized motive.
+
+    A direction is CONSUMED (one ``skill_directed`` -> the next matching
+    invocation): stamping every later same-session call "directed by
+    prompt-gate" would over-attribute — a skill the gate suggested once but
+    that was later invoked independently did not happen *because* of the gate.
+    ``directed`` is the caller's live per-session dict, so the pop persists
+    across entries in the fold."""
     args_why = headline(str(payload.get("args") or ""))
     if args_why:
         return args_why
     name = str(payload.get("name") or "")
     if name in directed:
-        measured = directed[name]
+        measured = directed.pop(name)     # consume: one direction, one invocation
         if isinstance(measured, dict) and measured.get("calls"):
             return (f"directed by prompt-gate "
                     f"(measured {measured.get('ok', 0)}/{measured['calls']})")
         return "directed by prompt-gate"
-    return (intended_use or {}).get(name, "")
+    use = (intended_use or {}).get(name)
+    return f"purpose: {use}" if use else ""
 
 
 def skill_trails(project=None, evs=None, intended_use=None) -> dict:
@@ -114,9 +123,16 @@ def skill_trails(project=None, evs=None, intended_use=None) -> dict:
             if t:
                 prompt_now[sid] = t
         elif e.type == "skill_directed":
-            for s in p.get("skills", []):
-                if isinstance(s, dict) and s.get("name"):
-                    directed.setdefault(sid, {})[str(s["name"])] = s.get("measured")
+            # ``.get(k, [])`` only defaults on a MISSING key — a present but
+            # non-list value ({"skills": null} / a number from a hand-edited or
+            # future-shaped row) would be returned as-is and raise on iteration,
+            # breaking the total-read invariant this fold promises. Guard the
+            # container type explicitly, not just the items.
+            skills = p.get("skills")
+            if isinstance(skills, list):
+                for s in skills:
+                    if isinstance(s, dict) and s.get("name"):
+                        directed.setdefault(sid, {})[str(s["name"])] = s.get("measured")
         elif e.type == "skill_used":
             if not p.get("name"):
                 continue
