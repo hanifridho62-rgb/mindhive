@@ -21,14 +21,18 @@ from .driver import preflight
 USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap")
 
 
-def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
+def _snapshot_interrupted_plan(project, run_id, loop_dir, cause,
+                               plan_id=None):
     """Out-of-usage marker (roadmap.py): persist the initial ask, the plan,
     and how far it got, as roadmap set + interrupt events. The marker rides
     STATE.md/MEMORY.md so the next session resumes from the next step instead
-    of starting cold. Best-effort by design — a snapshot failure must never
-    mask the loop_run_end event that closes the run."""
+    of starting cold. ``plan_id`` overrides the roadmap key (a fabrication
+    run keeps its one plan across every interruption; a bare loop run keys
+    by run_id). Best-effort by design — a snapshot failure must never mask
+    the loop_run_end event that closes the run."""
     try:
         from .. import roadmap as roadmap_mod
+        plan_id = plan_id or run_id
         tasks = task_mod.load_tasks(loop_dir)
         lines = tasks.prompt.strip().splitlines()
         prompt = lines[0].lstrip("# ").strip() if lines else ""
@@ -42,10 +46,10 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
             # the marker still records what was being built and why it stopped.
             steps = [{"text": prompt[:roadmap_mod.MAX_STEP_CHARS],
                       "status": "active"}]
-        set_payload = {"action": "set", "plan_id": run_id, "prompt": prompt,
+        set_payload = {"action": "set", "plan_id": plan_id, "prompt": prompt,
                        "title": prompt[:roadmap_mod.MAX_TITLE_CHARS],
                        "steps": steps}
-        int_payload = {"action": "interrupt", "plan_id": run_id,
+        int_payload = {"action": "interrupt", "plan_id": plan_id,
                        "cause": cause}
         roadmap_mod.validate_payload(set_payload)
         roadmap_mod.validate_payload(int_payload)
@@ -55,22 +59,27 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
                             project=project)
         # Delivery leg (autoresume.py): schedule the marker to re-enter
         # Claude once the usage window reopens — same best-effort stance as
-        # the snapshot itself. The resumed work runs from the loop's repo
-        # root (loop_dir is the .hive-loop dir inside it).
+        # the snapshot itself. Loop mode: the wake-up relaunches THIS loop on
+        # its goal dir (breaker, budgets, exit gate intact), running from the
+        # repo root (loop_dir is the goal dir inside it).
         from .. import autoresume as autoresume_mod
-        autoresume_mod.schedule(run_id, project=project,
-                                cwd=str(Path(loop_dir).parent))
+        autoresume_mod.schedule(plan_id, project=project,
+                                cwd=str(Path(loop_dir).parent),
+                                mode="loop", goal_dir=str(loop_dir))
     except Exception:
         pass
 
 
 def run_loop(project, loop_dir, cfg, driver, *,
              now_fn=time.time, sleep_fn=time.sleep, progress_fn=None,
-             live=False, force=False):
+             live=False, force=False, plan_id=None):
     """Drive one autonomous run to completion or a safeguard boundary.
 
     progress_fn(iteration_index)->bool is injected in tests to report whether
-    files changed; in production it is a git/mtime diff (Task 11)."""
+    files changed; in production it is a git/mtime diff (Task 11).
+    ``plan_id`` keys the interruption marker to an existing roadmap (a
+    fabrication's plan survives every sleep/wake cycle) instead of the
+    per-run id."""
     loop_dir = Path(loop_dir)
     guard.ensure_safe(force=force)              # LIVE_LOCK check
 
@@ -227,7 +236,8 @@ def run_loop(project, loop_dir, cfg, driver, *,
     # Out-of-usage interruption: preserve the plan + progress BEFORE the run
     # closes, so even a ledger reader that stops at loop_run_end sees the mark.
     if reason in USAGE_INTERRUPT_REASONS:
-        _snapshot_interrupted_plan(project, run_id, loop_dir, reason)
+        _snapshot_interrupted_plan(project, run_id, loop_dir, reason,
+                                   plan_id=plan_id)
     events.append_event("loop_run_end",
                         {"run_id": run_id, "reason": reason, "iterations": iteration},
                         project=project)

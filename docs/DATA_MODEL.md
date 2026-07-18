@@ -92,11 +92,18 @@ trail; contract owned by `hookcapture.py`), `memory_consolidated`,
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
 `autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
-model?, timer?, outcome?, detail?}` — auto-resume delivery lifecycle,
-`autoresume.py`: action ∈ scheduled, fired, cancelled; after a usage-limit
-interruption the roadmap marker is scheduled to re-enter Claude once the
-~5h window reopens, and these events are the delivery audit trail; the
-roadmap events remain the semantic record).
+model?, timer?, mode?, goal_dir?, outcome?, detail?}` — auto-resume delivery
+lifecycle, `autoresume.py`: action ∈ scheduled, fired, cancelled; after a
+usage-limit interruption the roadmap marker is scheduled to re-enter Claude
+once the ~5h window reopens — mode "prompt" as a one-shot headless session,
+mode "loop" by relaunching the loop engine on `goal_dir`; the roadmap
+events remain the semantic record),
+`fabrication` (`{action, fab_id, goal_dir?, title?, steps?, source?, due?,
+timer?, cwd?, run_id?, reason?, iterations?}` — PRD assembly-line
+lifecycle, `fabricate.py`: action ∈ compiled, dispatched, run; a PRD
+compiled into a loop goal dir + fabricate-tagged roadmap, armed on an OS
+timer, and executed unattended by the loop engine — `run_id` joins each
+launch to its `loop_*` telemetry).
 
 Registry/audit types are **exempt from merging everywhere**: `code_change`,
 `sop`, `learning` are never absorbed by consolidation (`consolidate.py`) and
@@ -134,6 +141,10 @@ Key joins an AI reader should know:
 - `plan_id` threads a roadmap's lifecycle events into one plan record
   (`roadmap.fold`) and joins the `autoresume` delivery telemetry
   (`autoresume.fold`) to the interrupted plan whose marker it re-delivers.
+- `fab_id` threads a fabrication's compiled/dispatched/run events into one
+  assembly-line record (`fabricate.fold`); it doubles as the roadmap
+  `plan_id` for the whole fabrication, and each run event's `run_id` joins
+  the launch to its `loop_run_start`/`loop_iteration`/`loop_run_end` rows.
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
 

@@ -83,6 +83,15 @@ def cmd_append(args) -> int | None:
             print(f"error: {e} (use: hive autoresume schedule|fire|"
                   f"cancel …)", file=sys.stderr)
             return 2
+    elif args.type == "fabrication":
+        # And the assembly-line telemetry: same contract-at-the-surface rule.
+        from . import fabricate as fabricate_mod
+        try:
+            fabricate_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f"error: {e} (use: hive fabricate compile|dispatch|"
+                  f"run …)", file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -639,6 +648,120 @@ def cmd_autoresume_wait(args) -> int | None:
     fired = autoresume_mod.wait(getattr(args, "project", None),
                                 poll_s=args.poll)
     print(f"autoresume wait: {fired} delivery(ies) fired")
+    return None
+
+
+def _latest_learning_report(evs) -> str:
+    """The most recent Self-Reliant PRD report from the ledger's learning
+    events (the structured ``report`` field; the display ``text`` is a
+    fallback for history written before the field existed)."""
+    for e in reversed(evs):
+        if e.type == "learning" and isinstance(e.payload, dict):
+            report = str(e.payload.get("report")
+                         or e.payload.get("text") or "").strip()
+            if report:
+                return report
+    return ""
+
+
+def cmd_fabricate_compile(args) -> int | None:
+    from . import fabricate as fabricate_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    project = getattr(args, "project", None)
+    if args.prd_file:
+        from pathlib import Path
+        try:
+            text = Path(args.prd_file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"error: cannot read PRD file: {e}", file=sys.stderr)
+            return 2
+        source = args.prd_file
+    elif args.from_learning:
+        text = _latest_learning_report(events.read_all(project))
+        if not text:
+            print("error: no Self-Reliant learning (PRD) in the ledger — "
+                  "run a learn-mode research cycle first, or pass a PRD "
+                  "file", file=sys.stderr)
+            return 2
+        source = "learning:latest"
+    else:
+        print("error: pass a PRD file, or --from-learning for the latest "
+              "Self-Reliant PRD", file=sys.stderr)
+        return 2
+    try:
+        rec = fabricate_mod.compile_work_order(
+            text, fab_id=args.id, base_dir=args.dir, source=source,
+            project=project, session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"fabricate compiled: {rec['fab_id']} — {rec['title']} "
+          f"({rec['steps']} SOP step(s))")
+    print(f"  goal dir: {rec['goal_dir']}")
+    print(f"  next: hive fabricate dispatch {rec['fab_id']} "
+          f"[--at <ts> | --in-hours <h>]")
+    return None
+
+
+def cmd_fabricate_dispatch(args) -> int | None:
+    from . import fabricate as fabricate_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        p = fabricate_mod.dispatch(args.fab_id,
+                                   project=getattr(args, "project", None),
+                                   at=args.at, in_hours=args.in_hours,
+                                   session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"fabricate dispatched: {args.fab_id} -> runs {p['due']} "
+          f"(timer: {p['timer']})")
+    if p["timer"] == "none":
+        print("note: no OS timer registered — run it yourself when due: "
+              f"hive fabricate run {args.fab_id}")
+    return None
+
+
+def cmd_fabricate_run(args) -> int | None:
+    from . import fabricate as fabricate_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        p = fabricate_mod.run(args.fab_id,
+                              project=getattr(args, "project", None),
+                              session_id=sid, force=args.force)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"fabricate run: {args.fab_id} -> {p['reason']} "
+          f"({p['iterations']} iteration(s), loop run {p['run_id']})")
+    return 0 if p["reason"] in ("completed", "api_cap", "budget_cap") else 1
+
+
+def cmd_fabricate_list(args) -> int | None:
+    from . import fabricate as fabricate_mod
+    recs = sorted(
+        fabricate_mod.fold(events.read_all(getattr(args, "project",
+                                                   None))).values(),
+        key=lambda r: (r["updated"], r["fab_id"]))
+    if args.json:
+        print(json.dumps(recs, indent=2, ensure_ascii=False))
+        return None
+    if not recs:
+        print("(no fabrications — compile a PRD: "
+              "hive fabricate compile <prd.md>)")
+        return None
+    marks = {"compiled": "·", "dispatched": "!", "completed": "x",
+             "stopped": "?"}
+    for i, r in enumerate(recs, 1):
+        if r["status"] == "dispatched":
+            tail = f"runs {r['due']} (timer {r['timer']})"
+        elif r["status"] in ("completed", "stopped"):
+            tail = f"{r['reason']} ({r['iterations']} iteration(s))"
+        else:
+            tail = f"{r['steps']} step(s) compiled"
+        print(f"  {i}. {marks.get(r['status'], '?')} [{r['fab_id']}] "
+              f"{r['title'] or '(untitled)'} — {tail}")
+    print(f"\n{len(recs)} fabrication(s)")
     return None
 
 
@@ -1522,6 +1645,48 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="max seconds between due checks (default: 60)")
     arw.add_argument("--project", default=None)
     arw.set_defaults(func=cmd_autoresume_wait)
+
+    # --- fabricate (PRD assembly line: compile -> dispatch -> run) ---
+    fb = sub.add_parser("fabricate", help="PRD assembly line: compile an "
+                        "Executable PRD into a loop work order, put it on "
+                        "an OS timer, and run it unattended (usage caps "
+                        "sleep/wake via autoresume)")
+    fbsub = fb.add_subparsers(dest="fabricate_cmd", required=True)
+    fbc = fbsub.add_parser("compile", help="PRD -> goal dir + roadmap")
+    fbc.add_argument("prd_file", nargs="?", default=None,
+                     help="path to a PRD markdown file")
+    fbc.add_argument("--from-learning", action="store_true",
+                     dest="from_learning",
+                     help="use the latest Self-Reliant PRD from the ledger")
+    fbc.add_argument("--id", default=None,
+                     help="fab id (default: fab-<title-slug>)")
+    fbc.add_argument("--dir", default=None,
+                     help="repo root the work runs in (default: here)")
+    fbc.add_argument("--project", default=None)
+    fbc.add_argument("--session", default=None)
+    fbc.set_defaults(func=cmd_fabricate_compile)
+    fbd = fbsub.add_parser("dispatch", help="arm the OS timer that starts "
+                           "the run (default: ~now)")
+    fbd.add_argument("fab_id")
+    fbd.add_argument("--at", default=None,
+                     help="UTC start time, e.g. 2026-07-18T22:00:00Z")
+    fbd.add_argument("--in-hours", type=float, default=None, dest="in_hours",
+                     help="start this many hours from now")
+    fbd.add_argument("--project", default=None)
+    fbd.add_argument("--session", default=None)
+    fbd.set_defaults(func=cmd_fabricate_dispatch)
+    fbr = fbsub.add_parser("run", help="execute one loop launch now (what "
+                           "the dispatch timer runs)")
+    fbr.add_argument("fab_id")
+    fbr.add_argument("--force", action="store_true",
+                     help="bypass the LIVE_LOCK guard (use with care)")
+    fbr.add_argument("--project", default=None)
+    fbr.add_argument("--session", default=None)
+    fbr.set_defaults(func=cmd_fabricate_run)
+    fbl = fbsub.add_parser("list", help="list fabrications")
+    fbl.add_argument("--project", default=None)
+    fbl.add_argument("--json", action="store_true")
+    fbl.set_defaults(func=cmd_fabricate_list)
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")
