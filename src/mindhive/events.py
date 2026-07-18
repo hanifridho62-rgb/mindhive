@@ -38,6 +38,11 @@ DETERMINISTIC_TYPES = {
     "rule_activated", "rule_promoted", "rule_demoted", "rule_expired",
     "rule_enforced", "rule_rerouted", "trigger_trained",
     "invoke_requested", "invoke_result", "skill_used",
+    # Prompt-quality gate directed a skill (promptgate fired with trained rules
+    # on an underspecified prompt). Payload {skills: [{name, plugin?, measured?}]}.
+    # Oversee joins it to a later same-session skill_used to show the honest
+    # causal "why" ("directed by prompt-gate") — see oversee.skill_trails.
+    "skill_directed",
     "memory_consolidated",
     # Prompt enrichment (Oversee, see enrich.py): an enrichment act the user
     # actually used (copied/recorded) and the default-on toggle's audit

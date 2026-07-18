@@ -751,16 +751,37 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function ovGroup(items, glyph, cls, dim){
     return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
   }
-  // Skill trail on chat cards: which skills fired, when (HH:MM), the outcome,
-  // and the recorded "why" — the args the skill was invoked with plus the
-  // prompt it was serving ("during"). Ledger facts only, never synthesized.
+  // Skill trail on chat cards: which skills fired, when (HH:MM + relative), the
+  // outcome, and the recorded "why" — the args the skill was invoked with, else
+  // a prompt-gate direction, else the skill's intended use, plus the prompt it
+  // was serving ("during"). Ledger facts only, never synthesized. The skill
+  // name links to its Skill & Plugin detail.
+  function skillAgo(ts){
+    const t = Date.parse(ts || '');
+    if (!t) return '';
+    const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  }
+  function ovOpenSkill(name, plugin){
+    if (!name) return;
+    showSkillPanel();
+    showSkillDetail(name, plugin || null);
+  }
   function ovSkillRow(k){
     const name = (k.plugin ? k.plugin + ':' : '') + (k.name || '');
     const why = [k.why, k.during ? 'during: ' + k.during : '']
       .filter(Boolean).join(' \\u00b7 ');
+    const ago = skillAgo(k.ts);
     return '<div class="snip ovskill"><span class="'+(k.ok === false ? 'sbad' : 'sok')
-      + '">\\u2726</span> <span class="dup">'+esc((k.ts || '').slice(11, 16))+'</span> '
-      + esc(name)+(k.ok === false ? ' <span class="sbad">failed</span>' : '')
+      + '">\\u2726</span> <span class="dup">'+esc((k.ts || '').slice(11, 16))
+      + (ago ? ' \\u00b7 '+esc(ago) : '')+'</span> '
+      + '<span class="ovsklink" style="cursor:pointer;text-decoration:underline" '
+      + 'data-skill="'+escAttr(k.name || '')+'" data-plugin="'+escAttr(k.plugin || '')
+      + '">'+esc(name)+'</span>'
+      + (k.ok === false ? ' <span class="sbad">failed</span>' : '')
       + (why ? '<div class="dup" style="margin-left:18px">'+esc(why)+'</div>' : '')
       + '</div>';
   }
@@ -768,7 +789,17 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     const ks = r.skills || [];
     if (!ks.length) return '';
     const hidden = (r.skills_total || ks.length) - ks.length;
-    return '<div class="snip dup">skills used:</div>' + ks.map(ovSkillRow).join('')
+    // Compact distinct-skill summary with xN counts (first-appearance order).
+    const counts = {}, order = [];
+    ks.forEach(k => {
+      const n = (k.plugin ? k.plugin + ':' : '') + (k.name || '');
+      if (!(n in counts)){ counts[n] = 0; order.push(n); }
+      counts[n]++;
+    });
+    const summary = order.map(n => esc(n) + (counts[n] > 1 ? ' \\u00d7'+counts[n] : ''))
+      .join(' \\u00b7 ');
+    return '<div class="snip dup">skills used: '+summary+'</div>'
+      + ks.map(ovSkillRow).join('')
       + (hidden > 0 ? '<div class="snip dup">\\u2026 '+hidden+' earlier</div>' : '');
   }
   // The roadmap panel's data source (KTD5): an explicit roadmap plan when
@@ -1037,6 +1068,10 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       const key = el.dataset.key;
       if (RM_NODE_OPEN.has(key)) RM_NODE_OPEN.delete(key); else RM_NODE_OPEN.add(key);
       paintOversee();
+    });
+    view.querySelectorAll('.ovsklink').forEach(el => el.onclick = (ev) => {
+      ev.stopPropagation();
+      ovOpenSkill(el.dataset.skill, el.dataset.plugin);
     });
   }
   async function renderOversee(){

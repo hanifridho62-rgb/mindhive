@@ -87,7 +87,11 @@ LEDGER, the hash chain, the Memory view, and keyword recall:
 lifecycle), `trigger_trained`, `invoke_requested`/`invoke_result`,
 `skill_used` (`{name, plugin?, ok, text, args?}` — optional `args` is the
 capped invocation ask, the recorded "why" behind Oversee's per-session skill
-trail; contract owned by `hookcapture.py`), `memory_consolidated`,
+trail; contract owned by `hookcapture.py`),
+`skill_directed` (`{skills: [{name, plugin?, measured?}]}` — the prompt-quality
+gate directed these skills on an underspecified prompt; `promptgate.py` writes
+it, `oversee.skill_trails` joins it to a later same-session `skill_used` for the
+honest causal "directed by prompt-gate" why), `memory_consolidated`,
 `prompt_enriched`/`enrich_toggled` (Oversee prompt enrichment, `enrich.py`:
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth).
