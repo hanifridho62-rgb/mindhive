@@ -162,6 +162,27 @@ def test_extract_skill_response_content_blocks_and_truncation():
     assert len(p["text"]) == 200
 
 
+def test_extract_skill_args_captured_and_capped():
+    """The invocation ask rides the payload as optional ``args`` (the "why"
+    Oversee's skill trail shows), capped like the other captured strings."""
+    payload = {"tool_name": "Skill",
+               "tool_input": {"skill": "p:s",
+                              "args": "  why this fired  " + "x" * 500},
+               "tool_response": {}}
+    [(_, p)] = hookcapture.extract_events(payload)
+    assert p["args"].startswith("why this fired")
+    assert len(p["args"]) == hookcapture.SKILL_ARGS_MAX
+
+
+def test_extract_skill_non_string_or_blank_args_omitted():
+    for args in (42, None, "   "):
+        payload = {"tool_name": "Skill",
+                   "tool_input": {"skill": "s", "args": args},
+                   "tool_response": {}}
+        [(_, p)] = hookcapture.extract_events(payload)
+        assert "args" not in p
+
+
 def test_record_skill_payload_appends_skill_used_event():
     raw = json.dumps({"session_id": "s1", "tool_name": "Skill",
                       "tool_input": {"skill": "superpowers:brainstorming"},

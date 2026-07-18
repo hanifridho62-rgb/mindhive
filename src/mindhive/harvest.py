@@ -90,12 +90,17 @@ def _split_skill_name(raw: str) -> dict:
 
 def _skill_from_tool_use(inp: dict) -> dict | None:
     """skill_used payload for a Skill tool_use block, or None. Same field
-    fallbacks as the live hook (tool_input.skill / .name / .skill_name)."""
+    fallbacks as the live hook (tool_input.skill / .name / .skill_name),
+    including the optional capped ``args`` ask, so both capture paths agree
+    on the payload shape."""
     for key in ("skill", "name", "skill_name"):
         v = (inp or {}).get(key)
         if isinstance(v, str) and v.strip():
             out = _split_skill_name(v)
             out.update({"ok": True, "text": "harvested Skill tool call"})
+            args = (inp or {}).get("args")
+            if isinstance(args, str) and args.strip():
+                out["args"] = args.strip()[:hookcapture.SKILL_ARGS_MAX]
             return out
     return None
 

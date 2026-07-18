@@ -21,6 +21,7 @@ _CMD_TOOLS = ("Bash", "PowerShell")
 CMD_MAX = 180
 DESC_MAX = 120
 _SKILL_TEXT_MAX = 200
+SKILL_ARGS_MAX = 200
 
 
 def line_stats(tool, inp, resp=None):
@@ -87,9 +88,11 @@ def _response_text(resp) -> str:
 
 def _skill_payload(inp, resp) -> dict | None:
     """Build the ``skill_used`` event payload from a Skill-tool PostToolUse
-    payload: ``{name, plugin?, ok, text}``. The skill name comes from
+    payload: ``{name, plugin?, ok, text, args?}``. The skill name comes from
     ``tool_input`` (``plugin:skill`` namespacing is split into the two fields);
-    ``ok`` reflects the tool_response error markers. None when unparseable."""
+    ``ok`` reflects the tool_response error markers; ``args`` is the capped
+    invocation ask when one was passed — the recorded "why" behind Oversee's
+    per-session skill trail. None when unparseable."""
     raw = None
     for key in ("skill", "name", "skill_name"):
         v = inp.get(key)
@@ -103,6 +106,9 @@ def _skill_payload(inp, resp) -> dict | None:
            "text": _response_text(resp).strip()[:_SKILL_TEXT_MAX]}
     if plugin:
         out["plugin"] = plugin
+    args = inp.get("args")
+    if isinstance(args, str) and args.strip():
+        out["args"] = args.strip()[:SKILL_ARGS_MAX]
     return out
 
 
@@ -111,7 +117,7 @@ def extract_events(payload) -> list:
     pairs. The payload's ``text`` field is byte-identical to the historical
     value (path / command[:180]) — harvest's dedup key depends on it. Extra
     keys (plus/minus/tool/desc) ride alongside, and the Skill tool yields a
-    structured ``skill_used`` payload (``{name, plugin?, ok, text}``). A file
+    structured ``skill_used`` payload (``{name, plugin?, ok, text, args?}``). A file
     change that computes to +0 −0 is not a change and is skipped (locked
     design rule).
 

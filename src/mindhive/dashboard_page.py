@@ -751,6 +751,26 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function ovGroup(items, glyph, cls, dim){
     return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
   }
+  // Skill trail on chat cards: which skills fired, when (HH:MM), the outcome,
+  // and the recorded "why" — the args the skill was invoked with plus the
+  // prompt it was serving ("during"). Ledger facts only, never synthesized.
+  function ovSkillRow(k){
+    const name = (k.plugin ? k.plugin + ':' : '') + (k.name || '');
+    const why = [k.why, k.during ? 'during: ' + k.during : '']
+      .filter(Boolean).join(' \\u00b7 ');
+    return '<div class="snip ovskill"><span class="'+(k.ok === false ? 'sbad' : 'sok')
+      + '">\\u2726</span> <span class="dup">'+esc((k.ts || '').slice(11, 16))+'</span> '
+      + esc(name)+(k.ok === false ? ' <span class="sbad">failed</span>' : '')
+      + (why ? '<div class="dup" style="margin-left:18px">'+esc(why)+'</div>' : '')
+      + '</div>';
+  }
+  function ovSkills(r){
+    const ks = r.skills || [];
+    if (!ks.length) return '';
+    const hidden = (r.skills_total || ks.length) - ks.length;
+    return '<div class="snip dup">skills used:</div>' + ks.map(ovSkillRow).join('')
+      + (hidden > 0 ? '<div class="snip dup">\\u2026 '+hidden+' earlier</div>' : '');
+  }
   // The roadmap panel's data source (KTD5): an explicit roadmap plan when
   // the ledger has one for this run/session id — it carries the true
   // original ask and step statuses — else a client-side synthesis from the
@@ -833,6 +853,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<span class="pill">'+(r.iterations||0)+(chat
           ? ' command'+((r.iterations||0)===1?'':'s')
           : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
+      + (chat && r.skills_total ? ' <span class="pill">'+r.skills_total
+          + ' skill'+(r.skills_total===1?'':'s')+'</span>' : '')
       + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
       + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
                     + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
@@ -842,6 +864,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       if (r.doing) body += ovRow('\\u25d0', 'ovspin', r.doing);
       body += ovGroup(r.planned, '\\u25cb', 'ovpend')
             + ovGroup(r.not_yet, '\\u25cb', 'ovpend', true);
+      body += ovSkills(r);
       body += '<div class="snip dup">started '+esc(r.started||'')
             + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
     }

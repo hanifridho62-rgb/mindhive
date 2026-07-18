@@ -87,6 +87,56 @@ def test_semantic_events_and_next_steps_fill_the_checklist():
     assert s["doing"] == "migrating the reader now"
 
 
+def test_skill_trail_records_name_time_ok_and_why():
+    _ev("session_start", {}, 0)
+    _ev("user_prompt", {"text": "ship the parser"}, 1)
+    _ev("skill_used", {"name": "ce-plan", "plugin": "compound-engineering",
+                       "ok": True, "text": "planned",
+                       "args": "plan the parser feature"}, 2)
+    _ev("user_prompt", {"text": "now fix the bug"}, 3)
+    _ev("skill_used", {"name": "ce-debug", "ok": False, "text": "boom"}, 4)
+    s = oversee.interactive_sessions("test",
+                                     now_fn=lambda: _epoch("2026-07-08T10:05:00Z"))[0]
+    assert s["skills_total"] == 2
+    a, b = s["skills"]
+    assert a["name"] == "ce-plan" and a["plugin"] == "compound-engineering"
+    assert a["ts"] == "2026-07-08T10:02:00Z"
+    assert a["ok"] is True
+    assert a["why"] == "plan the parser feature"      # the args = the ask
+    assert a["during"] == "ship the parser"           # the prompt it served
+    assert b["ok"] is False and b["why"] == ""
+    assert b["during"] == "now fix the bug"           # later prompt shifts it
+
+
+def test_skill_before_any_prompt_and_nameless_payloads():
+    _ev("session_start", {}, 0)
+    _ev("skill_used", {"name": "verify"}, 1)
+    _ev("skill_used", {"text": "no name"}, 2)         # skipped, never raises
+    s = oversee.interactive_sessions("test",
+                                     now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["skills_total"] == 1
+    assert s["skills"][0]["during"] == ""             # nothing preceded it
+
+
+def test_skill_trail_caps_display_but_counts_all():
+    _ev("session_start", {}, 0)
+    for i in range(12):
+        _ev("skill_used", {"name": f"s{i}"}, 1, second=i)
+    s = oversee.interactive_sessions("test",
+                                     now_fn=lambda: _epoch("2026-07-08T10:02:00Z"))[0]
+    assert s["skills_total"] == 12
+    assert [k["name"] for k in s["skills"]] == [f"s{i}" for i in range(4, 12)]
+
+
+def test_skill_used_keeps_the_session_fresh():
+    _ev("session_start", {}, 0)
+    _ev("user_prompt", {"text": "long think"}, 1)
+    _ev("skill_used", {"name": "verify"}, 30)         # only recent activity
+    s = oversee.interactive_sessions("test",
+                                     now_fn=lambda: _epoch("2026-07-08T10:31:00Z"))[0]
+    assert s["online"] is True
+
+
 def test_self_reliant_run_is_labeled_and_titled():
     # a Self-Reliant run's research-<id> stream carries the provenance label
     # and a human title (it has no user_prompt to title from)
