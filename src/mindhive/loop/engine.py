@@ -53,6 +53,13 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
                             project=project)
         events.append_event("roadmap", int_payload, tags=["roadmap"],
                             project=project)
+        # Delivery leg (autoresume.py): schedule the marker to re-enter
+        # Claude once the usage window reopens — same best-effort stance as
+        # the snapshot itself. The resumed work runs from the loop's repo
+        # root (loop_dir is the .hive-loop dir inside it).
+        from .. import autoresume as autoresume_mod
+        autoresume_mod.schedule(run_id, project=project,
+                                cwd=str(Path(loop_dir).parent))
     except Exception:
         pass
 

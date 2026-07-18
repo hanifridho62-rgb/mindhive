@@ -44,6 +44,13 @@ DETERMINISTIC_TYPES = {
     # trail. Telemetry like trigger_trained — the settings sidecar is the
     # source of truth, these events are the ledger evidence.
     "prompt_enriched", "enrich_toggled",
+    # Auto-resume delivery lifecycle (scheduled/fired/cancelled — see
+    # autoresume.py): after a usage-limit interruption, the roadmap marker
+    # is scheduled to re-enter Claude once the ~5h window reopens.
+    # Telemetry — the roadmap events stay the semantic record; these are the
+    # delivery audit trail (when it was due, whether it fired, what came
+    # back).
+    "autoresume",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 

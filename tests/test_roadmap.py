@@ -349,8 +349,12 @@ def test_cli_roadmap_step_interrupt_resume_complete(capsys):
     assert cli_mod.main(["roadmap", "resume", "auth-refactor"]) == 0
     assert cli_mod.main(["roadmap", "complete", "auth-refactor"]) == 0
     evs = events.read_all()
-    assert [e.payload["action"] for e in evs] == \
+    assert [e.payload["action"] for e in evs if e.type == "roadmap"] == \
         ["set", "step", "interrupt", "resume", "complete"]
+    # the usage-shaped interrupt armed the delivery leg; the human resume
+    # withdrew it (see autoresume.py)
+    assert [e.payload["action"] for e in evs if e.type == "autoresume"] == \
+        ["scheduled", "cancelled"]
     cli_mod.main(["roadmap", "list"])
     assert "no roadmaps" in capsys.readouterr().out       # completed hidden
     cli_mod.main(["roadmap", "list", "--all"])

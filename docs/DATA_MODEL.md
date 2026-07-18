@@ -90,7 +90,13 @@ capped invocation ask, the recorded "why" behind Oversee's per-session skill
 trail; contract owned by `hookcapture.py`), `memory_consolidated`,
 `prompt_enriched`/`enrich_toggled` (Oversee prompt enrichment, `enrich.py`:
 recorded enrichment acts and the default-on toggle's audit trail — the
-settings sidecar `enrich.json` is the source of truth).
+settings sidecar `enrich.json` is the source of truth),
+`autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
+model?, timer?, outcome?, detail?}` — auto-resume delivery lifecycle,
+`autoresume.py`: action ∈ scheduled, fired, cancelled; after a usage-limit
+interruption the roadmap marker is scheduled to re-enter Claude once the
+~5h window reopens, and these events are the delivery audit trail; the
+roadmap events remain the semantic record).
 
 Registry/audit types are **exempt from merging everywhere**: `code_change`,
 `sop`, `learning` are never absorbed by consolidation (`consolidate.py`) and
@@ -125,6 +131,9 @@ Key joins an AI reader should know:
 - `sop_id` threads an SOP's lifecycle events into one registry entry
   (`sop.fold`); `files[]` in `code_change` joins audit entries to the
   `file_touched` telemetry that queued the gate.
+- `plan_id` threads a roadmap's lifecycle events into one plan record
+  (`roadmap.fold`) and joins the `autoresume` delivery telemetry
+  (`autoresume.fold`) to the interrupted plan whose marker it re-delivers.
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
 
