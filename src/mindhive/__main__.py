@@ -95,10 +95,14 @@ def cmd_hook(args) -> int | None:
     elif args.stage == "user_prompt_submit":
         # Prompt-quality gate: inject skill-trigger directives when the typed
         # prompt is underspecified. Print ONLY when the gate fires (stdout is
-        # the hook's context channel); a clear prompt prints nothing.
-        from . import promptgate
+        # the hook's context channel); a clear prompt prints nothing. When
+        # prompt enrichment is enabled (the default), the fired context also
+        # carries the clarifying questions (see enrich.extend_hook_context —
+        # additive, sidecar-only read, fail-open).
+        from . import enrich, promptgate
         context = promptgate.hook_context(raw)
         if context:
+            context = enrich.extend_hook_context(context, raw)
             print(json.dumps(context))
     return None
 
@@ -1078,6 +1082,29 @@ def cmd_triggers_check(args) -> int | None:
     return None
 
 
+def cmd_enrich(args) -> int | None:
+    from . import enrich as enrich_mod
+    if args.enrich_cmd == "status":
+        st = enrich_mod.settings(args.project)
+        print(f"prompt enrichment: "
+              f"{'enabled' if st['enabled'] else 'disabled'} "
+              f"({st['source']}"
+              + (f", updated {st['updated']}" if st.get("updated") else "")
+              + ")")
+    elif args.enrich_cmd in ("on", "off"):
+        st = enrich_mod.set_enabled(args.enrich_cmd == "on",
+                                    project=args.project)
+        print(f"prompt enrichment "
+              f"{'enabled' if st['enabled'] else 'disabled'}")
+    elif args.enrich_cmd == "preview":
+        res = enrich_mod.enrich(args.prompt, project=args.project)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(res["enriched_prompt"])
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
@@ -1523,6 +1550,26 @@ def _build_parser() -> argparse.ArgumentParser:
     tgc.add_argument("prompt")
     tgc.add_argument("--project", default=None)
     tgc.set_defaults(func=cmd_triggers_check)
+
+    # --- enrich (Oversee prompt enrichment: default-on toggle + preview) ---
+    en = sub.add_parser("enrich",
+                        help="prompt enrichment (Oversee): default-on toggle "
+                             "and deterministic prompt preview")
+    ensub = en.add_subparsers(dest="enrich_cmd", required=True)
+    for _name, _help in (("status", "show whether prompt enrichment is on"),
+                         ("on", "enable prompt enrichment"),
+                         ("off", "disable prompt enrichment")):
+        sp = ensub.add_parser(_name, help=_help)
+        sp.add_argument("--project", default=None)
+        sp.set_defaults(func=cmd_enrich)
+    env = ensub.add_parser("preview",
+                           help="enrich one draft prompt: questions, source "
+                                "candidates, skills, SOP check, composed text")
+    env.add_argument("prompt")
+    env.add_argument("--project", default=None)
+    env.add_argument("--json", action="store_true",
+                     help="emit the full enrichment result as JSON")
+    env.set_defaults(func=cmd_enrich)
 
     return p
 

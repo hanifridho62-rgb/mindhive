@@ -39,6 +39,11 @@ DETERMINISTIC_TYPES = {
     "rule_enforced", "rule_rerouted", "trigger_trained",
     "invoke_requested", "invoke_result", "skill_used",
     "memory_consolidated",
+    # Prompt enrichment (Oversee, see enrich.py): an enrichment act the user
+    # actually used (copied/recorded) and the default-on toggle's audit
+    # trail. Telemetry like trigger_trained — the settings sidecar is the
+    # source of truth, these events are the ledger evidence.
+    "prompt_enriched", "enrich_toggled",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
