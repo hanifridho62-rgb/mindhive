@@ -73,6 +73,16 @@ def cmd_append(args) -> int | None:
             print(f"error: {e} (use: hive roadmap set|step|interrupt|"
                   f"resume|complete …)", file=sys.stderr)
             return 2
+    elif args.type == "autoresume":
+        # Same stance for the delivery telemetry: the raw path must not
+        # smuggle a malformed lifecycle event past the autoresume contract.
+        from . import autoresume as autoresume_mod
+        try:
+            autoresume_mod.validate_payload(payload)
+        except ValueError as e:
+            print(f"error: {e} (use: hive autoresume schedule|fire|"
+                  f"cancel …)", file=sys.stderr)
+            return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
@@ -418,15 +428,58 @@ def cmd_roadmap_step(args) -> int | None:
 
 
 def cmd_roadmap_interrupt(args) -> int | None:
-    return _cmd_roadmap_write(args, "interrupt")
+    rc = _cmd_roadmap_write(args, "interrupt")
+    if rc:
+        return rc
+    # Usage-shaped interruptions get the delivery leg automatically: the
+    # marker is scheduled to re-enter Claude after the cooldown. Best-effort
+    # — a scheduling problem must never turn a recorded interrupt into a
+    # failure.
+    from . import autoresume as autoresume_mod
+    if args.no_auto_resume or not autoresume_mod.is_usage_cause(args.cause):
+        return None
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        ev = autoresume_mod.schedule(args.plan_id, session_id=sid)
+    except (ValueError, OSError) as e:
+        print(f"note: auto-resume not scheduled: {e}", file=sys.stderr)
+        return None
+    p = ev.payload
+    print(f"autoresume scheduled: fires {p['due']} (timer: {p['timer']})")
+    if p["timer"] == "none":
+        print("note: no OS timer registered — deliver with "
+              f"`hive autoresume wait` or `hive autoresume fire "
+              f"{args.plan_id}`")
+    return None
+
+
+def _cancel_pending_autoresume(args) -> None:
+    """A human picked the plan back up (resume/complete): a still-pending
+    auto-resume delivery would only fire-and-skip later — withdraw it and
+    its OS timer. Silent when nothing is scheduled."""
+    from . import autoresume as autoresume_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        autoresume_mod.cancel(args.plan_id, session_id=sid)
+    except (ValueError, OSError):
+        return
+    print(f"autoresume cancelled: {args.plan_id}")
 
 
 def cmd_roadmap_resume(args) -> int | None:
-    return _cmd_roadmap_write(args, "resume")
+    rc = _cmd_roadmap_write(args, "resume")
+    if rc:
+        return rc
+    _cancel_pending_autoresume(args)
+    return None
 
 
 def cmd_roadmap_complete(args) -> int | None:
-    return _cmd_roadmap_write(args, "complete")
+    rc = _cmd_roadmap_write(args, "complete")
+    if rc:
+        return rc
+    _cancel_pending_autoresume(args)
+    return None
 
 
 def cmd_roadmap_autoclose(args) -> int | None:
@@ -497,6 +550,99 @@ def cmd_roadmap_show(args) -> int | None:
     print("\nhistory (oldest first):")
     for e in hist:
         print(f"  {e['ts']}  {e['action']:9s}  session {e['session']}")
+    return None
+
+
+def cmd_autoresume_schedule(args) -> int | None:
+    from . import autoresume as autoresume_mod
+    from . import roadmap as roadmap_mod
+    project = getattr(args, "project", None)
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    evs = events.read_all(project)
+    plan_id = args.plan_id
+    if plan_id is None:
+        # Bare `hive autoresume schedule` targets the freshest interruption —
+        # the "my session just died" one-liner.
+        marks = roadmap_mod.interrupted(evs)
+        if not marks:
+            print("error: no interrupted roadmap to auto-resume "
+                  "(hive roadmap list)", file=sys.stderr)
+            return 2
+        plan_id = sorted(marks,
+                         key=lambda r: r["interrupted_at"])[-1]["plan_id"]
+    try:
+        ev = autoresume_mod.schedule(
+            plan_id, project=project, evs=evs, cooldown_hours=args.in_hours,
+            at=args.at, model=args.model, cwd=args.cwd, session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    p = ev.payload
+    print(f"autoresume scheduled: {plan_id} -> fires {p['due']} "
+          f"(attempt {p['attempt']}, timer: {p['timer']})")
+    if p["timer"] == "none":
+        print("note: no OS timer registered — deliver with "
+              f"`hive autoresume wait` or `hive autoresume fire {plan_id}`")
+    return None
+
+
+def cmd_autoresume_list(args) -> int | None:
+    from . import autoresume as autoresume_mod
+    recs = sorted(
+        autoresume_mod.fold(events.read_all(getattr(args, "project",
+                                                    None))).values(),
+        key=lambda r: (r["updated"], r["plan_id"]))
+    if args.json:
+        print(json.dumps(recs, indent=2, ensure_ascii=False))
+        return None
+    if not recs:
+        print("(no auto-resume deliveries — schedule one: "
+              "hive autoresume schedule <plan_id>)")
+        return None
+    marks = {"scheduled": "!", "fired": "x", "cancelled": "-"}
+    for i, r in enumerate(recs, 1):
+        if r["status"] == "scheduled":
+            tail = f"fires {r['due']} (attempt {r['attempt']}, " \
+                   f"timer {r['timer']})"
+        elif r["status"] == "fired":
+            tail = f"{r['outcome']} @ {r['updated']}"
+        else:
+            tail = f"cancelled @ {r['updated']}"
+        print(f"  {i}. {marks.get(r['status'], '?')} [{r['plan_id']}] {tail}")
+    print(f"\n{len(recs)} delivery record(s)")
+    return None
+
+
+def cmd_autoresume_cancel(args) -> int | None:
+    from . import autoresume as autoresume_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        ev = autoresume_mod.cancel(args.plan_id,
+                                   project=getattr(args, "project", None),
+                                   session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"autoresume cancelled: {args.plan_id} @ {ev.ts}")
+    return None
+
+
+def cmd_autoresume_fire(args) -> int | None:
+    from . import autoresume as autoresume_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    payload = autoresume_mod.fire(args.plan_id,
+                                  project=getattr(args, "project", None),
+                                  session_id=sid, timeout_s=args.timeout)
+    print(f"autoresume fired: {args.plan_id} -> {payload['outcome']}"
+          + (f" — {payload['detail']}" if payload.get("detail") else ""))
+    return 1 if payload["outcome"] == "error" else None
+
+
+def cmd_autoresume_wait(args) -> int | None:
+    from . import autoresume as autoresume_mod
+    fired = autoresume_mod.wait(getattr(args, "project", None),
+                                poll_s=args.poll)
+    print(f"autoresume wait: {fired} delivery(ies) fired")
     return None
 
 
@@ -1340,12 +1486,18 @@ def _build_parser() -> argparse.ArgumentParser:
     rmp.add_argument("--session", default=None)
     rmp.set_defaults(func=cmd_roadmap_step)
     rmi = rmsub.add_parser("interrupt", help="mark the plan interrupted "
-                           "(records the out-of-usage marker)")
+                           "(records the out-of-usage marker; usage-shaped "
+                           "causes auto-schedule the delivery back into "
+                           "Claude)")
     rmi.add_argument("plan_id")
     rmi.add_argument("--cause", required=True,
                      help="why work stopped, e.g. usage_limit")
     rmi.add_argument("--note", default=None)
     rmi.add_argument("--session", default=None)
+    rmi.add_argument("--no-auto-resume", action="store_true",
+                     dest="no_auto_resume",
+                     help="record the marker only; do not schedule the "
+                     "post-cooldown delivery")
     rmi.set_defaults(func=cmd_roadmap_interrupt)
     rmr = rmsub.add_parser("resume", help="pick an interrupted plan back up")
     rmr.add_argument("plan_id")
@@ -1373,6 +1525,54 @@ def _build_parser() -> argparse.ArgumentParser:
     rmw.add_argument("--project", default=None)
     rmw.add_argument("--json", action="store_true")
     rmw.set_defaults(func=cmd_roadmap_show)
+
+    # --- autoresume (deliver the interruption marker back into Claude) ---
+    ar = sub.add_parser("autoresume", help="auto-resume: after the usage "
+                        "cooldown, deliver an interrupted plan's marker "
+                        "(the ask, progress, next steps) straight back "
+                        "into Claude")
+    arsub = ar.add_subparsers(dest="autoresume_cmd", required=True)
+    ars = arsub.add_parser("schedule", help="schedule the delivery "
+                           "(default: interruption time + 5h)")
+    ars.add_argument("plan_id", nargs="?", default=None,
+                     help="roadmap id (default: the latest interrupted plan)")
+    ars.add_argument("--in-hours", type=float, default=None, dest="in_hours",
+                     help="cooldown hours from the interruption (default: 5)")
+    ars.add_argument("--at", default=None,
+                     help="explicit UTC due time, e.g. 2026-07-18T15:00:00Z")
+    ars.add_argument("--model", default=None,
+                     help="model for the delivered session (default: the "
+                     "CLI's configured model)")
+    ars.add_argument("--cwd", default=None,
+                     help="where the resumed work runs (default: here)")
+    ars.add_argument("--project", default=None)
+    ars.add_argument("--session", default=None)
+    ars.set_defaults(func=cmd_autoresume_schedule)
+    arl = arsub.add_parser("list", help="list delivery records")
+    arl.add_argument("--project", default=None)
+    arl.add_argument("--json", action="store_true")
+    arl.set_defaults(func=cmd_autoresume_list)
+    arc = arsub.add_parser("cancel", help="withdraw a pending delivery "
+                           "and its OS timer")
+    arc.add_argument("plan_id")
+    arc.add_argument("--project", default=None)
+    arc.add_argument("--session", default=None)
+    arc.set_defaults(func=cmd_autoresume_cancel)
+    arf = arsub.add_parser("fire", help="deliver the marker now (what the "
+                           "OS timer runs at the due time)")
+    arf.add_argument("plan_id")
+    arf.add_argument("--timeout", type=int, default=None,
+                     help="seconds the delivered session may run "
+                     "(default: 3600)")
+    arf.add_argument("--project", default=None)
+    arf.add_argument("--session", default=None)
+    arf.set_defaults(func=cmd_autoresume_fire)
+    arw = arsub.add_parser("wait", help="portable fallback: block until "
+                           "each pending delivery is due, then fire it")
+    arw.add_argument("--poll", type=float, default=60.0,
+                     help="max seconds between due checks (default: 60)")
+    arw.add_argument("--project", default=None)
+    arw.set_defaults(func=cmd_autoresume_wait)
 
     # --- graph build / graph related ---
     gp = sub.add_parser("graph", help="knowledge graph commands")

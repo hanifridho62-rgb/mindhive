@@ -26,24 +26,36 @@ def resolve_exe(cmd: str = "claude") -> str:
     return shutil.which(cmd) or cmd
 
 
-def run_headless(prompt: str, model: str = MODEL, timeout_s: int = 180) -> dict:
+def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
+                 permission_mode: str | None = None,
+                 cwd: str | None = None) -> dict:
     """One-shot `claude --output-format json -p` with the prompt fed via stdin.
     Returns ``{"exit": int, "stdout": str}``. Spawn failures map to conventional
     exit codes (127 not-found, 124 timeout) so callers treat them uniformly.
+
+    ``model=None`` omits the flag so the CLI's own configured default decides
+    (the auto-resume delivery wants the user's model, not the reflection
+    alias); ``permission_mode`` lets a delivery run actually act (headless has
+    no interactive approval), and ``cwd`` pins where that work happens.
 
     The prompt must never ride in argv: on Windows the CLI resolves to a .CMD
     shim that cmd.exe hosts, and cmd.exe rejects command lines past ~8k chars
     ("The command line is too long."), killing long composed prompts. stdin has
     no such limit, and `claude -p` reads the prompt from stdin when no
     positional prompt is given."""
-    argv = [resolve_exe(), "--output-format", "json", "--model", model, "-p"]
+    argv = [resolve_exe(), "--output-format", "json"]
+    if model:
+        argv += ["--model", model]
+    if permission_mode:
+        argv += ["--permission-mode", permission_mode]
+    argv += ["-p"]
     # Recursion guard (KTD3): every hooks/*.ps1 exits immediately when this
     # variable is set, so a headless session spawned here can never re-fire the
     # hooks (no reflect->session_end->reflect loop, no phantom session events).
     env = dict(os.environ, MINDHIVE_HEADLESS="1")
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                              env=env, input=prompt,
+                              env=env, input=prompt, cwd=cwd or None,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {"exit": proc.returncode, "stdout": proc.stdout or ""}
     except FileNotFoundError:

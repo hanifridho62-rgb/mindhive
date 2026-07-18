@@ -469,13 +469,21 @@ def notice(evs) -> str:
     marks = interrupted(evs)
     if not marks:
         return ""
+    try:
+        # Delivery status per plan (autoresume.py). Lazy + guarded: the
+        # delivery telemetry must never break the marker itself.
+        from . import autoresume as _autoresume
+        ar_recs = _autoresume.fold(evs)
+    except Exception:
+        ar_recs = {}
     out = ["## ⚠ Interrupted plan — creation context preserved", "",
            "Work below was interrupted before it finished (e.g. Claude usage "
            "ran out). The original ask and the plan's progress are the "
            "creation context: pick the work up at the next step instead of "
            "starting over. Resume: `hive roadmap resume <id>` · finished: "
            "`hive roadmap complete <id>` · full detail: "
-           "`hive roadmap show <id>`.", ""]
+           "`hive roadmap show <id>` · auto-deliver back into Claude after "
+           "the usage cooldown: `hive autoresume schedule <id>`.", ""]
     for r in marks:
         head = r["title"] or r["plan_id"]
         prog = r["progress"]
@@ -484,6 +492,16 @@ def notice(evs) -> str:
                    f"(cause: {r['cause']})")
         out.append(f"- **Asked:** {r['prompt']}")
         out.append(f"- **Progress:** {prog['done']}/{prog['total']} steps done")
+        ar = ar_recs.get(r["plan_id"])
+        if ar and ar["status"] == "scheduled":
+            out.append(
+                f"- **Auto-resume:** marker re-enters Claude at {ar['due']} "
+                f"(attempt {ar['attempt']}, timer: {ar['timer']}) — deliver "
+                f"now: `hive autoresume fire {r['plan_id']}`")
+        elif ar and ar["status"] == "fired":
+            detail = f" — {ar['detail']}" if ar.get("detail") else ""
+            out.append(f"- **Auto-resume:** delivery {ar['outcome']} @ "
+                       f"{ar['updated']}{detail}")
         done = [s for s in r["steps"] if s["status"] == "done"]
         hidden = len(done) - _NOTICE_DONE_TAIL
         if hidden > 0:

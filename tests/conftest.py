@@ -19,3 +19,6 @@ import pytest
 def isolate_store(tmp_path, monkeypatch):
     monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path))
     monkeypatch.setenv("MINDHIVE_PROJECT", "test")
+    # Auto-resume scheduling must never register a REAL Windows scheduled
+    # task from inside the suite (autoresume._timer_enabled reads this).
+    monkeypatch.setenv("MINDHIVE_AUTORESUME_TIMER", "off")

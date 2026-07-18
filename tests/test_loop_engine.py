@@ -247,6 +247,12 @@ def test_api_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
     rec = roadmap.get(evs, result["run_id"])
     assert rec["status"] == "interrupted"
     assert rec["progress"] == {"done": 1, "total": 4}
+    # the delivery leg is armed: the marker is scheduled to re-enter Claude
+    # after the cooldown, from the loop's repo root
+    ars = [e for e in evs if e.type == "autoresume"]
+    assert [e.payload["action"] for e in ars] == ["scheduled"]
+    assert ars[0].payload["plan_id"] == result["run_id"]
+    assert ars[0].payload["cwd"] == str(loop_dir.parent)
 
 
 def test_budget_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
@@ -259,9 +265,12 @@ def test_budget_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
                              now_fn=_fake_clock(), sleep_fn=lambda s: None,
                              progress_fn=lambda i: True)
     assert result["reason"] == "budget_cap"
-    rms = [e for e in events.read_all() if e.type == "roadmap"]
+    evs = events.read_all()
+    rms = [e for e in evs if e.type == "roadmap"]
     assert [e.payload["action"] for e in rms] == ["set", "interrupt"]
     assert rms[1].payload["cause"] == "budget_cap"
+    assert [e.payload["action"] for e in evs if e.type == "autoresume"] \
+        == ["scheduled"]
 
 
 def test_non_usage_endings_append_no_roadmap(tmp_path, monkeypatch):
@@ -275,7 +284,8 @@ def test_non_usage_endings_append_no_roadmap(tmp_path, monkeypatch):
     engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
                     now_fn=_fake_clock(), sleep_fn=lambda s: None,
                     progress_fn=lambda i: True)
-    assert not [e for e in events.read_all() if e.type == "roadmap"]
+    assert not [e for e in events.read_all()
+                if e.type in ("roadmap", "autoresume")]
 
 
 def test_heuristic_blocked_iteration_does_not_trip_breaker(tmp_path, monkeypatch):
