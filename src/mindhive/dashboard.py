@@ -626,6 +626,24 @@ def make_handler(token: str):
                 project=proj, evs=evs, top=int(top) if top else None,
                 incident_summaries=summ))
 
+        def _get_skills_trail(self, proj, am, qs):
+            # Durable per-session skill trail (agent-native parity with the CLI
+            # and dashboard cards) — reads the SAME shared fold Oversee uses, so
+            # ended/stale sessions stay auditable after they leave the board.
+            # HIVE MIND merges every namespace like the other skills endpoints.
+            from . import oversee as oversee_mod
+            iu = oversee_mod.intended_use_map()
+            session = (qs.get("session") or [None])[0] or None
+            names = _all_projects() if am else [proj]
+            out = {}
+            for n in names:
+                for sid, entries in oversee_mod.skill_trails(
+                        project=n, intended_use=iu).items():
+                    if session and sid != session:
+                        continue
+                    out[sid] = entries
+            return self._json({"trails": out})
+
         def _get_oversee(self, proj, am, qs):
             # Oversee: every kind of live Claude work — hive loop runs AND
             # interactive sessions (straight from hook telemetry, no /circle
@@ -639,13 +657,17 @@ def make_handler(token: str):
             from . import roadmap as roadmap_mod
             from .loop import state as loop_state
             names = _all_projects() if am else [proj]
+            # Built once per request (60 s memoized) so every card's skill trail
+            # gets the intended-use "why" fallback without a per-session rescan.
+            iu = oversee_mod.intended_use_map()
             runs, plans, dismissed = [], [], 0
             for n in names:
                 evs = events.read_all(n)
                 res = loop_state.list_runs(n)
                 rmap = roadmap_mod.fold(evs)
                 live_ids = set()
-                for r in res["runs"] + oversee_mod.interactive_sessions(n, evs=evs):
+                for r in res["runs"] + oversee_mod.interactive_sessions(
+                        n, evs=evs, intended_use=iu):
                     r["project"] = n
                     plan = rmap.get(r["run_id"])
                     if plan is not None and plan["status"] != "completed":
@@ -1052,6 +1074,7 @@ def make_handler(token: str):
             "/api/skills/status": _get_skills_status,
             "/api/skills/history": _get_skills_history,
             "/api/skills/stats": _get_skills_stats,
+            "/api/skills/trail": _get_skills_trail,
             "/api/skills/recommend": _get_skills_recommend,
             "/api/enrich/settings": _get_enrich_settings,
             "/api/export": _get_export,

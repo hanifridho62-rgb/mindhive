@@ -1,7 +1,9 @@
 # tests/test_oversee.py — interactive-session Oversee projection.
+import types
 from datetime import datetime
 
 from mindhive import events, oversee
+from mindhive import __main__ as cli
 
 
 def _epoch(iso):
@@ -150,3 +152,91 @@ def test_self_reliant_run_is_labeled_and_titled():
     assert sr["origin"] == "self-reliant"
     assert sr["title"] == "Self-Reliant run ab12cd34"
     assert by_id["sess-plain"]["origin"] is None
+
+
+# --- richer why: causal direction + intended-use fallback ----------------------
+
+def test_skill_directed_stamps_causal_why():
+    _ev("session_start", {}, 0)
+    _ev("user_prompt", {"text": "make it better"}, 1)
+    _ev("skill_directed", {"skills": [{"name": "ce-plan",
+                                       "plugin": "compound-engineering",
+                                       "measured": {"ok": 12, "calls": 12}}]}, 2)
+    _ev("skill_used", {"name": "ce-plan", "plugin": "compound-engineering"}, 3)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:05:00Z"))[0]
+    k = s["skills"][0]
+    assert k["why"] == "directed by prompt-gate (measured 12/12)"
+    assert k["during"] == "make it better"
+
+
+def test_skill_directed_without_measured_stat():
+    _ev("session_start", {}, 0)
+    _ev("skill_directed", {"skills": [{"name": "verify"}]}, 1)   # unproven -> no stat
+    _ev("skill_used", {"name": "verify"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["skills"][0]["why"] == "directed by prompt-gate"
+
+
+def test_args_why_beats_direction():
+    _ev("session_start", {}, 0)
+    _ev("skill_directed", {"skills": [{"name": "ce-plan"}]}, 1)
+    _ev("skill_used", {"name": "ce-plan", "args": "plan the parser"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["skills"][0]["why"] == "plan the parser"   # args (the ask) wins
+
+
+def test_intended_use_fills_bare_why():
+    _ev("session_start", {}, 0)
+    _ev("skill_used", {"name": "verify"}, 1)            # no args, no direction, no prompt
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"),
+        intended_use={"verify": "exercise the real flow end to end"})[0]
+    assert s["skills"][0]["why"] == "exercise the real flow end to end"
+
+
+def test_direction_is_scoped_to_its_session():
+    _ev("session_start", {}, 0, sid="A")
+    _ev("skill_directed", {"skills": [{"name": "ce-plan"}]}, 1, sid="A")
+    _ev("session_start", {}, 0, sid="B")
+    _ev("skill_used", {"name": "ce-plan"}, 2, sid="B")
+    res = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:05:00Z"))
+    b = {r["run_id"]: r for r in res}["B"]
+    assert b["skills"][0]["why"] == ""                  # A's direction must not leak
+
+
+def test_malformed_skill_directed_never_raises():
+    _ev("session_start", {}, 0)
+    _ev("skill_directed", {"skills": ["not-a-dict", {"noname": 1}]}, 1)
+    _ev("skill_used", {"name": "ce-plan"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["skills"][0]["why"] == ""                  # junk skipped, total read
+
+
+# --- skill_trails: the durable fold behind the CLI / API -----------------------
+
+def test_skill_trails_includes_ended_sessions():
+    _ev("session_start", {}, 0)
+    _ev("skill_used", {"name": "verify"}, 1)
+    _ev("session_end", {}, 2)
+    # the live board drops the ended session...
+    assert oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z")) == []
+    # ...but the durable fold keeps its trail
+    trails = oversee.skill_trails(project="test")
+    assert [k["name"] for k in trails["sess-abc"]] == ["verify"]
+
+
+def test_cli_skills_trail_prints_trail(capsys, monkeypatch):
+    monkeypatch.setattr(oversee, "intended_use_map", lambda *a, **k: {})
+    _ev("session_start", {}, 0)
+    _ev("user_prompt", {"text": "ship it"}, 1)
+    _ev("skill_used", {"name": "ce-plan", "args": "plan the thing"}, 2)
+    args = types.SimpleNamespace(session=None, all=False, json=False, project="test")
+    cli.cmd_skills_trail(args)
+    out = capsys.readouterr().out
+    assert "ce-plan" in out and "plan the thing" in out and "sess-abc" in out

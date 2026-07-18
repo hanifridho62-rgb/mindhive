@@ -418,6 +418,58 @@ def render_context(findings, rules) -> str:
     return "\n".join(lines)
 
 
+def directed_skills(findings, rules) -> list:
+    """The skills the gate would direct for these findings, one per firing
+    dimension that has a trained rule, deduped by skill name. Each entry:
+    ``{name, plugin?, measured?}`` — ``measured`` is ``{ok, calls}`` only when
+    the rule is a proven MUST-USE (directive ``must``). Pure."""
+    out, seen = [], set()
+    for f in findings or []:
+        r = (rules or {}).get(f.get("dimension"))
+        if not isinstance(r, dict):
+            continue
+        name = r.get("skill")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        entry = {"name": name}
+        plugin = r.get("plugin")
+        if plugin:
+            entry["plugin"] = plugin
+        if r.get("directive") == "must":
+            entry["measured"] = {"ok": r.get("ok", 0), "calls": r.get("calls", 0)}
+        out.append(entry)
+    return out
+
+
+def record_direction(raw: str, project=None):
+    """Best-effort: when the gate fires with trained rules on a human prompt,
+    append one ``skill_directed`` event so Oversee can later show the honest
+    causal "why". Returns the event or None. Never raises — a write failure
+    must never disturb the UserPromptSubmit hook (fail-open, like the gate)."""
+    try:
+        payload = json.loads(raw or "{}")
+        if not isinstance(payload, dict):
+            return None
+        verdict = assess(payload.get("prompt", ""))
+        if verdict["skip"] or verdict["clear"]:
+            return None
+        skills = directed_skills(verdict["findings"],
+                                 load_manifest(project).get("rules"))
+        if not skills:
+            return None
+        from . import events as ev_mod
+        # session_id from the hook payload so the event lands in the SAME
+        # segment as the skill_used it will be joined with (matches how
+        # hookcapture stamps skill_used); default fallback if absent.
+        sid = payload.get("session_id") or None
+        return ev_mod.append_event("skill_directed", {"skills": skills},
+                                   session_id=sid, tags=["skill", "gate", "auto"],
+                                   project=project)
+    except Exception:
+        return None
+
+
 def hook_context(raw: str, project=None) -> dict:
     """Parse a UserPromptSubmit payload (JSON on the hook's stdin) and return
     the hook output: additive context when the gate fires and trained rules

@@ -104,6 +104,10 @@ def cmd_hook(args) -> int | None:
         if context:
             context = enrich.extend_hook_context(context, raw)
             print(json.dumps(context))
+        # Durable causal trace: record which skills the gate directed so Oversee
+        # can later show the honest "directed by prompt-gate" why. Best-effort
+        # and self-guarding — never disturbs the context printed above.
+        promptgate.record_direction(raw)
     return None
 
 
@@ -654,6 +658,53 @@ def cmd_skills_recommend(args) -> int | None:
         for a in e.get("alternatives", []):
             flag = " — try to measure" if a.get("try_to_measure") else ""
             print(f"       alt: {a['name']} [{a['provenance']}]{flag}")
+    return None
+
+
+def cmd_skills_trail(args) -> int | None:
+    """Per-session skill trail from the ledger — the durable view of which
+    skills a session used, when, and why (args / prompt-gate direction / the
+    skill's intended use). Reuses oversee.skill_trails so the CLI, the read
+    API, and the live dashboard cards can never disagree."""
+    from . import oversee as oversee_mod
+    from . import paths
+    iu = oversee_mod.intended_use_map()
+    if getattr(args, "all", False):
+        home = paths.store_home()
+        names = ([d.name for d in sorted(home.iterdir())
+                  if d.is_dir() and (d / "events").is_dir()]
+                 if home.exists() else [])
+    else:
+        names = [args.project]
+    trails = {}
+    for n in names:
+        for sid, entries in oversee_mod.skill_trails(project=n,
+                                                     intended_use=iu).items():
+            if args.session and sid != args.session:
+                continue
+            trails[sid] = entries
+    if args.json:
+        print(json.dumps(trails, indent=2))
+        return None
+    # newest session first, keyed on its last recorded skill
+    ordered = sorted(trails.items(),
+                     key=lambda kv: (kv[1][-1]["ts"] if kv[1] else ""),
+                     reverse=True)
+    if not any(entries for _, entries in ordered):
+        print("(no skill activity recorded yet)")
+        return None
+    for sid, entries in ordered:
+        if not entries:
+            continue
+        print(f"session {sid[:12]} · {len(entries)} skill(s)")
+        for e in entries:
+            mark = "ok  " if e["ok"] else "FAIL"
+            name = (e["plugin"] + ":" if e["plugin"] else "") + e["name"]
+            line = f"  {e['ts'][11:16]} {mark} {name}"
+            why = e["why"] or (f"during: {e['during']}" if e["during"] else "")
+            if why:
+                line += f"  — {why}"
+            print(line)
     return None
 
 
@@ -1372,6 +1423,15 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="<= 3 one-line suggestions (fast; for the session hook)")
     skc.add_argument("--project", default=None, help="target namespace")
     skc.set_defaults(func=cmd_skills_recommend)
+    skt = sksub.add_parser("trail",
+                           help="per-session skill trail (which skills, when, why) "
+                                "from the ledger — survives the live Oversee board")
+    skt.add_argument("--session", default=None, help="one session id (default: all)")
+    skt.add_argument("--all", action="store_true",
+                     help="merge every namespace (HIVE MIND), not just this project")
+    skt.add_argument("--json", action="store_true", help="emit the raw trail JSON")
+    skt.add_argument("--project", default=None, help="target namespace")
+    skt.set_defaults(func=cmd_skills_trail)
 
     # --- clusters: parallel-orchestration layer for /mindhive-orchestrator ---
     cl = sub.add_parser("clusters",

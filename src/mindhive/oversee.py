@@ -43,17 +43,108 @@ def _text(payload) -> str:
     return str(payload)
 
 
+_IU_CACHE = {"ts": 0.0, "map": {}}
+_IU_TTL = 60.0                        # inventory rescans at most once a minute
+
+
+def intended_use_map(now_fn=time.time) -> dict:
+    """``{skill_name: intended-use one-liner}`` from the live plugin inventory,
+    memoized for ``_IU_TTL`` seconds so the 2.5 s dashboard refresh never
+    re-scans the plugin cache. This is the honest never-empty fallback for a
+    trail row's "why" when the invocation carried no args and no gate
+    direction — the skill's stated PURPOSE, not a claimed motive. Best-effort:
+    any inventory error keeps the last good map (or ``{}``)."""
+    now = now_fn()
+    if _IU_CACHE["map"] and (now - _IU_CACHE["ts"]) < _IU_TTL:
+        return _IU_CACHE["map"]
+    m: dict = {}
+    try:
+        from . import plugins, recommend
+        for s in recommend.flatten_inventory(
+                plugins.live_inventory()["inventory"]):
+            name = s.get("name")
+            desc = headline(str(s.get("description") or ""))
+            if name and desc and name not in m:
+                m[name] = desc
+    except Exception:
+        return _IU_CACHE["map"] or {}
+    _IU_CACHE.update(ts=now, map=m)
+    return m
+
+
+def _skill_why(payload, directed, intended_use) -> str:
+    """The recorded "why" for one ``skill_used``, honesty-ordered: the
+    invocation args (the ask) -> a same-session prompt-gate direction (causal)
+    -> the skill's intended-use one-liner (its purpose) -> empty. Never a
+    synthesized motive."""
+    args_why = headline(str(payload.get("args") or ""))
+    if args_why:
+        return args_why
+    name = str(payload.get("name") or "")
+    if name in directed:
+        measured = directed[name]
+        if isinstance(measured, dict) and measured.get("calls"):
+            return (f"directed by prompt-gate "
+                    f"(measured {measured.get('ok', 0)}/{measured['calls']})")
+        return "directed by prompt-gate"
+    return (intended_use or {}).get(name, "")
+
+
+def skill_trails(project=None, evs=None, intended_use=None) -> dict:
+    """``{session_id: [entry, ...]}`` skill trail for EVERY session — live,
+    ended, or stale — with no live-board lifecycle filtering. This is the
+    durable fold behind the ``hive skills trail`` CLI and the read API; the
+    live ``interactive_sessions`` view reuses it too, so the surfaces can never
+    disagree. Each entry is ``{name, plugin, ts, ok, why, during}``: ``during``
+    is the headline of the most recent preceding ``user_prompt`` in the
+    session; ``why`` follows :func:`_skill_why`. Chronological (``read_all`` is
+    ordered) and total — skips ``manual``/junk rows, never raises."""
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    trails: dict = {}
+    prompt_now: dict = {}
+    directed: dict = {}                   # sid -> {skill_name: measured|None}
+    for e in evs:
+        sid = e.session_id
+        if not sid or sid == "manual":
+            continue
+        p = e.payload if isinstance(e.payload, dict) else {}
+        if e.type == "user_prompt":
+            t = headline(_text(p))
+            if t:
+                prompt_now[sid] = t
+        elif e.type == "skill_directed":
+            for s in p.get("skills", []):
+                if isinstance(s, dict) and s.get("name"):
+                    directed.setdefault(sid, {})[str(s["name"])] = s.get("measured")
+        elif e.type == "skill_used":
+            if not p.get("name"):
+                continue
+            trails.setdefault(sid, []).append({
+                "name": str(p["name"]),
+                "plugin": str(p.get("plugin") or ""),
+                "ts": e.ts,
+                "ok": bool(p.get("ok", True)),
+                "why": _skill_why(p, directed.get(sid, {}), intended_use),
+                "during": prompt_now.get(sid, ""),
+            })
+    return trails
+
+
 def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
+                         intended_use=None,
                          online_seconds=ONLINE_WINDOW_SECONDS,
                          active_seconds=ACTIVE_WINDOW_SECONDS) -> list[dict]:
     """Active interactive-session records, newest first, shaped like the loop
     run records (plus ``kind: "chat"``) so the dashboard renders one list."""
     if evs is None:
         evs = ev_mod.read_all(project)
+    # One shared fold owns the per-session skill trail (live + durable views
+    # never disagree — KTD2); attached per card in the output pass below.
+    trails = skill_trails(evs=evs, intended_use=intended_use)
     sessions: dict[str, dict] = {}
     order: list[str] = []
     dismissed: dict[str, str] = {}
-    prompt_now: dict[str, str] = {}      # latest prompt headline per session
     for e in evs:
         if e.type == "loop_run_dismissed":
             rid = (e.payload or {}).get("run_id")
@@ -70,7 +161,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 "started": e.ts, "status": "running", "iterations": 0,
                 "total_cost_usd": 0.0, "total_tokens": 0, "last_event_ts": e.ts,
                 "ended": False, "doing": None, "done": [], "planned": [],
-                "not_yet": [], "files": [], "task": "", "skills": [],
+                "not_yet": [], "files": [], "task": "",
                 # provenance: Self-Reliant runs log into research-<id> streams;
                 # the label rides the card so Oversee shows whose work this is
                 # (filled by the per-event pass below — same idiom as
@@ -89,7 +180,6 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             if t:
                 s["title"] = t
                 s["doing"] = t
-                prompt_now[sid] = t
         elif e.type == "assistant_response":
             t = headline(_text(e.payload))
             if t:
@@ -113,17 +203,6 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 s["files"].append(p)
         elif e.type == "command_run":
             s["iterations"] += 1          # activity count for the pill
-        elif e.type == "skill_used" and isinstance(e.payload, dict):
-            name = e.payload.get("name")
-            if name:
-                s["skills"].append({
-                    "name": str(name),
-                    "plugin": str(e.payload.get("plugin") or ""),
-                    "ts": e.ts,
-                    "ok": bool(e.payload.get("ok", True)),
-                    "why": headline(str(e.payload.get("args") or "")),
-                    "during": prompt_now.get(sid, ""),
-                })
 
     now = now_fn()
     out = []
@@ -149,8 +228,9 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
         files = s.pop("files")
         s["done"] = s["done"][-_DONE_CAP:] + [f"touched {p}" for p in files[-_DONE_CAP:]]
         s["planned"] = s["planned"][-_DONE_CAP:]
-        s["skills_total"] = len(s["skills"])
-        s["skills"] = s["skills"][-_DONE_CAP:]
+        sk = trails.get(sid, [])
+        s["skills_total"] = len(sk)
+        s["skills"] = sk[-_DONE_CAP:]
         s.pop("task", None)
         out.append(s)
     out.reverse()

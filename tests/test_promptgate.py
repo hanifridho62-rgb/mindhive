@@ -301,6 +301,60 @@ def test_hook_context_dedups_shared_skill_across_dimensions():
     assert ctx.count("planner") == 1
 
 
+# --- skill_directed: honest causal-why capture ---------------------------------
+
+def test_directed_skills_from_findings_and_rules():
+    man = promptgate.train(_SKILLS, _stats({"planner": (3, 3)}),
+                           now="2026-07-14T00:00:00Z")
+    findings = promptgate.assess("fix it")["findings"]     # several dimensions
+    skills = promptgate.directed_skills(findings, man["rules"])
+    names = [s["name"] for s in skills]
+    assert names == ["planner"]                            # deduped across dims
+    assert skills[0]["measured"] == {"ok": 3, "calls": 3}  # proven MUST carries stat
+
+
+def test_directed_skills_empty_without_rules():
+    findings = promptgate.assess("fix it")["findings"]
+    assert promptgate.directed_skills(findings, None) == []
+
+
+def test_record_direction_appends_skill_directed():
+    _seed_manifest()
+    ev = promptgate.record_direction(
+        json.dumps({"prompt": "fix it", "session_id": "s-gate"}), project="test")
+    assert ev is not None and ev.type == "skill_directed"
+    assert ev.session_id == "s-gate"                       # rides the prompt's session
+    assert [s["name"] for s in ev.payload["skills"]] == ["planner"]
+    stored = [e for e in events.read_all("test") if e.type == "skill_directed"]
+    assert len(stored) == 1
+
+
+def test_record_direction_noop_on_clear_prompt():
+    _seed_manifest()
+    raw = json.dumps({"prompt": "Refactor src/mindhive/enforce.py evaluate() and "
+                                "extend tests/test_enforce.py", "session_id": "s"})
+    assert promptgate.record_direction(raw, project="test") is None
+    assert [e for e in events.read_all("test") if e.type == "skill_directed"] == []
+
+
+def test_record_direction_noop_without_trained_rules():
+    # gate fires but no manifest -> nothing to attribute -> no event
+    assert promptgate.record_direction(
+        json.dumps({"prompt": "fix it", "session_id": "s"}), project="test") is None
+
+
+def test_record_direction_fail_open_on_append_error(monkeypatch):
+    _seed_manifest()
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(events, "append_event", boom)
+    # must swallow the write failure and never disturb the hook
+    assert promptgate.record_direction(
+        json.dumps({"prompt": "fix it", "session_id": "s"}), project="test") is None
+
+
 # --- CLI wiring -----------------------------------------------------------------
 
 def test_cli_hook_stage_prints_context_only_when_firing(tmp_path, capsys, monkeypatch):
