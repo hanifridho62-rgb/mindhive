@@ -51,6 +51,13 @@ DETERMINISTIC_TYPES = {
     # delivery audit trail (when it was due, whether it fired, what came
     # back).
     "autoresume",
+    # PRD assembly-line lifecycle (compiled/dispatched/run — see
+    # fabricate.py): a PRD compiled into a loop goal dir + roadmap, put on
+    # an OS timer, and executed unattended by the loop engine. Telemetry —
+    # the roadmap stays the semantic plan and loop_* the run telemetry;
+    # these events are the fabrication audit trail (what was compiled from
+    # where, when it was due, which loop run it launched and how it ended).
+    "fabrication",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
