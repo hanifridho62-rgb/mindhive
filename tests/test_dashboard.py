@@ -2027,6 +2027,8 @@ def test_enrich_preview_requires_prompt(dashboard_server):
 def test_page_has_enrich_hooks(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")
-    assert "enPanel" in body and "Prompt enrichment" in body
+    assert "enPanel" in body and "Enrichment" in body
     assert "/api/enrich/settings" in body and "/api/enrich/preview" in body
     assert "/api/enrich/toggle" in body
+    # HIVE MIND stub: the panel must never silently vanish under "*"
+    assert "pick a concrete project in the header" in body
