@@ -425,6 +425,20 @@ def cmd_roadmap_complete(args) -> int | None:
     return _cmd_roadmap_write(args, "complete")
 
 
+def cmd_roadmap_autoclose(args) -> int | None:
+    """Close the session's auto-synced roadmap (run by the SessionEnd hook).
+    Silent no-op when the session has no auto-owned open plan — the hook must
+    never fail or chatter."""
+    from . import roadmap as roadmap_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    if not sid:
+        return None
+    ev = roadmap_mod.autoclose_session(sid)
+    if ev is not None:
+        print(f"roadmap {ev.payload['action']}: {sid} @ {ev.ts}")
+    return None
+
+
 def cmd_roadmap_list(args) -> int | None:
     from . import roadmap as roadmap_mod
     recs = roadmap_mod.plans(events.read_all(getattr(args, "project", None)),
@@ -1290,6 +1304,12 @@ def _build_parser() -> argparse.ArgumentParser:
     rmc.add_argument("plan_id")
     rmc.add_argument("--session", default=None)
     rmc.set_defaults(func=cmd_roadmap_complete)
+    rma = rmsub.add_parser("autoclose", help="close a session's auto-synced "
+                           "roadmap (run by the SessionEnd hook): complete "
+                           "when all steps are done/skipped, else interrupt")
+    rma.add_argument("--session", default=None,
+                     help="session id (defaults to MINDHIVE_SESSION)")
+    rma.set_defaults(func=cmd_roadmap_autoclose)
     rml = rmsub.add_parser("list", help="list roadmaps")
     rml.add_argument("--project", default=None)
     rml.add_argument("--json", action="store_true")

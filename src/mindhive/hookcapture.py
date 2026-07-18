@@ -183,6 +183,21 @@ def record_post_tool_use(raw: str, project=None, now=None) -> dict:
         payload = json.loads(raw)
         sid = payload.get("session_id") if isinstance(payload, dict) else None
         appended = 0
+        if isinstance(payload, dict) and payload.get("tool_name") == "TodoWrite":
+            # Session roadmap auto-sync (roadmap.py): the todo list IS the
+            # session's plan + progress. Deliberately NOT in extract_events —
+            # that pure mapping is mirrored by harvest.py, and replaying
+            # historical TodoWrite snapshots from transcripts could only
+            # reorder the registry, never improve it. Best-effort: a sync
+            # failure is logged, never breaks capture.
+            try:
+                from . import roadmap
+                inp = payload.get("tool_input") or {}
+                if roadmap.sync_from_todos(sid, inp.get("todos"),
+                                           project=project, ts=now):
+                    appended += 1
+            except Exception as e:
+                log_hook_error("todo_roadmap", e)
         for etype, ep in extract_events(payload):
             events.append_event(etype, ep, session_id=sid,
                                 tags=["auto"], ts=now, project=project)
