@@ -114,6 +114,21 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   .rmnode.rmpend { color:#8a93a6; }
   .rmnode.rmskip { color:#555c6e; }
   .rmdetail { color:#9aa3b8; font-size:11px; margin:2px 0; }
+  /* Prompt enrichment panel (Oversee): toggle + questions + composed prompt */
+  .enwrap { margin:0 0 12px; padding:10px 12px; background:#0c0e14;
+    border:1px solid #2a2f3d; border-radius:8px; }
+  .enwrap textarea { width:100%; box-sizing:border-box; background:#141824;
+    color:#dfe6f3; border:1px solid #2a2f3d; border-radius:6px;
+    padding:6px 8px; font:inherit; margin-top:6px; }
+  .ensec { margin:8px 0 2px; }
+  .enq { margin:6px 0; }
+  .enq input { width:70%; background:#141824; color:#dfe6f3;
+    border:1px solid #2a2f3d; border-radius:6px; padding:2px 8px;
+    font:inherit; margin-top:2px; }
+  .enok { color:#46c46a; font-weight:700; }
+  .enbad { color:#ff8a8a; font-weight:700; }
+  .enout { background:#141824; border:1px solid #2a2f3d; border-radius:8px;
+    padding:8px 10px; white-space:pre-wrap; max-height:40vh; overflow:auto; }
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
@@ -859,6 +874,117 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
       + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
   }
+  // --- Prompt enrichment (Oversee): improve a draft prompt before spending a
+  // session on it — asks the user (clarifying questions), checks the source
+  // code (candidate files), injects skills, and composes an Anthropic-SOP
+  // shaped prompt. Default-ON server-side; the draft, answers, and last
+  // result survive the 2.5 s live refresh via module state (OV_EXPANDED
+  // idiom), and the refresh skips repaints while the user is typing here.
+  let EN_SET = null;       // /api/enrich/settings result
+  let EN_RESULT = null;    // last /api/enrich/preview result
+  let EN_PROMPT = '';      // draft prompt text
+  const EN_ANSWERS = {};   // question id -> typed answer
+  function enOn(){ return !EN_SET || EN_SET.enabled !== false; }
+  function enChip(met){
+    return met ? '<span class="enok">\\u2713</span>'
+               : '<span class="enbad">\\u2717</span>';
+  }
+  function enResult(r){
+    let html = '<div class="ensec">'
+      + (r.sop||[]).map(c => '<span class="pill" title="'+escAttr(c.hint||'')+'">'
+          + enChip(c.met)+' '+esc(c.label)+'</span>').join(' ')+'</div>';
+    if ((r.questions||[]).length){
+      html += '<div class="ensec"><b>Asking you</b> \\u2014 answers fold into '
+        + 'the composed prompt (re-enrich after answering):</div>'
+        + r.questions.map(q => '<div class="enq">'+esc(q.text)
+          + '<br><input class="enans" data-qid="'+escAttr(q.id)
+          + '" placeholder="answer\\u2026" value="'+escAttr(EN_ANSWERS[q.id]||'')
+          + '"></div>').join('');
+    }
+    if ((r.sources||[]).length){
+      html += '<div class="ensec"><b>From the source code</b>: '
+        + r.sources.map(s => '<span class="skchip" title="'+escAttr(s.why||'')
+            + '">'+esc(s.path)+'</span>').join(' ')+'</div>';
+    }
+    const sk = ((r.skills||{}).directives||[]).concat((r.skills||{}).suggestions||[]);
+    if (sk.length){
+      html += '<div class="ensec"><b>Skills to inject</b>: '
+        + sk.map(s => '<span class="pill'+(s.provenance==='measured'?'':' est')+'">'
+            + esc(s.skill)+(s.plugin?' \\u00b7 '+esc(s.plugin):'')
+            + ' \\u2014 '+esc(s.provenance)+'</span>').join(' ')+'</div>';
+    }
+    return html
+      + '<div class="ensec"><b>Enriched prompt</b> (Anthropic-SOP shaped)'
+      + ' <button id="encopy" class="mini">copy</button></div>'
+      + '<pre class="enout">'+esc(r.enriched_prompt||'')+'</pre>';
+  }
+  function enPanel(){
+    if (PROJECT === '*'){
+      // Never vanish silently: under HIVE MIND the panel stays visible as a
+      // stub saying where the feature lives (enrichment reads ONE project
+      // namespace — ledger, settings sidecar, trained manifest).
+      return '<div id="enpanel" class="enwrap"><div class="file">Enrichment'
+        + ' <span class="dup">pick a concrete project in the header to use '
+        + 'it \\u2014 enrichment works per project</span></div></div>';
+    }
+    const on = enOn();
+    let html = '<div id="enpanel" class="enwrap"><div class="file">'
+      + 'Enrichment'
+      + '<button class="mini" id="entoggle" title="on by default; the choice '
+      + 'persists per project">'+(on ? 'on \\u2014 turn off' : 'off \\u2014 turn on')
+      + '</button>'
+      + (on ? '' : ' <span class="dup">disabled \\u2014 the hook adds nothing '
+                   + 'and this panel is idle</span>')
+      + '</div>';
+    if (on){
+      html += '<textarea id="enprompt" rows="3" placeholder="Paste a draft '
+        + 'prompt \\u2014 enrichment asks you, checks the source code, injects '
+        + 'skills, and composes an Anthropic-SOP prompt">'+esc(EN_PROMPT)
+        + '</textarea>'
+        + '<div style="margin:6px 0"><button id="enrun">Enrich</button></div>'
+        + (EN_RESULT ? enResult(EN_RESULT) : '');
+    }
+    return html + '</div>';
+  }
+  async function enrichNow(){
+    const ta = view.querySelector('#enprompt');
+    if (ta) EN_PROMPT = ta.value;
+    if (!EN_PROMPT.trim()) return;
+    await run('enriching prompt\\u2026', async () => {
+      const res = await apiPost('/api/enrich/preview',
+                                {prompt: EN_PROMPT, answers: EN_ANSWERS});
+      if (!res.ok) { showText(res); return; }
+      EN_RESULT = res.result;
+      paintOversee();
+    });
+  }
+  function wireEnrich(){
+    const t = view.querySelector('#entoggle');
+    if (t) t.onclick = async () => {
+      const res = await apiPost('/api/enrich/toggle', {enabled: !enOn()});
+      if (!res.ok) { showText(res); return; }
+      EN_SET = res.settings;
+      if (!EN_SET.enabled) EN_RESULT = null;
+      paintOversee();
+    };
+    const go = view.querySelector('#enrun');
+    if (go) go.onclick = () => enrichNow();
+    const cp = view.querySelector('#encopy');
+    if (cp) cp.onclick = async () => {
+      if (!EN_RESULT) return;
+      try { await navigator.clipboard.writeText(EN_RESULT.enriched_prompt); }
+      catch(_){ /* clipboard may be unavailable; the text stays visible */ }
+      // record the act, fire-and-forget: copying is real use, previews are not
+      apiPost('/api/enrich/preview',
+              {prompt: EN_PROMPT, answers: EN_ANSWERS, record: true});
+      cp.textContent = 'copied \\u2713';
+    };
+    view.querySelectorAll('.enans').forEach(el => {
+      el.oninput = () => { EN_ANSWERS[el.dataset.qid] = el.value; };
+    });
+    const ta = view.querySelector('#enprompt');
+    if (ta) ta.oninput = () => { EN_PROMPT = ta.value; };
+  }
   function paintOversee(){
     if (!OV_DATA) return;
     // Online/offline strip: shown ONLY while Claude is working on a session.
@@ -876,13 +1002,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         + '<ul class="hits">'+plans.map(p => rmPlanCard(p, showProj)).join('')+'</ul>'
       : '';
     if (!OV_DATA.runs.length && !plans.length){
-      showHTML(online + '<h2 class="h">No work sessions \\u2014 interactive '
+      showHTML(enPanel() + online + '<h2 class="h">No work sessions \\u2014 interactive '
         + 'Claude sessions appear here as their telemetry flows, and '
         + '<code>hive loop</code> runs join them. Finished sessions are '
         + 'removed automatically.</h2>');
+      wireEnrich();
       return;
     }
-    showHTML(online + strip
+    showHTML(enPanel() + online + strip
       + (OV_DATA.runs.length
         ? '<h2 class="h">'+OV_DATA.runs.length+' work session'
           + (OV_DATA.runs.length===1?'':'s')
@@ -890,6 +1017,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
              +' finished &amp; removed</span>' : '')+'</h2>'
           + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>'
         : ''));
+    wireEnrich();
     view.querySelectorAll('.ovtitle').forEach(el => el.onclick = () => {
       const rid = el.closest('li').dataset.rid;
       if (OV_EXPANDED.has(rid)) OV_EXPANDED.delete(rid); else OV_EXPANDED.add(rid);
@@ -912,9 +1040,15 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     });
   }
   async function renderOversee(){
-    const res = await apiGet('/api/oversee');
+    // Skip this refresh tick while the user is typing in the enrichment
+    // panel — a repaint would eat the caret and the click-in-progress.
+    const ae = document.activeElement;
+    if (ae && ae.closest && ae.closest('#enpanel')) return;
+    const [res, es] = await Promise.all([apiGet('/api/oversee'),
+                                         apiGet('/api/enrich/settings')]);
     if (!res || res.ok === false) throw new Error((res && res.error) || 'oversee fetch failed');
     OV_DATA = res;
+    EN_SET = (es && typeof es.enabled === 'boolean') ? es : {enabled: true};
     paintOversee();
   }
   async function deleteRun(rid, proj){
