@@ -13,6 +13,11 @@ if (-not $sid) { $sid = "unknown" }
 $env:MINDHIVE_SESSION = $sid
 try {
     & $py -m mindhive append session_end "session closed" | Out-Null
+    # Close the session's auto-synced roadmap (roadmap.py autoclose) BEFORE the
+    # projections rebuild: all steps done -> complete (leaves every view);
+    # unfinished -> interrupt, so the plan's creation context rides STATE.md
+    # into the next session.
+    & $py -m mindhive roadmap autoclose --session $sid | Out-Null
     # Queue a thermo-nuclear review of the source files touched this session BEFORE
     # rebuilding projections, so the pending-review notice lands in STATE.md (which
     # the next session_start injects). Cheap, LLM-free; the review itself runs in
