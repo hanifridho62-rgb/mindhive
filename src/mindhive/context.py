@@ -26,8 +26,10 @@ Two origins are measured:
 
 The pipeline is four stages over one currency, the ``Segment``: collect (the
 only stage that touches the filesystem), ``analyze`` (totals, ranking, share,
-budget delta), ``findings`` (rule-based trim suggestions), and render. Adding a
-new context source later means writing one collector; nothing downstream moves.
+budget delta), ``findings`` (rule-based trim suggestions), and render. Analysis,
+findings and rendering are origin-agnostic — they only ever see ``Segment`` — so
+a new context source needs a collector plus its CLI wiring, and nothing in the
+three downstream stages changes.
 
 Reads stay total. This walks user configuration written by many tools over a
 long time and will meet truncated frontmatter, invalid UTF-8, and directories
@@ -63,6 +65,15 @@ OUTLIER_FACTOR = 4           # skill description this many times the median
 MAX_PATHS_PROBED = 200       # bound the stat() calls the dead-path rule makes
 
 _ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:\\[^\s\"'`|,;:*?<>]+|/(?:home|Users|mnt|opt)/[^\s\"'`|,;:*?<>]+)")
+_URL_RE = re.compile(r"https?://\S+")
+# Only candidates that look like a FILE reference are probed. The tokenizer
+# stops at whitespace, so a path containing a space ("My Documents") truncates
+# to a stub that does not exist — reporting that stub as a dead reference is a
+# false positive on a very common path shape. Requiring a trailing extension
+# discards those stubs (they rarely end in one) while keeping the real target
+# of this rule: stale references to specific files in deleted worktrees.
+_FILE_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+_TRAILING_PUNCT = ".,;:!?)]}'\""
 
 
 @dataclass(frozen=True)
@@ -110,7 +121,7 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _memory_folder() -> str:
+def _memory_folder(cwd: Path | None = None) -> str:
     """The folder key under which the native MEMORY.md is stored.
 
     MEMORY.md is keyed by the *main repo* folder, not the current directory. Run
@@ -120,22 +131,23 @@ def _memory_folder() -> str:
     ``paths.detect_project`` does (``--git-common-dir`` points at the main
     repo's .git even from a linked worktree), and fall back to cwd off-repo."""
     import subprocess
+    base = Path(cwd) if cwd is not None else Path.cwd()
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(Path.cwd()), capture_output=True, text=True, timeout=2,
+            cwd=str(base), capture_output=True, text=True, timeout=2,
             creationflags=paths.NO_WINDOW,
         )
         if r.returncode == 0 and r.stdout.strip():
             gcd = Path(r.stdout.strip())
             if not gcd.is_absolute():
-                gcd = Path.cwd() / gcd
+                gcd = base / gcd
             gcd = gcd.resolve()
             if gcd.name == ".git":
                 return str(gcd.parent)
     except Exception:
         pass
-    return str(Path.cwd())
+    return str(base)
 
 
 def _file_segment(path: Path, name: str, origin: str, kind: str,
@@ -239,14 +251,6 @@ def collect_claude(home: Path | None = None,
     return out
 
 
-def collect_all(project: str | None = None, home: Path | None = None,
-                cache_dir: Path | None = None,
-                memory_path: Path | None = None) -> list[Segment]:
-    """Every measurable contributor, both origins."""
-    return (collect_hive(project=project, memory_path=memory_path)
-            + collect_claude(home=home, cache_dir=cache_dir))
-
-
 # --------------------------------------------------------------------------
 # analysis
 # --------------------------------------------------------------------------
@@ -320,12 +324,10 @@ def _finding_oversized(segments) -> list[Finding]:
     ]
 
 
-def _finding_duplicate_lines(segments) -> list[Finding]:
+def _finding_duplicate_lines(segments, texts: dict[str, str]) -> list[Finding]:
     out = []
     for s in segments:
-        if not s.path:
-            continue
-        text = _read_text(Path(s.path))
+        text = texts.get(s.path) if s.path else None
         if text is None:
             continue
         counts: dict[str, int] = {}
@@ -338,10 +340,14 @@ def _finding_duplicate_lines(segments) -> list[Finding]:
             continue
         wasted = sum(len(k) * (v - 1) for k, v in repeats.items())
         worst = max(repeats.items(), key=lambda kv: len(kv[0]) * (kv[1] - 1))
+        # Derive the token cost arithmetically. Materializing a filler string of
+        # `wasted` characters just to measure its length would allocate megabytes
+        # on a pathologically duplicated artifact.
+        wasted_tokens = max(1, round(wasted / CHARS_PER_TOKEN)) if wasted else 0
         out.append(Finding(
             rule="duplicate_lines", severity="medium", subject=s.name,
             message=(f"{s.name} repeats {len(repeats)} line(s) {DUPLICATE_MIN_COUNT}+ "
-                     f"times, wasting ~{wasted:,} chars (~{estimate_tokens('x' * wasted)} "
+                     f"times, wasting ~{wasted:,} chars (~{wasted_tokens} "
                      f"est. tokens). Worst repeats {worst[1]}x: {worst[0][:60]!r}"),
         ))
     return out
@@ -353,26 +359,47 @@ def _is_illustrative(candidate: str) -> bool:
     Instruction files legitimately contain example paths — "never use absolute
     paths like /Users/name/Code/project/src/file.ts". Those will never exist on
     disk, so without this the dead-path rule fires on every doc that teaches
-    path hygiene, and a rule that cries wolf gets ignored. Elision markers and
-    obvious placeholder segments are the reliable tells."""
-    if "..." in candidate:
+    path hygiene, and a rule that cries wolf gets ignored.
+
+    The tokens here are deliberately unambiguous placeholders. Bare words like
+    "user" or "name" are NOT matched: `user` is a real account name on Docker
+    images, WSL and CI runners, so suppressing every `/home/user/...` would hide
+    genuinely stale references — the opposite failure."""
+    if "..." in candidate or "${" in candidate:
         return True
     lowered = candidate.lower()
     return any(tok in lowered for tok in
-               ("<", ">", "${", "/name/", "/username/", "/user/", "/path/to/",
-                "yourname", "your-name", "example.com"))
+               ("/path/to/", "/name/", "yourname", "your-name", "username-here",
+                "<", ">", "example.com"))
 
 
-def _finding_dead_paths(segments) -> list[Finding]:
+def _path_candidates(text: str) -> list[str]:
+    """Extract probe-worthy absolute file references from arbitrary text.
+
+    URLs are stripped first: an address like ``http://host/mnt/backup/x`` would
+    otherwise yield ``/mnt/backup/x``, which was never a filesystem reference at
+    all. Trailing sentence punctuation is trimmed — prose ends paths with a
+    period, and on POSIX ``file.md.`` is a genuinely different (non-existent)
+    name from ``file.md``."""
+    cleaned = _URL_RE.sub(" ", text)
+    out = []
+    for raw in dict.fromkeys(_ABS_PATH_RE.findall(cleaned)):
+        cand = raw.rstrip(_TRAILING_PUNCT)
+        if not cand or _is_illustrative(cand):
+            continue
+        if not _FILE_EXT_RE.search(cand):
+            continue
+        out.append(cand)
+    return out
+
+
+def _finding_dead_paths(segments, texts: dict[str, str]) -> list[Finding]:
     out = []
     for s in segments:
-        if not s.path:
-            continue
-        text = _read_text(Path(s.path))
+        text = texts.get(s.path) if s.path else None
         if text is None:
             continue
-        candidates = [c for c in dict.fromkeys(_ABS_PATH_RE.findall(text))
-                      if not _is_illustrative(c)][:MAX_PATHS_PROBED]
+        candidates = _path_candidates(text)[:MAX_PATHS_PROBED]
         dead = []
         for cand in candidates:
             try:
@@ -394,8 +421,8 @@ def _finding_outlier_skills(segments) -> list[Finding]:
     skills = [s for s in segments if s.kind == "skill"]
     if len(skills) < 4:
         return []
-    ordered = sorted(s.tokens for s in skills)
-    median = ordered[len(ordered) // 2] or 1
+    import statistics
+    median = statistics.median(s.tokens for s in skills) or 1
     return [
         Finding(rule="outlier_description", severity="low", subject=s.name,
                 message=(f"{s.name} has a {s.tokens}-token trigger description, "
@@ -414,11 +441,23 @@ def findings(segments: list[Segment]) -> list[Finding]:
     touches the artifacts it reports on."""
     segs = list(segments or [])
     total = sum(s.tokens for s in segs)
+
+    # Read each file-backed segment exactly once and share the text across the
+    # rules that need it. Reading per-rule would re-read every artifact for
+    # every content rule — the same redundant-read trap this tool exists to
+    # surface, and it would grow with each rule added.
+    texts: dict[str, str] = {}
+    for s in segs:
+        if s.path and s.path not in texts:
+            text = _read_text(Path(s.path))
+            if text is not None:
+                texts[s.path] = text
+
     out: list[Finding] = []
     out += _finding_dominant(segs, total)
     out += _finding_oversized(segs)
-    out += _finding_duplicate_lines(segs)
-    out += _finding_dead_paths(segs)
+    out += _finding_duplicate_lines(segs, texts)
+    out += _finding_dead_paths(segs, texts)
     out += _finding_outlier_skills(segs)
     order = {"high": 0, "medium": 1, "low": 2}
     return sorted(out, key=lambda f: (order.get(f.severity, 3), f.rule, f.subject))

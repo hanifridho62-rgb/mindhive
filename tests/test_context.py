@@ -182,6 +182,28 @@ def test_collect_claude_without_plugins_dir_returns_only_instructions(tmp_path):
     assert [s.name for s in segs] == ["CLAUDE.md"]
 
 
+def test_one_unreadable_skill_does_not_drop_every_plugin(tmp_path):
+    """A single unreadable SKILL.md must not zero out the whole skills measure.
+
+    The scan is wrapped as a unit, so an unguarded read failure deep inside it
+    would discard every plugin's segments silently — the report would claim
+    zero installed skills. A directory named SKILL.md forces a read error
+    portably (no chmod semantics to depend on)."""
+    home = tmp_path / "home"
+    cache = _make_plugin_cache(tmp_path / "cache", {
+        "alpha": {"ok1": _skill_md("ok1", "first good skill"),
+                  "ok2": _skill_md("ok2", "second good skill")},
+    })
+    # Replace one skill's SKILL.md with a directory of the same name.
+    broken = cache / "mkt" / "alpha" / "1.0.0" / "skills" / "broken"
+    (broken / "SKILL.md").mkdir(parents=True)
+
+    segs = context.collect_claude(home=home, cache_dir=cache)
+    skills = [s for s in segs if s.kind == "skill"]
+    assert {s.name for s in skills} == {"alpha:ok1", "alpha:ok2"}, \
+        "healthy skills must survive an unreadable sibling"
+
+
 def test_collect_claude_on_absent_home_returns_empty(tmp_path):
     segs = context.collect_claude(home=tmp_path / "ghost",
                                   cache_dir=tmp_path / "ghost-cache")
@@ -293,6 +315,61 @@ def test_is_illustrative_still_allows_real_dead_paths(tmp_path):
                  f"touched: {tmp_path / 'worktrees' / 'gone' / 'mod.py'}\n")
     found = context.findings([_seg("state.md", path=str(doc), tokens=10)])
     assert any(f.rule == "dead_path" for f in found)
+
+
+def test_dead_path_ignores_paths_containing_spaces(tmp_path):
+    """The tokenizer stops at whitespace, so 'C:\\Users\\x\\My Documents\\a.txt'
+    truncates to a stub that does not exist. Reporting that stub as a dead
+    reference is a false positive on a very common Windows path shape."""
+    doc = _write(tmp_path / "d.md",
+                 "see C:\\Users\\hanif\\My Documents\\notes.txt for details\n")
+    found = context.findings([_seg("d.md", path=str(doc), tokens=10)])
+    assert not any(f.rule == "dead_path" for f in found)
+
+
+def test_dead_path_ignores_urls(tmp_path):
+    """'/mnt/...' inside a URL was never a filesystem reference."""
+    doc = _write(tmp_path / "d.md", "docs at http://example.org/mnt/guide/x.md ok\n")
+    found = context.findings([_seg("d.md", path=str(doc), tokens=10)])
+    assert not any(f.rule == "dead_path" for f in found)
+
+
+def test_dead_path_trims_trailing_sentence_punctuation(tmp_path):
+    """Prose ends paths with a period. On POSIX 'x.py.' is a different,
+    non-existent name from 'x.py', so the period must be trimmed before probing."""
+    real = _write(tmp_path / "real.py", "x")
+    doc = _write(tmp_path / "d.md", f"it lives at {real}.\n")
+    found = context.findings([_seg("d.md", path=str(doc), tokens=10)])
+    assert not any(f.rule == "dead_path" for f in found)
+
+
+def test_dead_path_requires_a_file_extension(tmp_path):
+    """Directory-shaped candidates are too ambiguous to call dead."""
+    doc = _write(tmp_path / "d.md", f"dir {tmp_path / 'gone' / 'subdir'}\n")
+    found = context.findings([_seg("d.md", path=str(doc), tokens=10)])
+    assert not any(f.rule == "dead_path" for f in found)
+
+
+def test_outlier_uses_true_median_on_even_length_input():
+    """ordered[n//2] is the upper-median on an even-length list, which inflates
+    the threshold and hides genuine outliers."""
+    # 8 skills: [10,10,10,10,50,50,50,200].
+    # True median = (10+50)/2 = 30 -> threshold 120 -> the 200 fires.
+    # Upper-median ordered[4] = 50 -> threshold 200 -> 200 is not > 200, silent.
+    segs = [_seg(f"p:s{i}", kind="skill", tokens=10) for i in range(4)]
+    segs += [_seg(f"p:b{i}", kind="skill", tokens=50) for i in range(3)]
+    segs.append(_seg("p:whale", kind="skill", tokens=200))
+    found = context.findings(segs)
+    assert any(f.rule == "outlier_description" and "whale" in f.subject
+               for f in found)
+
+
+def test_memory_folder_accepts_injected_cwd(tmp_path):
+    """The resolver must be drivable from a caller-supplied directory rather
+    than only the process cwd, so it is testable off the real machine layout."""
+    folder = context._memory_folder(cwd=tmp_path)
+    assert isinstance(folder, str) and folder
+    assert Path(folder).exists()
 
 
 def test_memory_folder_resolves_to_a_real_directory():

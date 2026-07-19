@@ -106,7 +106,17 @@ def _skills_for(plugin_dir: Path) -> list[dict]:
     if not sdir.is_dir():
         return skills
     for skill_md in sorted(sdir.glob("*/SKILL.md")):
-        fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="ignore"))
+        # Skip a skill we cannot read rather than aborting the whole scan. The
+        # glob races against plugin installs/updates, and a file can be locked
+        # (antivirus) or vanish between enumeration and read. Callers wrap
+        # scan() as a unit, so letting one file raise here would silently drop
+        # EVERY plugin's skills — matching _read_json's guard above keeps the
+        # read total, per the project's skip-don't-raise rule.
+        try:
+            raw = skill_md.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        fm = _parse_frontmatter(raw)
         name = fm.get("name") or skill_md.parent.name
         trigger = fm.get("description", "")
         skills.append({"name": name, "trigger": trigger})
