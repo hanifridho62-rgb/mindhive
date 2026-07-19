@@ -1,0 +1,478 @@
+# src/mindhive/context.py
+"""Context-budget analyzer for the always-on session surface.
+
+Mind Hive's operating rule is that nothing unbounded may ship into auto-loaded
+context, and the delivery caps exist to enforce it — ``LESSONS_CAP`` (sync),
+``DECISIONS_CAP`` (sync), ``_TIMELINE_CAP`` (briefing), ``SUGGEST_CAP``
+(projector). Every one of those bounds an *item count*. None bounds a *size*.
+Ten lessons can be 500 bytes or 50 KB and the caps cannot tell the difference,
+so the artifacts they nominally protect grew unmeasured: at the time this module
+was written STATE.md was 37 KB and the native MEMORY.md 23 KB, together roughly
+16,000 estimated tokens paid at the start of every single session.
+
+This module measures that surface. It is deliberately **read-only** — it never
+writes, trims, or rewrites an artifact, and it never changes what the sync and
+briefing paths deliver. It reports what the cost is and which contributors are
+worth trimming; deciding to act on that stays with the operator.
+
+Two origins are measured:
+
+``hive``    the artifacts this tool itself maintains — STATE.md, BRIEFING.md,
+            SOUL.md in the namespace directory, plus the native MEMORY.md that
+            the desktop app auto-loads (``sync.native_memory_path``).
+``claude``  the wider always-on load — the user's CLAUDE.md and the trigger
+            description of every installed plugin skill, which is resident in
+            context before any work begins.
+
+The pipeline is four stages over one currency, the ``Segment``: collect (the
+only stage that touches the filesystem), ``analyze`` (totals, ranking, share,
+budget delta), ``findings`` (rule-based trim suggestions), and render. Adding a
+new context source later means writing one collector; nothing downstream moves.
+
+Reads stay total. This walks user configuration written by many tools over a
+long time and will meet truncated frontmatter, invalid UTF-8, and directories
+that no longer exist. Every collector skips what it cannot parse and returns
+what it could — a malformed file must never take down a report.
+
+Token figures are **estimates**. The package declares no third-party
+dependencies, so an exact tokenizer is out of scope for a reporting tool;
+``estimate_tokens`` is a documented character-ratio heuristic and is the single
+place to swap in an exact backend if that ever becomes worth a dependency."""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+from . import paths
+
+# Average characters per token for English prose and markdown. Real tokenizers
+# land near this for ordinary text; dense punctuation or CJK diverge. Used only
+# to rank contributors against each other, where a consistent ratio matters far
+# more than absolute precision.
+CHARS_PER_TOKEN = 4
+
+# Findings thresholds. Deliberately generous: a finding should mean "this is
+# worth your attention", not "this is 2% over a line I invented".
+DOMINANT_SHARE = 0.30        # one artifact eating >30% of the whole budget
+OVERSIZED_BYTES = 20_000     # a single auto-loaded artifact past ~5k tokens
+DUPLICATE_MIN_LEN = 24       # ignore short repeated lines (headers, "---", "")
+DUPLICATE_MIN_COUNT = 3      # a line must repeat at least this often to matter
+OUTLIER_FACTOR = 4           # skill description this many times the median
+MAX_PATHS_PROBED = 200       # bound the stat() calls the dead-path rule makes
+
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:\\[^\s\"'`|,;:*?<>]+|/(?:home|Users|mnt|opt)/[^\s\"'`|,;:*?<>]+)")
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One measured contributor to auto-loaded context."""
+    name: str
+    origin: str          # "hive" | "claude"
+    path: str            # "" when the segment is not a single file
+    nbytes: int
+    tokens: int
+    kind: str            # "artifact" | "skill" | "instructions"
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Finding:
+    """A rule-based trim suggestion. Advisory only — nothing acts on these."""
+    rule: str
+    severity: str        # "high" | "medium" | "low"
+    subject: str
+    message: str
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate the token cost of ``text``.
+
+    A character-ratio heuristic (see ``CHARS_PER_TOKEN``), not an exact count.
+    Monotonic by construction: appending text can never lower the estimate,
+    which is what makes the ranking trustworthy even though the absolute
+    numbers are approximate. Empty text costs nothing; any non-empty text costs
+    at least one token."""
+    if not text:
+        return 0
+    return max(1, round(len(text) / CHARS_PER_TOKEN))
+
+
+def _read_text(path: Path) -> str | None:
+    """Read a file as text, or return None if it cannot be read at all.
+
+    ``errors="replace"`` keeps invalid UTF-8 measurable rather than fatal — a
+    corrupt byte should cost its bytes in the report, not abort the run."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _memory_folder() -> str:
+    """The folder key under which the native MEMORY.md is stored.
+
+    MEMORY.md is keyed by the *main repo* folder, not the current directory. Run
+    from inside a linked worktree, ``Path.cwd()`` encodes to the worktree path
+    and the lookup misses the real file entirely — which silently understates
+    the report by the size of MEMORY.md. Resolve the main repo the same way
+    ``paths.detect_project`` does (``--git-common-dir`` points at the main
+    repo's .git even from a linked worktree), and fall back to cwd off-repo."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(Path.cwd()), capture_output=True, text=True, timeout=2,
+            creationflags=paths.NO_WINDOW,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            gcd = Path(r.stdout.strip())
+            if not gcd.is_absolute():
+                gcd = Path.cwd() / gcd
+            gcd = gcd.resolve()
+            if gcd.name == ".git":
+                return str(gcd.parent)
+    except Exception:
+        pass
+    return str(Path.cwd())
+
+
+def _file_segment(path: Path, name: str, origin: str, kind: str,
+                  detail: str = "") -> Segment | None:
+    """Measure one file, or return None when it is absent/unreadable."""
+    text = _read_text(path)
+    if text is None:
+        return None
+    try:
+        nbytes = path.stat().st_size
+    except Exception:
+        nbytes = len(text.encode("utf-8", errors="replace"))
+    return Segment(name=name, origin=origin, path=str(path), nbytes=nbytes,
+                   tokens=estimate_tokens(text), kind=kind, detail=detail)
+
+
+# --------------------------------------------------------------------------
+# collectors
+# --------------------------------------------------------------------------
+
+def collect_hive(project: str | None = None, memory_path: Path | None = None,
+                 folder: str | None = None) -> list[Segment]:
+    """Measure the artifacts Mind Hive maintains and auto-loads.
+
+    The namespace artifacts resolve through ``paths.project_dir`` so this always
+    reports the same namespace the rest of the tool is operating on — with many
+    namespaces on disk, re-deriving the path here would risk measuring somebody
+    else's project. MEMORY.md lives outside the store, at the native per-project
+    path the desktop app reads; ``memory_path`` overrides it for tests."""
+    out: list[Segment] = []
+    pdir = paths.project_dir(project)
+
+    for filename, kind in (("STATE.md", "artifact"),
+                           ("BRIEFING.md", "artifact"),
+                           ("SOUL.md", "artifact")):
+        seg = _file_segment(pdir / filename, filename, "hive", kind)
+        if seg is not None:
+            out.append(seg)
+
+    if memory_path is None:
+        from . import sync
+        try:
+            memory_path = sync.native_memory_path(folder or _memory_folder())
+        except Exception:
+            memory_path = None
+    if memory_path is not None:
+        seg = _file_segment(Path(memory_path), "MEMORY.md", "hive", "artifact",
+                            detail="native auto-loaded memory digest")
+        if seg is not None:
+            out.append(seg)
+
+    return out
+
+
+def collect_claude(home: Path | None = None,
+                   cache_dir: Path | None = None) -> list[Segment]:
+    """Measure the wider always-on Claude Code load.
+
+    Covers the user's CLAUDE.md instructions and the trigger description of
+    every installed plugin skill. Only the description is charged, not the skill
+    body: the body loads on invocation, the description is resident in context
+    from the start, and charging the body would overstate the standing cost by
+    orders of magnitude.
+
+    Plugin discovery reuses ``plugins.scan``, which already handles version
+    dedup and cache layout. Both roots are injectable so tests never read the
+    real ``~/.claude``."""
+    home = Path(home) if home is not None else Path.home()
+    out: list[Segment] = []
+
+    for rel, name in ((Path(".claude") / "CLAUDE.md", "CLAUDE.md"),
+                      (Path(".claude") / "settings.json", "settings.json")):
+        seg = _file_segment(home / rel, name, "claude", "instructions")
+        if seg is not None:
+            out.append(seg)
+
+    from . import plugins
+    try:
+        found = plugins.scan(cache_dir) if cache_dir is not None else plugins.scan()
+    except Exception:
+        found = []
+
+    for plugin in found or []:
+        if not isinstance(plugin, dict):
+            continue
+        pname = plugin.get("name") or "?"
+        for skill in plugin.get("skills") or []:
+            if not isinstance(skill, dict):
+                continue
+            trigger = skill.get("trigger") or skill.get("description") or ""
+            if not trigger:
+                continue
+            sname = skill.get("name") or "?"
+            out.append(Segment(
+                name=f"{pname}:{sname}", origin="claude", path="",
+                nbytes=len(trigger.encode("utf-8", errors="replace")),
+                tokens=estimate_tokens(trigger), kind="skill",
+                detail="skill trigger description",
+            ))
+
+    return out
+
+
+def collect_all(project: str | None = None, home: Path | None = None,
+                cache_dir: Path | None = None,
+                memory_path: Path | None = None) -> list[Segment]:
+    """Every measurable contributor, both origins."""
+    return (collect_hive(project=project, memory_path=memory_path)
+            + collect_claude(home=home, cache_dir=cache_dir))
+
+
+# --------------------------------------------------------------------------
+# analysis
+# --------------------------------------------------------------------------
+
+def analyze(segments: list[Segment], budget: int | None = None) -> dict:
+    """Total, rank, and (optionally) compare against a token budget.
+
+    Ranking is descending by tokens with the name as a tiebreak, so repeated
+    runs over unchanged inputs produce byte-identical output — a report that
+    reshuffles itself is useless for spotting real change."""
+    segs = list(segments or [])
+    total_tokens = sum(s.tokens for s in segs)
+    total_bytes = sum(s.nbytes for s in segs)
+
+    ranked = sorted(segs, key=lambda s: (-s.tokens, s.name))
+    rows = [{
+        "name": s.name, "origin": s.origin, "kind": s.kind, "path": s.path,
+        "bytes": s.nbytes, "tokens": s.tokens, "detail": s.detail,
+        "share": (s.tokens / total_tokens) if total_tokens else 0.0,
+    } for s in ranked]
+
+    by_origin: dict[str, dict] = {}
+    for s in segs:
+        slot = by_origin.setdefault(s.origin, {"tokens": 0, "bytes": 0, "count": 0})
+        slot["tokens"] += s.tokens
+        slot["bytes"] += s.nbytes
+        slot["count"] += 1
+
+    report = {
+        "total_tokens": total_tokens,
+        "total_bytes": total_bytes,
+        "count": len(segs),
+        "by_origin": by_origin,
+        "segments": rows,
+        "budget": budget,
+        "over_budget": (total_tokens - budget) if budget is not None else None,
+        "estimated": True,
+        "chars_per_token": CHARS_PER_TOKEN,
+    }
+    return report
+
+
+# --------------------------------------------------------------------------
+# findings
+# --------------------------------------------------------------------------
+
+def _finding_dominant(segments, total) -> list[Finding]:
+    out = []
+    if not total:
+        return out
+    for s in segments:
+        share = s.tokens / total
+        if share > DOMINANT_SHARE:
+            out.append(Finding(
+                rule="dominant_artifact", severity="high", subject=s.name,
+                message=(f"{s.name} is {share:.0%} of the whole auto-loaded budget "
+                         f"(~{s.tokens} est. tokens). Trimming this one file moves "
+                         f"the total more than anything else."),
+            ))
+    return out
+
+
+def _finding_oversized(segments) -> list[Finding]:
+    return [
+        Finding(rule="oversized_artifact", severity="medium", subject=s.name,
+                message=(f"{s.name} is {s.nbytes:,} bytes (~{s.tokens} est. tokens), "
+                         f"past the {OVERSIZED_BYTES:,}-byte guideline for a single "
+                         f"auto-loaded artifact."))
+        for s in segments
+        if s.kind == "artifact" and s.nbytes > OVERSIZED_BYTES
+    ]
+
+
+def _finding_duplicate_lines(segments) -> list[Finding]:
+    out = []
+    for s in segments:
+        if not s.path:
+            continue
+        text = _read_text(Path(s.path))
+        if text is None:
+            continue
+        counts: dict[str, int] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if len(stripped) >= DUPLICATE_MIN_LEN:
+                counts[stripped] = counts.get(stripped, 0) + 1
+        repeats = {k: v for k, v in counts.items() if v >= DUPLICATE_MIN_COUNT}
+        if not repeats:
+            continue
+        wasted = sum(len(k) * (v - 1) for k, v in repeats.items())
+        worst = max(repeats.items(), key=lambda kv: len(kv[0]) * (kv[1] - 1))
+        out.append(Finding(
+            rule="duplicate_lines", severity="medium", subject=s.name,
+            message=(f"{s.name} repeats {len(repeats)} line(s) {DUPLICATE_MIN_COUNT}+ "
+                     f"times, wasting ~{wasted:,} chars (~{estimate_tokens('x' * wasted)} "
+                     f"est. tokens). Worst repeats {worst[1]}x: {worst[0][:60]!r}"),
+        ))
+    return out
+
+
+def _is_illustrative(candidate: str) -> bool:
+    """True for paths that are documentation examples, not real references.
+
+    Instruction files legitimately contain example paths — "never use absolute
+    paths like /Users/name/Code/project/src/file.ts". Those will never exist on
+    disk, so without this the dead-path rule fires on every doc that teaches
+    path hygiene, and a rule that cries wolf gets ignored. Elision markers and
+    obvious placeholder segments are the reliable tells."""
+    if "..." in candidate:
+        return True
+    lowered = candidate.lower()
+    return any(tok in lowered for tok in
+               ("<", ">", "${", "/name/", "/username/", "/user/", "/path/to/",
+                "yourname", "your-name", "example.com"))
+
+
+def _finding_dead_paths(segments) -> list[Finding]:
+    out = []
+    for s in segments:
+        if not s.path:
+            continue
+        text = _read_text(Path(s.path))
+        if text is None:
+            continue
+        candidates = [c for c in dict.fromkeys(_ABS_PATH_RE.findall(text))
+                      if not _is_illustrative(c)][:MAX_PATHS_PROBED]
+        dead = []
+        for cand in candidates:
+            try:
+                if not Path(cand).exists():
+                    dead.append(cand)
+            except Exception:
+                continue
+        if dead:
+            out.append(Finding(
+                rule="dead_path", severity="low", subject=s.name,
+                message=(f"{s.name} references {len(dead)} absolute path(s) that no "
+                         f"longer exist (e.g. {dead[0]}). Stale paths cost tokens every "
+                         f"session and mislead on read."),
+            ))
+    return out
+
+
+def _finding_outlier_skills(segments) -> list[Finding]:
+    skills = [s for s in segments if s.kind == "skill"]
+    if len(skills) < 4:
+        return []
+    ordered = sorted(s.tokens for s in skills)
+    median = ordered[len(ordered) // 2] or 1
+    return [
+        Finding(rule="outlier_description", severity="low", subject=s.name,
+                message=(f"{s.name} has a {s.tokens}-token trigger description, "
+                         f"{s.tokens / median:.1f}x the median of {median}. Long "
+                         f"descriptions are resident in context for every session."))
+        for s in skills
+        if s.tokens > median * OUTLIER_FACTOR
+    ]
+
+
+def findings(segments: list[Segment]) -> list[Finding]:
+    """Rule-based trim suggestions over measured segments.
+
+    Each rule is independent and returns zero or more findings, so a rule that
+    finds nothing is silent rather than noisy. Nothing here mutates its input or
+    touches the artifacts it reports on."""
+    segs = list(segments or [])
+    total = sum(s.tokens for s in segs)
+    out: list[Finding] = []
+    out += _finding_dominant(segs, total)
+    out += _finding_oversized(segs)
+    out += _finding_duplicate_lines(segs)
+    out += _finding_dead_paths(segs)
+    out += _finding_outlier_skills(segs)
+    order = {"high": 0, "medium": 1, "low": 2}
+    return sorted(out, key=lambda f: (order.get(f.severity, 3), f.rule, f.subject))
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+def render_text(report: dict, found: list[Finding], top: int | None = None) -> str:
+    """Human-readable report. Figures are labelled as estimates throughout."""
+    rows = report.get("segments") or []
+    if not rows:
+        return ("No context contributors found. Nothing is auto-loading from this "
+                "namespace, or the store has not been synced yet.")
+
+    shown = rows[:top] if top else rows
+    lines = []
+    total_t = report["total_tokens"]
+    lines.append(f"Auto-loaded context: ~{total_t:,} est. tokens "
+                 f"({report['total_bytes']:,} bytes across {report['count']} contributors)")
+
+    for origin, slot in sorted(report.get("by_origin", {}).items()):
+        share = (slot["tokens"] / total_t) if total_t else 0.0
+        lines.append(f"  {origin:<7} ~{slot['tokens']:>7,} est. tokens  "
+                     f"{share:>5.0%}  ({slot['count']} item(s))")
+
+    budget = report.get("budget")
+    if budget is not None:
+        over = report.get("over_budget") or 0
+        verdict = f"OVER by ~{over:,}" if over > 0 else f"under by ~{abs(over):,}"
+        lines.append(f"  budget  {budget:,} est. tokens -> {verdict}")
+
+    lines.append("")
+    lines.append(f"{'tokens':>8}  {'share':>6}  {'origin':<7} name")
+    for r in shown:
+        lines.append(f"{r['tokens']:>8,}  {r['share']:>5.0%}  {r['origin']:<7} {r['name']}")
+    if top and len(rows) > top:
+        lines.append(f"{'...':>8}  {len(rows) - top} more (use --top to widen)")
+
+    if found:
+        lines.append("")
+        lines.append(f"Trim suggestions ({len(found)}):")
+        for f in found:
+            lines.append(f"  [{f.severity}] {f.rule}: {f.message}")
+
+    lines.append("")
+    lines.append(f"Token figures are estimates (~{report['chars_per_token']} chars/token). "
+                 "This command is read-only and changed nothing.")
+    return "\n".join(lines)
+
+
+def to_json(report: dict, found: list[Finding]) -> str:
+    """Machine-readable report. Stable keys so downstream tooling can rely on it."""
+    payload = dict(report)
+    payload["findings"] = [asdict(f) for f in found]
+    return json.dumps(payload, indent=2, sort_keys=True)
