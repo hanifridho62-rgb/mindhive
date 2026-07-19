@@ -64,7 +64,16 @@ DUPLICATE_MIN_COUNT = 3      # a line must repeat at least this often to matter
 OUTLIER_FACTOR = 4           # skill description this many times the median
 MAX_PATHS_PROBED = 200       # bound the stat() calls the dead-path rule makes
 
-_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:\\[^\s\"'`|,;:*?<>]+|/(?:home|Users|mnt|opt)/[^\s\"'`|,;:*?<>]+)")
+# POSIX roots worth probing. `tmp` and `var` are included deliberately: those
+# trees are ephemeral, so a reference into them is exactly the kind of stale
+# pointer this rule exists to catch — and their absence made the rule silently
+# untestable on Linux/macOS, where pytest's tmp_path lives under /tmp or
+# /var/folders. The list stays an allow-list rather than "any absolute path" so
+# URL-ish and API-route strings in prose cannot be mistaken for filesystem refs.
+_ABS_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:\\[^\s\"'`|,;:*?<>]+"
+    r"|/(?:home|Users|mnt|opt|tmp|var|srv|data)/[^\s\"'`|,;:*?<>]+)"
+)
 _URL_RE = re.compile(r"https?://\S+")
 # Only candidates that look like a FILE reference are probed. The tokenizer
 # stops at whitespace, so a path containing a space ("My Documents") truncates

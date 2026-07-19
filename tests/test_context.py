@@ -317,6 +317,21 @@ def test_is_illustrative_still_allows_real_dead_paths(tmp_path):
     assert any(f.rule == "dead_path" for f in found)
 
 
+def test_tmp_path_is_extractable_canary(tmp_path):
+    """Canary for the negative dead-path tests below.
+
+    Those tests assert that NO dead_path finding fires. If the extractor stops
+    recognising the platform's tmp root, they would all pass vacuously while
+    testing nothing — which is exactly how a Linux-only regression shipped
+    green on Windows. This asserts the fixture root is actually extractable,
+    so the suite fails loudly instead of silently going hollow."""
+    probe = tmp_path / "canary" / "file.py"
+    assert context._path_candidates(f"ref {probe}\n") == [str(probe)], (
+        f"tmp_path root {tmp_path} is not matched by _ABS_PATH_RE — the "
+        f"negative dead-path tests below are vacuous on this platform"
+    )
+
+
 def test_dead_path_ignores_paths_containing_spaces(tmp_path):
     """The tokenizer stops at whitespace, so 'C:\\Users\\x\\My Documents\\a.txt'
     truncates to a stub that does not exist. Reporting that stub as a dead
