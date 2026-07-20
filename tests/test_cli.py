@@ -118,18 +118,22 @@ def test_flag_category_adds_tag():
     assert "judgment" in ev.tags and "git" in ev.tags
 
 
-def test_project_on_corrupt_log_exits_cleanly(tmp_path, capsys):
-    """A corrupt event-log line must surface as a clean CLI error (exit 1), not a
-    raw traceback. read_all still fails loud — the CLI just frames it."""
+def test_project_survives_corrupt_log_and_verify_reports_it(tmp_path, capsys):
+    """A corrupt/torn event-log line must NOT break `hive` commands: reads are
+    total, so `hive project` still succeeds (exit 0) over the good events. The
+    corruption is surfaced explicitly by `hive verify` (corrupt_rows), not by
+    crashing every command with a framed error. (Regression: a single torn
+    `command_run` fragment used to exit-1 every CLI command and 500 every
+    dashboard section.)"""
     events.append_event("decision", {"text": "a"}, session_id="s", ts="2026-06-20T10:00:00Z")
     seg = next((tmp_path / "test" / "events").glob("*.jsonl"))
     with open(seg, "a", encoding="utf-8") as f:
         f.write("{not json\n")
-    ret = cli_mod.main(["project"])
-    assert ret == 1
-    err = capsys.readouterr().err
-    assert "corrupt event log" in err.lower()
-    assert "Traceback" not in err
+    assert cli_mod.main(["project"]) == 0     # projection no longer crashes
+    assert cli_mod.main(["verify"]) == 0
+    out = capsys.readouterr().out
+    assert "corrupt_rows" in out              # verify surfaces the torn row
+    assert "unparseable json" in out
 
 
 def test_cli_consolidate_runs_and_reports(tmp_path, monkeypatch, capsys):

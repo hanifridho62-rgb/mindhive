@@ -2,17 +2,41 @@
 from mindhive import events, paths
 
 
-def test_read_all_fails_loud_on_missing_required_field(tmp_path):
-    import json
-    import pytest
+def test_read_all_skips_malformed_rows_and_stays_total(tmp_path):
+    # Ledger-schema SOP: reads stay TOTAL. A torn/interleaved write from a past
+    # session — a line of unparseable JSON, or a JSON object missing a required
+    # Event field — must be SKIPPED, never raised. Every dashboard endpoint and
+    # every `hive` CLI command reads via read_all; one corrupt byte-run must not
+    # take down the whole hive (it did: a torn `command_run` fragment 500'd every
+    # dashboard section and crashed every CLI command).
+    events.append_event("decision", {"text": "before"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    seg = next(paths.events_dir("test").glob("*.jsonl"))
+    with open(seg, "a", encoding="utf-8") as f:
+        f.write('{"ts":"2026-06-20T11:00:00Z","type":"decision"}\n')  # missing fields
+        f.write(':"command_run"}\n')                                   # torn fragment
+    events.append_event("decision", {"text": "after"}, session_id="s",
+                        ts="2026-06-20T12:00:00Z")
+    evs = events.read_all("test")
+    assert [e.payload.get("text") for e in evs] == ["before", "after"]
+
+
+def test_corrupt_rows_surfaces_skipped_rows(tmp_path):
+    # The strict companion to the total read: read_all() drops malformed rows so
+    # folds never crash; corrupt_rows() SURFACES them so `hive verify` and the
+    # dashboard can report corruption instead of it passing silently.
     events.append_event("decision", {"text": "ok"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
-    seg = next((tmp_path / "test" / "events").glob("*.jsonl"))
-    # Append a structurally valid JSON line that lacks required fields.
+    seg = next(paths.events_dir("test").glob("*.jsonl"))
     with open(seg, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": "2026-06-20T11:00:00Z", "type": "decision"}) + "\n")
-    with pytest.raises(json.JSONDecodeError, match="missing required field"):
-        events.read_all("test")
+        f.write('{"ts":"2026-06-20T11:00:00Z","type":"decision"}\n')  # missing fields
+        f.write(':"command_run"}\n')                                   # torn fragment
+    bad = events.corrupt_rows("test")
+    assert len(bad) == 2
+    joined = " ".join(r["reason"] for r in bad)
+    assert "missing required field" in joined
+    assert "unparseable json" in joined
+    assert all(r["segment"] == seg.name for r in bad)
 
 
 def test_canonical_json_is_stable():

@@ -19,17 +19,40 @@ def test_verify_detects_tamper(tmp_path):
     assert result["ok"] is False
     assert result["reason"] == "hash_mismatch"
 
-def test_verify_corrupt_event_log(tmp_path):
+def test_appended_garbage_keeps_verify_ok_but_shows_in_corrupt_rows(tmp_path):
+    # New contract: reads are TOTAL. An appended unparseable line is not a
+    # logical event, so it neither crashes verify nor changes the chain — a torn
+    # write must never take the hive down. verify() stays ok (the sealed chain of
+    # real events is intact); events.corrupt_rows() is where the garbage is
+    # surfaced loudly. Tamper-evidence for ALTERED or DELETED existing events is
+    # still caught as hash_mismatch (see test_verify_detects_tamper).
     events.append_event("decision", {"text": "a"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
     chain.write_chain()
     seg = next((tmp_path / "test" / "events").glob("*.jsonl"))
-    # Append a corrupt (unparseable) JSONL line
     with open(seg, "a", encoding="utf-8") as f:
         f.write("{not json\n")
+    assert chain.verify()["ok"] is True
+    bad = events.corrupt_rows("test")
+    assert len(bad) == 1
+    assert "unparseable json" in bad[0]["reason"]
+
+
+def test_verify_detects_delete_by_corruption(tmp_path):
+    # Deleting a sealed event by corrupting its line is still caught: read_all
+    # skips the row, so the recomputed chain head no longer matches chain.json.
+    events.append_event("decision", {"text": "one"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    events.append_event("decision", {"text": "two"}, session_id="s",
+                        ts="2026-06-20T11:00:00Z")
+    chain.write_chain()
+    seg = next((tmp_path / "test" / "events").glob("*.jsonl"))
+    seg.write_text(
+        seg.read_text(encoding="utf-8").replace('"text":"one"', "GARBAGE"),
+        encoding="utf-8")
     result = chain.verify()
     assert result["ok"] is False
-    assert result["reason"] == "corrupt_event_log"
+    assert result["reason"] == "hash_mismatch"
 
 def test_verify_corrupt_chain_file(tmp_path):
     events.append_event("decision", {"text": "a"}, session_id="s",

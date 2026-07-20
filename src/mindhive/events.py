@@ -159,6 +159,37 @@ def _maybe_read_from_pg(project=None):
         return None  # degrade to file read
 
 
+# Fields an Event row cannot be reconstructed without. A row missing any of
+# these is malformed (a torn write, or a pre-schema line) and is skipped by the
+# total read below — corrupt_rows() reports it instead.
+_REQUIRED_FIELDS = ("ts", "session_id", "type", "payload")
+
+
+def _row_to_event(line: str):
+    """Parse one ledger line into an ``Event``, or return ``None`` when the row
+    is malformed — unparseable JSON, a non-object value, or an object missing a
+    required Event field.
+
+    Reads stay TOTAL (ledger-schema SOP): the append-only log carries history
+    written by every past version of the code, and a torn or interleaved write
+    from a crashed / concurrent session must never crash a fold or projection.
+    A single corrupt line used to raise here, which `main()` and all 14 dashboard
+    endpoints turned into a total outage — every `hive` command and every UI
+    section failed on one bad `command_run` fragment. Corruption is not swallowed
+    silently: it is surfaced, loudly but non-fatally, by corrupt_rows() and
+    `hive verify` (any dropped row also changes the hash-chain head, so verify()
+    still reports a mismatch — tamper-evidence lives there, not in crashing
+    readers)."""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or any(k not in obj for k in _REQUIRED_FIELDS):
+        return None
+    known = {k: obj[k] for k in Event.__dataclass_fields__ if k in obj}
+    return Event(**known)
+
+
 def read_all(project=None) -> list["Event"]:
     pg = _maybe_read_from_pg(project)
     if pg is not None:
@@ -172,22 +203,43 @@ def read_all(project=None) -> list["Event"]:
             line = line.strip()
             if not line:
                 continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise json.JSONDecodeError(
-                    f"{seg.name}:{i}: {e.msg}", e.doc, e.pos
-                ) from e
-            # A structurally valid JSON line that is missing a required Event
-            # field would otherwise raise a raw TypeError from Event(**known),
-            # bypassing the framed corrupt-log handling. Fail loud, framed.
-            missing = [k for k in ("ts", "session_id", "type", "payload")
-                       if k not in obj]
-            if missing:
-                raise json.JSONDecodeError(
-                    f"{seg.name}:{i}: event missing required field(s): "
-                    f"{', '.join(missing)}", line, 0)
-            known = {k: obj[k] for k in Event.__dataclass_fields__ if k in obj}
-            rows.append((obj.get("ts", ""), seg.name, i, Event(**known)))
+            ev = _row_to_event(line)
+            if ev is None:
+                continue          # skip a malformed/torn row (reads stay total)
+            rows.append((ev.ts or "", seg.name, i, ev))
     rows.sort(key=lambda t: (t[0], t[1], t[2]))
     return [r[3] for r in rows]
+
+
+def corrupt_rows(project=None) -> list[dict]:
+    """Every malformed ledger row across all segments: unparseable JSON, a
+    non-object JSON value, or an object missing a required Event field.
+
+    read_all() skips exactly these rows so folds and projections stay total;
+    this is the strict companion that REPORTS them, so `hive verify` and the
+    dashboard can show corruption instead of it passing silently. Returns [] for
+    a clean store. Each row: ``{segment, line, reason, preview}``."""
+    d = paths.events_dir(project)
+    out: list[dict] = []
+    if not d.exists():
+        return out
+    for seg in sorted(d.glob("*.jsonl")):
+        for i, line in enumerate(seg.read_text(encoding="utf-8").splitlines()):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError as e:
+                reason = f"unparseable json: {e.msg}"
+            else:
+                if not isinstance(obj, dict):
+                    reason = "not a json object"
+                else:
+                    missing = [k for k in _REQUIRED_FIELDS if k not in obj]
+                    reason = (f"missing required field(s): {', '.join(missing)}"
+                              if missing else None)
+            if reason:
+                out.append({"segment": seg.name, "line": i,
+                            "reason": reason, "preview": s[:80]})
+    return out

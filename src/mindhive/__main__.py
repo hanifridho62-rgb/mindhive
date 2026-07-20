@@ -168,7 +168,15 @@ def cmd_directives(args) -> int | None:
 
 
 def cmd_verify(args) -> int | None:
-    print(json.dumps(chain.verify()))
+    # Chain integrity is the tamper-evidence check; corrupt_rows is the loud,
+    # explicit surfacing of any torn/malformed rows that read_all() skips to stay
+    # total. Reporting both here is where "fail loud" now lives — instead of
+    # crashing every reader on a single bad line.
+    result = chain.verify()
+    bad = events.corrupt_rows()
+    if bad:
+        result = {**result, "corrupt_rows": bad}
+    print(json.dumps(result))
     return None
 
 
@@ -1855,15 +1863,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    """CLI entry point. Frames a corrupt event log as a clean error instead of
-    leaking a traceback — read_all itself stays fail-loud so the tamper-evident
-    hash chain is never silently weakened; we only present the failure nicely."""
+    """CLI entry point. read_all() is now TOTAL — it skips malformed/torn rows so
+    a single corrupt line can never crash a `hive` command (it used to: one torn
+    write took down every CLI command AND every dashboard section). Corruption is
+    surfaced explicitly by `hive verify` (corrupt_rows + any hash mismatch), not
+    by crashing readers. This catch stays as defense-in-depth for any other stray
+    json.loads on a command path."""
     try:
         return _run(argv)
     except json.JSONDecodeError as e:
         print(f"error: corrupt event log ({e})", file=sys.stderr)
-        print("       a line in the event log is not valid JSON; "
-              "run `hive verify` to locate it.", file=sys.stderr)
+        print("       run `hive verify` to locate the corrupt line(s).",
+              file=sys.stderr)
         return 1
 
 
