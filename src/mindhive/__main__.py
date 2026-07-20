@@ -167,6 +167,30 @@ def cmd_directives(args) -> int | None:
     return None
 
 
+def cmd_context(args) -> int | None:
+    """Report what auto-loads into every session — ranked by estimated token
+    cost, with trim suggestions. Strictly read-only: the delivery caps bound
+    item counts, this measures the size those counts never constrained."""
+    from . import context as context_mod
+    project = getattr(args, "project", None)
+    origin = getattr(args, "origin", "all")
+
+    segments = []
+    if origin in ("all", "hive"):
+        segments += context_mod.collect_hive(project=project)
+    if origin in ("all", "claude"):
+        segments += context_mod.collect_claude()
+
+    report = context_mod.analyze(segments, budget=getattr(args, "budget", None))
+    found = context_mod.findings(segments)
+
+    if getattr(args, "json", False):
+        print(context_mod.to_json(report, found))
+    else:
+        print(context_mod.render_text(report, found, top=getattr(args, "top", None)))
+    return None
+
+
 def cmd_verify(args) -> int | None:
     # Chain integrity is the tamper-evidence check; corrupt_rows is the loud,
     # explicit surfacing of any torn/malformed rows that read_all() skips to stay
@@ -1352,6 +1376,20 @@ def _build_parser() -> argparse.ArgumentParser:
     st.set_defaults(func=cmd_state)
     sub.add_parser("projects", help="list namespaces (registered vs unregistered)").set_defaults(func=cmd_projects)
     sub.add_parser("directives", help="print the session operating directives").set_defaults(func=cmd_directives)
+
+    cx = sub.add_parser("context",
+                        help="measure the auto-loaded context budget (read-only)")
+    cx.add_argument("--project", default=None,
+                    help="target namespace explicitly (default: detect from cwd)")
+    cx.add_argument("--json", action="store_true", help="machine-readable report")
+    cx.add_argument("--budget", type=int, default=None,
+                    help="compare the total against a token budget")
+    cx.add_argument("--top", type=int, default=None,
+                    help="show only the N heaviest contributors")
+    cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",
+                    help="limit the report to one origin (default: all)")
+    cx.set_defaults(func=cmd_context)
+
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
 
