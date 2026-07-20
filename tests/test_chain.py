@@ -65,6 +65,61 @@ def test_verify_corrupt_chain_file(tmp_path):
     assert result["reason"] == "corrupt_chain_file"
 
 
+def test_verify_ok_when_events_appended_after_checkpoint():
+    """The steady state: chain.json is a checkpoint refreshed at projection time,
+    but events keep being appended after it. verify() must treat those as intact
+    new history (prefix still hashes to the stored head), NOT a tamper mismatch."""
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    chain.write_chain()                       # checkpoint at 1 event
+    events.append_event("decision", {"text": "b"}, session_id="s",
+                        ts="2026-06-20T10:01:00Z")
+    events.append_event("caveat", {"text": "c"}, session_id="s",
+                        ts="2026-06-20T10:02:00Z")
+    result = chain.verify()
+    assert result["ok"] is True               # history is intact — not a mismatch
+    assert result["ahead"] == 2               # 2 events appended past the checkpoint
+
+def test_verify_no_ahead_key_when_checkpoint_current():
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    chain.write_chain()
+    result = chain.verify()
+    assert result["ok"] is True
+    assert "ahead" not in result              # fully up to date -> no drift to report
+
+def test_verify_detects_tamper_before_checkpoint_with_later_appends():
+    """A rewrite of already-checkpointed history must still be caught even when
+    legitimate events were appended afterward — the prefix hash breaks."""
+    events.append_event("decision", {"text": "alpha"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    chain.write_chain()                       # checkpoint attests to "alpha"
+    events.append_event("decision", {"text": "later"}, session_id="s",
+                        ts="2026-06-20T10:05:00Z")
+    from mindhive import paths
+    seg = next((paths.project_dir() / "events").glob("*.jsonl"))
+    seg.write_text(seg.read_text(encoding="utf-8").replace('"alpha"', '"beta"'),
+                   encoding="utf-8")
+    result = chain.verify()
+    assert result["ok"] is False
+    assert result["reason"] == "hash_mismatch"
+
+def test_verify_detects_truncation_below_checkpoint():
+    """If the log is shorter than the checkpoint claims, checkpointed history was
+    deleted — genuine tamper, not a benign drift."""
+    events.append_event("decision", {"text": "a"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    events.append_event("decision", {"text": "b"}, session_id="s",
+                        ts="2026-06-20T10:01:00Z")
+    chain.write_chain()                       # checkpoint at 2 events
+    from mindhive import paths
+    seg = next((paths.project_dir() / "events").glob("*.jsonl"))
+    first = seg.read_text(encoding="utf-8").splitlines()[0]
+    seg.write_text(first + "\n", encoding="utf-8")   # drop the 2nd event
+    result = chain.verify()
+    assert result["ok"] is False
+    assert result["reason"] == "hash_mismatch"
+
 def test_verify_without_chain_file():
     events.append_event("decision", {"text": "a"}, session_id="s",
                         ts="2026-06-20T10:00:00Z")
