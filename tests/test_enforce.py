@@ -120,6 +120,93 @@ def test_load_manifest_missing_is_empty():
     assert enforce.load_manifest("test") == {}
 
 
+# --- static policy tier (GateGuard port) --------------------------------------
+
+def _pre(tool, tool_input):
+    return json.dumps({"tool_name": tool, "tool_input": tool_input})
+
+
+def test_policy_destructive_command_asks():
+    out = enforce.hook_decision(_pre("Bash", {"command": "rm -rf /tmp/x"}),
+                                project="test")
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "ask"
+    assert hso["permissionDecisionReason"].startswith(enforce.ENFORCED_MARK)
+
+
+def test_policy_no_verify_denies():
+    out = enforce.hook_decision(
+        _pre("Bash", {"command": "git commit --no-verify -m 'x'"}),
+        project="test")
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_policy_no_verify_wins_over_destructive_ask():
+    # A command that trips both gates must DENY (the stronger decision), not ask.
+    out = enforce.hook_decision(
+        _pre("Bash", {"command": "git push --force --no-verify"}),
+        project="test")
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_policy_config_protection_denies_existing(tmp_path):
+    target = tmp_path / ".eslintrc.json"
+    target.write_text("{}", encoding="utf-8")
+    out = enforce.hook_decision(
+        _pre("Edit", {"file_path": str(target)}), project="test")
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_policy_disabled_via_manifest():
+    pol = enforce.evaluate_policies(
+        "Bash", {"command": "rm -rf /tmp/x"},
+        manifest={"policy:gate:destructive-command": {"enabled": False}})
+    assert pol is None
+
+
+def test_policy_reason_override_wins():
+    pol = enforce.evaluate_policies(
+        "Bash", {"command": "rm -rf /tmp/x"},
+        manifest={"policy:gate:destructive-command": {"reason": "NOPE"}})
+    assert pol == ("ask", "NOPE")
+
+
+def test_policy_ignores_non_command_tools():
+    assert enforce.evaluate_policies("Grep", {"pattern": "rm -rf x"},
+                                     manifest={}) is None
+
+
+def test_policy_safe_command_allows():
+    assert enforce.evaluate_policies("Bash", {"command": "git status"},
+                                     manifest={}) is None
+
+
+def test_policy_is_fail_open(monkeypatch):
+    from mindhive import gateguard
+    monkeypatch.setattr(gateguard, "is_destructive_command",
+                        lambda cmd: 1 / 0)
+    assert enforce.evaluate_policies("Bash", {"command": "rm -rf x"},
+                                     manifest={}) is None
+
+
+def test_learned_matcher_still_fires_alongside_policies():
+    enforce.set_enabled("test", "tool:ripgrep-timeout", True)
+    out = enforce.hook_decision(_pre("Grep", {"pattern": "x"}), project="test")
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_set_enabled_accepts_policy_ids():
+    res = enforce.set_enabled("test", "policy:gate:no-verify", False)
+    assert res.get("enabled") is False
+    man = enforce.load_manifest("test")
+    assert man["policy:gate:no-verify"]["enabled"] is False
+    # and the disabled policy no longer fires through hook_decision
+    out = enforce.hook_decision(
+        _pre("Bash", {"command": "git commit --no-verify -m 'x'"}),
+        project="test")
+    assert out == {}
+
+
 def test_suggest_adds_disabled_stub_for_ruled_recurring_signature(monkeypatch):
     from mindhive import incidents
     monkeypatch.setattr(incidents, "summaries", lambda project=None: [

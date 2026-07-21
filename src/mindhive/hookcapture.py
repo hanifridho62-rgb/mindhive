@@ -170,6 +170,105 @@ def log_hook_error(stage: str, exc) -> None:
         pass
 
 
+# --- live failure capture (PostToolUseFailure) --------------------------------
+# Failure categories, matched case-insensitively as substrings, first hit wins.
+# The point is the MACHINE-READABLE payload: the ledger already holds 260
+# legacy tool_failed events whose payloads carry no parseable `tool` field
+# (SOP tool-mcp-integration §1) — every live-captured failure fixes that
+# pattern by carrying {tool, category, retryable} alongside the transcript
+# contract {text, signature, action}.
+_FAILURE_CATEGORIES = (
+    ("permission_denied", ("permission denied", "access denied",
+                           "access is denied", "eacces", "eperm",
+                           "operation not permitted"), False),
+    ("not_found", ("no such file", "not found", "enoent",
+                   "cannot find"), False),
+    ("timeout", ("timed out", "timeout", "etimedout"), True),
+    ("network", ("econnrefused", "econnreset", "enetunreach",
+                 "getaddrinfo", "network is unreachable"), True),
+    ("syntax", ("syntaxerror", "parse error", "parser error",
+                "unexpected token", "invalid syntax"), False),
+)
+
+
+def categorize_failure(text) -> dict:
+    """Deterministic ``{category, retryable}`` for a failure's error text.
+
+    Retryable means a verbatim retry can plausibly succeed (transient infra);
+    a permission denial or contract violation is NOT retryable — adjust the
+    call instead (SOP tool-mcp-integration §2)."""
+    low = (text or "").lower()
+    for category, needles, retryable in _FAILURE_CATEGORIES:
+        if any(n in low for n in needles):
+            return {"category": category, "retryable": retryable}
+    return {"category": "error", "retryable": False}
+
+
+def _failure_text(payload) -> str:
+    """Best-effort error text from a PostToolUseFailure payload. The field
+    layout is defensive on purpose — this hook's schema is exactly the kind
+    of coupling that silently renamed fields have broken before."""
+    err = payload.get("error")
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    if isinstance(err, dict):
+        for key in ("message", "text"):
+            v = err.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    text = _response_text(payload.get("tool_response"))
+    if text.strip():
+        return text.strip()
+    v = payload.get("stderr")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return ""
+
+
+def record_post_tool_use_failure(raw: str, project=None, now=None) -> dict:
+    """Parse a raw PostToolUseFailure payload and append one structured
+    ``tool_failed`` event.
+
+    Reuses the transcript-harvest semantics from failures.py — infra noise is
+    skipped, explicit rejections become ``judgment:rejected:*`` signatures
+    (KTD4), and the action string is byte-identical to
+    ``failures.action_from_tool_use`` so the (session, signature, action)
+    idempotency key lets the transcript back-harvest dedup the live event.
+    Events carry the ``live`` tag to distinguish hook capture from transcript
+    harvest. Never raises."""
+    if not raw or not raw.strip():
+        return {"appended": 0}
+    try:
+        from . import failures, signature as sig_mod
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return {"appended": 0}
+        tool = payload.get("tool_name") or payload.get("toolName") or "unknown"
+        inp = payload.get("tool_input") or payload.get("toolInput") or {}
+        text = _failure_text(payload)
+        if not text or failures._is_infra_noise(text):
+            return {"appended": 0}
+        action = failures.action_from_tool_use({"name": tool, "input": inp})
+        if failures._is_rejection(text):
+            signature = (f"judgment:rejected:{(tool or 'unknown').lower()}:"
+                         f"{sig_mod.slug_id(action)}")
+            cat = {"category": "rejected", "retryable": False}
+            tags = ["auto", "failure", "judgment", "live"]
+        else:
+            signature = sig_mod.signature(text)
+            cat = categorize_failure(text)
+            tags = ["auto", "failure", "live"]
+        p = {"text": text[:failures._EXCERPT_MAX], "signature": signature,
+             "action": action, "tool": tool, **cat}
+        events.append_event("tool_failed", p,
+                            session_id=payload.get("session_id"),
+                            tags=tags, ts=now, project=project)
+        return {"appended": 1}
+    except Exception as e:
+        log_hook_error("post_tool_use_failure", e)
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def record_post_tool_use(raw: str, project=None, now=None) -> dict:
     """Parse a raw PostToolUse payload and append the captured events.
 

@@ -253,3 +253,101 @@ def test_record_todowrite_sync_failure_is_logged_not_raised(monkeypatch):
     assert res == {"appended": 0}                 # capture contract intact
     log = paths.store_home() / "hooks_errors.log"
     assert "todo_roadmap" in log.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# post_tool_use_failure — structured live failure capture
+# --------------------------------------------------------------------------
+# SOP tool-mcp-integration records 260 legacy tool_failed events with no
+# parseable `tool` field; the live failure stage exists to fix that pattern:
+# every captured failure carries machine-readable {tool, category, retryable}
+# alongside the classic {text, signature, action} transcript-harvest contract.
+
+import pytest
+
+
+@pytest.mark.parametrize("text,category,retryable", [
+    ("Permission denied (os error 13)", "permission_denied", False),
+    ("EACCES: access denied", "permission_denied", False),
+    ("ENOENT: no such file or directory", "not_found", False),
+    ("command timed out after 120000ms", "timeout", True),
+    ("connect ECONNREFUSED 127.0.0.1:443", "network", True),
+    ("SyntaxError: invalid syntax", "syntax", False),
+    ("something exploded", "error", False),
+])
+def test_categorize_failure(text, category, retryable):
+    got = hookcapture.categorize_failure(text)
+    assert got == {"category": category, "retryable": retryable}
+
+
+def _failure_raw(**over):
+    payload = {"session_id": "sess-f", "tool_name": "Bash",
+               "tool_input": {"command": "pytest -q"},
+               "error": "Permission denied (os error 13)"}
+    payload.update(over)
+    return json.dumps(payload)
+
+
+def test_record_failure_appends_structured_tool_failed():
+    res = hookcapture.record_post_tool_use_failure(_failure_raw(), project="test")
+    assert res == {"appended": 1}
+    (ev,) = events.read_all("test")
+    assert ev.type == "tool_failed"
+    assert ev.session_id == "sess-f"
+    p = ev.payload
+    assert p["tool"] == "Bash"
+    assert p["category"] == "permission_denied"
+    assert p["retryable"] is False
+    assert p["action"] == "pytest -q"            # byte-identical to harvest's
+    assert p["signature"]                        # root-cause key present
+    assert "Permission denied" in p["text"]
+
+
+def test_record_failure_action_matches_transcript_harvest_key():
+    # The (session, signature, action) idempotency key must match what
+    # failures.capture_dir would produce so back-harvest dedups the live event.
+    from mindhive import failures
+    hookcapture.record_post_tool_use_failure(_failure_raw(), project="test")
+    (ev,) = events.read_all("test")
+    expected = failures.action_from_tool_use(
+        {"name": "Bash", "input": {"command": "pytest -q"}})
+    assert ev.payload["action"] == expected
+
+
+def test_record_failure_rejection_becomes_judgment_signature():
+    raw = _failure_raw(error="The user doesn't want to proceed with this tool use.")
+    hookcapture.record_post_tool_use_failure(raw, project="test")
+    (ev,) = events.read_all("test")
+    assert ev.payload["signature"].startswith("judgment:rejected:bash:")
+    assert ev.payload["category"] == "rejected"
+    assert "judgment" in ev.tags
+
+
+def test_record_failure_skips_infra_noise():
+    raw = _failure_raw(error="[mindhive-rule] scoped grep required")
+    assert hookcapture.record_post_tool_use_failure(raw, project="test") == \
+        {"appended": 0}
+    assert events.read_all("test") == []
+
+
+def test_record_failure_reads_tool_response_text():
+    raw = _failure_raw(error=None,
+                       tool_response={"error": "ENOENT: no such file"})
+    hookcapture.record_post_tool_use_failure(raw, project="test")
+    (ev,) = events.read_all("test")
+    assert ev.payload["category"] == "not_found"
+
+
+def test_record_failure_empty_or_textless_appends_nothing():
+    assert hookcapture.record_post_tool_use_failure("", project="test") == \
+        {"appended": 0}
+    raw = _failure_raw(error=None)
+    assert hookcapture.record_post_tool_use_failure(raw, project="test") == \
+        {"appended": 0}
+
+
+def test_record_failure_malformed_is_logged_not_raised():
+    res = hookcapture.record_post_tool_use_failure("{not json", project="test")
+    assert "error" in res
+    log = paths.store_home() / "hooks_errors.log"
+    assert "post_tool_use_failure" in log.read_text(encoding="utf-8")

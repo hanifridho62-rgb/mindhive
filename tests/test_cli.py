@@ -148,3 +148,17 @@ def test_cli_consolidate_runs_and_reports(tmp_path, monkeypatch, capsys):
     assert ret in (None, 0)
     out = capsys.readouterr().out
     assert '"consolidated": 1' in out
+
+
+def test_hook_post_tool_use_failure_captures_from_stdin(monkeypatch):
+    payload = ('{"session_id":"s9","tool_name":"Bash",'
+               '"tool_input":{"command":"pytest -q"},'
+               '"error":"ENOENT: no such file or directory"}')
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    ret = cli_mod.main(["hook", "post_tool_use_failure"])
+    assert ret == 0
+    evs = events.read_all()
+    assert len(evs) == 1
+    assert evs[0].type == "tool_failed"
+    assert evs[0].payload["tool"] == "Bash"
+    assert evs[0].payload["category"] == "not_found"

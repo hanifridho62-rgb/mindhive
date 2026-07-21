@@ -94,6 +94,11 @@ def cmd_hook(args) -> int | None:
     if args.stage == "post_tool_use":
         from . import hookcapture
         print(json.dumps(hookcapture.record_post_tool_use(raw)))
+    elif args.stage == "post_tool_use_failure":
+        # Structured live failure capture: one tool_failed event with a
+        # machine-readable {tool, category, retryable} payload per failure.
+        from . import hookcapture
+        print(json.dumps(hookcapture.record_post_tool_use_failure(raw)))
     elif args.stage == "pre_tool_use":
         # Deny the ineffective tool form for enabled-enforcement signatures.
         # Print ONLY on a deny (stdout is the hook's decision channel); an allow
@@ -169,11 +174,20 @@ def cmd_directives(args) -> int | None:
 
 def cmd_context(args) -> int | None:
     """Report what auto-loads into every session — ranked by estimated token
-    cost, with trim suggestions. Strictly read-only: the delivery caps bound
-    item counts, this measures the size those counts never constrained."""
+    cost, with trim suggestions. Reporting never mutates anything; the one
+    write path is --set-budget, which persists the namespace's token budget.
+    --check turns the report into a gate: exit 1 when over the budget (the
+    hook adoption flows and scripts rely on), exit 2 when asked to check with
+    no budget configured at all."""
     from . import context as context_mod
     project = getattr(args, "project", None)
     origin = getattr(args, "origin", "all")
+
+    if getattr(args, "set_budget", None) is not None:
+        data = context_mod.save_budget(args.set_budget, project=project)
+        print(f"context budget set to {data['budget']:,} est. tokens "
+              f"(stored in {context_mod.BUDGET_FILE})")
+        return None
 
     segments = []
     if origin in ("all", "hive"):
@@ -181,13 +195,29 @@ def cmd_context(args) -> int | None:
     if origin in ("all", "claude"):
         segments += context_mod.collect_claude()
 
-    report = context_mod.analyze(segments, budget=getattr(args, "budget", None))
+    budget = getattr(args, "budget", None)
+    if budget is None:
+        budget = context_mod.load_budget(project)
+
+    report = context_mod.analyze(segments, budget=budget)
     found = context_mod.findings(segments)
 
     if getattr(args, "json", False):
         print(context_mod.to_json(report, found))
     else:
         print(context_mod.render_text(report, found, top=getattr(args, "top", None)))
+
+    if getattr(args, "check", False):
+        if budget is None:
+            print("error: --check needs a budget — set one with "
+                  "`hive context --set-budget N` (or pass --budget N)",
+                  file=sys.stderr)
+            return 2
+        over = report.get("over_budget") or 0
+        if over > 0:
+            print(f"OVER BUDGET by ~{over:,} est. tokens — trim before adding "
+                  f"anything new (see suggestions above)", file=sys.stderr)
+            return 1
     return None
 
 
@@ -1365,7 +1395,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
     hk.add_argument("stage",
-                    choices=["post_tool_use", "pre_tool_use", "user_prompt_submit"],
+                    choices=["post_tool_use", "post_tool_use_failure",
+                             "pre_tool_use", "user_prompt_submit"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
 
@@ -1383,7 +1414,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="target namespace explicitly (default: detect from cwd)")
     cx.add_argument("--json", action="store_true", help="machine-readable report")
     cx.add_argument("--budget", type=int, default=None,
-                    help="compare the total against a token budget")
+                    help="compare against a one-off token budget "
+                         "(overrides the persisted one)")
+    cx.add_argument("--set-budget", type=int, default=None, dest="set_budget",
+                    help="persist the namespace's token budget and exit")
+    cx.add_argument("--check", action="store_true",
+                    help="exit 1 when the measured total exceeds the budget")
     cx.add_argument("--top", type=int, default=None,
                     help="show only the N heaviest contributors")
     cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",

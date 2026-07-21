@@ -72,6 +72,73 @@ MATCHERS = {
 }
 
 
+# --- static policy tier (GateGuard port, 2026-07 ECC adoption) -----------------
+# A second, deliberate layer distinct from the learned ladder above: these
+# encode standing operating rules the user explicitly adopted (see
+# docs/plans/2026-07-21-001-feat-ecc-integration-wave-plan.md), not signatures
+# escalated from incidents — the adoption decision IS the opt-in, so they
+# default ON. Each is individually overridable in rules/enforce.json under
+# "policy:<id>" ({"enabled": false} disables; a "reason" entry overrides the
+# classifier's text). The classifiers live in gateguard.py (pure, tested);
+# ordering puts deny decisions before ask so a command tripping both gates
+# gets the stronger outcome.
+
+def _policy_no_verify(tool_name, tool_input):
+    if tool_name not in ("Bash", "PowerShell"):
+        return None
+    from . import gateguard
+    reason = gateguard.check_no_verify((tool_input or {}).get("command", ""))
+    if not reason:
+        return None
+    return f"{reason}. Investigate and fix whatever the hook rejects instead."
+
+
+def _policy_config_protection(tool_name, tool_input):
+    from . import gateguard
+    return gateguard.protected_config_file(tool_name, tool_input)
+
+
+def _policy_destructive(tool_name, tool_input):
+    if tool_name not in ("Bash", "PowerShell"):
+        return None
+    from . import gateguard
+    reason = gateguard.is_destructive_command(
+        (tool_input or {}).get("command", ""))
+    if not reason:
+        return None
+    return (f"Destructive-command gate: {reason}. Confirm this is genuinely "
+            f"intended, or use a safer alternative.")
+
+
+# (id, permissionDecision, check). "deny" blocks outright; "ask" escalates to
+# the human — right for destructive commands, which are sometimes legitimate.
+POLICY_CHECKS = (
+    ("gate:no-verify", "deny", _policy_no_verify),
+    ("gate:config-protection", "deny", _policy_config_protection),
+    ("gate:destructive-command", "ask", _policy_destructive),
+)
+
+
+def evaluate_policies(tool_name, tool_input, manifest=None,
+                      project=None) -> tuple | None:
+    """(decision, reason) when a policy check fires, else None. Policies are
+    ON unless the manifest explicitly disables them; a per-entry ``reason``
+    override wins. Fail-open like everything in this module."""
+    try:
+        man = manifest if manifest is not None else load_manifest(project)
+        for pid, decision, fn in POLICY_CHECKS:
+            entry = man.get(f"policy:{pid}")
+            entry = entry if isinstance(entry, dict) else {}
+            if entry.get("enabled") is False:
+                continue
+            reason = fn(tool_name, tool_input)
+            if reason:
+                return decision, (entry.get("reason") or "").strip() or reason
+    except Exception:
+        return None
+    return None
+
+
 # --- enforcement manifest (rules/enforce.json): which signatures are enforced ---
 
 def _manifest_path(project=None):
@@ -126,8 +193,10 @@ ENFORCED_MARK = "[mindhive-rule]"
 
 def hook_decision(raw: str, project=None) -> dict:
     """Parse a PreToolUse payload (JSON on the hook's stdin) and return the hook's
-    output: a deny decision when a matcher fires, or {} (allow) otherwise. Never
-    raises — a malformed payload is an allow."""
+    output: a deny/ask decision when a policy or matcher fires, or {} (allow)
+    otherwise. The static policy tier runs first (its checks are standing
+    rules); the learned manifest matchers follow. Never raises — a malformed
+    payload is an allow."""
     try:
         payload = json.loads(raw or "{}")
     except (json.JSONDecodeError, ValueError):
@@ -136,12 +205,19 @@ def hook_decision(raw: str, project=None) -> dict:
         return {}
     tool_name = payload.get("tool_name") or payload.get("toolName") or ""
     tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
-    reason = evaluate(tool_name, tool_input, project=project)
+    manifest = load_manifest(project)
+    decision, reason = "deny", None
+    pol = evaluate_policies(tool_name, tool_input, manifest=manifest)
+    if pol:
+        decision, reason = pol
+    else:
+        reason = evaluate(tool_name, tool_input, project=project,
+                          manifest=manifest)
     if not reason:
         return {}
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
+        "permissionDecision": decision,
         "permissionDecisionReason": f"{ENFORCED_MARK} {reason}",
     }}
 
@@ -178,12 +254,14 @@ def suggest(project=None) -> list:
 
 
 def set_enabled(project, signature, enabled: bool) -> dict:
-    """Enable or disable enforcement for one signature. Refuses a signature with
-    no matcher (there would be nothing to enforce). A human toggle PINS the
-    entry: auto_escalate never overrides an explicit human decision."""
-    if signature not in MATCHERS:
+    """Enable or disable enforcement for one signature or ``policy:<id>``
+    entry. Refuses a signature with no matcher/policy (there would be nothing
+    to enforce). A human toggle PINS the entry: auto_escalate never overrides
+    an explicit human decision."""
+    policy_ids = {f"policy:{pid}" for pid, _d, _f in POLICY_CHECKS}
+    if signature not in MATCHERS and signature not in policy_ids:
         return {"error": f"no enforcement matcher for '{signature}'",
-                "known": sorted(MATCHERS)}
+                "known": sorted(MATCHERS) + sorted(policy_ids)}
     man = load_manifest(project)
     entry = man.get(signature) if isinstance(man.get(signature), dict) else {}
     entry["enabled"] = bool(enabled)

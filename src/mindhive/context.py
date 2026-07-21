@@ -10,10 +10,16 @@ so the artifacts they nominally protect grew unmeasured: at the time this module
 was written STATE.md was 37 KB and the native MEMORY.md 23 KB, together roughly
 16,000 estimated tokens paid at the start of every single session.
 
-This module measures that surface. It is deliberately **read-only** — it never
-writes, trims, or rewrites an artifact, and it never changes what the sync and
-briefing paths deliver. It reports what the cost is and which contributors are
-worth trimming; deciding to act on that stays with the operator.
+This module measures that surface. It never trims or rewrites an artifact, and
+it never changes what the sync and briefing paths deliver. It reports what the
+cost is and which contributors are worth trimming; deciding to act on that
+stays with the operator. The one thing it persists is the operator-set token
+**budget** (``context_budget.json`` beside the namespace artifacts — the same
+operator-config sidecar pattern as ``rules/enforce.json``): ``hive context
+--check`` compares the measured total against it and exits non-zero when over,
+which is the enforcement hook adoption flows and scripts gate on. Without a
+persisted budget, ``over_budget`` was computed and thrown away every run — a
+silent regression path for every new plugin or adopted skill.
 
 Two origins are measured:
 
@@ -104,6 +110,36 @@ class Finding:
     severity: str        # "high" | "medium" | "low"
     subject: str
     message: str
+
+
+# Operator-config sidecar holding the persisted token budget for this
+# namespace. Config, not a projection: it is not rebuildable from the ledger,
+# exactly like rules/enforce.json.
+BUDGET_FILE = "context_budget.json"
+
+
+def load_budget(project=None) -> int | None:
+    """The persisted token budget for this namespace, or None when unset.
+    Fail-open: a missing, corrupt, or non-positive value reads as no budget."""
+    try:
+        path = paths.project_dir(project) / BUDGET_FILE
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        budget = obj.get("budget") if isinstance(obj, dict) else None
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            return None
+        return int(budget) if budget > 0 else None
+    except Exception:
+        return None
+
+
+def save_budget(budget: int, project=None) -> dict:
+    """Persist the namespace's token budget. Returns the stored record."""
+    import time
+    data = {"budget": int(budget),
+            "set_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"}
+    paths.write_text_atomic(paths.project_dir(project) / BUDGET_FILE,
+                            json.dumps(data, indent=2, sort_keys=True))
+    return data
 
 
 def estimate_tokens(text: str) -> int:
@@ -256,6 +292,25 @@ def collect_claude(home: Path | None = None,
                 tokens=estimate_tokens(trigger), kind="skill",
                 detail="skill trigger description",
             ))
+
+    # Local (unpackaged) skills: ~/.claude/skills/<name>/SKILL.md — the path
+    # adopted skills arrive through. Previously invisible to this analyzer,
+    # which meant the budget could not see the one growth channel an adoption
+    # flow actually uses. _skills_for's parent-dir contract (<dir>/skills/*)
+    # makes home/.claude the right root here.
+    try:
+        for skill in plugins._skills_for(home / ".claude") or []:
+            trigger = skill.get("trigger") or ""
+            if not trigger:
+                continue
+            out.append(Segment(
+                name=f"local:{skill.get('name') or '?'}", origin="claude",
+                path="", nbytes=len(trigger.encode("utf-8", errors="replace")),
+                tokens=estimate_tokens(trigger), kind="skill",
+                detail="local skill trigger description",
+            ))
+    except Exception:
+        pass
 
     return out
 
