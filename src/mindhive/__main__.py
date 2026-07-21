@@ -221,6 +221,59 @@ def cmd_context(args) -> int | None:
     return None
 
 
+def _packs_manifest_path(arg) -> "Path":
+    """Resolve the packs manifest: --manifest wins; otherwise
+    <git toplevel>/docs/packs/packs.json. git rev-parse is used instead of
+    bare cwd so the command works from any subdirectory of the checkout
+    (inside a linked worktree, --show-toplevel is the worktree root — the
+    checkout being validated, which is exactly right)."""
+    from pathlib import Path
+    if arg:
+        return Path(arg)
+    import subprocess
+    from . import paths as paths_mod
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=2,
+                           creationflags=paths_mod.NO_WINDOW)
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip()) / "docs" / "packs" / "packs.json"
+    except Exception:
+        pass
+    return Path("docs") / "packs" / "packs.json"
+
+
+def cmd_packs_check(args) -> int | None:
+    """Run every pack quality gate; exit 1 on any error-severity finding —
+    the same gate contract as `hive context --check`. Read-only."""
+    from . import packs as packs_mod
+    report = packs_mod.analyze(_packs_manifest_path(getattr(args, "manifest", None)))
+    if getattr(args, "json", False):
+        print(packs_mod.to_json(report))
+    else:
+        print(packs_mod.render_text(report))
+    return None if report.get("ok") else 1
+
+
+def cmd_packs_report(args) -> int | None:
+    """Full pack stats (depth, similarity matrices, findings). Informational:
+    always exits 0 — gating belongs to `hive packs check`."""
+    from . import packs as packs_mod
+    report = packs_mod.analyze(_packs_manifest_path(getattr(args, "manifest", None)))
+    only = getattr(args, "pack", None)
+    if only:
+        stats = report.get("stats") or {}
+        packs_stats = stats.get("packs") or {}
+        stats["packs"] = {k: v for k, v in packs_stats.items() if k == only}
+        report["findings"] = [f for f in report.get("findings") or []
+                              if only in f.get("subject", "")]
+    if getattr(args, "json", False):
+        print(packs_mod.to_json(report))
+    else:
+        print(packs_mod.render_text(report))
+    return None
+
+
 def cmd_verify(args) -> int | None:
     # Chain integrity is the tamper-evidence check; corrupt_rows is the loud,
     # explicit surfacing of any torn/malformed rows that read_all() skips to stay
@@ -1425,6 +1478,29 @@ def _build_parser() -> argparse.ArgumentParser:
     cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",
                     help="limit the report to one origin (default: all)")
     cx.set_defaults(func=cmd_context)
+
+    # --- packs (stack content pack quality gates) ---
+    pk = sub.add_parser("packs",
+                        help="stack content pack quality gates (read-only)")
+    pksub = pk.add_subparsers(dest="packs_cmd", required=True)
+    pkc = pksub.add_parser("check",
+                           help="run all gates; exit 1 on error findings")
+    pkc.add_argument("--manifest", default=None,
+                     help="path to packs.json "
+                          "(default: <git root>/docs/packs/packs.json)")
+    pkc.add_argument("--json", action="store_true",
+                     help="machine-readable report")
+    pkc.set_defaults(func=cmd_packs_check)
+    pkr = pksub.add_parser("report",
+                           help="full stats: depth, similarity matrices, "
+                                "findings (always exits 0)")
+    pkr.add_argument("--manifest", default=None,
+                     help="path to packs.json "
+                          "(default: <git root>/docs/packs/packs.json)")
+    pkr.add_argument("--json", action="store_true",
+                     help="machine-readable report")
+    pkr.add_argument("--pack", default=None, help="limit output to one pack")
+    pkr.set_defaults(func=cmd_packs_report)
 
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
