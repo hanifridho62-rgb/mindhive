@@ -1,0 +1,70 @@
+{
+  "version": 2,
+  "similarity_external_max_pct": 10.0,
+  "similarity_external_warn_pct": 6.5,
+  "similarity_internal_same_role_max_pct": 18.0,
+  "shared_preamble_markers": [
+    "run the full pytest suite",
+    "hive log",
+    "hive context --check",
+    "pythonpath=<worktree>/src",
+    "ci green",
+    "$lastexitcode"
+  ],
+  "depth_ratio_max": 2.5,
+  "min_lines": 150,
+  "min_code_blocks": 6,
+  "min_code_blocks_by_role": {
+    "verification": 4
+  },
+  "quartet_depth_target_lines": 300,
+  "max_description_chars": 300,
+  "required_sections": [
+    "## When to Activate",
+    "## Quick Reference"
+  ],
+  "required_sections_by_role": {
+    "verification": [
+      "## When to Activate",
+      "## Output Template"
+    ]
+  },
+  "min_phase_sections_by_role": {
+    "verification": 3
+  },
+  "packs": [
+    {
+      "name": "mindhive-python",
+      "roles": ["patterns", "security", "tdd", "verification"],
+      "features": [],
+      "domain_markers": ["append-only", "event ledger", "fold(", "projection rebuild"],
+      "leak_severity": "warn",
+      "compare_external": ["ecc-quartets"],
+      "related": []
+    },
+    {
+      "name": "windows-powershell",
+      "roles": ["patterns", "verification"],
+      "features": [],
+      "domain_markers": ["New-Item -Force", "Store stub", "NativeCommandError"],
+      "leak_severity": "warn",
+      "compare_external": ["ecc-quartets"],
+      "related": []
+    },
+    {
+      "name": "claude-harness",
+      "roles": ["patterns", "verification"],
+      "features": [],
+      "domain_markers": ["PreToolUse", "hook_decision", "promptgate"],
+      "leak_severity": "warn",
+      "compare_external": ["ecc-quartets"],
+      "related": []
+    }
+  ],
+  "external_corpora": {
+    "ecc-quartets": {
+      "path_env": "MINDHIVE_ECC_SKILLS",
+      "families": ["django", "laravel", "quarkus", "springboot"]
+    }
+  }
+}
