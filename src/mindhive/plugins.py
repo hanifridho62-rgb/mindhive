@@ -66,10 +66,15 @@ def _read_json(path: Path):
 
 
 def _parse_frontmatter(text: str) -> dict:
-    """Extract simple `key: value` pairs from a leading --- frontmatter block.
+    """Extract `key: value` pairs from a leading --- frontmatter block.
 
     SKILL.md frontmatter is shallow (name + description), so a hand parser is
-    enough and avoids a YAML dependency. Values are single-line.
+    enough and avoids a YAML dependency. Besides single-line values, block
+    scalars (`>`, `>-`, `|`, `|-`) are folded: their indented continuation
+    lines join with spaces. Without this, a skill written ECC-style
+    (``description: >-``) parses to the literal marker string, which zeroes
+    every description-derived signal downstream (recommend's need_match,
+    context token accounting, the oversee purpose map).
     """
     if not text.startswith("---"):
         return {}
@@ -78,10 +83,30 @@ def _parse_frontmatter(text: str) -> dict:
         return {}
     block = text[3:end]
     out = {}
-    for line in block.splitlines():
-        m = re.match(r"\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", line)
-        if m:
-            out[m.group(1).lower()] = m.group(2).strip().strip('"').strip("'")
+    lines = block.splitlines()
+    i = 0
+    while i < len(lines):
+        m = re.match(r"\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", lines[i])
+        if not m:
+            i += 1
+            continue
+        key, value = m.group(1).lower(), m.group(2).strip()
+        if value in (">", ">-", ">+", "|", "|-", "|+"):
+            parts = []
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                # A continuation line is indented; a new `key:` line at the
+                # same level (or the end of the block) terminates the scalar.
+                if nxt.strip() and not nxt[:1].isspace():
+                    break
+                if nxt.strip():
+                    parts.append(nxt.strip())
+                i += 1
+            out[key] = " ".join(parts)
+            continue
+        out[key] = value.strip('"').strip("'")
+        i += 1
     return out
 
 

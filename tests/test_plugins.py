@@ -148,6 +148,47 @@ def test_frontmatter_unterminated_block_returns_empty():
     assert plugins._parse_frontmatter("---\nname: oops\nno closing fence\n") == {}
 
 
+def test_frontmatter_folded_scalar_description():
+    """ECC-style folded block scalar: 16/278 ECC skills write `description: >-`
+    with the text on following indented lines. The single-line parser used to
+    return the literal '>-' as the description, zeroing every downstream
+    description-derived signal (need_match, breadth_prior, token accounting)."""
+    fm = plugins._parse_frontmatter(
+        "---\n"
+        "name: token-budget-advisor\n"
+        "description: >-\n"
+        "  Use when planning token budgets\n"
+        "  across long agent sessions.\n"
+        "---\n\n# Body\n")
+    assert fm["name"] == "token-budget-advisor"
+    assert fm["description"] == ("Use when planning token budgets "
+                                 "across long agent sessions.")
+
+
+def test_frontmatter_literal_scalar_and_clip_variants():
+    for marker in (">", "|", "|-"):
+        fm = plugins._parse_frontmatter(
+            f"---\ndescription: {marker}\n  line one\n  line two\n---\n")
+        assert fm["description"] == "line one line two", marker
+
+
+def test_frontmatter_block_scalar_ends_at_next_key():
+    fm = plugins._parse_frontmatter(
+        "---\n"
+        "description: >-\n"
+        "  folded text here\n"
+        "metadata: origin\n"
+        "---\n")
+    assert fm["description"] == "folded text here"
+    assert fm["metadata"] == "origin"
+
+
+def test_frontmatter_block_scalar_empty_body_is_empty_string():
+    fm = plugins._parse_frontmatter("---\ndescription: >-\nname: x\n---\n")
+    assert fm["description"] == ""
+    assert fm["name"] == "x"
+
+
 def test_skill_name_falls_back_to_directory(tmp_path):
     cache = tmp_path / "cache"
     v = cache / "mkt" / "p" / "1.0.0"

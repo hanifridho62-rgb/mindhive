@@ -457,3 +457,73 @@ def test_render_text_reports_budget_verdict():
     assert "OVER by" in context.render_text(rep_over, [])
     rep_under = context.analyze([_seg(tokens=10)], budget=400)
     assert "under by" in context.render_text(rep_under, [])
+
+
+# --------------------------------------------------------------------------
+# persisted budget + enforcement (--check) + local-skills collector
+# --------------------------------------------------------------------------
+
+def test_budget_save_load_roundtrip():
+    context.save_budget(30000, project="test")
+    assert context.load_budget("test") == 30000
+
+
+def test_budget_missing_is_none():
+    assert context.load_budget("test") is None
+
+
+def test_budget_corrupt_file_is_none():
+    _write(paths.project_dir("test") / context.BUDGET_FILE, "{not json")
+    assert context.load_budget("test") is None
+
+
+def test_budget_nonpositive_is_none():
+    context.save_budget(0, project="test") if hasattr(context, "save_budget") else None
+    _write(paths.project_dir("test") / context.BUDGET_FILE,
+           '{"budget": -5}')
+    assert context.load_budget("test") is None
+
+
+def test_collect_claude_measures_local_skills(tmp_path):
+    home = tmp_path / "home"
+    _write(home / ".claude" / "skills" / "ecc-benchmark" / "SKILL.md",
+           _skill_md("ecc-benchmark", "Use when benchmarking agent harnesses."))
+    cache = _make_plugin_cache(tmp_path / "cache", {})
+    segs = context.collect_claude(home=home, cache_dir=cache)
+    local = [s for s in segs if s.name == "local:ecc-benchmark"]
+    assert len(local) == 1
+    assert local[0].kind == "skill"
+    assert local[0].tokens == context.estimate_tokens(
+        "Use when benchmarking agent harnesses.")
+
+
+def test_collect_claude_local_skills_folded_description(tmp_path):
+    # The adopt path meets ECC-style folded descriptions; the analyzer must
+    # charge the real text, not the literal '>-' marker.
+    home = tmp_path / "home"
+    _write(home / ".claude" / "skills" / "folded" / "SKILL.md",
+           "---\nname: folded\ndescription: >-\n  Use when folding\n  things.\n---\n")
+    segs = context.collect_claude(home=home, cache_dir=tmp_path / "nocache")
+    (seg,) = [s for s in segs if s.name == "local:folded"]
+    assert seg.tokens == context.estimate_tokens("Use when folding things.")
+
+
+def test_cli_set_budget_persists(capsys):
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["context", "--set-budget", "31000"]) == 0
+    assert context.load_budget(None) == 31000
+
+
+def test_cli_check_exit_codes():
+    from mindhive import __main__ as cli_mod
+    # A hive-origin artifact with known weight in the isolated namespace.
+    _write(paths.project_dir("test") / "STATE.md", "x" * 4000)   # ~1000 tokens
+    context.save_budget(10, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 1
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+
+
+def test_cli_check_without_budget_is_an_error(capsys):
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 2
