@@ -288,6 +288,45 @@ def test_send_runs_and_logs_both_sides_of_the_exchange():
     assert h.events[1][1]["text"] == "all done"
 
 
+def test_result_longer_than_2000_chars_is_not_truncated():
+    """Regression (measured 2026-07-22): the persisted result was capped at
+    [:2000], silently cutting answers mid-word. 13 of 22 real workspace
+    responses in the live ledger sat at exactly 2000 chars — a 59% silent
+    data-loss rate that no test covered."""
+    body = "word " * 1000                      # 5000 chars, well past the old cap
+    h = Harness(lines=_stream_lines(result=body))
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    stored = h.events[1][1]["text"]
+    assert stored == body.strip()
+    assert len(stored) > 2000
+    assert "truncated" not in stored
+
+
+def test_result_past_the_cap_is_truncated_and_says_so():
+    """Truncation must never be silent again: past RESULT_TEXT_CAP the payload
+    is bounded AND carries the same visible marker harvest._cap_words uses."""
+    body = "y" * (workspace.RESULT_TEXT_CAP + 500)
+    h = Harness(lines=_stream_lines(result=body))
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    stored = h.events[1][1]["text"]
+    assert stored.endswith("…[truncated]")
+    assert len(stored) <= workspace.RESULT_TEXT_CAP + len(" …[truncated]")
+    assert stored.startswith("y" * 100)
+
+
+def test_empty_result_still_logs_the_no_text_placeholder():
+    """The '(no text)' fallback is unrelated to the cap and must survive it."""
+    h = Harness(lines=_stream_lines(result=""))
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    assert h.events[1][1]["text"] == "(no text)"
+
+
 def test_send_feeds_prompt_via_stdin_never_argv():
     """Regression: the researcher's composed programs run to tens of KB, and
     cmd.exe (hosting the Windows .CMD claude shim) rejects command lines past
@@ -903,3 +942,92 @@ def test_api_post_profile_roundtrip():
                              body={"name": "p1", "config_dir": "C:/x"})
     assert res["ok"]
     assert workspace.api_post("profile_remove", body={"name": "p1"})["ok"]
+
+
+# --- one run, one ledger identity (U1) ----------------------------------------
+# Before this, Manager._log resolved `a.session_id or f"ws-{a.id}"`. a.session_id
+# is None at send() time and only set later, when the stream's `system` init
+# event arrives — so a run's prompt landed under ws-<id> and its outcome under
+# the claude uuid. Measured in the live ledger: 14 ws-<id> sessions holding ONLY
+# a user_prompt, and all 22 assistant_response + 6 tool_failed events under
+# separate uuids.
+
+def _sids(h):
+    """The ledger session id of every event this harness captured."""
+    return [kw.get("session_id") for _, _, kw in h.events]
+
+
+def test_prompt_and_outcome_share_one_ledger_session_id():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    etypes = [e[0] for e in h.events]
+    assert etypes == ["user_prompt", "assistant_response"]
+    assert len(set(_sids(h))) == 1, "one run must write under one identity"
+    assert _sids(h)[0] == f"ws-{a.id}"
+
+
+def test_failed_run_logs_its_failure_under_the_same_id_as_its_prompt():
+    h = Harness(code=1)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    assert [e[0] for e in h.events] == ["user_prompt", "tool_failed"]
+    assert len(set(_sids(h))) == 1
+
+
+def test_ledger_id_is_unaffected_by_the_claude_session_arriving_mid_run():
+    """The regression itself: a.session_id is assigned while the stream is being
+    drained. That must no longer move the ledger identity underneath the run."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    a = _agent_obj(h, aid)
+    before = a.ledger_sid
+    h.mgr.send(aid, "go")
+    _wait_settled(a)
+    assert a.session_id == "sess-1"          # the resume token DID arrive...
+    assert a.ledger_sid == before            # ...and the ledger id did not move
+    assert set(_sids(h)) == {before}
+
+
+def test_ledger_id_is_stable_across_runs_and_unique_per_agent():
+    h = Harness()
+    a1 = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(a1, "first")
+    _wait_settled(_agent_obj(h, a1))
+    h.mgr.send(a1, "second")
+    _wait_settled(_agent_obj(h, a1))
+    assert len(set(_sids(h))) == 1, "same agent keeps one card across runs"
+    a2 = h.mgr.spawn(name="B")["agent"]["id"]
+    h.mgr.send(a2, "other")
+    _wait_settled(_agent_obj(h, a2))
+    assert len(set(_sids(h))) == 2, "different agents are different cards"
+
+
+def test_claude_session_id_rides_in_the_payload_once_known():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    prompt_payload, done_payload = h.events[0][1], h.events[1][1]
+    # unknown at send() time, known by run-end — correlation is preserved
+    assert "claude_session_id" not in prompt_payload
+    assert done_payload["claude_session_id"] == "sess-1"
+
+
+def test_run_still_logs_when_the_claude_session_id_never_arrives():
+    """A stream with no `system` init event must not break logging — the ledger
+    may never crash a pane."""
+    lines = [json.dumps({"type": "result", "subtype": "success",
+                         "result": "done", "num_turns": 1})]
+    h = Harness(lines=lines)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    assert a.session_id is None
+    assert [e[0] for e in h.events] == ["user_prompt", "assistant_response"]
+    assert set(_sids(h)) == {f"ws-{a.id}"}
+    assert all("claude_session_id" not in p for _, p, _ in h.events)

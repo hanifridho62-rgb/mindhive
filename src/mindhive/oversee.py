@@ -38,10 +38,27 @@ _ACTIVITY_TYPES = {
 } | ev_mod.SEMANTIC_TYPES
 
 
+WORKSPACE_TAG = "workspace"          # workspace._log stamps every fleet event
+
+
 def _text(payload) -> str:
     if isinstance(payload, dict):
         return payload.get("text", "") or payload.get("path", "") or ""
     return str(payload)
+
+
+def _is_workspace(e) -> bool:
+    """Whether this event came from a MindParallel/MindSwarm run rather than an
+    ordinary interactive session.
+
+    The distinction decides whether an event is TERMINAL for the card. It must
+    be exact: ``tool_failed`` is written by five different producers (failures
+    transcript capture, hookcapture, invoker, ``__main__``, workspace), so
+    keying on the type alone would paint any session that merely had one failed
+    tool call as a failed run. Tags are checked defensively — reads stay total,
+    a hand-edited or future-shaped row must never raise here."""
+    tags = getattr(e, "tags", None)
+    return isinstance(tags, (list, tuple)) and WORKSPACE_TAG in tags
 
 
 _IU_CACHE = {"ts": 0.0, "map": {}}
@@ -196,10 +213,15 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             if t:
                 s["title"] = t
                 s["doing"] = t
+            if _is_workspace(e):
+                # an agent is reusable: a fresh run supersedes the last outcome
+                s["status"] = "running"
         elif e.type == "assistant_response":
             t = headline(_text(e.payload))
             if t:
                 s["doing"] = t
+            if _is_workspace(e):
+                s["status"] = "done"        # terminal for a fleet run only
         elif e.type == "state_set" and isinstance(e.payload, dict):
             s["task"] = str(e.payload.get("task") or s["task"])
             ns = e.payload.get("next_step")
@@ -219,6 +241,8 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 s["files"].append(p)
         elif e.type == "command_run":
             s["iterations"] += 1          # activity count for the pill
+        elif e.type == "tool_failed" and _is_workspace(e):
+            s["status"] = "failed"        # the run died — say so, don't linger
 
     now = now_fn()
     out = []

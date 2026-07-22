@@ -41,6 +41,11 @@ _SAFE_PROFILE = re.compile(r"^[A-Za-z0-9 _.\-]{1,64}$")
 
 MAX_AGENTS = 16
 MAX_LINES = 4000                 # per-agent scrollback cap (oldest dropped)
+# Chars of a run's final result kept in the ledger. Sized to the same order as
+# harvest._MAX_WORDS (5000 words) so one captured answer is bounded without
+# clipping any realistic response — the old bare [:2000] slice truncated 13 of
+# 22 real answers mid-word (measured 2026-07-22), silently.
+RESULT_TEXT_CAP = 30000
 RUN_TIMEOUT_S = int(os.environ.get("MINDHIVE_WS_TIMEOUT", "1800"))
 
 # Per-pane model picker: the ids the headless CLI's --model flag accepts.
@@ -421,6 +426,21 @@ def _feed_stdin(proc, text) -> None:
         pass
 
 
+def _cap_result(text: str, limit: int = RESULT_TEXT_CAP) -> str:
+    """Bound a run's persisted final result so one giant answer cannot bloat the
+    ledger, while still keeping entries far longer than any realistic response.
+
+    The previous bound was a bare ``[:2000]`` slice. It cut the answer mid-word
+    and left no marker, so the loss was invisible in both the ledger and the UI
+    — 13 of 22 real workspace answers sat at exactly 2000 chars before this was
+    measured. Truncation now announces itself, matching ``harvest._cap_words``.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + " …[truncated]"
+
+
 class Agent:
     """One workspace agent: identity + scrollback + the current run."""
 
@@ -436,6 +456,14 @@ class Agent:
         self.status = "idle"            # idle | running | done | error | stopped
         self.lines: list = []
         self.session_id = None          # claude session for --resume continuity
+        # Stable ledger identity for this agent's whole life. Deliberately NOT
+        # session_id: that is the --resume token and stays None until the
+        # stream's `system` init event arrives, so using it for ledger writes
+        # split every run across TWO sessions — the prompt under ws-<id>, the
+        # outcome under the claude uuid. Oversee then rendered one run as two
+        # cards, and the card holding the result was the one deleted by the
+        # session_end harvest imports from the subprocess's own transcript.
+        self.ledger_sid = f"ws-{self.id}"
         self.task_id = None             # kanban card being executed, if any
         self.skills_used: list = []     # Skill tool invocations, ordered, deduped
         self.last_turns = None          # num_turns of the most recent run
@@ -671,7 +699,7 @@ class Manager:
         elif code == 0 and saw_result:
             a.status = "done"
             self._log(a, "assistant_response",
-                      {"text": (result_text or "").strip()[:2000] or "(no text)",
+                      {"text": _cap_result(result_text) or "(no text)",
                        "agent": a.name, "role": a.role})
         else:
             a.status = "error"
@@ -687,8 +715,16 @@ class Manager:
 
     def _log(self, a, etype, payload) -> None:
         try:
-            self._append(etype, payload,
-                         session_id=a.session_id or f"ws-{a.id}",
+            # One run, one ledger identity (Agent.ledger_sid). The claude
+            # session id rides in the payload instead: it is the --resume
+            # token, it is unknown at send() time, and keying ledger writes on
+            # it is what split a run's prompt from its outcome. Carrying it
+            # here keeps the run correlatable with its harvested transcript.
+            body = dict(payload)
+            if a.session_id:
+                body["claude_session_id"] = a.session_id
+            self._append(etype, body,
+                         session_id=a.ledger_sid,
                          tags=["workspace", "swarm" if a.swarm else "parallel",
                                a.role],
                          project=a.project)

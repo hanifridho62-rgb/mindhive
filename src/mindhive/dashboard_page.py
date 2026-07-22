@@ -738,7 +738,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   const RM_OPEN = new Set();
   const RM_NODE_OPEN = new Set();
   function ovStatus(r){
-    if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
+    if (r.kind === 'chat'){
+      // Fleet runs (MindParallel/MindSwarm) ride in as chat cards and DO have a
+      // terminal outcome; ordinary interactive sessions stay "running" until
+      // session_end or staleness, so they fall through to the neutral glyph.
+      if (r.status === 'failed') return ['\\u2716', 'sbad', 'run failed'];
+      if (r.status === 'done') return ['\\u2714', 'sok', 'run finished'];
+      return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
+    }
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
     if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
     if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
