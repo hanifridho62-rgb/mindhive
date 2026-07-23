@@ -151,3 +151,42 @@ def test_origin_of_marks_self_reliant_output():
     assert events.origin_of("sess-1") is None
     assert events.origin_of(None) is None
     assert events.origin_of("researchy-session") is None   # prefix, not substring
+
+
+def test_agent_lifecycle_types_are_valid_deterministic():
+    # WS1 (agent process layer / journal): the fleet's terminal + checkpoint
+    # telemetry. Deterministic like autoresume/prompt_enriched — machine-readable
+    # process-table evidence that must stay OUT of the semantic LEDGER, the hash
+    # chain, the knowledge graph, and the Memory view. Without registration
+    # append_event raises and workspace._log's crash guard would silently drop
+    # every disconnect — the exact failure class WS4 needs to learn from.
+    for t in ("agent_disconnect", "agent_checkpoint"):
+        assert t in events.DETERMINISTIC_TYPES
+        assert t not in events.SEMANTIC_TYPES
+        assert t not in events.MEMORY_VIEW_TYPES
+    ev = events.append_event(
+        "agent_disconnect",
+        {"agent": "A", "role": "agent", "reason": "stopped",
+         "exit_code": -9, "cost": 0.01},
+        session_id="ws-1", tags=["workspace", "parallel", "agent"],
+        project="test")
+    assert ev.type == "agent_disconnect"
+    ev2 = events.append_event(
+        "agent_checkpoint",
+        {"agent": "A", "role": "agent", "seq": 1, "cost_so_far": 0.02},
+        session_id="ws-1", tags=["workspace", "parallel", "agent"],
+        project="test")
+    assert ev2.type == "agent_checkpoint"
+
+
+def test_budget_set_is_a_valid_deterministic_type():
+    # WS2: the ceiling-change audit event. Deterministic telemetry, out of the
+    # semantic layer / Memory view (the enrich_toggled precedent).
+    assert "budget_set" in events.DETERMINISTIC_TYPES
+    assert "budget_set" not in events.SEMANTIC_TYPES
+    assert "budget_set" not in events.MEMORY_VIEW_TYPES
+    ev = events.append_event("budget_set",
+                             {"cost_budget_usd": 5.0, "window_hours": 6.0},
+                             session_id="s", tags=["workspace", "budget"],
+                             project="test")
+    assert ev.type == "budget_set"

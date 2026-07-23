@@ -55,10 +55,9 @@ def _is_workspace(e) -> bool:
     be exact: ``tool_failed`` is written by five different producers (failures
     transcript capture, hookcapture, invoker, ``__main__``, workspace), so
     keying on the type alone would paint any session that merely had one failed
-    tool call as a failed run. Tags are checked defensively — reads stay total,
-    a hand-edited or future-shaped row must never raise here."""
-    tags = getattr(e, "tags", None)
-    return isinstance(tags, (list, tuple)) and WORKSPACE_TAG in tags
+    tool call as a failed run. Delegates to the canonical predicate in events so
+    the three fold sites (here, Manager.rehydrate, the budget fold) can't drift."""
+    return ev_mod.is_workspace_tagged(e)
 
 
 _IU_CACHE = {"ts": 0.0, "map": {}}
@@ -243,6 +242,12 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             s["iterations"] += 1          # activity count for the pill
         elif e.type == "tool_failed" and _is_workspace(e):
             s["status"] = "failed"        # the run died — say so, don't linger
+        elif e.type == "agent_disconnect" and _is_workspace(e):
+            # WS1 terminal journal: a non-clean run ending. A deliberate user
+            # stop reads as 'stopped' (not a failure); every other reason
+            # (timeout|exit|stream|budget) — or an unclassifiable one — as failed.
+            reason = e.payload.get("reason") if isinstance(e.payload, dict) else None
+            s["status"] = "stopped" if reason == "stopped" else "failed"
 
     now = now_fn()
     out = []

@@ -1324,6 +1324,13 @@ def serve(port: int | None = None, open_browser: bool = True,
     print("Close this window or press Ctrl+C to stop.", flush=True)
     if open_browser:
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    # Rebuild the fleet's record from the ledger (WS1 G3) so a restart shows
+    # recent agents, not a blank singleton. Non-fatal: rehydration must never
+    # stop the dashboard from serving.
+    try:
+        workspace_mod.MANAGER.rehydrate()
+    except Exception:
+        pass
     stop_event = threading.Event()
     threading.Thread(target=_auto_harvest_loop, args=(stop_event,), daemon=True).start()
     try:

@@ -56,6 +56,22 @@ DETERMINISTIC_TYPES = {
     # delivery audit trail (when it was due, whether it fired, what came
     # back).
     "autoresume",
+    # Agent process layer (WS1 — see workspace.py). The fleet's journal:
+    # agent_disconnect marks a NON-CLEAN run ending with a machine-readable
+    # reason (stopped|timeout|exit|stream|budget) so the Improvements loop can
+    # tell a deliberate stop or a budget death from a real tool failure;
+    # agent_checkpoint carries in-flight deltas for restart rehydration.
+    # Deterministic telemetry like autoresume — process-table evidence that
+    # stays OUT of the semantic LEDGER, the graph, and the Memory view. (It is
+    # still on the hash chain: compute_chain folds the WHOLE event log, not just
+    # the semantic layer, so every appended row is chained regardless of type.)
+    "agent_disconnect", "agent_checkpoint",
+    # Workspace cost ceiling changed (WS2 — see workspace_budget.py). Audit
+    # trail for the user-set spend ceiling; the budget.json sidecar is the
+    # source of truth (the enrich_toggled precedent). Deterministic telemetry,
+    # out of the semantic layer, the graph, and the Memory view (but on the hash
+    # chain, like every appended row).
+    "budget_set",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
@@ -74,6 +90,17 @@ MEMORY_VIEW_TYPES = SEMANTIC_TYPES | {"user_prompt", "assistant_response"}
 # Oversee sections can never disagree about what a run produced.
 SELF_RELIANT_TAG = "self-reliant"
 SELF_RELIANT_SESSION_PREFIX = "research-"
+
+WORKSPACE_TAG = "workspace"          # workspace._log stamps every fleet event
+
+
+def is_workspace_tagged(e) -> bool:
+    """True when an event carries the workspace tag — a MindParallel/MindSwarm
+    fleet event rather than an ordinary interactive session. The canonical home
+    for the check reused by oversee, Manager.rehydrate, and the budget fold.
+    Reads stay total: a hand-edited or future-shaped ``tags`` value never raises."""
+    tags = getattr(e, "tags", None)
+    return isinstance(tags, (list, tuple)) and WORKSPACE_TAG in tags
 
 
 def origin_of(session_id, tags=None):

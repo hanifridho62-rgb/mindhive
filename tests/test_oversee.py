@@ -321,6 +321,32 @@ def test_workspace_agent_re_sent_after_a_failure_is_running_again():
     assert _only()["status"] == "running"
 
 
+# --- WS1: agent_disconnect is a terminal signal for a fleet card ---------------
+# A non-clean run ending is journaled as agent_disconnect(reason=...). A user
+# stop reads as a terminal 'stopped' (not a failure, not a lingering live
+# session); every other reason (timeout/exit/stream/budget) reads as 'failed'.
+
+
+def test_stopped_workspace_run_reports_stopped():
+    _wsev("user_prompt", {"text": "long job", "agent": "A"}, 1)
+    _wsev("agent_disconnect", {"reason": "stopped", "agent": "A"}, 2)
+    assert _only()["status"] == "stopped"
+
+
+def test_disconnected_workspace_run_reports_failed():
+    _wsev("user_prompt", {"text": "job", "agent": "A"}, 1)
+    _wsev("agent_disconnect", {"reason": "timeout", "agent": "A"}, 2)
+    assert _only()["status"] == "failed"
+
+
+def test_reasonless_disconnect_defaults_to_failed_and_never_raises():
+    # total read: a disconnect with no/garbled reason must not raise, and an
+    # unclassifiable ending is conservatively a failure, not a lingering run
+    _wsev("user_prompt", {"text": "job", "agent": "A"}, 1)
+    _wsev("agent_disconnect", {"agent": "A"}, 2)          # no reason field
+    assert _only()["status"] == "failed"
+
+
 # --- one fleet run, one whole card (U2, end-to-end) ----------------------------
 # These drive a REAL Manager (fake subprocess, real append_event) and then read
 # back through oversee.interactive_sessions. The bug being guarded was two

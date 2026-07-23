@@ -31,7 +31,7 @@ import subprocess
 import threading
 import time
 
-from . import claude_cli, events as ev_mod, paths
+from . import claude_cli, events as ev_mod, paths, workspace_budget as wsbudget
 
 # Profile names end up interpolated into a Windows `cmd /k` string by
 # profile_login, so restrict them to an identifier-safe charset — no shell
@@ -40,6 +40,7 @@ from . import claude_cli, events as ev_mod, paths
 _SAFE_PROFILE = re.compile(r"^[A-Za-z0-9 _.\-]{1,64}$")
 
 MAX_AGENTS = 16
+REHYDRATE_HORIZON = MAX_AGENTS   # cap the restart process-table fold (WS1 G3)
 MAX_LINES = 4000                 # per-agent scrollback cap (oldest dropped)
 # Chars of a run's final result kept in the ledger. Sized to the same order as
 # harvest._MAX_WORDS (5000 words) so one captured answer is bounded without
@@ -453,7 +454,7 @@ class Agent:
         self.model = (model or "").strip()      # "" = account default
         self.project = project
         self.swarm = swarm
-        self.status = "idle"            # idle | running | done | error | stopped
+        self.status = "idle"            # idle|running|done|error|stopped|interrupted
         self.lines: list = []
         self.session_id = None          # claude session for --resume continuity
         # Stable ledger identity for this agent's whole life. Deliberately NOT
@@ -472,6 +473,8 @@ class Agent:
         self.created = _now_iso()
         self.proc = None
         self._timer = None
+        self._disconnect_reason = None   # per-run terminal reason (stopped|timeout)
+        self.rehydrated_record = False   # True only for a ledger-rebuilt record
 
     def snapshot(self) -> dict:
         return {"id": self.id, "name": self.name, "role": self.role,
@@ -488,13 +491,36 @@ class Agent:
         if len(self.lines) > MAX_LINES:
             del self.lines[:len(self.lines) - MAX_LINES]
 
+    @classmethod
+    def rehydrated(cls, agent_id, name, role, *, profile="default", project=None,
+                   swarm=False, status="interrupted", session_id=None,
+                   last_cost=None, last_turns=None, created=None):
+        """Rebuild an Agent RECORD from the ledger after a restart (WS1 G3). It
+        is a settled record, never a live run: no subprocess is attached, and a
+        run that was in flight when the process died is 'interrupted' — NOT
+        'running', which would be a phantom clear_idle could never remove. The
+        recovered claude session id is kept so a follow-up send() can --resume."""
+        a = cls(name or "Agent", role=role, profile=profile, project=project,
+                swarm=swarm)
+        a.id = agent_id
+        a.ledger_sid = f"ws-{agent_id}"
+        a.status = status
+        a.session_id = session_id
+        a.last_cost = last_cost
+        a.last_turns = last_turns
+        if created:
+            a.created = created
+        a.rehydrated_record = True       # a ledger record — clear_idle may cull it
+        return a
+
 
 class Manager:
     """Owns the agent fleet. Thread-safe; the dashboard holds one instance."""
 
-    def __init__(self, spawn=None, append_event=None):
+    def __init__(self, spawn=None, append_event=None, read_events=None):
         self._spawn = spawn or _default_spawn
         self._append = append_event or ev_mod.append_event
+        self._read = read_events or ev_mod.read_all
         self._lock = threading.Lock()
         self.agents: dict = {}
         self.mission = None             # {"mission", "started", "coordinator"}
@@ -509,8 +535,117 @@ class Manager:
     def get(self, agent_id):
         return self.agents.get(agent_id)
 
+    def rehydrate(self, project=None, evs=None, horizon=REHYDRATE_HORIZON) -> dict:
+        """Rebuild the fleet's RECORD from the ledger (WS1 G3) so a dashboard
+        restart shows recent agents instead of a blank singleton. Folds ws-<id>
+        fleet sessions, keeps the newest ``horizon``, and reconstructs
+        identity / role / status / cost / session — but NEVER re-attaches a
+        subprocess (a killed run is gone). Total read: malformed rows are
+        skipped, never raised. Idempotent: an agent already live is left as-is.
+        Returns ``{"rehydrated": n}``. The read is O(history) once at startup,
+        same as Oversee's fold — a true event-horizon read is a later refinement.
+        """
+        if evs is None:
+            evs = self._read(project)
+        recs: dict = {}
+        for e in evs or []:
+            sid = getattr(e, "session_id", None)
+            if not isinstance(sid, str) or not sid.startswith("ws-"):
+                continue
+            if not ev_mod.is_workspace_tagged(e):   # canonical shared predicate
+                continue
+            tags = getattr(e, "tags", None)         # a list once tagged (above)
+            p = e.payload if isinstance(getattr(e, "payload", None), dict) else {}
+            et = getattr(e, "type", "")
+            ts = getattr(e, "ts", "") or ""
+            r = recs.get(sid)
+            if r is None:
+                r = recs[sid] = {"name": None, "role": "agent", "swarm": False,
+                                 "status": "interrupted", "session_id": None,
+                                 "last_cost": None, "last_turns": None,
+                                 "created": ts, "last_ts": ts}
+            if ts:
+                r["last_ts"] = ts
+            if "swarm" in tags:
+                r["swarm"] = True
+            if len(tags) >= 3 and isinstance(tags[2], str):
+                r["role"] = tags[2]
+            if p.get("agent"):
+                r["name"] = str(p["agent"])
+            if p.get("role"):
+                r["role"] = str(p["role"])
+            if p.get("claude_session_id"):
+                r["session_id"] = str(p["claude_session_id"])
+            if et == "user_prompt":
+                r["status"] = "interrupted"    # in-flight unless a terminal follows
+            elif et == "assistant_response":
+                r["status"] = "done"
+                # The done path persists cost/turns on assistant_response (WS2);
+                # recover them here exactly as the agent_disconnect branch does,
+                # else a cleanly-completed rehydrated agent shows a blank cost.
+                if p.get("cost") is not None:
+                    r["last_cost"] = p["cost"]
+                if p.get("turns") is not None:
+                    r["last_turns"] = p["turns"]
+            elif et == "tool_failed":
+                r["status"] = "error"
+            elif et == "agent_disconnect":
+                r["status"] = "stopped" if p.get("reason") == "stopped" else "error"
+                if p.get("cost") is not None:
+                    r["last_cost"] = p["cost"]
+                if p.get("turns") is not None:
+                    r["last_turns"] = p["turns"]
+        order = sorted(recs, key=lambda s: recs[s]["last_ts"], reverse=True)[:horizon]
+        added = 0
+        with self._lock:
+            live = {a.ledger_sid for a in self.agents.values()}
+            for sid in order:
+                if sid in live:
+                    continue
+                # Never rehydrate past the fleet cap (G3): live agents plus the
+                # newest-horizon records can otherwise overflow MAX_AGENTS and
+                # wedge every future spawn (which refuses at the cap).
+                if len(self.agents) >= MAX_AGENTS:
+                    break
+                r = recs[sid]
+                a = Agent.rehydrated(sid[3:], r["name"], r["role"],
+                                     project=project, swarm=r["swarm"],
+                                     status=r["status"], session_id=r["session_id"],
+                                     last_cost=r["last_cost"],
+                                     last_turns=r["last_turns"],
+                                     created=r["created"])
+                self.agents[a.id] = a
+                added += 1
+        return {"rehydrated": added}
+
+    def _budget_gate(self, project, n=1) -> dict:
+        """Pre-flight spend gate (WS2). Fails OPEN on any error — a broken budget
+        subsystem must never block a spawn (R5)."""
+        try:
+            return wsbudget.gate(project, n=n)
+        except Exception:
+            return {"ok": True}
+
     def spawn(self, name=None, role="agent", profile="default", project=None,
               prompt=None, swarm=False, model=None) -> dict:
+        """Gated spawn — the public entry point. The budget gate is checked once
+        here; MindSwarm gates the whole fleet up front and calls ``_spawn_agent``
+        directly, so a mission never double-gates per member."""
+        g = self._budget_gate(project)
+        if not g.get("ok", True):
+            return {"ok": False,
+                    "error": g.get("reason", "workspace spend ceiling reached"),
+                    "wait_seconds": g.get("wait_seconds")}
+        return self._spawn_agent(name=name, role=role, profile=profile,
+                                 project=project, prompt=prompt, swarm=swarm,
+                                 model=model)
+
+    def _spawn_agent(self, name=None, role="agent", profile="default",
+                     project=None, prompt=None, swarm=False, model=None) -> dict:
+        """Ungated spawn core: create and register the agent (still honouring the
+        fleet cap) and optionally send its first prompt. The spend gate lives in
+        the public :meth:`spawn`; the only ungated caller is ``start_mission``,
+        which gates the whole fleet as one pre-spawn check."""
         with self._lock:
             if len(self.agents) >= MAX_AGENTS:
                 return {"ok": False, "error": f"agent cap reached ({MAX_AGENTS})"}
@@ -537,21 +672,29 @@ class Manager:
             return {"ok": False, "error": "unknown agent"}
         proc = a.proc
         if proc is not None and proc.poll() is None:
+            # Mark stopped BEFORE the kill: the reader thread unblocks the moment
+            # the process dies, and its terminal branch keys on a.status — setting
+            # it after the kill raced the reader into the failure branch.
+            a.status = "stopped"
+            a._disconnect_reason = "stopped"
             try:
                 proc.kill()
             except OSError:
                 pass
-            a.status = "stopped"
             a.emit("■ stopped by user")
         return {"ok": True}
 
     def clear_idle(self) -> dict:
         """Remove every settled MindParallel agent (not running, not swarm) —
-        the one-click cull behind the dashboard's Clear idle button. Swarm
-        agents are left to the mission_stop lifecycle."""
+        the one-click cull behind the dashboard's Clear idle button. A LIVE swarm
+        agent is left to the mission_stop lifecycle, but a REHYDRATED swarm record
+        (rebuilt from the ledger after a restart, with no live mission to own it)
+        is cullable too — otherwise it holds a cap slot forever and no lifecycle
+        can ever release it."""
         with self._lock:
             ids = [a.id for a in self.agents.values()
-                   if a.status != "running" and not a.swarm]
+                   if a.status != "running"
+                   and (not a.swarm or a.rehydrated_record)]
         removed = 0
         for i in ids:
             a = self.get(i)
@@ -631,6 +774,7 @@ class Manager:
         threading.Thread(target=_feed_stdin, args=(a.proc, prompt),
                          daemon=True).start()
         a.status = "running"
+        a._disconnect_reason = None      # per-run: cleared before this run starts
         a.emit(f"❯ {prompt}")
         self._log(a, "user_prompt", {"text": prompt, "agent": a.name,
                                      "role": a.role})
@@ -643,6 +787,12 @@ class Manager:
 
     def _timeout_kill(self, a, proc):
         if proc.poll() is None:
+            # Stamp the reason BEFORE the kill. kill() unblocks the reader
+            # thread, whose terminal branch reads ``a._disconnect_reason`` to
+            # journal the disconnect; setting it after the kill races the reader
+            # into labelling a timeout as a generic 'exit'. Same ordering guard
+            # as stop().
+            a._disconnect_reason = "timeout"
             try:
                 proc.kill()
             except OSError:
@@ -695,12 +845,16 @@ class Manager:
         if a._timer is not None:
             a._timer.cancel()
         if a.status == "stopped":
-            pass                                     # user kill already reported
+            # User kill: previously a bare `pass` that wrote nothing, orphaning
+            # the user_prompt. Journal a terminal so the run is never a dangling
+            # prompt and WS4 can tell a deliberate stop from a failure.
+            self._emit_disconnect(a, reason="stopped", exit_code=code)
         elif code == 0 and saw_result:
             a.status = "done"
             self._log(a, "assistant_response",
                       {"text": _cap_result(result_text) or "(no text)",
-                       "agent": a.name, "role": a.role})
+                       "agent": a.name, "role": a.role,
+                       "cost": a.last_cost, "turns": a.last_turns})
         else:
             a.status = "error"
             a.emit(f"✖ run failed (exit {code})")
@@ -708,10 +862,26 @@ class Manager:
                       {"text": f"workspace run failed (exit {code})",
                        "signature": f"workspace:{a.role}",
                        "action": f"workspace agent {a.name} run"})
+            self._emit_disconnect(
+                a, reason=a._disconnect_reason or ("exit" if code else "stream"),
+                exit_code=code)
         if a.task_id:
             done = a.status == "done"
             _board_finish(a.task_id, done)
             a.task_id = None
+
+    def _emit_disconnect(self, a, reason, exit_code) -> None:
+        """Journal a non-clean run ending as a machine-readable agent_disconnect
+        (WS1 telemetry). Unlike the coarse ``workspace:<role>`` tool_failed,
+        ``reason`` (stopped|timeout|exit|stream|budget) is keyable, so the
+        Improvements loop can learn from a budget death or a user stop without
+        confusing it with a genuine tool failure. Additive — the
+        assistant_response / tool_failed writes stay; this is the process-layer
+        signal, not a replacement."""
+        self._log(a, "agent_disconnect",
+                  {"agent": a.name, "role": a.role, "reason": reason,
+                   "exit_code": exit_code, "cost": a.last_cost,
+                   "turns": a.last_turns})
 
     def _log(self, a, etype, payload) -> None:
         try:
@@ -743,10 +913,15 @@ class Manager:
         if want > room:
             return {"ok": False, "error":
                     f"mission needs {want} agents but only {room} slots are free"}
+        g = self._budget_gate(project, n=want)     # gate the whole fleet pre-spawn
+        if not g.get("ok", True):
+            return {"ok": False,
+                    "error": g.get("reason", "workspace spend ceiling reached"),
+                    "wait_seconds": g.get("wait_seconds")}
         spawned = []
-        res = self.spawn(name="Coordinator 1", role="coordinator",
-                         profile=profile, project=project, swarm=True,
-                         prompt=f"MISSION: {mission}")
+        res = self._spawn_agent(name="Coordinator 1", role="coordinator",
+                                profile=profile, project=project, swarm=True,
+                                prompt=f"MISSION: {mission}")
         if not res.get("ok"):
             return res
         spawned.append(res["agent"])
@@ -754,7 +929,7 @@ class Manager:
                  + [("scout", i + 1) for i in range(int(scouts))]
                  + [("reviewer", i + 1) for i in range(int(reviewers))])
         for role, n in roles:
-            r = self.spawn(
+            r = self._spawn_agent(
                 name=f"{role.title()} {n}", role=role, profile=profile,
                 project=project, swarm=True,
                 prompt=(f"MISSION: {mission}\nWork your role. Check Mind Hive "
@@ -1006,6 +1181,8 @@ def api_get(action, proj=None, qs=None) -> dict:
         return auth_status_all()
     if action == "board":
         return load_board()
+    if action == "budget":
+        return {"ok": True, **wsbudget.snapshot(proj)}
     return {"ok": False, "error": "not found"}
 
 
@@ -1067,4 +1244,8 @@ def api_post(action, proj=None, body=None) -> dict:
         return MANAGER.stop_mission()
     if action == "command":
         return MANAGER.command(body.get("target", "all"), body.get("text", ""))
+    if action == "set_budget":
+        return wsbudget.set_budget(proj, body.get("cost_budget_usd", 0.0),
+                                   body.get("window_hours",
+                                            wsbudget.DEFAULT_WINDOW_HOURS))
     return {"ok": False, "error": "not found"}

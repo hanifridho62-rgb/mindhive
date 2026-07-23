@@ -52,6 +52,41 @@ class FakeProc:
         self._done = True
 
 
+class _HoldProc:
+    """A run that stays open until stop()/kill() releases it, so a test can drive
+    the user-stop terminal path deterministically — the instant FakeProc finishes
+    before stop() can flip the agent to 'stopped'."""
+
+    def __init__(self):
+        self.stdin = _FakeStdin()
+        self._released = threading.Event()
+        self._code = 0
+        self._done = False
+        self.killed = False
+
+    @property
+    def stdout(self):
+        def gen():
+            self._released.wait(timeout=5)
+            return
+            yield            # unreachable — makes this a generator
+        return gen()
+
+    def poll(self):
+        return self._code if self._done else None
+
+    def wait(self):
+        self._released.wait(timeout=5)
+        self._done = True
+        return self._code
+
+    def kill(self):
+        self.killed = True
+        self._code = -9
+        self._done = True
+        self._released.set()
+
+
 def _stream_lines(session_id="sess-1", result="all done"):
     return [
         json.dumps({"type": "system", "subtype": "init",
@@ -495,6 +530,21 @@ def test_clear_idle_removes_only_settled_non_swarm_agents():
     assert res["ok"] and res["removed"] == 2     # done + fresh idle
     left = {a["id"] for a in h.mgr.list()["agents"]}
     assert left == {running, swarm}              # running and swarm survive
+
+
+def test_clear_idle_culls_rehydrated_swarm_record_but_not_live_swarm():
+    # a LIVE swarm agent belongs to the mission lifecycle and must survive, but a
+    # REHYDRATED swarm record (rebuilt from the ledger, no mission to own it) has
+    # to be cullable or it holds a cap slot forever.
+    mgr = _bare_manager()
+    live = workspace.Agent("Crew", role="builder", swarm=True)   # spawned live
+    mgr.agents[live.id] = live
+    rec = workspace.Agent.rehydrated("sw01", "Builder 1", "builder",
+                                     swarm=True, status="done")   # from ledger
+    mgr.agents[rec.id] = rec
+    res = mgr.clear_idle()
+    assert res["removed"] == 1
+    assert {a.id for a in mgr.agents.values()} == {live.id}
 
 
 def test_api_post_clear_idle_dispatches():
@@ -974,7 +1024,10 @@ def test_failed_run_logs_its_failure_under_the_same_id_as_its_prompt():
     aid = h.mgr.spawn(name="A")["agent"]["id"]
     h.mgr.send(aid, "go")
     _wait_settled(_agent_obj(h, aid))
-    assert [e[0] for e in h.events] == ["user_prompt", "tool_failed"]
+    # WS1 adds a machine-readable agent_disconnect after the coarse tool_failed;
+    # both land under the run's one ledger identity (U1).
+    assert [e[0] for e in h.events] == \
+        ["user_prompt", "tool_failed", "agent_disconnect"]
     assert len(set(_sids(h))) == 1
 
 
@@ -1031,3 +1084,373 @@ def test_run_still_logs_when_the_claude_session_id_never_arrives():
     assert [e[0] for e in h.events] == ["user_prompt", "assistant_response"]
     assert set(_sids(h)) == {f"ws-{a.id}"}
     assert all("claude_session_id" not in p for _, p, _ in h.events)
+
+
+# --- WS1: agent_disconnect journal (terminal signals) --------------------------
+# A run had exactly three terminal paths (workspace.py:697-714): a clean
+# assistant_response, a coarse tool_failed, and — for a user stop — a bare `pass`
+# that wrote NOTHING, orphaning the user_prompt. WS1 journals every non-clean
+# ending as a machine-readable agent_disconnect(reason=...), keying the failure
+# class so the Improvements loop (WS4) can tell a stop/timeout/budget death from
+# a genuine tool failure. The clean path stays a single assistant_response.
+
+
+def test_user_stopped_run_journals_agent_disconnect_stopped():
+    proc = _HoldProc()
+    events = []
+    mgr = workspace.Manager(
+        spawn=lambda argv, env, cwd: proc,
+        append_event=lambda et, pl, **kw: events.append((et, pl, kw)))
+    aid = mgr.spawn(name="A")["agent"]["id"]
+    mgr.send(aid, "long job")
+    a = mgr.get(aid)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and a.status != "running":
+        time.sleep(0.01)
+    assert a.status == "running"            # the run is genuinely in flight
+
+    mgr.stop(aid)
+    deadline = time.time() + 5              # wait for the LEDGER write, not status
+    while time.time() < deadline and not any(
+            e[0] == "agent_disconnect" for e in events):
+        time.sleep(0.01)
+
+    assert a.status == "stopped"
+    kinds = [e[0] for e in events]
+    assert "agent_disconnect" in kinds      # the orphan is closed
+    i = kinds.index("agent_disconnect")
+    assert events[i][1]["reason"] == "stopped"
+    assert events[i][2].get("session_id") == a.ledger_sid   # one run, one identity
+
+
+def test_failed_run_also_journals_agent_disconnect():
+    h = Harness(code=1)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    # the coarse tool_failed stays (Memory/Improvements), the disconnect is added
+    assert [e[0] for e in h.events] == \
+        ["user_prompt", "tool_failed", "agent_disconnect"]
+    dc = h.events[-1][1]
+    assert dc["reason"] == "exit" and dc["exit_code"] == 1
+    assert dc["agent"] == "A" and dc["role"] == "agent"
+
+
+def test_completed_run_journals_no_agent_disconnect():
+    # a clean run's assistant_response IS its terminal record — adding a disconnect
+    # would double every happy-path run (22 of 29 in history) for no gain
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    assert [e[0] for e in h.events] == ["user_prompt", "assistant_response"]
+
+
+def test_timeout_kill_marks_reason_timeout():
+    # a timeout kill must be DISTINGUISHABLE from a generic failure (both hit the
+    # reader's else branch) — _timeout_kill stamps the reason the reader journals
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    a = _agent_obj(h, aid)
+
+    class _P:
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+    h.mgr._timeout_kill(a, _P())
+    assert a._disconnect_reason == "timeout"
+
+
+def test_disconnect_reason_is_per_run_state():
+    # agents are reusable: a prior run's timeout must not mislabel the next run's
+    # disconnect. send() clears the marker before the run starts.
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    a = _agent_obj(h, aid)
+    a._disconnect_reason = "timeout"           # stale from a prior run
+    h.mgr.send(aid, "go")
+    _wait_settled(a)
+    assert a._disconnect_reason is None
+
+
+# --- WS1: process-table rehydration (restart survival, G3) ---------------------
+# Manager.__init__ used to restore nothing, so a dashboard restart wiped every
+# agent's identity, status, session id and cost. rehydrate() folds recent
+# ws-<id> fleet sessions back into a RECORD of the fleet — never a live run: no
+# subprocess is re-attached, and a run interrupted by the restart is 'interrupted'
+# (not a phantom 'running' that clear_idle, keyed on status != 'running', could
+# never remove).
+
+from mindhive import events as _evmod
+
+
+def _wsrow(sid, etype, payload, second, *, swarm=False):
+    role = payload.get("role", "agent")
+    tags = ["workspace", "swarm" if swarm else "parallel", role]
+    return _evmod.Event(ts=f"2026-07-08T10:00:{second:02d}Z", session_id=sid,
+                        type=etype, payload=payload, tags=tags)
+
+
+def _wsrun(sid, *pairs, swarm=False):
+    """(etype, payload) pairs -> workspace-tagged Event rows for one ws-<id> run."""
+    return [_wsrow(sid, et, pl, i, swarm=swarm) for i, (et, pl) in enumerate(pairs)]
+
+
+def _bare_manager():
+    # a Manager that never touches the real ledger — rehydrate() is fed events
+    return workspace.Manager(spawn=lambda *a: None,
+                             append_event=lambda *a, **k: None,
+                             read_events=lambda project=None: [])
+
+
+def test_rehydrate_reconstructs_a_completed_agent():
+    evs = _wsrun("ws-abc123",
+                 ("user_prompt", {"text": "audit", "agent": "Fleet 1",
+                                  "role": "agent"}),
+                 ("assistant_response", {"text": "done", "agent": "Fleet 1",
+                                         "role": "agent",
+                                         "claude_session_id": "cuid-1"}))
+    mgr = _bare_manager()
+    res = mgr.rehydrate(evs=evs)
+    assert res["rehydrated"] == 1
+    a = mgr.get("abc123")
+    assert a is not None
+    assert a.ledger_sid == "ws-abc123"
+    assert a.name == "Fleet 1" and a.role == "agent"
+    assert a.status == "done"
+    assert a.session_id == "cuid-1"        # claude session recovered for --resume
+    assert a.proc is None                  # a record, never a live subprocess
+
+
+def test_rehydrate_maps_every_terminal_status():
+    evs = (
+        _wsrun("ws-done", ("user_prompt", {"agent": "D"}),
+                          ("assistant_response", {"agent": "D"}))
+        + _wsrun("ws-fail", ("user_prompt", {"agent": "F"}),
+                            ("tool_failed", {"agent": "F",
+                                             "signature": "workspace:agent"}))
+        + _wsrun("ws-stop", ("user_prompt", {"agent": "S"}),
+                            ("agent_disconnect", {"agent": "S", "reason": "stopped"}))
+        + _wsrun("ws-timeout", ("user_prompt", {"agent": "T"}),
+                               ("agent_disconnect", {"agent": "T",
+                                                     "reason": "timeout"}))
+        + _wsrun("ws-live", ("user_prompt", {"agent": "L"}))   # no terminal event
+    )
+    mgr = _bare_manager()
+    mgr.rehydrate(evs=evs)
+    st = {aid: mgr.get(aid).status
+          for aid in ("done", "fail", "stop", "timeout", "live")}
+    assert st == {"done": "done", "fail": "error", "stop": "stopped",
+                  "timeout": "error", "live": "interrupted"}
+
+
+def test_rehydrate_recovers_cost_and_turns_from_disconnect():
+    evs = _wsrun("ws-c",
+                 ("user_prompt", {"agent": "C"}),
+                 ("tool_failed", {"agent": "C", "signature": "workspace:agent"}),
+                 ("agent_disconnect", {"agent": "C", "reason": "exit",
+                                       "cost": 0.42, "turns": 7}))
+    mgr = _bare_manager()
+    mgr.rehydrate(evs=evs)
+    a = mgr.get("c")
+    assert a.status == "error"
+    assert a.last_cost == 0.42 and a.last_turns == 7
+
+
+def test_rehydrate_recovers_cost_and_turns_from_done_path():
+    # WS2 persists cost/turns on the done path's assistant_response too — a
+    # cleanly-completed run must rehydrate WITH its cost, not a blank.
+    evs = _wsrun("ws-d",
+                 ("user_prompt", {"agent": "D"}),
+                 ("assistant_response", {"agent": "D", "cost": 0.19, "turns": 4}))
+    mgr = _bare_manager()
+    mgr.rehydrate(evs=evs)
+    a = mgr.get("d")
+    assert a.status == "done"
+    assert a.last_cost == 0.19 and a.last_turns == 4
+
+
+def test_rehydrated_agents_are_settled_not_phantom_running():
+    # a restart-interrupted run must be clearable, never a phantom 'running' that
+    # clear_idle (status != 'running') could never remove
+    evs = _wsrun("ws-x", ("user_prompt", {"agent": "X"}))
+    mgr = _bare_manager()
+    mgr.rehydrate(evs=evs)
+    assert mgr.get("x").status != "running"
+    assert mgr.clear_idle()["removed"] == 1
+    assert mgr.list()["agents"] == []
+
+
+def test_rehydrate_caps_at_horizon_newest_first():
+    # 20 sessions, distinct minutes; only the newest REHYDRATE_HORIZON survive
+    evs = [_evmod.Event(ts=f"2026-07-08T10:{i:02d}:00Z", session_id=f"ws-a{i:02d}",
+                        type="user_prompt", payload={"agent": f"A{i}"},
+                        tags=["workspace", "parallel", "agent"]) for i in range(20)]
+    mgr = _bare_manager()
+    res = mgr.rehydrate(evs=evs)
+    assert res["rehydrated"] == workspace.REHYDRATE_HORIZON
+    ids = {a["id"] for a in mgr.list()["agents"]}
+    assert "a19" in ids and "a04" in ids           # newest HORIZON survive
+    assert "a03" not in ids and "a00" not in ids   # oldest dropped
+
+
+def test_rehydrate_never_exceeds_max_agents_with_live_agents():
+    # live agents plus newest-horizon records must not overflow MAX_AGENTS —
+    # an over-cap fleet wedges every future spawn (which refuses at the cap).
+    mgr = _bare_manager()
+    for i in range(workspace.MAX_AGENTS - 2):       # nearly-full live fleet
+        live = workspace.Agent(f"L{i}")
+        mgr.agents[live.id] = live
+    evs = [_evmod.Event(ts=f"2026-07-08T10:{i:02d}:00Z", session_id=f"ws-r{i:02d}",
+                        type="user_prompt", payload={"agent": f"R{i}"},
+                        tags=["workspace", "parallel", "agent"])
+           for i in range(10)]
+    res = mgr.rehydrate(evs=evs)
+    assert res["rehydrated"] == 2                    # only 2 free slots were left
+    assert len(mgr.agents) == workspace.MAX_AGENTS
+
+
+def test_rehydrate_is_idempotent_and_skips_live_agents():
+    evs = _wsrun("ws-dup", ("user_prompt", {"agent": "Dup"}),
+                           ("assistant_response", {"agent": "Dup"}))
+    mgr = _bare_manager()
+    assert mgr.rehydrate(evs=evs)["rehydrated"] == 1
+    assert mgr.rehydrate(evs=evs)["rehydrated"] == 0   # no duplicate on re-fold
+    assert len(mgr.list()["agents"]) == 1
+
+
+def test_rehydrate_skips_non_workspace_and_junk_rows():
+    import types as _t
+    evs = [
+        _wsrow("ws-ok", "user_prompt", {"agent": "OK"}, 0),
+        _evmod.Event(ts="2026-07-08T10:00:01Z", session_id="sess-plain",
+                     type="user_prompt", payload={"text": "hi"}, tags=[]),
+        _evmod.Event(ts="2026-07-08T10:00:02Z", session_id="research-xyz",
+                     type="assistant_response", payload={}, tags=["workspace"]),
+        _t.SimpleNamespace(session_id="ws-bad", type="user_prompt",
+                           payload="not-a-dict", tags="not-a-list", ts="z"),
+        _t.SimpleNamespace(session_id=None, type=None, payload=None,
+                           tags=None, ts=None),
+    ]
+    mgr = _bare_manager()
+    res = mgr.rehydrate(evs=evs)                    # must not raise (total read)
+    assert res["rehydrated"] == 1
+    assert [a["id"] for a in mgr.list()["agents"]] == ["ok"]
+
+
+def test_rehydrate_uses_injected_reader_when_no_events_passed():
+    golden = _wsrun("ws-rdr", ("user_prompt", {"agent": "R"}),
+                              ("assistant_response", {"agent": "R"}))
+    mgr = workspace.Manager(spawn=lambda *a: None,
+                            append_event=lambda *a, **k: None,
+                            read_events=lambda project=None: golden)
+    res = mgr.rehydrate()                # no evs -> pulls from the injected reader
+    assert res["rehydrated"] == 1
+    assert mgr.get("rdr").status == "done"
+
+
+def test_rehydrated_swarm_agent_keeps_role_and_swarm_flag():
+    evs = _wsrun("ws-sw",
+                 ("user_prompt", {"agent": "Builder 1", "role": "builder"}),
+                 ("assistant_response", {"agent": "Builder 1", "role": "builder"}),
+                 swarm=True)
+    mgr = _bare_manager()
+    mgr.rehydrate(evs=evs)
+    a = mgr.get("sw")
+    assert a.role == "builder" and a.swarm is True
+
+
+# --- WS2: per-run cost accounting (the entry source) ---------------------------
+# Every run's cost reached Agent.last_cost in memory and was then discarded — 0
+# of 29 historical runs persisted a cost. WS2 persists it on the terminal events
+# so loop/budget.py can fold entries: the done path's assistant_response gains
+# cost/turns; the failure path's agent_disconnect already carries them (WS1a).
+
+
+def test_completed_run_persists_its_cost_on_the_done_path():
+    h = Harness(lines=_stream_lines(result="ok"))   # envelope: $0.0123, 2 turns
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    done = h.events[1]
+    assert done[0] == "assistant_response"
+    assert done[1]["cost"] == 0.0123
+    assert done[1]["turns"] == 2
+
+
+def test_done_path_persists_none_cost_when_envelope_omits_it():
+    # distinguish "no cost reported" (None) from "$0" so the fold can skip it
+    lines = [json.dumps({"type": "result", "subtype": "success",
+                         "result": "done", "num_turns": 1})]     # no total_cost_usd
+    h = Harness(lines=lines)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    assert h.events[1][0] == "assistant_response"
+    assert h.events[1][1]["cost"] is None
+    assert h.events[1][1]["turns"] == 1
+
+
+# --- WS2: pre-flight budget gate -----------------------------------------------
+# Manager.spawn / start_mission check a rolling estimate against the user-set
+# ceiling before launching subprocesses; the gate fails OPEN on no ceiling, no
+# history, or any budget-subsystem error (a broken gate must never block work).
+
+
+def test_spawn_refused_when_gate_blocks_launches_nothing(monkeypatch):
+    h = Harness()
+    monkeypatch.setattr(workspace.wsbudget, "gate",
+                        lambda project=None, n=1, **k:
+                        {"ok": False, "reason": "over ceiling",
+                         "wait_seconds": 42.0})
+    res = h.mgr.spawn(name="A", prompt="go")
+    assert not res["ok"]
+    assert "over ceiling" in res["error"] and res["wait_seconds"] == 42.0
+    assert h.calls == []                       # no subprocess launched
+    assert h.mgr.list()["agents"] == []        # no agent created
+
+
+def test_spawn_allowed_when_gate_passes(monkeypatch):
+    h = Harness()
+    monkeypatch.setattr(workspace.wsbudget, "gate",
+                        lambda project=None, n=1, **k: {"ok": True, "estimate": 0.01})
+    assert h.mgr.spawn(name="A")["ok"]
+    assert len(h.mgr.list()["agents"]) == 1
+
+
+def test_spawn_gate_fails_open_on_subsystem_error(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("budget subsystem down")
+    h = Harness()
+    monkeypatch.setattr(workspace.wsbudget, "gate", boom)
+    assert h.mgr.spawn(name="A")["ok"]         # R5: fail open, never block
+    assert len(h.mgr.list()["agents"]) == 1
+
+
+def test_mission_refused_pre_spawn_when_gate_blocks(monkeypatch):
+    h = Harness()
+    monkeypatch.setattr(workspace.wsbudget, "gate",
+                        lambda project=None, n=1, **k: {"ok": False, "reason": "over"})
+    res = h.mgr.start_mission("do it", builders=1, scouts=0, reviewers=0)
+    assert not res["ok"] and "over" in res["error"]
+    assert h.mgr.list()["agents"] == []        # whole mission gated, nothing spawned
+
+
+def test_default_spawn_is_unlimited_and_allowed():
+    # no ceiling set in the isolated store -> the real gate fails open
+    h = Harness()
+    assert h.mgr.spawn(name="A")["ok"]
+
+
+def test_api_budget_get_and_set_roundtrip():
+    res = workspace.api_post("set_budget", proj="test",
+                             body={"cost_budget_usd": 7.5, "window_hours": 4})
+    assert res["ok"] and res["cost_budget_usd"] == 7.5
+    got = workspace.api_get("budget", proj="test")
+    assert got["ok"]
+    assert got["cost_budget_usd"] == 7.5 and got["window_hours"] == 4.0
+    assert got["remaining_usd"] == 7.5         # no spend yet
