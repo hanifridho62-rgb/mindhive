@@ -16,6 +16,12 @@ final result as ``assistant_response``, and a failed run as ``tool_failed``
 with signature ``workspace:<role>`` — so workspace activity flows into Memory,
 the graph, and the Improvements loop with zero extra plumbing.
 
+Output durability: the line buffer is a live VIEW that forgets its head at
+MAX_LINES and dies with the process, so every run also streams into a durable
+per-run artifact (runlog.py). All three exit paths — clean, failed, user-stopped
+— finalise that artifact and record a bounded excerpt plus its path, so no run
+can finish (or die) with its output written nowhere.
+
 MindSwarm reuses the same agents: a mission spawns a coordinator plus builders,
 scouts, and reviewers, each with a role lens appended to its system prompt that
 also tells it to read/write the shared Mind Hive memory (`hive recall` /
@@ -31,7 +37,7 @@ import subprocess
 import threading
 import time
 
-from . import claude_cli, events as ev_mod, paths
+from . import claude_cli, events as ev_mod, paths, runlog
 
 # Profile names end up interpolated into a Windows `cmd /k` string by
 # profile_login, so restrict them to an identifier-safe charset — no shell
@@ -435,6 +441,10 @@ class Agent:
         self.swarm = swarm
         self.status = "idle"            # idle | running | done | error | stopped
         self.lines: list = []
+        self.emitted = 0                # lines EVER emitted (absolute cursor)
+        self.run_count = 0              # sends so far — one run, one artifact
+        self.artifact = None            # path of the current/last run's artifact
+        self._runlog = None             # runlog.RunLog of the in-flight run
         self.session_id = None          # claude session for --resume continuity
         self.task_id = None             # kanban card being executed, if any
         self.skills_used: list = []     # Skill tool invocations, ordered, deduped
@@ -453,12 +463,20 @@ class Agent:
                 "session_id": self.session_id, "task_id": self.task_id,
                 "skills_used": list(self.skills_used),
                 "last_turns": self.last_turns, "last_cost": self.last_cost,
-                "created": self.created, "lines": len(self.lines)}
+                "created": self.created, "lines": len(self.lines),
+                "artifact": self.artifact}
 
     def emit(self, line: str) -> None:
         self.lines.append(line)
+        self.emitted += 1
         if len(self.lines) > MAX_LINES:
             del self.lines[:len(self.lines) - MAX_LINES]
+        # The ring is a live VIEW and forgets its head; the run artifact is the
+        # record and forgets nothing. Mirroring here (rather than at the stream
+        # loop) means no emit path can bypass durability.
+        rl = self._runlog
+        if rl is not None:
+            rl.append(line + "\n")
 
 
 class Manager:
@@ -536,14 +554,23 @@ class Manager:
         return {"ok": True, "removed": removed}
 
     def output(self, agent_id, since=0) -> dict:
+        """Lines after ``since``, plus how many this cursor can never see.
+
+        ``next`` is an ABSOLUTE line number (lines ever emitted), so a cursor
+        stays meaningful after the ring trims its head. A poller that falls
+        behind by more than MAX_LINES used to be clamped and silently resumed at
+        the wrong offset; now the gap is reported — a bounded view must announce
+        its bound. The untrimmed run lives in the agent's artifact."""
         a = self.get(agent_id)
         if a is None:
             return {"ok": False, "error": "unknown agent"}
         since = max(0, int(since))
-        # the buffer trims from the front; clamp so a stale cursor still works
-        since = min(since, len(a.lines))
-        return {"ok": True, "lines": a.lines[since:], "next": len(a.lines),
-                "status": a.status}
+        first = a.emitted - len(a.lines)       # absolute index of lines[0]
+        dropped = max(0, first - since)
+        start = max(0, min(since, a.emitted) - first)
+        return {"ok": True, "lines": a.lines[start:], "next": a.emitted,
+                "dropped": dropped, "status": a.status,
+                "artifact": a.artifact}
 
     # --- one run = one headless claude call ---------------------------------
     def send(self, agent_id, prompt, extra_system=None, add_dirs=None,
@@ -553,8 +580,13 @@ class Manager:
             return {"ok": False, "error": "unknown agent"}
         if not (prompt or "").strip():
             return {"ok": False, "error": "prompt is empty"}
-        if a.status == "running":
-            return {"ok": False, "error": f"{a.name} is busy — wait or stop it"}
+        if a.status == "running" and not self._settle_orphan(a):
+            # Structured and retryable (SOP 2.1) so a caller can wait or reroute.
+            # A bare string here was read as terminal by the Self-Reliant loop
+            # and killed whole runs; the message text is unchanged for the UI.
+            return {"ok": False, "error": f"{a.name} is busy — wait or stop it",
+                    "isError": True, "errorCategory": "agent_busy",
+                    "isRetryable": True}
         argv = [claude_cli.resolve_exe(), "--output-format", "stream-json",
                 "--verbose"]
         # Permission posture. Default is bypassPermissions: headless runs have
@@ -603,17 +635,69 @@ class Manager:
         threading.Thread(target=_feed_stdin, args=(a.proc, prompt),
                          daemon=True).start()
         a.status = "running"
+        # One send = one run = one artifact. Opened BEFORE the first emit so the
+        # prompt itself heads the durable record, and handed to the reader
+        # explicitly: a later send must never make an earlier reader finalise
+        # the wrong run.
+        a.run_count += 1
+        rl = runlog.RunLog(runlog.workspace_key(a.id, a.run_count),
+                           project=a.project)
+        a._runlog = rl
+        a.artifact = str(rl.path)
         a.emit(f"❯ {prompt}")
         self._log(a, "user_prompt", {"text": prompt, "agent": a.name,
                                      "role": a.role})
-        t = threading.Thread(target=self._reader, args=(a, a.proc), daemon=True)
+        t = threading.Thread(target=self._reader, args=(a, a.proc, rl),
+                             daemon=True)
         t.start()
         a._timer = threading.Timer(RUN_TIMEOUT_S, self._timeout_kill, args=(a, a.proc))
         a._timer.daemon = True
         a._timer.start()
         return {"ok": True, "agent": a.snapshot()}
 
+    def settle(self, agent_id) -> dict:
+        """Release an agent stuck at ``running`` whose run is actually over.
+
+        An orchestrator calls this between turns when it abandoned a turn at its
+        wall-clock budget. Reports whether anything was settled; a genuinely live
+        run is never yanked out from under itself."""
+        a = self.get(agent_id)
+        if a is None:
+            return {"ok": False, "error": "unknown agent"}
+        settled = a.status == "running" and self._settle_orphan(a)
+        return {"ok": True, "settled": settled, "agent": a.snapshot()}
+
+    def _settle_orphan(self, a) -> bool:
+        """True when an agent whose process has demonstrably exited but whose
+        status was never settled has been released.
+
+        The orphan cascade (documented at research.py:742-754): a turn crossing
+        its wall-clock budget leaves the run in flight; abandoning the worker
+        thread strands ``status == "running"``; the next ``send()`` then rejects
+        with "is busy", which the caller treats as terminal — "and the whole run
+        dies." ResearchController worked around it for itself, so the swarm and
+        MindParallel paths never inherited the fix. It lives here now.
+
+        The kill path stays single and explicit: this only settles a process
+        that has ALREADY exited, so it can never race ``_timeout_kill``."""
+        proc = a.proc
+        if proc is None or proc.poll() is None:
+            return False                     # live run (or a fake): leave it
+        if a._timer is not None:
+            a._timer.cancel()
+        rl, a._runlog = a._runlog, None
+        if rl is not None:
+            artifact = rl.finalise()         # keep whatever the orphan produced
+            if artifact:
+                a.artifact = artifact
+        a.status = "stopped"
+        a.emit("■ orphaned run settled — its process had already exited")
+        return True
+
     def _timeout_kill(self, a, proc):
+        # Sole owner of the kill path: the reader thread owns settling, and
+        # _settle_orphan only touches already-exited processes, so no two
+        # mechanisms can fight over one run.
         if proc.poll() is None:
             try:
                 proc.kill()
@@ -621,7 +705,7 @@ class Manager:
                 pass
             a.emit(f"✖ run exceeded {RUN_TIMEOUT_S}s — killed")
 
-    def _reader(self, a, proc):
+    def _reader(self, a, proc, rl=None):
         """Drain one run's stream-json stdout into the agent buffer, then
         record the outcome in the ledger and release any kanban card."""
         result_text, saw_result = "", False
@@ -666,16 +750,40 @@ class Manager:
         code = proc.wait()
         if a._timer is not None:
             a._timer.cancel()
-        if a.status == "stopped":
-            pass                                     # user kill already reported
-        elif code == 0 and saw_result:
+        stopped = a.status == "stopped"
+        clean = (code == 0 and saw_result)
+        if not stopped and not clean:
+            a.emit(f"✖ run failed (exit {code})")    # recorded, then persisted
+        # Persist BEFORE any branch decides what to say: no exit path may
+        # discard produced output. The event keeps a bounded excerpt plus the
+        # pointer; the artifact keeps the whole run.
+        artifact = rl.finalise() if rl is not None else None
+        excerpt = rl.excerpt() if rl is not None else ""
+        if a._runlog is rl:
+            a._runlog = None
+        if artifact:
+            a.artifact = artifact
+        text = ((result_text or "").strip() or excerpt)[:2000] or "(no text)"
+        if stopped:
+            # a user stop recorded nothing at all before MN-0 — interrupted work
+            # is still work the operator paid for
+            self._log(a, "assistant_response",
+                      {"text": text, "agent": a.name, "role": a.role,
+                       "artifact": artifact, "partial": True})
+        elif clean:
             a.status = "done"
             self._log(a, "assistant_response",
-                      {"text": (result_text or "").strip()[:2000] or "(no text)",
-                       "agent": a.name, "role": a.role})
+                      {"text": text, "agent": a.name, "role": a.role,
+                       "artifact": artifact, "partial": False})
         else:
             a.status = "error"
-            a.emit(f"✖ run failed (exit {code})")
+            # A non-zero exit (or a missing `result` event) used to log ONLY the
+            # bare tool_failed below: a run that did real work and then died lost
+            # 100% of that work's record. The partial response goes first so the
+            # output is durable before the failure is reported.
+            self._log(a, "assistant_response",
+                      {"text": text, "agent": a.name, "role": a.role,
+                       "artifact": artifact, "partial": True})
             self._log(a, "tool_failed",
                       {"text": f"workspace run failed (exit {code})",
                        "signature": f"workspace:{a.role}",
