@@ -36,6 +36,49 @@ def test_append_no_payload_returns_2():
     assert ret == 2
 
 
+# --- registry contracts at the CLI append surface ---------------------------
+# `hive append <registry type>` accepts an arbitrary payload, so a MALFORMED
+# lifecycle event could ride the hash chain as dead weight. These prove the
+# mindnet_task contract is enforced here. Scope note: shape validation cannot
+# refuse a *well-formed* but illegitimate payload (a phase jump is shape-valid);
+# that is the phase controller's job, not this gate's.
+
+def test_append_mindnet_task_malformed_is_rejected(capsys):
+    bad = '{"action": "declare", "title": "no task_id here"}'
+    assert cli_mod.main(["append", "mindnet_task", bad, "--json"]) == 2
+    err = capsys.readouterr().err
+    assert "task_id" in err                 # the validator's own reason
+    assert "hive mindnet" in err            # the corrective hint
+    assert events.read_all() == []          # nothing entered the chain
+
+
+def test_append_mindnet_task_unknown_action_is_rejected(capsys):
+    bad = '{"action": "teleport", "task_id": "mn1-u1"}'
+    assert cli_mod.main(["append", "mindnet_task", bad, "--json"]) == 2
+    assert "hive mindnet" in capsys.readouterr().err
+    assert events.read_all() == []
+
+
+def test_append_mindnet_task_wellformed_appends_and_folds():
+    """The discriminating half: the gate refuses malformed rows only — a valid
+    declare still lands and still folds into the graph projection."""
+    from mindhive.mindnet import tasks as tasks_mod
+    good = ('{"action": "declare", "task_id": "mn1-u1", '
+            '"title": "Gate both append surfaces"}')
+    assert cli_mod.main(["append", "mindnet_task", good, "--json"]) == 0
+    evs = events.read_all()
+    assert len(evs) == 1 and evs[0].type == "mindnet_task"
+    graph = tasks_mod.fold(evs)
+    assert graph["mn1-u1"].title == "Gate both append surfaces"
+
+
+def test_append_free_text_type_is_not_gated_by_any_contract():
+    """A type with no registered contract must stay wide open — the dispatch is
+    a gate on the registry, not on the store."""
+    assert cli_mod.main(["append", "decision", "no contract applies here"]) == 0
+    assert len(events.read_all()) == 1
+
+
 def test_hook_post_tool_use_captures_from_stdin(monkeypatch):
     payload = '{"session_id":"s9","tool_name":"Bash","tool_input":{"command":"pytest -q"}}'
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))

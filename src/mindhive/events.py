@@ -1,4 +1,5 @@
 # src/mindhive/events.py
+import importlib
 import json
 import os
 import time
@@ -85,6 +86,50 @@ VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 # LEDGER, the hash-chained intent layer, and the knowledge graph — but are shown
 # in the Memory view so the full exchange is visible in the hive.
 MEMORY_VIEW_TYPES = SEMANTIC_TYPES | {"user_prompt", "assistant_response"}
+
+# --- registry payload contracts ----------------------------------------------
+# DATA_MODEL.md §6.2: the store stays type-agnostic (append_event does NOT call
+# this — every internal writer already builds a valid payload), and each type's
+# contract lives in its owning module, enforced at the surfaces that accept an
+# arbitrary type+payload from the user. There are TWO such surfaces — `hive
+# append` and the dashboard's POST /api/append — so the dispatch lives here,
+# beside the type registry, instead of being copied into both. Copying is how
+# they drifted: the CLI enforced four contracts and the endpoint enforced none.
+#
+# event type -> (contract module, corrective hint carried in the rejection)
+_PAYLOAD_CONTRACTS = {
+    "code_change": (".changelog", 'hive log <category> "..."'),
+    "sop": (".sop", "hive sop add|update|delete …"),
+    "roadmap": (".roadmap",
+                "hive roadmap set|step|interrupt|resume|complete …"),
+    "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
+    "mindnet_task": (".mindnet.tasks",
+                     "hive mindnet declare|status|depend|reparent|evidence …"),
+    # mindnet_phase is deliberately ABSENT: its contract module
+    # (mindnet/phases.py) does not exist yet, and a row here pointing at a
+    # missing module would turn every append of that type into an ImportError.
+    # The MN-1 unit that creates phases.py adds the row.
+}
+
+
+def validate_typed_payload(event_type, payload) -> None:
+    """Enforce *event_type*'s registry contract at an arbitrary-payload append
+    surface. Raises ``ValueError`` whose message already carries the corrective
+    hint, so both surfaces report the same thing. A type with no registered
+    contract — every free-text memo and every telemetry type — is accepted
+    unchanged, which keeps this a gate on the registry, not on the store."""
+    contract = _PAYLOAD_CONTRACTS.get(event_type)
+    if contract is None:
+        return
+    module_name, hint = contract
+    # Deferred import: keeps `hive` startup cheap and the import side effects
+    # of five modules scoped to the one append that actually needs them.
+    mod = importlib.import_module(module_name, __package__)
+    try:
+        mod.validate_payload(payload)
+    except ValueError as e:
+        raise ValueError(f"{e} (use: {hint})") from e
+
 
 # --- provenance: which outputs came from a Self-Reliant run ------------------
 # Self-Reliant stamps everything it writes twice: every event is tagged

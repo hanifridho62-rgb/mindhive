@@ -429,6 +429,75 @@ def test_append_creates_event(dashboard_server):
     assert "ts" in obj
 
 
+# --- registry contracts at the dashboard append surface ---------------------
+# POST /api/append is the second surface that takes an arbitrary type+payload.
+# It used to hardcode {"text": payload} — discarding any structured body, so it
+# could not produce a valid registry payload at all — and it ran none of the
+# per-type contracts `hive append` enforces. Both halves are covered here.
+# Scope note: this is shape validation. A well-formed payload is accepted by
+# design; refusing an illegitimate-but-well-formed one is the controller's job.
+
+def test_append_keeps_structured_payload_for_registry_type(dashboard_server):
+    from mindhive import events
+    from mindhive.mindnet import tasks as tasks_mod
+    base, token = dashboard_server
+    payload = {"action": "declare", "task_id": "dash-u1",
+               "title": "structured bodies survive the endpoint"}
+    status, obj = _post(base, "/api/append",
+                        {"type": "mindnet_task", "payload": payload,
+                         "project": "p"}, token)
+    assert status == 200 and obj["ok"] is True
+    evs = events.read_all("p")
+    assert len(evs) == 1
+    # The real payload was stored — not {"text": …} — so it round-trips through
+    # its own contract and folds into the graph.
+    assert evs[0].payload == payload
+    tasks_mod.validate_payload(evs[0].payload)
+    assert tasks_mod.fold(evs)["dash-u1"].title == payload["title"]
+
+
+def test_append_rejects_malformed_registry_payload(dashboard_server):
+    from mindhive import events
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/append",
+                        {"type": "mindnet_task",
+                         "payload": {"action": "declare"},   # no task_id
+                         "project": "p"}, token)
+    # An expected domain rejection, not a server fault.
+    assert status == 200
+    assert obj["ok"] is False
+    assert "task_id" in obj["error"] and "hive mindnet" in obj["error"]
+    assert events.read_all("p") == []       # the ledger is unchanged
+
+
+def test_append_validates_the_other_registry_types_too(dashboard_server):
+    """The endpoint now enforces every contract the CLI does, not just the new
+    one — roadmap stands in for the four that predate mindnet_task."""
+    from mindhive import events
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/append",
+                        {"type": "roadmap", "payload": {"action": "set"},
+                         "project": "p"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "hive roadmap" in obj["error"]
+    assert events.read_all("p") == []
+
+
+def test_append_still_wraps_plain_text_for_free_text_types(dashboard_server):
+    """Regression: the {"text": …} path must survive for uncontracted types —
+    it is what the dashboard's own Append box sends."""
+    from mindhive import events
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/append",
+                        {"type": "decision", "payload": "a plain string note",
+                         "tags": "test", "project": "p"}, token)
+    assert status == 200 and obj["ok"] is True and obj["type"] == "decision"
+    evs = events.read_all("p")
+    assert len(evs) == 1
+    assert evs[0].payload == {"text": "a plain string note"}
+    assert evs[0].tags == ["test"]
+
+
 def test_post_requires_token(dashboard_server):
     base, token = dashboard_server
     url = f"{base}/api/project"

@@ -764,11 +764,27 @@ def make_handler(token: str):
 
         def _post_append(self, proj, body):
             etype = body.get("type")
-            text = body.get("payload", "")
+            raw = body.get("payload", "")
             tags = [t for t in (body.get("tags") or "").split(",") if t]
             if not etype:
                 return self._json({"ok": False, "error": "type is required"}, 200)
-            ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
+            # A structured body IS the payload; only a plain string is free
+            # text needing the {"text": …} wrapper. Wrapping unconditionally
+            # meant this endpoint could never produce a valid registry payload
+            # (a mindnet_task/roadmap/sop/code_change/autoresume contract is
+            # never one text field) — so validating without this first would
+            # have rejected every registry append instead of gating it.
+            payload = raw if isinstance(raw, dict) else {"text": raw}
+            try:
+                # The same dispatch `hive append` runs (events._PAYLOAD_
+                # CONTRACTS), so the CLI and this endpoint cannot drift.
+                events.validate_typed_payload(etype, payload)
+            except ValueError as e:
+                # An expected domain rejection, not a server fault: ok:False,
+                # 200 like _post_embed's LIVE_LOCK. Nothing is appended, and
+                # nothing raises out of the handler.
+                return self._json({"ok": False, "error": str(e)}, 200)
+            ev = events.append_event(etype, payload, tags=tags, project=proj)
             projector.project(proj)
             return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
 

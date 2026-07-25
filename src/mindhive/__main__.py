@@ -40,49 +40,18 @@ def cmd_append(args) -> int | None:
         print("error: provide a payload argument or use --stdin", file=sys.stderr)
         return 2
     payload = json.loads(raw) if args.json else {"text": raw}
-    if args.type == "code_change":
-        # The change-log is only mandatory if the generic append path can't
-        # smuggle an uncategorized/unexplained entry past it. The event store
-        # itself stays type-agnostic — the contract is enforced here, at the
-        # one surface that accepts an arbitrary type+payload from the user.
-        from . import changelog as changelog_mod
-        try:
-            changelog_mod.validate_payload(payload)
-        except ValueError as e:
-            print(f'error: {e} (use: hive log <category> "...")',
-                  file=sys.stderr)
-            return 2
-    elif args.type == "sop":
-        # Same reasoning for the SOP registry: the raw append path must not
-        # smuggle a malformed lifecycle event past the sop contract.
-        from . import sop as sop_mod
-        try:
-            sop_mod.validate_payload(payload)
-        except ValueError as e:
-            print(f"error: {e} (use: hive sop add|update|delete …)",
-                  file=sys.stderr)
-            return 2
-    elif args.type == "roadmap":
-        # And for the roadmap registry: a malformed lifecycle event would
-        # corrupt no fold (reads are total) but would still be dead weight in
-        # the chain — reject it at the one arbitrary-payload surface.
-        from . import roadmap as roadmap_mod
-        try:
-            roadmap_mod.validate_payload(payload)
-        except ValueError as e:
-            print(f"error: {e} (use: hive roadmap set|step|interrupt|"
-                  f"resume|complete …)", file=sys.stderr)
-            return 2
-    elif args.type == "autoresume":
-        # Same stance for the delivery telemetry: the raw path must not
-        # smuggle a malformed lifecycle event past the autoresume contract.
-        from . import autoresume as autoresume_mod
-        try:
-            autoresume_mod.validate_payload(payload)
-        except ValueError as e:
-            print(f"error: {e} (use: hive autoresume schedule|fire|"
-                  f"cancel …)", file=sys.stderr)
-            return 2
+    # A registry type's contract is only mandatory if the generic append path
+    # can't smuggle a malformed lifecycle event past it. The event store itself
+    # stays type-agnostic — the contract is enforced here, at a surface that
+    # accepts an arbitrary type+payload from the user. There are two such
+    # surfaces (this one and the dashboard's POST /api/append), so the dispatch
+    # they share lives in events.validate_typed_payload; keeping the branch
+    # list in one place is what stops the two from drifting apart.
+    try:
+        events.validate_typed_payload(args.type, payload)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     tags = [t for t in args.tags.split(",") if t]
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
