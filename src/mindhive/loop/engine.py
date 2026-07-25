@@ -3,7 +3,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .. import events, guard, recall as recall_mod
+from .. import events, guard, recall as recall_mod, runlog as runlog_mod
 from ..briefing import build_briefing
 from . import budget as budget_mod
 from . import context as ctx_mod
@@ -156,12 +156,21 @@ def run_loop(project, loop_dir, cfg, driver, *,
             error_sig = "rate_limited" if result.rate_limited else result.error
             occupancy = result.usage.context_occupancy
 
+            # The payload's `summary` is one line captured by `summary:\s*(.+)`
+            # and is "" whenever the model omits that field — which used to make
+            # the whole reply unrecoverable. Persist the reply itself first, in
+            # full, and carry the pointer; `summary` stays exactly as it was.
+            artifact = runlog_mod.write_once(
+                runlog_mod.loop_key(run_id, iteration), result.text,
+                project=project)
+
             events.append_event("loop_iteration", {
                 "run_id": run_id,
                 "model": model,
                 "tier": tier,
                 "iteration": iteration,
                 "summary": status.summary or "",
+                "artifact": artifact,
                 "progress": progressed,
                 "cost_usd": result.usage.cost_usd,
                 "total_tokens": result.usage.total_tokens,

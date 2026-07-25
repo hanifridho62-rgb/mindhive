@@ -1,5 +1,7 @@
 # tests/test_loop_engine.py
-from mindhive import events
+from pathlib import Path
+
+from mindhive import events, runlog
 from mindhive.loop import engine, config
 from mindhive.loop.driver import DriverResult, Usage
 
@@ -286,6 +288,93 @@ def test_non_usage_endings_append_no_roadmap(tmp_path, monkeypatch):
                     progress_fn=lambda i: True)
     assert not [e for e in events.read_all()
                 if e.type in ("roadmap", "autoresume")]
+
+
+# --- MN-0 D1: only a single regex-captured line used to survive ----------------
+
+def _only_iteration():
+    return next(e for e in events.read_all() if e.type == "loop_iteration")
+
+
+def test_iteration_without_a_summary_line_still_persists_the_full_reply(
+        tmp_path, monkeypatch):
+    """D1 regression (engine.py:159-171 + contract.py:10 before MN-0): the
+    iteration payload was `status.summary or ""` — one line captured by
+    `summary:\\s*(.+)`. When the model never emitted a `summary:` line the ledger
+    recorded an EMPTY STRING and the entire worked output was written nowhere.
+    That is the reported "finished but the output isn't shown" symptom."""
+    loop_dir = _setup(tmp_path, monkeypatch)
+    reply = ("I rewrote the tokenizer and re-ran the suite: 41 pass, 3 skip.\n"
+             "The remaining skips need network access.\n"
+             "LOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n")
+    assert "summary:" not in reply.lower()          # the defect's trigger
+    drv = FakeDriver([_result(reply)])
+    cfg = config.LoopConfig(max_iterations=1)
+    result = engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg,
+                             driver=drv, now_fn=_fake_clock(),
+                             sleep_fn=lambda s: None, progress_fn=lambda i: True)
+
+    it = _only_iteration()
+    assert it.payload["summary"] == ""              # unchanged, deliberately
+    # ...but the reply itself is now durable, in full
+    assert it.payload["artifact"] == str(
+        runlog.artifact_path(runlog.loop_key(result["run_id"], 1)))
+    assert Path(it.payload["artifact"]).read_text(encoding="utf-8") == reply
+
+
+def test_iteration_with_a_summary_keeps_both_the_line_and_the_full_reply(
+        tmp_path, monkeypatch):
+    loop_dir = _setup(tmp_path, monkeypatch)
+    reply = ("long working notes here\n"
+             "LOOP_STATUS:\n  progress: true\n  EXIT_SIGNAL: false\n"
+             "  summary: tokenizer rewritten\n")
+    drv = FakeDriver([_result(reply)])
+    cfg = config.LoopConfig(max_iterations=1)
+    engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                    now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                    progress_fn=lambda i: True)
+    it = _only_iteration()
+    assert it.payload["summary"] == "tokenizer rewritten"
+    assert "long working notes here" in Path(
+        it.payload["artifact"]).read_text(encoding="utf-8")
+
+
+def test_iteration_that_produced_no_text_carries_no_artifact(tmp_path, monkeypatch):
+    """A timed-out driver returns text="" — an empty artifact would be noise on
+    the operator's disk, so the pointer is None and consumers degrade."""
+    loop_dir = _setup(tmp_path, monkeypatch)
+    timeout = DriverResult(text="", usage=Usage(), session_id=None, num_turns=0,
+                           rate_limited=False, error="timeout")
+    drv = FakeDriver([timeout])
+    cfg = config.LoopConfig(max_iterations=1)
+    engine.run_loop(project="test", loop_dir=loop_dir, cfg=cfg, driver=drv,
+                    now_fn=_fake_clock(), sleep_fn=lambda s: None,
+                    progress_fn=lambda i: True)
+    assert _only_iteration().payload["artifact"] is None
+    assert runlog.list_artifacts("test") == []
+
+
+def test_historical_iteration_without_an_artifact_still_folds(tmp_path, monkeypatch):
+    """Payload-extension canary (spec §3.4, risk 3): iterations written before
+    MN-0 have no `artifact` key. The loop projections must keep folding them —
+    and be seen to actually PROCESS the row, not skip it."""
+    _setup(tmp_path, monkeypatch)
+    from mindhive import taskview
+    from mindhive.loop import state as loop_state
+    events.append_event("loop_run_start",
+                        {"run_id": "old1", "title": "Legacy run",
+                         "max_iterations": 3}, project="test")
+    events.append_event("loop_iteration",
+                        {"run_id": "old1", "iteration": 1,
+                         "summary": "did a thing", "progress": True,
+                         "cost_usd": 0.02, "total_tokens": 500},
+                        project="test")
+
+    st = loop_state.last_run_status("test")
+    assert st["iterations"] == 1                   # folded, not skipped
+    rows = taskview.items(events.read_all("test"))
+    loops = [r for r in rows["items"] if r.get("kind") == "loop"]
+    assert loops and loops[0]["text"] == "did a thing"
 
 
 def test_heuristic_blocked_iteration_does_not_trip_breaker(tmp_path, monkeypatch):

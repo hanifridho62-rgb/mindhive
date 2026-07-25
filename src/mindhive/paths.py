@@ -81,6 +81,13 @@ def events_dir(project: str | None = None) -> Path:
     return project_dir(project) / "events"
 
 
+def runs_dir(project: str | None = None) -> Path:
+    """Per-run output artifacts (runlog.py). Evidence, not a projection: unlike
+    events/ these are not rebuildable, and losing one degrades every consumer to
+    the bounded excerpt its ledger event carries."""
+    return project_dir(project) / "runs"
+
+
 def known_projects() -> set[str]:
     """Registered namespace names from the autosync registry (`autosync.json`) —
     the store's allow-list of 'real' projects. Read the file directly rather than

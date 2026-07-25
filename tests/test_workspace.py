@@ -8,10 +8,11 @@ subprocess is ever launched.
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
-from mindhive import workspace
+from mindhive import runlog, workspace
 
 
 # --- fakes ------------------------------------------------------------------
@@ -903,3 +904,311 @@ def test_api_post_profile_roundtrip():
                              body={"name": "p1", "config_dir": "C:/x"})
     assert res["ok"]
     assert workspace.api_post("profile_remove", body={"name": "p1"})["ok"]
+
+
+# --- MN-0: output durability ----------------------------------------------------
+# Every test below pins one of the four defects read in the code on 2026-07-25
+# (docs/superpowers/specs/2026-07-25-mn0-parallel-output-durability-design.md).
+
+
+class _GatedProc(FakeProc):
+    """A FakeProc that streams its lines and then blocks, so a test can act on
+    a run that is genuinely mid-flight (the user pressing Stop, a timeout kill)
+    instead of racing an instantly-finished fake."""
+
+    def __init__(self, lines, code=0):
+        super().__init__(lines, code=code)
+        self.streamed = threading.Event()
+        self.release = threading.Event()
+        self.stdout = self._gen(list(lines))
+
+    def _gen(self, lines):
+        for ln in lines:
+            yield ln
+        self.streamed.set()
+        self.release.wait(5)
+
+
+def _gated(h, lines, code=0):
+    """Re-point a Harness at gated procs; returns the list they land in."""
+    procs = []
+
+    def spawn(argv, env, cwd):
+        p = _GatedProc(list(lines), code=code)
+        h.calls.append((argv, env, cwd))
+        h.procs.append(p)
+        procs.append(p)
+        return p
+
+    h.mgr._spawn = spawn
+    return procs
+
+
+def _artifact_of(payload) -> str:
+    """The artifact body a ledger event points at."""
+    path = payload["artifact"]
+    assert path, "event carries no artifact pointer"
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _events_of(h, etype) -> list:
+    return [p for (t, p, _kw) in h.events if t == etype]
+
+
+def _wait_event(h, etype, timeout=5.0) -> list:
+    """Block until the reader thread has logged `etype`.
+
+    `_wait_settled` is not enough on the stop path: stop() flips the status to
+    "stopped" immediately, so it returns while the reader is still finalising —
+    the ledger write is the event to wait for, not the status."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = _events_of(h, etype)
+        if found:
+            return found
+        time.sleep(0.01)
+    raise AssertionError(f"{etype} was never logged")
+
+
+# --- D3: the failure path used to discard 100% of the work's record -----------
+
+def test_failed_run_persists_the_output_it_produced():
+    """D3 regression (workspace.py:676-682 before MN-0): on a non-zero exit with
+    no `result` event, the accumulated output was never written anywhere — only
+    a bare tool_failed naming the exit code. A run that did real work and then
+    died lost the entire record of that work. This is the reported "stops
+    midway" symptom."""
+    lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s1", "model": "m"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "migrated the parser"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "41 of 44 tests pass"}]}}),
+        # NB: no result event — the run dies before the CLI emits one
+    ]
+    h = Harness(lines=lines, code=1)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "do the migration")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+
+    assert a.status == "error"
+    # the produced output is durably recorded BEFORE the failure is logged:
+    # no work is discarded on the way to reporting the error
+    etypes = [e[0] for e in h.events]
+    assert etypes == ["user_prompt", "assistant_response", "tool_failed"]
+    resp = h.events[1][1]
+    assert resp["partial"] is True
+    assert "migrated the parser" in resp["text"]
+    body = _artifact_of(resp)
+    assert "migrated the parser" in body
+    assert "41 of 44 tests pass" in body
+    # and the failure record itself is unchanged (Improvements still sees it)
+    assert h.events[2][1]["signature"] == "workspace:agent"
+
+
+def test_stopped_run_persists_what_it_had_produced():
+    """The user-stop path recorded nothing at all before MN-0. Work the operator
+    interrupted is still work they paid for."""
+    lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s1", "model": "m"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "found the root cause"}]}}),
+    ]
+    h = Harness()
+    procs = _gated(h, lines)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "investigate")
+    assert procs[0].streamed.wait(5)
+    h.mgr.stop(aid)                       # user presses Stop mid-run
+    procs[0].release.set()
+    a = _agent_obj(h, aid)
+    resps = _wait_event(h, "assistant_response")
+
+    assert a.status == "stopped"
+    assert len(resps) == 1
+    assert resps[0]["partial"] is True
+    assert "found the root cause" in _artifact_of(resps[0])
+
+
+# --- D2: truncation and volatility ---------------------------------------------
+
+def test_clean_run_keeps_its_event_shape_and_gains_an_artifact_pointer():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    _wait_settled(_agent_obj(h, aid))
+    resp = _events_of(h, "assistant_response")[0]
+    assert resp["text"] == "all done"          # unchanged shape for consumers
+    assert resp["partial"] is False
+    assert "working on it" in _artifact_of(resp)
+
+
+def test_long_run_is_complete_on_disk_while_ring_and_excerpt_stay_bounded():
+    """D2: the durable record was capped at 2000 chars over a volatile 4000-line
+    in-memory ring, so a long run lost its BEGINNING from the live view and lost
+    everything but the excerpt on a dashboard restart."""
+    n = workspace.MAX_LINES + 200
+    lines = [json.dumps({"type": "system", "subtype": "init",
+                         "session_id": "s1", "model": "m"})]
+    lines += [json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": f"chunk {i}"}]}}) for i in range(n)]
+    lines.append(json.dumps({"type": "result", "subtype": "success",
+                             "result": "R" * 5000, "num_turns": 1,
+                             "total_cost_usd": 0.1, "session_id": "s1"}))
+    h = Harness(lines=lines)
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "long job")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+
+    # the live ring did lose the beginning — that part is by design
+    assert len(a.lines) == workspace.MAX_LINES
+    assert "chunk 0" not in a.lines
+    # the excerpt in the event stays bounded, exactly as before MN-0
+    resp = _events_of(h, "assistant_response")[0]
+    assert len(resp["text"]) == 2000
+    # ...but nothing is lost: the artifact holds the whole run, head included
+    body = _artifact_of(resp)
+    assert "chunk 0" in body
+    assert f"chunk {n - 1}" in body
+
+
+def test_run_artifact_outlives_the_manager():
+    """Restart durability: the fleet object is discarded (a dashboard restart)
+    and the run's output is still retrievable from disk."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    key = runlog.workspace_key(a.id, 1)
+    path = a.artifact
+    del h
+    assert runlog.read(key) is not None
+    assert "working on it" in Path(path).read_text(encoding="utf-8")
+
+
+def test_each_send_gets_its_own_artifact():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "first")
+    _wait_settled(_agent_obj(h, aid))
+    h.mgr.send(aid, "second")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    paths_seen = [p["artifact"] for p in _events_of(h, "assistant_response")]
+    assert len(set(paths_seen)) == 2           # one run, one artifact
+    assert "❯ second" in Path(paths_seen[1]).read_text(encoding="utf-8")
+    assert "❯ first" not in Path(paths_seen[1]).read_text(encoding="utf-8")
+
+
+def test_snapshot_carries_the_artifact_pointer():
+    h = Harness()
+    snap = h.mgr.spawn(name="A")["agent"]
+    assert snap["artifact"] is None             # nothing run yet
+    aid = snap["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    assert a.snapshot()["artifact"] == a.artifact
+    assert a.artifact
+
+
+# --- D2 (cursor honesty): a bounded view must announce its bound ---------------
+
+def test_output_reports_lines_a_stale_cursor_can_never_see():
+    """`since = min(since, len(a.lines))` kept polling alive but silently
+    resumed at the wrong offset once the ring had trimmed past the cursor. The
+    gap is now reported instead of hidden."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    a = _agent_obj(h, aid)
+    first = h.mgr.output(aid, since=0)
+    assert first["dropped"] == 0
+    overflow = 50
+    for i in range(workspace.MAX_LINES + overflow):
+        a.emit(f"line {i}")
+
+    out = h.mgr.output(aid, since=first["next"])
+    # spawn banner + overflow lines fell out of the ring; the poller's cursor
+    # had only consumed the banner, so exactly `overflow` lines are unreachable
+    assert out["dropped"] == overflow
+    assert len(out["lines"]) == workspace.MAX_LINES
+    assert out["next"] == workspace.MAX_LINES + overflow + 1
+    # a cursor that is up to date reports no loss — the canary proving the
+    # count above tracks real trimming rather than always being nonzero
+    fresh = h.mgr.output(aid, since=out["next"])
+    assert fresh["dropped"] == 0 and fresh["lines"] == []
+
+
+# --- D4: a timed-out run orphaned the agent and killed the next turn ----------
+
+def test_send_settles_an_agent_whose_run_died_without_settling():
+    """D4 (research.py:742-754 documents the cascade): a turn crossing its
+    wall-clock budget left the agent's status stuck at "running"; the NEXT
+    send() rejected with "is busy", which the loop treated as terminal — "and
+    the whole run dies." The guard now lives in Manager, so the swarm and
+    MindParallel paths inherit it, not just ResearchController."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "first")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    a.status = "running"                  # the orphan: process gone, status stuck
+
+    res = h.mgr.send(aid, "second")
+    assert res["ok"], "an orphaned agent must be settled, not declared busy"
+    _wait_settled(a)
+    assert a.status == "done"
+    assert len(h.calls) == 2              # the second run really was dispatched
+
+
+def test_genuinely_busy_agent_returns_a_structured_retryable_error():
+    """SOP 2.1: failures carry isError/errorCategory/isRetryable so a caller can
+    reroute instead of treating a bare string as terminal."""
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    a = _agent_obj(h, aid)
+    a.proc, a.status = None, "running"    # live run, nothing to settle
+    res = h.mgr.send(aid, "hi")
+    assert not res["ok"]
+    assert "busy" in res["error"]         # unchanged operator-facing message
+    assert res["isError"] is True
+    assert res["errorCategory"] == "agent_busy"
+    assert res["isRetryable"] is True
+
+
+def test_settle_releases_an_orphan_and_leaves_a_live_run_alone():
+    h = Harness()
+    aid = h.mgr.spawn(name="A")["agent"]["id"]
+    h.mgr.send(aid, "go")
+    a = _agent_obj(h, aid)
+    _wait_settled(a)
+    a.status = "running"
+    assert h.mgr.settle(aid)["settled"] is True
+    assert a.status != "running"
+    # a genuinely live run is never settled out from under itself
+    a.proc, a.status = None, "running"
+    assert h.mgr.settle(aid)["settled"] is False
+    assert a.status == "running"
+    assert not h.mgr.settle("nope")["ok"]
+
+
+# --- payload-extension canary (spec §3.4, risk 3) ------------------------------
+
+def test_historical_assistant_response_without_an_artifact_still_folds():
+    """Events written before MN-0 carry no `artifact` / `partial` keys. The
+    ledger is never migrated, so every reader must keep folding them — and be
+    seen to actually PROCESS the row rather than skip it."""
+    from mindhive import events as ev_mod, oversee
+    ev_mod.append_event("assistant_response",
+                        {"text": "an answer from before MN-0", "agent": "A",
+                         "role": "agent"},
+                        session_id="ws-legacy", tags=["workspace", "parallel"])
+    evs = ev_mod.read_all()
+    rows = oversee.interactive_sessions(evs=evs)
+    row = next(s for s in rows if s["run_id"] == "ws-legacy")
+    assert "an answer from before MN-0" in row["doing"]   # folded, not skipped
