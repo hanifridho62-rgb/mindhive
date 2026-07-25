@@ -86,7 +86,8 @@ def collapse(items, threshold: float = DEFAULT_THRESHOLD) -> list:
         # roadmap lifecycle events (an add and its later update) are distinct
         # steps of one record's history (mirrors the CONSOLIDATE_TYPES
         # exemption in consolidate.py).
-        if item.get("type") in ("code_change", "sop", "roadmap"):
+        if item.get("type") in ("code_change", "sop", "roadmap",
+                                "mindnet_task", "mindnet_phase"):
             rep = dict(item)
             rep["similar_count"] = 0
             out.append(rep)

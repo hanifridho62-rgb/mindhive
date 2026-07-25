@@ -30,8 +30,12 @@ from . import dedupe, events as ev_mod, guard, paths, projector
 # event — absorbing one would silently rewrite the current SOP set. roadmap
 # is exempt for the same reason: roadmap.fold replays every set/step/
 # interrupt event, and absorbing one would silently rewrite a plan's progress.
+# mindnet_task / mindnet_phase are exempt for the same replay reason: both
+# folds replay EVERY lifecycle event, so absorbing one would silently rewrite a
+# task's dependencies or a phase's evidence trail.
 CONSOLIDATE_TYPES = ev_mod.SEMANTIC_TYPES - {"state_set", "code_change",
-                                             "learning", "sop", "roadmap"}
+                                             "learning", "sop", "roadmap",
+                                             "mindnet_task", "mindnet_phase"}
 DEFAULT_LIMIT = 3            # clusters merged per pass
 DEFAULT_COOLDOWN_HOURS = 6.0
 _MARKER = "consolidate_marker.json"

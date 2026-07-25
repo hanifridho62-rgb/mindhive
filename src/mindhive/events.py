@@ -28,6 +28,18 @@ SEMANTIC_TYPES = {
     # interrupted plan projects into STATE.md as the out-of-usage marker that
     # preserves creation context for the next session.
     "roadmap",
+    # MindNetwork MN-2 task graph lifecycle (declare/status/phase/depend/
+    # reparent/evidence — see mindnet/tasks.py): the hierarchical task tree the
+    # flat roadmap cannot express (no parent_id, 50-step cap, wholesale-replace
+    # only). Semantic so the graph is recallable and chain-verified; the current
+    # graph is a deterministic fold that REFUSES cycle-closing edges rather than
+    # merely reporting them.
+    "mindnet_task",
+    # MindNetwork MN-1 phase spine lifecycle (see mindnet/controller.py): which
+    # phase a task is in and the evidence satisfying each exit criterion. Every
+    # satisfaction records verified_by (python | agent | human) so a claim
+    # nobody machine-checked can never fold as if it had been.
+    "mindnet_phase",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
@@ -56,6 +68,14 @@ DETERMINISTIC_TYPES = {
     # delivery audit trail (when it was due, whether it fired, what came
     # back).
     "autoresume",
+    # MindNetwork MN-5 cat-status feed: one event per faculty waking or going
+    # idle (skill-plugin, sop, improvements, history, task-graph, compatibility,
+    # pr-green). Deterministic, NOT semantic — it is high-volume UI telemetry
+    # and must never bloat the hash chain. Deliberately ledger-derived rather
+    # than in-memory: R16's "a missing cat means a real bug" collapses if the
+    # feed can vanish for unrelated reasons (MindSwarm's mission state is a
+    # plain instance attribute that dies with the server).
+    "mindnet_activity",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
