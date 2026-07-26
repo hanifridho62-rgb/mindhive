@@ -509,7 +509,22 @@ def test_the_temp_name_is_distinct_per_writer(monkeypatch):
     monkeypatch.setattr(os, "replace", spy)
     state, stamp = _sized_state(2), _stamp()
 
+    # A barrier holds all four threads ALIVE AT ONCE, and that is the whole
+    # point rather than a detail of the setup. `threading.get_ident` is only
+    # guaranteed unique among CURRENTLY RUNNING threads — CPython recycles an
+    # ident once a thread exits. Starting four threads in a loop lets an early
+    # one finish before a later one starts, so the later one legitimately
+    # inherits the dead one's ident and the names collide through no fault of
+    # the writer. That is exactly what CI caught on Linux/py3.12 while Windows
+    # and py3.11 happened not to recycle: a green test resting on timing.
+    #
+    # The invariant the sidecar actually needs is narrower and is what is
+    # asserted now — two writers that are live SIMULTANEOUSLY never share a tmp
+    # path. Ident reuse after a thread is gone cannot collide with anything.
+    ready = threading.Barrier(4, timeout=10)
+
     def one_write():
+        ready.wait()            # nobody names a tmp file until all four exist
         # Retried for the destination-contention reason in `_retry` — this test
         # is about the SOURCE name being unique, and an unhandled thread
         # exception here would pass while leaking a warning.
@@ -521,8 +536,9 @@ def test_the_temp_name_is_distinct_per_writer(monkeypatch):
     for t in threads:
         t.join()
 
-    # One UNIQUE name per thread. Not `len(seen) == 4`: a retried replace spies
-    # the same source again, so the count floats while the SET does not.
+    # One UNIQUE name per concurrently-live thread. Not `len(seen) == 4`: a
+    # retried replace spies the same source again, so the count floats while
+    # the SET does not.
     assert len(seen) >= 4
     assert len(set(seen)) == 4, f"writers shared a tmp name: {sorted(set(seen))}"
     assert all(str(os.getpid()) in name for name in seen)
