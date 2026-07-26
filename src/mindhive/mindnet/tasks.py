@@ -20,6 +20,10 @@ It is built dynamically by an agent, so every structural rule here is a
 - **Bounds** (`MAX_NODES`, `MAX_DEPTH`, `MAX_DEPS_PER_TASK`) stop a runaway
   decomposition loop from exhausting memory. `fold` enforces the node cap while
   building, so the wall is hit before allocation, not after.
+- **One rule per axis, whatever the spelling.** Three actions write
+  ``parent_id`` — `reparent`, a re-declare, and a first declare — so all three
+  route through `_placement_refusal`. A gate only two of them answer to is not
+  a gate; it is a detour sign.
 - **Triple-threat cycle detection.** Three INDEPENDENT checks, because a
   deadlock can exist without forming a simple cycle in either graph alone:
   `dependency_cycle` (A waits on B waits on C waits on A), `hierarchy_cycle`
@@ -70,6 +74,25 @@ def phase_index(phase):
         return None
 
 
+# ADR-0005's bypass waives the METHOD — brainstorm/plan/PRD for a one-line fix —
+# so a trivial task is born at `execution` and its terminal gate is the bug
+# audit rather than `pr-green`. Named once because two places consume them (the
+# fold derives the entry, `can_complete` gates the exit) and a drift between
+# those two is exactly how a bypass turns into a skeleton key.
+TRIVIAL_ENTRY_PHASE = "execution"
+TRIVIAL_EXIT_PHASE = "audit-bug"
+
+
+def _at_or_past(phase, mark) -> bool:
+    """True when *phase* sits at or beyond *mark* in the pipeline. Total on
+    both sides: an unrecognised phase answers False rather than raising, so a
+    record written by some past version of the code cannot take the fold down
+    (invariant 3) — and False is the fail-safe answer, since every caller uses
+    this to decide whether to REFUSE something."""
+    a, b = phase_index(phase), phase_index(mark)
+    return a is not None and b is not None and a >= b
+
+
 # --- statuses -----------------------------------------------------------------
 STATUS_PENDING = "pending"
 STATUS_READY = "ready"
@@ -96,29 +119,54 @@ MAX_DESC_CHARS = 2000
 MAX_SCRIPT_CHARS = 500
 MAX_REF_CHARS = 300
 MAX_LANG_CHARS = 40
+# Refusals accumulate on the record they belong to, so the same runaway-loop
+# reasoning that bounds nodes has to bound them — otherwise a re-declare loop
+# grows one Task without limit. The OLDEST are kept: the first refusal explains
+# how the graph got into this shape, and a loop only ever repeats itself.
+MAX_VIOLATIONS = 20
 
-ACTIONS = ("declare", "status", "phase", "depend", "reparent", "evidence")
+# ONE WRITER ON THE PHASE AXIS. "phase" was an action here until it proved to be
+# a free teleport: the fold's branch tested membership in PHASES and nothing
+# else (`phase_index` was defined and never called), so two raw appends —
+# declare, then phase="pr-green" — parked a task at the terminal gate with no
+# work done. `mindnet_phase`, gated by the controller, is now the only writer.
+ACTIONS = ("declare", "status", "depend", "reparent", "evidence")
 
 
 @dataclass(frozen=True)
 class Task:
     """One node. Frozen on purpose: the fold rebuilds records with
     ``dataclasses.replace`` rather than mutating in place, so two folds of the
-    same events can never alias each other's state."""
+    same events can never alias each other's state.
+
+    ``phase`` records the task's **declared entry phase** and nothing more.
+    Nothing in this module writes it after the declare — the authoritative
+    current phase lives in the controller's `mindnet_phase` records, which is
+    the whole point of keeping one writer on that axis. The field stays because
+    the entry point itself is a `mindnet_task` fact that U4 and the CLI read: a
+    trivial task enters at ``TRIVIAL_ENTRY_PHASE``, everything else at the gate.
+    A phase comparison written *here* would therefore compare declared defaults
+    and pass vacuously — put phase-aware checks in the controller.
+
+    ``violations`` carries the refusals the fold made against THIS record, in
+    the order they happened. Appends are immutable, so a refused event stays on
+    the ledger forever; without somewhere to record the refusal the projection
+    would silently disagree with the ledger and nobody could see why."""
 
     task_id: str                        # caller-supplied; keeps the fold pure
     title: str
     parent_id: str | None = None        # None => root; infinite nesting
     description: str = ""
-    phase: str = PHASES[0]              # every task starts at the gate
+    phase: str = PHASES[0]              # DECLARED ENTRY phase — see the docstring
     status: str = STATUS_PENDING
     dependencies: tuple = ()            # task_ids that must be COMPLETED first
     language_context: tuple = ()        # permitted languages (R13, read by MN-4)
     validation_script: str = ""         # shell string; executed by MN-1's runner
     evidence: tuple = ()                # runlog artifact paths (MN-0)
     faculty: str | None = None          # MN-5 cat feed label
-    triviality_bypass: bool = False     # ADR-0005 bypass, explicit and audited
+    triviality_bypass: bool = False     # ADR-0005 bypass, FIRST DECLARE ONLY
     depth: int = 0                      # DERIVED by the fold, never stored
+    violations: tuple = ()              # refusals recorded here — see docstring
 
 
 # --- payload contract ---------------------------------------------------------
@@ -137,8 +185,13 @@ def validate_payload(payload) -> None:
         raise ValueError("mindnet_task payload must be an object")
     action = payload.get("action")
     if action not in ACTIONS:
+        # `phase` was a legal action until one-writer landed, so it is named
+        # explicitly: an operator (or an agent replaying this morning's example)
+        # lands here, and the bare action list does not say where it went.
+        moved = (" — a phase move is a `mindnet_phase` event, not a "
+                 "`mindnet_task` one" if action == "phase" else "")
         raise ValueError("mindnet_task requires an action — one of: "
-                         + ", ".join(ACTIONS))
+                         + ", ".join(ACTIONS) + moved)
     if not ID_RE.match(str(payload.get("task_id") or "")):
         raise ValueError(
             "mindnet_task requires a kebab-case task_id (lowercase letters, "
@@ -175,9 +228,6 @@ def validate_payload(payload) -> None:
     elif action == "status":
         if payload.get("status") not in STATUSES:
             raise ValueError("status must be one of: " + ", ".join(STATUSES))
-    elif action == "phase":
-        if payload.get("phase") not in PHASES:
-            raise ValueError("phase must be one of: " + ", ".join(PHASES))
     elif action == "depend":
         if not ID_RE.match(str(payload.get("on") or "")):
             raise ValueError("depend requires 'on': the blocking task_id")
@@ -428,13 +478,26 @@ def ready(tasks) -> list:
     return out
 
 
-def can_complete(tasks, task_id):
+def can_complete(tasks, task_id, satisfied=None):
     """None when *task_id* may be marked COMPLETED, else the blocking reason.
 
-    Order is deliberate: the subtree check runs BEFORE the triviality bypass,
-    because ADR-0005's bypass waives the *method* (brainstorm/plan/PRD for a
-    one-line fix), never graph integrity. A trivial parent with an open child
-    is still not finished."""
+    *satisfied* is an INJECTED predicate ``(task_id, phase) -> bool`` supplied
+    by the controller. Injected rather than imported so the dependency stays
+    one-directional: `controller.py` reads this module, never the reverse.
+
+    Four gates, in this order:
+
+    1. **The subtree**, first and unconditionally. ADR-0005's bypass waives the
+       *method* (brainstorm/plan/PRD for a one-line fix), never graph
+       integrity: a trivial parent with an open child is still not finished.
+    2. **The predicate's existence.** Without it the terminal phase cannot be
+       checked, and a gate that cannot check must refuse. This module ships
+       ahead of the controller, so a missing argument must not silently loosen
+       the very thing it was added to tighten.
+    3. **The artifact**, for a non-bypassed task.
+    4. **The terminal phase** — `pr-green` normally, ``TRIVIAL_EXIT_PHASE`` for
+       a bypassed one. Completion previously read four things and *phase* was
+       not among them, so `pr-green`'s exit evidence gated nothing at all."""
     t = tasks.get(task_id)
     if t is None:
         return f"no such task '{task_id}'"
@@ -443,11 +506,94 @@ def can_complete(tasks, task_id):
     if open_kids:
         return (f"'{task_id}' has {len(open_kids)} open descendant(s): "
                 + ", ".join(open_kids[:5]))
-    if t.triviality_bypass:
-        return None
-    if not t.evidence:
+    if satisfied is None:
+        return (f"'{task_id}' cannot complete: no satisfaction predicate was "
+                f"supplied, so the terminal phase cannot be verified")
+    if not t.triviality_bypass and not t.evidence:
         return (f"'{task_id}' has no evidence — a validation run must record "
                 f"its artifact before this task can complete")
+    gate = TRIVIAL_EXIT_PHASE if t.triviality_bypass else PHASES[-1]
+    try:
+        ok = bool(satisfied(task_id, gate))
+    except Exception as e:          # foreign code; a fault is not a pass
+        return (f"'{task_id}' cannot complete: the satisfaction predicate "
+                f"raised {type(e).__name__} — this gate fails closed")
+    if not ok:
+        return (f"'{task_id}' has not satisfied '{gate}' — clearing that "
+                f"phase's exit criterion is what completion means")
+    return None
+
+
+# --- refusals the fold has to record ------------------------------------------
+
+def _note(existing, reason) -> tuple:
+    """*existing* violations plus *reason*, capped at MAX_VIOLATIONS."""
+    if len(existing) >= MAX_VIOLATIONS:
+        return existing
+    return existing + (reason,)
+
+
+def _placement_refusal(tasks, task_id, cand, parent):
+    """Reason string when placing *task_id* under *parent* must be declined,
+    else None. THE one rule for every writer of ``parent_id`` — the `reparent`
+    action, the re-declare upsert, and the first declare all route through
+    here, so the three paths refuse the same placements with the same message.
+    They did not: `reparent` shipped with only the cycle check and the first
+    declare with none at all, so an over-deep edge landed simply by being
+    spelled differently.
+
+    *cand* is the record as it would stand WITHOUT the move — an existing task
+    for the two update paths, the freshly built (still parentless) record for a
+    first declare. Four gates:
+
+    - **No-op.** Echoing the parent a task already has is not a move.
+    - **Hierarchy cycle** — parenting a task under its own descendant.
+    - **Status.** Settled work is not restructured (its subtree membership is
+      part of the completion record `can_complete` already accepted), and open
+      work is not hung under a closed parent (that would retroactively falsify
+      the same record with nothing on the ledger admitting the change of mind).
+    - **Depth**, measured over the WHOLE resulting subtree on a probe copy of
+      the graph — the `depend` branch's idiom. Checking only the placed node is
+      how a two-deep subtree slips one past the wall, and a task's subtree can
+      be non-empty even on its first declare (children may have been declared
+      against it before it existed).
+
+    A parent NOT YET in the graph is never refused: ledger order is not
+    declaration order, so a forward reference is legitimate and its depth is
+    simply unresolvable at that moment. `hierarchy_cycle` already returns None
+    for an absent parent, and `_all_depths` treats a dangling parent as a root,
+    so all three gates fall through by construction rather than by a special
+    case that could rot.
+
+    There is deliberately NO phase gate. ``Task.phase`` is the declared entry
+    phase with no writer in this module, so the comparison would read defaults
+    and pass vacuously; the controller owns that check."""
+    if parent == cand.parent_id:
+        # Without this, re-declaring a COMPLETED task to sharpen its title —
+        # while faithfully echoing the parent_id it already has — would
+        # manufacture a violation for a move that is not happening.
+        return None
+    cyc = hierarchy_cycle(tasks, task_id, parent)
+    if cyc is not None:
+        return f"refused placement of '{task_id}': {cyc}"
+    if cand.status in CLOSED_STATUSES:
+        return (f"refused placement of '{task_id}': it is {cand.status} — "
+                f"settled work is not restructured after the fact")
+    dest = tasks.get(parent) if parent is not None else None
+    if dest is not None and dest.status in CLOSED_STATUSES:
+        return (f"refused placement of '{task_id}': parent '{parent}' is "
+                f"{dest.status} and cannot take on open work")
+    probe = dict(tasks)
+    probe[task_id] = replace(cand, parent_id=parent)
+    depths = _all_depths(probe)
+    reached = [depths.get(m, 0) for m in {task_id} | descendants(probe, task_id)]
+    if any(d < 0 for d in reached):
+        return (f"refused placement of '{task_id}': it would leave an "
+                f"unresolvable parent chain")
+    worst = max(reached, default=0)
+    if worst > MAX_DEPTH:
+        return (f"refused placement of '{task_id}': the subtree would reach "
+                f"depth {worst}, past MAX_DEPTH {MAX_DEPTH}")
     return None
 
 
@@ -462,10 +608,17 @@ def fold(evs) -> dict:
     replaces wholesale — right for a flat plan, destructive for a graph node
     carrying progress).
 
-    Structural refusals happen HERE, not just in `check_graph`: a `depend` or
-    `reparent` that would close a cycle is declined. The event stays on the
-    ledger — appends are immutable — but the projection never enters the bad
-    state, so one hallucinated edge cannot corrupt the graph permanently."""
+    Structural refusals happen HERE, not just in `check_graph`: a `depend` that
+    would close a cycle, ANY placement that would cycle / overflow the depth
+    bound / restructure settled work (whether it arrives as a `reparent`, a
+    re-declare, or a first declare — all three call `_placement_refusal`), and
+    a late `triviality_bypass` are declined. The event stays on the ledger —
+    appends are immutable — but the projection never enters the bad state, so
+    one hallucinated edge cannot corrupt the graph permanently. Each refusal
+    lands in the record's ``violations`` so the projection can say WHY it
+    disagrees with the ledger.
+
+    The phase axis is not written here at all: `mindnet_phase` owns it."""
     tasks: dict = {}
     for ev in evs or []:
         if getattr(ev, "type", None) != "mindnet_task":
@@ -488,21 +641,45 @@ def fold(evs) -> dict:
             if cur is None:
                 if len(tasks) >= MAX_NODES:
                     continue        # runaway-decomposition wall, pre-allocation
-                tasks[tid] = Task(
+                trivial = bool(p.get("triviality_bypass"))
+                cand = Task(
                     task_id=tid,
                     title=title[:MAX_TITLE_CHARS],
-                    parent_id=parent,
+                    # Born parentless; the placement is decided below by the
+                    # same rule the other two writers answer to. Assigning
+                    # `parent` here instead is what let a first declare land an
+                    # edge that `reparent` would have refused.
+                    parent_id=None,
                     description=str(p.get("description") or "")[:MAX_DESC_CHARS],
+                    # The bypass waives brainstorm/plan/PRD, so a trivial task
+                    # is BORN at `execution` — the spec's own written exception
+                    # to the forward-skip ban. DERIVED here rather than taken
+                    # from the payload: an entry phase a caller could name is
+                    # the teleport this module just stopped accepting.
+                    phase=TRIVIAL_ENTRY_PHASE if trivial else PHASES[0],
                     language_context=_id_tuple(p.get("language_context")),
                     validation_script=str(
                         p.get("validation_script") or "")[:MAX_SCRIPT_CHARS],
                     faculty=str(p["faculty"]) if p.get("faculty") else None,
-                    triviality_bypass=bool(p.get("triviality_bypass")),
+                    triviality_bypass=trivial,
                 )
+                if parent is not None:
+                    why = _placement_refusal(tasks, tid, cand, parent)
+                    cand = (replace(cand, parent_id=parent) if why is None
+                            else replace(cand, violations=_note((), why)))
+                tasks[tid] = cand
                 continue
             fields = {"title": title[:MAX_TITLE_CHARS]}
-            if parent is not None and hierarchy_cycle(tasks, tid, parent) is None:
-                fields["parent_id"] = parent
+            viol = cur.violations
+            if parent is not None:
+                # A re-declare carrying parent_id IS a move, so it answers to
+                # the same gate — otherwise the hardened action is trivially
+                # routed around by spelling the move as a declare.
+                why = _placement_refusal(tasks, tid, cur, parent)
+                if why is None:
+                    fields["parent_id"] = parent
+                else:
+                    viol = _note(viol, why)
             if p.get("description"):
                 fields["description"] = str(p["description"])[:MAX_DESC_CHARS]
             if p.get("validation_script"):
@@ -512,8 +689,25 @@ def fold(evs) -> dict:
                 fields["language_context"] = _id_tuple(p["language_context"])
             if p.get("faculty"):
                 fields["faculty"] = str(p["faculty"])
-            if "triviality_bypass" in p:
-                fields["triviality_bypass"] = bool(p["triviality_bypass"])
+            if "triviality_bypass" in p and \
+                    bool(p["triviality_bypass"]) != cur.triviality_bypass:
+                # FIRST DECLARE ONLY. Applying the flag on every re-declare was
+                # a completion skeleton key: declare a task non-trivial, advance
+                # it, then re-declare it trivial and it closed with no evidence
+                # at all. The change is dropped and the ATTEMPT recorded — the
+                # event is already immutable on the ledger, so a silent drop
+                # would leave the projection unable to explain itself.
+                want = bool(p["triviality_bypass"])
+                if not want and _at_or_past(cur.phase, TRIVIAL_ENTRY_PHASE):
+                    viol = _note(viol, (
+                        f"refused: clearing triviality_bypass on '{tid}', "
+                        f"already at or past '{TRIVIAL_ENTRY_PHASE}'"))
+                else:
+                    viol = _note(viol, (
+                        f"ignored: triviality_bypass on '{tid}' is settable on "
+                        f"the first declare only (attempted {want})"))
+            if viol is not cur.violations:
+                fields["violations"] = viol
             tasks[tid] = replace(cur, **fields)
 
         elif cur is None:
@@ -522,10 +716,6 @@ def fold(evs) -> dict:
         elif action == "status":
             if p.get("status") in STATUSES:
                 tasks[tid] = replace(cur, status=p["status"])
-
-        elif action == "phase":
-            if p.get("phase") in PHASES:
-                tasks[tid] = replace(cur, phase=p["phase"])
 
         elif action == "depend":
             on = p.get("on")
@@ -547,7 +737,9 @@ def fold(evs) -> dict:
             raw_parent = p.get("parent_id")
             parent = (str(raw_parent)
                       if isinstance(raw_parent, str) and raw_parent else None)
-            if hierarchy_cycle(tasks, tid, parent) is not None:
+            why = _placement_refusal(tasks, tid, cur, parent)
+            if why is not None:
+                tasks[tid] = replace(cur, violations=_note(cur.violations, why))
                 continue
             tasks[tid] = replace(cur, parent_id=parent)
 

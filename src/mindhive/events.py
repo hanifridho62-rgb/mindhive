@@ -29,8 +29,9 @@ SEMANTIC_TYPES = {
     # interrupted plan projects into STATE.md as the out-of-usage marker that
     # preserves creation context for the next session.
     "roadmap",
-    # MindNetwork MN-2 task graph lifecycle (declare/status/phase/depend/
-    # reparent/evidence — see mindnet/tasks.py): the hierarchical task tree the
+    # MindNetwork MN-2 task graph lifecycle (declare/status/depend/reparent/
+    # evidence — see mindnet/tasks.py; the phase axis is mindnet_phase's, and
+    # ONLY its): the hierarchical task tree the
     # flat roadmap cannot express (no parent_id, 50-step cap, wholesale-replace
     # only). Semantic so the graph is recallable and chain-verified; the current
     # graph is a deterministic fold that REFUSES cycle-closing edges rather than
