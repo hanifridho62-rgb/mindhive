@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import sys
+from contextlib import contextmanager
 from . import events, projector, chain, paths
 from . import recall as recall_mod
 from . import export as export_mod
@@ -643,6 +644,630 @@ def cmd_roadmap_show(args) -> int | None:
     print("\nhistory (oldest first):")
     for e in hist:
         print(f"  {e['ts']}  {e['action']:9s}  session {e['session']}")
+    return None
+
+
+# --- mindnet: the operator surface for MN-1's phase spine --------------------
+# `tasks.py` owns the graph axis, `phases.py` the evidence contract,
+# `controller.py` the phase axis, `executor.py` the validation runs and
+# `sidecar.py` the projection. Nothing below re-implements any of that; these
+# handlers are the argv-to-contract adapter, and three rules shape all of them.
+#
+# 1. A DECLARE WRITES BOTH AXES. A `mindnet_task` declare does not create a
+#    `PhaseRecord` — only a `mindnet_phase` declare does (`controller.fold`,
+#    create-only). A command that wrote the graph half alone would print a task
+#    and then silently orphan every phase event that task ever received, which
+#    is exactly the failure `test_a_task_declared_only_on_the_graph_axis_orphans_
+#    its_phase_events` pins in the controller suite.
+#
+# 2. THE SIDECAR IS WRITTEN LAST. `sidecar._staleness` compares segment size and
+#    mtime, so ANY event appended after the write makes the sidecar read stale —
+#    and `telemetry.busy` appends two `mindnet_activity` rows around every
+#    mutation. A stale sidecar sends U9's injector to its phase-agnostic block,
+#    which silently disables the phase-aware injection MN-1 exists to deliver.
+#    `_mn_work` is the ONE place that ordering lives, so it cannot be got wrong
+#    per-command.
+#
+# 3. `verified_by` IS DERIVED HERE, NEVER TAKEN FROM THE OPERATOR (KTD2). There
+#    is deliberately no `--verified-by` flag. A stat is a Python check, a real
+#    subprocess exit code is a Python check — and nothing else is. A phase this
+#    surface cannot honestly check is REFUSED with the flag that records the
+#    weaker claim, rather than stamped `python` for the operator's convenience.
+
+# The faculty a mindnet command wakes (U10's cat feed). One name, drawn from
+# `telemetry.FACULTIES` — invariant 10 forbids a second spelling, and
+# `test_a_mutating_command_emits_faculty_telemetry` asserts membership rather
+# than trusting the string.
+MINDNET_FACULTY = "task-graph"
+
+# Exit codes. 2 keeps the file's existing meaning — REFUSED, nothing recorded —
+# and 1 is the case this surface adds: the command ran and recorded something,
+# but the outcome is not the one asked for (a failing validation run, a re-stat
+# that found the evidence gone, an agent-reported satisfy the fold will not
+# accept). Printing a success line over any of those is the specific failure
+# mode this machine exists to prevent.
+MN_REFUSED = 2
+MN_NOOP = 1
+
+
+def _mn_error(reason) -> int:
+    print(f"error: {reason}", file=sys.stderr)
+    return MN_REFUSED
+
+
+def _mn_read(args):
+    """``(project, session, evs, tasks, PhaseState)`` — ONE ledger read per
+    command, threaded into every module that would otherwise read it again."""
+    from .mindnet import controller as c_mod
+    from .mindnet import tasks as t_mod
+    project = getattr(args, "project", None)
+    sid = getattr(args, "session", None) or os.environ.get("MINDHIVE_SESSION")
+    evs = events.read_all(project)
+    tasks = t_mod.fold(evs)
+    return project, sid, evs, tasks, c_mod.fold(evs, tasks)
+
+
+def _mn_refresh(project):
+    """Rebuild the sidecar from the ledger. The ledger is the source of truth,
+    so a projection that could not be refreshed is a NOTE, never a failed
+    command — the write itself already landed."""
+    from .mindnet import sidecar as sc_mod
+    out = sc_mod.rebuild(project)
+    if not out.written:
+        print(f"note: sidecar not refreshed: {out.reason}", file=sys.stderr)
+    return out
+
+
+def _mn_projection(project):
+    """The projection as the sidecar now reads it — i.e. what the block that
+    just ran actually wrote. Cheaper than a second `read_all`, and it reports
+    the fold's own answer rather than the handler's guess at it."""
+    from .mindnet import sidecar as sc_mod
+    return sc_mod.read(project).state
+
+
+@contextmanager
+def _mn_work(project, sid, task_id=None, phase=None):
+    """Wake the faculty for the duration of a mutation, then write the sidecar —
+    IN THAT ORDER, ALWAYS, including on the way out of an exception.
+
+    Rule 2 above, in one place. `telemetry.busy` emits its closing `idle` from a
+    `finally`, so the refresh here is genuinely the last write of the command;
+    doing it inside the block would stamp the sidecar before the `idle` row
+    landed and leave it reading stale. The refresh runs even when the body
+    raised, because the telemetry rows landed either way."""
+    from .mindnet import telemetry as tel_mod
+    try:
+        with tel_mod.busy(MINDNET_FACULTY, task_id=task_id, phase=phase,
+                          project=project, session_id=sid):
+            yield
+    finally:
+        _mn_refresh(project)
+
+
+def _mn_stored(payload):
+    """``None`` when *payload* satisfies the WRITER contract, else the reason.
+
+    `phases.validate_stored` immediately before the write is the roadmap/sop
+    convention, and calling it BEFORE the telemetry block matters: a contract
+    violation then costs no events at all rather than a pair of orphaned
+    activity rows."""
+    from .mindnet import phases as ph_mod
+    try:
+        ph_mod.validate_stored(payload)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def _mn_phase_event(payload, sid, project):
+    return events.append_event("mindnet_phase", payload, session_id=sid,
+                               tags=["mindnet", "phase"], project=project)
+
+
+def _mn_no_record(task_id) -> int:
+    return _mn_error(f"no phase record for '{task_id}' — declare it on both "
+                     f"axes first with: hive mindnet declare {task_id} "
+                     f'--title "…"')
+
+
+def cmd_mindnet_declare(args) -> int | None:
+    """Declare a task on BOTH axes (rule 1). Idempotent by construction: the
+    graph fold upserts a re-declare and the phase fold ignores it, so re-running
+    this to sharpen a title never resets accumulated progress."""
+    from .mindnet import tasks as t_mod
+    project = getattr(args, "project", None)
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    task_payload = {"action": "declare", "task_id": args.task_id,
+                    "title": args.title}
+    for key, value in (("parent_id", args.parent),
+                       ("description", args.description),
+                       ("validation_script", args.validation_script),
+                       ("faculty", args.faculty)):
+        if value:
+            task_payload[key] = value
+    if args.language:
+        task_payload["language_context"] = list(args.language)
+    if args.triviality_bypass:
+        # FIRST DECLARE ONLY (KTD10) — `tasks.fold` records a later change as a
+        # violation and drops it. Not re-checked here: one home for the rule.
+        task_payload["triviality_bypass"] = True
+    # The phase-axis declare names NO phase: the entry point is derived by
+    # `tasks.fold` (the gate, or `execution` for a bypassed task), and a
+    # caller-named entry phase is the teleport MN-2 stopped accepting.
+    phase_payload = {"action": "declare", "task_id": args.task_id,
+                     "verified_by": "python"}
+    try:
+        t_mod.validate_payload(task_payload)
+    except ValueError as e:
+        return _mn_error(e)
+    why = _mn_stored(phase_payload)
+    if why:
+        return _mn_error(why)
+
+    with _mn_work(project, sid, args.task_id):
+        events.append_event("mindnet_task", task_payload, session_id=sid,
+                            tags=["mindnet", "task"], project=project)
+        ev = _mn_phase_event(phase_payload, sid, project)
+    rec = _mn_projection(project).records.get(args.task_id)
+    print(f"mindnet declare: {args.task_id} at "
+          f"'{rec.phase if rec is not None else t_mod.PHASES[0]}' @ {ev.ts}")
+    return None
+
+
+def cmd_mindnet_enter(args) -> int | None:
+    """Move a task forward (or back) one phase, gated by `can_advance`."""
+    from .mindnet import controller as c_mod
+    project, sid, _evs, tasks, state = _mn_read(args)
+    tid, to_phase = args.task_id, args.phase
+    rec = state.records.get(tid)
+    if rec is None:
+        return _mn_no_record(tid)
+    ok, why = c_mod.can_advance(state.records, tasks, tid, to_phase)
+    if not ok:
+        # roadmap.record's idiom: name the command that unsticks it. The two
+        # moves that ever can are earning the exit criterion and recording that
+        # it was not earned.
+        return _mn_error(
+            f'{why}. Earn it with: hive mindnet satisfy {tid} …  ·  or record '
+            f'the failure with: hive mindnet fall-back {tid} <phase> '
+            f'--detail "…"')
+    payload = {"action": "enter", "task_id": tid, "phase": to_phase,
+               "epoch": rec.epoch, "verified_by": "python"}
+    why = _mn_stored(payload)
+    if why:
+        return _mn_error(why)
+    with _mn_work(project, sid, tid, to_phase):
+        ev = _mn_phase_event(payload, sid, project)
+    print(f"mindnet enter: {tid} '{rec.phase}' -> '{to_phase}' @ {ev.ts}")
+    return None
+
+
+def _mn_file_evidence(args, rec):
+    """File evidence for a document phase: a stat, which IS a Python check — so
+    `python` is the honest label for it and nothing weaker is accepted.
+
+    KTD7 rides along: the resolving worktree root and branch go onto the
+    evidence, so a later re-stat from a sibling checkout answers `unknown`
+    rather than `fail`. `detect_project` collapses every worktree onto one
+    namespace (SOP 10), so a branch-specific plan file is legitimately absent
+    from another checkout and calling that a failure would be a lie."""
+    from .mindnet import controller as c_mod
+    from .mindnet import phases as ph_mod
+    ref = str(args.ref or "").strip()
+    if not ref:
+        wanted = ", ".join(ph_mod.descriptor(rec.phase)["required_dir"])
+        return None, (f"'{rec.phase}' takes file evidence — name the document "
+                      f"with: hive mindnet satisfy {args.task_id} --ref "
+                      f"<path under {wanted}>")
+    root = paths.worktree_root()
+    target, why = ph_mod.resolve_ref(rec.phase, ref, root)
+    if target is None:
+        return None, why
+    try:
+        present = target.is_file()
+    except OSError as e:
+        return None, f"cannot stat '{ref}': {type(e).__name__}: {e}"
+    if not present:
+        return None, (f"'{ref}' does not exist under {root} — a satisfaction "
+                      f"for evidence that is not there is precisely the claim "
+                      f"this machine exists to refuse")
+    detail = args.detail or f"stat: '{ref}' exists under {root}"
+    evidence = {"kind": "file", "ref": ref, "result": "ok", "detail": detail,
+                "root": str(root)}
+    # Reuses `controller._head_branch` rather than respelling `git rev-parse`
+    # here: `controller.restat` compares against exactly this value, and two
+    # spellings of the same git question are two things that can drift apart
+    # without either one looking wrong.
+    branch = c_mod._head_branch(root)
+    if branch:
+        evidence["branch"] = branch
+    return _mn_satisfy_payload(args.task_id, rec, detail, evidence), None
+
+
+def _mn_event_evidence(args, evs, rec):
+    """`execution`'s exit criterion (KTD16): a ``code_change`` event that names
+    this task.
+
+    The join key is optional and additive, so historical rows simply do not
+    match. `hive log --task` is U8's producer; until it lands the corrective
+    hint names the raw append that writes the same row today, because a hint
+    pointing at a flag that does not exist is worse than no hint."""
+    from .mindnet import phases as ph_mod
+    tid = args.task_id
+    hit = None
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "code_change":
+            continue
+        p = getattr(ev, "payload", None)
+        if isinstance(p, dict) and p.get("task_id") == tid:
+            hit = ev            # the LAST match: the newest change-set for it
+    if hit is None:
+        return None, (
+            f"no code_change event on the ledger carries task_id '{tid}', so "
+            f"'{rec.phase}' has nothing to verify. Record the change-set "
+            f"against this task with: hive append code_change "
+            f'\'{{"category": "update", "text": "…", "files": ["…"], '
+            f'"task_id": "{tid}"}}\' --json')
+    detail = (args.detail
+              or f"code_change @ {hit.ts}: {hit.payload.get('text') or ''}")
+    detail = str(detail)[:ph_mod.MAX_DETAIL_CHARS]
+    evidence = {"kind": "event", "ref": "", "result": "ok", "detail": detail}
+    return _mn_satisfy_payload(tid, rec, detail, evidence), None
+
+
+def _mn_satisfy_payload(task_id, rec, detail, evidence) -> dict:
+    return {"action": "satisfy", "task_id": task_id, "phase": rec.phase,
+            "epoch": rec.epoch, "detail": detail,
+            # Derived by THIS code path, never accepted from the operator
+            # (KTD2). Both callers above ran a real check to get here.
+            "verified_by": "python", "evidence": evidence}
+
+
+def _mn_python_evidence(args, evs, rec):
+    """``(payload, None)`` when this surface can honestly stamp `python` for
+    *rec*'s current phase, else ``(None, reason)``.
+
+    Two refusals before any evidence is looked at, and both are KTD2 rather than
+    ergonomics:
+
+    - a phase whose descriptor names a verifier WEAKER than `python` has no
+      machine check to run (KTD17: no review event type exists and `hive review
+      clear` appends nothing), so a `python` claim for it would be a lie;
+    - a command-kind phase's only honest producer is a real run, which is
+      `hive mindnet validate` — a hand-written satisfy there attests to a
+      subprocess that never happened."""
+    from .mindnet import phases as ph_mod
+    desc = ph_mod.descriptor(rec.phase) or {}
+    need, kind = desc.get("verified_by"), desc.get("kind")
+    if need != "python":
+        return None, (
+            f"'{rec.phase}' is {need}-reported by design — there is no machine "
+            f"check that can honestly clear it, so this surface will not stamp "
+            f"one. Record it with: hive mindnet satisfy {args.task_id} "
+            f'--agent-reported --detail "…"')
+    if kind == "command":
+        return None, (
+            f"'{rec.phase}' takes command evidence, and the only honest "
+            f"producer of that is a real run: hive mindnet validate "
+            f"{args.task_id}  ·  if the gate refused the script, record the "
+            f"refusal with: hive mindnet satisfy {args.task_id} "
+            f'--agent-reported --detail "<the refusal reason>"')
+    if kind == "file":
+        return _mn_file_evidence(args, rec)
+    if kind == "event":
+        return _mn_event_evidence(args, evs, rec)
+    return None, (f"'{rec.phase}' has no evidence descriptor this surface "
+                  f"knows how to check")
+
+
+def _mn_agent_satisfy(args, project, sid, evs, tasks, rec) -> int | None:
+    """The KTD15 escape hatch: an AGENT-reported satisfy carrying its reason
+    verbatim, so a fail-closed gate's false positive cannot deadlock a task
+    while the ledger still shows Python did not verify it.
+
+    `executor.agent_satisfy` returns ``clears`` and this MUST read it. Against
+    the committed descriptors it is False for `audit-bug`, whose verifier is
+    `python`: `controller._apply_satisfy` refuses the weaker claim, the event
+    folds as a violation, and the phase stays unsatisfied. Printing a success
+    line over that no-op is the exact dishonesty the two-validator contract
+    exists to stop."""
+    from .mindnet import executor as x_mod
+    tid = args.task_id
+    if not str(args.detail or "").strip():
+        return _mn_error(
+            f"--agent-reported must carry the reason verbatim: hive mindnet "
+            f'satisfy {tid} --agent-reported --detail "…" — an unexplained '
+            f"agent claim is the self-attestation this contract exists to stop")
+    out = err = None
+    with _mn_work(project, sid, tid, rec.phase):
+        try:
+            out = x_mod.agent_satisfy(tid, args.detail, evs=evs, tasks=tasks,
+                                      project=project, session_id=sid)
+        except ValueError as e:
+            err = e
+    if err is not None:
+        return _mn_error(err)
+    print(f"mindnet satisfy: {tid} '{rec.phase}'@{rec.epoch} recorded "
+          f"(verified by agent) @ {out.event.ts}")
+    if not out.clears:
+        # Flushed first so the warning cannot surface AHEAD of the line it
+        # qualifies: stdout is block-buffered when piped and stderr is not, so
+        # a log would otherwise read "did NOT clear" before "recorded".
+        sys.stdout.flush()
+        print(f"warning: this did NOT clear '{rec.phase}' — {out.note}",
+              file=sys.stderr)
+        return MN_NOOP
+    return None
+
+
+def cmd_mindnet_satisfy(args) -> int | None:
+    """Record that the task's CURRENT phase cleared its exit criterion.
+
+    The phase is never named on the command line: KTD5 binds a satisfaction to
+    the phase the task is actually in, so accepting one here would only produce
+    events the fold records as violations."""
+    project, sid, evs, tasks, state = _mn_read(args)
+    tid = args.task_id
+    rec = state.records.get(tid)
+    if rec is None:
+        return _mn_no_record(tid)
+    if args.agent_reported:
+        return _mn_agent_satisfy(args, project, sid, evs, tasks, rec)
+    payload, why = _mn_python_evidence(args, evs, rec)
+    if payload is None:
+        return _mn_error(why)
+    why = _mn_stored(payload)
+    if why:
+        return _mn_error(why)
+    with _mn_work(project, sid, tid, rec.phase):
+        ev = _mn_phase_event(payload, sid, project)
+    print(f"mindnet satisfy: {tid} '{rec.phase}'@{rec.epoch} ok "
+          f"(verified by python) @ {ev.ts}")
+    return None
+
+
+def cmd_mindnet_fall_back(args) -> int | None:
+    """Move a task BACKWARD and pay the epoch cost (KTD4): every satisfaction at
+    or past the target is invalidated, so walking forward again needs new
+    evidence at the new generation."""
+    from .mindnet.tasks import phase_index
+    project, sid, _evs, _tasks, state = _mn_read(args)
+    tid, to_phase = args.task_id, args.phase
+    rec = state.records.get(tid)
+    if rec is None:
+        return _mn_no_record(tid)
+    to_i, cur_i = phase_index(to_phase), phase_index(rec.phase)
+    if to_i is None:
+        from .mindnet.tasks import PHASES
+        return _mn_error(f"'{to_phase}' is not a phase — one of: "
+                         + ", ".join(PHASES))
+    if cur_i is not None and to_i > cur_i:
+        return _mn_error(
+            f"'{to_phase}' is ahead of '{rec.phase}' — falling back means "
+            f"going back. Move forward with: hive mindnet enter {tid} "
+            f"{to_phase}")
+    payload = {"action": "fall_back", "task_id": tid, "phase": to_phase,
+               "epoch": rec.epoch, "detail": args.detail,
+               "verified_by": "python"}
+    why = _mn_stored(payload)
+    if why:
+        return _mn_error(why)
+    with _mn_work(project, sid, tid, to_phase):
+        ev = _mn_phase_event(payload, sid, project)
+    new = _mn_projection(project).records.get(tid)
+    print(f"mindnet fall-back: {tid} '{rec.phase}' -> '{to_phase}' "
+          f"(epoch {rec.epoch + 1 if new is None else new.epoch}) @ {ev.ts}")
+    return None
+
+
+def cmd_mindnet_validate(args) -> int | None:
+    """Run the task's ``validation_script`` behind U6's fail-closed gate and
+    record what came back as python-verified command evidence."""
+    from .mindnet import executor as x_mod
+    project, sid, evs, tasks, state = _mn_read(args)
+    tid = args.task_id
+    rec = state.records.get(tid)
+    if rec is None:
+        return _mn_no_record(tid)
+    with _mn_work(project, sid, tid, rec.phase):
+        out = x_mod.validate(
+            tid, script=args.script, evs=evs, tasks=tasks, project=project,
+            session_id=sid,
+            timeout_s=args.timeout or x_mod.DEFAULT_TIMEOUT_S)
+    run = out.run
+    if out.event is None:
+        # A refusal appends nothing at all — the run never happened, so there
+        # is no evidence and no honest satisfy to write.
+        return _mn_error(out.reason or run.reason)
+    print(f"mindnet validate: {tid} '{rec.phase}' {run.result} "
+          f"(exit {run.exit_code} in {run.duration_s}s) @ {out.event.ts}")
+    if run.artifact:
+        print(f"  artifact: {run.artifact}")
+    if run.result != "ok":
+        print(f"  {run.reason}")
+        return MN_NOOP
+    return None
+
+
+def cmd_mindnet_restat(args) -> int | None:
+    """Re-check the file evidence behind the task's current phase (KTD8).
+
+    A failure never moves the task — it marks the phase stale, which blocks the
+    way out of it. A re-stat from another checkout answers `unknown`, never
+    `fail` (KTD7)."""
+    from .mindnet import controller as c_mod
+    project, sid, evs, tasks, state = _mn_read(args)
+    tid = args.task_id
+    rec = state.records.get(tid)
+    if rec is None:
+        return _mn_no_record(tid)
+    with _mn_work(project, sid, tid, rec.phase):
+        out = c_mod.restat(tid, evs=evs, tasks=tasks, project=project,
+                           session_id=sid)
+    print(f"mindnet restat: {tid} {out.status} — {out.reason}")
+    return MN_NOOP if out.status == "stale" else None
+
+
+# `verified_by` spelled for a human. The tier is the point of the whole
+# two-validator contract, so `show` never renders a satisfaction without it.
+MN_TIERS = {"python": "python", "agent": "agent-reported",
+            "human": "human-attested"}
+
+
+def _mn_sat_line(s) -> str:
+    """One satisfaction, with its verifier tier and why it does or does not
+    count. Order matters: an invalidated record and a stale one are both also
+    "not ok", and reporting them as a bare failure loses the reason an operator
+    can act on."""
+    if not s.valid:
+        glyph, note = "[-]", "  (superseded — a fall-back bumped the epoch)"
+    elif s.stale:
+        glyph, note = "[!]", ("  (STALE — a later check at the same authority "
+                              "contradicted it)")
+    elif s.result != "ok":
+        glyph, note = "[!]", "  (failed)"
+    else:
+        glyph = "[x]" if s.verified_by == "python" else "[~]"
+        note = ""
+    tier = MN_TIERS.get(s.verified_by, s.verified_by or "unattested")
+    ref = f"  {s.ref}" if s.ref else ""
+    return f"{glyph} {s.phase}@{s.epoch}  {s.result}  {tier}{ref}{note}"
+
+
+def _mn_orphan_lines(task_id, rows) -> list:
+    return ([f"  orphans ({len(rows)}) — phase events for '{task_id}' with "
+             f"nowhere to land:"]
+            + [f"    - {o.action} '{o.phase or '?'}' @ {o.ts} "
+               f"(session {o.session_id}): {o.reason}" for o in rows])
+
+
+def cmd_mindnet_show(args) -> int | None:
+    """One task in full: phase, epoch, every satisfaction with its verifier
+    tier, the fold's refusals, and any orphaned phase events aimed at the id.
+
+    Re-stats the current phase's file evidence. KTD8 puts that here and in
+    `hive mindnet restat` and NOWHERE else — never on the injection hook path,
+    where a stat per prompt would be a latency bill and an append would grow the
+    hash chain once per keystroke."""
+    from dataclasses import asdict
+    from .mindnet import controller as c_mod
+    project, sid, evs, tasks, state = _mn_read(args)
+    tid = args.task_id
+    rec, task = state.records.get(tid), tasks.get(tid)
+    orphans = state.orphans.get(tid, ())
+    if rec is None and task is None and not orphans:
+        return _mn_error(f"no task '{tid}' in the ledger — declare it with: "
+                         f'hive mindnet declare {tid} --title "…"  ·  or see '
+                         f"what is there: hive mindnet list")
+    check = None
+    if rec is not None:
+        check = c_mod.restat(tid, evs=evs, tasks=tasks, project=project,
+                             session_id=sid)
+        if check.event is not None:
+            # The finding is now on the ledger; re-fold so this render shows the
+            # phase as stale, and refresh the sidecar the append just aged.
+            _mn_refresh(project)
+            evs = events.read_all(project)
+            state = c_mod.fold(evs, tasks)
+            rec = state.records.get(tid)
+
+    if args.json:
+        print(json.dumps({
+            "task_id": tid,
+            "task": asdict(task) if task is not None else None,
+            "record": asdict(rec) if rec is not None else None,
+            "orphans": [asdict(o) for o in orphans],
+            "restat": (None if check is None
+                       else {"status": check.status, "reason": check.reason}),
+        }, indent=2, ensure_ascii=False, default=str))
+        return None
+
+    if rec is not None:
+        title = task.title if task is not None else "(no graph record)"
+        print(f"mindnet {tid} — {title}  [{rec.phase}, epoch {rec.epoch}]")
+        if task is not None:
+            bypass = "  triviality-bypass" if task.triviality_bypass else ""
+            print(f"  status: {task.status}   parent: "
+                  f"{task.parent_id or '(root)'}   depth: {task.depth}{bypass}")
+        print("  evidence:")
+        for s in rec.satisfactions:
+            print("    " + _mn_sat_line(s))
+        if not rec.satisfactions:
+            print("    (none recorded)")
+        print(f"  re-stat: {check.status} — {check.reason}")
+        if rec.violations:
+            print("  violations (refusals the fold recorded):")
+            for v in rec.violations:
+                print(f"    - {v}")
+    elif task is not None:
+        print(f"mindnet {tid} — {task.title}  [on the graph axis only — no "
+              f"phase record, so every phase event for it orphans]")
+        print(f'  fix: hive mindnet declare {tid} --title "{task.title}"')
+    else:
+        print(f"mindnet {tid} — nothing on either axis")
+    for line in (_mn_orphan_lines(tid, orphans) if orphans else ()):
+        print(line)
+    return None
+
+
+def cmd_mindnet_list(args) -> int | None:
+    """Every task with its current phase and status, plus the orphan bucket.
+
+    Reads the LEDGER, not the sidecar: this is not the hook path, and a listing
+    that could disagree with `hive mindnet show` would be worse than a slow
+    one."""
+    from dataclasses import asdict
+    from .mindnet import controller as c_mod
+    from .mindnet import tasks as t_mod
+    project = getattr(args, "project", None)
+    evs = events.read_all(project)
+    tasks = t_mod.fold(evs)
+    state = c_mod.fold(evs, tasks)
+    rows = [(tid, tasks[tid], state.records.get(tid)) for tid in sorted(tasks)
+            if args.all or tasks[tid].status not in t_mod.CLOSED_STATUSES]
+    if args.json:
+        print(json.dumps(
+            {"tasks": {tid: {"task": asdict(t),
+                             "phase": c_mod.phase_of(state.records, tasks, tid),
+                             "record": None if r is None else asdict(r)}
+                       for tid, t, r in rows},
+             "orphans": {tid: [asdict(o) for o in v]
+                         for tid, v in state.orphans.items()}},
+            indent=2, ensure_ascii=False, default=str))
+        return None
+    if not rows and not state.orphans:
+        print('(no mindnet tasks — declare one: hive mindnet declare <id> '
+              '--title "…")')
+        return None
+    for i, (tid, task, rec) in enumerate(rows, 1):
+        phase = c_mod.phase_of(state.records, tasks, tid)
+        # `?` is the one an operator has to act on: declared on the graph axis
+        # and nowhere on the phase axis, so every phase event for it orphans.
+        mark = "?" if rec is None else ("!" if rec.violations else ">")
+        indent = "  " * min(max(task.depth, 0), t_mod.MAX_DEPTH)
+        print(f"  {i}. {mark} {indent}[{tid}] {task.title}  {phase}  "
+              f"epoch {0 if rec is None else rec.epoch}  ({task.status})")
+    print(f"\n{len(rows)} task(s)")
+    if state.orphans:
+        total = sum(len(v) for v in state.orphans.values())
+        print(f"{total} orphaned phase event(s) under "
+              f"{len(state.orphans)} unrecorded task id(s): "
+              + ", ".join(sorted(state.orphans))
+              + " — inspect one with: hive mindnet show <id>")
+    return None
+
+
+def cmd_mindnet_rebuild(args) -> int | None:
+    """Re-derive the sidecar from the ledger. What makes the projection honest
+    rather than authoritative — and the repair for a stale or corrupt one."""
+    from .mindnet import sidecar as sc_mod
+    project = getattr(args, "project", None)
+    out = sc_mod.rebuild(project)
+    if not out.written:
+        return _mn_error(out.reason)
+    print(f"mindnet rebuild: {out.records} record(s) from "
+          f"{out.events_seen} event(s) -> {sc_mod.sidecar_path(project)}")
     return None
 
 
@@ -1661,6 +2286,121 @@ def _build_parser() -> argparse.ArgumentParser:
     rmw.add_argument("--project", default=None)
     rmw.add_argument("--json", action="store_true")
     rmw.set_defaults(func=cmd_roadmap_show)
+
+    # --- mindnet (MN-1: the deterministic phase spine over the task graph) ---
+    # Mirrors the `roadmap` subparser above. Two deliberate omissions:
+    #
+    #   * no `--verified-by` anywhere (KTD2) — the value is derived by whatever
+    #     check actually ran, and a flag would hand the untrusted party the
+    #     field that says whether to trust them;
+    #   * no argparse `choices=PHASES` on the phase arguments. `tasks.PHASES` is
+    #     the ONE legend (invariant 10) and `controller.can_advance` already
+    #     answers with it; a second copy in the parser would be a place for the
+    #     legend to drift, and would swap a reason an operator can act on for
+    #     argparse's bare "invalid choice".
+    mn = sub.add_parser("mindnet", help="MindNetwork task graph + phase spine: "
+                        "declare tasks, walk the 6-phase pipeline, and record "
+                        "the evidence that earned each move")
+    mnsub = mn.add_subparsers(dest="mindnet_cmd", required=True)
+
+    mnd = mnsub.add_parser("declare", help="declare a task on BOTH axes (the "
+                           "graph node and its phase record)")
+    mnd.add_argument("task_id", help="stable kebab-case id, e.g. mn1-u7")
+    mnd.add_argument("--title", required=True, help="the actionable ask")
+    mnd.add_argument("--parent", default=None, help="parent task_id")
+    mnd.add_argument("--description", default=None)
+    mnd.add_argument("--validation-script", default=None,
+                     dest="validation_script",
+                     help="the command `hive mindnet validate` runs (argv, "
+                          "never a shell)")
+    mnd.add_argument("--language", action="append", default=None,
+                     help="permitted language (repeatable; read by MN-4)")
+    mnd.add_argument("--faculty", default=None, help="MN-5 cat feed label")
+    mnd.add_argument("--triviality-bypass", action="store_true",
+                     dest="triviality_bypass",
+                     help="ADR-0005's one-line-fix bypass: born at 'execution' "
+                          "and gated by the bug audit. FIRST DECLARE ONLY")
+    mnd.add_argument("--project", default=None)
+    mnd.add_argument("--session", default=None)
+    mnd.set_defaults(func=cmd_mindnet_declare)
+
+    mne = mnsub.add_parser("enter", help="move a task to another phase "
+                           "(forward moves are evidence-gated)")
+    mne.add_argument("task_id")
+    mne.add_argument("phase", help="target phase")
+    mne.add_argument("--project", default=None)
+    mne.add_argument("--session", default=None)
+    mne.set_defaults(func=cmd_mindnet_enter)
+
+    mns = mnsub.add_parser("satisfy", help="record that the task's CURRENT "
+                           "phase cleared its exit criterion")
+    mns.add_argument("task_id")
+    mns.add_argument("--ref", default=None,
+                     help="worktree-root-relative document path (file phases)")
+    mns.add_argument("--detail", default=None,
+                     help="one line of context; REQUIRED with "
+                          "--agent-reported, where it carries the reason "
+                          "verbatim")
+    mns.add_argument("--agent-reported", action="store_true",
+                     dest="agent_reported",
+                     help="no Python check ran — record the weaker claim "
+                          "honestly instead of stamping 'python'")
+    mns.add_argument("--project", default=None)
+    mns.add_argument("--session", default=None)
+    mns.set_defaults(func=cmd_mindnet_satisfy)
+
+    mnf = mnsub.add_parser("fall-back", help="move a task backward and "
+                           "invalidate every satisfaction at or past the "
+                           "target (bumps the epoch)")
+    mnf.add_argument("task_id")
+    mnf.add_argument("phase", help="the phase to go back to")
+    mnf.add_argument("--detail", required=True,
+                     help="what failed — the one transition that exists to "
+                          "record a failure may not record nothing about it")
+    mnf.add_argument("--project", default=None)
+    mnf.add_argument("--session", default=None)
+    mnf.set_defaults(func=cmd_mindnet_fall_back)
+
+    mnv = mnsub.add_parser("validate", help="run the task's validation script "
+                           "behind the fail-closed gate and record the result "
+                           "as python-verified evidence")
+    mnv.add_argument("task_id")
+    mnv.add_argument("--script", default=None,
+                     help="override the stored validation_script (a one-off "
+                          "re-check)")
+    mnv.add_argument("--timeout", type=int, default=None,
+                     help="seconds the run may take (default: 600)")
+    mnv.add_argument("--project", default=None)
+    mnv.add_argument("--session", default=None)
+    mnv.set_defaults(func=cmd_mindnet_validate)
+
+    mnr = mnsub.add_parser("restat", help="re-check the file evidence behind "
+                           "the current phase (a failure marks it stale; it "
+                           "never moves the task)")
+    mnr.add_argument("task_id")
+    mnr.add_argument("--project", default=None)
+    mnr.add_argument("--session", default=None)
+    mnr.set_defaults(func=cmd_mindnet_restat)
+
+    mnw = mnsub.add_parser("show", help="one task in full: phase, evidence "
+                           "with its verifier tier, refusals, orphans")
+    mnw.add_argument("task_id")
+    mnw.add_argument("--project", default=None)
+    mnw.add_argument("--session", default=None)
+    mnw.add_argument("--json", action="store_true")
+    mnw.set_defaults(func=cmd_mindnet_show)
+
+    mnl = mnsub.add_parser("list", help="every task with its phase and status")
+    mnl.add_argument("--all", action="store_true",
+                     help="include completed and abandoned tasks")
+    mnl.add_argument("--project", default=None)
+    mnl.add_argument("--json", action="store_true")
+    mnl.set_defaults(func=cmd_mindnet_list)
+
+    mnb = mnsub.add_parser("rebuild", help="re-derive the phase sidecar from "
+                           "the ledger (the repair for a stale or corrupt one)")
+    mnb.add_argument("--project", default=None)
+    mnb.set_defaults(func=cmd_mindnet_rebuild)
 
     # --- autoresume (deliver the interruption marker back into Claude) ---
     ar = sub.add_parser("autoresume", help="auto-resume: after the usage "
