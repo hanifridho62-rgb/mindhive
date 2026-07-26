@@ -106,10 +106,14 @@ _PAYLOAD_CONTRACTS = {
     "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
     "mindnet_task": (".mindnet.tasks",
                      "hive mindnet declare|status|depend|reparent|evidence …"),
-    # mindnet_phase is deliberately ABSENT: its contract module
-    # (mindnet/phases.py) does not exist yet, and a row here pointing at a
-    # missing module would turn every append of that type into an ImportError.
-    # The MN-1 unit that creates phases.py adds the row.
+    # mindnet_phase points at the APPEND-SURFACE half of a two-validator
+    # contract: phases.validate_payload refuses any payload carrying
+    # `verified_by`, so this surface cannot self-attest a machine verification
+    # nothing performed. The writer's shape (which REQUIRES verified_by) is
+    # phases.validate_stored, called by the CLI just before append_event —
+    # registering that one here instead would invert the honesty rule.
+    "mindnet_phase": (".mindnet.phases",
+                      "hive mindnet declare|enter|satisfy|fall-back …"),
 }
 
 
