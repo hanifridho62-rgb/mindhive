@@ -15,6 +15,7 @@ one commit.
 import json
 import subprocess
 from . import events as ev_mod, paths, review
+from .sop import ID_RE
 
 CATEGORIES = (
     "update", "minor_change", "deletion",
@@ -183,13 +184,41 @@ def validate_payload(payload) -> None:
     files = payload.get("files")
     if not isinstance(files, list) or not files:
         raise ValueError("code_change requires a non-empty files list")
+    # OPTIONAL MindNetwork join key (KTD16). Absent on every historical event
+    # and on every entry that is not part of a tracked task, so it is checked
+    # only when present — requiring it would invalidate the whole existing
+    # change-log, and reads must stay total either way.
+    #
+    # It is checked at all because `mindnet` satisfies the `execution` phase by
+    # scanning for a code_change whose task_id equals the task's: a typo'd or
+    # non-string id joins to nothing, and the operator sees "no code_change
+    # carries this task_id" long after the entry was written, with no clue
+    # which of the two spellings was wrong.
+    task_id = payload.get("task_id")
+    if task_id is not None and not ID_RE.match(str(task_id)):
+        raise ValueError(
+            "code_change task_id must be a kebab-case task id (lowercase "
+            "letters, digits, hyphens; max 64 chars) — it joins this entry to "
+            "a mindnet task's 'execution' phase evidence")
 
 
 def record(category, text, files=None, session_id=None, project=None,
-           evs=None):
+           evs=None, task_id=None):
     """Append one code_change entry covering a change-set, then clear the
     pending marker. Raises ValueError on an invalid category, a too-short
-    explanation, or an empty resolved file list."""
+    explanation, an empty resolved file list, or a malformed *task_id*.
+
+    *task_id* is the optional MindNetwork join key (KTD16): when the change-set
+    belongs to a declared `mindnet` task, stamping it here is what lets that
+    task's `execution` phase find machine-checkable evidence that code was
+    actually written. The key is OMITTED from the payload entirely when not
+    given, so an untracked entry stays byte-identical to every historical one
+    and the hash chain sees no schema change.
+
+    The join already worked without this argument — `changelog.validate_payload`
+    rejects no extra key, so `hive append code_change '{…,"task_id":"x"}'
+    --json` has always landed a valid joined entry. This is the ergonomic
+    producer for it, not an unblock."""
     if category not in CATEGORIES:
         raise ValueError(
             f"unknown category: {category!r} — one of: {', '.join(CATEGORIES)}")
@@ -214,9 +243,17 @@ def record(category, text, files=None, session_id=None, project=None,
     if not files:
         raise ValueError(
             "no changed files detected — pass them explicitly with --files")
+    payload = {"text": text, "category": category, "files": list(files)}
+    if task_id is not None:
+        if not ID_RE.match(str(task_id)):
+            raise ValueError(
+                f"invalid --task id {task_id!r}: it must be a kebab-case task "
+                "id (lowercase letters, digits, hyphens; max 64 chars), and it "
+                "must match the id the task was declared under — a near-miss "
+                "joins to nothing and the phase never satisfies")
+        payload["task_id"] = str(task_id)
     ev = ev_mod.append_event(
-        "code_change",
-        {"text": text, "category": category, "files": list(files)},
+        "code_change", payload,
         session_id=session_id, tags=["changelog"], project=project)
     try:
         clear(project)
@@ -247,6 +284,11 @@ def entries(evs, project=None):
             "text": p.get("text", ""),
             "files": p.get("files") or [],
         }
+        # Only when present: every historical entry lacks it, and materialising
+        # an empty key would make the display shape claim a join that is not
+        # there.
+        if p.get("task_id"):
+            d["task_id"] = p["task_id"]
         if project is not None:
             d["project"] = project
         out.append((i, d))

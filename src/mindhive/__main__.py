@@ -358,7 +358,8 @@ def cmd_log_add(args) -> int | None:
     sid = args.session or os.environ.get("MINDHIVE_SESSION")
     try:
         ev = changelog_mod.record(args.category, args.explanation,
-                                  files=args.files or None, session_id=sid)
+                                  files=args.files or None, session_id=sid,
+                                  task_id=getattr(args, "task", None))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -2176,6 +2177,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="affected files (default: pending marker, then session, then git)")
         lc.add_argument("--session", default=None,
                         help="session id (default: $MINDHIVE_SESSION)")
+        # The MindNetwork join key (KTD16). `execution` is the one phase whose
+        # evidence is an EVENT rather than a file, and it looks for a
+        # code_change carrying this task_id — so without a way to stamp it from
+        # the surface that writes every change-log entry, the contract accepts
+        # a field nothing produces. Omitted entirely when absent, so an
+        # untracked entry stays byte-identical to every historical one.
+        lc.add_argument("--task", default=None, metavar="TASK_ID",
+                        help="mindnet task this change-set belongs to; stamps "
+                             "the join key its `execution` phase looks for")
         lc.set_defaults(func=cmd_log_add, category=_cat)
     lgq = lgsub.add_parser("queue", help="queue this session's unlogged source files (run by session_end)")
     lgq.add_argument("--session", default=None,

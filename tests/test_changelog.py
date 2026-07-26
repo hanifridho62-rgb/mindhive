@@ -310,3 +310,66 @@ def test_cli_log_show_lists_entries_newest_first(capsys):
     assert ret == 0
     out = capsys.readouterr().out
     assert out.index("swapped the parser") < out.index("older change")
+
+
+# --- the MindNetwork join key (KTD16) ----------------------------------------
+#
+# `execution` is the one phase whose evidence is an EVENT rather than a file: it
+# looks for a code_change carrying its task_id. Before `--task` existed the
+# contract validated a field no surface could produce, so the phase was
+# unsatisfiable through the CLI that writes every change-log entry.
+
+def _one_code_change():
+    rows = [e for e in events.read_all() if e.type == "code_change"]
+    assert len(rows) == 1, f"expected exactly one code_change, got {len(rows)}"
+    return rows[0]
+
+
+def test_record_stamps_the_task_join_key():
+    ev = changelog.record("update", "taught the fold to refuse a cycling edge",
+                          files=["src/mindhive/a.py"], task_id="mn1-u8")
+    assert ev.payload["task_id"] == "mn1-u8"
+
+
+def test_record_omits_the_key_entirely_when_no_task_is_given():
+    """Not `None`, not `""` — ABSENT. An untracked entry has to stay
+    byte-identical to every historical one, or the hash chain sees a schema
+    change on rows nobody touched."""
+    ev = changelog.record("update", "an ordinary entry, no task attached",
+                          files=["src/mindhive/a.py"])
+    assert "task_id" not in ev.payload
+
+
+@pytest.mark.parametrize("bad", ["Not Kebab", "has space", "UPPER", "x" * 65])
+def test_record_rejects_a_malformed_task_id(bad):
+    with pytest.raises(ValueError):
+        changelog.record("update", "a fine explanation of a real change",
+                         files=["src/mindhive/a.py"], task_id=bad)
+
+
+def test_cli_log_task_flag_stamps_the_key(capsys):
+    ret = cli_mod.main(["log", "update", "wired the join key through the CLI",
+                        "--files", "src/mindhive/a.py", "--task", "mn1-u8"])
+    capsys.readouterr()
+    assert ret is None or ret == 0
+    assert _one_code_change().payload["task_id"] == "mn1-u8"
+
+
+def test_cli_log_without_the_task_flag_omits_the_key(capsys):
+    ret = cli_mod.main(["log", "update", "no task on this change-set at all",
+                        "--files", "src/mindhive/a.py"])
+    capsys.readouterr()
+    assert ret is None or ret == 0
+    assert "task_id" not in _one_code_change().payload
+
+
+def test_cli_log_rejects_a_malformed_task_id(capsys):
+    ret = cli_mod.main(["log", "update", "a fine explanation of a real change",
+                        "--files", "src/mindhive/a.py", "--task", "Not Kebab"])
+    assert ret == 2
+    err = capsys.readouterr().err
+    # Name the FLAG the operator typed, not the payload field it becomes — and
+    # say why a near-miss matters, since an id that merely looks right joins to
+    # nothing and leaves `execution` quietly unsatisfiable.
+    assert "--task" in err and "near-miss" in err
+    assert [e for e in events.read_all() if e.type == "code_change"] == []

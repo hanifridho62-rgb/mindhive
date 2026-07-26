@@ -291,6 +291,61 @@ def validate_payload(payload) -> None:
     _check_shape(payload)
 
 
+def ledger_body(payload) -> str:
+    """Self-describing markdown body for a ``mindnet_phase`` event's LEDGER
+    entry, mirroring `roadmap.ledger_body` / `sop.ledger_body`.
+
+    Two things break without it, because `projector.build_ledger_entries`
+    defaults to ``payload.get("text", "")`` and these payloads carry no
+    ``text``:
+
+    1. Every phase event renders as an EMPTY body — invisible to keyword
+       recall, which searches the projected markdown, not the raw ledger.
+    2. Same-second events COLLIDE. The LEDGER filename is
+       ``<ts>-<type>-<sha256(ts + type + body)[:8]>.md``; with an empty body two
+       events sharing a second produce byte-identical names and the second
+       silently overwrites the first. `now_iso` is second-resolution and a
+       satisfy immediately followed by an enter is the normal case, so this is
+       not a corner.
+
+    Total by contract: the projector hands this whatever is on the ledger,
+    including rows written by earlier versions of the code, so every field is
+    read defensively and nothing here raises."""
+    if not isinstance(payload, dict):
+        return str(payload)
+    action = payload.get("action", "")
+    phase = payload.get("phase", "")
+    head = f"[{action}] mindnet phase {payload.get('task_id', '')}"
+    if phase:
+        head += f" — {phase}"
+    parts = [head]
+    epoch = payload.get("epoch")
+    verified_by = payload.get("verified_by")
+    if epoch is not None or verified_by:
+        # The two fields that decide how a satisfaction is WEIGHED (KTD2/KTD3)
+        # must survive into the searchable projection — otherwise "was this
+        # machine-checked?" is answerable only by reading the raw jsonl.
+        marks = []
+        if epoch is not None:
+            marks.append(f"epoch {epoch}")
+        if verified_by:
+            marks.append(f"verified_by: {verified_by}")
+        parts.append(" · ".join(marks))
+    ev = payload.get("evidence")
+    if isinstance(ev, dict):
+        bits = [f"kind: {ev.get('kind', '')}"]
+        for key in ("result", "ref"):
+            if ev.get(key):
+                bits.append(f"{key}: {ev[key]}")
+        parts.append("evidence — " + ", ".join(bits))
+        if ev.get("detail"):
+            parts.append(str(ev["detail"]))
+    detail = str(payload.get("detail") or "").strip()
+    if detail:
+        parts.append(detail)
+    return "\n\n".join(parts)
+
+
 def validate_stored(payload) -> None:
     """Enforce the WRITER's shape: everything `validate_payload` checks, plus a
     ``verified_by`` the appending code path derived. The CLI calls this

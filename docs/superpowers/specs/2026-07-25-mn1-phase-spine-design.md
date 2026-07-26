@@ -1,11 +1,38 @@
 # MN-1 — the phase spine (governor core)
 
-> Status: **design, awaiting approval.** Slice 2 of 6 in
-> `2026-07-25-mindnetwork-architecture-decomposition.md`.
+> Status: **implemented (2026-07-27), with five recorded amendments.** Slice 2
+> of 6 in `2026-07-25-mindnetwork-architecture-decomposition.md`.
+> Where the shipped code and this document disagreed, the disagreement is
+> written down in §0 rather than left for a reader to trip over — that is this
+> document's own §10 rule ("amended in the same change-set, not silently
+> contradicted") applied to itself.
 > Every "already exists" claim is file:line-grounded against this checkout on
 > 2026-07-25. Every latency figure is measured on this machine, not estimated.
 > Standing constraints (CLAUDE.md + SOPs): stdlib-only; test-first; `hive log`
 > every `src/`+`tests/` change-set; land green; append-only ledger.
+
+---
+
+## 0. Amendment log (2026-07-27, MN-1 U8)
+
+Five places where the design as written and the design as built disagreed. Each
+is amended IN PLACE below and recorded here, so the contradiction has one
+resolution instead of two coexisting statements.
+
+| # | Where | Was | Is, and why |
+|---|---|---|---|
+| A1 | §2 row 4 + §2.1 | `audit-bug` "agent-reported"; §2.1 stated flatly "Python never spawns" | **Python executes it, behind a fail-closed gate.** `hive mindnet validate` runs the task's `validation_script` as argv (`shell=False`, `posix=False`, timeout, `runlog` capture) and stamps `verified_by="python"` on the result. The two statements could not both survive: the operator authorised free-form validation execution, and a `command` phase that Python may not run has no python-verifiable evidence at all. What is preserved is the *reason* the old rule existed — see A1b. |
+| A1b | §2.1 | — | The `gh` / `git push` denylist and the fail-closed classifier are what carry KTD6's intent forward. `tests/test_research.py` still asserts Python never shells out to `gh pr`, and `executor.py` refuses that argv explicitly rather than relying on nobody writing it. |
+| A2 | §2 row 5 | `audit-code` verified by **python** | **agent-reported** (KTD17). No review event type is registered in `events.py` and `hive review clear` (`review.py:121-126`) unlinks a sidecar and appends nothing — there is no artifact Python could read, so a `python` claim here would be exactly the lie §2.1's honesty rule exists to prevent. A `review_cleared` producer is its own slice. `audit-code` also takes `event` evidence, not `command`. |
+| A3 | §2.2, §3.1, §7 | `trivial` | **`triviality_bypass`**. The shipped field name, in `tasks.Task`, the `mindnet_task` payload, and the CLI flag. `trivial` was never written to a ledger row. |
+| A4 | §2 rows 0–2 | `brainstorm` had no directory constraint | **`brainstorm` requires `docs/superpowers/specs/`.** With no directory, *any* non-empty file satisfied it — including `mindnet/state.json`, the machine's own sidecar. Related widening in the same table: `plan` accepts **two** directories, `docs/plans/` and `docs/superpowers/plans/`, because this repo genuinely has both and a single-directory rule would have left this machine unable to validate its own plan file. Containment (`Path.is_relative_to` on resolved paths), never a string prefix. |
+| A5 | §7, and the decomposition's build order | MN-2 was "fifth in the build order and depends on MN-3"; §7 was forward-declaration only | **MN-2 shipped BEFORE MN-1.** The phase spine needs a task to hang a phase on, so `mindnet/tasks.py` is a real module with its own suite, not a sketch. §7's dataclass is superseded by the shipped `tasks.Task`; its three cycle checks all shipped. |
+
+Two smaller corrections, folded into the sections themselves rather than given
+rows: `verified_by` is a **top-level** field of the `mindnet_phase` payload, not
+a member of `evidence` (§3.1 showed it nested — a self-attesting shape KTD2
+forbids); and §6's module table omitted `sidecar.py`, `executor.py` and
+`tasks.py`, while §6.2's command list omitted `validate` and `restat`.
 
 ---
 
@@ -47,39 +74,66 @@ PHASES = ("brainstorm", "plan", "prd", "execution",
           "audit-bug", "audit-code", "audit-system", "pr-green")
 ```
 
-| # | Phase | Objective | Exit evidence | Verified by |
-|---|-------|-----------|---------------|-------------|
-| 0 | `brainstorm` | Explore intent, constraints, rejected alternatives | design/spec file exists, non-empty | **python** |
-| 1 | `plan` | Data structures, contracts, dependencies, language lock | plan file under `docs/superpowers/plans/` | **python** |
-| 2 | `prd` | Source-of-truth requirements doc | file under `docs/prds/` | **python** |
-| 3 | `execution` | Write code strictly against the PRD | `code_change` event present for this task | **python** |
-| 4 | `audit-bug` | Unit/integration tests green | test command exit 0 | agent-reported |
-| 5 | `audit-code` | Correctness + maintainability review | review record event | **python** |
-| 6 | `audit-system` | Thermo-nuclear / system-level audit cleared | review cleared | agent-reported |
-| 7 | `pr-green` | CI green on the PR | `gh pr checks` green | agent-reported |
+| # | Phase | Objective | Evidence kind | Exit evidence | Verified by |
+|---|-------|-----------|---------------|---------------|-------------|
+| 0 | `brainstorm` | Explore intent, constraints, rejected alternatives | `file` | a file **contained in** `docs/superpowers/specs/` (A4) | **python** |
+| 1 | `plan` | Data structures, contracts, dependencies, language lock | `file` | a file contained in `docs/plans/` **or** `docs/superpowers/plans/` (A4) | **python** |
+| 2 | `prd` | Source-of-truth requirements doc | `file` | a file contained in `docs/prds/` | **python** |
+| 3 | `execution` | Write code strictly against the PRD | `event` | a `code_change` event carrying this `task_id` (KTD16) | **python** |
+| 4 | `audit-bug` | Unit/integration tests green | `command` | `validation_script` exit 0, captured to a runlog artifact (A1) | **python** |
+| 5 | `audit-code` | Correctness + maintainability review | `event` | a review record — no such event type exists yet (A2) | agent-reported |
+| 6 | `audit-system` | Thermo-nuclear / system-level audit cleared | `command` | review cleared | agent-reported |
+| 7 | `pr-green` | CI green on the PR | `command` | `gh pr checks` green — run by the agent; the executor **refuses** this argv (A1b) | agent-reported |
 
 ### 2.1 Evidence kinds, and the honesty rule
 
 `EVIDENCE_KINDS = ("file", "event", "command", "human")`
 
-- `file` — Python stats the path: exists and non-empty. `verified_by="python"`.
+- `file` — Python resolves the path against the worktree root and requires it
+  to be **contained** in one of the phase's required directories (never a
+  string prefix: `docs/prds/../../../etc/passwd` passes a `startswith` test).
+  `verified_by="python"`.
 - `event` — a ledger event of the required type exists for this task.
   `verified_by="python"`.
-- `command` — **the agent ran it and reports the exit code.** Python records
-  the claim and stamps `verified_by="agent"`. Python never spawns.
-- `human` — operator confirmation. `verified_by="human"`.
+- `command` — **Python runs it, behind a fail-closed gate** (amended, A1). See
+  below.
+- `human` — operator confirmation at an interactive prompt.
+  `verified_by="human"`.
 
-**Why `command` is agent-reported and not Python-executed.** KTD6 is locked:
-"Python plans; the agent executes — Python never spawns agents"
-(`skills/mindhive-orchestrator/references/parallel-orchestration.md:10-12`).
-For PR-green specifically the operator already decided agent-executes-`gh`,
-respecting the `GITHUB_DENY` posture — `tests/test_research.py:1139-1141`
-actively asserts Python never shells out to `gh pr`. So the directive's
-"`validation_script` that MUST return exit code 0" becomes: the agent runs it,
-Python holds the gate state, and the record says which of the two vouched for
-it. A satisfaction stamped `verified_by="agent"` is **never** displayed or
-folded as if Python had checked it. That distinction is the whole point of R11
-— see §5.
+**Why `command` is Python-executed, and what that cost.** *(Amended A1 — the
+original text here read "the agent ran it and reports the exit code… Python
+never spawns", which the shipped executor contradicts. The operator authorised
+free-form validation execution, and the reason is structural: a `command` phase
+Python may not run has no python-verifiable evidence at all, so `audit-bug`
+would have been agent-reported forever and the honesty rule would have had
+nothing left to distinguish.)*
+
+`hive mindnet validate` splits the stored `validation_script` with
+`shlex.split(cmd, posix=False)` and runs the argv with `shell=False`, an
+explicit timeout, `paths.NO_WINDOW`, and output captured through MN-0's
+`runlog` — the `research.run_experiment` idiom. `posix=False` is load-bearing on
+Windows: POSIX-mode `shlex` eats backslashes as escapes, silently turning
+`pytest C:\Users\…` into `pytest C:Users…` and recording a false `fail`.
+
+What survives from KTD6 ("Python plans; the agent executes") is its actual
+subject — **`gh`**. `executor.py` refuses, by explicit denylist, any argv whose
+program resolves to `gh` or to `git push`, so the `GITHUB_DENY` posture and
+`tests/test_research.py`'s standing assertion that Python never shells out to
+`gh pr` are enforced rather than merely restated. `pr-green` therefore stays
+agent-reported (table row 7).
+
+Both refusals — the destructive-command classifier and the denylist — **fail
+closed**: any reason string refuses, and any exception raised *inside* the
+classifier also refuses. This deliberately inverts `enforce.evaluate_policies`
+(`except Exception: return None` → allow), which is fail-open because it is
+advisory. Fail-open is right for a hint and dangerous for an execution gate.
+
+A refusal must not wedge a task, so `audit-bug` remains satisfiable by
+`hive mindnet satisfy --agent-reported`, whose `detail` MUST carry the refusal
+reason verbatim. A classifier false positive therefore costs an honest downgrade
+rather than a deadlock — and a satisfaction stamped `verified_by="agent"` is
+**never** displayed or folded as if Python had checked it. That distinction is
+the whole point of R11 — see §5.
 
 ### 2.2 Legal transitions
 
@@ -92,11 +146,18 @@ folded as if Python had checked it. That distinction is the whole point of R11
    may fall all the way to `plan`. Falling back is how the machine handles
    failure, so it must never be gated.
 3. **Forward skip > 1** — illegal, with one exception:
-4. **Triviality bypass** — a task declared `trivial: true` enters at
-   `execution`, treating `brainstorm`/`plan`/`prd` as not-required. Scope is
-   ADR-0005's verbatim list: one-line fixes, typos, renames, config tweaks,
-   doc edits. Recorded on the task, so the bypass is auditable rather than
-   implicit. Non-trivial work cannot use it.
+4. **Triviality bypass** — a task declared `triviality_bypass: true` *(amended
+   A3: the field was called `trivial` here and shipped as
+   `triviality_bypass`)* enters at `execution`, treating
+   `brainstorm`/`plan`/`prd` as not-required, and its terminal gate is
+   `audit-bug` rather than `pr-green`. Scope is ADR-0005's verbatim list:
+   one-line fixes, typos, renames, config tweaks, doc edits. Recorded on the
+   task, so the bypass is auditable rather than implicit. Non-trivial work
+   cannot use it, and three further rules make that stick: the flag is honoured
+   on the **first declare only** (a later re-declare setting it was a
+   completion skeleton key), clearing it on a task already at or past
+   `execution` is refused, and the trivial entry itself is refused when any
+   bypassed phase already carries a satisfaction.
 
 ---
 
@@ -110,22 +171,40 @@ Registry/audit lifecycle, exactly like `roadmap` and `sop`: low volume,
 recallable, chain-verified, and it must survive consolidation.
 
 ```json
-{"action": "enter|satisfy|fall_back|declare",
+{"action": "declare|enter|satisfy|fall_back",
  "task_id": "kebab-case, <=64 chars",
- "phase": "one of PHASES",
- "trivial": false,
+ "phase": "one of PHASES (omitted only on declare)",
+ "epoch": 0,
+ "verified_by": "python|agent|human",
+ "detail": "<=2000 chars (REQUIRED on fall_back)",
  "evidence": {"kind": "file|event|command|human",
-              "ref": "path | event type | command",
+              "ref": "worktree-root-relative path | runlog artifact | command",
               "result": "ok|fail",
-              "verified_by": "python|agent|human",
-              "detail": "<=500 chars"}}
+              "detail": "<=2000 chars"}}
 ```
 
-Contract enforced by `mindnet/phases.validate_payload`, dispatched from
-`__main__.cmd_append` alongside the existing `roadmap`/`sop`/`code_change`
-cases (`__main__.py:65-73` is the pattern). Merge exemptions: add to
-`consolidate.CONSOLIDATE_TYPES` **and** `dedupe.collapse` — both, because
-those two already drifted apart (§7 known defect 2).
+Three corrections against the shape first drafted here. `verified_by` is
+**top-level, not inside `evidence`** — nesting it inside the object the caller
+supplies is the self-attestation KTD2 exists to stop. `epoch` is required on
+`satisfy`: a satisfaction not bound to the task's current `fall_back`
+generation is re-usable forever. And `trivial` is not a field of this payload
+at all (A3) — the bypass lives on the `mindnet_task` axis, and the entry phase
+is *derived* by the fold rather than named by a caller, because a caller-named
+entry phase is precisely the teleport MN-2 removed.
+
+Contract enforced by `mindnet/phases.validate_payload` (the append surface,
+which refuses `verified_by`) and `mindnet/phases.validate_stored` (the writer,
+which requires it), dispatched from `events._PAYLOAD_CONTRACTS` — the dispatch
+table now lives beside the type registry so the CLI and the dashboard's
+`POST /api/append` cannot enforce different contracts, which is how they
+drifted before. Merge exemptions: `consolidate.NEVER_CONSOLIDATE` **and**
+`dedupe.NEVER_COLLAPSE` — both, because those two already drifted apart, on
+`learning` and `state_set` as well as here.
+
+`mindnet_phase` also needs a `ledger_body(payload)` (it has, in `phases.py`).
+Its payload carries no `text`, so without one every phase event would project
+an empty LEDGER body and two events in the same second would hash to the same
+filename.
 
 ### 3.2 `mindnet_activity` → `DETERMINISTIC_TYPES`
 
@@ -205,12 +284,22 @@ colliding with the existing `graph.py` (knowledge graph), and keeps everything
 out of `dashboard_page.py` (1780 lines, past the thermo-nuclear threshold;
 invariant 8 forbids new code there).
 
+As built (the table originally listed four modules and omitted three):
+
 | Module | Purpose | Test |
 |---|---|---|
-| `mindnet/phases.py` | The legend: names, order, evidence descriptors, `validate_payload` | `test_mindnet_phases.py` |
-| `mindnet/controller.py` | Fold, transition table, evidence evaluation, sidecar read/write | `test_mindnet_controller.py` |
+| `mindnet/tasks.py` | MN-2's graph: the `PHASES` legend, `Task`, the fold, triple-threat cycle detection, `ledger_body` | `test_mindnet_tasks.py` |
+| `mindnet/phases.py` | Evidence descriptors, ref containment, the two-surface contract, `ledger_body` | `test_mindnet_phases.py` |
+| `mindnet/controller.py` | Fold, transition table, evidence evaluation, `restat` | `test_mindnet_controller.py` |
+| `mindnet/sidecar.py` | `mindnet/state.json`: the freshness stamp, the pid-scoped write, `rebuild` | `test_mindnet_sidecar.py` |
 | `mindnet/inject.py` | Unconditional phase-aware `extend_hook_context` | `test_mindnet_inject.py` |
+| `mindnet/executor.py` | The validation runner: argv, fail-closed gate, `gh`/`git push` denylist | `test_mindnet_executor.py` |
 | `mindnet/telemetry.py` | `mindnet_activity` emission (MN-5 feed) | `test_mindnet_telemetry.py` |
+
+`PHASES` lives in `tasks.py` and is **imported** by `phases.py`, never
+redefined — invariant 10, one legend one home. Sidecar read/write was split out
+of `controller.py` rather than left inside it, because the hook path must reach
+the sidecar without importing the fold it exists to avoid running.
 
 Reused as-is, not reimplemented: the `UserPromptSubmit` hook path, `sop.block()`
 (`projector.py:145-147`), `incidents.inject()`, `recommend`/`plugins` for the
@@ -248,17 +337,36 @@ integration, not the unit under test.
 
 ### 6.2 CLI
 
-`hive mindnet` subparser, mirroring `hive roadmap` (`__main__.py:1622-1696`):
-`declare`, `enter`, `satisfy`, `fall-back`, `show`, `list`, `rebuild`.
+`hive mindnet` subparser, mirroring `hive roadmap` (`__main__.py:2225-2288`):
+`declare`, `enter`, `satisfy`, `fall-back`, `validate`, `restat`, `show`,
+`list`, `rebuild`. As built this is nine subcommands, not seven — `validate`
+(run the script behind the gate) and `restat` (re-check file evidence) were
+missing from the original list, and both are impure writers that must be
+explicit commands rather than side effects of `show`.
+
+Two deliberate omissions in the parser: no `--verified-by` flag anywhere (KTD2
+— that field is derived by whatever check actually ran), and no argparse
+`choices=PHASES` on the phase arguments (a second copy of the legend is a place
+for it to drift, and it would swap a reason the operator can act on for
+argparse's bare "invalid choice").
+
+`declare` writes **both** axes — a `mindnet_task` event and a `mindnet_phase`
+one. See DATA_MODEL.md §4.1 for why a task on only one axis is broken.
 
 ---
 
-## 7. MN-2 forward-declaration (design only — not built in this slice)
+## 7. MN-2 — ~~forward-declaration~~ **shipped first** (amended A5)
 
-MN-2 is fifth in the build order and depends on MN-3. Recorded here only so
-MN-1's event shape does not have to change when MN-2 lands. The `task_id` on
-every `mindnet_phase` event **is** the future graph node id — that is the only
-coupling MN-1 introduces.
+*Amended A5.* This section was written as forward-declaration: "MN-2 is fifth
+in the build order and depends on MN-3." It shipped **before** MN-1 instead,
+because the phase spine needs a task to hang a phase on and the alternative was
+a state machine with no state to govern. The build order in
+`2026-07-25-mindnetwork-architecture-decomposition.md` is amended to match.
+
+`mindnet/tasks.py` is therefore a real module with its own suite, not a sketch,
+and the sketch below is superseded by the shipped `Task`. The `task_id` on
+every `mindnet_phase` event **is** the graph node id — still the only coupling
+between the two axes.
 
 ```python
 @dataclass
@@ -271,9 +379,17 @@ class Task:
     status: str                   # pending|in_progress|blocked|completed
     dependencies: tuple[str, ...] # all must be completed before in_progress
     language_context: tuple[str, ...]   # permitted languages (R13)
-    trivial: bool                 # ADR-0005 bypass
+    triviality_bypass: bool       # ADR-0005 bypass (A3: was `trivial` here)
     evidence: tuple[dict, ...]
 ```
+
+The shipped record differs in three ways worth knowing before reading the code:
+it is `@dataclass(frozen=True)` and rebuilt with `dataclasses.replace` (so two
+folds can never alias each other's state); `evidence` is a tuple of runlog
+artifact **paths**, not dicts; and it carries two derived fields the sketch has
+no room for — `depth` (recomputed in one memoized pass at the end of every
+fold) and `violations` (the refusals the fold made against this record, which
+is how the projection can explain why it disagrees with an immutable ledger).
 
 Cycle safety needs **two** independent checks, not one: the `parent_id` chain
 must stay a tree (no ancestor loops), and the `dependencies` edges must stay a

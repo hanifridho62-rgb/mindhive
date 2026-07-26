@@ -72,11 +72,28 @@ DETERMINISTIC_TYPES = {
     "autoresume",
     # MindNetwork MN-5 cat-status feed: one event per faculty waking or going
     # idle (skill-plugin, sop, improvements, history, task-graph, compatibility,
-    # pr-green). Deterministic, NOT semantic — it is high-volume UI telemetry
-    # and must never bloat the hash chain. Deliberately ledger-derived rather
-    # than in-memory: R16's "a missing cat means a real bug" collapses if the
-    # feed can vanish for unrelated reasons (MindSwarm's mission state is a
-    # plain instance attribute that dies with the server).
+    # pr-green). Deterministic, NOT semantic — high-volume UI telemetry.
+    #
+    # What "deterministic" buys, precisely: membership here and NOT in
+    # SEMANTIC_TYPES / MEMORY_VIEW_TYPES keeps the feed off the SEMANTIC layer —
+    # no LEDGER markdown file per event (projector.LEDGER_TYPES), no Memory
+    # view row, no keyword-recall corpus entry, no consolidation pass.
+    #
+    # What it does NOT buy: staying off the hash chain. `chain.compute_chain`
+    # folds `events.read_all()` with NO type filter, so every activity event is
+    # hashed at append-projection time and re-hashed in full by every `hive
+    # verify`. The chain is over the whole ledger, not over the semantic subset.
+    # The volume consequence is MN-5's to carry: the cat board is the only
+    # consumer, `telemetry.busy` already emits at most one active/idle PAIR per
+    # transition rather than per frame, and if MN-5's rendering ever tempts a
+    # per-tick emitter the cost lands on `hive verify`'s runtime for the life of
+    # the store. Bound the emission rate there; do not assume this registration
+    # exempts anything.
+    #
+    # Deliberately ledger-derived rather than in-memory: R16's "a missing cat
+    # means a real bug" collapses if the feed can vanish for unrelated reasons
+    # (MindSwarm's mission state is a plain instance attribute that dies with
+    # the server).
     "mindnet_activity",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
@@ -104,8 +121,17 @@ _PAYLOAD_CONTRACTS = {
     "roadmap": (".roadmap",
                 "hive roadmap set|step|interrupt|resume|complete …"),
     "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
+    # The hint names ONLY what ships. `mindnet_task` has five actions
+    # (tasks.ACTIONS) but exactly one CLI producer — `hive mindnet declare`;
+    # `status`, `depend`, `reparent` and `evidence` have no subcommand yet and
+    # are reachable only through this same raw-append surface. Advertising them
+    # as commands sent an operator whose append was just rejected off to run
+    # four things that do not exist, which is a worse failure than the original
+    # rejection. When a subcommand lands, add it here in the same change-set.
     "mindnet_task": (".mindnet.tasks",
-                     "hive mindnet declare|status|depend|reparent|evidence …"),
+                     "hive mindnet declare … — the status/depend/reparent/"
+                     "evidence actions have no subcommand yet; append them as "
+                     "raw JSON with a valid `action` field"),
     # mindnet_phase points at the APPEND-SURFACE half of a two-validator
     # contract: phases.validate_payload refuses any payload carrying
     # `verified_by`, so this surface cannot self-attest a machine verification

@@ -438,9 +438,11 @@ def test_worktree_root_is_not_detect_project():
 # guard that cries wolf gets deleted within a week.
 #
 # Case-SENSITIVE on purpose: prose legitimately capitalises at a sentence start
-# or in a heading (`mindnet/__init__.py` lists "PR-green" in its slice table),
-# and the drift that actually breaks a string comparison is a different
-# SPELLING, not a different case.
+# or in a heading, and the drift that actually breaks a string comparison is a
+# different SPELLING, not a different case. (U8 did fix the one real instance —
+# `mindnet/__init__.py`'s slice table used to write the terminal phase with a
+# capitalised prefix — but the scanner is not what caught it, and widening it to
+# case-insensitive would start flagging every capitalised sentence opener.)
 
 _COMPOUND_RE = re.compile(r"audit[-_ ]?(?:bug|code|system)|pr[-_ ]?green")
 _LITERAL_RE = re.compile(r"""["']([A-Za-z][A-Za-z0-9_-]*)["']""")

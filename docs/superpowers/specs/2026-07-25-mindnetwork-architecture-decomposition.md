@@ -18,9 +18,19 @@
 ## 1. What MindNetwork is
 
 MindNetwork is the governing brain over every phase of building code in this
-repo — brainstorm → plan → PRD → execution → bug audit → code audit → system
-audit → PR green — enforced by the system rather than requested by prose, and
-observable in MindSwarm so the operator can see which faculty is awake.
+repo — brainstorm → plan → prd → execution → audit-bug → audit-code →
+audit-system → pr-green — enforced by the system rather than requested by
+prose, and observable in MindSwarm so the operator can see which faculty is
+awake. (Amended 2026-07-27: this line used to spell the pipeline in prose —
+"PRD", "bug audit", "PR green". Invariant 10 says the `tasks.PHASES` strings
+are used verbatim in code, UI **and** docs, and this sentence is the first
+place a reader meets them.)
+
+> **Build-order amendment (2026-07-27).** §MN-2 below places the task graph
+> fifth, after MN-3. It shipped **second**, immediately after MN-0 and before
+> MN-1: the phase spine needs a task to hang a phase on. As-built order is
+> MN-0 → MN-2 → MN-1 → (MN-5, MN-3, MN-4 outstanding). Recorded as amendment
+> A5 in `2026-07-25-mn1-phase-spine-design.md` §0.
 
 ### 1.1 The founding insight: the spine already exists, as prose
 

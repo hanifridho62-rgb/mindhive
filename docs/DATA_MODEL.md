@@ -79,6 +79,9 @@ LEDGER, the hash chain, the Memory view, and keyword recall:
 | `code_change` | `{text, category, files[]}` | mandatory change-log (`changelog.py`); category ∈ update, minor_change, deletion, reduction, major_change, replacement |
 | `learning` | `{text, …}` | Self-Reliant PRD report |
 | `sop` | `{action, sop_id, title?, text?}` | SOP lifecycle (`sop.py`); action ∈ add, update, delete; current registry = deterministic fold, delivered via the STATE.md SOP block |
+| `roadmap` | `{action, plan_id, title?, prompt?, steps[]?, index?, status?, cause?, note?}` | Flat plan registry (`roadmap.py`); action ∈ set, step, interrupt, resume, complete; `set` replaces the step list wholesale (≤ `MAX_STEPS` 50, no `parent_id`); `interrupt` projects the STATE.md out-of-usage marker |
+| `mindnet_task` | `{action, task_id, title?, parent_id?, description?, status?, on?, ref?, dependencies[]?, language_context[]?, validation_script?, faculty?, triviality_bypass?}` | MN-2 hierarchical task graph (`mindnet/tasks.py`); action ∈ declare, status, depend, reparent, evidence. **No `phase` action** — the phase axis has exactly one writer (see `mindnet_phase`). `triviality_bypass` is honoured on the FIRST declare only. The fold *refuses* cycle-closing / over-deep / settled-work edges and records the refusal in the record's `violations` rather than entering the bad state |
+| `mindnet_phase` | `{action, task_id, phase?, epoch?, evidence?{kind, ref?, result?, detail?}, detail?, verified_by}` | MN-1 phase spine (`mindnet/phases.py` contract, `mindnet/controller.py` fold); action ∈ declare, enter, satisfy, fall_back; phase ∈ brainstorm, plan, prd, execution, audit-bug, audit-code, audit-system, pr-green; evidence kind ∈ file, event, command, human; `verified_by` ∈ python, agent, human. **Two validators, deliberately:** `validate_payload` (the raw-append surface) REFUSES a payload carrying `verified_by`, and `validate_stored` (the writer, called just before `append_event`) REQUIRES it |
 
 **Deterministic** (`DETERMINISTIC_TYPES`) — machine-harvested telemetry:
 `file_touched`, `command_run`, `git_diff`, `session_start`, `session_end`,
@@ -100,12 +103,43 @@ model?, timer?, outcome?, detail?}` — auto-resume delivery lifecycle,
 `autoresume.py`: action ∈ scheduled, fired, cancelled; after a usage-limit
 interruption the roadmap marker is scheduled to re-enter Claude once the
 ~5h window reopens, and these events are the delivery audit trail; the
-roadmap events remain the semantic record).
+roadmap events remain the semantic record),
+`mindnet_activity` (`{faculty, status, task_id?, phase?}` — MN-1's faculty feed
+for MN-5's cat board, `mindnet/telemetry.py`: faculty ∈ skill-plugin, sop,
+improvements, history, task-graph, compatibility, pr-green; status ∈ active,
+idle; `task_id`/`phase` are decoration and are dropped when malformed rather
+than losing the event).
 
-Registry/audit types are **exempt from merging everywhere**: `code_change`,
-`sop`, `learning` are never absorbed by consolidation (`consolidate.py`) and
-never collapsed by display dedupe (`dedupe.py`) — similar wording does not
-mean same fact for audit rows, and the SOP fold replays every lifecycle event.
+**"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
+type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
+row, no recall corpus entry and no consolidation pass — but
+`chain.compute_chain` folds `events.read_all()` with **no type filter**, so
+every telemetry event is hashed and re-hashed in full by every `hive verify`.
+Volume is therefore a real cost of a high-frequency type (`mindnet_activity`
+being the one to watch); bound it at the emitter.
+
+### 3.1 Merge exemptions (both lists, or it is not exempt)
+
+Registry/audit types are **exempt from merging everywhere**, and "everywhere"
+is two independent lists that must agree:
+
+| List | Governs | Constant |
+|---|---|---|
+| consolidation (the dreaming pass) | a ledger-visible merge — `memory_consolidated` hides the absorbed originals from every future briefing | `consolidate.NEVER_CONSOLIDATE` (subtracted from `CONSOLIDATE_TYPES`) |
+| display dedupe | a display-time merge in the briefing, the dashboard Memory view, and Improvements | `dedupe.NEVER_COLLAPSE` |
+
+Exempt in both: `code_change`, `learning`, `state_set`, `sop`, `roadmap`,
+`mindnet_task`, `mindnet_phase`. Two reasons, and both matter — **audit rows**
+(`code_change`, `learning`) where similar wording does not mean the same fact,
+and **replayed registries** (`sop`, `roadmap`, `mindnet_task`,
+`mindnet_phase`) whose folds replay every lifecycle event, so an add and its
+later update are two steps of one record's history rather than a duplicate
+pair. `state_set` is last-one-wins state with no `text` at all.
+
+They are two lists on purpose, so they are checked rather than derived:
+`tests/test_architecture_drift.py` asserts the agreement. It exists because
+they drifted twice — `learning` and `state_set` were exempt from consolidation
+while still collapsible in the display path.
 
 ## 4. Relationships (how the tables connect)
 
@@ -140,6 +174,54 @@ Key joins an AI reader should know:
   (`autoresume.fold`) to the interrupted plan whose marker it re-delivers.
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
+- `task_id` is MindNetwork's join key and threads **three** streams:
+  `mindnet_task` (the graph node — `tasks.fold`), `mindnet_phase` (that node's
+  phase and evidence — `controller.fold`), and `mindnet_activity` (the faculty
+  feed). It also joins *outward*: `code_change.task_id` is an optional key
+  (written by `changelog.record(task_id=…)`) and is what makes the `execution`
+  phase machine-checkable — the check is "a `code_change` event on this
+  ledger carries this `task_id`". Historical `code_change` rows have no such
+  key, which is exactly why it is optional and reads stay total.
+
+### 4.1 MindNetwork: two axes, one declare
+
+A MindNetwork task exists on **two** axes with two event types, and a task
+present on only one of them is broken in a way that is easy to create and hard
+to see:
+
+| Axis | Event type | Fold | What it owns |
+|---|---|---|---|
+| graph | `mindnet_task` | `mindnet/tasks.py` | parent/child, dependencies, status, `triviality_bypass`, `validation_script` |
+| phase | `mindnet_phase` | `mindnet/controller.py` | current phase, per-phase evidence, epoch, `verified_by` |
+
+`Task.phase` records only the **declared entry phase** and has no writer inside
+`tasks.py`; the authoritative current phase is the controller's. That is the
+one-writer rule, and it is why `mindnet_task` has no `phase` action.
+
+Consequence for any producer: **`hive mindnet declare` appends BOTH events.** A
+graph node with no phase record cannot advance (there is nothing to advance),
+and a phase record with no graph node folds into the controller's `orphans`
+bucket — rendered, never silently dropped, because the events are already
+immutable on the ledger.
+
+### 4.2 The validation executor's denylist
+
+`hive mindnet validate` is the one place Python runs an operator-authored
+string (`mindnet/executor.py`). Contract, so nothing downstream has to assume
+it: `shlex.split(cmd, posix=False)` → argv with `shell=False`, an explicit
+timeout, and output captured through MN-0's `runlog`. Two refusals, both
+**fail-closed** — the opposite of `enforce.evaluate_policies`, which is
+fail-open by design because it is advisory:
+
+- the destructive-command classifier refuses on any reason string **and on any
+  exception it raises**;
+- an explicit denylist refuses any argv resolving to `gh` or to `git push`, so
+  the "`pr-green` stays agent-reported, `GITHUB_DENY` is preserved" claim is
+  enforced rather than merely asserted.
+
+A refusal must never wedge a task: the phase can still be satisfied by
+`hive mindnet satisfy --agent-reported`, whose `detail` carries the refusal
+reason verbatim, so the ledger shows plainly that Python did not verify it.
 
 ## 5. Invariants — do not break these
 
@@ -165,10 +247,17 @@ Key joins an AI reader should know:
    `changelog.py`, `sop.py`) with a `validate_payload` enforced in
    `__main__.cmd_append` — the store stays type-agnostic; the contract lives
    at the append surfaces.
-3. Decide merge semantics: audit/registry types must be exempted in
-   `consolidate.CONSOLIDATE_TYPES` and `dedupe.collapse`.
+3. Decide merge semantics: an audit/registry type must be named in **both**
+   `consolidate.NEVER_CONSOLIDATE` and `dedupe.NEVER_COLLAPSE` (§3.1).
+   `tests/test_architecture_drift.py` fails if you do only one.
 4. Decide projections: LEDGER body (`projector.build_ledger_entries`),
-   STATE/MEMORY block, briefing section, dashboard API + view.
+   STATE/MEMORY block, briefing section, dashboard API + view. **A semantic
+   type whose payload has no `text` key needs a `ledger_body(payload)` in its
+   owning module** (pattern: `sop`, `roadmap`, `mindnet/phases`,
+   `mindnet/tasks`) wired into `build_ledger_entries`. Without one it projects
+   an empty body — invisible to keyword recall, which searches the projected
+   markdown — and, because the LEDGER filename hashes `ts + type + body`, two
+   events in the same second collide and one silently overwrites the other.
 5. Add tests mirroring `tests/test_sop.py` (contract, fold totality,
    delivery, CLI) and run the full suite.
 6. Record the change: `hive log <category> "…"` — the change-log gate is

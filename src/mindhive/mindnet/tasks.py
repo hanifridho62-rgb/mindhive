@@ -243,6 +243,59 @@ def validate_payload(payload) -> None:
     # the whole contract.
 
 
+def ledger_body(payload) -> str:
+    """Self-describing markdown body for a ``mindnet_task`` event's LEDGER
+    entry, mirroring `roadmap.ledger_body` / `sop.ledger_body`.
+
+    Same two failures as `phases.ledger_body` without it: these payloads carry
+    no ``text``, so `projector.build_ledger_entries`' default renders an empty
+    body (invisible to keyword recall, which searches the projected markdown)
+    and two same-second events hash to the SAME filename, silently overwriting
+    each other.
+
+    Total by contract — the projector hands this whatever is on the ledger,
+    including rows from earlier versions of the code."""
+    if not isinstance(payload, dict):
+        return str(payload)
+    action = payload.get("action", "")
+    head = f"[{action}] mindnet task {payload.get('task_id', '')}"
+    title = str(payload.get("title") or "").strip()
+    if title:
+        head += f" — {title}"
+    parts = [head]
+    # Only the fields THIS action actually writes, so the entry reads as what
+    # happened rather than as a dump of the whole record.
+    facts = []
+    if action == "declare":
+        parent = payload.get("parent_id")
+        facts.append(f"parent: {parent}" if parent else "parent: (root)")
+        if payload.get("triviality_bypass"):
+            facts.append("triviality_bypass: true")
+        if payload.get("faculty"):
+            facts.append(f"faculty: {payload['faculty']}")
+        langs = payload.get("language_context")
+        if isinstance(langs, list) and langs:
+            facts.append("language_context: " + ", ".join(str(x) for x in langs))
+    elif action == "status":
+        facts.append(f"status: {payload.get('status', '')}")
+    elif action == "depend":
+        facts.append(f"depends on: {payload.get('on', '')}")
+    elif action == "reparent":
+        parent = payload.get("parent_id")
+        facts.append(f"parent: {parent}" if parent else "parent: (root)")
+    elif action == "evidence":
+        facts.append(f"ref: {payload.get('ref', '')}")
+    if facts:
+        parts.append(" · ".join(facts))
+    script = str(payload.get("validation_script") or "").strip()
+    if script:
+        parts.append(f"validation_script: {script}")
+    desc = str(payload.get("description") or "").strip()
+    if desc:
+        parts.append(desc)
+    return "\n\n".join(parts)
+
+
 # --- traversal (all iterative) ------------------------------------------------
 
 def roots(tasks) -> list:
