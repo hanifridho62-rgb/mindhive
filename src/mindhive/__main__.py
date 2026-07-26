@@ -84,9 +84,18 @@ def cmd_hook(args) -> int | None:
         # carries the clarifying questions (see enrich.extend_hook_context —
         # additive, sidecar-only read, fail-open).
         from . import enrich, promptgate
+        from .mindnet import inject as mn_inject
         context = promptgate.hook_context(raw)
         if context:
             context = enrich.extend_hook_context(context, raw)
+        # MN-1 U9: the phase spine steers EVERY turn, including a clear prompt —
+        # that unconditional reach is the whole point, so this call sits outside
+        # the `if` above rather than riding the gate's decision. Sidecar-only
+        # read, additive, fail-open; it returns `context` untouched (possibly
+        # falsy) whenever there is nothing to say or anything goes wrong, so the
+        # print below still fires only when a subsystem actually spoke.
+        context = mn_inject.extend_hook_context(context, raw)
+        if context:
             print(json.dumps(context))
         # Durable causal trace: record which skills the gate directed so Oversee
         # can later show the honest "directed by prompt-gate" why. Best-effort

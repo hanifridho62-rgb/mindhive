@@ -74,26 +74,41 @@ from typing import NamedTuple
 from .. import events as ev_mod
 from .. import paths
 from . import controller as c_mod
+from . import tasks as t_mod
 from .controller import Orphan, PhaseRecord, PhaseState, Satisfaction
+from .tasks import Task
 
 # Bumped only when the on-disk shape changes in a way a reader must notice.
 # Nothing branches on it today: an unrecognised document already degrades to an
 # empty read through the same path a corrupt one takes, which is the fail-open
 # behaviour a version check would have to implement anyway. It is written so a
 # future reader can tell WHICH shape it is looking at.
-SCHEMA_VERSION = 1
+#
+# 2 added the ``tasks`` block. A v1 document decodes to an empty task map rather
+# than an error, which is the honest answer: it genuinely carried no graph.
+SCHEMA_VERSION = 2
 
 
 class Sidecar(NamedTuple):
     """`read`'s answer.
 
     ``fresh`` is the field callers must branch on. ``state`` is populated even
-    when ``fresh`` is False — see the module docstring."""
+    when ``fresh`` is False — see the module docstring.
+
+    ``tasks`` is the GRAPH the phase state was folded against, carried here for
+    one reason: `inject.py` runs on every prompt and needs three facts the phase
+    record does not hold — ``status`` (an injector that steers a completed task
+    forever is worse than none), ``triviality_bypass`` (whose whole point is a
+    different, narrower exit gate), and ``title``. The only other source is
+    `tasks.fold(events.read_all())`, which is the ~264 ms this file exists to
+    avoid. It is a projection of the same events the records came from, taken in
+    the same pass, so it cannot disagree with them."""
 
     state: PhaseState
     fresh: bool
     reason: str                 # why it is not fresh; "" when it is
     stamp: dict                 # as read; {} when there was nothing to read
+    tasks: dict = {}            # task_id -> Task; {} for a v1 document
 
 
 class Rebuild(NamedTuple):
@@ -199,7 +214,7 @@ def _staleness(stamp, project=None):
 
 # --- serialization ------------------------------------------------------------------
 
-def _encode(state, stamp) -> str:
+def _encode(state, stamp, tasks=None) -> str:
     """The sidecar document. ``sort_keys`` makes the bytes a function of the
     CONTENT alone — two folds that built their dicts in a different insertion
     order still produce an identical file, which is what makes `rebuild`
@@ -215,6 +230,7 @@ def _encode(state, stamp) -> str:
         "records": {tid: asdict(rec) for tid, rec in state.records.items()},
         "orphans": {tid: [asdict(o) for o in rows]
                     for tid, rows in state.orphans.items()},
+        "tasks": {tid: asdict(t) for tid, t in (tasks or {}).items()},
     }, sort_keys=True, indent=2) + "\n"
 
 
@@ -279,6 +295,21 @@ def _decode(doc) -> PhaseState:
     return PhaseState(records, orphans)
 
 
+def _decode_tasks(doc) -> dict:
+    """The document's ``tasks`` block as ``task_id -> Task``. Absent (a v1
+    document) or malformed reads as ``{}``, and one unbuildable row costs that
+    row — the same row-level totality `_decode` gives the records."""
+    raw = doc.get("tasks")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for tid, obj in raw.items():
+        task = _row(Task, obj)
+        if isinstance(tid, str) and task is not None:
+            out[tid] = task
+    return out
+
+
 # --- the read path (hook-safe: degrades, never raises) --------------------------------
 
 def read(project=None) -> Sidecar:
@@ -311,7 +342,8 @@ def read(project=None) -> Sidecar:
     if not isinstance(stamp, dict):
         stamp = {}
     why = _staleness(stamp, project)
-    return Sidecar(_decode(doc), why is None, why or "", stamp)
+    return Sidecar(_decode(doc), why is None, why or "", stamp,
+                   _decode_tasks(doc))
 
 
 # --- the write path -------------------------------------------------------------------
@@ -331,8 +363,9 @@ def _tmp_path(p) -> Path:
     return p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
 
 
-def write(state, stamp, project=None) -> Path:
-    """Serialize *state* + *stamp* to the sidecar, atomically.
+def write(state, stamp, project=None, tasks=None) -> Path:
+    """Serialize *state* + *stamp* (+ the *tasks* graph) to the sidecar,
+    atomically.
 
     Raises `OSError` on a filesystem failure — this is the low-level primitive
     and its callers decide what a failure means. `rebuild` turns it into a
@@ -341,7 +374,7 @@ def write(state, stamp, project=None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_path(p)
     try:
-        tmp.write_text(_encode(state, stamp), encoding="utf-8")
+        tmp.write_text(_encode(state, stamp, tasks), encoding="utf-8")
         os.replace(tmp, p)
     except OSError:
         # A half-written tmp left behind is litter that accumulates one file per
@@ -391,9 +424,15 @@ def rebuild(project=None, evs=None, tasks=None) -> Rebuild:
                 f"was pruned this would erase real state; if that is what you "
                 f"want, delete {p} and rebuild again.",
                 0, len(standing.records))
+    # Folded HERE rather than left to `controller.fold`'s own default, because
+    # the graph is not just an input to the phase fold any more — it is written
+    # beside it, and a caller that injected nothing must still get a sidecar
+    # whose two halves came from the same events.
+    if tasks is None:
+        tasks = t_mod.fold(evs)
     state = c_mod.fold(evs, tasks)
     try:
-        write(state, _stamp(evs, segments), project)
+        write(state, _stamp(evs, segments), project, tasks)
     except OSError as e:
         return Rebuild(False,
                        f"could not write {sidecar_path(project)}: "
