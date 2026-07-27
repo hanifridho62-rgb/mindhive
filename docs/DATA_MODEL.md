@@ -266,16 +266,73 @@ returning the standard hook shape:
                         "permissionDecisionReason": "[mindhive-rule] …"}}
 ```
 
-| Signature | Fires when | Message |
+| Signature | Fires when | Message opens with |
 |---|---|---|
-| `gate:mindnet-phase` | a write/execute tool while the active task is `in_progress` at `brainstorm`, `plan` or `prd` | `ACCESS DENIED: MindNetwork State Machine violation. You cannot write or execute code while in Phase: {phase}.` |
+| `gate:mindnet-phase` | a write/execute tool while **any** `in_progress` task sits at `brainstorm`, `plan` or `prd` | `ACCESS DENIED: MindNetwork State Machine violation. You cannot write or execute code while in Phase: {phase}.` |
 | `gate:mindnet-language` | a file write whose extension falls outside a populated `language_context` | `ACCESS DENIED: Language Compatibility Lock violation. This task is strictly restricted to {languages}.` |
 
 Both are `deny` rather than `ask`: a destructive command is sometimes
 legitimate, a state-machine violation is not. Both inherit the manifest kill
 switch every policy has (`rules/enforce.json`, `policy:<signature>` →
-`{"enabled": false}`), which is the documented way to turn a rule off that can
-otherwise stop an operator working.
+`{"enabled": false}`).
+
+Each message continues past the sentence above with the **task id** and the way
+out. That is load-bearing rather than cosmetic: with several tasks in the graph
+a message naming only the phase does not say which task froze the repository,
+and a refusal an operator cannot act on is an outage.
+
+**Five guards keep this from bricking a repository.** Three were in the first
+implementation; two were added after review, and each of those two was a
+reachable total deadlock that shipped green:
+
+- **`in_progress` only** for the phase block. `pending` is every declared task's
+  default status (`tasks.py`), and `inject.active` deliberately steers it.
+  Denying on it would mean one forgotten task refuses every write forever.
+- **The current phase's evidence directory is exempt**, read from
+  `phases.PHASE_EVIDENCE` (invariant 10). Without it, `brainstorm` forbids
+  writing the very document under `docs/superpowers/specs/` that clears it.
+  Matched on a **segment-aligned suffix**, because `Write`/`Edit` require an
+  *absolute* `file_path` — an anchored comparison against
+  `docs/superpowers/specs/` fails on every path the tool can actually emit,
+  which is how the first implementation shipped a guard that never once fired.
+  The suffix match errs open by design: a guard that exists to prevent a
+  deadlock must fail permissive.
+- **Unmapped extensions never deny.** The language table is finite; the file
+  types a repo contains are not. Trailing dots, trailing spaces and `::$DATA`
+  are stripped before the extension is parsed, since Windows strips them when
+  creating the file.
+- **The evidence exemption spans BOTH rules.** Every planning phase is cleared
+  by a markdown document and `.md` maps to `markdown`, so a `language_context`
+  of `["python"]` had the phase rule wave the document through and the language
+  rule deny it one check later — two individually-sound guards composing into
+  the deadlock both prevent.
+- **`hive`, `git` and `gh` are never denied as execute tools.** Every documented
+  remedy (`hive mindnet satisfy`, `hive mindnet enter`,
+  `hive rules enforce --disable`) and the mandatory `hive log` entry run through
+  Bash; denying them made the block unrecoverable without leaving the session.
+  Running code (`python`, `pytest`, `node`) stays denied — that is the point of
+  the rule.
+
+The phase block scans for **any** blocked `in_progress` task rather than
+consulting the single furthest-along one. Routing it through `inject.active`
+meant advancing any unrelated task to `execution` silently switched the gate off
+repo-wide, and finishing that task switched it back on just as invisibly.
+
+The language lock is scoped to `WORKABLE_STATUSES`. It previously consulted
+status not at all, so a task completed months ago still enforced its
+`language_context` on every write — and because the shared ordering prefers the
+task furthest along, the settled task out-competed the live one.
+
+Fail-open throughout: missing, stale, corrupt or empty sidecar allows.
+`mindnet/enforcer.py` does not import `events` at all — `PreToolUse` fires on
+every tool call, so a ~264 ms ledger read there is not a slow feature but an
+unusable session. It also does not resolve the worktree root, because
+`paths.worktree_root` shells out to git with a 2-second timeout.
+
+**Blast radius.** The `PreToolUse` hook is registered at user level and
+`paths.detect_project` collapses every linked worktree onto the main repo's
+namespace, so one sidecar governs every checkout of a repo: a blocked task in
+one worktree denies in all of them.
 
 Three guards keep this from bricking a repository, and each has a test whose
 deletion is the outage:
