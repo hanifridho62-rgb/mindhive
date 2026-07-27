@@ -187,6 +187,126 @@ def test_an_execute_tool_is_not_exempted_by_a_docs_path():
         _sc(phase="brainstorm")) is not None
 
 
+# --- P0 REGRESSIONS: the three deadlocks that shipped -------------------------------
+#
+# All three passed review and CI. Each is here in the exact shape that let it
+# through, because the original tests were green on inputs the system never
+# actually produces.
+
+@pytest.mark.parametrize("path", [
+    # THE shape that matters: Write/Edit/MultiEdit REQUIRE an absolute
+    # file_path, and this project's rule 12 mandates absolute paths anyway. The
+    # original anti-deadlock tests were all relative, so the exemption was
+    # never once exercised against a path the tool can actually emit — and it
+    # failed on every one of them, denying the very document that clears the
+    # phase.
+    "C:/Users/hanif/mindhive/docs/superpowers/specs/thing.md",
+    "C:\\Users\\hanif\\mindhive\\docs\\superpowers\\specs\\thing.md",
+    "/home/u/repo/docs/superpowers/specs/thing.md",
+    "docs/superpowers/specs/thing.md",
+])
+def test_the_evidence_exemption_survives_an_absolute_path(path):
+    assert enf.phase_violation("Write", {"file_path": path},
+                               _sc(phase="brainstorm")) is None
+
+
+def test_an_absolute_path_outside_the_evidence_dir_is_still_denied():
+    """The suffix match must not become a blanket allow."""
+    assert enf.phase_violation(
+        "Write", {"file_path": "C:/Users/hanif/mindhive/src/widget.py"},
+        _sc(phase="brainstorm")) is not None
+
+
+def test_the_phase_and_language_rules_compose_without_deadlocking():
+    """P0: two individually-sound guards composing into the exact deadlock both
+    were written to prevent. Every planning phase is cleared by a markdown
+    document; `.md` maps to `markdown`; so any language_context not literally
+    listing `markdown` made all three planning gates unclearable — the phase
+    rule waved the document through and the language rule denied it one check
+    later."""
+    sc = _sc(phase="brainstorm", langs=("python",))
+    path = "C:/Users/hanif/mindhive/docs/superpowers/specs/spec.md"
+    assert enf.phase_violation("Write", {"file_path": path}, sc) is None
+    assert enf.language_violation("Write", {"file_path": path}, sc) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "hive mindnet satisfy t1 --ref docs/superpowers/specs/spec.md",
+    "hive mindnet enter t1 plan",
+    "hive rules enforce --disable policy:gate:mindnet-phase",
+    "hive log update \"recorded the change\"",
+    "git status",
+    "gh pr list",
+])
+def test_the_documented_escape_routes_are_reachable(cmd):
+    """P0: every remedy the system itself prescribes runs through Bash, and the
+    block denied Bash unconditionally — so a blocked phase could not be cleared,
+    the rule could not be disabled, and the mandatory `hive log` entry could not
+    be written. The block was unrecoverable without leaving the session."""
+    assert enf.phase_violation("Bash", {"command": cmd},
+                               _sc(phase="brainstorm")) is None
+
+
+@pytest.mark.parametrize("cmd", ["python build.py", "pytest -q",
+                                 "node app.js", "./configure && make"])
+def test_executing_code_is_still_denied(cmd):
+    """The exemption is an escape hatch, not an off switch — running code
+    during a planning phase is exactly what the rule exists to stop."""
+    assert enf.phase_violation("Bash", {"command": cmd},
+                               _sc(phase="brainstorm")) is not None
+
+
+def test_the_refusal_names_the_task_and_the_way_out():
+    """A refusal an operator cannot act on is an outage. With several tasks in
+    the graph, naming only the phase does not even say which task froze the
+    repository."""
+    reason = enf.phase_violation(*_write(), _sc(phase="brainstorm"))
+    assert "'t1'" in reason
+    assert "docs/superpowers/specs/" in reason
+    assert "hive rules enforce --disable" in reason
+
+
+@pytest.mark.parametrize("status", [t_mod.STATUS_COMPLETED,
+                                    t_mod.STATUS_ABANDONED,
+                                    t_mod.STATUS_BLOCKED])
+def test_a_settled_task_no_longer_holds_the_language_lock(status):
+    """P1: `locked_task` consulted status not at all, and the shared ordering
+    prefers the task furthest along — which a COMPLETED task always is. So a
+    task finished last month out-competed the live one and enforced its
+    language_context on every write in the repo, forever. That is the brick the
+    `in_progress` rule prevents for the phase block, applied to only one rule."""
+    assert enf.language_violation("Write", {"file_path": "app.js"},
+                                  _sc(status=status,
+                                      langs=("python",))) is None
+
+
+def test_a_live_task_still_holds_the_language_lock():
+    """The canary — without it the test above passes against a lock that never
+    fires at all."""
+    for status in (t_mod.STATUS_PENDING, t_mod.STATUS_READY,
+                   t_mod.STATUS_IN_PROGRESS):
+        assert enf.language_violation("Write", {"file_path": "app.js"},
+                                      _sc(status=status,
+                                          langs=("python",))) is not None
+
+
+@pytest.mark.parametrize("path", ["src/app.ts.", "src/app.ts  ",
+                                  "src/app.ts::$DATA"])
+def test_windows_path_suffixes_cannot_slip_past_the_language_lock(path):
+    """Win32 strips trailing dots/spaces and treats `::` as an alternate data
+    stream, so all of these create `app.ts` — but each parsed to an extension
+    the table does not know, and 'unmapped never denies' waved them through."""
+    assert enf.language_violation("Write", {"file_path": path},
+                                  _sc(langs=("python",))) is not None
+
+
+def test_a_drive_relative_prefix_is_not_invented_into_evidence():
+    """`text[1] == ':'` matched far more than a drive letter, and amputating an
+    arbitrary `xx:` prefix could turn an unrelated path into something that
+    looked like this phase's evidence."""
+    assert enf._norm("https://x/docs/plans/y.md").startswith("https:")
+
+
 # --- R7: the language lock -------------------------------------------------------
 
 def test_a_javascript_write_is_denied_under_a_python_lock():
@@ -306,9 +426,38 @@ def test_no_in_progress_task_anywhere_allows():
     assert enf.phase_violation(*_write(), sc) is None
 
 
-def test_selection_is_deterministic_across_two_in_progress_tasks():
-    """Two candidates must resolve the same way every time — a denial that
-    depends on dict ordering is a denial an operator cannot reproduce."""
+def test_selection_does_not_depend_on_dict_insertion_order():
+    """A denial an operator cannot reproduce is a denial they cannot clear.
+
+    Built as TWO sidecars whose dicts are populated in opposite order, not as
+    five calls against one object: `json.loads` preserves document order and
+    `sidecar._decode` preserves it again, so the risk is that WRITE order
+    decides the answer. Repeating a call on a single already-constructed dict
+    can never surface that — Python dict iteration is stable within one object,
+    so the earlier version of this test passed unconditionally."""
+    def build(order):
+        tasks, recs = {}, {}
+        for tid, phase in order:
+            tasks[tid] = t_mod.Task(task_id=tid, title=tid.upper(),
+                                    status=t_mod.STATUS_IN_PROGRESS)
+            recs[tid] = PhaseRecord(task_id=tid, phase=phase, epoch=0)
+        return s_mod.Sidecar(s_mod.PhaseState(recs, {}), True, "", {}, tasks,
+                             {})
+
+    forward = build([("a", "brainstorm"), ("b", "prd")])
+    reverse = build([("b", "prd"), ("a", "brainstorm")])
+    assert enf.phase_violation(*_write(), forward) \
+        == enf.phase_violation(*_write(), reverse)
+
+
+def test_a_second_task_further_along_does_not_switch_the_block_off():
+    """REGRESSION. This test previously asserted the OPPOSITE, and the opposite
+    was the bug: routing the block through `active_task` (which returns the
+    single task FURTHEST along) meant advancing any unrelated task to
+    `execution` silently disabled the gate repo-wide, and finishing that task
+    silently re-enabled it. The block is a property of the repository — if a
+    task you picked up is still at a planning gate, producing code is out of
+    order."""
     tasks = {
         "a": t_mod.Task(task_id="a", title="A",
                         status=t_mod.STATUS_IN_PROGRESS),
@@ -318,24 +467,10 @@ def test_selection_is_deterministic_across_two_in_progress_tasks():
     recs = {"a": PhaseRecord(task_id="a", phase="brainstorm", epoch=0),
             "b": PhaseRecord(task_id="b", phase="execution", epoch=0)}
     sc = s_mod.Sidecar(s_mod.PhaseState(recs, {}), True, "", {}, tasks, {})
-    first = enf.phase_violation(*_write(), sc)
-    assert all(enf.phase_violation(*_write(), sc) == first for _ in range(5))
-
-
-def test_the_furthest_along_task_wins_selection():
-    """Matches `inject.active`'s documented order, so the block the agent READS
-    and the rule that DENIES it describe the same task. A task at `execution`
-    outranks one still at `brainstorm`, so writes are allowed."""
-    tasks = {
-        "a": t_mod.Task(task_id="a", title="A",
-                        status=t_mod.STATUS_IN_PROGRESS),
-        "b": t_mod.Task(task_id="b", title="B",
-                        status=t_mod.STATUS_IN_PROGRESS),
-    }
-    recs = {"a": PhaseRecord(task_id="a", phase="brainstorm", epoch=0),
-            "b": PhaseRecord(task_id="b", phase="execution", epoch=0)}
-    sc = s_mod.Sidecar(s_mod.PhaseState(recs, {}), True, "", {}, tasks, {})
-    assert enf.phase_violation(*_write(), sc) is None
+    reason = enf.phase_violation(*_write(), sc)
+    assert reason is not None
+    assert "brainstorm" in reason
+    assert "'a'" in reason, "the refusal must name the task that is blocking"
 
 
 # --- R8: the latency contract is structural ------------------------------------------
