@@ -87,6 +87,12 @@ MAX_FIELD_CHARS = 120
 # that case directly.
 MAX_ADVICE_CHARS = 1800
 
+# Per-item wall on the render side. `advice.MAX_ITEM_CHARS` already caps these
+# at resolve time and the two are deliberately equal, but this module cannot
+# import that one (it imports this one) and must not assume a file on disk was
+# written by a cooperating version. The persistence suite pins them equal.
+MAX_ADVICE_ITEM_CHARS = 240
+
 # The advice section's keys, in RENDER order — SOPs and prior-failure
 # constraints are hard rules and lead; skills are an offer and follow.
 #
@@ -311,8 +317,15 @@ def phase_block(rec, task) -> str:
     else:
         lines.append("- This is the terminal gate for this task; there is "
                      "nothing to advance to, only evidence to produce.")
-    lines.append("- Need context first? Recall the ledger, then read the code, "
-                 "then consult the skill catalog. Ask the user last.")
+    # The line that used to sit here — "Recall the ledger, then read the code,
+    # then consult the skill catalog" — was MN-3's "partial failure": it named
+    # three registries and queried none of them. The registries are now queried
+    # at write time and their answers render below in `advice_block`, so a
+    # pointer to them would be both redundant and, when the pointer disagreed
+    # with the quoted text, actively confusing. The ordering advice it carried
+    # ("ask the user last") is behaviour, not retrieval, and survives.
+    lines.append("- Do not ask the user for anything the block above or below "
+                 "already answers; ask last, not first.")
 
     # Two independent bounds, deliberately. The per-field caps above are what
     # actually bind today; this one is the wall that still holds when a future
@@ -334,6 +347,53 @@ def phase_block(rec, task) -> str:
     return "\n".join(out)[:MAX_BLOCK_CHARS]
 
 
+def advice_block(obj) -> str:
+    """MN-3's resolved advice, rendered. Pure, total, independently capped.
+
+    *obj* is the sidecar's plain ``{section: [line]}`` dict — already resolved,
+    already sanitized, already per-item capped by `advice.py`. Nothing here
+    queries anything: the retrieval happened at write time, and re-deriving it
+    on this path is exactly the ~264 ms the sidecar exists to avoid.
+
+    Re-sanitizes anyway. `sidecar._decode_advice` validates the shape and
+    `advice.resolve` strips the marker, but the sidecar is a file on disk and
+    this string goes into a prompt — the cost of `safe_text` over at most seven
+    short items is nothing next to a forged directive header.
+
+    Empty in, empty out — and the caller relies on that: an advice header with
+    no items under it would appear on every prompt in every project that has
+    never resolved anything."""
+    if not isinstance(obj, dict):
+        return ""
+    lines: list = []
+    for key in ADVICE_KEYS:
+        rows = obj.get(key)
+        if not isinstance(rows, list):
+            continue
+        items = [safe_text(r, MAX_ADVICE_ITEM_CHARS) for r in rows]
+        items = [i for i in items if i]
+        if not items:
+            continue
+        lines.append(f"{MARK} {ADVICE_LABELS[key]}:")
+        lines.extend(f"- {i}" for i in items)
+    if not lines:
+        return ""
+    # Whole items are dropped rather than the text being sliced, for the same
+    # reason `phase_block` drops whole lines: a half-sentence SOP reads as a
+    # complete instruction that happens to be wrong. A section header left
+    # dangling by its items being dropped is pruned on the way out.
+    out: list = []
+    total = 0
+    for line in lines:
+        if total + len(line) + 1 > MAX_ADVICE_CHARS:
+            break
+        out.append(line)
+        total += len(line) + 1
+    while out and out[-1].startswith(MARK):
+        out.pop()
+    return "\n".join(out)
+
+
 def block(sc) -> str:
     """What to inject for sidecar *sc*: the phase-specific block, the agnostic
     one, or ``""`` for silence. See the module docstring's three outcomes."""
@@ -345,7 +405,14 @@ def block(sc) -> str:
     rec, task = active(sc)
     if rec is None:
         return ""
-    return phase_block(rec, task)
+    text = phase_block(rec, task)
+    # Only reached on the fresh branch, and that placement is the point: a
+    # stale projection returns `AGNOSTIC_BLOCK` above and never gets here.
+    # Advice resolved against a task that has since fallen back to the planning
+    # gate is a confident, wrong instruction — strictly worse than silence,
+    # which is the same argument this module already makes for stale phase data.
+    extra = advice_block(getattr(sc, "advice", None))
+    return f"{text}\n{extra}" if extra else text
 
 
 # --- the hook surface --------------------------------------------------------------
