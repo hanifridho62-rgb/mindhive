@@ -28,6 +28,33 @@ _WORD = re.compile(r"[a-z0-9]+")
 
 DEFAULT_THRESHOLD = 0.85
 
+# Audit/registry types that NEVER collapse, whatever their wording.
+#
+# Named as a module constant rather than inlined in `collapse` so the agreement
+# with `consolidate.CONSOLIDATE_TYPES` is machine-checkable — DATA_MODEL.md §6.3
+# requires a new registry type to be exempted in BOTH lists, and the two drifted
+# apart twice before `tests/test_architecture_drift.py` started asserting it.
+#
+# Two reasons a type lands here, and both matter:
+#
+#   * AUDIT ROWS — `code_change` and `learning`. Two similarly-worded change-log
+#     entries are two genuinely distinct changes, and two Self-Reliant PRDs
+#     about the same goal read alike while prescribing different builds.
+#     Collapsing either hides a real record behind a near-twin.
+#   * REPLAYED REGISTRIES — `sop`, `roadmap`, `mindnet_task`, `mindnet_phase`.
+#     Their folds replay EVERY lifecycle event, so an add and its later update
+#     are two steps of one record's history, not a duplicate pair.
+#
+# `state_set` is here for a third reason: it is "last one wins" state, carries
+# no `text` at all, and is excluded from the LEDGER entirely — collapsing two of
+# them is not wrong so much as meaningless. It reaches this function only
+# through the dashboard's Memory view (`dashboard._get_memory` filters on
+# `events.MEMORY_VIEW_TYPES`, which includes it), where its empty text already
+# never matched anything. Listing it explicitly costs nothing and closes the
+# last gap in the two-list agreement.
+NEVER_COLLAPSE = ("code_change", "learning", "state_set", "sop", "roadmap",
+                  "mindnet_task", "mindnet_phase")
+
 
 def text_fingerprint(text) -> str:
     """Short, deterministic content hash of a memo's normalized text. Used to
@@ -81,12 +108,10 @@ def collapse(items, threshold: float = DEFAULT_THRESHOLD) -> list:
     reps = []          # list of (key, token_set, norm_text, rep_dict)
     out = []
     for item in items:
-        # Audit/registry entries never collapse: two similarly-worded
-        # change-log entries are genuinely distinct changes, and two SOP or
-        # roadmap lifecycle events (an add and its later update) are distinct
-        # steps of one record's history (mirrors the CONSOLIDATE_TYPES
-        # exemption in consolidate.py).
-        if item.get("type") in ("code_change", "sop", "roadmap"):
+        # Audit/registry entries never collapse — see NEVER_COLLAPSE above for
+        # why each type is on that list. It mirrors, and is tested against,
+        # `consolidate.CONSOLIDATE_TYPES`.
+        if item.get("type") in NEVER_COLLAPSE:
             rep = dict(item)
             rep["similar_count"] = 0
             out.append(rep)

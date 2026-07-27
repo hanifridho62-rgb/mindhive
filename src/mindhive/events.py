@@ -1,4 +1,5 @@
 # src/mindhive/events.py
+import importlib
 import json
 import os
 import time
@@ -28,6 +29,19 @@ SEMANTIC_TYPES = {
     # interrupted plan projects into STATE.md as the out-of-usage marker that
     # preserves creation context for the next session.
     "roadmap",
+    # MindNetwork MN-2 task graph lifecycle (declare/status/depend/reparent/
+    # evidence — see mindnet/tasks.py; the phase axis is mindnet_phase's, and
+    # ONLY its): the hierarchical task tree the
+    # flat roadmap cannot express (no parent_id, 50-step cap, wholesale-replace
+    # only). Semantic so the graph is recallable and chain-verified; the current
+    # graph is a deterministic fold that REFUSES cycle-closing edges rather than
+    # merely reporting them.
+    "mindnet_task",
+    # MindNetwork MN-1 phase spine lifecycle (see mindnet/controller.py): which
+    # phase a task is in and the evidence satisfying each exit criterion. Every
+    # satisfaction records verified_by (python | agent | human) so a claim
+    # nobody machine-checked can never fold as if it had been.
+    "mindnet_phase",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
@@ -56,6 +70,31 @@ DETERMINISTIC_TYPES = {
     # delivery audit trail (when it was due, whether it fired, what came
     # back).
     "autoresume",
+    # MindNetwork MN-5 cat-status feed: one event per faculty waking or going
+    # idle (skill-plugin, sop, improvements, history, task-graph, compatibility,
+    # pr-green). Deterministic, NOT semantic — high-volume UI telemetry.
+    #
+    # What "deterministic" buys, precisely: membership here and NOT in
+    # SEMANTIC_TYPES / MEMORY_VIEW_TYPES keeps the feed off the SEMANTIC layer —
+    # no LEDGER markdown file per event (projector.LEDGER_TYPES), no Memory
+    # view row, no keyword-recall corpus entry, no consolidation pass.
+    #
+    # What it does NOT buy: staying off the hash chain. `chain.compute_chain`
+    # folds `events.read_all()` with NO type filter, so every activity event is
+    # hashed at append-projection time and re-hashed in full by every `hive
+    # verify`. The chain is over the whole ledger, not over the semantic subset.
+    # The volume consequence is MN-5's to carry: the cat board is the only
+    # consumer, `telemetry.busy` already emits at most one active/idle PAIR per
+    # transition rather than per frame, and if MN-5's rendering ever tempts a
+    # per-tick emitter the cost lands on `hive verify`'s runtime for the life of
+    # the store. Bound the emission rate there; do not assume this registration
+    # exempts anything.
+    #
+    # Deliberately ledger-derived rather than in-memory: R16's "a missing cat
+    # means a real bug" collapses if the feed can vanish for unrelated reasons
+    # (MindSwarm's mission state is a plain instance attribute that dies with
+    # the server).
+    "mindnet_activity",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
@@ -65,6 +104,63 @@ VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 # LEDGER, the hash-chained intent layer, and the knowledge graph — but are shown
 # in the Memory view so the full exchange is visible in the hive.
 MEMORY_VIEW_TYPES = SEMANTIC_TYPES | {"user_prompt", "assistant_response"}
+
+# --- registry payload contracts ----------------------------------------------
+# DATA_MODEL.md §6.2: the store stays type-agnostic (append_event does NOT call
+# this — every internal writer already builds a valid payload), and each type's
+# contract lives in its owning module, enforced at the surfaces that accept an
+# arbitrary type+payload from the user. There are TWO such surfaces — `hive
+# append` and the dashboard's POST /api/append — so the dispatch lives here,
+# beside the type registry, instead of being copied into both. Copying is how
+# they drifted: the CLI enforced four contracts and the endpoint enforced none.
+#
+# event type -> (contract module, corrective hint carried in the rejection)
+_PAYLOAD_CONTRACTS = {
+    "code_change": (".changelog", 'hive log <category> "..."'),
+    "sop": (".sop", "hive sop add|update|delete …"),
+    "roadmap": (".roadmap",
+                "hive roadmap set|step|interrupt|resume|complete …"),
+    "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
+    # The hint names ONLY what ships. `mindnet_task` has five actions
+    # (tasks.ACTIONS) but exactly one CLI producer — `hive mindnet declare`;
+    # `status`, `depend`, `reparent` and `evidence` have no subcommand yet and
+    # are reachable only through this same raw-append surface. Advertising them
+    # as commands sent an operator whose append was just rejected off to run
+    # four things that do not exist, which is a worse failure than the original
+    # rejection. When a subcommand lands, add it here in the same change-set.
+    "mindnet_task": (".mindnet.tasks",
+                     "hive mindnet declare … — the status/depend/reparent/"
+                     "evidence actions have no subcommand yet; append them as "
+                     "raw JSON with a valid `action` field"),
+    # mindnet_phase points at the APPEND-SURFACE half of a two-validator
+    # contract: phases.validate_payload refuses any payload carrying
+    # `verified_by`, so this surface cannot self-attest a machine verification
+    # nothing performed. The writer's shape (which REQUIRES verified_by) is
+    # phases.validate_stored, called by the CLI just before append_event —
+    # registering that one here instead would invert the honesty rule.
+    "mindnet_phase": (".mindnet.phases",
+                      "hive mindnet declare|enter|satisfy|fall-back …"),
+}
+
+
+def validate_typed_payload(event_type, payload) -> None:
+    """Enforce *event_type*'s registry contract at an arbitrary-payload append
+    surface. Raises ``ValueError`` whose message already carries the corrective
+    hint, so both surfaces report the same thing. A type with no registered
+    contract — every free-text memo and every telemetry type — is accepted
+    unchanged, which keeps this a gate on the registry, not on the store."""
+    contract = _PAYLOAD_CONTRACTS.get(event_type)
+    if contract is None:
+        return
+    module_name, hint = contract
+    # Deferred import: keeps `hive` startup cheap and the import side effects
+    # of five modules scoped to the one append that actually needs them.
+    mod = importlib.import_module(module_name, __package__)
+    try:
+        mod.validate_payload(payload)
+    except ValueError as e:
+        raise ValueError(f"{e} (use: {hint})") from e
+
 
 # --- provenance: which outputs came from a Self-Reliant run ------------------
 # Self-Reliant stamps everything it writes twice: every event is tagged

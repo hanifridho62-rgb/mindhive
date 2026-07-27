@@ -110,12 +110,78 @@ def _policy_destructive(tool_name, tool_input):
             f"intended, or use a safer alternative.")
 
 
+# --- MN-4: the MindNetwork state machine gets teeth ---------------------------------
+
+def _mindnet_sidecar(cache):
+    """The MindNetwork projection, read AT MOST ONCE per hook invocation.
+
+    Both mindnet checks need it, and `PreToolUse` fires on every tool call — two
+    independent reads would double the file I/O on the hottest path in the
+    system. The cache is a plain dict owned by `evaluate_policies` for the
+    duration of one call, so nothing is shared between invocations and there is
+    no staleness window to reason about.
+
+    ``None`` on any fault, which every caller treats as allow."""
+    if cache is None:
+        cache = {}
+    if "sc" not in cache:
+        from .mindnet import sidecar as s_mod
+        try:
+            cache["sc"] = s_mod.read(cache.get("project"))
+        except Exception:
+            cache["sc"] = None
+    return cache["sc"]
+
+
+def _policy_mindnet_phase(tool_name, tool_input, cache=None):
+    """MN-4's phase block: no producing code while the active task sits at a
+    planning gate.
+
+    The import is lazy for the same reason `_policy_destructive` reaches
+    `gateguard` lazily — `enforce.py` is imported by the hook shim in every
+    project, including the ones with no MindNetwork state at all.
+
+    The tool-name test comes BEFORE the sidecar read: neither rule can ever deny
+    a `Read`, and paying a file read to discover that on the most common tool
+    call in the system is pure waste."""
+    from .mindnet import enforcer as mn
+    if tool_name not in mn.WRITE_TOOLS and tool_name not in mn.EXECUTE_TOOLS:
+        return None
+    return mn.phase_violation(tool_name, tool_input, _mindnet_sidecar(cache))
+
+
+def _policy_mindnet_language(tool_name, tool_input, cache=None):
+    """MN-4's language lock: no writing a file whose extension falls outside a
+    populated ``language_context``."""
+    from .mindnet import enforcer as mn
+    if tool_name not in mn.WRITE_TOOLS:
+        return None
+    return mn.language_violation(tool_name, tool_input,
+                                 _mindnet_sidecar(cache))
+
+
+# Opt in to the shared per-call cache. An explicit flag rather than arity
+# inspection: the check contract stays `(tool_name, tool_input)` for everything
+# that does not need the sidecar, and a future check declares its need instead
+# of having it guessed from a signature.
+_policy_mindnet_phase.wants_cache = True
+_policy_mindnet_language.wants_cache = True
+
+
 # (id, permissionDecision, check). "deny" blocks outright; "ask" escalates to
 # the human — right for destructive commands, which are sometimes legitimate.
+#
+# The two mindnet entries are appended, never inserted: `gate:no-verify` and the
+# config-protection gate were standing rules before MindNetwork existed and must
+# keep their precedence. Both are "deny" rather than "ask" — a destructive
+# command is sometimes legitimate, but a state-machine violation is not: the
+# phase is the system's statement that this work is out of order.
 POLICY_CHECKS = (
     ("gate:no-verify", "deny", _policy_no_verify),
     ("gate:config-protection", "deny", _policy_config_protection),
     ("gate:destructive-command", "ask", _policy_destructive),
+    ("gate:mindnet-phase", "deny", _policy_mindnet_phase),
+    ("gate:mindnet-language", "deny", _policy_mindnet_language),
 )
 
 
@@ -126,12 +192,19 @@ def evaluate_policies(tool_name, tool_input, manifest=None,
     override wins. Fail-open like everything in this module."""
     try:
         man = manifest if manifest is not None else load_manifest(project)
+        # Scoped to this one call. Checks that declare `wants_cache` share it,
+        # so a projection several of them need is read once rather than once
+        # each — and nothing survives into the next invocation, so there is no
+        # staleness window.
+        cache = {"project": project}
         for pid, decision, fn in POLICY_CHECKS:
             entry = man.get(f"policy:{pid}")
             entry = entry if isinstance(entry, dict) else {}
             if entry.get("enabled") is False:
                 continue
-            reason = fn(tool_name, tool_input)
+            reason = (fn(tool_name, tool_input, cache)
+                      if getattr(fn, "wants_cache", False)
+                      else fn(tool_name, tool_input))
             if reason:
                 return decision, (entry.get("reason") or "").strip() or reason
     except Exception:
@@ -207,7 +280,8 @@ def hook_decision(raw: str, project=None) -> dict:
     tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
     manifest = load_manifest(project)
     decision, reason = "deny", None
-    pol = evaluate_policies(tool_name, tool_input, manifest=manifest)
+    pol = evaluate_policies(tool_name, tool_input, manifest=manifest,
+                            project=project)
     if pol:
         decision, reason = pol
     else:

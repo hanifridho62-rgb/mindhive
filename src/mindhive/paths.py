@@ -73,6 +73,32 @@ def detect_project(cwd: Path | None = None) -> str:
     return normalize(cwd.name)
 
 
+def worktree_root(cwd: Path | None = None) -> Path | None:
+    """Absolute root of the git WORKTREE containing *cwd*, or ``None`` outside
+    one. Total: any failure (no git, not a repo, timeout) answers ``None``.
+
+    Deliberately DISTINCT from `detect_project`, which resolves
+    ``--git-common-dir`` so every linked worktree collapses onto the main repo's
+    memory namespace (SOP 10). Both are correct for their own axis and
+    conflating them is a real bug: **evidence paths are per-checkout, the ledger
+    namespace is per-repo**. A plan file that exists only on one branch is
+    legitimately absent from another checkout, so a satisfaction recorded here
+    must remember which root resolved it rather than being re-stat'd against
+    whichever worktree happens to be reading."""
+    cwd = cwd or Path.cwd()
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(cwd), capture_output=True, text=True, timeout=2,
+            creationflags=NO_WINDOW,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip()).resolve()
+    except Exception:
+        pass
+    return None
+
+
 def project_dir(project: str | None = None) -> Path:
     return store_home() / (project or detect_project())
 

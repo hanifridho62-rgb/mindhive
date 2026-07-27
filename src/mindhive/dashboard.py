@@ -604,6 +604,28 @@ def make_handler(token: str):
             return self._json(plugins_mod.call_history(name, project=proj,
                                                        limit=limit, evs=evs))
 
+        def _get_mindnet_cats(self, proj, am, qs):
+            # MN-5's cat board: which faculties are awake, dimming, or gone.
+            # Imported lazily like the other mindnet touchpoints so a dashboard
+            # in a project that has never used the phase spine pays nothing.
+            #
+            # `now` is resolved HERE and passed in, because `ui_cats.board` is
+            # pure by design — that is what makes its 180 s and 6 h boundaries
+            # testable at the boundary instead of approximately.
+            from datetime import datetime, timezone
+
+            from .mindnet import telemetry as tel_mod
+            from .mindnet import ui_cats as cats_mod
+            evs = [e for _, e in all_event_pairs()] if am else \
+                events.read_all(proj)
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cats = cats_mod.board(tel_mod.fold(evs), now)
+            # The thresholds ride along so the page renders "idle 4h" without a
+            # second copy of 180/21600 in JavaScript (invariant 10).
+            return self._json({"cats": list(cats),
+                               "dim_after_secs": cats_mod.DIM_AFTER_SECS,
+                               "hide_after_secs": cats_mod.HIDE_AFTER_SECS})
+
         def _get_skills_stats(self, proj, am, qs):
             # per-skill completion-rate telemetry aggregated from the ledger
             # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
@@ -764,11 +786,27 @@ def make_handler(token: str):
 
         def _post_append(self, proj, body):
             etype = body.get("type")
-            text = body.get("payload", "")
+            raw = body.get("payload", "")
             tags = [t for t in (body.get("tags") or "").split(",") if t]
             if not etype:
                 return self._json({"ok": False, "error": "type is required"}, 200)
-            ev = events.append_event(etype, {"text": text}, tags=tags, project=proj)
+            # A structured body IS the payload; only a plain string is free
+            # text needing the {"text": …} wrapper. Wrapping unconditionally
+            # meant this endpoint could never produce a valid registry payload
+            # (a mindnet_task/roadmap/sop/code_change/autoresume contract is
+            # never one text field) — so validating without this first would
+            # have rejected every registry append instead of gating it.
+            payload = raw if isinstance(raw, dict) else {"text": raw}
+            try:
+                # The same dispatch `hive append` runs (events._PAYLOAD_
+                # CONTRACTS), so the CLI and this endpoint cannot drift.
+                events.validate_typed_payload(etype, payload)
+            except ValueError as e:
+                # An expected domain rejection, not a server fault: ok:False,
+                # 200 like _post_embed's LIVE_LOCK. Nothing is appended, and
+                # nothing raises out of the handler.
+                return self._json({"ok": False, "error": str(e)}, 200)
+            ev = events.append_event(etype, payload, tags=tags, project=proj)
             projector.project(proj)
             return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
 
@@ -1068,6 +1106,7 @@ def make_handler(token: str):
             "/api/sops": _get_sops,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
+            "/api/mindnet/cats": _get_mindnet_cats,
             "/api/plugins/recommend": _get_plugins_recommend,
             "/api/plugins/inventory": _get_plugins_inventory,
             "/api/skills/detail": _get_skills_detail,

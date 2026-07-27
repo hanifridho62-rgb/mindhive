@@ -2,6 +2,9 @@
 import hashlib
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import roadmap
+# Both reach only `sop` -> `events`, so a module-level import here introduces no
+# cycle (the same reason `roadmap` is imported this way rather than lazily).
+from .mindnet import phases as mn_phases, tasks as mn_tasks
 
 LEDGER_TYPES = events.SEMANTIC_TYPES - {"state_set"}
 
@@ -172,6 +175,15 @@ def build_ledger_entries(evs):
             # Plan id, prompt, and step text must survive so keyword recall
             # finds a plan by what was asked or what it contains.
             body = roadmap.ledger_body(ev.payload)
+        elif ev.type == "mindnet_task" and isinstance(ev.payload, dict):
+            # Structured, text-less payloads like roadmap's. Without a body
+            # renderer these project as EMPTY entries — and, worse, two events
+            # in the same second hash to the same filename (see `fname` below,
+            # which mixes the body into the digest) and one silently
+            # overwrites the other.
+            body = mn_tasks.ledger_body(ev.payload)
+        elif ev.type == "mindnet_phase" and isinstance(ev.payload, dict):
+            body = mn_phases.ledger_body(ev.payload)
         fname = f"{_ts_compact(ev.ts)}-{ev.type}-{_short(ev.ts + ev.type + body)}.md"
         content = (f"---\nts: {ev.ts}\ntype: {ev.type}\n"
                    f"tags: {','.join(ev.tags)}\nsession: {ev.session_id}\n---\n\n{body}\n")
