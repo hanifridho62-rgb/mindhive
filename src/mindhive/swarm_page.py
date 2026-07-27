@@ -71,6 +71,35 @@ _PAGE = """<!doctype html>
     display:none; z-index:9; }
   #empty { position:absolute; inset:0; display:flex; align-items:center;
     justify-content:center; color:#8b949e; text-align:center; }
+  /* --- MN-5: the faculty cat board -------------------------------------
+     A debugging surface, not decoration. A cat that has been dim for hours
+     is the visible form of a silent hang, which is the whole reason the
+     strip exists — so `dim` is muted but never hidden, and only the 6-hour
+     rule removes a cat entirely (that filtering happens server-side in
+     ui_cats.board; this stylesheet only renders what arrives). */
+  #mn-cats { flex:0 0 auto; display:flex; align-items:center; gap:6px;
+    padding:5px 14px; background:#12161d; border-bottom:1px solid #30363d;
+    min-height:34px; overflow-x:auto; }
+  #mn-cats .lbl { color:#8b949e; font-size:10.5px; letter-spacing:.6px;
+    text-transform:uppercase; margin-right:2px; flex:0 0 auto; }
+  #mn-cats .none { color:#6e7681; font-size:11.5px; }
+  .mn-cat { position:relative; display:flex; align-items:center; gap:5px;
+    border:1px solid #30363d; border-radius:999px; padding:2px 9px 2px 5px;
+    background:#161b22; cursor:pointer; flex:0 0 auto; font-size:11.5px; }
+  .mn-cat:hover { border-color:#58a6ff; }
+  .mn-cat svg { width:19px; height:19px; display:block; }
+  .mn-cat.active { color:#7ee787; border-color:#2ea043; }
+  .mn-cat.active svg { animation:mn-bob 1.6s ease-in-out infinite; }
+  .mn-cat.dim { color:#8b949e; opacity:.55; }
+  .mn-cat.dim svg { animation:none; }
+  @keyframes mn-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
+  #mn-cat-panel { position:fixed; z-index:20; display:none; min-width:210px;
+    background:#161b22; border:1px solid #30363d; border-radius:8px;
+    padding:8px 10px; font-size:11.5px; box-shadow:0 6px 22px #0009; }
+  #mn-cat-panel h3 { margin:0 0 5px; font-size:12px; color:#e8b64c; }
+  #mn-cat-panel .kv { display:flex; gap:6px; }
+  #mn-cat-panel .kv span:first-child { color:#8b949e; min-width:58px; }
+  #mn-cat-panel .warn { margin-top:5px; color:#ff9e64; }
 </style></head>
 <body>
 <header>
@@ -83,6 +112,9 @@ _PAGE = """<!doctype html>
   <span id="mstate" class="badge idle">IDLE</span>
   <button class="stop" onclick="stopMission()">&#9888; Stop</button>
 </header>
+<div id="mn-cats"><span class="lbl">faculties</span>
+  <span class="none">no MindNetwork activity</span></div>
+<div id="mn-cat-panel"></div>
 <div id="wrap">
   <div id="stage">
     <div id="world">
@@ -348,6 +380,109 @@ _PAGE = """<!doctype html>
     view.k *= f; applyView();
   }, {passive:false});
 
+  // --- MN-5: the faculty cat board ---------------------------------------
+  // Every threshold decision is made server-side in ui_cats.board: the 6-hour
+  // rule removes a cat from the payload entirely, and the 180-second rule
+  // arrives as display:"dim". Nothing here recomputes either — one home for
+  // those numbers, and this loop cannot drift from the tests that pin them.
+  const CAT_SVG = `<svg viewBox="0 0 16 16" shape-rendering="crispEdges"
+    aria-hidden="true"><g fill="currentColor">
+    <rect x="2" y="3" width="2" height="3"/><rect x="12" y="3" width="2" height="3"/>
+    <rect x="3" y="5" width="10" height="7"/><rect x="4" y="12" width="8" height="1"/>
+    <rect x="13" y="8" width="2" height="1"/><rect x="15" y="6" width="1" height="2"/>
+    </g><g fill="#0e1116"><rect x="5" y="7" width="2" height="2"/>
+    <rect x="9" y="7" width="2" height="2"/><rect x="7" y="10" width="2" height="1"/>
+    </g></svg>`;
+  const CAT_LABEL = { 'skill-plugin':'Skills', 'sop':'SOPs',
+    'improvements':'Improvements', 'history':'History', 'task-graph':'Tasks',
+    'compatibility':'Compatibility', 'pr-green':'PR green' };
+
+  function catAge(s){
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm';
+    return (s/3600).toFixed(1) + 'h';
+  }
+
+  function catPanel(cat, el){
+    const p = document.getElementById('mn-cat-panel');
+    // textContent throughout: task_id and phase are ledger-supplied strings
+    // and this is the one place they reach the DOM.
+    p.innerHTML = '';
+    const h = document.createElement('h3');
+    h.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
+    p.appendChild(h);
+    const rows = [['task', cat.task_id || '—'], ['phase', cat.phase || '—'],
+                  ['skill', cat.skill || '—'], ['state', cat.status],
+                  ['last seen', catAge(cat.age_secs) + ' ago']];
+    for (const [k, v] of rows){
+      const d = document.createElement('div'); d.className = 'kv';
+      const a = document.createElement('span'); a.textContent = k;
+      const b = document.createElement('span'); b.textContent = v;
+      d.appendChild(a); d.appendChild(b); p.appendChild(d);
+    }
+    // The reason this board exists: awake but not moving is a stuck parallel
+    // run, and the user asked to be able to see that at a glance.
+    if (cat.status === 'active' && cat.age_secs >= 900){
+      const w = document.createElement('div'); w.className = 'warn';
+      w.textContent = 'active with no update for ' + catAge(cat.age_secs)
+        + ' — possible silent hang';
+      p.appendChild(w);
+    }
+    const r = el.getBoundingClientRect();
+    p.style.left = Math.round(r.left) + 'px';
+    p.style.top = Math.round(r.bottom + 6) + 'px';
+    p.style.display = 'block';
+  }
+
+  function paintCats(cats){
+    const bar = document.getElementById('mn-cats');
+    const open = bar.querySelector('.mn-cat.sel');
+    const openFaculty = open ? open.dataset.faculty : null;
+    bar.innerHTML = '';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl'; lbl.textContent = 'faculties';
+    bar.appendChild(lbl);
+    if (!cats.length){
+      const n = document.createElement('span');
+      n.className = 'none'; n.textContent = 'no MindNetwork activity';
+      bar.appendChild(n);
+      document.getElementById('mn-cat-panel').style.display = 'none';
+      return;
+    }
+    for (const cat of cats){
+      const el = document.createElement('span');
+      el.className = 'mn-cat ' + cat.display;
+      el.dataset.faculty = cat.faculty;
+      el.innerHTML = CAT_SVG;
+      const t = document.createElement('span');
+      t.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
+      el.appendChild(t);
+      el.title = (CAT_LABEL[cat.faculty] || cat.faculty)
+        + ' — ' + cat.status + ', last seen ' + catAge(cat.age_secs) + ' ago';
+      el.onclick = (ev) => {
+        ev.stopPropagation();
+        const already = el.classList.contains('sel');
+        bar.querySelectorAll('.mn-cat.sel').forEach(x => x.classList.remove('sel'));
+        if (already){ document.getElementById('mn-cat-panel').style.display = 'none'; }
+        else { el.classList.add('sel'); catPanel(cat, el); }
+      };
+      // Re-open the panel the poll just replaced, so a 1.2 s refresh does not
+      // close a panel the user is reading.
+      if (cat.faculty === openFaculty){ el.classList.add('sel'); }
+      bar.appendChild(el);
+      if (cat.faculty === openFaculty){ catPanel(cat, el); }
+    }
+  }
+  document.addEventListener('click', () => {
+    document.getElementById('mn-cat-panel').style.display = 'none';
+    document.querySelectorAll('#mn-cats .mn-cat.sel')
+      .forEach(x => x.classList.remove('sel'));
+  });
+
+  async function pollCats(){
+    try { paintCats((await api('/api/mindnet/cats')).cats || []); } catch(_){}
+  }
+
   // --- poll loop ---
   async function poll(){
     try {
@@ -357,6 +492,10 @@ _PAGE = """<!doctype html>
       paint();
       await pollInspector();
     } catch(_){}
+    // Outside the try above on purpose: a workspace fetch failure must not
+    // also take out the cat board, which is the surface you look at when
+    // something is wrong.
+    await pollCats();
   }
   (async function loop(){ await poll(); setTimeout(loop, 1200); })();
 </script>

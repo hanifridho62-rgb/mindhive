@@ -604,6 +604,28 @@ def make_handler(token: str):
             return self._json(plugins_mod.call_history(name, project=proj,
                                                        limit=limit, evs=evs))
 
+        def _get_mindnet_cats(self, proj, am, qs):
+            # MN-5's cat board: which faculties are awake, dimming, or gone.
+            # Imported lazily like the other mindnet touchpoints so a dashboard
+            # in a project that has never used the phase spine pays nothing.
+            #
+            # `now` is resolved HERE and passed in, because `ui_cats.board` is
+            # pure by design — that is what makes its 180 s and 6 h boundaries
+            # testable at the boundary instead of approximately.
+            from datetime import datetime, timezone
+
+            from .mindnet import telemetry as tel_mod
+            from .mindnet import ui_cats as cats_mod
+            evs = [e for _, e in all_event_pairs()] if am else \
+                events.read_all(proj)
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cats = cats_mod.board(tel_mod.fold(evs), now)
+            # The thresholds ride along so the page renders "idle 4h" without a
+            # second copy of 180/21600 in JavaScript (invariant 10).
+            return self._json({"cats": list(cats),
+                               "dim_after_secs": cats_mod.DIM_AFTER_SECS,
+                               "hide_after_secs": cats_mod.HIDE_AFTER_SECS})
+
         def _get_skills_stats(self, proj, am, qs):
             # per-skill completion-rate telemetry aggregated from the ledger
             # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
@@ -1084,6 +1106,7 @@ def make_handler(token: str):
             "/api/sops": _get_sops,
             "/api/recall": _get_recall,
             "/api/graph": _get_graph,
+            "/api/mindnet/cats": _get_mindnet_cats,
             "/api/plugins/recommend": _get_plugins_recommend,
             "/api/plugins/inventory": _get_plugins_inventory,
             "/api/skills/detail": _get_skills_detail,
