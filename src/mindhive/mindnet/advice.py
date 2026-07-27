@@ -78,13 +78,9 @@ MAX_SKILLS = 3          # the directive's "top 3 highly relevant"
 MAX_SOPS = 2
 MAX_CONSTRAINTS = 2
 MAX_ITEM_CHARS = 240
-MAX_ADVICE_CHARS = 1800
-
-# A recorded reason is capped BEFORE the sentence is built, so the forbidding
-# language at the end can never be the part that gets truncated away. A
-# constraint that reads "...failed due to some long thing" without the
-# prohibition is trivia, not a constraint.
-MAX_REASON_CHARS = 90
+# Mirrors `inject.MAX_ADVICE_CHARS`; see the note there on why the renderer's
+# own 195 chars of headers and bullets have to be counted too.
+MAX_ADVICE_CHARS = 2000
 
 # Words too common to carry any signal about what a task is ABOUT. Without this
 # a task titled "update the code" matches every SOP mentioning "code".
@@ -96,6 +92,16 @@ _STOP = frozenset((
     "add", "new", "get", "set", "run", "make", "made", "do", "does", "done",
     "code", "file", "files", "test", "tests", "work", "task", "change",
     "changes", "update", "updates", "fix", "fixes", "should", "must", "will",
+    # Inflections of the above. They matter because `_STOP` is checked against
+    # the RAW word while matching runs on the STEM: "test" was filtered but
+    # "testing" survived as the stem "test", so a task titled "Testing the
+    # updated dashboard" and an unrelated SOP about "testing the updated
+    # release notes" shared {test, updat} and cleared the threshold on two
+    # words carrying no topic at all. Listing them lets `_STOP_STEMS` fold
+    # every form into one filtered stem.
+    "testing", "tested", "updating", "updated", "changing", "changed",
+    "fixing", "fixed", "working", "worked", "adding", "added", "making",
+    "running", "runs", "coding", "tasks", "uses", "needed", "needs",
 ))
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -107,6 +113,13 @@ CONSTRAINT_TEMPLATE = (
     "SYSTEM WARNING: In a previous execution, this approach failed due to "
     "{reason}. You are strictly forbidden from repeating this pattern. Use an "
     "alternative method.")
+
+# DERIVED, not guessed. A hand-picked 90 plus the template's own 153 chars came
+# to 243 against a 240-char item cap, so a long root cause pushed the closing
+# sentence off the end and the constraint rendered as "...Use an alternative
+# meth" — losing exactly the prohibition that makes it a constraint rather than
+# trivia. Deriving it means the two cannot drift.
+MAX_REASON_CHARS = MAX_ITEM_CHARS - len(CONSTRAINT_TEMPLATE.format(reason=""))
 
 # How many keyword overlaps a candidate needs before it is considered relevant.
 # One shared word is noise; two is a signal.
@@ -151,13 +164,24 @@ def stem(word: str) -> str:
     return w
 
 
+_STOP_STEMS = frozenset(stem(w) for w in _STOP)
+
+
 def keywords(text) -> set:
     """Content words in *text*, lowercased and stemmed. Total over non-strings:
-    this runs over registry values that a corrupt file can deliver as
-    anything."""
+    this runs over registry values that a corrupt file can deliver as anything.
+
+    Filtered on BOTH the raw word and its stem. Checking only the raw word let
+    every inflected stopword straight back in through the stem — see `_STOP`."""
     try:
-        return {stem(w) for w in _WORD_RE.findall(str(text or "").lower())
-                if len(w) > 2 and w not in _STOP}
+        out = set()
+        for w in _WORD_RE.findall(str(text or "").lower()):
+            if len(w) <= 2 or w in _STOP:
+                continue
+            s = stem(w)
+            if s and s not in _STOP_STEMS:
+                out.add(s)
+        return out
     except (ValueError, TypeError):
         return set()
 
@@ -174,16 +198,37 @@ def _overlap(candidate_text, task_kw) -> int:
     return len(keywords(candidate_text) & task_kw)
 
 
+def required_overlap(task_kw) -> int:
+    """How many shared keywords a candidate needs to count as relevant.
+
+    ADAPTIVE, because a fixed 2 made whole classes of ordinary task titles
+    structurally unmatchable rather than merely hard to match. "Refactor"
+    yields one keyword; "Fix the failing tests" yields one after stopwords.
+    Against a fixed threshold of 2 the maximum achievable overlap is 1, so NO
+    source could ever match no matter what the registries held — the feature
+    was silently a no-op and looked identical to "nothing relevant exists".
+
+    One shared word out of a one-word task is a weaker signal than two out of
+    four, and that is accepted deliberately: a slightly noisy suggestion beats
+    a guarantee of silence. A task with no content words at all still resolves
+    to nothing, which is honest — there is no basis for a match."""
+    return min(MIN_OVERLAP, len(task_kw)) if task_kw else MIN_OVERLAP
+
+
 def _ranked(rows, task_kw, text_of, limit):
     """The *limit* best-matching rows, most relevant first.
 
     Sorted on ``(-overlap, index)``: the index tie-break is what keeps the
     result stable when two candidates match equally well, so the injected block
-    does not reshuffle itself between two rebuilds of identical data."""
+    does not reshuffle itself between two rebuilds of identical data. The
+    incoming order is itself deterministic — `sop.current` sorts by
+    ``(created, sop_id)``, `incidents.summaries` by ``sorted(glob)`` and
+    `recommend.recommend` by ``(-score, name)``."""
+    need = required_overlap(task_kw)
     scored = []
     for i, row in enumerate(rows):
         n = _overlap(text_of(row), task_kw)
-        if n >= MIN_OVERLAP:
+        if n >= need:
             scored.append((-n, i, row))
     scored.sort(key=lambda t: (t[0], t[1]))
     return [row for _n, _i, row in scored[:limit]]

@@ -175,6 +175,37 @@ def test_the_injector_and_the_resolver_agree_on_the_section_keys():
     assert set(inj.ADVICE_KEYS) == set(adv.to_dict(adv.EMPTY))
 
 
+def test_the_injector_and_the_resolver_agree_on_the_item_cap():
+    """The OTHER half of the same duplication, which went unpinned while
+    `inject.py`'s own comment claimed this suite already covered it.
+
+    Live consequence of the drift: raise `advice.MAX_ITEM_CHARS` without
+    touching inject's copy and every long item gets sliced mid-sentence by
+    `safe_text` at render time — breaking `advice_block`'s guarantee that whole
+    items are dropped rather than truncated, which exists because a
+    half-sentence SOP reads as a complete instruction that happens to be
+    wrong."""
+    assert inj.MAX_ADVICE_ITEM_CHARS == adv.MAX_ITEM_CHARS
+
+
+def test_the_render_budget_fits_a_fully_populated_advice_set():
+    """Asserted by RENDERING, not by arithmetic over the item caps.
+
+    The original guard multiplied the caps ((3+2+2) * 240 = 1680) and compared
+    against the budget. That misses the 195 chars the renderer itself adds —
+    three section headers, seven `- ` bullets, ten newlines — so a full set
+    rendered to 1875 against an 1800 budget and the last skill was silently
+    dropped, while the guard stayed green."""
+    worst = {"sops": ["S" * adv.MAX_ITEM_CHARS] * adv.MAX_SOPS,
+             "constraints": ["C" * adv.MAX_ITEM_CHARS] * adv.MAX_CONSTRAINTS,
+             "skills": ["K" * adv.MAX_ITEM_CHARS] * adv.MAX_SKILLS}
+    rendered = inj.advice_block(worst)
+    kept = len([ln for ln in rendered.splitlines() if ln.startswith("- ")])
+    assert kept == adv.MAX_SOPS + adv.MAX_CONSTRAINTS + adv.MAX_SKILLS, (
+        "a fully populated advice set must survive the render budget intact")
+    assert len(rendered) <= inj.MAX_ADVICE_CHARS
+
+
 # --- U4: resolution rides the read the caller already paid ---------------------------
 
 def test_rebuild_resolves_advice_for_the_active_task(quiet):

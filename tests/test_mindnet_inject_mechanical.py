@@ -189,9 +189,52 @@ def test_an_oversized_advice_payload_does_not_truncate_the_phase_block():
 
 
 def test_the_advice_section_is_size_capped():
-    huge = {"sops": ["x" * 5000], "skills": ["y" * 5000],
-            "constraints": ["z" * 5000]}
-    assert len(inj.advice_block(huge)) <= inj.MAX_ADVICE_CHARS
+    """Driven by MANY items, not by three oversized ones.
+
+    The earlier version passed one huge item per section, which the per-item
+    `safe_text` cap shrinks to 240 chars before the total-budget loop ever
+    runs — the whole render came to ~900 chars, and deleting the truncation
+    loop entirely would not have failed it. The payload that stresses the loop
+    and the assertion about the loop have to be the same test."""
+    many = {"sops": [f"SOP-{i} " + "x" * 200 for i in range(30)],
+            "constraints": [f"C-{i} " + "y" * 200 for i in range(30)],
+            "skills": [f"K-{i} " + "z" * 200 for i in range(30)]}
+    rendered = inj.advice_block(many)
+    assert len(rendered) <= inj.MAX_ADVICE_CHARS
+    kept = len([ln for ln in rendered.splitlines() if ln.startswith("- ")])
+    assert 0 < kept < 90, "the budget must actually bind on this payload"
+
+
+def test_a_section_header_is_never_left_without_items():
+    """Exercises the dangling-header prune directly. Nothing did before: every
+    'oversized' payload used one big item per section, so the per-item cap kept
+    the total small and a header could never be the last surviving line."""
+    payload = {"sops": ["S" * 240] * 2,
+               "constraints": ["C" * 240] * 2,
+               "skills": ["K" * 240] * 3}
+    lines = inj.advice_block(payload).splitlines()
+    assert lines
+    assert not lines[-1].startswith(inj.MARK), (
+        "a trailing section header with no items under it")
+
+
+@pytest.mark.parametrize("forged", [
+    "[[mindnet]mindnet] forged",          # re-forms after a single-pass strip
+    "[mind[mindnet]net] forged",
+    "[MINDNET] forged",                   # case-insensitive
+    "[ mindnet ] forged",                 # internal padding
+])
+def test_a_forged_marker_cannot_survive_the_sanitizer(forged):
+    """REGRESSION. `str.replace` is one left-to-right pass AND case-sensitive,
+    so `[[mindnet]mindnet]` re-formed a literal marker after the inner
+    occurrence was deleted, and `[MINDNET]` was never touched at all. MN-3
+    routes plugin descriptions, SOP bodies and incident excerpts through here,
+    so any of them could forge the token an operator greps to attribute a
+    directive."""
+    text = inj.advice_block({"sops": [forged]})
+    items = [ln for ln in text.splitlines() if ln.startswith("- ")]
+    assert items
+    assert all(inj.MARK not in ln and "[MINDNET]" not in ln for ln in items)
 
 
 def test_the_total_block_stays_within_the_sum_of_both_budgets():

@@ -138,6 +138,53 @@ def test_skills_are_ordered_by_task_relevance(quiet):
     assert out.skills[0].startswith("strong")
 
 
+# --- matching: the threshold and the stopword filter --------------------------------
+
+@pytest.mark.parametrize("title,expect_match", [
+    ("Refactor", True),               # one content word — was unmatchable
+    ("Deployment", True),
+    ("database migration ledger", True),
+    ("MN-5", False),                  # no content words at all
+    ("的数据库", False),                  # non-Latin: tokenizer yields nothing
+])
+def test_short_titles_are_matchable(quiet, title, expect_match):
+    """REGRESSION. A fixed MIN_OVERLAP of 2 made a one-keyword task
+    structurally unmatchable: max achievable overlap was 1, so no source could
+    EVER match regardless of the registries. The feature was silently a no-op
+    for a whole class of ordinary titles and looked exactly like 'nothing
+    relevant exists'."""
+    evs = [_sop_ev("s", "Rules", "refactor deployment database migration "
+                                 "ledger guidance for the team")]
+    out = adv.resolve(_task(title=title), evs=evs)
+    assert bool(out.sops) is expect_match
+
+
+def test_a_title_with_no_content_words_resolves_empty(quiet):
+    """The honest floor: no keywords means no basis for a match, and inventing
+    one would be worse than silence."""
+    assert adv.resolve(_task(title="MN-5"), evs=[]) == adv.EMPTY
+
+
+def test_inflected_stopwords_do_not_create_false_matches(quiet):
+    """REGRESSION. `_STOP` was checked against the RAW word while matching ran
+    on the STEM, so 'test' was filtered but 'testing' survived as the stem
+    'test'. A task and a totally unrelated SOP could then share {test, updat}
+    and clear the threshold on two words carrying no topic whatsoever."""
+    evs = [_sop_ev("noise", "Release notes",
+                   "Testing the updated release notes before a deploy")]
+    out = adv.resolve(_task(title="Testing the updated dashboard"), evs=evs)
+    assert out.sops == ()
+
+
+def test_the_stopword_filter_still_lets_real_topics_through(quiet):
+    """The canary: without it, the test above passes against a filter that
+    rejects everything."""
+    evs = [_sop_ev("real", "Dashboard rules",
+                   "dashboard rendering guidance for the operator view")]
+    assert adv.resolve(_task(title="Testing the updated dashboard"),
+                       evs=evs).sops
+
+
 # --- SOPs: R2 --------------------------------------------------------------------
 
 def test_a_matching_sop_body_survives_verbatim(quiet):
@@ -227,6 +274,27 @@ def test_a_summary_with_no_recorded_reason_is_skipped(quiet):
         _summary("blank", excerpt="database migration ledger")])
     out = adv.resolve(_task(title="database migration ledger"), evs=[])
     assert out.constraints == ()
+
+
+def test_the_prohibition_survives_the_longest_allowed_reason(quiet):
+    """REGRESSION. `MAX_REASON_CHARS` was hand-picked at 90 against a 153-char
+    template and a 240-char item cap — 243 total, so the closing sentence was
+    chopped and the constraint rendered as '...Use an alternative meth'. That
+    is exactly the outcome the cap exists to prevent: a prohibition without the
+    prohibition is trivia."""
+    quiet.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _summary("s", root_cause="R" * 400,
+                 excerpt="database migration ledger")])
+    out = adv.resolve(_task(title="database migration ledger"), evs=[])
+    assert out.constraints
+    assert len(out.constraints[0]) <= adv.MAX_ITEM_CHARS
+    assert out.constraints[0].endswith("Use an alternative method.")
+
+
+def test_the_reason_cap_is_derived_from_the_template(quiet):
+    """Pinned so the two can never drift apart again."""
+    boiler = len(adv.CONSTRAINT_TEMPLATE.format(reason=""))
+    assert adv.MAX_REASON_CHARS + boiler == adv.MAX_ITEM_CHARS
 
 
 def test_at_most_two_constraints_are_kept(quiet):

@@ -58,8 +58,11 @@ from __future__ import annotations
 
 import posixpath
 
+import re
+
 from . import phases as ph_mod
 from . import tasks as t_mod
+from .controller import WORKABLE_STATUSES
 
 # The phases at which producing code is, by definition, out of order. Derived
 # from the pipeline's own shape: everything before `execution` is a method
@@ -98,12 +101,49 @@ EXTENSION_LANGUAGE = {
     ".html": "html", ".css": "css", ".scss": "css",
 }
 
-# The two refusal messages, verbatim from the MN-4 directive. One home each, so
-# a test can assert the exact operator-facing wording.
-PHASE_DENIAL = ("ACCESS DENIED: MindNetwork State Machine violation. You "
-                "cannot write or execute code while in Phase: {phase}.")
-LANGUAGE_DENIAL = ("ACCESS DENIED: Language Compatibility Lock violation. This "
-                   "task is strictly restricted to {languages}.")
+# Programs the phase block must NEVER deny, because they are how the block is
+# escaped. `hive` is the state machine's own control surface — the injected
+# context tells the agent to clear a gate with `hive mindnet satisfy`, and
+# denying that is the system refusing the remedy it just prescribed. `git` and
+# `gh` are inspection, not code execution.
+#
+# Without this the block is unrecoverable from inside a session: every
+# documented way out (`hive mindnet satisfy`, `hive mindnet enter`,
+# `hive rules enforce --disable`) runs through Bash, as does the mandatory
+# `hive log` entry.
+EXEMPT_PROGRAMS = frozenset({"hive", "git", "gh"})
+
+# The two refusal messages. The directive's wording is the first sentence; the
+# rest is the way out.
+#
+# A refusal an operator cannot act on is an outage. The original text named only
+# the phase — with several tasks in the graph that does not even say WHICH task
+# froze the repo, let alone how to unfreeze it.
+PHASE_DENIAL = (
+    "ACCESS DENIED: MindNetwork State Machine violation. You cannot write or "
+    "execute code while in Phase: {phase}. (task '{task_id}') To proceed: "
+    "produce this phase's evidence under {where}, then `hive mindnet satisfy "
+    "{task_id}` and `hive mindnet enter {task_id} <next>`. `hive`, `git` and "
+    "`gh` commands are not blocked. To turn this rule off entirely: "
+    "`hive rules enforce --disable policy:gate:mindnet-phase`.")
+LANGUAGE_DENIAL = (
+    "ACCESS DENIED: Language Compatibility Lock violation. This task is "
+    "strictly restricted to {languages}. (task '{task_id}') Either write a "
+    "permitted file type, widen the task's language_context, or disable the "
+    "rule: `hive rules enforce --disable policy:gate:mindnet-language`.")
+
+# A drive letter is exactly one alpha character followed by a colon. The
+# original test — `text[1] == ":"` — also matched `a:docs/plans/x.md`, a
+# drive-RELATIVE path on the A: volume, and amputating the prefix turned it into
+# something that looked like this phase's evidence.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+# Windows silently strips trailing dots and spaces from a path, and everything
+# after `::` is an NTFS alternate-data-stream name. `src/app.ts.` and
+# `src/app.ts::$DATA` both create `app.ts`, but both parsed to an extension the
+# language table does not know — and "unmapped never denies" then waved them
+# through.
+_ADS_RE = re.compile(r"::.*$")
 
 
 # --- selecting the task that decides --------------------------------------------------
@@ -142,16 +182,60 @@ def active_task(sc):
     return (best[1], best[2]) if best else (None, None)
 
 
-def locked_task(sc):
-    """The task whose ``language_context`` applies, or ``None``.
+def blocking_task(sc):
+    """``(phase, Task)`` for an `in_progress` task sitting at a BLOCKED phase,
+    or ``(None, None)``.
 
-    Unlike the phase block, the lock is a property of the task's declared SCOPE
-    rather than of whether anyone is currently working it — a task restricted to
-    Python does not become polyglot by being parked. So eligibility here is
-    "has a phase record and a populated context", and among several the same
-    ordering as `active_task` picks one deterministically."""
+    Distinct from `active_task`, and the distinction is a real defect this
+    replaces. `active_task` returns the single task FURTHEST along the pipeline;
+    routing the phase block through it meant that starting any second task and
+    advancing it to `execution` silently switched the whole gate off — the rule
+    defeated by unrelated state, invisibly, and switched back on just as
+    invisibly when that task finished.
+
+    The block is a property of the REPOSITORY: if any task you have explicitly
+    picked up is still at a planning gate, producing code is out of order.
+
+    Ordering among several is stated and total (earliest phase, then epoch, then
+    id) so the task NAMED in the refusal is reproducible — an operator who
+    cannot reproduce a denial cannot clear it."""
     if not getattr(sc, "fresh", False):
-        return None
+        return None, None
+    records = getattr(getattr(sc, "state", None), "records", None) or {}
+    tasks = getattr(sc, "tasks", None) or {}
+    best = None
+    for tid, rec in records.items():
+        task = tasks.get(tid)
+        if task is None or getattr(task, "status", None) \
+                != t_mod.STATUS_IN_PROGRESS:
+            continue
+        if rec.phase not in BLOCKED_PHASES:
+            continue
+        idx = t_mod.phase_index(rec.phase)
+        key = (idx if idx is not None else len(t_mod.PHASES), rec.epoch, tid)
+        if best is None or key < best[0]:
+            best = (key, rec.phase, task)
+    return (best[1], best[2]) if best else (None, None)
+
+
+def locked_task(sc):
+    """``(phase, Task)`` whose ``language_context`` applies, or
+    ``(None, None)``.
+
+    Eligibility is `WORKABLE_STATUSES` — the same set `can_advance` gates on.
+    Restricting it is a fix, not tightening for its own sake: the first version
+    consulted status not at all, so a task COMPLETED last month still enforced
+    its `language_context` on every write in the repository, forever. Because
+    the shared ordering prefers the task furthest along, and a finished task is
+    by definition furthest along, the settled task actively out-competed the
+    live one. That is precisely the brick the `in_progress` rule prevents for
+    the phase block, applied to only one of the two rules.
+
+    Still broader than `blocking_task`: `pending` and `ready` count, because the
+    lock describes the task's declared SCOPE rather than whether anyone is
+    typing right now. But a settled task has no scope left to defend."""
+    if not getattr(sc, "fresh", False):
+        return None, None
     records = getattr(getattr(sc, "state", None), "records", None) or {}
     tasks = getattr(sc, "tasks", None) or {}
     best = None
@@ -159,46 +243,90 @@ def locked_task(sc):
         task = tasks.get(tid)
         if task is None or not getattr(task, "language_context", ()):
             continue
+        if getattr(task, "status", None) not in WORKABLE_STATUSES:
+            continue
         idx = t_mod.phase_index(rec.phase)
         key = (-idx if idx is not None else 1, rec.epoch, tid)
         if best is None or key < best[0]:
-            best = (key, task)
-    return best[1] if best else None
+            best = (key, rec.phase, task)
+    return (best[1], best[2]) if best else (None, None)
 
 
 # --- paths -------------------------------------------------------------------------
 
 def _norm(path) -> str:
-    """*path* as a normalized, forward-slashed, relative POSIX path, or ``""``.
+    """*path* as a normalized, forward-slashed POSIX path, or ``""``.
 
-    Normalization is what makes the evidence exemption a CONTAINMENT test rather
-    than a prefix test: `posixpath.normpath` collapses ``a/../b``, so a
-    traversal out of an exempt directory produces a path that no longer sits
-    under it. `phases.resolve_ref` refuses prefix matching for exactly this
-    reason and it would be pointless to reopen the hole one module over."""
+    Normalization is what makes the evidence exemption survive ``..``:
+    `posixpath.normpath` collapses ``a/../b``, so a traversal out of an exempt
+    directory produces a path that no longer sits under it."""
     if not isinstance(path, str) or not path.strip():
         return ""
-    text = path.replace("\\", "/").strip()
-    if len(text) > 2 and text[1] == ":":       # a Windows drive letter
-        text = text[2:]
+    text = _DRIVE_RE.sub("", path.replace("\\", "/").strip())
     return posixpath.normpath(text).lstrip("/")
+
+
+def _segments(path) -> tuple:
+    return tuple(p for p in _norm(path).split("/") if p and p != ".")
 
 
 def is_phase_evidence(phase, path) -> bool:
     """Whether writing *path* would produce evidence for *phase*.
 
+    **Matched on a segment-aligned SUFFIX, not anchored at the start.** That is
+    the whole correction here, and it is not a style choice: the `Write`/`Edit`
+    tool schemas REQUIRE an absolute `file_path`, and this project's own rule 12
+    mandates absolute paths everywhere. So the only shape this ever really sees
+    is ``C:/Users/hanif/mindhive/docs/superpowers/specs/thing.md``. An anchored
+    containment test against ``docs/superpowers/specs/`` fails on every one of
+    them, the exemption never fires, and `brainstorm` denies the very document
+    that clears it — the repository deadlocks with no way out. The first
+    implementation did exactly that, and every test that was supposed to catch
+    it passed a RELATIVE path.
+
+    Comparing whole segments rather than characters keeps it honest:
+    ``docs/plans-archive/x.md`` shares a string prefix with ``docs/plans`` and
+    is a different directory. At least one segment must follow the matched run,
+    so the directory itself is not mistaken for a file in it.
+
+    The tradeoff is deliberate. A suffix match also exempts
+    ``src/docs/plans/x.py``, which is not really this phase's evidence — it
+    over-exempts, letting one write through that the rule would rather stop.
+    Under-exempting bricks the repository. When a guard exists to prevent a
+    deadlock its failure direction must be "too permissive", so this errs open.
+
+    Root-relative resolution would be exact, but `paths.worktree_root` shells
+    out to git with a 2-second timeout and this runs on EVERY tool call.
+
     The exempt directories come from `phases.PHASE_EVIDENCE`, never from a
-    second list here (invariant 10): add a ``required_dir`` there and this
-    honours it without being edited, which is what a test asserts."""
-    norm = _norm(path)
-    if not norm:
+    second list here (invariant 10)."""
+    segs = _segments(path)
+    if not segs:
         return False
     desc = ph_mod.descriptor(phase) or {}
     for d in desc.get("required_dir") or ():
-        base = _norm(d)
-        if base and (norm == base or norm.startswith(base + "/")):
-            return True
+        need = _segments(d)
+        if not need:
+            continue
+        # `len(segs) - len(need)` (not +1) requires a segment AFTER the run.
+        for i in range(len(segs) - len(need)):
+            if segs[i:i + len(need)] == need:
+                return True
     return False
+
+
+def _program(command) -> str:
+    """The bare program name a shell command invokes, lowercased, or ``""``.
+
+    Deliberately crude — first token only. It gates an EXEMPTION, so its failure
+    direction is over-exempting something that merely starts with
+    `hive`/`git`/`gh`, never denying a legitimate escape."""
+    if not isinstance(command, str):
+        return ""
+    head = command.strip().split()
+    if not head:
+        return ""
+    return posixpath.basename(head[0].replace("\\", "/")).lower()
 
 
 def _file_path(tool_input):
@@ -220,15 +348,28 @@ def phase_violation(tool_name, tool_input, sc) -> str | None:
     try:
         if tool_name not in WRITE_TOOLS and tool_name not in EXECUTE_TOOLS:
             return None
-        phase, task = active_task(sc)
-        if task is None or phase not in BLOCKED_PHASES:
+        phase, task = blocking_task(sc)
+        if task is None:
             return None
         # Writes only. A shell command is not a document, whatever path string
         # it happens to mention, so `EXECUTE_TOOLS` never takes this exit.
         if tool_name in WRITE_TOOLS and \
                 is_phase_evidence(phase, _file_path(tool_input)):
             return None
-        return PHASE_DENIAL.format(phase=phase)
+        # The escape hatch. Every documented remedy for this block — satisfy,
+        # enter, disable the rule, and the mandatory `hive log` entry — is a
+        # `hive` command, and denying those made the block unrecoverable
+        # without leaving the session entirely.
+        if tool_name in EXECUTE_TOOLS and \
+                _program((tool_input or {}).get("command")
+                         if isinstance(tool_input, dict) else "") \
+                in EXEMPT_PROGRAMS:
+            return None
+        desc = ph_mod.descriptor(phase) or {}
+        where = " or ".join(desc.get("required_dir") or ()) \
+            or "this phase's evidence path"
+        return PHASE_DENIAL.format(
+            phase=phase, task_id=getattr(task, "task_id", "?"), where=where)
     except Exception:
         return None
 
@@ -242,7 +383,7 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
     try:
         if tool_name not in WRITE_TOOLS:
             return None
-        task = locked_task(sc)
+        phase, task = locked_task(sc)
         if task is None:
             return None
         allowed = {str(x).strip().lower()
@@ -252,13 +393,26 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
         path = _file_path(tool_input)
         if not path:
             return None
-        ext = posixpath.splitext(_norm(path))[1].lower()
+        # The evidence exemption has to hold across BOTH rules. It did not:
+        # every planning phase is cleared by a markdown document, `.md` maps to
+        # `markdown`, and so any language_context that did not literally list
+        # `markdown` made all three planning gates unclearable — the phase rule
+        # correctly waved the document through and this rule denied it one
+        # check later. Two guards, each individually sound, composing into the
+        # deadlock both were written to prevent.
+        if is_phase_evidence(phase, path):
+            return None
+        # Trailing dots, trailing spaces and `::$DATA` are stripped by Windows
+        # when the file is actually created, so `app.ts.` writes `app.ts`.
+        # Parse the name Windows will use, not the one we were handed.
+        base = _ADS_RE.sub("", posixpath.basename(_norm(path)))
+        ext = posixpath.splitext(base.rstrip(". "))[1].lower()
         lang = EXTENSION_LANGUAGE.get(ext)
         # Unmapped is not a violation — the table is finite, the file types a
         # repository contains are not.
         if lang is None or lang in allowed:
             return None
-        return LANGUAGE_DENIAL.format(
-            languages=", ".join(sorted(allowed)))
+        return LANGUAGE_DENIAL.format(languages=", ".join(sorted(allowed)),
+                                      task_id=getattr(task, "task_id", "?"))
     except Exception:
         return None
