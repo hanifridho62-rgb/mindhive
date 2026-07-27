@@ -80,6 +80,32 @@ MARK = "[mindnet]"
 MAX_BLOCK_CHARS = 1200
 MAX_FIELD_CHARS = 120
 
+# MN-3's advice gets its OWN budget, deliberately separate from the phase block
+# above. The phase directive is the thing this module exists to deliver; sharing
+# one wall would let a long SOP body push the exit criterion out of the prompt.
+# `test_an_oversized_advice_payload_does_not_truncate_the_phase_block` drives
+# that case directly.
+MAX_ADVICE_CHARS = 1800
+
+# The advice section's keys, in RENDER order — SOPs and prior-failure
+# constraints are hard rules and lead; skills are an offer and follow.
+#
+# Duplicated from `advice.to_dict` on purpose. This module must not import
+# `advice` (that module imports this one, for the sanitizer), so the two ends of
+# the serialization boundary know the shape independently.
+# `test_the_injector_and_the_resolver_agree_on_the_section_keys` is what makes
+# the duplication safe: rename a key on either side and it fails loudly instead
+# of silently rendering nothing.
+ADVICE_KEYS = ("sops", "constraints", "skills")
+
+# What each section is FOR, in the imperative. Without these the block is three
+# unlabelled lists and the agent has to guess which ones are binding.
+ADVICE_LABELS = {
+    "sops": "Standing procedures that govern this task — follow them",
+    "constraints": "Prior recorded failures on work like this",
+    "skills": "Skills matched to this task by the registry",
+}
+
 # The three verification claims, spelled out once. `MACHINE_VERIFIED` is the ONLY
 # string containing the words "machine-verified", which is what lets a test
 # assert its absence rather than a disclaimer's presence.

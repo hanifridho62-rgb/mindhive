@@ -86,7 +86,11 @@ from .tasks import Task
 #
 # 2 added the ``tasks`` block. A v1 document decodes to an empty task map rather
 # than an error, which is the honest answer: it genuinely carried no graph.
-SCHEMA_VERSION = 2
+#
+# 3 added the ``advice`` block (MN-3). Same story in both directions: a v2
+# document decodes to no advice, which is true — it was written before anything
+# resolved any — and a v2 reader ignores a key it does not know about.
+SCHEMA_VERSION = 3
 
 
 class Sidecar(NamedTuple):
@@ -102,13 +106,22 @@ class Sidecar(NamedTuple):
     different, narrower exit gate), and ``title``. The only other source is
     `tasks.fold(events.read_all())`, which is the ~264 ms this file exists to
     avoid. It is a projection of the same events the records came from, taken in
-    the same pass, so it cannot disagree with them."""
+    the same pass, so it cannot disagree with them.
+
+    ``advice`` is MN-3's resolved skill/SOP/prior-failure text, carried for
+    exactly the same reason as ``tasks``: resolving it needs the ledger AND a
+    filesystem scan of the plugin cache, and `inject.py` runs on every prompt.
+    It is kept as a plain ``{str: [str]}`` dict rather than an `advice.Advice`
+    so that decoding it here would not require importing `advice` — which
+    imports `inject`, which imports this module. The shape contract between the
+    two ends is pinned by a test rather than by a shared import."""
 
     state: PhaseState
     fresh: bool
     reason: str                 # why it is not fresh; "" when it is
     stamp: dict                 # as read; {} when there was nothing to read
     tasks: dict = {}            # task_id -> Task; {} for a v1 document
+    advice: dict = {}           # MN-3 resolved advice; {} for a v1/v2 document
 
 
 class Rebuild(NamedTuple):
@@ -214,7 +227,7 @@ def _staleness(stamp, project=None):
 
 # --- serialization ------------------------------------------------------------------
 
-def _encode(state, stamp, tasks=None) -> str:
+def _encode(state, stamp, tasks=None, advice=None) -> str:
     """The sidecar document. ``sort_keys`` makes the bytes a function of the
     CONTENT alone — two folds that built their dicts in a different insertion
     order still produce an identical file, which is what makes `rebuild`
@@ -231,6 +244,11 @@ def _encode(state, stamp, tasks=None) -> str:
         "orphans": {tid: [asdict(o) for o in rows]
                     for tid, rows in state.orphans.items()},
         "tasks": {tid: asdict(t) for tid, t in (tasks or {}).items()},
+        # Empty buckets are dropped rather than written, the same call `_decode`
+        # makes for empty orphan lists: it keeps the round trip an exact
+        # equality, and a key whose value is `[]` claims a resolution ran and
+        # found nothing, which is indistinguishable here from none having run.
+        "advice": {k: list(v) for k, v in (advice or {}).items() if v},
     }, sort_keys=True, indent=2) + "\n"
 
 
@@ -310,6 +328,27 @@ def _decode_tasks(doc) -> dict:
     return out
 
 
+def _decode_advice(doc) -> dict:
+    """The document's ``advice`` block as ``{str: [str]}``. Absent (a v1/v2
+    document) or malformed reads as ``{}``.
+
+    Validated down to the leaves on the way OUT, not merely on the way in — the
+    same call `telemetry.fold` makes. This decodes on the hook path and the
+    result goes straight into a prompt, so a value that is not a string is
+    dropped here rather than rendered as one somewhere downstream."""
+    raw = doc.get("advice")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key, rows in raw.items():
+        if not isinstance(key, str) or not isinstance(rows, list):
+            continue
+        vals = [r for r in rows if isinstance(r, str) and r.strip()]
+        if vals:
+            out[key] = vals
+    return out
+
+
 # --- the read path (hook-safe: degrades, never raises) --------------------------------
 
 def read(project=None) -> Sidecar:
@@ -343,7 +382,7 @@ def read(project=None) -> Sidecar:
         stamp = {}
     why = _staleness(stamp, project)
     return Sidecar(_decode(doc), why is None, why or "", stamp,
-                   _decode_tasks(doc))
+                   _decode_tasks(doc), _decode_advice(doc))
 
 
 # --- the write path -------------------------------------------------------------------
@@ -363,9 +402,9 @@ def _tmp_path(p) -> Path:
     return p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
 
 
-def write(state, stamp, project=None, tasks=None) -> Path:
-    """Serialize *state* + *stamp* (+ the *tasks* graph) to the sidecar,
-    atomically.
+def write(state, stamp, project=None, tasks=None, advice=None) -> Path:
+    """Serialize *state* + *stamp* (+ the *tasks* graph, + MN-3 *advice*) to the
+    sidecar, atomically.
 
     Raises `OSError` on a filesystem failure — this is the low-level primitive
     and its callers decide what a failure means. `rebuild` turns it into a
@@ -374,7 +413,7 @@ def write(state, stamp, project=None, tasks=None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_path(p)
     try:
-        tmp.write_text(_encode(state, stamp, tasks), encoding="utf-8")
+        tmp.write_text(_encode(state, stamp, tasks, advice), encoding="utf-8")
         os.replace(tmp, p)
     except OSError:
         # A half-written tmp left behind is litter that accumulates one file per
@@ -385,6 +424,37 @@ def write(state, stamp, project=None, tasks=None) -> Path:
             pass
         raise
     return p
+
+
+def resolve_advice(state, tasks, evs, project=None) -> dict:
+    """MN-3 advice for the task the injector would actually steer, as the plain
+    dict `write` persists. ``{}`` for anything that cannot be resolved.
+
+    **Keyed off `inject.active`, deliberately.** That function owns the
+    selection order — workable statuses only, furthest along the pipeline first,
+    total tie-break — and advice resolved for a DIFFERENT task than the one the
+    block describes would be worse than no advice at all. One home for the rule
+    rather than a second implementation drifting beside it.
+
+    Both imports are local. `inject` imports this module, so a module-level
+    import here would close a cycle; `advice` reaches `plugins`, `sop` and
+    `incidents`, which is a lot of machinery to load on a path that may only
+    ever read. Same idiom as `plugins.recommend_for`'s lazy imports.
+
+    Total: advice is the least important thing a rebuild does, and an exception
+    escaping here would take the phase projection down with it."""
+    try:
+        from . import advice as adv_mod
+        from . import inject as inj_mod
+        # `fresh=True`: this is the state being written right now, so by
+        # construction it is current — the flag exists for READERS deciding
+        # whether a file on disk can still be trusted.
+        _rec, task = inj_mod.active(Sidecar(state, True, "", {}, tasks or {}))
+        if task is None:
+            return {}
+        return adv_mod.to_dict(adv_mod.resolve(task, evs=evs, project=project))
+    except Exception:
+        return {}
 
 
 def rebuild(project=None, evs=None, tasks=None) -> Rebuild:
@@ -431,8 +501,12 @@ def rebuild(project=None, evs=None, tasks=None) -> Rebuild:
     if tasks is None:
         tasks = t_mod.fold(evs)
     state = c_mod.fold(evs, tasks)
+    # *evs* is passed through rather than left to the resolver's own default:
+    # that default reads the ledger, and the entire reason MN-3 resolves at
+    # write time is that this read has already been paid for.
+    advice = resolve_advice(state, tasks, evs, project)
     try:
-        write(state, _stamp(evs, segments), project, tasks)
+        write(state, _stamp(evs, segments), project, tasks, advice)
     except OSError as e:
         return Rebuild(False,
                        f"could not write {sidecar_path(project)}: "
