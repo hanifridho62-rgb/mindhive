@@ -223,6 +223,104 @@ A refusal must never wedge a task: the phase can still be satisfied by
 `hive mindnet satisfy --agent-reported`, whose `detail` carries the refusal
 reason verbatim, so the ledger shows plainly that Python did not verify it.
 
+### 4.3 The sidecar's `advice` section (MN-3)
+
+`mindnet/state.json` is a **projection**, rebuildable from the ledger and never
+a source of truth. Schema version 3 adds an `advice` block beside `records`,
+`orphans` and `tasks`:
+
+```json
+"advice": {"sops": ["…"], "constraints": ["…"], "skills": ["…"]}
+```
+
+Each value is a list of finished, sanitized, per-item-capped LINES — not
+records. It exists because MN-3's injector must staple the actual text of the
+matched SOPs, prior-failure constraints and skill descriptions into every
+prompt, and all three sources are expensive:
+
+| Source | Entry point | Cost |
+|---|---|---|
+| skills | `plugins.recommend_for` | `events.read_all` (~264 ms) + a `live_inventory` filesystem scan |
+| SOPs | `sop.current` | `events.read_all` |
+| prior failures | `incidents.summaries` | ledger + per-incident file reads |
+
+So resolution runs at **write** time (`sidecar.resolve_advice`, called from
+`rebuild` with the events the caller already read) and the **read** path costs
+one `sidecar.read` it was already paying. `inject.py` renders the block and
+never imports `advice` — that module imports `inject` for the sanitizer, and the
+two ends of the boundary agree on the key names through a contract test rather
+than a shared import.
+
+Compatibility runs both ways: a v2 document decodes to no advice (true — it was
+written before anything resolved any), and a v2 reader ignores a key it does not
+know. Empty lists are not persisted, keeping the round trip an exact equality.
+
+### 4.4 `PreToolUse` denial payloads (MN-4)
+
+The phase spine's teeth. Two entries appended to `enforce.POLICY_CHECKS`, both
+returning the standard hook shape:
+
+```json
+{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "[mindhive-rule] …"}}
+```
+
+| Signature | Fires when | Message |
+|---|---|---|
+| `gate:mindnet-phase` | a write/execute tool while the active task is `in_progress` at `brainstorm`, `plan` or `prd` | `ACCESS DENIED: MindNetwork State Machine violation. You cannot write or execute code while in Phase: {phase}.` |
+| `gate:mindnet-language` | a file write whose extension falls outside a populated `language_context` | `ACCESS DENIED: Language Compatibility Lock violation. This task is strictly restricted to {languages}.` |
+
+Both are `deny` rather than `ask`: a destructive command is sometimes
+legitimate, a state-machine violation is not. Both inherit the manifest kill
+switch every policy has (`rules/enforce.json`, `policy:<signature>` →
+`{"enabled": false}`), which is the documented way to turn a rule off that can
+otherwise stop an operator working.
+
+Three guards keep this from bricking a repository, and each has a test whose
+deletion is the outage:
+
+- **`in_progress` only.** `pending` is every declared task's default status
+  (`tasks.py`), and `inject.active` deliberately steers it. Denying on it would
+  mean one forgotten task refuses every write in the repo forever.
+- **The current phase's evidence directory is exempt**, read from
+  `phases.PHASE_EVIDENCE` (invariant 10) and scoped to the current phase.
+  Without it, `brainstorm` forbids writing the very document under
+  `docs/superpowers/specs/` that clears it. Containment, not prefix — the same
+  call `phases.resolve_ref` makes.
+- **Unmapped extensions never deny.** The language table is finite; the file
+  types a repo contains are not.
+
+Fail-open throughout: missing, stale, corrupt or empty sidecar allows.
+`mindnet/enforcer.py` does not import `events` at all — `PreToolUse` fires on
+every tool call, so a ~264 ms ledger read there is not a slow feature but an
+unusable session.
+
+### 4.5 The MN-5 cat board payload
+
+`GET /api/mindnet/cats` →
+
+```json
+{"cats": [{"faculty": "task-graph", "display": "active", "status": "active",
+           "task_id": "mn5-u9", "phase": "execution", "age_secs": 4,
+           "skill": ""}],
+ "dim_after_secs": 180, "hide_after_secs": 21600}
+```
+
+`ui_cats.board(state, now)` is pure with `now` injected, which is what makes the
+two thresholds testable at the boundary rather than approximately. Classification
+is by **age**, not status: under 180 s is `active`, 180 s to 6 h is `dim`, and at
+6 h the faculty leaves the payload entirely. An `idle` faculty inside the window
+still renders — "finished a minute ago" and "hung a minute ago" are both worth
+seeing, and the raw `status` rides along so the UI can distinguish them.
+
+The dim band **is** the feature: a faculty reporting `active` with an age of
+hours is a stuck parallel run, which is the reason the board was asked for. The
+thresholds ship in the payload so the page never respells them (invariant 10).
+An unparseable `ts` is treated as maximally old and hidden — treating it as
+fresh would pin a corrupt row on screen as a permanently active cat, and a false
+"something is running" is the one thing this board must never say.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
