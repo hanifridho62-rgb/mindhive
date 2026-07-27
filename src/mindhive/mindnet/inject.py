@@ -59,6 +59,8 @@ own marker is stripped, so a title cannot forge a second directive header.
 """
 from __future__ import annotations
 
+import re
+
 from . import phases as ph_mod
 from . import sidecar as s_mod
 from . import tasks as t_mod
@@ -74,6 +76,14 @@ from .tasks import PHASES, TRIVIAL_EXIT_PHASE, phase_index
 # what.
 MARK = "[mindnet]"
 
+# Matches the marker in any casing and with internal padding. `str.replace` was
+# not enough on either axis: it is case-SENSITIVE, so `[MINDNET]` survived it
+# untouched, and it is a single left-to-right pass, so `[[mindnet]mindnet]`
+# re-forms a literal `[mindnet]` after the inner occurrence is deleted. Both
+# were reachable from any plugin description or SOP body once MN-3 started
+# routing third-party text through here.
+_MARK_RE = re.compile(r"\[\s*mindnet\s*\]", re.IGNORECASE)
+
 # Invariant 5 bounds SIZE. Every field is already capped, so the natural block
 # is ~700 chars; this is the wall that holds if a future line is added carelessly
 # or a projection row arrives longer than its writer allowed.
@@ -85,7 +95,12 @@ MAX_FIELD_CHARS = 120
 # one wall would let a long SOP body push the exit criterion out of the prompt.
 # `test_an_oversized_advice_payload_does_not_truncate_the_phase_block` drives
 # that case directly.
-MAX_ADVICE_CHARS = 1800
+# 2000, not 1800. The old value was derived from the item caps alone
+# ((3+2+2) * 240 = 1680) and ignored what the RENDERER adds — three section
+# headers, seven `- ` bullets and the newlines between them, 195 chars. A fully
+# populated advice set renders to 1875, so the budget silently dropped the last
+# skill and the guard test could not see it because it never rendered anything.
+MAX_ADVICE_CHARS = 2000
 
 # Per-item wall on the render side. `advice.MAX_ITEM_CHARS` already caps these
 # at resolve time and the two are deliberately equal, but this module cannot
@@ -163,7 +178,16 @@ def safe_text(value, width: int = MAX_FIELD_CHARS) -> str:
     module expects to be text can arrive as an arbitrary-precision int off a
     corrupt file. That is a raise on the hook path hiding inside an f-string."""
     try:
-        return " ".join(str(value or "").replace(MARK, "").split())[:width]
+        text = " ".join(str(value or "").split())
+        # To a FIXED POINT, because deleting one occurrence can create another:
+        # `[[mindnet]mindnet]` -> `[mindnet]` in a single pass. One `re.sub` is
+        # still one pass; the loop is what actually closes it.
+        while True:
+            stripped = _MARK_RE.sub("", text)
+            if stripped == text:
+                break
+            text = stripped
+        return text[:width]
     except (ValueError, TypeError):
         return "?"
 
