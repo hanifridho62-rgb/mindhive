@@ -91,7 +91,12 @@ _PAGE = """<!doctype html>
   .mn-cat.active { color:#7ee787; border-color:#2ea043; }
   .mn-cat.active svg { animation:mn-bob 1.6s ease-in-out infinite; }
   .mn-cat.dim { color:#8b949e; opacity:.55; }
-  .mn-cat.dim svg { animation:none; }
+  /* grayscale, not just opacity. The cats used to be a currentColor silhouette,
+     so `.mn-cat.dim`'s grey text colour greyed the sprite for free. They are
+     per-faculty coloured now, and without an explicit filter a dim cat would
+     still look fully alive — losing the 180-second band, which IS the hang
+     signal this board exists to show. */
+  .mn-cat.dim svg { animation:none; filter:grayscale(100%); }
   @keyframes mn-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
   #mn-cat-panel { position:fixed; z-index:20; display:none; min-width:210px;
     background:#161b22; border:1px solid #30363d; border-radius:8px;
@@ -171,16 +176,25 @@ _PAGE = """<!doctype html>
     '.bbbbbbbbbb.',
     '.bbbbbbbbbb.',
     '..bb.bb.bb..'];
+  // Seven, not six: `telemetry.FACULTIES` has seven members and the faculty
+  // board gives each one its own cat, so a six-entry table would make two
+  // faculties render identically — the exact thing that board is for. Every
+  // modulo below reads the table's length rather than a literal, so adding an
+  // eighth palette cannot leave a hardcoded 7 behind.
   const CAT_PALETTES = [
     {name:'white',   b:'#f2f2f0', p:'#e3e3df', e:'#4aa3ff'},
     {name:'calico',  b:'#f2f2f0', p:'#e8863a', e:'#3fb950'},
     {name:'orange',  b:'#e8863a', p:'#c9641f', e:'#3fb950'},
     {name:'tabby',   b:'#9aa2ad', p:'#6b7280', e:'#e8b64c'},
     {name:'siamese', b:'#e8dcc8', p:'#5b4636', e:'#58a6ff'},
-    {name:'black',   b:'#262a33', p:'#16181d', e:'#e8b64c'}];
-  function catFor(id){ return (parseInt(String(id).slice(0,4), 16) || 0) % 6; }
+    {name:'black',   b:'#262a33', p:'#16181d', e:'#e8b64c'},
+    {name:'cream',   b:'#f0d9a8', p:'#d8b878', e:'#3fb950'}];
+  function catFor(id){
+    return (parseInt(String(id).slice(0,4), 16) || 0) % CAT_PALETTES.length;
+  }
   function catSVG(idx, size){
-    const c = CAT_PALETTES[idx % 6];
+    const c = CAT_PALETTES[((idx % CAT_PALETTES.length) + CAT_PALETTES.length)
+                           % CAT_PALETTES.length];
     const fill = {b:c.b, p:c.p, e:c.e, n:'#ff8fb3'};
     let rects = '';
     CAT_GRID.forEach((row, y) => { for (let x = 0; x < row.length; x++) {
@@ -385,14 +399,19 @@ _PAGE = """<!doctype html>
   // rule removes a cat from the payload entirely, and the 180-second rule
   // arrives as display:"dim". Nothing here recomputes either — one home for
   // those numbers, and this loop cannot drift from the tests that pin them.
-  const CAT_SVG = `<svg viewBox="0 0 16 16" shape-rendering="crispEdges"
-    aria-hidden="true"><g fill="currentColor">
-    <rect x="2" y="3" width="2" height="3"/><rect x="12" y="3" width="2" height="3"/>
-    <rect x="3" y="5" width="10" height="7"/><rect x="4" y="12" width="8" height="1"/>
-    <rect x="13" y="8" width="2" height="1"/><rect x="15" y="6" width="1" height="2"/>
-    </g><g fill="#0e1116"><rect x="5" y="7" width="2" height="2"/>
-    <rect x="9" y="7" width="2" height="2"/><rect x="7" y="10" width="2" height="1"/>
-    </g></svg>`;
+  // The canonical faculty order, injected from `telemetry.FACULTIES` — the one
+  // legend. A faculty's cat is its INDEX in that tuple, so the mapping is
+  // stable across polls and a faculty added to the legend gets its own palette
+  // without anybody editing a second list here. A hand-written faculty->colour
+  // table would be exactly that second list, and it would drift.
+  const FACULTY_ORDER = __FACULTIES__;
+  function facultyCat(faculty){
+    const i = FACULTY_ORDER.indexOf(faculty);
+    // `ui_cats.board` iterates FACULTIES and drops anything absent, so an
+    // unknown faculty cannot reach the payload. Answer 0 rather than -1 anyway:
+    // a negative index would pick the wrong palette silently.
+    return i < 0 ? 0 : i;
+  }
   const CAT_LABEL = { 'skill-plugin':'Skills', 'sop':'SOPs',
     'improvements':'Improvements', 'history':'History', 'task-graph':'Tasks',
     'compatibility':'Compatibility', 'pr-green':'PR green' };
@@ -453,7 +472,7 @@ _PAGE = """<!doctype html>
       const el = document.createElement('span');
       el.className = 'mn-cat ' + cat.display;
       el.dataset.faculty = cat.faculty;
-      el.innerHTML = CAT_SVG;
+      el.innerHTML = catSVG(facultyCat(cat.faculty), 19);
       const t = document.createElement('span');
       t.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
       el.appendChild(t);
@@ -505,4 +524,14 @@ _PAGE = """<!doctype html>
 def render_swarm(token: str) -> str:
     # Escape every "<" in the JSON-encoded token so neither "</script>" nor
     # "<!--" can break out of the inline <script> block.
-    return _PAGE.replace("__TOKEN__", json.dumps(token).replace("<", "\\u003c"))
+    #
+    # The faculty legend is injected rather than restated in JavaScript, so the
+    # per-faculty cat index derives from `telemetry.FACULTIES` and cannot drift
+    # from it (invariant 10). Imported lazily to keep this module's "token in,
+    # HTML out" purity: a page render must not pull the mindnet package into a
+    # dashboard serving a project that has none.
+    from .mindnet.telemetry import FACULTIES
+    return (_PAGE
+            .replace("__FACULTIES__", json.dumps(list(FACULTIES)))
+            .replace("__TOKEN__",
+                     json.dumps(token).replace("<", "\\u003c")))
