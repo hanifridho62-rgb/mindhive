@@ -1272,6 +1272,71 @@ def cmd_mindnet_rebuild(args) -> int | None:
     return None
 
 
+def cmd_mindnet_enforce(args) -> int | None:
+    """Read or toggle MN-6's opt-in: whether the MN-4 policy checks may deny
+    anything in THIS checkout.
+
+    Bare, it is a status read — and the one place an operator sees
+    `optin.DORMANT_NOTE`, so "why is nothing being enforced?" has an answer that
+    does not require reading source.
+
+    Two properties this handler must keep, both learned the hard way in MN-4:
+
+    * **No ledger append.** `sidecar._staleness` counts every event, so a row
+      written here without also rewriting the sidecar would read STALE and
+      silently degrade U9's phase-aware injection. It also means disarming a
+      frozen repository never depends on the ledger being writable.
+    * **Reachable while the teeth are biting.** Every remedy MN-4 documented ran
+      through `Bash`, which the phase block denied unconditionally — the kill
+      switch was locked inside the room it opened. `hive` is exempt from the
+      phase block, the language lock only inspects writes, and this writes via
+      `paths.write_text_atomic` rather than a `Write` tool call, so all three
+      rules are satisfied at once rather than each alone."""
+    from .mindnet import optin
+    project = getattr(args, "project", None)
+    if args.enable or args.disable:
+        out = optin.set_enabled(
+            bool(args.enable), project=project,
+            session=getattr(args, "session", None)
+            or os.environ.get("MINDHIVE_SESSION"))
+        st = optin.status(project)
+        if args.json:
+            print(json.dumps({**st, "wrote": out}, indent=2))
+            return None
+        verb = "enabled" if args.enable else "disabled"
+        print(f"mindnet enforce: {verb} for {out['root']} -> {out['path']}")
+        # The recorded root and the EFFECTIVE answer can legitimately differ:
+        # MINDNETWORK_ENFORCE out-ranks the file, and a deeper recorded root
+        # out-ranks a shallower one. Saying only "enabled" there would be a lie
+        # the operator finds out about at the next denial.
+        if st["armed"] != bool(args.enable):
+            print(f"  note: effective state here is "
+                  f"{'armed' if st['armed'] else 'dormant'} "
+                  f"({st['source']}) — {st['note']}")
+        return None
+    st = optin.status(project)
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return None
+    print(f"mindnet enforce: {'armed' if st['armed'] else 'dormant'} "
+          f"({st['source']})")
+    print(f"  {st['note']}")
+    # The remedy has to name the mechanism that is actually deciding. The
+    # environment out-ranks the record, so suggesting `--enable` while
+    # MINDNETWORK_ENFORCE=0 is holding the gate shut sends an operator to a flag
+    # that will change the file and nothing else — the same class of
+    # unactionable advice MN-4's original one-sentence refusal was.
+    if st["source"] == "env":
+        print(f"  {optin.ENV_VAR} is set in this process and out-ranks the "
+              f"record — unset it to fall back to the per-checkout opt-in")
+    elif not st["armed"]:
+        print("  turn it on for this checkout: hive mindnet enforce --enable")
+    else:
+        print("  turn it off for this checkout: hive mindnet enforce --disable"
+              f"  ·  or for this process only: {optin.ENV_VAR}=0")
+    return None
+
+
 def cmd_autoresume_schedule(args) -> int | None:
     from . import autoresume as autoresume_mod
     from . import roadmap as roadmap_mod
@@ -2411,6 +2476,23 @@ def _build_parser() -> argparse.ArgumentParser:
                            "the ledger (the repair for a stale or corrupt one)")
     mnb.add_argument("--project", default=None)
     mnb.set_defaults(func=cmd_mindnet_rebuild)
+
+    # MN-6's blast-radius gate. Bare = status; the two directions are mutually
+    # exclusive because `--enable --disable` has no defensible reading and
+    # silently picking one is how a toggle for a repo-freezing rule goes wrong.
+    mnx = mnsub.add_parser("enforce", help="read or toggle whether MN-4's "
+                           "PreToolUse teeth may deny anything in THIS "
+                           "checkout (opt-in; dormant by default)")
+    mnxg = mnx.add_mutually_exclusive_group()
+    mnxg.add_argument("--enable", action="store_true",
+                      help="arm enforcement for this checkout root")
+    mnxg.add_argument("--disable", action="store_true",
+                      help="disarm it for this checkout root — recorded, so it "
+                           "also out-ranks an armed parent checkout")
+    mnx.add_argument("--project", default=None)
+    mnx.add_argument("--session", default=None)
+    mnx.add_argument("--json", action="store_true")
+    mnx.set_defaults(func=cmd_mindnet_enforce)
 
     # --- autoresume (deliver the interruption marker back into Claude) ---
     ar = sub.add_parser("autoresume", help="auto-resume: after the usage "
