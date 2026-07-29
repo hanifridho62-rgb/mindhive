@@ -329,29 +329,65 @@ every tool call, so a ~264 ms ledger read there is not a slow feature but an
 unusable session. It also does not resolve the worktree root, because
 `paths.worktree_root` shells out to git with a 2-second timeout.
 
+### 4.4.1 The opt-in gate (MN-6)
+
 **Blast radius.** The `PreToolUse` hook is registered at user level and
 `paths.detect_project` collapses every linked worktree onto the main repo's
-namespace, so one sidecar governs every checkout of a repo: a blocked task in
-one worktree denies in all of them.
+namespace, so one sidecar governs every checkout of a repo: a blocked task in one
+worktree would deny in all of them. Both mindnet entries therefore default
+**dormant**, restoring `enforce.py`'s own stated contract ("enforcement is always
+opt-in"). Every other member of `POLICY_CHECKS` decides from the tool call alone
+and is the same answer in every repository; these two decide from mutable
+projection state, which is what makes ON-by-default wrong for them specifically.
 
-Three guards keep this from bricking a repository, and each has a test whose
-deletion is the outage:
+Two mechanisms, and the environment one out-ranks the file:
 
-- **`in_progress` only.** `pending` is every declared task's default status
-  (`tasks.py`), and `inject.active` deliberately steers it. Denying on it would
-  mean one forgotten task refuses every write in the repo forever.
-- **The current phase's evidence directory is exempt**, read from
-  `phases.PHASE_EVIDENCE` (invariant 10) and scoped to the current phase.
-  Without it, `brainstorm` forbids writing the very document under
-  `docs/superpowers/specs/` that clears it. Containment, not prefix — the same
-  call `phases.resolve_ref` makes.
-- **Unmapped extensions never deny.** The language table is finite; the file
-  types a repo contains are not.
+| Mechanism | Scope | `status()["source"]` |
+|---|---|---|
+| `MINDNETWORK_ENFORCE=1` / `=0` | this process | `env` |
+| `<project>/mindnet/enforce.json` | one checkout root | `file` |
+| neither | — | `default` (dormant) |
 
-Fail-open throughout: missing, stale, corrupt or empty sidecar allows.
-`mindnet/enforcer.py` does not import `events` at all — `PreToolUse` fires on
-every tool call, so a ~264 ms ledger read there is not a slow feature but an
-unusable session.
+```json
+{"version": 1,
+ "roots": {"C:/Users/hanif/mindhive": {"enabled": true,
+                                       "at": "2026-07-29T12:00:00Z",
+                                       "session": "s1"}}}
+```
+
+`MINDNETWORK_ENFORCE` decides in **both** directions so it beats the record —
+that is the kill switch MN-4 lacked, and it needs no writable disk. Only the
+documented spellings (`1/true/yes/on/enable[d]`, `0/false/no/off/disable[d]`)
+decide; anything else, **including the empty string a shell leaves when a
+variable is cleared**, falls through to the record rather than being guessed at.
+
+Roots are keyed and matched **segment-aligned**, and the **deepest** recorded
+root that covers `Path.cwd()` wins. This repo's linked worktrees live *under* the
+main checkout (`<repo>/.claude/worktrees/<name>`), so plain containment would
+mean arming the main checkout silently re-arms every worktree in it — the same
+repo-wide reach, one level down. Deepest-wins is what makes `--disable` from
+inside one worktree a real local escape from an armed ancestor, which is also why
+a disable is **recorded rather than deleted**: a deleted entry out-ranks nothing.
+
+`hive mindnet enforce` reads the state (and is the only place `[mindnet]
+enforcement dormant: opt-in required` is surfaced); `--enable` / `--disable`
+toggle it. The toggle **appends no ledger event** — `sidecar._staleness` counts
+every event, so a row written without also rewriting the sidecar reads STALE and
+silently degrades U9's phase-aware injection, and disarming a frozen repo must
+not depend on the ledger being writable.
+
+The opt-in is checked **before** the sidecar read, so a project that never opted
+in pays no mindnet file I/O on any tool call; the tool-name test still comes
+first, so `Read` pays neither. `optin.py` imports neither `events` nor
+`subprocess`: resolving the current checkout is pure path arithmetic, and the one
+`paths.worktree_root` git call happens in the CLI when a root is *recorded*.
+Fail-open in the direction that matters — any fault in the gate is **dormant**,
+never armed.
+
+The gate composes with, rather than replaces, the manifest kill switch: an armed
+opt-in still respects `policy:gate:mindnet-*` → `{"enabled": false}`, and
+dormancy never reaches `gate:no-verify`, `gate:config-protection` or
+`gate:destructive-command`, which have their own adoption decision.
 
 ### 4.5 The MN-5 cat board payload
 
