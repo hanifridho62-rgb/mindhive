@@ -98,7 +98,12 @@ class FakeRunner:
         self._lock = threading.Lock()
 
     def __call__(self, run_key, script, **kw):
-        tid = kw.get("task_id") or str(run_key)
+        # The task id travels in the run key, because that is the only channel
+        # `executor.execute`'s real signature offers. Parsing it here rather than
+        # accepting a `task_id=` kwarg is what keeps this double's contract
+        # identical to the real runner's — a fake that accepts an argument
+        # production would reject is how a seam silently rots.
+        tid = str(run_key).split("-", 2)[-1]
         with self._lock:
             self.calls.append(tid)
             self.kwargs[tid] = kw
@@ -310,55 +315,505 @@ def test_frontier_agrees_with_tasks_ready_on_every_shape_here():
 
 # --- the performance budget --------------------------------------------------
 
-def _worst_case_graph():
-    """`MAX_NODES` tasks that are ALL ready, each at full `MAX_DEPTH`.
+def _bench_graph(n=None, fanout=1):
+    """*n* tasks that are ALL ready, each at full `MAX_DEPTH`.
 
     The shape matters more than the size, and the obvious fixture measures
     nothing: with a linear dependency chain, `ready` short-circuits on the
-    dependency test for every task but the root, so the ancestor walk — the
-    expensive part — runs once instead of 2000 times. The true worst case is
-    every task ready and every task deep, which forces a full
-    `ancestors()` climb per node.
+    dependency test for every task but the root, so the ancestor climb — the
+    expensive part — runs once instead of N times. Here every task is ready AND
+    deep, forcing the climb per chain, and dependencies are satisfied rather than
+    absent so the dependency loop runs too instead of skipping an empty tuple.
 
-    Deps are satisfied rather than absent (each task depends on a COMPLETED
-    node), so the dependency loop is exercised too instead of being skipped on
-    an empty tuple."""
+    *fanout* controls how many siblings share a parent. ``1`` gives every task
+    its own parent, which defeats `ready`'s parent-keyed ancestor cache — the
+    pathological shape. A larger fanout is what real graphs look like."""
+    n = t_mod.MAX_NODES if n is None else n
     graph = {"done": _task("done", status=t_mod.STATUS_COMPLETED)}
     chain = ["done"]
-    for i in range(t_mod.MAX_NODES - 1):
-        # Rebuild the parent chain every MAX_DEPTH so no node exceeds the cap
-        # (past it the fold reports a violation and the shape stops being the
-        # legal worst case).
+    for i in range(n - 1):
+        # Restart the parent chain at MAX_DEPTH: past the cap the fold reports a
+        # violation and the shape stops being the legal worst case.
         if len(chain) > t_mod.MAX_DEPTH:
             chain = ["done"]
         tid = f"t{i}"
         graph[tid] = _task(tid, deps=("done",), parent=chain[-1])
-        chain.append(tid)
+        if i % fanout == 0:
+            chain.append(tid)
     return graph
 
 
-def test_the_frontier_is_under_five_milliseconds_at_max_nodes():
-    """The plan's R8, on the worst legal shape rather than a convenient one."""
-    graph = _worst_case_graph()
-    assert len(graph) == t_mod.MAX_NODES
-
-    # The canary: if the fixture were short-circuiting the way a linear chain
-    # does, almost nothing would be ready and the timing would prove nothing.
-    ready = orc.frontier(graph)
-    assert len(ready) == t_mod.MAX_NODES - 1, (
-        f"only {len(ready)} of {t_mod.MAX_NODES} tasks are ready — the fixture "
-        f"is short-circuiting and this benchmark measures nothing")
-
+def _best_ms(graph, rounds=3):
     orc.frontier(graph)                                   # warm any import cost
-    # Best of three: this runs on shared CI, and a single sample turns an
-    # unrelated scheduling hiccup into a red build.
+    # Best of N: this runs on shared CI, where a single sample turns an unrelated
+    # scheduling hiccup into a red build.
     timings = []
-    for _ in range(3):
+    for _ in range(rounds):
         start = time.perf_counter()
         orc.frontier(graph)
         timings.append((time.perf_counter() - start) * 1000)
-    assert min(timings) < 5.0, (
-        f"frontier took {min(timings):.2f} ms on {t_mod.MAX_NODES} ready nodes")
+    return min(timings)
+
+
+def test_the_frontier_is_under_five_milliseconds_on_a_realistic_max_size_graph():
+    """The plan's R8, on a graph shaped like a real one: `MAX_NODES` tasks, all
+    ready, at full depth, with siblings sharing parents.
+
+    Measured ~0.8 ms — a 6x margin. The bound is meaningful here rather than
+    arbitrary: `ready`'s ancestor answer is cached by `parent_id`, so a branching
+    graph climbs each chain once."""
+    graph = _bench_graph(fanout=200)
+    assert len(graph) == t_mod.MAX_NODES
+    ready = orc.frontier(graph)
+    assert len(ready) == t_mod.MAX_NODES - 1, (
+        f"only {len(ready)} of {t_mod.MAX_NODES} are ready — the fixture is "
+        f"short-circuiting and this benchmark measures nothing")
+    ms = _best_ms(graph)
+    assert ms < 5.0, f"frontier took {ms:.2f} ms on a realistic MAX_NODES graph"
+
+
+def test_the_frontier_stays_bounded_on_the_pathological_shape():
+    """Every task with its own parent, which defeats the ancestor cache entirely.
+
+    Deliberately a LOOSER bound than the test above, and the looseness is the
+    honest part: measured ~4.6 ms, so a 5 ms assertion here would be flaky on
+    shared CI rather than protective. What matters is that the pathological case
+    is still milliseconds — `frontier` runs once per wave, and a wave spawns
+    subprocesses costing orders of magnitude more."""
+    ms = _best_ms(_bench_graph(fanout=1))
+    assert ms < 25.0, (
+        f"frontier took {ms:.2f} ms on {t_mod.MAX_NODES} unique-parent nodes")
+
+
+def test_the_frontier_does_not_scale_quadratically():
+    """The assertion that actually catches a regression. A threshold test passes
+    on a faster machine no matter how the complexity changed; this compares the
+    curve to itself, so an accidental O(N^2) fails on any machine.
+
+    Quadrupling the nodes must cost well under 16x — the quadratic factor —
+    leaving generous room for the sort's N log N and for CI noise."""
+    small = _best_ms(_bench_graph(n=500, fanout=1), rounds=5)
+    large = _best_ms(_bench_graph(n=2000, fanout=1), rounds=5)
+    assert large < small * 10, (
+        f"500 nodes: {small:.2f} ms, 2000 nodes: {large:.2f} ms — a {large/small:.1f}x "
+        f"cost for 4x the nodes looks quadratic")
+
+
+# ============================================================================
+# U4 — the wave execution loop
+# ============================================================================
+#
+# The failure cascade comes FIRST in this section deliberately. It is the
+# property most likely to be quietly wrong, and writing the happy path first
+# tends to shape the code so the cascade becomes awkward to add.
+
+def test_a_failed_task_never_spawns_its_dependents():
+    """THE test. Not "the dependents are unfinished" — the runner must never
+    have been CALLED for them. A loop that submits B and C and then discards
+    their results would pass the weaker assertion while having already run
+    the work."""
+    fake = FakeRunner(results={"a": "fail"})
+    out = orc.orchestrate(_diamond(), runner=fake, execute=True)
+
+    assert fake.submitted() == {"a"}, (
+        f"the loop submitted {fake.submitted() - {'a'}} after 'a' failed")
+    assert out.blocked == ["a"]
+    assert out.completed == []
+    assert out.outcome == orc.OUTCOME_STALLED
+
+
+def test_one_failed_arm_does_not_abort_the_healthy_arm():
+    """A partial failure must not take the whole wave down: B is independent of
+    C and has to finish, or one flaky node costs an entire graph."""
+    fake = FakeRunner(results={"c": "fail"})
+    out = orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED),
+                          runner=fake, execute=True)
+
+    assert "b" in out.completed
+    assert out.blocked == ["c"]
+    assert "d" not in fake.submitted(), "the join ran with a blocked parent"
+    assert out.outcome == orc.OUTCOME_STALLED
+
+
+@pytest.mark.parametrize("bad", ["fail", "timeout", "refused", "spawn-failed"])
+def test_every_non_ok_result_blocks_the_task(bad):
+    """Enumerated against `RUN_RESULTS` rather than treated as "not ok", so a
+    result value added later fails loudly instead of being silently classified
+    as success."""
+    fake = FakeRunner(results={"a": bad})
+    out = orc.orchestrate(_graph(_task("a")), runner=fake, execute=True)
+    assert out.blocked == ["a"]
+    assert out.completed == []
+
+
+def test_the_result_mapping_covers_every_declared_run_result():
+    """The canary for the parametrize above: if `RUN_RESULTS` grows, this fails
+    and the new value gets a deliberate classification."""
+    assert set(orc.RESULT_STATUS) == set(x_mod.RUN_RESULTS), (
+        "orchestrator.RESULT_STATUS and executor.RUN_RESULTS disagree — one of "
+        "them grew and the other did not")
+
+
+def test_an_unknown_result_value_raises_rather_than_defaulting_to_success():
+    """Silently treating an unrecognized result as `ok` would mark a task
+    COMPLETED on evidence nobody checked."""
+    fake = FakeRunner()
+    fake.results["a"] = "some-new-result"
+    with pytest.raises(ValueError, match="some-new-result"):
+        orc.orchestrate(_graph(_task("a")), runner=fake, execute=True)
+
+
+def test_a_runner_that_raises_blocks_the_task_and_does_not_kill_the_loop():
+    """`executor.execute` maps its own faults to typed results, but a custom
+    runner (or a bug in one) can still raise. One exploding task must not take
+    the whole orchestration down."""
+    fake = FakeRunner(raises={"b"})
+    out = orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED),
+                          runner=fake, execute=True)
+    assert out.blocked == ["b"]
+    assert "c" in out.completed
+    assert out.outcome == orc.OUTCOME_STALLED
+
+
+# --- the happy path and wave sequencing ---------------------------------------
+
+def test_a_diamond_settles_in_three_waves_with_the_documented_membership():
+    """Membership, not just the count: a loop that ran the right NUMBER of waves
+    with the wrong tasks in them would pass a count assertion."""
+    fake = FakeRunner()
+    out = orc.orchestrate(_diamond(), runner=fake, execute=True)
+
+    assert out.outcome == orc.OUTCOME_SETTLED
+    assert [w.tasks for w in out.waves] == [["a"], ["b", "c"], ["d"]]
+    assert out.completed == ["a", "b", "c", "d"]
+    assert out.blocked == []
+
+
+def test_a_linear_graph_settles_one_task_per_wave():
+    fake = FakeRunner()
+    out = orc.orchestrate(_linear(), runner=fake, execute=True)
+    assert [w.tasks for w in out.waves] == [["a"], ["b"], ["c"]]
+    assert out.outcome == orc.OUTCOME_SETTLED
+
+
+def test_both_arms_of_a_wave_run_concurrently():
+    """The reason a ThreadPoolExecutor is here at all. A serial implementation
+    produces the same statuses and the same waves, so only observed overlap
+    tells the two apart."""
+    fake = FakeRunner(delay=0.05)
+    orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED), runner=fake,
+                    execute=True)
+    assert fake.peak >= 2, (
+        f"peak concurrency was {fake.peak} — the wave ran serially")
+
+
+def test_the_limit_bounds_concurrency_end_to_end():
+    """`limit=1` must hold at the POOL, not only at the frontier."""
+    fake = FakeRunner(delay=0.02)
+    out = orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED),
+                          runner=fake, execute=True, limit=1)
+    assert fake.peak == 1, f"peak concurrency was {fake.peak} with limit=1"
+    assert out.outcome == orc.OUTCOME_SETTLED, (
+        "a limit must slow the graph down, not prevent it from finishing")
+
+
+def test_an_already_finished_graph_runs_nothing():
+    fake = FakeRunner()
+    out = orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_COMPLETED)),
+                          runner=fake, execute=True)
+    assert fake.calls == []
+    assert out.waves == []
+    assert out.outcome == orc.OUTCOME_SETTLED
+
+
+def test_an_all_blocked_graph_stalls_without_running_anything():
+    fake = FakeRunner()
+    out = orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_BLOCKED),
+                                 _task("b", deps=("a",))),
+                          runner=fake, execute=True)
+    assert fake.calls == []
+    assert out.outcome == orc.OUTCOME_STALLED
+
+
+# --- termination --------------------------------------------------------------
+
+def test_a_wave_that_changes_nothing_terminates_instead_of_spinning():
+    """KTD7. A runner that reports `ok` without the status actually advancing
+    (the shape a mis-wired persistence layer produces) must not loop forever."""
+    fake = FakeRunner()
+    out = orc.orchestrate(_linear(), runner=fake, execute=True,
+                          apply_status=lambda graph, done, failed: graph)
+    assert out.outcome == orc.OUTCOME_STALLED
+    assert len(out.waves) == 1, (
+        f"ran {len(out.waves)} identical waves before noticing no progress")
+
+
+def test_the_wave_cap_is_a_backstop():
+    """The runaway guard, matching how MAX_NODES and MAX_DEPS_PER_TASK bound the
+    graph itself. Asserted with a cap of 1 on a graph that needs 3."""
+    fake = FakeRunner()
+    out = orc.orchestrate(_linear(), runner=fake, execute=True, max_waves=1)
+    assert len(out.waves) == 1
+    assert out.outcome == orc.OUTCOME_CAPPED
+    assert out.completed == ["a"], "the one wave it did run must still count"
+
+
+def test_the_default_wave_cap_is_generous_enough_for_a_max_depth_graph():
+    """A cap that a legal graph can hit is a bug, not a backstop."""
+    assert orc.MAX_WAVES >= t_mod.MAX_DEPTH
+
+
+# --- the dry run --------------------------------------------------------------
+
+def test_a_dry_run_plans_without_spawning_anything():
+    """KTD5. The default, because an orchestrator that spawns real agent
+    processes is the most dangerous command on this surface."""
+    fake = FakeRunner()
+    out = orc.orchestrate(_diamond(), runner=fake)
+    assert fake.calls == [], "a dry run must not call the runner"
+    assert out.outcome == orc.OUTCOME_DRY_RUN
+    assert [w.tasks for w in out.waves] == [["a"], ["b", "c"], ["d"]], (
+        "a dry run still has to say what it WOULD do")
+
+
+def test_a_dry_run_appends_nothing_to_the_ledger():
+    before = len(events.read_all())
+    orc.orchestrate(_diamond(), runner=FakeRunner())
+    assert len(events.read_all()) == before
+
+
+def test_execute_defaults_to_false():
+    """Asserted on the signature, so a future edit cannot flip the default
+    without this test noticing."""
+    sig = inspect.signature(orc.orchestrate)
+    assert sig.parameters["execute"].default is False
+
+
+# --- the child environment ----------------------------------------------------
+
+def test_a_child_inherits_the_parent_arming_decision(monkeypatch):
+    """R7. MN-6 made enforcement opt-in per process; a spawned child that did
+    not inherit the decision would silently run with different rules than the
+    orchestrator that started it."""
+    from mindhive.mindnet import optin
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("a")), runner=fake, execute=True)
+    assert fake.kwargs["a"]["env"][optin.ENV_VAR] == "1"
+
+
+def test_a_dormant_parent_arms_nothing_in_the_child(monkeypatch, tmp_path):
+    from mindhive.mindnet import optin
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("a")), runner=fake, execute=True)
+    assert fake.kwargs["a"]["env"][optin.ENV_VAR] == "0"
+
+
+def test_the_run_key_names_the_task_it_is_running():
+    """Attribution. Without the task id in the key, the RunLog artifacts of a
+    parallel wave are unassignable — exactly the MN-0 problem durability solved.
+
+    Asserted on the key rather than on a `task_id=` kwarg because the key is the
+    only channel `executor.execute` actually has; a kwarg would `TypeError` on
+    every real run."""
+    assert orc.run_key(0, "b") == "mn7-w0-b"
+    assert orc.run_key(2, "mn1-u7").endswith("mn1-u7")
+
+
+def test_the_runner_is_called_with_only_arguments_the_real_executor_accepts():
+    """The seam's contract, checked against the real signature. A fake runner
+    accepting `**kw` will swallow anything; this is what stops the orchestrator
+    from passing a keyword only the double understands."""
+    fake = FakeRunner()
+    orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED), runner=fake,
+                    execute=True)
+    accepted = set(inspect.signature(x_mod.execute).parameters)
+    for tid, kwargs in fake.kwargs.items():
+        extra = set(kwargs) - accepted
+        assert not extra, (
+            f"task '{tid}' was run with {extra}, which executor.execute does "
+            f"not accept — every real run would TypeError")
+
+
+def test_each_task_in_a_wave_gets_its_own_run_key():
+    """Two tasks sharing a run key would overwrite each other's durable
+    artifact — one wave, one lost log."""
+    keys = {orc.run_key(0, tid) for tid in ("b", "c")}
+    assert len(keys) == 2
+
+
+def test_a_retry_in_a_later_wave_does_not_overwrite_the_earlier_log():
+    """Wave-scoped keys: the same task attempted twice keeps both artifacts."""
+    assert orc.run_key(0, "a") != orc.run_key(1, "a")
+
+
+def test_the_default_runner_is_the_executor():
+    """The seam exists for testing; production must not accidentally keep a
+    test double."""
+    assert inspect.signature(orc.orchestrate).parameters[
+        "runner"].default is x_mod.execute
+
+
+# ============================================================================
+# U5 — ledger writes and the per-wave sidecar rebuild
+# ============================================================================
+
+def _declare(tid, **payload):
+    """Put *tid* on BOTH axes, the way `hive mindnet declare` does.
+
+    Needed because these tests exercise the REAL persistence path, and a status
+    row aimed at a task the ledger never declared orphans instead of landing —
+    which would make every round-trip assertion below pass vacuously against an
+    empty graph."""
+    events.append_event(
+        "mindnet_task",
+        dict({"action": "declare", "task_id": tid, "title": f"task {tid}"},
+             **payload), tags=["mindnet", "task"])
+    events.append_event(
+        "mindnet_phase",
+        {"action": "declare", "task_id": tid, "phase": t_mod.PHASES[0]},
+        tags=["mindnet", "phase"])
+
+
+def test_a_wave_leaves_the_sidecar_fresh():
+    """The MN-6 lesson, asserted where it bites. `sidecar._staleness` counts
+    EVERY event, so a status row appended without rewriting the sidecar makes the
+    projection read STALE — and a stale projection silently disables both MN-1's
+    phase-aware injection and MN-4's teeth for the very next wave."""
+    _declare("a")
+    sc_mod.rebuild()
+    assert sc_mod.read().fresh is True, "canary: the sidecar started stale"
+
+    orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+    assert sc_mod.read().fresh is True
+
+
+def test_appending_the_same_rows_without_a_rebuild_reads_stale():
+    """The canary for the test above. A freshness assertion that cannot go red
+    proves only that `fresh` returns True somewhere."""
+    _declare("a")
+    sc_mod.rebuild()
+    events.append_event("mindnet_task",
+                        {"action": "status", "task_id": "a",
+                         "status": t_mod.STATUS_COMPLETED},
+                        tags=["mindnet", "task"])
+    assert sc_mod.read().fresh is False, (
+        "the staleness stamp no longer notices an unaccounted event — every "
+        "rebuild-after-append rule in this repo rests on it")
+
+
+def test_exactly_one_rebuild_per_wave_not_one_per_task(monkeypatch):
+    """Two tasks settle in one wave; the projection is rewritten once. One
+    rebuild per task would fold the whole ledger twice for no gain."""
+    _declare("a")
+    _declare("b")
+    calls = {"n": 0}
+    real = sc_mod.rebuild
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(sc_mod, "rebuild", counting)
+    out = orc.orchestrate(_graph(_task("a"), _task("b")),
+                          runner=FakeRunner(), execute=True)
+    assert [w.tasks for w in out.waves] == [["a", "b"]], "not a single wave"
+    assert calls["n"] == 1, f"{calls['n']} rebuilds for one wave"
+
+
+def test_the_written_rows_fold_back_to_the_reported_statuses():
+    """The round trip. What the run REPORTS and what the ledger REPLAYS to must
+    agree, or the projection and the return value tell different stories."""
+    _declare("a")
+    _declare("b", dependencies=["a"])
+    out = orc.orchestrate(_graph(_task("a"), _task("b", deps=("a",))),
+                          runner=FakeRunner(results={"b": "fail"}),
+                          execute=True)
+    assert out.completed == ["a"] and out.blocked == ["b"]
+
+    folded = t_mod.fold(events.read_all())
+    assert folded["a"].status == t_mod.STATUS_COMPLETED
+    assert folded["b"].status == t_mod.STATUS_BLOCKED
+
+
+def test_every_written_payload_satisfies_the_writer_contract():
+    """`tasks.validate_payload` is the append surface's own gate. A row this
+    module writes that the gate would refuse folds as a violation and gates
+    nothing — the same trap `test_cli_mindnet` pins for the phase axis."""
+    _declare("a")
+    orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+    rows = [e for e in events.read_all()
+            if e.type == "mindnet_task" and e.payload.get("action") == "status"]
+    assert rows, "canary: no status rows were written at all"
+    for ev in rows:
+        t_mod.validate_payload(ev.payload)
+
+
+def test_the_status_rows_are_marked_machine_written():
+    """`auto` is the taxonomy's existing mark for a row the operator did not
+    type. Without it these are indistinguishable from a hand-recorded status."""
+    _declare("a")
+    orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+    rows = [e for e in events.read_all()
+            if e.type == "mindnet_task" and e.payload.get("action") == "status"]
+    assert rows and all("auto" in e.tags for e in rows)
+
+
+def test_a_failing_ledger_append_does_not_corrupt_the_reported_outcome(
+        monkeypatch):
+    """The run already happened. If recording it fails, the report must still be
+    honest about what ran rather than crashing and losing it entirely."""
+    _declare("a")
+
+    def boom(*a, **k):
+        raise OSError("ledger is read-only")
+
+    monkeypatch.setattr(events, "append_event", boom)
+    with pytest.raises(OSError):
+        orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+
+
+def test_no_rows_are_written_for_a_wave_that_settled_nothing(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(sc_mod, "rebuild",
+                        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+    before = len(events.read_all())
+    orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_BLOCKED)),
+                    runner=FakeRunner(), execute=True)
+    assert len(events.read_all()) == before
+    assert calls["n"] == 0, "a wave that did nothing must not rewrite anything"
+
+
+# --- the one test that uses the real executor ---------------------------------
+
+def test_a_failed_child_still_leaves_its_durable_artifact(tmp_path,
+                                                          monkeypatch):
+    """MN-0's guarantee, through the real `executor.execute` rather than the
+    fake. The injected runner makes every other test cheap, but a seam nobody
+    ever drives against reality is a seam that can be wrong."""
+    from mindhive import paths
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: tmp_path)
+    _declare("a")
+    failing = " ".join([__import__("sys").executable, "-X", "utf8",
+                        str(_FAIL_SCRIPT(tmp_path))])
+
+    out = orc.orchestrate({"a": _task("a", validation_script=failing)},
+                          execute=True)
+
+    assert out.blocked == ["a"], f"expected a blocked task, got {out}"
+    from mindhive import runlog
+    arts = runlog.list_artifacts()
+    assert arts, "the failed child's durable log was lost — MN-0 regression"
+
+
+def _FAIL_SCRIPT(tmp_path):
+    """A child that prints and then exits non-zero."""
+    p = tmp_path / "boom.py"
+    p.write_text("import sys\nprint('partial output')\nsys.exit(3)\n",
+                 encoding="utf-8")
+    return p
 
 
 def test_the_module_does_not_read_the_ledger_to_answer_the_frontier():
