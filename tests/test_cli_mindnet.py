@@ -261,7 +261,7 @@ def test_no_verified_by_flag_exists_on_satisfy():
     surface = _subparser_action(_subparser("mindnet")).choices
     assert set(surface) == {"declare", "enter", "satisfy", "fall-back",
                             "validate", "restat", "show", "list", "rebuild",
-                            "enforce"}
+                            "enforce", "orchestrate"}
     for name, sp in surface.items():
         bad = [o for a in sp._actions for o in a.option_strings
                if "verified" in o.lower()]
@@ -975,6 +975,141 @@ def test_the_toggle_is_reachable_while_the_language_lock_denies_writes(
     assert enf.hook_decision(json.dumps(
         {"tool_name": "Bash",
          "tool_input": {"command": "hive mindnet enforce --disable"}})) == {}
+
+
+# --- MN-7 U6: `hive mindnet orchestrate` -------------------------------------------
+#
+# The dangerous command on this surface, so the safe form is the default: bare
+# `orchestrate` plans and spawns nothing, and `--execute` is explicit.
+
+def _orc_graph():
+    """A -> {B, C} -> D on the ledger, all declared on both axes."""
+    _ok("mindnet", "declare", "a", "--title", "root")
+    for tid in ("b", "c"):
+        _ok("mindnet", "declare", tid, "--title", f"arm {tid}")
+        events.append_event("mindnet_task",
+                            {"action": "depend", "task_id": tid, "on": "a"},
+                            tags=["mindnet", "task"])
+    _ok("mindnet", "declare", "d", "--title", "join")
+    for tid in ("b", "c"):
+        events.append_event("mindnet_task",
+                            {"action": "depend", "task_id": "d", "on": tid},
+                            tags=["mindnet", "task"])
+    _ok("mindnet", "rebuild")
+
+
+def test_orchestrate_bare_is_a_dry_run_that_spawns_nothing(capsys, monkeypatch):
+    """KTD5. Nothing may start without `--execute`."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    calls = []
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda *a, **k: calls.append(a) or ([], []))
+
+    assert _cli("mindnet", "orchestrate") == 0
+    out = capsys.readouterr().out
+    assert calls == [], "a dry run started work"
+    assert "dry-run" in out
+    assert "a" in out and "b" in out, "a dry run must say what it WOULD do"
+
+
+def test_orchestrate_dry_run_appends_nothing_to_the_ledger():
+    _orc_graph()
+    before = len(events.read_all())
+    _ok("mindnet", "orchestrate")
+    assert len(events.read_all()) == before
+
+
+def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (sorted(batch), []))
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 0
+    out = capsys.readouterr().out
+    assert "settled" in out
+
+
+def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
+    """A stall is an operator-actionable state, not a success: work remains and
+    nothing can advance it. A zero exit there would let a CI step that wraps this
+    pass while the graph is stuck."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: ([], sorted(batch)))
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 1
+    assert "stalled" in capsys.readouterr().out
+
+
+def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (sorted(batch), []))
+    capsys.readouterr()                       # drop the fixture's declare noise
+
+    assert _cli("mindnet", "orchestrate", "--execute", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["outcome"] == "settled"
+    assert data["completed"] == ["a", "b", "c", "d"]
+    assert data["blocked"] == []
+    assert [w["tasks"] for w in data["waves"]] == [["a"], ["b", "c"], ["d"]]
+
+
+def test_orchestrate_honours_the_limit_end_to_end(capsys):
+    _orc_graph()
+    capsys.readouterr()                       # drop the fixture's declare noise
+    assert _cli("mindnet", "orchestrate", "--limit", "1", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert all(len(w["tasks"]) <= 1 for w in data["waves"])
+
+
+def test_orchestrate_reports_a_graph_with_nothing_to_do(capsys):
+    assert _cli("mindnet", "orchestrate") == 0
+    assert "no mindnet" in capsys.readouterr().out.lower()
+
+
+def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
+    """The property `test_every_mutating_command_leaves_the_sidecar_fresh`
+    protects, extended to the one command that writes a whole wave of rows."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (sorted(batch), []))
+    _ok("mindnet", "orchestrate", "--execute")
+    assert sc_mod.read().fresh is True
+
+
+def test_orchestrate_is_on_the_frozen_subcommand_surface():
+    surface = _subparser_action(_subparser("mindnet")).choices
+    assert "orchestrate" in surface
+
+
+def test_orchestrate_is_reachable_while_the_phase_block_denies_everything(
+        worktree, monkeypatch):
+    """The locked-room lesson applied to the new command. An operator may well
+    need to drive the graph while a task sits at a planning gate, and `hive` being
+    exempt is what makes that possible — asserted against the real enforcer with
+    enforcement ARMED, not against a restatement of the exemption list."""
+    from mindhive import enforce as enf
+    optin = _enforce_optin()
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    monkeypatch.chdir(worktree)
+    _walk_trivial(target="execution")
+    _ok("mindnet", "fall-back", TASK, "brainstorm", "--detail", "reopened")
+    _pick_up()
+
+    blocked = enf.hook_decision(json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "py -m pytest -q"}}))
+    assert (blocked.get("hookSpecificOutput") or {}).get(
+        "permissionDecision") == "deny", "canary: the phase block is not biting"
+
+    assert enf.hook_decision(json.dumps(
+        {"tool_name": "Bash",
+         "tool_input": {"command": "hive mindnet orchestrate --execute"}})) == {}
 
 
 def test_enforce_works_outside_a_git_worktree(tmp_path, monkeypatch):

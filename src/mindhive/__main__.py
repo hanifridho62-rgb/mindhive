@@ -1272,6 +1272,60 @@ def cmd_mindnet_rebuild(args) -> int | None:
     return None
 
 
+def cmd_mindnet_orchestrate(args) -> int | None:
+    """Walk the task graph in waves, running every unblocked task concurrently.
+
+    **Bare is a dry run.** `--execute` is the explicit opt-in, because this is
+    the one command here that starts real child processes and the safe form must
+    be the one an operator gets by accident.
+
+    Reads the LEDGER rather than the sidecar, like `list` and for the same
+    reason: this is not the hook path, and an orchestration that could disagree
+    with `hive mindnet list` about the graph would be worse than a slow one.
+
+    Exit 1 on `stalled` — work remains and nothing can advance it, which is
+    operator-actionable. A zero exit there would let a wrapping CI step pass
+    while the graph is stuck. `capped` is the same: it means the run gave up."""
+    from dataclasses import asdict
+    from .mindnet import orchestrator as orc_mod
+    from .mindnet import tasks as t_mod
+    project = getattr(args, "project", None)
+    tasks = t_mod.fold(events.read_all(project))
+    if not tasks:
+        print('(no mindnet tasks to orchestrate — declare one: hive mindnet '
+              'declare <id> --title "…")')
+        return None
+
+    out = orc_mod.orchestrate(
+        tasks, execute=bool(args.execute), limit=args.limit,
+        max_waves=args.max_waves if args.max_waves is not None
+        else orc_mod.MAX_WAVES,
+        project=project, timeout_s=args.timeout)
+
+    if args.json:
+        print(json.dumps(asdict(out), indent=2, ensure_ascii=False,
+                         default=str))
+    else:
+        verb = "would run" if not args.execute else "ran"
+        print(f"mindnet orchestrate: {out.outcome} — {len(out.waves)} wave(s), "
+              f"{verb} {sum(len(w.tasks) for w in out.waves)} task(s)")
+        for w in out.waves:
+            line = f"  wave {w.index + 1}: " + ", ".join(w.tasks)
+            if args.execute:
+                line += (f"   [ok: {len(w.completed)}, "
+                         f"blocked: {len(w.blocked)}]")
+            print(line)
+        if out.blocked:
+            # Named, not counted: an operator cannot act on "3 blocked".
+            print("  blocked: " + ", ".join(out.blocked)
+                  + "  ·  inspect one with: hive mindnet show <id>")
+        if not args.execute:
+            print("  this was a dry run — add --execute to actually run it")
+    # `dry-run` and `settled` are successes; the other two are not.
+    return 1 if out.outcome in (orc_mod.OUTCOME_STALLED,
+                                orc_mod.OUTCOME_CAPPED) else None
+
+
 def cmd_mindnet_enforce(args) -> int | None:
     """Read or toggle MN-6's opt-in: whether the MN-4 policy checks may deny
     anything in THIS checkout.
@@ -2476,6 +2530,28 @@ def _build_parser() -> argparse.ArgumentParser:
                            "the ledger (the repair for a stale or corrupt one)")
     mnb.add_argument("--project", default=None)
     mnb.set_defaults(func=cmd_mindnet_rebuild)
+
+    # MN-7's orchestrator. No `choices=` on --limit/--max-waves for the same
+    # reason the phase arguments carry none: the bound belongs to the
+    # orchestrator, and a second copy in the parser is a place for it to drift.
+    mno = mnsub.add_parser("orchestrate", help="walk the graph in waves, "
+                           "running every unblocked task concurrently (a DRY "
+                           "RUN unless --execute is given)")
+    mno.add_argument("--execute", action="store_true",
+                     help="actually run the tasks. Without this the command "
+                          "plans the waves and starts nothing")
+    mno.add_argument("--limit", type=int, default=None,
+                     help="most tasks to run at once (default: the whole "
+                          "frontier)")
+    mno.add_argument("--max-waves", type=int, default=None, dest="max_waves",
+                     help="runaway backstop (default: "
+                          "orchestrator.MAX_WAVES)")
+    mno.add_argument("--timeout", type=int, default=None,
+                     help="seconds any one task may take")
+    mno.add_argument("--project", default=None)
+    mno.add_argument("--session", default=None)
+    mno.add_argument("--json", action="store_true")
+    mno.set_defaults(func=cmd_mindnet_orchestrate)
 
     # MN-6's blast-radius gate. Bare = status; the two directions are mutually
     # exclusive because `--enable --disable` has no defensible reading and

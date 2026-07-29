@@ -237,7 +237,15 @@ def test_swarm_cat_choice_is_deterministic_from_agent_id():
     # random per new node but stable across refreshes: derived from the id,
     # never from Math.random
     assert "parseInt(String(id).slice(0,4), 16)" in SWARM
-    assert "% 6" in SWARM
+    # The bound is taken from the palette table's own length, not a literal.
+    # This used to assert `"% 6" in SWARM`; MN-7 gave each of the seven
+    # `telemetry.FACULTIES` its own cat, which needed a seventh palette — and a
+    # hardcoded `% 6` beside a 7-entry table silently makes the last palette
+    # unreachable. Asserting the literal pinned the defect rather than the
+    # contract, so the assertion now names the property: the index is bounded by
+    # the table, whatever the table's size becomes.
+    assert "% CAT_PALETTES.length" in SWARM
+    assert "% 6" not in SWARM
     assert "Math.random" not in SWARM
 
 

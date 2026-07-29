@@ -414,6 +414,86 @@ An unparseable `ts` is treated as maximally old and hidden — treating it as
 fresh would pin a corrupt row on screen as a permanently active cat, and a false
 "something is running" is the one thing this board must never say.
 
+Each faculty's cat is its **index in `telemetry.FACULTIES`**, injected into the
+page as `FACULTY_ORDER` rather than restated as a faculty→colour table in
+JavaScript (invariant 10): a faculty added to the tuple gets its own palette with
+no second list to update, and none can silently collide. `CAT_PALETTES` therefore
+carries at least `len(FACULTIES)` entries and every modulo reads the table's
+length. Dim cats get `filter:grayscale(100%)` — the pre-MN-7 sprite was a
+`currentColor` silhouette, so the dim text colour greyed it for free; a coloured
+cat needs the filter or the 180-second band stops being visible at a glance.
+
+### 4.6 The MN-7 orchestrator: waves over the graph
+
+`hive mindnet orchestrate` walks the MN-2 graph in **waves**. One wave = the
+current frontier, run concurrently, then persisted.
+
+```json
+{"outcome": "settled",
+ "waves": [{"index": 0, "tasks": ["a"], "completed": ["a"], "blocked": []},
+           {"index": 1, "tasks": ["b", "c"], "completed": ["b", "c"],
+            "blocked": []}],
+ "completed": ["a", "b", "c"], "blocked": []}
+```
+
+**The frontier is not a new rule.** `orchestrator.frontier(graph, limit)` calls
+`tasks.ready()` — PENDING, every dependency COMPLETED, no BLOCKED ancestor — and
+adds only the concurrency bound. Re-deriving readiness would let a second rule
+disagree with `can_complete` about the same graph, which means spawning work the
+rest of the machine considers blocked; `orchestrator.py` therefore contains no
+status literals at all and a test over its own source enforces that.
+
+The failure cascade is a consequence, not extra code: a blocked task is not
+COMPLETED, so every dependent stays off the frontier forever. `tasks.ready`
+caches its ancestor answer by `parent_id` — exact, since siblings share an
+ancestor set by definition. Measured on `MAX_NODES` all-ready nodes at
+`MAX_DEPTH`: ~0.8 ms branching, ~4.6 ms with every task on its own parent chain.
+
+| Outcome | Meaning | Exit |
+|---|---|---|
+| `dry-run` | planned only; no child ever started | 0 |
+| `settled` | nothing left to do | 0 |
+| `stalled` | work remains, nothing can advance it | 1 |
+| `capped` | hit `MAX_WAVES` with work outstanding | 1 |
+
+`RESULT_STATUS` maps every `executor.RUN_RESULTS` value to a status — `ok` →
+`completed`, all four failure modes → `blocked` — and an unrecognized value
+**raises** rather than defaulting, because a new failure mode reading as success
+would mark a task COMPLETED on evidence nobody checked. A runner that *raises*
+blocks only its own task; the two directions differ on purpose (a task failure
+versus a bug in the mapping).
+
+Four properties that are contract rather than implementation detail:
+
+- **`--execute` is opt-in.** Bare `orchestrate` is a dry run. This is the one
+  command here that starts real child processes, so the safe form is the one an
+  operator gets by accident.
+- **One `sidecar.rebuild` per wave, AFTER the status appends.** `_staleness`
+  counts every event, so a row written without rewriting the sidecar reads STALE
+  — silently disabling MN-1's phase-aware injection and MN-4's teeth for the next
+  wave. `_persist` then returns the caller's graph advanced by exactly those rows
+  rather than re-folding: `rebuild` already folds the ledger, and a re-fold would
+  discard any graph that did not come from it.
+- **Termination compares statuses across a wave**, not completion counts. A wave
+  reporting success while nothing moved would otherwise re-run identically to the
+  cap — a spin dressed as progress. `MAX_WAVES` is a runaway backstop, set at or
+  above `MAX_DEPTH` so no legal graph can hit it.
+- **The task id travels in the run key** (`mn7-w<wave>-<task_id>`), never as a
+  runner keyword: `executor.execute` has no task parameter, so a keyword would
+  `TypeError` on every real run while a test double accepted it. The key also
+  names the RunLog artifact, so identity and attribution are one string, and it
+  is wave-scoped so a retry cannot overwrite an earlier attempt's log.
+
+Children inherit the parent's MN-6 arming decision through `executor.execute`'s
+`env=` overlay (merged over `os.environ`, never substituted — a bare replacement
+drops `PATH`/`SYSTEMROOT` and the child fails to start at all).
+
+**Known limitation.** A task's command is its `Task.validation_script`, which is
+a *validator*, not an implementer. A task without one is refused by the executor
+and lands `blocked` — honest, but it means `--execute` is only useful today for
+graphs whose tasks carry a runnable script. Resolving what an "implement this
+task" command should be is deferred; the dry run is fully useful regardless.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
