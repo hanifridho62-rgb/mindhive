@@ -131,6 +131,49 @@ class FakeRunner:
         return set(self.calls)
 
 
+class Rendezvous(FakeRunner):
+    """A runner that PROVES overlap instead of sampling for it.
+
+    A `peak >= 2` assertion over `time.sleep` runners is a timing sample, and it
+    reported a false failure in CI: the isolated variant went red on windows/py3.12
+    while passing on windows/py3.11 in the same run. Correct parallel code can score
+    peak 1 there, because `worktree.add` runs inside each worker thread and a
+    `git worktree add` costs hundreds of milliseconds against a contended index lock
+    — so one task can finish its 50 ms run before its sibling's checkout even exists.
+
+    A barrier inverts the dependency. Every call blocks until *n* calls have arrived,
+    so a truly concurrent wave releases immediately and a serial one cannot proceed
+    at all: `wait()` times out, `tripped` stays False, and the test says exactly
+    that. No sleep, no sampling, and a serial implementation fails by construction
+    rather than by being slower than a threshold."""
+
+    def __init__(self, parties, timeout=20.0, **kw):
+        super().__init__(**kw)
+        self.parties = parties
+        self.barrier = threading.Barrier(parties, timeout=timeout)
+        self.tripped = False
+        self.arrived = 0
+
+    def __call__(self, run_key, script, **kw):
+        with self._lock:
+            self.arrived += 1
+            # One-shot. A `threading.Barrier` resets after it trips, so a graph
+            # whose LATER wave is narrower than *parties* would leave that wave's
+            # lone task waiting for partners that will never come — the full timeout
+            # burned on a question already answered. Asked once, then transparent.
+            wait = not self.tripped
+        if wait:
+            try:
+                self.barrier.wait()
+                self.tripped = True
+            except threading.BrokenBarrierError:
+                # Swallowed on purpose: raising would come back as a task failure
+                # and the test would report "blocked" rather than "never
+                # overlapped", pointing the next reader at the wrong thing.
+                pass
+        return super().__call__(run_key, script, **kw)
+
+
 def _run_result(result):
     """A real `executor.RunResult`, so the tests constrain the contract rather
     than a shape invented here.
@@ -738,13 +781,19 @@ def test_a_linear_graph_settles_one_task_per_wave():
 
 def test_both_arms_of_a_wave_run_concurrently():
     """The reason a ThreadPoolExecutor is here at all. A serial implementation
-    produces the same statuses and the same waves, so only observed overlap
-    tells the two apart."""
-    fake = FakeRunner(delay=0.05)
+    produces the same statuses and the same waves, so only observed overlap tells
+    the two apart.
+
+    The diamond's middle wave is exactly two tasks, and `DEFAULT_MAX_WORKERS` has a
+    floor of 2, so the pool can always serve both arms at once."""
+    fake = Rendezvous(parties=2)
     orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED), runner=fake,
                     execute=True)
-    assert fake.peak >= 2, (
-        f"peak concurrency was {fake.peak} — the wave ran serially")
+    # Three calls in total, not two: the diamond's tail runs in a later wave.
+    assert fake.arrived == 3, f"the whole diamond should have run, got {fake.arrived}"
+    assert fake.tripped, (
+        "the two arms never overlapped — one finished before the other started, "
+        "which is what a serial wave looks like")
 
 
 def test_the_limit_bounds_concurrency_end_to_end():
@@ -755,6 +804,24 @@ def test_the_limit_bounds_concurrency_end_to_end():
     assert fake.peak == 1, f"peak concurrency was {fake.peak} with limit=1"
     assert out.outcome == orc.OUTCOME_SETTLED, (
         "a limit must slow the graph down, not prevent it from finishing")
+
+
+def test_the_rendezvous_runner_detects_a_serial_wave():
+    """The canary for the two concurrency tests above. A barrier that trips no
+    matter what proves nothing — and a green concurrency test is only meaningful if
+    the same instrument reports red when the work really is serialized.
+
+    `limit=1` gives a pool of one, so the second call cannot start until the first
+    returns: the barrier must NOT trip. Short timeout because this test's happy path
+    is the timeout — the parties never assemble, by design."""
+    fake = Rendezvous(parties=2, timeout=1.5)
+    out = orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED),
+                          runner=fake, execute=True, limit=1)
+    assert fake.arrived >= 1, "nothing ran at all — the canary tests nothing"
+    assert not fake.tripped, (
+        "the barrier tripped with a pool of one, so it cannot distinguish parallel "
+        "from serial and the concurrency tests above are vacuous")
+    assert out.outcome == orc.OUTCOME_SETTLED
 
 
 def test_an_already_finished_graph_runs_nothing():
@@ -1115,11 +1182,21 @@ def test_the_worktree_is_retired_even_when_the_agent_raised(gitrepo):
 
 def test_isolated_tasks_run_concurrently(gitrepo):
     """R3 — the entire purpose. MN-8 capped agents at one because they shared a
-    tree; with a tree each, the pool is free to fan out."""
-    fake = FakeRunner(delay=0.05)
-    orc.orchestrate(_graph(_task("b"), _task("c"), _task("d")), runner=fake,
+    tree; with a tree each, the pool is free to fan out.
+
+    Two tasks and a barrier, not three tasks and a stopwatch. The stopwatch version
+    of this test went red on windows/py3.12 while passing on windows/py3.11 in the
+    same CI run: `worktree.add` runs inside the worker thread, so a `git worktree
+    add` against a contended index lock can outlast a sibling's whole 50 ms run and
+    correct parallel code scores a peak of 1. The barrier asks the question directly
+    — were two agents ever in flight together? — and cannot answer yes by luck."""
+    fake = Rendezvous(parties=2)
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake,
                     execute=True, root=gitrepo, isolate=True)
-    assert fake.peak >= 2, f"peak concurrency was {fake.peak} with isolation on"
+    assert fake.arrived == 2, f"both tasks should have run, got {fake.arrived}"
+    assert fake.tripped, (
+        "two isolated tasks never overlapped — with a worktree each there is "
+        "nothing left to serialize them, so the pool is not fanning out")
 
 
 def test_a_dry_run_creates_no_worktree(gitrepo):
