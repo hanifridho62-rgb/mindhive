@@ -430,18 +430,52 @@ current frontier, run concurrently, then persisted.
 
 ```json
 {"outcome": "settled",
- "waves": [{"index": 0, "tasks": ["a"], "completed": ["a"], "blocked": []},
-           {"index": 1, "tasks": ["b", "c"], "completed": ["b", "c"],
-            "blocked": []}],
- "completed": ["a", "b", "c"], "blocked": []}
+ "waves": [{"index": 0, "tasks": ["a"], "completed": ["a"], "blocked": [],
+            "skipped": [], "reasons": {}},
+           {"index": 1, "tasks": ["b", "c"], "completed": ["b"],
+            "blocked": ["c"], "skipped": [],
+            "reasons": {"c": "the validation run exited 3 · log: <abs path>"}}],
+ "completed": ["a", "b"], "blocked": ["c"], "skipped": [],
+ "reasons": {"c": "the validation run exited 3 · log: <abs path>"}}
 ```
+
+**`blocked` vs `skipped` is the load-bearing distinction.** A status row is written
+only for a task whose child **actually ran** — keyed on `RunResult.executed`, which
+`executor.py` calls "the SECURITY property ... deliberately not derivable from
+`result`". `refused` (the gate said no — including the default case of a task with
+no `validation_script`) and `spawn-failed` (the OS said no) mean nothing happened,
+so the task is reported `skipped`, keeps its PENDING status, and stays recoverable.
+
+Mapping those to `blocked` was a P0: `tasks.ready` excludes every task with a
+BLOCKED ancestor and every task whose dependency is not COMPLETED, so one
+script-less task killed its whole subtree **and** its dependents — permanently,
+because `orchestrator._persist` is the only writer of `mindnet_task` `status` rows
+and a re-declare is forbidden from resetting status. There was no CLI remedy at
+all. A skipped task instead terminates the loop through the no-progress guard,
+reporting `stalled` with the reason attached.
 
 **The frontier is not a new rule.** `orchestrator.frontier(graph, limit)` calls
 `tasks.ready()` — PENDING, every dependency COMPLETED, no BLOCKED ancestor — and
-adds only the concurrency bound. Re-deriving readiness would let a second rule
-disagree with `can_complete` about the same graph, which means spawning work the
-rest of the machine considers blocked; `orchestrator.py` therefore contains no
-status literals at all and a test over its own source enforces that.
+adds exactly two things: the concurrency bound, and **withholding container
+tasks**. `ready` answers "may this start", not "may this be run as a unit", so it
+offers a parent alongside its still-open children; running both and writing the
+parent COMPLETED produces a status `can_complete` refuses ("has N open
+descendant(s)"), and `can_complete` has no production caller to catch it.
+Re-deriving readiness itself would let a second rule disagree with `can_complete`
+about the same graph; `orchestrator.py` therefore contains no status literals at
+all and a test over its own source enforces that.
+
+**`MAX_WAVES` is a floor, not the cap.** The effective cap is
+`max(MAX_WAVES, len(graph) + 1)`. `MAX_DEPTH` bounds the *parent* chain, while
+dependency-chain length is bounded only by `MAX_NODES` — so a legal 65-task
+dependency chain hit the "runaway backstop" and exited 1. An explicit
+`--max-waves` is still honoured verbatim.
+
+**The worktree root is resolved once**, before any child, and a failure refuses the
+whole run. Letting each child fall back to `executor.execute`'s own
+`paths.worktree_root()` meant one `git rev-parse` per task fired concurrently, and
+a missing git or one call past its 2s timeout made every task in the wave report
+itself failed.
 
 The failure cascade is a consequence, not extra code: a blocked task is not
 COMPLETED, so every dependent stays off the frontier forever. `tasks.ready`
@@ -456,12 +490,13 @@ ancestor set by definition. Measured on `MAX_NODES` all-ready nodes at
 | `stalled` | work remains, nothing can advance it | 1 |
 | `capped` | hit `MAX_WAVES` with work outstanding | 1 |
 
-`RESULT_STATUS` maps every `executor.RUN_RESULTS` value to a status — `ok` →
-`completed`, all four failure modes → `blocked` — and an unrecognized value
-**raises** rather than defaulting, because a new failure mode reading as success
-would mark a task COMPLETED on evidence nobody checked. A runner that *raises*
-blocks only its own task; the two directions differ on purpose (a task failure
-versus a bug in the mapping).
+`RESULT_STATUS` and `NON_EXECUTING_RESULTS` together **partition**
+`executor.RUN_RESULTS`: `ok` → `completed`, `fail`/`timeout` → `blocked`, and
+`refused`/`spawn-failed` → no row at all. A value in neither set **raises** rather
+than defaulting, because a new failure mode reading as success would mark a task
+COMPLETED on evidence nobody checked. A runner that *raises* blocks only its own
+task; the two directions differ on purpose (a task failure versus a bug in the
+mapping).
 
 Four properties that are contract rather than implementation detail:
 

@@ -286,6 +286,10 @@ def test_the_palette_modulo_follows_the_table_length():
     """A hardcoded `% 6` beside a 7-entry table silently makes the 7th palette
     unreachable — the defect would survive the fix."""
     page = render_swarm("tok")
+    # Paired positive: absence of the old literal alone would also pass if a
+    # regression swapped `% 6` for a hardcoded `% 7`, reintroducing the exact
+    # defect class (the next added palette becomes unreachable).
+    assert "% CAT_PALETTES.length" in page
     assert "% 6" not in page, "hardcoded palette modulo disagrees with the table"
 
 

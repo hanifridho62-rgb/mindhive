@@ -307,6 +307,17 @@ def hook_decision(raw: str, project=None) -> dict:
         return {}
     tool_name = payload.get("tool_name") or payload.get("toolName") or ""
     tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+    # Resolve the namespace ONCE. `paths.detect_project` shells out to git (up to
+    # two `rev-parse` calls, each with a 2s timeout), and every consumer that
+    # takes `project=None` pays it independently: `load_manifest` did, and MN-6's
+    # opt-in read added a second. On a hook that fires on EVERY tool call that is
+    # a duplicated subprocess per call, so the concrete name is resolved here and
+    # threaded down.
+    if project is None:
+        try:
+            project = paths.detect_project()
+        except Exception:
+            project = None
     manifest = load_manifest(project)
     decision, reason = "deny", None
     pol = evaluate_policies(tool_name, tool_input, manifest=manifest,

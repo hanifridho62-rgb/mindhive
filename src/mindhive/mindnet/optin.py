@@ -54,18 +54,28 @@ working; a bug in it must fail towards "everything is allowed", never towards
 "nothing is". That is the same direction `enforce.py` fails in, for the same
 reason.
 
-`PreToolUse` fires on every tool call, so resolving the current checkout is pure
+`PreToolUse` fires on every tool call, so resolving the CURRENT CHECKOUT is pure
 path arithmetic — `Path.cwd()` and tuple comparison, no subprocess. The one git
-call (`paths.worktree_root`, 2-second timeout) happens once, in the CLI, when a
-root is RECORDED. Asserted structurally by
-`test_the_module_imports_neither_events_nor_subprocess` rather than by a timing
-bound, which cannot rot.
+call for a checkout root (`paths.worktree_root`, 2-second timeout) happens once,
+in the CLI, when a root is RECORDED.
+
+That claim is scoped deliberately, because a broader version of it was wrong.
+Resolving the *namespace* is a different matter: `record_path(None)` reaches
+`paths.project_dir(None)` -> `paths.detect_project()`, which DOES shell out to
+git. `enforce.hook_decision` therefore resolves the namespace once per hook
+invocation and threads the concrete name down, so this module never triggers that
+call on the hot path — but a caller that passes ``project=None`` will.
+`test_status_never_shells_out_when_the_project_is_known` covers only the
+already-resolved shape, and its name says so; the ``project=None`` shape has its
+own test asserting where the cost actually lands, because the first version of
+this docstring claimed "no subprocess" flatly and the only test covering it passed
+the one argument that avoids the call — the same defect the MN-4 P0 was.
 """
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .. import paths
 
@@ -121,8 +131,32 @@ def read_record(project=None) -> dict:
             continue
         if not isinstance(entry, dict) or "enabled" not in entry:
             continue
+        # RELATIVE keys are dropped. `_resolve` would resolve them against the
+        # READER's cwd, so a hand-edited or copied `{"roots": {".": ...}}` becomes
+        # a root at maximum depth that follows the operator into every directory —
+        # out-ranking every genuinely recorded ancestor and, because the tie-break
+        # is strict, un-out-rankable by `--disable` (which records the same depth).
+        # `set_enabled` only ever writes absolute keys, so this drops nothing
+        # production can produce.
+        if not _is_absolute_key(key):
+            continue
         out[key] = bool(entry.get("enabled"))
     return out
+
+
+def _is_absolute_key(key) -> bool:
+    """Whether a record key names an absolute path, under EITHER platform's rules.
+
+    Both flavours are consulted because the record is shared across every checkout
+    of one repo: a Windows-authored ``C:/x`` key must still read as absolute to a
+    POSIX reader rather than being silently treated as relative to its cwd (and
+    then resolving to something inside it). ``/x`` is absolute to
+    `PurePosixPath` and not to `PureWindowsPath`; ``C:/x`` is the reverse."""
+    text = str(key).strip()
+    if not text:
+        return False
+    return (PurePosixPath(text).is_absolute()
+            or PureWindowsPath(text).is_absolute())
 
 
 # --- paths: absolute on both sides, always ------------------------------------
@@ -213,6 +247,13 @@ def status(project=None, cwd=None, env=None) -> dict:
                 depth = len(_parts(root))
                 if best is None or depth > best[0]:
                     best = (depth, root, enabled)
+                elif depth == best[0] and enabled != best[2]:
+                    # Two records at the SAME depth disagreeing can only come from
+                    # a hand-edited file (`set_enabled` writes one canonical key
+                    # per root). Resolving it by iteration order would make the
+                    # answer depend on JSON key sorting; an opt-in gate resolves an
+                    # ambiguity the same way it resolves a fault — dormant.
+                    best = (depth, root, False)
             if best is not None:
                 _d, root, enabled = best
                 return {"armed": bool(enabled), "source": "file",

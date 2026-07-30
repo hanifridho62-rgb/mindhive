@@ -1299,8 +1299,9 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     try:
         out = orc_mod.orchestrate(
             tasks, execute=bool(args.execute), limit=args.limit,
-            max_waves=args.max_waves if args.max_waves is not None
-            else orc_mod.MAX_WAVES,
+            # None lets the orchestrator derive the cap from the graph; passing
+            # MAX_WAVES verbatim capped a legal long dependency chain.
+            max_waves=args.max_waves,
             project=project, timeout_s=args.timeout,
             max_workers=args.max_workers)
     except Exception as exc:
@@ -1324,12 +1325,20 @@ def cmd_mindnet_orchestrate(args) -> int | None:
                 line += (f"   [ok: {len(w.completed)}, "
                          f"blocked: {len(w.blocked)}]")
             print(line)
-        if out.blocked:
-            # Named WITH ITS REASON, not counted: an operator cannot act on
-            # "3 blocked", and pointing them at `hive mindnet show` was worse
-            # than useless while the status rows carried no reason at all.
-            print("  blocked:")
-            for tid in out.blocked:
+        # Named WITH ITS REASON, not counted: an operator cannot act on
+        # "3 blocked", and pointing them at `hive mindnet show` was worse than
+        # useless while the status rows carried no reason at all.
+        for label, ids in (("blocked", out.blocked), ("skipped", out.skipped)):
+            if not ids:
+                continue
+            if label == "skipped":
+                # The distinction is load-bearing: skipped tasks never ran and
+                # keep their status, so they are fixable and re-runnable. Blocked
+                # ones ran and failed.
+                print("  skipped (nothing ran; still pending):")
+            else:
+                print("  blocked:")
+            for tid in ids:
                 why = out.reasons.get(tid) or "no reason recorded"
                 print(f"    {tid}: {why}")
         if not args.execute:
@@ -2554,8 +2563,9 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="actually run the tasks. Without this the command "
                           "plans the waves and starts nothing")
     mno.add_argument("--limit", type=int, default=None,
-                     help="most tasks to run at once (default: the whole "
-                          "frontier)")
+                     help="most tasks to take from the frontier per wave — which "
+                          "tasks run AT ALL this wave (default: all of them). "
+                          "For a concurrency brake use --max-workers")
     mno.add_argument("--max-waves", type=int, default=None, dest="max_waves",
                      help="runaway backstop (default: "
                           "orchestrator.MAX_WAVES)")

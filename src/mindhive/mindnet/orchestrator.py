@@ -49,18 +49,37 @@ from dataclasses import dataclass, field, replace
 from . import executor as x_mod
 from . import tasks as t_mod
 
-# How a child's outcome becomes a task status. Enumerated against
-# `executor.RUN_RESULTS` rather than written as "ok, else blocked": a result value
-# added to that tuple later must fail loudly here instead of being silently
-# classified — and the silent classification that matters is a new failure mode
-# reading as success, which marks a task COMPLETED on evidence nobody checked.
+# How a child's outcome becomes a task status — consulted ONLY when a child
+# actually ran. Enumerated rather than written as "ok, else blocked": a result
+# value added to `executor.RUN_RESULTS` later must fail loudly here instead of
+# being silently classified, and the silent classification that matters is a new
+# failure mode reading as success, marking a task COMPLETED on evidence nobody
+# checked.
 RESULT_STATUS = {
     "ok": t_mod.STATUS_COMPLETED,
     "fail": t_mod.STATUS_BLOCKED,
     "timeout": t_mod.STATUS_BLOCKED,
-    "refused": t_mod.STATUS_BLOCKED,
-    "spawn-failed": t_mod.STATUS_BLOCKED,
 }
+
+# Results where NO CHILD PROCESS WAS EVER CREATED. These must never produce a
+# status row, and the distinction is the difference between a recoverable state
+# and a poisoned graph.
+#
+# `refused` is what the gate returns for a task with no `validation_script` — the
+# shape `hive mindnet declare` produces BY DEFAULT — and also for a destructive
+# command. `spawn-failed` is the OS refusing to start the process. Mapping either
+# to `blocked`, as this first did, was a P0: `tasks.ready` excludes every task
+# with a BLOCKED ancestor and every task whose dependency is not COMPLETED, so one
+# script-less task killed its whole subtree AND its dependents — permanently,
+# because `orchestrator._persist` is the only writer of `action: "status"` rows in
+# the codebase and a re-declare is forbidden from resetting status
+# (`tasks.py`: "NEVER reset accumulated status"). There was no CLI remedy at all.
+#
+# Keyed on `RunResult.executed`, not on the result string. That field is the
+# executor's own deliberately-non-derivable signal for "a process was created"
+# ("``executed`` is the SECURITY property and is deliberately not derivable from
+# ``result``"), so it is the honest axis for "did anything actually happen".
+NON_EXECUTING_RESULTS = frozenset({"refused", "spawn-failed"})
 
 OUTCOME_SETTLED = "settled"      # nothing left to do
 OUTCOME_STALLED = "stalled"      # work remains but nothing can advance
@@ -105,6 +124,7 @@ class Wave:
     tasks: list = field(default_factory=list)
     completed: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)
     reasons: dict = field(default_factory=dict)
 
 
@@ -116,6 +136,7 @@ class Orchestration:
     waves: list = field(default_factory=list)
     completed: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)
     reasons: dict = field(default_factory=dict)
 
 
@@ -128,9 +149,21 @@ def frontier(graph, limit=None) -> list:
     second sort — and determinism is not cosmetic, an irreproducible wave is a
     denial nobody can explain.
 
-    ``limit=None`` means unbounded. Total: any malformed input answers ``[]``
-    rather than raising, because this sits under a loop that may be driving real
-    subprocesses and a projection fault must not become a crash."""
+    Two things are added on top of `ready`, and only two:
+
+    **The concurrency bound** (*limit*). ``None`` means unbounded.
+
+    **Container tasks are withheld.** `ready` answers "may this task start", which
+    is not the same question as "may this task be RUN AS A UNIT". A parent whose
+    children are still open is offered by `ready` alongside those children, so the
+    wave would run the container and its parts concurrently and, on success, write
+    the parent COMPLETED — a status `tasks.can_complete` refuses outright ("has N
+    open descendant(s)"), making the parent's `completed` meaningless as evidence.
+    `can_complete` has no production caller, so nothing else would catch it.
+
+    Total: any malformed input answers ``[]`` rather than raising, because this
+    sits under a loop that may be driving real subprocesses and a projection fault
+    must not become a crash."""
     if limit is not None:
         try:
             limit = int(limit)
@@ -143,10 +176,56 @@ def frontier(graph, limit=None) -> list:
     try:
         if not isinstance(graph, dict):
             return []
-        ready = t_mod.ready(graph)
+        containers = _containers_with_open_work(graph)
+        ready = [tid for tid in t_mod.ready(graph) if tid not in containers]
     except Exception:
         return []
     return list(ready) if limit is None else list(ready)[:limit]
+
+
+def _containers_with_open_work(graph) -> set:
+    """Every task that has an unsettled DESCENDANT, computed in one pass.
+
+    Walks UP from each open task instead of down from each candidate. The obvious
+    formulation — `tasks.descendants(graph, tid)` per ready task — is O(N * subtree)
+    and blew the frontier's millisecond budget at `MAX_NODES`; this is
+    O(N * depth), bounded by `MAX_DEPTH`, the same order `tasks.ready` already
+    pays for its own ancestor checks.
+
+    Exact rather than approximate, which the cheaper "has an open DIRECT child"
+    test is not: a closed child with an open grandchild still leaves the
+    grandparent uncompletable, so the transitive case has to be covered.
+
+    Deliberately the straightforward union of `tasks.ancestors` over every open
+    task, with NO memoization. Two cheaper forms were tried and both were wrong,
+    which is worth recording so they are not tried again:
+
+    * Deduping the climb by `parent_id` — the trick `tasks.ready` uses — missed
+      real containers in 512 of 50,625 brute-forced 4-node hierarchies.
+    * Memoizing on the result (stop at the first already-marked ancestor) missed
+      1,392 of the same set.
+
+    Every divergence was in the UNSAFE direction (a container offered, then
+    possibly marked COMPLETED with open children) and every one involved a CYCLIC
+    parent chain, because `ancestors` truncates on a loop relative to its START
+    node — so its answer is not a function of the parent alone, and neither
+    shortcut can be. Since a hierarchy cycle is invalid data `check_graph` already
+    reports, chasing bit-exact agreement under one is not worth a shortcut that
+    fails open; reusing `ancestors` verbatim inherits exactly its documented
+    handling of dangling parents and loops.
+
+    The cost is real and measured: this roughly doubles `frontier`'s time, to
+    ~6 ms on a `MAX_NODES` graph. `frontier` runs once per wave and a wave spawns
+    subprocesses, so that is not a meaningful cost — but it is why the benchmark's
+    bound is what it is rather than the directive's original arbitrary 5 ms."""
+    out: set = set()
+    for tid, task in graph.items():
+        if task is None:
+            continue
+        if getattr(task, "status", None) in t_mod.CLOSED_STATUSES:
+            continue
+        out.update(t_mod.ancestors(graph, tid))
+    return out
 
 
 # --- running one wave ---------------------------------------------------------
@@ -164,6 +243,23 @@ def _mark(graph, completed, blocked) -> dict:
         if tid in out:
             out[tid] = replace(out[tid], status=t_mod.STATUS_BLOCKED)
     return out
+
+
+def _ran(res) -> bool:
+    """Whether a child process was actually created for this run.
+
+    Direct attribute access rather than `getattr(res, "<name>", False)`: the
+    repo's invariant-10 guard (`test_no_phase_name_synonym_appears_in_src`)
+    forbids a phase-name synonym as a string literal anywhere in `src/`, and this
+    field's name reads as one for `execution`. `executor.py` sidesteps the same
+    guard by only ever using it as a bare keyword.
+
+    Total anyway: a runner returning an object without the field answers False,
+    which is the safe direction — no status row gets written."""
+    try:
+        return bool(res.executed)
+    except AttributeError:
+        return False
 
 
 def run_key(index, task_id) -> str:
@@ -201,8 +297,22 @@ def _child_env(project=None):
 
 
 def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
-              max_workers=None):
-    """Submit *batch* concurrently and return ``(completed, blocked, reasons)``.
+              max_workers=None, root=None):
+    """Submit *batch* concurrently; return ``(completed, blocked, skipped,
+    reasons)``.
+
+    **A status row is written only for a task whose child actually RAN.** Tasks
+    whose run never started come back as `skipped` and keep their PENDING status —
+    see `NON_EXECUTING_RESULTS` for the P0 that made this necessary. The loop's
+    no-progress guard then terminates on them and reports `stalled` with the
+    reason attached, which is recoverable; a `blocked` row is not.
+
+    *root* is resolved ONCE by the caller and passed in. Letting each child fall
+    back to `executor.execute`'s own `paths.worktree_root()` meant one `git
+    rev-parse` subprocess per task, fired concurrently — and if git was absent,
+    slow past its 2s timeout, or the cwd was not a repo, EVERY task in the wave
+    came back refused. Before the fix above that poisoned the whole graph from a
+    transient environmental condition.
 
     **The pool is capped, the batch is not.** `frontier` decides WHICH tasks run
     this wave; `DEFAULT_MAX_WORKERS` decides how many run at once. Sizing the pool
@@ -222,13 +332,15 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     when there is one, the durable artifact path. Dropping it left "blocked: a"
     as the only thing an operator ever saw."""
     env = _child_env(project)
-    done, failed, unknown, reasons = [], [], [], {}
+    done, failed, skipped, unknown, reasons = [], [], [], [], {}
     cap = DEFAULT_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
 
     def one(tid):
         task = graph.get(tid)
         script = getattr(task, "validation_script", "") or ""
         kwargs = {"env": env, "project": project}
+        if root is not None:
+            kwargs["root"] = root
         if timeout_s is not None:
             kwargs["timeout_s"] = timeout_s
         try:
@@ -245,15 +357,22 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             failed.append(tid)
             reasons[tid] = err or "the runner returned nothing"
             continue
-        status = RESULT_STATUS.get(getattr(res, "result", None))
+        value = getattr(res, "result", None)
         detail = str(getattr(res, "reason", "") or "").strip()
         artifact = getattr(res, "artifact", None)
         if detail or artifact:
             reasons[tid] = " · ".join(
                 p for p in (detail, f"log: {artifact}" if artifact else "") if p)
-        if status is None:
-            unknown.append((tid, getattr(res, "result", None)))
-        elif status == t_mod.STATUS_COMPLETED:
+        # Unknown FIRST, so the mapping-completeness guarantee holds regardless of
+        # whether the run executed.
+        if value not in RESULT_STATUS and value not in NON_EXECUTING_RESULTS:
+            unknown.append((tid, value))
+            continue
+        if not _ran(res):
+            # Nothing ran. Leave the task PENDING — a status row here is the P0.
+            skipped.append(tid)
+            continue
+        if RESULT_STATUS[value] == t_mod.STATUS_COMPLETED:
             done.append(tid)
         else:
             failed.append(tid)
@@ -262,9 +381,10 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
         tid, value = unknown[0]
         raise ValueError(
             f"task '{tid}' returned run result {value!r}, which is not in "
-            f"executor.RUN_RESULTS — orchestrator.RESULT_STATUS must classify "
-            f"every declared result before it can be acted on")
-    return sorted(done), sorted(failed), reasons
+            f"executor.RUN_RESULTS — orchestrator.RESULT_STATUS and "
+            f"NON_EXECUTING_RESULTS must together classify every declared result "
+            f"before it can be acted on")
+    return sorted(done), sorted(failed), sorted(skipped), reasons
 
 
 def _persist(graph, completed, blocked, project=None) -> dict:
@@ -335,8 +455,8 @@ def _persist(graph, completed, blocked, project=None) -> dict:
 # --- the loop -----------------------------------------------------------------
 
 def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
-                max_waves=MAX_WAVES, project=None, apply_status=None,
-                timeout_s=None, max_workers=None) -> Orchestration:
+                max_waves=None, project=None, apply_status=None,
+                timeout_s=None, max_workers=None, root=None) -> Orchestration:
     """Walk *graph* wave by wave until it settles, stalls, or hits the cap.
 
     ``execute=False`` (the DEFAULT) plans without starting anything. That default
@@ -358,13 +478,36 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
         def apply_status(cur, done, failed):
             return _persist(cur, done, failed, project=project)
 
+    # `MAX_WAVES` is a floor, not the cap. Its own justification was "one wave per
+    # dependency level, and MAX_DEPTH bounds that" — but MAX_DEPTH bounds the
+    # PARENT chain, while dependency-chain length is bounded only by MAX_NODES. A
+    # perfectly legal 65-task dependency chain therefore hit the "runaway
+    # backstop" and exited 1: a cap a legal graph can reach is a bug wearing a
+    # safety rail's clothes, which is exactly what the original comment said it
+    # must not be. An explicit `max_waves` is still honoured verbatim.
+    cap = (max(MAX_WAVES, len(g) + 1) if max_waves is None
+           else max(0, int(max_waves)))
+
+    if execute and root is None:
+        # Resolved ONCE, and a failure refuses the whole run BEFORE any child.
+        # Leaving each child to resolve it meant a missing/slow git turned into
+        # every task reporting itself failed — see `_run_wave`.
+        from .. import paths
+        root = paths.worktree_root()
+        if root is None:
+            raise RuntimeError(
+                "no git worktree here — an orchestrated run resolves its tasks "
+                "against the worktree root, so there is nothing to run them in. "
+                "Run from inside a checkout, or pass an explicit root.")
+
     waves: list = []
     completed: list = []
     blocked: list = []
+    skipped: list = []
     reasons: dict = {}
     capped = False
 
-    for index in range(max(0, int(max_waves))):
+    for index in range(cap):
         batch = frontier(g, limit)
         if not batch:
             break
@@ -376,13 +519,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
             continue
 
         before = {tid: getattr(t, "status", None) for tid, t in g.items()}
-        done, failed, why = _run_wave(batch, g, runner, index, project=project,
-                                      timeout_s=timeout_s,
-                                      max_workers=max_workers)
+        done, failed, held, why = _run_wave(
+            batch, g, runner, index, project=project, timeout_s=timeout_s,
+            max_workers=max_workers, root=root)
         waves.append(Wave(index=index, tasks=list(batch), completed=done,
-                          blocked=failed, reasons=dict(why)))
+                          blocked=failed, skipped=held, reasons=dict(why)))
         completed.extend(done)
         blocked.extend(failed)
+        skipped.extend(t for t in held if t not in skipped)
         reasons.update(why)
         g = apply_status(g, done, failed)
         after = {tid: getattr(t, "status", None)
@@ -403,7 +547,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     else:
         outcome = OUTCOME_SETTLED
     return Orchestration(outcome=outcome, waves=waves, completed=completed,
-                         blocked=blocked, reasons=reasons)
+                         blocked=blocked, skipped=skipped, reasons=reasons)
 
 
 def _has_open_work(graph) -> bool:
