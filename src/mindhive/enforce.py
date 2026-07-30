@@ -133,6 +133,29 @@ def _mindnet_sidecar(cache):
     return cache["sc"]
 
 
+def _mindnet_armed(cache):
+    """Whether MindNetwork enforcement was opted into here — read AT MOST ONCE
+    per hook invocation, like the sidecar and for the same reason.
+
+    MN-6's blast-radius gate. Both mindnet checks default DORMANT: unlike every
+    other member of `POLICY_CHECKS`, they decide from mutable projection state,
+    and `paths.detect_project` collapses every worktree of a repo onto ONE
+    namespace — so before this gate a single task parked at a planning gate
+    denied writes in every checkout at once, with nobody having opted in. See
+    `mindnet/optin.py` for the two mechanisms and the nesting rule.
+
+    ``False`` on any fault: a bug in an opt-in gate must fail towards "allowed"."""
+    if cache is None:
+        cache = {}
+    if "mn_armed" not in cache:
+        from .mindnet import optin
+        try:
+            cache["mn_armed"] = bool(optin.armed(cache.get("project")))
+        except Exception:
+            cache["mn_armed"] = False
+    return cache["mn_armed"]
+
+
 def _policy_mindnet_phase(tool_name, tool_input, cache=None):
     """MN-4's phase block: no producing code while the active task sits at a
     planning gate.
@@ -141,11 +164,15 @@ def _policy_mindnet_phase(tool_name, tool_input, cache=None):
     `gateguard` lazily — `enforce.py` is imported by the hook shim in every
     project, including the ones with no MindNetwork state at all.
 
-    The tool-name test comes BEFORE the sidecar read: neither rule can ever deny
-    a `Read`, and paying a file read to discover that on the most common tool
-    call in the system is pure waste."""
+    Three tests, cheapest first, and the order is the contract. The tool-name
+    test comes first: neither rule can ever deny a `Read`, and paying anything to
+    discover that on the most common tool call in the system is pure waste. The
+    opt-in test comes before the sidecar read, so a project that never opted in
+    pays no mindnet file I/O on any tool call at all."""
     from .mindnet import enforcer as mn
     if tool_name not in mn.WRITE_TOOLS and tool_name not in mn.EXECUTE_TOOLS:
+        return None
+    if not _mindnet_armed(cache):
         return None
     return mn.phase_violation(tool_name, tool_input, _mindnet_sidecar(cache))
 
@@ -155,6 +182,8 @@ def _policy_mindnet_language(tool_name, tool_input, cache=None):
     populated ``language_context``."""
     from .mindnet import enforcer as mn
     if tool_name not in mn.WRITE_TOOLS:
+        return None
+    if not _mindnet_armed(cache):
         return None
     return mn.language_violation(tool_name, tool_input,
                                  _mindnet_sidecar(cache))
@@ -278,6 +307,17 @@ def hook_decision(raw: str, project=None) -> dict:
         return {}
     tool_name = payload.get("tool_name") or payload.get("toolName") or ""
     tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+    # Resolve the namespace ONCE. `paths.detect_project` shells out to git (up to
+    # two `rev-parse` calls, each with a 2s timeout), and every consumer that
+    # takes `project=None` pays it independently: `load_manifest` did, and MN-6's
+    # opt-in read added a second. On a hook that fires on EVERY tool call that is
+    # a duplicated subprocess per call, so the concrete name is resolved here and
+    # threaded down.
+    if project is None:
+        try:
+            project = paths.detect_project()
+        except Exception:
+            project = None
     manifest = load_manifest(project)
     decision, reason = "deny", None
     pol = evaluate_policies(tool_name, tool_input, manifest=manifest,

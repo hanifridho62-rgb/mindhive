@@ -124,13 +124,17 @@ PHASE_DENIAL = (
     "execute code while in Phase: {phase}. (task '{task_id}') To proceed: "
     "produce this phase's evidence under {where}, then `hive mindnet satisfy "
     "{task_id}` and `hive mindnet enter {task_id} <next>`. `hive`, `git` and "
-    "`gh` commands are not blocked. To turn this rule off entirely: "
+    "`gh` commands are not blocked. To turn enforcement off for this checkout: "
+    "`hive mindnet enforce --disable`  ·  for this process only: "
+    "`MINDNETWORK_ENFORCE=0`  ·  or just this one rule: "
     "`hive rules enforce --disable policy:gate:mindnet-phase`.")
 LANGUAGE_DENIAL = (
     "ACCESS DENIED: Language Compatibility Lock violation. This task is "
     "strictly restricted to {languages}. (task '{task_id}') Either write a "
-    "permitted file type, widen the task's language_context, or disable the "
-    "rule: `hive rules enforce --disable policy:gate:mindnet-language`.")
+    "permitted file type, widen the task's language_context, or turn "
+    "enforcement off: `hive mindnet enforce --disable`  ·  "
+    "`MINDNETWORK_ENFORCE=0`  ·  or just this rule: "
+    "`hive rules enforce --disable policy:gate:mindnet-language`.")
 
 # A drive letter is exactly one alpha character followed by a colon. The
 # original test — `text[1] == ":"` — also matched `a:docs/plans/x.md`, a

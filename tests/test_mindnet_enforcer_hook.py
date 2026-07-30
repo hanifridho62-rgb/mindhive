@@ -31,12 +31,30 @@ import json
 import pytest
 
 from mindhive import enforce
+from mindhive.mindnet import optin
 from mindhive.mindnet import sidecar as s_mod
 from mindhive.mindnet import tasks as t_mod
 from mindhive.mindnet.controller import PhaseRecord
 
 
 # --- helpers -------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def armed(monkeypatch):
+    """Arm MindNetwork enforcement for this whole file.
+
+    MN-6 made the two mindnet policies OPT-IN (they now default dormant, see
+    `optin.py` and `tests/test_mindnet_optin.py` for why: one sidecar governs
+    every worktree of a repo, so an ON-by-default rule froze checkouts nobody
+    had opted in). Every assertion below is about what enforcement DOES once
+    somebody asked for it, so the whole file opts in — otherwise each of these
+    "is denied" tests would pass or fail for the wrong reason, and each "is
+    allowed" test would pass vacuously.
+
+    The dormant half of the contract gets its own section at the foot of this
+    file, where the flag is the only thing that differs between a deny and an
+    allow."""
+    monkeypatch.setenv(optin.ENV_VAR, "1")
 
 def _sc(phase="brainstorm", status=t_mod.STATUS_IN_PROGRESS, langs=(),
         fresh=True):
@@ -239,6 +257,145 @@ def test_both_mindnet_policies_deny_rather_than_ask():
     for pid, decision, _fn in enforce.POLICY_CHECKS:
         if pid.startswith("gate:mindnet-"):
             assert decision == "deny"
+
+
+# --- MN-6: the blast-radius gate at the surface that actually runs ------------------
+#
+# The two tests below are ONE pair with ONE variable. Same payload, same sidecar,
+# same manifest — only the opt-in flag differs. That is what makes them evidence
+# rather than two unrelated observations.
+
+def test_a_phase_violating_write_is_allowed_when_enforcement_is_dormant(
+        spine, monkeypatch):
+    """No opt-in anywhere: a `brainstorm` write that MN-4 would refuse must run.
+
+    This is the whole blast-radius fix. `paths.detect_project` collapses every
+    worktree of a repo onto one namespace, so the sidecar this reads is SHARED —
+    an ON-by-default rule meant one forgotten `in_progress` task at a planning
+    gate denied writes in every checkout at once."""
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
+
+
+def test_the_same_write_is_denied_once_enforcement_is_armed(spine, monkeypatch):
+    """The other half of the pair, and the canary for the test above: the flag
+    is the ONLY difference, so 'allowed' up there cannot be some unrelated
+    allow."""
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    out = enforce.hook_decision(_payload(file_path="src/x.py"))
+    assert _decision(out) == "deny"
+    assert "MindNetwork State Machine violation" in _reason(out)
+
+
+def test_a_language_violating_write_is_allowed_when_dormant(spine, monkeypatch):
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    assert enforce.hook_decision(_payload(file_path="app.js")) == {}
+
+
+def test_a_dormant_hook_never_reads_the_sidecar(spine, monkeypatch):
+    """Dormant must be CHEAP as well as permissive. The opt-in test comes before
+    the projection read, so a project that never opted in pays no file I/O for
+    mindnet on any tool call."""
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    enforce.hook_decision(_payload(file_path="src/x.py"))
+    assert spine["reads"] == 0
+
+
+def test_a_dormant_bash_command_is_allowed(spine, monkeypatch):
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    assert enforce.hook_decision(json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "py -m pytest -q"}})) \
+        == {}
+
+
+def test_the_env_kill_switch_beats_a_persisted_opt_in(spine, monkeypatch,
+                                                      tmp_path):
+    """MN-4's third P0 was a kill switch locked inside the room it opened. An
+    operator whose repo is frozen must be able to disarm enforcement without
+    writing a file — and the variable has to win against the record on disk,
+    not merely in its absence."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    optin.set_enabled(True, project=None, root=root)
+    monkeypatch.chdir(root)
+
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    assert _decision(enforce.hook_decision(_payload(file_path="src/x.py"))) \
+        == "deny", "canary: the persisted opt-in must be capable of denying"
+
+    monkeypatch.setenv(optin.ENV_VAR, "0")
+    assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
+
+
+def test_dormancy_does_not_disable_the_policies_that_were_here_first(
+        spine, monkeypatch):
+    """Composition, which is how MN-4's second P0 happened: two individually
+    sound guards that broke each other. `gate:no-verify` and the destructive and
+    config-protection gates are standing rules with their own adoption decision
+    — the mindnet opt-in must not reach them."""
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    out = enforce.hook_decision(json.dumps(
+        {"tool_name": "Bash",
+         "tool_input": {"command": "git commit --no-verify -m x"}}))
+    assert _decision(out) == "deny"
+    assert "MindNetwork" not in _reason(out)
+
+
+def test_the_manifest_switch_and_the_opt_in_are_independent(spine, monkeypatch):
+    """Two switches, both real. An armed opt-in must still respect a manifest
+    disable, or the documented kill switch MN-4 shipped stops working."""
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    monkeypatch.setattr(enforce, "load_manifest", lambda project=None: {
+        "policy:gate:mindnet-phase": {"enabled": False},
+        "policy:gate:mindnet-language": {"enabled": False}})
+    assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
+
+
+def test_a_raising_optin_check_is_dormant_not_an_outage(spine, monkeypatch):
+    """Fail-open, in the direction that matters: a bug in the gate must allow,
+    never deny. Distinct from the sidecar's fail-open — this fault happens
+    BEFORE the projection is read."""
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+
+    def boom(*a, **k):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(optin, "armed", boom)
+    assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
+
+
+def test_the_opt_in_is_checked_once_per_hook_call(spine, monkeypatch):
+    """Both mindnet checks need the answer and `PreToolUse` fires on every tool
+    call — the same reason the sidecar is read once. Shares the per-call cache
+    `evaluate_policies` already owns."""
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    n = {"calls": 0}
+    real = optin.armed
+
+    def counting(*a, **k):
+        n["calls"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(optin, "armed", counting)
+    enforce.hook_decision(_payload(file_path="app.js"))
+    assert n["calls"] == 1
+
+
+def test_a_dormant_read_only_tool_is_still_free(spine, monkeypatch):
+    """The tool-name test must stay ahead of the opt-in test, so `Read` — the
+    most common call in the system — pays neither."""
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    n = {"calls": 0}
+
+    def counting(*a, **k):
+        n["calls"] += 1
+        return False
+
+    monkeypatch.setattr(optin, "armed", counting)
+    enforce.hook_decision(_payload(tool="Read", file_path="src/x.py"))
+    assert n["calls"] == 0
 
 
 def test_enforce_does_not_import_mindnet_at_module_level():

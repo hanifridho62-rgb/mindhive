@@ -207,6 +207,92 @@ def test_the_existing_swarm_page_hooks_survive():
         assert hook in page, f"the swarm page lost '{hook}'"
 
 
+# --- MN-7 U1: seven faculties, seven cats -----------------------------------------
+#
+# The board shipped with one shared `CAT_SVG` silhouette assigned to every
+# faculty, so all seven were distinguishable only by their text label — against
+# the ask that each faculty map to a distinct sprite or palette. These tests pin
+# the fix and, more importantly, pin the ONE LEGEND: the faculty order comes from
+# `telemetry.FACULTIES` and nowhere else, so a faculty added there cannot end up
+# uncoloured or colliding with an existing one.
+
+def _palettes(page) -> list:
+    """Every ``(body, patch, eye)`` colour triple in the page's palette table.
+
+    The triple, not the body colour alone: `white` and `calico` deliberately
+    share a body and differ by patch, so a body-only comparison would call two
+    genuinely distinct cats duplicates."""
+    import re
+    block = page[page.index("CAT_PALETTES"):]
+    block = block[:block.index("];") + 1]
+    return re.findall(
+        r"b:'(#[0-9a-fA-F]{3,6})',\s*p:'(#[0-9a-fA-F]{3,6})',\s*"
+        r"e:'(#[0-9a-fA-F]{3,6})'", block)
+
+
+def test_the_page_carries_at_least_one_palette_per_faculty():
+    """The structural guard. `FACULTIES` has 7 entries; a 6-entry palette table
+    means two faculties share a cat, which is the defect this unit fixes."""
+    pals = _palettes(render_swarm("tok"))
+    assert len(pals) >= len(tel.FACULTIES), (
+        f"{len(pals)} palettes for {len(tel.FACULTIES)} faculties — at least "
+        f"two faculties would render identically")
+
+
+def test_every_palette_is_visually_distinct():
+    """A 7-entry table that repeats a triple fixes nothing."""
+    pals = [tuple(c.lower() for c in p) for p in _palettes(render_swarm("tok"))]
+    assert len(set(pals)) == len(pals), f"duplicate palettes: {pals}"
+
+
+def test_the_faculty_order_is_injected_from_the_one_legend():
+    """Derived, not hand-written. A second faculty list in JavaScript is a place
+    for the legend to drift, and the drift direction is 'the new faculty renders
+    as whatever index -1 happens to mean'."""
+    page = render_swarm("tok")
+    assert json.dumps(list(tel.FACULTIES)) in page
+
+
+def test_the_faculty_cats_no_longer_share_one_sprite():
+    """The canary for the three tests above. `el.innerHTML = CAT_SVG` was the
+    defect; if that assignment is still in the page, the palettes exist and
+    nothing uses them."""
+    page = render_swarm("tok")
+    assert "el.innerHTML = CAT_SVG" not in page
+    assert "CAT_SVG" not in page, (
+        "the shared silhouette constant is now dead code — remove it rather "
+        "than leaving a second sprite path a future edit can wire back up")
+
+
+def test_the_faculty_cat_index_is_derived_from_the_injected_order():
+    page = render_swarm("tok")
+    assert "FACULTY_ORDER" in page
+    assert "indexOf" in page[page.index("FACULTY_ORDER"):]
+
+
+def test_a_dimmed_cat_is_desaturated_not_merely_faded():
+    """Full-colour sprites break the old dim signal: the shared silhouette used
+    `currentColor`, so `.mn-cat.dim`'s grey text colour greyed the cat too. A
+    coloured cat needs an explicit filter or the 180-second band — the whole
+    hang-detection feature — stops being visible at a glance."""
+    page = render_swarm("tok")
+    dim = page[page.index(".mn-cat.dim"):]
+    dim = dim[:dim.index("#mn-cat-panel")]
+    assert "grayscale" in dim
+    assert "opacity" in page[page.index(".mn-cat.dim"):][:200]
+
+
+def test_the_palette_modulo_follows_the_table_length():
+    """A hardcoded `% 6` beside a 7-entry table silently makes the 7th palette
+    unreachable — the defect would survive the fix."""
+    page = render_swarm("tok")
+    # Paired positive: absence of the old literal alone would also pass if a
+    # regression swapped `% 6` for a hardcoded `% 7`, reintroducing the exact
+    # defect class (the next added palette becomes unreachable).
+    assert "% CAT_PALETTES.length" in page
+    assert "% 6" not in page, "hardcoded palette modulo disagrees with the table"
+
+
 def test_the_token_is_still_escaped_in_the_rendered_page():
     """`render_swarm` escapes every '<' in the JSON-encoded token so neither
     '</script>' nor '<!--' can break out of the inline script. Adding markup

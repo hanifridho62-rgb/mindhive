@@ -146,6 +146,117 @@ def _satisfies(task_id=TASK):
 
 # --- the declared surface --------------------------------------------------------
 
+# --- MN-7 U3: the child-environment seam ------------------------------------------
+#
+# The orchestrator needs a spawned child to inherit the parent's MN-6 arming
+# decision, so `execute` grew an optional `env=`. Real subprocesses here, per the
+# file's own precedent: what reaches the child IS the behaviour, and a mocked
+# `subprocess` would assert only that the module passes along a dict the test
+# wrote.
+
+def _env_probe(tmp_path, *names):
+    """A child script that writes the named variables to a marker file.
+
+    A file rather than stdout because `execute` bounds and rewrites captured
+    output, and a separate throwaway script rather than `python -c` because
+    `gate` splits with ``shlex.split(posix=False)`` — quotes are retained in the
+    token, so an inline `-c "code"` would reach the interpreter still quoted."""
+    marker = tmp_path / "env.txt"
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os, sys\n"
+        f"names = {list(names)!r}\n"
+        "vals = [name + '=' + os.environ.get(name, '<unset>') "
+        "for name in names]\n"
+        f"open({str(marker)!r}, 'w', encoding='utf-8')"
+        ".write('\\n'.join(vals))\n",
+        encoding="utf-8")
+    return marker, " ".join([sys.executable, str(probe)])
+
+
+def _probe_read(marker) -> dict:
+    text = marker.read_text(encoding="utf-8")
+    return dict(line.split("=", 1) for line in text.splitlines() if line)
+
+
+def test_no_env_argument_leaves_the_child_environment_untouched(tmp_path,
+                                                               monkeypatch):
+    """The regression guard for every existing caller. `env=None` must keep
+    today's exact behaviour — inherit the parent — not an empty environment."""
+    monkeypatch.setenv("MN7_PROBE", "inherited")
+    marker, script = _env_probe(tmp_path, "MN7_PROBE")
+    run = x_mod.execute("mn-t-env-1", script, root=tmp_path)
+    assert run.result == "ok", run.reason
+    assert _probe_read(marker)["MN7_PROBE"] == "inherited"
+
+
+def test_an_injected_variable_reaches_the_child(tmp_path):
+    marker, script = _env_probe(tmp_path, "MINDNETWORK_ENFORCE")
+    run = x_mod.execute("mn-t-env-2", script, root=tmp_path,
+                        env={"MINDNETWORK_ENFORCE": "1"})
+    assert run.result == "ok", run.reason
+    assert _probe_read(marker)["MINDNETWORK_ENFORCE"] == "1"
+
+
+def test_an_injected_variable_overrides_the_inherited_one(tmp_path, monkeypatch):
+    """Otherwise the orchestrator could not disarm a child in a shell that had
+    already armed itself."""
+    monkeypatch.setenv("MINDNETWORK_ENFORCE", "1")
+    marker, script = _env_probe(tmp_path, "MINDNETWORK_ENFORCE")
+    x_mod.execute("mn-t-env-3", script, root=tmp_path,
+                  env={"MINDNETWORK_ENFORCE": "0"})
+    assert _probe_read(marker)["MINDNETWORK_ENFORCE"] == "0"
+
+
+def test_the_injected_env_is_merged_not_substituted(tmp_path, monkeypatch):
+    """THE test. A bare replacement strips PATH and, on Windows, SYSTEMROOT —
+    and a child with no SYSTEMROOT does not start at all, surfacing as an opaque
+    `spawn-failed`. The child running successfully at all is half the proof; the
+    inherited variable surviving alongside the injected one is the other half."""
+    monkeypatch.setenv("MN7_INHERITED", "still-here")
+    marker, script = _env_probe(tmp_path, "MN7_INHERITED", "MN7_INJECTED",
+                                "PATH")
+    run = x_mod.execute("mn-t-env-4", script, root=tmp_path,
+                        env={"MN7_INJECTED": "new"})
+    assert run.result == "ok", run.reason
+    got = _probe_read(marker)
+    assert got["MN7_INHERITED"] == "still-here"
+    assert got["MN7_INJECTED"] == "new"
+    assert got["PATH"] != "<unset>" and got["PATH"], (
+        "PATH did not survive — the env was substituted, not merged")
+
+
+def test_a_non_mapping_env_is_ignored_rather_than_raising(tmp_path):
+    """Totality: this module maps every fault to a typed result, and a bad
+    argument must not be the one thing that escapes as a crash."""
+    marker, script = _env_probe(tmp_path, "MN7_PROBE")
+    for junk in (["a", "b"], "MN7=1", 42, object()):
+        run = x_mod.execute("mn-t-env-5", script, root=tmp_path, env=junk)
+        assert run.result == "ok", f"env={junk!r} broke the run: {run.reason}"
+    assert marker.exists()
+
+
+def test_an_env_value_of_none_unsets_the_variable(tmp_path, monkeypatch):
+    """The orchestrator needs to be able to REMOVE an inherited variable, not
+    only overwrite it — otherwise there is no way to hand a child a clean slate
+    for one setting."""
+    monkeypatch.setenv("MN7_GONE", "present")
+    marker, script = _env_probe(tmp_path, "MN7_GONE")
+    x_mod.execute("mn-t-env-6", script, root=tmp_path, env={"MN7_GONE": None})
+    assert _probe_read(marker)["MN7_GONE"] == "<unset>"
+
+
+def test_the_probe_script_can_actually_observe_its_environment(tmp_path,
+                                                              monkeypatch):
+    """The canary for every assertion above: if the probe silently wrote nothing
+    the tests would be reading a stale or empty marker."""
+    monkeypatch.setenv("MN7_CANARY", "yes")
+    marker, script = _env_probe(tmp_path, "MN7_CANARY")
+    assert not marker.exists()
+    x_mod.execute("mn-t-env-7", script, root=tmp_path)
+    assert _probe_read(marker) == {"MN7_CANARY": "yes"}
+
+
 def test_the_denylist_names_the_two_things_the_plan_promises_stay_agent_reported():
     """KTD15: the plan CLAIMS `pr-green` stays agent-reported and that the
     research module's GitHub boundary is preserved. An explicit denylist is what

@@ -112,6 +112,7 @@ chain.
 """
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -335,10 +336,39 @@ def _finalise(rl):
         return None
 
 
+def _child_env(extra):
+    """``os.environ`` merged with *extra*, or ``None`` to inherit unchanged.
+
+    **Merged, never substituted.** A bare replacement drops `PATH` and — on
+    Windows — `SYSTEMROOT`, and a child with no `SYSTEMROOT` does not start at
+    all: the failure arrives as an opaque `spawn-failed`, which looks like a bad
+    command rather than a bad environment.
+
+    A value of ``None`` REMOVES the variable, so a caller can hand a child a
+    clean slate for one setting instead of only overwriting it. Anything that is
+    not a mapping is ignored: this module maps every fault to a typed result, and
+    a bad argument must not be the one thing that escapes as a crash."""
+    if not isinstance(extra, dict) or not extra:
+        return None
+    merged = dict(os.environ)
+    for key, value in extra.items():
+        if value is None:
+            merged.pop(str(key), None)
+        else:
+            merged[str(key)] = str(value)
+    return merged
+
+
 def execute(run_key, script, root=None, timeout_s=DEFAULT_TIMEOUT_S,
-            project=None, max_bytes=None, _clock=time.monotonic) -> RunResult:
+            project=None, max_bytes=None, env=None,
+            _clock=time.monotonic) -> RunResult:
     """Run *script* as argv and capture everything. Appends nothing to the
     ledger — `validate` owns that, so this stays callable from a dry run.
+
+    *env* is an optional overlay on the child's environment (MN-7): the
+    orchestrator uses it so a spawned child inherits the parent's MN-6 arming
+    decision. ``None`` inherits the parent environment unchanged, which is what
+    every pre-MN-7 caller relies on — see `_child_env` for the merge rules.
 
     Exceptions are narrowed to ``(OSError, subprocess.SubprocessError)`` and
     mapped to a typed result, mirroring `research.run_experiment`: a spawn
@@ -374,7 +404,8 @@ def execute(run_key, script, root=None, timeout_s=DEFAULT_TIMEOUT_S,
     try:
         proc = subprocess.run(
             list(argv), shell=False, capture_output=True, text=True,
-            timeout=timeout_s, cwd=str(root), creationflags=paths.NO_WINDOW)
+            timeout=timeout_s, cwd=str(root), env=_child_env(env),
+            creationflags=paths.NO_WINDOW)
         out, err, code = (_as_text(proc.stdout), _as_text(proc.stderr),
                           proc.returncode)
     except subprocess.TimeoutExpired as e:

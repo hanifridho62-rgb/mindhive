@@ -329,29 +329,65 @@ every tool call, so a ~264 ms ledger read there is not a slow feature but an
 unusable session. It also does not resolve the worktree root, because
 `paths.worktree_root` shells out to git with a 2-second timeout.
 
+### 4.4.1 The opt-in gate (MN-6)
+
 **Blast radius.** The `PreToolUse` hook is registered at user level and
 `paths.detect_project` collapses every linked worktree onto the main repo's
-namespace, so one sidecar governs every checkout of a repo: a blocked task in
-one worktree denies in all of them.
+namespace, so one sidecar governs every checkout of a repo: a blocked task in one
+worktree would deny in all of them. Both mindnet entries therefore default
+**dormant**, restoring `enforce.py`'s own stated contract ("enforcement is always
+opt-in"). Every other member of `POLICY_CHECKS` decides from the tool call alone
+and is the same answer in every repository; these two decide from mutable
+projection state, which is what makes ON-by-default wrong for them specifically.
 
-Three guards keep this from bricking a repository, and each has a test whose
-deletion is the outage:
+Two mechanisms, and the environment one out-ranks the file:
 
-- **`in_progress` only.** `pending` is every declared task's default status
-  (`tasks.py`), and `inject.active` deliberately steers it. Denying on it would
-  mean one forgotten task refuses every write in the repo forever.
-- **The current phase's evidence directory is exempt**, read from
-  `phases.PHASE_EVIDENCE` (invariant 10) and scoped to the current phase.
-  Without it, `brainstorm` forbids writing the very document under
-  `docs/superpowers/specs/` that clears it. Containment, not prefix — the same
-  call `phases.resolve_ref` makes.
-- **Unmapped extensions never deny.** The language table is finite; the file
-  types a repo contains are not.
+| Mechanism | Scope | `status()["source"]` |
+|---|---|---|
+| `MINDNETWORK_ENFORCE=1` / `=0` | this process | `env` |
+| `<project>/mindnet/enforce.json` | one checkout root | `file` |
+| neither | — | `default` (dormant) |
 
-Fail-open throughout: missing, stale, corrupt or empty sidecar allows.
-`mindnet/enforcer.py` does not import `events` at all — `PreToolUse` fires on
-every tool call, so a ~264 ms ledger read there is not a slow feature but an
-unusable session.
+```json
+{"version": 1,
+ "roots": {"C:/Users/hanif/mindhive": {"enabled": true,
+                                       "at": "2026-07-29T12:00:00Z",
+                                       "session": "s1"}}}
+```
+
+`MINDNETWORK_ENFORCE` decides in **both** directions so it beats the record —
+that is the kill switch MN-4 lacked, and it needs no writable disk. Only the
+documented spellings (`1/true/yes/on/enable[d]`, `0/false/no/off/disable[d]`)
+decide; anything else, **including the empty string a shell leaves when a
+variable is cleared**, falls through to the record rather than being guessed at.
+
+Roots are keyed and matched **segment-aligned**, and the **deepest** recorded
+root that covers `Path.cwd()` wins. This repo's linked worktrees live *under* the
+main checkout (`<repo>/.claude/worktrees/<name>`), so plain containment would
+mean arming the main checkout silently re-arms every worktree in it — the same
+repo-wide reach, one level down. Deepest-wins is what makes `--disable` from
+inside one worktree a real local escape from an armed ancestor, which is also why
+a disable is **recorded rather than deleted**: a deleted entry out-ranks nothing.
+
+`hive mindnet enforce` reads the state (and is the only place `[mindnet]
+enforcement dormant: opt-in required` is surfaced); `--enable` / `--disable`
+toggle it. The toggle **appends no ledger event** — `sidecar._staleness` counts
+every event, so a row written without also rewriting the sidecar reads STALE and
+silently degrades U9's phase-aware injection, and disarming a frozen repo must
+not depend on the ledger being writable.
+
+The opt-in is checked **before** the sidecar read, so a project that never opted
+in pays no mindnet file I/O on any tool call; the tool-name test still comes
+first, so `Read` pays neither. `optin.py` imports neither `events` nor
+`subprocess`: resolving the current checkout is pure path arithmetic, and the one
+`paths.worktree_root` git call happens in the CLI when a root is *recorded*.
+Fail-open in the direction that matters — any fault in the gate is **dormant**,
+never armed.
+
+The gate composes with, rather than replaces, the manifest kill switch: an armed
+opt-in still respects `policy:gate:mindnet-*` → `{"enabled": false}`, and
+dormancy never reaches `gate:no-verify`, `gate:config-protection` or
+`gate:destructive-command`, which have their own adoption decision.
 
 ### 4.5 The MN-5 cat board payload
 
@@ -377,6 +413,121 @@ thresholds ship in the payload so the page never respells them (invariant 10).
 An unparseable `ts` is treated as maximally old and hidden — treating it as
 fresh would pin a corrupt row on screen as a permanently active cat, and a false
 "something is running" is the one thing this board must never say.
+
+Each faculty's cat is its **index in `telemetry.FACULTIES`**, injected into the
+page as `FACULTY_ORDER` rather than restated as a faculty→colour table in
+JavaScript (invariant 10): a faculty added to the tuple gets its own palette with
+no second list to update, and none can silently collide. `CAT_PALETTES` therefore
+carries at least `len(FACULTIES)` entries and every modulo reads the table's
+length. Dim cats get `filter:grayscale(100%)` — the pre-MN-7 sprite was a
+`currentColor` silhouette, so the dim text colour greyed it for free; a coloured
+cat needs the filter or the 180-second band stops being visible at a glance.
+
+### 4.6 The MN-7 orchestrator: waves over the graph
+
+`hive mindnet orchestrate` walks the MN-2 graph in **waves**. One wave = the
+current frontier, run concurrently, then persisted.
+
+```json
+{"outcome": "settled",
+ "waves": [{"index": 0, "tasks": ["a"], "completed": ["a"], "blocked": [],
+            "skipped": [], "reasons": {}},
+           {"index": 1, "tasks": ["b", "c"], "completed": ["b"],
+            "blocked": ["c"], "skipped": [],
+            "reasons": {"c": "the validation run exited 3 · log: <abs path>"}}],
+ "completed": ["a", "b"], "blocked": ["c"], "skipped": [],
+ "reasons": {"c": "the validation run exited 3 · log: <abs path>"}}
+```
+
+**`blocked` vs `skipped` is the load-bearing distinction.** A status row is written
+only for a task whose child **actually ran** — keyed on `RunResult.executed`, which
+`executor.py` calls "the SECURITY property ... deliberately not derivable from
+`result`". `refused` (the gate said no — including the default case of a task with
+no `validation_script`) and `spawn-failed` (the OS said no) mean nothing happened,
+so the task is reported `skipped`, keeps its PENDING status, and stays recoverable.
+
+Mapping those to `blocked` was a P0: `tasks.ready` excludes every task with a
+BLOCKED ancestor and every task whose dependency is not COMPLETED, so one
+script-less task killed its whole subtree **and** its dependents — permanently,
+because `orchestrator._persist` is the only writer of `mindnet_task` `status` rows
+and a re-declare is forbidden from resetting status. There was no CLI remedy at
+all. A skipped task instead terminates the loop through the no-progress guard,
+reporting `stalled` with the reason attached.
+
+**The frontier is not a new rule.** `orchestrator.frontier(graph, limit)` calls
+`tasks.ready()` — PENDING, every dependency COMPLETED, no BLOCKED ancestor — and
+adds exactly two things: the concurrency bound, and **withholding container
+tasks**. `ready` answers "may this start", not "may this be run as a unit", so it
+offers a parent alongside its still-open children; running both and writing the
+parent COMPLETED produces a status `can_complete` refuses ("has N open
+descendant(s)"), and `can_complete` has no production caller to catch it.
+Re-deriving readiness itself would let a second rule disagree with `can_complete`
+about the same graph; `orchestrator.py` therefore contains no status literals at
+all and a test over its own source enforces that.
+
+**`MAX_WAVES` is a floor, not the cap.** The effective cap is
+`max(MAX_WAVES, len(graph) + 1)`. `MAX_DEPTH` bounds the *parent* chain, while
+dependency-chain length is bounded only by `MAX_NODES` — so a legal 65-task
+dependency chain hit the "runaway backstop" and exited 1. An explicit
+`--max-waves` is still honoured verbatim.
+
+**The worktree root is resolved once**, before any child, and a failure refuses the
+whole run. Letting each child fall back to `executor.execute`'s own
+`paths.worktree_root()` meant one `git rev-parse` per task fired concurrently, and
+a missing git or one call past its 2s timeout made every task in the wave report
+itself failed.
+
+The failure cascade is a consequence, not extra code: a blocked task is not
+COMPLETED, so every dependent stays off the frontier forever. `tasks.ready`
+caches its ancestor answer by `parent_id` — exact, since siblings share an
+ancestor set by definition. Measured on `MAX_NODES` all-ready nodes at
+`MAX_DEPTH`: ~0.8 ms branching, ~4.6 ms with every task on its own parent chain.
+
+| Outcome | Meaning | Exit |
+|---|---|---|
+| `dry-run` | planned only; no child ever started | 0 |
+| `settled` | nothing left to do | 0 |
+| `stalled` | work remains, nothing can advance it | 1 |
+| `capped` | hit `MAX_WAVES` with work outstanding | 1 |
+
+`RESULT_STATUS` and `NON_EXECUTING_RESULTS` together **partition**
+`executor.RUN_RESULTS`: `ok` → `completed`, `fail`/`timeout` → `blocked`, and
+`refused`/`spawn-failed` → no row at all. A value in neither set **raises** rather
+than defaulting, because a new failure mode reading as success would mark a task
+COMPLETED on evidence nobody checked. A runner that *raises* blocks only its own
+task; the two directions differ on purpose (a task failure versus a bug in the
+mapping).
+
+Four properties that are contract rather than implementation detail:
+
+- **`--execute` is opt-in.** Bare `orchestrate` is a dry run. This is the one
+  command here that starts real child processes, so the safe form is the one an
+  operator gets by accident.
+- **One `sidecar.rebuild` per wave, AFTER the status appends.** `_staleness`
+  counts every event, so a row written without rewriting the sidecar reads STALE
+  — silently disabling MN-1's phase-aware injection and MN-4's teeth for the next
+  wave. `_persist` then returns the caller's graph advanced by exactly those rows
+  rather than re-folding: `rebuild` already folds the ledger, and a re-fold would
+  discard any graph that did not come from it.
+- **Termination compares statuses across a wave**, not completion counts. A wave
+  reporting success while nothing moved would otherwise re-run identically to the
+  cap — a spin dressed as progress. `MAX_WAVES` is a runaway backstop, set at or
+  above `MAX_DEPTH` so no legal graph can hit it.
+- **The task id travels in the run key** (`mn7-w<wave>-<task_id>`), never as a
+  runner keyword: `executor.execute` has no task parameter, so a keyword would
+  `TypeError` on every real run while a test double accepted it. The key also
+  names the RunLog artifact, so identity and attribution are one string, and it
+  is wave-scoped so a retry cannot overwrite an earlier attempt's log.
+
+Children inherit the parent's MN-6 arming decision through `executor.execute`'s
+`env=` overlay (merged over `os.environ`, never substituted — a bare replacement
+drops `PATH`/`SYSTEMROOT` and the child fails to start at all).
+
+**Known limitation.** A task's command is its `Task.validation_script`, which is
+a *validator*, not an implementer. A task without one is refused by the executor
+and lands `blocked` — honest, but it means `--execute` is only useful today for
+graphs whose tasks carry a runnable script. Resolving what an "implement this
+task" command should be is deferred; the dry run is fully useful regardless.
 
 ## 5. Invariants — do not break these
 

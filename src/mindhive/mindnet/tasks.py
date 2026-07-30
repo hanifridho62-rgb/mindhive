@@ -515,8 +515,19 @@ def ready(tasks) -> list:
     Three conditions: the task is PENDING, every dependency is COMPLETED, and
     no ancestor is BLOCKED. The ancestor rule is transitive on purpose — if
     only the immediate parent blocked, blocking would be escaped by nesting one
-    level deeper."""
+    level deeper.
+
+    The ancestor answer is cached **by `parent_id`**, which is exact rather than
+    approximate: two tasks with the same parent have, by definition, the same
+    ancestor set. Keying on the parent instead of the task means a branching
+    graph climbs each chain once instead of once per sibling, and — the reason it
+    is written this way rather than as a hand-rolled memoized climb — the
+    computation itself is still `ancestors()` verbatim, so the cache cannot drift
+    from that function's own total handling of dangling parents and pre-existing
+    loops. MN-7's orchestrator reads this once per wave over graphs up to
+    `MAX_NODES`."""
     out: list = []
+    anc_blocked: dict = {}
     for tid in sorted(tasks):
         t = tasks[tid]
         if t.status != STATUS_PENDING:
@@ -524,8 +535,16 @@ def ready(tasks) -> list:
         if any(tasks.get(d) is None or tasks[d].status != STATUS_COMPLETED
                for d in t.dependencies):
             continue
-        if any(tasks[a].status == STATUS_BLOCKED
-               for a in ancestors(tasks, tid)):
+        pid = t.parent_id
+        if pid is None:
+            blocked = False
+        elif pid in anc_blocked:
+            blocked = anc_blocked[pid]
+        else:
+            blocked = any(tasks[a].status == STATUS_BLOCKED
+                          for a in ancestors(tasks, tid))
+            anc_blocked[pid] = blocked
+        if blocked:
             continue
         out.append(tid)
     return out

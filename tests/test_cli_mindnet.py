@@ -50,6 +50,7 @@ nothing to do with the code under test. The autouse fixture below pins
 one segment and one line order.
 """
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -259,7 +260,8 @@ def test_no_verified_by_flag_exists_on_satisfy():
     # And the whole `mindnet` surface, not just this one subcommand.
     surface = _subparser_action(_subparser("mindnet")).choices
     assert set(surface) == {"declare", "enter", "satisfy", "fall-back",
-                            "validate", "restat", "show", "list", "rebuild"}
+                            "validate", "restat", "show", "list", "rebuild",
+                            "enforce", "orchestrate"}
     for name, sp in surface.items():
         bad = [o for a in sp._actions for o in a.option_strings
                if "verified" in o.lower()]
@@ -730,3 +732,452 @@ def test_the_mock_validator_is_committed_and_runnable():
                        capture_output=True, text=True, timeout=60,
                        creationflags=paths.NO_WINDOW)
     assert r.returncode == 0
+
+
+# --- MN-6: `hive mindnet enforce` — the opt-in toggle -------------------------------
+#
+# The toggle for a rule that can freeze a repository is the most safety-critical
+# command on this surface, because it is the remedy. MN-4 shipped three
+# deadlocks and every one of them was a remedy that could not be reached: the
+# phase block denied `Bash` unconditionally, so `hive mindnet satisfy`,
+# `hive mindnet enter` and `hive rules enforce --disable` were all locked inside
+# the room they existed to open. `test_the_toggle_is_reachable_while_*` below is
+# that lesson turned into a test, and it asserts against the REAL enforcer, not
+# a restatement of the exemption list.
+
+def _enforce_optin():
+    from mindhive.mindnet import optin
+    return optin
+
+
+def _pick_up(task=TASK):
+    """Mark *task* `in_progress` and refresh the sidecar.
+
+    Two things this has to get right, and both are contracts the enforcer
+    depends on rather than test scaffolding:
+
+    * `in_progress` is the ONLY status the phase block acts on — MN-4's
+      anti-brick guard deliberately excludes `pending` (the dataclass default),
+      because a task declared months ago and forgotten would otherwise deny
+      every write in the repo forever. Nothing on the `mindnet` subparser writes
+      the status axis, so the row is appended directly.
+    * `sidecar._staleness` counts ALL events, so a row appended after the last
+      sidecar write reads STALE — and a stale projection allows everything. A
+      test that skipped the rebuild would assert 'allowed' about staleness while
+      believing it had asserted something about the opt-in."""
+    events.append_event("mindnet_task",
+                        {"action": "status", "task_id": task,
+                         "status": t_mod.STATUS_IN_PROGRESS}, tags=["mindnet"])
+    _ok("mindnet", "rebuild")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_optin(monkeypatch):
+    """A real `MINDNETWORK_ENFORCE` in the developer's shell would out-rank the
+    persisted record and silently invert every assertion below."""
+    monkeypatch.delenv(_enforce_optin().ENV_VAR, raising=False)
+
+
+def test_enforce_with_no_flag_reports_dormant(capsys):
+    """A status read, and the only place the dormant note is surfaced to a
+    human. Exit 0: 'dormant' is the correct default state, not an error."""
+    assert _cli("mindnet", "enforce") == 0
+    out = capsys.readouterr().out
+    assert _enforce_optin().DORMANT_NOTE in out
+
+
+def test_enforce_enable_then_status_reports_armed(worktree, monkeypatch, capsys):
+    """The chdir is not scaffolding: `status` resolves the current checkout from
+    `Path.cwd()`, which is the SAME input the `PreToolUse` hook uses. Anchoring
+    the status read on anything else would let `hive mindnet enforce` and the
+    hook disagree, and the operator would find out at the next denial."""
+    monkeypatch.chdir(worktree)
+    _ok("mindnet", "enforce", "--enable")
+    capsys.readouterr()
+    assert _cli("mindnet", "enforce") == 0
+    out = capsys.readouterr().out
+    assert _enforce_optin().DORMANT_NOTE not in out
+    assert str(worktree).replace("\\", "/") in out.replace("\\", "/")
+
+
+def test_a_dormant_status_names_the_mechanism_holding_the_gate_shut(
+        worktree, monkeypatch, capsys):
+    """A remedy that does not name the deciding mechanism is unactionable — the
+    same defect as MN-4's original one-sentence refusal. `MINDNETWORK_ENFORCE=0`
+    out-ranks the record, so pointing the operator at `--enable` there sends
+    them to a flag that changes the file and nothing else."""
+    optin = _enforce_optin()
+    monkeypatch.chdir(worktree)
+    _ok("mindnet", "enforce", "--enable")
+    monkeypatch.setenv(optin.ENV_VAR, "0")
+    capsys.readouterr()
+
+    assert _cli("mindnet", "enforce") == 0
+    out = capsys.readouterr().out
+    assert optin.ENV_VAR in out
+    assert "--enable" not in out
+
+
+def test_enabling_while_the_env_var_forces_dormant_says_so(worktree, monkeypatch,
+                                                           capsys):
+    """`--enable` writes the record honestly but must not report success as
+    though the teeth are now live, or the operator learns otherwise at the next
+    write that sails through."""
+    optin = _enforce_optin()
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv(optin.ENV_VAR, "0")
+    _ok("mindnet", "enforce", "--enable")
+    out = capsys.readouterr().out
+    assert "dormant" in out
+    assert optin.armed(None, cwd=worktree) is False
+
+
+def test_enforce_enable_records_the_current_worktree_root(worktree):
+    """The git call happens HERE, once, in the CLI — never on the hook path."""
+    _ok("mindnet", "enforce", "--enable")
+    rec = json.loads(
+        _enforce_optin().record_path(None).read_text(encoding="utf-8"))
+    assert list(rec["roots"]) == [str(worktree.resolve()).replace("\\", "/")]
+
+
+def test_enforce_enable_actually_arms_the_hook(worktree, monkeypatch):
+    """The verifier that matters: not 'the file changed' but 'the PreToolUse
+    surface now refuses'. A toggle that writes a record nothing reads is the
+    exact shape of MN-4's first P0."""
+    from mindhive import enforce as enf
+    monkeypatch.chdir(worktree)
+    _walk_trivial(target="execution")
+    _ok("mindnet", "fall-back", TASK, "brainstorm", "--detail", "reopened")
+    _pick_up()
+    payload = json.dumps({"tool_name": "Write",
+                          "tool_input": {"file_path": str(worktree / "x.py")}})
+
+    assert enf.hook_decision(payload) == {}, (
+        "canary: enforcement must be dormant before the opt-in")
+
+    _ok("mindnet", "enforce", "--enable")
+
+    out = enf.hook_decision(payload)
+    assert (out.get("hookSpecificOutput") or {}).get(
+        "permissionDecision") == "deny"
+
+    _ok("mindnet", "enforce", "--disable")
+    assert enf.hook_decision(payload) == {}
+
+
+def test_enforce_disable_from_a_nested_checkout_beats_an_armed_parent(
+        tmp_path, monkeypatch):
+    """Linked worktrees live under the main checkout in this repo, so a
+    `--disable` that could not out-rank an armed ancestor would be a no-op
+    exactly when it is needed."""
+    optin = _enforce_optin()
+    main = tmp_path / "main"
+    nested = main / ".claude" / "worktrees" / "wt"
+    nested.mkdir(parents=True)
+
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: main)
+    _ok("mindnet", "enforce", "--enable")
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: nested)
+    _ok("mindnet", "enforce", "--disable")
+
+    assert optin.armed(None, cwd=nested) is False
+    assert optin.armed(None, cwd=main) is True
+
+
+def test_enforce_rejects_asking_for_both_directions_at_once():
+    """`--enable --disable` has no defensible reading; argparse's mutually
+    exclusive group makes it exit 2 rather than silently picking one."""
+    with pytest.raises(SystemExit) as e:
+        _cli("mindnet", "enforce", "--enable", "--disable")
+    assert e.value.code == 2
+
+
+def test_enforce_json_status_is_machine_readable(worktree, monkeypatch, capsys):
+    monkeypatch.chdir(worktree)
+    _ok("mindnet", "enforce", "--enable")
+    capsys.readouterr()
+    assert _cli("mindnet", "enforce", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["armed"] is True
+    assert data["source"] == "file"
+    assert Path(data["root"]) == worktree.resolve()
+
+
+def test_the_toggle_appends_no_ledger_event(worktree):
+    """Two reasons, both load-bearing. (1) `sidecar._staleness` counts ALL
+    events, so an event appended without rewriting the sidecar reads STALE and
+    U9's phase-aware injection silently degrades. (2) An operator disarming a
+    frozen repository must not have that write depend on the ledger being
+    writable at all."""
+    before = len(events.read_all())
+    _ok("mindnet", "enforce", "--enable")
+    _ok("mindnet", "enforce", "--disable")
+    assert len(events.read_all()) == before
+
+
+def test_the_toggle_leaves_the_sidecar_fresh(worktree):
+    """The consequence of the rule above, asserted through the projection the
+    injector actually consults."""
+    _walk_trivial(target="execution")
+    _ok("mindnet", "enforce", "--enable")
+    assert sc_mod.read().fresh is True
+
+
+@pytest.mark.parametrize("command", [
+    "hive mindnet enforce --disable",
+    "hive mindnet satisfy mn1-u7 --ref docs/plans/x.md",
+    "hive rules enforce --disable policy:gate:mindnet-phase",
+    "hive log update 'recorded the change'",
+])
+def test_the_toggle_is_reachable_while_the_phase_block_denies_everything(
+        worktree, monkeypatch, command):
+    """MN-4's third P0, generalized: every documented remedy runs through Bash,
+    and the phase block denied Bash unconditionally. Asserted against the real
+    `enforce.hook_decision` with enforcement ARMED and a task parked at
+    `brainstorm` — the state that froze the repo."""
+    from mindhive import enforce as enf
+    optin = _enforce_optin()
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    monkeypatch.chdir(worktree)
+    _walk_trivial(target="execution")
+    _ok("mindnet", "fall-back", TASK, "brainstorm", "--detail", "reopened")
+    _pick_up()
+
+    blocked = enf.hook_decision(json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "py -m pytest -q"}}))
+    assert (blocked.get("hookSpecificOutput") or {}).get(
+        "permissionDecision") == "deny", (
+        "canary: the phase block must actually be biting on this state")
+
+    assert enf.hook_decision(json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": command}})) == {}
+
+
+def test_the_toggle_is_reachable_while_the_language_lock_denies_writes(
+        worktree, monkeypatch):
+    """The composed case — MN-4's SECOND P0 was two individually sound guards
+    that deadlocked together, so the escape has to be checked against both rules
+    at once, not each alone."""
+    from mindhive import enforce as enf
+    optin = _enforce_optin()
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    monkeypatch.chdir(worktree)
+    _ok("mindnet", "declare", "lang-task", "--title", "python only",
+        "--language", "python", "--triviality-bypass")
+
+    denied = enf.hook_decision(json.dumps(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": str(worktree / "app.js")}}))
+    assert (denied.get("hookSpecificOutput") or {}).get(
+        "permissionDecision") == "deny", (
+        "canary: the language lock must actually be biting")
+
+    assert enf.hook_decision(json.dumps(
+        {"tool_name": "Bash",
+         "tool_input": {"command": "hive mindnet enforce --disable"}})) == {}
+
+
+# --- MN-7 U6: `hive mindnet orchestrate` -------------------------------------------
+#
+# The dangerous command on this surface, so the safe form is the default: bare
+# `orchestrate` plans and spawns nothing, and `--execute` is explicit.
+
+def _orc_graph():
+    """A -> {B, C} -> D on the ledger, all declared on both axes."""
+    _ok("mindnet", "declare", "a", "--title", "root")
+    for tid in ("b", "c"):
+        _ok("mindnet", "declare", tid, "--title", f"arm {tid}")
+        events.append_event("mindnet_task",
+                            {"action": "depend", "task_id": tid, "on": "a"},
+                            tags=["mindnet", "task"])
+    _ok("mindnet", "declare", "d", "--title", "join")
+    for tid in ("b", "c"):
+        events.append_event("mindnet_task",
+                            {"action": "depend", "task_id": "d", "on": tid},
+                            tags=["mindnet", "task"])
+    _ok("mindnet", "rebuild")
+
+
+def test_orchestrate_bare_is_a_dry_run_that_spawns_nothing(capsys, monkeypatch):
+    """KTD5. Nothing may start without `--execute`."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    calls = []
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda *a, **k: calls.append(a) or ([], [], [], {}))
+
+    assert _cli("mindnet", "orchestrate") == 0
+    out = capsys.readouterr().out
+    assert calls == [], "a dry run started work"
+    assert "dry-run" in out
+    assert "a" in out and "b" in out, "a dry run must say what it WOULD do"
+
+
+def test_orchestrate_dry_run_appends_nothing_to_the_ledger():
+    _orc_graph()
+    before = len(events.read_all())
+    _ok("mindnet", "orchestrate")
+    assert len(events.read_all()) == before
+
+
+def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}))
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 0
+    out = capsys.readouterr().out
+    assert "settled" in out
+
+
+def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
+    """A stall is an operator-actionable state, not a success: work remains and
+    nothing can advance it. A zero exit there would let a CI step that wraps this
+    pass while the graph is stuck."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (
+                            [], sorted(batch), [],
+                            {t: "synthetic failure" for t in batch}))
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 1
+    assert "stalled" in capsys.readouterr().out
+
+
+def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}))
+    capsys.readouterr()                       # drop the fixture's declare noise
+
+    assert _cli("mindnet", "orchestrate", "--execute", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["outcome"] == "settled"
+    assert data["completed"] == ["a", "b", "c", "d"]
+    assert data["blocked"] == []
+    assert [w["tasks"] for w in data["waves"]] == [["a"], ["b", "c"], ["d"]]
+
+
+def test_orchestrate_honours_the_limit_end_to_end(capsys):
+    _orc_graph()
+    capsys.readouterr()                       # drop the fixture's declare noise
+    assert _cli("mindnet", "orchestrate", "--limit", "1", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert all(len(w["tasks"]) <= 1 for w in data["waves"])
+
+
+def test_orchestrate_reports_a_graph_with_nothing_to_do(capsys):
+    assert _cli("mindnet", "orchestrate") == 0
+    assert "no mindnet" in capsys.readouterr().out.lower()
+
+
+def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
+    """The property `test_every_mutating_command_leaves_the_sidecar_fresh`
+    protects, extended to the one command that writes a whole wave of rows."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}))
+    _ok("mindnet", "orchestrate", "--execute")
+    assert sc_mod.read().fresh is True
+
+
+def test_orchestrate_text_output_names_why_each_task_blocked(capsys,
+                                                            monkeypatch):
+    """"blocked: a" is not actionable, and the old text pointed operators at
+    `hive mindnet show`, which had nothing recorded to show."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (
+                            [], sorted(batch), [],
+                            {t: "the validation run exited 3" for t in batch}))
+    capsys.readouterr()
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 1
+    out = capsys.readouterr().out
+    assert "a: the validation run exited 3" in out
+
+
+def test_orchestrate_json_carries_the_blocked_reasons(capsys, monkeypatch):
+    """The agent-facing surface needs the reason as data, not only as prose on
+    stdout — otherwise an agent hitting `blocked` has to reconstruct the run-key
+    convention and hunt for the log by hand."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (
+                            [], sorted(batch), [], {t: "refused" for t in batch}))
+    capsys.readouterr()
+
+    assert _cli("mindnet", "orchestrate", "--execute", "--json") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["reasons"]["a"] == "refused"
+    assert data["waves"][0]["reasons"]["a"] == "refused"
+
+
+def test_orchestrate_reports_an_orchestrator_fault_as_an_error_not_a_traceback(
+        capsys, monkeypatch):
+    """`main()` only catches JSONDecodeError, so without local handling a ledger
+    or projection fault reached the operator as a raw stack trace — and the two
+    faults _persist raises are exactly the ones carrying the repair instructions."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+
+    def boom(*a, **k):
+        raise RuntimeError("the projection is now STALE")
+
+    monkeypatch.setattr(orc_mod, "orchestrate", boom)
+    assert _cli("mindnet", "orchestrate", "--execute") == 2
+    assert "STALE" in capsys.readouterr().err
+
+
+def test_orchestrate_max_workers_is_distinct_from_limit():
+    """Two knobs, two meanings: --limit decides which tasks run this wave at all,
+    --max-workers how many run at once. Collapsing them would make a wide graph
+    either serial or unbounded."""
+    sp = _subparser("mindnet", "orchestrate")
+    opts = [s for a in sp._actions for s in a.option_strings]
+    assert "--limit" in opts and "--max-workers" in opts
+
+
+def test_orchestrate_is_on_the_frozen_subcommand_surface():
+    surface = _subparser_action(_subparser("mindnet")).choices
+    assert "orchestrate" in surface
+
+
+def test_orchestrate_is_reachable_while_the_phase_block_denies_everything(
+        worktree, monkeypatch):
+    """The locked-room lesson applied to the new command. An operator may well
+    need to drive the graph while a task sits at a planning gate, and `hive` being
+    exempt is what makes that possible — asserted against the real enforcer with
+    enforcement ARMED, not against a restatement of the exemption list."""
+    from mindhive import enforce as enf
+    optin = _enforce_optin()
+    monkeypatch.setenv(optin.ENV_VAR, "1")
+    monkeypatch.chdir(worktree)
+    _walk_trivial(target="execution")
+    _ok("mindnet", "fall-back", TASK, "brainstorm", "--detail", "reopened")
+    _pick_up()
+
+    blocked = enf.hook_decision(json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "py -m pytest -q"}}))
+    assert (blocked.get("hookSpecificOutput") or {}).get(
+        "permissionDecision") == "deny", "canary: the phase block is not biting"
+
+    assert enf.hook_decision(json.dumps(
+        {"tool_name": "Bash",
+         "tool_input": {"command": "hive mindnet orchestrate --execute"}})) == {}
+
+
+def test_enforce_works_outside_a_git_worktree(tmp_path, monkeypatch):
+    """`paths.worktree_root` answers None off a repo (total by contract). The
+    toggle must still have something to record rather than crashing — the cwd
+    is the honest answer."""
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: None)
+    monkeypatch.chdir(tmp_path)
+    _ok("mindnet", "enforce", "--enable")
+    assert _enforce_optin().armed(None, cwd=tmp_path) is True
