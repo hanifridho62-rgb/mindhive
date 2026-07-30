@@ -615,6 +615,36 @@ runs. Because that appends activity rows and `_staleness` counts every event,
 spawned agent may be unable to edit; granting it is an operator decision this
 surface deliberately does not make silently.
 
+### 4.9 The pr-green completion gate (MN-10)
+
+MindNetwork's founding requirement: a task *"tidak akan selesai hingga pr berwarna
+hijau"* — not finished until the PR is green. `tasks.can_complete` implemented it
+from the start: no open descendants, evidence recorded, and the terminal phase
+satisfied (`pr-green`, or `TRIVIAL_EXIT_PHASE` for an ADR-0005 bypass).
+
+**Nothing called it.** Every reference to `can_complete` in `src/` was a comment or
+a docstring, so `_persist` — the only writer of a `completed` row — marked tasks
+finished without ever asking. A task could be COMPLETED at `brainstorm`, unblocking
+its dependents on a promise the machine never checked.
+
+`orchestrator.completion_gate_default` is the wire. A run succeeding is not the
+same as a task being finished: on refusal the task moves out of `completed` into
+`skipped`, keeps its PENDING status, its dependents stay blocked, and the reason
+says what is missing. The satisfaction predicate comes from the **sidecar** (which
+`_persist` rebuilds every wave, so it is current by construction) rather than a
+fresh ~264 ms fold; a missing sidecar yields no records and the gate refuses, which
+is the direction a gate must fail in.
+
+**A second wire was required, and its absence had been invisible.**
+`can_complete`'s own message says *"a validation run must record its artifact"* —
+but `Task.evidence` is written only by a `mindnet_task` `action: "evidence"` row,
+and **nothing in the codebase ever wrote one**. The field was permanently empty, so
+gate 3 was unsatisfiable for every non-bypassed task. That went unnoticed only
+because nothing called the gate either; wiring the gate alone would have made normal
+tasks permanently incompletable. `executor.validate` now mirrors a successful run's
+artifact onto the graph axis (best-effort — the phase-axis satisfy is the
+load-bearing write and has already landed).
+
 ### 4.8 Per-task worktree isolation (MN-9)
 
 `hive mindnet orchestrate --execute --isolation worktree` gives each agent its own

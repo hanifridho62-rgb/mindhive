@@ -507,6 +507,43 @@ def _refresh(project=None) -> None:
             f"teeth until `hive mindnet rebuild` succeeds")
 
 
+def completion_gate_default(graph, task_id, project=None, records=None):
+    """``None`` when *task_id* may be marked COMPLETED, else the blocking reason.
+
+    **This is the wire the original ask was missing.** MindNetwork's founding
+    requirement said a task "tidak akan selesai hingga pr berwarna hijau" — it is
+    not finished until the PR is green — and `tasks.can_complete` implements
+    exactly that: no open descendants, evidence recorded, and the terminal phase
+    (`pr-green`, or `TRIVIAL_EXIT_PHASE` for an ADR-0005 bypass) satisfied.
+
+    Nothing called it. Every reference to `can_complete` in `src/` was a comment
+    or a docstring, so the only writer of a `completed` row — `_persist` — marked
+    tasks finished without ever asking. A task could be COMPLETED at `brainstorm`,
+    which unblocks its dependents on a promise the machine never checked.
+
+    The satisfaction predicate comes from the SIDECAR, not a fresh ledger fold:
+    `_persist` rebuilds the sidecar after every wave, so it is current by
+    construction, and a file read costs nothing next to the ~264 ms fold. A stale
+    or missing sidecar yields no records, the predicate answers False, and the gate
+    REFUSES — which is the direction a gate must fail in."""
+    if records is None:
+        try:
+            from . import sidecar as sc_mod
+            sc = sc_mod.read(project)
+            records = getattr(getattr(sc, "state", None), "records", None) or {}
+        except Exception:
+            records = {}
+    from . import controller as c_mod
+    try:
+        return t_mod.can_complete(graph, task_id,
+                                  c_mod.satisfaction_predicate(records))
+    except Exception as exc:                            # noqa: BLE001
+        # A fault in the gate is not a pass. `can_complete` fails closed on a
+        # raising predicate for the same reason.
+        return (f"'{task_id}' cannot complete: the completion gate raised "
+                f"{type(exc).__name__}: {exc}")
+
+
 def _persist(graph, completed, blocked, project=None) -> dict:
     """Write the wave's outcomes to the ledger and re-fold the graph.
 
@@ -577,7 +614,8 @@ def _persist(graph, completed, blocked, project=None) -> dict:
 def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
                 max_waves=None, project=None, apply_status=None,
                 timeout_s=None, max_workers=None, root=None,
-                payload_for=None, isolate=False) -> Orchestration:
+                payload_for=None, isolate=False,
+                completion_gate=None) -> Orchestration:
     """Walk *graph* wave by wave until it settles, stalls, or hits the cap.
 
     ``execute=False`` (the DEFAULT) plans without starting anything. That default
@@ -598,6 +636,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     if apply_status is None:
         def apply_status(cur, done, failed):
             return _persist(cur, done, failed, project=project)
+    # The DEFAULT is the real pr-green gate. Injectable so loop tests can
+    # isolate the loop from the gate, but a test asserts this default so the
+    # seam cannot quietly become permissive in production.
+    if completion_gate is None:
+        def gate(cur, tid):
+            return completion_gate_default(cur, tid, project=project)
+    else:
+        gate = completion_gate
 
     # `MAX_WAVES` is a floor, not the cap. Its own justification was "one wave per
     # dependency level, and MAX_DEPTH bounds that" — but MAX_DEPTH bounds the
@@ -646,6 +692,24 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
             batch, g, runner, index, project=project, timeout_s=timeout_s,
             max_workers=max_workers, root=root, payload_for=payload_for,
             isolate=isolate)
+        why_map = dict(why)
+        # THE PR-GREEN GATE. A run succeeding is not the same as a task being
+        # finished: the founding requirement is that a task is not done until its
+        # terminal phase is satisfied. A refusal moves the task out of `completed`
+        # and into `skipped`, so it keeps its PENDING status, its dependents stay
+        # blocked, and the reason says what is still missing.
+        allowed = []
+        for tid in done:
+            why = gate(g, tid)
+            if why is None:
+                allowed.append(tid)
+            else:
+                held.append(tid)
+                why_map[tid] = (f"{why_map[tid]} · {why}" if tid in why_map
+                                else why)
+        done = allowed
+        why = why_map
+
         wave_branches = {t: i.branch for t, i in iso.items() if i.ok}
         wave_kept = {t: i.path for t, i in iso.items()
                      if i.ok and i.reason}

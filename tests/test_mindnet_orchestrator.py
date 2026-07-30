@@ -145,9 +145,32 @@ def _run_result(result):
         artifact=None, excerpt="", duration_s=0.01)
 
 
+# Captured BEFORE the autouse patch below, so the gate tests can drive the real
+# thing rather than the permissive stand-in.
+_REAL_GATE = orc.completion_gate_default
+
+
 @pytest.fixture(autouse=True)
 def _session(monkeypatch):
     monkeypatch.setenv("MINDHIVE_SESSION", SESSION)
+
+
+@pytest.fixture(autouse=True)
+def _permissive_completion_gate(monkeypatch):
+    """Isolate the LOOP tests from the pr-green gate.
+
+    The real gate enforces MindNetwork's founding requirement — a task is not
+    finished until its terminal phase is satisfied — so almost no bare fixture task
+    can legitimately complete, and every wave/cascade/concurrency assertion in this
+    file would fail for a reason it is not about.
+
+    Two things stop this from becoming a lie: the `--- the pr-green gate ---`
+    section drives `_REAL_GATE` directly in BOTH directions, and
+    `test_orchestrate_defaults_to_the_real_completion_gate` pins the production
+    default. There is also an end-to-end test in `test_cli_mindnet.py` where a task
+    walked to its terminal phase really does complete."""
+    monkeypatch.setattr(orc, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
 
 
 # ============================================================================
@@ -1523,3 +1546,114 @@ def test_a_raising_retire_does_not_replace_the_agents_result(gitrepo,
                           root=gitrepo, isolate=True)
     assert out.completed == ["b"], "the cleanup error replaced the agent's result"
     assert "locked" in str(out.kept.get("b", "")) or out.kept
+
+
+# ============================================================================
+# MN-10 — the pr-green gate
+# ============================================================================
+#
+# MindNetwork's founding prompt: a task "tidak akan selesai hingga pr berwarna
+# hijau". `tasks.can_complete` implemented that from the start — and NOTHING called
+# it. Every reference in `src/` was a comment or a docstring, so the only writer of
+# a `completed` row marked tasks finished without ever asking, and a task could be
+# COMPLETED at `brainstorm` while its dependents unblocked on a promise nobody
+# checked.
+#
+# These tests drive `_REAL_GATE`, captured before the autouse permissive patch.
+
+def test_orchestrate_defaults_to_the_real_completion_gate():
+    """The production default must be the real gate, or the autouse fixture above
+    would be hiding a permissive orchestrator rather than isolating a test."""
+    import inspect
+    src = inspect.getsource(orc.orchestrate)
+    assert "completion_gate_default" in src
+    assert inspect.signature(orc.orchestrate).parameters[
+        "completion_gate"].default is None, (
+        "the injectable must default to None so the real gate is used")
+
+
+def test_the_gate_refuses_a_task_that_has_not_reached_its_terminal_phase():
+    """The headline requirement. A bare task sits at `brainstorm`; completing it
+    there is exactly what the missing wire allowed."""
+    graph = _graph(_task("a"))
+    why = _REAL_GATE(graph, "a", records={})
+    assert why is not None
+    assert "a" in why
+
+
+def test_the_gate_refuses_a_parent_with_open_children():
+    """`can_complete`'s first gate, reached through the wire."""
+    graph = _graph(_task("p"), _task("c", parent="p"))
+    why = _REAL_GATE(graph, "p", records={})
+    assert why and "descendant" in why
+
+
+def test_the_gate_allows_a_task_whose_terminal_phase_is_satisfied():
+    """The other direction, so the refusals above are not vacuous.
+
+    A `triviality_bypass` task's terminal phase is `TRIVIAL_EXIT_PHASE`
+    (`audit-bug`), not `pr-green` — ADR-0005 waives the METHOD, never the gate. The
+    records are built to say that phase is satisfied."""
+    from mindhive.mindnet.controller import PhaseRecord, Satisfaction
+    task = _task("a", triviality_bypass=True)
+    graph = {"a": task}
+    rec = PhaseRecord(task_id="a", phase=t_mod.TRIVIAL_EXIT_PHASE, epoch=0,
+                      satisfactions=(Satisfaction(
+                          phase=t_mod.TRIVIAL_EXIT_PHASE, epoch=0, valid=True,
+                          result="ok", verified_by="python"),))
+    assert _REAL_GATE(graph, "a", records={"a": rec}) is None
+
+
+def test_a_refused_completion_writes_no_status_row_and_stays_pending(monkeypatch):
+    """Through the LOOP with the real gate restored: the run succeeded, the gate
+    refused, so nothing is recorded and the task remains retryable."""
+    monkeypatch.setattr(orc, "completion_gate_default", _REAL_GATE)
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+
+    assert out.completed == [], "a task completed without reaching pr-green"
+    assert out.skipped == ["a"]
+    assert _status_rows() == []
+    assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
+    assert "a" in out.reasons and out.reasons["a"]
+
+
+def test_a_refused_completion_keeps_its_dependents_blocked(monkeypatch):
+    """The consequence that makes the gate worth having: an unfinished task must
+    not unblock the work that waits on it."""
+    monkeypatch.setattr(orc, "completion_gate_default", _REAL_GATE)
+    graph = _graph(_task("a"), _task("b", deps=("a",)))
+    fake = FakeRunner()
+    orc.orchestrate(graph, runner=fake, execute=True)
+    assert "b" not in fake.submitted(), "the dependent ran on an unfinished parent"
+
+
+def test_the_gate_reason_is_appended_to_the_runs_own_reason(monkeypatch):
+    """The operator needs both halves: the run's outcome AND why it still did not
+    count as finished."""
+    monkeypatch.setattr(orc, "completion_gate_default", _REAL_GATE)
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")},
+                          runner=FakeRunner(results={"a": "ok"}), execute=True)
+    assert out.reasons["a"]
+
+
+def test_the_gate_fails_closed_when_it_raises(monkeypatch):
+    """A gate that cannot decide must refuse. `can_complete` already fails closed
+    on a raising predicate; the wire must not undo that."""
+    def boom(*a, **k):
+        raise RuntimeError("records unreadable")
+
+    monkeypatch.setattr(t_mod, "can_complete", boom)
+    why = _REAL_GATE(_graph(_task("a")), "a", records={})
+    assert why and "RuntimeError" in why
+
+
+def test_a_missing_sidecar_refuses_rather_than_allowing(tmp_path, monkeypatch):
+    """The gate reads its records from the sidecar. No sidecar means no
+    satisfaction records, which `can_complete` treats as unsatisfied — the safe
+    direction, and worth pinning because the alternative is a gate that opens
+    whenever the projection is absent."""
+    monkeypatch.chdir(tmp_path)
+    why = _REAL_GATE(_graph(_task("a")), "a")
+    assert why is not None

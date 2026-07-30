@@ -1112,6 +1112,12 @@ def test_orchestrate_dry_run_appends_nothing_to_the_ledger():
 
 def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
+    # Permissive completion gate: this test is about the COMMAND, not the
+    # pr-green gate. The real gate refuses a bare fixture task (no evidence,
+    # not at its terminal phase), which is asserted directly in
+    # test_a_task_walked_to_its_terminal_phase_really_does_complete.
+    monkeypatch.setattr(orc_mod, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
@@ -1138,6 +1144,12 @@ def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
 
 def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
+    # Permissive completion gate: this test is about the COMMAND, not the
+    # pr-green gate. The real gate refuses a bare fixture task (no evidence,
+    # not at its terminal phase), which is asserted directly in
+    # test_a_task_walked_to_its_terminal_phase_really_does_complete.
+    monkeypatch.setattr(orc_mod, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
@@ -1168,6 +1180,12 @@ def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
     """The property `test_every_mutating_command_leaves_the_sidecar_fresh`
     protects, extended to the one command that writes a whole wave of rows."""
     from mindhive.mindnet import orchestrator as orc_mod
+    # Permissive completion gate: this test is about the COMMAND, not the
+    # pr-green gate. The real gate refuses a bare fixture task (no evidence,
+    # not at its terminal phase), which is asserted directly in
+    # test_a_task_walked_to_its_terminal_phase_really_does_complete.
+    monkeypatch.setattr(orc_mod, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
@@ -1311,6 +1329,46 @@ def test_orchestrate_json_carries_branches_and_kept(capsys, monkeypatch):
     data = json.loads(capsys.readouterr().out)
     assert data["branches"] == {"a": "mn9/a"}
     assert data["kept"] == {"a": "/tmp/x"}
+
+
+def test_a_task_walked_to_its_terminal_phase_really_does_complete(monkeypatch):
+    """The end-to-end proof for the pr-green gate, and the one test that cannot be
+    satisfied by a stand-in.
+
+    `tests/test_mindnet_orchestrator.py` patches the gate permissive so its loop
+    assertions stay about the loop; that leaves an obligation here — showing that a
+    REAL task, walked through the REAL phase spine to its terminal phase with REAL
+    recorded evidence, is actually allowed to complete. Without this the gate could
+    be refusing everything forever and every other test would still pass."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _walk_trivial(target="audit-bug", script=_script("--mode", "ok"))
+    _ok("mindnet", "validate", TASK)          # records python-verified evidence
+    _ok("mindnet", "rebuild")
+
+    graph = t_mod.fold(events.read_all())
+    # The evidence axis is now populated by the validation run itself. Asserted
+    # here because it was EMPTY before this change: `can_complete`'s message said
+    # "a validation run must record its artifact", and no such producer existed, so
+    # the gate was unsatisfiable for every non-bypassed task.
+    assert graph[TASK].evidence, "the validation run recorded no task evidence"
+    assert str(graph[TASK].evidence[0]).endswith(".txt"), (
+        f"the ref is not the run artifact: {graph[TASK].evidence}")
+
+    why = orc_mod.completion_gate_default(graph, TASK)
+    assert why is None, f"a fully-walked task was still refused: {why}"
+
+
+def test_the_same_task_is_refused_one_phase_earlier(monkeypatch):
+    """The canary for the test above: at `execution` — before the terminal phase is
+    satisfied — the very same task must NOT be completable. If both passed, the
+    gate would be doing nothing."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _walk_trivial(target="execution")
+    _ok("mindnet", "rebuild")
+
+    graph = t_mod.fold(events.read_all())
+    why = orc_mod.completion_gate_default(graph, TASK)
+    assert why is not None, "a task at 'execution' was allowed to complete"
 
 
 def test_orchestrate_is_on_the_frozen_subcommand_surface():
