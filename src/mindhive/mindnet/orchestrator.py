@@ -108,6 +108,11 @@ DEFAULT_MAX_WORKERS = max(2, os.cpu_count() or 2)
 # mark for a projection the operator did not type.
 STATUS_TAGS = ["mindnet", "task", "auto"]
 
+# The faculty an orchestrated wave lights up. `task-graph` rather than a new name:
+# `telemetry.FACULTIES` is the one legend and walking the graph is exactly what
+# that faculty means.
+_WAVE_FACULTY = "task-graph"
+
 
 @dataclass(frozen=True)
 class Wave:
@@ -296,8 +301,17 @@ def _child_env(project=None):
     return {optin.ENV_VAR: "1" if armed else "0"}
 
 
+def validation_script_of(task) -> str:
+    """The task's stored validation command — the payload `executor.execute` wants.
+
+    Paired with `agent.prompt_for`, which is the payload `agent.run` wants. The
+    two runners take the same POSITION but not the same content, so the pairing is
+    explicit at the call site rather than guessed from the runner."""
+    return getattr(task, "validation_script", "") or ""
+
+
 def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
-              max_workers=None, root=None):
+              max_workers=None, root=None, payload_for=None):
     """Submit *batch* concurrently; return ``(completed, blocked, skipped,
     reasons)``.
 
@@ -335,9 +349,11 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     done, failed, skipped, unknown, reasons = [], [], [], [], {}
     cap = DEFAULT_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
 
+    payload_of = payload_for or validation_script_of
+
     def one(tid):
         task = graph.get(tid)
-        script = getattr(task, "validation_script", "") or ""
+        script = payload_of(task)
         kwargs = {"env": env, "project": project}
         if root is not None:
             kwargs["root"] = root
@@ -348,9 +364,17 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
         except Exception as exc:                       # noqa: BLE001 — see above
             return tid, None, f"{type(exc).__name__}: {exc}"
 
-    with cf.ThreadPoolExecutor(
-            max_workers=max(1, min(len(batch), cap))) as pool:
-        results = list(pool.map(one, batch))
+    # The cat board exists to make parallel work visible, and an orchestrated
+    # wave IS the parallel work — but nothing here emitted the feed, so the board
+    # stayed empty during the one activity it was built for. `busy` brackets the
+    # wave (active on the way in, idle on the way out, even on an exception), so
+    # the `task-graph` cat is lit for exactly as long as the wave runs.
+    from . import telemetry as tel_mod
+    with tel_mod.busy(_WAVE_FACULTY, task_id=batch[0] if batch else None,
+                      project=project):
+        with cf.ThreadPoolExecutor(
+                max_workers=max(1, min(len(batch), cap))) as pool:
+            results = list(pool.map(one, batch))
 
     for tid, res, err in results:
         if err is not None or res is None:
@@ -385,6 +409,21 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             f"NON_EXECUTING_RESULTS must together classify every declared result "
             f"before it can be acted on")
     return sorted(done), sorted(failed), sorted(skipped), reasons
+
+
+def _refresh(project=None) -> None:
+    """Rebuild the sidecar once, and RAISE if it refused.
+
+    `rebuild` signals refusal with ``written=False`` and never raises — by design,
+    it is wired into a hook path. Discarding that answer meant a failed projection
+    refresh was silently swallowed and the next wave read a stale sidecar."""
+    from . import sidecar as sc_mod
+    out = sc_mod.rebuild(project)
+    if not out.written:
+        raise RuntimeError(
+            f"the sidecar could not be rebuilt: {out.reason} — the projection is "
+            f"now STALE, which disables phase-aware injection and the PreToolUse "
+            f"teeth until `hive mindnet rebuild` succeeds")
 
 
 def _persist(graph, completed, blocked, project=None) -> dict:
@@ -426,6 +465,12 @@ def _persist(graph, completed, blocked, project=None) -> dict:
     rows = ([(tid, t_mod.STATUS_COMPLETED) for tid in completed]
             + [(tid, t_mod.STATUS_BLOCKED) for tid in blocked])
     if not rows:
+        # No STATUS rows — but the wave still appended the cat feed's activity
+        # rows, and `_staleness` counts EVERY event. Returning here without a
+        # rebuild would leave the projection stale on a wave that settled nothing,
+        # which is the MN-6 failure exactly: MN-1 injection and MN-4's teeth go
+        # quiet until something else happens to rebuild.
+        _refresh(project)
         return graph
     unrecorded = []
     for tid, status in rows:
@@ -436,19 +481,13 @@ def _persist(graph, completed, blocked, project=None) -> dict:
                                 project=project)
         except Exception as exc:                       # noqa: BLE001 — see above
             unrecorded.append(f"{tid} ({type(exc).__name__}: {exc})")
-    out = sc_mod.rebuild(project)
+    _refresh(project)
     if unrecorded:
         raise RuntimeError(
             "these tasks RAN but their status could not be recorded: "
             + ", ".join(unrecorded)
             + " — re-running the orchestrator would execute them again; "
               "record them by hand or repair the ledger first")
-    if not out.written:
-        raise RuntimeError(
-            f"the wave's status rows landed but the sidecar could not be "
-            f"rebuilt: {out.reason} — the projection is now STALE, which "
-            f"disables phase-aware injection and the PreToolUse teeth until "
-            f"`hive mindnet rebuild` succeeds")
     return _mark(graph, completed, blocked)
 
 
@@ -456,7 +495,8 @@ def _persist(graph, completed, blocked, project=None) -> dict:
 
 def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
                 max_waves=None, project=None, apply_status=None,
-                timeout_s=None, max_workers=None, root=None) -> Orchestration:
+                timeout_s=None, max_workers=None, root=None,
+                payload_for=None) -> Orchestration:
     """Walk *graph* wave by wave until it settles, stalls, or hits the cap.
 
     ``execute=False`` (the DEFAULT) plans without starting anything. That default
@@ -521,7 +561,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
         before = {tid: getattr(t, "status", None) for tid, t in g.items()}
         done, failed, held, why = _run_wave(
             batch, g, runner, index, project=project, timeout_s=timeout_s,
-            max_workers=max_workers, root=root)
+            max_workers=max_workers, root=root, payload_for=payload_for)
         waves.append(Wave(index=index, tasks=list(batch), completed=done,
                           blocked=failed, skipped=held, reasons=dict(why)))
         completed.extend(done)

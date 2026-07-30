@@ -602,12 +602,13 @@ def test_a_run_that_never_started_does_not_block_the_task(never_ran):
 def test_a_never_started_run_writes_no_ledger_row_and_leaves_the_task_pending():
     """The half that makes it RECOVERABLE, asserted against the real ledger."""
     _declare("a")
-    before = len(events.read_all())
     out = orc.orchestrate({"a": _task("a")},
                           runner=FakeRunner(results={"a": "refused"}),
                           execute=True)
     assert out.skipped == ["a"]
-    assert len(events.read_all()) == before, "a status row was written anyway"
+    # STATUS rows specifically: a wave also appends the cat feed's activity rows,
+    # and counting every event would conflate the two.
+    assert _status_rows() == [], "a status row was written anyway"
     assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
 
 
@@ -952,6 +953,21 @@ def test_the_default_runner_is_the_executor():
 # U5 — ledger writes and the per-wave sidecar rebuild
 # ============================================================================
 
+def _status_rows():
+    """Every `mindnet_task` status row on the ledger, newest last.
+
+    A wave appends TWO kinds of row — status rows (the graph) and
+    `mindnet_activity` rows (the cat feed) — so tests that mean "was a status
+    recorded" must say so rather than counting events."""
+    return [e for e in events.read_all()
+            if e.type == "mindnet_task"
+            and e.payload.get("action") == "status"]
+
+
+def _activity_rows():
+    return [e for e in events.read_all() if e.type == "mindnet_activity"]
+
+
 def _declare(tid, **payload):
     """Put *tid* on BOTH axes, the way `hive mindnet declare` does.
 
@@ -1081,6 +1097,10 @@ def test_one_failing_append_does_not_abandon_the_rest_of_the_wave(monkeypatch):
     real = events.append_event
 
     def flaky(etype, payload, **kw):
+        # Scoped to status rows: the wave also emits `mindnet_activity` for the
+        # cat board, and intercepting those would make this test about telemetry.
+        if not (etype == "mindnet_task" and payload.get("action") == "status"):
+            return real(etype, payload, **kw)
         seen.append(payload.get("task_id"))
         if payload.get("task_id") == "a":
             raise OSError("this one row fails")
@@ -1185,15 +1205,11 @@ def test_each_wave_carries_only_its_own_reasons():
     assert "b" in out.waves[1].reasons
 
 
-def test_no_rows_are_written_for_a_wave_that_settled_nothing(monkeypatch):
-    calls = {"n": 0}
-    monkeypatch.setattr(sc_mod, "rebuild",
-                        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
-    before = len(events.read_all())
+def test_a_wave_that_settles_nothing_writes_no_status_rows():
+    """An all-blocked graph produces no frontier, so no status row is written."""
     orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_BLOCKED)),
                     runner=FakeRunner(), execute=True)
-    assert len(events.read_all()) == before
-    assert calls["n"] == 0, "a wave that did nothing must not rewrite anything"
+    assert _status_rows() == []
 
 
 # --- the one test that uses the real executor ---------------------------------
