@@ -574,15 +574,31 @@ unauthenticated or rate-limited machine blocked every task it touched.
 
 | Outcome | `executed` | Status written |
 |---|---|---|
-| clean envelope, exit 0 | yes | `completed` |
+| clean envelope, exit 0 | yes | **none** — `ran-unverified` |
 | `is_error` envelope, **any** exit code | no | none — task stays PENDING |
 | no readable envelope (any exit) | no | none |
 | exit 127 (`claude` absent) | no | none |
-| exit 124 (timeout) | yes | `blocked` — may have left partial work |
+| exit 124 (timeout) | yes | **none** — wall-clock, not a task failure |
 | clean envelope, non-zero exit | yes | `blocked` |
 
 `fail` is therefore narrow by design: the agent reported a non-error result and
 still exited non-zero. Everything unprovable fails toward recoverable.
+
+**An agent's exit 0 is not evidence.** `RESULT_STATUS["ok"] -> completed` was
+written for `executor.execute`, where exit 0 means a validation command passed.
+An implementer's exit 0 only means the model replied — and `prompt_for` explicitly
+invites the failing reply ("if you cannot complete the task, say so plainly"). So
+a clean agent run returns `ran-unverified` and writes **no status row**: the task
+stays PENDING, the transcript and any branch are reported, and
+`hive mindnet validate` is what turns the work into evidence. Before this, a task
+nobody worked on was written COMPLETED, its dependents unblocked, and the run
+reported `settled`; nothing downstream re-checks, because `can_complete` has no
+production caller and the fold is last-write-wins.
+
+Three sets therefore partition the outcomes, and a value in none of them raises:
+`RESULT_STATUS` (it ran and the outcome IS evidence), `NON_EXECUTING_RESULTS` (no
+child was created), and `UNVERIFIED_RESULTS` (it ran, the outcome is not
+evidence — `ran-unverified` and `timeout`).
 
 **Concurrency depends on isolation.** Every agent runs with `cwd=root`, so without
 isolation two agents editing one working tree corrupt each other's edits and the

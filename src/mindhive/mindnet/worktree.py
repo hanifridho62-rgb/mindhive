@@ -124,10 +124,43 @@ def add(root, task_id) -> Isolated:
         return Isolated(task_id=tid, path=str(target), branch=branch, ok=False,
                         reason=base_err or "cannot resolve HEAD to branch from")
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # `-B` rather than `-b`: a leftover branch from an earlier run whose worktree
-    # was already retired must not make every future run of this task fail. The
-    # branch is reset to the current base, which is what a fresh attempt means.
+    # A leftover branch from an earlier retired run must not make every future run
+    # of this task fail — but resetting one that HOLDS COMMITS destroys them.
+    # `-B` did exactly that: an agent commits, `retire` keeps the tree and reports
+    # it, the operator removes the directory as this function's own message tells
+    # them to, and the next run force-moved the branch back to base and made the
+    # commit unreachable. Silently, exit 0. The old docstring claimed "committed
+    # work survives whichever way this goes"; it did not.
+    #
+    # So: reset only a branch with nothing on it, and refuse otherwise.
+    has_branch, _o, _e = _git(root, "rev-parse", "--verify", "--quiet", branch)
+    if has_branch:
+        _ok2, count, _e2 = _git(root, "rev-list", "--count", f"HEAD..{branch}")
+        try:
+            unmerged = int((count or "0").strip() or 0)
+        except ValueError:
+            unmerged = 1                    # unknown reads as "there is work"
+        if unmerged:
+            return Isolated(
+                task_id=tid, path=str(target), branch=branch, base=base,
+                ok=False,
+                reason=(f"branch {branch} already holds {unmerged} commit(s) "
+                        f"that {'HEAD'} does not. Resetting it would make them "
+                        f"unreachable — merge or rename it first "
+                        f"(`git log {branch}`), then re-run"))
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # `exist_ok=True` still raises when the path exists as a FILE, and a
+        # read-only or ACL-blocked parent raises too. This module's contract is
+        # "answers a value, never raises" — and a raise here escapes `one()`'s
+        # try in the orchestrator and takes down the whole wave.
+        return Isolated(task_id=tid, path=str(target), branch=branch, base=base,
+                        ok=False,
+                        reason=f"cannot create {target.parent}: "
+                               f"{type(exc).__name__}: {exc}")
+
     ok, _out, err = _git(root, "worktree", "add", "-B", branch, str(target))
     if not ok:
         return Isolated(task_id=tid, path=str(target), branch=branch, base=base,
@@ -139,8 +172,12 @@ def add(root, task_id) -> Isolated:
 def state(path, base="") -> tuple:
     """``(dirty, ahead)`` for the worktree at *path*.
 
-    ``dirty`` counts untracked files too — an agent that created a file and did not
-    commit it has produced work, and `--porcelain` lists it.
+    ``dirty`` counts untracked AND IGNORED files. Untracked because an agent that
+    created a file without committing it has produced work; ignored because plain
+    `--porcelain` omits those, so output written under `dist/`, `build/`,
+    `.pytest_cache/` or any other ignored path read as "clean" and was deleted by
+    `remove --force`. A task like "build the desktop artifact" lands entirely in
+    ignored paths.
 
     ``ahead`` is commits on this worktree that *base* does not have, and it
     REQUIRES *base* — `add` captures it for exactly this call. The first version
@@ -151,7 +188,7 @@ def state(path, base="") -> tuple:
 
     Answers ``(True, 0)`` when it cannot tell at all. Unknown must read as "there
     may be work here", because the only consumer is the decision to delete."""
-    ok, out, _err = _git(path, "status", "--porcelain")
+    ok, out, _err = _git(path, "status", "--porcelain", "--ignored=matching")
     if not ok:
         return True, 0
     dirty = bool(out.strip())
@@ -169,9 +206,15 @@ def state(path, base="") -> tuple:
 def retire(root, path, branch="", base="") -> Retired:
     """Remove the worktree at *path* — but only if nothing would be lost.
 
-    The branch is never deleted. Committed work therefore survives whichever way
-    this goes, and the only thing a removal could destroy is uncommitted changes,
-    which is precisely the case that is refused."""
+    The branch is never deleted here, and `add` refuses to reset a branch that
+    holds commits — those two together are what make committed work survive. The
+    first version of this docstring claimed the removal alone was enough; it was
+    not, because `add`'s `-B` then force-moved the branch back to base and made
+    those commits unreachable.
+
+    Ignored files count as work. `git status --porcelain` omits them, so a plain
+    `--porcelain` read called an agent's output under `dist/`, `build/` or any
+    other ignored path "clean" and `remove --force` erased it."""
     target = Path(path)
     if not target.exists():
         return Retired(removed=False, kept=False,

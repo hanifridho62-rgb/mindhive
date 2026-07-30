@@ -563,7 +563,7 @@ def test_one_failed_arm_does_not_abort_the_healthy_arm():
     assert out.outcome == orc.OUTCOME_STALLED
 
 
-@pytest.mark.parametrize("bad", ["fail", "timeout"])
+@pytest.mark.parametrize("bad", ["fail"])
 def test_a_run_that_executed_and_failed_blocks_the_task(bad):
     """Only results where a child ACTUALLY RAN may block. Enumerated rather than
     treated as "not ok", so a result value added later fails loudly instead of
@@ -625,15 +625,39 @@ def test_a_skipped_task_does_not_kill_its_dependents():
     assert orc.frontier(fixed) == ["b"], "the dependent is permanently dead"
 
 
-def test_the_two_result_sets_partition_every_declared_run_result():
-    """Stronger than the old single-set check: every `RUN_RESULTS` value must be
-    classified as either "it ran" or "it never started", and no value may be in
-    both. If `RUN_RESULTS` grows, this fails and the new value gets a deliberate
-    home rather than defaulting into the blocking path."""
-    ran, never = set(orc.RESULT_STATUS), set(orc.NON_EXECUTING_RESULTS)
-    assert ran | never == set(x_mod.RUN_RESULTS), (
-        f"unclassified run results: {set(x_mod.RUN_RESULTS) - ran - never}")
-    assert not (ran & never), f"classified both ways: {ran & never}"
+def test_the_three_result_sets_partition_every_declared_run_result():
+    """Every `RUN_RESULTS` value must land in exactly one of three homes, so a new
+    value fails loudly instead of defaulting into the blocking path:
+
+      RESULT_STATUS         it ran, and the outcome IS evidence -> status row
+      NON_EXECUTING_RESULTS no child was ever created           -> no row
+      UNVERIFIED_RESULTS    it ran, the outcome is NOT evidence -> no row
+
+    The third set is new. It exists because two results were writing rows they had
+    not earned: an agent's exit-0 reply was marking tasks COMPLETED, and a
+    wall-clock timeout was marking them BLOCKED and deleting their subtrees."""
+    homes = [set(orc.RESULT_STATUS), set(orc.NON_EXECUTING_RESULTS),
+             set(orc.UNVERIFIED_RESULTS)]
+    declared = set(x_mod.RUN_RESULTS)
+    covered = set().union(*homes)
+    assert declared <= covered, f"unclassified run results: {declared - covered}"
+    for i, one in enumerate(homes):
+        for other in homes[i + 1:]:
+            assert not (one & other), f"classified two ways: {one & other}"
+
+
+def test_a_timeout_writes_no_status_row_and_leaves_the_task_pending():
+    """The regression. `timeout` used to map to BLOCKED, and `tasks.ready` removes
+    a blocked task's whole subtree from every future frontier permanently — so one
+    slow agent run poisoned the graph."""
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")},
+                          runner=FakeRunner(results={"a": "timeout"}),
+                          execute=True)
+    assert out.blocked == [], "a wall-clock timeout blocked the task"
+    assert out.skipped == ["a"]
+    assert _status_rows() == []
+    assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
 
 
 def test_the_non_executing_set_matches_the_executors_own_executed_flag():
@@ -1434,3 +1458,68 @@ def test_the_module_does_not_read_the_ledger_to_answer_the_frontier():
         assert orc.frontier(_linear()) == ["a"]
     finally:
         events.read_all = real
+
+
+def test_an_agent_that_declines_the_task_is_not_marked_completed():
+    """THE second P0, end to end through the loop.
+
+    `prompt_for` invites the failing reply, that reply is exit 0 with a clean
+    envelope, and `RESULT_STATUS["ok"] -> COMPLETED` then wrote a permanent
+    COMPLETED row for work nobody did — unblocking dependents and reporting
+    `settled`. `can_complete` has no production caller, and `fold` is
+    last-write-wins, so nothing downstream would ever have caught it."""
+    from mindhive.mindnet import agent as ag_mod
+    _declare("a")
+    _declare("b", dependencies=["a"])
+
+    def declining_agent(run_key, payload, **kw):
+        return x_mod.RunResult(result=ag_mod.RESULT_RAN_UNVERIFIED,
+                               executed=True, exit_code=0,
+                               reason="I could not do this")
+
+    graph = _graph(_task("a"), _task("b", deps=("a",)))
+    out = orc.orchestrate(graph, runner=declining_agent, execute=True,
+                          root=".")
+
+    assert out.completed == [], "an agent's say-so marked the task COMPLETED"
+    assert out.skipped == ["a"]
+    assert _status_rows() == []
+    assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
+    assert out.outcome == orc.OUTCOME_STALLED, (
+        "the run reported success for work nobody did")
+
+
+def test_an_isolation_failure_that_RAISES_does_not_abort_the_wave(gitrepo,
+                                                                 monkeypatch):
+    """The existing test makes `add` RETURN ok=False. This makes it RAISE, which is
+    the case that escaped `one()`'s try, re-raised out of `pool.map`, and discarded
+    the results of every sibling agent that had already run — so re-running
+    duplicated real agent work."""
+    from mindhive.mindnet import worktree as wt_mod
+    real = wt_mod.add
+
+    def exploding(root, tid):
+        if tid == "b":
+            raise OSError("the parent path is a file")
+        return real(root, tid)
+
+    monkeypatch.setattr(wt_mod, "add", exploding)
+    out = orc.orchestrate(_graph(_task("b"), _task("c")), runner=FakeRunner(),
+                          execute=True, root=gitrepo, isolate=True)
+
+    assert out.skipped == ["b"]
+    assert out.completed == ["c"], "the sibling agent's result was discarded"
+    assert "OSError" in out.reasons["b"]
+
+
+def test_a_raising_retire_does_not_replace_the_agents_result(gitrepo,
+                                                            monkeypatch):
+    """A raise inside a `finally` REPLACES the value the runner already produced,
+    so a cleanup error would be reported instead of the agent's real outcome."""
+    from mindhive.mindnet import worktree as wt_mod
+    monkeypatch.setattr(wt_mod, "retire",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("locked")))
+    out = orc.orchestrate(_graph(_task("b")), runner=FakeRunner(), execute=True,
+                          root=gitrepo, isolate=True)
+    assert out.completed == ["b"], "the cleanup error replaced the agent's result"
+    assert "locked" in str(out.kept.get("b", "")) or out.kept

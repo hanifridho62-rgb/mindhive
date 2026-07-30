@@ -317,3 +317,77 @@ def test_state_without_a_base_cannot_report_ahead(repo):
     _git(p, "commit", "-qm", "work")
     assert wt.state(p, got.base)[1] >= 1, "canary: with the base it IS ahead"
     assert wt.state(p)[1] == 0
+
+
+# --- the P0 a reviewer verified live in a throwaway repo ----------------------
+
+def test_add_refuses_to_reset_a_branch_that_holds_commits(repo):
+    """THE P0. `-B` force-moves the branch, and the sequence is entirely ordinary:
+
+      1. an agent commits inside its isolated worktree
+      2. `retire` keeps the tree (ahead=1) and reports it
+      3. the operator removes the DIRECTORY, exactly as `add`'s own refusal
+         message instructs (`git worktree remove --force <target>`)
+      4. the next run does `worktree add -B mn9/t1` -> the branch is reset to base
+         and the commit becomes unreachable. Exit 0, no warning.
+
+    So committed agent work was destroyed by a normal retry. The old docstring
+    claimed "committed work survives whichever way this goes"; it did not, and the
+    only `-B` test reset a branch with ZERO commits on it — the same
+    "assert a shape production does not emit" pattern as MN-4/7/8."""
+    first = wt.add(repo, "t1")
+    p = Path(first.path)
+    (p / "agent.txt").write_text("hours of work\n", encoding="utf-8")
+    _git(p, "add", "agent.txt")
+    _git(p, "commit", "-qm", "agent work")
+    sha = _git(p, "rev-parse", "HEAD").stdout.strip()
+
+    # The operator follows the documented remedy: remove the directory.
+    _git(repo, "worktree", "remove", "--force", str(p))
+
+    again = wt.add(repo, "t1")
+    assert not again.ok, "the branch was reset and the commit destroyed"
+    assert "commit" in again.reason
+    contains = _git(repo, "branch", "--contains", sha, check=False).stdout
+    assert "mn9/t1" in contains, f"commit {sha[:7]} is no longer reachable"
+
+
+def test_add_still_resets_a_branch_with_nothing_on_it(repo):
+    """The canary: the leftover-branch case the `-B` reset exists for must keep
+    working, or every task becomes single-use."""
+    first = wt.add(repo, "t1")
+    assert wt.retire(repo, first.path, first.branch, first.base).removed
+    assert "mn9/t1" in _branches(repo)
+    again = wt.add(repo, "t1")
+    assert again.ok, again.reason
+
+
+def test_retire_keeps_a_worktree_whose_only_output_is_gitignored(repo):
+    """`git status --porcelain` omits ignored paths, so an agent's output under
+    `dist/`, `build/` or `.pytest_cache/` read as clean and `remove --force` erased
+    it. A task like "build the desktop artifact" lands entirely in ignored paths."""
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore dist")
+
+    got = wt.add(repo, "t1")
+    out_dir = Path(got.path) / "dist"
+    out_dir.mkdir()
+    (out_dir / "artifact.bin").write_text("the build output", encoding="utf-8")
+
+    res = wt.retire(repo, got.path, got.branch, got.base)
+    assert res.kept is True, "gitignored agent output was deleted"
+    assert (out_dir / "artifact.bin").exists()
+
+
+def test_add_does_not_raise_when_the_worktree_parent_is_a_file(repo):
+    """`mkdir(exist_ok=True)` still raises when the path exists as a FILE, and that
+    raise escaped `one()`'s try in the orchestrator — taking down the whole wave and
+    discarding the results of agents that had already run."""
+    parent = repo.joinpath(*wt.WORKTREE_DIR)
+    parent.parent.mkdir(parents=True, exist_ok=True)
+    parent.write_text("not a directory", encoding="utf-8")
+
+    got = wt.add(repo, "t1")
+    assert got.ok is False
+    assert got.reason

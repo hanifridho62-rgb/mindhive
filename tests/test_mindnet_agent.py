@@ -135,12 +135,22 @@ def test_the_prompt_is_not_built_from_a_none_task():
 
 # --- the outcome mapping -----------------------------------------------------
 
-def test_a_clean_run_is_ok_and_counts_as_executed(monkeypatch):
-    _spawn(monkeypatch, 0, _envelope("did the work"))
+def test_a_clean_run_is_ran_unverified_not_completed(monkeypatch):
+    """Exit 0 means THE MODEL REPLIED, not that the task is done.
+
+    `RESULT_STATUS["ok"] -> COMPLETED` was written for `executor.execute`, where
+    exit 0 is a validation command passing — real evidence. Routing an implementer
+    through it made an agent's say-so enough to mark a task COMPLETED, and
+    `prompt_for` explicitly invites the failing reply ("if you cannot complete the
+    task, say so plainly"). That reply is exit 0 with a clean envelope, so a task
+    nobody worked on was written COMPLETED, its dependents unblocked, and the run
+    reported `settled`."""
+    _spawn(monkeypatch, 0, _envelope("I could not do this — the API is undocumented"))
     run = ag.run("k1", "do it")
-    assert run.result == "ok"
-    assert run.executed is True
-    assert orc.RESULT_STATUS[run.result] == t_mod.STATUS_COMPLETED
+    assert run.result == ag.RESULT_RAN_UNVERIFIED
+    assert run.executed is True, "the agent did run; the transcript is real"
+    assert run.result not in orc.RESULT_STATUS, "an agent's reply is not evidence"
+    assert run.result in orc.UNVERIFIED_RESULTS
 
 
 def test_a_usage_limit_does_not_block_the_task(monkeypatch):
@@ -230,14 +240,20 @@ def test_a_missing_cli_is_never_run_not_a_failure(monkeypatch):
     assert "not installed" in run.reason
 
 
-def test_a_timeout_DID_run_and_blocks(monkeypatch):
-    """The one non-zero case that must block: the agent was working and was
-    killed, so the tree may hold partial work an operator has to look at."""
+def test_a_timeout_ran_but_does_not_block(monkeypatch):
+    """It DID run, so the transcript and any branch are real — but being killed on
+    wall-clock is an environmental condition (a slow model call, a sleeping laptop,
+    a task that needed 40 minutes), and `blocked` deletes the task's whole subtree
+    from every future frontier permanently.
+
+    The isolation path already preserves the evidence: a timed-out tree is dirty,
+    so `retire` keeps it and reports the path."""
     _spawn(monkeypatch, 124, "")
     run = ag.run("k5", "do it", timeout_s=42)
     assert run.result == "timeout"
     assert run.executed is True
-    assert orc.RESULT_STATUS[run.result] == t_mod.STATUS_BLOCKED
+    assert run.result in orc.UNVERIFIED_RESULTS
+    assert run.result not in orc.RESULT_STATUS
     assert "42" in run.reason
 
 
@@ -281,7 +297,8 @@ def test_every_result_this_module_emits_is_classified_by_the_orchestrator(
         monkeypatch):
     """The two modules must agree, or a run comes back with a verdict the loop
     cannot act on."""
-    known = set(orc.RESULT_STATUS) | set(orc.NON_EXECUTING_RESULTS)
+    known = (set(orc.RESULT_STATUS) | set(orc.NON_EXECUTING_RESULTS)
+             | set(orc.UNVERIFIED_RESULTS))
     for code, out in ((0, _envelope()), (0, _envelope(is_error=True, status=429)),
                       (0, "junk"), (127, ""), (124, ""), (3, "")):
         _spawn(monkeypatch, code, out)
@@ -319,7 +336,8 @@ def test_an_unwritable_artifact_does_not_take_the_run_down(monkeypatch):
 
     monkeypatch.setattr(runlog, "write_once", boom)
     run = ag.run("k10", "do it")
-    assert run.result == "ok", "a lost log must not change the verdict"
+    assert run.result == ag.RESULT_RAN_UNVERIFIED, (
+        "a lost log must not change the verdict")
     assert run.artifact is None
 
 

@@ -58,7 +58,6 @@ from . import tasks as t_mod
 RESULT_STATUS = {
     "ok": t_mod.STATUS_COMPLETED,
     "fail": t_mod.STATUS_BLOCKED,
-    "timeout": t_mod.STATUS_BLOCKED,
 }
 
 # Results where NO CHILD PROCESS WAS EVER CREATED. These must never produce a
@@ -80,6 +79,23 @@ RESULT_STATUS = {
 # ("``executed`` is the SECURITY property and is deliberately not derivable from
 # ``result``"), so it is the honest axis for "did anything actually happen".
 NON_EXECUTING_RESULTS = frozenset({"refused", "spawn-failed"})
+
+# Results that write NO STATUS ROW even though a child DID run. Distinct from
+# `NON_EXECUTING_RESULTS`: there the run never happened, here it happened and its
+# outcome is not evidence of anything.
+#
+# `agent.RESULT_RAN_UNVERIFIED` — an agent replied. `RESULT_STATUS["ok"] ->
+# COMPLETED` was written for a validation command, where exit 0 means a check
+# passed; an implementer's exit 0 only means the model answered, and `prompt_for`
+# explicitly invites the failing reply. Marking that COMPLETED unblocked
+# dependents and reported `settled` for work nobody did.
+#
+# `timeout` — the agent was killed on wall-clock. That is an environmental
+# condition (a slow model call, a sleeping laptop, a task that needed 40 minutes),
+# and `blocked` would delete the task's whole subtree from every future frontier
+# permanently. The isolation path already preserves the evidence: a timed-out tree
+# is dirty, so `retire` keeps it and reports the path.
+UNVERIFIED_RESULTS = frozenset({"ran-unverified", "timeout"})
 
 OUTCOME_SETTLED = "settled"      # nothing left to do
 OUTCOME_STALLED = "stalled"      # work remains but nothing can advance
@@ -368,7 +384,16 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
 
         if isolate:
             from . import worktree as wt_mod
-            iso = wt_mod.add(root, tid)
+            try:
+                iso = wt_mod.add(root, tid)
+            except Exception as exc:                   # noqa: BLE001
+                # `worktree.add` promises to answer a value, but this sits OUTSIDE
+                # the try below, so a raise here escapes `one()`, re-raises out of
+                # `pool.map`, and discards the results of every sibling agent that
+                # already ran — re-running then duplicates real agent work.
+                iso = wt_mod.Isolated(
+                    task_id=tid, ok=False,
+                    reason=f"isolation raised {type(exc).__name__}: {exc}")
             isolated[tid] = iso
             if not iso.ok:
                 # An environmental failure, so it must NOT write a status row.
@@ -399,10 +424,19 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                 # and blocks the next attempt for that task. `retire` refuses to
                 # delete anything holding work, so this is safe to run
                 # unconditionally.
-                from . import worktree as wt_mod2
-                kept = wt_mod2.retire(root, iso.path, iso.branch, iso.base)
-                if kept.kept:
-                    isolated[tid] = replace(iso, reason=kept.reason)
+                #
+                # Guarded, because a raise in a `finally` REPLACES the result the
+                # runner already produced — the agent's real outcome would be lost
+                # and reported as a cleanup error.
+                try:
+                    from . import worktree as wt_mod2
+                    kept = wt_mod2.retire(root, iso.path, iso.branch, iso.base)
+                    if kept.kept:
+                        isolated[tid] = replace(iso, reason=kept.reason)
+                except Exception as exc:               # noqa: BLE001
+                    isolated[tid] = replace(
+                        iso, reason=f"kept {iso.path}: cleanup raised "
+                                    f"{type(exc).__name__}: {exc}")
 
     # The cat board exists to make parallel work visible, and an orchestrated
     # wave IS the parallel work — but nothing here emitted the feed, so the board
@@ -429,11 +463,18 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                 p for p in (detail, f"log: {artifact}" if artifact else "") if p)
         # Unknown FIRST, so the mapping-completeness guarantee holds regardless of
         # whether the run executed.
-        if value not in RESULT_STATUS and value not in NON_EXECUTING_RESULTS:
+        if (value not in RESULT_STATUS and value not in NON_EXECUTING_RESULTS
+                and value not in UNVERIFIED_RESULTS):
             unknown.append((tid, value))
             continue
         if not _ran(res):
             # Nothing ran. Leave the task PENDING — a status row here is the P0.
+            skipped.append(tid)
+            continue
+        if value in UNVERIFIED_RESULTS:
+            # It ran, and its outcome is not evidence of anything. No status row:
+            # an agent's say-so must not mark a task COMPLETED, and a wall-clock
+            # timeout must not mark it BLOCKED and delete its whole subtree.
             skipped.append(tid)
             continue
         if RESULT_STATUS[value] == t_mod.STATUS_COMPLETED:

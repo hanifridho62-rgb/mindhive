@@ -62,6 +62,14 @@ MAX_SAFE_WORKERS = 1
 _EXIT_NOT_FOUND = 127
 _EXIT_TIMEOUT = 124
 
+# The agent ran and replied, and nothing has verified the outcome. Deliberately
+# NOT in `executor.RUN_RESULTS`: that tuple is the validation executor's closed
+# vocabulary, and an implementer's "I replied" is a different kind of answer from
+# a validator's "the check passed". The orchestrator classifies it as writing no
+# status row — see `agent.run`'s closing comment for the false-COMPLETED bug this
+# exists to prevent.
+RESULT_RAN_UNVERIFIED = "ran-unverified"
+
 
 def prompt_for(task, phase=None) -> str:
     """The instruction a spawned agent receives for *task*.
@@ -215,4 +223,24 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
                       "whether it did anything cannot be established", False)
     if code != 0:
         return result("fail", f"the agent exited {code}", True)
-    return result("ok", "", True)
+
+    # Exit 0 means THE MODEL REPLIED. It does not mean the task is done.
+    #
+    # `RESULT_STATUS["ok"] -> STATUS_COMPLETED` was written for
+    # `executor.execute`, where exit 0 is a VALIDATION COMMAND passing — real
+    # evidence. Routing an implementer through the same mapping made an agent's
+    # say-so sufficient to mark a task COMPLETED, and `prompt_for` explicitly
+    # invites the failing reply ("If you cannot complete the task, say so
+    # plainly"). That reply is exit 0 with a clean envelope, so a task nobody
+    # worked on was written COMPLETED, its dependents unblocked, and the run
+    # reported `settled`. Nothing downstream re-checks: `can_complete` has no
+    # production caller and `fold` is last-write-wins.
+    #
+    # `ran-unverified` is therefore its own result: the agent ran (so this is not
+    # `refused` — the transcript and any branch are real and worth looking at) but
+    # nothing has verified the outcome, so the orchestrator writes no status row.
+    # `hive mindnet validate` is what turns it into evidence.
+    return result(RESULT_RAN_UNVERIFIED,
+                  "the agent ran and replied, but nothing has verified that the "
+                  "task is actually done — inspect the transcript or run "
+                  "`hive mindnet validate`", True)
