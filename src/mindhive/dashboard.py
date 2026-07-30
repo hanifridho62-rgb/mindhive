@@ -624,7 +624,8 @@ def make_handler(token: str):
             # second copy of 180/21600 in JavaScript (invariant 10).
             return self._json({"cats": list(cats),
                                "dim_after_secs": cats_mod.DIM_AFTER_SECS,
-                               "hide_after_secs": cats_mod.HIDE_AFTER_SECS})
+                               "hide_after_secs": cats_mod.HIDE_AFTER_SECS,
+                               "idle_vanish_secs": cats_mod.IDLE_VANISH_SECS})
 
         def _get_skills_stats(self, proj, am, qs):
             # per-skill completion-rate telemetry aggregated from the ledger

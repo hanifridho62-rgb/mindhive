@@ -5,23 +5,34 @@
 filters that to the ones that said `active`. Neither knows WHEN anything was
 said, and when is the entire feature.
 
-## The board is a hang detector, not decoration
+## Two questions, two axes
 
-The user asked for the cats to find silent hangs in parallel work: a faculty
-that went active four hours ago and has said nothing since means something is
-stuck. Under `awake` that faculty is indistinguishable from one that started a
-second ago — the exact case the board exists to make visible. So this module
-classifies by AGE:
+The board answers two different things, and an earlier version of this module
+collapsed them into one:
 
-- under `DIM_AFTER_SECS` (180 s)   -> `active`
-- 180 s up to `HIDE_AFTER_SECS`    -> `dim`, still on screen. This band IS the
-                                      hang: dim-but-present is the signal.
-- at or past 6 h                   -> absent from the payload entirely.
+**"Is it running?"** is the STATUS axis. The user's ask was explicit — *"ketika
+tidak sedang berjalan maka kucing akan menghilang"* — a cat for work that is not
+running should go away. A faculty that reported `idle` has told us it finished.
 
-Age, not status, is the axis. A faculty that reported `idle` thirty seconds ago
-still renders, because "finished just now" and "hung just now" are both things
-the operator wants to see; the raw ``status`` rides along so the UI can tell
-them apart.
+**"Is it stuck?"** is the AGE axis. A faculty that went `active` four hours ago
+and has said nothing since is hung, and hiding it would delete the only signal
+that says so.
+
+Classifying by age ALONE (the previous rule) satisfied the second and broke the
+first: a faculty that finished thirty seconds ago stayed on screen, green, for
+three minutes and then dim for six hours. So:
+
+- `idle`, older than `IDLE_VANISH_SECS` (15 s) -> gone. It finished.
+- `active`, under `DIM_AFTER_SECS` (180 s)     -> `active`.
+- `active`, 180 s up to `HIDE_AFTER_SECS`      -> `dim`, still on screen. This
+                                                  band IS the hang signal.
+- anything at or past 6 h                      -> gone.
+
+The 15-second grace exists because `telemetry.busy` writes an `active` row and
+an `idle` row around EVERY mutation, so a burst of commands would otherwise
+flicker the cat in and out on a 1.2 s poll. It is the one number here chosen by
+this module rather than specified: raise it for a longer afterglow, set it to 0
+for a cat that vanishes the instant its work stops.
 
 ## Pure, with `now` injected
 
@@ -42,13 +53,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from .telemetry import FACULTIES
+from .telemetry import FACULTIES, STATUS_IDLE
 
 # The directive's two numbers. One home each: the UI reads them from here rather
 # than respelling them in JavaScript, so the badge and the payload can never
 # disagree about what "idle" means.
 DIM_AFTER_SECS = 180
 HIDE_AFTER_SECS = 6 * 3600
+
+# How long a FINISHED faculty lingers before its cat disappears. See the module
+# docstring: this is a flicker guard, not a feature, because `telemetry.busy`
+# brackets every mutation with an active row and an idle row.
+IDLE_VANISH_SECS = 15
 
 DISPLAY_ACTIVE = "active"
 DISPLAY_DIM = "dim"
@@ -98,12 +114,20 @@ def age_secs(ts, now):
     return max(0.0, (b - a).total_seconds())
 
 
-def classify(age):
+def classify(age, status=None):
     """``active``/``dim``, or ``None`` when the faculty should not render.
+
+    *status* is the faculty's last reported state. A faculty that said `idle` has
+    finished, so its cat disappears once the flicker grace has passed — that is
+    the user's ask, and it is why this takes status at all. `status=None` (the
+    default) keeps the pure age behaviour, which is what an unknown or malformed
+    row gets.
 
     ``None`` for an unparseable age is the deliberate branch — see the module
     docstring on why an unreadable timestamp hides rather than shows."""
     if age is None or age >= HIDE_AFTER_SECS:
+        return None
+    if status == STATUS_IDLE and age >= IDLE_VANISH_SECS:
         return None
     return DISPLAY_DIM if age >= DIM_AFTER_SECS else DISPLAY_ACTIVE
 
@@ -129,7 +153,8 @@ def board(state, now, skills=None) -> tuple:
         if act is None:
             continue
         age = age_secs(getattr(act, "ts", None), now)
-        display = classify(age)
+        status = str(getattr(act, "status", "") or "")
+        display = classify(age, status)
         if display is None:
             continue
         rows.append({
