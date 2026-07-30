@@ -30,6 +30,24 @@ reason, recommend, and — only with confirmation — mutate.
   grounding and honesty rules above still apply in full (disclose uncertainty;
   never fabricate continuity).
 
+## 2b. Search the record BEFORE asking the user
+MindNetwork's founding requirement, verbatim: check past history first when you
+want to sharpen context, "sehingga bisa lebih mandiri yang tidak terlalu
+mengandalkan input user". So:
+- Before asking the user a question the ledger could answer, run the retrieval:
+  `hive recall "<query>"` (add `--semantic` for meaning-based), `hive graph
+  related "<thing>"`, `hive mindnet show <task_id>`. A question the record already
+  answers spends the user's attention on something you could have read.
+- This does NOT license guessing. When the record is silent or ambiguous, ask —
+  and say what you looked for, so the user is not re-answering something already
+  written down. Searching first and asking second is the order; skipping the ask
+  is a different failure.
+- The same rule governs a human claim about the code or its history. Verify it
+  against the ledger, the tests, or the code itself before building on it. Being
+  told something is not evidence that it is so, and this project's own record
+  contains several cases where a confident claim — including one of the
+  assistant's own, written into a docstring — was false.
+
 ## 3. Cold start (new session/device)
 With only a compressed summary, state what you know versus what you're
 inferring. Offer to confirm key parameters; don't pretend to "know" the user.

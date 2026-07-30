@@ -437,6 +437,42 @@ length. Dim cats get `filter:grayscale(100%)` — the pre-MN-7 sprite was a
 `currentColor` silhouette, so the dim text colour greyed it for free; a coloured
 cat needs the filter or the 180-second band stops being visible at a glance.
 
+**Where the board renders (MN-13).** The ask was a cat on every running section, so
+an operator can see "apa saja yang menyala dan apa saja yang tidak menyala". It first
+shipped on the MindSwarm page alone — a page nobody keeps open — so the signal was
+absent from the dashboard the operator actually watches. It now renders on both, from
+**one** implementation in `cat_board.py`: `CSS`, `HTML` and `script()` are
+interpolated into each page's template. Pasting the strip into the second page would
+have created a second copy of the palettes, sprites and labels — invariant 10's exact
+failure mode, and an invisible one, since a drifted page shows a plausible board that
+merely disagrees with the other.
+
+Two things stay out of `cat_board` on purpose:
+
+- **The container's box.** The swarm page wants a full-width band under its header;
+  the dashboard wants an inline cluster at its header's trailing edge. Only the cat
+  and panel rules are page-independent, so a page declaring `#mn-cats` itself is
+  correct — a shared rule plus two per-page overrides is the same duplication.
+- **When a cat renders.** `ui_cats.board` decides every band server-side and ships
+  the thresholds in the payload, so the fragment cannot disagree with the tests that
+  pin them.
+
+The dashboard drives the board from its **own** interval, not from `refreshLive`:
+that timer returns early when no section has registered a live renderer, when the
+visible section is not refreshable, and while a manual operation runs — precisely the
+moments the board exists to report on. It calls `apiGet`, so the picker's project
+scopes it like every other read. The caption sits **above the head** (the original
+ask: "kucing yang diatas kepala nya bertulisan Skill and plugin") via
+`flex-direction:column-reverse`, which puts the sprite below the text while leaving
+the caption first in the DOM for a screen reader.
+
+The metadata panel clamps into the viewport, measured after it is shown — a
+`display:none` element reads zero wide, so clamping a hidden panel does nothing. This
+was a live regression, not a hypothetical: left-aligning to the cat is harmless on
+the swarm page, but the dashboard's strip sits at the right edge, so the last cats in
+the legend opened their panel off screen and their task id — the thing you click for
+— could not be read.
+
 ### 4.6 The MN-7 orchestrator: waves over the graph
 
 `hive mindnet orchestrate` walks the MN-2 graph in **waves**. One wave = the

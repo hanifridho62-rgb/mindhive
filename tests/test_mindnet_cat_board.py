@@ -246,13 +246,19 @@ def _palettes(page) -> list:
 
     The triple, not the body colour alone: `white` and `calico` deliberately
     share a body and differ by patch, so a body-only comparison would call two
-    genuinely distinct cats duplicates."""
-    import re
-    block = page[page.index("CAT_PALETTES"):]
-    block = block[:block.index("];") + 1]
-    return re.findall(
-        r"b:'(#[0-9a-fA-F]{3,6})',\s*p:'(#[0-9a-fA-F]{3,6})',\s*"
-        r"e:'(#[0-9a-fA-F]{3,6})'", block)
+    genuinely distinct cats duplicates.
+
+    Parsed as JSON rather than scraped with a regex: the table is now serialized
+    from `cat_board.CAT_PALETTES`, so `json.loads` reads exactly what the browser
+    will and a colour-format change cannot make this helper silently return [].
+    An earlier regex version did exactly that — it matched the hand-written
+    ``b:'#fff'`` form, and when the same table started arriving JSON-quoted it
+    reported zero palettes for a page that carried all seven."""
+    marker = "const CAT_PALETTES = "
+    block = page[page.index(marker) + len(marker):]
+    table = json.loads(block[:block.index(";")])
+    assert table, "the palette table parsed as empty — the helper is broken"
+    return [(p["b"], p["p"], p["e"]) for p in table]
 
 
 def test_the_page_carries_at_least_one_palette_per_faculty():

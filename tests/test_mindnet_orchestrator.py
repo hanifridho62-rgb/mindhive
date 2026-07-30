@@ -1657,3 +1657,67 @@ def test_a_missing_sidecar_refuses_rather_than_allowing(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     why = _REAL_GATE(_graph(_task("a")), "a")
     assert why is not None
+
+
+# ============================================================================
+# MN-12 — the usage brake ("jika usage memungkinkan")
+# ============================================================================
+
+def _usage_runner(*starved):
+    """A runner whose named tasks fail for an ACCOUNT reason, not a task reason."""
+    from mindhive.mindnet import agent as ag_mod
+
+    def fake(run_key, payload, **kw):
+        tid = str(run_key).split("-", 2)[-1]
+        if tid in starved:
+            return x_mod.RunResult(
+                result="refused", executed=False, exit_code=0,
+                reason=f"{ag_mod.USAGE_MARK} the agent could not run: 429: "
+                       f"You have hit your weekly limit")
+        return _run_result("ok")
+
+    return fake
+
+
+def test_a_usage_limit_halts_the_run_instead_of_burning_the_whole_frontier():
+    """The founding prompt asked for parallelism only "jika usage memungkinkan".
+    There is no way to ask before spawning, so this is the retrospective half:
+    eight tasks against an exhausted weekly limit produce eight identical failures,
+    and unlike a task failure, running more of them now changes nothing."""
+    graph = _graph(_task("a"), _task("b", deps=("a",)), _task("c", deps=("b",)))
+    out = orc.orchestrate(graph, runner=_usage_runner("a"), execute=True,
+                          root=".")
+    assert out.outcome == orc.OUTCOME_USAGE
+    assert len(out.waves) == 1, "the loop kept planning waves against a dead quota"
+
+
+def test_the_brake_keeps_whatever_already_ran_in_that_wave():
+    """Braking must not discard work: the tasks that DID succeed keep their rows."""
+    graph = _graph(_task("a"), _task("b"), _task("c"))
+    out = orc.orchestrate(graph, runner=_usage_runner("c"), execute=True,
+                          root=".", max_workers=3)
+    assert out.outcome == orc.OUTCOME_USAGE
+    assert set(out.completed) >= {"a", "b"}, (
+        f"the brake threw away completed work: {out}")
+
+
+def test_an_ordinary_task_failure_does_NOT_halt_the_run():
+    """The canary. A task failing is normal and the loop must carry on; only an
+    account condition is terminal."""
+    graph = _graph(_task("a"), _task("b"))
+    out = orc.orchestrate(graph, runner=FakeRunner(results={"a": "fail"}),
+                          execute=True, root=".")
+    assert out.outcome != orc.OUTCOME_USAGE
+    assert "b" in out.completed
+
+
+def test_the_usage_marker_is_read_off_the_reason_not_a_second_channel():
+    """One place carries the CLI's own words. A second channel would be a second
+    thing to keep in sync."""
+    from mindhive.mindnet import agent as ag_mod
+    starved = x_mod.RunResult(result="refused", executed=False,
+                              reason=f"{ag_mod.USAGE_MARK} 429: weekly limit")
+    normal = x_mod.RunResult(result="refused", executed=False,
+                             reason="no validation script to run")
+    assert ag_mod.is_usage_limit(starved) is True
+    assert ag_mod.is_usage_limit(normal) is False

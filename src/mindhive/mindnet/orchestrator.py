@@ -101,7 +101,15 @@ OUTCOME_SETTLED = "settled"      # nothing left to do
 OUTCOME_STALLED = "stalled"      # work remains but nothing can advance
 OUTCOME_CAPPED = "capped"        # hit MAX_WAVES with work outstanding
 OUTCOME_DRY_RUN = "dry-run"      # planned only; no child ever started
-OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN)
+# The founding prompt asked for parallelism only "jika usage memungkinkan". The CLI
+# gives no way to ask before spawning, so this is the retrospective half: the moment
+# one agent reports a quota/auth condition, stop. Eight tasks against an exhausted
+# weekly limit produce eight identical failures and the ninth teaches nobody
+# anything — and unlike a task failure, nothing about waiting is going to change by
+# running more of them now.
+OUTCOME_USAGE = "usage-halted"
+OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
+            OUTCOME_USAGE)
 
 # A runaway backstop, not a budget — the same role `MAX_NODES` and
 # `MAX_DEPS_PER_TASK` play for the graph. A legal graph can need at most one wave
@@ -276,18 +284,12 @@ def _mark(graph, completed, blocked) -> dict:
 def _ran(res) -> bool:
     """Whether a child process was actually created for this run.
 
-    Direct attribute access rather than `getattr(res, "<name>", False)`: the
-    repo's invariant-10 guard (`test_no_phase_name_synonym_appears_in_src`)
-    forbids a phase-name synonym as a string literal anywhere in `src/`, and this
-    field's name reads as one for `execution`. `executor.py` sidesteps the same
-    guard by only ever using it as a bare keyword.
-
-    Total anyway: a runner returning an object without the field answers False,
-    which is the safe direction — no status row gets written."""
-    try:
-        return bool(res.executed)
-    except AttributeError:
-        return False
+    Delegates to `agent.ran`, which owns the field and therefore the question. This
+    wrapper exists only so the wave loop reads locally and so the import stays lazy
+    — a caller supplying its own runner must not be made to import the agent module
+    just to have its results classified."""
+    from . import agent as ag_ran
+    return ag_ran.ran(res)
 
 
 def run_key(index, task_id) -> str:
@@ -489,7 +491,11 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             f"executor.RUN_RESULTS — orchestrator.RESULT_STATUS and "
             f"NON_EXECUTING_RESULTS must together classify every declared result "
             f"before it can be acted on")
-    return sorted(done), sorted(failed), sorted(skipped), reasons, isolated
+    from . import agent as ag_check
+    starved = any(ag_check.is_usage_limit(r) for _t, r, _e in results
+                  if r is not None)
+    return (sorted(done), sorted(failed), sorted(skipped), reasons,
+            isolated, starved)
 
 
 def _refresh(project=None) -> None:
@@ -688,7 +694,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
             continue
 
         before = {tid: getattr(t, "status", None) for tid, t in g.items()}
-        done, failed, held, why, iso = _run_wave(
+        done, failed, held, why, iso, starved = _run_wave(
             batch, g, runner, index, project=project, timeout_s=timeout_s,
             max_workers=max_workers, root=root, payload_for=payload_for,
             isolate=isolate)
@@ -722,6 +728,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
         blocked.extend(failed)
         skipped.extend(t for t in held if t not in skipped)
         reasons.update(why)
+        if starved:
+            # Recorded first: whatever DID run this wave keeps its row and
+            # its reported reason. Braking must not discard work.
+            g = apply_status(g, done, failed)
+            return Orchestration(
+                outcome=OUTCOME_USAGE, waves=waves, completed=completed,
+                blocked=blocked, skipped=skipped, reasons=reasons,
+                branches=branches, kept=kept)
         g = apply_status(g, done, failed)
         after = {tid: getattr(t, "status", None)
                  for tid, t in (g or {}).items()}
