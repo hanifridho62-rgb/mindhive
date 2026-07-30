@@ -728,6 +728,51 @@ resolve conflicts is the operator's call — an orchestrator that auto-merged N
 branches would be making that call silently, and a bad merge costs far more than a
 manual one.
 
+### 4.10 The always-on catalog pass (MN-14)
+
+The founding requirement asks for a system that *"secara paksa mengoptimalisasi dan
+improvisasi untuk prompt ... pada pembangunan kode sekecil apapun ... dengan membuka
+katalog skill and plugin"* — forcibly, for code work however small, open the catalog
+and add the context the model needs.
+
+`promptgate` implemented only half of that. Its quality gate fires when a prompt
+looks *underspecified*; a well-phrased code request got nothing at all, which is
+precisely the case "sekecil apapun" names. Being asked clearly is not a reason to
+skip the catalog.
+
+So `hook_context` runs **two independent passes** and joins them:
+
+| pass | fires when | block |
+|---|---|---|
+| quality gate | `assess` finds the prompt underspecified | "looks underspecified — …" |
+| catalog (MN-14) | `is_code_work` matches, however clear the prompt | "Code work — skill & plugin catalog consulted" |
+
+`is_code_work` is pure, cheap, and covers English **and** Indonesian vocabulary plus
+a bare source filename — an English-only detector would answer "not code work" for
+most of this user's prompts. It skips machine-injected text for the same reason the
+gate does (a task notification is nobody asking for anything) and returns False past
+`PROMPT_SCAN_CAP`, so a pasted log cannot become a regex scan on the hook's path.
+
+The catalog's skill is trained through the **same** `_pick_skill` ranker as every
+dimension, stored as `manifest["always"]`. A second selection path would be a second
+place to get measured-vs-unmeasured provenance wrong, and the first disagreement
+would have this line calling a skill proven while the gate's own ranking says
+otherwise. No inventory match means no rule and no line — invent nothing.
+
+When both passes fire, a skill already named by the gate is **not** repeated under
+the catalog heading: the same name under two headings reads as either one demand or
+two and the reader cannot tell which. Suppression is per-skill, so a catalog pick the
+gate did not name still surfaces.
+
+**What this is not.** "Force" here means forcing *context* in — the output stays
+`additionalContext`, additive, never a decision, and tests assert no `deny`, `block`
+or `permissionDecision` can appear. Denying the user's own prompt would be a
+different and hostile mechanism, and is deliberately not built.
+
+A manifest trained before this unit has no `always` key. That degrades to the
+previous behaviour rather than raising — the hook's fail-open promise covers a stale
+sidecar too, and a retrain fills it in.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
