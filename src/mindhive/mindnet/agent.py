@@ -134,10 +134,12 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     `NON_EXECUTING_RESULTS` and neither has to learn a second vocabulary. That
     also means `executed` carries the same meaning here as there.
 
-    *env* is accepted and currently unused beyond being recorded — `run_headless`
-    builds its own environment around the `MINDHIVE_HEADLESS` guard, and quietly
-    dropping the caller's overlay is better than silently defeating that guard.
-    The signature keeps it so the orchestrator's runner contract stays uniform."""
+    *env* is a real overlay on the child's environment as of MN-9 — the
+    orchestrator uses it to give each concurrent agent its own `MINDHIVE_SESSION`,
+    because `events.append_event` appends to ``<session_id>.jsonl`` without a lock
+    and two agents sharing a segment interleave into corrupt JSONL.
+    `claude_cli._child_env` forces `MINDHIVE_HEADLESS` on after the overlay, so
+    passing one can never defeat the recursion guard."""
     key = str(run_key)
     header = (f"agent run: {key}\n"
               f"cwd:       {root}\n"
@@ -149,7 +151,7 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     try:
         out = claude_cli.run_headless(
             prompt, model=model, timeout_s=int(timeout_s),
-            permission_mode=permission_mode,
+            permission_mode=permission_mode, env=env,
             cwd=str(root) if root else None)
     except Exception as exc:                            # noqa: BLE001
         # `run_headless` maps its own faults to exit codes, so reaching here

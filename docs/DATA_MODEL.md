@@ -584,12 +584,11 @@ unauthenticated or rate-limited machine blocked every task it touched.
 `fail` is therefore narrow by design: the agent reported a non-error result and
 still exited non-zero. Everything unprovable fails toward recoverable.
 
-**Concurrency is capped at one.** Every agent runs with `cwd=root`, the same
-checkout, so two editing one working tree concurrently corrupt each other's edits
-and the git index. `agent.MAX_SAFE_WORKERS` is 1 and `--max-workers` above it is
-ignored with a printed note; `--allow-shared-tree` overrides. **Per-task git
-worktrees are the real fix and are not built** — until then, agent execution is
-sequential.
+**Concurrency depends on isolation.** Every agent runs with `cwd=root`, so without
+isolation two agents editing one working tree corrupt each other's edits and the
+git index — `agent.MAX_SAFE_WORKERS` is 1 and `--max-workers` above it is ignored
+with a printed note (`--allow-shared-tree` overrides). `--isolation worktree`
+removes the reason for the cap; see §4.8.
 
 An orchestrated wave also emits the `task-graph` faculty through
 `telemetry.busy`, so the §4.5 cat board lights up for exactly as long as the wave
@@ -599,6 +598,53 @@ runs. Because that appends activity rows and `_staleness` counts every event,
 **Still open:** authority. No `permission_mode` is granted by default, so a
 spawned agent may be unable to edit; granting it is an operator decision this
 surface deliberately does not make silently.
+
+### 4.8 Per-task worktree isolation (MN-9)
+
+`hive mindnet orchestrate --execute --isolation worktree` gives each agent its own
+git worktree and its own ledger segment. That is what lifts §4.7's cap of one, so
+it is the difference between sequential and genuinely parallel agent execution.
+Default is `none` — N worktrees is real disk and real git state, so the safe form
+is the one an operator gets by accident.
+
+| | path | branch | ledger segment |
+|---|---|---|---|
+| per task | `.claude/worktrees/mn9-<task_id>` | `mn9/<task_id>` | `mn9-<task_id>.jsonl` |
+
+**Two preconditions, both load-bearing.**
+
+`.claude/worktrees/` is in the **committed** `.gitignore`. It previously lived only
+in `.git/info/exclude`, which is local and does not travel, so on any other clone
+an agent's worktree appeared as untracked changes in the parent — and this
+project's own change-log detection reads `git status`.
+
+Each agent gets `MINDHIVE_SESSION=mn9-<task_id>`, because `events.append_event`
+appends to `<session_id>.jsonl` through an **unlocked** `open(..., "a")`.
+Concurrent agents sharing a session interleave mid-line into JSONL the fold cannot
+read, and the ledger is the source of truth for everything. The per-session
+segmentation was already the design; nothing was passing a distinct session down.
+`claude_cli.run_headless` gained an `env` overlay for this, and it applies
+`MINDHIVE_HEADLESS` **after** the overlay so no caller can defeat the recursion
+guard (the failure mode of that is an unbounded spawn loop).
+
+**Cleanup never discards work.** `worktree.retire` removes a checkout only when it
+is clean **and** not ahead of the base commit `add` captured. Anything else is left
+on disk and reported under `kept`, which is the one line of the run report an
+operator must act on. The branch is never deleted, so committed work survives
+either way — the only thing a removal could destroy is uncommitted changes, and
+that is precisely the case that is refused. `remove` always passes `--force`: on
+Windows it fails with "Permission denied" whenever a handle is still open in the
+tree, which right after an agent finishes writing is the normal case.
+
+A failed `git worktree add` becomes that task's `skipped` (`refused` /
+`executed=False`, reusing §4.7's mapping rather than adding a branch to it), so one
+task's environmental failure never writes a status row and never stops the wave.
+
+**Merging is not automated.** Each agent's work lands on its own branch and the
+orchestrator reports the names. What to integrate, in what order, and how to
+resolve conflicts is the operator's call — an orchestrator that auto-merged N
+branches would be making that call silently, and a bad merge costs far more than a
+manual one.
 
 ## 5. Invariants — do not break these
 

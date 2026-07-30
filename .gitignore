@@ -8,3 +8,9 @@ __pycache__/
 /dist/
 /build/MindHive/
 /*.spec
+
+# Linked git worktrees, including the per-task ones MN-9's orchestrator creates.
+# This lived only in .git/info/exclude, which is local and does not travel — so on
+# any other clone an agent's worktree showed up as untracked changes in the parent
+# repo, and this project's own change-log detection reads git status.
+.claude/worktrees/

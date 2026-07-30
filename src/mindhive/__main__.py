@@ -1369,21 +1369,33 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     # orchestrator could not do any actual work before this.
     workers = args.max_workers
     timeout = args.timeout
+    isolate = args.isolation == "worktree"
+    if isolate and args.via_script:
+        # A validation script re-checks a task in place; isolating it would run the
+        # check against an empty branch and prove nothing. Refusing beats silently
+        # ignoring the flag the operator typed.
+        return _mn_error("--isolation worktree is for agent runs; a "
+                         "--via-script run re-checks a task in place and has "
+                         "nothing to isolate")
     if args.via_script:
         runner, payload_for = x_mod.execute, orc_mod.validation_script_of
     else:
         runner, payload_for = ag_mod.run, ag_mod.prompt_for
         if timeout is None:
             timeout = ag_mod.DEFAULT_TIMEOUT_S
-        # Every agent runs with cwd=root — the SAME checkout. Two agents editing
-        # one working tree concurrently corrupt each other's edits and the git
-        # index, so this refuses to fan out unless the operator accepts it.
-        # Per-task git worktrees are the real fix and are not built yet.
-        if not args.allow_shared_tree:
+        # With `--isolation worktree` each agent gets its OWN checkout and its own
+        # ledger segment, so the shared-tree cap no longer applies and the pool is
+        # free to fan out. Without it every agent runs with cwd=root — the same
+        # tree — and two editing it concurrently corrupt each other's edits and
+        # the git index.
+        if isolate or args.allow_shared_tree:
+            pass                                    # caller's --max-workers stands
+        else:
             if workers is not None and workers > ag_mod.MAX_SAFE_WORKERS:
                 print(f"note: --max-workers {workers} ignored — agents share one "
-                      f"working tree, so they run one at a time. "
-                      f"--allow-shared-tree overrides (they WILL collide).",
+                      f"working tree, so they run one at a time. Use "
+                      f"`--isolation worktree` for real parallelism, or "
+                      f"--allow-shared-tree to let them collide.",
                       file=sys.stderr)
             workers = ag_mod.MAX_SAFE_WORKERS
 
@@ -1395,7 +1407,7 @@ def cmd_mindnet_orchestrate(args) -> int | None:
             # MAX_WAVES verbatim capped a legal long dependency chain.
             max_waves=args.max_waves,
             project=project, timeout_s=timeout,
-            max_workers=workers)
+            max_workers=workers, isolate=isolate)
     except Exception as exc:
         # An orchestrator fault is an operator-facing failure, not a stack trace.
         # `main()` only catches JSONDecodeError, so without this a ledger or
@@ -1433,6 +1445,15 @@ def cmd_mindnet_orchestrate(args) -> int | None:
             for tid in ids:
                 why = out.reasons.get(tid) or "no reason recorded"
                 print(f"    {tid}: {why}")
+        if out.branches:
+            print("  branches: " + ", ".join(
+                f"{t}={b}" for t, b in sorted(out.branches.items())))
+        if out.kept:
+            # The one thing an operator MUST act on: a checkout `retire` refused to
+            # delete because it still held work nobody has looked at.
+            print("  worktrees kept (they hold work):")
+            for tid, path in sorted(out.kept.items()):
+                print(f"    {tid}: {path}")
         if not args.execute:
             print("  this was a dry run — add --execute to actually run it")
     # `dry-run` and `settled` are successes; the other two are not.
@@ -2682,6 +2703,12 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="run each task's stored validation_script instead of "
                           "spawning an agent. This only RE-CHECKS tasks; it does "
                           "not do their work")
+    mno.add_argument("--isolation", choices=("none", "worktree"),
+                     default="none",
+                     help="`worktree` gives each agent its own git worktree and "
+                          "its own ledger segment, which is what allows agents to "
+                          "run in PARALLEL. `none` (default) runs them one at a "
+                          "time in the current checkout")
     mno.add_argument("--allow-shared-tree", action="store_true",
                      dest="allow_shared_tree",
                      help="let agents run concurrently in ONE working tree. They "

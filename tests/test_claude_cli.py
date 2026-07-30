@@ -104,3 +104,75 @@ def test_error_text_empty_on_success_or_garbage():
     # a success envelope's result must never be reported as an error cause
     assert claude_cli.error_text('{"is_error": false, "result": "fine"}') == ""
     assert claude_cli.error_text("not json") == ""
+
+
+# --- MN-9: the child-environment overlay -------------------------------------
+#
+# The orchestrator needs each concurrent agent to get its own MINDHIVE_SESSION:
+# `events.append_event` writes to `<session_id>.jsonl` with an unlocked append, so
+# two agents sharing one segment interleave into corrupt JSONL — and the ledger is
+# the source of truth for the whole system.
+
+def _capture_env(monkeypatch):
+    """Run the spawn against a fake subprocess, returning the child's env."""
+    import subprocess as sp
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw.get("env") or {})
+        return _Proc()
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    return seen
+
+
+def test_no_env_argument_leaves_todays_behaviour_unchanged(monkeypatch):
+    """The regression guard for invoker.py, reflect.py and autoresume.py, none of
+    which pass env."""
+    import os
+    seen = _capture_env(monkeypatch)
+    claude_cli.run_headless("p")
+    assert seen.get("MINDHIVE_HEADLESS") == "1"
+    assert seen.get("PATH") == os.environ.get("PATH")
+
+
+def test_an_injected_variable_reaches_the_child(monkeypatch):
+    seen = _capture_env(monkeypatch)
+    claude_cli.run_headless("p", env={"MINDHIVE_SESSION": "mn9-t1"})
+    assert seen.get("MINDHIVE_SESSION") == "mn9-t1"
+
+
+def test_the_overlay_cannot_disable_the_recursion_guard(monkeypatch):
+    """THE test of this unit. Every hooks/*.ps1 exits immediately when
+    MINDHIVE_HEADLESS is set, so a child that could unset it would re-fire the
+    hooks, which re-enter this spawn path — an unbounded spawn loop, not a wrong
+    answer. The guard is applied AFTER the overlay for exactly this reason."""
+    for attempt in ("0", "", "false", None):
+        seen = _capture_env(monkeypatch)
+        claude_cli.run_headless("p", env={"MINDHIVE_HEADLESS": attempt})
+        assert seen.get("MINDHIVE_HEADLESS") == "1", (
+            f"env={{'MINDHIVE_HEADLESS': {attempt!r}}} defeated the guard")
+
+
+def test_the_overlay_is_merged_not_substituted(monkeypatch):
+    """A bare replacement drops PATH and, on Windows, SYSTEMROOT — and a child with
+    no SYSTEMROOT does not start at all."""
+    import os
+    seen = _capture_env(monkeypatch)
+    claude_cli.run_headless("p", env={"MN9_NEW": "x"})
+    assert seen.get("MN9_NEW") == "x"
+    assert seen.get("PATH") == os.environ.get("PATH")
+
+
+def test_an_overlay_value_of_none_removes_the_variable(monkeypatch):
+    monkeypatch.setenv("MN9_GONE", "present")
+    seen = _capture_env(monkeypatch)
+    claude_cli.run_headless("p", env={"MN9_GONE": None})
+    assert "MN9_GONE" not in seen
+
+
+def test_a_non_mapping_overlay_is_ignored_rather_than_raising(monkeypatch):
+    for junk in (["a"], "K=V", 42, object()):
+        seen = _capture_env(monkeypatch)
+        claude_cli.run_headless("p", env=junk)
+        assert seen.get("MINDHIVE_HEADLESS") == "1"

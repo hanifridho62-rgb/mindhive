@@ -26,9 +26,33 @@ def resolve_exe(cmd: str = "claude") -> str:
     return shutil.which(cmd) or cmd
 
 
+def _child_env(extra):
+    """``os.environ`` plus *extra*, with the recursion guard forced LAST.
+
+    Merged, never replaced: a bare replacement drops ``PATH`` and — on Windows —
+    ``SYSTEMROOT``, and a child with no ``SYSTEMROOT`` does not start at all
+    (`mindnet/executor._child_env` learned the same thing). A non-mapping argument
+    is ignored rather than raised.
+
+    ``MINDHIVE_HEADLESS`` is applied after the overlay so **no caller can turn the
+    guard off**, deliberately or by accident. Every ``hooks/*.ps1`` exits
+    immediately when it is set; a child that re-fires the hooks re-enters this
+    spawn path, and the failure mode of that is an unbounded spawn loop rather
+    than a wrong answer."""
+    merged = dict(os.environ)
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if value is None:
+                merged.pop(str(key), None)
+            else:
+                merged[str(key)] = str(value)
+    merged["MINDHIVE_HEADLESS"] = "1"
+    return merged
+
+
 def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
                  permission_mode: str | None = None,
-                 cwd: str | None = None) -> dict:
+                 cwd: str | None = None, env: dict | None = None) -> dict:
     """One-shot `claude --output-format json -p` with the prompt fed via stdin.
     Returns ``{"exit": int, "stdout": str}``. Spawn failures map to conventional
     exit codes (127 not-found, 124 timeout) so callers treat them uniformly.
@@ -37,6 +61,12 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
     (the auto-resume delivery wants the user's model, not the reflection
     alias); ``permission_mode`` lets a delivery run actually act (headless has
     no interactive approval), and ``cwd`` pins where that work happens.
+
+    ``env`` is an overlay on the child's environment — MN-9's orchestrator uses it
+    to give each concurrent agent its own ``MINDHIVE_SESSION``, because
+    `events.append_event` writes to ``<session_id>.jsonl`` with an unlocked append
+    and two agents sharing one segment interleave into corrupt JSONL. See
+    `_child_env` for the merge rules and why the recursion guard is applied last.
 
     The prompt must never ride in argv: on Windows the CLI resolves to a .CMD
     shim that cmd.exe hosts, and cmd.exe rejects command lines past ~8k chars
@@ -52,10 +82,11 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
     # Recursion guard (KTD3): every hooks/*.ps1 exits immediately when this
     # variable is set, so a headless session spawned here can never re-fire the
     # hooks (no reflect->session_end->reflect loop, no phantom session events).
-    env = dict(os.environ, MINDHIVE_HEADLESS="1")
+    # `_child_env` forces it on AFTER any caller overlay, so it cannot be unset.
+    child_env = _child_env(env)
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                              env=env, input=prompt, cwd=cwd or None,
+                              env=child_env, input=prompt, cwd=cwd or None,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {"exit": proc.returncode, "stdout": proc.stdout or ""}
     except FileNotFoundError:

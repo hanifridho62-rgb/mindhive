@@ -1094,7 +1094,7 @@ def test_orchestrate_bare_is_a_dry_run_that_spawns_nothing(capsys, monkeypatch):
     _orc_graph()
     calls = []
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda *a, **k: calls.append(a) or ([], [], [], {}))
+                        lambda *a, **k: calls.append(a) or ([], [], [], {}, {}))
 
     assert _cli("mindnet", "orchestrate") == 0
     out = capsys.readouterr().out
@@ -1114,7 +1114,7 @@ def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 0
     out = capsys.readouterr().out
@@ -1130,7 +1130,7 @@ def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
                             [], sorted(batch), [],
-                            {t: "synthetic failure" for t in batch}))
+                            {t: "synthetic failure" for t in batch}, {}))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
     assert "stalled" in capsys.readouterr().out
@@ -1140,7 +1140,7 @@ def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
     capsys.readouterr()                       # drop the fixture's declare noise
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 0
@@ -1170,7 +1170,7 @@ def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
     _ok("mindnet", "orchestrate", "--execute")
     assert sc_mod.read().fresh is True
 
@@ -1184,7 +1184,7 @@ def test_orchestrate_text_output_names_why_each_task_blocked(capsys,
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
                             [], sorted(batch), [],
-                            {t: "the validation run exited 3" for t in batch}))
+                            {t: "the validation run exited 3" for t in batch}, {}))
     capsys.readouterr()
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
@@ -1200,7 +1200,7 @@ def test_orchestrate_json_carries_the_blocked_reasons(capsys, monkeypatch):
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
-                            [], sorted(batch), [], {t: "refused" for t in batch}))
+                            [], sorted(batch), [], {t: "refused" for t in batch}, {}))
     capsys.readouterr()
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 1
@@ -1232,6 +1232,85 @@ def test_orchestrate_max_workers_is_distinct_from_limit():
     sp = _subparser("mindnet", "orchestrate")
     opts = [s for a in sp._actions for s in a.option_strings]
     assert "--limit" in opts and "--max-workers" in opts
+
+
+def test_isolation_defaults_to_none(capsys):
+    """Creating N worktrees is real disk and real git state, so the safe form is
+    the one an operator gets by accident — the same default `--execute` takes.
+    Asserted on the parser so a future edit cannot flip it silently."""
+    sp = _subparser("mindnet", "orchestrate")
+    iso = next(a for a in sp._actions if "--isolation" in a.option_strings)
+    assert iso.default == "none"
+    assert set(iso.choices) == {"none", "worktree"}
+
+
+def test_isolation_worktree_lifts_the_shared_tree_worker_cap(monkeypatch):
+    """MN-8 capped agents at one because they shared a checkout. With one each,
+    the cap has no reason to apply — this is the whole point of the flag."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    seen = {}
+    monkeypatch.setattr(orc_mod, "orchestrate",
+                        lambda *a, **k: seen.update(k) or orc_mod.Orchestration(
+                            outcome=orc_mod.OUTCOME_SETTLED))
+    _ok("mindnet", "declare", "a", "--title", "a")
+
+    _ok("mindnet", "orchestrate", "--execute", "--isolation", "worktree",
+        "--max-workers", "4")
+    assert seen["max_workers"] == 4 and seen["isolate"] is True
+
+    _ok("mindnet", "orchestrate", "--execute", "--max-workers", "4")
+    assert seen["max_workers"] == 1, "the shared-tree cap stopped applying"
+    assert seen["isolate"] is False
+
+
+def test_isolation_is_refused_for_a_via_script_run(capsys):
+    """A validation script re-checks a task in place; isolating it would run the
+    check against an empty branch and prove nothing. Refusing beats silently
+    ignoring a flag the operator typed."""
+    _ok("mindnet", "declare", "a", "--title", "a")
+    capsys.readouterr()
+    assert _cli("mindnet", "orchestrate", "--execute", "--via-script",
+                "--isolation", "worktree") == 2
+    assert "isolation" in capsys.readouterr().err
+
+
+def test_an_invalid_isolation_value_exits_2():
+    with pytest.raises(SystemExit) as e:
+        _cli("mindnet", "orchestrate", "--isolation", "chroot")
+    assert e.value.code == 2
+
+
+def test_orchestrate_reports_branches_and_kept_worktrees(capsys, monkeypatch):
+    from mindhive.mindnet import orchestrator as orc_mod
+    monkeypatch.setattr(orc_mod, "orchestrate", lambda *a, **k:
+                        orc_mod.Orchestration(
+                            outcome=orc_mod.OUTCOME_SETTLED, completed=["a"],
+                            branches={"a": "mn9/a"},
+                            kept={"a": "/tmp/wt/mn9-a"}))
+    _ok("mindnet", "declare", "a", "--title", "a")
+    capsys.readouterr()
+
+    _ok("mindnet", "orchestrate", "--execute", "--isolation", "worktree")
+    out = capsys.readouterr().out
+    assert "mn9/a" in out
+    assert "/tmp/wt/mn9-a" in out
+    assert "hold work" in out, "a kept worktree must say WHY it matters"
+
+
+def test_orchestrate_json_carries_branches_and_kept(capsys, monkeypatch):
+    from mindhive.mindnet import orchestrator as orc_mod
+    monkeypatch.setattr(orc_mod, "orchestrate", lambda *a, **k:
+                        orc_mod.Orchestration(
+                            outcome=orc_mod.OUTCOME_SETTLED,
+                            branches={"a": "mn9/a"}, kept={"a": "/tmp/x"}))
+    _ok("mindnet", "declare", "a", "--title", "a")
+    capsys.readouterr()
+
+    _ok("mindnet", "orchestrate", "--execute", "--isolation", "worktree",
+        "--json")
+    data = json.loads(capsys.readouterr().out)
+    assert data["branches"] == {"a": "mn9/a"}
+    assert data["kept"] == {"a": "/tmp/x"}
 
 
 def test_orchestrate_is_on_the_frozen_subcommand_surface():

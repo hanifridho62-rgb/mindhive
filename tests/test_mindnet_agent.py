@@ -49,14 +49,34 @@ def _spawn(monkeypatch, exit_code=0, stdout=None):
     """Patch the ONE seam, recording what it was asked to run."""
     seen = {}
 
-    def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None):
+    def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None,
+             env=None):
         seen.update(prompt=prompt, model=model, timeout_s=timeout_s,
-                    permission_mode=permission_mode, cwd=cwd)
+                    permission_mode=permission_mode, cwd=cwd, env=env)
         return {"exit": exit_code,
                 "stdout": _envelope() if stdout is None else stdout}
 
     monkeypatch.setattr(claude_cli, "run_headless", fake)
     return seen
+
+
+def test_the_double_only_records_arguments_the_real_function_accepts(monkeypatch):
+    """This double is patched over `run_headless`, so a parameter it accepts but
+    the real function does not would make every test in this file pass against a
+    call production rejects — which is exactly how MN-7's `task_id=` bug survived
+    its entire suite.
+
+    Uses the real `monkeypatch` rather than a hand-rolled setattr: an un-torn-down
+    patch here leaks the fake into every later test in the module, and the first
+    version of this test did precisely that."""
+    import inspect
+    real = set(inspect.signature(claude_cli.run_headless).parameters)
+    seen = _spawn(monkeypatch)
+    ag.run("sig", "p")
+    extra = set(seen) - {"prompt"} - real
+    assert not extra, (
+        f"the double records arguments the real function has no parameter for: "
+        f"{extra}")
 
 
 def _task(tid="t1", **kw):
@@ -321,6 +341,16 @@ def test_the_timeout_default_is_longer_than_the_validators(monkeypatch):
     seen = _spawn(monkeypatch)
     ag.run("k12", "p")
     assert seen["timeout_s"] == ag.DEFAULT_TIMEOUT_S
+
+
+def test_the_env_overlay_is_threaded_to_the_spawn(monkeypatch):
+    """MN-9 made this real: the orchestrator uses it to give each concurrent agent
+    its own MINDHIVE_SESSION, because `events.append_event` appends to
+    `<session_id>.jsonl` without a lock. It was documented as ignored before, which
+    is the shape of a future bug."""
+    seen = _spawn(monkeypatch)
+    ag.run("k", "p", env={"MINDHIVE_SESSION": "mn9-t1"})
+    assert seen["env"] == {"MINDHIVE_SESSION": "mn9-t1"}
 
 
 def test_no_permission_mode_is_granted_by_default(monkeypatch):
