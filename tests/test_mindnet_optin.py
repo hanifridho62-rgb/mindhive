@@ -308,12 +308,37 @@ def test_a_relative_root_is_stored_absolute(roots, monkeypatch):
     assert optin.armed(PROJECT, cwd=roots["main"]) is True
 
 
-def test_a_backslash_root_matches_a_forward_slash_cwd(roots):
-    """Windows hands both spellings around; they name one directory."""
-    optin.set_enabled(True, project=PROJECT,
-                      root=str(roots["main"]).replace("/", "\\"))
-    assert optin.armed(
-        PROJECT, cwd=Path(str(roots["main"]).replace("\\", "/"))) is True
+def test_the_stored_root_key_is_always_forward_slashed(roots):
+    """The cross-platform half: whatever separator the operator typed, the key on
+    disk is forward-slashed, so the record is readable and stable everywhere."""
+    out = optin.set_enabled(True, project=PROJECT, root=roots["main"])
+    assert "\\" not in out["root"]
+    rec = json.loads(optin.record_path(PROJECT).read_text(encoding="utf-8"))
+    assert all("\\" not in key for key in rec["roots"])
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="separator equivalence is a Windows path rule; on "
+                           "POSIX a backslash is a legal FILENAME character, so "
+                           "'\\tmp\\x' really is a different path from '/tmp/x' "
+                           "and asserting they match would assert a bug")
+def test_a_backslash_root_matches_a_forward_slash_cwd():
+    """Windows hands both spellings around; there they name one directory.
+
+    Deliberately platform-gated rather than written to pass everywhere. The first
+    version of this test asserted the equivalence unconditionally and passed on
+    Windows while failing on Linux CI — the same class as the MN-4 P0: an
+    assertion about a shape that only exists on one platform. The skip is not a
+    coverage hole; `test_the_stored_root_key_is_always_forward_slashed` above
+    carries the part that is genuinely cross-platform."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "main"
+        root.mkdir()
+        optin.set_enabled(True, project=PROJECT,
+                          root=str(root).replace("/", "\\"))
+        assert optin.armed(
+            PROJECT, cwd=Path(str(root).replace("\\", "/"))) is True
 
 
 def test_traversal_in_a_root_is_collapsed_before_it_is_stored(roots):
