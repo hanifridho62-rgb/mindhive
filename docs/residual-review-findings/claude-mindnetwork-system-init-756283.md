@@ -44,6 +44,9 @@ remembering rather than just closing:
 
 ## Not fixed — deferred with reasoning
 
+- **DONE (MN-9)** ~~Per-task git worktrees~~ — shipped as `--isolation worktree`;
+  agent execution is no longer capped at one.
+
 - **P2 · `orchestrator.py` · No wave-level timeout.** `pool.map` blocks until every
   task returns. `executor.execute` bounds each child but kills only the **direct**
   child, so a `validation_script` that forks its own tree can leave grandchildren

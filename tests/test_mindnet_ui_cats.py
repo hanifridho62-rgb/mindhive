@@ -120,12 +120,61 @@ def test_a_faculty_active_for_four_hours_is_shown_dim_not_hidden():
     assert row["task-graph"]["age_secs"] == pytest.approx(4 * 3600, abs=1)
 
 
-def test_a_recently_idle_faculty_is_still_rendered():
-    """Classification is by AGE, not by status. 'Finished a minute ago' and
-    'hung a minute ago' are both worth seeing."""
-    rows = ui.board(_state(_act("sop", 30, status=tel.STATUS_IDLE)), NOW)
-    assert _by_faculty(rows)["sop"]["status"] == tel.STATUS_IDLE
-    assert rows
+def test_a_finished_faculty_disappears():
+    """The user's ask, stated verbatim: "ketika tidak sedang berjalan maka kucing
+    akan menghilang".
+
+    This REPLACES an earlier test that asserted the opposite ("classification is
+    by AGE, not by status", so a faculty idle for 30 s still rendered). That rule
+    was chosen to protect hang detection and it did — but it also meant a cat for
+    finished work sat on screen, green, for three minutes and dim for six hours.
+    Splitting the two axes keeps the hang signal (the test below) without
+    contradicting the ask."""
+    rows = ui.board(_state(_act("sop", ui.IDLE_VANISH_SECS + 5,
+                                status=tel.STATUS_IDLE)), NOW)
+    assert rows == (), f"a finished faculty is still on the board: {rows}"
+
+
+def test_a_just_finished_faculty_lingers_for_the_flicker_grace():
+    """`telemetry.busy` brackets EVERY mutation with an active row and an idle
+    row, so a burst of commands on a 1.2 s poll would flicker the cat in and out
+    without this. The canary for the test above, too: it proves the disappearance
+    is driven by the grace boundary and not by idle rows never rendering at all."""
+    rows = ui.board(_state(_act("sop", 2, status=tel.STATUS_IDLE)), NOW)
+    assert len(rows) == 1
+    assert rows[0]["status"] == tel.STATUS_IDLE
+
+
+def test_the_hang_signal_survives_the_disappearance_rule():
+    """The property the old age-only rule existed to protect, asserted against
+    the new one: `active` and stale must still render dim, however old, right up
+    to the 6-hour cutoff. If this ever goes red the board has stopped being a
+    hang detector."""
+    for ago in (ui.DIM_AFTER_SECS + 1, 4 * 3600, ui.HIDE_AFTER_SECS - 60):
+        rows = ui.board(_state(_act("task-graph", ago,
+                                    status=tel.STATUS_ACTIVE)), NOW)
+        assert len(rows) == 1, f"the hang signal vanished at {ago}s"
+        assert rows[0]["display"] == ui.DISPLAY_DIM
+
+
+def test_an_unknown_status_falls_back_to_the_age_rule():
+    """Totality: `telemetry.fold` skips malformed rows, but a status this module
+    has never heard of must not make a cat vanish — losing a cat is losing a
+    signal, and the safe direction here is to keep showing it."""
+    rows = ui.board(_state(_act("sop", 300, status="something-new")), NOW)
+    assert len(rows) == 1
+    assert rows[0]["display"] == ui.DISPLAY_DIM
+
+
+def test_classify_without_a_status_keeps_the_pure_age_behaviour():
+    """The signature stays backwards-compatible: `classify(age)` is still the
+    age-only rule, so any caller that does not know about status is unchanged."""
+    assert ui.classify(5) == ui.DISPLAY_ACTIVE
+    assert ui.classify(ui.DIM_AFTER_SECS + 1) == ui.DISPLAY_DIM
+    assert ui.classify(ui.HIDE_AFTER_SECS) is None
+    # ...and an idle faculty past the grace is hidden only when status is given.
+    assert ui.classify(ui.IDLE_VANISH_SECS + 1) == ui.DISPLAY_ACTIVE
+    assert ui.classify(ui.IDLE_VANISH_SECS + 1, tel.STATUS_IDLE) is None
 
 
 # --- R11/R12: shape and ordering ----------------------------------------------------

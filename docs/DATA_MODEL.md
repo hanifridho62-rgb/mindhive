@@ -401,11 +401,25 @@ dormancy never reaches `gate:no-verify`, `gate:config-protection` or
 ```
 
 `ui_cats.board(state, now)` is pure with `now` injected, which is what makes the
-two thresholds testable at the boundary rather than approximately. Classification
-is by **age**, not status: under 180 s is `active`, 180 s to 6 h is `dim`, and at
-6 h the faculty leaves the payload entirely. An `idle` faculty inside the window
-still renders — "finished a minute ago" and "hung a minute ago" are both worth
-seeing, and the raw `status` rides along so the UI can distinguish them.
+thresholds testable at the boundary rather than approximately.
+
+**Two questions, two axes.** Classifying by age alone (the original rule) answered
+"is it stuck?" and got "is it running?" wrong — a faculty that finished 30 seconds
+ago stayed on screen, green, for three minutes and dim for six hours, against the
+stated ask that a cat for work that is not running should disappear.
+
+| Last reported | Age | Renders |
+|---|---|---|
+| `idle` | past `IDLE_VANISH_SECS` (15 s) | **gone** — it finished |
+| `active` | under `DIM_AFTER_SECS` (180 s) | `active` |
+| `active` | 180 s to 6 h | `dim` — **this band is the hang signal** |
+| anything | at or past 6 h | gone |
+
+The 15-second grace is a flicker guard, not a feature: `telemetry.busy` brackets
+every mutation with an `active` row and an `idle` row, so a burst of commands on a
+1.2 s poll would blink the cat in and out. Set it to 0 for a cat that vanishes the
+instant work stops. `classify(age)` without a status keeps the old age-only
+meaning, so no caller is silently changed.
 
 The dim band **is** the feature: a faculty reporting `active` with an age of
 hours is a stuck parallel run, which is the reason the board was asked for. The
@@ -523,11 +537,130 @@ Children inherit the parent's MN-6 arming decision through `executor.execute`'s
 `env=` overlay (merged over `os.environ`, never substituted — a bare replacement
 drops `PATH`/`SYSTEMROOT` and the child fails to start at all).
 
-**Known limitation.** A task's command is its `Task.validation_script`, which is
-a *validator*, not an implementer. A task without one is refused by the executor
-and lands `blocked` — honest, but it means `--execute` is only useful today for
-graphs whose tasks carry a runnable script. Resolving what an "implement this
-task" command should be is deferred; the dry run is fully useful regardless.
+### 4.7 What a spawned agent runs (MN-8)
+
+The question that made §4.6's orchestrator decoration. `Task.validation_script` is
+a **validator** — the command `hive mindnet validate` runs to prove a phase
+cleared — so handing it to `executor.execute` could only ever RE-CHECK a task.
+Nothing could take a task and do its work.
+
+`hive mindnet orchestrate --execute` now spawns a headless `claude` per task via
+`mindnet/agent.py`, built on `claude_cli.run_headless` (the repo's one spawn home:
+it already handles the Windows `.CMD` shim, carries the prompt on **stdin** past
+cmd.exe's ~8k argv limit, and sets the `MINDHIVE_HEADLESS` recursion guard so a
+spawned session cannot re-fire this project's hooks). `--via-script` selects the
+old validator behaviour.
+
+Two runners, two payloads, paired explicitly at the call site because they take
+different content in the same argument position:
+
+| Runner | Payload builder | What it does |
+|---|---|---|
+| `agent.run` (default) | `agent.prompt_for` | spawns an agent that does the work |
+| `executor.execute` (`--via-script`) | `orchestrator.validation_script_of` | re-runs the task's validator |
+
+`prompt_for` builds the instruction from the graph, not from prose an operator
+maintains: the id/title/description are the task's own, the phase's exit criterion
+comes from `phases.descriptor` (invariant 10), and `language_context` is restated
+because MN-4 will enforce it on the agent whether or not the agent was told.
+
+**The envelope is checked before the exit code, and that ordering is the whole
+correctness of the mapping.** `is_error` means the CLI ran and the *model* never
+worked — auth, a usage limit, a refused request. That is not a task failure, and
+recording one would `blocked` the task and remove its whole subtree from every
+future frontier. Checking the exit code first was the first implementation, and a
+real spawn produced `is_error: true` with `"Not logged in"` at **exit 1**, so an
+unauthenticated or rate-limited machine blocked every task it touched.
+
+| Outcome | `executed` | Status written |
+|---|---|---|
+| clean envelope, exit 0 | yes | **none** — `ran-unverified` |
+| `is_error` envelope, **any** exit code | no | none — task stays PENDING |
+| no readable envelope (any exit) | no | none |
+| exit 127 (`claude` absent) | no | none |
+| exit 124 (timeout) | yes | **none** — wall-clock, not a task failure |
+| clean envelope, non-zero exit | yes | `blocked` |
+
+`fail` is therefore narrow by design: the agent reported a non-error result and
+still exited non-zero. Everything unprovable fails toward recoverable.
+
+**An agent's exit 0 is not evidence.** `RESULT_STATUS["ok"] -> completed` was
+written for `executor.execute`, where exit 0 means a validation command passed.
+An implementer's exit 0 only means the model replied — and `prompt_for` explicitly
+invites the failing reply ("if you cannot complete the task, say so plainly"). So
+a clean agent run returns `ran-unverified` and writes **no status row**: the task
+stays PENDING, the transcript and any branch are reported, and
+`hive mindnet validate` is what turns the work into evidence. Before this, a task
+nobody worked on was written COMPLETED, its dependents unblocked, and the run
+reported `settled`; nothing downstream re-checks, because `can_complete` has no
+production caller and the fold is last-write-wins.
+
+Three sets therefore partition the outcomes, and a value in none of them raises:
+`RESULT_STATUS` (it ran and the outcome IS evidence), `NON_EXECUTING_RESULTS` (no
+child was created), and `UNVERIFIED_RESULTS` (it ran, the outcome is not
+evidence — `ran-unverified` and `timeout`).
+
+**Concurrency depends on isolation.** Every agent runs with `cwd=root`, so without
+isolation two agents editing one working tree corrupt each other's edits and the
+git index — `agent.MAX_SAFE_WORKERS` is 1 and `--max-workers` above it is ignored
+with a printed note (`--allow-shared-tree` overrides). `--isolation worktree`
+removes the reason for the cap; see §4.8.
+
+An orchestrated wave also emits the `task-graph` faculty through
+`telemetry.busy`, so the §4.5 cat board lights up for exactly as long as the wave
+runs. Because that appends activity rows and `_staleness` counts every event,
+`_persist` rebuilds the sidecar even on a wave that settles nothing.
+
+**Still open:** authority. No `permission_mode` is granted by default, so a
+spawned agent may be unable to edit; granting it is an operator decision this
+surface deliberately does not make silently.
+
+### 4.8 Per-task worktree isolation (MN-9)
+
+`hive mindnet orchestrate --execute --isolation worktree` gives each agent its own
+git worktree and its own ledger segment. That is what lifts §4.7's cap of one, so
+it is the difference between sequential and genuinely parallel agent execution.
+Default is `none` — N worktrees is real disk and real git state, so the safe form
+is the one an operator gets by accident.
+
+| | path | branch | ledger segment |
+|---|---|---|---|
+| per task | `.claude/worktrees/mn9-<task_id>` | `mn9/<task_id>` | `mn9-<task_id>.jsonl` |
+
+**Two preconditions, both load-bearing.**
+
+`.claude/worktrees/` is in the **committed** `.gitignore`. It previously lived only
+in `.git/info/exclude`, which is local and does not travel, so on any other clone
+an agent's worktree appeared as untracked changes in the parent — and this
+project's own change-log detection reads `git status`.
+
+Each agent gets `MINDHIVE_SESSION=mn9-<task_id>`, because `events.append_event`
+appends to `<session_id>.jsonl` through an **unlocked** `open(..., "a")`.
+Concurrent agents sharing a session interleave mid-line into JSONL the fold cannot
+read, and the ledger is the source of truth for everything. The per-session
+segmentation was already the design; nothing was passing a distinct session down.
+`claude_cli.run_headless` gained an `env` overlay for this, and it applies
+`MINDHIVE_HEADLESS` **after** the overlay so no caller can defeat the recursion
+guard (the failure mode of that is an unbounded spawn loop).
+
+**Cleanup never discards work.** `worktree.retire` removes a checkout only when it
+is clean **and** not ahead of the base commit `add` captured. Anything else is left
+on disk and reported under `kept`, which is the one line of the run report an
+operator must act on. The branch is never deleted, so committed work survives
+either way — the only thing a removal could destroy is uncommitted changes, and
+that is precisely the case that is refused. `remove` always passes `--force`: on
+Windows it fails with "Permission denied" whenever a handle is still open in the
+tree, which right after an agent finishes writing is the normal case.
+
+A failed `git worktree add` becomes that task's `skipped` (`refused` /
+`executed=False`, reusing §4.7's mapping rather than adding a branch to it), so one
+task's environmental failure never writes a status row and never stops the wave.
+
+**Merging is not automated.** Each agent's work lands on its own branch and the
+orchestrator reports the names. What to integrate, in what order, and how to
+resolve conflicts is the operator's call — an orchestrator that auto-merged N
+branches would be making that call silently, and a bad merge costs far more than a
+manual one.
 
 ## 5. Invariants — do not break these
 

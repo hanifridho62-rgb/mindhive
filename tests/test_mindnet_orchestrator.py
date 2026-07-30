@@ -563,7 +563,7 @@ def test_one_failed_arm_does_not_abort_the_healthy_arm():
     assert out.outcome == orc.OUTCOME_STALLED
 
 
-@pytest.mark.parametrize("bad", ["fail", "timeout"])
+@pytest.mark.parametrize("bad", ["fail"])
 def test_a_run_that_executed_and_failed_blocks_the_task(bad):
     """Only results where a child ACTUALLY RAN may block. Enumerated rather than
     treated as "not ok", so a result value added later fails loudly instead of
@@ -602,12 +602,13 @@ def test_a_run_that_never_started_does_not_block_the_task(never_ran):
 def test_a_never_started_run_writes_no_ledger_row_and_leaves_the_task_pending():
     """The half that makes it RECOVERABLE, asserted against the real ledger."""
     _declare("a")
-    before = len(events.read_all())
     out = orc.orchestrate({"a": _task("a")},
                           runner=FakeRunner(results={"a": "refused"}),
                           execute=True)
     assert out.skipped == ["a"]
-    assert len(events.read_all()) == before, "a status row was written anyway"
+    # STATUS rows specifically: a wave also appends the cat feed's activity rows,
+    # and counting every event would conflate the two.
+    assert _status_rows() == [], "a status row was written anyway"
     assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
 
 
@@ -624,15 +625,39 @@ def test_a_skipped_task_does_not_kill_its_dependents():
     assert orc.frontier(fixed) == ["b"], "the dependent is permanently dead"
 
 
-def test_the_two_result_sets_partition_every_declared_run_result():
-    """Stronger than the old single-set check: every `RUN_RESULTS` value must be
-    classified as either "it ran" or "it never started", and no value may be in
-    both. If `RUN_RESULTS` grows, this fails and the new value gets a deliberate
-    home rather than defaulting into the blocking path."""
-    ran, never = set(orc.RESULT_STATUS), set(orc.NON_EXECUTING_RESULTS)
-    assert ran | never == set(x_mod.RUN_RESULTS), (
-        f"unclassified run results: {set(x_mod.RUN_RESULTS) - ran - never}")
-    assert not (ran & never), f"classified both ways: {ran & never}"
+def test_the_three_result_sets_partition_every_declared_run_result():
+    """Every `RUN_RESULTS` value must land in exactly one of three homes, so a new
+    value fails loudly instead of defaulting into the blocking path:
+
+      RESULT_STATUS         it ran, and the outcome IS evidence -> status row
+      NON_EXECUTING_RESULTS no child was ever created           -> no row
+      UNVERIFIED_RESULTS    it ran, the outcome is NOT evidence -> no row
+
+    The third set is new. It exists because two results were writing rows they had
+    not earned: an agent's exit-0 reply was marking tasks COMPLETED, and a
+    wall-clock timeout was marking them BLOCKED and deleting their subtrees."""
+    homes = [set(orc.RESULT_STATUS), set(orc.NON_EXECUTING_RESULTS),
+             set(orc.UNVERIFIED_RESULTS)]
+    declared = set(x_mod.RUN_RESULTS)
+    covered = set().union(*homes)
+    assert declared <= covered, f"unclassified run results: {declared - covered}"
+    for i, one in enumerate(homes):
+        for other in homes[i + 1:]:
+            assert not (one & other), f"classified two ways: {one & other}"
+
+
+def test_a_timeout_writes_no_status_row_and_leaves_the_task_pending():
+    """The regression. `timeout` used to map to BLOCKED, and `tasks.ready` removes
+    a blocked task's whole subtree from every future frontier permanently — so one
+    slow agent run poisoned the graph."""
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")},
+                          runner=FakeRunner(results={"a": "timeout"}),
+                          execute=True)
+    assert out.blocked == [], "a wall-clock timeout blocked the task"
+    assert out.skipped == ["a"]
+    assert _status_rows() == []
+    assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
 
 
 def test_the_non_executing_set_matches_the_executors_own_executed_flag():
@@ -903,6 +928,185 @@ def test_the_real_default_runner_blocks_a_scripted_failure_but_skips_a_scriptles
         "the scriptless task was permanently poisoned — the P0")
 
 
+# ============================================================================
+# MN-9 — per-task worktree isolation
+# ============================================================================
+
+@pytest.fixture
+def gitrepo(tmp_path):
+    """A real repository, because `worktree.add` runs real git."""
+    import subprocess
+    root = tmp_path / "repo"
+    root.mkdir()
+    for args in (("init", "-q", "-b", "main"),
+                 ("config", "user.email", "t@example.com"),
+                 ("config", "user.name", "T")):
+        subprocess.run(["git", "-C", str(root), *args], check=True,
+                       capture_output=True)
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "seed.txt"], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "seed"],
+                   check=True, capture_output=True)
+    return root
+
+
+def test_each_isolated_task_runs_in_its_own_checkout(gitrepo):
+    """R1 — the property the MN-8 shared-tree cap existed to protect."""
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake, execute=True,
+                    root=gitrepo, isolate=True)
+    roots = {tid: kw["root"] for tid, kw in fake.kwargs.items()}
+    assert len(set(roots.values())) == 2, f"tasks shared a checkout: {roots}"
+    for tid, r in roots.items():
+        assert f"mn9-{tid}" in str(r)
+
+
+def test_without_isolation_every_task_shares_the_one_root(gitrepo):
+    """The CANARY for the test above: without `isolate`, the roots are identical,
+    so "two distinct roots" up there cannot be passing for an unrelated reason."""
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake, execute=True,
+                    root=gitrepo)
+    roots = {kw["root"] for kw in fake.kwargs.values()}
+    assert roots == {gitrepo}
+
+
+def test_each_isolated_task_gets_its_own_ledger_segment(gitrepo):
+    """R2, and the reason parallelism could not ship without this unit.
+    `events.append_event` writes to `<session_id>.jsonl` with an UNLOCKED append,
+    so two concurrent agents sharing a session interleave into corrupt JSONL —
+    and the ledger is the source of truth for the entire system."""
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake, execute=True,
+                    root=gitrepo, isolate=True)
+    sessions = {tid: kw["env"].get("MINDHIVE_SESSION")
+                for tid, kw in fake.kwargs.items()}
+    assert all(sessions.values()), f"a task got no session: {sessions}"
+    assert len(set(sessions.values())) == 2, f"tasks shared a segment: {sessions}"
+
+
+def test_a_child_using_the_injected_session_writes_its_own_segment(gitrepo,
+                                                                  monkeypatch):
+    """R2 proved at the outcome, not just the input.
+
+    The test above asserts distinct sessions reach the children; this asserts what
+    that BUYS — a runner that actually appends under the session it was handed
+    produces one segment file per agent. Without it they all append to one
+    `<session>.jsonl` through an unlocked `open(..., "a")`, and concurrent writes
+    interleave mid-line into JSONL the fold cannot read."""
+    from mindhive import paths
+
+    def appending_runner(run_key, script, **kw):
+        # What a real agent does when it runs `hive log`: append under whatever
+        # MINDHIVE_SESSION its environment carries.
+        sid = kw["env"]["MINDHIVE_SESSION"]
+        events.append_event("mindnet_activity",
+                            {"faculty": "task-graph", "status": "active"},
+                            session_id=sid, tags=["mindnet"])
+        return _run_result("ok")
+
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=appending_runner,
+                    execute=True, root=gitrepo, isolate=True)
+
+    segments = {p.name for p in paths.events_dir().glob("*.jsonl")}
+    assert "mn9-b.jsonl" in segments and "mn9-c.jsonl" in segments, (
+        f"agents did not get their own segments: {sorted(segments)}")
+
+
+def test_without_isolation_no_session_is_forced(gitrepo):
+    """The canary for R2: the shared-tree path must not silently start
+    re-segmenting the ledger, which would change behaviour for --via-script runs."""
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b")), runner=fake, execute=True, root=gitrepo)
+    assert "MINDHIVE_SESSION" not in fake.kwargs["b"]["env"]
+
+
+def test_the_isolation_env_does_not_clobber_the_arming_decision(gitrepo):
+    """The session overlay is added to the env, not substituted for it — MN-6's
+    arming decision still has to reach the child."""
+    from mindhive.mindnet import optin
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b")), runner=fake, execute=True,
+                    root=gitrepo, isolate=True)
+    env = fake.kwargs["b"]["env"]
+    assert optin.ENV_VAR in env
+    assert env["MINDHIVE_SESSION"]
+
+
+def test_a_failed_isolation_skips_only_its_own_task(gitrepo, monkeypatch):
+    """R4/KTD6. One task's environmental failure must not write a status row (that
+    would delete its subtree from the graph) and must not stop the other task."""
+    from mindhive.mindnet import worktree as wt_mod
+    real = wt_mod.add
+
+    def flaky(root, tid):
+        if tid == "b":
+            return wt_mod.Isolated(task_id=tid, ok=False, reason="disk on fire")
+        return real(root, tid)
+
+    monkeypatch.setattr(wt_mod, "add", flaky)
+    out = orc.orchestrate(_graph(_task("b"), _task("c")), runner=FakeRunner(),
+                          execute=True, root=gitrepo, isolate=True)
+
+    assert out.skipped == ["b"]
+    assert out.blocked == [], "an isolation failure wrote a status row"
+    assert out.completed == ["c"], "the healthy task did not run"
+    assert "disk on fire" in out.reasons["b"]
+
+
+def test_a_clean_worktree_is_retired_and_its_branch_reported(gitrepo):
+    fake = FakeRunner()
+    out = orc.orchestrate(_graph(_task("b")), runner=fake, execute=True,
+                          root=gitrepo, isolate=True)
+    assert out.branches == {"b": "mn9/b"}
+    assert out.kept == {}, "a clean worktree was left on disk"
+    assert not (gitrepo / ".claude" / "worktrees" / "mn9-b").exists()
+
+
+def test_a_worktree_holding_work_is_kept_and_reported(gitrepo):
+    """The whole point of isolation is the work; cleanup must never delete it, and
+    the operator needs to be told where it is."""
+    class Writer(FakeRunner):
+        def __call__(self, run_key, script, **kw):
+            (Path(kw["root"]) / "agent-output.txt").write_text(
+                "hours of work", encoding="utf-8")
+            return super().__call__(run_key, script, **kw)
+
+    out = orc.orchestrate(_graph(_task("b")), runner=Writer(), execute=True,
+                          root=gitrepo, isolate=True)
+    kept = out.kept.get("b")
+    assert kept, f"the worktree holding work was not reported: {out.kept}"
+    assert (Path(kept) / "agent-output.txt").read_text(encoding="utf-8") \
+        == "hours of work"
+
+
+def test_the_worktree_is_retired_even_when_the_agent_raised(gitrepo):
+    """The `finally`: a worktree left by a crashed run accumulates and blocks the
+    next attempt for that task."""
+    out = orc.orchestrate(_graph(_task("b")), runner=FakeRunner(raises={"b"}),
+                          execute=True, root=gitrepo, isolate=True)
+    assert out.blocked == ["b"]
+    assert not (gitrepo / ".claude" / "worktrees" / "mn9-b").exists()
+
+
+def test_isolated_tasks_run_concurrently(gitrepo):
+    """R3 — the entire purpose. MN-8 capped agents at one because they shared a
+    tree; with a tree each, the pool is free to fan out."""
+    fake = FakeRunner(delay=0.05)
+    orc.orchestrate(_graph(_task("b"), _task("c"), _task("d")), runner=fake,
+                    execute=True, root=gitrepo, isolate=True)
+    assert fake.peak >= 2, f"peak concurrency was {fake.peak} with isolation on"
+
+
+def test_a_dry_run_creates_no_worktree(gitrepo):
+    out = orc.orchestrate(_graph(_task("b")), runner=FakeRunner(),
+                          root=gitrepo, isolate=True)
+    assert out.outcome == orc.OUTCOME_DRY_RUN
+    assert not (gitrepo / ".claude" / "worktrees").exists()
+    assert out.branches == {}
+
+
 def test_the_run_key_names_the_task_it_is_running():
     """Attribution. Without the task id in the key, the RunLog artifacts of a
     parallel wave are unassignable — exactly the MN-0 problem durability solved.
@@ -951,6 +1155,21 @@ def test_the_default_runner_is_the_executor():
 # ============================================================================
 # U5 — ledger writes and the per-wave sidecar rebuild
 # ============================================================================
+
+def _status_rows():
+    """Every `mindnet_task` status row on the ledger, newest last.
+
+    A wave appends TWO kinds of row — status rows (the graph) and
+    `mindnet_activity` rows (the cat feed) — so tests that mean "was a status
+    recorded" must say so rather than counting events."""
+    return [e for e in events.read_all()
+            if e.type == "mindnet_task"
+            and e.payload.get("action") == "status"]
+
+
+def _activity_rows():
+    return [e for e in events.read_all() if e.type == "mindnet_activity"]
+
 
 def _declare(tid, **payload):
     """Put *tid* on BOTH axes, the way `hive mindnet declare` does.
@@ -1081,6 +1300,10 @@ def test_one_failing_append_does_not_abandon_the_rest_of_the_wave(monkeypatch):
     real = events.append_event
 
     def flaky(etype, payload, **kw):
+        # Scoped to status rows: the wave also emits `mindnet_activity` for the
+        # cat board, and intercepting those would make this test about telemetry.
+        if not (etype == "mindnet_task" and payload.get("action") == "status"):
+            return real(etype, payload, **kw)
         seen.append(payload.get("task_id"))
         if payload.get("task_id") == "a":
             raise OSError("this one row fails")
@@ -1185,15 +1408,11 @@ def test_each_wave_carries_only_its_own_reasons():
     assert "b" in out.waves[1].reasons
 
 
-def test_no_rows_are_written_for_a_wave_that_settled_nothing(monkeypatch):
-    calls = {"n": 0}
-    monkeypatch.setattr(sc_mod, "rebuild",
-                        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
-    before = len(events.read_all())
+def test_a_wave_that_settles_nothing_writes_no_status_rows():
+    """An all-blocked graph produces no frontier, so no status row is written."""
     orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_BLOCKED)),
                     runner=FakeRunner(), execute=True)
-    assert len(events.read_all()) == before
-    assert calls["n"] == 0, "a wave that did nothing must not rewrite anything"
+    assert _status_rows() == []
 
 
 # --- the one test that uses the real executor ---------------------------------
@@ -1239,3 +1458,68 @@ def test_the_module_does_not_read_the_ledger_to_answer_the_frontier():
         assert orc.frontier(_linear()) == ["a"]
     finally:
         events.read_all = real
+
+
+def test_an_agent_that_declines_the_task_is_not_marked_completed():
+    """THE second P0, end to end through the loop.
+
+    `prompt_for` invites the failing reply, that reply is exit 0 with a clean
+    envelope, and `RESULT_STATUS["ok"] -> COMPLETED` then wrote a permanent
+    COMPLETED row for work nobody did — unblocking dependents and reporting
+    `settled`. `can_complete` has no production caller, and `fold` is
+    last-write-wins, so nothing downstream would ever have caught it."""
+    from mindhive.mindnet import agent as ag_mod
+    _declare("a")
+    _declare("b", dependencies=["a"])
+
+    def declining_agent(run_key, payload, **kw):
+        return x_mod.RunResult(result=ag_mod.RESULT_RAN_UNVERIFIED,
+                               executed=True, exit_code=0,
+                               reason="I could not do this")
+
+    graph = _graph(_task("a"), _task("b", deps=("a",)))
+    out = orc.orchestrate(graph, runner=declining_agent, execute=True,
+                          root=".")
+
+    assert out.completed == [], "an agent's say-so marked the task COMPLETED"
+    assert out.skipped == ["a"]
+    assert _status_rows() == []
+    assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
+    assert out.outcome == orc.OUTCOME_STALLED, (
+        "the run reported success for work nobody did")
+
+
+def test_an_isolation_failure_that_RAISES_does_not_abort_the_wave(gitrepo,
+                                                                 monkeypatch):
+    """The existing test makes `add` RETURN ok=False. This makes it RAISE, which is
+    the case that escaped `one()`'s try, re-raised out of `pool.map`, and discarded
+    the results of every sibling agent that had already run — so re-running
+    duplicated real agent work."""
+    from mindhive.mindnet import worktree as wt_mod
+    real = wt_mod.add
+
+    def exploding(root, tid):
+        if tid == "b":
+            raise OSError("the parent path is a file")
+        return real(root, tid)
+
+    monkeypatch.setattr(wt_mod, "add", exploding)
+    out = orc.orchestrate(_graph(_task("b"), _task("c")), runner=FakeRunner(),
+                          execute=True, root=gitrepo, isolate=True)
+
+    assert out.skipped == ["b"]
+    assert out.completed == ["c"], "the sibling agent's result was discarded"
+    assert "OSError" in out.reasons["b"]
+
+
+def test_a_raising_retire_does_not_replace_the_agents_result(gitrepo,
+                                                            monkeypatch):
+    """A raise inside a `finally` REPLACES the value the runner already produced,
+    so a cleanup error would be reported instead of the agent's real outcome."""
+    from mindhive.mindnet import worktree as wt_mod
+    monkeypatch.setattr(wt_mod, "retire",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("locked")))
+    out = orc.orchestrate(_graph(_task("b")), runner=FakeRunner(), execute=True,
+                          root=gitrepo, isolate=True)
+    assert out.completed == ["b"], "the cleanup error replaced the agent's result"
+    assert "locked" in str(out.kept.get("b", "")) or out.kept

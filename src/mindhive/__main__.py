@@ -1272,6 +1272,71 @@ def cmd_mindnet_rebuild(args) -> int | None:
     return None
 
 
+def cmd_mindnet_depend(args) -> int | None:
+    """Record that *task_id* cannot start until *on* is COMPLETED.
+
+    The edge that makes a graph a graph — and until now the only way to write one
+    was `hive append mindnet_task '{"action":"depend",...}' --json`, raw JSON for
+    the relation the whole orchestrator is built on.
+
+    **Every refusal is checked HERE, before the append.** `tasks.fold` declines an
+    unsound edge by silently `continue`-ing, so a handler that appended first and
+    reported second would print success for an event that folds to nothing — the
+    no-op-must-not-print-success trap this surface already guards on `satisfy`.
+    The checks are the fold's own (`dependency_cycle`, `cross_graph_conflict`,
+    `MAX_DEPS_PER_TASK`) run against the same probe graph, so the two cannot
+    disagree about what is legal."""
+    from dataclasses import replace
+    from .mindnet import sidecar as sc_mod
+    from .mindnet import tasks as t_mod
+    project = getattr(args, "project", None)
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    tid, on = args.task_id, args.on
+
+    tasks = t_mod.fold(events.read_all(project))
+    if tid not in tasks:
+        return _mn_error(f"no such task '{tid}' — see: hive mindnet list")
+    if on not in tasks:
+        return _mn_error(f"no such task '{on}' to depend on — see: "
+                         f"hive mindnet list")
+    if tid == on:
+        return _mn_error(f"'{tid}' cannot depend on itself")
+
+    cur = tasks[tid]
+    if on in cur.dependencies:
+        print(f"mindnet depend: {tid} already depends on {on} (no change)")
+        return None
+    if len(cur.dependencies) >= t_mod.MAX_DEPS_PER_TASK:
+        return _mn_error(
+            f"'{tid}' already has {len(cur.dependencies)} dependencies, the "
+            f"maximum is {t_mod.MAX_DEPS_PER_TASK} — a node waiting on more "
+            f"than that is under-decomposed")
+
+    probe = dict(tasks)
+    probe[tid] = replace(cur, dependencies=cur.dependencies + (on,))
+    cyc = t_mod.dependency_cycle(probe)
+    if cyc is not None:
+        return _mn_error("that edge would close a dependency cycle: "
+                         + " -> ".join(cyc))
+    dead = t_mod.cross_graph_conflict(probe)
+    if dead is not None:
+        return _mn_error(
+            f"that edge would deadlock: '{dead[0]}' would depend on its own "
+            f"relative '{dead[1]}' — a parent cannot wait on its own child, and "
+            f"a child cannot wait on its own ancestor")
+
+    ev = events.append_event("mindnet_task",
+                             {"action": "depend", "task_id": tid, "on": on},
+                             session_id=sid, tags=["mindnet", "task"],
+                             project=project)
+    # Sidecar LAST: `_staleness` counts every event, so rebuilding before this
+    # append would leave the projection stale and silently degrade MN-1's
+    # phase-aware injection.
+    sc_mod.rebuild(project)
+    print(f"mindnet depend: {tid} now waits for {on} @ {ev.ts}")
+    return None
+
+
 def cmd_mindnet_orchestrate(args) -> int | None:
     """Walk the task graph in waves, running every unblocked task concurrently.
 
@@ -1287,6 +1352,8 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     operator-actionable. A zero exit there would let a wrapping CI step pass
     while the graph is stuck. `capped` is the same: it means the run gave up."""
     from dataclasses import asdict
+    from .mindnet import agent as ag_mod
+    from .mindnet import executor as x_mod
     from .mindnet import orchestrator as orc_mod
     from .mindnet import tasks as t_mod
     project = getattr(args, "project", None)
@@ -1296,14 +1363,51 @@ def cmd_mindnet_orchestrate(args) -> int | None:
               'declare <id> --title "…")')
         return None
 
+    # Two runners, paired explicitly with their payload builders because they take
+    # DIFFERENT content in the same argument position. The agent is the default:
+    # `validation_script` only ever re-checks a task, which is exactly why the
+    # orchestrator could not do any actual work before this.
+    workers = args.max_workers
+    timeout = args.timeout
+    isolate = args.isolation == "worktree"
+    if isolate and args.via_script:
+        # A validation script re-checks a task in place; isolating it would run the
+        # check against an empty branch and prove nothing. Refusing beats silently
+        # ignoring the flag the operator typed.
+        return _mn_error("--isolation worktree is for agent runs; a "
+                         "--via-script run re-checks a task in place and has "
+                         "nothing to isolate")
+    if args.via_script:
+        runner, payload_for = x_mod.execute, orc_mod.validation_script_of
+    else:
+        runner, payload_for = ag_mod.run, ag_mod.prompt_for
+        if timeout is None:
+            timeout = ag_mod.DEFAULT_TIMEOUT_S
+        # With `--isolation worktree` each agent gets its OWN checkout and its own
+        # ledger segment, so the shared-tree cap no longer applies and the pool is
+        # free to fan out. Without it every agent runs with cwd=root — the same
+        # tree — and two editing it concurrently corrupt each other's edits and
+        # the git index.
+        if isolate or args.allow_shared_tree:
+            pass                                    # caller's --max-workers stands
+        else:
+            if workers is not None and workers > ag_mod.MAX_SAFE_WORKERS:
+                print(f"note: --max-workers {workers} ignored — agents share one "
+                      f"working tree, so they run one at a time. Use "
+                      f"`--isolation worktree` for real parallelism, or "
+                      f"--allow-shared-tree to let them collide.",
+                      file=sys.stderr)
+            workers = ag_mod.MAX_SAFE_WORKERS
+
     try:
         out = orc_mod.orchestrate(
-            tasks, execute=bool(args.execute), limit=args.limit,
+            tasks, runner=runner, payload_for=payload_for,
+            execute=bool(args.execute), limit=args.limit,
             # None lets the orchestrator derive the cap from the graph; passing
             # MAX_WAVES verbatim capped a legal long dependency chain.
             max_waves=args.max_waves,
-            project=project, timeout_s=args.timeout,
-            max_workers=args.max_workers)
+            project=project, timeout_s=timeout,
+            max_workers=workers, isolate=isolate)
     except Exception as exc:
         # An orchestrator fault is an operator-facing failure, not a stack trace.
         # `main()` only catches JSONDecodeError, so without this a ledger or
@@ -1341,6 +1445,15 @@ def cmd_mindnet_orchestrate(args) -> int | None:
             for tid in ids:
                 why = out.reasons.get(tid) or "no reason recorded"
                 print(f"    {tid}: {why}")
+        if out.branches:
+            print("  branches: " + ", ".join(
+                f"{t}={b}" for t, b in sorted(out.branches.items())))
+        if out.kept:
+            # The one thing an operator MUST act on: a checkout `retire` refused to
+            # delete because it still held work nobody has looked at.
+            print("  worktrees kept (they hold work):")
+            for tid, path in sorted(out.kept.items()):
+                print(f"    {tid}: {path}")
         if not args.execute:
             print("  this was a dry run — add --execute to actually run it")
     # `dry-run` and `settled` are successes; the other two are not.
@@ -2553,6 +2666,15 @@ def _build_parser() -> argparse.ArgumentParser:
     mnb.add_argument("--project", default=None)
     mnb.set_defaults(func=cmd_mindnet_rebuild)
 
+    mndep = mnsub.add_parser("depend", help="record that one task cannot start "
+                             "until another is completed (the edge the "
+                             "orchestrator walks)")
+    mndep.add_argument("task_id", help="the task that has to wait")
+    mndep.add_argument("on", help="the task_id it waits for")
+    mndep.add_argument("--project", default=None)
+    mndep.add_argument("--session", default=None)
+    mndep.set_defaults(func=cmd_mindnet_depend)
+
     # MN-7's orchestrator. No `choices=` on --limit/--max-waves for the same
     # reason the phase arguments carry none: the bound belongs to the
     # orchestrator, and a second copy in the parser is a place for it to drift.
@@ -2575,7 +2697,23 @@ def _build_parser() -> argparse.ArgumentParser:
                           "wide the frontier is (default: cpu count). Distinct "
                           "from --limit, which decides which tasks run at all")
     mno.add_argument("--timeout", type=int, default=None,
-                     help="seconds any one task may take")
+                     help="seconds any one task may take (default: 1800 for "
+                          "agents, 600 for --via-script)")
+    mno.add_argument("--via-script", action="store_true", dest="via_script",
+                     help="run each task's stored validation_script instead of "
+                          "spawning an agent. This only RE-CHECKS tasks; it does "
+                          "not do their work")
+    mno.add_argument("--isolation", choices=("none", "worktree"),
+                     default="none",
+                     help="`worktree` gives each agent its own git worktree and "
+                          "its own ledger segment, which is what allows agents to "
+                          "run in PARALLEL. `none` (default) runs them one at a "
+                          "time in the current checkout")
+    mno.add_argument("--allow-shared-tree", action="store_true",
+                     dest="allow_shared_tree",
+                     help="let agents run concurrently in ONE working tree. They "
+                          "will collide on each other's edits and the git index "
+                          "— without this, agents run one at a time")
     mno.add_argument("--project", default=None)
     mno.add_argument("--session", default=None)
     mno.add_argument("--json", action="store_true")

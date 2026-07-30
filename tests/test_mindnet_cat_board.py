@@ -154,6 +154,31 @@ def test_the_payload_names_the_thresholds_so_the_ui_need_not_respell_them(
     _status, body = _get(base, "/api/mindnet/cats", token)
     assert body["dim_after_secs"] == ui.DIM_AFTER_SECS
     assert body["hide_after_secs"] == ui.HIDE_AFTER_SECS
+    assert body["idle_vanish_secs"] == ui.IDLE_VANISH_SECS
+
+
+def test_a_finished_faculty_is_gone_at_the_endpoint_too():
+    """The disappearance rule asserted where it has to hold. A rule that works in
+    the provider and is bypassed by the endpoint is not a rule — the same reason
+    the 6-hour filter has its own endpoint test."""
+    # Deliberately not the `server` fixture: this needs two separate feeds.
+    handler = dashboard.make_handler("t")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        _emit("sop", status=tel.STATUS_IDLE, ago=ui.IDLE_VANISH_SECS + 30)
+        _status, body = _get(base, "/api/mindnet/cats", "t")
+        assert body["cats"] == [], f"finished faculty still served: {body}"
+
+        # Canary: the same feed with an ACTIVE row at the same age must render,
+        # so the empty result above is the status rule and not an empty feed.
+        _emit("task-graph", status=tel.STATUS_ACTIVE,
+              ago=ui.IDLE_VANISH_SECS + 30)
+        _status, body = _get(base, "/api/mindnet/cats", "t")
+        assert [c["faculty"] for c in body["cats"]] == ["task-graph"]
+    finally:
+        srv.shutdown()
 
 
 def test_the_page_does_not_hardcode_the_threshold_numbers():
