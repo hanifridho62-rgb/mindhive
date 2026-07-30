@@ -42,6 +42,7 @@ import ast
 import inspect
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -761,18 +762,133 @@ def test_the_status_rows_are_marked_machine_written():
     assert rows and all("auto" in e.tags for e in rows)
 
 
-def test_a_failing_ledger_append_does_not_corrupt_the_reported_outcome(
+def test_a_failing_ledger_append_names_the_tasks_that_went_unrecorded(
         monkeypatch):
-    """The run already happened. If recording it fails, the report must still be
-    honest about what ran rather than crashing and losing it entirely."""
+    """The tasks already RAN. The failure must say exactly which ones have no
+    ledger row, because re-running the orchestrator would execute them a second
+    time — silent double execution is the cost of a vague error here."""
     _declare("a")
 
     def boom(*a, **k):
         raise OSError("ledger is read-only")
 
     monkeypatch.setattr(events, "append_event", boom)
-    with pytest.raises(OSError):
+    with pytest.raises(RuntimeError, match="a "):
         orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+
+
+def test_one_failing_append_does_not_abandon_the_rest_of_the_wave(monkeypatch):
+    """Aborting the loop mid-wave left the remaining settled tasks with no row at
+    all AND skipped the rebuild, leaving the sidecar stale on top of the rows that
+    did land — the exact condition _persist exists to prevent."""
+    _declare("a")
+    _declare("b")
+    seen = []
+    real = events.append_event
+
+    def flaky(etype, payload, **kw):
+        seen.append(payload.get("task_id"))
+        if payload.get("task_id") == "a":
+            raise OSError("this one row fails")
+        return real(etype, payload, **kw)
+
+    monkeypatch.setattr(events, "append_event", flaky)
+    with pytest.raises(RuntimeError) as err:
+        orc.orchestrate(_graph(_task("a"), _task("b")),
+                        runner=FakeRunner(), execute=True)
+
+    assert seen == ["a", "b"], "the loop stopped at the first failure"
+    msg = str(err.value)
+    # `"b (" not in`, not `"b" not in`: the message's own prose contains a 'b'
+    # ("but their"), so the bare-letter check matched itself.
+    assert "a (" in msg and "b (" not in msg, msg
+    assert t_mod.fold(events.read_all())["b"].status == \
+        t_mod.STATUS_COMPLETED, "b's row was lost with a's"
+
+
+def test_a_failed_sidecar_rebuild_is_raised_not_swallowed(monkeypatch):
+    """`sidecar.rebuild` signals refusal with written=False and NEVER raises (it
+    is wired into a hook path). Discarding that return value meant a failed
+    projection refresh was silently swallowed and the next wave read a stale
+    sidecar — MN-6's lesson, reintroduced by the code that documents it."""
+    _declare("a")
+    monkeypatch.setattr(sc_mod, "rebuild",
+                        lambda *a, **k: sc_mod.Rebuild(False, "disk full"))
+    with pytest.raises(RuntimeError, match="STALE"):
+        orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+
+
+def test_a_successful_rebuild_is_not_treated_as_a_failure(monkeypatch):
+    """The canary for the test above: the written=True path must stay quiet."""
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+    assert out.outcome == orc.OUTCOME_SETTLED
+
+
+# --- MN-7 review follow-ups: bounded concurrency and recorded reasons ---------
+
+def test_the_pool_is_capped_independently_of_the_frontier_width():
+    """Sizing the pool to the batch meant a wide frontier spawned one thread and
+    one child per ready task — up to MAX_NODES(2000) subprocesses from a single
+    command. The cap bounds EXECUTION; the frontier still plans every ready task."""
+    wide = _graph(*[_task(f"t{i}") for i in range(40)])
+    fake = FakeRunner(delay=0.01)
+    out = orc.orchestrate(wide, runner=fake, execute=True, max_workers=3)
+
+    assert len(out.waves[0].tasks) == 40, "the wave must still PLAN all 40"
+    assert fake.peak <= 3, f"peak concurrency {fake.peak} exceeded the cap"
+    assert out.outcome == orc.OUTCOME_SETTLED, "a cap must not lose tasks"
+
+
+def test_the_default_worker_cap_is_at_least_two():
+    """Floor of 2 so a single-core CI box still runs a wave concurrently —
+    otherwise the concurrency test above would pass for the wrong reason there."""
+    assert orc.DEFAULT_MAX_WORKERS >= 2
+
+
+def test_the_default_cap_applies_when_no_override_is_given():
+    wide = _graph(*[_task(f"t{i}") for i in range(orc.DEFAULT_MAX_WORKERS + 20)])
+    fake = FakeRunner(delay=0.01)
+    orc.orchestrate(wide, runner=fake, execute=True)
+    assert fake.peak <= orc.DEFAULT_MAX_WORKERS
+
+
+def test_a_blocked_task_carries_the_reason_it_blocked():
+    """"blocked: a" with no reason is not actionable, and the CLI was pointing
+    operators at `hive mindnet show` which had nothing recorded to show."""
+    fake = FakeRunner(results={"a": "fail"})
+    out = orc.orchestrate(_graph(_task("a")), runner=fake, execute=True)
+    assert out.blocked == ["a"]
+    assert "synthetic fail" in out.reasons["a"]
+
+
+def test_a_raising_runner_records_its_exception_as_the_reason():
+    fake = FakeRunner(raises={"a"})
+    out = orc.orchestrate(_graph(_task("a")), runner=fake, execute=True)
+    assert "OSError" in out.reasons["a"]
+
+
+def test_the_reason_carries_the_durable_artifact_path_when_there_is_one(
+        tmp_path, monkeypatch):
+    """The RunLog artifact is the only place a failed child's output survives;
+    a reason that does not point at it makes MN-0's durability unreachable."""
+    from mindhive import paths
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: tmp_path)
+    _declare("a")
+    script = " ".join([__import__("sys").executable, str(_FAIL_SCRIPT(tmp_path))])
+    out = orc.orchestrate({"a": _task("a", validation_script=script)},
+                          execute=True)
+    assert out.blocked == ["a"]
+    assert "log:" in out.reasons["a"], out.reasons
+    assert Path(out.reasons["a"].split("log:")[1].strip()).exists()
+
+
+def test_each_wave_carries_only_its_own_reasons():
+    """Per-wave attribution: a reason from wave 1 must not appear against wave 2."""
+    fake = FakeRunner(results={"b": "fail"})
+    out = orc.orchestrate(_diamond(), runner=fake, execute=True)
+    assert "a" not in out.waves[1].reasons
+    assert "b" in out.waves[1].reasons
 
 
 def test_no_rows_are_written_for_a_wave_that_settled_nothing(monkeypatch):

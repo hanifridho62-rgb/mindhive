@@ -1296,11 +1296,20 @@ def cmd_mindnet_orchestrate(args) -> int | None:
               'declare <id> --title "…")')
         return None
 
-    out = orc_mod.orchestrate(
-        tasks, execute=bool(args.execute), limit=args.limit,
-        max_waves=args.max_waves if args.max_waves is not None
-        else orc_mod.MAX_WAVES,
-        project=project, timeout_s=args.timeout)
+    try:
+        out = orc_mod.orchestrate(
+            tasks, execute=bool(args.execute), limit=args.limit,
+            max_waves=args.max_waves if args.max_waves is not None
+            else orc_mod.MAX_WAVES,
+            project=project, timeout_s=args.timeout,
+            max_workers=args.max_workers)
+    except Exception as exc:
+        # An orchestrator fault is an operator-facing failure, not a stack trace.
+        # `main()` only catches JSONDecodeError, so without this a ledger or
+        # projection error surfaces as a raw traceback — and the two faults
+        # `_persist` raises are precisely the ones carrying the instructions for
+        # what to do next.
+        return _mn_error(f"{type(exc).__name__}: {exc}")
 
     if args.json:
         print(json.dumps(asdict(out), indent=2, ensure_ascii=False,
@@ -1316,9 +1325,13 @@ def cmd_mindnet_orchestrate(args) -> int | None:
                          f"blocked: {len(w.blocked)}]")
             print(line)
         if out.blocked:
-            # Named, not counted: an operator cannot act on "3 blocked".
-            print("  blocked: " + ", ".join(out.blocked)
-                  + "  ·  inspect one with: hive mindnet show <id>")
+            # Named WITH ITS REASON, not counted: an operator cannot act on
+            # "3 blocked", and pointing them at `hive mindnet show` was worse
+            # than useless while the status rows carried no reason at all.
+            print("  blocked:")
+            for tid in out.blocked:
+                why = out.reasons.get(tid) or "no reason recorded"
+                print(f"    {tid}: {why}")
         if not args.execute:
             print("  this was a dry run — add --execute to actually run it")
     # `dry-run` and `settled` are successes; the other two are not.
@@ -2546,6 +2559,11 @@ def _build_parser() -> argparse.ArgumentParser:
     mno.add_argument("--max-waves", type=int, default=None, dest="max_waves",
                      help="runaway backstop (default: "
                           "orchestrator.MAX_WAVES)")
+    mno.add_argument("--max-workers", type=int, default=None,
+                     dest="max_workers",
+                     help="ceiling on CONCURRENT children, independent of how "
+                          "wide the frontier is (default: cpu count). Distinct "
+                          "from --limit, which decides which tasks run at all")
     mno.add_argument("--timeout", type=int, default=None,
                      help="seconds any one task may take")
     mno.add_argument("--project", default=None)

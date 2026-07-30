@@ -43,6 +43,7 @@ testable without starting a process, and it is why `frontier` is kept pure.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import os
 from dataclasses import dataclass, field, replace
 
 from . import executor as x_mod
@@ -73,6 +74,17 @@ OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN)
 # legal graph could hit would be a bug wearing a safety rail's clothes.
 MAX_WAVES = 64
 
+# Ceiling on concurrent children per wave, independent of how wide the frontier
+# is. Without it `max_workers` was the batch size, so a graph with a wide
+# frontier (up to `MAX_NODES`, 2000) would spawn one thread and one child process
+# per ready task — thousands of subprocesses from a single command, by accident.
+#
+# This bounds EXECUTION, not planning: the wave still contains every ready task
+# and they queue through the pool. `--limit` is the other knob and means something
+# different — it truncates the frontier, deciding which tasks run in this wave at
+# all. Floor of 2 so a single-core CI box still runs a wave concurrently.
+DEFAULT_MAX_WORKERS = max(2, os.cpu_count() or 2)
+
 # Machine-written rows, like `telemetry`'s: `auto` is the taxonomy's existing
 # mark for a projection the operator did not type.
 STATUS_TAGS = ["mindnet", "task", "auto"]
@@ -80,12 +92,20 @@ STATUS_TAGS = ["mindnet", "task", "auto"]
 
 @dataclass(frozen=True)
 class Wave:
-    """One round of the loop: what was submitted, and how it came back."""
+    """One round of the loop: what was submitted, and how it came back.
+
+    ``reasons`` maps a settled task to WHY it settled that way. Carried because
+    the alternative was discarding it: `_run_wave` receives a full `RunResult`
+    per child — with its reason, exit code and durable artifact path — and a
+    result that reduced to a bare id list left an operator with "blocked: a" and
+    no way to find out why, while the CLI cheerfully suggested inspecting a task
+    that had nothing recorded against it."""
 
     index: int
     tasks: list = field(default_factory=list)
     completed: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
+    reasons: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -96,6 +116,7 @@ class Orchestration:
     waves: list = field(default_factory=list)
     completed: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
+    reasons: dict = field(default_factory=dict)
 
 
 def frontier(graph, limit=None) -> list:
@@ -179,21 +200,30 @@ def _child_env(project=None):
     return {optin.ENV_VAR: "1" if armed else "0"}
 
 
-def _run_wave(batch, graph, runner, index, project=None, timeout_s=None):
-    """Submit *batch* concurrently and return ``(completed, blocked)``.
+def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
+              max_workers=None):
+    """Submit *batch* concurrently and return ``(completed, blocked, reasons)``.
 
-    Concurrency is bounded by the batch itself — `frontier` already applied the
-    limit, so the pool is sized to what it returned rather than applying the
-    bound twice in two places that could disagree.
+    **The pool is capped, the batch is not.** `frontier` decides WHICH tasks run
+    this wave; `DEFAULT_MAX_WORKERS` decides how many run at once. Sizing the pool
+    to the batch, as this first did, meant a wide frontier spawned one thread and
+    one child process per ready task — thousands of subprocesses from one command.
+    The two knobs are deliberately separate: a wave still contains every ready
+    task, they just queue.
 
     A runner that RAISES blocks its task: `executor.execute` maps its own faults
     to typed results, but a custom runner (or a bug in one) can still throw, and
     one exploding task must not take the orchestration down. An unrecognized
     result VALUE is the opposite case and is re-raised on the main thread — that
     is a programming error in the mapping, not a task failure, and swallowing it
-    would mark tasks on evidence nobody classified."""
+    would mark tasks on evidence nobody classified.
+
+    ``reasons`` keeps each child's own account of itself — the reason string and,
+    when there is one, the durable artifact path. Dropping it left "blocked: a"
+    as the only thing an operator ever saw."""
     env = _child_env(project)
-    done, failed, unknown = [], [], []
+    done, failed, unknown, reasons = [], [], [], {}
+    cap = DEFAULT_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
 
     def one(tid):
         task = graph.get(tid)
@@ -206,14 +236,21 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None):
         except Exception as exc:                       # noqa: BLE001 — see above
             return tid, None, f"{type(exc).__name__}: {exc}"
 
-    with cf.ThreadPoolExecutor(max_workers=max(1, len(batch))) as pool:
+    with cf.ThreadPoolExecutor(
+            max_workers=max(1, min(len(batch), cap))) as pool:
         results = list(pool.map(one, batch))
 
     for tid, res, err in results:
         if err is not None or res is None:
             failed.append(tid)
+            reasons[tid] = err or "the runner returned nothing"
             continue
         status = RESULT_STATUS.get(getattr(res, "result", None))
+        detail = str(getattr(res, "reason", "") or "").strip()
+        artifact = getattr(res, "artifact", None)
+        if detail or artifact:
+            reasons[tid] = " · ".join(
+                p for p in (detail, f"log: {artifact}" if artifact else "") if p)
         if status is None:
             unknown.append((tid, getattr(res, "result", None)))
         elif status == t_mod.STATUS_COMPLETED:
@@ -227,7 +264,7 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None):
             f"task '{tid}' returned run result {value!r}, which is not in "
             f"executor.RUN_RESULTS — orchestrator.RESULT_STATUS must classify "
             f"every declared result before it can be acted on")
-    return sorted(done), sorted(failed)
+    return sorted(done), sorted(failed), reasons
 
 
 def _persist(graph, completed, blocked, project=None) -> dict:
@@ -249,19 +286,49 @@ def _persist(graph, completed, blocked, project=None) -> dict:
     silently DISCARDS any graph that did not come from the ledger, and the
     orchestrator is the only writer of these rows — so the fold could not tell us
     anything we did not just write, while quietly losing everything we were
-    handed."""
+    handed.
+
+    A failing append does not abandon the rest of the wave. The tasks already
+    RAN; aborting the loop would leave some settled tasks with no ledger row at
+    all, so a retry would silently run them a second time — and skipping the
+    rebuild on the way out would leave the sidecar stale on top of the rows that
+    *did* land, which is the exact condition this function exists to prevent. So
+    every row is attempted, the rebuild always runs, and the failures are raised
+    together afterwards naming precisely which tasks went unrecorded.
+
+    `rebuild`'s answer is CHECKED. It signals refusal with ``written=False`` and
+    never raises (by design — it is wired into a hook path), so discarding the
+    return value, as this first did, meant a failed projection refresh was
+    silently swallowed and the next wave read a stale sidecar: MN-6's lesson,
+    reintroduced by the code documenting it."""
     from .. import events
     from . import sidecar as sc_mod
     rows = ([(tid, t_mod.STATUS_COMPLETED) for tid in completed]
             + [(tid, t_mod.STATUS_BLOCKED) for tid in blocked])
     if not rows:
         return graph
+    unrecorded = []
     for tid, status in rows:
         payload = {"action": "status", "task_id": tid, "status": status}
-        t_mod.validate_payload(payload)
-        events.append_event("mindnet_task", payload, tags=STATUS_TAGS,
-                            project=project)
-    sc_mod.rebuild(project)
+        try:
+            t_mod.validate_payload(payload)
+            events.append_event("mindnet_task", payload, tags=STATUS_TAGS,
+                                project=project)
+        except Exception as exc:                       # noqa: BLE001 — see above
+            unrecorded.append(f"{tid} ({type(exc).__name__}: {exc})")
+    out = sc_mod.rebuild(project)
+    if unrecorded:
+        raise RuntimeError(
+            "these tasks RAN but their status could not be recorded: "
+            + ", ".join(unrecorded)
+            + " — re-running the orchestrator would execute them again; "
+              "record them by hand or repair the ledger first")
+    if not out.written:
+        raise RuntimeError(
+            f"the wave's status rows landed but the sidecar could not be "
+            f"rebuilt: {out.reason} — the projection is now STALE, which "
+            f"disables phase-aware injection and the PreToolUse teeth until "
+            f"`hive mindnet rebuild` succeeds")
     return _mark(graph, completed, blocked)
 
 
@@ -269,7 +336,7 @@ def _persist(graph, completed, blocked, project=None) -> dict:
 
 def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
                 max_waves=MAX_WAVES, project=None, apply_status=None,
-                timeout_s=None) -> Orchestration:
+                timeout_s=None, max_workers=None) -> Orchestration:
     """Walk *graph* wave by wave until it settles, stalls, or hits the cap.
 
     ``execute=False`` (the DEFAULT) plans without starting anything. That default
@@ -294,6 +361,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     waves: list = []
     completed: list = []
     blocked: list = []
+    reasons: dict = {}
     capped = False
 
     for index in range(max(0, int(max_waves))):
@@ -308,12 +376,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
             continue
 
         before = {tid: getattr(t, "status", None) for tid, t in g.items()}
-        done, failed = _run_wave(batch, g, runner, index, project=project,
-                                 timeout_s=timeout_s)
+        done, failed, why = _run_wave(batch, g, runner, index, project=project,
+                                      timeout_s=timeout_s,
+                                      max_workers=max_workers)
         waves.append(Wave(index=index, tasks=list(batch), completed=done,
-                          blocked=failed))
+                          blocked=failed, reasons=dict(why)))
         completed.extend(done)
         blocked.extend(failed)
+        reasons.update(why)
         g = apply_status(g, done, failed)
         after = {tid: getattr(t, "status", None)
                  for tid, t in (g or {}).items()}
@@ -333,7 +403,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     else:
         outcome = OUTCOME_SETTLED
     return Orchestration(outcome=outcome, waves=waves, completed=completed,
-                         blocked=blocked)
+                         blocked=blocked, reasons=reasons)
 
 
 def _has_open_work(graph) -> bool:

@@ -1004,7 +1004,7 @@ def test_orchestrate_bare_is_a_dry_run_that_spawns_nothing(capsys, monkeypatch):
     _orc_graph()
     calls = []
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda *a, **k: calls.append(a) or ([], []))
+                        lambda *a, **k: calls.append(a) or ([], [], {}))
 
     assert _cli("mindnet", "orchestrate") == 0
     out = capsys.readouterr().out
@@ -1024,7 +1024,7 @@ def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), []))
+                        lambda batch, *a, **k: (sorted(batch), [], {}))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 0
     out = capsys.readouterr().out
@@ -1038,7 +1038,9 @@ def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: ([], sorted(batch)))
+                        lambda batch, *a, **k: (
+                            [], sorted(batch),
+                            {t: "synthetic failure" for t in batch}))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
     assert "stalled" in capsys.readouterr().out
@@ -1048,7 +1050,7 @@ def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), []))
+                        lambda batch, *a, **k: (sorted(batch), [], {}))
     capsys.readouterr()                       # drop the fixture's declare noise
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 0
@@ -1078,9 +1080,68 @@ def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), []))
+                        lambda batch, *a, **k: (sorted(batch), [], {}))
     _ok("mindnet", "orchestrate", "--execute")
     assert sc_mod.read().fresh is True
+
+
+def test_orchestrate_text_output_names_why_each_task_blocked(capsys,
+                                                            monkeypatch):
+    """"blocked: a" is not actionable, and the old text pointed operators at
+    `hive mindnet show`, which had nothing recorded to show."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (
+                            [], sorted(batch),
+                            {t: "the validation run exited 3" for t in batch}))
+    capsys.readouterr()
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 1
+    out = capsys.readouterr().out
+    assert "a: the validation run exited 3" in out
+
+
+def test_orchestrate_json_carries_the_blocked_reasons(capsys, monkeypatch):
+    """The agent-facing surface needs the reason as data, not only as prose on
+    stdout — otherwise an agent hitting `blocked` has to reconstruct the run-key
+    convention and hunt for the log by hand."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (
+                            [], sorted(batch), {t: "refused" for t in batch}))
+    capsys.readouterr()
+
+    assert _cli("mindnet", "orchestrate", "--execute", "--json") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["reasons"]["a"] == "refused"
+    assert data["waves"][0]["reasons"]["a"] == "refused"
+
+
+def test_orchestrate_reports_an_orchestrator_fault_as_an_error_not_a_traceback(
+        capsys, monkeypatch):
+    """`main()` only catches JSONDecodeError, so without local handling a ledger
+    or projection fault reached the operator as a raw stack trace — and the two
+    faults _persist raises are exactly the ones carrying the repair instructions."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+
+    def boom(*a, **k):
+        raise RuntimeError("the projection is now STALE")
+
+    monkeypatch.setattr(orc_mod, "orchestrate", boom)
+    assert _cli("mindnet", "orchestrate", "--execute") == 2
+    assert "STALE" in capsys.readouterr().err
+
+
+def test_orchestrate_max_workers_is_distinct_from_limit():
+    """Two knobs, two meanings: --limit decides which tasks run this wave at all,
+    --max-workers how many run at once. Collapsing them would make a wide graph
+    either serial or unbounded."""
+    sp = _subparser("mindnet", "orchestrate")
+    opts = [s for a in sp._actions for s in a.option_strings]
+    assert "--limit" in opts and "--max-workers" in opts
 
 
 def test_orchestrate_is_on_the_frozen_subcommand_surface():
