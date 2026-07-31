@@ -382,6 +382,10 @@ def train(skills, stats, evs=None, now=None, incident_summaries=None) -> dict:
             "prompts_scanned": observed["prompts_scanned"],
             "playbook_phases": len(play.get("phases") or {}),
             "playbook_records": len(play.get("records") or []),
+            # What the record pool dropped, and by which mechanism. Reported because
+            # the shrinkage was previously undisclosed AND misattributed: the pool cap
+            # is never reached on a real store, and dedupe is what removes the rows.
+            "playbook_pool": dict(play.get("pool") or {}),
         },
         "rules": rules,
         "always": always,

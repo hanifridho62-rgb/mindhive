@@ -398,8 +398,32 @@ def record_pool(evs, cap: int = RECORD_POOL) -> list:
     prompt at hook time by `pick_records`. Freezing the choice at train time was the
     first version and it read badly — the only thing available to match against was a
     phase's generic need text, so a prompt about one subject was told to read records
-    about another."""
+    about another.
+
+    See `pool_stats` for what this selection dropped and why."""
+    return pool_with_stats(evs, cap)[0]
+
+
+def pool_stats(evs, cap: int = RECORD_POOL) -> dict:
+    """`{seen, kept, collapsed, capped}` for the pool built from *evs*.
+
+    Exists because the pool's shrinkage was undisclosed, and I described the mechanism
+    wrongly when I first wrote it down: I reported a silent truncation at the `cap`,
+    but on the live store the cap is **never reached** — 130 kept out of 284 curated —
+    and the 154 missing rows are dropped by *dedupe*. Reporting the two separately is
+    what makes that distinguishable instead of a number a reader has to guess at."""
+    return pool_with_stats(evs, cap)[1]
+
+
+def pool_with_stats(evs, cap: int = RECORD_POOL):
+    """`(pool, stats)` — one pass, so the counts can never disagree with the pool.
+
+    Computing them separately would be two traversals of the same events with two
+    chances to drift; a stats block that contradicts the pool it describes is worse
+    than no stats at all."""
     out, seen = [], set()
+    seen_ct = collapsed = 0
+    capped = False
     for ev in sorted((evs or []), key=lambda e: str(getattr(e, "ts", "") or ""),
                      reverse=True):
         if getattr(ev, "type", None) not in POINTER_TYPES:
@@ -407,15 +431,21 @@ def record_pool(evs, cap: int = RECORD_POOL) -> list:
         gist = _gist(getattr(ev, "payload", None))
         if not gist:
             continue
+        seen_ct += 1
         key = _dedupe_key(gist)
         if key in seen:
+            collapsed += 1
+            continue
+        if len(out) >= cap:
+            # Counted, not silently discarded: the whole point of this block is that a
+            # reader can tell WHICH mechanism shortened the pool.
+            capped = True
             continue
         seen.add(key)
         out.append({"type": ev.type, "ts": str(getattr(ev, "ts", "") or ""),
                     "gist": gist})
-        if len(out) >= cap:
-            break
-    return out
+    return out, {"seen": seen_ct, "kept": len(out), "collapsed": collapsed,
+                 "capped": capped}
 
 
 def df_table(records) -> dict:
@@ -552,8 +582,9 @@ def build(skills, stats, evs=None, open_incidents=(), skill_rules=None) -> dict:
         picked = _skills_for(need, skills, stats, open_incidents, skill_rules)
         if picked:
             phases[phase] = {"skills": picked}
-    pool = record_pool(evs)
-    return {"phases": phases, "records": pool, "df": df_table(pool)}
+    pool, stats = pool_with_stats(evs)
+    return {"phases": phases, "records": pool, "df": df_table(pool),
+            "pool": stats}
 
 
 def render(playbook, phase, prompt_text, exclude=()) -> str:

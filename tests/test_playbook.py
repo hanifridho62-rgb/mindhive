@@ -290,6 +290,67 @@ def test_the_pool_drops_near_identical_memos():
     assert pool[0]["ts"] == "2026-07-09T00:00:00Z", "dedupe kept the older copy"
 
 
+# --- U4: disclose what the pool dropped, and by which mechanism ----------------
+#
+# The pool's shrinkage was undisclosed, and I described the mechanism wrongly when I
+# first wrote it down: I reported a silent truncation at RECORD_POOL, but on the live
+# store the cap is never reached — 130 kept out of 284 curated — and the 154 missing
+# rows are dropped by dedupe. Reporting the two separately is what makes that
+# distinguishable instead of a number the reader has to guess at.
+
+def test_the_pool_reports_what_it_saw_kept_and_collapsed():
+    same = "one lesson written twice in different sessions"
+    stats = pb.pool_stats([
+        _ev("2026-07-01T00:00:00Z", "decision", same),
+        _ev("2026-07-02T00:00:00Z", "decision", same),
+        _ev("2026-07-03T00:00:00Z", "caveat", "a genuinely different lesson"),
+        _ev("2026-07-04T00:00:00Z", "command_run", "not a curated memo at all"),
+    ])
+    assert stats["seen"] == 3, "only curated memos with a gist count as seen"
+    assert stats["kept"] == 2
+    assert stats["collapsed"] == 1
+    assert stats["capped"] is False
+
+
+def test_the_pool_counts_are_internally_consistent():
+    """kept + collapsed can never exceed seen, or the block is describing a pool that
+    does not exist."""
+    stats = pb.pool_stats([
+        _ev(f"2026-07-{d:02d}T00:00:00Z", "decision", f"distinct lesson {d}")
+        for d in range(1, 15)])
+    assert stats["kept"] + stats["collapsed"] <= stats["seen"]
+
+
+def test_an_all_distinct_pool_reports_nothing_collapsed():
+    stats = pb.pool_stats([
+        _ev(f"2026-07-0{i}T00:00:00Z", "decision", f"distinct lesson {i}")
+        for i in (1, 2, 3)])
+    assert stats["collapsed"] == 0 and stats["kept"] == 3
+
+
+def test_hitting_the_cap_is_reported_separately_from_collapsing():
+    """The exact confusion this unit corrects. A pool shortened by the cap and a pool
+    shortened by dedupe are different facts about the store, and conflating them is
+    what let me state the wrong mechanism confidently."""
+    stats = pb.pool_stats([
+        _ev(f"2026-07-{d:02d}T00:00:00Z", "decision", f"distinct lesson {d}")
+        for d in range(1, 9)], cap=3)
+    assert stats["kept"] == 3
+    assert stats["capped"] is True
+    assert stats["collapsed"] == 0, "distinct memos must not be counted as duplicates"
+
+
+def test_the_pool_and_its_stats_come_from_one_pass():
+    """Two traversals would be two chances to drift, and a stats block that contradicts
+    the pool it describes is worse than no stats at all."""
+    evs = [_ev("2026-07-01T00:00:00Z", "decision", "alpha lesson"),
+           _ev("2026-07-02T00:00:00Z", "decision", "alpha lesson"),
+           _ev("2026-07-03T00:00:00Z", "caveat", "beta lesson")]
+    pool, stats = pb.pool_with_stats(evs)
+    assert len(pool) == stats["kept"]
+    assert pb.record_pool(evs) == pool, "the public pool diverged from the counted one"
+
+
 def test_the_pool_is_capped():
     many = [_ev(f"2026-07-{d:02d}T00:00:00Z", "decision", f"distinct lesson {d}")
             for d in range(1, 29)]
