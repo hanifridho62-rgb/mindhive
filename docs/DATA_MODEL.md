@@ -849,6 +849,82 @@ lowercased, so a stored skill name or ledger gist can neither forge a line nor p
 an order the system is issuing. A manifest with no playbook falls back to MN-14's
 single-skill line.
 
+### 4.12 Repairing the playbook, and closing the loop (MN-16)
+
+An audit of the *live* injected output falsified two of the defects I had written down
+and surfaced two worse ones. The corrections are recorded here because the credibility
+of the rest depends on which claims were measured.
+
+| Claimed | Measured | Verdict |
+|---|---|---|
+| `RECORD_POOL` truncates the pool silently | Cap never reached — 130 kept of 284. The 154 missing rows are dropped by **dedupe** | **False as stated** |
+| `render_always` is dead code the playbook replaced | 33 of 191 distinct real code prompts infer no technique, so the fallback is live | **False** |
+| Relevance needs IDF re-ranking | IDF re-ranking left the top-3 ordering unchanged on every prompt tried | **Rejected, not built** |
+
+**Inference is by weight of evidence.** `infer` counts how many *distinct* cues each
+phase matches and takes the strongest; ties resolve in `_CUES` order, so balanced
+evidence behaves exactly as it did before. First-match-wins was deciding for **64 of 275
+(23%)** real code prompts that matched more than one phase. `cue_scores` is public so a
+surface can explain an inference rather than assert it.
+
+Two missing cues mattered more than the ranking. The `plan` phase carried the Indonesian
+word but not the English one, so a prompt literally asking for a plan inferred nothing.
+And `fix` was absent everywhere — which is why "fix the code … improve the file
+architecture" was classified a system audit off a single passing mention of architecture.
+No cue was deleted to fix any of this: demoting incidental signals keeps the true
+positives.
+
+Distribution over the **distinct** prompts afterwards — the honest view, since the raw
+corpus repeats scheduled prompts and the old "audit-system 60" was largely one prompt
+repeated ~54 times:
+
+```
+plan 45 · audit-bug 44 · pr-green 43 · audit-code 10
+brainstorm 6 · execution 5 · audit-system 4 · prd 1
+```
+
+**Gists are cut at a word boundary**, close whatever delimiter the cut left open, and
+carry an ellipsis so a shortened quote cannot pose as a complete one. 100 of 130 live
+gists previously sat at the limit, most ending mid-token. The single quote is
+deliberately *not* balanced — in prose it is an apostrophe far more often than a quote,
+and enforcing an even count would corrupt "don't".
+
+**Weak records are suppressed, not padded over.** A document-frequency table (pruned to
+terms in two or more records) is precomputed at train time and used as a *threshold
+only* — never a sort key, because re-ranking by it demonstrably changed nothing. Measured
+limit, stated rather than smoothed over: suppression is **inert** when every candidate
+shares exactly one common term with the prompt, which is what happens when the prompt's
+distinguishing words are Indonesian and the ledger is English. The sample went from 14
+record lines to 12, not the 10 first predicted.
+
+**The pool discloses what it dropped** — seen / kept / collapsed / capped, separately, so
+the mechanism is distinguishable rather than guessed at.
+
+**The loop closes through machinery that already existed.** `record_direction` used to
+return early on a clear verdict, so a well-phrased code prompt directed skills through
+the catalog and traced nothing. It now records both paths on the existing
+`skill_directed` type — no new event type, no projector renderer, no dashboard change.
+`catalog_block` owns the playbook-versus-fallback decision so the recorded trail cannot
+disagree with the printed block; `playbook.selected_skills` does the same one level down
+with `render` and `directed_skills` as its two projections.
+
+Training then folds the events through **`oversee.skill_trails`** — reused, not
+reimplemented, since two joins would be two things to keep honest — and counts directed
+versus consumed per skill. A skill directed at least `MIN_DIRECTIONS` times and never
+used sorts behind its peers.
+
+**Demotion only.** Being taken never promotes: the signal is confounded, because the
+agent may follow directions mechanically. Provenance wording stays `recommend`'s to
+decide — an ignored skill above the auto gate is still a MUST. Demotion reorders; it
+never re-labels.
+
+**Cost.** Everything expensive is train-time (0.82 s). The hook moved from 0.27-0.29 s to
+**0.38-0.46 s**, still below the MN-15-era 0.39-0.65 s and far below the 1.09 s a ledger
+read would cost; the test that forbids a ledger read on the hook path is the hard guard.
+A memo that would have recovered ~0.08 s of duplicated work between `hook_context` and
+`record_direction` was written and then reverted: the two load the manifest separately,
+so any key cheap enough to be worth it is either a guaranteed miss or a staleness hazard.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
