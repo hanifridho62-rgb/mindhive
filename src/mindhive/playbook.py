@@ -33,6 +33,7 @@ is what lets the tests pin the bytes.
 """
 from __future__ import annotations
 
+import math
 import re
 
 # Caps. The injected block competes with the user's own prompt for attention: past a
@@ -50,6 +51,18 @@ QUERY_TERMS = 4
 # matched was the phase's generic need text. Scoring ~200 short gists is a few
 # milliseconds against a 0.39-0.65 s hook, and it buys real relevance.
 RECORD_POOL = 200
+
+# A record is kept only if it scores at least this fraction of the best match for the
+# prompt. Relative, not absolute: three records that match equally well are three
+# useful pointers, while two thematically-adjacent records padding out a list whose
+# first entry is the actual answer are noise. Measured at 0.45 on the live store:
+# `[11.9, 3.5, 3.5] -> keep 1`, `[2.0, 2.0, 2.0] -> keep 3`, 28% of record lines gone
+# and never the strong match.
+KEEP_RATIO = 0.45
+# Terms appearing in fewer than this many records are left out of the stored table. A
+# missing term is scored as rare, which is exactly what it is, so pruning costs no
+# accuracy: 639 terms / 8 561 bytes full versus 214 / 2 757 pruned on the live pool.
+DF_MIN = 2
 # Gists are deduped on this many leading characters. The live store legitimately holds
 # near-identical memos (the same lesson harvested in several sessions), and pointing at
 # the same text twice wastes a third of the block.
@@ -405,7 +418,56 @@ def record_pool(evs, cap: int = RECORD_POOL) -> list:
     return out
 
 
-def pick_records(records, prompt_text, phase=None, cap: int = RECORD_CAP) -> list:
+def df_table(records) -> dict:
+    """`{term: number of records containing it}` for terms in at least `DF_MIN`.
+
+    Built at train time and stored in the manifest so the hook never has to. Sorted so
+    the serialized table is byte-stable across runs — a manifest that reordered on
+    every train would churn the sidecar for no reason."""
+    from . import recommend
+    counts: dict = {}
+    for r in (records or []):
+        gist = r.get("gist") if isinstance(r, dict) else None
+        if not isinstance(gist, str):
+            continue
+        for term in recommend._keywords(gist):
+            counts[term] = counts.get(term, 0) + 1
+    return {t: n for t, n in sorted(counts.items()) if n >= DF_MIN}
+
+
+def _rarity(gist, prompt_text, df, total) -> float:
+    """How much the terms *gist* shares with the prompt actually narrow things down.
+
+    Rare shared terms count for more than common ones, which is what separates the
+    record that answers the prompt from one that merely shares its subject area. Used
+    ONLY as a threshold, never as a sort key: re-ranking by this score was measured
+    against the existing order and left the top three unchanged on every real prompt
+    tried, so reordering would be churn presented as an improvement.
+
+    Total by construction — it runs on a table read off disk."""
+    from . import recommend
+    if not isinstance(df, dict):
+        return 0.0
+    try:
+        n = int(total)
+    except (TypeError, ValueError):
+        return 0.0
+    if n < 1:
+        return 0.0
+    shared = recommend._keywords(prompt_text) & recommend._keywords(gist)
+    if not shared:
+        return 0.0
+    out = 0.0
+    for term in shared:
+        seen = df.get(term, 1)
+        if not isinstance(seen, int) or seen < 1:
+            seen = 1
+        out += math.log((n + 1) / (min(seen, n) + 1))
+    return out
+
+
+def pick_records(records, prompt_text, phase=None, cap: int = RECORD_CAP,
+                 df=None, total=None) -> list:
     """The pooled memos most worth reading for THIS prompt, best first.
 
     Scored against the prompt's own words first and the phase's need text second, so a
@@ -413,6 +475,12 @@ def pick_records(records, prompt_text, phase=None, cap: int = RECORD_CAP) -> lis
     of work. Ties break newest-first: the ledger never rewrites anything, so an older
     memo is the more likely to have been superseded — recency is the honest tie-break
     rather than a claim the old one is wrong.
+
+    *df* and *total* enable U3's suppression: a record scoring far below the best
+    available match for this prompt is dropped rather than used to fill the quota. The
+    rarity score is a THRESHOLD only — the order above is untouched, because
+    re-ranking by rarity was measured and left the top three unchanged. Omit them (a
+    manifest trained before U3) and behaviour is exactly what it was.
 
     Total by construction: a malformed row scores nothing and drops out rather than
     raising inside a hook that must never break a prompt."""
@@ -435,8 +503,19 @@ def pick_records(records, prompt_text, phase=None, cap: int = RECORD_CAP) -> lis
         ts = str(r.get("ts") or "")
         scored.append(((-direct, -themed, _neg_ts(ts), str(r.get("type") or "")), r))
     scored.sort(key=lambda t: t[0])
+    survivors = [r for _key, r in scored]
+    if df and survivors:
+        rarity = {id(r): _rarity(r.get("gist"), prompt_text, df, total)
+                  for r in survivors}
+        best = max(rarity.values())
+        # `best > 0` guard: when the prompt shares no scoreable term with anything,
+        # every score is 0 and a ratio test would keep or drop the whole list
+        # arbitrarily. Fall through to the unfiltered order instead — the records still
+        # matched on the phase theme, which is why they are here at all.
+        if best > 0:
+            survivors = [r for r in survivors if rarity[id(r)] >= best * KEEP_RATIO]
     out, seen = [], set()
-    for _key, r in scored:
+    for r in survivors:
         k = _dedupe_key(r.get("gist"))
         if k in seen:
             continue
@@ -473,7 +552,8 @@ def build(skills, stats, evs=None, open_incidents=(), skill_rules=None) -> dict:
         picked = _skills_for(need, skills, stats, open_incidents, skill_rules)
         if picked:
             phases[phase] = {"skills": picked}
-    return {"phases": phases, "records": record_pool(evs)}
+    pool = record_pool(evs)
+    return {"phases": phases, "records": pool, "df": df_table(pool)}
 
 
 def render(playbook, phase, prompt_text, exclude=()) -> str:
@@ -496,7 +576,10 @@ def render(playbook, phase, prompt_text, exclude=()) -> str:
     picked = [s for s in (entry.get("skills") or [])
               if isinstance(s, dict) and s.get("skill")
               and s["skill"] not in skipped]
-    records = pick_records(playbook.get("records"), prompt_text, phase)
+    pool = playbook.get("records")
+    records = pick_records(pool, prompt_text, phase,
+                           df=playbook.get("df"),
+                           total=len(pool) if isinstance(pool, list) else None)
     if not picked and not records:
         return ""
 

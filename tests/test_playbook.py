@@ -463,6 +463,150 @@ def test_pick_records_is_total_on_malformed_rows():
     assert [r["gist"] for r in picked] == ["dashboard export panel"]
 
 
+# --- U3: suppress weak matches instead of padding to a fixed count -------------
+#
+# Measured first, and it killed the obvious idea: IDF-weighted RE-RANKING left the
+# top-3 ordering unchanged on every real prompt tried, so records are still ordered
+# exactly as before. What the rarity score is genuinely good at is telling a strong
+# match from a weak one, which supports SUPPRESSION. At a 45% cutoff the sample
+# prompts went from 14 record lines to 10 — and where one record was genuinely strong
+# it cut 3 lines to 1, while correctly keeping all three when scores tied.
+
+def _df(pool):
+    """The document-frequency table the same way training builds it."""
+    return pb.df_table(pool)
+
+
+def test_a_strong_match_suppresses_the_weak_ones():
+    """The case that motivated the unit: `[11.9, 3.5, 3.5] -> keep 1/3` on the live
+    store. Two thematically-adjacent records were padding out a list whose first entry
+    was the actual answer."""
+    pool = pb.record_pool([
+        _ev("2026-07-01T00:00:00Z", "caveat",
+            "worktree PYTHONPATH pytest subprocess editable install resolution"),
+        _ev("2026-07-02T00:00:00Z", "decision", "worktree branch merged to master"),
+        _ev("2026-07-03T00:00:00Z", "decision", "worktree removed after review"),
+    ])
+    picked = pb.pick_records(pool, "worktree PYTHONPATH pytest subprocess",
+                             df=_df(pool), total=len(pool))
+    assert len(picked) == 1, [r["gist"] for r in picked]
+    assert "PYTHONPATH" in picked[0]["gist"]
+
+
+def test_genuinely_tied_records_all_survive():
+    """The threshold is relative, not an absolute cutoff. Three records that match a
+    prompt equally well are three useful pointers, not noise."""
+    pool = pb.record_pool([
+        _ev(f"2026-07-0{i}T00:00:00Z", "decision", f"dashboard export panel note {i}")
+        for i in (1, 2, 3)])
+    picked = pb.pick_records(pool, "dashboard export panel",
+                             df=_df(pool), total=len(pool))
+    assert len(picked) == 3
+
+
+def test_thresholding_never_empties_a_non_empty_result():
+    """The failure mode to avoid: a cutoff that drops everything, including the best
+    match, leaving the block silent about records it did have."""
+    pool = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat",
+                               "dashboard export panel")])
+    assert len(pb.pick_records(pool, "dashboard export",
+                               df=_df(pool), total=len(pool))) == 1
+
+
+def test_thresholding_still_returns_nothing_when_nothing_matches():
+    """Canary: the tests above prove nothing if the function keeps whatever it is
+    handed."""
+    pool = pb.record_pool([_ev("2026-07-01T00:00:00Z", "decision",
+                               "zzqqxx wholly unrelated vocabulary")])
+    assert pb.pick_records(pool, "dashboard export panel",
+                           df=_df(pool), total=len(pool)) == []
+
+
+def test_without_a_df_table_behaviour_is_unchanged():
+    """A manifest trained before this unit carries no table. It must degrade to the
+    previous behaviour, not raise and not silently return nothing — the same fail-open
+    promise every other part of this module makes."""
+    pool = pb.record_pool([
+        _ev("2026-07-01T00:00:00Z", "caveat", "worktree PYTHONPATH pytest subprocess"),
+        _ev("2026-07-02T00:00:00Z", "decision", "worktree branch merged to master"),
+    ])
+    assert len(pb.pick_records(pool, "worktree branch", df=None, total=None)) == 2
+
+
+def test_a_malformed_df_table_does_not_raise():
+    """It comes off disk, so a past or hand-edited version may have written anything."""
+    pool = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", "dashboard export")])
+    for bad in ({"dashboard": "not a number"}, {"dashboard": None},
+                {7: 2}, "not a dict", []):
+        picked = pb.pick_records(pool, "dashboard export", df=bad, total=1)
+        assert isinstance(picked, list)
+
+
+def test_a_nonsense_total_does_not_raise():
+    pool = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", "dashboard export")])
+    for total in (0, -5, None, "many"):
+        assert isinstance(pb.pick_records(pool, "dashboard export",
+                                          df={"dashboard": 2}, total=total), list)
+
+
+def test_thresholded_picking_is_deterministic():
+    pool = pb.record_pool([
+        _ev(f"2026-07-0{i}T00:00:00Z", "decision", f"dashboard export note {i}")
+        for i in (1, 2, 3)])
+    args = dict(df=_df(pool), total=len(pool))
+    assert (pb.pick_records(pool, "dashboard export", **args)
+            == pb.pick_records(pool, "dashboard export", **args))
+
+
+def test_the_cap_still_bounds_a_field_of_ties():
+    pool = pb.record_pool([
+        _ev(f"2026-07-{d:02d}T00:00:00Z", "decision", f"dashboard export note {d}")
+        for d in range(1, 9)])
+    picked = pb.pick_records(pool, "dashboard export", df=_df(pool),
+                             total=len(pool), cap=3)
+    assert len(picked) == 3
+
+
+def test_suppression_is_inert_when_every_candidate_shares_one_common_term():
+    """The measured LIMIT of this unit, recorded so nobody reads the feature as
+    stronger than it is.
+
+    Suppression can only discriminate when candidates differ in how many or how rare
+    their shared terms are. On the live store, "CI merah di windows py3.12" leaves
+    every candidate sharing exactly one term — `windows` — so all eight score 2.57 and
+    nothing is dropped. The prompt's distinguishing words are Indonesian and the ledger
+    is written in English, so they match nothing at all.
+
+    That is why the sample went from 14 record lines to 12 rather than the 10 the plan
+    predicted: the prediction came from a prototype that ranked the whole pool, where a
+    record sharing two or three terms existed to raise the ceiling. The unit still
+    earns its place where discrimination exists — the worktree prompt goes from 3
+    records to 1 — but a reader must not expect it everywhere."""
+    pool = pb.record_pool([
+        _ev(f"2026-07-0{i}T00:00:00Z", "decision",
+            f"windows specific note number {i} about unrelated subject {i}")
+        for i in (1, 2, 3)])
+    table = pb.df_table(pool)
+    picked = pb.pick_records(pool, "windows", df=table, total=len(pool))
+    assert len(picked) == 3, (
+        "a tie across every candidate must leave the list alone, not truncate it "
+        "arbitrarily")
+
+
+def test_the_df_table_prunes_singletons():
+    """A term appearing in exactly one record carries no discriminating information
+    the default does not already supply, and storing every one of them tripled the
+    table for nothing: 639 terms / 8 561 bytes full versus 214 terms / 2 757 bytes
+    pruned on the live pool. A missing term is treated as rare, which is what it is."""
+    pool = pb.record_pool([
+        _ev("2026-07-01T00:00:00Z", "decision", "dashboard export alpha"),
+        _ev("2026-07-02T00:00:00Z", "decision", "dashboard export bravo"),
+    ])
+    table = pb.df_table(pool)
+    assert table.get("dashboard") == 2 and table.get("export") == 2
+    assert "alpha" not in table and "bravo" not in table
+
+
 def test_pick_records_breaks_ties_newest_first():
     """The ledger never rewrites anything, so both copies of a superseded lesson are
     still there. Recency is the honest tie-break — not a claim the old one is wrong."""
@@ -499,8 +643,11 @@ def _stats(spec):
 
 
 def test_build_returns_phases_and_a_shared_record_pool():
+    """Required keys, not an exact key set. The shape grows legitimately (U3 added the
+    document-frequency table), and an equality assertion on the key set turns every
+    honest addition into a failure that says nothing about correctness."""
     got = pb.build(_SKILLS, _stats({"planner": (5, 5)}), evs=_pool_fixture())
-    assert set(got) == {"phases", "records"}
+    assert {"phases", "records", "df"} <= set(got)
     assert got["phases"]["plan"]["skills"][0]["skill"] == "planner"
     assert got["records"], "the pool is empty"
 
@@ -551,8 +698,10 @@ def test_build_is_deterministic():
 
 
 def test_build_survives_an_empty_world():
+    """No inventory and no events: every collection comes back empty rather than the
+    call raising, because a fresh project trains before it has any history."""
     got = pb.build([], {}, evs=None)
-    assert got == {"phases": {}, "records": []}
+    assert got["phases"] == {} and got["records"] == [] and got["df"] == {}
 
 
 # --- render -------------------------------------------------------------------
