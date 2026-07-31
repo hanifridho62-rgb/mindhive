@@ -765,6 +765,197 @@ def test_build_survives_an_empty_world():
     assert got["phases"] == {} and got["records"] == [] and got["df"] == {}
 
 
+# --- U6: demote directions that are never taken ---------------------------------
+#
+# `skill_directed` events already exist and `oversee.skill_trails` already joins each
+# to a later same-session `skill_used` with consume-once semantics. Nothing fed that
+# back into ranking, so a suggestion the system kept making and nobody ever used kept
+# being made first.
+#
+# Demotion only, deliberately. A skill directed many times and never used is evidence
+# the suggestion is not landing. The converse is confounded — the agent may follow
+# directions mechanically — so a high taken-rate must not manufacture authority a
+# skill has not earned.
+
+def _direction(ts, sid, *names):
+    return Event(ts=ts, session_id=sid, type="skill_directed",
+                 payload={"skills": [{"name": n} for n in names]})
+
+
+def _use(ts, sid, name):
+    return Event(ts=ts, session_id=sid, type="skill_used",
+                 payload={"name": name, "ok": True})
+
+
+def _ignored_events(skill, times, start=1):
+    """*times* sessions where *skill* was directed and never used."""
+    out = []
+    for i in range(times):
+        out.append(_direction(f"2026-07-{start + i:02d}T00:00:00Z", f"s{i}", skill))
+    return out
+
+
+def test_taken_counts_come_from_the_ledger():
+    evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
+           _use("2026-07-01T00:01:00Z", "s1", "planner"),
+           _direction("2026-07-02T00:00:00Z", "s2", "planner"),
+           _direction("2026-07-03T00:00:00Z", "s3", "debugger")]
+    taken = pb.taken_rates(evs)
+    assert taken["planner"] == {"directed": 2, "taken": 1}
+    assert taken["debugger"] == {"directed": 1, "taken": 0}
+
+
+def test_a_use_in_another_session_is_not_counted_as_taken():
+    """Consume-once, same-session — the semantics `oversee` already documents. A skill
+    directed in one session and used in a different one did not happen *because* of
+    that direction."""
+    evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
+           _use("2026-07-02T00:00:00Z", "s2", "planner")]
+    assert pb.taken_rates(evs)["planner"]["taken"] == 0
+
+
+def test_one_direction_is_consumed_by_one_use():
+    """Two uses after a single direction is one taken direction, not two — otherwise a
+    skill invoked repeatedly would look more useful than it was suggested."""
+    evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
+           _use("2026-07-01T00:01:00Z", "s1", "planner"),
+           _use("2026-07-01T00:02:00Z", "s1", "planner")]
+    assert pb.taken_rates(evs)["planner"] == {"directed": 1, "taken": 1}
+
+
+def test_taken_rates_reuses_the_oversee_fold():
+    """Not a reimplementation. Two independent joins would be two things to keep honest,
+    and the first divergence would have the trail and the ranking disagreeing about
+    whether a suggestion was taken. Asserted by comparing against what `oversee` itself
+    reports for the same events."""
+    from mindhive import oversee
+    evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
+           _use("2026-07-01T00:01:00Z", "s1", "planner"),
+           _direction("2026-07-02T00:00:00Z", "s2", "debugger")]
+    trails = oversee.skill_trails(evs=evs)
+    joined = sum(1 for entries in trails.values() for e in entries
+                 if "directed by prompt-gate" in e["why"])
+    counts = pb.taken_rates(evs)
+    assert sum(v["taken"] for v in counts.values()) == joined
+
+
+def test_a_never_taken_skill_sinks_below_an_equal_peer():
+    """The payoff. Both skills match the need and carry identical telemetry; only the
+    direction history differs."""
+    skills = [
+        {"name": "ignored", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+        {"name": "used", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+    ]
+    stats = _stats({"ignored": (5, 5), "used": (5, 5)})
+    evs = _ignored_events("ignored", 8)
+    got = pb.build(skills, stats, evs=evs)
+    order = [s["skill"] for s in got["phases"]["plan"]["skills"]]
+    assert order.index("used") < order.index("ignored"), order
+
+
+def test_one_ignored_direction_does_not_demote():
+    """The anti-thrash guarantee: a demotion that fires on a single unused direction
+    would swing the ranking on noise."""
+    skills = [
+        {"name": "aaa", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+        {"name": "bbb", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+    ]
+    stats = _stats({"aaa": (5, 5), "bbb": (5, 5)})
+    baseline = [s["skill"] for s in
+                pb.build(skills, stats, evs=[])["phases"]["plan"]["skills"]]
+    one = [s["skill"] for s in
+           pb.build(skills, stats, evs=_ignored_events("aaa", 1))
+           ["phases"]["plan"]["skills"]]
+    assert one == baseline, "a single ignored direction changed the order"
+
+
+def test_being_taken_does_not_promote_above_a_better_measured_peer():
+    """Demotion only. A skill that gets used a lot must not out-rank one with stronger
+    measured completion — the taken signal is confounded by the agent simply following
+    instructions, and provenance stays `recommend`'s to decide."""
+    skills = [
+        {"name": "strong", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+        {"name": "popular", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+    ]
+    stats = _stats({"strong": (10, 10), "popular": (5, 10)})
+    evs = []
+    for i in range(8):
+        evs += [_direction(f"2026-07-{i + 1:02d}T00:00:00Z", f"s{i}", "popular"),
+                _use(f"2026-07-{i + 1:02d}T00:01:00Z", f"s{i}", "popular")]
+    order = [s["skill"] for s in
+             pb.build(skills, stats, evs=evs)["phases"]["plan"]["skills"]]
+    assert order[0] == "strong", order
+
+
+def test_demotion_never_changes_the_directive_wording():
+    """R7 is untouched: a measured skill above the auto gate stays a MUST even when its
+    suggestions are being ignored. Demotion reorders; it never re-labels."""
+    skills = [{"name": "ignored", "plugin": "p",
+               "description": "plan break down structured multi-step task goal "
+                              "requirements"}]
+    got = pb.build(skills, _stats({"ignored": (5, 5)}),
+                   evs=_ignored_events("ignored", 8))
+    assert got["phases"]["plan"]["skills"][0]["directive"] == "must"
+
+
+def test_ranking_without_direction_history_is_unchanged():
+    """The migration path: a store with no `skill_directed` events at all, and a
+    manifest trained before this unit, must rank exactly as U2 left it."""
+    skills = [
+        {"name": "aaa", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+        {"name": "bbb", "plugin": "p",
+         "description": "plan break down structured multi-step task goal requirements"},
+    ]
+    stats = _stats({"aaa": (5, 5), "bbb": (5, 5)})
+    with_none = pb.build(skills, stats, evs=[])
+    assert [s["skill"] for s in with_none["phases"]["plan"]["skills"]] == ["aaa", "bbb"]
+
+
+def test_no_skill_is_demoted_when_nothing_was_ever_directed():
+    """Canary. Every demotion test above is vacuous if the ranking shifts on an empty
+    direction history."""
+    evs = [_use("2026-07-01T00:00:00Z", "s1", "planner")]      # uses, no directions
+    assert pb.taken_rates(evs) == {}
+
+
+def test_taken_rates_tolerates_junk():
+    """It reads the ledger, which holds rows written by every past version."""
+    junk = [object(), None,
+            Event(ts="x", session_id="s", type="skill_directed", payload={"skills": 7}),
+            Event(ts="x", session_id="s", type="skill_directed", payload=None),
+            Event(ts="x", session_id="manual", type="skill_directed",
+                  payload={"skills": [{"name": "planner"}]})]
+    assert isinstance(pb.taken_rates(junk), dict)
+
+
+def test_the_demotion_counts_are_stored_in_the_manifest():
+    """Stored so the hook never recomputes them: the fold is a full pass over 22 835
+    events, which is train-time work by definition."""
+    got = pb.build([{"name": "planner", "plugin": "p",
+                     "description": "plan break down structured multi-step task goal"}],
+                   _stats({"planner": (5, 5)}),
+                   evs=_ignored_events("planner", 8))
+    assert got["taken"]["planner"]["directed"] == 8
+    assert got["taken"]["planner"]["taken"] == 0
+
+
+def test_build_is_deterministic_with_direction_history():
+    args = ([{"name": "planner", "plugin": "p",
+              "description": "plan break down structured multi-step task goal"}],
+            _stats({"planner": (5, 5)}))
+    evs = _ignored_events("planner", 8)
+    a = pb.build(*args, evs=evs)
+    b = pb.build(*args, evs=evs)
+    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 # --- render -------------------------------------------------------------------
 
 def _built():

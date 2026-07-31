@@ -63,6 +63,9 @@ KEEP_RATIO = 0.45
 # missing term is scored as rare, which is exactly what it is, so pruning costs no
 # accuracy: 639 terms / 8 561 bytes full versus 214 / 2 757 pruned on the live pool.
 DF_MIN = 2
+# Directions a skill must accumulate before never being taken counts against it. One
+# ignored suggestion is noise; a demotion that swung on it would thrash the ranking.
+MIN_DIRECTIONS = 4
 # Gists are deduped on this many leading characters. The live store legitimately holds
 # near-identical memos (the same lesson harvested in several sessions), and pointing at
 # the same text twice wastes a third of the block.
@@ -348,7 +351,75 @@ def _gist(payload) -> str:
     return _shorten(_GIST_LEAD.sub("", " ".join(raw.split())).strip())
 
 
-def _skills_for(need, skills, stats, open_incidents=(), skill_rules=None):
+def taken_rates(evs) -> dict:
+    """`{skill: {directed, taken}}` — how often a direction was followed.
+
+    The `taken` half comes from `oversee.skill_trails`, which already joins each
+    `skill_directed` to the next matching same-session `skill_used` and documents why
+    the join is consume-once: stamping every later call in the session would
+    over-attribute, since a skill the gate suggested once but that was invoked
+    independently later did not happen *because* of the suggestion. Reusing that fold
+    rather than writing a second one is the point — two joins would be two things to
+    keep honest, and the first divergence would have the trail and the ranking
+    disagreeing about whether a suggestion was taken.
+
+    Train-time only: the fold is a full pass over the events (22 835 on the live store),
+    which is exactly the work the hook must never do."""
+    from . import oversee as ov_mod
+    out: dict = {}
+    for ev in (evs or []):
+        if getattr(ev, "type", None) != "skill_directed":
+            continue
+        # `oversee` skips `manual` and junk sessions, so the directed side must skip
+        # them too or a direction could be counted that the join can never satisfy.
+        sid = getattr(ev, "session_id", None)
+        if not sid or sid == "manual":
+            continue
+        payload = getattr(ev, "payload", None)
+        skills = payload.get("skills") if isinstance(payload, dict) else None
+        if not isinstance(skills, list):
+            continue
+        for s in skills:
+            if isinstance(s, dict) and s.get("name"):
+                row = out.setdefault(str(s["name"]), {"directed": 0, "taken": 0})
+                row["directed"] += 1
+    if not out:
+        return {}
+    try:
+        trails = ov_mod.skill_trails(evs=evs)
+    except Exception:                                       # noqa: BLE001
+        return out
+    for entries in (trails or {}).values():
+        for e in (entries or []):
+            if "directed by prompt-gate" not in str(e.get("why") or ""):
+                continue
+            row = out.get(str(e.get("name") or ""))
+            if row is not None:
+                row["taken"] += 1
+    return out
+
+
+def _demoted(name, taken) -> int:
+    """`1` when this skill's suggestions are being ignored, else `0`.
+
+    A sort *prefix*, not a score: it can only push a skill behind its peers, never pull
+    one ahead of a better-measured rival. The taken signal is confounded — the agent may
+    follow directions mechanically — so it is trusted to say "this is not landing" and
+    never to say "this has earned authority".
+
+    `MIN_DIRECTIONS` is the anti-thrash guard: one ignored suggestion is noise."""
+    row = (taken or {}).get(name)
+    if not isinstance(row, dict):
+        return 0
+    directed = row.get("directed")
+    was_taken = row.get("taken")
+    if not isinstance(directed, int) or not isinstance(was_taken, int):
+        return 0
+    return 1 if directed >= MIN_DIRECTIONS and was_taken <= 0 else 0
+
+
+def _skills_for(need, skills, stats, open_incidents=(), skill_rules=None,
+                taken=None):
     """The reliable skills for one need, best first.
 
     Ranking is `recommend`'s own provenance chain — measured beats unmeasured, then
@@ -373,7 +444,11 @@ def _skills_for(need, skills, stats, open_incidents=(), skill_rules=None):
         blocked = name in set(open_incidents or ())
         must = (measured and not blocked
                 and (rate or 0.0) >= recommend.AUTO_MIN_RATE)
-        key = (0 if measured else 1, -(rate if measured else -1.0), -nm,
+        # The demotion leads the key, so an ignored skill sits behind every peer that
+        # still gets used — but it cannot reorder anything within its own group, which
+        # keeps `recommend`'s provenance chain authoritative for everything else.
+        key = (_demoted(name, taken),
+               0 if measured else 1, -(rate if measured else -1.0), -nm,
                len(str(s.get("description") or "")), name)
         ranked.append((key, {
             "skill": name,
@@ -577,14 +652,16 @@ def build(skills, stats, evs=None, open_incidents=(), skill_rules=None) -> dict:
     settled here and the choice happens at hook time. A phase with no skills is
     omitted rather than stored empty: an empty dict in a sidecar reads like a trained
     result, and it is not one."""
+    taken = taken_rates(evs)
     phases = {}
     for phase, need in PHASE_NEED.items():
-        picked = _skills_for(need, skills, stats, open_incidents, skill_rules)
+        picked = _skills_for(need, skills, stats, open_incidents, skill_rules,
+                             taken=taken)
         if picked:
             phases[phase] = {"skills": picked}
-    pool, stats = pool_with_stats(evs)
+    pool, pstats = pool_with_stats(evs)
     return {"phases": phases, "records": pool, "df": df_table(pool),
-            "pool": stats}
+            "pool": pstats, "taken": taken}
 
 
 def selected_skills(playbook, phase, exclude=()) -> list:

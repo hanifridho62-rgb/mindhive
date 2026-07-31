@@ -574,6 +574,13 @@ def catalog_block(prompt, manifest, exclude=()):
     each would let the causal trail claim a direction the block never rendered, and
     nothing in the system would surface the disagreement.
 
+    Deliberately NOT memoized, even though the two callers compute it twice per prompt
+    (~0.08 s of a 0.36 s hook). The two load the manifest separately, so any cache key
+    cheap enough to be worth it — object identity, or a content fingerprint — is either
+    a guaranteed miss or a staleness hazard where a caller with a different manifest
+    gets the previous answer. Correctness in a hook that runs on every prompt is worth
+    more than 80 ms, and the honest number is reported rather than optimized away.
+
     Returns `("", [])` when there is nothing to say. Pure — the manifest is passed in."""
     if not is_code_work(prompt):
         return "", []
