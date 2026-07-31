@@ -979,13 +979,41 @@ def _board_path():
     return paths.store_home() / "workspace_board.json"
 
 
+# A read that loses a race with the atomic write retries this many times, this far
+# apart. The store's own pinned caveat records why: on Windows `os.replace` raises
+# PermissionError (WinError 5) against the DESTINATION, and for that instant a
+# concurrent reader gets a sharing violation on a file that exists and is intact.
+_BOARD_READ_TRIES = 4
+_BOARD_READ_BACKOFF = 0.02
+
+
 def load_board() -> dict:
-    try:
-        b = json.loads(_board_path().read_text(encoding="utf-8"))
+    """The board, or an empty one.
+
+    Retries a transient read failure instead of reporting an empty board.
+    `_write_board_locked` is already atomic, so the only way a reader sees nothing is by
+    landing inside the replace — and answering "no tasks" there is a failure disguised as
+    an absence. That disguise is what made
+    `test_board_dispatch_runs_card_on_idle_agent` fail on windows/py3.12 while passing on
+    py3.11 in the same CI run: the board had a card, the read lost the race, and the
+    caller saw an empty list.
+
+    A MISSING file is not retried — absence is a real answer there, and the common
+    first-run path must not pay four sleeps for it. Malformed JSON *is* retried, because
+    a truncated read of a file mid-replace looks exactly like that."""
+    for attempt in range(_BOARD_READ_TRIES):
+        try:
+            b = json.loads(_board_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"tasks": []}
+        except (OSError, ValueError):
+            if attempt + 1 >= _BOARD_READ_TRIES:
+                return {"tasks": []}
+            time.sleep(_BOARD_READ_BACKOFF)
+            continue
         if isinstance(b, dict) and isinstance(b.get("tasks"), list):
             return b
-    except (OSError, ValueError):
-        pass
+        return {"tasks": []}        # valid JSON, wrong shape — retrying cannot help
     return {"tasks": []}
 
 
