@@ -328,7 +328,17 @@ def _shorten(text: str, width: int = GIST_CHARS) -> str:
     while len(out) > width and " " in head:
         head = head[:head.rfind(" ")].rstrip(_GIST_TRAIL)
         out = head + TRUNCATION_MARK + _open_delimiters(head)
-    return out
+    if len(out) > width:
+        # The re-trim above needs a space to back up to. A single unbroken token
+        # containing an unclosed delimiter has none, so it fell through one character
+        # over the cap — `"x"*60 + "(" + "y"*60` returned 111 against a cap of 110.
+        # Shave the head to make room for the mark and the closers rather than
+        # returning something the caller's budget did not allow for.
+        closers = _open_delimiters(head)
+        room = max(1, width - len(TRUNCATION_MARK) - len(closers))
+        head = head[:room].rstrip(_GIST_TRAIL) or head[:room]
+        out = head + TRUNCATION_MARK + _open_delimiters(head)
+    return out[:width]
 
 
 def _gist(payload) -> str:
@@ -354,24 +364,29 @@ def _gist(payload) -> str:
 def taken_rates(evs) -> dict:
     """`{skill: {directed, taken}}` — how often a direction was followed.
 
-    The `taken` half comes from `oversee.skill_trails`, which already joins each
-    `skill_directed` to the next matching same-session `skill_used` and documents why
-    the join is consume-once: stamping every later call in the session would
-    over-attribute, since a skill the gate suggested once but that was invoked
-    independently later did not happen *because* of the suggestion. Reusing that fold
-    rather than writing a second one is the point — two joins would be two things to
-    keep honest, and the first divergence would have the trail and the ranking
-    disagreeing about whether a suggestion was taken.
+    The `taken` half comes from `oversee.consumed_directions`, which owns the
+    consume-once pairing rule: one `skill_directed` pairs with the next matching
+    same-session `skill_used`, then is spent. Reusing that rather than writing a second
+    pairing is the point — two implementations would let the trail and the ranking
+    disagree about what happened.
 
-    Train-time only: the fold is a full pass over the events (22 835 on the live store),
-    which is exactly the work the hook must never do."""
+    It deliberately does NOT read `oversee.skill_trails`. That fold answers the DISPLAY
+    question ("what is the most informative why for this use?"), and invocation args win
+    there, so a use carrying args returns the args and never reaches the direction
+    branch. 78 of 216 real `skill_used` rows (36%) carry args, so counting from the trail
+    made a followed suggestion look ignored — and since this signal demotes on "never
+    taken", it would have demoted skills that ARE being taken. The bug was mine and it
+    was systematic, not noise.
+
+    Train-time only: a full pass over the events (22 835 on the live store), which is
+    exactly the work the hook must never do."""
     from . import oversee as ov_mod
     out: dict = {}
     for ev in (evs or []):
         if getattr(ev, "type", None) != "skill_directed":
             continue
-        # `oversee` skips `manual` and junk sessions, so the directed side must skip
-        # them too or a direction could be counted that the join can never satisfy.
+        # `oversee` skips `manual` and blank sessions, so the directed side must skip
+        # them too or a direction could be counted that the pairing can never satisfy.
         sid = getattr(ev, "session_id", None)
         if not sid or sid == "manual":
             continue
@@ -379,23 +394,22 @@ def taken_rates(evs) -> dict:
         skills = payload.get("skills") if isinstance(payload, dict) else None
         if not isinstance(skills, list):
             continue
-        for s in skills:
-            if isinstance(s, dict) and s.get("name"):
-                row = out.setdefault(str(s["name"]), {"directed": 0, "taken": 0})
-                row["directed"] += 1
+        # Per-event set: one injection naming a skill twice is ONE direction. Counting
+        # it twice would make it permanently under-taken, since the pairing can only
+        # ever consume one of them.
+        for name in {str(s["name"]) for s in skills
+                     if isinstance(s, dict) and s.get("name")}:
+            out.setdefault(name, {"directed": 0, "taken": 0})["directed"] += 1
     if not out:
         return {}
     try:
-        trails = ov_mod.skill_trails(evs=evs)
+        consumed = ov_mod.consumed_directions(evs=evs)
     except Exception:                                       # noqa: BLE001
         return out
-    for entries in (trails or {}).values():
-        for e in (entries or []):
-            if "directed by prompt-gate" not in str(e.get("why") or ""):
-                continue
-            row = out.get(str(e.get("name") or ""))
-            if row is not None:
-                row["taken"] += 1
+    for name, times in (consumed or {}).items():
+        row = out.get(str(name))
+        if row is not None:
+            row["taken"] = int(times)
     return out
 
 

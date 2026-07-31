@@ -73,6 +73,57 @@ def intended_use_map(now_fn=time.time) -> dict:
     return m
 
 
+def consumed_directions(project=None, evs=None) -> dict:
+    """``{skill_name: times a direction was followed}`` — consume-once pairing.
+
+    One ``skill_directed`` pairs with the next matching ``skill_used`` in the SAME
+    session, then is spent. That is the same rule :func:`_skill_why` applies, and it
+    exists here separately because the two ask different questions:
+
+    - **display** (``_skill_why``): "what is the most informative why for this use?"
+      The invocation args win when present, so a use that carries args returns the args
+      and never reaches the direction branch. Correct for a trail a person reads.
+    - **learning** (this function): "was this suggestion ever followed?" Whether the
+      caller happened to pass args is irrelevant to that, and letting it matter biases
+      the answer badly — 78 of 216 real ``skill_used`` rows (36%) carry args, so a
+      genuinely-followed suggestion would look ignored and any consumer that demotes on
+      "never taken" would demote a skill that IS being taken.
+
+    Sharing the pairing RULE while keeping the two answers separate is the point; the
+    alternative is a second implementation of the pairing itself, which would let the
+    trail and the learner disagree about what happened.
+
+    Total and ledger-shaped: skips ``manual``/blank sessions and malformed rows exactly
+    as `skill_trails` does, so the two folds see the same events."""
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    pending: dict = {}
+    out: dict = {}
+    for e in (evs or []):
+        sid = getattr(e, "session_id", None)
+        if not sid or sid == "manual":
+            continue
+        p = e.payload if isinstance(getattr(e, "payload", None), dict) else {}
+        if e.type == "skill_directed":
+            skills = p.get("skills")
+            if not isinstance(skills, list):
+                continue
+            for s in skills:
+                if isinstance(s, dict) and s.get("name"):
+                    # A set per event: one injection naming a skill twice is still one
+                    # direction, and counting it twice would make it undercountable.
+                    pending.setdefault(sid, {}).setdefault(str(s["name"]), 0)
+                    pending[sid][str(s["name"])] = 1
+        elif e.type == "skill_used":
+            name = p.get("name")
+            if not name:
+                continue
+            name = str(name)
+            if pending.get(sid, {}).pop(name, 0):
+                out[name] = out.get(name, 0) + 1
+    return out
+
+
 def _skill_why(payload, directed, intended_use) -> str:
     """The recorded "why" for one ``skill_used``, honesty-ordered: the
     invocation args (the ask) -> a same-session prompt-gate direction (causal)

@@ -908,10 +908,20 @@ the catalog and traced nothing. It now records both paths on the existing
 disagree with the printed block; `playbook.selected_skills` does the same one level down
 with `render` and `directed_skills` as its two projections.
 
-Training then folds the events through **`oversee.skill_trails`** — reused, not
-reimplemented, since two joins would be two things to keep honest — and counts directed
-versus consumed per skill. A skill directed at least `MIN_DIRECTIONS` times and never
+Training then counts directed versus consumed per skill through
+**`oversee.consumed_directions`** — which owns the consume-once pairing rule, reused
+rather than reimplemented. A skill directed at least `MIN_DIRECTIONS` times and never
 used sorts behind its peers.
+
+The first version counted from `oversee.skill_trails` instead, and that was wrong in a
+way worth recording. That fold answers the **display** question — "what is the most
+informative why for this use?" — and invocation args win there, so a `skill_used`
+carrying `args` returns the args and never reaches the direction branch. **78 of 216
+real `skill_used` rows (36%) carry args**, so a followed suggestion looked ignored, and
+since the signal demotes on "never taken" it would have demoted skills that *are* being
+taken while presenting that as evidence. Systematic, not noise. The pairing rule now
+lives in its own function and only the display path keeps the args ordering; on the live
+store the fix moved `ce-plan` from `taken: 1` to `taken: 2` immediately.
 
 **Demotion only.** Being taken never promotes: the signal is confounded, because the
 agent may follow directions mechanically. Provenance wording stays `recommend`'s to

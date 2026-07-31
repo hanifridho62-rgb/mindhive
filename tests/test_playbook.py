@@ -442,6 +442,24 @@ def test_a_single_unbroken_token_still_yields_something():
     assert len(pool[0]["gist"]) <= pb.GIST_CHARS
 
 
+@pytest.mark.parametrize("text", [
+    "x" * 60 + "(" + "y" * 60,          # unbroken token, unclosed bracket
+    "a" * 200,                           # unbroken token, no delimiter
+    '"' + "z" * 200,                     # opens a quote it never closes
+    "(" * 40 + "w" * 100,                # many unclosed openers
+    "word " + "q" * 200,                 # one space, then an unbreakable tail
+])
+def test_shorten_never_exceeds_the_cap(text):
+    """A self-review finding, and it was real. The re-trim loop needs a space to back
+    up to; a single unbroken token carrying an unclosed delimiter has none, so the
+    appended closer pushed the result one character past the cap —
+    `"x"*60 + "(" + "y"*60` returned 111 against a cap of 110. The cap is a budget the
+    caller relies on, so silently exceeding it is a defect however small."""
+    out = pb._shorten(text, 110)
+    assert len(out) <= 110, f"{len(out)} chars: {out[-20:]!r}"
+    assert out.strip(), "shortening must not empty the gist"
+
+
 def test_gist_truncation_is_deterministic():
     text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo " * 3
     a = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", text)])[0]["gist"]
@@ -823,20 +841,58 @@ def test_one_direction_is_consumed_by_one_use():
     assert pb.taken_rates(evs)["planner"] == {"directed": 1, "taken": 1}
 
 
-def test_taken_rates_reuses_the_oversee_fold():
-    """Not a reimplementation. Two independent joins would be two things to keep honest,
-    and the first divergence would have the trail and the ranking disagreeing about
-    whether a suggestion was taken. Asserted by comparing against what `oversee` itself
-    reports for the same events."""
+def test_taken_rates_reuses_the_oversee_pairing():
+    """Not a reimplementation. Two independent pairings would be two things to keep
+    honest, and the first divergence would have the trail and the ranking disagreeing
+    about what happened. Asserted against `oversee.consumed_directions` itself, so a
+    local reimplementation that drifted would fail here."""
     from mindhive import oversee
     evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
            _use("2026-07-01T00:01:00Z", "s1", "planner"),
            _direction("2026-07-02T00:00:00Z", "s2", "debugger")]
-    trails = oversee.skill_trails(evs=evs)
-    joined = sum(1 for entries in trails.values() for e in entries
-                 if "directed by prompt-gate" in e["why"])
+    consumed = oversee.consumed_directions(evs=evs)
     counts = pb.taken_rates(evs)
-    assert sum(v["taken"] for v in counts.values()) == joined
+    assert sum(v["taken"] for v in counts.values()) == sum(consumed.values())
+    assert consumed == {"planner": 1}
+
+
+def test_a_direction_followed_with_invocation_args_still_counts_as_taken():
+    """The worst defect this self-review found, and it was systematic rather than an
+    edge case.
+
+    `taken` was counted off `oversee.skill_trails`, whose `why` string is honesty-
+    ordered with the invocation args winning — so a `skill_used` carrying `args` returns
+    the args and never reaches the direction branch. **78 of 216 real `skill_used` rows
+    (36%) carry args.** Since U6 demotes on "never taken", the loop would have demoted
+    skills that ARE being taken, and it would have looked like evidence.
+
+    The two questions are genuinely different — what to DISPLAY for a use versus whether
+    a suggestion was FOLLOWED — so the pairing rule moved into
+    `oversee.consumed_directions` and only the display logic keeps the args ordering."""
+    evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
+           Event(ts="2026-07-01T00:01:00Z", session_id="s1", type="skill_used",
+                 payload={"name": "planner", "ok": True, "args": "do the thing"})]
+    assert pb.taken_rates(evs)["planner"] == {"directed": 1, "taken": 1}
+
+
+def test_the_display_trail_still_prefers_the_invocation_args():
+    """The complement: fixing the learning signal must not change what a person reads.
+    `oversee.skill_trails` keeps showing the args as the why."""
+    from mindhive import oversee
+    evs = [_direction("2026-07-01T00:00:00Z", "s1", "planner"),
+           Event(ts="2026-07-01T00:01:00Z", session_id="s1", type="skill_used",
+                 payload={"name": "planner", "ok": True, "args": "do the thing"})]
+    assert oversee.skill_trails(evs=evs)["s1"][0]["why"] == "do the thing"
+
+
+def test_a_skill_named_twice_in_one_injection_is_one_direction():
+    """Otherwise it is permanently under-taken: the pairing can consume only one of
+    them, so `directed: 2, taken: 1` would look like a half-ignored suggestion forever.
+    U5's writer dedupes, but the ledger holds rows from every past version."""
+    evs = [Event(ts="2026-07-01T00:00:00Z", session_id="s1", type="skill_directed",
+                 payload={"skills": [{"name": "planner"}, {"name": "planner"}]}),
+           _use("2026-07-01T00:01:00Z", "s1", "planner")]
+    assert pb.taken_rates(evs)["planner"] == {"directed": 1, "taken": 1}
 
 
 def test_a_never_taken_skill_sinks_below_an_equal_peer():
