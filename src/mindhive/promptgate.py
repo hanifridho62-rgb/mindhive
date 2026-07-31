@@ -165,6 +165,15 @@ _CODE_INTENT_RES = (
     # English-only detector would answer "not code work" for most of them.
     re.compile(r"\b(?:kode|koding|perbaiki|perbaikan|buatkan|bikin|tambahkan|"
                r"ubah|hapus|periksa|uji|fitur|berkas|terapkan|jalankan)\b"),
+    # Symptom reports that never say "bug". "kucing di dashboard tidak muncul" is a
+    # bug report with no keyword from any list above, and it read as conversation —
+    # the catalog stayed shut on exactly the prompt that needed the debugging skill.
+    # A false positive here costs a few injected lines; a miss costs the whole
+    # feature on the phrasing this user actually uses.
+    re.compile(r"\btidak\s+(?:mun[cs]ul|jalan|bisa|berfungsi|bekerja|ke?luar|"
+               r"tampil|terbaca|tersimpan|jadi)\b"),
+    re.compile(r"\b(?:kenapa|mengapa)\b.{0,40}\b(?:tidak|gagal|error|salah)\b"),
+    re.compile(r"\b(?:macet|hilang|salah|aneh|lambat|nge?blank)\b"),
     # A named file or a fenced/backticked span is code work whatever the verb.
     re.compile(r"\b[\w./\\-]{2,}\.(?:py|js|ts|tsx|jsx|md|json|ya?ml|toml|"
                r"cfg|ini|sh|ps1|rs|go|java|rb|c|h|cpp)\b"),
@@ -355,6 +364,14 @@ def train(skills, stats, evs=None, now=None, incident_summaries=None) -> dict:
     always = (dict(always_pick, label=ALWAYS_SPEC["label"],
                    remedy=ALWAYS_SPEC["remedy"], need=ALWAYS_SPEC["need"])
               if always_pick else {})
+    # MN-15: the per-phase playbook — reliable skills plus the ledger records worth
+    # reading. Built HERE because this function already holds the inventory, the
+    # telemetry and `evs`; the live store is 22.8k events and `read_all` measures
+    # 1.09 s, so a hook that rebuilt this per prompt would several-fold the latency
+    # of every prompt the user types.
+    from . import playbook as pb_mod
+    play = pb_mod.build(skills, stats, evs=evs, open_incidents=open_inc,
+                        skill_rules=skill_rules)
     measured_n = sum(1 for r in rules.values() if r["provenance"] == "measured")
     return {
         "trained_at": now or ev_mod.now_iso(),
@@ -363,9 +380,12 @@ def train(skills, stats, evs=None, now=None, incident_summaries=None) -> dict:
             "rules": len(rules),
             "measured_rules": measured_n,
             "prompts_scanned": observed["prompts_scanned"],
+            "playbook_phases": len(play.get("phases") or {}),
+            "playbook_records": len(play.get("records") or []),
         },
         "rules": rules,
         "always": always,
+        "playbook": play,
     }
 
 
@@ -604,9 +624,21 @@ def hook_context(raw: str, project=None) -> dict:
                             directed_skills(verdict["findings"],
                                             manifest.get("rules"))}
         if is_code_work(prompt):
-            always = render_always(manifest.get("always"), exclude=directed)
-            if always:
-                blocks.append(always)
+            # MN-15 first: when a technique can be inferred, the playbook block says
+            # everything the single-skill line said and more (technique, ordered
+            # reliable skills, the records to read). Falling back to `render_always`
+            # only when there is no playbook keeps a pre-MN-15 manifest working and
+            # avoids two adjacent catalog blocks saying overlapping things.
+            from . import playbook as pb_mod
+            body = pb_mod.render(manifest.get("playbook"),
+                                 pb_mod.infer(prompt), prompt, exclude=directed)
+            if body:
+                blocks.append(f"{TRIGGER_MARK} Code work — skill & plugin catalog "
+                              f"consulted.\n{body}")
+            else:
+                always = render_always(manifest.get("always"), exclude=directed)
+                if always:
+                    blocks.append(always)
         if not blocks:
             return {}
         return {"hookSpecificOutput": {

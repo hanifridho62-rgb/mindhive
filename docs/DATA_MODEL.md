@@ -773,6 +773,82 @@ A manifest trained before this unit has no `always` key. That degrades to the
 previous behaviour rather than raising — the hook's fail-open promise covers a stale
 sidecar too, and a retrain fills it in.
 
+### 4.11 The per-prompt playbook (MN-15)
+
+MN-14 named one skill. The follow-up ask was for three things:
+
+> setiap prompt akan di tambahkan konteks dengan memberitahu **ledger mana saja yang
+> perlu dibaca** dan **menggunakan teknik apa** … ketika membangun sesuatu maka akan
+> menampilkan skill yang berhubungan dengan plan kemudian **di sintesakan skill yang
+> dapat di andalkan** sehingga lebih efisien
+
+`playbook.py` renders exactly that, in the order technique → skills → records, so a
+reader who stops after one line still has the most useful part:
+
+```
+Technique for this prompt: plan — write the plan before the first edit.
+Reliable skills for it, in order:
+  1. MUST USE: ce-plan (compound-engineering) via the Skill tool — measured 37/37 completion.
+  2. MUST USE: writing-plans (superpowers) via the Skill tool — measured 8/8 completion.
+Read these ledger records before starting:
+  - caveat @ 2026-07-18T04:44:19Z — dashboard_page.py: 1,715 lines — past the …
+  - open them with: hive recall "dashboard buatkan export fitur"
+```
+
+**Where the cost lands, measured.** The live store is 373 segments / 12.54 MB /
+22 835 events; `events.read_all()` takes **1.09 s**; the whole hook runs in **~0.28 s**
+including interpreter startup. A hook that read the ledger would several-fold the
+latency of every prompt typed. So nothing on the hook path reads it:
+`promptgate.train_and_store` already calls `read_all` behind a staleness gate and
+`train()` already receives `evs`, so the index is built there and stored in the
+manifest the hook was already loading. Manifest grows to ~36 KB; the injected block is
+~1.2 KB against the previous 335 B, and latency did not regress.
+`test_nothing_here_reads_the_ledger_on_the_hook_path` monkeypatches `read_all` to
+raise, so a later edit that reaches for it fails a test rather than slowing every
+prompt.
+
+**Two levels, because the two halves are decided at different times.** Which *skills*
+suit a technique is a property of the technique, so it is settled at train time under
+`playbook["phases"][<phase>]`. Which *records* a prompt should read is a property of
+the prompt, so only the pool is stored (`playbook["records"]`, newest-first, deduped,
+capped at `RECORD_POOL`) and `pick_records` ranks it against the prompt's own words at
+hook time — a few milliseconds for ~200 short gists.
+
+That split was not the first design. Freezing records per phase at train time meant
+the only thing available to match against was the phase's generic need text, and the
+result was visibly wrong: a prompt about a CSV export in the dashboard was told to
+read a decision about phase-deny rules. Prompt relevance is the primary sort key, the
+phase theme the secondary, recency the tie-break — the ledger never rewrites anything,
+so an older memo is the more likely to have been superseded.
+
+**Three things deliberately reused rather than rebuilt.** Phase names come from
+`mindnet.tasks.PHASES` (the cue table maps onto that legend and tests assert every key
+is in it — a near-miss spelling would also trip the invariant-10 guard, which forbids
+phase-name synonyms as string literals anywhere in `src/`). Skill ranking is
+`recommend`'s own provenance chain, so this cannot call a skill proven that the rest of
+the system calls unproven, and an open incident denies MUST wording here as it does in
+`train`. Pointers are `type @ ts` + gist + the exact `hive recall` command, **not** the
+projector's `.md` filename: that name mixes a digest of the rendered body
+(`projector.py:187`) and reproducing it would mean a second copy of the scheme.
+
+`POINTER_TYPES` is `caveat`, `decision`, `experiment_result` — the memos a person wrote
+on purpose. `command_run` (8 501 rows) and `assistant_response` (7 152) are raw history
+and would bury the signal.
+
+**Cues cover Indonesian as well as English**, including symptom reports that never name
+a defect. "kucing di dashboard tidak muncul" is a bug report with no keyword any
+English table would catch; before those cues it inferred no technique and the debugging
+skill stayed shut on exactly the prompt that needed it. A false positive costs a few
+injected lines; a miss costs the feature entirely on the phrasing this user actually
+uses.
+
+**Still additive.** `infer` returning None means the block says nothing about technique
+rather than guessing — a confidently wrong technique teaches the reader to skip the
+marker. Values read off disk are collapsed to one line *and* have the directive words
+lowercased, so a stored skill name or ledger gist can neither forge a line nor pose as
+an order the system is issuing. A manifest with no playbook falls back to MN-14's
+single-skill line.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
