@@ -198,6 +198,77 @@ def recall_query(text: str, cap: int = QUERY_TERMS) -> str:
 
 _GIST_LEAD = re.compile(r"^[\s*#>_`~.\-–—:;,]+")
 
+# Appended when a gist was shortened. A silently cut quote misrepresents the record —
+# the reader cannot tell whether the memo ended there or the display gave up.
+TRUNCATION_MARK = "…"
+
+# Delimiters balanced when a cut lands inside one. `'` is deliberately absent: in
+# ordinary prose it is an apostrophe far more often than a quote ("don't", "user's"),
+# so treating it as a delimiter would append a stray quote to perfectly good text.
+# Enforcing an even count of it was a requirement I wrote and then had to drop —
+# `test_an_apostrophe_is_not_treated_as_a_delimiter` pins the decision.
+_GIST_PAIRS = (('"', '"'), ("`", "`"), ("(", ")"), ("[", "]"), ("{", "}"))
+
+# Trailing punctuation that reads as a dangling connective once the rest is gone.
+_GIST_TRAIL = " \t,;:-–—([{`\"/&+"
+
+
+def _open_delimiters(text: str) -> str:
+    """The delimiters *text* leaves unclosed, in the order needed to close them.
+
+    Closing them is more honest than cutting back to before the opener: a truncated
+    quotation that ends `…"` is conventional and keeps the memo's words, whereas
+    discarding everything from the opener onward can throw away most of the gist to
+    fix a one-character problem."""
+    stack: list = []
+    for ch in text:
+        for opener, closer in _GIST_PAIRS:
+            if opener == closer:
+                if ch == opener:
+                    if stack and stack[-1] == closer:
+                        stack.pop()
+                    else:
+                        stack.append(closer)
+                    break
+            elif ch == opener:
+                stack.append(closer)
+                break
+            elif ch == closer:
+                if closer in stack:
+                    # Pop down to the matching opener; a stray closer with no opener
+                    # is left alone rather than corrupting the stack.
+                    while stack and stack.pop() != closer:
+                        pass
+                break
+    return "".join(reversed(stack))
+
+
+def _shorten(text: str, width: int = GIST_CHARS) -> str:
+    """*text* bounded to *width*, cut at a word boundary and left syntactically whole.
+
+    Measured motivation: 100 of 130 gists in the live pool sat exactly at the limit
+    and most ended mid-token (`…rror 5 on the DESTINATIO`), with at least one carrying
+    an odd double-quote count into the injected prompt.
+
+    Text at or under *width* is returned byte-for-byte — this is a truncator, not a
+    reformatter."""
+    if len(text) <= width:
+        return text
+    head = text[:max(1, width - len(TRUNCATION_MARK))]
+    space = head.rfind(" ")
+    if space > 0:
+        head = head[:space]
+    head = head.rstrip(_GIST_TRAIL)
+    if not head.strip():
+        # One unbroken token longer than the whole budget: a hard cut is the only
+        # option, and returning nothing would drop the record from the pool.
+        head = text[:max(1, width - len(TRUNCATION_MARK))].rstrip()
+    out = head + TRUNCATION_MARK + _open_delimiters(head)
+    while len(out) > width and " " in head:
+        head = head[:head.rfind(" ")].rstrip(_GIST_TRAIL)
+        out = head + TRUNCATION_MARK + _open_delimiters(head)
+    return out
+
 
 def _gist(payload) -> str:
     """One line of an event's own words, or "" when it has none to offer.
@@ -216,7 +287,7 @@ def _gist(payload) -> str:
         raw = payload
     if not raw or not raw.strip():
         return ""
-    return _GIST_LEAD.sub("", " ".join(raw.split()))[:GIST_CHARS].strip()
+    return _shorten(_GIST_LEAD.sub("", " ".join(raw.split())).strip())
 
 
 def _skills_for(need, skills, stats, open_incidents=(), skill_rules=None):

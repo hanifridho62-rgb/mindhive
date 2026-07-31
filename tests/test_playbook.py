@@ -208,6 +208,89 @@ def test_the_pool_skips_records_with_nothing_to_say():
     assert [r["gist"] for r in pool] == ["a real lesson"]
 
 
+def test_a_short_gist_survives_byte_for_byte():
+    """The guard that keeps U1 a truncator and not a reformatter. Anything under the
+    limit must come through untouched, so the word-boundary logic below cannot
+    silently start rewriting text that was already fine."""
+    text = "worktree needs PYTHONPATH on the pytest subprocess"
+    pool = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", text)])
+    assert pool[0]["gist"] == text
+
+
+def test_an_over_long_gist_ends_at_a_word_boundary():
+    """Measured on the live store: 100 of 130 pool gists sat at the character limit
+    and most were cut mid-token — tails like `...DESTINATIO` and `...write or exe`. A
+    pointer that trails off mid-word is a pointer the reader skips."""
+    words = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet "
+             "kilo lima mike november oscar papa quebec romeo sierra tango")
+    gist = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", words)])[0]["gist"]
+    body = gist[:-len(pb.TRUNCATION_MARK)] if gist.endswith(pb.TRUNCATION_MARK) else gist
+    assert body.split()[-1] in words.split(), (
+        f"last token is a fragment, not a whole word: {body[-24:]!r}")
+    assert len(gist) <= pb.GIST_CHARS
+
+
+def test_a_truncated_gist_says_so():
+    """A silently shortened quote misrepresents the record — the reader cannot tell
+    whether the memo ended there or was cut."""
+    long_text = "supercalifragilistic " * 12
+    gist = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", long_text)])[0]["gist"]
+    assert gist.endswith(pb.TRUNCATION_MARK)
+
+
+def test_an_untruncated_gist_does_not_claim_to_be_cut():
+    gist = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", "short one")])[0]["gist"]
+    assert not gist.endswith(pb.TRUNCATION_MARK)
+
+
+@pytest.mark.parametrize("opener,closer", [('"', '"'), ("`", "`"), ("(", ")"),
+                                           ("[", "]"), ("{", "}")])
+def test_a_cut_inside_a_quoted_span_does_not_leak_an_unbalanced_delimiter(opener, closer):
+    """At least one live gist reached the injected text with an odd double-quote
+    count. An unbalanced delimiter makes everything after it read as though it were
+    still inside the quotation."""
+    head = "the decision was recorded as " + opener + "keep the gate failing open"
+    text = (head + " because a gate that can break a prompt is worse than a gate "
+                   "that stays quiet" + closer)
+    gist = pb.record_pool([_ev("2026-07-01T00:00:00Z", "decision", text)])[0]["gist"]
+    assert len(gist) < len(text), "fixture did not actually trigger truncation"
+    if opener == closer:
+        assert gist.count(opener) % 2 == 0, f"odd {opener!r} count: {gist!r}"
+    else:
+        assert gist.count(opener) <= gist.count(closer), f"unclosed {opener!r}: {gist!r}"
+
+
+def test_an_apostrophe_is_not_treated_as_a_delimiter():
+    """A requirement I wrote and then had to drop, recorded here so it is not
+    reinstated by a later reader.
+
+    "balance every quote" sounds right until you notice that `'` in ordinary prose is
+    an apostrophe far more often than a quote. Enforcing an even count would append a
+    stray `'` to text like "don't" or "the runner's output" — corrupting good text to
+    satisfy a rule aimed at a different character."""
+    text = ("the runner's own output said it couldn't resolve the interpreter, "
+            "which isn't the same failure as the one we'd been chasing all morning")
+    gist = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", text)])[0]["gist"]
+    assert len(gist) < len(text), "fixture did not actually trigger truncation"
+    assert "''" not in gist and not gist.rstrip(pb.TRUNCATION_MARK).endswith("'"), (
+        f"an apostrophe was balanced as if it were a quote: {gist!r}")
+
+
+def test_a_single_unbroken_token_still_yields_something():
+    """The degenerate case. Backing up to a word boundary must not walk all the way
+    to an empty string and drop the record from the pool entirely."""
+    pool = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", "x" * 400)])
+    assert pool and pool[0]["gist"].strip()
+    assert len(pool[0]["gist"]) <= pb.GIST_CHARS
+
+
+def test_gist_truncation_is_deterministic():
+    text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo " * 3
+    a = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", text)])[0]["gist"]
+    b = pb.record_pool([_ev("2026-07-01T00:00:00Z", "caveat", text)])[0]["gist"]
+    assert a == b
+
+
 def test_a_gist_loses_its_leading_markdown():
     """Many memos were harvested out of formatted prose. `** Even after` spends the
     first characters of a one-line pointer on noise."""
