@@ -716,6 +716,30 @@ def directed_skills(playbook, phase, exclude=()) -> list:
     return out
 
 
+def engaged(playbook, phase, prompt_text, exclude=()) -> set:
+    """The faculty names this prompt's block actually exercised.
+
+    Pure, and derived from the SAME selection the block renders — so a cat lights only
+    when the faculty really ran. That honesty is the whole point of the board: before
+    MN-17 six of the seven faculties had a labelled cat and no emitter at all, so the
+    operator read "not running" and could not distinguish it from "never wired".
+
+    Names come from `telemetry.FACULTIES` rather than being spelled here, so the legend
+    stays single (invariant 10)."""
+    from .mindnet import telemetry as tel_mod
+    out = set()
+    if selected_skills(playbook, phase, exclude):
+        out.add("skill-plugin")
+    pool = (playbook or {}).get("records") if isinstance(playbook, dict) else None
+    if pool and pick_records(pool, prompt_text, phase,
+                            df=(playbook or {}).get("df"),
+                            total=len(pool) if isinstance(pool, list) else None):
+        out.add("history")
+    # Membership check, not a hardcoded list: a faculty renamed in the legend must not
+    # silently stop being announced here.
+    return {f for f in out if f in tel_mod.FACULTIES}
+
+
 def render(playbook, phase, prompt_text, exclude=()) -> str:
     """The injected block for one prompt, or "" when there is nothing to say.
 

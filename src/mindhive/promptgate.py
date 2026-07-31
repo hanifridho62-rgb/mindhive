@@ -607,6 +607,33 @@ def catalog_block(prompt, manifest, exclude=()):
     return text, [entry]
 
 
+def announce_faculties(faculties, project=None, session_id=None) -> int:
+    """Report each faculty in *faculties* as having woken and finished. Returns the
+    number of pairs written.
+
+    An `active` row and an `idle` row together, not a `busy` block, because by the time
+    this is called the work is done — the prompt's block has already been rendered and
+    printed. `ui_cats` hides an idle faculty once its 15-second flicker grace passes, so
+    the pair is exactly what makes the cat appear and then vanish, which is the behaviour
+    that was asked for ("ketika tidak sedang berjalan maka kucing akan menghilang").
+
+    Never raises. A cat animation that cannot be logged must not disturb the prompt —
+    the same contract `telemetry.emit` and `record_direction` already keep."""
+    from .mindnet import telemetry as tel_mod
+    written = 0
+    for faculty in sorted(faculties or ()):
+        try:
+            if tel_mod.emit(faculty, tel_mod.STATUS_ACTIVE, project=project,
+                            session_id=session_id) is None:
+                continue
+            tel_mod.emit(faculty, tel_mod.STATUS_IDLE, project=project,
+                         session_id=session_id)
+            written += 1
+        except Exception:                                   # noqa: BLE001
+            continue
+    return written
+
+
 def record_direction(raw: str, project=None):
     """Best-effort: append one ``skill_directed`` event naming every skill this prompt's
     injection actually directed, so Oversee can later show the honest causal "why" and
@@ -634,10 +661,22 @@ def record_direction(raw: str, project=None):
         # of claim about the same prompt, and `oversee` consumes one direction per
         # skill. The catalog is asked to exclude what the gate already named, matching
         # what `hook_context` printed.
-        _text, catalog = catalog_block(prompt, manifest,
-                                      exclude={s["name"] for s in skills})
+        exclude = {s["name"] for s in skills}
+        _text, catalog = catalog_block(prompt, manifest, exclude=exclude)
         named = {s["name"] for s in skills}
         skills += [s for s in catalog if s["name"] not in named]
+        # MN-17: light the cats for what actually ran. This sits here, in the
+        # side-effect function, rather than in `hook_context` — that one has to stay
+        # pure and deterministic because tests pin its bytes, and a ledger write inside
+        # it would break both. Announced BEFORE the early return below, because a
+        # faculty can engage on a prompt that directs no skill at all (records surfaced,
+        # no skill matched), and the operator still needs to see that it ran.
+        if is_code_work(prompt):
+            from . import playbook as pb_ann
+            announce_faculties(
+                pb_ann.engaged(manifest.get("playbook"), pb_ann.infer(prompt),
+                               prompt, exclude=exclude),
+                project=project, session_id=payload.get("session_id") or None)
         if not skills:
             return None
         from . import events as ev_mod

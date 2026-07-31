@@ -119,6 +119,14 @@ MAX_ADVICE_ITEM_CHARS = 240
 # of silently rendering nothing.
 ADVICE_KEYS = ("sops", "constraints", "skills")
 
+# Which faculty cat each advice section lights (MN-17). Keyed on ADVICE_KEYS members, so
+# the existing key-agreement test fails loudly if a section is renamed on either side
+# rather than this map silently announcing nothing. `skills` is absent on purpose: the
+# `skill-plugin` cat is announced from the promptgate catalog, which is the surface that
+# actually opens the skill and plugin catalog for a prompt — lighting it twice from two
+# subsystems would say the faculty ran twice.
+_ADVICE_FACULTY = {"sops": "sop", "constraints": "improvements"}
+
 # What each section is FOR, in the imperative. Without these the block is three
 # unlabelled lists and the agent has to guess which ones are binding.
 ADVICE_LABELS = {
@@ -440,6 +448,36 @@ def block(sc) -> str:
 
 
 # --- the hook surface --------------------------------------------------------------
+
+def engaged_faculties(sc) -> set:
+    """The faculty names the block for sidecar *sc* actually carried.
+
+    Pure — the caller announces. That split is not cosmetic: the natural place to emit
+    looked like `advice.resolve`, but that runs during a sidecar REBUILD, so emitting
+    there made the rebuild write to the ledger and broke the projection invariant
+    ("same events in, same bytes out"). Advice is *consulted* here, at prompt time,
+    which is where the operator's cat should light.
+
+    Reports only what the block will actually show: a cat that lights whether or not a
+    standing procedure matched carries no information, which is the failure the whole
+    faculty board exists to avoid."""
+    from . import telemetry as tel_mod
+    if not block(sc):
+        return set()
+    obj = getattr(sc, "advice", None)
+    if not isinstance(obj, dict):
+        # The sidecar stores advice as the same plain ``{section: [line]}`` dict
+        # `advice_block` renders. Anything else is a shape this module does not know,
+        # and inventing a conversion here would mean importing `advice` — which the
+        # ADVICE_KEYS note above forbids, because `advice` imports this module.
+        return set()
+    out = set()
+    for key, faculty in _ADVICE_FACULTY.items():
+        rows = obj.get(key)
+        if isinstance(rows, list) and any(str(r or "").strip() for r in rows):
+            out.add(faculty)
+    return {f for f in out if f in tel_mod.FACULTIES}
+
 
 def extend_hook_context(context, raw, project=None, sc=None) -> dict:
     """Append MN-1's phase directive to a UserPromptSubmit hook context.

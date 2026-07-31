@@ -95,13 +95,29 @@ def cmd_hook(args) -> int | None:
         # read, additive, fail-open; it returns `context` untouched (possibly
         # falsy) whenever there is nothing to say or anything goes wrong, so the
         # print below still fires only when a subsystem actually spoke.
-        context = mn_inject.extend_hook_context(context, raw)
+        # The sidecar is read ONCE here and threaded in, rather than letting the
+        # injector read it and then reading it again to ask what it used (MN-17).
+        try:
+            from .mindnet import sidecar as mn_sidecar
+            spine = mn_sidecar.read()
+        except Exception:                                   # noqa: BLE001
+            spine = None
+        context = mn_inject.extend_hook_context(context, raw, sc=spine)
         if context:
             print(json.dumps(context))
         # Durable causal trace: record which skills the gate directed so Oversee
         # can later show the honest "directed by prompt-gate" why. Best-effort
         # and self-guarding — never disturbs the context printed above.
         promptgate.record_direction(raw)
+        # MN-17: light the cats for the faculties this turn actually used. AFTER the
+        # print, for the same reason `record_direction` is: stdout is the context
+        # channel, and a telemetry write must never be able to interleave with it.
+        # The catalog and history cats are announced inside `record_direction`, which
+        # already holds what the block named; the spine's SOP and past-failure cats are
+        # announced here, where the advice is CONSULTED — emitting them where advice is
+        # RESOLVED would put a ledger write inside a projection rebuild.
+        if spine is not None:
+            promptgate.announce_faculties(mn_inject.engaged_faculties(spine))
     return None
 
 

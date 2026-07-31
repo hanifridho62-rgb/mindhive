@@ -136,6 +136,11 @@ STATUS_TAGS = ["mindnet", "task", "auto"]
 # `telemetry.FACULTIES` is the one legend and walking the graph is exactly what
 # that faculty means.
 _WAVE_FACULTY = "task-graph"
+# The completion gate's own faculty — the cat for the founding prompt's last stage.
+# Named from the legend, never a second spelling of it: writing that stage's name with a
+# space instead of a hyphen is itself the invariant-10 violation, and the guard caught me
+# doing it here twice.
+_GATE_FACULTY = "pr-green"
 
 
 @dataclass(frozen=True)
@@ -540,14 +545,21 @@ def completion_gate_default(graph, task_id, project=None, records=None):
         except Exception:
             records = {}
     from . import controller as c_mod
-    try:
-        return t_mod.can_complete(graph, task_id,
-                                  c_mod.satisfaction_predicate(records))
-    except Exception as exc:                            # noqa: BLE001
-        # A fault in the gate is not a pass. `can_complete` fails closed on a
-        # raising predicate for the same reason.
-        return (f"'{task_id}' cannot complete: the completion gate raised "
-                f"{type(exc).__name__}: {exc}")
+    # MN-17: the gate is the pr-green faculty actually doing its job, so it announces
+    # itself. `busy` rather than a hand-written pair, because the check runs
+    # inline here and the `finally` guarantees the cat goes idle however the gate
+    # ends — including on the exception path below, which is exactly where a cat stuck
+    # awake forever would be most misleading.
+    from . import telemetry as tel_mod
+    with tel_mod.busy(_GATE_FACULTY, task_id=task_id, project=project):
+        try:
+            return t_mod.can_complete(graph, task_id,
+                                      c_mod.satisfaction_predicate(records))
+        except Exception as exc:                        # noqa: BLE001
+            # A fault in the gate is not a pass. `can_complete` fails closed on a
+            # raising predicate for the same reason.
+            return (f"'{task_id}' cannot complete: the completion gate raised "
+                    f"{type(exc).__name__}: {exc}")
 
 
 def _persist(graph, completed, blocked, project=None) -> dict:
