@@ -587,6 +587,44 @@ def build(skills, stats, evs=None, open_incidents=(), skill_rules=None) -> dict:
             "pool": stats}
 
 
+def selected_skills(playbook, phase, exclude=()) -> list:
+    """The full skill rows this playbook would name for *phase*, in order.
+
+    One selection point with two projections: `render` turns these into directive
+    lines, `directed_skills` turns them into the `skill_directed` payload. Deciding the
+    selection twice would let the recorded trail claim a direction the block never
+    showed — and nothing would surface the disagreement."""
+    if not phase or not isinstance(playbook, dict):
+        return []
+    phases = playbook.get("phases")
+    entry = phases.get(phase) if isinstance(phases, dict) else None
+    if not isinstance(entry, dict):
+        return []
+    skipped = set(exclude or ())
+    return [s for s in (entry.get("skills") or [])
+            if isinstance(s, dict) and s.get("skill") and s["skill"] not in skipped]
+
+
+def directed_skills(playbook, phase, exclude=()) -> list:
+    """The selection above in `skill_directed` payload shape.
+
+    Same `{name, plugin?, measured?}` rows `promptgate.directed_skills` emits and
+    `oversee.skill_trails` consumes, so the causal trail treats a catalog direction and
+    a gate direction identically. `measured` is attached only for a proven MUST — an
+    unproven skill must never reach the trail looking measured."""
+    out = []
+    for s in selected_skills(playbook, phase, exclude):
+        entry = {"name": _clean(s["skill"])}
+        plugin = _clean(s.get("plugin"))
+        if plugin:
+            entry["plugin"] = plugin
+        if s.get("directive") == "must":
+            entry["measured"] = {"ok": int(s.get("ok") or 0),
+                                 "calls": int(s.get("calls") or 0)}
+        out.append(entry)
+    return out
+
+
 def render(playbook, phase, prompt_text, exclude=()) -> str:
     """The injected block for one prompt, or "" when there is nothing to say.
 
@@ -599,14 +637,7 @@ def render(playbook, phase, prompt_text, exclude=()) -> str:
     important part."""
     if not phase or not isinstance(playbook, dict):
         return ""
-    phases = playbook.get("phases")
-    entry = phases.get(phase) if isinstance(phases, dict) else None
-    if not isinstance(entry, dict):
-        entry = {}
-    skipped = set(exclude or ())
-    picked = [s for s in (entry.get("skills") or [])
-              if isinstance(s, dict) and s.get("skill")
-              and s["skill"] not in skipped]
+    picked = selected_skills(playbook, phase, exclude)
     pool = playbook.get("records")
     records = pick_records(pool, prompt_text, phase,
                            df=playbook.get("df"),

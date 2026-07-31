@@ -356,12 +356,66 @@ def test_record_direction_appends_skill_directed():
     assert len(stored) == 1
 
 
-def test_record_direction_noop_on_clear_prompt():
+def test_a_clear_code_prompt_records_the_catalog_direction():
+    """MN-16 U5 reversed this test deliberately; it used to assert `is None`.
+
+    Pinning "a clear prompt records nothing" pinned the gap: MN-14 opened the catalog
+    for well-phrased code prompts, so those prompts direct skills — and none of it
+    reached the ledger, which is why there was no feedback signal to learn from. What
+    is recorded must be what the injection actually named."""
     _seed_manifest()
     raw = json.dumps({"prompt": "Refactor src/mindhive/enforce.py evaluate() and "
                                 "extend tests/test_enforce.py", "session_id": "s"})
-    assert promptgate.record_direction(raw, project="test") is None
+    ev = promptgate.record_direction(raw, project="test")
+    assert ev is not None and ev.type == "skill_directed"
+    assert ev.session_id == "s"
+    named = [s["name"] for s in ev.payload["skills"]]
+    assert named, "a direction was claimed with no skills in it"
+    # The recorded names are exactly what the block printed — not a superset.
+    ctx = promptgate.hook_context(raw, project="test")[
+        "hookSpecificOutput"]["additionalContext"]
+    for name in named:
+        assert name in ctx, f"recorded {name!r} but the block never named it"
+
+
+def test_a_conversational_prompt_records_nothing():
+    """The complement of the reversal above: silence is now reserved for prompts that
+    neither fire the gate nor read as code work. A direction recorded for a thank-you
+    note would poison the taken-rate signal U6 learns from."""
+    _seed_manifest()
+    for prompt in ("what did we decide last week", "terima kasih"):
+        assert promptgate.record_direction(
+            json.dumps({"prompt": prompt, "session_id": "s"}), project="test") is None
     assert [e for e in events.read_all("test") if e.type == "skill_directed"] == []
+
+
+def test_one_prompt_records_one_event_even_when_both_blocks_fire():
+    """A vague code prompt fires the quality gate AND the catalog. Two events for one
+    prompt would double-count the direction, and `oversee` consumes one direction per
+    skill — so the second would attribute a later use twice."""
+    _seed_manifest()
+    promptgate.record_direction(
+        json.dumps({"prompt": "fix it", "session_id": "s-both"}), project="test")
+    stored = [e for e in events.read_all("test") if e.type == "skill_directed"]
+    assert len(stored) == 1
+    names = [s["name"] for s in stored[0].payload["skills"]]
+    assert len(names) == len(set(names)), f"a skill was named twice: {names}"
+
+
+def test_the_recorded_payload_is_what_oversee_consumes():
+    """Asserted by feeding the event through the real fold rather than re-describing the
+    shape here — a shape test would pass while the join silently ignored the row."""
+    from mindhive import oversee
+    _seed_manifest()
+    promptgate.record_direction(
+        json.dumps({"prompt": "fix it", "session_id": "s-join"}), project="test")
+    directed = [s["name"] for e in events.read_all("test")
+                if e.type == "skill_directed" for s in e.payload["skills"]]
+    events.append_event("skill_used", {"name": directed[0], "ok": True},
+                        session_id="s-join", project="test")
+    trail = oversee.skill_trails(project="test")["s-join"]
+    assert any("directed by prompt-gate" in entry["why"] for entry in trail), (
+        f"oversee did not join the recorded direction: {trail}")
 
 
 def test_record_direction_noop_without_trained_rules():

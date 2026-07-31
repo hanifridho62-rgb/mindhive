@@ -566,20 +566,71 @@ def directed_skills(findings, rules) -> list:
     return out
 
 
+def catalog_block(prompt, manifest, exclude=()):
+    """`(text, skills)` — the MN-14/MN-15 catalog block and the skills it names.
+
+    ONE decision with two consumers: `hook_context` prints the text, `record_direction`
+    records the skills. Deciding "playbook or the single-skill fallback" separately in
+    each would let the causal trail claim a direction the block never rendered, and
+    nothing in the system would surface the disagreement.
+
+    Returns `("", [])` when there is nothing to say. Pure — the manifest is passed in."""
+    if not is_code_work(prompt):
+        return "", []
+    from . import playbook as pb_mod
+    play = (manifest or {}).get("playbook")
+    phase = pb_mod.infer(prompt)
+    body = pb_mod.render(play, phase, prompt, exclude=exclude)
+    if body:
+        return (f"{TRIGGER_MARK} Code work — skill & plugin catalog consulted.\n"
+                f"{body}"), pb_mod.directed_skills(play, phase, exclude=exclude)
+    # Fallback to MN-14's single trained skill. Measured as live, not dead: 33 of the
+    # 191 distinct real code prompts still infer no technique at all.
+    always = (manifest or {}).get("always")
+    text = render_always(always, exclude=exclude)
+    if not text:
+        return "", []
+    entry = {"name": _safe_text(always.get("skill"))}
+    plugin = _safe_text(always.get("plugin"))
+    if plugin:
+        entry["plugin"] = plugin
+    if always.get("directive") == "must":
+        entry["measured"] = {"ok": int(always.get("ok") or 0),
+                             "calls": int(always.get("calls") or 0)}
+    return text, [entry]
+
+
 def record_direction(raw: str, project=None):
-    """Best-effort: when the gate fires with trained rules on a human prompt,
-    append one ``skill_directed`` event so Oversee can later show the honest
-    causal "why". Returns the event or None. Never raises — a write failure
-    must never disturb the UserPromptSubmit hook (fail-open, like the gate)."""
+    """Best-effort: append one ``skill_directed`` event naming every skill this prompt's
+    injection actually directed, so Oversee can later show the honest causal "why" and
+    training can tell a suggestion that gets taken from one that never does.
+
+    Covers BOTH paths. It used to return early on a clear verdict, which meant a
+    well-phrased code prompt directed skills through the MN-14/MN-15 catalog and
+    recorded nothing at all — exactly the case MN-14 opened up, and the reason there was
+    no feedback signal to learn from.
+
+    Returns the event or None. Never raises — a write failure must never disturb the
+    UserPromptSubmit hook (fail-open, like the gate)."""
     try:
         payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             return None
-        verdict = assess(payload.get("prompt", ""))
-        if verdict["skip"] or verdict["clear"]:
+        prompt = payload.get("prompt", "")
+        verdict = assess(prompt)
+        if verdict["skip"]:
             return None
-        skills = directed_skills(verdict["findings"],
-                                 load_manifest(project).get("rules"))
+        manifest = load_manifest(project)
+        skills = ([] if verdict["clear"]
+                  else directed_skills(verdict["findings"], manifest.get("rules")))
+        # One event, not two: the gate's directions and the catalog's are the same kind
+        # of claim about the same prompt, and `oversee` consumes one direction per
+        # skill. The catalog is asked to exclude what the gate already named, matching
+        # what `hook_context` printed.
+        _text, catalog = catalog_block(prompt, manifest,
+                                      exclude={s["name"] for s in skills})
+        named = {s["name"] for s in skills}
+        skills += [s for s in catalog if s["name"] not in named]
         if not skills:
             return None
         from . import events as ev_mod
@@ -627,22 +678,12 @@ def hook_context(raw: str, project=None) -> dict:
                 directed = {s["name"] for s in
                             directed_skills(verdict["findings"],
                                             manifest.get("rules"))}
-        if is_code_work(prompt):
-            # MN-15 first: when a technique can be inferred, the playbook block says
-            # everything the single-skill line said and more (technique, ordered
-            # reliable skills, the records to read). Falling back to `render_always`
-            # only when there is no playbook keeps a pre-MN-15 manifest working and
-            # avoids two adjacent catalog blocks saying overlapping things.
-            from . import playbook as pb_mod
-            body = pb_mod.render(manifest.get("playbook"),
-                                 pb_mod.infer(prompt), prompt, exclude=directed)
-            if body:
-                blocks.append(f"{TRIGGER_MARK} Code work — skill & plugin catalog "
-                              f"consulted.\n{body}")
-            else:
-                always = render_always(manifest.get("always"), exclude=directed)
-                if always:
-                    blocks.append(always)
+        # The catalog block: the playbook when a technique can be inferred, MN-14's
+        # single trained skill otherwise. `catalog_block` owns that choice so the
+        # recorded causal trail cannot disagree with what was printed.
+        catalog, _skills = catalog_block(prompt, manifest, exclude=directed)
+        if catalog:
+            blocks.append(catalog)
         if not blocks:
             return {}
         return {"hookSpecificOutput": {
