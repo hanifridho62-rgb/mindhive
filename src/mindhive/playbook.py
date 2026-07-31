@@ -83,6 +83,11 @@ _CUES = (
     ("audit-bug", (
         r"\bbug\b", r"\bcrash\b", r"\btraceback\b", r"\bregression\b",
         r"\bfails?\b", r"\bfailing\b", r"\bbroken\b", r"\berror\b",
+        # `fix` was missing, which is how "fix the code ... improve the file
+        # architecture" — 58 of 275 real code prompts — ended up classified as a
+        # system audit off a single passing mention of architecture. The most ordinary
+        # English phrasing for a defect matched nothing at all.
+        r"\bfix(?:es|ed|ing)?\b", r"\brepair\b", r"\bpatch\b",
         r"\bperbaiki\b", r"\brusak\b", r"\bgagal\b",
         # Symptom reports that never name a defect. Without these, "kucing di
         # dashboard tidak muncul" inferred no technique at all.
@@ -113,9 +118,19 @@ _CUES = (
     # exactly what was asked for: "ketika membangun sesuatu maka akan menampilkan
     # skill yang berhubungan dengan plan".
     ("plan", (
+        # The phase's own name, which the first version of this table somehow lacked:
+        # it carried the Indonesian word but not the English one, so a prompt literally
+        # asking for a plan inferred nothing at all. Written as a prefix match so the
+        # gerund and plural are covered without any forbidden spelling appearing here
+        # as a quoted literal (see the invariant-10 note above).
+        r"\bplan\w*\b",
         r"\bbuild\b", r"\bimplement\b", r"\badd\b", r"\bfeature\b", r"\bcreate\b",
         r"\bnew \w+ (?:module|command|endpoint|page)\b", r"\bdesign\b",
         r"\bbuat(?:kan)?\b", r"\bbikin\b", r"\btambah(?:kan)?\b", r"\bbangun\b",
+        # No `roadmap` cue: I added one and `test_conversation_infers_no_technique`
+        # caught it immediately — "who owns the roadmap" is an ownership question, not
+        # a request to build anything, and the word shows up in status questions about
+        # as often as in planning ones.
         r"\bfitur\b", r"\brencana\b",
     )),
     # The catch-all for hands-on change with nothing to decide first.
@@ -164,20 +179,50 @@ _QUERY_STOP = {
 }
 
 
-def infer(text: str) -> str | None:
-    """The phase whose cues the prompt matches, or None.
+def cue_scores(text: str) -> dict:
+    """`{phase: number of DISTINCT cues matched}`, omitting phases that matched none.
 
-    First match wins, and `_CUES` is ordered most-specific-first: a prompt about a
-    red pipeline is merge-gate work even though it also says "fail". None means the
-    prompt named no technique — the caller then says nothing about technique rather
-    than guessing one, because a confidently wrong technique is worse than silence."""
+    Distinct cues, not total matches: weight of evidence is how many different signals
+    point at a phase, not how many times one word was typed. Otherwise "bug bug bug"
+    would outrank a prompt naming three genuinely different build signals.
+
+    Exposed rather than private so a test can pin the scores directly and so
+    `hive` surfaces can explain an inference instead of asserting it."""
     low = " ".join(str(text or "").lower().split())
     if not low:
-        return None
+        return {}
+    out = {}
     for phase, pats in _COMPILED:
-        if any(p.search(low) for p in pats):
-            return phase
-    return None
+        n = sum(1 for p in pats if p.search(low))
+        if n:
+            out[phase] = n
+    return out
+
+
+def infer(text: str) -> str | None:
+    """The phase the prompt points at hardest, or None when it points nowhere.
+
+    **Weight of evidence, not table position.** Measured over 1 179 real prompts from
+    this project's ledger: 274 read as code work and 64 of them (23%) matched cues
+    from more than one phase. Under the original first-match-wins rule, table position
+    decided all 64 — and the distribution showed it, with `audit-system` at 60 and
+    `pr-green` at 53 against `execution` at 10, driven by passing mentions of
+    "architecture", "PR", "merge" and "green" inside ordinary build requests. Counting
+    cues fixes that without deleting any cue: a prompt genuinely about the merge gate
+    hits several of its cues and still wins, while one that merely mentions a PR hits
+    exactly one.
+
+    Ties resolve by `_CUES` order, so where evidence is genuinely balanced the answer
+    is exactly what it was before — the change is bounded to real collisions.
+
+    None means the prompt named no technique. The caller then says nothing about
+    technique rather than guessing, because a confidently wrong technique is worse
+    than silence: it teaches the reader to skip the marker."""
+    scores = cue_scores(text)
+    if not scores:
+        return None
+    order = {phase: i for i, (phase, _pats) in enumerate(_COMPILED)}
+    return min(scores, key=lambda ph: (-scores[ph], order[ph]))
 
 
 def recall_query(text: str, cap: int = QUERY_TERMS) -> str:

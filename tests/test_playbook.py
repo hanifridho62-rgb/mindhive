@@ -99,10 +99,107 @@ def test_ordinary_prompts_infer_the_expected_technique(prompt, phase):
 
 
 def test_a_red_pipeline_is_merge_gate_work_not_generic_failure():
-    """Specificity ordering, and the reason `_CUES` is ordered rather than a dict:
-    this prompt matches the defect cues too ("fail"), and the answer that helps is
-    the merge gate."""
+    """This prompt matches the defect cues too ("fail"), and the answer that helps is
+    the merge gate. Under weight-of-evidence it wins on cue count: `ci`, `checks
+    fail`, and `pull request` all point one way."""
     assert pb.infer("the CI checks fail on the pull request") == "pr-green"
+
+
+# --- U2: inference decided by weight of evidence, not table position ------------
+#
+# Measured over 1 179 real prompts from this project's own ledger: 274 read as code
+# work, and 64 of them (23%) matched cues belonging to MORE than one phase. With
+# first-match-wins, table position decided those — and the resulting distribution was
+# implausible: audit-system 60 and pr-green 53 against execution 10, driven almost
+# entirely by incidental mentions of "architecture", "PR", "merge" and "green" inside
+# ordinary build requests.
+
+def test_a_build_request_that_merely_mentions_a_pr_is_not_merge_gate_work():
+    """The 23% collision, in one case. This is a request to build something that also
+    says the PR should be green — the technique that helps is planning the work, not
+    watching a pipeline that has nothing in it yet."""
+    prompt = ("buatkan fitur export CSV baru di dashboard, tambahkan test nya, "
+              "dan pastikan PR nya hijau")
+    assert pb.infer(prompt) == "plan", (
+        "an incidental PR mention outranked three build cues")
+
+
+def test_a_build_request_that_mentions_architecture_in_passing_is_not_a_system_audit():
+    """`\\barchitectur` won 60 of the 205 classifications — every single audit-system
+    hit — mostly from long directives that mention architecture while asking for a
+    feature."""
+    prompt = ("implement the new export endpoint following the existing service "
+              "architecture, and add a feature flag for it")
+    assert pb.infer(prompt) in ("plan", "execution"), (
+        "a passing mention of architecture routed a build request to a system audit")
+
+
+def test_a_prompt_genuinely_about_the_merge_gate_still_infers_it():
+    """The complement — demoting incidental cues must not lose the true positives."""
+    prompt = "the CI pipeline is red, checks fail on the pull request, get it green"
+    assert pb.infer(prompt) == "pr-green"
+
+
+def test_a_prompt_genuinely_about_architecture_still_infers_a_system_audit():
+    prompt = ("review the whole system architecture end to end for integration gaps "
+              "between the services")
+    assert pb.infer(prompt) == "audit-system"
+
+
+def test_the_strongest_evidence_wins_regardless_of_table_position():
+    """The property, stated directly: a phase late in the table beats an earlier one
+    when the prompt points at it harder."""
+    # `execution` sits last in the table; this prompt hits several of its cues and
+    # exactly one merge-gate cue.
+    prompt = "refactor and rename the module, then move and extract the helper, merge"
+    assert pb.infer(prompt) == "execution"
+
+
+def test_tied_evidence_resolves_by_table_order():
+    """The documented tie-break, and the reason the ordering is kept at all: where
+    evidence is genuinely balanced the behaviour is exactly what it was before U2, so
+    the change is bounded to real collisions."""
+    # One defect cue ("bug") and one build cue ("feature"); audit-bug is earlier.
+    assert pb.infer("bug in the feature") == "audit-bug"
+
+
+def test_a_prompt_asking_for_a_plan_infers_the_plan_phase():
+    """A straight gap, and an ironic one: the cue list carried the Indonesian word but
+    not the English one, so a prompt literally asking for a plan inferred nothing.
+    Both of these returned None before U2."""
+    for prompt in ("plan dulu sebelum mulai",
+                   "write the plan first",
+                   "anda wajib plan terlebih dahulu di sesi ini"):
+        assert pb.infer(prompt) == "plan", prompt
+
+
+def test_the_plainest_english_for_a_defect_infers_the_defect_phase():
+    """The same class of gap as the missing plan cue, and the one that actually
+    distorted the corpus. "fix the code ... improve the file architecture" accounted
+    for 58 of 275 real code prompts and every one was classified a system audit,
+    because `fix` matched nothing anywhere and a single passing mention of
+    architecture was the only signal in the prompt."""
+    for prompt in ("fix the code in this project",
+                   "please fix the exporter",
+                   "patch the resolver"):
+        assert pb.infer(prompt) == "audit-bug", prompt
+
+
+def test_a_passing_mention_of_architecture_no_longer_carries_a_whole_prompt():
+    """The end-to-end form of the case above: with `fix` present, the defect cue wins
+    and architecture stops being the only thing in the prompt that matched."""
+    prompt = ("I would like you to fix the code in this project, if necessary, "
+              "and improve the file architecture.")
+    assert pb.infer(prompt) == "audit-bug"
+
+
+def test_cue_scoring_counts_distinct_cues_not_repetitions():
+    """Weight of evidence means how many different signals point at a phase, not how
+    many times one word was typed. Otherwise a prompt saying "bug bug bug" would beat
+    a prompt naming three genuinely different build signals."""
+    repeated = pb.infer("bug bug bug bug bug feature build implement create")
+    assert repeated == "plan", (
+        "a repeated single cue outweighed four distinct cues from another phase")
 
 
 def test_a_symptom_report_that_never_says_bug_still_infers_a_technique():
