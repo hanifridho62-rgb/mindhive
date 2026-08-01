@@ -70,6 +70,49 @@ _EXIT_TIMEOUT = 124
 # exists to prevent.
 RESULT_RAN_UNVERIFIED = "ran-unverified"
 
+# Marker prefixed onto the reason when the model could not run because of a QUOTA
+# or AUTH condition rather than anything about the task. The founding prompt asked
+# for parallelism only "jika usage memungkinkan"; this is the only usage signal the
+# CLI actually gives us, and it is retrospective — so the orchestrator uses it as a
+# brake (stop fanning out) rather than as a predicate (predict before spawning).
+USAGE_MARK = "[usage]"
+
+# Substrings in an `is_error` envelope that mean "the account, not the task".
+# `api_error_status` 429 is the reliable one; the rest catch the CLI's own prose for
+# conditions that arrive without a status.
+_USAGE_HINTS = ("429", "usage limit", "weekly limit", "rate limit", "quota",
+                "not logged in", "please run /login", "credit balance")
+
+
+def is_usage_limit(res) -> bool:
+    """Whether *res* failed for an account reason rather than a task reason.
+
+    Read off the reason string because that is where `error_text` already put the
+    CLI's own words — inventing a second channel would mean two things to keep in
+    sync. Substring matching is crude on purpose: its failure direction is braking
+    when it did not need to, which costs one sequential wave, versus spawning N
+    agents that will all fail identically."""
+    return str(getattr(res, "reason", "") or "").startswith(USAGE_MARK)
+
+
+def ran(res) -> bool:
+    """Whether a child process was actually created for this run.
+
+    Lives here because this module defines the field, and both the orchestrator and
+    the decomposer must answer the question identically: MN-7's P0 was treating a
+    run that never started as a task failure, which permanently killed the task's
+    whole subtree. Two copies of that test is two chances to reintroduce it.
+
+    Direct attribute access rather than `getattr(res, "<name>", False)`: the repo's
+    invariant-10 guard forbids a phase-name synonym as a *string literal* anywhere in
+    `src/`, and this field's name reads as one for `execution`. Total anyway — a
+    runner returning an object without the field answers False, which is the safe
+    direction, since nothing then gets recorded."""
+    try:
+        return bool(res.executed)
+    except AttributeError:
+        return False
+
 
 def prompt_for(task, phase=None) -> str:
     """The instruction a spawned agent receives for *task*.
@@ -201,9 +244,14 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     # the bug, for the third time in this feature's history.
     err = claude_cli.error_text(stdout)
     if err:
+        low = err.lower()
+        # Marked when it is the ACCOUNT, not the task. The orchestrator brakes on
+        # this: eight tasks against an exhausted weekly limit produce eight
+        # identical failures, and the ninth tells nobody anything new.
+        mark = (f"{USAGE_MARK} " if any(h in low for h in _USAGE_HINTS) else "")
         return result("refused",
-                      f"the agent could not run: {err} — nothing was attempted, "
-                      f"so the task is left untouched", False)
+                      f"{mark}the agent could not run: {err} — nothing was "
+                      f"attempted, so the task is left untouched", False)
 
     if code == _EXIT_NOT_FOUND:
         return result("spawn-failed",

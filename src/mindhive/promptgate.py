@@ -125,6 +125,60 @@ DIMENSIONS = {
     },
 }
 
+# --- MN-14: the always-on catalog pass ----------------------------------------
+#
+# The gate above only fires on a prompt that looks BAD. MindNetwork's founding
+# requirement is stronger and different: the system should "secara paksa
+# mengoptimalisasi dan improvisasi untuk prompt ... pada pembangunan kode sekecil
+# apapun ... dengan membuka katalog skill and plugin". Forcibly — for code work
+# however small — open the catalog and add the context the model needs.
+#
+# A well-specified prompt got nothing, which is exactly the case the requirement
+# names: "sekecil apapun" is not "only when you phrased it badly". So a second,
+# independent pass runs on any prompt that reads as code work and surfaces the
+# trained catalog entry for it.
+#
+# It is the same channel as the gate — `additionalContext`, additive, never a
+# decision. Forcing CONTEXT is what was asked for; denying the user's own prompt
+# would be a different and hostile thing, and is not built here.
+ALWAYS_KEY = "code-work"
+ALWAYS_SPEC = {
+    "label": "code work — the catalog was consulted",
+    "need": "implementation code test verification plan review structured "
+            "engineering method",
+    "remedy": "open it before the first edit, not after the work is done",
+}
+
+# Code-intent signals. Deliberately narrow: a false positive costs a few injected
+# lines on a prompt that did not need them, but every miss is the requirement not
+# being met, so the list covers the ordinary vocabulary of asking for code work
+# rather than trying to be clever.
+_CODE_INTENT_RES = (
+    re.compile(r"\b(?:code|coding|implement|implementation|refactor|refactoring)\b"),
+    re.compile(r"\b(?:bug|debug|fix|patch|repair|broken|crash|error|failing)\b"),
+    re.compile(r"\b(?:test|tests|testing|pytest|coverage|regression)\b"),
+    re.compile(r"\b(?:feature|function|method|class|module|api|endpoint)\b"),
+    re.compile(r"\b(?:build|ship|deploy|release|migrate|migration)\b"),
+    re.compile(r"\b(?:review|audit|lint|typecheck|ci|pipeline)\b"),
+    re.compile(r"\b(?:commit|branch|merge|rebase|pr|pull request)\b"),
+    # Indonesian, because the user writes their prompts in it and an
+    # English-only detector would answer "not code work" for most of them.
+    re.compile(r"\b(?:kode|koding|perbaiki|perbaikan|buatkan|bikin|tambahkan|"
+               r"ubah|hapus|periksa|uji|fitur|berkas|terapkan|jalankan)\b"),
+    # Symptom reports that never say "bug". "kucing di dashboard tidak muncul" is a
+    # bug report with no keyword from any list above, and it read as conversation —
+    # the catalog stayed shut on exactly the prompt that needed the debugging skill.
+    # A false positive here costs a few injected lines; a miss costs the whole
+    # feature on the phrasing this user actually uses.
+    re.compile(r"\btidak\s+(?:mun[cs]ul|jalan|bisa|berfungsi|bekerja|ke?luar|"
+               r"tampil|terbaca|tersimpan|jadi)\b"),
+    re.compile(r"\b(?:kenapa|mengapa)\b.{0,40}\b(?:tidak|gagal|error|salah)\b"),
+    re.compile(r"\b(?:macet|hilang|salah|aneh|lambat|nge?blank)\b"),
+    # A named file or a fenced/backticked span is code work whatever the verb.
+    re.compile(r"\b[\w./\\-]{2,}\.(?:py|js|ts|tsx|jsx|md|json|ya?ml|toml|"
+               r"cfg|ini|sh|ps1|rs|go|java|rb|c|h|cpp)\b"),
+)
+
 
 def _content_words(text: str) -> list[str]:
     return [w for w in _WORD.findall(str(text or "").lower())
@@ -146,6 +200,23 @@ def is_machine_prompt(text: str) -> bool:
     if s.startswith("<") or s.startswith("/"):
         return True
     return s[:40].lower().startswith("base directory for this skill:")
+
+
+def is_code_work(text: str) -> bool:
+    """Whether *text* reads as a request to build, change or check code.
+
+    Pure and cheap — it runs on every prompt beside `assess`. Machine-injected text
+    answers False for the same reason the gate skips it: a task notification or an
+    injected skill body is not the user asking for anything. Past
+    `PROMPT_SCAN_CAP` it also answers False, so a pasted log cannot turn into a
+    100KB regex scan on the hook's critical path."""
+    if is_machine_prompt(text):
+        return False
+    t = str(text or "")
+    if len(t) > PROMPT_SCAN_CAP:
+        return False
+    low = " ".join(t.lower().split())
+    return any(rx.search(low) for rx in _CODE_INTENT_RES)
 
 
 def assess(text: str) -> dict:
@@ -283,6 +354,24 @@ def train(skills, stats, evs=None, now=None, incident_summaries=None) -> dict:
         rules[dim] = dict(pick, label=spec["label"], remedy=spec["remedy"],
                           need=spec["need"],
                           observed=observed["by_dimension"].get(dim, 0))
+    # MN-14: the always-on catalog entry, trained through the SAME picker as every
+    # dimension. A second selection path here would be a second thing to keep
+    # honest about measured-vs-unmeasured provenance, and the first time they
+    # disagreed the always-on line would be the one claiming a skill is proven when
+    # the gate's own ranking says otherwise.
+    always_pick = _pick_skill(ALWAYS_SPEC["need"], skills, stats,
+                              open_incidents=open_inc, skill_rules=skill_rules)
+    always = (dict(always_pick, label=ALWAYS_SPEC["label"],
+                   remedy=ALWAYS_SPEC["remedy"], need=ALWAYS_SPEC["need"])
+              if always_pick else {})
+    # MN-15: the per-phase playbook — reliable skills plus the ledger records worth
+    # reading. Built HERE because this function already holds the inventory, the
+    # telemetry and `evs`; the live store is 22.8k events and `read_all` measures
+    # 1.09 s, so a hook that rebuilt this per prompt would several-fold the latency
+    # of every prompt the user types.
+    from . import playbook as pb_mod
+    play = pb_mod.build(skills, stats, evs=evs, open_incidents=open_inc,
+                        skill_rules=skill_rules)
     measured_n = sum(1 for r in rules.values() if r["provenance"] == "measured")
     return {
         "trained_at": now or ev_mod.now_iso(),
@@ -291,8 +380,16 @@ def train(skills, stats, evs=None, now=None, incident_summaries=None) -> dict:
             "rules": len(rules),
             "measured_rules": measured_n,
             "prompts_scanned": observed["prompts_scanned"],
+            "playbook_phases": len(play.get("phases") or {}),
+            "playbook_records": len(play.get("records") or []),
+            # What the record pool dropped, and by which mechanism. Reported because
+            # the shrinkage was previously undisclosed AND misattributed: the pool cap
+            # is never reached on a real store, and dedupe is what removes the rows.
+            "playbook_pool": dict(play.get("pool") or {}),
         },
         "rules": rules,
+        "always": always,
+        "playbook": play,
     }
 
 
@@ -418,6 +515,33 @@ def render_context(findings, rules) -> str:
     return "\n".join(lines)
 
 
+def render_always(always, exclude=()) -> str:
+    """MN-14's block: the catalog entry for ordinary code work.
+
+    *exclude* is the set of skill names the quality gate already directed in the
+    same injection. Repeating a skill under two headings reads like two different
+    demands, and the model has to guess whether it is being told the same thing
+    twice or something new."""
+    if not isinstance(always, dict) or not always.get("skill"):
+        return ""
+    if always["skill"] in set(exclude):
+        return ""
+    skill = _safe_text(always["skill"])
+    plugin = _safe_text(always.get("plugin"))
+    where = f" ({plugin})" if plugin else ""
+    lead = (f"{TRIGGER_MARK} Code work — skill & plugin catalog consulted. "
+            f"Before the first edit:")
+    if always.get("directive") == "must":
+        line = (f"- MUST USE: {skill}{where} via the Skill tool — measured "
+                f"{always.get('ok', 0)}/{always.get('calls', 0)} completion; "
+                f"{always.get('remedy', '')}.")
+    else:
+        line = (f"- TRY & MEASURE: {skill}{where} via the Skill tool (not ad-hoc) "
+                f"so its completion rate gets measured; "
+                f"{always.get('remedy', '')}.")
+    return "\n".join([lead, line])
+
+
 def directed_skills(findings, rules) -> list:
     """The skills the gate would direct for these findings, one per firing
     dimension that has a trained rule, deduped by skill name. Each entry:
@@ -442,20 +566,117 @@ def directed_skills(findings, rules) -> list:
     return out
 
 
+def catalog_block(prompt, manifest, exclude=()):
+    """`(text, skills)` — the MN-14/MN-15 catalog block and the skills it names.
+
+    ONE decision with two consumers: `hook_context` prints the text, `record_direction`
+    records the skills. Deciding "playbook or the single-skill fallback" separately in
+    each would let the causal trail claim a direction the block never rendered, and
+    nothing in the system would surface the disagreement.
+
+    Deliberately NOT memoized, even though the two callers compute it twice per prompt
+    (~0.08 s of a 0.36 s hook). The two load the manifest separately, so any cache key
+    cheap enough to be worth it — object identity, or a content fingerprint — is either
+    a guaranteed miss or a staleness hazard where a caller with a different manifest
+    gets the previous answer. Correctness in a hook that runs on every prompt is worth
+    more than 80 ms, and the honest number is reported rather than optimized away.
+
+    Returns `("", [])` when there is nothing to say. Pure — the manifest is passed in."""
+    if not is_code_work(prompt):
+        return "", []
+    from . import playbook as pb_mod
+    play = (manifest or {}).get("playbook")
+    phase = pb_mod.infer(prompt)
+    body = pb_mod.render(play, phase, prompt, exclude=exclude)
+    if body:
+        return (f"{TRIGGER_MARK} Code work — skill & plugin catalog consulted.\n"
+                f"{body}"), pb_mod.directed_skills(play, phase, exclude=exclude)
+    # Fallback to MN-14's single trained skill. Measured as live, not dead: 33 of the
+    # 191 distinct real code prompts still infer no technique at all.
+    always = (manifest or {}).get("always")
+    text = render_always(always, exclude=exclude)
+    if not text:
+        return "", []
+    entry = {"name": _safe_text(always.get("skill"))}
+    plugin = _safe_text(always.get("plugin"))
+    if plugin:
+        entry["plugin"] = plugin
+    if always.get("directive") == "must":
+        entry["measured"] = {"ok": int(always.get("ok") or 0),
+                             "calls": int(always.get("calls") or 0)}
+    return text, [entry]
+
+
+def announce_faculties(faculties, project=None, session_id=None) -> int:
+    """Report each faculty in *faculties* as having woken and finished. Returns the
+    number of pairs written.
+
+    An `active` row and an `idle` row together, not a `busy` block, because by the time
+    this is called the work is done — the prompt's block has already been rendered and
+    printed. `ui_cats` hides an idle faculty once its 15-second flicker grace passes, so
+    the pair is exactly what makes the cat appear and then vanish, which is the behaviour
+    that was asked for ("ketika tidak sedang berjalan maka kucing akan menghilang").
+
+    Never raises. A cat animation that cannot be logged must not disturb the prompt —
+    the same contract `telemetry.emit` and `record_direction` already keep."""
+    from .mindnet import telemetry as tel_mod
+    written = 0
+    for faculty in sorted(faculties or ()):
+        try:
+            if tel_mod.emit(faculty, tel_mod.STATUS_ACTIVE, project=project,
+                            session_id=session_id) is None:
+                continue
+            tel_mod.emit(faculty, tel_mod.STATUS_IDLE, project=project,
+                         session_id=session_id)
+            written += 1
+        except Exception:                                   # noqa: BLE001
+            continue
+    return written
+
+
 def record_direction(raw: str, project=None):
-    """Best-effort: when the gate fires with trained rules on a human prompt,
-    append one ``skill_directed`` event so Oversee can later show the honest
-    causal "why". Returns the event or None. Never raises — a write failure
-    must never disturb the UserPromptSubmit hook (fail-open, like the gate)."""
+    """Best-effort: append one ``skill_directed`` event naming every skill this prompt's
+    injection actually directed, so Oversee can later show the honest causal "why" and
+    training can tell a suggestion that gets taken from one that never does.
+
+    Covers BOTH paths. It used to return early on a clear verdict, which meant a
+    well-phrased code prompt directed skills through the MN-14/MN-15 catalog and
+    recorded nothing at all — exactly the case MN-14 opened up, and the reason there was
+    no feedback signal to learn from.
+
+    Returns the event or None. Never raises — a write failure must never disturb the
+    UserPromptSubmit hook (fail-open, like the gate)."""
     try:
         payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             return None
-        verdict = assess(payload.get("prompt", ""))
-        if verdict["skip"] or verdict["clear"]:
+        prompt = payload.get("prompt", "")
+        verdict = assess(prompt)
+        if verdict["skip"]:
             return None
-        skills = directed_skills(verdict["findings"],
-                                 load_manifest(project).get("rules"))
+        manifest = load_manifest(project)
+        skills = ([] if verdict["clear"]
+                  else directed_skills(verdict["findings"], manifest.get("rules")))
+        # One event, not two: the gate's directions and the catalog's are the same kind
+        # of claim about the same prompt, and `oversee` consumes one direction per
+        # skill. The catalog is asked to exclude what the gate already named, matching
+        # what `hook_context` printed.
+        exclude = {s["name"] for s in skills}
+        _text, catalog = catalog_block(prompt, manifest, exclude=exclude)
+        named = {s["name"] for s in skills}
+        skills += [s for s in catalog if s["name"] not in named]
+        # MN-17: light the cats for what actually ran. This sits here, in the
+        # side-effect function, rather than in `hook_context` — that one has to stay
+        # pure and deterministic because tests pin its bytes, and a ledger write inside
+        # it would break both. Announced BEFORE the early return below, because a
+        # faculty can engage on a prompt that directs no skill at all (records surfaced,
+        # no skill matched), and the operator still needs to see that it ran.
+        if is_code_work(prompt):
+            from . import playbook as pb_ann
+            announce_faculties(
+                pb_ann.engaged(manifest.get("playbook"), pb_ann.infer(prompt),
+                               prompt, exclude=exclude),
+                project=project, session_id=payload.get("session_id") or None)
         if not skills:
             return None
         from . import events as ev_mod
@@ -471,24 +692,49 @@ def record_direction(raw: str, project=None):
 
 
 def hook_context(raw: str, project=None) -> dict:
-    """Parse a UserPromptSubmit payload (JSON on the hook's stdin) and return
-    the hook output: additive context when the gate fires and trained rules
-    exist, {} otherwise. Additive only — never a block decision. Never raises;
-    any error is an empty (silent) result."""
+    """Parse a UserPromptSubmit payload (JSON on the hook's stdin) and return the
+    hook output: additive context, or {} when there is nothing to say.
+
+    Two independent passes, joined into one injection:
+
+    - the **quality gate** — fires only on a prompt that looks underspecified;
+    - the **catalog pass** (MN-14) — fires on any prompt that reads as code work,
+      however small and however well phrased, because that is what the founding
+      requirement asked for. A clear prompt used to get nothing at all.
+
+    Additive only — never a block decision. Never raises; any error is an empty
+    (silent) result, because a gate that can break a prompt is worse than a gate
+    that occasionally says nothing."""
     try:
         payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             return {}
-        verdict = assess(payload.get("prompt", ""))
-        if verdict["skip"] or verdict["clear"]:
+        prompt = payload.get("prompt", "")
+        verdict = assess(prompt)
+        if verdict["skip"]:
             return {}
+        # One manifest read serves both passes. Reading it twice would double the
+        # hook's disk cost on every prompt for no gain.
         manifest = load_manifest(project)
-        context = render_context(verdict["findings"], manifest.get("rules"))
-        if not context:
+        blocks, directed = [], set()
+        if not verdict["clear"]:
+            gate = render_context(verdict["findings"], manifest.get("rules"))
+            if gate:
+                blocks.append(gate)
+                directed = {s["name"] for s in
+                            directed_skills(verdict["findings"],
+                                            manifest.get("rules"))}
+        # The catalog block: the playbook when a technique can be inferred, MN-14's
+        # single trained skill otherwise. `catalog_block` owns that choice so the
+        # recorded causal trail cannot disagree with what was printed.
+        catalog, _skills = catalog_block(prompt, manifest, exclude=directed)
+        if catalog:
+            blocks.append(catalog)
+        if not blocks:
             return {}
         return {"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
+            "additionalContext": "\n".join(blocks),
         }}
     except Exception:
         return {}

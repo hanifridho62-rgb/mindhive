@@ -12,6 +12,8 @@ Pure presentation: token in, HTML string out; all state is server-side.
 """
 import json
 
+from . import cat_board
+
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -77,34 +79,15 @@ _PAGE = """<!doctype html>
      strip exists — so `dim` is muted but never hidden, and only the 6-hour
      rule removes a cat entirely (that filtering happens server-side in
      ui_cats.board; this stylesheet only renders what arrives). */
+  /* This page wants the board as a full-width strip under the header; the main
+     dashboard wants it inline in its own header. That box is the only part that
+     differs, so it is the only part still written here — every cat and panel rule
+     comes from `cat_board.CSS`. */
   #mn-cats { flex:0 0 auto; display:flex; align-items:center; gap:6px;
     padding:5px 14px; background:#12161d; border-bottom:1px solid #30363d;
-    min-height:34px; overflow-x:auto; }
-  #mn-cats .lbl { color:#8b949e; font-size:10.5px; letter-spacing:.6px;
-    text-transform:uppercase; margin-right:2px; flex:0 0 auto; }
-  #mn-cats .none { color:#6e7681; font-size:11.5px; }
-  .mn-cat { position:relative; display:flex; align-items:center; gap:5px;
-    border:1px solid #30363d; border-radius:999px; padding:2px 9px 2px 5px;
-    background:#161b22; cursor:pointer; flex:0 0 auto; font-size:11.5px; }
-  .mn-cat:hover { border-color:#58a6ff; }
-  .mn-cat svg { width:19px; height:19px; display:block; }
-  .mn-cat.active { color:#7ee787; border-color:#2ea043; }
-  .mn-cat.active svg { animation:mn-bob 1.6s ease-in-out infinite; }
-  .mn-cat.dim { color:#8b949e; opacity:.55; }
-  /* grayscale, not just opacity. The cats used to be a currentColor silhouette,
-     so `.mn-cat.dim`'s grey text colour greyed the sprite for free. They are
-     per-faculty coloured now, and without an explicit filter a dim cat would
-     still look fully alive — losing the 180-second band, which IS the hang
-     signal this board exists to show. */
-  .mn-cat.dim svg { animation:none; filter:grayscale(100%); }
-  @keyframes mn-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
-  #mn-cat-panel { position:fixed; z-index:20; display:none; min-width:210px;
-    background:#161b22; border:1px solid #30363d; border-radius:8px;
-    padding:8px 10px; font-size:11.5px; box-shadow:0 6px 22px #0009; }
-  #mn-cat-panel h3 { margin:0 0 5px; font-size:12px; color:#e8b64c; }
-  #mn-cat-panel .kv { display:flex; gap:6px; }
-  #mn-cat-panel .kv span:first-child { color:#8b949e; min-width:58px; }
-  #mn-cat-panel .warn { margin-top:5px; color:#ff9e64; }
+    min-height:44px; overflow-x:auto; }
+  #mn-cats .lbl { margin-right:2px; }
+/*__CAT_CSS__*/
 </style></head>
 <body>
 <header>
@@ -117,9 +100,7 @@ _PAGE = """<!doctype html>
   <span id="mstate" class="badge idle">IDLE</span>
   <button class="stop" onclick="stopMission()">&#9888; Stop</button>
 </header>
-<div id="mn-cats"><span class="lbl">faculties</span>
-  <span class="none">no MindNetwork activity</span></div>
-<div id="mn-cat-panel"></div>
+<!--__CAT_HTML__-->
 <div id="wrap">
   <div id="stage">
     <div id="world">
@@ -158,51 +139,13 @@ _PAGE = """<!doctype html>
     agent: '#8ab4f8' };
   const ROLE_ICON = { coordinator:'&#9819;', builder:'&#128295;', scout:'&#128269;',
     reviewer:'&#128065;', agent:'&#9679;' };
-  // 6 pixel cats (white, calico, orange, grey tabby, siamese, black) drawn as
-  // inline SVG rect grids — no image files, so the page stays offline-self-
-  // contained. A node's cat is picked deterministically from its agent id:
-  // random per new node, stable across refreshes. Grid chars: b body, p patch,
-  // e eye, n nose, . empty.
-  const CAT_GRID = [
-    '.b........b.',
-    '.bb......bb.',
-    '.bpb....bpb.',
-    '.bbbbbbbbbb.',
-    'bbbbbbbbbbbb',
-    'bbeebbbbeebb',
-    'bbbbbnnbbbbb',
-    '.bbbbbbbbbb.',
-    '.bpbbbbbbpb.',
-    '.bbbbbbbbbb.',
-    '.bbbbbbbbbb.',
-    '..bb.bb.bb..'];
-  // Seven, not six: `telemetry.FACULTIES` has seven members and the faculty
-  // board gives each one its own cat, so a six-entry table would make two
-  // faculties render identically — the exact thing that board is for. Every
-  // modulo below reads the table's length rather than a literal, so adding an
-  // eighth palette cannot leave a hardcoded 7 behind.
-  const CAT_PALETTES = [
-    {name:'white',   b:'#f2f2f0', p:'#e3e3df', e:'#4aa3ff'},
-    {name:'calico',  b:'#f2f2f0', p:'#e8863a', e:'#3fb950'},
-    {name:'orange',  b:'#e8863a', p:'#c9641f', e:'#3fb950'},
-    {name:'tabby',   b:'#9aa2ad', p:'#6b7280', e:'#e8b64c'},
-    {name:'siamese', b:'#e8dcc8', p:'#5b4636', e:'#58a6ff'},
-    {name:'black',   b:'#262a33', p:'#16181d', e:'#e8b64c'},
-    {name:'cream',   b:'#f0d9a8', p:'#d8b878', e:'#3fb950'}];
+  // The cats, their palettes and the whole faculty board come from
+  // `cat_board.script()` — one copy, shared with the main dashboard. This page adds
+  // only its own consumer: a node's cat is picked deterministically from its agent
+  // id, so it is random per new node and stable across refreshes.
+/*__CAT_JS__*/
   function catFor(id){
     return (parseInt(String(id).slice(0,4), 16) || 0) % CAT_PALETTES.length;
-  }
-  function catSVG(idx, size){
-    const c = CAT_PALETTES[((idx % CAT_PALETTES.length) + CAT_PALETTES.length)
-                           % CAT_PALETTES.length];
-    const fill = {b:c.b, p:c.p, e:c.e, n:'#ff8fb3'};
-    let rects = '';
-    CAT_GRID.forEach((row, y) => { for (let x = 0; x < row.length; x++) {
-      const col = fill[row[x]];
-      if (col) rects += '<rect x="'+x+'" y="'+y+'" width="1" height="1" fill="'+col+'"/>';
-    }});
-    return '<svg viewBox="0 0 12 12" width="'+size+'" height="'+size
-      + '" shape-rendering="crispEdges">'+rects+'</svg>';
   }
   function api(path){ return fetch(withP(path) + (path.includes('?')?'&':'?') + 'token='
       + encodeURIComponent(TOKEN), {headers:{'X-Hive-Token':TOKEN}}).then(r=>r.json()); }
@@ -395,108 +338,10 @@ _PAGE = """<!doctype html>
   }, {passive:false});
 
   // --- MN-5: the faculty cat board ---------------------------------------
-  // Every threshold decision is made server-side in ui_cats.board: the 6-hour
-  // rule removes a cat from the payload entirely, and the 180-second rule
-  // arrives as display:"dim". Nothing here recomputes either — one home for
-  // those numbers, and this loop cannot drift from the tests that pin them.
-  // The canonical faculty order, injected from `telemetry.FACULTIES` — the one
-  // legend. A faculty's cat is its INDEX in that tuple, so the mapping is
-  // stable across polls and a faculty added to the legend gets its own palette
-  // without anybody editing a second list here. A hand-written faculty->colour
-  // table would be exactly that second list, and it would drift.
-  const FACULTY_ORDER = __FACULTIES__;
-  function facultyCat(faculty){
-    const i = FACULTY_ORDER.indexOf(faculty);
-    // `ui_cats.board` iterates FACULTIES and drops anything absent, so an
-    // unknown faculty cannot reach the payload. Answer 0 rather than -1 anyway:
-    // a negative index would pick the wrong palette silently.
-    return i < 0 ? 0 : i;
-  }
-  const CAT_LABEL = { 'skill-plugin':'Skills', 'sop':'SOPs',
-    'improvements':'Improvements', 'history':'History', 'task-graph':'Tasks',
-    'compatibility':'Compatibility', 'pr-green':'PR green' };
-
-  function catAge(s){
-    if (s < 60) return s + 's';
-    if (s < 3600) return Math.floor(s/60) + 'm';
-    return (s/3600).toFixed(1) + 'h';
-  }
-
-  function catPanel(cat, el){
-    const p = document.getElementById('mn-cat-panel');
-    // textContent throughout: task_id and phase are ledger-supplied strings
-    // and this is the one place they reach the DOM.
-    p.innerHTML = '';
-    const h = document.createElement('h3');
-    h.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
-    p.appendChild(h);
-    const rows = [['task', cat.task_id || '—'], ['phase', cat.phase || '—'],
-                  ['skill', cat.skill || '—'], ['state', cat.status],
-                  ['last seen', catAge(cat.age_secs) + ' ago']];
-    for (const [k, v] of rows){
-      const d = document.createElement('div'); d.className = 'kv';
-      const a = document.createElement('span'); a.textContent = k;
-      const b = document.createElement('span'); b.textContent = v;
-      d.appendChild(a); d.appendChild(b); p.appendChild(d);
-    }
-    // The reason this board exists: awake but not moving is a stuck parallel
-    // run, and the user asked to be able to see that at a glance.
-    if (cat.status === 'active' && cat.age_secs >= 900){
-      const w = document.createElement('div'); w.className = 'warn';
-      w.textContent = 'active with no update for ' + catAge(cat.age_secs)
-        + ' — possible silent hang';
-      p.appendChild(w);
-    }
-    const r = el.getBoundingClientRect();
-    p.style.left = Math.round(r.left) + 'px';
-    p.style.top = Math.round(r.bottom + 6) + 'px';
-    p.style.display = 'block';
-  }
-
-  function paintCats(cats){
-    const bar = document.getElementById('mn-cats');
-    const open = bar.querySelector('.mn-cat.sel');
-    const openFaculty = open ? open.dataset.faculty : null;
-    bar.innerHTML = '';
-    const lbl = document.createElement('span');
-    lbl.className = 'lbl'; lbl.textContent = 'faculties';
-    bar.appendChild(lbl);
-    if (!cats.length){
-      const n = document.createElement('span');
-      n.className = 'none'; n.textContent = 'no MindNetwork activity';
-      bar.appendChild(n);
-      document.getElementById('mn-cat-panel').style.display = 'none';
-      return;
-    }
-    for (const cat of cats){
-      const el = document.createElement('span');
-      el.className = 'mn-cat ' + cat.display;
-      el.dataset.faculty = cat.faculty;
-      el.innerHTML = catSVG(facultyCat(cat.faculty), 19);
-      const t = document.createElement('span');
-      t.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
-      el.appendChild(t);
-      el.title = (CAT_LABEL[cat.faculty] || cat.faculty)
-        + ' — ' + cat.status + ', last seen ' + catAge(cat.age_secs) + ' ago';
-      el.onclick = (ev) => {
-        ev.stopPropagation();
-        const already = el.classList.contains('sel');
-        bar.querySelectorAll('.mn-cat.sel').forEach(x => x.classList.remove('sel'));
-        if (already){ document.getElementById('mn-cat-panel').style.display = 'none'; }
-        else { el.classList.add('sel'); catPanel(cat, el); }
-      };
-      // Re-open the panel the poll just replaced, so a 1.2 s refresh does not
-      // close a panel the user is reading.
-      if (cat.faculty === openFaculty){ el.classList.add('sel'); }
-      bar.appendChild(el);
-      if (cat.faculty === openFaculty){ catPanel(cat, el); }
-    }
-  }
-  document.addEventListener('click', () => {
-    document.getElementById('mn-cat-panel').style.display = 'none';
-    document.querySelectorAll('#mn-cats .mn-cat.sel')
-      .forEach(x => x.classList.remove('sel'));
-  });
+  // The board itself — palettes, sprites, labels, the metadata panel and the
+  // outside-click dismiss — is injected above from `cat_board.script()`, so this
+  // page and the main dashboard render one implementation. All this page owns is
+  // the poll that feeds it.
 
   async function pollCats(){
     try { paintCats((await api('/api/mindnet/cats')).cats || []); } catch(_){}
@@ -525,13 +370,14 @@ def render_swarm(token: str) -> str:
     # Escape every "<" in the JSON-encoded token so neither "</script>" nor
     # "<!--" can break out of the inline <script> block.
     #
-    # The faculty legend is injected rather than restated in JavaScript, so the
-    # per-faculty cat index derives from `telemetry.FACULTIES` and cannot drift
-    # from it (invariant 10). Imported lazily to keep this module's "token in,
-    # HTML out" purity: a page render must not pull the mindnet package into a
-    # dashboard serving a project that has none.
-    from .mindnet.telemetry import FACULTIES
+    # The cat board arrives from `cat_board`, which also injects the faculty legend
+    # from `telemetry.FACULTIES` — so the per-faculty cat index derives from that one
+    # tuple and cannot drift from it (invariant 10). The board substitutions run
+    # BEFORE the token one: they inject page text, and letting a token-derived string
+    # be scanned for markers afterwards would let a crafted token place its own.
     return (_PAGE
-            .replace("__FACULTIES__", json.dumps(list(FACULTIES)))
+            .replace("/*__CAT_CSS__*/", cat_board.CSS)
+            .replace("<!--__CAT_HTML__-->", cat_board.HTML)
+            .replace("/*__CAT_JS__*/", cat_board.script())
             .replace("__TOKEN__",
                      json.dumps(token).replace("<", "\\u003c")))

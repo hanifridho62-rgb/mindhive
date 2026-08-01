@@ -119,6 +119,14 @@ MAX_ADVICE_ITEM_CHARS = 240
 # of silently rendering nothing.
 ADVICE_KEYS = ("sops", "constraints", "skills")
 
+# Which faculty cat each advice section lights (MN-17). Keyed on ADVICE_KEYS members, so
+# the existing key-agreement test fails loudly if a section is renamed on either side
+# rather than this map silently announcing nothing. `skills` is absent on purpose: the
+# `skill-plugin` cat is announced from the promptgate catalog, which is the surface that
+# actually opens the skill and plugin catalog for a prompt — lighting it twice from two
+# subsystems would say the faculty ran twice.
+_ADVICE_FACULTY = {"sops": "sop", "constraints": "improvements"}
+
 # What each section is FOR, in the imperative. Without these the block is three
 # unlabelled lists and the agent has to guess which ones are binding.
 ADVICE_LABELS = {
@@ -420,26 +428,65 @@ def advice_block(obj) -> str:
 
 def block(sc) -> str:
     """What to inject for sidecar *sc*: the phase-specific block, the agnostic
-    one, or ``""`` for silence. See the module docstring's three outcomes."""
+    one, or ``""`` for silence. See the module docstring's three outcomes.
+
+    Advice rides BOTH branches; per-task phase direction rides only the fresh one.
+
+    That split replaces a fresh-only rule, and the narrowing is deliberate. The original
+    argument was that advice resolved against a task which has since fallen back to the
+    planning gate is a confident, wrong instruction. True — of the PHASE, which a later
+    event genuinely can change. It does not transfer to SOPs and prior-failure
+    constraints: those are resolved against the task's TEXT, and no later event can
+    invalidate them.
+
+    Withholding them bought no safety and cost the whole feature. Measured: ONE appended
+    event of any type marks the sidecar stale, and the hook itself appends on every prompt,
+    so stale is the NORMAL state — the SOP section and the Improvements section were
+    injected by no prompt at all, despite both resolvers working and being tested."""
     records = getattr(getattr(sc, "state", None), "records", None) or {}
     if not records:
         return ""
+    extra = advice_block(getattr(sc, "advice", None))
     if not getattr(sc, "fresh", False):
-        return AGNOSTIC_BLOCK
+        return f"{AGNOSTIC_BLOCK}\n{extra}" if extra else AGNOSTIC_BLOCK
     rec, task = active(sc)
     if rec is None:
         return ""
     text = phase_block(rec, task)
-    # Only reached on the fresh branch, and that placement is the point: a
-    # stale projection returns `AGNOSTIC_BLOCK` above and never gets here.
-    # Advice resolved against a task that has since fallen back to the planning
-    # gate is a confident, wrong instruction — strictly worse than silence,
-    # which is the same argument this module already makes for stale phase data.
-    extra = advice_block(getattr(sc, "advice", None))
     return f"{text}\n{extra}" if extra else text
 
 
 # --- the hook surface --------------------------------------------------------------
+
+def engaged_faculties(sc) -> set:
+    """The faculty names the block for sidecar *sc* actually carried.
+
+    Pure — the caller announces. That split is not cosmetic: the natural place to emit
+    looked like `advice.resolve`, but that runs during a sidecar REBUILD, so emitting
+    there made the rebuild write to the ledger and broke the projection invariant
+    ("same events in, same bytes out"). Advice is *consulted* here, at prompt time,
+    which is where the operator's cat should light.
+
+    Reports only what the block will actually show: a cat that lights whether or not a
+    standing procedure matched carries no information, which is the failure the whole
+    faculty board exists to avoid."""
+    from . import telemetry as tel_mod
+    if not block(sc):
+        return set()
+    obj = getattr(sc, "advice", None)
+    if not isinstance(obj, dict):
+        # The sidecar stores advice as the same plain ``{section: [line]}`` dict
+        # `advice_block` renders. Anything else is a shape this module does not know,
+        # and inventing a conversion here would mean importing `advice` — which the
+        # ADVICE_KEYS note above forbids, because `advice` imports this module.
+        return set()
+    out = set()
+    for key, faculty in _ADVICE_FACULTY.items():
+        rows = obj.get(key)
+        if isinstance(rows, list) and any(str(r or "").strip() for r in rows):
+            out.add(faculty)
+    return {f for f in out if f in tel_mod.FACULTIES}
+
 
 def extend_hook_context(context, raw, project=None, sc=None) -> dict:
     """Append MN-1's phase directive to a UserPromptSubmit hook context.

@@ -198,6 +198,73 @@ def test_board_load_missing_file_is_empty():
     assert workspace.load_board() == {"tasks": []}
 
 
+def test_board_load_retries_a_read_that_lost_the_write_race(monkeypatch):
+    """A transient read failure must not be reported as an empty board.
+
+    `_write_board_locked` is already atomic, so the only way a reader sees nothing is by
+    landing inside the replace. On Windows that surfaces as PermissionError against the
+    destination — the store carries a pinned caveat about exactly this — and answering
+    "no tasks" there is a failure disguised as an absence.
+
+    That disguise is what made `test_board_dispatch_runs_card_on_idle_agent` fail on
+    windows/py3.12 while passing on py3.11 in the same CI run: the board held a card, the
+    read lost the race, and the caller indexed an empty list."""
+    workspace.save_board({"tasks": [{"id": "t1", "title": "Card", "prompt": "go"}]})
+    real = Path.read_text
+    calls = {"n": 0}
+
+    def flaky(self, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(5, "Access is denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert workspace.load_board()["tasks"][0]["id"] == "t1"
+    assert calls["n"] >= 2, "the read was not retried"
+
+
+def test_board_load_gives_up_rather_than_hanging(monkeypatch):
+    """The retry is bounded. A permanently unreadable board must still answer."""
+    workspace.save_board({"tasks": [{"id": "t1", "title": "Card", "prompt": "go"}]})
+    calls = {"n": 0}
+
+    def always_denied(self, *a, **kw):
+        calls["n"] += 1
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(Path, "read_text", always_denied)
+    assert workspace.load_board() == {"tasks": []}
+    assert calls["n"] == workspace._BOARD_READ_TRIES
+
+
+def test_board_load_does_not_retry_a_missing_file(monkeypatch):
+    """Absence is a real answer, and the first-run path must not pay four sleeps for
+    it."""
+    calls = {"n": 0}
+
+    def missing(self, *a, **kw):
+        calls["n"] += 1
+        raise FileNotFoundError(2, "No such file")
+
+    monkeypatch.setattr(Path, "read_text", missing)
+    assert workspace.load_board() == {"tasks": []}
+    assert calls["n"] == 1, "a missing board was retried"
+
+
+def test_board_load_does_not_retry_a_wrong_shape(monkeypatch):
+    """Valid JSON of the wrong shape is not a race — retrying cannot change it."""
+    calls = {"n": 0}
+
+    def wrong(self, *a, **kw):
+        calls["n"] += 1
+        return '{"tasks": "not a list"}'
+
+    monkeypatch.setattr(Path, "read_text", wrong)
+    assert workspace.load_board() == {"tasks": []}
+    assert calls["n"] == 1
+
+
 def test_board_save_normalizes_tasks():
     res = workspace.save_board({"tasks": [
         {"title": "Build it", "prompt": "do the thing", "status": "running"},

@@ -101,7 +101,15 @@ OUTCOME_SETTLED = "settled"      # nothing left to do
 OUTCOME_STALLED = "stalled"      # work remains but nothing can advance
 OUTCOME_CAPPED = "capped"        # hit MAX_WAVES with work outstanding
 OUTCOME_DRY_RUN = "dry-run"      # planned only; no child ever started
-OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN)
+# The founding prompt asked for parallelism only "jika usage memungkinkan". The CLI
+# gives no way to ask before spawning, so this is the retrospective half: the moment
+# one agent reports a quota/auth condition, stop. Eight tasks against an exhausted
+# weekly limit produce eight identical failures and the ninth teaches nobody
+# anything — and unlike a task failure, nothing about waiting is going to change by
+# running more of them now.
+OUTCOME_USAGE = "usage-halted"
+OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
+            OUTCOME_USAGE)
 
 # A runaway backstop, not a budget — the same role `MAX_NODES` and
 # `MAX_DEPS_PER_TASK` play for the graph. A legal graph can need at most one wave
@@ -128,6 +136,11 @@ STATUS_TAGS = ["mindnet", "task", "auto"]
 # `telemetry.FACULTIES` is the one legend and walking the graph is exactly what
 # that faculty means.
 _WAVE_FACULTY = "task-graph"
+# The completion gate's own faculty — the cat for the founding prompt's last stage.
+# Named from the legend, never a second spelling of it: writing that stage's name with a
+# space instead of a hyphen is itself the invariant-10 violation, and the guard caught me
+# doing it here twice.
+_GATE_FACULTY = "pr-green"
 
 
 @dataclass(frozen=True)
@@ -276,18 +289,12 @@ def _mark(graph, completed, blocked) -> dict:
 def _ran(res) -> bool:
     """Whether a child process was actually created for this run.
 
-    Direct attribute access rather than `getattr(res, "<name>", False)`: the
-    repo's invariant-10 guard (`test_no_phase_name_synonym_appears_in_src`)
-    forbids a phase-name synonym as a string literal anywhere in `src/`, and this
-    field's name reads as one for `execution`. `executor.py` sidesteps the same
-    guard by only ever using it as a bare keyword.
-
-    Total anyway: a runner returning an object without the field answers False,
-    which is the safe direction — no status row gets written."""
-    try:
-        return bool(res.executed)
-    except AttributeError:
-        return False
+    Delegates to `agent.ran`, which owns the field and therefore the question. This
+    wrapper exists only so the wave loop reads locally and so the import stays lazy
+    — a caller supplying its own runner must not be made to import the agent module
+    just to have its results classified."""
+    from . import agent as ag_ran
+    return ag_ran.ran(res)
 
 
 def run_key(index, task_id) -> str:
@@ -489,7 +496,11 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             f"executor.RUN_RESULTS — orchestrator.RESULT_STATUS and "
             f"NON_EXECUTING_RESULTS must together classify every declared result "
             f"before it can be acted on")
-    return sorted(done), sorted(failed), sorted(skipped), reasons, isolated
+    from . import agent as ag_check
+    starved = any(ag_check.is_usage_limit(r) for _t, r, _e in results
+                  if r is not None)
+    return (sorted(done), sorted(failed), sorted(skipped), reasons,
+            isolated, starved)
 
 
 def _refresh(project=None) -> None:
@@ -505,6 +516,50 @@ def _refresh(project=None) -> None:
             f"the sidecar could not be rebuilt: {out.reason} — the projection is "
             f"now STALE, which disables phase-aware injection and the PreToolUse "
             f"teeth until `hive mindnet rebuild` succeeds")
+
+
+def completion_gate_default(graph, task_id, project=None, records=None):
+    """``None`` when *task_id* may be marked COMPLETED, else the blocking reason.
+
+    **This is the wire the original ask was missing.** MindNetwork's founding
+    requirement said a task "tidak akan selesai hingga pr berwarna hijau" — it is
+    not finished until the PR is green — and `tasks.can_complete` implements
+    exactly that: no open descendants, evidence recorded, and the terminal phase
+    (`pr-green`, or `TRIVIAL_EXIT_PHASE` for an ADR-0005 bypass) satisfied.
+
+    Nothing called it. Every reference to `can_complete` in `src/` was a comment
+    or a docstring, so the only writer of a `completed` row — `_persist` — marked
+    tasks finished without ever asking. A task could be COMPLETED at `brainstorm`,
+    which unblocks its dependents on a promise the machine never checked.
+
+    The satisfaction predicate comes from the SIDECAR, not a fresh ledger fold:
+    `_persist` rebuilds the sidecar after every wave, so it is current by
+    construction, and a file read costs nothing next to the ~264 ms fold. A stale
+    or missing sidecar yields no records, the predicate answers False, and the gate
+    REFUSES — which is the direction a gate must fail in."""
+    if records is None:
+        try:
+            from . import sidecar as sc_mod
+            sc = sc_mod.read(project)
+            records = getattr(getattr(sc, "state", None), "records", None) or {}
+        except Exception:
+            records = {}
+    from . import controller as c_mod
+    # MN-17: the gate is the pr-green faculty actually doing its job, so it announces
+    # itself. `busy` rather than a hand-written pair, because the check runs
+    # inline here and the `finally` guarantees the cat goes idle however the gate
+    # ends — including on the exception path below, which is exactly where a cat stuck
+    # awake forever would be most misleading.
+    from . import telemetry as tel_mod
+    with tel_mod.busy(_GATE_FACULTY, task_id=task_id, project=project):
+        try:
+            return t_mod.can_complete(graph, task_id,
+                                      c_mod.satisfaction_predicate(records))
+        except Exception as exc:                        # noqa: BLE001
+            # A fault in the gate is not a pass. `can_complete` fails closed on a
+            # raising predicate for the same reason.
+            return (f"'{task_id}' cannot complete: the completion gate raised "
+                    f"{type(exc).__name__}: {exc}")
 
 
 def _persist(graph, completed, blocked, project=None) -> dict:
@@ -577,7 +632,8 @@ def _persist(graph, completed, blocked, project=None) -> dict:
 def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
                 max_waves=None, project=None, apply_status=None,
                 timeout_s=None, max_workers=None, root=None,
-                payload_for=None, isolate=False) -> Orchestration:
+                payload_for=None, isolate=False,
+                completion_gate=None) -> Orchestration:
     """Walk *graph* wave by wave until it settles, stalls, or hits the cap.
 
     ``execute=False`` (the DEFAULT) plans without starting anything. That default
@@ -598,6 +654,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     if apply_status is None:
         def apply_status(cur, done, failed):
             return _persist(cur, done, failed, project=project)
+    # The DEFAULT is the real pr-green gate. Injectable so loop tests can
+    # isolate the loop from the gate, but a test asserts this default so the
+    # seam cannot quietly become permissive in production.
+    if completion_gate is None:
+        def gate(cur, tid):
+            return completion_gate_default(cur, tid, project=project)
+    else:
+        gate = completion_gate
 
     # `MAX_WAVES` is a floor, not the cap. Its own justification was "one wave per
     # dependency level, and MAX_DEPTH bounds that" — but MAX_DEPTH bounds the
@@ -642,10 +706,28 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
             continue
 
         before = {tid: getattr(t, "status", None) for tid, t in g.items()}
-        done, failed, held, why, iso = _run_wave(
+        done, failed, held, why, iso, starved = _run_wave(
             batch, g, runner, index, project=project, timeout_s=timeout_s,
             max_workers=max_workers, root=root, payload_for=payload_for,
             isolate=isolate)
+        why_map = dict(why)
+        # THE PR-GREEN GATE. A run succeeding is not the same as a task being
+        # finished: the founding requirement is that a task is not done until its
+        # terminal phase is satisfied. A refusal moves the task out of `completed`
+        # and into `skipped`, so it keeps its PENDING status, its dependents stay
+        # blocked, and the reason says what is still missing.
+        allowed = []
+        for tid in done:
+            why = gate(g, tid)
+            if why is None:
+                allowed.append(tid)
+            else:
+                held.append(tid)
+                why_map[tid] = (f"{why_map[tid]} · {why}" if tid in why_map
+                                else why)
+        done = allowed
+        why = why_map
+
         wave_branches = {t: i.branch for t, i in iso.items() if i.ok}
         wave_kept = {t: i.path for t, i in iso.items()
                      if i.ok and i.reason}
@@ -658,6 +740,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
         blocked.extend(failed)
         skipped.extend(t for t in held if t not in skipped)
         reasons.update(why)
+        if starved:
+            # Recorded first: whatever DID run this wave keeps its row and
+            # its reported reason. Braking must not discard work.
+            g = apply_status(g, done, failed)
+            return Orchestration(
+                outcome=OUTCOME_USAGE, waves=waves, completed=completed,
+                blocked=blocked, skipped=skipped, reasons=reasons,
+                branches=branches, kept=kept)
         g = apply_status(g, done, failed)
         after = {tid: getattr(t, "status", None)
                  for tid, t in (g or {}).items()}

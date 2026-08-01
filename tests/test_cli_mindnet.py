@@ -261,7 +261,8 @@ def test_no_verified_by_flag_exists_on_satisfy():
     surface = _subparser_action(_subparser("mindnet")).choices
     assert set(surface) == {"declare", "enter", "satisfy", "fall-back",
                             "validate", "restat", "show", "list", "rebuild",
-                            "enforce", "orchestrate", "depend"}
+                            "enforce", "orchestrate", "depend",
+                            "decompose"}
     for name, sp in surface.items():
         bad = [o for a in sp._actions for o in a.option_strings
                if "verified" in o.lower()]
@@ -1094,7 +1095,7 @@ def test_orchestrate_bare_is_a_dry_run_that_spawns_nothing(capsys, monkeypatch):
     _orc_graph()
     calls = []
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda *a, **k: calls.append(a) or ([], [], [], {}, {}))
+                        lambda *a, **k: calls.append(a) or ([], [], [], {}, {}, False))
 
     assert _cli("mindnet", "orchestrate") == 0
     out = capsys.readouterr().out
@@ -1112,9 +1113,15 @@ def test_orchestrate_dry_run_appends_nothing_to_the_ledger():
 
 def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
+    # Permissive completion gate: this test is about the COMMAND, not the
+    # pr-green gate. The real gate refuses a bare fixture task (no evidence,
+    # not at its terminal phase), which is asserted directly in
+    # test_a_task_walked_to_its_terminal_phase_really_does_complete.
+    monkeypatch.setattr(orc_mod, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 0
     out = capsys.readouterr().out
@@ -1130,7 +1137,7 @@ def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
                             [], sorted(batch), [],
-                            {t: "synthetic failure" for t in batch}, {}))
+                            {t: "synthetic failure" for t in batch}, {}, False))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
     assert "stalled" in capsys.readouterr().out
@@ -1138,9 +1145,15 @@ def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
 
 def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
     from mindhive.mindnet import orchestrator as orc_mod
+    # Permissive completion gate: this test is about the COMMAND, not the
+    # pr-green gate. The real gate refuses a bare fixture task (no evidence,
+    # not at its terminal phase), which is asserted directly in
+    # test_a_task_walked_to_its_terminal_phase_really_does_complete.
+    monkeypatch.setattr(orc_mod, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False))
     capsys.readouterr()                       # drop the fixture's declare noise
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 0
@@ -1168,9 +1181,15 @@ def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
     """The property `test_every_mutating_command_leaves_the_sidecar_fresh`
     protects, extended to the one command that writes a whole wave of rows."""
     from mindhive.mindnet import orchestrator as orc_mod
+    # Permissive completion gate: this test is about the COMMAND, not the
+    # pr-green gate. The real gate refuses a bare fixture task (no evidence,
+    # not at its terminal phase), which is asserted directly in
+    # test_a_task_walked_to_its_terminal_phase_really_does_complete.
+    monkeypatch.setattr(orc_mod, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False))
     _ok("mindnet", "orchestrate", "--execute")
     assert sc_mod.read().fresh is True
 
@@ -1184,7 +1203,7 @@ def test_orchestrate_text_output_names_why_each_task_blocked(capsys,
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
                             [], sorted(batch), [],
-                            {t: "the validation run exited 3" for t in batch}, {}))
+                            {t: "the validation run exited 3" for t in batch}, {}, False))
     capsys.readouterr()
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
@@ -1200,7 +1219,7 @@ def test_orchestrate_json_carries_the_blocked_reasons(capsys, monkeypatch):
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
-                            [], sorted(batch), [], {t: "refused" for t in batch}, {}))
+                            [], sorted(batch), [], {t: "refused" for t in batch}, {}, False))
     capsys.readouterr()
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 1
@@ -1234,14 +1253,44 @@ def test_orchestrate_max_workers_is_distinct_from_limit():
     assert "--limit" in opts and "--max-workers" in opts
 
 
-def test_isolation_defaults_to_none(capsys):
-    """Creating N worktrees is real disk and real git state, so the safe form is
-    the one an operator gets by accident — the same default `--execute` takes.
-    Asserted on the parser so a future edit cannot flip it silently."""
-    sp = _subparser("mindnet", "orchestrate")
-    iso = next(a for a in sp._actions if "--isolation" in a.option_strings)
-    assert iso.default == "none"
-    assert set(iso.choices) == {"none", "worktree"}
+def test_isolation_defaults_to_worktree_for_agent_runs(monkeypatch):
+    """Flipped deliberately. Sharing one working tree is the DANGEROUS mode — two
+    agents editing it corrupt each other's edits and the git index — so `none`
+    cannot be what an operator gets by accident. It also delivers the founding ask
+    that parallel work happen "secara paksa": `--execute` alone now fans out.
+
+    `--via-script` defaults the other way, because re-checking a task in place has
+    nothing to isolate."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    seen = {}
+    monkeypatch.setattr(orc_mod, "orchestrate",
+                        lambda *a, **k: seen.update(k) or orc_mod.Orchestration(
+                            outcome=orc_mod.OUTCOME_SETTLED))
+    _ok("mindnet", "declare", "a", "--title", "a")
+
+    _ok("mindnet", "orchestrate", "--execute")
+    assert seen["isolate"] is True, "an agent run defaulted to a shared tree"
+
+    _ok("mindnet", "orchestrate", "--execute", "--via-script")
+    assert seen["isolate"] is False
+
+    _ok("mindnet", "orchestrate", "--execute", "--isolation", "none")
+    assert seen["isolate"] is False, "an explicit --isolation was ignored"
+
+
+def test_parallelism_needs_no_extra_flag_now(monkeypatch):
+    """The founding ask: when tasks CAN run in parallel, do it — not "ask the
+    operator to opt in". With isolation on by default, the worker cap is the
+    machine's, not 1."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    seen = {}
+    monkeypatch.setattr(orc_mod, "orchestrate",
+                        lambda *a, **k: seen.update(k) or orc_mod.Orchestration(
+                            outcome=orc_mod.OUTCOME_SETTLED))
+    _ok("mindnet", "declare", "a", "--title", "a")
+    _ok("mindnet", "orchestrate", "--execute")
+    assert seen["max_workers"] is None, (
+        "the shared-tree cap of 1 is still being applied")
 
 
 def test_isolation_worktree_lifts_the_shared_tree_worker_cap(monkeypatch):
@@ -1258,7 +1307,9 @@ def test_isolation_worktree_lifts_the_shared_tree_worker_cap(monkeypatch):
         "--max-workers", "4")
     assert seen["max_workers"] == 4 and seen["isolate"] is True
 
-    _ok("mindnet", "orchestrate", "--execute", "--max-workers", "4")
+    # The cap now needs an EXPLICIT shared tree, since isolation is the default.
+    _ok("mindnet", "orchestrate", "--execute", "--isolation", "none",
+        "--max-workers", "4")
     assert seen["max_workers"] == 1, "the shared-tree cap stopped applying"
     assert seen["isolate"] is False
 
@@ -1313,6 +1364,46 @@ def test_orchestrate_json_carries_branches_and_kept(capsys, monkeypatch):
     assert data["kept"] == {"a": "/tmp/x"}
 
 
+def test_a_task_walked_to_its_terminal_phase_really_does_complete(monkeypatch):
+    """The end-to-end proof for the pr-green gate, and the one test that cannot be
+    satisfied by a stand-in.
+
+    `tests/test_mindnet_orchestrator.py` patches the gate permissive so its loop
+    assertions stay about the loop; that leaves an obligation here — showing that a
+    REAL task, walked through the REAL phase spine to its terminal phase with REAL
+    recorded evidence, is actually allowed to complete. Without this the gate could
+    be refusing everything forever and every other test would still pass."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _walk_trivial(target="audit-bug", script=_script("--mode", "ok"))
+    _ok("mindnet", "validate", TASK)          # records python-verified evidence
+    _ok("mindnet", "rebuild")
+
+    graph = t_mod.fold(events.read_all())
+    # The evidence axis is now populated by the validation run itself. Asserted
+    # here because it was EMPTY before this change: `can_complete`'s message said
+    # "a validation run must record its artifact", and no such producer existed, so
+    # the gate was unsatisfiable for every non-bypassed task.
+    assert graph[TASK].evidence, "the validation run recorded no task evidence"
+    assert str(graph[TASK].evidence[0]).endswith(".txt"), (
+        f"the ref is not the run artifact: {graph[TASK].evidence}")
+
+    why = orc_mod.completion_gate_default(graph, TASK)
+    assert why is None, f"a fully-walked task was still refused: {why}"
+
+
+def test_the_same_task_is_refused_one_phase_earlier(monkeypatch):
+    """The canary for the test above: at `execution` — before the terminal phase is
+    satisfied — the very same task must NOT be completable. If both passed, the
+    gate would be doing nothing."""
+    from mindhive.mindnet import orchestrator as orc_mod
+    _walk_trivial(target="execution")
+    _ok("mindnet", "rebuild")
+
+    graph = t_mod.fold(events.read_all())
+    why = orc_mod.completion_gate_default(graph, TASK)
+    assert why is not None, "a task at 'execution' was allowed to complete"
+
+
 def test_orchestrate_is_on_the_frozen_subcommand_surface():
     surface = _subparser_action(_subparser("mindnet")).choices
     assert "orchestrate" in surface
@@ -1350,3 +1441,98 @@ def test_enforce_works_outside_a_git_worktree(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _ok("mindnet", "enforce", "--enable")
     assert _enforce_optin().armed(None, cwd=tmp_path) is True
+
+# --- MN-11: `hive mindnet decompose` -----------------------------------------------
+
+def _fake_decomposer(monkeypatch, *pairs, executed=True):
+    """Patch the agent seam so no real spawn happens."""
+    import json as _json
+    from mindhive.mindnet import decompose as dc_mod
+    from mindhive.mindnet import executor as x_mod
+    body = _json.dumps({"subtasks": [{"title": t, "description": ""}
+                                     for t in pairs]})
+
+    def fake(run_key, prompt, **kw):
+        return x_mod.RunResult(result="ran-unverified", executed=executed,
+                               exit_code=0, excerpt=body,
+                               reason="" if executed else "never ran")
+
+    monkeypatch.setattr(dc_mod.ag_mod, "run", fake)
+    return dc_mod
+
+
+def test_decompose_is_a_dry_run_that_declares_nothing(capsys, monkeypatch):
+    """Same default as `orchestrate --execute`: this writes to an append-only
+    ledger where a mistake cannot be deleted, only superseded."""
+    _fake_decomposer(monkeypatch, "visualisasi data", "kapan digenerate")
+    _ok("mindnet", "declare", "graph", "--title", "bikin graph")
+    before = len(events.read_all())
+    capsys.readouterr()
+
+    assert _cli("mindnet", "decompose", "graph") == 0
+    out = capsys.readouterr().out
+    assert "would declare 2" in out
+    assert "visualisasi" in out
+    assert len(events.read_all()) == before, "a dry run wrote to the ledger"
+
+
+def test_decompose_execute_declares_the_subtasks_under_their_parent(monkeypatch):
+    _fake_decomposer(monkeypatch, "visualisasi data", "kapan digenerate")
+    _ok("mindnet", "declare", "graph", "--title", "bikin graph")
+
+    _ok("mindnet", "decompose", "graph", "--execute")
+    folded = t_mod.fold(events.read_all())
+    kids = [t for t in folded.values() if t.parent_id == "graph"]
+    assert len(kids) == 2
+    assert {k.title for k in kids} == {"visualisasi data", "kapan digenerate"}
+
+
+def test_decomposed_subtasks_land_on_the_phase_axis_too(monkeypatch):
+    """A task on the graph axis alone orphans every phase event it receives."""
+    _fake_decomposer(monkeypatch, "one thing")
+    _ok("mindnet", "declare", "graph", "--title", "bikin graph")
+    _ok("mindnet", "decompose", "graph", "--execute")
+
+    _evs, _tasks, state = _state()
+    assert state.orphans == {}, f"orphaned phase events: {state.orphans}"
+    kids = [t for t in _tasks.values() if t.parent_id == "graph"]
+    assert kids and kids[0].task_id in state.records
+
+
+def test_decompose_leaves_the_sidecar_fresh(monkeypatch):
+    _fake_decomposer(monkeypatch, "one thing")
+    _ok("mindnet", "declare", "graph", "--title", "bikin graph")
+    _ok("mindnet", "decompose", "graph", "--execute")
+    assert sc_mod.read().fresh is True
+
+
+def test_decompose_refuses_an_unknown_task(capsys, monkeypatch):
+    _fake_decomposer(monkeypatch, "x")
+    capsys.readouterr()
+    assert _cli("mindnet", "decompose", "ghost") == 2
+    assert "no such task" in capsys.readouterr().err
+
+
+def test_decompose_reports_an_agent_that_never_ran(capsys, monkeypatch):
+    """A usage limit must not read as "this task is already atomic"."""
+    _fake_decomposer(monkeypatch, "x", executed=False)
+    _ok("mindnet", "declare", "graph", "--title", "bikin graph")
+    capsys.readouterr()
+    assert _cli("mindnet", "decompose", "graph") == 2
+    assert capsys.readouterr().err.strip()
+
+
+def test_decompose_json_is_machine_readable(capsys, monkeypatch):
+    _fake_decomposer(monkeypatch, "alpha")
+    _ok("mindnet", "declare", "graph", "--title", "bikin graph")
+    capsys.readouterr()
+
+    assert _cli("mindnet", "decompose", "graph", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["task_id"] == "graph"
+    assert data["declared"] == []
+    assert [p["title"] for p in data["proposals"]] == ["alpha"]
+
+
+def test_decompose_is_on_the_frozen_subcommand_surface():
+    assert "decompose" in _subparser_action(_subparser("mindnet")).choices

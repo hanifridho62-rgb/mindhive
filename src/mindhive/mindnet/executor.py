@@ -559,7 +559,43 @@ def validate(task_id, script=None, root=None, timeout_s=DEFAULT_TIMEOUT_S,
     ev = ev_mod.append_event("mindnet_phase", payload, session_id=session_id,
                              tags=["mindnet", "phase", "validation"], ts=ts,
                              project=project)
+    _record_task_evidence(task_id, run, session_id=session_id, ts=ts,
+                          project=project)
     return Validation(run, ev, run.reason)
+
+
+def _record_task_evidence(task_id, run, session_id=None, ts=None, project=None):
+    """Mirror a successful run's artifact onto the task's GRAPH-axis evidence.
+
+    `tasks.can_complete` refuses a non-bypassed task with ``"has no evidence — a
+    validation run must record its artifact before this task can complete"``. That
+    sentence described a producer that did not exist: `Task.evidence` is written
+    only by a `mindnet_task` ``action: "evidence"`` row, and nothing in the codebase
+    ever wrote one. So the field was permanently empty and the gate was
+    unsatisfiable — which went unnoticed only because nothing called the gate
+    either. Wiring the gate without this would have made every normal task
+    permanently incompletable.
+
+    This is the honest producer: a validation run is exactly the thing that
+    "records its artifact", and `run.artifact` is that artifact.
+
+    Best-effort. The phase-axis satisfy above is the load-bearing write and has
+    already landed; failing the whole validation because a mirror row could not be
+    appended would turn a successful run into a reported failure. A missing
+    artifact (MN-0 lost the file) simply records nothing — `evidence` requires a
+    non-empty ``ref`` by contract, and inventing one would be worse than absent."""
+    ref = (run.artifact or "")[:t_mod.MAX_REF_CHARS]
+    if not ref.strip() or run.evidence_result != "ok":
+        return None
+    payload = {"action": "evidence", "task_id": task_id, "ref": ref}
+    try:
+        t_mod.validate_payload(payload)
+        return ev_mod.append_event("mindnet_task", payload,
+                                   session_id=session_id,
+                                   tags=["mindnet", "task", "validation"],
+                                   ts=ts, project=project)
+    except Exception:
+        return None
 
 
 # --- the escape hatch ---------------------------------------------------------------

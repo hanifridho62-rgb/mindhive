@@ -437,6 +437,42 @@ length. Dim cats get `filter:grayscale(100%)` — the pre-MN-7 sprite was a
 `currentColor` silhouette, so the dim text colour greyed it for free; a coloured
 cat needs the filter or the 180-second band stops being visible at a glance.
 
+**Where the board renders (MN-13).** The ask was a cat on every running section, so
+an operator can see "apa saja yang menyala dan apa saja yang tidak menyala". It first
+shipped on the MindSwarm page alone — a page nobody keeps open — so the signal was
+absent from the dashboard the operator actually watches. It now renders on both, from
+**one** implementation in `cat_board.py`: `CSS`, `HTML` and `script()` are
+interpolated into each page's template. Pasting the strip into the second page would
+have created a second copy of the palettes, sprites and labels — invariant 10's exact
+failure mode, and an invisible one, since a drifted page shows a plausible board that
+merely disagrees with the other.
+
+Two things stay out of `cat_board` on purpose:
+
+- **The container's box.** The swarm page wants a full-width band under its header;
+  the dashboard wants an inline cluster at its header's trailing edge. Only the cat
+  and panel rules are page-independent, so a page declaring `#mn-cats` itself is
+  correct — a shared rule plus two per-page overrides is the same duplication.
+- **When a cat renders.** `ui_cats.board` decides every band server-side and ships
+  the thresholds in the payload, so the fragment cannot disagree with the tests that
+  pin them.
+
+The dashboard drives the board from its **own** interval, not from `refreshLive`:
+that timer returns early when no section has registered a live renderer, when the
+visible section is not refreshable, and while a manual operation runs — precisely the
+moments the board exists to report on. It calls `apiGet`, so the picker's project
+scopes it like every other read. The caption sits **above the head** (the original
+ask: "kucing yang diatas kepala nya bertulisan Skill and plugin") via
+`flex-direction:column-reverse`, which puts the sprite below the text while leaving
+the caption first in the DOM for a screen reader.
+
+The metadata panel clamps into the viewport, measured after it is shown — a
+`display:none` element reads zero wide, so clamping a hidden panel does nothing. This
+was a live regression, not a hypothetical: left-aligning to the cat is harmless on
+the swarm page, but the dashboard's strip sits at the right edge, so the last cats in
+the legend opened their panel off screen and their task id — the thing you click for
+— could not be read.
+
 ### 4.6 The MN-7 orchestrator: waves over the graph
 
 `hive mindnet orchestrate` walks the MN-2 graph in **waves**. One wave = the
@@ -615,6 +651,36 @@ runs. Because that appends activity rows and `_staleness` counts every event,
 spawned agent may be unable to edit; granting it is an operator decision this
 surface deliberately does not make silently.
 
+### 4.9 The pr-green completion gate (MN-10)
+
+MindNetwork's founding requirement: a task *"tidak akan selesai hingga pr berwarna
+hijau"* — not finished until the PR is green. `tasks.can_complete` implemented it
+from the start: no open descendants, evidence recorded, and the terminal phase
+satisfied (`pr-green`, or `TRIVIAL_EXIT_PHASE` for an ADR-0005 bypass).
+
+**Nothing called it.** Every reference to `can_complete` in `src/` was a comment or
+a docstring, so `_persist` — the only writer of a `completed` row — marked tasks
+finished without ever asking. A task could be COMPLETED at `brainstorm`, unblocking
+its dependents on a promise the machine never checked.
+
+`orchestrator.completion_gate_default` is the wire. A run succeeding is not the
+same as a task being finished: on refusal the task moves out of `completed` into
+`skipped`, keeps its PENDING status, its dependents stay blocked, and the reason
+says what is missing. The satisfaction predicate comes from the **sidecar** (which
+`_persist` rebuilds every wave, so it is current by construction) rather than a
+fresh ~264 ms fold; a missing sidecar yields no records and the gate refuses, which
+is the direction a gate must fail in.
+
+**A second wire was required, and its absence had been invisible.**
+`can_complete`'s own message says *"a validation run must record its artifact"* —
+but `Task.evidence` is written only by a `mindnet_task` `action: "evidence"` row,
+and **nothing in the codebase ever wrote one**. The field was permanently empty, so
+gate 3 was unsatisfiable for every non-bypassed task. That went unnoticed only
+because nothing called the gate either; wiring the gate alone would have made normal
+tasks permanently incompletable. `executor.validate` now mirrors a successful run's
+artifact onto the graph axis (best-effort — the phase-axis satisfy is the
+load-bearing write and has already landed).
+
 ### 4.8 Per-task worktree isolation (MN-9)
 
 `hive mindnet orchestrate --execute --isolation worktree` gives each agent its own
@@ -661,6 +727,265 @@ orchestrator reports the names. What to integrate, in what order, and how to
 resolve conflicts is the operator's call — an orchestrator that auto-merged N
 branches would be making that call silently, and a bad merge costs far more than a
 manual one.
+
+### 4.10 The always-on catalog pass (MN-14)
+
+The founding requirement asks for a system that *"secara paksa mengoptimalisasi dan
+improvisasi untuk prompt ... pada pembangunan kode sekecil apapun ... dengan membuka
+katalog skill and plugin"* — forcibly, for code work however small, open the catalog
+and add the context the model needs.
+
+`promptgate` implemented only half of that. Its quality gate fires when a prompt
+looks *underspecified*; a well-phrased code request got nothing at all, which is
+precisely the case "sekecil apapun" names. Being asked clearly is not a reason to
+skip the catalog.
+
+So `hook_context` runs **two independent passes** and joins them:
+
+| pass | fires when | block |
+|---|---|---|
+| quality gate | `assess` finds the prompt underspecified | "looks underspecified — …" |
+| catalog (MN-14) | `is_code_work` matches, however clear the prompt | "Code work — skill & plugin catalog consulted" |
+
+`is_code_work` is pure, cheap, and covers English **and** Indonesian vocabulary plus
+a bare source filename — an English-only detector would answer "not code work" for
+most of this user's prompts. It skips machine-injected text for the same reason the
+gate does (a task notification is nobody asking for anything) and returns False past
+`PROMPT_SCAN_CAP`, so a pasted log cannot become a regex scan on the hook's path.
+
+The catalog's skill is trained through the **same** `_pick_skill` ranker as every
+dimension, stored as `manifest["always"]`. A second selection path would be a second
+place to get measured-vs-unmeasured provenance wrong, and the first disagreement
+would have this line calling a skill proven while the gate's own ranking says
+otherwise. No inventory match means no rule and no line — invent nothing.
+
+When both passes fire, a skill already named by the gate is **not** repeated under
+the catalog heading: the same name under two headings reads as either one demand or
+two and the reader cannot tell which. Suppression is per-skill, so a catalog pick the
+gate did not name still surfaces.
+
+**What this is not.** "Force" here means forcing *context* in — the output stays
+`additionalContext`, additive, never a decision, and tests assert no `deny`, `block`
+or `permissionDecision` can appear. Denying the user's own prompt would be a
+different and hostile mechanism, and is deliberately not built.
+
+A manifest trained before this unit has no `always` key. That degrades to the
+previous behaviour rather than raising — the hook's fail-open promise covers a stale
+sidecar too, and a retrain fills it in.
+
+### 4.11 The per-prompt playbook (MN-15)
+
+MN-14 named one skill. The follow-up ask was for three things:
+
+> setiap prompt akan di tambahkan konteks dengan memberitahu **ledger mana saja yang
+> perlu dibaca** dan **menggunakan teknik apa** … ketika membangun sesuatu maka akan
+> menampilkan skill yang berhubungan dengan plan kemudian **di sintesakan skill yang
+> dapat di andalkan** sehingga lebih efisien
+
+`playbook.py` renders exactly that, in the order technique → skills → records, so a
+reader who stops after one line still has the most useful part:
+
+```
+Technique for this prompt: plan — write the plan before the first edit.
+Reliable skills for it, in order:
+  1. MUST USE: ce-plan (compound-engineering) via the Skill tool — measured 37/37 completion.
+  2. MUST USE: writing-plans (superpowers) via the Skill tool — measured 8/8 completion.
+Read these ledger records before starting:
+  - caveat @ 2026-07-18T04:44:19Z — dashboard_page.py: 1,715 lines — past the …
+  - open them with: hive recall "dashboard buatkan export fitur"
+```
+
+**Where the cost lands, measured.** The live store is 373 segments / 12.54 MB /
+22 835 events; `events.read_all()` takes **1.09 s**; the whole hook runs in **~0.28 s**
+including interpreter startup. A hook that read the ledger would several-fold the
+latency of every prompt typed. So nothing on the hook path reads it:
+`promptgate.train_and_store` already calls `read_all` behind a staleness gate and
+`train()` already receives `evs`, so the index is built there and stored in the
+manifest the hook was already loading. Manifest grows to ~36 KB; the injected block is
+~1.2 KB against the previous 335 B, and latency did not regress.
+`test_nothing_here_reads_the_ledger_on_the_hook_path` monkeypatches `read_all` to
+raise, so a later edit that reaches for it fails a test rather than slowing every
+prompt.
+
+**Two levels, because the two halves are decided at different times.** Which *skills*
+suit a technique is a property of the technique, so it is settled at train time under
+`playbook["phases"][<phase>]`. Which *records* a prompt should read is a property of
+the prompt, so only the pool is stored (`playbook["records"]`, newest-first, deduped,
+capped at `RECORD_POOL`) and `pick_records` ranks it against the prompt's own words at
+hook time — a few milliseconds for ~200 short gists.
+
+That split was not the first design. Freezing records per phase at train time meant
+the only thing available to match against was the phase's generic need text, and the
+result was visibly wrong: a prompt about a CSV export in the dashboard was told to
+read a decision about phase-deny rules. Prompt relevance is the primary sort key, the
+phase theme the secondary, recency the tie-break — the ledger never rewrites anything,
+so an older memo is the more likely to have been superseded.
+
+**Three things deliberately reused rather than rebuilt.** Phase names come from
+`mindnet.tasks.PHASES` (the cue table maps onto that legend and tests assert every key
+is in it — a near-miss spelling would also trip the invariant-10 guard, which forbids
+phase-name synonyms as string literals anywhere in `src/`). Skill ranking is
+`recommend`'s own provenance chain, so this cannot call a skill proven that the rest of
+the system calls unproven, and an open incident denies MUST wording here as it does in
+`train`. Pointers are `type @ ts` + gist + the exact `hive recall` command, **not** the
+projector's `.md` filename: that name mixes a digest of the rendered body
+(`projector.py:187`) and reproducing it would mean a second copy of the scheme.
+
+`POINTER_TYPES` is `caveat`, `decision`, `experiment_result` — the memos a person wrote
+on purpose. `command_run` (8 501 rows) and `assistant_response` (7 152) are raw history
+and would bury the signal.
+
+**Cues cover Indonesian as well as English**, including symptom reports that never name
+a defect. "kucing di dashboard tidak muncul" is a bug report with no keyword any
+English table would catch; before those cues it inferred no technique and the debugging
+skill stayed shut on exactly the prompt that needed it. A false positive costs a few
+injected lines; a miss costs the feature entirely on the phrasing this user actually
+uses.
+
+**Still additive.** `infer` returning None means the block says nothing about technique
+rather than guessing — a confidently wrong technique teaches the reader to skip the
+marker. Values read off disk are collapsed to one line *and* have the directive words
+lowercased, so a stored skill name or ledger gist can neither forge a line nor pose as
+an order the system is issuing. A manifest with no playbook falls back to MN-14's
+single-skill line.
+
+### 4.12 Repairing the playbook, and closing the loop (MN-16)
+
+An audit of the *live* injected output falsified two of the defects I had written down
+and surfaced two worse ones. The corrections are recorded here because the credibility
+of the rest depends on which claims were measured.
+
+| Claimed | Measured | Verdict |
+|---|---|---|
+| `RECORD_POOL` truncates the pool silently | Cap never reached — 130 kept of 284. The 154 missing rows are dropped by **dedupe** | **False as stated** |
+| `render_always` is dead code the playbook replaced | 33 of 191 distinct real code prompts infer no technique, so the fallback is live | **False** |
+| Relevance needs IDF re-ranking | IDF re-ranking left the top-3 ordering unchanged on every prompt tried | **Rejected, not built** |
+
+**Inference is by weight of evidence.** `infer` counts how many *distinct* cues each
+phase matches and takes the strongest; ties resolve in `_CUES` order, so balanced
+evidence behaves exactly as it did before. First-match-wins was deciding for **64 of 275
+(23%)** real code prompts that matched more than one phase. `cue_scores` is public so a
+surface can explain an inference rather than assert it.
+
+Two missing cues mattered more than the ranking. The `plan` phase carried the Indonesian
+word but not the English one, so a prompt literally asking for a plan inferred nothing.
+And `fix` was absent everywhere — which is why "fix the code … improve the file
+architecture" was classified a system audit off a single passing mention of architecture.
+No cue was deleted to fix any of this: demoting incidental signals keeps the true
+positives.
+
+Distribution over the **distinct** prompts afterwards — the honest view, since the raw
+corpus repeats scheduled prompts and the old "audit-system 60" was largely one prompt
+repeated ~54 times:
+
+```
+plan 45 · audit-bug 44 · pr-green 43 · audit-code 10
+brainstorm 6 · execution 5 · audit-system 4 · prd 1
+```
+
+**Gists are cut at a word boundary**, close whatever delimiter the cut left open, and
+carry an ellipsis so a shortened quote cannot pose as a complete one. 100 of 130 live
+gists previously sat at the limit, most ending mid-token. The single quote is
+deliberately *not* balanced — in prose it is an apostrophe far more often than a quote,
+and enforcing an even count would corrupt "don't".
+
+**Weak records are suppressed, not padded over.** A document-frequency table (pruned to
+terms in two or more records) is precomputed at train time and used as a *threshold
+only* — never a sort key, because re-ranking by it demonstrably changed nothing. Measured
+limit, stated rather than smoothed over: suppression is **inert** when every candidate
+shares exactly one common term with the prompt, which is what happens when the prompt's
+distinguishing words are Indonesian and the ledger is English. The sample went from 14
+record lines to 12, not the 10 first predicted.
+
+**The pool discloses what it dropped** — seen / kept / collapsed / capped, separately, so
+the mechanism is distinguishable rather than guessed at.
+
+**The loop closes through machinery that already existed.** `record_direction` used to
+return early on a clear verdict, so a well-phrased code prompt directed skills through
+the catalog and traced nothing. It now records both paths on the existing
+`skill_directed` type — no new event type, no projector renderer, no dashboard change.
+`catalog_block` owns the playbook-versus-fallback decision so the recorded trail cannot
+disagree with the printed block; `playbook.selected_skills` does the same one level down
+with `render` and `directed_skills` as its two projections.
+
+Training then counts directed versus consumed per skill through
+**`oversee.consumed_directions`** — which owns the consume-once pairing rule, reused
+rather than reimplemented. A skill directed at least `MIN_DIRECTIONS` times and never
+used sorts behind its peers.
+
+The first version counted from `oversee.skill_trails` instead, and that was wrong in a
+way worth recording. That fold answers the **display** question — "what is the most
+informative why for this use?" — and invocation args win there, so a `skill_used`
+carrying `args` returns the args and never reaches the direction branch. **78 of 216
+real `skill_used` rows (36%) carry args**, so a followed suggestion looked ignored, and
+since the signal demotes on "never taken" it would have demoted skills that *are* being
+taken while presenting that as evidence. Systematic, not noise. The pairing rule now
+lives in its own function and only the display path keeps the args ordering; on the live
+store the fix moved `ce-plan` from `taken: 1` to `taken: 2` immediately.
+
+**Demotion only.** Being taken never promotes: the signal is confounded, because the
+agent may follow directions mechanically. Provenance wording stays `recommend`'s to
+decide — an ignored skill above the auto gate is still a MUST. Demotion reorders; it
+never re-labels.
+
+**Cost.** Everything expensive is train-time (0.82 s). The hook moved from 0.27-0.29 s to
+**0.38-0.46 s**, still below the MN-15-era 0.39-0.65 s and far below the 1.09 s a ledger
+read would cost; the test that forbids a ledger read on the hook path is the hard guard.
+A memo that would have recovered ~0.08 s of duplicated work between `hook_context` and
+`record_direction` was written and then reverted: the two load the manifest separately,
+so any key cheap enough to be worth it is either a guaranteed miss or a staleness hazard.
+
+### 4.13 Waking the spine: auto-declare and the staleness gate (MN-18)
+
+The phase spine, the SOP section and the Improvements section were **built, tested, and
+reached by no prompt**. `advice.resolve_sops` and `advice.resolve_constraints` worked;
+`inject.block` returned `""` on its first line because the sidecar held no phase records,
+and nothing created the first task — `hive mindnet declare` is hand-run and `decompose`
+needs a parent.
+
+**Two gates were shut, not one.** Auto-declaring a task is the obvious fix and it is
+insufficient. Measured: one appended event of *any* type marks the sidecar stale, the hook
+itself appends on every prompt (`skill_directed`, faculty activity rows), and advice rode
+only the fresh branch. A declared task would still have got the generic block forever.
+
+**Gate 1 — a task exists.** `autodeclare.decide` is pure: everything is passed in, because
+this runs where `events.read_all` costs 1.09 s against a ~0.4 s budget and where a raise
+breaks the user's prompt. Refusal is the default, with three independent bounds on an
+append-only store:
+
+| Bound | Effect |
+|---|---|
+| off until armed, through MN-6's `optin` | no writes at all in a dormant project |
+| no declare while a record is active | one auto-declared root at a time — writes are one-per-work-session |
+| id derived deterministically from the prompt | a repeated prompt re-declares the same id, which the graph fold upserts |
+
+**No phase is ever named.** `cmd_mindnet_declare` is explicit that the entry point is
+derived by `tasks.fold` and that "a caller-named entry phase is the teleport MN-2 stopped
+accepting". `playbook.infer` therefore decides only *whether* a prompt is recognizable code
+work worth declaring for — never where the task starts. A test asserts the absence of a
+phase field structurally.
+
+**Gate 2 — advice rides the stale branch.** `inject.block` now carries resolved advice on
+both branches while per-task phase direction stays fresh-only. The old rule withheld
+everything on staleness, argued from phase correctness — right about the *phase*, which a
+later event can change; wrong about SOPs and prior-failure constraints, which resolve
+against the task's *text* and cannot be invalidated by a later event. Since stale is the
+normal state, the broader rule cost the entire feature and bought no safety.
+
+Rejected: rebuilding on the prompt path (0.32 s against ~0.4 s, for a result the next
+prompt's own write invalidates), and narrowing staleness to the event types the projection
+folds — the better long-term answer, but segment size and mtime cannot reveal an event's
+type without the read the budget forbids. Deferred, recorded in the plan.
+
+**The refresh lives in `hive state`.** There is no `session_start` stage in this CLI; the
+session-start hook runs `hive state`, which is the only command in that hook belonging to
+this repo. Stale-gated, so a session opening against a fresh projection pays nothing.
+
+**The canary matters more than any single unit.** Every unit here can pass while the user
+sees nothing — that is precisely what happened, with the resolvers' own unit tests green
+throughout. `test_the_sop_and_improvements_sections_reach_the_prompt` walks arm → prompt →
+refresh → prompt and asserts on the text the user receives, and its own canary disables
+`advice_block` to prove it is not passing by finding nothing.
 
 ## 5. Invariants — do not break these
 

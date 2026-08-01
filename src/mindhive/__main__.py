@@ -95,13 +95,45 @@ def cmd_hook(args) -> int | None:
         # read, additive, fail-open; it returns `context` untouched (possibly
         # falsy) whenever there is nothing to say or anything goes wrong, so the
         # print below still fires only when a subsystem actually spoke.
-        context = mn_inject.extend_hook_context(context, raw)
+        # The sidecar is read ONCE here and threaded in, rather than letting the
+        # injector read it and then reading it again to ask what it used (MN-17).
+        try:
+            from .mindnet import sidecar as mn_sidecar
+            spine = mn_sidecar.read()
+        except Exception:                                   # noqa: BLE001
+            spine = None
+        context = mn_inject.extend_hook_context(context, raw, sc=spine)
         if context:
             print(json.dumps(context))
         # Durable causal trace: record which skills the gate directed so Oversee
         # can later show the honest "directed by prompt-gate" why. Best-effort
         # and self-guarding — never disturbs the context printed above.
         promptgate.record_direction(raw)
+        # MN-17: light the cats for the faculties this turn actually used. AFTER the
+        # print, for the same reason `record_direction` is: stdout is the context
+        # channel, and a telemetry write must never be able to interleave with it.
+        # The catalog and history cats are announced inside `record_direction`, which
+        # already holds what the block named; the spine's SOP and past-failure cats are
+        # announced here, where the advice is CONSULTED — emitting them where advice is
+        # RESOLVED would put a ledger write inside a projection rebuild.
+        if spine is not None:
+            promptgate.announce_faculties(mn_inject.engaged_faculties(spine))
+        # MN-18: bring a task into existence so the spine has something to speak about.
+        # Nothing else in the tree did this — `hive mindnet declare` is hand-run and
+        # `decompose` needs a parent — so the phase spine, the SOP section and the
+        # Improvements section were built and reached by no prompt.
+        #
+        # Here, in the side-effect layer, for the same reasons the two calls above are:
+        # the printed context is the product, and this must not be able to disturb it. The
+        # sidecar read above is reused rather than repeated, and there is deliberately no
+        # rebuild — that costs 0.32 s against this path's ~0.4 s budget, and the next
+        # prompt's own write would invalidate the result anyway.
+        try:
+            from .mindnet import autodeclare as mn_auto
+            mn_auto.maybe_declare(_hook_prompt(raw), spine,
+                                  session_id=_hook_session(raw))
+        except Exception:                                   # noqa: BLE001
+            pass
     return None
 
 
@@ -120,6 +152,17 @@ def cmd_state(args) -> int | None:
               f"'{paths.detect_project()}' — run from the project dir, set "
               f"MINDHIVE_PROJECT, or pass --project. See `hive projects`.",
               file=sys.stderr)
+    # MN-18 U4: refresh the MindNetwork projection here, stale-gated. The session-start
+    # hook runs `hive state`, this is the only command in that hook belonging to this repo,
+    # and the fold costs 0.32 s — invisible once per session, decisive on the prompt path
+    # where the hook must stay under ~0.4 s. Without it the projection never returns to
+    # fresh and per-task phase direction never appears. Silent on failure: printing STATE.md
+    # is this command's job and a projection rebuild must not be able to stop it.
+    try:
+        from .mindnet import autodeclare as mn_auto
+        mn_auto.refresh_projection(project)
+    except Exception:                                       # noqa: BLE001
+        pass
     s = paths.project_dir(project) / "STATE.md"
     print(s.read_text(encoding="utf-8") if s.exists()
           else "(no STATE.md — run: hive project)")
@@ -761,6 +804,29 @@ def _mn_stored(payload):
     return None
 
 
+def _hook_payload(raw):
+    """The hook's stdin payload as a dict, or `{}`.
+
+    Total: the hook's own contract is that malformed input yields silence, never a raise,
+    and three call sites now need the same two fields out of it."""
+    try:
+        obj = json.loads(raw or "{}")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _hook_prompt(raw) -> str:
+    value = _hook_payload(raw).get("prompt")
+    return value if isinstance(value, str) else ""
+
+
+def _hook_session(raw):
+    """The prompt's session id, so a declare lands in the same segment as the turn that
+    caused it — the same reasoning `record_direction` documents."""
+    return _hook_payload(raw).get("session_id") or None
+
+
 def _mn_phase_event(payload, sid, project):
     return events.append_event("mindnet_phase", payload, session_id=sid,
                                tags=["mindnet", "phase"], project=project)
@@ -1272,6 +1338,60 @@ def cmd_mindnet_rebuild(args) -> int | None:
     return None
 
 
+def cmd_mindnet_decompose(args) -> int | None:
+    """Ask an agent what subtasks *task_id* actually requires, and optionally
+    declare them.
+
+    A DRY RUN unless `--execute`, for the same reason `orchestrate` is: this writes
+    to an append-only ledger where a mistake cannot be deleted, only superseded.
+
+    Every refusal is decided before anything is appended — `tasks.fold` drops an
+    unsound edge SILENTLY, so a half-landed decomposition would report success and
+    leave gaps the operator never sees."""
+    from .mindnet import decompose as dc_mod
+    from .mindnet import sidecar as sc_mod
+    from .mindnet import tasks as t_mod
+    project = getattr(args, "project", None)
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+
+    graph = t_mod.fold(events.read_all(project))
+    if args.task_id not in graph:
+        return _mn_error(f"no such task '{args.task_id}' — see: "
+                         f"hive mindnet list")
+
+    out = dc_mod.run(args.task_id, graph, project=project,
+                     timeout_s=args.timeout)
+    if out.reason and not out.proposals:
+        return _mn_error(out.reason)
+
+    if args.execute:
+        out = dc_mod.declare(out, project=project, session_id=sid)
+        # Once, after the whole batch — six subtasks must not pay six folds.
+        sc_mod.rebuild(project)
+
+    if args.json:
+        from dataclasses import asdict
+        print(json.dumps(asdict(out), indent=2, ensure_ascii=False))
+        return None
+
+    usable = out.usable
+    if not out.proposals:
+        print(f"mindnet decompose: {args.task_id} — the agent proposed no "
+              f"subtasks (it may already be atomic)")
+        return None
+    verb = "declared" if args.execute else "would declare"
+    print(f"mindnet decompose: {args.task_id} — {verb} {len(usable)} subtask(s)")
+    for p in out.proposals:
+        mark = ">" if p.ok else "!"
+        print(f"  {mark} [{p.task_id or '(no id)'}] {p.title}")
+        if not p.ok:
+            print(f"      refused: {p.reason}")
+    if not args.execute:
+        print("  this was a dry run — add --execute to declare them")
+    # A refusal the operator should see rather than a silent partial success.
+    return 1 if usable and len(usable) != len(out.proposals) else None
+
+
 def cmd_mindnet_depend(args) -> int | None:
     """Record that *task_id* cannot start until *on* is COMPLETED.
 
@@ -1369,7 +1489,16 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     # orchestrator could not do any actual work before this.
     workers = args.max_workers
     timeout = args.timeout
-    isolate = args.isolation == "worktree"
+    # DEFAULT: isolate agent runs. Sharing one working tree is the DANGEROUS mode
+    # — two agents editing it corrupt each other's edits and the git index — so
+    # `none` cannot be what an operator gets by accident. It also delivers the
+    # founding ask that parallel work happen "secara paksa": `--execute` alone now
+    # fans out. `--via-script` re-checks a task in place and has nothing to
+    # isolate, so it defaults the other way.
+    isolation = args.isolation
+    if isolation is None:
+        isolation = "none" if args.via_script else "worktree"
+    isolate = isolation == "worktree"
     if isolate and args.via_script:
         # A validation script re-checks a task in place; isolating it would run the
         # check against an empty branch and prove nothing. Refusing beats silently
@@ -2666,6 +2795,18 @@ def _build_parser() -> argparse.ArgumentParser:
     mnb.add_argument("--project", default=None)
     mnb.set_defaults(func=cmd_mindnet_rebuild)
 
+    mndc = mnsub.add_parser("decompose", help="ask an agent what subtasks a task "
+                            "actually requires (a DRY RUN unless --execute)")
+    mndc.add_argument("task_id", help="the task to break down")
+    mndc.add_argument("--execute", action="store_true",
+                      help="actually declare the proposed subtasks")
+    mndc.add_argument("--timeout", type=int, default=None,
+                      help="seconds the agent may take (default: 300)")
+    mndc.add_argument("--project", default=None)
+    mndc.add_argument("--session", default=None)
+    mndc.add_argument("--json", action="store_true")
+    mndc.set_defaults(func=cmd_mindnet_decompose)
+
     mndep = mnsub.add_parser("depend", help="record that one task cannot start "
                              "until another is completed (the edge the "
                              "orchestrator walks)")
@@ -2703,12 +2844,13 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="run each task's stored validation_script instead of "
                           "spawning an agent. This only RE-CHECKS tasks; it does "
                           "not do their work")
-    mno.add_argument("--isolation", choices=("none", "worktree"),
-                     default="none",
-                     help="`worktree` gives each agent its own git worktree and "
-                          "its own ledger segment, which is what allows agents to "
-                          "run in PARALLEL. `none` (default) runs them one at a "
-                          "time in the current checkout")
+    mno.add_argument("--isolation", choices=("none", "worktree"), default=None,
+                     help="`worktree` (the DEFAULT for agent runs) gives each agent "
+                          "its own git worktree and ledger segment, so a wave runs "
+                          "in PARALLEL. `none` runs them one at a time in the "
+                          "current checkout — they would corrupt each other's "
+                          "edits otherwise, so it is the unsafe mode, not the safe "
+                          "one")
     mno.add_argument("--allow-shared-tree", action="store_true",
                      dest="allow_shared_tree",
                      help="let agents run concurrently in ONE working tree. They "

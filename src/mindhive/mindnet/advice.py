@@ -343,6 +343,12 @@ def resolve(task, evs=None, project=None) -> Advice:
         constraints = resolve_constraints(kw, project)
     except Exception:
         constraints = ()
+    # MN-17 note, deliberately NOT an emitter. Announcing the `sop` / `improvements`
+    # cats from here was the obvious placement and it was wrong: `resolve` runs during a
+    # sidecar REBUILD, so writing telemetry events made the rebuild mutate the ledger and
+    # broke "same events in, same bytes out" — `test_rebuild_stays_byte_idempotent_with_
+    # advice` caught it immediately. The faculties are announced from the hook instead,
+    # where advice is CONSULTED rather than computed. See `inject.engaged_faculties`.
     return Advice(skills=skills, sops=sops, constraints=constraints)
 
 

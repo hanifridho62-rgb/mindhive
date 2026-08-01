@@ -131,6 +131,49 @@ class FakeRunner:
         return set(self.calls)
 
 
+class Rendezvous(FakeRunner):
+    """A runner that PROVES overlap instead of sampling for it.
+
+    A `peak >= 2` assertion over `time.sleep` runners is a timing sample, and it
+    reported a false failure in CI: the isolated variant went red on windows/py3.12
+    while passing on windows/py3.11 in the same run. Correct parallel code can score
+    peak 1 there, because `worktree.add` runs inside each worker thread and a
+    `git worktree add` costs hundreds of milliseconds against a contended index lock
+    — so one task can finish its 50 ms run before its sibling's checkout even exists.
+
+    A barrier inverts the dependency. Every call blocks until *n* calls have arrived,
+    so a truly concurrent wave releases immediately and a serial one cannot proceed
+    at all: `wait()` times out, `tripped` stays False, and the test says exactly
+    that. No sleep, no sampling, and a serial implementation fails by construction
+    rather than by being slower than a threshold."""
+
+    def __init__(self, parties, timeout=20.0, **kw):
+        super().__init__(**kw)
+        self.parties = parties
+        self.barrier = threading.Barrier(parties, timeout=timeout)
+        self.tripped = False
+        self.arrived = 0
+
+    def __call__(self, run_key, script, **kw):
+        with self._lock:
+            self.arrived += 1
+            # One-shot. A `threading.Barrier` resets after it trips, so a graph
+            # whose LATER wave is narrower than *parties* would leave that wave's
+            # lone task waiting for partners that will never come — the full timeout
+            # burned on a question already answered. Asked once, then transparent.
+            wait = not self.tripped
+        if wait:
+            try:
+                self.barrier.wait()
+                self.tripped = True
+            except threading.BrokenBarrierError:
+                # Swallowed on purpose: raising would come back as a task failure
+                # and the test would report "blocked" rather than "never
+                # overlapped", pointing the next reader at the wrong thing.
+                pass
+        return super().__call__(run_key, script, **kw)
+
+
 def _run_result(result):
     """A real `executor.RunResult`, so the tests constrain the contract rather
     than a shape invented here.
@@ -145,9 +188,32 @@ def _run_result(result):
         artifact=None, excerpt="", duration_s=0.01)
 
 
+# Captured BEFORE the autouse patch below, so the gate tests can drive the real
+# thing rather than the permissive stand-in.
+_REAL_GATE = orc.completion_gate_default
+
+
 @pytest.fixture(autouse=True)
 def _session(monkeypatch):
     monkeypatch.setenv("MINDHIVE_SESSION", SESSION)
+
+
+@pytest.fixture(autouse=True)
+def _permissive_completion_gate(monkeypatch):
+    """Isolate the LOOP tests from the pr-green gate.
+
+    The real gate enforces MindNetwork's founding requirement — a task is not
+    finished until its terminal phase is satisfied — so almost no bare fixture task
+    can legitimately complete, and every wave/cascade/concurrency assertion in this
+    file would fail for a reason it is not about.
+
+    Two things stop this from becoming a lie: the `--- the pr-green gate ---`
+    section drives `_REAL_GATE` directly in BOTH directions, and
+    `test_orchestrate_defaults_to_the_real_completion_gate` pins the production
+    default. There is also an end-to-end test in `test_cli_mindnet.py` where a task
+    walked to its terminal phase really does complete."""
+    monkeypatch.setattr(orc, "completion_gate_default",
+                        lambda graph, tid, **kw: None)
 
 
 # ============================================================================
@@ -715,13 +781,19 @@ def test_a_linear_graph_settles_one_task_per_wave():
 
 def test_both_arms_of_a_wave_run_concurrently():
     """The reason a ThreadPoolExecutor is here at all. A serial implementation
-    produces the same statuses and the same waves, so only observed overlap
-    tells the two apart."""
-    fake = FakeRunner(delay=0.05)
+    produces the same statuses and the same waves, so only observed overlap tells
+    the two apart.
+
+    The diamond's middle wave is exactly two tasks, and `DEFAULT_MAX_WORKERS` has a
+    floor of 2, so the pool can always serve both arms at once."""
+    fake = Rendezvous(parties=2)
     orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED), runner=fake,
                     execute=True)
-    assert fake.peak >= 2, (
-        f"peak concurrency was {fake.peak} — the wave ran serially")
+    # Three calls in total, not two: the diamond's tail runs in a later wave.
+    assert fake.arrived == 3, f"the whole diamond should have run, got {fake.arrived}"
+    assert fake.tripped, (
+        "the two arms never overlapped — one finished before the other started, "
+        "which is what a serial wave looks like")
 
 
 def test_the_limit_bounds_concurrency_end_to_end():
@@ -732,6 +804,24 @@ def test_the_limit_bounds_concurrency_end_to_end():
     assert fake.peak == 1, f"peak concurrency was {fake.peak} with limit=1"
     assert out.outcome == orc.OUTCOME_SETTLED, (
         "a limit must slow the graph down, not prevent it from finishing")
+
+
+def test_the_rendezvous_runner_detects_a_serial_wave():
+    """The canary for the two concurrency tests above. A barrier that trips no
+    matter what proves nothing — and a green concurrency test is only meaningful if
+    the same instrument reports red when the work really is serialized.
+
+    `limit=1` gives a pool of one, so the second call cannot start until the first
+    returns: the barrier must NOT trip. Short timeout because this test's happy path
+    is the timeout — the parties never assemble, by design."""
+    fake = Rendezvous(parties=2, timeout=1.5)
+    out = orc.orchestrate(_diamond(a_status=t_mod.STATUS_COMPLETED),
+                          runner=fake, execute=True, limit=1)
+    assert fake.arrived >= 1, "nothing ran at all — the canary tests nothing"
+    assert not fake.tripped, (
+        "the barrier tripped with a pool of one, so it cannot distinguish parallel "
+        "from serial and the concurrency tests above are vacuous")
+    assert out.outcome == orc.OUTCOME_SETTLED
 
 
 def test_an_already_finished_graph_runs_nothing():
@@ -1092,11 +1182,21 @@ def test_the_worktree_is_retired_even_when_the_agent_raised(gitrepo):
 
 def test_isolated_tasks_run_concurrently(gitrepo):
     """R3 — the entire purpose. MN-8 capped agents at one because they shared a
-    tree; with a tree each, the pool is free to fan out."""
-    fake = FakeRunner(delay=0.05)
-    orc.orchestrate(_graph(_task("b"), _task("c"), _task("d")), runner=fake,
+    tree; with a tree each, the pool is free to fan out.
+
+    Two tasks and a barrier, not three tasks and a stopwatch. The stopwatch version
+    of this test went red on windows/py3.12 while passing on windows/py3.11 in the
+    same CI run: `worktree.add` runs inside the worker thread, so a `git worktree
+    add` against a contended index lock can outlast a sibling's whole 50 ms run and
+    correct parallel code scores a peak of 1. The barrier asks the question directly
+    — were two agents ever in flight together? — and cannot answer yes by luck."""
+    fake = Rendezvous(parties=2)
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake,
                     execute=True, root=gitrepo, isolate=True)
-    assert fake.peak >= 2, f"peak concurrency was {fake.peak} with isolation on"
+    assert fake.arrived == 2, f"both tasks should have run, got {fake.arrived}"
+    assert fake.tripped, (
+        "two isolated tasks never overlapped — with a worktree each there is "
+        "nothing left to serialize them, so the pool is not fanning out")
 
 
 def test_a_dry_run_creates_no_worktree(gitrepo):
@@ -1523,3 +1623,178 @@ def test_a_raising_retire_does_not_replace_the_agents_result(gitrepo,
                           root=gitrepo, isolate=True)
     assert out.completed == ["b"], "the cleanup error replaced the agent's result"
     assert "locked" in str(out.kept.get("b", "")) or out.kept
+
+
+# ============================================================================
+# MN-10 — the pr-green gate
+# ============================================================================
+#
+# MindNetwork's founding prompt: a task "tidak akan selesai hingga pr berwarna
+# hijau". `tasks.can_complete` implemented that from the start — and NOTHING called
+# it. Every reference in `src/` was a comment or a docstring, so the only writer of
+# a `completed` row marked tasks finished without ever asking, and a task could be
+# COMPLETED at `brainstorm` while its dependents unblocked on a promise nobody
+# checked.
+#
+# These tests drive `_REAL_GATE`, captured before the autouse permissive patch.
+
+def test_orchestrate_defaults_to_the_real_completion_gate():
+    """The production default must be the real gate, or the autouse fixture above
+    would be hiding a permissive orchestrator rather than isolating a test."""
+    import inspect
+    src = inspect.getsource(orc.orchestrate)
+    assert "completion_gate_default" in src
+    assert inspect.signature(orc.orchestrate).parameters[
+        "completion_gate"].default is None, (
+        "the injectable must default to None so the real gate is used")
+
+
+def test_the_gate_refuses_a_task_that_has_not_reached_its_terminal_phase():
+    """The headline requirement. A bare task sits at `brainstorm`; completing it
+    there is exactly what the missing wire allowed."""
+    graph = _graph(_task("a"))
+    why = _REAL_GATE(graph, "a", records={})
+    assert why is not None
+    assert "a" in why
+
+
+def test_the_gate_refuses_a_parent_with_open_children():
+    """`can_complete`'s first gate, reached through the wire."""
+    graph = _graph(_task("p"), _task("c", parent="p"))
+    why = _REAL_GATE(graph, "p", records={})
+    assert why and "descendant" in why
+
+
+def test_the_gate_allows_a_task_whose_terminal_phase_is_satisfied():
+    """The other direction, so the refusals above are not vacuous.
+
+    A `triviality_bypass` task's terminal phase is `TRIVIAL_EXIT_PHASE`
+    (`audit-bug`), not `pr-green` — ADR-0005 waives the METHOD, never the gate. The
+    records are built to say that phase is satisfied."""
+    from mindhive.mindnet.controller import PhaseRecord, Satisfaction
+    task = _task("a", triviality_bypass=True)
+    graph = {"a": task}
+    rec = PhaseRecord(task_id="a", phase=t_mod.TRIVIAL_EXIT_PHASE, epoch=0,
+                      satisfactions=(Satisfaction(
+                          phase=t_mod.TRIVIAL_EXIT_PHASE, epoch=0, valid=True,
+                          result="ok", verified_by="python"),))
+    assert _REAL_GATE(graph, "a", records={"a": rec}) is None
+
+
+def test_a_refused_completion_writes_no_status_row_and_stays_pending(monkeypatch):
+    """Through the LOOP with the real gate restored: the run succeeded, the gate
+    refused, so nothing is recorded and the task remains retryable."""
+    monkeypatch.setattr(orc, "completion_gate_default", _REAL_GATE)
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")}, runner=FakeRunner(), execute=True)
+
+    assert out.completed == [], "a task completed without reaching pr-green"
+    assert out.skipped == ["a"]
+    assert _status_rows() == []
+    assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
+    assert "a" in out.reasons and out.reasons["a"]
+
+
+def test_a_refused_completion_keeps_its_dependents_blocked(monkeypatch):
+    """The consequence that makes the gate worth having: an unfinished task must
+    not unblock the work that waits on it."""
+    monkeypatch.setattr(orc, "completion_gate_default", _REAL_GATE)
+    graph = _graph(_task("a"), _task("b", deps=("a",)))
+    fake = FakeRunner()
+    orc.orchestrate(graph, runner=fake, execute=True)
+    assert "b" not in fake.submitted(), "the dependent ran on an unfinished parent"
+
+
+def test_the_gate_reason_is_appended_to_the_runs_own_reason(monkeypatch):
+    """The operator needs both halves: the run's outcome AND why it still did not
+    count as finished."""
+    monkeypatch.setattr(orc, "completion_gate_default", _REAL_GATE)
+    _declare("a")
+    out = orc.orchestrate({"a": _task("a")},
+                          runner=FakeRunner(results={"a": "ok"}), execute=True)
+    assert out.reasons["a"]
+
+
+def test_the_gate_fails_closed_when_it_raises(monkeypatch):
+    """A gate that cannot decide must refuse. `can_complete` already fails closed
+    on a raising predicate; the wire must not undo that."""
+    def boom(*a, **k):
+        raise RuntimeError("records unreadable")
+
+    monkeypatch.setattr(t_mod, "can_complete", boom)
+    why = _REAL_GATE(_graph(_task("a")), "a", records={})
+    assert why and "RuntimeError" in why
+
+
+def test_a_missing_sidecar_refuses_rather_than_allowing(tmp_path, monkeypatch):
+    """The gate reads its records from the sidecar. No sidecar means no
+    satisfaction records, which `can_complete` treats as unsatisfied — the safe
+    direction, and worth pinning because the alternative is a gate that opens
+    whenever the projection is absent."""
+    monkeypatch.chdir(tmp_path)
+    why = _REAL_GATE(_graph(_task("a")), "a")
+    assert why is not None
+
+
+# ============================================================================
+# MN-12 — the usage brake ("jika usage memungkinkan")
+# ============================================================================
+
+def _usage_runner(*starved):
+    """A runner whose named tasks fail for an ACCOUNT reason, not a task reason."""
+    from mindhive.mindnet import agent as ag_mod
+
+    def fake(run_key, payload, **kw):
+        tid = str(run_key).split("-", 2)[-1]
+        if tid in starved:
+            return x_mod.RunResult(
+                result="refused", executed=False, exit_code=0,
+                reason=f"{ag_mod.USAGE_MARK} the agent could not run: 429: "
+                       f"You have hit your weekly limit")
+        return _run_result("ok")
+
+    return fake
+
+
+def test_a_usage_limit_halts_the_run_instead_of_burning_the_whole_frontier():
+    """The founding prompt asked for parallelism only "jika usage memungkinkan".
+    There is no way to ask before spawning, so this is the retrospective half:
+    eight tasks against an exhausted weekly limit produce eight identical failures,
+    and unlike a task failure, running more of them now changes nothing."""
+    graph = _graph(_task("a"), _task("b", deps=("a",)), _task("c", deps=("b",)))
+    out = orc.orchestrate(graph, runner=_usage_runner("a"), execute=True,
+                          root=".")
+    assert out.outcome == orc.OUTCOME_USAGE
+    assert len(out.waves) == 1, "the loop kept planning waves against a dead quota"
+
+
+def test_the_brake_keeps_whatever_already_ran_in_that_wave():
+    """Braking must not discard work: the tasks that DID succeed keep their rows."""
+    graph = _graph(_task("a"), _task("b"), _task("c"))
+    out = orc.orchestrate(graph, runner=_usage_runner("c"), execute=True,
+                          root=".", max_workers=3)
+    assert out.outcome == orc.OUTCOME_USAGE
+    assert set(out.completed) >= {"a", "b"}, (
+        f"the brake threw away completed work: {out}")
+
+
+def test_an_ordinary_task_failure_does_NOT_halt_the_run():
+    """The canary. A task failing is normal and the loop must carry on; only an
+    account condition is terminal."""
+    graph = _graph(_task("a"), _task("b"))
+    out = orc.orchestrate(graph, runner=FakeRunner(results={"a": "fail"}),
+                          execute=True, root=".")
+    assert out.outcome != orc.OUTCOME_USAGE
+    assert "b" in out.completed
+
+
+def test_the_usage_marker_is_read_off_the_reason_not_a_second_channel():
+    """One place carries the CLI's own words. A second channel would be a second
+    thing to keep in sync."""
+    from mindhive.mindnet import agent as ag_mod
+    starved = x_mod.RunResult(result="refused", executed=False,
+                              reason=f"{ag_mod.USAGE_MARK} 429: weekly limit")
+    normal = x_mod.RunResult(result="refused", executed=False,
+                             reason="no validation script to run")
+    assert ag_mod.is_usage_limit(starved) is True
+    assert ag_mod.is_usage_limit(normal) is False

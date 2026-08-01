@@ -5,8 +5,16 @@ The single-page HTML/CSS/JS control panel, isolated from ``dashboard.py`` so
 the HTTP handler and data logic aren't buried under ~380 lines of embedded
 markup (and ``dashboard.py`` stays under the project's 1000-line file cap).
 Pure presentation: takes a session token, returns a self-contained HTML
-document string. No sibling-module dependencies."""
+document string.
+
+One sibling dependency, deliberately: ``cat_board`` supplies the MindNetwork
+faculty board that this page and the swarm page both render. The alternative was a
+second copy of the palettes, sprites and labels in each page — two homes for one
+legend, drifting invisibly. ``cat_board`` is itself pure presentation, so this stays
+a presentation-only module."""
 import json
+
+from . import cat_board
 
 
 def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
@@ -132,6 +140,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
     color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
   button.mini:hover { color:#ff8a8a; }
+  /* MN-13: the faculty cat board, inline in the header. Every cat and panel rule
+     comes from `cat_board.CSS`; this is only the container's own box, which differs
+     from the swarm page's full-width strip. `margin-left:auto` pushes it to the
+     header's trailing edge so it never shoves the project picker around as cats
+     appear and vanish. */
+  #mn-cats { display:flex; align-items:flex-end; gap:5px; margin-left:auto;
+    flex:0 1 auto; overflow-x:auto; max-width:52%; }
+/*__CAT_CSS__*/
   /*__TASKS_CSS__*/
 </style></head>
 <body>
@@ -143,6 +159,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <select id="proj" onchange="onProjChange()"></select></label>
   <span id="live" title="Real-time updates — click to pause/resume" onclick="toggleLive()"><span class="blip">&#9679;</span> live</span>
   <span id="synced"></span>
+  <!--__CAT_HTML__-->
 </header>
 <main>
   <nav>
@@ -1772,9 +1789,31 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
 
   //__TASKS_JS__
 
+  // --- MN-13: the faculty cat board ---------------------------------------
+  // Injected from `cat_board.script()` — the same implementation the swarm page
+  // renders, not a copy of it.
+/*__CAT_JS__*/
+  // Its own interval rather than a hook into refreshLive(): refreshLive returns
+  // early whenever the visible section is not live-refreshable, when a manual
+  // operation is running, or before any section has registered a liveFn — and the
+  // cat board's whole job is to be readable exactly then, when something is slow or
+  // stuck. Sharing that timer would blank the board at the moment it matters.
+  // Errors are swallowed for the same reason the swarm page keeps this call outside
+  // its main try: a failing board must not take out the page, and a failing page
+  // must not take out the board.
+  async function pollCats(){
+    if (!liveOn || document.hidden) return;
+    try { paintCats((await apiGet('/api/mindnet/cats')).cats || []); } catch(_){}
+  }
+  setInterval(pollCats, LIVE_MS);
+
   // populate the project picker, then land on the overview
-  (async () => { await loadProjects(); showOverview(); })();
+  (async () => { await loadProjects(); showOverview(); pollCats(); })();
 </script>
-</body></html>""".replace("__TOKEN__", json.dumps(token)) \
+</body></html>""" \
+    .replace("/*__CAT_CSS__*/", cat_board.CSS) \
+    .replace("<!--__CAT_HTML__-->", cat_board.HTML) \
+    .replace("/*__CAT_JS__*/", cat_board.script()) \
+    .replace("__TOKEN__", json.dumps(token)) \
     .replace("/*__TASKS_CSS__*/", tasks_css) \
     .replace("//__TASKS_JS__", tasks_js)
