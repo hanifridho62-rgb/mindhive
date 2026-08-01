@@ -86,10 +86,14 @@ FACULTIES = ("skill-plugin", "sop", "improvements", "history", "task-graph",
 # emits it from `enforce.hook_decision`, which is the seam where that rule
 # finishes deciding (`enforcer.py` itself may not import `events`). Named here
 # so the cross-module caller shares this legend rather than respelling the
-# string, and asserted a member so a rename cannot leave a dangling emitter that
-# `_payload` would silently refuse.
+# string.
+#
+# Membership is pinned by `test_mindnet_telemetry.py`, not by a module-level
+# `assert`: asserts are stripped under `python -O`, and the guard would then be
+# absent exactly where it matters. A drift between this name and `FACULTIES`
+# makes `_payload` refuse every `compatibility` row silently — the cat stops
+# waking, with no error, which is the bug this constant exists to prevent.
 FACULTY_COMPATIBILITY = "compatibility"
-assert FACULTY_COMPATIBILITY in FACULTIES
 
 STATUS_ACTIVE = "active"
 STATUS_IDLE = "idle"

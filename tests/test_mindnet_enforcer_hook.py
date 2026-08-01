@@ -537,14 +537,20 @@ def _activity():
     return [e for e in events.read_all() if e.type == tel.EVENT_TYPE]
 
 
-def test_a_language_denial_wakes_the_compatibility_cat(spine):
+def test_a_language_denial_wakes_the_compatibility_cat_and_closes_it(spine):
+    """An `active` row AND its paired `idle`, in that order.
+
+    The unpaired version parked the cat in `ui_cats`' dim band — which is the
+    documented HANG signal — for six hours after a decision that took
+    microseconds. `telemetry.busy` pairs every other faculty's rows for exactly
+    this reason; work that is instantaneous has to close itself."""
     from mindhive.mindnet import telemetry as tel
     spine["sc"] = _sc(phase="execution", langs=("python",))
     enforce.hook_decision(_payload(file_path="app.js"))
     rows = _activity()
-    assert len(rows) == 1
-    assert rows[0].payload["faculty"] == "compatibility"
-    assert rows[0].payload["status"] == tel.STATUS_ACTIVE
+    assert [r.payload["status"] for r in rows] == [tel.STATUS_ACTIVE,
+                                                   tel.STATUS_IDLE]
+    assert {r.payload["faculty"] for r in rows} == {"compatibility"}
 
 
 def test_the_woken_cat_names_the_task_that_locked_the_repo(spine):
@@ -556,10 +562,16 @@ def test_the_woken_cat_names_the_task_that_locked_the_repo(spine):
 
 
 def test_a_shell_denial_wakes_the_cat_too(spine):
+    """And names the same task the refusal named. Asserting only the row COUNT
+    let a wrong or absent `task_id` pass — the shell path had no equivalent of
+    the task-id assertion the write path got."""
     spine["sc"] = _sc(phase="execution", langs=("python",))
     enforce.hook_decision(_payload(tool="Bash",
                                    command="echo x > src/app.ts"))
-    assert len(_activity()) == 1
+    rows = _activity()
+    assert len(rows) == 2
+    assert {r.payload.get("task_id") for r in rows} == {"t1"}
+    assert {r.payload.get("phase") for r in rows} == {"execution"}
 
 
 def test_a_phase_denial_does_not_wake_the_compatibility_cat(spine):
@@ -583,8 +595,8 @@ def test_a_malformed_task_id_still_emits_the_event(spine):
     spine["sc"].tasks["t1"].__dict__["task_id"] = "NOT A VALID ID"
     enforce.hook_decision(_payload(file_path="app.js"))
     rows = _activity()
-    assert len(rows) == 1
-    assert "task_id" not in rows[0].payload
+    assert len(rows) == 2
+    assert all("task_id" not in r.payload for r in rows)
 
 
 def test_the_decision_survives_a_telemetry_failure(spine, monkeypatch):
@@ -599,9 +611,14 @@ def test_the_decision_survives_a_telemetry_failure(spine, monkeypatch):
     assert "Language Compatibility Lock violation" in _reason(out)
 
 
-def test_the_woken_cat_reaches_the_board(spine):
-    """End to end: the emit is only worth anything if `ui_cats` renders it. The
-    unit tests above would all pass against an event nothing displays."""
+def test_the_woken_cat_reaches_the_board_then_leaves_it(spine):
+    """End to end: the emit is only worth anything if `ui_cats` renders it, and
+    only correct if it stops rendering it.
+
+    The first version of this test asserted `DISPLAY_DIM` past 180 s as the
+    expected end state — encoding the hang signal as the desired outcome. With
+    the paired `idle`, the cat is on the board briefly and then gone, which is
+    what `ui_cats` means by "it finished"."""
     from mindhive import events
     from mindhive.mindnet import telemetry as tel
     from mindhive.mindnet import ui_cats
@@ -609,11 +626,13 @@ def test_the_woken_cat_reaches_the_board(spine):
     enforce.hook_decision(_payload(file_path="app.js"))
     state = tel.fold(events.read_all())
     stamp = state["compatibility"].ts
-    cats = {c["faculty"]: c for c in ui_cats.board(state, now=stamp)}
-    assert cats["compatibility"]["display"] == ui_cats.DISPLAY_ACTIVE
-    later = ui_cats.shift(stamp, ui_cats.DIM_AFTER_SECS + 1)
-    dimmed = {c["faculty"]: c for c in ui_cats.board(state, now=later)}
-    assert dimmed["compatibility"]["display"] == ui_cats.DISPLAY_DIM
+    assert "compatibility" in {c["faculty"]
+                               for c in ui_cats.board(state, now=stamp)}
+    gone = ui_cats.shift(stamp, ui_cats.IDLE_VANISH_SECS + 1)
+    assert "compatibility" not in {c["faculty"]
+                                   for c in ui_cats.board(state, now=gone)}, (
+        "an instantaneous decision must not leave a cat parked in the dim band, "
+        "which ui_cats defines as the hang signal")
 
 
 def test_the_new_cat_takes_its_canonical_slot_rather_than_arrival_order(spine):
@@ -635,3 +654,102 @@ def test_the_new_cat_takes_its_canonical_slot_rather_than_arrival_order(spine):
     order = [c["faculty"] for c in
              ui_cats.board(state, now=state["compatibility"].ts)]
     assert order == ["compatibility", "pr-green"]
+
+
+# --- review fix: the audit append must not age the projection it audits ---------------
+#
+# THE regression this section exists for, and it was invisible to every other
+# test in this file. `sidecar._staleness` compares each segment's
+# `[st_size, st_mtime_ns]`; `_record_denial` appends a row to exactly that
+# directory. So the first refusal aged the sidecar, the next `sidecar.read`
+# answered `fresh=False`, and `locked_task`/`blocking_task`/`active_task` all
+# open with `if not sc.fresh: return None, None` — ALLOW. Re-running the refused
+# command succeeded, and the phase block went dormant with it.
+#
+# The repo already states the rule this broke, at `__main__.py`: "No ledger
+# append. `sidecar._staleness` counts every event, so a row written here without
+# also rewriting the sidecar would read STALE." The audit was the first ledger
+# writer on the hook path itself.
+#
+# These tests use the REAL `sidecar.read`, deliberately: the `spine` fixture
+# monkeypatches it with a closure returning a fixed `fresh=True` sidecar, so no
+# test that uses `spine` can observe this class of bug at all.
+
+def _real_sidecar():
+    from mindhive.mindnet import sidecar as sc_mod
+    return sc_mod
+
+
+def test_a_denial_does_not_age_the_sidecar(monkeypatch):
+    """The refusal is recorded AND the projection stays current. Without the
+    re-stamp these are mutually exclusive."""
+    sc_mod = _real_sidecar()
+    sc_mod.rebuild()
+    assert sc_mod.read().fresh, "precondition: a fresh sidecar to age"
+    out = enforce.hook_decision(
+        _payload(tool="Bash", command="git commit --no-verify -m 'x'"))
+    assert _decision(out) == "deny", "precondition: the append must have run"
+    assert _denials(), "precondition: a row must have been written"
+    assert sc_mod.read().fresh, (
+        "the audit append aged the sidecar — the next tool call reads a stale "
+        "projection and BOTH mindnet gates go dormant")
+
+
+def test_a_language_denial_does_not_age_the_sidecar_despite_three_appends(
+        spine):
+    """A language denial writes three rows (`policy_denied` plus the cat's
+    `active`/`idle` pair). The re-stamp has to happen after the LAST of them, or
+    a later append re-ages what an earlier re-stamp restored."""
+    sc_mod = _real_sidecar()
+    sc_mod.rebuild()
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    out = enforce.hook_decision(_payload(file_path="app.js"))
+    assert _decision(out) == "deny"
+    assert len(_denials()) == 1 and len(_activity()) == 2, "precondition"
+    assert sc_mod.read().fresh
+
+
+def test_an_already_stale_sidecar_is_never_certified_fresh(monkeypatch):
+    """The guard on the fix. Re-stamping is only ever allowed to preserve a
+    freshness that already held — writing a current stamp onto a projection that
+    genuinely predates the ledger would assert a correspondence nobody
+    established, which is worse than the staleness it hides."""
+    from mindhive import events
+    sc_mod = _real_sidecar()
+    sc_mod.rebuild()
+    events.append_event("caveat", {"text": "something else moved the ledger"})
+    assert not sc_mod.read().fresh, "precondition: genuinely stale"
+    enforce.hook_decision(
+        _payload(tool="Bash", command="git commit --no-verify -m 'x'"))
+    assert not sc_mod.read().fresh, (
+        "an audit append re-stamped a sidecar that was already stale")
+
+
+def test_a_concurrent_writer_leaves_the_sidecar_stale(monkeypatch):
+    """The narrow race the re-stamp must not paper over. If another process
+    appended in the same window, the ledger really has moved past what this
+    sidecar projects, and only OUR OWN append is safe to absorb."""
+    from mindhive import events
+    sc_mod = _real_sidecar()
+    sc_mod.rebuild()
+    assert sc_mod.read().fresh, "precondition"
+
+    real_append = events.append_event
+
+    def append_and_race(*a, **kw):
+        out = real_append(*a, **kw)
+        # A second segment appears between our append and the re-stat.
+        real_append("caveat", {"text": "another session"},
+                    session_id="other-session")
+        return out
+
+    monkeypatch.setattr(enforce_events_module(), "append_event", append_and_race)
+    enforce.hook_decision(
+        _payload(tool="Bash", command="git commit --no-verify -m 'x'"))
+    assert not sc_mod.read().fresh, (
+        "a third party's append was absorbed into our stamp")
+
+
+def enforce_events_module():
+    from mindhive import events
+    return events

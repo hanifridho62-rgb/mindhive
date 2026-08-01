@@ -687,3 +687,123 @@ def test_every_phase_is_classified(phase):
     sc = _sc(phase=phase)
     result = enf.phase_violation(*_write(), sc)
     assert (result is None) == (phase not in BLOCKED)
+
+
+# --- review fixes: the shell rule was reading `>` far too literally -------------------
+#
+# The first shipped version of the shell path ran its redirect regex over the RAW
+# command with no notion of quoting, heredocs, or command segments. A security
+# review executed it and produced a verified allow/deny table; these are the rows
+# that came back wrong. Every one of them is a FALSE DENIAL — the exact
+# false-positive cost MN-4 deferred this whole surface to avoid — or a chained
+# bypass, so this section is the honest boundary of the rule.
+
+@pytest.mark.parametrize("command", [
+    'echo "renamed a.py -> b.js"',
+    'grep -n "a -> b.md" notes.txt',
+    "pytest -q -k 'x>y.js'",
+    "echo 'x => y.ts'",
+    'git log --format="%s -> %h" > /dev/null',
+    'python -c "print(1 > 0)"',
+])
+def test_an_arrow_or_a_quoted_angle_bracket_is_not_a_redirect(command):
+    """`->` is not a redirect and `grep` writes nothing. The first version denied
+    both: `\d?>>?` matched the `>` in `->` and read the next token as a
+    filename, so a read-only grep whose PATTERN mentioned a `.md` file was
+    refused. Quoting is the other half — a `>` inside a quoted string is data,
+    not an operator."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+def test_a_quoted_redirect_target_is_still_seen_after_masking():
+    """The sibling that keeps the fix above from being 'ignore all quotes'. The
+    OPERATOR must be outside quotes; the TARGET may be quoted, and it has to be,
+    for any path containing a space."""
+    assert enf.language_violation("Bash", {"command": 'echo x > "src/app.ts"'},
+                                  _sc(langs=("python",))) is not None
+
+
+def test_a_heredoc_body_is_not_scanned_for_redirects():
+    """THE anti-deadlock regression, verified reachable by review.
+
+    `_redirect_targets` returned every hit in the whole string, so a heredoc
+    BODY that merely mentioned `echo x > src/app.ts` was collected alongside the
+    real target. The real target here is this phase's evidence document and is
+    correctly exempt — but `any(...)` then denied on the body hit anyway. That is
+    precisely the composition the module comment promises cannot reopen, and
+    this repo's own planning documents contain example text of that shape."""
+    command = ("cat > docs/superpowers/specs/design.md <<'EOF'\n"
+               "Example: echo x > src/app.ts\n"
+               "EOF")
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(phase="brainstorm",
+                                      langs=("python",))) is None
+
+
+def test_a_heredocs_own_target_is_still_seen():
+    """The sibling. Stripping bodies must not strip the command line itself."""
+    command = "cat > src/app.ts <<'EOF'\nconst x = 1\nEOF"
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "git status; echo x > src/app.ts",
+    "hive log update ok && echo x > src/app.ts",
+    "gh pr view | echo x > src/app.ts",
+    "git status && npx create-react-app web",
+])
+def test_an_exempt_program_does_not_exempt_the_rest_of_the_chain(command):
+    """`EXEMPT_PROGRAMS` was applied to the first token of the WHOLE command, so
+    prefixing anything with `git status;` turned the entire rule off. The
+    exemption exists so the documented remedies stay reachable — that argues for
+    exempting the invocation, not everything chained after it."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is not None, command
+
+
+@pytest.mark.parametrize("command", [
+    "hive mindnet satisfy t1",
+    "hive log update 'wrote src/app.ts'",
+    "git commit -m 'add app.ts'",
+    "git status 2>&1",
+    "hive rules enforce --disable policy:gate:mindnet-language",
+])
+def test_the_escape_hatch_survives_segment_scoping(command):
+    """The guard the fix above must not break. Every documented way out of an
+    enforcement state runs through Bash, so narrowing the exemption to a segment
+    must still leave a bare remedy exempt."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "echo x >| src/app.ts",
+    "echo x | tee --append src/app.ts",
+    "echo x | tee -a -- src/app.ts",
+])
+def test_the_other_spellings_of_the_shapes_already_claimed(command):
+    """Not new shapes — the SAME two shapes spelled the way a shell actually
+    allows. `>|` is the clobber-override redirect and was matched by nothing;
+    `tee --append` had `--append` captured AS the path, which then went to the
+    extension table, came back unmapped, and allowed. A rule that claims to
+    cover redirects and `tee` should cover their real spellings."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is not None, command
+
+
+def test_redirecting_program_output_to_a_forbidden_extension_still_denies():
+    """A judgment call, pinned so it is a decision rather than an accident.
+
+    The lock asks what lands on disk, not who authored it. `python gen.py >
+    report.md` creates a markdown file, and a `Write` of `report.md` under a
+    python-only context is refused — denying one and allowing the other would
+    make the rule depend on which tool happened to be used, which is the exact
+    inconsistency this whole unit exists to remove."""
+    assert enf.language_violation(
+        "Bash", {"command": "python gen.py > report.md"},
+        _sc(langs=("python",))) is not None
+    assert enf.language_violation(
+        "Bash", {"command": "python gen.py > report.md"},
+        _sc(langs=("python", "markdown"))) is None

@@ -133,17 +133,68 @@ SCAFFOLD_LANGUAGE = {
     ("rails", "new"): "ruby",
 }
 
-# An output redirect and its target. `\d?>>?` covers `>`, `>>` and `2>`; the
-# `(?!&)` is load-bearing rather than defensive — `2>&1` and `>&2` are the two
-# most common redirects in this repo's own commands, and a pattern that read
-# `&1` as a filename would deny a stderr redirect. Quotes are captured and
-# stripped by the caller rather than excluded, so `> "src/app ts.ts"` is seen
-# instead of silently missed.
-_REDIRECT_RE = re.compile(r"\d?>>?\s*(?!&)([^\s;&|<>()]+)")
+# A quoted run. Everything inside one is DATA, not shell syntax, and the first
+# version of this rule did not know that: it read the `>` in
+# `echo "renamed a.py -> b.js"` as a redirect and refused an echo. Quoted spans
+# are neutralised before scanning rather than deleted, so a quoted TARGET —
+# `> "src/app ts.ts"`, the only way to write a path containing a space — is
+# still captured.
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+# The operators that are syntax outside quotes and data inside them.
+_SHELL_OPS = frozenset("><|;&")
+
+# `<<WORD`, `<<'WORD'`, `<<-WORD`. What follows on subsequent lines is a
+# document, not a command, and scanning it produced the review's worst finding:
+# a heredoc whose BODY merely mentioned `echo x > src/app.ts` was refused, even
+# though the only file it created was the exempt one named on the command line.
+# This project's own conventions prescribe heredocs for multi-line text, so the
+# bodies most likely to be written are the ones most likely to quote a command.
+_HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+# Where one command ends and the next begins. The exemption for `hive`/`git`/`gh`
+# is applied per segment, because it was previously read off the first token of
+# the WHOLE string — so prefixing anything with `git status;` switched the entire
+# rule off. The exemption exists to keep the documented remedies reachable, which
+# argues for exempting the invocation, not everything chained after it.
+#
+# The `(?<!>)` keeps a redirect from being mistaken for a separator: the `|` in
+# `>|` is part of the clobber-override operator and the `&` in `2>&1` is part of
+# the descriptor, and splitting either one cuts a redirect in half so neither
+# side matches anything.
+_SEGMENT_RE = re.compile(r"\|\||&&|(?<!>)[;\n|&]")
+
+# An output redirect and its target.
+#
+# `\d?>>?\|?` covers `>`, `>>`, `2>` and `>|` (the clobber-override form, which
+# the first version matched with nothing at all). Three details are each a bug
+# the review found, not defensive padding:
+#
+# * `(?<![-=<>])` — without it the `>` in `->` and `=>` is a redirect, so
+#   `echo "a -> b.js"` and `node -e "[1].map(x => x.js)"` were both refused. It
+#   also stops `>>` being matched a second time at its own second character.
+# * `(?!&)` — `2>&1` and `>&2` are the two most common redirects in this repo's
+#   own commands; reading `&1` as a filename denies a stderr redirect.
+# * `[ \t]*` rather than `\s*` — `\s` matches newlines, so a `>` at end of line
+#   captured the FIRST TOKEN OF THE NEXT LINE as its target.
+#
+# The target alternates quoted-run before bare-token so a path with a space is
+# taken whole instead of truncated at the space.
+_TARGET = r"(\"[^\"]*\"|'[^']*'|[^\s;&|<>()]+)"
+_REDIRECT_RE = re.compile(r"(?<![-=<>])\d?>>?\|?[ \t]*(?!&)" + _TARGET)
 
 # `tee` is a redirect wearing a different hat: it is how a pipeline writes a
-# file. `-a` is the append form.
-_TEE_RE = re.compile(r"(?:^|[\s;&|])tee\s+(?:-a\s+)?([^\s;&|<>()]+)")
+# file. Any run of flags may precede the path — the first version handled only
+# `-a`, so `tee --append x.ts` captured `--append` AS the path, sent it to the
+# extension table, got "unmapped", and allowed.
+_TEE_RE = re.compile(r"(?:^|[\s;&|])tee[ \t]+"
+                     r"(?:(?:--|-{1,2}[A-Za-z][A-Za-z0-9-]*)[ \t]+)*" + _TARGET)
+
+# Tokens that may sit in front of the real program without changing what it is.
+# `cd web && npm init` is already handled by segment splitting; these are the
+# ones that stay inside a single segment.
+_SCAFFOLD_NOISE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env|command|"
+                             r"time|nohup)$")
 
 # Programs the phase block must NEVER deny, because they are how the block is
 # escaped. `hive` is the state machine's own control surface — the injected
@@ -389,13 +440,85 @@ def _tokens(command) -> list:
     return toks
 
 
-def _scaffold_language(command) -> str | None:
-    """The language a scaffolding command would generate, or ``None``."""
-    toks = _tokens(command)
-    if not toks:
-        return None
+def _strip_heredocs(text) -> str:
+    """*text* with heredoc BODIES removed and every command line kept.
+
+    A body is a document. Scanning it made the rule refuse commands whose only
+    created file was permitted, purely because the text they were writing quoted
+    a shell command — and a body that never terminates is treated as running to
+    the end, which drops more than it should. Dropping is the safe direction."""
+    lines = text.split("\n")
+    kept, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        i += 1
+        for match in _HEREDOC_RE.finditer(line):
+            delimiter = match.group(2)
+            while i < len(lines) and lines[i].strip() != delimiter:
+                i += 1
+            i += 1                      # and the delimiter line itself
+    return "\n".join(kept)
+
+
+def _mask_quoted(text) -> str:
+    """*text* with shell operators inside quoted runs neutralised.
+
+    Length-preserving, so every offset into the result still indexes the
+    original — the caller reads captured targets out of the untouched string and
+    never sees a masked byte."""
+    out = list(text)
+    for match in _QUOTED_RE.finditer(text):
+        for i in range(match.start(), match.end()):
+            if out[i] in _SHELL_OPS:
+                out[i] = "\x00"
+    return "".join(out)
+
+
+def _segment_spans(masked) -> tuple:
+    """`(start, end)` for each `;`/`&&`/`||`/`|`/`&`-separated command."""
+    spans, start = [], 0
+    for match in _SEGMENT_RE.finditer(masked):
+        spans.append((start, match.start()))
+        start = match.end()
+    spans.append((start, len(masked)))
+    return tuple(spans)
+
+
+def _scan(command):
+    """`(text, masked, spans)` for a command, with exempt segments dropped.
+
+    One place decides what part of a command is even eligible to be read as
+    shell syntax: bodies out, quotes neutralised, exempt invocations skipped.
+    Both the redirect scan and the scaffold scan go through it, so they cannot
+    disagree about what the command says."""
+    if not isinstance(command, str) or not command.strip():
+        return "", "", ()
+    text = _strip_heredocs(command)
+    masked = _mask_quoted(text)
+    spans = tuple(s for s in _segment_spans(masked)
+                  if _program(text[s[0]:s[1]]) not in EXEMPT_PROGRAMS)
+    return text, masked, spans
+
+
+def _segment_scaffold(segment) -> str | None:
+    toks = [t for t in _tokens(segment) if not t.startswith(("-", "+"))]
+    while toks and _SCAFFOLD_NOISE.match(toks[0]):
+        toks.pop(0)
+        if toks:
+            toks[0] = posixpath.basename(toks[0].replace("\\", "/"))
     for key, lang in SCAFFOLD_LANGUAGE.items():
         if tuple(toks[:len(key)]) == key:
+            return lang
+    return None
+
+
+def _scaffold_language(command) -> str | None:
+    """The language a scaffolding command would generate, or ``None``."""
+    text, _masked, spans = _scan(command)
+    for start, end in spans:
+        lang = _segment_scaffold(text[start:end])
+        if lang is not None:
             return lang
     return None
 
@@ -408,15 +531,21 @@ def _redirect_targets(command) -> tuple:
     wrongly reads as a path is a refusal the operator did not earn. Missing is
     recoverable; a false refusal on an execute tool is the false-positive cost
     MN-4 declined to pay. Every candidate still has to survive the extension
-    table afterwards, where unmapped allows."""
-    if not isinstance(command, str) or not command.strip():
-        return ()
+    table afterwards, where unmapped allows.
+
+    The regexes run over the MASKED text so quoted data cannot be read as
+    syntax, and every captured span is sliced out of the ORIGINAL so no masked
+    byte reaches the extension parser."""
+    text, masked, spans = _scan(command)
     out = []
-    for rx in (_REDIRECT_RE, _TEE_RE):
-        for match in rx.finditer(command):
-            token = match.group(1).strip("'\"")
-            if token:
-                out.append(token)
+    for start, end in spans:
+        segment = masked[start:end]
+        for rx in (_REDIRECT_RE, _TEE_RE):
+            for match in rx.finditer(segment):
+                token = text[start + match.start(1):
+                             start + match.end(1)].strip("'\"")
+                if token:
+                    out.append(token)
     return tuple(out)
 
 
@@ -523,7 +652,6 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
         if tool_name in WRITE_TOOLS:
             paths, scaffold = (_file_path(obj),), None
         else:
-            command = obj.get("command")
             # The escape hatch has to survive BOTH rules for the same reason it
             # exists at all: every documented way out of an enforcement state —
             # `hive mindnet satisfy`, `hive rules enforce --disable`, the
@@ -531,8 +659,13 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
             # writes files constantly, and a rule that refused `git checkout`
             # over a `.ts` path in the command text would be unrecoverable from
             # inside a session.
-            if _program(command) in EXEMPT_PROGRAMS:
-                return None
+            #
+            # Applied PER SEGMENT inside `_scan`, not to the first token of the
+            # whole string. Reading it off the whole string meant `git status;`
+            # in front of anything switched the rule off entirely — the
+            # exemption is for the remedy's invocation, not for whatever is
+            # chained after it.
+            command = obj.get("command")
             paths, scaffold = _redirect_targets(command), \
                 _scaffold_language(command)
         if (scaffold is not None and scaffold not in allowed) or \

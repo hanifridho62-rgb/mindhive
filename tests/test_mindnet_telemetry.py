@@ -465,3 +465,25 @@ def test_the_phase_field_is_bound_to_the_one_legend():
     for phase in t_mod.PHASES:
         tel.emit("sop", tel.STATUS_ACTIVE, phase=phase)
     assert [r.payload["phase"] for r in _rows()] == list(t_mod.PHASES)
+
+
+def test_the_cross_module_faculty_constant_is_a_real_member():
+    """`enforce.hook_decision` emits `FACULTY_COMPATIBILITY` from outside this
+    package. If it ever drifts from `FACULTIES`, `_payload` refuses the row and
+    returns None — the cat stops waking with no error anywhere, which is exactly
+    the bug the constant exists to prevent.
+
+    Here rather than as a module-level `assert`: asserts are stripped under
+    `python -O`, so that guard would be absent precisely where a silent failure
+    is least recoverable."""
+    assert tel.FACULTY_COMPATIBILITY in tel.FACULTIES
+
+
+def test_the_signature_that_routes_the_cat_is_the_registered_one():
+    """Invariant 10 across a module boundary. `hook_decision` decides whether to
+    wake `compatibility` by comparing the fired signature against
+    `MINDNET_LANGUAGE_SIGNATURE`; if that string ever stops being the one in
+    `POLICY_CHECKS`, the comparison silently never matches."""
+    from mindhive import enforce
+    assert enforce.MINDNET_LANGUAGE_SIGNATURE in [
+        pid for pid, _decision, _fn in enforce.POLICY_CHECKS]

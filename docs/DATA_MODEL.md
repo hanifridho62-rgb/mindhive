@@ -113,8 +113,9 @@ than losing the event),
 `PreToolUse` refusal, written by `enforce.hook_decision`: `signature` is the
 `POLICY_CHECKS` id an operator would disable in the manifest, and `""` for the
 learned-matcher tier which has none; `decision` ∈ deny, ask; `reason` is stored
-**without** `ENFORCED_MARK` and truncated at `DENIAL_REASON_LIMIT` (600), while
-the hook payload still carries the full text. **Appended on deny only** —
+**without** `ENFORCED_MARK` and truncated at `DENIAL_REASON_LIMIT` (600) — as is
+`tool_name` at `TOOL_NAME_LIMIT` (120), since it comes off the same untrusted
+stdin payload — while the hook payload still carries the full text. **Appended on deny only** —
 `PreToolUse` fires on every tool call, so an append on the allow path would put
 a file write on the hottest path in the system; `tests/test_enforce.py` keeps an
 allow-path canary because every other test in that section would pass just as
@@ -336,29 +337,74 @@ command put a file on disk in a forbidden language:
 
 | Shape | Example | Resolved via |
 |---|---|---|
-| Redirect / heredoc / `tee` target | `echo x > src/app.ts`, `cat > a.ts <<EOF` | `EXTENSION_LANGUAGE`, same as a write |
+| Redirect / heredoc / `tee` target | `echo x > src/app.ts`, `cat > a.ts <<EOF`, `>>`, `>\|`, `tee --append` | `EXTENSION_LANGUAGE`, same as a write |
 | Scaffolding generator | `npx create-react-app`, `cargo new`, `go mod init` | `SCAFFOLD_LANGUAGE` |
 
 Everything else allows. `node app.js` under a Python-only task is **not** a
 violation — running a program produces no source. `SCAFFOLD_LANGUAGE` is keyed
 on a token **prefix**, not a program name, because `go mod init` scaffolds and
-`go mod tidy` does not. The redirect pattern excludes `>&`, since `2>&1` and
-`>&2` are the two most common redirects in this repo's own commands and reading
-`&1` as a filename would deny a stderr redirect. The evidence exemption and
-`EXEMPT_PROGRAMS` both apply on this path — writing a brainstorm document with
-`>` must not reopen the composition deadlock above, and `git` writes files
-constantly. **PowerShell cmdlet file creation (`Set-Content`, `Out-File`) is
-not covered**, and is asserted as a known gap rather than left assumed-covered.
+`go mod tidy` does not.
+
+**A command is lexed before it is scanned, and each step is a false-refusal this
+rule shipped without.** `>` is only an operator in the right context:
+
+- **Heredoc bodies are stripped.** A body is a document, not a command. Scanning
+  it refused `cat > notes.md <<EOF` whose body merely quoted `echo x > a.ts` —
+  and where the real target was this phase's evidence document, the body hit
+  overruled the exemption and re-created the deadlock §4.4 promises cannot
+  reopen. This project's conventions prescribe heredocs for multi-line text, so
+  the bodies most likely to be written are the ones most likely to quote a shell
+  command.
+- **Quoted runs are neutralised, not deleted.** `echo "renamed a.py -> b.js"`
+  and `grep -n "a -> b.md" f` created nothing and were both refused. Masking is
+  length-preserving so a quoted TARGET — `> "src/app ts.ts"`, the only way to
+  write a path with a space — is still captured.
+- **`->` and `=>` are not redirects,** and `[ \t]*` (not `\s*`) stops a
+  line-final `>` from claiming the next line's first token as its target.
+- **`>&` is excluded**: `2>&1` and `>&2` are the two most common redirects in
+  this repo's own commands, and reading `&1` as a filename denies a stderr
+  redirect.
+- **`EXEMPT_PROGRAMS` is applied per `;`/`&&`/`||`/`|` segment**, not to the
+  first token of the whole string. Reading it off the whole command meant
+  `git status;` in front of anything switched the rule off. The exemption exists
+  to keep the documented remedies reachable, which covers the remedy's
+  invocation, not whatever is chained after it.
+
+**Coverage is partial by design, and the boundary is wide.** Uncovered and
+verified to allow: `cp`, `mv`, `install`, `touch`, `dd of=`, `curl -o`,
+`sed -i`, `patch`, `unzip`, `python -c "open(...)"`, `$VAR`/`$(...)`
+indirection, `sh -c '…'` (quote-masking makes the inner redirect data), and
+PowerShell cmdlets (`Set-Content`, `Out-File`). The rule is an anti-mistake rail
+for a cooperating agent, **not a sandbox** — a `policy_denied` row proves the
+shapes the rule recognises were refused, never that no violation occurred.
 
 **Every refusal appends one `policy_denied` event** (§3), so enforcement is
 auditable per SOP 1.4 — it previously appended nothing on deny or allow, which
 made MindNetwork's own forcing unreconstructable. A **language** denial
-additionally emits `mindnet_activity` for the `compatibility` faculty, which is
-that cat's only emit site (MN-4 left it with none, so it never woke). Both
-writes live in `enforce.hook_decision`, never in `mindnet/enforcer.py` — a test
-asserts over that module's source that it imports no `events`, and both
-`append_event` and `telemetry.emit` do. A phase denial does not wake the
-compatibility cat; the phase spine is `task-graph`'s faculty.
+additionally emits the `compatibility` faculty's `mindnet_activity` pair, which
+is that cat's only emit site (MN-4 left it with none, so it never woke) — an
+`active` row AND its `idle`, like `telemetry.busy` writes for every other
+faculty, because an unpaired `active` parks the cat in the 180 s–6 h band that
+§4.5 defines as the *hang* signal. All three writes live in
+`enforce.hook_decision`, never in `mindnet/enforcer.py` — a test asserts over
+that module's source that it imports no `events`, and both `append_event` and
+`telemetry.emit` do. A phase denial does not wake the compatibility cat; the
+phase spine is `task-graph`'s faculty.
+
+**An audit append must not age the projection it audits.** `_staleness`
+compares each segment's `[st_size, st_mtime_ns]`, so writing to the events
+directory ages the sidecar; the next read answers `fresh=False`, and
+`locked_task`/`blocking_task`/`active_task` all open with `if not sc.fresh:
+return None, None` — **allow**. So the first refusal of any kind switched off
+*both* gates until the next `hive mindnet rebuild`, and re-running the refused
+command succeeded. `hook_decision` therefore snapshots freshness **before** its
+appends and re-stamps **after** the last one. Re-stamping rather than rebuilding
+is sound because neither written type feeds any fold the sidecar projects, so
+the phase state still corresponds to the ledger; a rebuild is unavailable here
+because it costs a full `read_all` on the hook that fires for every tool call.
+Two guards: a sidecar that was **already** stale is never certified fresh, and
+if any segment other than the one appended to also moved, the ledger genuinely
+has passed the projection and stale is the correct answer.
 
 The phase block scans for **any** blocked `in_progress` task rather than
 consulting the single furthest-along one. Routing it through `inject.active`
