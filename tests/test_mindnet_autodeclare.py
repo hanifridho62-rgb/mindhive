@@ -338,3 +338,194 @@ def test_the_hook_does_not_rebuild_the_projection(monkeypatch, capsys):
     monkeypatch.setattr(sc_mod, "rebuild", explode)
     _hook(CODE_PROMPT, monkeypatch=monkeypatch)
     capsys.readouterr()
+
+
+# --- U4: the projection is refreshed off the prompt path -------------------------
+#
+# `sidecar.rebuild` costs 0.32 s against the hook's ~0.4 s budget, so it cannot run per
+# prompt — but without it the projection never returns to fresh and per-task phase direction
+# never appears. The host has to be somewhere a fold is already tolerated and that runs once
+# per session.
+#
+# `hive state` is that place: the session-start hook already runs it, it is the only command
+# in that hook belonging to this repo, and 0.32 s is invisible at session start while it is
+# decisive on the prompt path. Stale-gated, so a session opening against an already-fresh
+# projection pays nothing.
+
+def test_the_session_refresh_rebuilds_a_stale_projection(monkeypatch, capsys):
+    _arm(monkeypatch)
+    _hook(CODE_PROMPT, monkeypatch=monkeypatch)          # declares, leaving it stale
+    capsys.readouterr()
+    assert sc_mod.read().fresh is False, "fixture did not leave the projection stale"
+    ad.refresh_projection()
+    assert sc_mod.read().fresh is True
+
+
+def test_the_session_refresh_leaves_a_fresh_projection_alone(monkeypatch):
+    """Stale-gated: a session that opens against a fresh projection must not pay the
+    fold."""
+    sc_mod.rebuild()
+    calls = {"n": 0}
+    real = sc_mod.rebuild
+
+    def counted(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(sc_mod, "rebuild", counted)
+    ad.refresh_projection()
+    assert calls["n"] == 0
+
+
+def test_a_refresh_failure_is_silent(monkeypatch):
+    """It runs inside a display command at session start. A projection that cannot be
+    rebuilt must not take that command down."""
+    monkeypatch.setattr(sc_mod, "rebuild",
+                        lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
+    assert ad.refresh_projection() is False
+
+
+def test_hive_state_refreshes_the_projection(monkeypatch, capsys):
+    """The wiring, not just the helper. A test that only called `refresh_projection`
+    would pass while nothing invoked it — which is how the spine went dormant in the
+    first place."""
+    from mindhive import __main__ as cli
+    _arm(monkeypatch)
+    _hook(CODE_PROMPT, monkeypatch=monkeypatch)
+    capsys.readouterr()
+    assert sc_mod.read().fresh is False
+    cli.main(["state"])
+    capsys.readouterr()
+    assert sc_mod.read().fresh is True
+
+
+def test_the_prompt_path_never_refreshes(monkeypatch, capsys):
+    """The whole reason the refresh lives elsewhere."""
+    _arm(monkeypatch)
+
+    def explode(*a, **kw):
+        raise AssertionError("the prompt path refreshed the projection")
+
+    monkeypatch.setattr(ad, "refresh_projection", explode)
+    _hook(CODE_PROMPT, monkeypatch=monkeypatch)
+    capsys.readouterr()
+
+
+def test_after_a_refresh_the_declared_task_steers_the_next_prompt(monkeypatch, capsys):
+    """The point of the whole unit: once fresh, per-task phase direction appears — so the
+    fresh branch is reachable in practice and not only in principle."""
+    from mindhive.mindnet import inject as mn_inject
+    _arm(monkeypatch)
+    _hook(CODE_PROMPT, monkeypatch=monkeypatch)
+    capsys.readouterr()
+    ad.refresh_projection()
+    out = mn_inject.block(sc_mod.read())
+    assert "active task" in out, out[:200]
+
+
+# --- U5: the canary that would have caught the dormancy --------------------------
+#
+# Every unit above can pass while the user still sees nothing. That is not hypothetical —
+# it is exactly what happened: `advice.resolve_sops` and `advice.resolve_constraints` were
+# implemented and tested, and reached no prompt for the whole life of the feature, because
+# two gates upstream of them were shut. Unit tests on the resolvers were green throughout.
+#
+# So this walks the entire path in one test and asserts on the text the user actually
+# receives. It is the same shape as MN-17's emitter guard: that one fails when a declared
+# faculty has no emitter, this one fails when a resolved section has no route to the prompt.
+
+def _seed_sop_and_incident(project=None):
+    """One SOP and one prior-failure record, both matching the task's own words.
+
+    Seeded through the real surfaces — a `sop` event and an incident markdown file — so
+    what the resolvers see here is what they see in production."""
+    from mindhive import paths
+    events.append_event(
+        "sop", {"action": "add", "sop_id": "sop-csv-export",
+                "title": "csv export dashboard procedure",
+                "text": "always stream the csv export dashboard endpoint, never buffer "
+                        "the whole file in memory"},
+        session_id="s-seed", tags=["sop"], project=project)
+    d = paths.project_dir(project) / "rules" / "incidents"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "csv-export-buffer.md").write_text(
+        "---\nsignature: csv:export:buffer\nstatus: active\noccurrences: 2\n"
+        "rule_source: auto\nflag: \nsessions: 1\n---\n\n"
+        "# Incident: csv:export:buffer\n\n"
+        "## Raw Signal\n- Error excerpt: `buffering the whole csv export dashboard "
+        "endpoint exhausted memory`\n\n"
+        "## Auto Evaluation\n- Prevention rule: stream the csv export dashboard endpoint "
+        "instead of buffering it\n\n"
+        "## Human Evaluation\n<!-- -->\n\n"
+        "## Active Prevention Rule\n> stream the csv export dashboard endpoint instead "
+        "of buffering it\n", encoding="utf-8")
+
+
+def _injected(prompt, session_id, monkeypatch, capsys) -> str:
+    _hook(prompt, session_id=session_id, monkeypatch=monkeypatch)
+    out = capsys.readouterr().out.strip()
+    if not out:
+        return ""
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_the_sop_and_improvements_sections_reach_the_prompt(monkeypatch, capsys):
+    """The end-to-end claim of MN-18, on the text the user receives.
+
+    arm -> prompt (declares) -> refresh -> prompt (advice is injected). Both gates open, or
+    this fails."""
+    _arm(monkeypatch)
+    _seed_manifest()
+    _seed_sop_and_incident()
+    # First prompt brings the task into existence.
+    _injected(CODE_PROMPT, "s-e2e-1", monkeypatch, capsys)
+    assert _declares(), "no task was declared, so the spine has nothing to speak about"
+    ad.refresh_projection()
+    # Second prompt receives the spine's advice for that task.
+    ctx = _injected("lanjutkan pekerjaan csv export dashboard endpoint",
+                    "s-e2e-2", monkeypatch, capsys)
+    assert "stream the csv export dashboard endpoint" in ctx, ctx[:400]
+    assert "buffering the whole csv export" in ctx or "instead of buffering" in ctx, ctx[:400]
+
+
+def test_an_unarmed_project_stays_silent_end_to_end(monkeypatch, capsys):
+    """The opt-in is real, not decorative: with MindNetwork unarmed nothing is declared and
+    the spine says nothing, however much SOP and incident material exists."""
+    monkeypatch.delenv("MINDNETWORK_ENFORCE", raising=False)
+    _seed_manifest()
+    _seed_sop_and_incident()
+    _injected(CODE_PROMPT, "s-e2e-off", monkeypatch, capsys)
+    assert _declares() == []
+    ad.refresh_projection()
+    ctx = _injected("lanjutkan pekerjaan csv export dashboard endpoint",
+                    "s-e2e-off-2", monkeypatch, capsys)
+    assert "stream the csv export" not in ctx
+
+
+def test_no_seeded_material_invents_no_sections(monkeypatch, capsys):
+    """A declared task with nothing to advise about must not manufacture advice."""
+    _arm(monkeypatch)
+    _seed_manifest()
+    _injected(CODE_PROMPT, "s-e2e-bare", monkeypatch, capsys)
+    ad.refresh_projection()
+    ctx = _injected("lanjutkan pekerjaan export", "s-e2e-bare-2", monkeypatch, capsys)
+    for label in ("Standing procedures", "prior failure", "avoid:"):
+        assert label not in ctx, f"invented an advice section: {ctx[:300]}"
+
+
+def test_the_canary_fails_when_the_advice_call_is_removed(monkeypatch, capsys):
+    """The canary's own canary. If `inject.block` stopped carrying advice, the test above
+    must fail rather than pass by finding nothing — that failure mode has bitten this repo
+    twice, so it is asserted rather than assumed."""
+    from mindhive.mindnet import inject as mn_inject
+    _arm(monkeypatch)
+    _seed_manifest()
+    _seed_sop_and_incident()
+    _injected(CODE_PROMPT, "s-e2e-break", monkeypatch, capsys)
+    ad.refresh_projection()
+    monkeypatch.setattr(mn_inject, "advice_block", lambda *a, **kw: "")
+    ctx = _injected("lanjutkan pekerjaan csv export dashboard endpoint",
+                    "s-e2e-break-2", monkeypatch, capsys)
+    assert "stream the csv export dashboard endpoint" not in ctx, (
+        "advice still appeared with advice_block disabled — the canary above proves "
+        "nothing")

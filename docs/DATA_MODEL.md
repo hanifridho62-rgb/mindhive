@@ -935,6 +935,58 @@ A memo that would have recovered ~0.08 s of duplicated work between `hook_contex
 `record_direction` was written and then reverted: the two load the manifest separately,
 so any key cheap enough to be worth it is either a guaranteed miss or a staleness hazard.
 
+### 4.13 Waking the spine: auto-declare and the staleness gate (MN-18)
+
+The phase spine, the SOP section and the Improvements section were **built, tested, and
+reached by no prompt**. `advice.resolve_sops` and `advice.resolve_constraints` worked;
+`inject.block` returned `""` on its first line because the sidecar held no phase records,
+and nothing created the first task — `hive mindnet declare` is hand-run and `decompose`
+needs a parent.
+
+**Two gates were shut, not one.** Auto-declaring a task is the obvious fix and it is
+insufficient. Measured: one appended event of *any* type marks the sidecar stale, the hook
+itself appends on every prompt (`skill_directed`, faculty activity rows), and advice rode
+only the fresh branch. A declared task would still have got the generic block forever.
+
+**Gate 1 — a task exists.** `autodeclare.decide` is pure: everything is passed in, because
+this runs where `events.read_all` costs 1.09 s against a ~0.4 s budget and where a raise
+breaks the user's prompt. Refusal is the default, with three independent bounds on an
+append-only store:
+
+| Bound | Effect |
+|---|---|
+| off until armed, through MN-6's `optin` | no writes at all in a dormant project |
+| no declare while a record is active | one auto-declared root at a time — writes are one-per-work-session |
+| id derived deterministically from the prompt | a repeated prompt re-declares the same id, which the graph fold upserts |
+
+**No phase is ever named.** `cmd_mindnet_declare` is explicit that the entry point is
+derived by `tasks.fold` and that "a caller-named entry phase is the teleport MN-2 stopped
+accepting". `playbook.infer` therefore decides only *whether* a prompt is recognizable code
+work worth declaring for — never where the task starts. A test asserts the absence of a
+phase field structurally.
+
+**Gate 2 — advice rides the stale branch.** `inject.block` now carries resolved advice on
+both branches while per-task phase direction stays fresh-only. The old rule withheld
+everything on staleness, argued from phase correctness — right about the *phase*, which a
+later event can change; wrong about SOPs and prior-failure constraints, which resolve
+against the task's *text* and cannot be invalidated by a later event. Since stale is the
+normal state, the broader rule cost the entire feature and bought no safety.
+
+Rejected: rebuilding on the prompt path (0.32 s against ~0.4 s, for a result the next
+prompt's own write invalidates), and narrowing staleness to the event types the projection
+folds — the better long-term answer, but segment size and mtime cannot reveal an event's
+type without the read the budget forbids. Deferred, recorded in the plan.
+
+**The refresh lives in `hive state`.** There is no `session_start` stage in this CLI; the
+session-start hook runs `hive state`, which is the only command in that hook belonging to
+this repo. Stale-gated, so a session opening against a fresh projection pays nothing.
+
+**The canary matters more than any single unit.** Every unit here can pass while the user
+sees nothing — that is precisely what happened, with the resolvers' own unit tests green
+throughout. `test_the_sop_and_improvements_sections_reach_the_prompt` walks arm → prompt →
+refresh → prompt and asserts on the text the user receives, and its own canary disables
+`advice_block` to prove it is not passing by finding nothing.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.

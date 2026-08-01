@@ -155,17 +155,40 @@ def test_the_phase_directive_still_renders_alongside_advice():
     assert "Exit criterion" in text
 
 
-# --- stale: advice is suppressed with everything else ---------------------------------
+# --- stale: phase direction is suppressed, advice is not (MN-18 U3) -------------------
 
 @pytest.mark.parametrize("phase", PHASES)
-def test_a_stale_sidecar_yields_no_advice_at_all(phase):
-    """Stale advice is worse than none — a confident instruction about a task
-    that may have fallen back to the planning gate."""
+def test_a_stale_sidecar_still_carries_advice_but_no_phase_direction(phase):
+    """MN-18 U3 reversed this test deliberately; it used to assert
+    `block(...) == AGNOSTIC_BLOCK` and that every advice sentinel was absent.
+
+    The old rule — "stale advice is worse than none, a confident instruction about a task
+    that may have fallen back to the planning gate" — is right about the PHASE, which a
+    later event genuinely can change. It does not transfer to SOPs and prior-failure
+    constraints: those resolve against the task's TEXT, and no later event can invalidate
+    them.
+
+    And the cost of the broader rule was the whole feature. Measured: ONE appended event of
+    any type marks the sidecar stale, and the hook appends on every prompt — so stale is the
+    NORMAL state, and while advice rode only the fresh branch the SOP section and the
+    Improvements section were injected by no prompt at all, for the entire life of the
+    feature, with their own unit tests green throughout."""
     text = inj.block(_sc(_full(), fresh=False, phase=phase))
-    assert text == inj.AGNOSTIC_BLOCK
+    # Phase direction is still withheld: the staleness warning leads, and nothing names
+    # this task's gate or exit criterion.
+    assert text.startswith(inj.AGNOSTIC_BLOCK)
+    assert "Exit criterion" not in text
+    # Advice now rides through — that is the point of the reversal.
     for sentinel in ("OTTER-SENTINEL-7742", "BADGER-SENTINEL-3391",
                      "MAGPIE-SENTINEL-5510"):
-        assert sentinel not in text
+        assert sentinel in text, f"{sentinel} was dropped on the stale branch"
+
+
+@pytest.mark.parametrize("phase", PHASES)
+def test_a_stale_sidecar_with_no_advice_is_exactly_the_agnostic_block(phase):
+    """The complement, and the half of the old assertion that survives unchanged: a project
+    with no resolved advice sees precisely what it saw before U3."""
+    assert inj.block(_sc({}, fresh=False, phase=phase)) == inj.AGNOSTIC_BLOCK
 
 
 def test_a_sidecar_with_no_records_stays_silent_even_carrying_advice():

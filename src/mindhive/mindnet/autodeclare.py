@@ -153,6 +153,31 @@ def declare(decision, session_id=None, project=None):
         return None
 
 
+def refresh_projection(project=None) -> bool:
+    """Rebuild the sidecar when it is stale. Returns whether a rebuild was written.
+
+    **Not on the prompt path**, and that is the entire point of the function existing
+    separately. `sidecar.rebuild` measures 0.32 s against the hook's ~0.4 s budget, so per
+    prompt it is unaffordable — but without it the projection never returns to fresh and
+    per-task phase direction never appears.
+
+    `hive state` is the host: the session-start hook already runs it, it is the only command
+    in that hook belonging to this repo, and 0.32 s is invisible at session start while it is
+    decisive on the prompt path. There is no `session_start` stage in this CLI to hang it on
+    — checked — so this is the available session-start signal, not a first choice discarded.
+
+    Stale-gated: a session opening against a fresh projection pays nothing. Never raises —
+    it runs inside a display command, and a projection that cannot be rebuilt must not take
+    that command down."""
+    try:
+        from . import sidecar as s_mod
+        if s_mod.read(project).fresh:
+            return False
+        return bool(getattr(s_mod.rebuild(project), "written", False))
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def maybe_declare(prompt, sidecar, session_id=None, project=None, env=None):
     """The whole gate: armed, then decided, then appended. Returns the events or None.
 

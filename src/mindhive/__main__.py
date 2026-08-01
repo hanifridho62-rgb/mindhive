@@ -152,6 +152,17 @@ def cmd_state(args) -> int | None:
               f"'{paths.detect_project()}' — run from the project dir, set "
               f"MINDHIVE_PROJECT, or pass --project. See `hive projects`.",
               file=sys.stderr)
+    # MN-18 U4: refresh the MindNetwork projection here, stale-gated. The session-start
+    # hook runs `hive state`, this is the only command in that hook belonging to this repo,
+    # and the fold costs 0.32 s — invisible once per session, decisive on the prompt path
+    # where the hook must stay under ~0.4 s. Without it the projection never returns to
+    # fresh and per-task phase direction never appears. Silent on failure: printing STATE.md
+    # is this command's job and a projection rebuild must not be able to stop it.
+    try:
+        from .mindnet import autodeclare as mn_auto
+        mn_auto.refresh_projection(project)
+    except Exception:                                       # noqa: BLE001
+        pass
     s = paths.project_dir(project) / "STATE.md"
     print(s.read_text(encoding="utf-8") if s.exists()
           else "(no STATE.md — run: hive project)")
