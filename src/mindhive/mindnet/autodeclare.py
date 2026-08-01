@@ -37,6 +37,11 @@ from . import tasks as t_mod
 # unreadable and buys nothing the description would not carry better.
 MAX_TITLE_CHARS = 90
 
+# Stamped on every auto-declared task so `hive mindnet list` distinguishes one the machine
+# created from one the operator wrote. The store is append-only, so provenance has to be
+# written at declare time — there is no later pass that could add it.
+AUTO_DESCRIPTION = "auto-declared by MindNetwork from the prompt that started this work"
+
 # Where a headline ends. First sentence, first line, or the cap — whichever comes first.
 _HEADLINE_END = re.compile(r"[.!?\n]")
 _WS = re.compile(r"\s+")
@@ -111,6 +116,56 @@ def _active_records(sidecar):
     if records is None:
         return {}                      # a real projection with nothing folded yet
     return records if isinstance(records, dict) else None
+
+
+def declare(decision, session_id=None, project=None):
+    """Append *decision* on BOTH axes. Returns the two events, or None.
+
+    Both or neither. A task on the graph axis with no phase record is the half-declared
+    state `_mn_no_record` exists to complain about, and on an append-only store you cannot
+    take the first event back — so the graph event goes first and a failure on the phase
+    event is reported, not swallowed into a half-task.
+
+    **The phase payload names no phase.** `tasks.fold` derives the entry point; naming one
+    here is the teleport MN-2 removed.
+
+    Never raises: the caller is a hook whose product is the printed context, and a
+    bookkeeping failure must not touch it."""
+    if not getattr(decision, "declare", False):
+        return None
+    try:
+        from .. import events as ev_mod
+        task_ev = ev_mod.append_event(
+            "mindnet_task",
+            {"action": "declare", "task_id": decision.task_id,
+             "title": decision.title,
+             # Provenance, so `hive mindnet list` distinguishes a machine-declared task
+             # from one the operator wrote by hand. Permanent, like everything here.
+             "description": AUTO_DESCRIPTION},
+            session_id=session_id, tags=["mindnet", "task", "auto"], project=project)
+        phase_ev = ev_mod.append_event(
+            "mindnet_phase",
+            {"action": "declare", "task_id": decision.task_id,
+             "verified_by": "python"},
+            session_id=session_id, tags=["mindnet", "phase", "auto"], project=project)
+        return task_ev, phase_ev
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def maybe_declare(prompt, sidecar, session_id=None, project=None, env=None):
+    """The whole gate: armed, then decided, then appended. Returns the events or None.
+
+    One entry point so the hook has one call and the ORDER of the gates is stated in one
+    place. The opt-in comes first deliberately — an unarmed project must not even pay the
+    decision, and more importantly must produce no trace of having considered it."""
+    try:
+        from . import optin as optin_mod
+        if not optin_mod.armed(project, env=env):
+            return None
+    except Exception:                                       # noqa: BLE001
+        return None                                         # unreadable opt-in => dormant
+    return declare(decide(prompt, sidecar), session_id=session_id, project=project)
 
 
 def decide(prompt, sidecar) -> Decision:

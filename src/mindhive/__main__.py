@@ -118,6 +118,22 @@ def cmd_hook(args) -> int | None:
         # RESOLVED would put a ledger write inside a projection rebuild.
         if spine is not None:
             promptgate.announce_faculties(mn_inject.engaged_faculties(spine))
+        # MN-18: bring a task into existence so the spine has something to speak about.
+        # Nothing else in the tree did this — `hive mindnet declare` is hand-run and
+        # `decompose` needs a parent — so the phase spine, the SOP section and the
+        # Improvements section were built and reached by no prompt.
+        #
+        # Here, in the side-effect layer, for the same reasons the two calls above are:
+        # the printed context is the product, and this must not be able to disturb it. The
+        # sidecar read above is reused rather than repeated, and there is deliberately no
+        # rebuild — that costs 0.32 s against this path's ~0.4 s budget, and the next
+        # prompt's own write would invalidate the result anyway.
+        try:
+            from .mindnet import autodeclare as mn_auto
+            mn_auto.maybe_declare(_hook_prompt(raw), spine,
+                                  session_id=_hook_session(raw))
+        except Exception:                                   # noqa: BLE001
+            pass
     return None
 
 
@@ -775,6 +791,29 @@ def _mn_stored(payload):
     except ValueError as e:
         return str(e)
     return None
+
+
+def _hook_payload(raw):
+    """The hook's stdin payload as a dict, or `{}`.
+
+    Total: the hook's own contract is that malformed input yields silence, never a raise,
+    and three call sites now need the same two fields out of it."""
+    try:
+        obj = json.loads(raw or "{}")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _hook_prompt(raw) -> str:
+    value = _hook_payload(raw).get("prompt")
+    return value if isinstance(value, str) else ""
+
+
+def _hook_session(raw):
+    """The prompt's session id, so a declare lands in the same segment as the turn that
+    caused it — the same reasoning `record_direction` documents."""
+    return _hook_payload(raw).get("session_id") or None
 
 
 def _mn_phase_event(payload, sid, project):
