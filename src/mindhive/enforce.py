@@ -190,8 +190,18 @@ def _policy_mindnet_language(tool_name, tool_input, cache=None):
         return None
     if not _mindnet_armed(cache):
         return None
-    return mn.language_violation(tool_name, tool_input,
-                                 _mindnet_sidecar(cache))
+    sc = _mindnet_sidecar(cache)
+    reason = mn.language_violation(tool_name, tool_input, sc)
+    if reason and cache is not None:
+        # Stash which task did the locking so `hook_decision` can name it in the
+        # faculty feed. Resolved here rather than re-derived up there because
+        # this is the check that actually fired, and a cat pointing at a
+        # different task than the refusal message would be worse than no cat.
+        # `locked_task` is a pure dict scan over the already-read sidecar, and
+        # it only runs on the denial path.
+        phase, task = mn.locked_task(sc)
+        cache["mn_lang"] = (getattr(task, "task_id", ""), phase)
+    return reason
 
 
 # Opt in to the shared per-call cache. An explicit flag rather than arity
@@ -220,7 +230,7 @@ POLICY_CHECKS = (
 
 
 def evaluate_policies(tool_name, tool_input, manifest=None,
-                      project=None) -> tuple | None:
+                      project=None, cache=None) -> tuple | None:
     """(signature, decision, reason) when a policy check fires, else None.
     Policies are ON unless the manifest explicitly disables them; a per-entry
     ``reason`` override wins. Fail-open like everything in this module.
@@ -234,7 +244,14 @@ def evaluate_policies(tool_name, tool_input, manifest=None,
         # so a projection several of them need is read once rather than once
         # each — and nothing survives into the next invocation, so there is no
         # staleness window.
-        cache = {"project": project}
+        #
+        # `hook_decision` passes its own dict so a fired check can hand detail
+        # back out (which task held the language lock, for the faculty feed).
+        # It stays a per-call scratchpad either way; the only change is who owns
+        # the reference.
+        if cache is None:
+            cache = {}
+        cache["project"] = project
         for pid, decision, fn in POLICY_CHECKS:
             entry = man.get(f"policy:{pid}")
             entry = entry if isinstance(entry, dict) else {}
@@ -341,6 +358,39 @@ def _record_denial(signature, tool_name, decision, reason, project) -> None:
         pass
 
 
+# The one signature whose refusals are the `compatibility` faculty's work. Named
+# rather than inlined so the string that routes the cat is the same object as the
+# string in `POLICY_CHECKS`.
+MINDNET_LANGUAGE_SIGNATURE = "gate:mindnet-language"
+
+
+def _wake_compatibility(cache, project) -> None:
+    """Record that the `compatibility` faculty acted, for MN-5's cat board.
+
+    MN-4's Open Question 3 left `compatibility` with no emit site, so its cat
+    was permanently absent from a board whose defining claim is that a missing
+    cat means a real bug — an always-missing cat makes that claim untestable.
+    The language lock IS that faculty, and this is where it finishes deciding.
+
+    Here rather than in `mindnet/enforcer.py` because a test asserts over that
+    module's own source that it imports no `events` — the structural guarantee
+    behind the latency requirement, deliberately stronger than a timing bound.
+    `telemetry.emit` appends.
+
+    `emit` alone, not `busy`: there is no block to wrap. The faculty's work is
+    the single decision that just completed, and the board's 180 s dim already
+    expresses the wind-down. `emit` never raises and the wrapper is belt-and-
+    braces on top of that — a refusal that succeeded must not be reported as
+    anything else because a cat animation could not be logged."""
+    try:
+        from .mindnet import telemetry as tel
+        task_id, phase = (cache or {}).get("mn_lang") or ("", None)
+        tel.emit(tel.FACULTY_COMPATIBILITY, tel.STATUS_ACTIVE,
+                 task_id=task_id, phase=phase, project=project)
+    except Exception:
+        pass
+
+
 def hook_decision(raw: str, project=None) -> dict:
     """Parse a PreToolUse payload (JSON on the hook's stdin) and return the hook's
     output: a deny/ask decision when a policy or matcher fires, or {} (allow)
@@ -368,8 +418,9 @@ def hook_decision(raw: str, project=None) -> dict:
             project = None
     manifest = load_manifest(project)
     decision, reason, signature = "deny", None, ""
+    cache = {}
     pol = evaluate_policies(tool_name, tool_input, manifest=manifest,
-                            project=project)
+                            project=project, cache=cache)
     if pol:
         signature, decision, reason = pol
     else:
@@ -378,6 +429,8 @@ def hook_decision(raw: str, project=None) -> dict:
     if not reason:
         return {}
     _record_denial(signature, tool_name, decision, reason, project)
+    if signature == MINDNET_LANGUAGE_SIGNATURE:
+        _wake_compatibility(cache, project)
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,

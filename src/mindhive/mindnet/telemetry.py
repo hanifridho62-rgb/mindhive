@@ -82,6 +82,15 @@ EVENT_TYPE = "mindnet_activity"
 FACULTIES = ("skill-plugin", "sop", "improvements", "history", "task-graph",
              "compatibility", "pr-green")
 
+# The one faculty with a producer outside this package: MN-4's language lock
+# emits it from `enforce.hook_decision`, which is the seam where that rule
+# finishes deciding (`enforcer.py` itself may not import `events`). Named here
+# so the cross-module caller shares this legend rather than respelling the
+# string, and asserted a member so a rename cannot leave a dangling emitter that
+# `_payload` would silently refuse.
+FACULTY_COMPATIBILITY = "compatibility"
+assert FACULTY_COMPATIBILITY in FACULTIES
+
 STATUS_ACTIVE = "active"
 STATUS_IDLE = "idle"
 STATUSES = (STATUS_ACTIVE, STATUS_IDLE)

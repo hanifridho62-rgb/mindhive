@@ -516,3 +516,122 @@ def test_the_learning_loop_does_not_ingest_our_own_denials(spine):
     enforce.hook_decision(_payload(file_path="app.js"))
     assert _denials(), "guard against a vacuous pass: the row must exist"
     assert failures._existing_failure_keys("test") == set()
+
+
+# --- R5: the compatibility cat finally wakes -----------------------------------
+#
+# MN-4's Open Question 3 left this open: "`compatibility`, `history`, and
+# `pr-green` may not have a natural [emit site] yet; those cats simply never
+# wake." For `compatibility` there was always a natural site — the language lock
+# IS that faculty — so the cat was permanently absent from a board whose defining
+# claim (R16) is that a missing cat means a real bug. An always-missing cat makes
+# that claim untestable.
+#
+# The emit lives at the `hook_decision` seam, never inside `enforcer.py`:
+# `test_the_module_does_not_import_events_at_all` asserts over that module's own
+# source that it touches no ledger, and `telemetry.emit` appends.
+
+def _activity():
+    from mindhive import events
+    from mindhive.mindnet import telemetry as tel
+    return [e for e in events.read_all() if e.type == tel.EVENT_TYPE]
+
+
+def test_a_language_denial_wakes_the_compatibility_cat(spine):
+    from mindhive.mindnet import telemetry as tel
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(file_path="app.js"))
+    rows = _activity()
+    assert len(rows) == 1
+    assert rows[0].payload["faculty"] == "compatibility"
+    assert rows[0].payload["status"] == tel.STATUS_ACTIVE
+
+
+def test_the_woken_cat_names_the_task_that_locked_the_repo(spine):
+    """A cat that cannot be joined back to a task is a light with no switch —
+    the same reason the denial message itself carries the task id."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(file_path="app.js"))
+    assert _activity()[0].payload["task_id"] == "t1"
+
+
+def test_a_shell_denial_wakes_the_cat_too(spine):
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(tool="Bash",
+                                   command="echo x > src/app.ts"))
+    assert len(_activity()) == 1
+
+
+def test_a_phase_denial_does_not_wake_the_compatibility_cat(spine):
+    """Wiring `compatibility` to every mindnet refusal would make the board lie
+    about which faculty acted — the phase spine is `task-graph`'s business."""
+    enforce.hook_decision(_payload(file_path="src/x.py"))
+    assert _activity() == []
+
+
+def test_an_allowed_write_wakes_nothing(spine):
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
+    assert _activity() == []
+
+
+def test_a_malformed_task_id_still_emits_the_event(spine):
+    """`telemetry._payload` drops decoration it cannot validate rather than
+    dropping the row. The cat must appear even when the join key does not — an
+    absent cat is read as a bug, and 'the id was malformed' is not one."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    spine["sc"].tasks["t1"].__dict__["task_id"] = "NOT A VALID ID"
+    enforce.hook_decision(_payload(file_path="app.js"))
+    rows = _activity()
+    assert len(rows) == 1
+    assert "task_id" not in rows[0].payload
+
+
+def test_the_decision_survives_a_telemetry_failure(spine, monkeypatch):
+    """A refusal that succeeded must not be reported as anything else because a
+    cat animation could not be logged — `telemetry.emit`'s own contract, held at
+    the call site too."""
+    from mindhive.mindnet import telemetry as tel
+    monkeypatch.setattr(tel, "emit", lambda *a, **kw: 1 / 0)
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    out = enforce.hook_decision(_payload(file_path="app.js"))
+    assert _decision(out) == "deny"
+    assert "Language Compatibility Lock violation" in _reason(out)
+
+
+def test_the_woken_cat_reaches_the_board(spine):
+    """End to end: the emit is only worth anything if `ui_cats` renders it. The
+    unit tests above would all pass against an event nothing displays."""
+    from mindhive import events
+    from mindhive.mindnet import telemetry as tel
+    from mindhive.mindnet import ui_cats
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(file_path="app.js"))
+    state = tel.fold(events.read_all())
+    stamp = state["compatibility"].ts
+    cats = {c["faculty"]: c for c in ui_cats.board(state, now=stamp)}
+    assert cats["compatibility"]["display"] == ui_cats.DISPLAY_ACTIVE
+    later = ui_cats.shift(stamp, ui_cats.DIM_AFTER_SECS + 1)
+    dimmed = {c["faculty"]: c for c in ui_cats.board(state, now=later)}
+    assert dimmed["compatibility"]["display"] == ui_cats.DISPLAY_DIM
+
+
+def test_the_new_cat_takes_its_canonical_slot_rather_than_arrival_order(spine):
+    """`telemetry.FACULTIES` is the one canonical order (invariant 10), and
+    `compatibility` sits sixth — after `task-graph`, before `pr-green`. A board
+    that ordered by arrival would put the newest emitter last and reshuffle
+    every time a rule fires, which is a board an operator cannot scan.
+
+    `pr-green` is emitted FIRST here on purpose: it is canonically after
+    `compatibility`, so arrival order and canonical order disagree and the
+    assertion can tell them apart."""
+    from mindhive import events
+    from mindhive.mindnet import telemetry as tel
+    from mindhive.mindnet import ui_cats
+    tel.emit("pr-green", tel.STATUS_ACTIVE)
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(file_path="app.js"))
+    state = tel.fold(events.read_all())
+    order = [c["faculty"] for c in
+             ui_cats.board(state, now=state["compatibility"].ts)]
+    assert order == ["compatibility", "pr-green"]
