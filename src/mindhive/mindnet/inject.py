@@ -428,22 +428,31 @@ def advice_block(obj) -> str:
 
 def block(sc) -> str:
     """What to inject for sidecar *sc*: the phase-specific block, the agnostic
-    one, or ``""`` for silence. See the module docstring's three outcomes."""
+    one, or ``""`` for silence. See the module docstring's three outcomes.
+
+    Advice rides BOTH branches; per-task phase direction rides only the fresh one.
+
+    That split replaces a fresh-only rule, and the narrowing is deliberate. The original
+    argument was that advice resolved against a task which has since fallen back to the
+    planning gate is a confident, wrong instruction. True — of the PHASE, which a later
+    event genuinely can change. It does not transfer to SOPs and prior-failure
+    constraints: those are resolved against the task's TEXT, and no later event can
+    invalidate them.
+
+    Withholding them bought no safety and cost the whole feature. Measured: ONE appended
+    event of any type marks the sidecar stale, and the hook itself appends on every prompt,
+    so stale is the NORMAL state — the SOP section and the Improvements section were
+    injected by no prompt at all, despite both resolvers working and being tested."""
     records = getattr(getattr(sc, "state", None), "records", None) or {}
     if not records:
         return ""
+    extra = advice_block(getattr(sc, "advice", None))
     if not getattr(sc, "fresh", False):
-        return AGNOSTIC_BLOCK
+        return f"{AGNOSTIC_BLOCK}\n{extra}" if extra else AGNOSTIC_BLOCK
     rec, task = active(sc)
     if rec is None:
         return ""
     text = phase_block(rec, task)
-    # Only reached on the fresh branch, and that placement is the point: a
-    # stale projection returns `AGNOSTIC_BLOCK` above and never gets here.
-    # Advice resolved against a task that has since fallen back to the planning
-    # gate is a confident, wrong instruction — strictly worse than silence,
-    # which is the same argument this module already makes for stale phase data.
-    extra = advice_block(getattr(sc, "advice", None))
     return f"{text}\n{extra}" if extra else text
 
 
