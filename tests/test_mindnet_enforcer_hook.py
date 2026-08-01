@@ -442,3 +442,77 @@ def test_enforce_does_not_import_mindnet_at_module_level():
             text = getattr(node, "module", "") or ""
             names = {a.name for a in node.names}
             assert "mindnet" not in text and "mindnet" not in names
+
+
+# --- R4: the mindnet gates leave ledger evidence -------------------------------
+#
+# The architecture doc names this as MN-4's job: "PreToolUse currently appends no
+# event on deny or allow, so enforcement leaves no ledger evidence — contrary to
+# SOP 1.4. MN-4 fixes this; without it, MindNetwork's own forcing would be
+# unauditable." MN-4 shipped the teeth and not the record.
+#
+# The generic contract (allow-path canary, truncation, fail-open, ask-vs-deny)
+# lives in `tests/test_enforce.py`, which owns `hook_decision`. What is asserted
+# here is the half that is specific to these two gates: that the signature in the
+# ledger is the one an operator would put in their manifest to turn the rule off.
+
+def _denials():
+    from mindhive import events
+    return [e for e in events.read_all() if e.type == "policy_denied"]
+
+
+def test_a_language_denial_names_its_signature_in_the_ledger(spine):
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(file_path="app.js"))
+    rows = _denials()
+    assert len(rows) == 1
+    assert rows[0].payload["signature"] == "gate:mindnet-language"
+    assert "Language Compatibility Lock" in rows[0].payload["reason"]
+
+
+def test_a_phase_denial_names_its_signature_in_the_ledger(spine):
+    enforce.hook_decision(_payload(file_path="src/x.py"))
+    rows = _denials()
+    assert len(rows) == 1
+    assert rows[0].payload["signature"] == "gate:mindnet-phase"
+
+
+def test_a_shell_language_denial_records_the_execute_tool(spine):
+    """The tool name is what distinguishes the surface MN-4 covered from the one
+    it deferred. Recording `Write` for a `Bash` refusal would make the shell
+    rule's usage unmeasurable."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(tool="Bash",
+                                   command="echo x > src/app.ts"))
+    assert _denials()[0].payload["tool_name"] == "Bash"
+
+
+def test_an_allowed_call_leaves_no_denial_row(spine):
+    """The canary, restated over the mindnet gates specifically: these two are
+    the ones that evaluate a sidecar on every write, so an append that leaked to
+    the allow path would land hardest here."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
+    assert _denials() == []
+
+
+def test_a_dormant_checkout_records_nothing(spine, monkeypatch):
+    """MN-6 made these policies opt-in. A dormant checkout does not deny, so it
+    must not accumulate denial rows either — an audit trail that logs refusals
+    that never happened is worse than none."""
+    monkeypatch.delenv(optin.ENV_VAR, raising=False)
+    monkeypatch.setattr(optin, "armed", lambda project=None: False)
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    assert enforce.hook_decision(_payload(file_path="app.js")) == {}
+    assert _denials() == []
+
+
+def test_the_learning_loop_does_not_ingest_our_own_denials(spine):
+    """`failures.py` eating the enforcer's output has bitten this repo before —
+    it is why `ENFORCED_MARK` exists at all (`enforce.py:186-190`). A new event
+    type is a new way in, so assert the incident reader still sees nothing."""
+    from mindhive import failures
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    enforce.hook_decision(_payload(file_path="app.js"))
+    assert _denials(), "guard against a vacuous pass: the row must exist"
+    assert failures._existing_failure_keys("test") == set()

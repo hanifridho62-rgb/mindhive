@@ -168,7 +168,7 @@ def test_policy_reason_override_wins():
     pol = enforce.evaluate_policies(
         "Bash", {"command": "rm -rf /tmp/x"},
         manifest={"policy:gate:destructive-command": {"reason": "NOPE"}})
-    assert pol == ("ask", "NOPE")
+    assert pol == ("gate:destructive-command", "ask", "NOPE")
 
 
 def test_policy_ignores_non_command_tools():
@@ -253,3 +253,128 @@ def test_hook_decision_reason_carries_enforced_mark():
     out = enforce.hook_decision(raw, project="test")
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert reason.startswith(enforce.ENFORCED_MARK)
+
+
+# --- R4: a denial leaves ledger evidence --------------------------------------
+#
+# The architecture doc lists "PreToolUse auditability" as something MN-4 fixes:
+# "PreToolUse currently appends no event on deny or allow, so enforcement leaves
+# no ledger evidence — contrary to SOP 1.4." MN-4 shipped the teeth and not the
+# audit trail, so every refusal this repo has ever issued is unreconstructable.
+#
+# The load-bearing test in this section is the ALLOW-path canary. `PreToolUse`
+# fires on every tool call; an append on the allow path would put a file write on
+# the hottest path in the system. A section that only asserted "deny writes an
+# event" would pass just as happily against an enforcer that wrote one every
+# time, so the canary comes first and is asserted over two distinct allow
+# shapes: a tool no policy inspects, and a tool every policy inspected and
+# declined.
+
+def _denials(project="test"):
+    from mindhive import events
+    return [e for e in events.read_all(project) if e.type == "policy_denied"]
+
+
+@pytest.mark.parametrize("tool,tool_input", [
+    ("Read", {"file_path": "src/x.py"}),
+    ("Bash", {"command": "pytest -q"}),
+])
+def test_an_allowed_tool_call_appends_nothing(tool, tool_input):
+    """THE canary. Delete it and the section below still passes against an
+    enforcer that appends on every call."""
+    assert enforce.hook_decision(_pre(tool, tool_input), project="test") == {}
+    assert _denials() == []
+
+
+def test_a_denial_appends_exactly_one_event():
+    enforce.hook_decision(
+        _pre("Bash", {"command": "git commit --no-verify -m 'x'"}),
+        project="test")
+    rows = _denials()
+    assert len(rows) == 1
+    payload = rows[0].payload
+    assert payload["signature"] == "gate:no-verify"
+    assert payload["tool_name"] == "Bash"
+    assert payload["decision"] == "deny"
+    assert payload["reason"]
+
+
+def test_an_ask_decision_is_recorded_as_ask():
+    """`gate:destructive-command` escalates rather than refusing. Recording it
+    as a deny would misreport how often the enforcer actually stopped work."""
+    enforce.hook_decision(_pre("Bash", {"command": "rm -rf /tmp/x"}),
+                          project="test")
+    rows = _denials()
+    assert len(rows) == 1
+    assert rows[0].payload["decision"] == "ask"
+
+
+def test_the_stored_reason_omits_the_enforced_mark():
+    """`ENFORCED_MARK` is a wire marker for the hook payload — it exists so
+    `failures.py` does not re-ingest our own refusal as a fresh incident. The
+    ledger wants the rule's own words, not the envelope."""
+    enforce.hook_decision(
+        _pre("Bash", {"command": "git commit --no-verify -m 'x'"}),
+        project="test")
+    assert enforce.ENFORCED_MARK not in _denials()[0].payload["reason"]
+
+
+def test_an_oversized_reason_is_truncated_in_the_ledger_but_not_on_the_wire():
+    """A manifest `reason` override is operator-supplied text of any length.
+    The operator must still SEE all of it; the ledger must not carry a novel
+    per denial."""
+    huge = "x" * 10_000
+    enforce.set_enabled("test", "tool:ripgrep-timeout", True)
+    man = enforce.load_manifest("test")
+    man["tool:ripgrep-timeout"] = {"enabled": True, "reason": huge}
+    enforce._write_manifest("test", man)
+    out = enforce.hook_decision(
+        _pre("Grep", {"pattern": "x"}), project="test")
+    stored = _denials()[0].payload["reason"]
+    assert len(stored) < len(huge)
+    assert huge in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_a_learned_matcher_denial_records_an_empty_signature():
+    """The matcher tier returns a reason without a signature. Recording ``""``
+    is the honest answer; inventing one would put a name in the ledger that no
+    manifest entry matches."""
+    enforce.set_enabled("test", "tool:ripgrep-timeout", True)
+    enforce.hook_decision(_pre("Grep", {"pattern": "x"}), project="test")
+    assert _denials()[0].payload["signature"] == ""
+
+
+def test_the_decision_survives_a_ledger_that_cannot_be_written(monkeypatch):
+    """Fail-open, and in the direction that matters. A full or locked ledger
+    must not turn a deny into an allow — audit is a record OF the decision, not
+    a participant in it."""
+    from mindhive import events
+
+    def boom(*a, **kw):
+        raise OSError("ledger segment is read-only")
+
+    monkeypatch.setattr(events, "append_event", boom)
+    out = enforce.hook_decision(
+        _pre("Bash", {"command": "git commit --no-verify -m 'x'"}),
+        project="test")
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "--no-verify" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_two_denials_append_two_events():
+    for _ in range(2):
+        enforce.hook_decision(
+            _pre("Bash", {"command": "git commit --no-verify -m 'x'"}),
+            project="test")
+    assert len(_denials()) == 2
+
+
+def test_policy_denied_is_a_registered_event_type():
+    """An unregistered type is rejected by the append surfaces and would make
+    the audit trail silently empty."""
+    from mindhive import events
+    assert "policy_denied" in events.VALID_TYPES
+    assert "policy_denied" not in events.SEMANTIC_TYPES, (
+        "a refusal is telemetry, not a curated memo — semantic membership would "
+        "put one LEDGER markdown file and one recall-corpus entry on disk per "
+        "denial")

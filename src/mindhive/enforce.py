@@ -221,9 +221,13 @@ POLICY_CHECKS = (
 
 def evaluate_policies(tool_name, tool_input, manifest=None,
                       project=None) -> tuple | None:
-    """(decision, reason) when a policy check fires, else None. Policies are
-    ON unless the manifest explicitly disables them; a per-entry ``reason``
-    override wins. Fail-open like everything in this module."""
+    """(signature, decision, reason) when a policy check fires, else None.
+    Policies are ON unless the manifest explicitly disables them; a per-entry
+    ``reason`` override wins. Fail-open like everything in this module.
+
+    The signature rides along because `hook_decision` records the refusal and a
+    denial that cannot name the rule that issued it is not an audit trail — the
+    operator's remedy is a manifest entry keyed by exactly this string."""
     try:
         man = manifest if manifest is not None else load_manifest(project)
         # Scoped to this one call. Checks that declare `wants_cache` share it,
@@ -240,7 +244,8 @@ def evaluate_policies(tool_name, tool_input, manifest=None,
                       if getattr(fn, "wants_cache", False)
                       else fn(tool_name, tool_input))
             if reason:
-                return decision, (entry.get("reason") or "").strip() or reason
+                return (pid, decision,
+                        (entry.get("reason") or "").strip() or reason)
     except Exception:
         return None
     return None
@@ -298,6 +303,44 @@ def evaluate(tool_name, tool_input, project=None, manifest=None) -> str | None:
 ENFORCED_MARK = "[mindhive-rule]"
 
 
+# A denial message is a paragraph, not an essay — but a manifest `reason`
+# override is operator-supplied text of any length, and the ledger must not
+# carry a novel per refusal. The operator still sees all of it: truncation is
+# applied to the STORED copy only, never to the hook payload.
+DENIAL_REASON_LIMIT = 600
+
+
+def _record_denial(signature, tool_name, decision, reason, project) -> None:
+    """Append the ledger evidence that this refusal happened.
+
+    Called on DENY ONLY (KTD5). `PreToolUse` fires on every tool call, so an
+    append on the allow path would put a file write on the hottest path in the
+    system; a refusal is rare by construction and the tool call is being blocked
+    anyway, so the write is free in practice.
+
+    Fail-open and result-discarding (KTD6). A ledger that is full, locked, or
+    missing must not turn a deny into an allow — the audit is a record OF the
+    decision, never a participant in it. Same contract `telemetry.emit` already
+    documents for itself.
+
+    The import is lazy for the reason every import in this module is: the hook
+    shim loads `enforce` in every project on every tool call, and `events` pulls
+    in the whole store.
+
+    Stored without `ENFORCED_MARK` — that marker is a wire artifact whose job is
+    keeping `failures.py` from re-ingesting our own refusal text as a fresh
+    incident. The ledger wants the rule's own words."""
+    try:
+        from . import events
+        events.append_event(
+            "policy_denied",
+            {"signature": signature or "", "tool_name": str(tool_name or ""),
+             "decision": decision, "reason": reason[:DENIAL_REASON_LIMIT]},
+            tags=["enforce", "denial"], project=project)
+    except Exception:
+        pass
+
+
 def hook_decision(raw: str, project=None) -> dict:
     """Parse a PreToolUse payload (JSON on the hook's stdin) and return the hook's
     output: a deny/ask decision when a policy or matcher fires, or {} (allow)
@@ -324,16 +367,17 @@ def hook_decision(raw: str, project=None) -> dict:
         except Exception:
             project = None
     manifest = load_manifest(project)
-    decision, reason = "deny", None
+    decision, reason, signature = "deny", None, ""
     pol = evaluate_policies(tool_name, tool_input, manifest=manifest,
                             project=project)
     if pol:
-        decision, reason = pol
+        signature, decision, reason = pol
     else:
         reason = evaluate(tool_name, tool_input, project=project,
                           manifest=manifest)
     if not reason:
         return {}
+    _record_denial(signature, tool_name, decision, reason, project)
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,

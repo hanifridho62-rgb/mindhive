@@ -95,6 +95,24 @@ DETERMINISTIC_TYPES = {
     # (MindSwarm's mission state is a plain instance attribute that dies with
     # the server).
     "mindnet_activity",
+    # One row per PreToolUse refusal — the evidence a denial ever happened.
+    # Payload {signature, tool_name, decision, reason}; `signature` is ``""``
+    # for the learned-matcher tier, which has no signature to report, and the
+    # reason is stored WITHOUT `enforce.ENFORCED_MARK` and truncated.
+    #
+    # Deterministic, and the reasoning is the same as `mindnet_activity`'s: a
+    # refusal is telemetry, not a curated memo. Semantic membership would put a
+    # LEDGER markdown file, a Memory-view row and a recall-corpus entry on disk
+    # per denial, which is how a rule an operator hits fifty times in an
+    # afternoon would drown their actual memory.
+    #
+    # Appended on DENY ONLY. `PreToolUse` fires on every tool call, so an append
+    # on the allow path would put a file write on the hottest path in the
+    # system; a denial is rare by construction and the tool call is being
+    # blocked anyway. `tests/test_enforce.py` keeps an allow-path canary on
+    # this, because every other test in that section would pass just as well
+    # against an enforcer that appended every time.
+    "policy_denied",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
