@@ -108,7 +108,19 @@ roadmap events remain the semantic record),
 for MN-5's cat board, `mindnet/telemetry.py`: faculty ∈ skill-plugin, sop,
 improvements, history, task-graph, compatibility, pr-green; status ∈ active,
 idle; `task_id`/`phase` are decoration and are dropped when malformed rather
-than losing the event).
+than losing the event),
+`policy_denied` (`{signature, tool_name, decision, reason}` — one row per
+`PreToolUse` refusal, written by `enforce.hook_decision`: `signature` is the
+`POLICY_CHECKS` id an operator would disable in the manifest, and `""` for the
+learned-matcher tier which has none; `decision` ∈ deny, ask; `reason` is stored
+**without** `ENFORCED_MARK` and truncated at `DENIAL_REASON_LIMIT` (600), while
+the hook payload still carries the full text. **Appended on deny only** —
+`PreToolUse` fires on every tool call, so an append on the allow path would put
+a file write on the hottest path in the system; `tests/test_enforce.py` keeps an
+allow-path canary because every other test in that section would pass just as
+well against an enforcer that appended every time. Fail-open and
+result-discarding: a ledger that cannot be written must not turn a deny into an
+allow).
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
@@ -269,7 +281,7 @@ returning the standard hook shape:
 | Signature | Fires when | Message opens with |
 |---|---|---|
 | `gate:mindnet-phase` | a write/execute tool while **any** `in_progress` task sits at `brainstorm`, `plan` or `prd` | `ACCESS DENIED: MindNetwork State Machine violation. You cannot write or execute code while in Phase: {phase}.` |
-| `gate:mindnet-language` | a file write whose extension falls outside a populated `language_context` | `ACCESS DENIED: Language Compatibility Lock violation. This task is strictly restricted to {languages}.` |
+| `gate:mindnet-language` | a write, **or a shell command that creates a file**, whose language falls outside a populated `language_context` | `ACCESS DENIED: Language Compatibility Lock violation. This task is strictly restricted to {languages}.` |
 
 Both are `deny` rather than `ask`: a destructive command is sometimes
 legitimate, a state-machine violation is not. Both inherit the manifest kill
@@ -312,6 +324,41 @@ reachable total deadlock that shipped green:
   Bash; denying them made the block unrecoverable without leaving the session.
   Running code (`python`, `pytest`, `node`) stays denied — that is the point of
   the rule.
+
+**The language lock reaches shell commands, but only the two shapes that create
+files.** It originally inspected write tools alone, which left the most obvious
+way an agent puts bytes on disk — `cat > src/app.ts <<EOF` — outside the rule
+entirely. MN-4 deferred the surface for a reason that still stands: classifying
+an arbitrary command's language is a parsing problem whose false positives get
+paid on every call. So the question asked is not "what language does this
+command imply" but the narrower one the lock was always asking — does this
+command put a file on disk in a forbidden language:
+
+| Shape | Example | Resolved via |
+|---|---|---|
+| Redirect / heredoc / `tee` target | `echo x > src/app.ts`, `cat > a.ts <<EOF` | `EXTENSION_LANGUAGE`, same as a write |
+| Scaffolding generator | `npx create-react-app`, `cargo new`, `go mod init` | `SCAFFOLD_LANGUAGE` |
+
+Everything else allows. `node app.js` under a Python-only task is **not** a
+violation — running a program produces no source. `SCAFFOLD_LANGUAGE` is keyed
+on a token **prefix**, not a program name, because `go mod init` scaffolds and
+`go mod tidy` does not. The redirect pattern excludes `>&`, since `2>&1` and
+`>&2` are the two most common redirects in this repo's own commands and reading
+`&1` as a filename would deny a stderr redirect. The evidence exemption and
+`EXEMPT_PROGRAMS` both apply on this path — writing a brainstorm document with
+`>` must not reopen the composition deadlock above, and `git` writes files
+constantly. **PowerShell cmdlet file creation (`Set-Content`, `Out-File`) is
+not covered**, and is asserted as a known gap rather than left assumed-covered.
+
+**Every refusal appends one `policy_denied` event** (§3), so enforcement is
+auditable per SOP 1.4 — it previously appended nothing on deny or allow, which
+made MindNetwork's own forcing unreconstructable. A **language** denial
+additionally emits `mindnet_activity` for the `compatibility` faculty, which is
+that cat's only emit site (MN-4 left it with none, so it never woke). Both
+writes live in `enforce.hook_decision`, never in `mindnet/enforcer.py` — a test
+asserts over that module's source that it imports no `events`, and both
+`append_event` and `telemetry.emit` do. A phase denial does not wake the
+compatibility cat; the phase spine is `task-graph`'s faculty.
 
 The phase block scans for **any** blocked `in_progress` task rather than
 consulting the single furthest-along one. Routing it through `inject.active`
