@@ -178,10 +178,15 @@ def _policy_mindnet_phase(tool_name, tool_input, cache=None):
 
 
 def _policy_mindnet_language(tool_name, tool_input, cache=None):
-    """MN-4's language lock: no writing a file whose extension falls outside a
-    populated ``language_context``."""
+    """MN-4's language lock: no producing a file whose extension falls outside a
+    populated ``language_context``.
+
+    Execute tools are in the prefilter because the lock now reaches the two
+    shell shapes that create files (a redirect target, a scaffolding command).
+    The predicate still declines everything else, so widening this set costs a
+    dict lookup on `Bash`, not a parse."""
     from .mindnet import enforcer as mn
-    if tool_name not in mn.WRITE_TOOLS:
+    if tool_name not in mn.WRITE_TOOLS and tool_name not in mn.EXECUTE_TOOLS:
         return None
     if not _mindnet_armed(cache):
         return None

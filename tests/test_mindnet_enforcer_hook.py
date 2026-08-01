@@ -118,6 +118,38 @@ def test_a_permitted_language_is_allowed_at_the_hook(spine):
     assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
 
 
+def test_a_shell_redirect_violation_is_denied_at_the_hook(spine):
+    """The predicate now covers execute tools, but only if the prefilter in
+    `_policy_mindnet_language` lets them reach it. That prefilter read
+    `WRITE_TOOLS` alone, so the whole shell rule would have been dead code at
+    the only layer that runs — passing unit tests over a policy that never
+    fires."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    out = enforce.hook_decision(
+        _payload(tool="Bash", command="cat > src/app.ts <<'EOF'\nx\nEOF"))
+    assert _decision(out) == "deny"
+    assert "Language Compatibility Lock violation" in _reason(out)
+    assert enforce.ENFORCED_MARK in _reason(out)
+
+
+def test_a_harmless_shell_command_is_allowed_at_the_hook(spine):
+    """`Bash` is the most-called tool in the system. The sibling that keeps the
+    test above from being satisfied by an enforcer that denies every command."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    assert enforce.hook_decision(_payload(tool="Bash",
+                                          command="pytest -q")) == {}
+
+
+def test_the_kill_switch_reaches_the_shell_path_too(spine, monkeypatch):
+    """A rule that can refuse shell commands needs its off switch to work on
+    them — the manifest entry is the operator's documented remedy."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    monkeypatch.setattr(enforce, "load_manifest", lambda project=None: {
+        "policy:gate:mindnet-language": {"enabled": False}})
+    assert enforce.hook_decision(
+        _payload(tool="Bash", command="echo x > src/app.ts")) == {}
+
+
 def test_the_evidence_directory_exemption_survives_the_wiring(spine):
     """The anti-deadlock guard has to hold at the hook, not just in the
     predicate — this is the path that actually runs."""

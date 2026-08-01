@@ -13,6 +13,16 @@ Everything before this unit is advisory. `inject.py` tells the agent it is in
    populated ``language_context``. The field has existed on `Task` since MN-2
    ("permitted languages (R13, read by MN-4)") and nothing has ever read it.
 
+The language lock originally inspected write tools only, which left the most
+obvious way an agent puts bytes on disk — a redirect or a heredoc — outside the
+rule entirely. It now covers execute tools too, but ONLY through two shapes that
+create files: a redirect/`tee` target, and a small closed table of scaffolding
+generators. Running a program still produces no source and is still allowed.
+The deferral's reason was never "shell commands don't matter", it was that
+classifying an arbitrary command's language is a parsing problem with a
+false-positive cost on every call — and that reason bounds the rule instead of
+being overturned by it.
+
 Rule 1 can make a repository unwritable. Three guards keep that from happening,
 and each one is the answer to a specific way this goes wrong in production:
 
@@ -100,6 +110,40 @@ EXTENSION_LANGUAGE = {
     ".sql": "sql",
     ".html": "html", ".css": "css", ".scss": "css",
 }
+
+# Commands whose PURPOSE is generating a source tree, keyed by a token prefix.
+#
+# The lock asks "does this put a file on disk in a forbidden language". A
+# scaffolder answers yes without any path ever appearing in the tool call, so
+# the extension table cannot see it. Matching is on a token PREFIX rather than
+# the program alone, and that is the whole reason this is a table of tuples:
+# `go mod init` creates a module, `go mod tidy` edits one that exists, and a
+# program-keyed rule would deny both.
+#
+# Deliberately tiny. Anything absent is unmapped, and unmapped never denies —
+# the same failure direction `EXTENSION_LANGUAGE` errs in.
+SCAFFOLD_LANGUAGE = {
+    ("npx", "create-react-app"): "javascript",
+    ("npm", "init"): "javascript",
+    ("yarn", "create"): "javascript",
+    ("pnpm", "create"): "javascript",
+    ("cargo", "new"): "rust",
+    ("cargo", "init"): "rust",
+    ("go", "mod", "init"): "go",
+    ("rails", "new"): "ruby",
+}
+
+# An output redirect and its target. `\d?>>?` covers `>`, `>>` and `2>`; the
+# `(?!&)` is load-bearing rather than defensive — `2>&1` and `>&2` are the two
+# most common redirects in this repo's own commands, and a pattern that read
+# `&1` as a filename would deny a stderr redirect. Quotes are captured and
+# stripped by the caller rather than excluded, so `> "src/app ts.ts"` is seen
+# instead of silently missed.
+_REDIRECT_RE = re.compile(r"\d?>>?\s*(?!&)([^\s;&|<>()]+)")
+
+# `tee` is a redirect wearing a different hat: it is how a pipeline writes a
+# file. `-a` is the append form.
+_TEE_RE = re.compile(r"(?:^|[\s;&|])tee\s+(?:-a\s+)?([^\s;&|<>()]+)")
 
 # Programs the phase block must NEVER deny, because they are how the block is
 # escaped. `hive` is the state machine's own control surface — the injected
@@ -333,6 +377,49 @@ def _program(command) -> str:
     return posixpath.basename(head[0].replace("\\", "/")).lower()
 
 
+def _tokens(command) -> list:
+    """*command* as lowercased tokens with the program basenamed, or ``[]``.
+
+    Whitespace splitting, not `shlex` — a heredoc body or an unbalanced quote
+    makes `shlex.split` raise, and this runs on a path that must be total."""
+    if not isinstance(command, str) or not command.strip():
+        return []
+    toks = [t.lower() for t in command.split()]
+    toks[0] = posixpath.basename(toks[0].replace("\\", "/"))
+    return toks
+
+
+def _scaffold_language(command) -> str | None:
+    """The language a scaffolding command would generate, or ``None``."""
+    toks = _tokens(command)
+    if not toks:
+        return None
+    for key, lang in SCAFFOLD_LANGUAGE.items():
+        if tuple(toks[:len(key)]) == key:
+            return lang
+    return None
+
+
+def _redirect_targets(command) -> tuple:
+    """Every path *command* would write through a redirect or `tee`.
+
+    Crude on purpose, and in the safe direction: it feeds a DENY, so a shape it
+    fails to recognise is a bypass this iteration misses, while a token it
+    wrongly reads as a path is a refusal the operator did not earn. Missing is
+    recoverable; a false refusal on an execute tool is the false-positive cost
+    MN-4 declined to pay. Every candidate still has to survive the extension
+    table afterwards, where unmapped allows."""
+    if not isinstance(command, str) or not command.strip():
+        return ()
+    out = []
+    for rx in (_REDIRECT_RE, _TEE_RE):
+        for match in rx.finditer(command):
+            token = match.group(1).strip("'\"")
+            if token:
+                out.append(token)
+    return tuple(out)
+
+
 def _file_path(tool_input):
     obj = tool_input if isinstance(tool_input, dict) else {}
     for key in ("file_path", "path", "notebook_path"):
@@ -378,14 +465,52 @@ def phase_violation(tool_name, tool_input, sc) -> str | None:
         return None
 
 
+def _path_language_violation(phase, path, allowed) -> bool:
+    """Whether writing *path* would breach *allowed*. One resolution of "what
+    language is this file", shared by both tool classes (invariant 10)."""
+    if not path:
+        return False
+    # The evidence exemption has to hold across BOTH rules. It did not: every
+    # planning phase is cleared by a markdown document, `.md` maps to
+    # `markdown`, and so any language_context that did not literally list
+    # `markdown` made all three planning gates unclearable — the phase rule
+    # correctly waved the document through and this rule denied it one check
+    # later. Two guards, each individually sound, composing into the deadlock
+    # both were written to prevent. Writing that same document with `>` instead
+    # of `Write` must not reopen it, which is why this sits below the split
+    # rather than in the write branch.
+    if is_phase_evidence(phase, path):
+        return False
+    # Trailing dots, trailing spaces and `::$DATA` are stripped by Windows when
+    # the file is actually created, so `app.ts.` writes `app.ts`. Parse the name
+    # Windows will use, not the one we were handed.
+    base = _ADS_RE.sub("", posixpath.basename(_norm(path)))
+    ext = posixpath.splitext(base.rstrip(". "))[1].lower()
+    lang = EXTENSION_LANGUAGE.get(ext)
+    # Unmapped is not a violation — the table is finite, the file types a
+    # repository contains are not.
+    return lang is not None and lang not in allowed
+
+
 def language_violation(tool_name, tool_input, sc) -> str | None:
     """The refusal reason for a language-lock violation, or ``None`` to allow.
 
-    Writes only — inferring a language from an arbitrary shell command is a
-    parsing problem whose false positives would be paid on every command, and
-    the plan defers it deliberately rather than guessing."""
+    MN-4 shipped this over write tools only, and deferred shell commands with a
+    reason that still stands: inferring a language from an arbitrary command is
+    a parsing problem whose false positives would be paid on every call. That
+    reason bounds this rather than being overturned by it. The question asked
+    here is not "what language does this command imply" — it is the narrower,
+    decidable one the lock was always asking: does this command PUT A FILE ON
+    DISK in a forbidden language. Two shapes answer it, a redirect target and a
+    scaffolding generator, and everything else allows.
+
+    So `node app.js` stays allowed under a Python-only context — running a
+    program produces no source — while `cat > src/app.ts <<EOF` does not, which
+    is the same bytes on disk that a `Write` would have been refused for.
+
+    Total: any fault answers ``None``."""
     try:
-        if tool_name not in WRITE_TOOLS:
+        if tool_name not in WRITE_TOOLS and tool_name not in EXECUTE_TOOLS:
             return None
         phase, task = locked_task(sc)
         if task is None:
@@ -394,29 +519,27 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
                    for x in getattr(task, "language_context", ()) or ()}
         if not allowed:
             return None
-        path = _file_path(tool_input)
-        if not path:
-            return None
-        # The evidence exemption has to hold across BOTH rules. It did not:
-        # every planning phase is cleared by a markdown document, `.md` maps to
-        # `markdown`, and so any language_context that did not literally list
-        # `markdown` made all three planning gates unclearable — the phase rule
-        # correctly waved the document through and this rule denied it one
-        # check later. Two guards, each individually sound, composing into the
-        # deadlock both were written to prevent.
-        if is_phase_evidence(phase, path):
-            return None
-        # Trailing dots, trailing spaces and `::$DATA` are stripped by Windows
-        # when the file is actually created, so `app.ts.` writes `app.ts`.
-        # Parse the name Windows will use, not the one we were handed.
-        base = _ADS_RE.sub("", posixpath.basename(_norm(path)))
-        ext = posixpath.splitext(base.rstrip(". "))[1].lower()
-        lang = EXTENSION_LANGUAGE.get(ext)
-        # Unmapped is not a violation — the table is finite, the file types a
-        # repository contains are not.
-        if lang is None or lang in allowed:
-            return None
-        return LANGUAGE_DENIAL.format(languages=", ".join(sorted(allowed)),
-                                      task_id=getattr(task, "task_id", "?"))
+        obj = tool_input if isinstance(tool_input, dict) else {}
+        if tool_name in WRITE_TOOLS:
+            paths, scaffold = (_file_path(obj),), None
+        else:
+            command = obj.get("command")
+            # The escape hatch has to survive BOTH rules for the same reason it
+            # exists at all: every documented way out of an enforcement state —
+            # `hive mindnet satisfy`, `hive rules enforce --disable`, the
+            # mandatory `hive log` — runs through Bash. `git` additionally
+            # writes files constantly, and a rule that refused `git checkout`
+            # over a `.ts` path in the command text would be unrecoverable from
+            # inside a session.
+            if _program(command) in EXEMPT_PROGRAMS:
+                return None
+            paths, scaffold = _redirect_targets(command), \
+                _scaffold_language(command)
+        if (scaffold is not None and scaffold not in allowed) or \
+                any(_path_language_violation(phase, p, allowed) for p in paths):
+            return LANGUAGE_DENIAL.format(
+                languages=", ".join(sorted(allowed)),
+                task_id=getattr(task, "task_id", "?"))
+        return None
     except Exception:
         return None
