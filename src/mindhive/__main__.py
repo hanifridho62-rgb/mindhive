@@ -84,7 +84,7 @@ def cmd_hook(args) -> int | None:
         # prompt enrichment is enabled (the default), the fired context also
         # carries the clarifying questions (see enrich.extend_hook_context —
         # additive, sidecar-only read, fail-open).
-        from . import enrich, promptgate
+        from . import enrich, promptgate, style
         from .mindnet import inject as mn_inject
         context = promptgate.hook_context(raw)
         if context:
@@ -103,6 +103,13 @@ def cmd_hook(args) -> int | None:
         except Exception:                                   # noqa: BLE001
             spine = None
         context = mn_inject.extend_hook_context(context, raw, sc=spine)
+        # The standing reply-style pass: caveman by default, normal prose when
+        # the prompt asks to be taught. Unconditional on human-typed prompts for
+        # the same reason the spine above is — a style that only re-asserts
+        # itself when some other subsystem happened to speak is not a standing
+        # style. It runs LAST so it prepends to whatever the earlier passes
+        # produced, and it is the one pass that creates the context from nothing.
+        context = style.extend_hook_context(context, raw)
         if context:
             print(json.dumps(context))
         # Durable causal trace: record which skills the gate directed so Oversee

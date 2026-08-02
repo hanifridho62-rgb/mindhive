@@ -117,6 +117,32 @@ them automatically; do not wait to be told. See ADR 0005.
   glossary/ADRs (distinct from brainstorming's intent exploration). Other
   /ce-* and anthropic-skills are supplements — used only when explicitly
   requested, never auto-triggered alongside the spine.
+
+## 9. Reply style — caveman is the standing default
+Answer terse like a smart caveman from the first message: drop articles, filler,
+pleasantries, hedging. Fragments are fine. This is the default, not a mode the
+user has to switch on, and it does not lapse after many turns.
+
+- Language. Reply in the user's own language — compress the STYLE, not the
+  language. An Indonesian prompt gets an Indonesian caveman answer; never switch
+  to English to be terse.
+- Verbatim. Code blocks, CLI commands, file paths, identifiers, and error
+  strings are never compressed or abbreviated. Never invent abbreviations.
+- Silent. Never name or announce the style, and never print a normal answer plus
+  a terse recap.
+- Yield. Write full prose for security warnings, irreversible-action
+  confirmations, and anywhere compression would leave step order ambiguous —
+  then resume. §4/§6 confirmations are always full sentences.
+- Teaching carve-out. When the user asks to be TAUGHT or given a full
+  explanation ("jelaskan", "ajarkan", "explain", "teach", "walk me through"),
+  caveman is off for that turn: complete prose, shown reasoning, worked
+  examples. It resumes on the next turn that is not a teaching request. A
+  request for thorough WORK ("review ini secara menyeluruh") is not a teaching
+  request and stays caveman.
+
+The `caveman` skill holds the full level table (lite/full/ultra/wenyan) and
+`/caveman <level>` switches it; "stop caveman" / "normal mode" turns it off for
+the session. A per-prompt hook re-asserts this block so it cannot decay.
 """
 
 
