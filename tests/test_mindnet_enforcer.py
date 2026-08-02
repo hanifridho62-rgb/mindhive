@@ -885,12 +885,37 @@ def test_an_indented_fragment_is_a_violation_which_is_why_edit_is_excluded():
     assert enf.python_syntax_violation("    return a + b") is True
 
 
-def test_the_syntax_denial_is_the_mandated_message_verbatim():
-    assert enf.SYNTAX_DENIAL == (
+def test_the_syntax_denial_opens_with_the_mandated_message_verbatim():
+    """The externally-fixed half of the contract, pinned byte-for-byte."""
+    assert enf.SYNTAX_DENIAL_SENTENCE == (
         "ACCESS DENIED: Language Compatibility Lock Violation. The provided "
         "code contains alien syntax or spaghetti code that is not valid "
         "Python. You are strictly forbidden from writing non-compilable "
         "syntax.")
+    assert enf.SYNTAX_DENIAL.startswith(enf.SYNTAX_DENIAL_SENTENCE)
+
+
+def test_the_syntax_denial_names_the_task_and_a_way_out():
+    """The rule stated above `PHASE_DENIAL`: a refusal an operator cannot act
+    on is an outage. This denial shipped as the mandated sentence ALONE, which
+    named neither the task that froze the write nor any remedy — the only
+    message in the module you could not act on. The mandated text is a floor,
+    not a ceiling, and both siblings continue past their opening sentence for
+    exactly this reason."""
+    reason = enf.SYNTAX_DENIAL.format(task_id="t1")
+    assert "(task 't1')" in reason
+    assert "hive rules enforce --disable" in reason
+    assert "MINDNETWORK_ENFORCE=0" in reason
+
+
+@pytest.mark.parametrize("template", ["PHASE_DENIAL", "LANGUAGE_DENIAL",
+                                      "SYNTAX_DENIAL"])
+def test_every_denial_in_this_module_names_a_way_out(template):
+    """Enumerated over the module's own constants so a denial added later
+    without a remedy fails here rather than in a frozen session."""
+    text = getattr(enf, template)
+    assert "{task_id}" in text, f"{template} does not name the task"
+    assert "enforce --disable" in text, f"{template} offers no way out"
 
 
 def test_the_two_denials_are_distinct_messages():
@@ -899,8 +924,8 @@ def test_the_two_denials_are_distinct_messages():
     A tidy-up that collapses them into one string would give wrong advice for
     one of the two failures."""
     assert enf.SYNTAX_DENIAL != enf.LANGUAGE_DENIAL
-    assert "language_context" in enf.LANGUAGE_DENIAL
-    assert "language_context" not in enf.SYNTAX_DENIAL
+    assert "widen the task's language_context" in enf.LANGUAGE_DENIAL
+    assert "widen the task's language_context" not in enf.SYNTAX_DENIAL
 
 
 # --- MN-8a U2: the content check inside the real predicate --------------------------
@@ -917,7 +942,7 @@ def test_a_python_file_full_of_javascript_is_denied():
     reason = enf.language_violation(
         "Write", {"file_path": "src/x.py", "content": JS_BODY},
         _sc(langs=("python",)))
-    assert reason == enf.SYNTAX_DENIAL
+    assert reason == enf.SYNTAX_DENIAL.format(task_id="t1")
 
 
 def test_a_python_file_full_of_python_is_allowed():
@@ -1029,4 +1054,4 @@ def test_windows_path_suffixes_cannot_smuggle_alien_syntax_past(path):
     the extension rule already carries."""
     assert enf.language_violation(
         "Write", {"file_path": path, "content": JS_BODY},
-        _sc(langs=("python",))) == enf.SYNTAX_DENIAL
+        _sc(langs=("python",))) == enf.SYNTAX_DENIAL.format(task_id="t1")

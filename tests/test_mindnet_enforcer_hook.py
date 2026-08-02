@@ -163,8 +163,10 @@ def test_an_edit_fragment_is_not_denied_at_the_hook(spine):
 
 
 def enf_syntax_denial():
+    """The fixed opening SENTENCE, not the template — the full constant carries
+    a `{task_id}` placeholder the hook has already substituted by this point."""
     from mindhive.mindnet import enforcer
-    return enforcer.SYNTAX_DENIAL
+    return enforcer.SYNTAX_DENIAL_SENTENCE
 
 
 def test_a_shell_redirect_violation_is_denied_at_the_hook(spine):

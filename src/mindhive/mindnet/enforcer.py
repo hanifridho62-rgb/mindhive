@@ -240,10 +240,25 @@ LANGUAGE_DENIAL = (
 # widen `language_context` — is correct there and useless here: widening the
 # context does not make invalid code compile. Collapsing them into one string
 # would hand the operator the wrong instruction for one of the two failures.
-SYNTAX_DENIAL = (
+# Split in two because the opening sentence is a fixed external contract and the
+# continuation is this repo's own rule. `SYNTAX_DENIAL_SENTENCE` is pinned
+# verbatim by a test; the rest is the "name the task and the way out" clause
+# every denial here carries, for the reason stated above `PHASE_DENIAL` — a
+# refusal an operator cannot act on is an outage. The first draft of this
+# constant was the sentence alone, which named neither the task nor a remedy
+# and would have been the only denial in the module an operator could not act
+# on.
+SYNTAX_DENIAL_SENTENCE = (
     "ACCESS DENIED: Language Compatibility Lock Violation. The provided code "
     "contains alien syntax or spaghetti code that is not valid Python. You "
     "are strictly forbidden from writing non-compilable syntax.")
+SYNTAX_DENIAL = (
+    SYNTAX_DENIAL_SENTENCE
+    + " (task '{task_id}') Fix the syntax, write the file with `Edit` if this "
+      "is a fragment rather than a whole file, or turn enforcement off: "
+      "`hive mindnet enforce --disable`  ·  "
+      "`MINDNETWORK_ENFORCE=0`  ·  or just this rule: "
+      "`hive rules enforce --disable policy:gate:mindnet-language`.")
 
 # A drive letter is exactly one alpha character followed by a colon. The
 # original test — `text[1] == ":"` — also matched `a:docs/plans/x.md`, a
@@ -789,7 +804,8 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
         # checked by the rule above.
         if tool_name == "Write" and _python_content_violation(phase, obj,
                                                               allowed):
-            return SYNTAX_DENIAL
+            return SYNTAX_DENIAL.format(
+                task_id=getattr(task, "task_id", "?"))
         return None
     except Exception:
         return None
