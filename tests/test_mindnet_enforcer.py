@@ -707,7 +707,7 @@ def test_every_phase_is_classified(phase):
     'python -c "print(1 > 0)"',
 ])
 def test_an_arrow_or_a_quoted_angle_bracket_is_not_a_redirect(command):
-    """`->` is not a redirect and `grep` writes nothing. The first version denied
+    r"""`->` is not a redirect and `grep` writes nothing. The first version denied
     both: `\d?>>?` matched the `>` in `->` and read the next token as a
     filename, so a read-only grep whose PATTERN mentioned a `.md` file was
     refused. Quoting is the other half — a `>` inside a quoted string is data,
