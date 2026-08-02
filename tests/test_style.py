@@ -138,6 +138,91 @@ def test_long_prompt_is_scanned_but_bounded():
     assert not style.wants_teaching("y " * PROMPT_SCAN_CAP + " jelaskan ini")
 
 
+# --- sticky teaching mode -------------------------------------------------------
+#
+# A thorough lesson is never one turn. The memoryless matcher answered "not a
+# teaching request" for the follow-up that continues it, so the lesson collapsed
+# back to fragments at exactly the moment it was being extended.
+
+def _seq(session, *prompts):
+    """Drive prompts through one session in order; return the mode of each."""
+    return [style.resolve_mode(p, session) for p in prompts]
+
+
+def test_a_lesson_survives_indonesian_follow_ups():
+    assert _seq("s", "ajarkan saya cara kerja event store",
+                     "lanjutkan",
+                     "terus, bagian projector") == [style.MODE_TEACH] * 3
+
+
+def test_a_lesson_survives_english_follow_ups():
+    assert _seq("s", "teach me how the event store works",
+                     "continue",
+                     "go on") == [style.MODE_TEACH] * 3
+
+
+def test_a_substantive_new_question_ends_the_lesson():
+    assert _seq("s", "ajarkan saya event store",
+                     "perbaiki bug di dashboard") == [style.MODE_TEACH,
+                                                      style.MODE_CAVEMAN]
+
+
+def test_the_mode_does_not_latch_once_the_lesson_ended():
+    # The failure this guards is worse than the bug it replaced: an essay for
+    # every remaining turn of the session.
+    _seq("s", "ajarkan saya event store", "perbaiki bug di dashboard")
+    assert style.resolve_mode("lanjutkan", "s") == style.MODE_CAVEMAN
+
+
+def test_sessions_do_not_share_a_mode():
+    style.resolve_mode("ajarkan saya event store", "a")
+    assert style.resolve_mode("lanjutkan", "b") == style.MODE_CAVEMAN
+
+
+def test_a_continuation_as_the_very_first_prompt_is_not_a_lesson():
+    assert style.resolve_mode("lanjutkan", "cold") == style.MODE_CAVEMAN
+
+
+def test_a_long_prompt_that_merely_contains_a_marker_is_not_a_continuation():
+    # "next" leading a substantive request must not extend a stale lesson.
+    style.resolve_mode("ajarkan saya event store", "s")
+    long_one = ("next we need to migrate the projector to the new schema and "
+                "backfill every namespace before the release")
+    assert style.resolve_mode(long_one, "s") == style.MODE_CAVEMAN
+
+
+def test_without_a_session_id_behaviour_stays_memoryless():
+    style.resolve_mode("ajarkan saya event store", None)
+    assert style.resolve_mode("lanjutkan", None) == style.MODE_CAVEMAN
+
+
+def test_a_corrupt_sidecar_fails_open_to_caveman():
+    style.resolve_mode("ajarkan saya event store", "s")
+    style._mode_path().write_text("{not json", encoding="utf-8")
+    assert style.resolve_mode("lanjutkan", "s") == style.MODE_CAVEMAN
+
+
+def test_resolve_mode_never_reads_the_ledger(monkeypatch):
+    # R5. This runs on every prompt; a ledger read would drag the whole event
+    # log onto the hook's critical path.
+    from mindhive import events
+
+    def boom(*a, **kw):
+        raise AssertionError("resolve_mode read the ledger")
+
+    monkeypatch.setattr(events, "read_all", boom)
+    assert _seq("s", "ajarkan saya X", "lanjutkan") == [style.MODE_TEACH] * 2
+
+
+def test_injected_text_mid_lesson_neither_ends_nor_extends_it():
+    # A task notification arriving between two turns of a lesson is not the user
+    # speaking, so it must not clear the mode.
+    style.resolve_mode("ajarkan saya event store", "s")
+    assert style.block_for("<task-notification>done</task-notification>",
+                           "s") == ""
+    assert style.resolve_mode("lanjutkan", "s") == style.MODE_TEACH
+
+
 # --- hook composition ---------------------------------------------------------------
 
 def test_extend_creates_context_when_the_gate_stayed_silent():
@@ -203,6 +288,18 @@ def test_cli_swaps_in_teaching_mode_in_both_languages(monkeypatch, capsys):
         out = capsys.readouterr().out
         assert "teaching mode" in out.lower(), prompt
         assert "caveman, standing default" not in out, prompt
+
+
+def test_cli_keeps_the_lesson_across_turns(monkeypatch, capsys):
+    # The end-to-end proof of the multi-turn fix: same session_id, teach verb
+    # only on the first turn, prose on all three.
+    for prompt in ("ajarkan saya cara kerja event store", "lanjutkan",
+                   "terus, bagian projector"):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(
+            json.dumps({"prompt": prompt, "session_id": "lesson-1"})))
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+        assert cli.main(["hook", "user_prompt_submit"]) == 0
+        assert "teaching mode" in capsys.readouterr().out.lower(), prompt
 
 
 def test_cli_stays_silent_for_machine_injected_text(monkeypatch, capsys):

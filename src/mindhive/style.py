@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import re
 
+from . import paths
 from .promptgate import PROMPT_SCAN_CAP
 
 # Marker so an injected style block is greppable in a transcript and tellable
@@ -123,14 +124,117 @@ def wants_teaching(text) -> bool:
     return any(rx.search(low) for rx in _TEACH_RES)
 
 
-def block_for(text) -> str:
+MODE_CAVEMAN = "caveman"
+MODE_TEACH = "teach"
+
+# A continuation prompt LEADS with a continuation marker and is short. Both
+# halves carry weight: the `^` anchor keeps "...and then refactor the parser"
+# from reading as a continuation, and the length bound keeps a substantive
+# request that merely opens with "next" from reviving a lesson the user left.
+CONTINUATION_MAX_WORDS = 6
+
+_CONTINUATION_RES = (
+    re.compile(r"^(?:lanjut|lanjutkan|teruskan|terus|lagi|berikutnya|"
+               r"selanjutnya|sambung|sambungkan)\b"),
+    re.compile(r"^(?:continue|carry on|go on|keep going|next|more|"
+               r"and then|then|go ahead)\b"),
+)
+
+
+def is_continuation(text) -> bool:
+    """True for a short prompt whose whole content is "keep going"."""
+    if _is_injected(text):
+        return False
+    low = " ".join(str(text or "").lower().split())
+    if len(low.split()) > CONTINUATION_MAX_WORDS:
+        return False
+    return any(rx.search(low) for rx in _CONTINUATION_RES)
+
+
+def _mode_path(project=None):
+    """Per-session reply-mode sidecar.
+
+    Mode is derived, ephemeral, per-session state, so it lives in an
+    overwrite-in-place JSON sidecar and never in the ledger — the same call
+    `plugins._catalog_path` makes, for the same reason. The ledger is
+    append-only and hash-chained; a row per prompt would bloat the chain
+    forever with nothing prunable, since pruning would break the chain.
+
+    Self-pruning in normal use: an entry exists only while a session sits
+    mid-lesson, and the next substantive prompt deletes it. Only a session
+    abandoned mid-lesson leaves one behind."""
+    return paths.project_dir(project) / "style_mode.json"
+
+
+def _read_modes(project=None) -> dict:
+    """The sidecar as a dict, or `{}` for missing, unreadable, or corrupt.
+
+    Forgetting the mode is always a safe failure: the user gets the standing
+    caveman style, which is the default they asked for anyway."""
+    try:
+        p = _mode_path(project)
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _write_modes(modes, project=None) -> None:
+    try:
+        paths.write_text_atomic(_mode_path(project), json.dumps(modes))
+    except Exception:                                       # noqa: BLE001
+        pass                            # a style pass never breaks a prompt
+
+
+def resolve_mode(text, session_id=None, project=None) -> str:
+    """The reply mode for this turn — `MODE_TEACH` or `MODE_CAVEMAN`.
+
+    A thorough lesson is never one turn, so teaching mode is sticky. Three
+    transitions, checked in order:
+
+    1. a teach/explain verb starts (or restarts) a lesson;
+    2. a continuation prompt inside a live lesson keeps it alive;
+    3. anything else ends it.
+
+    Rule 3 is what stops the mode latching for the rest of the session: it
+    expires on the next real question, with no timeout to tune and no exit
+    command for the user to remember. Without a `session_id` there is nowhere
+    to keep state, so behaviour degrades to the memoryless original rather than
+    sharing one global mode across every session.
+
+    Reads and writes only the sidecar — never the ledger. This runs on every
+    prompt."""
+    if wants_teaching(text):
+        if session_id:
+            modes = _read_modes(project)
+            modes[str(session_id)] = MODE_TEACH
+            _write_modes(modes, project)
+        return MODE_TEACH
+    if not session_id:
+        return MODE_CAVEMAN
+    key = str(session_id)
+    modes = _read_modes(project)
+    if is_continuation(text) and modes.get(key) == MODE_TEACH:
+        return MODE_TEACH
+    if key in modes:                                        # the lesson is over
+        modes.pop(key)
+        _write_modes(modes, project)
+    return MODE_CAVEMAN
+
+
+def block_for(text, session_id=None, project=None) -> str:
     """The style directive for one prompt: teaching mode, or the caveman default.
 
     Empty string for machine-injected text — a task notification has no reply
-    style to set, and spending context on one every time would be pure waste."""
+    style to set, and spending context on one every time would be pure waste.
+    Injected text also short-circuits before `resolve_mode`, so a notification
+    arriving mid-lesson neither ends nor extends it."""
     if _is_injected(text):
         return ""
-    return TEACH_BLOCK if wants_teaching(text) else CAVEMAN_BLOCK
+    return (TEACH_BLOCK if resolve_mode(text, session_id, project) == MODE_TEACH
+            else CAVEMAN_BLOCK)
 
 
 def extend_hook_context(context, raw, project=None) -> dict:
@@ -148,7 +252,8 @@ def extend_hook_context(context, raw, project=None) -> dict:
         payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             return context
-        block = block_for(payload.get("prompt", ""))
+        block = block_for(payload.get("prompt", ""),
+                          payload.get("session_id"), project)
         if not block:
             return context
         hso = (context or {}).get("hookSpecificOutput") or {}
