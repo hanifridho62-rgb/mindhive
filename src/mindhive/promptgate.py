@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 from . import paths
 
@@ -607,31 +608,106 @@ def catalog_block(prompt, manifest, exclude=()):
     return text, [entry]
 
 
+# How often a turn re-asserts the faculties it lit. Must stay below
+# `ui_cats.DIM_AFTER_SECS` or the cat greys out between beats, which is the defect
+# the beat exists to prevent; a test pins the relationship rather than restating
+# the number here (invariant 10).
+FACULTY_BEAT_SECS = 60
+
+
+def _beat_path(project=None):
+    """The turn's beat marker. Its CONTENT is what was lit; its MTIME is the
+    throttle clock.
+
+    A file, not a module global, because every hook invocation is a fresh process
+    — `mindhive hook post_tool_use` starts, runs, and exits per tool call — so an
+    in-memory timestamp would reset every time and beat on every call. Derived
+    state, so it lives beside the other sidecars rather than in the append-only
+    chain."""
+    return paths.project_dir(project) / "faculty_beat.json"
+
+
 def announce_faculties(faculties, project=None, session_id=None) -> int:
-    """Report each faculty in *faculties* as having woken and finished. Returns the
-    number of pairs written.
+    """Light each faculty in *faculties*. Returns how many rows landed.
 
-    An `active` row and an `idle` row together, not a `busy` block, because by the time
-    this is called the work is done — the prompt's block has already been rendered and
-    printed. `ui_cats` hides an idle faculty once its 15-second flicker grace passes, so
-    the pair is exactly what makes the cat appear and then vanish, which is the behaviour
-    that was asked for ("ketika tidak sedang berjalan maka kucing akan menghilang").
+    `active` ONLY — no paired `idle`, and that is the fix rather than an omission.
+    This used to write both in the same second, and `ui_cats` hides an idle faculty
+    once its 15-second flicker grace passes, so a faculty that genuinely engaged was
+    visible for at most fifteen seconds after the work was already over. The board
+    reported every turn in the past tense.
 
-    Never raises. A cat animation that cannot be logged must not disturb the prompt —
-    the same contract `telemetry.emit` and `record_direction` already keep."""
+    Nothing writes the closing `idle` now. There is no turn-end hook registered, so
+    a settle would need a signal that does not exist — and a settle that fails to run
+    is precisely how a cat gets stranded lit, which `ui_cats` is explicit is worse
+    than a missing one. Silence dims the cat on the board's own schedule and means
+    exactly what the dim band has always meant: said active, then went quiet.
+    `beat_faculties` is what keeps a long turn out of that band.
+
+    Never raises. A cat that cannot be logged must not disturb the prompt — the same
+    contract `telemetry.emit` and `record_direction` already keep."""
     from .mindnet import telemetry as tel_mod
-    written = 0
+    lit, written = [], 0
     for faculty in sorted(faculties or ()):
         try:
             if tel_mod.emit(faculty, tel_mod.STATUS_ACTIVE, project=project,
                             session_id=session_id) is None:
                 continue
-            tel_mod.emit(faculty, tel_mod.STATUS_IDLE, project=project,
-                         session_id=session_id)
+            lit.append(faculty)
             written += 1
         except Exception:                                   # noqa: BLE001
             continue
+    if lit:
+        # Best-effort and AFTER the rows: the rows are the product, the marker only
+        # sustains them. An unwritable sidecar costs the heartbeat, never the cat.
+        try:
+            path = _beat_path(project)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"faculties": lit,
+                                        "session_id": session_id or ""}),
+                            encoding="utf-8")
+        except Exception:                                   # noqa: BLE001
+            pass
     return written
+
+
+def beat_faculties(project=None, session_id=None) -> int:
+    """Re-assert the faculties this turn lit, at most once per `FACULTY_BEAT_SECS`.
+
+    Called from `PostToolUse`, so it fires while Claude works and stops when Claude
+    stops — which is what keeps the dim band meaning "went silent" rather than "has
+    been working a while". A wall-clock timer would have kept a wedged turn green
+    forever and deleted the signal.
+
+    The throttle reads the marker's mtime, so the whole no-op path is one `stat` on
+    a hot path that runs per tool call. `telemetry.emit`'s docstring blesses the
+    repeat: the fold is idempotent under duplicates, so a re-asserted `active` costs
+    a row and changes nothing else.
+
+    Never raises, and returns 0 for every reason it might not beat — no turn in
+    flight, not due yet, unreadable marker."""
+    from .mindnet import telemetry as tel_mod
+    try:
+        path = _beat_path(project)
+        if not path.exists():
+            return 0                       # nothing was lit; nothing to sustain
+        if (time.time() - path.stat().st_mtime) < FACULTY_BEAT_SECS:
+            return 0                       # not due — the common case
+        data = json.loads(path.read_text(encoding="utf-8"))
+        faculties = data.get("faculties") if isinstance(data, dict) else None
+        if not isinstance(faculties, list) or not faculties:
+            return 0
+        sid = session_id or (data.get("session_id") or None)
+        written = 0
+        for faculty in faculties:
+            if tel_mod.emit(faculty, tel_mod.STATUS_ACTIVE, project=project,
+                            session_id=sid) is not None:
+                written += 1
+        # Re-arm even when nothing landed, or a down ledger would make every
+        # subsequent tool call retry the write on the hot path.
+        path.touch()
+        return written
+    except Exception:                                       # noqa: BLE001
+        return 0
 
 
 def record_direction(raw: str, project=None):

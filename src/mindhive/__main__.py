@@ -62,8 +62,18 @@ def cmd_append(args) -> int | None:
 def cmd_hook(args) -> int | None:
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if args.stage == "post_tool_use":
-        from . import hookcapture
+        # Imported in this branch too: a later branch imports it, which makes the
+        # name function-local for the WHOLE function, so referencing it here
+        # without its own import is an UnboundLocalError on every tool call.
+        from . import hookcapture, promptgate
         print(json.dumps(hookcapture.record_post_tool_use(raw)))
+        # MN-19: sustain whatever this turn lit. Claude producing tool calls IS the
+        # evidence it is still working, so the beat rides that signal rather than a
+        # clock — a wedged turn stops beating and dims on schedule, which is what
+        # keeps the dim band honest. Self-throttling (one `stat` when not due) and
+        # never-raising, because this runs on every single tool call and stdout
+        # above is the hook's contract.
+        promptgate.beat_faculties(session_id=_hook_session(raw))
     elif args.stage == "post_tool_use_failure":
         # Structured live failure capture: one tool_failed event with a
         # machine-readable {tool, category, retryable} payload per failure.

@@ -53,9 +53,30 @@ def test_the_main_dashboard_polls_the_cat_endpoint(dash):
 
 def test_the_dashboard_board_paints_what_it_polls(dash):
     """The canary for the three above: markup plus an endpoint proves nothing if no
-    call joins them."""
+    call joins them.
+
+    Pinned as the PROPERTY rather than one spelling of the call. It used to assert
+    `paintCats((await apiGet(...)))` inline, which broke the moment the poll grew a
+    second painter — a correct change failing a test that had pinned the shape
+    instead of the contract."""
     assert "paintCats" in dash
-    assert re.search(r"paintCats\(\s*\(await apiGet\('/api/mindnet/cats'\)\)", dash)
+    body = dash[dash.index("async function pollCats"):]
+    body = body[:body.index("}")+1]
+    assert "apiGet('/api/mindnet/cats')" in body, (
+        "pollCats no longer fetches the cat endpoint")
+    assert "paintCats(" in body, "the fetched board never reaches paintCats"
+
+
+def test_one_fetch_feeds_both_strips(dash, swarm):
+    """Two answers in one payload. A second request would double the poll rate of
+    a strip that already fires every 1.2 s against a full ledger read."""
+    for page, label in ((dash, "dashboard"), (swarm, "swarm")):
+        body = page[page.index("async function pollCats"):]
+        body = body[:body.index("\n  }") + 1]
+        assert body.count("/api/mindnet/cats") == 1, (
+            f"the {label} page fetches the cat endpoint more than once per poll")
+        assert "paintCats(" in body and "paintSessions(" in body, (
+            f"the {label} page does not feed both strips from that one fetch")
 
 
 def test_the_dashboard_board_does_not_wait_on_a_section_being_live(dash):
@@ -312,3 +333,129 @@ def test_the_token_is_substituted_after_the_board(dash, swarm):
         # expanded into a second copy of the script.
         assert page.count("function paintCats") == 1, (
             f"{render.__name__} expanded a marker supplied via the token")
+
+
+# --- MN-19: the session strip ------------------------------------------------
+
+def test_both_pages_carry_the_session_strip(dash, swarm):
+    """The operator lives on the dashboard and commands from the swarm page. A
+    signal that only reaches one of them is the gap MN-13 already closed once for
+    the faculty strip."""
+    for page, label in ((dash, "dashboard"), (swarm, "swarm")):
+        assert 'id="mn-sessions"' in page, f"{label} has no session strip"
+        assert "function paintSessions(" in page, f"{label} cannot paint it"
+
+
+def test_the_shared_sheet_does_not_own_the_session_container_either():
+    """Same split the faculty strip keeps: the dashboard wants an inline cluster in
+    its header, the swarm page a band under it. Only the box differs, so only the
+    box belongs to each page."""
+    assert not re.search(r"#mn-sessions\s*\{", cat_board.CSS), (
+        "cat_board.CSS declares the #mn-sessions box; that belongs to each page")
+
+
+def test_a_working_session_is_distinguishable_without_motion():
+    """Motion cannot be the only encoding — under `prefers-reduced-motion` it is
+    gone entirely, and a row of identical pills would tell the operator nothing.
+    Colour and a state dot carry it too."""
+    working = cat_board.CSS[cat_board.CSS.index(".mn-sess.working {"):]
+    working = working[:working.index("}")]
+    assert "color:" in working, f"working state is motion-only: {working}"
+
+
+def test_only_a_working_session_cat_animates():
+    assert ".mn-sess.working .mn-cat-sprite" in cat_board.CSS
+    assert not re.search(r"\.mn-sess\s+\.mn-cat-sprite\s*\{[^}]*animation:",
+                         cat_board.CSS), (
+        "every session cat animates regardless of state; motion then means nothing")
+
+
+def test_the_entrance_animates_only_transform_and_opacity():
+    """Animating layout properties janks. The reference is explicit and the
+    existing `mn-bob` already follows it."""
+    frames = cat_board.CSS[cat_board.CSS.index("@keyframes mn-sess-in"):]
+    frames = frames[:frames.index("}\n")]
+    for banned in ("width", "height", "top:", "left:", "margin"):
+        assert banned not in frames, f"the entrance animates {banned}: {frames}"
+    assert "opacity" in frames and "transform" in frames
+
+
+def test_the_entrance_is_in_the_small_transition_band():
+    """200-300ms for a small transition — fast enough not to feel laggy, slow
+    enough to read as arriving rather than popping."""
+    # Find the rule that DECLARES the entrance, not the reduced-motion override
+    # that also matches `.mn-sess {` and merely switches it off.
+    m = re.search(r"animation:mn-sess-in (\d+)ms", cat_board.CSS)
+    assert m, "no entrance animation is declared on the session pill"
+    assert 200 <= int(m.group(1)) <= 300
+
+
+def test_the_reduced_motion_guard_covers_the_entrance_too():
+    """The entrance rides the container, not the sprite, so the sprite-keyed rule
+    does not reach it. Without this a reduced-motion viewer still gets every
+    session cat sliding in."""
+    guard = cat_board.CSS[cat_board.CSS.index("prefers-reduced-motion"):]
+    guard = guard[:guard.index("/* --- MN-19")]
+    assert ".mn-sess" in guard and ".mn-cat-sprite" in guard
+
+
+def test_the_bob_phase_is_desynced_per_session():
+    """N cats bobbing in lockstep read as one strobing bar, not N workers — the
+    over-animation fatigue the interaction-design reference warns about. Negative
+    so a cat starts mid-bob rather than standing still first."""
+    js = cat_board.script()
+    body = js[js.index("function sessPhase("):]
+    body = body[:body.index("}")]
+    assert "idSeed" in body and "1600" in body
+    assert "-" in body, "the phase offset is positive; cats stand still on arrival"
+    assert "animationDelay" in js, "the phase is computed but never applied"
+
+
+def test_the_id_derivation_is_shared_not_respelled():
+    """`idSeed` feeds the palette pick, the bob phase, and the swarm page's node
+    cats. Three copies of one parseInt is three places for it to drift."""
+    js = cat_board.script()
+    assert js.count("parseInt(String(id).slice(0, 4), 16)") == 1
+
+
+def test_the_session_strip_does_not_rebuild_when_nothing_changed():
+    """`paintSessions` rebuilds its container, and rebuilding every 1.2 s restarts
+    a 1.6 s bob before it can finish — the defect already fixed for the swarm
+    chips. `age_secs` is deliberately outside the signature: it ticks every poll
+    and would defeat the guard entirely."""
+    js = cat_board.script()
+    body = js[js.index("function paintSessions("):]
+    assert "SESS_SIG" in body and "if (sig === SESS_SIG) return;" in body
+    sig = body[body.index("const sig ="):body.index("if (sig === SESS_SIG)")]
+    assert "age_secs" not in sig, (
+        "age is in the repaint signature, so the guard can never fire")
+
+
+def test_the_strip_reports_what_it_could_not_show():
+    js = cat_board.script()
+    body = js[js.index("function paintSessions("):]
+    assert "sessions_hidden" in body and "more" in body
+
+
+# --- MN-19 / U5: the board admits what it cannot see -------------------------
+
+def test_an_empty_strip_distinguishes_quiet_from_blind():
+    """The distinction whose absence cost this repo an entire investigation: a
+    checkout whose branch predated the producer rendered EXACTLY like a quiet one,
+    so "nothing is running" and "I cannot know" were indistinguishable."""
+    js = cat_board.script()
+    body = js[js.index("function paintSessions("):]
+    assert "producers.session === false" in body, (
+        "the empty state never consults the producer map")
+    assert "no Claude running" in body
+    blind = body[body.index("producers.session === false"):]
+    blind = blind[:blind.index("} else {")]
+    assert "not built into this dashboard" in blind
+
+
+def test_the_blind_state_is_visually_distinct_from_the_quiet_one():
+    """Same words in the same grey would defeat the point."""
+    assert ".blind" in cat_board.CSS or "blind" in cat_board.script()
+    js = cat_board.script()
+    body = js[js.index("function paintSessions("):]
+    assert "'blind'" in body and "'none'" in body

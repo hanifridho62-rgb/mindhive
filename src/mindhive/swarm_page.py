@@ -105,6 +105,13 @@ _PAGE = """<!doctype html>
     padding:5px 14px; background:#12161d; border-bottom:1px solid #30363d;
     min-height:44px; overflow-x:auto; }
   #mn-cats .lbl { margin-right:2px; }
+  /* The session strip is this page's own box, like `#mn-cats` — `cat_board.CSS`
+     owns the cats and pills, each page owns where they sit. Its own band under
+     the faculty strip so the two are never read as one list. */
+  #mn-sessions { flex:0 0 auto; display:flex; align-items:center; gap:6px;
+    padding:4px 14px; background:#0f1319; border-bottom:1px solid #30363d;
+    min-height:32px; overflow-x:auto; }
+  #mn-sessions .lbl { margin-right:2px; }
 /*__CAT_CSS__*/
 </style></head>
 <body>
@@ -162,9 +169,10 @@ _PAGE = """<!doctype html>
   // only its own consumer: a node's cat is picked deterministically from its agent
   // id, so it is random per new node and stable across refreshes.
 /*__CAT_JS__*/
-  function catFor(id){
-    return (parseInt(String(id).slice(0,4), 16) || 0) % CAT_PALETTES.length;
-  }
+  // Delegates to the shared derivation above — the same stable-number-from-an-id
+  // rule the session cats use for their palette and their bob phase. Kept as a
+  // named function because this page's node cats read better as `catFor(a.id)`.
+  function catFor(id){ return idCat(id); }
   function api(path){ return fetch(withP(path) + (path.includes('?')?'&':'?') + 'token='
       + encodeURIComponent(TOKEN), {headers:{'X-Hive-Token':TOKEN}}).then(r=>r.json()); }
   function apiPost(path, body){
@@ -386,7 +394,14 @@ _PAGE = """<!doctype html>
   // the poll that feeds it.
 
   async function pollCats(){
-    try { paintCats((await api('/api/mindnet/cats')).cats || []); } catch(_){}
+    // ONE fetch feeds both strips: the faculty board and the session board are
+    // two answers in the same payload, and a second request would double this
+    // page's poll rate for data already in hand.
+    try {
+      const board = await api('/api/mindnet/cats');
+      paintCats(board.cats || []);
+      paintSessions(board);
+    } catch(_){}
   }
 
   // --- poll loop ---

@@ -295,18 +295,28 @@ def test_conversation_lights_nothing():
     assert _activity() == []
 
 
-def test_a_lit_faculty_is_also_reported_idle_so_its_cat_vanishes():
-    """The user asked that the cat disappear when the section is not running.
-    `ui_cats` implements that by hiding an `idle` faculty once the 15-second flicker
-    grace passes — which only works if something actually reports idle."""
+def test_a_lit_faculty_is_not_extinguished_in_the_same_breath():
+    """This test used to assert the OPPOSITE, and the behaviour it pinned was the
+    bug: `record_direction` runs after the block is already printed, so writing
+    `active` and `idle` in the same second made the cat visible for at most the
+    15-second flicker grace — a report on work that was already over.
+
+    The cat still vanishes when the work stops; what changed is HOW. Silence does
+    it now, on `ui_cats`' own dim-then-hide schedule, sustained meanwhile by
+    `promptgate.beat_faculties`. No closing `idle` is written at all, because
+    there is no turn-end hook to write one from and a settle that never runs is
+    how a cat gets stranded lit."""
     _seed()
     promptgate.record_direction(
         json.dumps({"prompt": "buatkan fitur export CSV di dashboard",
                     "session_id": "s-cat"}), project="test")
     rows = _activity()
-    for faculty in {f for f, _s in rows}:
-        assert (faculty, "idle") in rows, f"{faculty} never reported idle"
-    assert ui_cats.classify(ui_cats.IDLE_VANISH_SECS + 1, tel.STATUS_IDLE) is None
+    assert rows, "the prompt lit no faculty at all"
+    assert not [f for f, s in rows if s == "idle"], (
+        f"a faculty was extinguished in the same breath it was lit: {rows}")
+    # The vanish path the original test cared about is still real — it is now
+    # reached by ageing out rather than by an immediate idle row.
+    assert ui_cats.classify(ui_cats.HIDE_AFTER_SECS + 1, tel.STATUS_ACTIVE) is None
 
 
 def test_emission_failure_never_disturbs_the_prompt(monkeypatch):

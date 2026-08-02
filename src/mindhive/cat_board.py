@@ -107,7 +107,37 @@ CSS = """
      more specific than this one and a media query adds no specificity itself. */
   @media (prefers-reduced-motion: reduce) {
     .mn-cat-sprite { animation:none !important; }
+    /* The entrance rides the CONTAINER, not the sprite, so the sprite-keyed rule
+       above does not reach it. Without this line a reduced-motion viewer would
+       still get every session cat sliding in. */
+    .mn-sess { animation:none !important; }
   }
+  /* --- MN-19: session cats -------------------------------------------------
+     A different question ("which Claude is working") deserves a different shape,
+     or the two strips read as one list and the faculty cats lose their meaning.
+     Faculty cats are labelled boxes; these are pills. */
+  .mn-sess { display:flex; align-items:center; gap:5px; flex:0 0 auto;
+    border:1px solid #30363d; border-radius:999px; padding:2px 9px 2px 4px;
+    background:#161b22; font-size:10.5px; line-height:1.15;
+    /* Entrance on transform+opacity ONLY — animating layout properties janks —
+       and 240ms with a decelerating curve, the band for a small transition. A
+       cat that pops into the strip reads as a glitch; one that rises into it
+       reads as arriving, which is the orientation cue that matters when a
+       session appears mid-poll. */
+    animation:mn-sess-in 240ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+  @keyframes mn-sess-in { from { opacity:0; transform:translateY(4px) }
+                          to { opacity:1; transform:none } }
+  .mn-sess .cap { white-space:nowrap; max-width:150px; overflow:hidden;
+    text-overflow:ellipsis; }
+  /* "Working" is NEVER encoded in motion alone: the colour and the caption say
+     it too, so the state survives `prefers-reduced-motion` fully intact rather
+     than becoming an unreadable row of identical pills. */
+  .mn-sess.working { color:#7ee787; border-color:#2ea043; }
+  .mn-sess.working .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
+  .mn-sess.resting { color:#8b949e; }
+  .mn-sess.resting .mn-cat-sprite { filter:grayscale(100%); opacity:.55; }
+  .mn-sess .dotk { width:5px; height:5px; border-radius:50%; flex:0 0 auto;
+    background:currentColor; }
   #mn-cat-panel { position:fixed; z-index:60; display:none; min-width:210px;
     background:#161b22; border:1px solid #30363d; border-radius:8px; color:#e6e8ef;
     padding:8px 10px; font-size:11.5px; box-shadow:0 6px 22px #0009; }
@@ -121,6 +151,8 @@ CSS = """
 # before the first poll answers; `paintCats` replaces the whole strip after that.
 HTML = ('<div id="mn-cats"><span class="lbl">faculties</span>'
         '<span class="none">no MindNetwork activity</span></div>'
+        '<div id="mn-sessions"><span class="lbl">working</span>'
+        '<span class="none">no Claude running</span></div>'
         '<div id="mn-cat-panel"></div>')
 
 # Nothing here recomputes a threshold: the 6-hour rule removes a cat from the
@@ -255,6 +287,91 @@ _JS = """
     document.querySelectorAll('#mn-cats .mn-cat.sel')
       .forEach(x => x.classList.remove('sel'));
   });
+
+  // --- MN-19: the session strip -------------------------------------------
+  // A cat per live Claude, from `oversee`'s existing liveness verdict. Nothing
+  // here decides whether a session is working — the server already did, and a
+  // second opinion in the page would let this strip and the Oversee section
+  // disagree about the same session.
+
+  // Spread the bob's phase across its own cycle, derived from the session id so
+  // it is stable across repaints and different between sessions. Negative, so a
+  // cat starts mid-bob instead of standing still for up to 1.6 s first. Without
+  // this, N cats pulse in lockstep and the strip reads as one strobing bar
+  // rather than N independent workers.
+  function sessPhase(id){
+    return -(idSeed(id) % 1600);
+  }
+  // One derivation of "a stable number from an id", shared by the palette pick
+  // and the phase offset, and by the swarm page's node cats through `catFor`.
+  // Arbitrary per new id, identical across refreshes — derived from the id, never
+  // drawn at random, which would repaint a different cat on every poll.
+  function idSeed(id){ return parseInt(String(id).slice(0, 4), 16) || 0; }
+  function idCat(id){ return idSeed(id) % CAT_PALETTES.length; }
+  // What was last drawn, per strip. `paintSessions` rebuilds its container, and
+  // rebuilding on every 1.2 s poll restarts a 1.6 s bob before it can finish —
+  // the same defect fixed for the swarm chips. `age_secs` is deliberately NOT in
+  // the signature: it changes every poll and would defeat the guard entirely, so
+  // the hover tooltip may lag a poll behind while the animation stays whole.
+  // That trade is the right way round — the motion IS the feature.
+  let SESS_SIG = null;
+  function paintSessions(board){
+    const bar = document.getElementById('mn-sessions');
+    if (!bar) return;                 // a page may carry the script, not the strip
+    const rows = (board && board.sessions) || [];
+    const producers = (board && board.producers) || {};
+    const hidden = (board && board.sessions_hidden) || 0;
+    const sig = JSON.stringify([rows.map(s => [s.session_id, s.display, s.kind,
+                                               s.title, s.doing]),
+                                hidden, producers.session]);
+    if (sig === SESS_SIG) return;
+    SESS_SIG = sig;
+    bar.innerHTML = '';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl'; lbl.textContent = 'working';
+    bar.appendChild(lbl);
+    if (!rows.length){
+      const n = document.createElement('span');
+      // The distinction that cost this repo an entire investigation. A build
+      // whose branch predates the producer rendered EXACTLY like a quiet one, so
+      // "nothing is running" and "I cannot know" were indistinguishable.
+      if (producers.session === false){
+        n.className = 'blind';
+        n.textContent = 'session signal not built into this dashboard';
+      } else {
+        n.className = 'none';
+        n.textContent = 'no Claude running';
+      }
+      bar.appendChild(n);
+      return;
+    }
+    for (const s of rows){
+      const el = document.createElement('span');
+      el.className = 'mn-sess ' + s.display;
+      el.innerHTML = catSVG(idCat(s.session_id), 18);
+      const sprite = el.querySelector('.mn-cat-sprite');
+      if (sprite) sprite.style.animationDelay = sessPhase(s.session_id) + 'ms';
+      const dot = document.createElement('span');
+      dot.className = 'dotk';
+      el.appendChild(dot);
+      const t = document.createElement('span');
+      t.className = 'cap';
+      // textContent: `title` and `doing` are ledger-supplied prose and this is
+      // the one place they reach the DOM.
+      t.textContent = s.doing || s.title || (s.kind + ' session');
+      el.appendChild(t);
+      el.title = (s.display === 'working' ? 'working' : 'quiet')
+        + ' \\u2014 ' + (s.kind || 'chat') + ' \\u2014 last seen '
+        + catAge(s.age_secs) + ' ago';
+      bar.appendChild(el);
+    }
+    if (hidden > 0){
+      const more = document.createElement('span');
+      more.className = 'more';
+      more.textContent = '+' + hidden + ' more';
+      bar.appendChild(more);
+    }
+  }
 """
 
 
