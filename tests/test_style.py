@@ -191,6 +191,30 @@ def test_a_long_prompt_that_merely_contains_a_marker_is_not_a_continuation():
     assert style.resolve_mode(long_one, "s") == style.MODE_CAVEMAN
 
 
+def test_an_oversized_prompt_is_never_a_continuation():
+    # The bound `wants_teaching` has, applied to the other scanner. A marker
+    # plus one multi-kilobyte token is <= CONTINUATION_MAX_WORDS, so before the
+    # cap it counted as "keep going" and dragged a full lower/split/join over
+    # the whole paste onto the hook's critical path — every prompt, mid-lesson.
+    from mindhive.promptgate import PROMPT_SCAN_CAP
+    huge = "lanjutkan " + "x" * (PROMPT_SCAN_CAP + 1)
+    assert not style.is_continuation(huge)
+    style.resolve_mode("ajarkan saya event store", "s")
+    assert style.resolve_mode(huge, "s") == style.MODE_CAVEMAN
+
+
+def test_the_sidecar_gates_the_scan_not_the_other_way_round(monkeypatch):
+    # Outside a live lesson the continuation scan cannot change the answer, so
+    # it must not run at all — and outside a live lesson is nearly every prompt.
+    # Raising from is_continuation is what turns a wrong order into a failure
+    # instead of into silent per-prompt work nobody measures.
+    def boom(_text):
+        raise AssertionError("is_continuation ran outside a live lesson")
+
+    monkeypatch.setattr(style, "is_continuation", boom)
+    assert style.resolve_mode("lanjutkan", "cold") == style.MODE_CAVEMAN
+
+
 def test_without_a_session_id_behaviour_stays_memoryless():
     style.resolve_mode("ajarkan saya event store", None)
     assert style.resolve_mode("lanjutkan", None) == style.MODE_CAVEMAN

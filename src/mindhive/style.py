@@ -148,10 +148,25 @@ _CONTINUATION_RES = (
 
 
 def is_continuation(text) -> bool:
-    """True for a short prompt whose whole content is "keep going"."""
+    """True for a short prompt whose whole content is "keep going".
+
+    Bounded by `PROMPT_SCAN_CAP` like `wants_teaching`, but by BAILING rather
+    than truncating, and the difference is not stylistic. A teach verb can sit
+    legitimately inside a long prompt, so that one scans a leading slice; a
+    continuation is capped at `CONTINUATION_MAX_WORDS` by definition, so nothing
+    past the cap can be one and none of it is worth normalizing. The expensive
+    part below is the whole-string `lower().split()`, not the regexes — without
+    this bail a pasted 100KB log gets swept on the hook's critical path.
+
+    The one input this reclassifies is a marker followed by a single
+    multi-kilobyte token, which now reads as caveman. Forgetting a lesson is the
+    safe failure here; inventing one is not."""
     if _is_injected(text):
         return False
-    low = " ".join(str(text or "").lower().split())
+    t = str(text or "")
+    if len(t) > PROMPT_SCAN_CAP:
+        return False
+    low = " ".join(t.lower().split())
     if len(low.split()) > CONTINUATION_MAX_WORDS:
         return False
     return any(rx.search(low) for rx in _CONTINUATION_RES)
@@ -211,7 +226,9 @@ def resolve_mode(text, session_id=None, project=None) -> str:
     sharing one global mode across every session.
 
     Reads and writes only the sidecar — never the ledger. This runs on every
-    prompt."""
+    prompt, which is also why rule 2 checks the already-loaded sidecar BEFORE
+    scanning the text: outside a live lesson the scan cannot change the answer,
+    and outside a live lesson is nearly every prompt."""
     if wants_teaching(text):
         if session_id:
             modes = _read_modes(project)
@@ -222,7 +239,7 @@ def resolve_mode(text, session_id=None, project=None) -> str:
         return MODE_CAVEMAN
     key = str(session_id)
     modes = _read_modes(project)
-    if is_continuation(text) and modes.get(key) == MODE_TEACH:
+    if modes.get(key) == MODE_TEACH and is_continuation(text):
         return MODE_TEACH
     if key in modes:                                        # the lesson is over
         modes.pop(key)
