@@ -63,6 +63,16 @@ _PAGE = """<!doctype html>
      snapshot, so "moving" means "the server says this agent is running" and
      never a guess the page made on its own. */
   .chip.running .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
+  /* This page's OWN motion, silenced by the same preference. `cat_board.CSS`
+     carries the guard for every cat sprite, but it cannot name `.dot`/`.badge` —
+     those are this page's furniture and do not exist on the dashboard. Without
+     this block a reduced-motion user would keep the pulsing dots and the pulsing
+     badge and lose only the animation this change added, which is the opposite
+     of honouring the preference. `running` survives without motion either way:
+     the dot stays amber against grey for every other state. */
+  @media (prefers-reduced-motion: reduce) {
+    .chip .dot.running, .badge.run { animation:none; }
+  }
   #insp { width:340px; flex:0 0 auto; background:#161b22; border-left:1px solid #30363d;
     padding:12px; overflow-y:auto; display:none; }
   #insp h2 { margin:0 0 6px; font-size:14px; }
@@ -234,6 +244,9 @@ _PAGE = """<!doctype html>
 
   // --- mission tree layout: coordinator center, role-grouped branches ---
   let AGENTS = [], SEL = null, CURSOR = 0;
+  // The markup `#chips` was last painted with. See `paint()` for why this is
+  // remembered rather than read back off the DOM.
+  let CHIPS_HTML = '';
   function positions(swarm){
     const W = document.getElementById('stage').clientWidth || 900;
     const H = document.getElementById('stage').clientHeight || 600;
@@ -270,7 +283,7 @@ _PAGE = """<!doctype html>
         +' L'+p.x+' '+p.y+'" fill="none" stroke="'+(ROLE_STYLE[a.role]||'#888')
         +'" stroke-width="1.6" stroke-opacity="0.75"/>';
     }).join('');
-    chips.innerHTML = swarm.map(a => {
+    const chipHTML = swarm.map(a => {
       const p = pos[a.id] || {x:0, y:0}, col = ROLE_STYLE[a.role] || '#888';
       // The agent's status rides on the chip itself, not just on its dot: that
       // is what lets the node cat animate. Safe as a class because `status` is
@@ -283,8 +296,24 @@ _PAGE = """<!doctype html>
         + '<span class="row">'+(ROLE_ICON[a.role]||'') + ' ' + esc(a.name)
         + ' <span class="dot '+a.status+'"></span></span></div>';
     }).join('');
-    chips.querySelectorAll('.chip').forEach(el =>
-      el.onclick = ev => { ev.stopPropagation(); inspect(el.dataset.id); });
+    // Only touch the DOM when the markup actually changed. `paint()` runs on
+    // every 1.2 s poll and the cat's bob is a 1.6 s cycle, so an unconditional
+    // rebuild tore down every sprite and restarted its animation before it could
+    // finish — the cat rose and snapped back mid-descent, forever, never
+    // completing a bob. The same applies to the dot's 1 s pulse, which fit
+    // inside the old window only by luck.
+    //
+    // Compared against a remembered string rather than reading `chips.innerHTML`
+    // back: the browser re-serializes markup it parses, so the round-trip would
+    // never compare equal and the guard would silently never fire. Anything that
+    // genuinely changes a chip — status, selection, name, or a stage resize
+    // moving its coordinates — changes this string and rebuilds.
+    if (CHIPS_HTML !== chipHTML) {
+      CHIPS_HTML = chipHTML;
+      chips.innerHTML = chipHTML;
+      chips.querySelectorAll('.chip').forEach(el =>
+        el.onclick = ev => { ev.stopPropagation(); inspect(el.dataset.id); });
+    }
     // mission badge + command targets
     const running = swarm.some(a => a.status === 'running');
     const ms = document.getElementById('mstate');

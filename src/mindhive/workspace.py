@@ -28,10 +28,13 @@ also tells it to read/write the shared Mind Hive memory (`hive recall` /
 `hive append`) — what one agent learns, the next one starts with.
 
 A running mission also lights MN-5's faculty cat board, under `SWARM_FACULTY`.
-That producer is edge-triggered on the fleet's AGGREGATE state — one row when
-the swarm starts working and one when it stops, never one per agent — and
-`Manager._sync_faculty` carries the reasoning for why the distinction is the
-requirement rather than a tidiness preference.
+That producer is edge-triggered on the fleet's AGGREGATE state, PER PROJECT —
+one row when a namespace's swarm starts working and one when it stops, never one
+per agent — plus a heartbeat no oftener than `FACULTY_BEAT_SECS` while agents are
+producing output, because the board grades a cat by the age of its last row and a
+mission outlives that threshold many times over. `Manager._sync_faculty` and
+`FACULTY_BEAT_SECS` carry the reasoning; both are requirements rather than
+tidiness preferences, and the tests name the failure each one prevents.
 """
 from __future__ import annotations
 
@@ -70,6 +73,32 @@ MAX_LINES = 4000                 # per-agent scrollback cap (oldest dropped)
 # the cat simply never appears, which R16 reads as a bug in the faculty rather
 # than a typo in the caller.
 SWARM_FACULTY = "task-graph"
+
+# How often a working swarm re-asserts its cat.
+#
+# `ui_cats` bands the board by the AGE of a faculty's last row: past
+# `DIM_AFTER_SECS` the cat goes grey with `animation:none`, and past 900 s its
+# panel reads "possible silent hang". Those thresholds were written for
+# `telemetry.busy` producers, which bracket a SHORT block. A mission runs up to
+# RUN_TIMEOUT_S, so a single `active` row at launch would leave a perfectly
+# healthy 30-minute mission greyed out and reporting a hang for ~90% of its life
+# — the board lying in the opposite direction from the bug this producer fixed.
+#
+# Re-asserting is explicitly sanctioned: `telemetry.emit`'s docstring notes that
+# "the fold is idempotent under repeats, so a duplicate `active` is harmless".
+# It also repairs the shared-faculty case — `orchestrator` and `__main__` write
+# `task-graph` too, and a `busy` block closing mid-mission would otherwise
+# extinguish this cat permanently, since an edge that already fired cannot fire
+# again.
+#
+# Driven by agent OUTPUT rather than a wall clock, and that is the whole design.
+# A timer would keep a wedged mission green forever, deleting the hang signal
+# the dim band exists to carry. Beating on output means a swarm that has gone
+# quiet stops beating, dims on schedule, and still reports the truth.
+#
+# Must stay below `ui_cats.DIM_AFTER_SECS`. Pinned by a test rather than derived
+# here, so the relationship is checked without a second spelling of the number.
+FACULTY_BEAT_SECS = 60
 RUN_TIMEOUT_S = int(os.environ.get("MINDHIVE_WS_TIMEOUT", "1800"))
 
 # Per-pane model picker: the ids the headless CLI's --model flag accepts.
@@ -516,14 +545,29 @@ class Manager:
         self._lock = threading.Lock()
         self.agents: dict = {}
         self.mission = None             # {"mission", "started", "coordinator"}
-        # The cat board's edge state. `_faculty_lit` is what the ledger last
-        # heard, NOT what the fleet is doing — comparing the two is the whole of
-        # the edge rule. The project and session are remembered from the moment
-        # the cat was lit so it is put out in the same namespace and segment it
-        # was lit in; see `_sync_faculty`.
-        self._faculty_lit = False
-        self._faculty_project = None
-        self._faculty_session = None
+        # The cat board's edge state, keyed BY PROJECT: `{project: session_id}`
+        # for every namespace whose cat the ledger last heard was lit. Keyed,
+        # not a single flag, because one Manager is process-global (`MANAGER`
+        # below) while the board is read per namespace — a shared flag let a
+        # second project's mission find the cat "already lit", emit nothing at
+        # all into its own namespace, and then put out the FIRST project's cat
+        # on the way down.
+        #
+        # It is what the ledger last heard, NOT what the fleet is doing —
+        # comparing the two is the whole of the edge rule. An entry is only
+        # written once its row has actually landed; see `_sync_faculty`.
+        self._faculty_lit: dict = {}
+        self._faculty_beat: dict = {}     # project -> monotonic of last row
+        self._faculty_beat_next = 0.0     # lock-free fast path for `beat=True`
+        # Serializes the decide-then-append sequence. Deliberately NOT
+        # `self._lock`: the fleet lock must never be held across a ledger write
+        # (the dashboard polls `list()` every 1.2 s), but two threads deciding
+        # opposite edges concurrently could still append them out of order and
+        # leave the fold reading `active` on a settled fleet. This lock is taken
+        # ONLY here, and always before `self._lock`, so the ordering is total
+        # and cannot deadlock against it.
+        self._faculty_emit_lock = threading.Lock()
+        self._faculty_synced = False      # ledger reconciled this process yet?
 
     # --- fleet -------------------------------------------------------------
     def list(self) -> dict:
@@ -764,6 +808,17 @@ class Manager:
                 except ValueError:
                     a.emit(raw)
                     continue
+                if not isinstance(obj, dict):
+                    # `_default_spawn` merges stderr into stdout, so any line the
+                    # CLI writes there reaches this parser. A bare JSON scalar or
+                    # array (`[1]`, `"warning"`, `null`) parses fine and then
+                    # dies on `.get` with an AttributeError the loop below does
+                    # not catch — killing the reader thread outright, which
+                    # strands the agent at `running` forever. That strands the
+                    # cat lit AND leaves the chip bobbing, so both new signals
+                    # would lie at once.
+                    a.emit(raw)
+                    continue
                 if obj.get("type") == "system" and obj.get("session_id"):
                     a.session_id = obj["session_id"]
                 if obj.get("type") == "assistant":
@@ -790,12 +845,38 @@ class Manager:
                         a.session_id = obj["session_id"]
                 for line in render_stream_event(obj):
                     a.emit(line)
+                if a.swarm:
+                    # The heartbeat. A cat stays awake for as long as its swarm
+                    # is actually producing output — which is what keeps the dim
+                    # band meaning "went silent" instead of "has been working a
+                    # while". Throttled by a lock-free clock check inside, so a
+                    # chatty run costs one comparison per stream object.
+                    self._sync_faculty(beat=True)
         except (OSError, ValueError):
             pass
+        except Exception:                       # noqa: BLE001
+            # This reader is the ONLY automatic settle path — `_timeout_kill`
+            # kills the process but never touches status — so a thread that dies
+            # here strands the agent at `running` forever: faculty cat lit, chip
+            # cat bobbing, both lying at once. Whatever the stream did, fall
+            # through to the settle below.
+            a.emit("✖ stream reader error — settling the run")
         code = proc.wait()
-        if a._timer is not None:
+        # Run identity. `_settle_orphan` releases an agent whose process exited
+        # while THIS reader was still parked, and the next `send` immediately
+        # installs a fresh proc, timer and reader. On that path this reader is a
+        # ghost of the previous run: cancelling `a._timer` would disarm the LIVE
+        # run's timeout backstop, writing `a.status` would report a working run
+        # as errored, and syncing would hand the board a false `idle` that the
+        # edge rule then refuses to correct. The file already guards the runlog
+        # this way (`if a._runlog is rl` below) — the status, the timer, the
+        # artifact pointer and the cat need the same guard. The ledger writes
+        # deliberately still happen: this reader's OWN run produced that output,
+        # and dropping it would lose the record the guard exists to protect.
+        mine = a.proc is proc
+        if mine and a._timer is not None:
             a._timer.cancel()
-        stopped = a.status == "stopped"
+        stopped = mine and a.status == "stopped"
         clean = (code == 0 and saw_result)
         if not stopped and not clean:
             a.emit(f"✖ run failed (exit {code})")    # recorded, then persisted
@@ -806,7 +887,7 @@ class Manager:
         excerpt = rl.excerpt() if rl is not None else ""
         if a._runlog is rl:
             a._runlog = None
-        if artifact:
+        if mine and artifact:
             a.artifact = artifact
         text = ((result_text or "").strip() or excerpt)[:2000] or "(no text)"
         if stopped:
@@ -816,12 +897,14 @@ class Manager:
                       {"text": text, "agent": a.name, "role": a.role,
                        "artifact": artifact, "partial": True})
         elif clean:
-            a.status = "done"
+            if mine:
+                a.status = "done"
             self._log(a, "assistant_response",
                       {"text": text, "agent": a.name, "role": a.role,
                        "artifact": artifact, "partial": False})
         else:
-            a.status = "error"
+            if mine:
+                a.status = "error"
             # A non-zero exit (or a missing `result` event) used to log ONLY the
             # bare tool_failed below: a run that did real work and then died lost
             # 100% of that work's record. The partial response goes first so the
@@ -835,12 +918,14 @@ class Manager:
                        "action": f"workspace agent {a.name} run"})
         # After every branch above has settled the status, and once — the three
         # exit paths (stopped, clean, failed) are all the same event to the
-        # board: this agent is no longer running.
-        self._sync_faculty()
-        if a.task_id:
-            done = a.status == "done"
-            _board_finish(a.task_id, done)
-            a.task_id = None
+        # board: this agent is no longer running. Guarded by `mine`: a ghost
+        # reader must not report the run that replaced it as finished.
+        if mine:
+            self._sync_faculty()
+            if a.task_id:
+                done = a.status == "done"
+                _board_finish(a.task_id, done)
+                a.task_id = None
 
     def _log(self, a, etype, payload) -> None:
         try:
@@ -857,62 +942,144 @@ class Manager:
     # had no producer at all: the faculty strip read "no MindNetwork activity"
     # however many agents were running. These two methods are that producer.
 
-    def _sync_faculty(self) -> None:
-        """Light or extinguish `SWARM_FACULTY` when the swarm's aggregate state
-        changes — and stay silent when it does not.
+    def _sync_faculty(self, beat=False) -> None:
+        """Light, re-assert, or extinguish `SWARM_FACULTY` per project.
 
         EDGE-triggered, and that is the requirement rather than an optimisation.
         `telemetry.fold` is last-write-wins per faculty, so an `idle` emitted
         when one builder finishes would put the cat out with four siblings still
         working — a false "nothing is running" on the board whose whole job is to
-        be trusted about exactly that. So: one `active` when the swarm goes from
-        nobody-running to somebody-running, one `idle` when the last one settles,
-        and nothing in between.
+        be trusted about exactly that. So: one `active` when a project's swarm
+        goes from nobody-running to somebody-running, one `idle` when its last
+        agent settles, and nothing in between.
+
+        *beat* is that rule's one deliberate exception. A mission outlives
+        `ui_cats.DIM_AFTER_SECS` many times over, and a lone `active` row at
+        launch would grey the cat out mid-mission and report a hang that is not
+        happening. Called with ``beat=True`` from the reader as agents produce
+        output, this re-asserts a cat that is already lit at most every
+        `FACULTY_BEAT_SECS`. See that constant for why output drives it and a
+        timer must not.
 
         The predicate is recomputed from the fleet rather than counted
         incrementally. A counter drifts permanently the first time a status
         changes on a path nobody remembered to decrement, and the drift is
         invisible; recomputing means a redundant call is merely wasted work and a
-        missed one self-corrects at the next transition.
+        missed one self-corrects at the next transition or beat.
 
-        The lock is released BEFORE the emit. Holding the fleet lock across a
-        ledger append would put a disk write in front of every `list()` the
-        dashboard polls, and `spawn` already calls `send` outside its own lock so
-        a re-entrant acquire here would deadlock the whole fleet.
+        The FLEET lock is released before every append — the dashboard polls
+        `list()` on it every 1.2 s, and `spawn` calls `send` while not holding it
+        so a re-entrant acquire would deadlock the whole fleet. Ordering between
+        concurrent deciders is kept by `_faculty_emit_lock` instead, which is
+        always taken first and never taken anywhere else.
+
+        An entry is recorded as lit only once its row has LANDED. `emit` returns
+        ``None`` on any fault, and a flag committed ahead of a write that failed
+        would leave a cat that exists only in this process's memory, with the
+        edge rule then refusing to retry it.
 
         Never raises, for the same reason `_log` does not: a run that succeeded
         must not be reported as failed because a cat could not be logged."""
+        # Lock-free fast path. The reader calls this per stream object, which on
+        # a chatty agent is many times a second; taking two locks to discover
+        # there is nothing to do would put real contention on the output path.
+        if beat and time.monotonic() < self._faculty_beat_next:
+            return
         try:
-            with self._lock:
-                live = next((a for a in self.agents.values()
-                             if a.swarm and a.status == "running"), None)
-                if (live is not None) == self._faculty_lit:
-                    return                      # no edge — the common case
-                if live is not None:
-                    self._faculty_lit = True
-                    self._faculty_project = live.project
-                    self._faculty_session = live.session_id or f"ws-{live.id}"
-                else:
-                    self._faculty_lit = False
-                # Read INSIDE the lock: another thread may light the cat again
-                # between here and the emit, and this call must report the edge
-                # it actually observed.
-                active = live is not None
-                project, session = self._faculty_project, self._faculty_session
-            self._emit_faculty(active, project, session)
+            with self._faculty_emit_lock:
+                now = time.monotonic()
+                with self._lock:
+                    live: dict = {}
+                    for a in self.agents.values():
+                        if a.swarm and a.status == "running":
+                            live.setdefault(a.project,
+                                            a.session_id or f"ws-{a.id}")
+                    self._reconcile_faculty(live)
+                    edges = [(p, True, sid) for p, sid in live.items()
+                             if p not in self._faculty_lit]
+                    if beat:
+                        edges += [(p, True, self._faculty_lit[p])
+                                  for p in live if p in self._faculty_lit
+                                  and now - self._faculty_beat.get(p, 0.0)
+                                  >= FACULTY_BEAT_SECS]
+                    edges += [(p, False, sid)
+                              for p, sid in list(self._faculty_lit.items())
+                              if p not in live]
+                if not edges:
+                    # Re-arm the fast path even with nothing to say, so a quiet
+                    # beat costs one clock read until the next one is due.
+                    self._faculty_beat_next = now + FACULTY_BEAT_SECS
+                    return
+                for project, active, session in edges:
+                    landed = self._emit_faculty(active, project, session)
+                    with self._lock:
+                        if active and landed is not None:
+                            self._faculty_lit[project] = session
+                            self._faculty_beat[project] = now
+                        else:
+                            # Either the swarm stopped, or the `active` row never
+                            # reached the ledger. Both mean: do not claim this
+                            # cat is lit. A failed light is retried by the next
+                            # transition or beat; a failed EXTINGUISH is not
+                            # retried, because keeping the entry would make every
+                            # FUTURE episode in this namespace skip its own
+                            # `active` edge — one stale row beats a permanently
+                            # deaf producer.
+                            self._faculty_lit.pop(project, None)
+                            self._faculty_beat.pop(project, None)
+                self._faculty_beat_next = now + FACULTY_BEAT_SECS
         except Exception:                       # noqa: BLE001
             pass
 
-    def _emit_faculty(self, active, project, session_id) -> None:
-        """One `mindnet_activity` row. Imported lazily (see `__init__`) and
-        injectable, mirroring `spawn` and `append_event` — a test observes the
-        real faculty name and the real status vocabulary without a ledger round
-        trip, because those names are the part that can silently be wrong."""
+    def _reconcile_faculty(self, live) -> None:
+        """Seed the edge state from the ledger once per process.
+
+        The edge state is in-memory, so a dashboard restarted mid-mission comes
+        back believing no cat is lit while the ledger still reads `active` — and
+        because the producer only speaks on edges, nothing would ever write the
+        corrective `idle`. `telemetry.py`'s own docstring warns about exactly
+        this coupling ("MindSwarm's mission state is a plain instance attribute
+        that dies with the server"); this keeps the warning honest one layer up.
+
+        Scoped to the projects actually in front of us, and run once: reading the
+        ledger is a full replay, and doing it per transition would put that on
+        the send path. Called with `self._lock` held — it only touches this
+        Manager's own dicts and hands the read to `telemetry`.
+
+        Bounded, deliberately: a namespace whose dashboard died and never ran
+        another mission is NOT repaired here, because nothing in this process
+        ever names that project. That case degrades to the dim band, which after
+        a crash reads exactly right — something said active and then went
+        silent."""
+        if self._faculty_synced:
+            return
+        self._faculty_synced = True
+        if not live:
+            return
+        from .mindnet import telemetry as tel_mod
+        for project in live:
+            try:
+                act = tel_mod.current(project=project).get(SWARM_FACULTY)
+            except Exception:               # noqa: BLE001
+                continue                    # unreadable ledger: assume nothing
+            if act is not None and act.status == tel_mod.STATUS_ACTIVE:
+                # Adopt the stale row so this Manager owns putting it out.
+                self._faculty_lit[project] = getattr(act, "task_id", "") or ""
+
+    def _emit_faculty(self, active, project, session_id):
+        """One `mindnet_activity` row; returns what the emitter returned
+        (``None`` when the write was refused or failed — the caller needs that
+        to decide whether the cat is really lit).
+
+        Imported lazily (see `__init__`) and injectable, mirroring `spawn` and
+        `append_event` — a test observes the real faculty name and the real
+        status vocabulary without a ledger round trip, because those names are
+        the part that can silently be wrong."""
         from .mindnet import telemetry as tel_mod
         emit = self._emit_activity or tel_mod.emit
-        emit(SWARM_FACULTY,
-             tel_mod.STATUS_ACTIVE if active else tel_mod.STATUS_IDLE,
-             project=project, session_id=session_id)
+        return emit(SWARM_FACULTY,
+                    tel_mod.STATUS_ACTIVE if active else tel_mod.STATUS_IDLE,
+                    project=project, session_id=session_id)
 
     # --- MindSwarm -----------------------------------------------------------
     def start_mission(self, mission, builders=2, scouts=1, reviewers=1,

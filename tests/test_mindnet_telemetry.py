@@ -467,6 +467,46 @@ def test_the_phase_field_is_bound_to_the_one_legend():
     assert [r.payload["phase"] for r in _rows()] == list(t_mod.PHASES)
 
 
+def test_the_docstring_names_every_module_that_writes_this_feed():
+    """The module docstring lists the emit seams and calls that list "the whole
+    producer set". A reader trusts it to tell a faculty with a labelled cat and no
+    emitter from one that is merely quiet — the distinction R16 rests on.
+
+    Nothing checked the claim, so the next producer wired up somewhere else would
+    make it quietly false. That is the doc-vs-code drift this repo has already
+    shipped once (docs/plans/2026-08-02-002), caught here by the source rather
+    than by review."""
+    import ast
+
+    src = REPO / "src" / "mindhive"
+    doc = tel.__doc__ or ""
+    writers = set()
+    for path in src.rglob("*.py"):
+        if path.name == "telemetry.py":
+            continue
+        # Parsed, not grepped. Half this package DISCUSSES `telemetry.busy` in
+        # prose — `ui_cats`'s own docstring explains the flicker grace in terms
+        # of it — and a text search cannot tell a sentence from a call site.
+        # Attribute ACCESS, not a call: `workspace` resolves `tel_mod.emit` into
+        # a local before calling it, so matching calls alone would miss the very
+        # producer this guard was written for.
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:                     # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and node.attr in ("emit", "busy")
+                    and isinstance(node.value, ast.Name)
+                    and "tel" in node.value.id):
+                writers.add(path.stem)
+    assert writers, "the scan matched nothing — the guard would pass vacuously"
+    missing = sorted(w for w in writers if w not in doc)
+    assert not missing, (
+        f"these modules write mindnet_activity but the telemetry docstring's "
+        f"producer list does not name them: {missing}")
+
+
 def test_the_cross_module_faculty_constant_is_a_real_member():
     """`enforce.hook_decision` emits `FACULTY_COMPATIBILITY` from outside this
     package. If it ever drifts from `FACULTIES`, `_payload` refuses the row and

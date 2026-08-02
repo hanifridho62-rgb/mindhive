@@ -113,11 +113,18 @@ class Harness:
             pass                 # the ledger is not what this file is about
 
         def record(faculty, status, **kw):
+            # Records FIRST, then defers to the injected hook for the return
+            # value. `emit` is a hook over the recorder rather than a
+            # replacement for it, so a test can make a write fail and still see
+            # what was attempted — which is the whole subject of the lost-row
+            # test below. Returning a truthy sentinel by default matters:
+            # `telemetry.emit` answers `None` only when the row did NOT land,
+            # and the producer keys its retry on exactly that.
             self.emits.append((faculty, status, kw))
-            return object()
+            return emit(faculty, status, **kw) if emit is not None else object()
 
         self.mgr = workspace.Manager(spawn=spawn, append_event=append,
-                                     emit_activity=emit or record)
+                                     emit_activity=record)
 
     def swarm_agent(self, project=None, prompt="go"):
         res = self.mgr.spawn(role="builder", swarm=True, project=project,
@@ -225,24 +232,74 @@ def test_a_second_episode_lights_the_cat_again():
     assert h.statuses[-1] == tel.STATUS_IDLE
 
 
-def test_the_idle_edge_lands_in_the_namespace_that_was_lit():
-    """Otherwise a mission that ends with a differently-scoped agent strands a lit
-    cat in the first project until the 6-hour hide rule finally removes it — and
-    `ui_cats` is explicit that a stuck cat is worse than a missing one, because it
-    claims work is running that is not."""
-    h = Harness()
-    first = h.swarm_agent(project="alpha")
-    second = h.swarm_agent(project="beta")
-    _wait_emits(h, 1)
-    assert h.emits[0][2]["project"] == "alpha"
+def _by_project(h):
+    """`{project: [status, ...]}` — what each namespace's board actually saw."""
+    out: dict = {}
+    for _f, status, kw in h.emits:
+        out.setdefault(kw.get("project"), []).append(status)
+    return out
 
-    for proc, agent_id in zip(h.procs, (first, second)):
-        proc.release()
-        _wait_settled(h.mgr.get(agent_id))
+
+def test_every_project_gets_its_own_cat():
+    """One Manager is process-global but the board is read per namespace, so the
+    edge state has to be too. A single shared flag made the SECOND project's
+    mission find the cat "already lit" and emit nothing at all into its own
+    namespace — eight agents running under a board reading "no MindNetwork
+    activity", which is the original bug, reintroduced one project over."""
+    h = Harness()
+    h.swarm_agent(project="alpha")
+    h.swarm_agent(project="beta")
     _wait_emits(h, 2)
-    assert h.emits[1][1] == tel.STATUS_IDLE
-    assert h.emits[1][2]["project"] == "alpha", (
-        f"the cat was lit for alpha and put out in another namespace: {h.emits}")
+    assert _by_project(h) == {"alpha": [tel.STATUS_ACTIVE],
+                              "beta": [tel.STATUS_ACTIVE]}
+
+
+def test_one_projects_swarm_settling_leaves_anothers_cat_alone():
+    """The compounding half: with a shared flag, alpha finishing while beta still
+    worked produced no edge at all, so alpha's cat stayed lit over an empty fleet
+    and beta's eventual idle landed in alpha's namespace."""
+    h = Harness()
+    alpha = h.swarm_agent(project="alpha")
+    beta = h.swarm_agent(project="beta")
+    _wait_emits(h, 2)
+
+    h.procs[0].release()
+    _wait_settled(h.mgr.get(alpha))
+    _wait_emits(h, 3)
+    assert _by_project(h)["alpha"] == [tel.STATUS_ACTIVE, tel.STATUS_IDLE]
+    assert _by_project(h)["beta"] == [tel.STATUS_ACTIVE], (
+        "beta's cat moved when alpha settled")
+
+    h.procs[1].release()
+    _wait_settled(h.mgr.get(beta))
+    _wait_emits(h, 4)
+    assert _by_project(h) == {
+        "alpha": [tel.STATUS_ACTIVE, tel.STATUS_IDLE],
+        "beta": [tel.STATUS_ACTIVE, tel.STATUS_IDLE]}
+
+
+def test_a_cat_is_put_out_in_the_namespace_it_was_lit_in():
+    """`ui_cats` is explicit that a stuck cat is worse than a missing one — it
+    claims work is running that is not — and a cat lit in one namespace and
+    extinguished in another is stuck until the 6-hour hide rule clears it."""
+    h = Harness()
+    agent_id = h.swarm_agent(project="alpha")
+    _wait_emits(h, 1)
+    h.procs[0].release()
+    _wait_settled(h.mgr.get(agent_id))
+    _wait_emits(h, 2)
+    assert [kw.get("project") for _f, _s, kw in h.emits] == ["alpha", "alpha"]
+
+
+def test_the_session_id_rides_along_so_the_row_lands_in_the_run_s_segment():
+    """`_log` stamps its events with the same `session_id or ws-<id>` fallback so
+    a run's rows share one segment. The `active` edge fires before the reader has
+    parsed a session id, so the FALLBACK is what executes on every real launch —
+    and it was previously asserted nowhere."""
+    h = Harness()
+    agent_id = h.swarm_agent()
+    _wait_emits(h, 1)
+    assert h.emits[0][2]["session_id"] == f"ws-{agent_id}"
 
 
 # --- what must NOT light it -------------------------------------------------
@@ -305,6 +362,74 @@ def test_settling_an_orphaned_run_puts_the_cat_out():
     assert h.statuses == [tel.STATUS_ACTIVE, tel.STATUS_IDLE], h.emits
 
 
+# --- the heartbeat: a long mission must not read as a hang ------------------
+
+def test_the_beat_interval_stays_under_the_dim_threshold():
+    """The heartbeat exists to keep a working mission out of the dim band, so an
+    interval at or above that band would be decoration. Pinned as a RELATIONSHIP
+    rather than restating 180 here — invariant 10 — so moving either number keeps
+    the guarantee or fails loudly."""
+    from mindhive.mindnet import ui_cats as ui
+    assert workspace.FACULTY_BEAT_SECS < ui.DIM_AFTER_SECS
+
+
+def test_a_mission_outliving_the_dim_threshold_would_read_as_a_hang():
+    """The defect the heartbeat repairs, stated against the real thresholds
+    rather than described. `RUN_TIMEOUT_S` is 1800 s and the board greys a cat at
+    180 s, so a lone `active` row at launch leaves a HEALTHY mission looking
+    stalled — and past 900 s its panel reads "possible silent hang" — for the
+    overwhelming majority of every real mission."""
+    from mindhive.mindnet import ui_cats as ui
+    assert ui.classify(ui.DIM_AFTER_SECS + 1, tel.STATUS_ACTIVE) == ui.DISPLAY_DIM
+    assert workspace.RUN_TIMEOUT_S > ui.DIM_AFTER_SECS * 5
+
+
+def test_a_producing_swarm_re_asserts_its_cat(monkeypatch):
+    """The repair. `telemetry.emit`'s own docstring blesses the repeat: "the fold
+    is idempotent under repeats, so a duplicate `active` is harmless"."""
+    monkeypatch.setattr(workspace, "FACULTY_BEAT_SECS", 0)
+    h = Harness()
+    agent_id = h.swarm_agent()
+    _wait_emits(h, 1)
+    h.procs[0].release()                      # output flows -> beats
+    _wait_settled(h.mgr.get(agent_id))
+    _wait_emits(h, 2)
+    assert h.statuses.count(tel.STATUS_ACTIVE) > 1, (
+        f"the cat was lit once and never re-asserted: {h.statuses}")
+    assert h.statuses[-1] == tel.STATUS_IDLE
+    assert h.statuses[0] == tel.STATUS_ACTIVE
+
+
+def test_the_heartbeat_is_throttled_by_its_interval():
+    """Unthrottled, this would append a ledger row per stream object — the board's
+    own read path is a full replay, so a chatty agent would make the cat expensive
+    to look at. The default interval is 60 s, so a whole fast run beats zero
+    times."""
+    h = Harness()
+    agent_id = h.swarm_agent()
+    _wait_emits(h, 1)
+    h.procs[0].release()
+    _wait_settled(h.mgr.get(agent_id))
+    _wait_emits(h, 2)
+    assert h.statuses == [tel.STATUS_ACTIVE, tel.STATUS_IDLE], h.emits
+
+
+def test_a_silent_swarm_stops_beating_so_the_dim_band_still_means_something(
+        monkeypatch):
+    """The design's load-bearing choice: output drives the beat, not a clock. A
+    wedged mission produces nothing, so it stops beating and dims on schedule —
+    and the dim band goes on meaning "said active, then went silent". A
+    wall-clock heartbeat would have kept a hung swarm green forever and deleted
+    the one signal this board exists to carry."""
+    monkeypatch.setattr(workspace, "FACULTY_BEAT_SECS", 0)
+    h = Harness()
+    h.swarm_agent()                            # held: running, but mute
+    _wait_emits(h, 1)
+    time.sleep(0.2)
+    assert h.statuses == [tel.STATUS_ACTIVE], (
+        f"a silent swarm kept its cat awake: {h.statuses}")
+
+
 # --- the observer never disturbs the observed -------------------------------
 
 def test_a_failing_emitter_cannot_break_a_run():
@@ -351,6 +476,146 @@ def test_concurrent_sends_and_settles_neither_deadlock_nor_corrupt_the_edge():
         _wait_settled(h.mgr.get(agent_id))
     _wait_emits(h, 2)
     assert h.statuses == [tel.STATUS_ACTIVE, tel.STATUS_IDLE], h.emits
+
+
+def test_a_row_that_never_landed_is_retried_rather_than_assumed(monkeypatch):
+    """`telemetry.emit` degrades to ``None`` on any fault — an unwritable segment,
+    a Windows sharing violation, a backend that is down. Committing the edge flag
+    ahead of that answer left a cat lit in this process's memory and dark in the
+    ledger, and because the producer only speaks on EDGES nothing would ever
+    retry it: the mission ran to completion with no cat and an unpaired `idle`.
+
+    `emit`'s docstring justifies being unconditional on the grounds that repeats
+    are harmless — the edge design removed the repeats that made a lossy emitter
+    safe, so the loss has to be noticed here instead."""
+    monkeypatch.setattr(workspace, "FACULTY_BEAT_SECS", 0)
+    seen = []
+
+    def flaky(faculty, status, **kw):
+        seen.append(status)
+        return None if len(seen) == 1 else object()    # the first write is lost
+
+    h = Harness(emit=flaky)
+    agent_id = h.swarm_agent()
+    _wait_emits(h, 1)
+    assert h.statuses == [tel.STATUS_ACTIVE]
+    h.procs[0].release()                       # output -> another attempt
+    _wait_settled(h.mgr.get(agent_id))
+    _wait_emits(h, 2)
+    assert h.statuses[1] == tel.STATUS_ACTIVE, (
+        f"the lost row was assumed to have landed, not retried: {h.statuses}")
+    assert h.statuses[-1] == tel.STATUS_IDLE
+
+
+def test_a_fresh_manager_puts_out_a_cat_the_ledger_still_says_is_lit():
+    """The restart case. The edge state dies with the process while the ledger
+    does not, so a dashboard restarted mid-mission came back believing nothing was
+    lit — and since the producer only speaks on edges, the stale `active` row sat
+    there for the full six hours with nothing able to correct it.
+
+    This is the coupling `telemetry.py`'s docstring warns about ("MindSwarm's
+    mission state is a plain instance attribute that dies with the server"),
+    reintroduced one layer up. The new Manager adopts the row so it can close
+    it."""
+    tel.emit(workspace.SWARM_FACULTY, tel.STATUS_ACTIVE)   # the previous process
+    assert tel.current().get(workspace.SWARM_FACULTY).status == tel.STATUS_ACTIVE
+
+    h = Harness()                              # a restarted dashboard
+    agent_id = h.swarm_agent()
+    # No `active` edge here, and that is the point: the ledger already says the
+    # cat is lit, so re-announcing it would be noise. What the fresh Manager
+    # gains is the ability to CLOSE it.
+    h.procs[0].release()
+    _wait_settled(h.mgr.get(agent_id))
+    _wait_emits(h, 1)
+    assert h.statuses[-1] == tel.STATUS_IDLE, (
+        f"the stale row was never closed: {h.statuses}")
+
+
+# --- the reader's own hazards, which this producer amplifies ----------------
+
+def test_a_ghost_reader_cannot_report_the_run_that_replaced_it():
+    """`_settle_orphan` fires only when the process has exited while its reader is
+    STILL PARKED — so on that path a live competing reader is guaranteed, not
+    merely possible. The next `send` installs a fresh proc, timer and reader; when
+    the ghost finally wakes it used to cancel the LIVE run's timeout backstop,
+    overwrite its status with `error`, and hand the board an `idle` for a mission
+    that was still working. The edge rule then refused to re-light it.
+
+    The file already guards its runlog this way (`if a._runlog is rl`); the
+    status, timer and cat needed the same identity check."""
+    h = Harness()
+    agent_id = h.swarm_agent()
+    _wait_emits(h, 1)
+    agent = h.mgr.get(agent_id)
+
+    h.procs[0].orphan()                        # exited; its reader still parked
+    assert h.mgr.send(agent_id, "again")["ok"] is True
+    assert agent.status == "running"
+    live_timer = agent._timer
+
+    h.procs[0].release()                       # the ghost wakes up
+    time.sleep(0.3)
+    assert agent.status == "running", (
+        "a ghost reader reported the run that replaced it as finished")
+    assert agent._timer is live_timer, "the live run's timeout was cancelled"
+    assert h.statuses[-1] == tel.STATUS_ACTIVE, (
+        f"a ghost reader put the cat out mid-run: {h.statuses}")
+
+    h.procs[1].release()
+    _wait_settled(agent)
+    assert agent.status == "done"
+    _wait_emits(h, len(h.emits) + 1 if h.statuses[-1] != tel.STATUS_IDLE else 1)
+    assert h.statuses[-1] == tel.STATUS_IDLE
+
+
+def test_a_non_dict_stream_line_does_not_kill_the_reader():
+    """`_default_spawn` merges stderr into stdout, so anything the CLI writes
+    there is fed to `json.loads`. A bare scalar or array parses fine and then dies
+    on `.get` with an AttributeError the loop did not catch — killing the only
+    automatic settle path. The agent then sits at `running` forever, which under
+    this change means the faculty cat stays lit AND the chip cat keeps bobbing:
+    both new signals lying at once."""
+    procs = []
+
+    def spawn(argv, env, cwd):
+        proc = HoldProc(["[1]", "null", '"a bare warning"', "3"]
+                        + _stream_lines())
+        procs.append(proc)
+        return proc
+
+    emits = []
+    mgr = workspace.Manager(spawn=spawn, append_event=lambda *a, **k: None,
+                            emit_activity=lambda f, s, **kw: (emits.append(s), object())[1])
+    res = mgr.spawn(role="builder", swarm=True, prompt="go")
+    assert res["ok"], res
+    procs[0].release()
+    agent = mgr.get(res["agent"]["id"])
+    _wait_settled(agent)
+    assert agent.status == "done", (
+        f"the reader died on a non-dict line (status={agent.status})")
+    assert emits[-1] == tel.STATUS_IDLE
+
+
+def test_a_failed_run_still_puts_the_cat_out():
+    """The `error` settle branch. Every other test drives a clean exit, so the
+    failing path was structurally present and never executed."""
+    procs = []
+
+    def spawn(argv, env, cwd):
+        proc = HoldProc([], code=1)            # no result event, non-zero exit
+        procs.append(proc)
+        return proc
+
+    emits = []
+    mgr = workspace.Manager(spawn=spawn, append_event=lambda *a, **k: None,
+                            emit_activity=lambda f, s, **kw: (emits.append(s), object())[1])
+    res = mgr.spawn(role="builder", swarm=True, prompt="go")
+    procs[0].release()
+    agent = mgr.get(res["agent"]["id"])
+    _wait_settled(agent)
+    assert agent.status == "error"
+    assert emits == [tel.STATUS_ACTIVE, tel.STATUS_IDLE], emits
 
 
 # --- the canary: the real wiring, not just the fake -------------------------

@@ -258,11 +258,17 @@ def test_a_node_cat_moves_only_while_its_own_agent_is_running():
     `mn-bob` rule was scoped to `.mn-cat.active`, a class a chip has never carried, so
     the sprite was inert whatever the agent was doing. The operator read that as "the
     animation is broken" rather than "these are two unrelated cat systems"."""
-    assert ".chip.running .mn-cat-sprite" in SWARM, (
-        "no rule animates a running agent's cat; the chips are inert again")
-    rule = SWARM[SWARM.index(".chip.running .mn-cat-sprite"):]
-    rule = rule[:rule.index("}")]
-    assert "mn-bob" in rule, f"the running chip's cat has no motion: {rule}"
+    m = re.search(r"\.chip\.running \.mn-cat-sprite\s*\{[^}]*animation:\s*"
+                  r"([A-Za-z0-9_-]+)", SWARM)
+    assert m, "no rule animates a running agent's cat; the chips are inert again"
+    # The animation NAME must resolve, not merely look plausible. A substring
+    # check passed for `mn-bob2` as happily as for `mn-bob`, and an animation
+    # naming keyframes that do not exist is silently inert in every browser —
+    # which is the exact bug this test exists to catch, wearing a typo.
+    declared = set(re.findall(r"@keyframes\s+([A-Za-z0-9_-]+)", SWARM))
+    assert m.group(1) in declared, (
+        f"the running chip's cat animates with '{m.group(1)}', which no "
+        f"@keyframes on this page declares (declared: {sorted(declared)})")
 
 
 def test_a_settled_agents_cat_holds_still():
@@ -282,6 +288,41 @@ def test_the_chip_carries_its_agents_status_as_a_class():
     assert '<div class="chip \'+a.status+' in SWARM
     # the selection ring must survive the addition — it shares the same attribute
     assert "(SEL===a.id?' sel':'')" in SWARM
+
+
+def test_the_chip_repaint_does_not_restart_the_cats_animation():
+    """`paint()` runs every 1.2 s and the bob is a 1.6 s cycle, so rebuilding
+    `#chips` unconditionally tore every sprite out of the DOM and restarted its
+    animation before it could finish — the cat rose and snapped back mid-descent
+    forever. Motion was technically present and visibly broken.
+
+    The guard compares against a remembered string, NOT `chips.innerHTML`: a
+    browser re-serializes the markup it parses, so reading it back would never
+    compare equal and the guard would silently never fire."""
+    assert "CHIPS_HTML !== chipHTML" in SWARM, (
+        "the chip repaint is unguarded; the node cat's bob restarts every poll")
+    assert not re.search(r"chips\.innerHTML\s*=\s*swarm\.map", SWARM), (
+        "the unconditional rebuild is still there")
+    guard = SWARM[SWARM.index("CHIPS_HTML !== chipHTML"):]
+    guard = guard[:guard.index("\n    }")]
+    assert "chips.innerHTML = chipHTML" in guard, "the rebuild escaped the guard"
+    assert "onclick" in guard, (
+        "click handlers are attached outside the guard, so a skipped repaint "
+        "would leave the chips unclickable")
+
+
+def test_the_pages_own_animations_honour_reduced_motion():
+    """`cat_board.CSS` carries the guard for cat sprites, but it cannot name
+    `.dot`/`.badge` — those are this page's furniture and do not exist on the
+    dashboard. Without a page-local block a reduced-motion user would keep every
+    pre-existing pulse and lose only the animation this change added, which is
+    the opposite of honouring the preference."""
+    blocks = re.findall(r"@media \(prefers-reduced-motion: reduce\)\s*\{"
+                        r"(.*?)\n  \}", SWARM, re.S)
+    assert blocks, "the swarm page ships no reduced-motion guard of its own"
+    covered = " ".join(blocks)
+    assert ".dot.running" in covered and ".badge.run" in covered, (
+        f"the page's own pulses keep animating under reduced motion: {covered}")
 
 
 def test_the_swarm_page_does_not_declare_its_own_bob_keyframes():
