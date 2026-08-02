@@ -75,6 +75,7 @@ execute), then invokes the implementation skills it selects.
 | `/circle` | The autonomous headless loop engine. `mindhive-orchestrator` may recommend it in Phase X for hands-off execution. |
 | `/engineering-loop` | circle × lfg with a memory spine. A heavier, fully-autonomous cousin; this skill is the interactive, validation-first front door. |
 | `ce-plan` / `ce-work` | Common Phase-X execution targets, scored in the Recommendation Matrix like any other candidate. |
+| `/caveman` | Presentation layer, not a pipeline stage — ultra-short replies in the user's own language. Orthogonal to every phase: it changes how output *reads*, never what a phase *does*, so it is never a Recommendation Matrix candidate and never competes for selection. |
 
 ## Follow-up chain map (Phase X.2)
 

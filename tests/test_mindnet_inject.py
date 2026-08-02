@@ -638,13 +638,26 @@ def test_cmd_hook_composes_the_gate_and_the_spine_into_one_object(
     assert add.index(promptgate.TRIGGER_MARK) < add.index(i_mod.MARK)
 
 
-def test_cmd_hook_stays_silent_when_there_is_no_mindnet_state(capsys,
-                                                              monkeypatch):
+def test_cmd_hook_emits_no_spine_and_no_empty_object_without_mindnet_state(
+        capsys, monkeypatch):
     """The regression the composition-point edit could easily cause: lifting the
     print out of `if context:` must not make every clear prompt in every project
-    print an empty context object."""
+    print an EMPTY context object.
+
+    This used to be spelled `out == ""`, which was the same thing back when the
+    spine was the only unconditional pass. It no longer is: the standing reply-
+    style pass (directives §9, `mindhive.style`) prints on every human-typed
+    prompt, so a clear prompt is legitimately non-silent now. The invariant is
+    therefore stated the way it was always meant — one parseable object carrying
+    REAL content, with neither the spine nor the gate in it."""
     assert _run_hook(monkeypatch, CLEAR_PROMPT) == 0
-    assert capsys.readouterr().out.strip() == ""
+    out = capsys.readouterr().out.strip()
+
+    payload = json.loads(out)                   # one object, and it parses
+    add = payload["hookSpecificOutput"]["additionalContext"]
+    assert add.strip()                          # never an empty context object
+    assert i_mod.MARK not in add                # no spine without mindnet state
+    assert promptgate.TRIGGER_MARK not in add   # no gate on a clear prompt
 
 
 # =================================================================================

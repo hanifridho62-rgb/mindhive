@@ -438,7 +438,8 @@ def test_record_direction_fail_open_on_append_error(monkeypatch):
 
 # --- CLI wiring -----------------------------------------------------------------
 
-def test_cli_hook_stage_prints_context_only_when_firing(tmp_path, capsys, monkeypatch):
+def test_cli_hook_stage_prints_gate_context_only_when_the_gate_fires(
+        tmp_path, capsys, monkeypatch):
     import io
     import sys
     _seed_manifest()
@@ -457,13 +458,19 @@ def test_cli_hook_stage_prints_context_only_when_firing(tmp_path, capsys, monkey
     out = capsys.readouterr().out
     assert "catalog consulted" in out and "underspecified" not in out
 
-    # Silence is now reserved for prompts that are gate-clear AND not code work.
+    # Gate-clear AND not code work: neither the gate nor the catalog speaks.
+    # The stage's OUTPUT is no longer empty here, though — the standing reply-
+    # style pass (directives §9, mindhive.style) prints on every human-typed
+    # prompt. So assert the two gate blocks are absent rather than asserting
+    # total silence, which stopped being this stage's contract. Total silence is
+    # now reserved for machine-injected text; test_style.py covers that.
     monkeypatch.setattr(sys, "stdin",
                         io.StringIO(json.dumps({"prompt": "what did we decide "
                                                           "last week"})))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
     assert cli.main(["hook", "user_prompt_submit"]) == 0
-    assert capsys.readouterr().out.strip() == ""
+    out = capsys.readouterr().out
+    assert "underspecified" not in out and "catalog consulted" not in out
 
 
 def _fixture_inventory():
