@@ -128,6 +128,47 @@ def test_command_says_the_style_is_already_on():
     assert "you do not need this command to turn it on" in text
 
 
+def test_addendum_documents_the_sticky_lesson():
+    text = _flat(_SKILL)
+    assert "the lesson holds across turns" in text
+    assert "next substantive question ends the lesson" in text
+    for marker in ("lanjutkan", "terus", "continue", "go on"):
+        assert marker in text, marker
+
+
+def test_addendum_covers_slash_command_turns():
+    text = _flat(_SKILL)
+    assert "/command" in text
+    assert "counts as the user speaking" in text
+
+
+def test_the_per_turn_wording_is_gone_everywhere():
+    # PR #87 documented teaching mode as "THIS turn only" / "off for that turn".
+    # Sticky mode makes both false, and a stale doc is what the next editor
+    # trusts over the code.
+    from mindhive import directives, style
+    spec = (_ROOT / "docs" / "superpowers" / "specs"
+            / "2026-06-23-mindhive-assistant-operating-spec.md")
+    sources = {
+        "SKILL.md": _SKILL.read_text(encoding="utf-8"),
+        "operating spec": spec.read_text(encoding="utf-8"),
+        "directives": directives.directives(),
+        "TEACH_BLOCK": style.TEACH_BLOCK,
+    }
+    for name, blob in sources.items():
+        low = " ".join(blob.lower().split())
+        assert "this turn only" not in low, name
+        assert "for that turn" not in low, name
+
+
+def test_directives_document_the_sticky_lesson_and_slash_commands():
+    from mindhive import directives
+    text = " ".join(directives.directives().lower().split())
+    assert "the lesson holds" in text
+    assert "sticky" in text
+    assert "slash commands count" in text
+
+
 def test_session_directives_establish_the_style_from_message_one():
     # The SessionStart half of the mechanism, read from the live module rather
     # than from a doc — this is what actually reaches the model.

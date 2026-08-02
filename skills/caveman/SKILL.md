@@ -90,20 +90,29 @@ human-typed prompt (`src/mindhive/style.py`) and it is written into the session
 directives (`src/mindhive/directives.py` §9), so the two together make "ACTIVE
 EVERY RESPONSE" above literally true instead of aspirational.
 
+A typed `/command` counts as the user speaking and keeps the style. Only
+genuinely injected text — harness tags, task notifications, injected skill
+bodies — has no reply style to set.
+
 **Both languages.** Activation is not keyed to English. The style holds whatever
 the user types in, and the teaching carve-out below is detected in English and
 Indonesian alike.
 
 **The teaching carve-out.** When the user asks to be *taught* or given a full
-explanation, caveman is OFF for that turn — complete prose, reasoning shown,
-worked examples, the why behind each step. Recognised in both languages:
+explanation, caveman goes OFF — complete prose, reasoning shown, worked
+examples, the why behind each step. Recognised in both languages:
 
 | Language | Asks to be taught |
 |----------|-------------------|
 | English | explain, explanation, elaborate, teach, teaching, tutorial, lesson, educate, walk me through, help me understand, deep dive, break it down |
 | Indonesian | jelaskan, jelasin, dijelaskan, menjelaskan, penjelasan, terangkan, jabarkan, uraikan, ajarkan, ajari, ajarin, mengajarkan, diajarkan, pengajaran, pelajaran, edukasi |
 
-Caveman resumes on the next turn that is not a teaching request.
+**The lesson holds across turns.** Teaching mode is sticky, because a thorough
+lesson is never one turn. A follow-up that only says keep going — `lanjutkan`,
+`terus`, `continue`, `go on` — stays in prose rather than snapping back to
+fragments mid-explanation. The next substantive question ends the lesson and
+caveman returns, so there is nothing for the user to switch off. State is a
+per-session sidecar, never the ledger.
 
 **Thoroughness is not teaching.** "Review ini secara menyeluruh" / "check this
 thoroughly" asks for thorough WORK, not a lecture — it stays caveman. Words like

@@ -64,13 +64,14 @@ CAVEMAN_BLOCK = (
 )
 
 TEACH_BLOCK = (
-    f"{STYLE_MARK} Reply style — teaching mode, THIS turn only.\n"
-    "This prompt asks to be taught or given a full explanation, so the standing "
-    "caveman style is OFF here. Write complete, ordinary prose: full sentences, "
-    "the reasoning shown, worked examples, and the why behind each step — not "
+    f"{STYLE_MARK} Reply style — teaching mode.\n"
+    "The user asked to be taught or given a full explanation, so the standing "
+    "caveman style is OFF. Write complete, ordinary prose: full sentences, the "
+    "reasoning shown, worked examples, and the why behind each step — not "
     "fragments.\n"
-    "Still reply in the user's own language. Caveman resumes on the next turn "
-    "that does not ask to be taught."
+    "This holds for the whole lesson, including follow-ups that only say keep "
+    "going. Caveman returns on the next substantive question.\n"
+    "Still reply in the user's own language."
 )
 
 # The teach/explain VERB list. Multiword English phrases live in their own
