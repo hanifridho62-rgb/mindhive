@@ -994,7 +994,12 @@ class Manager:
                         if a.swarm and a.status == "running":
                             live.setdefault(a.project,
                                             a.session_id or f"ws-{a.id}")
-                    self._reconcile_faculty(live)
+                # OUTSIDE the fleet lock: reconciling reads the ledger, which is
+                # a full replay, and `list()` polls this lock every 1.2 s. Once
+                # per process, so the second acquire below costs nothing after
+                # the first call.
+                self._reconcile_faculty(live)
+                with self._lock:
                     edges = [(p, True, sid) for p, sid in live.items()
                              if p not in self._faculty_lit]
                     if beat:
@@ -1043,8 +1048,9 @@ class Manager:
 
         Scoped to the projects actually in front of us, and run once: reading the
         ledger is a full replay, and doing it per transition would put that on
-        the send path. Called with `self._lock` held — it only touches this
-        Manager's own dicts and hands the read to `telemetry`.
+        the send path. Called WITHOUT the fleet lock — the read is I/O and the
+        dashboard polls `list()` on that lock — but under `_faculty_emit_lock`,
+        so no other decider can be mid-flight while the adoption lands.
 
         Bounded, deliberately: a namespace whose dashboard died and never ran
         another mission is NOT repaired here, because nothing in this process
@@ -1057,14 +1063,22 @@ class Manager:
         if not live:
             return
         from .mindnet import telemetry as tel_mod
+        adopted = []
         for project in live:
             try:
                 act = tel_mod.current(project=project).get(SWARM_FACULTY)
             except Exception:               # noqa: BLE001
                 continue                    # unreadable ledger: assume nothing
             if act is not None and act.status == tel_mod.STATUS_ACTIVE:
+                adopted.append(project)
+        if not adopted:
+            return
+        with self._lock:
+            for project in adopted:
                 # Adopt the stale row so this Manager owns putting it out.
-                self._faculty_lit[project] = getattr(act, "task_id", "") or ""
+                # `setdefault`: a light edge decided between the read above and
+                # this write is newer information than the ledger's, and must win.
+                self._faculty_lit.setdefault(project, "")
 
     def _emit_faculty(self, active, project, session_id):
         """One `mindnet_activity` row; returns what the emitter returned

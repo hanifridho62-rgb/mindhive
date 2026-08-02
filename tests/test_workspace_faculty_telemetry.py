@@ -532,6 +532,37 @@ def test_a_fresh_manager_puts_out_a_cat_the_ledger_still_says_is_lit():
         f"the stale row was never closed: {h.statuses}")
 
 
+def test_reconciling_the_ledger_does_not_block_the_dashboard_poll(monkeypatch):
+    """Reconciliation replays the whole ledger. Held under the FLEET lock — which
+    is what the first draft of this fix did — that puts a full disk read in front
+    of every `list()` the dashboard polls at 1.2 s, freezing the agent table for
+    as long as the store takes to read. The store this runs against in production
+    is ~22.8k events.
+
+    The canary matters here: without waiting for the read to actually be in
+    flight, a slow machine could finish `list()` before reconciliation even
+    started and the test would pass having proved nothing."""
+    from mindhive.mindnet import telemetry as tel_mod
+    real, entered = tel_mod.current, threading.Event()
+
+    def slow(*a, **kw):
+        entered.set()
+        time.sleep(0.6)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(tel_mod, "current", slow)
+    h = Harness()
+    worker = threading.Thread(target=h.swarm_agent, daemon=True)
+    worker.start()
+    assert entered.wait(3.0), "reconciliation never ran — the test proves nothing"
+
+    start = time.time()
+    h.mgr.list()
+    assert time.time() - start < 0.3, (
+        "list() queued behind the ledger read; the fleet lock is held across it")
+    worker.join(timeout=5)
+
+
 # --- the reader's own hazards, which this producer amplifies ----------------
 
 def test_a_ghost_reader_cannot_report_the_run_that_replaced_it():
