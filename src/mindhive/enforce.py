@@ -178,10 +178,15 @@ def _policy_mindnet_phase(tool_name, tool_input, cache=None):
 
 
 def _policy_mindnet_language(tool_name, tool_input, cache=None):
-    """MN-4's language lock: no writing a file whose extension falls outside a
-    populated ``language_context``."""
+    """MN-4's language lock: no producing a file whose extension falls outside a
+    populated ``language_context``.
+
+    Execute tools are in the prefilter because the lock now reaches the two
+    shell shapes that create files (a redirect target, a scaffolding command).
+    The predicate still declines everything else, so widening this set costs a
+    dict lookup on `Bash`, not a parse."""
     from .mindnet import enforcer as mn
-    if tool_name not in mn.WRITE_TOOLS:
+    if tool_name not in mn.WRITE_TOOLS and tool_name not in mn.EXECUTE_TOOLS:
         return None
     if not _mindnet_armed(cache):
         return None
@@ -197,6 +202,14 @@ _policy_mindnet_phase.wants_cache = True
 _policy_mindnet_language.wants_cache = True
 
 
+# The one signature whose refusals are the `compatibility` faculty's work.
+# Defined ABOVE `POLICY_CHECKS` and referenced inside it, so `hook_decision`'s
+# `signature == MINDNET_LANGUAGE_SIGNATURE` compares against the very string the
+# registry uses. A second literal spelled the same way would drift silently on
+# any rename, and the failure would be the cat going permanently dark — exactly
+# the bug this emit site exists to fix (invariant 10).
+MINDNET_LANGUAGE_SIGNATURE = "gate:mindnet-language"
+
 # (id, permissionDecision, check). "deny" blocks outright; "ask" escalates to
 # the human — right for destructive commands, which are sometimes legitimate.
 #
@@ -210,22 +223,33 @@ POLICY_CHECKS = (
     ("gate:config-protection", "deny", _policy_config_protection),
     ("gate:destructive-command", "ask", _policy_destructive),
     ("gate:mindnet-phase", "deny", _policy_mindnet_phase),
-    ("gate:mindnet-language", "deny", _policy_mindnet_language),
+    (MINDNET_LANGUAGE_SIGNATURE, "deny", _policy_mindnet_language),
 )
 
 
 def evaluate_policies(tool_name, tool_input, manifest=None,
-                      project=None) -> tuple | None:
-    """(decision, reason) when a policy check fires, else None. Policies are
-    ON unless the manifest explicitly disables them; a per-entry ``reason``
-    override wins. Fail-open like everything in this module."""
+                      project=None, cache=None) -> tuple | None:
+    """(signature, decision, reason) when a policy check fires, else None.
+    Policies are ON unless the manifest explicitly disables them; a per-entry
+    ``reason`` override wins. Fail-open like everything in this module.
+
+    The signature rides along because `hook_decision` records the refusal and a
+    denial that cannot name the rule that issued it is not an audit trail — the
+    operator's remedy is a manifest entry keyed by exactly this string."""
     try:
         man = manifest if manifest is not None else load_manifest(project)
         # Scoped to this one call. Checks that declare `wants_cache` share it,
         # so a projection several of them need is read once rather than once
         # each — and nothing survives into the next invocation, so there is no
         # staleness window.
-        cache = {"project": project}
+        #
+        # `hook_decision` passes its own dict so a fired check can hand detail
+        # back out (which task held the language lock, for the faculty feed).
+        # It stays a per-call scratchpad either way; the only change is who owns
+        # the reference.
+        if cache is None:
+            cache = {}
+        cache["project"] = project
         for pid, decision, fn in POLICY_CHECKS:
             entry = man.get(f"policy:{pid}")
             entry = entry if isinstance(entry, dict) else {}
@@ -235,7 +259,8 @@ def evaluate_policies(tool_name, tool_input, manifest=None,
                       if getattr(fn, "wants_cache", False)
                       else fn(tool_name, tool_input))
             if reason:
-                return decision, (entry.get("reason") or "").strip() or reason
+                return (pid, decision,
+                        (entry.get("reason") or "").strip() or reason)
     except Exception:
         return None
     return None
@@ -293,6 +318,157 @@ def evaluate(tool_name, tool_input, project=None, manifest=None) -> str | None:
 ENFORCED_MARK = "[mindhive-rule]"
 
 
+# A denial message is a paragraph, not an essay — but a manifest `reason`
+# override is operator-supplied text of any length, and the ledger must not
+# carry a novel per refusal. The operator still sees all of it: truncation is
+# applied to the STORED copy only, never to the hook payload.
+DENIAL_REASON_LIMIT = 600
+
+# `tool_name` comes straight off the hook's stdin JSON and is equally unbounded.
+# Capping only the reason left the other free-text field from the same untrusted
+# payload able to carry a row of any size.
+TOOL_NAME_LIMIT = 120
+
+
+def _record_denial(signature, tool_name, decision, reason, project) -> None:
+    """Append the ledger evidence that this refusal happened.
+
+    Called on DENY ONLY (KTD5). `PreToolUse` fires on every tool call, so an
+    append on the allow path would put a file write on the hottest path in the
+    system; a refusal is rare by construction and the tool call is being blocked
+    anyway, so the write is free in practice.
+
+    Fail-open and result-discarding (KTD6). A ledger that is full, locked, or
+    missing must not turn a deny into an allow — the audit is a record OF the
+    decision, never a participant in it. Same contract `telemetry.emit` already
+    documents for itself.
+
+    The import is lazy for the reason every import in this module is: the hook
+    shim loads `enforce` in every project on every tool call, and `events` pulls
+    in the whole store.
+
+    Stored without `ENFORCED_MARK` — that marker is a wire artifact whose job is
+    keeping `failures.py` from re-ingesting our own refusal text as a fresh
+    incident. The ledger wants the rule's own words."""
+    try:
+        from . import events
+        events.append_event(
+            "policy_denied",
+            {"signature": signature or "",
+             "tool_name": str(tool_name or "")[:TOOL_NAME_LIMIT],
+             "decision": decision, "reason": reason[:DENIAL_REASON_LIMIT]},
+            tags=["enforce", "denial"], project=project)
+    except Exception:
+        pass
+
+
+def _wake_compatibility(cache, project) -> None:
+    """Record that the `compatibility` faculty acted, for MN-5's cat board.
+
+    MN-4's Open Question 3 left `compatibility` with no emit site, so its cat
+    was permanently absent from a board whose defining claim is that a missing
+    cat means a real bug — an always-missing cat makes that claim untestable.
+    The language lock IS that faculty, and this is where it finishes deciding.
+
+    Here rather than in `mindnet/enforcer.py` because a test asserts over that
+    module's own source that it imports no `events` — the structural guarantee
+    behind the latency requirement, deliberately stronger than a timing bound.
+    `telemetry.emit` appends.
+
+    An `active` row AND its paired `idle`, which is what `telemetry.busy` does
+    for every other faculty. The first version emitted `active` alone, reasoning
+    that "the board's 180 s dim already expresses the wind-down" — but `ui_cats`
+    defines that band as the opposite: an `active` row aged past 180 s renders
+    dim and stays on screen for six hours, and dim IS the hang signal, the whole
+    reason the board was asked for. One denial at 09:00 would have shown
+    `compatibility` as a stuck faculty until 15:00. The work here is
+    instantaneous, so it must close itself.
+
+    The firing task is re-derived from the sidecar the checks already cached
+    rather than handed over through a side channel. `locked_task` is a pure dict
+    scan over that same object, so it returns the task the refusal named, and
+    there is no untyped `cache` key for a future check to collide with.
+
+    `emit` never raises; the wrapper is belt-and-braces on top of that — a
+    refusal that succeeded must not be reported as anything else because a cat
+    animation could not be logged."""
+    try:
+        from .mindnet import enforcer as mn
+        from .mindnet import telemetry as tel
+        phase, task = mn.locked_task((cache or {}).get("sc"))
+        task_id = getattr(task, "task_id", "")
+        for status in (tel.STATUS_ACTIVE, tel.STATUS_IDLE):
+            tel.emit(tel.FACULTY_COMPATIBILITY, status, task_id=task_id,
+                     phase=phase, project=project)
+    except Exception:
+        pass
+
+
+def _sidecar_snapshot(cache, project):
+    """`(sidecar, segment_stats)` when the phase projection is currently fresh,
+    else ``None``. Taken BEFORE this hook appends anything.
+
+    Only a sidecar that is already fresh may be re-stamped afterwards. Writing a
+    current stamp onto a projection that genuinely predates the ledger would
+    assert a correspondence nobody established — worse than the staleness it
+    would hide."""
+    try:
+        from .mindnet import sidecar as sc_mod
+        sc = (cache or {}).get("sc")
+        if sc is None:
+            sc = sc_mod.read(project)
+        if not getattr(sc, "fresh", False):
+            return None
+        return sc, sc_mod.segment_stats(project)
+    except Exception:
+        return None
+
+
+def _restamp_sidecar(snapshot, project) -> None:
+    """Re-stamp the phase projection this hook's own append just aged.
+
+    THE fix for the cascade that made auditing self-defeating.
+    `sidecar._staleness` compares each segment's ``[st_size, st_mtime_ns]``, so
+    appending a row to the events directory ages the sidecar. The next
+    `sidecar.read` then answers ``fresh=False``, and `locked_task`,
+    `blocking_task` and `active_task` all open with ``if not sc.fresh: return
+    None, None`` — ALLOW. So the first refusal of ANY kind switched off BOTH
+    MindNetwork gates until the next `hive mindnet rebuild`, and re-running the
+    very command that was just refused succeeded.
+
+    `__main__.py` already states the rule this broke — "No ledger append.
+    `sidecar._staleness` counts every event, so a row written here without also
+    rewriting the sidecar would read STALE" — and every other writer in the repo
+    obeys it by rebuilding. A rebuild is not available here: it costs a full
+    `events.read_all` (~264 ms) on the hook that fires for every tool call.
+
+    So the stamp is refreshed instead of the projection, which is sound because
+    neither row we write is projected: `policy_denied` and `mindnet_activity`
+    are read by no fold that feeds the sidecar, so the phase state genuinely
+    still corresponds to the ledger. `segment_stats` is an `os.scandir` over
+    cached stat data — microseconds, and it never opens a file.
+
+    A concurrent writer is the one case that must NOT be absorbed: if any
+    segment other than the one we appended to also moved, the ledger really has
+    passed what this sidecar projects, and stale is then the correct answer."""
+    if snapshot is None:
+        return
+    try:
+        from .mindnet import sidecar as sc_mod
+        sc, before = snapshot
+        after = sc_mod.segment_stats(project)
+        moved = [name for name in set(before) | set(after)
+                 if before.get(name) != after.get(name)]
+        if len(moved) > 1 or any(name not in after for name in before):
+            return
+        stamp = dict(getattr(sc, "stamp", None) or {})
+        stamp["segments"] = after
+        sc_mod.write(sc.state, stamp, project=project, tasks=sc.tasks,
+                     advice=sc.advice)
+    except Exception:
+        pass
+
+
 def hook_decision(raw: str, project=None) -> dict:
     """Parse a PreToolUse payload (JSON on the hook's stdin) and return the hook's
     output: a deny/ask decision when a policy or matcher fires, or {} (allow)
@@ -319,16 +495,24 @@ def hook_decision(raw: str, project=None) -> dict:
         except Exception:
             project = None
     manifest = load_manifest(project)
-    decision, reason = "deny", None
+    decision, reason, signature = "deny", None, ""
+    cache = {}
     pol = evaluate_policies(tool_name, tool_input, manifest=manifest,
-                            project=project)
+                            project=project, cache=cache)
     if pol:
-        decision, reason = pol
+        signature, decision, reason = pol
     else:
         reason = evaluate(tool_name, tool_input, project=project,
                           manifest=manifest)
     if not reason:
         return {}
+    # Snapshot BEFORE any append, re-stamp AFTER the last one — the audit must
+    # not age the projection that decides the next call (see `_restamp_sidecar`).
+    snapshot = _sidecar_snapshot(cache, project)
+    _record_denial(signature, tool_name, decision, reason, project)
+    if signature == MINDNET_LANGUAGE_SIGNATURE:
+        _wake_compatibility(cache, project)
+    _restamp_sidecar(snapshot, project)
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,

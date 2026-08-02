@@ -359,12 +359,191 @@ def test_the_language_lock_is_case_insensitive_about_the_context_itself():
                                   _sc(langs=("Python",))) is not None
 
 
-def test_an_execute_tool_is_not_language_locked():
-    """Deferred by the plan: inferring a language from an arbitrary shell
-    command is a parsing problem with a false-positive cost paid on every
-    command."""
+# --- R1/R2/R3: the shell path ------------------------------------------------------
+#
+# MN-4 deferred this whole surface, and the deferral's REASON is the shape of
+# everything below: "inferring a language from an arbitrary shell command is a
+# parsing problem with a false-positive cost paid on every command." That reason
+# still stands, so the rule here is NOT "what language does this command imply".
+# It is the narrower, decidable question the lock was always asking — does this
+# command PUT A FILE ON DISK in a forbidden language — and there are exactly two
+# shapes that answer it: a redirect target, and a scaffolding generator.
+#
+# Everything else allows. The tests are paired deliberately: for every "denies"
+# there is a sibling "allows" one token away, because a rule that denies too
+# much here is worse than the bypass it closes.
+
+def test_an_interpreter_invocation_is_still_not_language_locked():
+    """Was `test_an_execute_tool_is_not_language_locked`. The original asserted
+    the whole deferral; this asserts the half of it that is still true and
+    always will be.
+
+    Running a program produces no source file, so it is outside what the lock
+    is for. `node app.js` under a Python-only context stays allowed — denying it
+    is exactly the false positive MN-4 refused to pay for."""
     assert enf.language_violation("Bash", {"command": "node app.js"},
                                   _sc(langs=("python",))) is None
+
+
+@pytest.mark.parametrize("command", [
+    "cat > src/app.ts <<'EOF'\nconst x = 1\nEOF",
+    "echo x > src/app.ts",
+    "echo x >> src/app.ts",
+    "echo x | tee src/app.ts",
+    "echo x | tee -a src/app.ts",
+])
+def test_a_redirect_that_creates_a_forbidden_file_is_denied(command):
+    """The bypass MN-4 left open, and the reason this unit exists. A heredoc
+    writes TypeScript into a Python-only task and the write-tool filter never
+    sees it — same bytes on disk, same task, no refusal."""
+    reason = enf.language_violation("Bash", {"command": command},
+                                    _sc(langs=("python",)))
+    assert reason, command
+    assert "Language Compatibility Lock violation" in reason
+    assert "python" in reason
+    assert "t1" in reason, "the message must still name the task that locked it"
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -q",
+    "python -c 'print(1)'",
+    "ls -la src/app.ts",
+    "grep -n foo src/app.ts",
+    "cat src/app.ts",
+    "python x.py 2>&1",
+    "python x.py 2>/dev/null",
+    "echo done >&2",
+])
+def test_a_command_that_creates_nothing_is_allowed(command):
+    """The false-positive half, and the more important one. `2>&1` and `>&2`
+    are the trap: they contain `>` and are not paths, and a regex that treats
+    `&1` as a filename would deny a stderr redirect on a Python-only task."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "echo x > notes.txt",
+    "echo x > out",
+    "echo x > pyproject.toml",
+])
+def test_an_unmapped_redirect_target_is_not_a_violation(command):
+    """Unmapped-never-denies has to hold over the shell path too, or the rule
+    starts denying `.txt` and extensionless files."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+def test_a_permitted_redirect_target_is_allowed():
+    assert enf.language_violation(
+        "Bash", {"command": "echo x > README.md"},
+        _sc(langs=("python", "markdown"))) is None
+
+
+def test_a_quoted_redirect_target_is_still_seen():
+    """Quoting the path must not be a bypass — it is the natural spelling for
+    any path with a space in it."""
+    assert enf.language_violation("Bash", {"command": 'echo x > "src/app.ts"'},
+                                  _sc(langs=("python",))) is not None
+
+
+@pytest.mark.parametrize("command,langs", [
+    ("npx create-react-app web", ("python",)),
+    ("npm init -y", ("python",)),
+    ("cargo new thing", ("python",)),
+    ("rails new blog", ("python",)),
+    ("go mod init example.com/x", ("python",)),
+])
+def test_a_scaffolding_command_is_denied(command, langs):
+    """R3. These are defined by generating a source tree; the files they create
+    never pass through a tool call at all, so a path-based rule cannot see
+    them."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=langs)) is not None, command
+
+
+@pytest.mark.parametrize("command", [
+    "npm run test",
+    "npm install",
+    "npx tsc --noEmit",
+    "cargo build",
+    "cargo test",
+    "go mod tidy",
+    "go build ./...",
+])
+def test_a_non_scaffolding_toolchain_command_is_allowed(command):
+    """The sibling half. `go mod tidy` shares two tokens with `go mod init` and
+    creates no source; matching on the program alone would deny it."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+def test_a_scaffolding_command_in_its_own_language_is_allowed():
+    assert enf.language_violation("Bash", {"command": "npx create-react-app w"},
+                                  _sc(langs=("javascript",))) is None
+
+
+@pytest.mark.parametrize("command", [
+    "hive mindnet satisfy t1",
+    "hive log update 'wrote src/app.ts'",
+    "git commit -m 'add app.ts'",
+    "git checkout -- src/app.ts",
+    "gh pr view",
+])
+def test_the_exempt_programs_survive_the_language_lock(command):
+    """`EXEMPT_PROGRAMS` exists so the block is escapable from inside a session,
+    and every documented remedy runs through Bash. A language rule that denied
+    `hive` or `git` would re-create the unrecoverable state the phase block's
+    exemption was written to prevent — and `git` writes files constantly."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+def test_a_redirect_into_the_current_phases_evidence_directory_is_allowed():
+    """The compose-without-deadlocking property, now over the shell path.
+
+    MN-4 already shipped this bug once in the other direction: the phase gate
+    waved an evidence document through and the language lock denied it one
+    check later, making all three planning gates unclearable. Writing that
+    document with `>` instead of `Write` must not reopen it."""
+    assert enf.language_violation(
+        "Bash", {"command": "echo x > docs/superpowers/specs/design.md"},
+        _sc(phase="brainstorm", langs=("python",))) is None
+
+
+def test_powershell_cmdlet_file_creation_is_a_known_uncovered_gap():
+    """Asserted rather than assumed. `Set-Content` puts bytes on disk and this
+    iteration does not see it — PowerShell 5.1's quoting and parameter shapes
+    are a separate parsing surface, deferred by the plan.
+
+    This test exists so the gap is a recorded fact with a name. When the
+    PowerShell surface is covered, this test flips to `is not None` and the
+    deferral is closed on purpose rather than discovered by accident."""
+    assert enf.language_violation(
+        "PowerShell", {"command": "Set-Content src/app.ts 'x'"},
+        _sc(langs=("python",))) is None
+
+
+@pytest.mark.parametrize("tool_input", [
+    None, {}, {"command": None}, {"command": ""}, {"command": 123},
+    {"command": "   "}, "not-a-dict", [], 7,
+])
+def test_the_shell_path_is_total(tool_input):
+    """Fail-open over the new surface. A malformed payload must allow, never
+    raise — this decides whether a real tool call runs."""
+    assert enf.language_violation("Bash", tool_input,
+                                  _sc(langs=("python",))) is None
+
+
+def test_a_stale_sidecar_does_not_deny_over_the_shell_path():
+    assert enf.language_violation("Bash", {"command": "echo x > src/app.ts"},
+                                  _sc(langs=("python",), fresh=False)) is None
+
+
+def test_an_empty_language_context_locks_no_shell_command():
+    """An unpopulated lock is not a lock — the same rule the write path has."""
+    assert enf.language_violation("Bash", {"command": "echo x > src/app.ts"},
+                                  _sc(langs=())) is None
 
 
 def test_the_language_lock_ignores_task_status():
@@ -508,3 +687,123 @@ def test_every_phase_is_classified(phase):
     sc = _sc(phase=phase)
     result = enf.phase_violation(*_write(), sc)
     assert (result is None) == (phase not in BLOCKED)
+
+
+# --- review fixes: the shell rule was reading `>` far too literally -------------------
+#
+# The first shipped version of the shell path ran its redirect regex over the RAW
+# command with no notion of quoting, heredocs, or command segments. A security
+# review executed it and produced a verified allow/deny table; these are the rows
+# that came back wrong. Every one of them is a FALSE DENIAL — the exact
+# false-positive cost MN-4 deferred this whole surface to avoid — or a chained
+# bypass, so this section is the honest boundary of the rule.
+
+@pytest.mark.parametrize("command", [
+    'echo "renamed a.py -> b.js"',
+    'grep -n "a -> b.md" notes.txt',
+    "pytest -q -k 'x>y.js'",
+    "echo 'x => y.ts'",
+    'git log --format="%s -> %h" > /dev/null',
+    'python -c "print(1 > 0)"',
+])
+def test_an_arrow_or_a_quoted_angle_bracket_is_not_a_redirect(command):
+    """`->` is not a redirect and `grep` writes nothing. The first version denied
+    both: `\d?>>?` matched the `>` in `->` and read the next token as a
+    filename, so a read-only grep whose PATTERN mentioned a `.md` file was
+    refused. Quoting is the other half — a `>` inside a quoted string is data,
+    not an operator."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+def test_a_quoted_redirect_target_is_still_seen_after_masking():
+    """The sibling that keeps the fix above from being 'ignore all quotes'. The
+    OPERATOR must be outside quotes; the TARGET may be quoted, and it has to be,
+    for any path containing a space."""
+    assert enf.language_violation("Bash", {"command": 'echo x > "src/app.ts"'},
+                                  _sc(langs=("python",))) is not None
+
+
+def test_a_heredoc_body_is_not_scanned_for_redirects():
+    """THE anti-deadlock regression, verified reachable by review.
+
+    `_redirect_targets` returned every hit in the whole string, so a heredoc
+    BODY that merely mentioned `echo x > src/app.ts` was collected alongside the
+    real target. The real target here is this phase's evidence document and is
+    correctly exempt — but `any(...)` then denied on the body hit anyway. That is
+    precisely the composition the module comment promises cannot reopen, and
+    this repo's own planning documents contain example text of that shape."""
+    command = ("cat > docs/superpowers/specs/design.md <<'EOF'\n"
+               "Example: echo x > src/app.ts\n"
+               "EOF")
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(phase="brainstorm",
+                                      langs=("python",))) is None
+
+
+def test_a_heredocs_own_target_is_still_seen():
+    """The sibling. Stripping bodies must not strip the command line itself."""
+    command = "cat > src/app.ts <<'EOF'\nconst x = 1\nEOF"
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "git status; echo x > src/app.ts",
+    "hive log update ok && echo x > src/app.ts",
+    "gh pr view | echo x > src/app.ts",
+    "git status && npx create-react-app web",
+])
+def test_an_exempt_program_does_not_exempt_the_rest_of_the_chain(command):
+    """`EXEMPT_PROGRAMS` was applied to the first token of the WHOLE command, so
+    prefixing anything with `git status;` turned the entire rule off. The
+    exemption exists so the documented remedies stay reachable — that argues for
+    exempting the invocation, not everything chained after it."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is not None, command
+
+
+@pytest.mark.parametrize("command", [
+    "hive mindnet satisfy t1",
+    "hive log update 'wrote src/app.ts'",
+    "git commit -m 'add app.ts'",
+    "git status 2>&1",
+    "hive rules enforce --disable policy:gate:mindnet-language",
+])
+def test_the_escape_hatch_survives_segment_scoping(command):
+    """The guard the fix above must not break. Every documented way out of an
+    enforcement state runs through Bash, so narrowing the exemption to a segment
+    must still leave a bare remedy exempt."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "echo x >| src/app.ts",
+    "echo x | tee --append src/app.ts",
+    "echo x | tee -a -- src/app.ts",
+])
+def test_the_other_spellings_of_the_shapes_already_claimed(command):
+    """Not new shapes — the SAME two shapes spelled the way a shell actually
+    allows. `>|` is the clobber-override redirect and was matched by nothing;
+    `tee --append` had `--append` captured AS the path, which then went to the
+    extension table, came back unmapped, and allowed. A rule that claims to
+    cover redirects and `tee` should cover their real spellings."""
+    assert enf.language_violation("Bash", {"command": command},
+                                  _sc(langs=("python",))) is not None, command
+
+
+def test_redirecting_program_output_to_a_forbidden_extension_still_denies():
+    """A judgment call, pinned so it is a decision rather than an accident.
+
+    The lock asks what lands on disk, not who authored it. `python gen.py >
+    report.md` creates a markdown file, and a `Write` of `report.md` under a
+    python-only context is refused — denying one and allowing the other would
+    make the rule depend on which tool happened to be used, which is the exact
+    inconsistency this whole unit exists to remove."""
+    assert enf.language_violation(
+        "Bash", {"command": "python gen.py > report.md"},
+        _sc(langs=("python",))) is not None
+    assert enf.language_violation(
+        "Bash", {"command": "python gen.py > report.md"},
+        _sc(langs=("python", "markdown"))) is None
