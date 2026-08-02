@@ -62,9 +62,17 @@ the more aggressive choice — gateguard's own `_split_segments` makes the same
 tradeoff for the same reason. It cannot be evaded by an option-value trick, and
 a false positive is recoverable through `agent_satisfy`.
 
-This is what turns the plan's CLAIM that `pr-green` stays agent-reported and
-that the repo's GitHub boundary is preserved into something enforced. A
-source-grep test mirrors `tests/test_research.py`'s clause (d).
+This is what turns the repo's GitHub boundary from a claim into something
+enforced. A source-grep test mirrors `tests/test_research.py`'s clause (d).
+
+It used to be paired with a second claim — that `pr-green` therefore stays
+agent-reported — and MN-8b severed the two. The boundary is unchanged and the
+reasoning behind it still holds: `gh` is refused, so nothing here can read
+GitHub's CI matrix, and nothing here may claim to. What did not follow is the
+conclusion. The terminal gate's evidence is the LOCAL suite's exit code, which
+this module produces by running a real subprocess, so `python` is the honest
+label for it rather than an overreach. See `phases.py`'s `PHASE_EVIDENCE`
+comment for the bounded version of the claim.
 
 ## Refusal must not wedge a task
 
@@ -73,12 +81,20 @@ refusal reason VERBATIM and stamped ``agent``, so a classifier false positive
 cannot deadlock a task while the ledger still shows Python did not verify it.
 
 It returns ``clears`` alongside the event, and callers must read it. Against the
-committed contracts ``clears`` is **False for `audit-bug`**: that phase's
-descriptor names ``python`` as its verifier and `controller._apply_satisfy`
+committed contracts ``clears`` is **False for `audit-bug` and for `pr-green`**:
+both descriptors name ``python`` as their verifier and `controller._apply_satisfy`
 refuses any weaker claim, so the event lands honestly labelled and the phase
-stays unsatisfied. Closing that gap needs a fallback authority in `phases.py` or
-`controller.py`, which is outside this unit's scope — surfacing it beats
-printing a success line over a no-op.
+stays unsatisfied. Surfacing that beats printing a success line over a no-op.
+
+`pr-green` joined the set in MN-8b, and there the refusal is the POINT rather
+than a gap: a task must not be closeable by an agent asserting its own PR is
+green. That is only safe because the mechanical route is live — `validate` runs
+the suite and stamps `python` — and because `fall_back` is still open. Both
+exits are pinned in `tests/test_mindnet_executor.py`.
+
+`audit-bug` remains the unclosed case: its python verifier having REFUSED is
+exactly when the hatch is needed, and a fallback authority in `phases.py` or
+`controller.py` is still its own slice.
 
 ## Artifacts, and how ``n`` is derived
 
@@ -195,8 +211,9 @@ class Validation(NamedTuple):
 
 class AgentSatisfy(NamedTuple):
     """`agent_satisfy`'s answer. ``clears`` is not decoration — see the module
-    docstring: against the committed descriptors it is False for `audit-bug`,
-    and a caller that ignores it will report success for a no-op."""
+    docstring: against the committed descriptors it is False for `audit-bug`
+    and for `pr-green`, and a caller that ignores it will report success for a
+    no-op."""
 
     event: object
     clears: bool
@@ -249,9 +266,10 @@ def _denylist_refusal(argv):
     """The narrower refusal gateguard does not make, on the RESOLVED argv."""
     program = _program(argv[0])
     if program in DENIED_PROGRAMS:
-        return (f"denylist: '{program}' is refused here — the terminal phase "
-                f"stays agent-reported by design, so a validation run may not "
-                f"reach for the forge's own client")
+        return (f"denylist: '{program}' is refused here — a validation run "
+                f"verifies locally and may not reach for the forge's own "
+                f"client. The terminal gate's evidence is this repository's "
+                f"own suite exiting zero, not GitHub's answer about it")
     if program != "git":
         return None
     for token in argv[1:]:
@@ -610,10 +628,14 @@ def agent_satisfy(task_id, reason, evs=None, tasks=None, project=None,
     legible at either read depth.
 
     Read ``clears``. Against the committed descriptors it is False for
-    `audit-bug`: that phase names ``python`` as its verifier, and
+    `audit-bug` and for `pr-green`: both name ``python`` as their verifier, and
     `controller._apply_satisfy` refuses any weaker claim, so this event is
     recorded as a violation and the phase stays unsatisfied. The task can still
-    fall back; it cannot pass that gate until something stronger clears it."""
+    fall back; it cannot pass that gate until something stronger clears it.
+
+    At `pr-green` (MN-8b) that refusal is deliberate rather than a shortfall —
+    the terminal gate exists precisely so a task cannot be closed by assertion —
+    and the mechanical route through `validate` remains open."""
     text = "" if reason is None else str(reason)
     if not text.strip():
         raise ValueError(

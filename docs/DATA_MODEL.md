@@ -229,12 +229,19 @@ fail-open by design because it is advisory:
 - the destructive-command classifier refuses on any reason string **and on any
   exception it raises**;
 - an explicit denylist refuses any argv resolving to `gh` or to `git push`, so
-  the "`pr-green` stays agent-reported, `GITHUB_DENY` is preserved" claim is
-  enforced rather than merely asserted.
+  the `GITHUB_DENY` claim is enforced rather than merely asserted.
+
+This bullet once carried a second clause — that `pr-green` therefore stays
+agent-reported. MN-8b severed the two (§4.9). The boundary is unchanged and is
+still the reason nothing here reads GitHub's CI matrix; the conclusion about
+who may verify the terminal gate did not follow from it.
 
 A refusal must never wedge a task: the phase can still be satisfied by
 `hive mindnet satisfy --agent-reported`, whose `detail` carries the refusal
 reason verbatim, so the ledger shows plainly that Python did not verify it.
+**Read `clears` on the result** — for the two phases whose descriptor names
+`python` (`audit-bug`, and `pr-green` since MN-8b) that satisfy is recorded as a
+violation and does not clear the phase.
 
 ### 4.3 The sidecar's `advice` section (MN-3)
 
@@ -283,6 +290,42 @@ returning the standard hook shape:
 |---|---|---|
 | `gate:mindnet-phase` | a write/execute tool while **any** `in_progress` task sits at `brainstorm`, `plan` or `prd` | `ACCESS DENIED: MindNetwork State Machine violation. You cannot write or execute code while in Phase: {phase}.` |
 | `gate:mindnet-language` | a write, **or a shell command that creates a file**, whose language falls outside a populated `language_context` | `ACCESS DENIED: Language Compatibility Lock violation. This task is strictly restricted to {languages}.` |
+| `gate:mindnet-language` (MN-8a) | a **`Write`** of a `.py` path, permitted by the rule above, whose `content` does not parse as Python | `ACCESS DENIED: Language Compatibility Lock Violation. The provided code contains alien syntax or spaghetti code that is not valid Python.` |
+
+**The two language denials are separate messages on purpose.** The first is
+about a file NAMED in the wrong language and its remedy is to widen
+`language_context`; the second is about content that will not compile, where
+that advice is useless. Collapsing them would hand the operator the wrong
+instruction for one of the two failures.
+
+**What MN-8a checks, and what it deliberately does not.** The rules above all
+resolve a language from the DESTINATION — the extension, the redirect target,
+the scaffold generator. None looked at the payload, so `src/thing.py` containing
+`function add(a, b) { … }` satisfied every one of them. `Write` content for a
+`.py` path under a python-permitting context now goes through `ast.parse` **in
+memory**; nothing is written to disk in order to check it. The check runs last,
+so reaching it means the extension rule already allowed the write and a denial
+from there can only be about content.
+
+- **`Write` only.** `Edit`, `MultiEdit` and `NotebookEdit` carry *fragments*,
+  and a correct fragment — an indented method body, a lone `else:` branch —
+  raises `IndentationError` parsed standalone. Checking them would deny ordinary
+  edits, and since the documented ways out of an enforcement state are
+  themselves edits, a session could not reliably edit its way out. This is the
+  same class of guard as the five below, written in advance of the outage
+  rather than after it.
+- **Heredoc bodies are out of scope.** The redirect TARGET is still checked;
+  extracting the body is a shell-parsing problem whose false positives are paid
+  on every call — the same trade MN-4 already declined for command language
+  inference.
+- **`SyntaxError` is the only deny signal.** A `TypeError` on a non-string
+  payload or a `RecursionError` on a pathological literal is a fault in the
+  checker, not evidence about the code, and allows. It is caught inside the
+  helper because `SyntaxError` subclasses `Exception` and `language_violation`'s
+  outer fail-open would otherwise convert every intended denial into an allow.
+- **It answers "is this valid Python", not "was this meant as Python".** A JSON
+  object literal is a valid Python dict expression and parses clean. That limit
+  is pinned by a test rather than left to be discovered.
 
 Both are `deny` rather than `ask`: a destructive command is sometimes
 legitimate, a state-machine violation is not. Both inherit the manifest kill
@@ -773,6 +816,38 @@ because nothing called the gate either; wiring the gate alone would have made no
 tasks permanently incompletable. `executor.validate` now mirrors a successful run's
 artifact onto the graph axis (best-effort — the phase-axis satisfy is the
 load-bearing write and has already landed).
+
+**Who may satisfy it (MN-8b).** `PHASE_EVIDENCE["pr-green"]["verified_by"]` is
+`python`. It shipped as `agent`, which meant the founding requirement could be
+met by the agent asserting its own PR was green — the one gate in the pipeline
+that self-attestation could close.
+
+The rationale it inherited was borrowed from `audit-code` / `audit-system`:
+Python cannot see GitHub CI, because the executor denylists `gh` (§4.2). That
+premise still holds and the boundary is untouched. The conclusion does not
+follow, because those two phases have **no** artifact Python can read and this
+one does — the repository's own suite exits with a code, `executor.validate`
+runs it as a real subprocess, and `python` stamped off a real exit code is the
+honest label rather than the KTD2 lie.
+
+So the claim is **bounded, not dropped**: satisfying `pr-green` asserts the
+LOCAL suite passed, which is what `CLAUDE.md` accepts as standing in for CI. It
+asserts nothing about GitHub's matrix, and nothing may.
+
+Two consequences, both deliberate:
+
+- `controller._apply_satisfy` refuses a claim weaker than the descriptor, so an
+  `agent`-stamped satisfy at `pr-green` lands on the ledger (append-only:
+  what was claimed is recorded) and folds to a **violation**. The phase stays
+  open. `executor.agent_satisfy` reports this as `clears=False`.
+- The task is **not** wedged. Two exits stay live: re-run mechanically through
+  `validate`, or `fall_back` to an earlier phase, which opens a new epoch.
+  Both are pinned in `tests/test_mindnet_executor.py`; a gate nothing could
+  satisfy would be a bricked pipeline dressed up as a hardened one.
+
+Note the two gates compose: clearing the phase is necessary and not sufficient,
+because `can_complete` independently requires the task-axis `evidence` tuple
+that only a validation run records.
 
 ### 4.8 Per-task worktree isolation (MN-9)
 

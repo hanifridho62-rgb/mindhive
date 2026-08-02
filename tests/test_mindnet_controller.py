@@ -937,6 +937,80 @@ def test_only_the_inverted_child_is_frozen_not_its_parent():
     assert parent_ok, f"the parent could not catch up: {parent_reason}"
 
 
+def test_an_agent_attested_pr_green_is_a_violation_not_a_completion():
+    """MN-8b, the whole point of the change. The founding requirement is that a
+    task is not finished until the PR is green; before this, the agent could
+    satisfy that gate by saying so.
+
+    `_apply_satisfy` refuses a claim weaker than the descriptor, and `pr-green`
+    now names `python`. So the attestation still LANDS on the ledger — the
+    ledger is append-only and honesty means recording what was claimed — but it
+    folds to a violation and the phase stays open."""
+    _walk_to("pr-green")
+    state, tasks, records = _state()
+    assert records[TASK].phase == "pr-green", "the walk did not land"
+
+    _satisfy(phase="pr-green", epoch=0, verified_by="agent")
+    state, tasks, records = _state()
+    assert not c_mod.satisfied(records, TASK, "pr-green")
+    assert any("weaker claim" in v for v in records[TASK].violations), \
+        records[TASK].violations
+
+
+def test_a_machine_verified_pr_green_clears_the_terminal_gate():
+    """The other half, and the anti-wedge proof at the fold. If only the refusal
+    were tested, a `pr-green` that NOTHING could satisfy would pass just as
+    happily — and that is a bricked terminal gate, not a hardened one.
+
+    Note what this does NOT claim. `can_complete` carries a SECOND, independent
+    gate — the task-axis `evidence` tuple, which only a real validation run
+    records — so clearing the phase is necessary and not sufficient. That half
+    is the executor's and is proved end-to-end in `test_mindnet_executor.py`.
+    Asserting `can_complete(...) is None` here would fail on the evidence gate
+    and read as an authority problem, which is exactly the confusion this note
+    exists to prevent."""
+    _walk_to("pr-green")
+    _satisfy(phase="pr-green", epoch=0, verified_by="python")
+    state, tasks, records = _state()
+    assert c_mod.satisfied(records, TASK, "pr-green")
+    assert not records[TASK].violations, records[TASK].violations
+
+
+def test_the_two_authorities_at_pr_green_differ_only_in_who_verified():
+    """The discriminating pair, stated as one assertion so the two tests above
+    cannot both drift into passing for an unrelated reason. Same phase, same
+    epoch, same result — only `verified_by` differs, and only one clears."""
+    _walk_to("pr-green")
+    _satisfy(phase="pr-green", epoch=0, verified_by="agent")
+    state, tasks, records = _state()
+    agent_cleared = c_mod.satisfied(records, TASK, "pr-green")
+
+    _satisfy(phase="pr-green", epoch=0, verified_by="python")
+    state, tasks, records = _state()
+    python_cleared = c_mod.satisfied(records, TASK, "pr-green")
+
+    assert (agent_cleared, python_cleared) == (False, True)
+
+
+def test_a_failed_machine_run_does_not_clear_pr_green():
+    """`python` is the right authority AND the run has to have passed. A suite
+    that exited non-zero is a red PR reported honestly, not a green one."""
+    _walk_to("pr-green")
+    _satisfy(phase="pr-green", epoch=0, verified_by="python", result="fail")
+    state, tasks, records = _state()
+    assert not c_mod.satisfied(records, TASK, "pr-green")
+
+
+def test_a_human_attested_pr_green_is_still_refused():
+    """Unchanged by MN-8b and pinned so the flip did not accidentally reorder
+    the authority ranking — `human` was weaker than `agent` and stays weaker
+    than `python`."""
+    _walk_to("pr-green")
+    _satisfy(phase="pr-green", epoch=0, verified_by="human")
+    state, tasks, records = _state()
+    assert not c_mod.satisfied(records, TASK, "pr-green")
+
+
 def test_a_correctly_built_tree_is_never_an_inversion():
     """The canary. KTD13 mandates children finishing ahead of their parent, so
     an over-broad inversion rule would flag the flow the spec requires."""

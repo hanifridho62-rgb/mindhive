@@ -257,12 +257,18 @@ def test_the_probe_script_can_actually_observe_its_environment(tmp_path,
     assert _probe_read(marker) == {"MN7_CANARY": "yes"}
 
 
-def test_the_denylist_names_the_two_things_the_plan_promises_stay_agent_reported():
-    """KTD15: the plan CLAIMS `pr-green` stays agent-reported and that the
-    research module's GitHub boundary is preserved. An explicit denylist is what
-    makes the claim enforced rather than merely asserted, so the constants are
-    pinned here — a tidy-up that empties them would leave every behavioural test
-    below still passing for the wrong reason."""
+def test_the_denylist_names_the_github_boundary_it_promises_to_keep():
+    """KTD15: the research module's GitHub boundary is preserved. An explicit
+    denylist is what makes the claim enforced rather than merely asserted, so
+    the constants are pinned here — a tidy-up that empties them would leave
+    every behavioural test below still passing for the wrong reason.
+
+    This once carried a SECOND claim — that `pr-green` therefore stays
+    agent-reported — and MN-8b severed it. The boundary below is unchanged and
+    still the reason nothing here reads GitHub's CI matrix; what no longer
+    follows is a conclusion about who may verify the terminal gate, whose
+    evidence is the local suite's exit code. See
+    `test_an_agent_cannot_attest_its_own_pr_is_green`."""
     assert "gh" in x_mod.DENIED_PROGRAMS
     assert "push" in x_mod.DENIED_GIT_SUBCOMMANDS
     assert "refused" in x_mod.RUN_RESULTS
@@ -730,6 +736,105 @@ def test_agent_satisfy_reports_whether_the_fold_will_actually_clear_the_phase():
     rec = _records()[TASK]
     assert not c_mod.satisfied(_records(), TASK, "audit-bug")
     assert any("weaker claim" in v for v in rec.violations)
+
+
+# --- MN-8b: the terminal gate is machine-verified ----------------------------------
+
+def _at_pr_green(task_id=TASK, script=""):
+    """Drive *task_id* to `pr-green`, the terminal gate.
+
+    Longer than `_at_audit_bug` because the bypass only skips the METHOD
+    phases — every audit between `execution` and the gate is a real move, and
+    each is satisfied at the authority its own descriptor names so the walk
+    never leans on the rule under test."""
+    _declare(task_id, script=script, triviality_bypass=True)
+    walk = ("execution", "audit-bug", "audit-code", "audit-system", "pr-green")
+    for phase, nxt in zip(walk, walk[1:]):
+        desc = ph_mod.PHASE_EVIDENCE[phase]
+        events.append_event(
+            "mindnet_phase",
+            {"action": "satisfy", "task_id": task_id, "phase": phase,
+             "epoch": 0, "verified_by": desc["verified_by"],
+             "evidence": {"kind": desc["kind"],
+                          "ref": ("" if desc["kind"] == "event"
+                                  else f"runs/mn-{task_id}-setup/out.txt"),
+                          "result": "ok"}},
+            tags=["mindnet", "phase"])
+        events.append_event(
+            "mindnet_phase",
+            {"action": "enter", "task_id": task_id, "phase": nxt,
+             "verified_by": "python"},
+            tags=["mindnet", "phase"])
+    assert _records()[task_id].phase == "pr-green", \
+        "setup failed to reach the terminal gate"
+    return task_id
+
+
+def test_an_agent_cannot_attest_its_own_pr_is_green(tmp_path):
+    """MN-8b. `pr-green` names `python`, so the escape hatch no longer clears
+    the terminal gate — and `clears` is what stops the CLI printing a success
+    line over a no-op. `audit-bug` was the only phase in this set before; the
+    module docstring says so and now names both."""
+    _at_pr_green()
+    got = x_mod.agent_satisfy(TASK, "gate refused: policy false positive")
+    assert got.event is not None, "the attestation must still reach the ledger"
+    assert got.clears is False
+    assert got.note
+    assert got.event.payload["verified_by"] == "agent"
+    assert not c_mod.satisfied(_records(), TASK, "pr-green")
+    assert any("weaker claim" in v for v in _records()[TASK].violations)
+
+
+def test_a_real_run_clears_the_terminal_gate_and_completes_the_task(tmp_path):
+    """THE anti-wedge proof, and the one test that makes MN-8b safe rather than
+    merely strict.
+
+    Refusing the agent is only defensible if something else can still clear the
+    gate. A real subprocess exits 0, `validate` stamps `python` off that exit
+    code, and the task completes — including the SECOND gate `can_complete`
+    carries, the task-axis evidence tuple that only a validation run records.
+    Without this, `pr-green` would be a terminal phase nothing on earth could
+    satisfy, which is a bricked pipeline dressed up as a security fix."""
+    _at_pr_green(script=_script("--mode", "ok"))
+    out = x_mod.validate(TASK, root=tmp_path, timeout_s=30)
+    assert out.run.result == "ok"
+    p = out.event.payload
+    assert p["phase"] == "pr-green"
+    assert p["verified_by"] == "python"
+    assert p["evidence"]["result"] == "ok"
+    assert c_mod.satisfied(_records(), TASK, "pr-green")
+
+    graph = t_mod.fold(events.read_all())
+    assert graph[TASK].evidence, "the run recorded no task-axis evidence"
+    assert t_mod.can_complete(
+        graph, TASK, c_mod.satisfaction_predicate(_records())) is None
+
+
+def test_a_failing_run_does_not_clear_the_terminal_gate(tmp_path):
+    """A red suite reported honestly is not a green PR. Without this the test
+    above would pass against a gate that accepts any `python`-stamped row
+    regardless of what the run actually did."""
+    _at_pr_green(script=_script("--mode", "fail", "--exit-code", "2"))
+    out = x_mod.validate(TASK, root=tmp_path, timeout_s=30)
+    assert out.run.result == "fail"
+    assert out.event.payload["evidence"]["result"] == "fail"
+    assert not c_mod.satisfied(_records(), TASK, "pr-green")
+
+
+def test_a_refused_agent_attestation_still_leaves_fall_back_open(tmp_path):
+    """The second live exit. KTD15 says a refusal must not wedge a task; MN-8b
+    narrows the escape hatch at this one gate, so the remaining way back has to
+    be shown working rather than assumed."""
+    _at_pr_green()
+    x_mod.agent_satisfy(TASK, "gate refused: policy false positive")
+    events.append_event(
+        "mindnet_phase",
+        {"action": "fall_back", "task_id": TASK, "phase": "execution",
+         "detail": "pr-green: suite red", "verified_by": "python"},
+        tags=["mindnet", "phase"])
+    rec = _records()[TASK]
+    assert rec.phase == "execution", "the task could not fall back"
+    assert rec.epoch == 1, "a fall_back must open a new epoch"
 
 
 def test_agent_satisfy_requires_a_reason():

@@ -105,6 +105,26 @@ def test_the_two_reviewed_audits_are_honestly_agent_reported():
     assert p_mod.PHASE_EVIDENCE["audit-system"]["verified_by"] == "agent"
 
 
+def test_the_terminal_gate_is_machine_verified():
+    """MN-8b. `pr-green` is the founding requirement — a task is not finished
+    *"hingga PR berwarna hijau"* — and it was the one gate the agent could clear
+    by saying so.
+
+    It sat with the two audits above on a rationale that does not survive the
+    distinction they rest on. Those two have NO artifact Python can read. This
+    one does: the repository's own suite exits with a code, `executor.validate`
+    runs it as a real subprocess, and stamping `python` off a real exit code is
+    the honest label rather than the KTD2 lie."""
+    assert p_mod.PHASE_EVIDENCE["pr-green"]["verified_by"] == "python"
+
+
+def test_the_terminal_gate_still_takes_command_evidence():
+    """MN-8b changes WHO may verify, not WHAT counts as evidence. If `kind`
+    drifted to `file` the executor's command-kind path would stop satisfying it
+    and the gate would be unclearable by any mechanical route."""
+    assert p_mod.PHASE_EVIDENCE["pr-green"]["kind"] == "command"
+
+
 def test_descriptor_is_total_on_an_unknown_phase():
     assert p_mod.descriptor("audit_bug") is None
     assert p_mod.descriptor(None) is None
