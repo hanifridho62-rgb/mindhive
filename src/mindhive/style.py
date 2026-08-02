@@ -158,9 +158,11 @@ def is_continuation(text) -> bool:
     part below is the whole-string `lower().split()`, not the regexes — without
     this bail a pasted 100KB log gets swept on the hook's critical path.
 
-    The one input this reclassifies is a marker followed by a single
-    multi-kilobyte token, which now reads as caveman. Forgetting a lesson is the
-    safe failure here; inventing one is not."""
+    The bail measures the RAW string, matching `promptgate.is_code_work`, so
+    anything over the cap answers False even when it would normalize down to a
+    few words — a marker plus one multi-kilobyte token, or a marker trailed by
+    kilobytes of whitespace. Both now read as caveman. Forgetting a lesson is
+    the safe failure here; inventing one is not."""
     if _is_injected(text):
         return False
     t = str(text or "")
