@@ -612,20 +612,46 @@ def make_handler(token: str):
             # `now` is resolved HERE and passed in, because `ui_cats.board` is
             # pure by design — that is what makes its 180 s and 6 h boundaries
             # testable at the boundary instead of approximately.
+            import time
             from datetime import datetime, timezone
 
+            from . import oversee as oversee_mod
             from .mindnet import telemetry as tel_mod
             from .mindnet import ui_cats as cats_mod
+            from .mindnet import ui_sessions as sess_mod
             evs = [e for _, e in all_event_pairs()] if am else \
                 events.read_all(proj)
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # ONE clock for both boards. The faculty side ages rows from an ISO
+            # string and `oversee` decides liveness from an epoch float; reading
+            # the clock twice would let a session straddle the two and render as
+            # working on one axis and stale on the other in the same payload.
+            stamp = time.time()
+            now = datetime.fromtimestamp(stamp, timezone.utc) \
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
             cats = cats_mod.board(tel_mod.fold(evs), now)
+            # ONE ledger read for both, too. The two folds ask different
+            # questions of the SAME events, and `interactive_sessions` takes
+            # `evs` for exactly this reason — re-reading would double the cost of
+            # a poll that fires every 1.2 s against a store measured in tens of
+            # thousands of events.
+            sessions = sess_mod.board(
+                oversee_mod.interactive_sessions(
+                    project=proj, evs=evs, now_fn=lambda: stamp), now)
             # The thresholds ride along so the page renders "idle 4h" without a
             # second copy of 180/21600 in JavaScript (invariant 10).
             return self._json({"cats": list(cats),
+                               "sessions": list(sessions["cats"]),
+                               "sessions_total": sessions["total"],
+                               "sessions_hidden": sessions["hidden"],
+                               # Which signals this BUILD can observe at all, so
+                               # an empty strip can say "nothing running" rather
+                               # than being mistaken for "cannot know".
+                               "producers": tel_mod.producers(),
                                "dim_after_secs": cats_mod.DIM_AFTER_SECS,
                                "hide_after_secs": cats_mod.HIDE_AFTER_SECS,
-                               "idle_vanish_secs": cats_mod.IDLE_VANISH_SECS})
+                               "idle_vanish_secs": cats_mod.IDLE_VANISH_SECS,
+                               "online_after_secs":
+                                   oversee_mod.ONLINE_WINDOW_SECONDS})
 
         def _get_skills_stats(self, proj, am, qs):
             # per-skill completion-rate telemetry aggregated from the ledger

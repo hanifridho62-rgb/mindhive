@@ -213,6 +213,40 @@ def busy(faculty, task_id=None, phase=None, project=None, session_id=None):
 
 # --- reading -------------------------------------------------------------------------
 
+# What each producer needs to exist at all, for `producers()` below. Checked by
+# INSPECTION rather than kept as a hand-maintained boolean, because a stale
+# literal here would recreate the exact failure this function exists to expose.
+_PRODUCER_PROBES = (
+    ("faculty", "mindhive.playbook", "engaged"),
+    ("swarm", "mindhive.workspace", "SWARM_FACULTY"),
+    ("session", "mindhive.oversee", "interactive_sessions"),
+)
+
+
+def producers() -> dict:
+    """``{signal: bool}`` — which producers THIS BUILD actually carries.
+
+    The board's founding claim is that a missing cat means a real bug. That claim
+    is false in one specific way the board could not previously express: a build
+    whose branch simply predates a producer renders exactly like a build where
+    nothing is running. An operator hunting a silent faculty then has no way to
+    tell "not running" from "cannot possibly know" — and this repo lost real hours
+    to precisely that, with a checkout that had no `playbook` module at all while
+    the strip cheerfully read "no MindNetwork activity".
+
+    Never raises: an unimportable module is a `False`, which is the honest answer
+    and the whole point. A probe that threw would take out the poll that was
+    trying to report the gap."""
+    out: dict = {}
+    for name, module, attr in _PRODUCER_PROBES:
+        try:
+            import importlib
+            out[name] = hasattr(importlib.import_module(module), attr)
+        except Exception:                   # noqa: BLE001
+            out[name] = False
+    return out
+
+
 def fold(evs) -> dict:
     """Deterministic, total fold of `mindnet_activity` into
     ``faculty -> Activity``.
