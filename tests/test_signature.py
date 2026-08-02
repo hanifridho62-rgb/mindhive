@@ -83,3 +83,58 @@ def test_worktree_permission_denied_is_classified_not_raw():
     sig = signature(err)
     assert sig == "git:worktree-locked"
     assert not sig.startswith("raw:")           # no longer lost in the junk bucket
+
+
+# --- the "Exit code <n>" mega-bucket ------------------------------------
+# Masking every digit run to N collapsed "Exit code 1" and "Exit code 49" onto
+# one hash, and hashing only the FIRST line threw away the line that actually
+# named the failure. Together they produced raw:e5637cbd18 — 375 recorded
+# occurrences across four projects (49.3% of all captured failures), a bucket
+# holding unrelated root causes and therefore unreflectable and unfixable.
+
+
+def test_distinct_exit_codes_do_not_share_one_signature():
+    # Kills the wrong implementation that masks \d+ everywhere: an exit code is
+    # the identity of a failure family, not volatile noise like a line number.
+    sigs = {signature("Exit code %d" % code) for code in (1, 2, 49, 128, 143, 255)}
+    assert len(sigs) == 6
+
+
+def test_exit_code_header_keeps_the_diagnostic_detail_line():
+    # Same exit code, different diagnosis: this isolates the first-line-only
+    # defect. Neither detail line matches a named family, so the split can only
+    # come from the detail being folded in — not from some other classifier
+    # rule catching one of them first.
+    store_alias = signature("Exit code 1\nPython was not found; run without "
+                            "arguments to install from the Microsoft Store.")
+    not_a_repo = signature("Exit code 1\nfatal: not a git repository")
+    assert store_alias != not_a_repo
+
+
+def test_exit_code_detail_still_collapses_volatile_line_numbers_and_paths():
+    # The canary for the split above: masking must STILL apply inside the detail
+    # line. Without this the fix trades one mega-bucket for unbounded
+    # fragmentation, where every traceback line number mints a new signature.
+    a = signature('Exit code 2\n  File "C:\\a\\x.py", line 42, in <module>')
+    b = signature('Exit code 2\n  File "C:\\b\\y.py", line 99, in <module>')
+    assert a == b
+
+
+def test_bare_exit_code_without_detail_is_stable():
+    # Totality: a header with nothing after it must classify, not raise.
+    assert signature("Exit code 143") == signature("Exit code 143")
+    assert signature("Exit code 143").startswith("raw:")
+
+
+def test_exit_code_family_stays_an_unclassified_fallback():
+    # An exit code plus a detail line is still an unknown root cause, so it keeps
+    # the raw: prefix that reflect.py keys its fallback handling off.
+    assert signature("Exit code 128\nfatal: not a git repository").startswith("raw:")
+
+
+def test_unquoted_missing_module_classifies_like_the_quoted_form():
+    # Import failures emit the quoted form ("No module named 'tools'"), but
+    # `python -m <missing>` emits it UNQUOTED. Matching only the quoted form sent
+    # every `python -m` miss into the junk bucket instead of pymodule:*.
+    assert signature("C:\\py.exe: No module named pyflakes") == "pymodule:pyflakes"
+    assert signature("No module named pyflakes") == signature("No module named 'pyflakes'")

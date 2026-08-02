@@ -10,7 +10,10 @@ import re
 
 _SLUG = re.compile(r"[^a-z0-9]+")
 
-_NO_MODULE = re.compile(r"No module named '([^']+)'")
+# Import failures quote the name ("No module named 'tools'"); `python -m
+# <missing>` does not ("No module named pyflakes"). Matching only the quoted
+# form sent every `python -m` miss into the raw: fallback.
+_NO_MODULE = re.compile(r"No module named '?([A-Za-z_][\w.]*)'?")
 
 
 def slug(text, max_len: int = 48) -> str:
@@ -32,6 +35,19 @@ def slug_id(text, max_len: int = 40) -> str:
     return f"{prefix}-{h}" if prefix else h
 _PS_TERM = re.compile(r"The term '([^']+)'")
 _PS_NOTRECOG = re.compile(r"'([^']+)' is not recognized")
+_EXIT_CODE = re.compile(r"exit code (\d+)", re.I)
+
+
+def _mask(line: str) -> str:
+    """Volatile bits out: absolute paths and digit runs (line numbers, PIDs), so
+    the same error at a different line or path still collapses together."""
+    norm = str(line or "").strip().lower()
+    norm = re.sub(r"[a-z]:\\[^\s]+|/[^\s]+", "PATH", norm)
+    return re.sub(r"\d+", "N", norm)
+
+
+def _hash(norm: str) -> str:
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:10]
 
 
 def signature(error_text) -> str:
@@ -74,8 +90,19 @@ def signature(error_text) -> str:
 
     # Fallback: hash the first line with volatile bits (numbers, paths) masked so
     # the same error with different line numbers/paths still collapses together.
-    first = next((ln for ln in t.splitlines() if ln.strip()), "")
-    norm = first.strip().lower()
-    norm = re.sub(r"[a-z]:\\[^\s]+|/[^\s]+", "PATH", norm)
-    norm = re.sub(r"\d+", "N", norm)
-    return "raw:" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:10]
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    first = lines[0] if lines else ""
+
+    # "Exit code <n>" is a HEADER, not a diagnosis. Two bugs previously merged
+    # every such failure into a single unfixable bucket (raw:e5637cbd18, 375
+    # occurrences — 49.3% of all captured failures across four projects):
+    # masking every digit run made "Exit code 1" and "Exit code 49" identical,
+    # and hashing only the first line discarded the line that names the failure.
+    # So: keep the code verbatim, and fold in the masked detail line.
+    m = _EXIT_CODE.match(first)
+    if m:
+        rest = first[m.end():].strip()
+        detail = rest or (lines[1] if len(lines) > 1 else "")
+        return "raw:" + _hash("exit code %s|%s" % (m.group(1), _mask(detail)))
+
+    return "raw:" + _hash(_mask(first))
