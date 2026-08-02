@@ -24,8 +24,10 @@ anywhere compression would leave the order of steps ambiguous. Resume after.
 
 **Teaching carve-out.** A prompt asking to be taught or given a full explanation
 — `explain` / `teach` / `walk me through`, `jelaskan` / `ajarkan` / `terangkan`
-— gets complete prose for that turn, then caveman resumes. Asking for thorough
-*work* ("review ini secara menyeluruh") is not a teaching request.
+— gets complete prose, and the lesson holds across turns: a follow-up that only
+says `lanjutkan` / `continue` stays in prose. The next substantive question ends
+the lesson and caveman resumes. Asking for thorough *work* ("review ini secara
+menyeluruh") is not a teaching request.
 
 Level persists until changed or session end. Full level table, auto-clarity
 rules, and the MindHive addendum live in the `caveman` skill

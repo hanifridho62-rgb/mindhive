@@ -23,7 +23,11 @@ gate found nothing" indistinguishable from "the hook said nothing".
 The user's own standing exception, verbatim: "kecuali saya ingin anda
 menjelaskan dan mengajarkan kepada saya dengan menyeluruh". Terse fragments are
 the wrong shape for a lesson, so a prompt that asks to be taught gets the
-opposite instruction for that turn only.
+opposite instruction — and keeps it. The carve-out is STICKY: "menyeluruh" means
+a lesson that spans turns, and a follow-up that only says "lanjutkan" carries no
+teach verb, so per-turn detection collapsed the lesson at exactly the moment it
+was being extended. `resolve_mode` holds it open and ends it on the next
+substantive question.
 
 Detection keys on the explain/teach VERB, never on thoroughness words alone.
 "review ini secara menyeluruh" asks for thorough WORK, not a thorough lecture;
@@ -114,11 +118,12 @@ def _is_injected(text) -> bool:
 def wants_teaching(text) -> bool:
     """True when the prompt asks to be taught or given a full explanation.
 
-    Machine-injected text (task notifications, slash-command envelopes, injected
-    skill bodies) answers False for the same reason the prompt gate skips it: it
-    is not the user asking for anything. Past `PROMPT_SCAN_CAP` only the leading
-    slice is scanned, so a pasted 100KB log cannot turn this into a heavy regex
-    sweep on the hook's critical path."""
+    Injected text — harness tags and injected skill bodies — answers False: it is
+    not the user asking for anything. A slash command is NOT injected text here
+    (see `_is_injected`); `/explain the parser` is a teaching request like any
+    other. Past `PROMPT_SCAN_CAP` only the leading slice is scanned, so a pasted
+    100KB log cannot turn this into a heavy regex sweep on the hook's critical
+    path."""
     if _is_injected(text):
         return False
     low = " ".join(str(text or "").lower().split())[:PROMPT_SCAN_CAP]

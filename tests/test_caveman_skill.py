@@ -146,12 +146,23 @@ def test_the_per_turn_wording_is_gone_everywhere():
     # PR #87 documented teaching mode as "THIS turn only" / "off for that turn".
     # Sticky mode makes both false, and a stale doc is what the next editor
     # trusts over the code.
+    #
+    # The SOURCE file and the command file are in here deliberately. The first
+    # version of this test read only prose docs and rendered strings, and three
+    # live instances walked straight through it: two docstrings in style.py —
+    # the very module that implements stickiness, where `wants_teaching` still
+    # described the bug the commit before it had just fixed — and the teaching
+    # carve-out in commands/caveman.md. Stale wording does its damage where the
+    # next editor reads it, and that is the source, not only what it renders.
     from mindhive import directives, style
     spec = (_ROOT / "docs" / "superpowers" / "specs"
             / "2026-06-23-mindhive-assistant-operating-spec.md")
+    style_src = _ROOT / "src" / "mindhive" / "style.py"
     sources = {
         "SKILL.md": _SKILL.read_text(encoding="utf-8"),
+        "caveman.md": _COMMAND.read_text(encoding="utf-8"),
         "operating spec": spec.read_text(encoding="utf-8"),
+        "style.py source": style_src.read_text(encoding="utf-8"),
         "directives": directives.directives(),
         "TEACH_BLOCK": style.TEACH_BLOCK,
     }
