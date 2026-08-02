@@ -66,6 +66,8 @@ once per hook invocation in `enforce.py` and is shared by both.
 """
 from __future__ import annotations
 
+import ast
+
 import posixpath
 
 import re
@@ -230,6 +232,18 @@ LANGUAGE_DENIAL = (
     "enforcement off: `hive mindnet enforce --disable`  ·  "
     "`MINDNETWORK_ENFORCE=0`  ·  or just this rule: "
     "`hive rules enforce --disable policy:gate:mindnet-language`.")
+
+# MN-8a. A SECOND denial, deliberately not a reworded `LANGUAGE_DENIAL`.
+#
+# The two answer different questions and prescribe different remedies. The
+# message above is about a file NAMED in the wrong language, and its advice —
+# widen `language_context` — is correct there and useless here: widening the
+# context does not make invalid code compile. Collapsing them into one string
+# would hand the operator the wrong instruction for one of the two failures.
+SYNTAX_DENIAL = (
+    "ACCESS DENIED: Language Compatibility Lock Violation. The provided code "
+    "contains alien syntax or spaghetti code that is not valid Python. You "
+    "are strictly forbidden from writing non-compilable syntax.")
 
 # A drive letter is exactly one alpha character followed by a colon. The
 # original test — `text[1] == ":"` — also matched `a:docs/plans/x.md`, a
@@ -594,6 +608,89 @@ def phase_violation(tool_name, tool_input, sc) -> str | None:
         return None
 
 
+def python_syntax_violation(text) -> bool:
+    """Whether *text* is affirmatively NOT parseable Python. MN-8a.
+
+    The extension rule below asks what a file is NAMED. This asks what it
+    CONTAINS, which is the half MN-4 never had: `src/thing.py` holding
+    ``function add(a, b) { ... }`` satisfies every check in this module up to
+    here, because `.py` maps to `python` and `python` is permitted.
+
+    ## Only `SyntaxError` denies
+
+    `ast.parse` can fail for reasons that say nothing about the code — a
+    `TypeError` on a non-string payload, a `RecursionError` on a pathologically
+    nested literal, a `MemoryError`. Those are faults in the CHECKER, and the
+    two ways to get this wrong are symmetric: treat them as violations and
+    ordinary work gets denied by a crashing gate; let them escape and the caller
+    fails open on input that was never examined. So `SyntaxError` is the single
+    deny signal and everything else answers False.
+
+    Catching it HERE rather than letting it reach `language_violation` is
+    load-bearing, not tidiness. `SyntaxError` subclasses `Exception`, and that
+    function's outer ``except Exception: return None`` is a deliberate fail-open
+    — so a `SyntaxError` allowed to propagate would be silently converted into
+    an ALLOW on exactly the payloads this check exists to refuse. The gate would
+    look implemented, pass its own wiring test, and enforce nothing.
+
+    ## What this cannot do
+
+    It answers "is this valid Python", not "was this intended as Python". A JSON
+    object literal is a valid Python dict expression and parses clean. That
+    limit is pinned by a test rather than left for someone to discover.
+
+    Total by construction: no I/O, no raise, and a non-string is not evidence of
+    anything."""
+    if not isinstance(text, str):
+        return False
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        # Includes `IndentationError`, which is why only whole-file payloads
+        # ever reach here — see the tool split in `language_violation`.
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _path_language(path):
+    """The language *path*'s extension maps to, or ``None`` when unmapped.
+
+    Extracted so the extension rule and MN-8a's content rule cannot drift on
+    "what language is this file". Trailing dots, trailing spaces and `::$DATA`
+    are stripped by Windows when the file is actually created, so `app.ts.`
+    writes `app.ts` — parse the name Windows will USE, not the one we were
+    handed. A content check that skipped this would be evadable by the same
+    suffix trick the extension rule already had to learn about."""
+    base = _ADS_RE.sub("", posixpath.basename(_norm(path)))
+    ext = posixpath.splitext(base.rstrip(". "))[1].lower()
+    return EXTENSION_LANGUAGE.get(ext)
+
+
+def _python_content_violation(phase, obj, allowed) -> bool:
+    """Whether this `Write` payload puts non-Python bytes into a `.py` file.
+
+    Reached only AFTER the extension rule allowed the write, so the question
+    here is narrow: the file is named Python, Python is permitted, and the only
+    thing left to check is whether the content actually is Python.
+
+    `python not in allowed` short-circuits rather than being merely redundant —
+    a task locked to typescript must never be handed Python parse semantics,
+    and the extension rule has already refused the `.py` path anyway."""
+    if "python" not in allowed:
+        return False
+    path = _file_path(obj)
+    if not path or _path_language(path) != "python":
+        return False
+    # The evidence exemption holds across all three rules now, for the reason
+    # recorded in `_path_language_violation`: a guard that denies the only
+    # action clearing the current phase deadlocks the machine.
+    if is_phase_evidence(phase, path):
+        return False
+    return python_syntax_violation(obj.get("content"))
+
+
 def _path_language_violation(phase, path, allowed) -> bool:
     """Whether writing *path* would breach *allowed*. One resolution of "what
     language is this file", shared by both tool classes (invariant 10)."""
@@ -610,12 +707,7 @@ def _path_language_violation(phase, path, allowed) -> bool:
     # rather than in the write branch.
     if is_phase_evidence(phase, path):
         return False
-    # Trailing dots, trailing spaces and `::$DATA` are stripped by Windows when
-    # the file is actually created, so `app.ts.` writes `app.ts`. Parse the name
-    # Windows will use, not the one we were handed.
-    base = _ADS_RE.sub("", posixpath.basename(_norm(path)))
-    ext = posixpath.splitext(base.rstrip(". "))[1].lower()
-    lang = EXTENSION_LANGUAGE.get(ext)
+    lang = _path_language(path)
     # Unmapped is not a violation — the table is finite, the file types a
     # repository contains are not.
     return lang is not None and lang not in allowed
@@ -673,6 +765,31 @@ def language_violation(tool_name, tool_input, sc) -> str | None:
             return LANGUAGE_DENIAL.format(
                 languages=", ".join(sorted(allowed)),
                 task_id=getattr(task, "task_id", "?"))
+        # MN-8a, and it runs LAST on purpose: reaching here means the extension
+        # rule ALLOWED the write, so a denial from this point can only be about
+        # content. Ordering matters for the operator, not just for us — a `.py`
+        # write under a typescript lock is a wrong-file-type problem whose
+        # remedy is to widen the context, and it must not be reported as
+        # non-compilable syntax.
+        #
+        # `Write` ONLY, and that is a boundary rather than an unfinished edge.
+        # `Write` carries `content`: a whole file, which is what `ast.parse`
+        # expects. `Edit`/`MultiEdit`/`NotebookEdit` carry FRAGMENTS, and a
+        # correct fragment — an indented method body, a lone `else:` branch —
+        # raises `IndentationError` parsed standalone. Checking them would deny
+        # ordinary edits, and since the documented ways out of an enforcement
+        # state are themselves edits and commands, a session could not reliably
+        # edit its way back out. This module has already shipped one deadlock
+        # assembled from two individually-correct guards (see
+        # `_path_language_violation`); this is that lesson applied in advance.
+        #
+        # Shell heredoc bodies stay out for the same reason MN-4 left command
+        # language inference alone: extracting them is a parsing problem whose
+        # false positives get paid on every call. The redirect TARGET is still
+        # checked by the rule above.
+        if tool_name == "Write" and _python_content_violation(phase, obj,
+                                                              allowed):
+            return SYNTAX_DENIAL
         return None
     except Exception:
         return None
