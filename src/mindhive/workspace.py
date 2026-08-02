@@ -26,6 +26,12 @@ MindSwarm reuses the same agents: a mission spawns a coordinator plus builders,
 scouts, and reviewers, each with a role lens appended to its system prompt that
 also tells it to read/write the shared Mind Hive memory (`hive recall` /
 `hive append`) — what one agent learns, the next one starts with.
+
+A running mission also lights MN-5's faculty cat board, under `SWARM_FACULTY`.
+That producer is edge-triggered on the fleet's AGGREGATE state — one row when
+the swarm starts working and one when it stops, never one per agent — and
+`Manager._sync_faculty` carries the reasoning for why the distinction is the
+requirement rather than a tidiness preference.
 """
 from __future__ import annotations
 

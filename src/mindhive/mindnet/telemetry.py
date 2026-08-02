@@ -63,6 +63,29 @@ however many events the feed carries.
 This module is deliberately NOT wired into `controller.py` or `executor.py` —
 where the emit calls belong is a seam to decide explicitly, not a side effect of
 adding the producer.
+
+## The seams decided so far
+
+This list is the whole producer set. A faculty absent from it has a labelled cat
+and nothing that lights it, which is the one way R16's "a missing cat means a
+real bug" can be false for a reason that is not a bug:
+
+- `__main__._mn_work` — a mutating `hive mindnet` command (`task-graph`).
+- `orchestrator` — an executed wave (`task-graph`) and the completion gate
+  (`pr-green`).
+- `enforce.hook_decision` — MN-4's language lock (`compatibility`).
+- `promptgate.record_direction` — the prompt catalog, via `playbook.engaged`
+  (`skill-plugin`, `history`).
+- `__main__`'s UserPromptSubmit hook — the consulted spine, via
+  `inject.engaged_faculties` (`sop`, `improvements`).
+- `workspace.Manager._sync_faculty` — a running MindSwarm mission
+  (`task-graph`).
+
+The last was the gap that made the board untrustworthy in practice rather than
+in principle. MindSwarm is the surface an operator commands work from, and it
+had no producer at all: its strip read "no MindNetwork activity" however many
+agents were running, so on that page "not running" and "never wired" rendered
+identically — which is exactly what R16 exists to rule out.
 """
 from __future__ import annotations
 
