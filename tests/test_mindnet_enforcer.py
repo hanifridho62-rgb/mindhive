@@ -807,3 +807,251 @@ def test_redirecting_program_output_to_a_forbidden_extension_still_denies():
     assert enf.language_violation(
         "Bash", {"command": "python gen.py > report.md"},
         _sc(langs=("python", "markdown"))) is None
+
+
+# --- MN-8a U1: the AST syntax check ------------------------------------------------
+#
+# The extension rule above answers "what language is this FILE NAMED". This one
+# answers "is this CONTENT actually Python". They are different questions and a
+# `.py` file full of JavaScript passes the first and fails the second.
+
+VALID_PYTHON = [
+    "def add(a, b): return a + b",
+    "x = 1\n",
+    "",                                   # an intentional empty file
+    "   \n\t\n",                          # whitespace only
+    "match x:\n    case 1:\n        pass\n",   # 3.11+ syntax must not be alien
+    "# just a comment\n",
+]
+
+ALIEN_SYNTAX = [
+    "function add(a, b) { return a + b; }",        # JavaScript
+    "const x = 1;\nlet y = 2;",                    # JavaScript
+    "for f in *.py; do echo $f; done",             # Bash
+    "def broken(:\n",                              # genuinely malformed Python
+]
+
+
+@pytest.mark.parametrize("src", VALID_PYTHON)
+def test_valid_python_is_not_a_syntax_violation(src):
+    assert enf.python_syntax_violation(src) is False
+
+
+@pytest.mark.parametrize("src", ALIEN_SYNTAX)
+def test_alien_syntax_is_a_violation(src):
+    """The canary for every allow-assertion above: without this the helper could
+    return False unconditionally and the whole VALID_PYTHON block would still
+    pass."""
+    assert enf.python_syntax_violation(src) is True
+
+
+def test_a_json_object_is_not_a_violation_because_it_is_valid_python():
+    """The honest limit of this check, pinned so it is a decision rather than a
+    gap someone discovers later.
+
+    `ast.parse` answers "is this valid Python", NOT "was this intended as
+    Python". A JSON object literal is a perfectly good Python dict expression,
+    so it parses. Asserting a denial here would be asserting a capability the
+    implementation does not have and cannot get from `ast` alone."""
+    assert enf.python_syntax_violation('{"a": 1, "b": 2}') is False
+
+
+@pytest.mark.parametrize("junk", [None, 0, 1, [], {}, object(), b"x = 1"])
+def test_a_non_string_payload_is_never_a_violation(junk):
+    """Total on junk, like every other predicate in this module. A payload whose
+    `content` is missing or the wrong type is not evidence of alien syntax, and
+    an enforcer that raises here would take down the hook."""
+    assert enf.python_syntax_violation(junk) is False
+
+
+def test_a_null_byte_is_a_violation():
+    """Deliberate, and NOT the KTD4 fail-open case the plan first guessed at.
+
+    Python raises `SyntaxError` — not `ValueError` — for source containing a
+    null byte, and it is right to: such a file cannot be imported. So this is a
+    true positive rather than a checker fault, and it denies."""
+    assert enf.python_syntax_violation("x = 1\x00") is True
+
+
+def test_an_indented_fragment_is_a_violation_which_is_why_edit_is_excluded():
+    """The load-bearing reason `Edit` payloads are never AST-checked (KTD1).
+
+    A `new_string` of ``    return a + b`` is a correct edit to the middle of a
+    function and raises `IndentationError` — a `SyntaxError` subclass — when
+    parsed standalone. If `Edit` were routed through this helper, ordinary
+    edits would be denied and a live session would wedge. This test states the
+    hazard at the helper so the exclusion in `language_violation` reads as a
+    consequence rather than an oversight."""
+    assert enf.python_syntax_violation("    return a + b") is True
+
+
+def test_the_syntax_denial_opens_with_the_mandated_message_verbatim():
+    """The externally-fixed half of the contract, pinned byte-for-byte."""
+    assert enf.SYNTAX_DENIAL_SENTENCE == (
+        "ACCESS DENIED: Language Compatibility Lock Violation. The provided "
+        "code contains alien syntax or spaghetti code that is not valid "
+        "Python. You are strictly forbidden from writing non-compilable "
+        "syntax.")
+    assert enf.SYNTAX_DENIAL.startswith(enf.SYNTAX_DENIAL_SENTENCE)
+
+
+def test_the_syntax_denial_names_the_task_and_a_way_out():
+    """The rule stated above `PHASE_DENIAL`: a refusal an operator cannot act
+    on is an outage. This denial shipped as the mandated sentence ALONE, which
+    named neither the task that froze the write nor any remedy — the only
+    message in the module you could not act on. The mandated text is a floor,
+    not a ceiling, and both siblings continue past their opening sentence for
+    exactly this reason."""
+    reason = enf.SYNTAX_DENIAL.format(task_id="t1")
+    assert "(task 't1')" in reason
+    assert "hive rules enforce --disable" in reason
+    assert "MINDNETWORK_ENFORCE=0" in reason
+
+
+@pytest.mark.parametrize("template", ["PHASE_DENIAL", "LANGUAGE_DENIAL",
+                                      "SYNTAX_DENIAL"])
+def test_every_denial_in_this_module_names_a_way_out(template):
+    """Enumerated over the module's own constants so a denial added later
+    without a remedy fails here rather than in a frozen session."""
+    text = getattr(enf, template)
+    assert "{task_id}" in text, f"{template} does not name the task"
+    assert "enforce --disable" in text, f"{template} offers no way out"
+
+
+def test_the_two_denials_are_distinct_messages():
+    """They answer different questions and tell the operator to do different
+    things — widening `language_context` does not make invalid code compile.
+    A tidy-up that collapses them into one string would give wrong advice for
+    one of the two failures."""
+    assert enf.SYNTAX_DENIAL != enf.LANGUAGE_DENIAL
+    assert "widen the task's language_context" in enf.LANGUAGE_DENIAL
+    assert "widen the task's language_context" not in enf.SYNTAX_DENIAL
+
+
+# --- MN-8a U2: the content check inside the real predicate --------------------------
+
+JS_BODY = "function add(a, b) { return a + b; }"
+PY_BODY = "def add(a, b):\n    return a + b\n"
+FRAGMENT = "    return a + b"          # a correct mid-function edit
+
+
+def test_a_python_file_full_of_javascript_is_denied():
+    """The hole MN-8a closes. Every check before this one passes: `.py` maps to
+    `python`, `python` is permitted, the path is not evidence. Only the content
+    is wrong."""
+    reason = enf.language_violation(
+        "Write", {"file_path": "src/x.py", "content": JS_BODY},
+        _sc(langs=("python",)))
+    assert reason == enf.SYNTAX_DENIAL.format(task_id="t1")
+
+
+def test_a_python_file_full_of_python_is_allowed():
+    """The other half. Without it the test above passes against a rule that
+    denies every `.py` write."""
+    assert enf.language_violation(
+        "Write", {"file_path": "src/x.py", "content": PY_BODY},
+        _sc(langs=("python",))) is None
+
+
+@pytest.mark.parametrize("tool,payload", [
+    ("Edit", {"file_path": "src/x.py", "old_string": "pass",
+              "new_string": FRAGMENT}),
+    ("MultiEdit", {"file_path": "src/x.py",
+                   "edits": [{"old_string": "pass", "new_string": FRAGMENT}]}),
+    ("NotebookEdit", {"notebook_path": "src/x.py", "new_source": FRAGMENT}),
+])
+def test_a_fragment_bearing_tool_is_never_ast_checked(tool, payload):
+    """THE anti-wedge guard for MN-8a, and the reason the rule is `Write`-only.
+
+    ``    return a + b`` is a correct edit to the middle of a function and
+    raises `IndentationError` parsed standalone. Routing these payloads through
+    the syntax check would deny ordinary edits, and — because the escape hatches
+    (`hive mindnet enforce --disable`, `hive log`) are themselves edits and
+    commands — a session could not necessarily edit its way back out. This
+    module has already shipped one deadlock built from two individually-correct
+    guards; do not delete this test."""
+    assert enf.language_violation(tool, payload, _sc(langs=("python",))) is None
+
+
+def test_the_fragment_exclusion_is_not_vacuous():
+    """Canary. The parametrised test above would pass against a syntax check
+    that never fires at all, so pin that this exact fragment IS refused by the
+    helper — the exclusion is a routing decision, not an inert code path."""
+    assert enf.python_syntax_violation(FRAGMENT) is True
+
+
+def test_a_heredoc_body_is_not_ast_checked():
+    """KTD2: the shell rule still refuses by TARGET PATH, and extracting the
+    heredoc BODY stays out of scope — same false-positive economics MN-4 already
+    declined for command language inference. `src/x.py` is a permitted target
+    under a python lock, so this allows."""
+    cmd = "cat > src/x.py <<'EOF'\n" + JS_BODY + "\nEOF"
+    assert enf.language_violation("Bash", {"command": cmd},
+                                  _sc(langs=("python",))) is None
+
+
+def test_the_syntax_check_is_python_only():
+    """A task locked to typescript must not be handed Python parse semantics —
+    `.ts` content that is invalid TypeScript is not this rule's business."""
+    assert enf.language_violation(
+        "Write", {"file_path": "src/x.ts", "content": "const x: = ;"},
+        _sc(langs=("typescript",))) is None
+
+
+def test_the_extension_rule_still_wins_for_a_forbidden_extension():
+    """Ordering, pinned. A `.py` write under a typescript-only lock is refused
+    for being the wrong FILE TYPE — the operator's remedy is to widen the
+    context, so they must get `LANGUAGE_DENIAL`, not a message about
+    non-compilable syntax."""
+    reason = enf.language_violation(
+        "Write", {"file_path": "src/x.py", "content": JS_BODY},
+        _sc(langs=("typescript",)))
+    assert reason == enf.LANGUAGE_DENIAL.format(languages="typescript",
+                                                task_id="t1")
+
+
+def test_phase_evidence_survives_the_syntax_check():
+    """R5. The evidence exemption is the anti-deadlock guard and must hold
+    across BOTH rules — the same composition failure the `is_phase_evidence`
+    comment records."""
+    sc = _sc(phase="brainstorm", langs=("python",))
+    path = "C:/Users/hanif/mindhive/docs/superpowers/specs/spec.py"
+    assert enf.language_violation(
+        "Write", {"file_path": path, "content": JS_BODY}, sc) is None
+
+
+def test_no_language_context_means_no_syntax_check():
+    """The lock is opt-in per task. A task that declared no languages does not
+    acquire a syntax gate for free."""
+    assert enf.language_violation(
+        "Write", {"file_path": "src/x.py", "content": JS_BODY},
+        _sc(langs=())) is None
+
+
+def test_no_locked_task_means_no_syntax_check():
+    assert enf.language_violation(
+        "Write", {"file_path": "src/x.py", "content": JS_BODY},
+        _sc(langs=("python",), records=False)) is None
+
+
+@pytest.mark.parametrize("payload", [
+    {"file_path": "src/x.py"},                       # no content key at all
+    {"file_path": "src/x.py", "content": None},
+    {"file_path": "src/x.py", "content": 17},
+    {"file_path": "src/x.py", "content": b"x = 1"},
+])
+def test_a_missing_or_non_string_content_allows(payload):
+    """Fail-open on a payload shape this rule cannot read. Absent content is not
+    evidence of alien syntax."""
+    assert enf.language_violation("Write", payload,
+                                  _sc(langs=("python",))) is None
+
+
+@pytest.mark.parametrize("path", ["src/x.py.", "src/x.py ", "src/x.py::$DATA"])
+def test_windows_path_suffixes_cannot_smuggle_alien_syntax_past(path):
+    """Win32 strips these when it creates the file, so all three write `x.py`.
+    The syntax check must parse the name Windows will USE — the same correction
+    the extension rule already carries."""
+    assert enf.language_violation(
+        "Write", {"file_path": path, "content": JS_BODY},
+        _sc(langs=("python",))) == enf.SYNTAX_DENIAL.format(task_id="t1")

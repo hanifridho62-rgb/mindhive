@@ -89,6 +89,25 @@ MAX_REF_CHARS = 300
 # unlinks a sidecar and appends NOTHING. There is no artifact Python could read,
 # so a `python` claim for these two would be a lie — the precise thing KTD2
 # exists to prevent. A `review_cleared` producer is its own slice.
+#
+# `pr-green` is NOT in that group, and MN-8b moved it out. It shipped as
+# `agent` on a rationale borrowed from the two audits above — Python cannot see
+# GitHub CI, because `executor.DENIED_PROGRAMS` refuses `gh`. That much is still
+# true and the boundary is unchanged. What does not follow is the conclusion:
+# the audits have NO artifact Python can read, and this phase does. The
+# repository's own suite exits with a code, `executor.validate` runs it as a
+# real subprocess, and `python` stamped off a real exit code is the honest label
+# — the same one `audit-bug` already carries for the same reason.
+#
+# So the claim is bounded rather than dropped: this gate asserts the LOCAL suite
+# passed, which is what `CLAUDE.md` already accepts as standing in for CI. It
+# does not assert anything about GitHub's matrix, and nothing here may.
+#
+# The consequence is deliberate: `controller._apply_satisfy` refuses a claim
+# weaker than the descriptor, so an agent saying "the PR is green" now lands as
+# a violation instead of closing the task. `executor.agent_satisfy` reports that
+# through `clears=False`. The task is not wedged — a mechanical re-run clears
+# it, and `fall_back` remains — but it can no longer be finished by assertion.
 PHASE_EVIDENCE = {
     "brainstorm": {"kind": "file",
                    "required_dir": ("docs/superpowers/specs/",),
@@ -113,7 +132,7 @@ PHASE_EVIDENCE = {
                      "verified_by": "agent"},
     "pr-green": {"kind": "command",
                  "required_dir": (),
-                 "verified_by": "agent"},
+                 "verified_by": "python"},
 }
 
 

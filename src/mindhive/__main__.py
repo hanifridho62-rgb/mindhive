@@ -1041,11 +1041,18 @@ def _mn_agent_satisfy(args, project, sid, evs, tasks, rec) -> int | None:
     while the ledger still shows Python did not verify it.
 
     `executor.agent_satisfy` returns ``clears`` and this MUST read it. Against
-    the committed descriptors it is False for `audit-bug`, whose verifier is
-    `python`: `controller._apply_satisfy` refuses the weaker claim, the event
-    folds as a violation, and the phase stays unsatisfied. Printing a success
-    line over that no-op is the exact dishonesty the two-validator contract
-    exists to stop."""
+    the committed descriptors it is False for `audit-bug` and, since MN-8b, for
+    `pr-green` — both name `python` as their verifier, so
+    `controller._apply_satisfy` refuses the weaker claim, the event folds as a
+    violation, and the phase stays unsatisfied. Printing a success line over
+    that no-op is the exact dishonesty the two-validator contract exists to
+    stop.
+
+    The two are not the same situation and the warning is worth reading in
+    both. At `audit-bug` a False here is a GAP — the python verifier refused
+    and the hatch cannot close it. At `pr-green` it is the DESIGN: a task must
+    not be closeable by an agent asserting its own PR is green. Either way the
+    remedy is the same, a mechanical run through `hive mindnet validate`."""
     from .mindnet import executor as x_mod
     tid = args.task_id
     if not str(args.detail or "").strip():

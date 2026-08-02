@@ -321,8 +321,14 @@ def test_the_block_names_the_task_its_phase_and_that_phases_exit_criterion():
 def test_an_agent_verified_phase_never_renders_as_machine_verified():
     """KTD2/KTD17's honesty rule, applied to the presentation layer. Asserted on
     the ABSENCE of the machine-verified vocabulary rather than the presence of a
-    disclaimer, so a renderer that prints both still fails."""
-    for phase in ("audit-code", "audit-system", "pr-green"):
+    disclaimer, so a renderer that prints both still fails.
+
+    `pr-green` used to be in this list and MN-8b removed it — not by relaxing
+    the rule but because the phase changed sides. Its descriptor now names
+    `python`, so rendering it as machine-verified is the honest answer and the
+    stale entry here would have been asserting the lie. The complementary
+    direction is pinned below."""
+    for phase in ("audit-code", "audit-system"):
         b = i_mod.phase_block(_rec(phase=phase), _task())
         assert i_mod.MACHINE_VERIFIED not in b, phase
         assert "machine-verified" not in b, phase
@@ -330,6 +336,17 @@ def test_an_agent_verified_phase_never_renders_as_machine_verified():
 
     b = i_mod.phase_block(_rec(phase="plan"), _task())
     assert i_mod.MACHINE_VERIFIED in b, "a python phase must say Python checks it"
+
+
+def test_the_terminal_gate_renders_as_machine_verified():
+    """MN-8b through the presentation layer. The renderer derives its wording
+    from `PHASE_EVIDENCE` rather than keeping a second copy of the legend
+    (invariant 10), so this is what stops the two drifting: if the descriptor
+    were reverted, the prompt would go on telling the agent a real Python check
+    has to pass at a gate it could close by assertion."""
+    b = i_mod.phase_block(_rec(phase="pr-green"), _task())
+    assert i_mod.MACHINE_VERIFIED in b
+    assert i_mod.AGENT_REPORTED not in b
 
 
 def test_a_recorded_agent_satisfaction_never_renders_as_machine_verified():

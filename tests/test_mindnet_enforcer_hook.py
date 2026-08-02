@@ -118,6 +118,57 @@ def test_a_permitted_language_is_allowed_at_the_hook(spine):
     assert enforce.hook_decision(_payload(file_path="src/x.py")) == {}
 
 
+# --- MN-8a: the content check through the real hook ---------------------------------
+#
+# The predicate tests in `test_mindnet_enforcer.py` prove the rule decides
+# correctly. These prove the decision REACHES the surface that can act on it —
+# the same gap `test_a_shell_redirect_violation_is_denied_at_the_hook` was
+# written for, where a prefilter made a fully-tested rule dead code at the only
+# layer that runs.
+
+_JS = "function add(a, b) { return a + b; }"
+
+
+def test_alien_syntax_in_a_python_file_is_denied_at_the_hook(spine):
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    out = enforce.hook_decision(_payload(file_path="src/x.py", content=_JS))
+    assert _decision(out) == "deny"
+    # Asserted on the SPECIFIC message, not merely on "a denial happened": the
+    # extension rule can also deny this tool call, and a test satisfied by any
+    # refusal would stay green with the content check deleted.
+    assert enf_syntax_denial() in _reason(out)
+    assert enforce.ENFORCED_MARK in _reason(out)
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+
+
+def test_valid_python_content_is_allowed_at_the_hook(spine):
+    """The sibling that stops the test above from being satisfied by a hook that
+    denies every `.py` write."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    assert enforce.hook_decision(
+        _payload(file_path="src/x.py",
+                 content="def add(a, b):\n    return a + b\n")) == {}
+
+
+def test_an_edit_fragment_is_not_denied_at_the_hook(spine):
+    """The anti-wedge guard at the layer that would actually do the wedging.
+
+    ``    return a + b`` is a correct mid-function edit and is not standalone-
+    parseable. If this ever goes red, editing is broken inside any python-locked
+    task and the escape hatches are themselves edits."""
+    spine["sc"] = _sc(phase="execution", langs=("python",))
+    assert enforce.hook_decision(
+        _payload(tool="Edit", file_path="src/x.py", old_string="pass",
+                 new_source="x", new_string="    return a + b")) == {}
+
+
+def enf_syntax_denial():
+    """The fixed opening SENTENCE, not the template — the full constant carries
+    a `{task_id}` placeholder the hook has already substituted by this point."""
+    from mindhive.mindnet import enforcer
+    return enforcer.SYNTAX_DENIAL_SENTENCE
+
+
 def test_a_shell_redirect_violation_is_denied_at_the_hook(spine):
     """The predicate now covers execute tools, but only if the prefilter in
     `_policy_mindnet_language` lets them reach it. That prefilter read
