@@ -203,6 +203,21 @@ def _read_modes(project=None) -> dict:
 
 
 def _write_modes(modes, project=None) -> None:
+    """Overwrite the sidecar with *modes*. Never raises.
+
+    KNOWN RACE, accepted rather than fixed. `write_text_atomic` makes each write
+    atomic, but the surrounding read → mutate → write in `resolve_mode` is not:
+    the whole file is one JSON object keyed by session, so two sessions that
+    write near-simultaneously each save a dict built from a snapshot taken
+    before the other's write, and the later write drops the earlier session's
+    entry.
+
+    Blast radius is one session losing its live lesson and dropping back to
+    caveman until the next teach verb — the same failure `resolve_mode` already
+    treats as safe, reached by a rarer route. Fixing it properly needs per-file
+    locking or a compare-and-swap retry around the read/write pair, which is a
+    design change; a bare retry here would not help, since the lost update is
+    invisible to the writer that caused it."""
     try:
         paths.write_text_atomic(_mode_path(project), json.dumps(modes))
     except Exception:                                       # noqa: BLE001
