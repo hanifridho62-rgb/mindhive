@@ -48,13 +48,36 @@ def test_default_block_protects_technical_content_and_safety():
 @pytest.mark.parametrize("prompt", [
     "", "   ",
     "<task-notification>done</task-notification>",
-    "/caveman ultra",
+    "<system-reminder>be careful</system-reminder>",
     "Base directory for this skill: /x/y",
 ])
 def test_machine_injected_text_gets_no_style(prompt):
     # A task notification has no reply style to set; spending context on one
     # every turn would be pure waste.
     assert style.block_for(prompt) == ""
+
+
+@pytest.mark.parametrize("prompt", [
+    "/caveman ultra", "/circle", "/lfg lanjutkan", "/mindhive build the thing",
+])
+def test_slash_commands_are_user_turns_and_get_the_style(prompt):
+    # Regression: style used to borrow promptgate.is_machine_prompt, which
+    # answers True for a leading "/". Every slash-command turn silently lost its
+    # style block — a large share of this user's prompts.
+    assert style.block_for(prompt) == style.CAVEMAN_BLOCK
+
+
+def test_a_slash_command_can_itself_be_a_teaching_request():
+    assert style.block_for("/explain the parser") == style.TEACH_BLOCK
+
+
+def test_the_gates_own_predicate_is_left_alone():
+    # The divergence is deliberate. Grading the phrasing of "/circle" is
+    # meaningless, so the gate still skips it; only STYLE treats it as a user
+    # turn. Pinning both sides makes a future "helpful" re-unification fail here.
+    from mindhive import promptgate
+    assert promptgate.is_machine_prompt("/circle") is True
+    assert style._is_injected("/circle") is False
 
 
 # --- the teaching carve-out --------------------------------------------------------

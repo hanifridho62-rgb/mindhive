@@ -41,7 +41,7 @@ from __future__ import annotations
 import json
 import re
 
-from .promptgate import PROMPT_SCAN_CAP, is_machine_prompt
+from .promptgate import PROMPT_SCAN_CAP
 
 # Marker so an injected style block is greppable in a transcript and tellable
 # apart from the gate's and the spine's blocks.
@@ -87,6 +87,28 @@ _TEACH_RES = (
 )
 
 
+def _is_injected(text) -> bool:
+    """True for text the user did not type: harness tags and injected skill
+    bodies.
+
+    Deliberately a near-duplicate of `promptgate.is_machine_prompt` rather than a
+    call to it, and the one difference is the entire point. That predicate
+    answers True for a leading `/`, which is right for the prompt-quality GATE —
+    grading the phrasing of `/circle` is meaningless — and wrong for STYLE: a
+    slash command is the user typing, and the reply still owes them the standing
+    style.
+
+    Do not re-unify the two. Style borrowed the gate's predicate once, and every
+    slash-command turn silently lost its style block; `test_style.py` pins the
+    difference so a future merge fails loudly instead of quietly."""
+    s = str(text or "").lstrip()
+    if not s:
+        return True
+    if s.startswith("<"):                       # harness/system tags
+        return True
+    return s[:40].lower().startswith("base directory for this skill:")
+
+
 def wants_teaching(text) -> bool:
     """True when the prompt asks to be taught or given a full explanation.
 
@@ -95,7 +117,7 @@ def wants_teaching(text) -> bool:
     is not the user asking for anything. Past `PROMPT_SCAN_CAP` only the leading
     slice is scanned, so a pasted 100KB log cannot turn this into a heavy regex
     sweep on the hook's critical path."""
-    if is_machine_prompt(text):
+    if _is_injected(text):
         return False
     low = " ".join(str(text or "").lower().split())[:PROMPT_SCAN_CAP]
     return any(rx.search(low) for rx in _TEACH_RES)
@@ -106,7 +128,7 @@ def block_for(text) -> str:
 
     Empty string for machine-injected text — a task notification has no reply
     style to set, and spending context on one every time would be pure waste."""
-    if is_machine_prompt(text):
+    if _is_injected(text):
         return ""
     return TEACH_BLOCK if wants_teaching(text) else CAVEMAN_BLOCK
 
