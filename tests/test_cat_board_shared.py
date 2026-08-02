@@ -179,6 +179,52 @@ def test_the_label_sits_above_the_head():
     assert "column-reverse" in rule, f"the caption is not above the sprite: {rule}"
 
 
+def test_every_cat_sprite_carries_the_shared_motion_hook():
+    """`catSVG` is the ONE place a cat is drawn, on every page and at every size, so
+    the class it stamps is the only hook guaranteed to be on all of them. The
+    reduced-motion guard below keys on it; without the stamp that guard would silently
+    cover nothing."""
+    js = cat_board.script()
+    body = js[js.index("function catSVG"):]
+    body = body[:body.index("function catAge")]
+    assert 'class="mn-cat-sprite"' in body, (
+        "catSVG no longer stamps the shared sprite class; every rule keyed on it "
+        "silently stops matching")
+
+
+def test_the_board_honours_a_reduced_motion_preference():
+    """Motion here is a signal, not decoration — which is exactly why it must be
+    droppable. A user who has asked their OS for less motion still gets the colour,
+    the dim band and the panel; they just do not get the bob."""
+    assert "prefers-reduced-motion: reduce" in cat_board.CSS
+    guard = cat_board.CSS[cat_board.CSS.index("prefers-reduced-motion"):]
+    guard = guard[:guard.index("#mn-cat-panel")]
+    assert ".mn-cat-sprite" in guard and "animation:none" in guard, (
+        f"the reduced-motion block does not actually stop the motion: {guard}")
+    assert "!important" in guard, (
+        "the rules that switch each animation ON are more specific than this one, "
+        "and a media query adds no specificity — without !important the guard loses")
+
+
+def test_the_reduced_motion_guard_is_page_independent():
+    """It lives in the shared sheet precisely because it is the one motion rule both
+    cat systems need. Naming a page's own furniture here would make it a page rule in
+    the wrong file — and would leave the OTHER page's cats still moving."""
+    guard = cat_board.CSS[cat_board.CSS.index("prefers-reduced-motion"):]
+    guard = guard[:guard.index("#mn-cat-panel")]
+    assert ".chip" not in guard and "#mn-cats" not in guard, (
+        f"the shared guard names a page-specific selector: {guard}")
+
+
+def test_the_reduced_motion_guard_reaches_both_pages(dash, swarm):
+    """The canary for the two above: a guard that is correct in `cat_board.CSS` and
+    absent from a rendered page protects nobody. Same shape as the strip tests — prove
+    it arrives, not merely that it was written."""
+    for page, label in ((dash, "dashboard"), (swarm, "swarm")):
+        assert "prefers-reduced-motion: reduce" in page, (
+            f"the {label} page ships cats with no reduced-motion guard")
+
+
 def test_a_dim_cat_is_visibly_dim():
     """The dim band IS the hang signal. The sprites are per-faculty coloured, so
     opacity alone leaves a stalled cat looking alive."""

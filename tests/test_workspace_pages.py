@@ -6,6 +6,8 @@ tests/test_graphview.py — these assert on the rendered string: every shipped
 requirement of the Workspace feature is pinned here so a template edit can't
 silently drop it.
 """
+import re
+
 from mindhive.swarm_page import render_swarm
 from mindhive.workspace_page import render_parallel
 
@@ -247,6 +249,48 @@ def test_swarm_cat_choice_is_deterministic_from_agent_id():
     assert "% CAT_PALETTES.length" in SWARM
     assert "% 6" not in SWARM
     assert "Math.random" not in SWARM
+
+
+# --- the node cat is a status light, not decoration -------------------------------
+
+def test_a_node_cat_moves_only_while_its_own_agent_is_running():
+    """The reported bug. Every chip drew a cat and NONE of them ever moved: the only
+    `mn-bob` rule was scoped to `.mn-cat.active`, a class a chip has never carried, so
+    the sprite was inert whatever the agent was doing. The operator read that as "the
+    animation is broken" rather than "these are two unrelated cat systems"."""
+    assert ".chip.running .mn-cat-sprite" in SWARM, (
+        "no rule animates a running agent's cat; the chips are inert again")
+    rule = SWARM[SWARM.index(".chip.running .mn-cat-sprite"):]
+    rule = rule[:rule.index("}")]
+    assert "mn-bob" in rule, f"the running chip's cat has no motion: {rule}"
+
+
+def test_a_settled_agents_cat_holds_still():
+    """The other half of the signal, and the half a "just animate the cats" fix
+    silently loses. A cat that bobs whether or not its agent is working reports
+    nothing — it is the unconditional rule, not the missing one, that would make this
+    feature a lie."""
+    assert not re.search(r"\.chip\s+\.mn-cat-sprite\s*\{", SWARM), (
+        "a rule animates every chip cat regardless of status; motion then means "
+        "nothing about whether the agent is running")
+
+
+def test_the_chip_carries_its_agents_status_as_a_class():
+    """What joins the two tests above to real agent state. Without the status on the
+    chip element itself the CSS has nothing to key on — the status was previously only
+    on the inner `.dot`, which is why the cat could not see it."""
+    assert '<div class="chip \'+a.status+' in SWARM
+    # the selection ring must survive the addition — it shares the same attribute
+    assert "(SEL===a.id?' sel':'')" in SWARM
+
+
+def test_the_swarm_page_does_not_declare_its_own_bob_keyframes():
+    """One motion, one definition. A local `@keyframes mn-bob` beside the shared one
+    would drift — the strip's cats and the node cats bobbing at different rates, with
+    nothing to say which page was wrong. Counting is the whole assertion."""
+    assert SWARM.count("@keyframes mn-bob") == 1, (
+        "the swarm page carries a second mn-bob definition; it must reuse the one "
+        "that arrives with cat_board.CSS")
 
 
 # --- node inspector: skills used + run info (2026-07-11 plan R5) -------------------

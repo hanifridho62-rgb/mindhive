@@ -96,6 +96,18 @@ CSS = """
   .mn-cat.dim svg { animation:none; filter:grayscale(100%); }
   .mn-cat.sel { border-color:#e8b64c; }
   @keyframes mn-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
+  /* Motion is a signal on this board, not decoration — but it is not a signal
+     anybody asked to be shaken by. Keyed on `mn-cat-sprite`, which `catSVG`
+     stamps on EVERY cat it draws, so one rule covers the faculty strip and the
+     swarm page's node chips today and a third page's cats the day it adopts the
+     fragment. Named-class, not `.mn-cat svg`: the chip cats are deliberately
+     NOT inside a `.mn-cat` box (that box is the strip's furniture), so a
+     descendant selector would leave exactly the cats this guard exists for
+     still moving. `!important` because the rule that turns each animation ON is
+     more specific than this one and a media query adds no specificity itself. */
+  @media (prefers-reduced-motion: reduce) {
+    .mn-cat-sprite { animation:none !important; }
+  }
   #mn-cat-panel { position:fixed; z-index:60; display:none; min-width:210px;
     background:#161b22; border:1px solid #30363d; border-radius:8px; color:#e6e8ef;
     padding:8px 10px; font-size:11.5px; box-shadow:0 6px 22px #0009; }
@@ -141,8 +153,12 @@ _JS = """
       const col = fill[row[x]];
       if (col) rects += '<rect x="'+x+'" y="'+y+'" width="1" height="1" fill="'+col+'"/>';
     }});
-    return '<svg viewBox="0 0 12 12" width="'+size+'" height="'+size
-      + '" shape-rendering="crispEdges">'+rects+'</svg>';
+    // `mn-cat-sprite` is the one hook every cat carries, wherever it is drawn:
+    // the swarm page's strip, the dashboard's strip, and the swarm page's node
+    // chips. The reduced-motion guard in CSS keys on it, so a page that adopts
+    // this fragment inherits the guard without having to know it exists.
+    return '<svg class="mn-cat-sprite" viewBox="0 0 12 12" width="'+size
+      + '" height="'+size+'" shape-rendering="crispEdges">'+rects+'</svg>';
   }
   function catAge(s){
     if (s < 60) return s + 's';

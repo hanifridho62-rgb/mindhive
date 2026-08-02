@@ -55,6 +55,14 @@ _PAGE = """<!doctype html>
   .chip .dot { width:7px; height:7px; border-radius:50%; background:#3a4054; }
   .chip .dot.running { background:#e0b341; animation:pulse 1s infinite; }
   .chip .dot.done { background:#46c46a; } .chip .dot.error { background:#ff6b6b; }
+  /* The node cat bobs while its agent is actually running — the same motion the
+     faculty strip uses, from the SAME keyframes. `mn-bob` arrives below with
+     `cat_board.CSS`; declaring a second copy here is precisely the drift
+     invariant 10 forbids, and it would be invisible until one page's cats bobbed
+     at a different rate than the other's. The status comes off the agent
+     snapshot, so "moving" means "the server says this agent is running" and
+     never a guess the page made on its own. */
+  .chip.running .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
   #insp { width:340px; flex:0 0 auto; background:#161b22; border-left:1px solid #30363d;
     padding:12px; overflow-y:auto; display:none; }
   #insp h2 { margin:0 0 6px; font-size:14px; }
@@ -264,7 +272,12 @@ _PAGE = """<!doctype html>
     }).join('');
     chips.innerHTML = swarm.map(a => {
       const p = pos[a.id] || {x:0, y:0}, col = ROLE_STYLE[a.role] || '#888';
-      return '<div class="chip'+(SEL===a.id?' sel':'')+'" data-id="'+a.id
+      // The agent's status rides on the chip itself, not just on its dot: that
+      // is what lets the node cat animate. Safe as a class because `status` is
+      // server-owned and drawn from a fixed vocabulary (idle | running | done |
+      // error | stopped — workspace.py's Agent), unlike `a.name`, which is
+      // escaped below because it is not.
+      return '<div class="chip '+a.status+(SEL===a.id?' sel':'')+'" data-id="'+a.id
         +'" style="left:'+p.x+'px;top:'+p.y+'px;border-color:'+col+';color:'+col+'">'
         + catSVG(catFor(a.id), 30)
         + '<span class="row">'+(ROLE_ICON[a.role]||'') + ' ' + esc(a.name)
