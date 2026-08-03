@@ -257,6 +257,30 @@ def test_a_file_asserted_to_exist_is_still_contradicted(tmp_path):
         assert _outcome(got, premise.KIND_PATH) == [premise.CONTRADICTED], prompt
 
 
+def test_a_bare_filename_is_ambiguous_not_a_contradiction(tmp_path):
+    """Found by running the gate over realistic prompts. "refactor
+    promptgate.py" means `src/mindhive/promptgate.py`, which exists —
+    resolving a bare name against the repo root alone turned an ordinary
+    sentence into an accusation. Locating the real file would need a
+    filesystem walk the prompt path cannot afford, so the honest verdict is
+    the one used for everything else this module cannot settle."""
+    root = _repo(tmp_path)
+    claims = premise.extract("refactor promptgate.py to drop the cap")["claims"]
+    got = premise.check(claims, root=root, evs=[])
+    assert _outcome(got, premise.KIND_PATH) == [premise.UNKNOWN]
+    assert "bare filename" in got[0]["ground"]
+
+
+def test_a_qualified_path_keeps_its_teeth(tmp_path):
+    """The ambiguity carve-out is scoped to BARE names. A path with a
+    directory is unambiguous and still contradicts — this is what keeps the
+    real incident caught."""
+    root = _repo(tmp_path)
+    claims = premise.extract("patch src/mindhive/history.py now")["claims"]
+    got = premise.check(claims, root=root, evs=[])
+    assert _outcome(got, premise.KIND_PATH) == [premise.CONTRADICTED]
+
+
 def test_creation_reading_wins_when_a_path_is_named_twice(tmp_path):
     """"create foo.py, then edit foo.py" is one claim, and the creation
     reading must win regardless of mention order."""

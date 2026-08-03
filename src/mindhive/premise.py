@@ -347,6 +347,17 @@ def _check_path(claim, root):
         return _verdict(claim, UNKNOWN,
                         "does not exist yet — read as a file to create, not "
                         "as a claim that it is already there")
+    if "/" not in claim["value"] and "\\" not in claim["value"]:
+        # A BARE filename is ambiguous and must not be resolved against the
+        # repo root alone. "refactor promptgate.py" means `src/mindhive/
+        # promptgate.py` — which exists — and root-relative resolution turned
+        # that ordinary sentence into an accusation. Finding the real one would
+        # need a filesystem walk, which the prompt path cannot afford, so the
+        # honest answer is the one this module already uses for every other
+        # thing it cannot settle.
+        return _verdict(claim, UNKNOWN,
+                        "a bare filename — not resolvable to one repo path "
+                        "without a directory, so not checked")
     return _verdict(claim, CONTRADICTED,
                     "no such file in this checkout")
 
