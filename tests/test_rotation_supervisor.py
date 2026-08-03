@@ -158,6 +158,33 @@ def test_the_absolute_backstop_does_not_fire_on_healthy_sessions(tmp_path):
     assert result.rotations == 3
 
 
+# --- the loop's only accumulating state -------------------------------------
+
+def test_prune_window_drops_everything_older_than_the_window():
+    assert supervisor.prune_window([10.0, 50.0, 190.0], 200.0, 180.0) == [50.0, 190.0, 200.0]
+
+
+def test_prune_window_stays_flat_across_a_long_slow_session():
+    """The 'memory leak in the while-loop' concern, answered with evidence.
+
+    A session rotating hourly for a simulated year: the list must not grow with
+    elapsed time, only with rotation RATE. Unbounded growth here would be a slow
+    leak in a process the user leaves running all day."""
+    recent = []
+    for i in range(1, 8761):                 # one rotation an hour for a year
+        recent = supervisor.prune_window(recent, i * 3600.0, 180.0)
+    assert len(recent) == 1                  # flat, not 8760
+
+
+def test_prune_window_is_bounded_even_when_rotations_are_fast():
+    """Rapid rotations inside the window accumulate — but the loop trips the
+    spin guard at max_rotations, so the list is bounded twice over."""
+    recent = []
+    for i in range(1, 1001):
+        recent = supervisor.prune_window(recent, i * 1.0, 10.0)
+    assert len(recent) <= 11                 # window/step + 1, not 1000
+
+
 # --- the child's environment ------------------------------------------------
 
 def test_child_env_enables_rotation():
@@ -194,6 +221,19 @@ def test_a_spawn_failure_stops_rather_than_looping(tmp_path):
     result = _run(sp)
     assert result.reason == "spawn_failed"
     assert result.exit_code != 0
+    assert len(sp.calls) == 1
+
+
+def test_an_unexpected_spawn_exception_does_not_crash_the_supervisor(tmp_path):
+    """The supervisor is the user's session wrapper — if it dies, their whole
+    working session goes with it. OSError covers the documented spawn failures,
+    but anything a custom or future spawner raises must degrade to a reported
+    stop rather than a traceback out of the loop."""
+    sp = FakeSpawner(raises=RuntimeError("something nobody anticipated"))
+    result = _run(sp)
+    assert result.reason == "spawn_failed"
+    assert result.exit_code != 0
+    assert "something nobody anticipated" in result.detail
     assert len(sp.calls) == 1
 
 

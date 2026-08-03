@@ -55,6 +55,18 @@ class SessionResult:
     detail: str = ""
 
 
+def prune_window(recent, stamp: float, window_s: float) -> list[float]:
+    """Rotation timestamps still inside the sliding window, plus *stamp*.
+
+    Extracted so the loop's one piece of accumulating state is directly
+    testable. This is what keeps the supervisor's memory flat across a long
+    session: everything older than the window is dropped on every rotation, so
+    the list is bounded by the rotation RATE, never by how long the loop has
+    been running. The loop then trips at `max_rotations` entries, which bounds
+    it a second time — a list that cannot exceed a handful of floats."""
+    return [t for t in recent if stamp - t <= window_s] + [stamp]
+
+
 def _child_env(env=None):
     """The child's environment: ours, plus rotation on and headless off.
 
@@ -97,13 +109,20 @@ def default_reseed(pending: dict, *, project: str | None = None) -> str:
 
     Consolidation runs first so the briefing the successor reads is the merged
     one, not the sprawl the dead session left behind."""
+    from .. import projector
     from ..briefing import briefing as build_briefing
     from ..consolidate import consolidate
 
-    try:
-        consolidate(project=project)
-    except Exception:                                       # noqa: BLE001
-        pass            # best-effort: a stale briefing beats no successor
+    # Consolidate, then rebuild projections, then read the briefing — in that
+    # order. Each step feeds the next: merging near-duplicates first means the
+    # projections fold a compacted ledger, and rebuilding before reading means
+    # the successor gets the compacted view rather than the dead session's
+    # sprawl. Both are best-effort; a stale briefing beats no successor at all.
+    for step in (lambda: consolidate(project=project), projector.project):
+        try:
+            step()
+        except Exception:                                   # noqa: BLE001
+            pass
     text = build_briefing().read_text(encoding="utf-8")
     return (
         "This session is the successor to one that reached its context limit "
@@ -141,8 +160,14 @@ def run(*, project: str | None = None, spawn=None, now=None, reseed=None,
             # Inherited stdio puts the child in our console group, so Ctrl+C
             # reaches both. Relaunching here would make the loop unquittable.
             return SessionResult(0, spawns, rotations, "user_quit", "interrupted")
-        except OSError as e:
-            return SessionResult(1, spawns, rotations, "spawn_failed", str(e))
+        except Exception as e:                              # noqa: BLE001
+            # OSError covers the documented spawn failures (binary missing,
+            # exec denied). The broad catch is for everything else: this loop IS
+            # the user's session wrapper, so an unanticipated exception must
+            # become a reported stop, not a traceback that takes their whole
+            # working session down with it.
+            return SessionResult(1, spawns, rotations, "spawn_failed",
+                                 f"{type(e).__name__}: {e}")
 
         pending = artifact.read(project)
         if pending is None:
@@ -159,8 +184,7 @@ def run(*, project: str | None = None, spawn=None, now=None, reseed=None,
             )
 
         stamp = now()
-        recent = [t for t in recent if stamp - t <= window_s]
-        recent.append(stamp)
+        recent = prune_window(recent, stamp, window_s)
         if len(recent) >= max_rotations:
             return SessionResult(
                 1, spawns, rotations, "spin_guard",

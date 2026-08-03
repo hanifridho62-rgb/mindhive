@@ -101,6 +101,25 @@ check("hook is inert when MINDHIVE_ROTATION is unset",
       off.returncode == 0 and off.stdout.strip() == "" and artifact.read() is None,
       f"exit={off.returncode} stdout={off.stdout.strip()[:120]!r}")
 
+# ---------------------------------------------------------------- GATE 3b
+# The shim is registered globally the moment you run `install-hook`, but the
+# backend it calls only gains the `stop` stage when this branch merges. Claude
+# Code surfaces hook failures to the user, so an unguarded shim would print a
+# failure line at the end of EVERY turn in EVERY session until then. Point it at
+# a PYTHONPATH with no mindhive to reproduce exactly that, and require silence.
+artifact.clear()
+blind = subprocess.run(
+    ["powershell", "-NoProfile", "-File", SHIM],
+    input=payload, capture_output=True, text=True, timeout=120,
+    env={**os.environ, "MINDHIVE_ROTATION": "1", "MINDHIVE_ROTATION_CAP": "1000",
+         "PYTHONPATH": str(HOME / "no-mindhive-here")},
+)
+check("shim stays silent when the backend cannot answer (pre-merge state)",
+      blind.returncode == 0 and blind.stdout.strip() == ""
+      and blind.stderr.strip() == "",
+      f"exit={blind.returncode} stdout={blind.stdout.strip()[:80]!r} "
+      f"stderr={blind.stderr.strip()[:80]!r}")
+
 # ---------------------------------------------------------------- GATE 4
 # resolve_exe + Popen with no pipes + wait, against the actual binary.
 try:
