@@ -112,3 +112,89 @@ def test_min_heuristics_zero_restores_explicit_only_gate():
     done, _ = safeguards.should_exit(s, required_remaining=0, json_mode=True,
                                      min_heuristics=0)
     assert done is True
+
+
+# --- rotation spin guard -----------------------------------------------------
+#
+# Rotation is the remedy for a full context; a rotation that itself triggers a
+# rotation is a spin. Two distinct runaway shapes are bounded here:
+#
+#   1. Sheer frequency, over a trailing window.
+#   2. A seed so large that each FRESH session refills the window almost
+#      immediately. This one is the dangerous shape, because every individual
+#      rotation looks correct — the handoff is simply too big to fit.
+
+def _guard(**kw):
+    cfg = safeguards.RotationGuardConfig(**kw)
+    return safeguards.RotationGuard(cfg)
+
+
+def test_rotations_under_the_cap_are_allowed():
+    g = _guard(max_per_window=3, window_seconds=3600, min_turns_before_rotation=2)
+    now = 1000.0
+    for i in range(3):
+        assert g.allow(now=now + i) is True
+        g.record(now=now + i, turns_in_session=10)
+
+
+def test_rotation_at_the_cap_is_refused_with_a_reason():
+    g = _guard(max_per_window=2, window_seconds=3600, min_turns_before_rotation=2)
+    g.record(now=1000.0, turns_in_session=10)
+    g.record(now=1001.0, turns_in_session=10)
+    assert g.allow(now=1002.0) is False
+    assert "2" in g.reason and "3600" in g.reason
+
+
+def test_the_cap_window_slides():
+    # CANARY for the test above: the same two rotations, once they age out of
+    # the trailing window, must stop blocking. Without this, the refusal
+    # assertion could pass against an implementation that simply never allows a
+    # third rotation ever.
+    g = _guard(max_per_window=2, window_seconds=3600, min_turns_before_rotation=2)
+    g.record(now=1000.0, turns_in_session=10)
+    g.record(now=1001.0, turns_in_session=10)
+    assert g.allow(now=1002.0) is False
+    assert g.allow(now=1000.0 + 3601) is True
+
+
+def test_two_consecutive_immediate_refills_halt():
+    # A fresh session that crosses the ceiling again within a couple of turns
+    # means the SEED is oversized, not that the work is long. Rotating again
+    # cannot fix that, so the guard stops rather than spinning.
+    g = _guard(max_per_window=99, window_seconds=3600, min_turns_before_rotation=3)
+    g.record(now=1000.0, turns_in_session=1)
+    assert g.allow(now=1001.0) is True        # one is not yet a pattern
+    g.record(now=1001.0, turns_in_session=2)
+    assert g.allow(now=1002.0) is False
+    assert g.state == "HALTED"
+    assert "seed" in g.reason.lower() or "turn" in g.reason.lower()
+
+
+def test_a_healthy_run_between_them_does_not_halt():
+    # THE canary for the halt above. Without it, "halts on two short sessions"
+    # would pass equally well against a guard that halts on any two rotations —
+    # i.e. against a guard that is simply always-on.
+    g = _guard(max_per_window=99, window_seconds=3600, min_turns_before_rotation=3)
+    g.record(now=1000.0, turns_in_session=1)
+    g.record(now=1001.0, turns_in_session=50)     # a real, productive session
+    g.record(now=1002.0, turns_in_session=1)
+    assert g.allow(now=1003.0) is True
+    assert g.state == "OK"
+
+
+def test_halt_is_terminal():
+    g = _guard(max_per_window=99, window_seconds=3600, min_turns_before_rotation=3)
+    g.record(now=1000.0, turns_in_session=1)
+    g.record(now=1001.0, turns_in_session=1)
+    assert g.allow(now=1002.0) is False
+    # A later healthy-looking rotation must not silently un-halt it; the
+    # operator has to look at why the seed is oversized.
+    g.record(now=2000.0, turns_in_session=90)
+    assert g.allow(now=2001.0) is False
+
+
+def test_guard_defaults_are_usable_without_configuration():
+    g = safeguards.RotationGuard(safeguards.RotationGuardConfig())
+    assert g.allow(now=0.0) is True
+    assert g.state == "OK"
+    assert g.reason == ""

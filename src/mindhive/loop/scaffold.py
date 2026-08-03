@@ -7,8 +7,12 @@ _FIX_PLAN = ("# Fix plan\n\n- [ ] First concrete step\n- [ ] Second step\n\n"
 _AGENT = "# Build / test / run\n\nrun tests: <command>\nbuild: <command>\n"
 _TOML = """\
 [model]
-context_window = 200000
+# Fallback window, used only when the running model's id is not recognised.
+context_window = 1000000
 smart_zone_ratio = 0.5
+# Smart-zone ceiling in absolute tokens. The effective ceiling is the smaller
+# of this and smart_zone_ratio x the model's real window. 0 disables this bound.
+absolute_ceiling = 500000
 
 [budget]
 window_hours = 5

@@ -7,8 +7,17 @@ from pathlib import Path
 @dataclass
 class LoopConfig:
     # [model]
-    context_window: int = 200000
+    # The FALLBACK window, used only when a model id cannot be resolved to its
+    # real one (see loop/context.MODEL_WINDOWS). 1M because every model this
+    # loop routes to except Haiku 4.5 has a 1M window; the previous 200000
+    # meant an unresolved model rotated at 100k, ten times too early.
+    context_window: int = 1000000
     smart_zone_ratio: float = 0.5
+    # The operator's smart-zone ceiling in absolute tokens, applied alongside
+    # the ratio bound (the smaller wins). Expressed directly rather than left
+    # emergent from window * ratio, so the number the operator actually cares
+    # about is written down somewhere. 0 disables this bound only.
+    absolute_ceiling: int = 500000
     model: str | None = None       # explicit model pin — bypasses tier routing
     # [model.tiers] — model id per routing tier (light/mid/heavy)
     tier_light: str = "claude-haiku-4-5"
@@ -57,6 +66,7 @@ def load_config(path: Path) -> LoopConfig:
     return LoopConfig(
         context_window=model.get("context_window", cfg.context_window),
         smart_zone_ratio=model.get("smart_zone_ratio", cfg.smart_zone_ratio),
+        absolute_ceiling=model.get("absolute_ceiling", cfg.absolute_ceiling),
         model=model.get("model", cfg.model),
         tier_light=tiers.get("light", cfg.tier_light),
         tier_mid=tiers.get("mid", cfg.tier_mid),

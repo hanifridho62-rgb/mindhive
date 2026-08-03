@@ -1619,12 +1619,33 @@ def cmd_mindnet_orchestrate(args) -> int | None:
         return _mn_error("--isolation worktree is for agent runs; a "
                          "--via-script run re-checks a task in place and has "
                          "nothing to isolate")
+    runner_kwargs = None
     if args.via_script:
         runner, payload_for = x_mod.execute, orc_mod.validation_script_of
     else:
         runner, payload_for = ag_mod.run, ag_mod.prompt_for
         if timeout is None:
             timeout = ag_mod.DEFAULT_TIMEOUT_S
+        # The smart-zone gate. Without this the agent runner stays the one-shot
+        # it always was: it only chains — and therefore only rotates before the
+        # dumb zone — when it is handed a context config. Built from the loop's
+        # own config so ONE file governs the ceiling everywhere, rather than the
+        # fleet growing a second, quietly-diverging copy of the number.
+        #
+        # No guard is passed: `agent.run` makes its own PER-RUN one. A single
+        # guard shared across a wave is shared mutable state across threads, and
+        # its whole job is to halt — so one task's rotations would stop another
+        # task that had done nothing wrong.
+        from pathlib import Path as _Path
+        from .loop import config as loop_cfg_mod
+        from .loop import context as ctx_mod
+        _root = paths.worktree_root()
+        _lc = loop_cfg_mod.load_config(
+            _Path(_root or ".") / ".hive-loop" / "loop.toml")
+        runner_kwargs = {
+            "context_cfg": ctx_mod.ContextConfig(
+                _lc.context_window, _lc.smart_zone_ratio, _lc.absolute_ceiling),
+        }
         # With `--isolation worktree` each agent gets its OWN checkout and its own
         # ledger segment, so the shared-tree cap no longer applies and the pool is
         # free to fan out. Without it every agent runs with cwd=root — the same
@@ -1649,7 +1670,8 @@ def cmd_mindnet_orchestrate(args) -> int | None:
             # MAX_WAVES verbatim capped a legal long dependency chain.
             max_waves=args.max_waves,
             project=project, timeout_s=timeout,
-            max_workers=workers, isolate=isolate)
+            max_workers=workers, isolate=isolate,
+            runner_kwargs=runner_kwargs)
     except Exception as exc:
         # An orchestrator fault is an operator-facing failure, not a stack trace.
         # `main()` only catches JSONDecodeError, so without this a ledger or

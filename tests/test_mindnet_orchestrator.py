@@ -1798,3 +1798,29 @@ def test_the_usage_marker_is_read_off_the_reason_not_a_second_channel():
                              reason="no validation script to run")
     assert ag_mod.is_usage_limit(starved) is True
     assert ag_mod.is_usage_limit(normal) is False
+
+
+# --- runner_kwargs: what only SOME runners understand -------------------------
+
+def test_runner_kwargs_reach_the_runner():
+    """The smart-zone config travels this way. Without the passthrough the agent
+    runner never receives a context config, so its rotation chain is unreachable
+    in production and the feature is dead code that only tests can see."""
+    r = FakeRunner()
+    marker = object()
+    orc.orchestrate(_graph(_task("a")), runner=r, execute=True,
+                    apply_status=lambda g, d, f: g, root="/tmp",
+                    completion_gate=lambda g, t: None,
+                    runner_kwargs={"context_cfg": marker})
+    assert r.kwargs["a"]["context_cfg"] is marker
+
+
+def test_no_runner_kwargs_leaves_the_call_shape_untouched():
+    """CANARY for the test above, and the regression guard for
+    `executor.execute` — which has no `context_cfg` parameter and would raise
+    TypeError if the orchestrator ever passed one unconditionally."""
+    r = FakeRunner()
+    orc.orchestrate(_graph(_task("a")), runner=r, execute=True,
+                    apply_status=lambda g, d, f: g, root="/tmp",
+                    completion_gate=lambda g, t: None)
+    assert "context_cfg" not in r.kwargs["a"]

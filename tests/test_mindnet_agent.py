@@ -50,14 +50,50 @@ def _spawn(monkeypatch, exit_code=0, stdout=None):
     seen = {}
 
     def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None,
-             env=None):
+             env=None, session_id=None):
         seen.update(prompt=prompt, model=model, timeout_s=timeout_s,
-                    permission_mode=permission_mode, cwd=cwd, env=env)
+                    permission_mode=permission_mode, cwd=cwd, env=env,
+                    session_id=session_id)
         return {"exit": exit_code,
                 "stdout": _envelope() if stdout is None else stdout}
 
     monkeypatch.setattr(claude_cli, "run_headless", fake)
     return seen
+
+
+def _spawn_seq(monkeypatch, replies):
+    """Patch the seam with a SEQUENCE of replies, recording every call.
+
+    Multi-iteration behaviour cannot be observed through the single-shot double
+    above: the whole question is what the second call is asked to do given what
+    the first one returned."""
+    calls = []
+    remaining = list(replies)
+
+    def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None,
+             env=None, session_id=None):
+        calls.append({"prompt": prompt, "session_id": session_id,
+                      "timeout_s": timeout_s, "model": model})
+        return remaining.pop(0) if remaining else {
+            "exit": 0, "stdout": _envelope(), "usage": None, "session_id": None}
+
+    monkeypatch.setattr(claude_cli, "run_headless", fake)
+    return calls
+
+
+def _reply(*, occupancy=0, session="s1", done=False, exit_code=0):
+    """One `run_headless` return, with the usage shape the smart-zone gate reads
+    and the completion contract the loop already defines."""
+    body = "worked on it\n\nLOOP_STATUS:\n  EXIT_SIGNAL: %s\n" % (
+        "true" if done else "false")
+    return {
+        "exit": exit_code,
+        "stdout": json.dumps({"result": body, "is_error": False,
+                              "session_id": session}),
+        "usage": {"input_tokens": occupancy, "cache_creation_input_tokens": 0,
+                  "cache_read_input_tokens": 0, "output_tokens": 5},
+        "session_id": session,
+    }
 
 
 def test_the_double_only_records_arguments_the_real_function_accepts(monkeypatch):
@@ -432,3 +468,234 @@ def test_the_real_spawn_path_reports_a_missing_cli(tmp_path, monkeypatch):
     run = ag.run("k14", "p", root=tmp_path)
     assert run.result == "spawn-failed"
     assert run.executed is False
+
+
+# --- the smart-zone boundary --------------------------------------------------
+#
+# A fleet task used to be ONE `claude -p` call with no resume, so there was no
+# point at which its context could be measured and nowhere to rotate to. It is
+# now a chain of resumed calls with the gate between them — the same shape
+# `loop/engine.py` has used all along, and for the same reason.
+#
+# Every outcome assertion above still holds: rotation changes where a run
+# PAUSES, never what its result MEANS.
+
+def _cfg(ceiling=500_000):
+    from mindhive.loop import context as ctx
+    return ctx.ContextConfig(context_window=1_000_000, smart_zone_ratio=0.5,
+                             absolute_ceiling=ceiling)
+
+
+def test_a_finished_task_still_runs_exactly_once(monkeypatch):
+    """Regression guard on the common case: an agent that says it is done is
+    not asked again, and the one-shot behaviour is unchanged."""
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=10, done=True)])
+    run = ag.run("k", "p", context_cfg=_cfg())
+    assert len(calls) == 1
+    assert calls[0]["session_id"] is None      # the first call never resumes
+    assert run.result == ag.RESULT_RAN_UNVERIFIED
+
+
+def test_an_unfinished_task_resumes_the_same_session(monkeypatch):
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=10, session="sess-A", done=False),
+        _reply(occupancy=20, session="sess-A", done=True)])
+    ag.run("k", "p", context_cfg=_cfg())
+    assert len(calls) == 2
+    assert calls[1]["session_id"] == "sess-A", "under the ceiling, stay warm"
+
+
+def test_crossing_the_ceiling_drops_the_session(monkeypatch):
+    """THE unit. Occupancy past the ceiling means the next call must start a
+    FRESH session rather than resuming a conversation already in the dumb
+    zone."""
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=500_000, session="sess-A", done=False),
+        _reply(occupancy=10, session="sess-B", done=True)])
+    ag.run("k", "p", context_cfg=_cfg(ceiling=500_000))
+    assert len(calls) == 2
+    assert calls[1]["session_id"] is None, (
+        "resumed a session that had already left the smart zone")
+
+
+def test_just_under_the_ceiling_does_not_rotate(monkeypatch):
+    """CANARY for the test above: one token less and the session is kept.
+    Without this, the drop assertion would pass equally against an
+    implementation that never resumes anything at all."""
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=499_999, session="sess-A", done=False),
+        _reply(occupancy=10, session="sess-A", done=True)])
+    ag.run("k", "p", context_cfg=_cfg(ceiling=500_000))
+    assert calls[1]["session_id"] == "sess-A"
+
+
+def test_a_rotated_run_still_reports_ran_unverified(monkeypatch):
+    """Rotation is not evidence. A task that rotated and then finished sits in
+    exactly the same epistemic position as one that never rotated: the model
+    replied, and nothing checked it."""
+    _spawn_seq(monkeypatch, [
+        _reply(occupancy=900_000, done=False),
+        _reply(occupancy=10, done=True)])
+    run = ag.run("k", "p", context_cfg=_cfg())
+    assert run.result == ag.RESULT_RAN_UNVERIFIED
+    assert run.result not in orc.RESULT_STATUS
+
+
+def test_a_usage_limit_mid_chain_still_does_not_block(monkeypatch):
+    """The MN-8 P0, re-asserted across the new boundary. An iterative run must
+    not launder a quota failure into a task failure."""
+    _spawn_seq(monkeypatch, [
+        _reply(occupancy=10, done=False),
+        {"exit": 0, "usage": None, "session_id": None,
+         "stdout": _envelope("You've hit your weekly limit", is_error=True,
+                             status=429)}])
+    run = ag.run("k", "p", context_cfg=_cfg())
+    assert run.executed is False
+    assert run.result in orc.NON_EXECUTING_RESULTS
+    assert ag.USAGE_MARK in run.reason
+
+
+def test_a_timeout_mid_chain_is_still_a_timeout(monkeypatch):
+    _spawn_seq(monkeypatch, [
+        _reply(occupancy=10, done=False),
+        {"exit": 124, "stdout": "", "usage": None, "session_id": None}])
+    run = ag.run("k", "p", context_cfg=_cfg())
+    assert run.result == "timeout"
+    assert run.executed is True
+
+
+def test_a_real_failure_mid_chain_still_blocks(monkeypatch):
+    _spawn_seq(monkeypatch, [
+        _reply(occupancy=10, done=False),
+        _reply(occupancy=10, done=False, exit_code=3)])
+    run = ag.run("k", "p", context_cfg=_cfg())
+    assert run.result == "fail"
+    assert orc.RESULT_STATUS[run.result] == t_mod.STATUS_BLOCKED
+
+
+def test_the_iteration_cap_bounds_an_agent_that_never_finishes(monkeypatch):
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=10, done=False)] * 20)
+    ag.run("k", "p", context_cfg=_cfg(), max_iterations=4)
+    assert len(calls) == 4
+
+
+def test_the_wall_clock_cap_bounds_the_whole_chain_not_each_call(monkeypatch):
+    """A 1800s cap must mean 1800s for the TASK, not 1800s per iteration — the
+    latter would let a ten-iteration run park the machine for five hours.
+
+    Asserted as properties rather than an exact call/clock choreography: the
+    contract is "the budget is shared and shrinking", and pinning one specific
+    sequence of now() readings would be a test written to fit a single
+    implementation rather than to constrain every correct one."""
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=10, done=False)] * 20)
+
+    ticks = iter([0.0, 200.0, 400.0, 600.0, 800.0, 1000.0])
+    last = [0.0]
+
+    def clock():
+        try:
+            last[0] = next(ticks)
+        except StopIteration:
+            last[0] += 1000.0                 # far past the deadline
+        return last[0]
+
+    ag.run("k", "p", context_cfg=_cfg(), timeout_s=1000, max_iterations=20,
+           now_fn=clock)
+
+    budgets = [c["timeout_s"] for c in calls]
+    assert budgets, "no call was made at all"
+    assert budgets[0] <= 1000, "the first call exceeded the task's own budget"
+    assert budgets == sorted(budgets, reverse=True), (
+        f"the per-call budget did not shrink across the chain: {budgets}")
+    assert all(b > 0 for b in budgets), "a call was made with no time left"
+    assert len(calls) < 20, "the chain ignored its deadline and ran to the cap"
+
+
+def test_the_spin_guard_halts_a_chain_that_rotates_every_turn(monkeypatch):
+    """Two consecutive fresh sessions each blowing the ceiling immediately mean
+    the SEED is oversized. Rotating again repeats it, so the chain stops."""
+    from mindhive.loop import safeguards as sg
+    guard = sg.RotationGuard(sg.RotationGuardConfig(
+        max_per_window=99, window_seconds=3600, min_turns_before_rotation=3))
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=900_000, done=False)] * 10)
+    ag.run("k", "p", context_cfg=_cfg(), guard=guard, max_iterations=10)
+    assert guard.state == "HALTED"
+    assert len(calls) < 10, "the guard did not stop the chain"
+
+
+def test_without_a_context_cfg_the_run_stays_a_single_shot(monkeypatch):
+    """Backward compatibility. Every existing caller omits context_cfg and must
+    keep getting exactly one spawn — the orchestrator's contract with this
+    module has not changed for them."""
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=900_000, done=False)] * 5)
+    run = ag.run("k", "p")
+    assert len(calls) == 1
+    assert run.result == ag.RESULT_RAN_UNVERIFIED
+
+
+# Clock readings that PROVABLY reproduce the truncation this test guards, found
+# by walking float64 at mantissa granularity. Deriving the first budget as
+# `(now + 1800.0) - now` is algebraically exact and numerically is not: the
+# addition rounds onto the coarser grid around 2800, and that rounding error
+# survives the subtraction, so int() truncated 1799.9999999999998 to 1799.
+#
+# The band matters and is the whole reason this escaped local testing. It fires
+# around a thousand-ish seconds — i.e. a freshly booted machine, which is
+# exactly what a CI runner is. A developer box that has been up longer sits in a
+# clean band and never sees it. ~16.5% of uptimes between 300s and 5000s
+# reproduce it, so this was a one-in-six silent shortening of every agent's
+# wall-clock cap, not an exotic edge case.
+_TRUNCATING_CLOCKS = [1000.0000000000002, 1000.0000000000011,
+                      1000.000000000002, 1000.0000000000039]
+
+
+@pytest.mark.parametrize("clock_base", [0.0] + _TRUNCATING_CLOCKS)
+def test_the_first_call_gets_the_configured_cap_exactly(monkeypatch, clock_base):
+    """THE regression for a bug CI found and a local full-suite run did not.
+
+    Armed by construction: every value in `_TRUNCATING_CLOCKS` returns 1799 from
+    the arithmetic this replaced, so a revert makes this test fail rather than
+    pass quietly. 0.0 is kept as the trivially-clean control."""
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=10, done=True)])
+    ag.run("k", "p", context_cfg=_cfg(), timeout_s=1800,
+           now_fn=lambda: clock_base)
+    assert calls[0]["timeout_s"] == 1800, (
+        f"the first call was shortchanged at clock base {clock_base!r}")
+
+
+def test_the_reproducing_clocks_really_do_reproduce():
+    """The canary for the parametrization above. A regression test pinned to
+    magic constants is only worth anything if those constants still trigger the
+    fault — otherwise it silently degrades into a test that always passes, which
+    is how the first version of this suite was written and why CI caught what
+    the local run missed."""
+    for base in _TRUNCATING_CLOCKS:
+        assert int(max(1, (base + 1800.0) - base)) == 1799, (
+            f"{base!r} no longer reproduces the truncation, so the regression "
+            f"test above is no longer armed")
+
+
+def test_a_later_call_is_never_shortchanged_below_its_true_remainder(
+        monkeypatch):
+    """The same precision hazard one hop later: a budget that lands a hair under
+    the whole second it means must not truncate downward on every iteration, or
+    the loss compounds across a chain."""
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=10, done=False), _reply(occupancy=10, done=True)])
+    ticks = iter([1000.0000000000002, 1000.0000000000002])
+    ag.run("k", "p", context_cfg=_cfg(), timeout_s=1800,
+           now_fn=lambda: next(ticks))
+    assert calls[0]["timeout_s"] == 1800
+    assert calls[1]["timeout_s"] == 1800, (
+        "no time elapsed, yet the next call lost a whole second")
+
+
+def test_the_rotation_seed_carries_the_original_task_prompt(monkeypatch):
+    """A fresh session has none of the conversation. If the seed does not
+    restate the ask, the rotated agent works on nothing."""
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=900_000, done=False),
+        _reply(occupancy=10, done=True)])
+    ag.run("k", "implement the parser exactly as specified",
+           context_cfg=_cfg())
+    assert "implement the parser exactly as specified" in calls[1]["prompt"]

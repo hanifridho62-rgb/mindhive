@@ -86,3 +86,80 @@ class CircuitBreaker:
         self.consecutive_no_progress = 0
         self.consecutive_same_error = 0
         self.opened_at = None
+
+
+# --- rotation spin guard -----------------------------------------------------
+
+@dataclass
+class RotationGuardConfig:
+    """Bounds on session rotation. Deliberately separate from `BreakerConfig`:
+    the breaker asks "is the agent still making progress", this asks "is the
+    rotation machinery eating itself" — different question, different remedy."""
+
+    max_per_window: int = 6
+    window_seconds: float = 3600.0
+    # A fresh session that crosses the ceiling again within this many turns is
+    # evidence about the SEED, not about the work.
+    min_turns_before_rotation: int = 3
+
+
+class RotationGuard:
+    """Stops rotation from becoming a spin.
+
+    Rotation is the remedy for a full context. A rotation that immediately
+    causes another rotation is therefore not a remedy at all, and the failure
+    is quiet: every individual rotation looks correct in isolation. Two runaway
+    shapes are bounded.
+
+    **Frequency**, over a trailing window — the crude bound, and the one that
+    catches a caller looping far faster than real work could.
+
+    **Immediate refill** — two consecutive fresh sessions that each cross the
+    ceiling within `min_turns_before_rotation` turns. That means the handoff
+    seed is itself close to the ceiling, so the next rotation will do exactly
+    the same thing. Rotating again cannot fix an oversized seed, so the guard
+    HALTS and says so rather than burning the window discovering that.
+
+    The halt is terminal on purpose. An oversized seed is a condition an
+    operator has to look at; auto-recovering would hide the very signal that
+    explains why nothing is getting done. Mirrors the recursion-guard instinct
+    `claude_cli` already applies to spawn loops, where the failure mode is also
+    unbounded repetition rather than a wrong answer."""
+
+    def __init__(self, cfg: RotationGuardConfig):
+        self.cfg = cfg
+        self.state = "OK"
+        self.reason = ""
+        self._at: list = []                 # rotation timestamps
+        self._last_was_short = False
+
+    def allow(self, now: float) -> bool:
+        """Whether another rotation may happen. Total — never raises."""
+        if self.state == "HALTED":
+            return False
+        recent = [t for t in self._at if now - t < self.cfg.window_seconds]
+        if len(recent) >= self.cfg.max_per_window:
+            self.reason = (
+                f"rotation refused: {len(recent)} rotations already in the "
+                f"last {int(self.cfg.window_seconds)}s, cap is "
+                f"{self.cfg.max_per_window}")
+            return False
+        return True
+
+    def record(self, now: float, turns_in_session: int) -> None:
+        """Register a rotation that just happened.
+
+        *turns_in_session* is how many turns the session being rotated away
+        from actually ran. It is the discriminating input: a long session that
+        filled up is healthy, a one-turn session that filled up is a seed
+        problem."""
+        self._at.append(now)
+        short = int(turns_in_session or 0) <= self.cfg.min_turns_before_rotation
+        if short and self._last_was_short:
+            self.state = "HALTED"
+            self.reason = (
+                f"rotation halted: two consecutive sessions crossed the smart "
+                f"zone within {self.cfg.min_turns_before_rotation} turns, so "
+                f"the handoff seed is itself near the ceiling — rotating again "
+                f"would repeat this. Shrink the seed rather than retrying")
+        self._last_was_short = short
