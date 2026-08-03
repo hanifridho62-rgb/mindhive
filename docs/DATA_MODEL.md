@@ -121,7 +121,19 @@ a file write on the hottest path in the system; `tests/test_enforce.py` keeps an
 allow-path canary because every other test in that section would pass just as
 well against an enforcer that appended every time. Fail-open and
 result-discarding: a ledger that cannot be written must not turn a deny into an
-allow).
+allow),
+`verification` (`{text, argv[], exit_code, counts{}, excerpt, verified_by,
+artifact?, error?}` — one row per mechanical test run, written by
+`verify.run_and_record`: the argv actually executed, its **real** exit code, and
+a best-effort parse of the summary line. **Two validators, exactly as
+`mindnet_phase` has:** `validate_payload` (the raw-append surfaces) REFUSES a
+payload carrying `verified_by`, so a hand-written append can never forge a
+mechanical verification; `validate_stored` (the writer) REQUIRES it. The stamp
+attaches to the **exit code**, which was observed — `counts` is a parse, and an
+unparseable summary records counts **absent rather than zero**, because "we
+could not tell" and "nothing passed" are different facts. Full output goes to
+`runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
+path).
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
@@ -1154,6 +1166,96 @@ sees nothing — that is precisely what happened, with the resolvers' own unit t
 throughout. `test_the_sop_and_improvements_sections_reach_the_prompt` walks arm → prompt →
 refresh → prompt and asserts on the text the user receives, and its own canary disables
 `advice_block` to prove it is not passing by finding nothing.
+
+### 4.14 The premise gate (§0's mechanical half)
+
+`directives.OPERATING_SPEC` §0 makes absolute honesty the core operating rule.
+Its third clause — never accept a premise you did not verify — is the one a
+machine can enforce, and `premise.py` is that enforcement.
+
+**Why it exists.** The directive that commissioned this module asserted an
+interrupted roadmap (none existed), a file to patch (`src/mindhive/history.py`,
+present on no branch), two unbuilt features (both shipped and merged), and a
+3518-test baseline (the real number was 3580). Every checkable claim was false.
+`docs/plans/2026-08-02-003-feat-mindnet-mn8-hardening-plan.md` records the same
+pattern in its own frontmatter: *supersedes a directive whose premises were
+verified false*.
+
+**Why `promptgate` did not catch it.** That gate stops scanning at
+`PROMPT_SCAN_CAP` (2000 chars) because its target regexes backtrack
+catastrophically — a pasted 100KB run of dots measured ~100s unscanned vs ~ms
+capped. Past the cap `assess` returns `clear` and `is_code_work` returns False,
+so a 20KB handoff gets **no assessment and no catalog injection at all**. The
+incentive is inverted: the longer and more assertion-dense a prompt, the less
+scrutiny it receives — and handoffs, pasted specs, and generated continuations
+are all past the cap by construction. That cap is correct and is unchanged;
+`premise` carries its own larger budget (`PREMISE_SCAN_CAP`) and pays for it
+structurally, with bounded repetition and a start-anchoring lookbehind in every
+pattern so a hostile input is a linear scan rather than an exponential one. A
+test times this rather than trusting it.
+
+**Three stages, three claim classes.**
+
+| stage | contract |
+|---|---|
+| `extract(text)` | pure, bounded, no I/O → `{claims[], truncated{}, scanned}` |
+| `check(claims, evs, root)` | filesystem + ledger → one verdict per claim |
+| `render` / `report` | pure; `render` is the hook block, `report` the CLI listing |
+
+| claim class | evidence source |
+|---|---|
+| asserted repo-relative path | the filesystem, rooted at the checkout |
+| asserted roadmap id / interrupted roadmap | `roadmap.get` / `roadmap.interrupted` |
+| asserted test count | the last `verification` event (`verify.last_run`) |
+
+**Three-way verdicts, and `UNKNOWN` never collapses.** Folding `UNKNOWN` into
+`CONFIRMED` re-creates the failure being fixed — silence reading as assent.
+Folding it into `CONTRADICTED` is worse: it manufactures accusations against
+true statements, and the first false one teaches the operator to ignore the
+block permanently. A test-count claim on a store with no recorded run is
+`UNKNOWN`, never `CONTRADICTED`. The one asymmetry is deliberate: an empty
+roadmap store *is* authoritative about its own contents, so it contradicts
+rather than abstains.
+
+**Additive, never a deny.** The gate emits `additionalContext` only —
+`promptgate`'s MN-14 note settles that precedent for this surface, and it binds
+harder here, because a premise checker will have false positives (a path claim
+about a file the user is about to create) and a false positive that adds a line
+costs a line while one that blocks a prompt wedges the session. It fires only
+on a contradiction; a gate that speaks every prompt is one the reader learns to
+skip.
+
+**No subprocess, ever.** `repo_root` walks up for a `.git` entry instead of
+calling `paths.worktree_root`, which shells out to `git rev-parse`. This runs on
+every prompt, and the `UserPromptSubmit` path spawns nothing today. Equally, the
+gate reads the *last recorded* run and never produces one: a gate that could
+spawn a multi-minute suite on a keystroke is a denial of service on the user's
+own session. `.git` is tested with `exists`, not `is_dir`, because in a linked
+worktree it is a file.
+
+**What is deliberately NOT checked** — stated with equal prominence, because a
+gate that implied broader coverage would itself violate §0:
+
+- Claims about what a previous session did. No queryable evidence source.
+- Intent, urgency, authority, framing. Not factual claims.
+- Claims about code behavior. Would require executing the claim; nothing on the
+  prompt path may do that.
+- Git refs (asserted SHAs, branch names). Cheap in principle, but it would put a
+  process spawn on the prompt path. Deferred, not dismissed.
+- Counts of anything other than tests. One evidence source, one claim class.
+- Quotation vs assertion. The extractor reads text, not intent, so a path or
+  count *mentioned* as an example or a quote is extracted the same as one
+  asserted — running the CLI over a document that discusses a false baseline
+  will flag that baseline. Inherent to regex extraction, stated rather than
+  papered over; on the hook's real surface (a typed prompt) a stated count
+  almost always is an assertion.
+
+Both the injected block and the CLI listing end with that limit stated out loud,
+so a report of three contradictions can never read as a completed audit.
+
+`hive premise check [--file PATH]` exposes the same engine, exits non-zero on
+any contradiction, and exits zero on `UNKNOWN` — "could not check" is not a
+finding, and failing on it would train the operator to suppress the command.
 
 ## 5. Invariants — do not break these
 

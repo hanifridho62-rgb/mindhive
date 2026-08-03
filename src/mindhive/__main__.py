@@ -94,7 +94,7 @@ def cmd_hook(args) -> int | None:
         # prompt enrichment is enabled (the default), the fired context also
         # carries the clarifying questions (see enrich.extend_hook_context —
         # additive, sidecar-only read, fail-open).
-        from . import enrich, promptgate, style
+        from . import enrich, premise, promptgate, style
         from .mindnet import inject as mn_inject
         context = promptgate.hook_context(raw)
         if context:
@@ -113,6 +113,15 @@ def cmd_hook(args) -> int | None:
         except Exception:                                   # noqa: BLE001
             spine = None
         context = mn_inject.extend_hook_context(context, raw, sc=spine)
+        # §0's mechanical half: check the checkable factual claims this prompt
+        # makes against the filesystem, the roadmap fold, and the last recorded
+        # test run, and report contradictions. Unconditional for the same reason
+        # the spine above is, and with a sharper edge — `promptgate` stops
+        # scanning at PROMPT_SCAN_CAP, so the long, assertion-dense prompts most
+        # likely to carry a stale or fabricated premise are exactly the ones its
+        # gate never sees. Additive and fail-open: it returns `context`
+        # unchanged whenever nothing is contradicted or anything goes wrong.
+        context = premise.extend_hook_context(context, raw)
         # The standing reply-style pass: caveman by default, normal prose when
         # the prompt asks to be taught. Unconditional on human-typed prompts for
         # the same reason the spine above is — a style that only re-asserts
@@ -384,6 +393,38 @@ def cmd_embed(args) -> int | None:
 
 def cmd_selftest(args) -> int | None:
     return selftest_mod.run()
+
+
+def cmd_premise_check(args) -> int | None:
+    """Check a text's checkable factual claims against the record.
+
+    Exit code is the product: non-zero when anything is CONTRADICTED, so this
+    composes into a script. UNKNOWN exits zero — "could not check" is not a
+    finding, and failing on it would train the operator to pass `|| true`."""
+    from pathlib import Path
+
+    from . import events as ev_mod, premise
+    if getattr(args, "file", None):
+        try:
+            text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"cannot read {args.file}: {e}")
+            return 2
+    else:
+        text = sys.stdin.read() if not sys.stdin.isatty() else ""
+
+    found = premise.extract(text)
+    if not found["scanned"] and text:
+        # Reported, not silently passed: "too big to scan" and "nothing
+        # asserted" are different answers and must not look alike.
+        print(f"(not scanned — {len(text)} chars exceeds the "
+              f"{premise.PREMISE_SCAN_CAP}-char budget)")
+        return 0
+    verdicts = premise.check(found["claims"], evs=ev_mod.read_all(args.project))
+    print(premise.report(verdicts))
+    for kind, dropped in (found.get("truncated") or {}).items():
+        print(f"(+{dropped} further {kind} claim(s) not checked — per-class cap)")
+    return 1 if any(v["outcome"] == premise.CONTRADICTED for v in verdicts) else 0
 
 
 def cmd_briefing(args) -> int | None:
@@ -2521,6 +2562,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
+
+    # §0's operator-facing half. Deliberately NOT folded into `hive verify`,
+    # which already means "verify the hash chain" — one command answering two
+    # unrelated questions is how an operator ends up trusting the wrong answer.
+    pre = sub.add_parser(
+        "premise",
+        help="check a prompt or handoff doc's factual claims against the record")
+    pres = pre.add_subparsers(dest="premise_cmd", required=True)
+    prec = pres.add_parser(
+        "check",
+        help="report asserted paths, roadmap ids and test counts the record "
+             "contradicts (exits non-zero on any contradiction)")
+    prec.add_argument("--file", default=None,
+                      help="read the text from PATH (default: stdin)")
+    prec.add_argument("--project", default=None,
+                      help="target namespace explicitly (default: detect from cwd)")
+    prec.set_defaults(func=cmd_premise_check)
 
     r = sub.add_parser("recall", help="search ledger")
     r.add_argument("query")
