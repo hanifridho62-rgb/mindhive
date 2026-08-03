@@ -184,6 +184,20 @@ def test_cli_install_hook_exit_codes(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["reason"] == "malformed"
 
 
+def test_cli_install_hook_honours_an_explicit_command(tmp_path, capsys):
+    """A worktree's default_command() resolves to the WORKTREE's own copy of the
+    shim, which disappears when the worktree does. Registering from one has to be
+    able to name the main checkout's path instead."""
+    from mindhive import __main__ as cli_mod
+    p = _write(tmp_path, REAL_SHAPE)
+    explicit = "powershell -NoProfile -File C:/main/hooks/stop.ps1"
+    assert cli_mod.main(["session", "install-hook", str(p),
+                         "--command", explicit]) == 0
+    capsys.readouterr()
+    after = json.loads(p.read_text(encoding="utf-8"))
+    assert after["hooks"]["Stop"][0]["hooks"][0]["command"] == explicit
+
+
 def test_cli_install_hook_dry_run(tmp_path, capsys):
     from mindhive import __main__ as cli_mod
     p = _write(tmp_path, REAL_SHAPE)

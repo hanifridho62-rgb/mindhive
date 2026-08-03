@@ -204,7 +204,7 @@ def cmd_session_run(args) -> int | None:
 
 def cmd_session_install_hook(args) -> int | None:
     from .rotation import install as install_mod
-    result = install_mod.install(args.settings, dry_run=args.dry_run)
+    result = install_mod.install(args.settings, args.command, dry_run=args.dry_run)
     print(json.dumps(result))
     if not result["ok"]:
         return 2
@@ -2578,6 +2578,11 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(idempotent; the hook stays inert until "
                              "MINDHIVE_ROTATION is set)")
     se_install.add_argument("settings", help="path to the settings.json to edit")
+    se_install.add_argument("--command", default=None,
+                            help="the hook command to register (default: this "
+                                 "checkout's hooks/stop.ps1). Worth setting from "
+                                 "a worktree, where the default resolves to the "
+                                 "worktree's own copy rather than the main one")
     se_install.add_argument("--dry-run", action="store_true",
                             help="report what would change without writing")
     se_install.set_defaults(func=cmd_session_install_hook)
