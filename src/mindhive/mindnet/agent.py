@@ -289,7 +289,17 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
         now = now_fn()
         if deadline is None:
             deadline = now + float(timeout_s)
-        remaining = deadline - now
+            # The first call gets the configured cap VERBATIM, not
+            # `deadline - now`. Those are algebraically identical and not
+            # numerically identical: `time.monotonic()` can be large enough
+            # that (now + 1800.0) - now loses sub-integer precision, and the
+            # int() below then truncates 1799.999... to 1799. That shaves time
+            # off every run, and it is invisible until a platform whose clock
+            # happens to be big enough — CI caught it on windows/py3.12 while
+            # three other jobs passed.
+            remaining = float(timeout_s)
+        else:
+            remaining = deadline - now
         if iteration > 1 and remaining <= 0:
             # The task's own budget is spent. Stop rather than starting a call
             # that would run past the cap the operator set.
@@ -300,7 +310,10 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
 
         try:
             out = claude_cli.run_headless(
-                step_prompt, model=model, timeout_s=int(max(1, remaining)),
+                # round(), not truncation: a budget derived from clock
+                # arithmetic lands a hair under the whole second it means, and
+                # truncating each hop compounds the loss across a chain.
+                step_prompt, model=model, timeout_s=max(1, round(remaining)),
                 permission_mode=permission_mode, env=env,
                 cwd=str(root) if root else None, session_id=session_id)
         except Exception as exc:                        # noqa: BLE001

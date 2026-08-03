@@ -633,6 +633,63 @@ def test_without_a_context_cfg_the_run_stays_a_single_shot(monkeypatch):
     assert run.result == ag.RESULT_RAN_UNVERIFIED
 
 
+# Clock readings that PROVABLY reproduce the truncation this test guards, found
+# by walking float64 at mantissa granularity. Deriving the first budget as
+# `(now + 1800.0) - now` is algebraically exact and numerically is not: the
+# addition rounds onto the coarser grid around 2800, and that rounding error
+# survives the subtraction, so int() truncated 1799.9999999999998 to 1799.
+#
+# The band matters and is the whole reason this escaped local testing. It fires
+# around a thousand-ish seconds — i.e. a freshly booted machine, which is
+# exactly what a CI runner is. A developer box that has been up longer sits in a
+# clean band and never sees it. ~16.5% of uptimes between 300s and 5000s
+# reproduce it, so this was a one-in-six silent shortening of every agent's
+# wall-clock cap, not an exotic edge case.
+_TRUNCATING_CLOCKS = [1000.0000000000002, 1000.0000000000011,
+                      1000.000000000002, 1000.0000000000039]
+
+
+@pytest.mark.parametrize("clock_base", [0.0] + _TRUNCATING_CLOCKS)
+def test_the_first_call_gets_the_configured_cap_exactly(monkeypatch, clock_base):
+    """THE regression for a bug CI found and a local full-suite run did not.
+
+    Armed by construction: every value in `_TRUNCATING_CLOCKS` returns 1799 from
+    the arithmetic this replaced, so a revert makes this test fail rather than
+    pass quietly. 0.0 is kept as the trivially-clean control."""
+    calls = _spawn_seq(monkeypatch, [_reply(occupancy=10, done=True)])
+    ag.run("k", "p", context_cfg=_cfg(), timeout_s=1800,
+           now_fn=lambda: clock_base)
+    assert calls[0]["timeout_s"] == 1800, (
+        f"the first call was shortchanged at clock base {clock_base!r}")
+
+
+def test_the_reproducing_clocks_really_do_reproduce():
+    """The canary for the parametrization above. A regression test pinned to
+    magic constants is only worth anything if those constants still trigger the
+    fault — otherwise it silently degrades into a test that always passes, which
+    is how the first version of this suite was written and why CI caught what
+    the local run missed."""
+    for base in _TRUNCATING_CLOCKS:
+        assert int(max(1, (base + 1800.0) - base)) == 1799, (
+            f"{base!r} no longer reproduces the truncation, so the regression "
+            f"test above is no longer armed")
+
+
+def test_a_later_call_is_never_shortchanged_below_its_true_remainder(
+        monkeypatch):
+    """The same precision hazard one hop later: a budget that lands a hair under
+    the whole second it means must not truncate downward on every iteration, or
+    the loss compounds across a chain."""
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=10, done=False), _reply(occupancy=10, done=True)])
+    ticks = iter([1000.0000000000002, 1000.0000000000002])
+    ag.run("k", "p", context_cfg=_cfg(), timeout_s=1800,
+           now_fn=lambda: next(ticks))
+    assert calls[0]["timeout_s"] == 1800
+    assert calls[1]["timeout_s"] == 1800, (
+        "no time elapsed, yet the next call lost a whole second")
+
+
 def test_the_rotation_seed_carries_the_original_task_prompt(monkeypatch):
     """A fresh session has none of the conversation. If the seed does not
     restate the ask, the rotated agent works on nothing."""
