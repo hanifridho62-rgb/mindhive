@@ -104,6 +104,27 @@ def test_echo_false_stays_quiet(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_stream_retention_is_bounded_but_the_pipe_is_still_drained(monkeypatch):
+    """A runaway process must not grow this one until it dies.
+
+    Asserted on `_stream` rather than through `run_and_record`, because every
+    outer surface caps independently — `runlog` truncates at write time and
+    `excerpt` at EXCERPT_CHARS — so an unbounded in-memory buffer would look
+    identical from outside while still being the thing that OOMs. This is the
+    only place the property is observable.
+
+    Retention is bounded to the cap plus at most one line: a line arrives whole
+    and is not split mid-read. The exit code proves the pipe kept draining past
+    the bound — stop reading and the child blocks on a full pipe and the run
+    hangs, which would be a worse bug than the one being fixed."""
+    monkeypatch.setattr(verify.runlog, "MAX_ARTIFACT_BYTES", 200)
+    code, out, err = verify._stream(
+        _argv("for i in range(200): print('y' * 500)"), False)
+    assert code == 0, "the child must run to completion, not block on the pipe"
+    assert not err
+    assert len(out) < 5_000, "retention is unbounded (would be ~100_000)"
+
+
 def test_a_missing_program_is_recorded_not_raised():
     rec = verify.run_and_record(["definitely-not-a-real-program-xyz"], echo=False)
     assert rec["exit_code"] != 0

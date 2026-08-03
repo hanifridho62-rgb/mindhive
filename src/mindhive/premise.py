@@ -67,9 +67,16 @@ is against:
   a subprocess on the `UserPromptSubmit` critical path, which today spawns
   nothing.
 - Counts of anything other than tests. One evidence source, one claim class.
+- **Quotation vs assertion.** The extractor reads text, not intent, so a path
+  or count MENTIONED as an example, a quote, or a description of someone
+  else's claim is extracted the same as one asserted. Running the CLI over a
+  document that DISCUSSES a false baseline will flag that baseline. This is
+  inherent to regex extraction and is stated in `LIMITS_LINE` rather than
+  papered over; on the hook's real surface — a typed prompt — a stated count
+  almost always is an assertion, which is the case the gate is for.
 
-`render` states this limit in the injected block, so the report can never read
-as a clean bill of health for the rest of the prompt.
+`render` states these limits in the injected block, so the report can never
+read as a clean bill of health for the rest of the prompt.
 """
 from __future__ import annotations
 
@@ -147,18 +154,26 @@ _ROADMAP_FIELD_RE = re.compile(
 # The existence claim, which is what the real directive actually made: not
 # "resume plan X" but "an interrupted plan is waiting for you". Checkable
 # against `roadmap.interrupted`, and the false premise that started all this.
+#
+# Deliberately NOT triggered by the bare string `hive roadmap resume`. That
+# fires on any text that merely MENTIONS the command — this repo's own
+# DATA_MODEL.md and plan files among them — and mentioning a command is not
+# asserting that an interrupted roadmap exists. A prompt that really does name
+# one to resume supplies an id, which `_ROADMAP_CMD_RE` catches and checks
+# far more precisely.
 _ROADMAP_INTERRUPTED_RES = (
-    re.compile(r"\bhive\s+roadmap\s+resume\b"),
     re.compile(r"\binterrupted\s+(?:plan|roadmap)\b"),
     re.compile(r"\broadmap\s+resumption\b"),
 )
 
-# Two phrasings, both seen in the wild: "3518 passed" / "3518-test baseline",
-# and "baseline of 3580". Bounded windows on both sides so a stray number
-# elsewhere in a long prompt is never pulled in.
+# The number must be ADJACENT to test vocabulary: "3518 passed", "3518-test",
+# "3401 tests". A looser window around "suite"/"baseline" was tried and cut —
+# it read "the suite finished in 228s" as a claim of 228 tests, and a
+# contradiction manufactured out of a runtime is exactly the false positive
+# that teaches an operator to stop believing this gate. Recall lost is small:
+# every real phrasing seen in the wild puts the count next to the word.
 _TEST_COUNT_RES = (
     re.compile(r"\b(\d{2,7})\s*-?\s*(?:tests?|passed|passing)\b"),
-    re.compile(r"\b(?:baseline|suite)\b[^\n]{0,30}?\b(\d{2,7})\b"),
 )
 
 
@@ -392,8 +407,10 @@ def check(claims, evs=None, root=None) -> list:
 LIMITS_LINE = (
     "- Only file paths, roadmap ids, and test counts are checked. Everything "
     "else this prompt asserts — what a previous session did, what the code "
-    "does, why it is urgent — is unverified. This is not a clean bill of "
-    "health.")
+    "does, why it is urgent — is unverified. A path or number MENTIONED as an "
+    "example, a quote, or a description of someone else's claim is read as an "
+    "assertion too, so a contradiction here can be about the text rather than "
+    "about the intent. This is not a clean bill of health.")
 
 
 def _label(claim) -> str:

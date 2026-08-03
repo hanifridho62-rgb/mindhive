@@ -102,6 +102,29 @@ def test_extract_does_not_read_a_placeholder_as_a_roadmap_id():
             if c["kind"] == premise.KIND_ROADMAP_ID] == []
 
 
+def test_extract_does_not_read_a_mentioned_command_as_an_existence_claim():
+    """Documentation that MENTIONS `hive roadmap resume` is not asserting that
+    an interrupted roadmap exists. This repo's own DATA_MODEL.md and plan files
+    mention it, and a gate that contradicts its own docs is a gate the operator
+    learns to ignore."""
+    doc = "The `hive roadmap resume <id>` command re-enters an existing plan."
+    got = premise.extract(doc)
+    assert [c for c in got["claims"]
+            if c["kind"] == premise.KIND_ROADMAP_INTERRUPTED] == []
+
+
+def test_extract_does_not_read_a_runtime_as_a_test_count():
+    """"the suite finished in 228 seconds" is not a claim of 228 tests. A
+    contradiction manufactured out of a duration is precisely the false
+    positive that destroys trust in the gate."""
+    for benign in ("the suite finished in 228 seconds",
+                   "baseline run took 262 s",
+                   "the suite has a 30 second timeout"):
+        got = premise.extract(benign)
+        assert [c for c in got["claims"]
+                if c["kind"] == premise.KIND_TEST_COUNT] == [], benign
+
+
 def test_extract_is_total_on_junk_input():
     for junk in ("", "   \n\t ", None, 42, {"a": 1}, [], b"bytes"):
         got = premise.extract(junk)

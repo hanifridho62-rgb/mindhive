@@ -1243,6 +1243,12 @@ gate that implied broader coverage would itself violate §0:
 - Git refs (asserted SHAs, branch names). Cheap in principle, but it would put a
   process spawn on the prompt path. Deferred, not dismissed.
 - Counts of anything other than tests. One evidence source, one claim class.
+- Quotation vs assertion. The extractor reads text, not intent, so a path or
+  count *mentioned* as an example or a quote is extracted the same as one
+  asserted — running the CLI over a document that discusses a false baseline
+  will flag that baseline. Inherent to regex extraction, stated rather than
+  papered over; on the hook's real surface (a typed prompt) a stated count
+  almost always is an assertion.
 
 Both the injected block and the CLI listing end with that limit stated out loud,
 so a report of three contradictions can never read as a completed audit.

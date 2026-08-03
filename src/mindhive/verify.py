@@ -136,6 +136,7 @@ def _stream(argv, echo: bool):
     prints as it goes; the buffer is what becomes the artifact. argv list only
     — `shell=True` appears nowhere in this module and a test pins that."""
     chunks: list[str] = []
+    kept = 0
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -153,7 +154,16 @@ def _stream(argv, echo: bool):
     with proc:
         if proc.stdout is not None:
             for line in proc.stdout:
-                chunks.append(line)
+                # Bounded in MEMORY, not just at write time. `runlog` caps the
+                # artifact when it is written, but the buffer that feeds it was
+                # unbounded — a runaway suite printing gigabytes would grow this
+                # process until it died, losing the exit code that is the whole
+                # point. Past the cap we keep echoing and keep DRAINING the pipe
+                # (stopping the read would block the child on a full pipe and
+                # hang the run), we just stop retaining.
+                if kept < runlog.MAX_ARTIFACT_BYTES:
+                    chunks.append(line)
+                    kept += len(line)
                 if echo:
                     sys.stdout.write(line)
                     # Explicit, because "streams as it goes" is otherwise only
