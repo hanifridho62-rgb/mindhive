@@ -20,7 +20,12 @@ class Usage:
 
     @property
     def context_occupancy(self) -> int:
-        return self.input_tokens + self.cache_read_input_tokens
+        """Prompt size = total_tokens minus what the model wrote. Kept in this
+        shape deliberately: the two properties disagreed while this one omitted
+        `cache_creation_input_tokens`, and expressing it as a subtraction from
+        `total_tokens` makes a future divergence impossible rather than merely
+        unlikely. See loop/context.occupancy_from for why cache-write tokens count."""
+        return self.total_tokens - self.output_tokens
 
 
 @dataclass

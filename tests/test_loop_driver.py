@@ -100,6 +100,18 @@ def test_parse_result_extracts_usage_and_session():
     assert r.rate_limited is False
 
 
+def test_context_occupancy_includes_cache_creation():
+    """`context_occupancy` must agree with `total_tokens` on which fields are
+    prompt: everything except output_tokens. The two disagreed while occupancy
+    omitted cache_creation, so this pins them together."""
+    u = driver.Usage(input_tokens=2, output_tokens=661,
+                     cache_creation_input_tokens=4826,
+                     cache_read_input_tokens=198992)
+    assert u.context_occupancy == 203820
+    # Strictly less than total_tokens, by exactly the output it excludes.
+    assert u.total_tokens - u.context_occupancy == u.output_tokens
+
+
 def test_parse_result_detects_rate_limit():
     blob = '{"rate_limit_event": {"status": "rejected"}}'
     r = driver.parse_result(blob)
