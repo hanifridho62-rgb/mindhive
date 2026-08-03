@@ -66,6 +66,32 @@ pending marker, and STATE.md/briefing shows a blocking "⚠ Unlogged code
 changes" notice until the entry is recorded. Do not clear the notice any
 other way — write the entry.
 
+## The global Stop hook must stay fail-open and opt-in
+
+`hooks/stop.ps1` + `mindhive.rotation.hook` measure context occupancy at the end
+of every agent turn. Once registered in `~/.claude/settings.json` it fires in
+**every** Claude Code session on this machine, in every project — so a bug in it
+does not break one feature, it breaks all work everywhere, and it breaks it from
+inside the tool you would use to fix it.
+
+Two properties keep that safe. Do not weaken either:
+
+- **Fail-open.** Any exception, any unparseable payload, any unreadable
+  transcript → return `None` and print nothing. The blanket `except` in
+  `hook_decision` is deliberate, not sloppiness; a narrower catch lets some
+  unanticipated failure reach a surface where every exception is a user-visible
+  outage. `tests/test_rotation_hook.py` proves this by injecting failures at the
+  module seam rather than trusting that the try/except looks right.
+- **Opt-in.** The hook does nothing unless `MINDHIVE_ROTATION` is set, and only
+  `hive session run` sets it — for the children it spawns. Registering the hook
+  and switching it on are separate steps on purpose. Never make it
+  active-by-default "for convenience".
+
+**Never emit `{"decision": "block"}` from this hook.** For a Stop hook, `block`
+means *do not stop — keep working*. It would pin a full session open instead of
+rotating it, which is the exact opposite of the intent. Rotation is signalled by
+the `ROTATION_PENDING` artifact, because a Stop hook cannot end a session at all.
+
 ## Any change here must land green
 
 Whenever you touch code in this checkout, run the test suite before calling

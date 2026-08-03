@@ -87,6 +87,17 @@ def cmd_hook(args) -> int | None:
         decision = enforce.hook_decision(raw)
         if decision:
             print(json.dumps(decision))
+    elif args.stage == "stop":
+        # Smart-zone rotation: measure this session's real context occupancy and,
+        # when it is past the boundary, leave the ROTATION_PENDING artifact for
+        # the `hive session run` supervisor to find after the child exits.
+        # Print ONLY when there is something to say (stdout is the hook's channel),
+        # and never a `decision` — a Stop hook's "block" means CONTINUE working,
+        # so blocking here would pin a full session open instead of rotating it.
+        from .rotation import hook as rotation_hook
+        decision = rotation_hook.hook_decision(raw)
+        if decision:
+            print(json.dumps(decision))
     elif args.stage == "user_prompt_submit":
         # Prompt-quality gate: inject skill-trigger directives when the typed
         # prompt is underspecified. Print ONLY when the gate fires (stdout is
@@ -94,7 +105,7 @@ def cmd_hook(args) -> int | None:
         # prompt enrichment is enabled (the default), the fired context also
         # carries the clarifying questions (see enrich.extend_hook_context —
         # additive, sidecar-only read, fail-open).
-        from . import enrich, promptgate, style
+        from . import enrich, premise, promptgate, style
         from .mindnet import inject as mn_inject
         context = promptgate.hook_context(raw)
         if context:
@@ -113,6 +124,15 @@ def cmd_hook(args) -> int | None:
         except Exception:                                   # noqa: BLE001
             spine = None
         context = mn_inject.extend_hook_context(context, raw, sc=spine)
+        # §0's mechanical half: check the checkable factual claims this prompt
+        # makes against the filesystem, the roadmap fold, and the last recorded
+        # test run, and report contradictions. Unconditional for the same reason
+        # the spine above is, and with a sharper edge — `promptgate` stops
+        # scanning at PROMPT_SCAN_CAP, so the long, assertion-dense prompts most
+        # likely to carry a stale or fabricated premise are exactly the ones its
+        # gate never sees. Additive and fail-open: it returns `context`
+        # unchanged whenever nothing is contradicted or anything goes wrong.
+        context = premise.extend_hook_context(context, raw)
         # The standing reply-style pass: caveman by default, normal prose when
         # the prompt asks to be taught. Unconditional on human-typed prompts for
         # the same reason the spine above is — a style that only re-asserts
@@ -157,6 +177,37 @@ def cmd_hook(args) -> int | None:
                                   session_id=_hook_session(raw))
         except Exception:                                   # noqa: BLE001
             pass
+    return None
+
+
+def rotation_supervisor_defaults():
+    """Spin-guard defaults, read from the supervisor rather than duplicated as
+    argparse literals — two copies of a safety bound drift, and the copy that
+    drifts is always the one nobody is looking at."""
+    from .rotation import supervisor
+    return supervisor.MAX_ROTATIONS, supervisor.SPIN_WINDOW_S
+
+
+def cmd_session_run(args) -> int | None:
+    """Supervise an interactive Claude Code session, rotating it when the
+    smart-zone boundary is crossed. Returns the supervisor's own exit code so a
+    tripped spin guard is visible to whatever launched us."""
+    from .rotation import supervisor
+    result = supervisor.run(project=getattr(args, "project", None),
+                            max_rotations=args.max_rotations,
+                            window_s=args.spin_window)
+    print(f"{result.reason}: {result.spawns} session(s), "
+          f"{result.rotations} rotation(s)"
+          + (f" — {result.detail}" if result.detail else ""))
+    return result.exit_code or None
+
+
+def cmd_session_install_hook(args) -> int | None:
+    from .rotation import install as install_mod
+    result = install_mod.install(args.settings, args.command, dry_run=args.dry_run)
+    print(json.dumps(result))
+    if not result["ok"]:
+        return 2
     return None
 
 
@@ -384,6 +435,38 @@ def cmd_embed(args) -> int | None:
 
 def cmd_selftest(args) -> int | None:
     return selftest_mod.run()
+
+
+def cmd_premise_check(args) -> int | None:
+    """Check a text's checkable factual claims against the record.
+
+    Exit code is the product: non-zero when anything is CONTRADICTED, so this
+    composes into a script. UNKNOWN exits zero — "could not check" is not a
+    finding, and failing on it would train the operator to pass `|| true`."""
+    from pathlib import Path
+
+    from . import events as ev_mod, premise
+    if getattr(args, "file", None):
+        try:
+            text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"cannot read {args.file}: {e}")
+            return 2
+    else:
+        text = sys.stdin.read() if not sys.stdin.isatty() else ""
+
+    found = premise.extract(text)
+    if not found["scanned"] and text:
+        # Reported, not silently passed: "too big to scan" and "nothing
+        # asserted" are different answers and must not look alike.
+        print(f"(not scanned — {len(text)} chars exceeds the "
+              f"{premise.PREMISE_SCAN_CAP}-char budget)")
+        return 0
+    verdicts = premise.check(found["claims"], evs=ev_mod.read_all(args.project))
+    print(premise.report(verdicts))
+    for kind, dropped in (found.get("truncated") or {}).items():
+        print(f"(+{dropped} further {kind} claim(s) not checked — per-class cap)")
+    return 1 if any(v["outcome"] == premise.CONTRADICTED for v in verdicts) else 0
 
 
 def cmd_briefing(args) -> int | None:
@@ -2488,9 +2571,43 @@ def _build_parser() -> argparse.ArgumentParser:
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
     hk.add_argument("stage",
                     choices=["post_tool_use", "post_tool_use_failure",
-                             "pre_tool_use", "user_prompt_submit"],
+                             "pre_tool_use", "user_prompt_submit", "stop"],
                     help="which hook fired")
     hk.set_defaults(func=cmd_hook)
+
+    # Smart-zone rotation for INTERACTIVE sessions. `hive loop` already does this
+    # headlessly; nothing inside an interactive session can clear its own context,
+    # so the loop has to live outside it — here.
+    se = sub.add_parser("session", help="supervise an interactive Claude session "
+                                        "and rotate it when context fills")
+    se_sub = se.add_subparsers(dest="session_cmd", required=True)
+
+    se_run = se_sub.add_parser("run", help="run an interactive session under "
+                                           "smart-zone rotation")
+    se_run.add_argument("--project", default=None,
+                        help="target namespace explicitly (default: detect from cwd)")
+    se_run.add_argument("--max-rotations", type=int,
+                        default=rotation_supervisor_defaults()[0],
+                        help="rotations allowed inside the spin window before "
+                             "the circuit breaker trips")
+    se_run.add_argument("--spin-window", type=float,
+                        default=rotation_supervisor_defaults()[1],
+                        help="seconds the spin guard looks back over")
+    se_run.set_defaults(func=cmd_session_run)
+
+    se_install = se_sub.add_parser(
+        "install-hook", help="register the Stop hook in a settings.json "
+                             "(idempotent; the hook stays inert until "
+                             "MINDHIVE_ROTATION is set)")
+    se_install.add_argument("settings", help="path to the settings.json to edit")
+    se_install.add_argument("--command", default=None,
+                            help="the hook command to register (default: this "
+                                 "checkout's hooks/stop.ps1). Worth setting from "
+                                 "a worktree, where the default resolves to the "
+                                 "worktree's own copy rather than the main one")
+    se_install.add_argument("--dry-run", action="store_true",
+                            help="report what would change without writing")
+    se_install.set_defaults(func=cmd_session_install_hook)
 
     sub.add_parser("project", help="rebuild projections").set_defaults(func=cmd_project)
     st = sub.add_parser("state", help="print STATE.md")
@@ -2543,6 +2660,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
+
+    # §0's operator-facing half. Deliberately NOT folded into `hive verify`,
+    # which already means "verify the hash chain" — one command answering two
+    # unrelated questions is how an operator ends up trusting the wrong answer.
+    pre = sub.add_parser(
+        "premise",
+        help="check a prompt or handoff doc's factual claims against the record")
+    pres = pre.add_subparsers(dest="premise_cmd", required=True)
+    prec = pres.add_parser(
+        "check",
+        help="report asserted paths, roadmap ids and test counts the record "
+             "contradicts (exits non-zero on any contradiction)")
+    prec.add_argument("--file", default=None,
+                      help="read the text from PATH (default: stdin)")
+    prec.add_argument("--project", default=None,
+                      help="target namespace explicitly (default: detect from cwd)")
+    prec.set_defaults(func=cmd_premise_check)
 
     r = sub.add_parser("recall", help="search ledger")
     r.add_argument("query")

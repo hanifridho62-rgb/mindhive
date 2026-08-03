@@ -177,3 +177,23 @@ def test_absolute_ceiling_of_zero_disables_only_that_bound():
                                 absolute_ceiling=0)
     assert context.smart_zone_ceiling(cfg, model="claude-opus-5") == 500_000
     assert context.needs_reset(1_000, cfg, model="claude-opus-5") is False
+
+
+def test_occupancy_from_usage():
+    # From master: a plain cached turn where cache_creation is 0. Kept alongside
+    # the cache_creation-dominant case above because the two pin different
+    # halves of the same identity.
+    assert context.occupancy_from(input_tokens=8000,
+                                  cache_creation_input_tokens=0,
+                                  cache_read_input_tokens=42000) == 50000
+
+
+def test_occupancy_real_cached_turn_shape():
+    """From master, renamed to avoid shadowing the case above.
+
+    The real measured shape of a cached turn: input_tokens is 1-2 and nearly all
+    context sits in the two cache fields. Discriminating — the old two-field
+    formula returns 198_994 here, so a regression fails rather than passing."""
+    assert context.occupancy_from(input_tokens=2,
+                                  cache_creation_input_tokens=4826,
+                                  cache_read_input_tokens=198992) == 203820
