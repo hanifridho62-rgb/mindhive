@@ -67,6 +67,34 @@ def prune_window(recent, stamp: float, window_s: float) -> list[float]:
     return [t for t in recent if stamp - t <= window_s] + [stamp]
 
 
+def spin_verdict(rotations: int, recent, *, max_rotations: int,
+                 max_total_rotations: int, window_s: float,
+                 pending: dict | None = None) -> str | None:
+    """Why this loop looks like a spiral, or None if it looks healthy.
+
+    Both bounds live here because they answer ONE question — "should this stop
+    relaunching?" — and splitting them across two branches in the loop body made
+    the loop read as if two unrelated things could go wrong. They are two
+    symptoms of the same failure, and they need each other: the sliding window
+    catches a fast spiral, and the total catches a slow one that never puts two
+    rotations in the same window and so slips past the window entirely.
+
+    Returns the detail string rather than a bool so the caller reports numbers
+    instead of the fact that a limit exists."""
+    if rotations >= max_total_rotations:
+        return (f"{rotations} rotations total (limit {max_total_rotations}); "
+                f"too slow to trip the {window_s:g}s window but not a healthy "
+                f"session either")
+    if len(recent) >= max_rotations:
+        at = ""
+        if pending:
+            at = (f"; last at {pending.get('occupancy')}/"
+                  f"{pending.get('threshold')} tokens")
+        return (f"{len(recent)} rotations within {window_s:g}s "
+                f"(limit {max_rotations}){at}")
+    return None
+
+
 def _child_env(env=None):
     """The child's environment: ours, plus rotation on and headless off.
 
@@ -104,6 +132,35 @@ def default_spawn(handoff: str | None, *, cmd: str = "claude", extra=()) -> int:
     return proc.wait()
 
 
+def active_ask(project: str | None = None) -> str:
+    """The original ask of the active roadmap, if there is one.
+
+    A successor reseeded from the briefing alone knows what HAPPENED but not
+    what it was FOR — and a session that has lost the goal drifts toward
+    whatever the last few events were about. The roadmap already stores the ask
+    verbatim, so the handoff carries the destination alongside the progress.
+
+    Best-effort and total: no roadmap, a corrupt fold, an unreadable store — any
+    of them yield an empty string rather than costing the successor its whole
+    context."""
+    try:
+        from .. import events, roadmap
+        plans = roadmap.fold(events.read_all(project))
+    except Exception:                                       # noqa: BLE001
+        return ""
+    for record in plans.values():
+        if not isinstance(record, dict) or record.get("status") != "active":
+            continue
+        prompt = record.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            steps = record.get("steps") or []
+            done = sum(1 for s in steps
+                       if isinstance(s, dict) and s.get("status") == "done")
+            progress = f" ({done}/{len(steps)} steps done)" if steps else ""
+            return f"{prompt.strip()}{progress}"
+    return ""
+
+
 def default_reseed(pending: dict, *, project: str | None = None) -> str:
     """Compact the ledger and build the successor's opening context.
 
@@ -123,12 +180,14 @@ def default_reseed(pending: dict, *, project: str | None = None) -> str:
             step()
         except Exception:                                   # noqa: BLE001
             pass
-    text = build_briefing().read_text(encoding="utf-8")
-    return (
-        "This session is the successor to one that reached its context limit "
-        f"({pending.get('occupancy')} of {pending.get('threshold')} tokens). "
-        "Continue that work from the state below; do not restart it.\n\n" + text
-    )
+
+    header = ("This session is the successor to one that reached its context "
+              f"limit ({pending.get('occupancy')} of {pending.get('threshold')} "
+              "tokens). Continue that work; do not restart it.\n\n")
+    ask = active_ask(project)
+    if ask:
+        header += f"THE ASK (unchanged by the rotation):\n{ask}\n\n"
+    return header + build_briefing().read_text(encoding="utf-8")
 
 
 def run(*, project: str | None = None, spawn=None, now=None, reseed=None,
@@ -175,23 +234,12 @@ def run(*, project: str | None = None, spawn=None, now=None, reseed=None,
         artifact.clear(project)
         rotations += 1
 
-        if rotations >= max_total_rotations:
-            return SessionResult(
-                1, spawns, rotations, "spin_guard",
-                f"{rotations} rotations total (limit {max_total_rotations}); "
-                f"too slow to trip the {window_s:g}s window but not a healthy "
-                f"session either",
-            )
-
-        stamp = now()
-        recent = prune_window(recent, stamp, window_s)
-        if len(recent) >= max_rotations:
-            return SessionResult(
-                1, spawns, rotations, "spin_guard",
-                f"{len(recent)} rotations within {window_s:g}s "
-                f"(limit {max_rotations}); last at "
-                f"{pending.get('occupancy')}/{pending.get('threshold')} tokens",
-            )
+        recent = prune_window(recent, now(), window_s)
+        tripped = spin_verdict(rotations, recent, max_rotations=max_rotations,
+                               max_total_rotations=max_total_rotations,
+                               window_s=window_s, pending=pending)
+        if tripped:
+            return SessionResult(1, spawns, rotations, "spin_guard", tripped)
 
         try:
             handoff = reseed(pending)

@@ -185,6 +185,69 @@ def test_prune_window_is_bounded_even_when_rotations_are_fast():
     assert len(recent) <= 11                 # window/step + 1, not 1000
 
 
+# --- the spiral verdict, tested directly -------------------------------------
+
+def _verdict(rotations, recent, *, max_rotations=3, max_total=40, window_s=180.0):
+    return supervisor.spin_verdict(rotations, recent, max_rotations=max_rotations,
+                                   max_total_rotations=max_total,
+                                   window_s=window_s, pending=None)
+
+
+def test_verdict_is_none_for_a_healthy_loop():
+    assert _verdict(2, [10.0, 20.0]) is None
+
+
+def test_verdict_catches_the_fast_spiral_via_the_window():
+    got = _verdict(3, [10.0, 20.0, 30.0])
+    assert got and "within" in got
+
+
+def test_verdict_catches_the_slow_spiral_via_the_total():
+    """One rotation in the window — the sliding guard sees nothing wrong — but
+    40 rotations overall. This is the case a window-only guard misses entirely."""
+    got = _verdict(40, [10.0])
+    assert got and "total" in got
+
+
+def test_verdict_reports_numbers_not_just_that_a_limit_exists():
+    got = _verdict(3, [1.0, 2.0, 3.0], max_rotations=3, window_s=180.0)
+    assert "3" in got and "180" in got
+
+
+def test_verdict_includes_the_occupancy_when_a_pending_rotation_is_given():
+    got = supervisor.spin_verdict(
+        3, [1.0, 2.0, 3.0], max_rotations=3, max_total_rotations=40,
+        window_s=180.0, pending={"occupancy": 203820, "threshold": 1000})
+    assert "203820" in got and "1000" in got
+
+
+# --- the successor inherits the goal, not just the history -------------------
+
+def test_active_ask_is_empty_without_a_roadmap():
+    assert supervisor.active_ask() == ""
+
+
+def test_active_ask_returns_the_original_ask_with_progress():
+    """A successor reseeded from the briefing alone knows what happened but not
+    what it was for, and drifts toward whatever the last events were about."""
+    from mindhive import roadmap
+    roadmap.record("set", "p1", prompt="Build the rotation layer",
+                   title="t", steps=["a", "b", "c"])
+    roadmap.record("step", "p1", index=0, status="done")
+    got = supervisor.active_ask()
+    assert "Build the rotation layer" in got
+    assert "1/3" in got
+
+
+def test_active_ask_is_total_when_the_ledger_is_unreadable(monkeypatch):
+    """Losing the ask should cost the successor its ask, never its whole
+    context — this runs inside the reseed path of a live rotation."""
+    import mindhive.events as events_mod
+    monkeypatch.setattr(events_mod, "read_all",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("boom")))
+    assert supervisor.active_ask() == ""
+
+
 # --- the child's environment ------------------------------------------------
 
 def test_child_env_enables_rotation():
