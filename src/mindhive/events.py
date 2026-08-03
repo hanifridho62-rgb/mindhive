@@ -113,6 +113,22 @@ DETERMINISTIC_TYPES = {
     # this, because every other test in that section would pass just as well
     # against an enforcer that appended every time.
     "policy_denied",
+    # One row per mechanical test run: the argv, the REAL exit code, the parsed
+    # counts, and `verified_by: "python"` (see verify.py). This is the evidence
+    # a "the suite is green at N" claim gets checked against — before it existed
+    # such a claim was unfalsifiable, which is how a fabricated baseline
+    # survived several sessions unchallenged.
+    #
+    # Deterministic, for the same reason as `mindnet_activity` and
+    # `policy_denied`: a run record is machine-generated telemetry carrying no
+    # human intent, and semantic membership would put a LEDGER markdown file, a
+    # Memory-view row and a recall-corpus entry on disk per test run.
+    #
+    # The payload contract below is the honesty half: the arbitrary-append
+    # surfaces REFUSE a `verified_by` stamp, so this type cannot be forged by
+    # hand. Only `verify.run_and_record`, which actually spawned the process,
+    # may stamp it.
+    "verification",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
@@ -158,6 +174,14 @@ _PAYLOAD_CONTRACTS = {
     # registering that one here instead would invert the honesty rule.
     "mindnet_phase": (".mindnet.phases",
                       "hive mindnet declare|enter|satisfy|fall-back …"),
+    # Same two-validator split as mindnet_phase, and for the same reason:
+    # `verify.validate_payload` refuses any payload carrying `verified_by`, so
+    # this surface cannot stamp a mechanical run that never happened. The
+    # writer's shape (`verify.validate_stored`, which REQUIRES the stamp) is
+    # applied inside `run_and_record` just before append_event. Registering
+    # that one here would let a hand-written append forge the evidence the
+    # premise gate reads.
+    "verification": (".verify", "hive selftest — it records the run"),
 }
 
 
