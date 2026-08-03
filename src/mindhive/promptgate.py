@@ -615,7 +615,19 @@ def catalog_block(prompt, manifest, exclude=()):
 FACULTY_BEAT_SECS = 60
 
 
-def _beat_path(project=None):
+# A beat is refused outright once the marker is this old, however recently it was
+# touched. Without an ABSOLUTE bound the throttle is self-perpetuating: every beat
+# re-arms the clock, so one prompt that lit a faculty would keep re-asserting it
+# for as long as any tool call happens in that project — days later, in another
+# session, on prompts that engaged nothing. That turns the cat from "this faculty
+# ran" into "a Claude is using tools here", and makes `HIDE_AFTER_SECS`
+# unreachable, i.e. the beat would manufacture the stranded-lit cat that dropping
+# the `idle` row was supposed to avoid. Bounded by the dim threshold: a turn that
+# has produced no output for that long has stopped, and the cat should say so.
+FACULTY_BEAT_MAX_AGE_SECS = 180
+
+
+def _beat_path(project=None, session_id=None):
     """The turn's beat marker. Its CONTENT is what was lit; its MTIME is the
     throttle clock.
 
@@ -623,8 +635,22 @@ def _beat_path(project=None):
     — `mindhive hook post_tool_use` starts, runs, and exits per tool call — so an
     in-memory timestamp would reset every time and beat on every call. Derived
     state, so it lives beside the other sidecars rather than in the append-only
-    chain."""
-    return paths.project_dir(project) / "faculty_beat.json"
+    chain.
+
+    Keyed by SESSION, not just project. `paths.detect_project` deliberately
+    collapses every worktree of a repo onto one namespace, so a project-only
+    marker is shared by every interactive session on that repo — and one
+    session's tool calls would then re-assert faculties another session lit and
+    it never touched, stamped with the wrong session id."""
+    slug = "".join(c for c in str(session_id or "anon") if c.isalnum() or c in "-_")
+    return paths.project_dir(project) / f"faculty_beat-{slug[:64] or 'anon'}.json"
+
+
+# One turn is one hook process, so a module-level flag IS "first announce of this
+# turn". `cmd_hook` announces twice per prompt — once from `record_direction` for
+# the catalog, once for the consulted spine — and an overwrite would leave the
+# first set unsustained, dimming mid-turn exactly as if the beat did not exist.
+_ANNOUNCED_THIS_TURN = False
 
 
 def announce_faculties(faculties, project=None, session_id=None) -> int:
@@ -659,12 +685,28 @@ def announce_faculties(faculties, project=None, session_id=None) -> int:
     if lit:
         # Best-effort and AFTER the rows: the rows are the product, the marker only
         # sustains them. An unwritable sidecar costs the heartbeat, never the cat.
+        global _ANNOUNCED_THIS_TURN
         try:
-            path = _beat_path(project)
+            path = _beat_path(project, session_id)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"faculties": lit,
-                                        "session_id": session_id or ""}),
-                            encoding="utf-8")
+            keep = set(lit)
+            if _ANNOUNCED_THIS_TURN and path.exists():
+                # Second announce of the SAME turn — union, never overwrite. The
+                # catalog and the spine are announced separately from one hook
+                # invocation, and clobbering would leave the first set with no
+                # heartbeat to sustain it.
+                try:
+                    old = json.loads(path.read_text(encoding="utf-8"))
+                    keep |= {f for f in (old.get("faculties") or [])
+                             if isinstance(f, str)}
+                except Exception:                           # noqa: BLE001
+                    pass
+            _ANNOUNCED_THIS_TURN = True
+            # Atomic, like `_write_manifest` above: readers are OTHER PROCESSES
+            # on every tool call, and a truncate-then-write is a torn read for
+            # whichever one lands mid-write.
+            paths.write_text_atomic(path, json.dumps(
+                {"faculties": sorted(keep), "session_id": session_id or ""}))
         except Exception:                                   # noqa: BLE001
             pass
     return written
@@ -687,11 +729,23 @@ def beat_faculties(project=None, session_id=None) -> int:
     flight, not due yet, unreadable marker."""
     from .mindnet import telemetry as tel_mod
     try:
-        path = _beat_path(project)
-        if not path.exists():
+        path = _beat_path(project, session_id)
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
             return 0                       # nothing was lit; nothing to sustain
-        if (time.time() - path.stat().st_mtime) < FACULTY_BEAT_SECS:
+        if age < FACULTY_BEAT_SECS:
             return 0                       # not due — the common case
+        if age > FACULTY_BEAT_MAX_AGE_SECS:
+            # The turn that wrote this stopped producing output long enough ago
+            # that its cat has already dimmed. Beating now would resurrect a
+            # faculty for work that is not happening — and, because every beat
+            # re-arms the clock, would do so forever. Retire the marker instead.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return 0
         data = json.loads(path.read_text(encoding="utf-8"))
         faculties = data.get("faculties") if isinstance(data, dict) else None
         if not isinstance(faculties, list) or not faculties:

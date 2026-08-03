@@ -261,6 +261,50 @@ def _safe_chain_ok(name: str, evs=None) -> bool:
         return False
 
 
+# One memo of the session fold, shared by every poll of /api/mindnet/cats.
+# {(project, all_mode): (fingerprint, records)}
+_SESSIONS_MEMO: dict = {}
+
+
+def _sessions_cached(proj, am, evs, stamp):
+    """`oversee.interactive_sessions` for *evs*, folded at most once per ledger
+    change rather than once per poll.
+
+    Measured on the real store (25.5k events) this fold costs 150-300 ms, and
+    both pages poll this endpoint on a 1.2-2.5 s timer regardless of which
+    section is visible — on the swarm page it is chained INTO the agent-graph
+    repaint, so the graph refreshed measurably less often for it. The fold is
+    also doubly wasteful internally: `skill_trails` and the main loop each
+    re-derive `headline()` for the same rows.
+
+    The fingerprint is the event count plus the newest timestamp, which is exactly
+    what `sidecar._staleness` already uses for the same class of problem: nothing
+    appended means the fold cannot have changed.
+
+    `online` is the one field that must NOT be memoized — it is a function of the
+    wall clock, not of the events — so it is re-derived here from each record's
+    own `last_event_ts` against `ONLINE_WINDOW_SECONDS`. That is oversee's own
+    final line, applied to oversee's own constant; the FOLD is what is cached."""
+    from . import oversee as oversee_mod
+    from .loop.state import _ts_epoch
+    key = (proj, bool(am))
+    fingerprint = (len(evs), evs[-1].ts if evs else "")
+    cached = _SESSIONS_MEMO.get(key)
+    if cached is None or cached[0] != fingerprint:
+        records = oversee_mod.interactive_sessions(
+            project=proj, evs=evs, now_fn=lambda: stamp)
+        _SESSIONS_MEMO[key] = (fingerprint, records)
+    else:
+        records = cached[1]
+    out = []
+    for r in records:
+        last = _ts_epoch(r.get("last_event_ts"))
+        out.append(dict(r, online=(last is not None
+                                   and (stamp - last)
+                                   < oversee_mod.ONLINE_WINDOW_SECONDS)))
+    return out
+
+
 def make_handler(token: str):
     class DashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep the console quiet
@@ -612,7 +656,6 @@ def make_handler(token: str):
             # `now` is resolved HERE and passed in, because `ui_cats.board` is
             # pure by design — that is what makes its 180 s and 6 h boundaries
             # testable at the boundary instead of approximately.
-            import time
             from datetime import datetime, timezone
 
             from . import oversee as oversee_mod
@@ -634,9 +677,25 @@ def make_handler(token: str):
             # `evs` for exactly this reason — re-reading would double the cost of
             # a poll that fires every 1.2 s against a store measured in tens of
             # thousands of events.
-            sessions = sess_mod.board(
-                oversee_mod.interactive_sessions(
-                    project=proj, evs=evs, now_fn=lambda: stamp), now)
+            # The session half is isolated. `oversee.interactive_sessions` is not
+            # documented as total, it folds every event twice internally, and it
+            # is NEW here — letting it raise would 500 the whole endpoint and take
+            # the faculty strip, which was reliable before this, down with it. The
+            # page's own rule is that a failing board must not take out the page;
+            # the server owes it the same.
+            try:
+                sessions = sess_mod.board(
+                    _sessions_cached(proj, am, evs, stamp), now)
+                have_sessions = True
+            except Exception:                       # noqa: BLE001
+                sessions = {"cats": (), "total": 0, "hidden": 0}
+                have_sessions = False
+            producers = tel_mod.producers()
+            # Report the session signal as unobservable when the fold that feeds
+            # it just failed, so the strip says "cannot know" instead of the
+            # confident "nothing running" — the exact distinction this map exists
+            # to make.
+            producers["session"] = producers.get("session", False) and have_sessions
             # The thresholds ride along so the page renders "idle 4h" without a
             # second copy of 180/21600 in JavaScript (invariant 10).
             return self._json({"cats": list(cats),
@@ -646,7 +705,7 @@ def make_handler(token: str):
                                # Which signals this BUILD can observe at all, so
                                # an empty strip can say "nothing running" rather
                                # than being mistaken for "cannot know".
-                               "producers": tel_mod.producers(),
+                               "producers": producers,
                                "dim_after_secs": cats_mod.DIM_AFTER_SECS,
                                "hide_after_secs": cats_mod.HIDE_AFTER_SECS,
                                "idle_vanish_secs": cats_mod.IDLE_VANISH_SECS,

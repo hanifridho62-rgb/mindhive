@@ -69,9 +69,21 @@ CAT_LABEL = {
 
 # Only the page-independent rules. `#mn-cats` itself is each page's business.
 CSS = """
-  #mn-cats .lbl { color:#8b949e; font-size:10.5px; letter-spacing:.6px;
-    text-transform:uppercase; flex:0 0 auto; align-self:center; }
-  #mn-cats .none { color:#6e7681; font-size:11.5px; align-self:center; }
+  /* Scoped to BOTH strips. These were `#mn-cats`-only, so a descendant selector
+     could not reach the session strip and its empty states rendered in default
+     body type — which silently cost the whole quiet-vs-blind distinction its
+     visible effect, the one thing that distinction exists to have. */
+  #mn-cats .lbl, #mn-sessions .lbl { color:#8b949e; font-size:10.5px;
+    letter-spacing:.6px; text-transform:uppercase; flex:0 0 auto;
+    align-self:center; }
+  #mn-cats .none, #mn-sessions .none { color:#6e7681; font-size:11.5px;
+    align-self:center; }
+  #mn-sessions .more { color:#6e7681; font-size:11px; align-self:center; }
+  /* Amber, not grey. "I cannot observe this" is a different claim from "nothing
+     is happening", and if the two render the same the operator learns nothing —
+     which is exactly how a checkout with no producer read as a quiet one. */
+  #mn-cats .blind, #mn-sessions .blind { color:#ff9e64; font-size:11.5px;
+    align-self:center; }
   /* The label sits ABOVE the head, as originally asked ("kucing yang diatas
      kepala nya bertulisan Skill and plugin") — column-reverse puts the SVG below
      the text without reordering the DOM, so the label still reads first for a
@@ -306,7 +318,18 @@ _JS = """
   // and the phase offset, and by the swarm page's node cats through `catFor`.
   // Arbitrary per new id, identical across refreshes — derived from the id, never
   // drawn at random, which would repaint a different cat on every poll.
-  function idSeed(id){ return parseInt(String(id).slice(0, 4), 16) || 0; }
+  // Hashes the WHOLE id (djb2), not its first four characters as hex. The hex
+  // slice was written for hex agent ids and silently collapses every other shape
+  // to 0 — `ws-b474f44f`, `research-<id>`, any non-hex prefix — so those cats all
+  // drew the same palette AND the same zero phase offset, bobbing in perfect
+  // lockstep. That is precisely the strobing bar the desync exists to prevent,
+  // and it hit hardest in the multi-agent case where several cats share a screen.
+  function idSeed(id){
+    let h = 5381;
+    const s = String(id);
+    for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+    return h;
+  }
   function idCat(id){ return idSeed(id) % CAT_PALETTES.length; }
   // What was last drawn, per strip. `paintSessions` rebuilds its container, and
   // rebuilding on every 1.2 s poll restarts a 1.6 s bob before it can finish —
@@ -325,7 +348,10 @@ _JS = """
                                                s.title, s.doing]),
                                 hidden, producers.session]);
     if (sig === SESS_SIG) return;
-    SESS_SIG = sig;
+    // Cleared, not set, before the build: assigning the new signature up front
+    // meant a throw mid-build left a half-painted strip that every identical
+    // poll afterwards refused to repair. Set it only once the strip is whole.
+    SESS_SIG = null;
     bar.innerHTML = '';
     const lbl = document.createElement('span');
     lbl.className = 'lbl'; lbl.textContent = 'working';
@@ -335,7 +361,12 @@ _JS = """
       // The distinction that cost this repo an entire investigation. A build
       // whose branch predates the producer rendered EXACTLY like a quiet one, so
       // "nothing is running" and "I cannot know" were indistinguishable.
-      if (producers.session === false){
+      // `!== true`, not `=== false`. A payload with no `producers` key at all —
+      // an older server behind a long-lived tab, or a 500 that `apiGet` does not
+      // throw on — leaves this `undefined`, and `undefined === false` is false,
+      // so the confident "no Claude running" was rendered at the one moment the
+      // page genuinely could not know. Absence of the answer IS not-knowing.
+      if (producers.session !== true){
         n.className = 'blind';
         n.textContent = 'session signal not built into this dashboard';
       } else {
@@ -343,6 +374,7 @@ _JS = """
         n.textContent = 'no Claude running';
       }
       bar.appendChild(n);
+      SESS_SIG = sig;
       return;
     }
     for (const s of rows){
@@ -371,6 +403,7 @@ _JS = """
       more.textContent = '+' + hidden + ' more';
       bar.appendChild(more);
     }
+    SESS_SIG = sig;                  // the strip is whole; now remember it
   }
 """
 

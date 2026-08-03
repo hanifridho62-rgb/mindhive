@@ -364,6 +364,15 @@ def test_a_working_session_is_distinguishable_without_motion():
 
 
 def test_only_a_working_session_cat_animates():
+    # The rule must actually DECLARE an animation whose name resolves to real
+    # keyframes — a substring match passed for a rule that declared nothing, and
+    # would pass for `mn-bob2`, which every browser silently ignores.
+    m = re.search(r"\.mn-sess\.working \.mn-cat-sprite\s*\{[^}]*"
+                  r"animation:\s*([A-Za-z0-9_-]+)", cat_board.CSS)
+    assert m, "the working session cat declares no animation"
+    declared = set(re.findall(r"@keyframes\s+([A-Za-z0-9_-]+)", cat_board.CSS))
+    assert m.group(1) in declared, (
+        f"session cat animates with '{m.group(1)}', which no @keyframes declares")
     assert ".mn-sess.working .mn-cat-sprite" in cat_board.CSS
     assert not re.search(r"\.mn-sess\s+\.mn-cat-sprite\s*\{[^}]*animation:",
                          cat_board.CSS), (
@@ -415,7 +424,11 @@ def test_the_id_derivation_is_shared_not_respelled():
     """`idSeed` feeds the palette pick, the bob phase, and the swarm page's node
     cats. Three copies of one parseInt is three places for it to drift."""
     js = cat_board.script()
-    assert js.count("parseInt(String(id).slice(0, 4), 16)") == 1
+    assert js.count("function idSeed(") == 1
+    assert js.count("function idCat(") == 1
+    # `catFor` on the swarm page must delegate rather than hold a second copy.
+    from mindhive.swarm_page import render_swarm
+    assert "function catFor(id){ return idCat(id); }" in render_swarm("tok")
 
 
 def test_the_session_strip_does_not_rebuild_when_nothing_changed():
@@ -445,17 +458,47 @@ def test_an_empty_strip_distinguishes_quiet_from_blind():
     so "nothing is running" and "I cannot know" were indistinguishable."""
     js = cat_board.script()
     body = js[js.index("function paintSessions("):]
-    assert "producers.session === false" in body, (
-        "the empty state never consults the producer map")
+    assert "producers.session !== true" in body, (
+        "the empty state must treat a MISSING producer map as blind, not quiet — "
+        "`=== false` renders the confident answer when the payload has no key at "
+        "all, which is exactly when the page cannot know")
     assert "no Claude running" in body
-    blind = body[body.index("producers.session === false"):]
+    blind = body[body.index("producers.session !== true"):]
     blind = blind[:blind.index("} else {")]
     assert "not built into this dashboard" in blind
 
 
 def test_the_blind_state_is_visually_distinct_from_the_quiet_one():
-    """Same words in the same grey would defeat the point."""
-    assert ".blind" in cat_board.CSS or "blind" in cat_board.script()
-    js = cat_board.script()
-    body = js[js.index("function paintSessions("):]
-    assert "'blind'" in body and "'none'" in body
+    """Same words in the same grey would defeat the point.
+
+    This asserted `".blind" in CSS or "blind" in script()` — satisfied by the JS
+    string alone, so it passed while NO stylesheet declared the class and both
+    empty states rendered identically. The whole distinction shipped invisible."""
+    rules = _rule_for(".blind")
+    assert rules, "no stylesheet declares .blind; the two empty states look alike"
+    assert "color:" in rules, f".blind carries no colour of its own: {rules}"
+    quiet = _rule_for(".none")
+    assert quiet and "color:" in quiet
+    def _colour(block):
+        import re as _re
+        m = _re.search(r"color:(#[0-9a-fA-F]+)", block)
+        return m.group(1).lower() if m else None
+    assert _colour(rules) != _colour(quiet), (
+        "blind and quiet render in the same colour")
+
+
+def _rule_for(selector):
+    """The declaration block of the rule that styles *selector* on BOTH strips."""
+    import re as _re
+    m = _re.search(r"[^{}]*" + _re.escape(selector) + r"[^{}]*\{([^}]*)\}",
+                   cat_board.CSS)
+    return m.group(1) if m else ""
+
+
+def test_the_session_strips_own_furniture_is_actually_styled():
+    """A `#mn-cats`-scoped descendant selector cannot reach `#mn-sessions`. These
+    were exactly that, so the session strip's label and empty states rendered in
+    default body type — the mechanism shipped with none of its visible effect."""
+    for cls in (".lbl", ".none", ".blind", ".more"):
+        assert "#mn-sessions " + cls in cat_board.CSS, (
+            f"{cls} is never styled inside #mn-sessions")

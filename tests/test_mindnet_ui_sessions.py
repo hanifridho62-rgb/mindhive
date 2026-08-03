@@ -182,3 +182,95 @@ def test_the_age_rule_is_borrowed_not_respelled():
     assert "age_secs" in src
     assert "fromisoformat" not in src, (
         "ui_sessions parses timestamps itself instead of reusing ui_cats.age_secs")
+
+
+# --- the strip is a "now", not a history ------------------------------------
+
+def test_a_long_quiet_session_leaves_the_strip():
+    """`oversee` keeps a session for six hours because its list is a HISTORY you
+    scroll. This strip answers "who is working now". The live board showed six
+    sessions, all resting, the freshest four hours old — and the one working Claude
+    would have been pushed into "+N more" by its own corpses."""
+    out = us.board([_sess("old", online=False, ago=us.REST_KEEP_SECS + 60)], NOW)
+    assert out["cats"] == () and out["total"] == 0
+
+
+def test_a_recently_quiet_session_stays():
+    """Just paused is not gone — losing it the moment output stops would make the
+    strip flicker on every pause between tool calls."""
+    out = us.board([_sess("recent", online=False, ago=60)], NOW)
+    assert [r["session_id"] for r in out["cats"]] == ["recent"]
+
+
+def test_a_working_session_is_never_aged_out():
+    """Working beats every age rule. `online` is oversee's verdict and it wins."""
+    out = us.board([_sess("busy", online=True, ago=us.REST_KEEP_SECS + 9999)], NOW)
+    assert [r["display"] for r in out["cats"]] == [us.DISPLAY_WORKING]
+
+
+def test_the_rest_window_is_shorter_than_oversees_card_lifetime():
+    from mindhive import oversee
+    assert us.REST_KEEP_SECS < oversee.ACTIVE_WINDOW_SECONDS
+
+
+# --- only actual Claudes ----------------------------------------------------
+
+def test_a_workspace_agent_is_not_a_claude_session():
+    """`workspace._log` stamps `ws-<id>` when an agent has no CLI session yet, and
+    `oversee` labels every record it builds `kind: "chat"`. Those agents already
+    have their own cats on the swarm canvas — showing them here double-counts the
+    same work and dilutes what a session cat means. Seen on the live board:
+    `ws-b474f44f` rendered as a Claude Code session."""
+    out = us.board([_sess("ws-b474f44f"), _sess("real")], NOW)
+    assert [r["session_id"] for r in out["cats"]] == ["real"]
+
+
+def test_a_self_reliant_research_stream_is_not_a_claude_session():
+    out = us.board([_sess("research-abc"), _sess("real")], NOW)
+    assert [r["session_id"] for r in out["cats"]] == ["real"]
+
+
+def test_a_future_dated_row_is_dropped_not_pinned_first():
+    """Both `oversee`'s window test and `age_secs`' skew clamp read a negative
+    elapsed as maximally fresh, so one bad row would sort FIRST, render "working —
+    0s ago", survive every retirement rule, and eat a cap slot forever. `ui_cats`
+    hides an unparseable timestamp for this reason; a parseable-but-impossible one
+    must not get the opposite treatment."""
+    ahead = _sess("ahead")
+    ahead["last_event_ts"] = ui_cats.shift(NOW, us._FUTURE_SKEW_SECS + 600)
+    out = us.board([ahead, _sess("real")], NOW)
+    assert [r["session_id"] for r in out["cats"]] == ["real"]
+
+
+def test_a_small_clock_skew_is_tolerated():
+    """Skew between the writer and the renderer is normal and must not cost a cat."""
+    skewed = _sess("skewed")
+    skewed["last_event_ts"] = ui_cats.shift(NOW, 5)
+    out = us.board([skewed], NOW)
+    assert [r["session_id"] for r in out["cats"]] == ["skewed"]
+
+
+# --- what the pill actually says --------------------------------------------
+
+def test_a_long_title_is_clipped_server_side():
+    """`title` is whatever the turn's first prompt said — routinely a paragraph
+    with absolute paths. Shipping it whole every 1.2 s poll to render 150px of pill
+    is payload nobody reads. Seen on the live board: a 50-character Windows path."""
+    long_title = r"In C:\Users\hanif\mindhive, " + "diagnose the parser " * 8
+    out = us.board([_sess("x", title=long_title)], NOW)
+    assert len(out["cats"][0]["title"]) < len(long_title)
+    assert out["cats"][0]["title"].endswith("…")
+
+
+def test_a_short_title_is_left_alone():
+    out = us.board([_sess("x", title="fixing the parser")], NOW)
+    assert out["cats"][0]["title"] == "fixing the parser"
+
+
+def test_the_kind_comes_from_the_id_when_oversee_only_ever_says_chat():
+    """`oversee.interactive_sessions` hardcodes `kind: "chat"` on every record it
+    builds, so the declared value carries no information and the id prefix is the
+    only real evidence of what a session is."""
+    assert us._kind("ws-abc", "chat") == "agent"
+    assert us._kind("research-abc", "chat") == "research"
+    assert us._kind("54e0d771-aedd", "chat") == "chat"

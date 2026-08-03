@@ -134,7 +134,13 @@ def cmd_hook(args) -> int | None:
         # announced here, where the advice is CONSULTED — emitting them where advice is
         # RESOLVED would put a ledger write inside a projection rebuild.
         if spine is not None:
-            promptgate.announce_faculties(mn_inject.engaged_faculties(spine))
+            # Same session id `record_direction` used above, so both announces of
+            # this turn land on ONE beat marker and get unioned. Without it they
+            # write two markers and the heartbeat sustains only whichever the
+            # PostToolUse hook happens to find — the catalog cats would dim
+            # mid-turn, which is the very thing the beat exists to prevent.
+            promptgate.announce_faculties(mn_inject.engaged_faculties(spine),
+                                          session_id=_hook_session(raw))
         # MN-18: bring a task into existence so the spine has something to speak about.
         # Nothing else in the tree did this — `hive mindnet declare` is hand-run and
         # `decompose` needs a parent — so the phase spine, the SOP section and the

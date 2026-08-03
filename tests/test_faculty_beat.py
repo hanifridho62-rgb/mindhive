@@ -40,9 +40,20 @@ def _statuses():
     return [e.payload.get("status") for e in _rows()]
 
 
-def _age_marker(seconds):
+@pytest.fixture(autouse=True)
+def _fresh_turn():
+    """One turn is one hook PROCESS, and `_ANNOUNCED_THIS_TURN` encodes that. The
+    test suite is a single process running many "turns", so without this reset the
+    second test onward would take the union branch and every overwrite assertion
+    would pass for the wrong reason."""
+    pg._ANNOUNCED_THIS_TURN = False
+    yield
+    pg._ANNOUNCED_THIS_TURN = False
+
+
+def _age_marker(seconds, session_id=None):
     """Backdate the beat marker, which is how the throttle reads the clock."""
-    path = pg._beat_path(None)
+    path = pg._beat_path(None, session_id)
     old = time.time() - seconds
     os.utime(path, (old, old))
 
@@ -181,3 +192,93 @@ def test_the_marker_records_what_was_lit():
     pg.announce_faculties({"sop", "history"})
     data = json.loads(pg._beat_path(None).read_text(encoding="utf-8"))
     assert sorted(data["faculties"]) == ["history", "sop"]
+
+
+# --- the marker must not become a perpetual motion machine -------------------
+
+def test_a_marker_older_than_the_dim_threshold_refuses_to_beat():
+    """The failure the beat itself would otherwise manufacture. Every beat re-arms
+    the clock, so with only a lower bound one prompt that lit a faculty would keep
+    re-asserting it for as long as ANY tool call happened in that project — days
+    later, in another session, on prompts that engaged nothing. `HIDE_AFTER_SECS`
+    becomes unreachable and the cat means "a Claude is using tools here", which is
+    exactly the stranded-lit state dropping the `idle` row was supposed to avoid."""
+    pg.announce_faculties({"sop"})
+    before = len(_rows())
+    _age_marker(pg.FACULTY_BEAT_MAX_AGE_SECS + 60)
+    assert pg.beat_faculties() == 0
+    assert len(_rows()) == before, "a long-dead turn was resurrected"
+
+
+def test_a_dead_marker_is_retired_so_it_cannot_be_reconsidered():
+    pg.announce_faculties({"sop"})
+    _age_marker(pg.FACULTY_BEAT_MAX_AGE_SECS + 60)
+    pg.beat_faculties()
+    assert not pg._beat_path(None, None).exists()
+
+
+def test_the_absolute_bound_is_not_below_the_beat_interval():
+    """A ceiling under the floor would mean the beat could never fire at all."""
+    assert pg.FACULTY_BEAT_MAX_AGE_SECS > pg.FACULTY_BEAT_SECS
+
+
+def test_the_bound_does_not_exceed_the_dim_threshold():
+    """Past the dim band the cat is already grey, so beating would contradict what
+    the operator is looking at."""
+    assert pg.FACULTY_BEAT_MAX_AGE_SECS <= ui_cats.DIM_AFTER_SECS
+
+
+# --- two announces in one turn, two sessions in one project ------------------
+
+def test_a_second_announce_in_the_same_turn_unions_rather_than_clobbers():
+    """`cmd_hook` announces twice per prompt — the catalog from `record_direction`,
+    then the consulted spine. An overwrite left the first set with no heartbeat, so
+    the catalog cats dimmed mid-turn: the exact defect the beat exists to prevent."""
+    pg.announce_faculties({"skill-plugin", "history"}, session_id="s1")
+    pg.announce_faculties({"sop", "improvements"}, session_id="s1")
+    data = json.loads(pg._beat_path(None, "s1").read_text(encoding="utf-8"))
+    assert sorted(data["faculties"]) == ["history", "improvements", "skill-plugin",
+                                         "sop"]
+
+
+def test_a_new_turn_starts_from_nothing_lit():
+    """Union is scoped to ONE turn. Accumulating across turns would re-light
+    faculties that a later prompt never engaged."""
+    pg.announce_faculties({"history"}, session_id="s1")
+    pg._ANNOUNCED_THIS_TURN = False           # a fresh hook process = a new turn
+    pg.announce_faculties({"sop"}, session_id="s1")
+    data = json.loads(pg._beat_path(None, "s1").read_text(encoding="utf-8"))
+    assert data["faculties"] == ["sop"]
+
+
+def test_two_sessions_in_one_project_do_not_share_a_marker():
+    """`paths.detect_project` collapses every worktree of a repo onto one namespace,
+    so a project-only marker is shared by every interactive session on that repo —
+    and one session's tool calls would re-assert faculties another session lit and
+    it never touched, stamped with the wrong session id."""
+    pg.announce_faculties({"sop"}, session_id="sess-A")
+    pg._ANNOUNCED_THIS_TURN = False
+    pg.announce_faculties({"history"}, session_id="sess-B")
+    a = json.loads(pg._beat_path(None, "sess-A").read_text(encoding="utf-8"))
+    b = json.loads(pg._beat_path(None, "sess-B").read_text(encoding="utf-8"))
+    assert a["faculties"] == ["sop"] and b["faculties"] == ["history"]
+
+
+def test_one_sessions_beat_does_not_sustain_anothers_faculty():
+    pg.announce_faculties({"sop"}, session_id="sess-A")
+    pg._ANNOUNCED_THIS_TURN = False
+    pg.announce_faculties({"history"}, session_id="sess-B")
+    _age_marker(pg.FACULTY_BEAT_SECS + 5, "sess-B")
+    pg.beat_faculties(session_id="sess-B")
+    beaten = [e.payload["faculty"] for e in _rows()][2:]
+    assert beaten == ["history"], f"session B beat the wrong faculties: {beaten}"
+
+
+def test_the_marker_write_is_atomic():
+    """Readers are other PROCESSES on every tool call. A truncate-then-write is a
+    torn read for whichever one lands mid-write — and this file's own
+    `_write_manifest` already uses the atomic helper."""
+    import inspect
+    src = inspect.getsource(pg.announce_faculties)
+    assert "write_text_atomic" in src
+    assert ".write_text(" not in src

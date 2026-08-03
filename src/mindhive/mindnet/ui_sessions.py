@@ -56,6 +56,43 @@ DISPLAY_WORKING = "working"
 DISPLAY_RESTING = "resting"
 
 
+# How long a quiet session keeps a cat. `oversee`'s own 6-hour window is the
+# lifetime of an Oversee CARD — a list you scroll to see what happened today. A
+# strip answering "who is working NOW" cannot inherit it: the live board showed
+# six sessions, all resting, the freshest four hours old, and the one working
+# Claude would have been pushed into "+N more" by its own corpses.
+REST_KEEP_SECS = 15 * 60
+
+# A session id whose prefix says it is not an interactive Claude. Workspace agents
+# already have their own cats on the swarm canvas, and Self-Reliant research runs
+# are not a Claude anybody is watching for — showing either here double-counts
+# work and dilutes what a session cat means.
+_NOT_A_CHAT = ("ws-", "research-")
+
+# Clock skew between whatever wrote an event and whatever renders it is normal;
+# minutes into the future is not, and is unfixable once on screen.
+_FUTURE_SKEW_SECS = 120
+
+
+def _kind(session_id, declared) -> str:
+    """The session's kind. `oversee` hardcodes ``"chat"`` for every record it
+    builds, so the id prefix is the only real evidence of what a session is."""
+    if session_id.startswith("ws-"):
+        return "agent"
+    if session_id.startswith("research-"):
+        return "research"
+    return str(declared) if declared else "chat"
+
+
+def _clip(text, limit=72) -> str:
+    """*text* bounded, on a word edge where one is near the cut."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rstrip()
+    space = cut.rfind(" ")
+    return (cut[:space] if space > limit - 20 else cut) + "…"
+
+
 def _text(value) -> str:
     """*value* as a plain string, or ``""``.
 
@@ -90,16 +127,37 @@ def board(sessions, now, cap=SESSION_CAP) -> dict:
             # is here", which is worse than losing it — the same call `ui_cats`
             # makes for the same reason.
             continue
+        # A future-dated row would be permanently "working": `oversee`'s window
+        # test and `age_secs`' skew clamp both read a negative elapsed as maximally
+        # fresh, so it sorts first and no rule can ever retire it. `ui_cats` hides
+        # an UNPARSEABLE timestamp for this reason; a parseable-but-impossible one
+        # deserves the same answer, not the opposite. Args reversed to measure how
+        # far AHEAD it is, reusing the one parse rather than a second one.
+        if (age_secs(now, s.get("last_event_ts")) or 0) > _FUTURE_SKEW_SECS:
+            continue
+        sid_raw = str(s.get("run_id") or "")
+        if sid_raw.startswith(_NOT_A_CHAT):
+            continue
+        working = bool(s.get("online"))
+        if not working and age > REST_KEEP_SECS:
+            # Quiet for longer than this strip's memory. `oversee` keeps it for
+            # six hours because its list is a history; this strip is a "now", and
+            # a row of four-hour-old corpses buries the one Claude actually
+            # working — and eats the cap doing it.
+            continue
         sid = _text(s.get("run_id"))
         if not sid:
             continue
         rows.append({
             "session_id": sid,
-            "display": DISPLAY_WORKING if s.get("online") else DISPLAY_RESTING,
-            "kind": _text(s.get("kind")) or "chat",
-            "title": _text(s.get("title")),
-            "doing": _text(s.get("doing")),
-            "origin": _text(s.get("origin")),
+            "display": DISPLAY_WORKING if working else DISPLAY_RESTING,
+            "kind": _kind(sid, s.get("kind")),
+            # Truncated HERE, not in CSS. `title` is whatever the turn's first
+            # prompt said — routinely a full paragraph with absolute paths — and
+            # shipping the whole thing every 1.2 s poll to render 150px of pill
+            # is payload nobody reads.
+            "title": _clip(_text(s.get("title"))),
+            "doing": _clip(_text(s.get("doing"))),
             "age_secs": int(age),
         })
     rows.sort(key=lambda r: (r["display"] != DISPLAY_WORKING, r["age_secs"],

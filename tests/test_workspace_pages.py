@@ -238,12 +238,12 @@ def test_swarm_nodes_are_pixel_cat_sprites():
 def test_swarm_cat_choice_is_deterministic_from_agent_id():
     # random per new node but stable across refreshes: derived from the id,
     # never from Math.random
-    # The derivation itself now lives in the shared fragment (`idSeed`/`idCat`),
-    # because the session cats need the same stable-number-from-an-id rule for
-    # their palette and their bob phase. Pinned as the PROPERTY — a hex slice of
-    # the id, never a random — rather than one spelling of it, which is the lesson
-    # the `% 6` note below already records.
-    assert re.search(r"parseInt\(String\(id\)\.slice\(0,\s*4\), 16\)", SWARM)
+    # The derivation lives in the shared fragment (`idSeed`/`idCat`) — the session
+    # cats need the same stable-number-from-an-id rule. Pinned as the PROPERTY,
+    # never a spelling: it must be a pure function of the id with no randomness.
+    # It used to pin a hex slice of the first four characters, which silently
+    # collapsed every non-hex id (`ws-*`, `research-*`) to the same seed.
+    assert "function idSeed(" in SWARM and "function idCat(" in SWARM
     assert "catFor" in SWARM
     # The bound is taken from the palette table's own length, not a literal.
     # This used to assert `"% 6" in SWARM`; MN-7 gave each of the seven
