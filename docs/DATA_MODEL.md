@@ -1257,6 +1257,56 @@ so a report of three contradictions can never read as a completed audit.
 any contradiction, and exits zero on `UNKNOWN` — "could not check" is not a
 finding, and failing on it would train the operator to suppress the command.
 
+### 4.x Smart-zone session rotation (`mindhive.rotation`)
+
+Not an event type — a sidecar file plus a measurement rule. Recorded here because
+both are contracts other code reads.
+
+**Context occupancy.** `input_tokens + cache_creation_input_tokens +
+cache_read_input_tokens`. All three are prompt. With prompt caching on,
+`input_tokens` is 1–2 (the uncached remainder) while the conversation itself
+sits in the two cache fields: `cache_read` is served from cache, `cache_creation`
+is written to cache *on this turn*. Both were in the prompt the model read; the
+split is a billing distinction, not a size one. `output_tokens` is excluded — it
+is what the model wrote, and it reaches the context on the *next* turn, arriving
+inside these same input fields. One definition, in `loop.context.occupancy_from`,
+used by both `hive loop` and the Stop hook.
+
+**Rotation threshold.** `min(cap, ratio × window_for(model))`, default cap
+500,000, default ratio `LoopConfig.smart_zone_ratio` (0.5). The ratio is
+proportional, so one config is correct on a 200K Haiku and a 1M Opus; the cap is
+absolute, because a 1M window does not make a 900K session a good one. Windows
+live in `rotation.window.WINDOWS` as a static longest-prefix table — the hook
+runs at the end of every turn and must not make a network call. Refresh from
+`GET /v1/models/{id}` → `max_input_tokens`. Unknown ids resolve to the *smallest*
+current window (200K), so staleness costs a wasted rotation rather than a session
+that never rotates.
+
+**`ROTATION_PENDING`** — `paths.project_dir()/ROTATION_PENDING`, JSON:
+
+```json
+{"session_id": "...", "occupancy": 203820, "threshold": 500000,
+ "model": "claude-opus-5", "ts": "2026-08-03T00:00:00Z"}
+```
+
+Written by the Stop hook, read by `hive session run` after the child exits,
+cleared before every spawn. It exists because a Stop hook **cannot end a
+session**: its only outcomes are allow-the-stop and `{"decision":"block"}`, and
+block means *continue working* — the opposite of rotating. A file is the only
+signal that survives the child's exit, however the child died. Reading a corrupt
+one returns `None` (no rotation pending), because a truncated artifact is the
+normal consequence of an abrupt exit, not an exceptional event.
+
+**The Stop hook is inert by default.** It fires in every session on the machine,
+so registration (`hive session install-hook`) and activation are separate steps:
+it does nothing unless `MINDHIVE_ROTATION` is set, and `hive session run` sets
+that only in the environment of children it spawns. Rotation is therefore a
+property of running under the supervisor, not of having installed the hook. It
+also never emits `decision`, honours `stop_hook_active`, ignores subagent stops
+(`agent_id` present — a subagent's usage is the subagent's context), and returns
+silence on any exception. Fail-open is the contract: the failure mode of a
+measuring hook must be "we did not measure", never "your work stopped".
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
