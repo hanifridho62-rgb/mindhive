@@ -229,6 +229,44 @@ def test_unsafe_paths_are_refused_without_touching_the_filesystem(monkeypatch,
     assert called == [], "an unsafe path was stat'd"
 
 
+def test_a_file_named_for_creation_is_not_a_contradiction(tmp_path):
+    """THE noise test. "create src/mindhive/foo.py" is the most ordinary code
+    prompt there is, and the file is SUPPOSED to be missing. Flagging it would
+    make the gate wrong on the common case, which is how it stops being read
+    at all before it ever meets the rare case it exists for."""
+    root = _repo(tmp_path)
+    for prompt in ("create src/mindhive/foo.py with the parser",
+                   "add a new tests/test_foo.py covering it",
+                   "write src/mindhive/foo.py",
+                   "buat file baru src/mindhive/foo.py",
+                   "tambahkan tests/test_foo.py"):
+        claims = premise.extract(prompt)["claims"]
+        got = premise.check(claims, root=root, evs=[])
+        assert _outcome(got, premise.KIND_PATH) == [premise.UNKNOWN], prompt
+
+
+def test_a_file_asserted_to_exist_is_still_contradicted(tmp_path):
+    """The other half — the creation carve-out must not swallow the real
+    incident. The directive said MODIFY history.py, not create it."""
+    root = _repo(tmp_path)
+    for prompt in ("modify the matcher in src/mindhive/history.py",
+                   "the loader lives in src/mindhive/history.py",
+                   "as documented in src/mindhive/history.py"):
+        claims = premise.extract(prompt)["claims"]
+        got = premise.check(claims, root=root, evs=[])
+        assert _outcome(got, premise.KIND_PATH) == [premise.CONTRADICTED], prompt
+
+
+def test_creation_reading_wins_when_a_path_is_named_twice(tmp_path):
+    """"create foo.py, then edit foo.py" is one claim, and the creation
+    reading must win regardless of mention order."""
+    root = _repo(tmp_path)
+    claims = premise.extract(
+        "create src/mindhive/foo.py, then edit src/mindhive/foo.py")["claims"]
+    got = premise.check(claims, root=root, evs=[])
+    assert _outcome(got, premise.KIND_PATH) == [premise.UNKNOWN]
+
+
 def test_path_claims_are_unknown_outside_a_repo(tmp_path, monkeypatch):
     """No root resolved means no evidence, not a contradiction."""
     bare = tmp_path / "not-a-repo"

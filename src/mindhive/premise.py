@@ -139,6 +139,19 @@ _PATH_RE = re.compile(
 # citation.
 _URL_RE = re.compile(r"\bhttps?://[^\s<>\"'`\)\]]{0,300}")
 
+# "create src/mindhive/foo.py" names a TARGET; it does not assert the file
+# already exists. Without this distinction the single most common code-prompt
+# shape there is would draw a contradiction on every new file, and a gate that
+# is wrong on the ordinary case does not survive to be right on the rare one.
+# Bilingual for the same reason `promptgate._CODE_INTENT_RES` is: the user
+# writes prompts in Indonesian, and an English-only detector would call every
+# `buat file baru` a false claim.
+_CREATE_LOOKBACK = 80
+_CREATE_NEAR_RE = re.compile(
+    r"\b(?:creat\w*|add|adds|adding|new|writ\w*|generat\w*|scaffold\w*|make|"
+    r"introduc\w*|implement\w*|start\w*|buat\w*|bikin|tambah\w*|tulis\w*|"
+    r"baru)\b", re.IGNORECASE)
+
 # Only a *command position* or an explicit field yields a concrete id. Loose
 # proximity matching ("some id near the word roadmap") reads the metavariable
 # in `hive roadmap resume {roadmap_id_or_error}` as an asserted plan id, which
@@ -203,20 +216,31 @@ def extract(text) -> dict:
     by_kind: dict[str, list] = {}
     truncated: dict[str, int] = {}
 
-    def add(kind, value, raw):
+    def add(kind, value, raw, target=False):
         bucket = by_kind.setdefault(kind, [])
-        if any(c["value"] == value for c in bucket):
-            return                              # same assertion twice is one claim
+        for existing in bucket:
+            if existing["value"] == value:
+                # Same path named twice. "create foo.py … then edit foo.py"
+                # is one claim, and the CREATION reading wins — a path the
+                # prompt asks for is not an assertion that it already exists,
+                # whichever mention came first.
+                existing["target"] = existing.get("target") or target
+                return
         if len(bucket) >= MAX_CLAIMS_PER_CLASS:
             truncated[kind] = truncated.get(kind, 0) + 1
             return
-        bucket.append(_claim(kind, value, raw))
+        claim = _claim(kind, value, raw)
+        claim["target"] = target
+        bucket.append(claim)
 
     urls = _url_spans(text)
     for m in _PATH_RE.finditer(text):
         if _inside(m.span(), urls):
             continue
-        add(KIND_PATH, m.group(1), m.group(0))
+        start = m.start()
+        window = text[max(0, start - _CREATE_LOOKBACK):start]
+        target = bool(_CREATE_NEAR_RE.search(window))
+        add(KIND_PATH, m.group(1), m.group(0), target=target)
 
     for rx in (_ROADMAP_CMD_RE, _ROADMAP_FIELD_RE):
         for m in rx.finditer(text):
@@ -316,6 +340,13 @@ def _check_path(claim, root):
                         "refused: not a repo-relative path, so not checked")
     if _path_exists(target):
         return _verdict(claim, CONFIRMED, "exists in this checkout")
+    if claim.get("target"):
+        # Named as something to CREATE, not asserted to already exist. Absence
+        # is the expected state, so calling it a contradiction would be the
+        # gate being wrong about the most ordinary prompt in the repository.
+        return _verdict(claim, UNKNOWN,
+                        "does not exist yet — read as a file to create, not "
+                        "as a claim that it is already there")
     return _verdict(claim, CONTRADICTED,
                     "no such file in this checkout")
 
