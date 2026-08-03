@@ -676,6 +676,10 @@ def _preflight_report(project=None) -> dict:
     prior, latest_ts, latest_sid = set(), "", ""
     for e in evs:
         sid = getattr(e, "session_id", None)
+        # "manual" is the shared id detached background writers stamp (see
+        # promptgate.train_and_store) — it is not a session anyone worked in,
+        # so counting it would report a CONTINUATION on a store whose only
+        # other rows were written by a trainer.
         if not sid or sid == here or sid == "manual":
             continue
         prior.add(sid)

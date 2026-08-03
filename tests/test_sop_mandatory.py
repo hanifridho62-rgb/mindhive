@@ -270,6 +270,22 @@ def test_preflight_sees_a_prior_session(capsys, monkeypatch):
     assert "absorb the prior context" in out
 
 
+def test_preflight_reports_an_interrupted_plan(capsys):
+    """The branch most likely to crash on real data: `interrupted()` records
+    are read for their title and next step, and nothing else in the suite
+    exercises that read."""
+    from mindhive import roadmap
+    roadmap.record("set", "resume-me", prompt="finish the migration",
+                   title="Finish the migration",
+                   steps=["write the backfill", "run it", "verify counts"])
+    roadmap.record("interrupt", "resume-me", cause="usage_limit")
+    cli_mod.main(["sop", "preflight"])
+    out = capsys.readouterr().out
+    assert "Continuity: CONTINUATION" in out
+    assert "resume-me" in out
+    assert "write the backfill" in out, "the NEXT step is the actionable part"
+
+
 def test_preflight_ignores_the_current_session(capsys, monkeypatch):
     monkeypatch.setenv("MINDHIVE_SESSION", "here")
     events.append_event("decision", {"text": "my own work"}, session_id="here")

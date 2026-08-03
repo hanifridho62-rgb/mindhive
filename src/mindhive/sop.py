@@ -163,8 +163,9 @@ def fold(evs):
             rec["text"] = text
         if "mandatory" in p:
             rec["mandatory"] = bool(p["mandatory"])
-        else:
-            rec.setdefault("mandatory", False)
+        # No else: every record reaching here was built by the literal above,
+        # which always sets the key, so the absence of `mandatory` on THIS
+        # event means "unchanged" and there is nothing to default.
         rec["updated"] = ev.ts
         rec["version"] = rec["version"] + 1
         rec["session_id"] = ev.session_id
