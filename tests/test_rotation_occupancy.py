@@ -197,6 +197,49 @@ def test_invalid_utf8_does_not_raise(tmp_path):
     assert got.reason == "ok"
 
 
+def test_reads_only_the_tail_of_a_large_transcript(tmp_path):
+    """Real transcripts reach 23 MB. This runs at the end of EVERY agent turn,
+    so slurping the whole file allocates it and splits it into ~100k strings
+    each time. Only the newest assistant row matters, and it is at the end.
+
+    A 2 MB prefix of noise with the real row last: the answer must be right, and
+    (see the sibling test) it must not have needed the prefix to get there."""
+    rows = [json.dumps(_user("x" * 200)) for _ in range(10_000)]
+    rows.append(json.dumps(_assistant()))
+    p = tmp_path / "big.jsonl"
+    p.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    assert p.stat().st_size > 2_000_000
+
+    got = occupancy.read_occupancy(p)
+    assert got.tokens == 203820
+    assert got.reason == "ok"
+
+
+def test_tiny_tail_still_finds_a_row_only_present_early(tmp_path):
+    """The tail read is an optimisation, not a truncation. With the only usable
+    row far outside a deliberately tiny tail window, the full-file fallback must
+    still find it — otherwise the optimisation would silently start reporting
+    'no_usage' on long sessions whose last turn scrolled out of the window."""
+    rows = [json.dumps(_assistant())]
+    rows += [json.dumps(_user("y" * 200)) for _ in range(2_000)]
+    p = _write(tmp_path, rows)
+
+    got = occupancy.read_occupancy(p, tail_bytes=1024)
+    assert got.tokens == 203820
+    assert got.reason == "ok"
+
+
+def test_tail_boundary_does_not_corrupt_the_newest_row(tmp_path):
+    """A fixed-size tail almost always lands mid-line. The partial leading line
+    must be discarded, not parsed — and the row after it must survive intact."""
+    rows = [json.dumps(_user("z" * 500)) for _ in range(50)]
+    rows.append(json.dumps(_assistant()))
+    p = _write(tmp_path, rows)
+    for tail in (64, 200, 512, 900, 4096):
+        got = occupancy.read_occupancy(p, tail_bytes=tail)
+        assert got.tokens == 203820, f"tail_bytes={tail}"
+
+
 def test_model_absent_still_reports_tokens(tmp_path):
     p = _write(tmp_path, [{
         "type": "assistant", "isSidechain": False,

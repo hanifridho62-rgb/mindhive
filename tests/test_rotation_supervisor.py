@@ -134,6 +134,48 @@ def test_spin_guard_reports_its_numbers(tmp_path):
     assert "2" in result.detail and "180" in result.detail
 
 
+def test_a_slow_spiral_still_trips_the_absolute_backstop(tmp_path):
+    """DISCRIMINATING. Rotations 200s apart against a 180s window never put two
+    stamps in the same window, so the time-based guard alone never fires and the
+    loop relaunches forever — the exact death spiral the guard exists to stop.
+    An implementation with only the sliding window hangs this test rather than
+    failing it, which is why the total bound is separate and rate-independent."""
+    sp = FakeSpawner(rotate_for=999)
+    result = _run(sp, now=FakeClock(step=200), max_rotations=3, window_s=180,
+                  max_total_rotations=5)
+    assert result.reason == "spin_guard"
+    assert result.rotations == 5
+    assert "total" in result.detail
+
+
+def test_the_absolute_backstop_does_not_fire_on_healthy_sessions(tmp_path):
+    """CANARY for the test above: the same slow clock, under the bound, runs to
+    a normal finish. Proves the backstop is a ceiling, not a hair trigger."""
+    sp = FakeSpawner(rotate_for=3)
+    result = _run(sp, now=FakeClock(step=200), max_rotations=3, window_s=180,
+                  max_total_rotations=40)
+    assert result.reason == "user_quit"
+    assert result.rotations == 3
+
+
+# --- the child's environment ------------------------------------------------
+
+def test_child_env_enables_rotation():
+    assert supervisor._child_env({})["MINDHIVE_ROTATION"] == "1"
+
+
+def test_child_env_strips_an_inherited_headless_flag():
+    """Every hooks/*.ps1 exits immediately on MINDHIVE_HEADLESS=1, stop.ps1
+    included. The flag is inherited, so running the supervisor from inside a
+    headless session (a reflection run, an autoresume delivery) would pass it
+    down and silently disable rotation in every child — no error, just sessions
+    that never rotate."""
+    env = supervisor._child_env({"MINDHIVE_HEADLESS": "1", "PATH": "/x"})
+    assert "MINDHIVE_HEADLESS" not in env
+    assert env["MINDHIVE_ROTATION"] == "1"
+    assert env["PATH"] == "/x"          # the rest of the environment survives
+
+
 # --- interruption ----------------------------------------------------------
 
 def test_ctrl_c_is_a_user_quit_not_a_rotation(tmp_path):

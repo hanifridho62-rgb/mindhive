@@ -40,6 +40,11 @@ class Occupancy:
         return self.tokens is not None
 
 
+# How much of the end of a transcript to read before falling back to the whole
+# file. Comfortably larger than any single turn, small enough that reading it on
+# every turn is free. Measured against real transcripts: 23 MB files exist.
+TAIL_BYTES = 262_144
+
 _UNKNOWN_MISSING = Occupancy(None, None, "missing_file")
 _UNKNOWN_UNREADABLE = Occupancy(None, None, "unreadable")
 _UNKNOWN_NO_USAGE = Occupancy(None, None, "no_usage")
@@ -52,7 +57,7 @@ def _int(value) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def read_occupancy(path) -> Occupancy:
+def read_occupancy(path, *, tail_bytes: int = TAIL_BYTES) -> Occupancy:
     """Occupancy of the newest MAIN-SESSION assistant turn in the transcript.
 
     Sidechain rows are skipped: `isSidechain: true` marks a subagent's turn, and
@@ -70,13 +75,46 @@ def read_occupancy(path) -> Occupancy:
     try:
         if not p.is_file():
             return _UNKNOWN_MISSING
-        # errors="ignore" for the same reason harvest.py uses it: a transcript
-        # can carry bytes that are not valid UTF-8, and a measurement is worth
-        # more than byte-perfect fidelity we do not need.
-        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        size = p.stat().st_size
     except OSError:
         return _UNKNOWN_UNREADABLE
 
+    # Tail first. These files reach 23 MB in real use and this runs at the end of
+    # every single turn; reading the whole thing would allocate all of it and
+    # split it into ~100k strings each time, on the one path that has to be fast.
+    # The newest assistant turn is at the end by construction, so the tail is
+    # almost always enough — and when it is not, the full read below still runs,
+    # which keeps this an optimisation rather than a truncation.
+    if tail_bytes and size > tail_bytes:
+        found = _scan(_read_tail(p, tail_bytes))
+        if found is not None:
+            return found
+
+    try:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return _UNKNOWN_UNREADABLE
+    return _scan(text.splitlines()) or _UNKNOWN_NO_USAGE
+
+
+def _read_tail(p: Path, tail_bytes: int) -> list[str]:
+    """The last *tail_bytes* of the file, as whole lines.
+
+    The window lands mid-line essentially always, so the first fragment is
+    dropped — a half-line cannot be valid JSON anyway, but dropping it makes
+    that a decision rather than a lucky accident."""
+    try:
+        with p.open("rb") as fh:
+            fh.seek(-tail_bytes, 2)
+            chunk = fh.read()
+    except OSError:
+        return []
+    lines = chunk.decode("utf-8", errors="ignore").splitlines()
+    return lines[1:] if lines else []
+
+
+def _scan(lines) -> Occupancy | None:
+    """Newest usable assistant row in *lines*, or None if there isn't one."""
     for line in reversed(lines):
         line = line.strip()
         if not line:
@@ -103,4 +141,4 @@ def read_occupancy(path) -> Occupancy:
         model = message.get("model")
         return Occupancy(tokens, model if isinstance(model, str) else None, "ok")
 
-    return _UNKNOWN_NO_USAGE
+    return None

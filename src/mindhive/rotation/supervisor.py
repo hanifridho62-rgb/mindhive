@@ -37,6 +37,14 @@ from . import artifact
 MAX_ROTATIONS = 3
 SPIN_WINDOW_S = 180.0
 
+# Absolute backstop, independent of the window above. A spiral that rotates just
+# SLOWER than the window — every 200s against a 180s window — never puts two
+# rotations in the same window and so never trips the time-based guard, which
+# would leave the loop relaunching forever. That is the exact failure the guard
+# exists to prevent, so it needs a bound that does not depend on rate. Generous:
+# an all-day session rotating properly lands in the tens.
+MAX_TOTAL_ROTATIONS = 40
+
 
 @dataclass(frozen=True)
 class SessionResult:
@@ -48,13 +56,21 @@ class SessionResult:
 
 
 def _child_env(env=None):
-    """The child's environment: ours, plus rotation switched on.
+    """The child's environment: ours, plus rotation on and headless off.
 
-    Deliberately NOT `claude_cli._child_env` — that forces MINDHIVE_HEADLESS=1,
-    which every hooks/*.ps1 treats as "exit immediately". A headless child is
-    exactly what we do not want here: the Stop hook is the thing that makes this
-    session rotate, so it has to be allowed to fire."""
+    Deliberately NOT `claude_cli._child_env` — that FORCES MINDHIVE_HEADLESS=1,
+    and every hooks/*.ps1 (including stop.ps1) treats that as "exit immediately".
+    A headless child is the one thing this must not produce: the Stop hook is
+    what makes the session rotate, so it has to be allowed to fire.
+
+    The flag is also actively removed rather than merely not set. It is
+    inherited, so running `hive session run` from inside a headless session — a
+    reflection run, an autoresume delivery, an outer loop — would otherwise pass
+    it down and silently disable rotation for every child. Nothing would error;
+    sessions would just never rotate, which is the failure you discover weeks
+    later."""
     merged = dict(os.environ if env is None else env)
+    merged.pop("MINDHIVE_HEADLESS", None)
     merged["MINDHIVE_ROTATION"] = "1"
     return merged
 
@@ -98,7 +114,8 @@ def default_reseed(pending: dict, *, project: str | None = None) -> str:
 
 def run(*, project: str | None = None, spawn=None, now=None, reseed=None,
         max_rotations: int = MAX_ROTATIONS,
-        window_s: float = SPIN_WINDOW_S) -> SessionResult:
+        window_s: float = SPIN_WINDOW_S,
+        max_total_rotations: int = MAX_TOTAL_ROTATIONS) -> SessionResult:
     """Spawn, wait, rotate, repeat — until the user quits or the guard trips.
 
     `spawn`, `now` and `reseed` are injected so the loop's decisions can be
@@ -132,6 +149,14 @@ def run(*, project: str | None = None, spawn=None, now=None, reseed=None,
             return SessionResult(0, spawns, rotations, "user_quit")
         artifact.clear(project)
         rotations += 1
+
+        if rotations >= max_total_rotations:
+            return SessionResult(
+                1, spawns, rotations, "spin_guard",
+                f"{rotations} rotations total (limit {max_total_rotations}); "
+                f"too slow to trip the {window_s:g}s window but not a healthy "
+                f"session either",
+            )
 
         stamp = now()
         recent = [t for t in recent if stamp - t <= window_s]
