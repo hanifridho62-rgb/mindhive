@@ -100,6 +100,23 @@ def test_parse_result_extracts_usage_and_session():
     assert r.rate_limited is False
 
 
+def test_context_occupancy_counts_cache_creation():
+    # The fixture above has cache_creation_input_tokens=0, so it reads the same
+    # under the old two-term formula and the correct three-term one — it cannot
+    # discriminate. This one can: cache_creation is the dominant term, which is
+    # the shape of a session's opening turns, where the old formula reported
+    # 8000 against a real prompt of 208000.
+    blob = json.dumps({
+        "type": "result", "result": "",
+        "usage": {"input_tokens": 8000, "output_tokens": 10,
+                  "cache_creation_input_tokens": 200000,
+                  "cache_read_input_tokens": 0},
+    })
+    r = driver.parse_result(blob)
+    assert r.usage.cache_creation_input_tokens == 200000
+    assert r.usage.context_occupancy == 208000
+
+
 def test_parse_result_detects_rate_limit():
     blob = '{"rate_limit_event": {"status": "rejected"}}'
     r = driver.parse_result(blob)

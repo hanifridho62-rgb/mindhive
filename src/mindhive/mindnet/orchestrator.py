@@ -341,7 +341,8 @@ def validation_script_of(task) -> str:
 
 
 def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
-              max_workers=None, root=None, payload_for=None, isolate=False):
+              max_workers=None, root=None, payload_for=None, isolate=False,
+              runner_kwargs=None):
     """Submit *batch* concurrently; return ``(completed, blocked, skipped,
     reasons)``.
 
@@ -385,7 +386,12 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     def one(tid):
         task = graph.get(tid)
         script = payload_of(task)
+        # `runner_kwargs` carries what only SOME runners understand — the agent
+        # runner's smart-zone config, for instance, which `executor.execute`
+        # has no parameter for. Passed by the caller that chose the runner, so
+        # the two can never disagree about which extras are legal.
         kwargs = {"env": dict(env), "project": project}
+        kwargs.update(runner_kwargs or {})
         task_root = root
         iso = None
 
@@ -633,7 +639,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
                 max_waves=None, project=None, apply_status=None,
                 timeout_s=None, max_workers=None, root=None,
                 payload_for=None, isolate=False,
-                completion_gate=None) -> Orchestration:
+                completion_gate=None, runner_kwargs=None) -> Orchestration:
     """Walk *graph* wave by wave until it settles, stalls, or hits the cap.
 
     ``execute=False`` (the DEFAULT) plans without starting anything. That default
@@ -709,7 +715,7 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
         done, failed, held, why, iso, starved = _run_wave(
             batch, g, runner, index, project=project, timeout_s=timeout_s,
             max_workers=max_workers, root=root, payload_for=payload_for,
-            isolate=isolate)
+            isolate=isolate, runner_kwargs=runner_kwargs)
         why_map = dict(why)
         # THE PR-GREEN GATE. A run succeeding is not the same as a task being
         # finished: the founding requirement is that a task is not done until its

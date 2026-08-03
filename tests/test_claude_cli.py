@@ -33,7 +33,12 @@ def test_run_headless_builds_argv_with_resolved_exe(monkeypatch):
         claude_cli.subprocess, "run",
         lambda argv, **kw: captured.update(argv=argv, kw=kw) or _Proc())
     out = claude_cli.run_headless("do x")
-    assert out == {"exit": 0, "stdout": '{"is_error": false, "result": "hi"}'}
+    # Asserted key-by-key rather than as whole-dict equality: the contract is
+    # that these two keys carry the exit code and the raw envelope, not that
+    # the mapping has exactly two keys. `usage` and `session_id` were added
+    # alongside them for the smart-zone gate without changing this contract.
+    assert out["exit"] == 0
+    assert out["stdout"] == '{"is_error": false, "result": "hi"}'
     argv = captured["argv"]
     assert argv[0] == "C:/npm/claude.CMD"           # resolved, not bare "claude"
     assert argv[-1] == "-p"
@@ -60,7 +65,8 @@ def test_run_headless_maps_missing_cli_to_127(monkeypatch):
     def boom(*a, **k):
         raise FileNotFoundError("no claude")
     monkeypatch.setattr(claude_cli.subprocess, "run", boom)
-    assert claude_cli.run_headless("x") == {"exit": 127, "stdout": ""}
+    out = claude_cli.run_headless("x")
+    assert out["exit"] == 127 and out["stdout"] == ""
 
 
 def test_run_headless_maps_timeout_to_124(monkeypatch):
@@ -68,7 +74,8 @@ def test_run_headless_maps_timeout_to_124(monkeypatch):
     def boom(*a, **k):
         raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
     monkeypatch.setattr(claude_cli.subprocess, "run", boom)
-    assert claude_cli.run_headless("x") == {"exit": 124, "stdout": ""}
+    out = claude_cli.run_headless("x")
+    assert out["exit"] == 124 and out["stdout"] == ""
 
 
 def test_envelope_ok_true_on_success():
@@ -176,3 +183,101 @@ def test_a_non_mapping_overlay_is_ignored_rather_than_raising(monkeypatch):
         seen = _capture_env(monkeypatch)
         claude_cli.run_headless("p", env=junk)
         assert seen.get("MINDHIVE_HEADLESS") == "1"
+
+
+# --- the smart-zone gate needs two things this spawn used to throw away -------
+#
+# It discarded the envelope's `usage` block (so no caller could see how much
+# context a run was carrying) and had no way to resume (so there was no session
+# to rotate FROM). Both are additive: every assertion above still holds.
+
+def _capture_argv(monkeypatch, stdout=None):
+    captured = {}
+
+    class _P:
+        returncode = 0
+
+    _P.stdout = stdout if stdout is not None else '{"is_error": false, "result": "hi"}'
+    _P.stderr = ""
+    monkeypatch.setattr(
+        claude_cli.subprocess, "run",
+        lambda argv, **kw: captured.update(argv=argv, kw=kw) or _P())
+    return captured
+
+
+def test_no_session_id_produces_no_resume_flag(monkeypatch):
+    """Regression guard for every existing caller — invoker, reflect and
+    autoresume all spawn without a session and must keep spawning fresh."""
+    captured = _capture_argv(monkeypatch)
+    claude_cli.run_headless("p")
+    assert "--resume" not in captured["argv"]
+    assert "--continue" not in captured["argv"]
+
+
+def test_session_id_produces_an_explicit_resume(monkeypatch):
+    captured = _capture_argv(monkeypatch)
+    claude_cli.run_headless("p", session_id="sess-42")
+    argv = captured["argv"]
+    assert "--resume" in argv
+    assert argv[argv.index("--resume") + 1] == "sess-42"
+    # NEVER --continue: it can hijack the most-recent session in the directory,
+    # which in a fleet of concurrent worktree agents means one task silently
+    # resuming another task's conversation.
+    assert "--continue" not in argv
+
+
+def test_blank_session_id_is_treated_as_absent(monkeypatch):
+    for blank in (None, "", "   "):
+        captured = _capture_argv(monkeypatch)
+        claude_cli.run_headless("p", session_id=blank)
+        assert "--resume" not in captured["argv"], f"session_id={blank!r}"
+
+
+def test_usage_and_session_id_are_returned_from_the_envelope(monkeypatch):
+    blob = ('{"is_error": false, "result": "ok", "session_id": "sess-9", '
+            '"usage": {"input_tokens": 8000, "cache_creation_input_tokens": 200000, '
+            '"cache_read_input_tokens": 0, "output_tokens": 12}}')
+    _capture_argv(monkeypatch, stdout=blob)
+    out = claude_cli.run_headless("p")
+    assert out["session_id"] == "sess-9"
+    assert out["usage"]["cache_creation_input_tokens"] == 200000
+    assert out["exit"] == 0 and out["stdout"] == blob
+
+
+def test_error_envelope_yields_no_usage_rather_than_zeros(monkeypatch):
+    """An is_error envelope means the CLI ran and the MODEL never worked. Zeros
+    presented as fact would read as 'this session is carrying no context',
+    which would suppress a rotation that may well be due."""
+    _capture_argv(monkeypatch, stdout='{"is_error": true, "result": "429: limit"}')
+    out = claude_cli.run_headless("p")
+    assert out["usage"] is None
+    assert out["session_id"] is None
+
+
+def test_unreadable_envelope_yields_no_usage_and_does_not_raise(monkeypatch):
+    _capture_argv(monkeypatch, stdout="not json at all")
+    out = claude_cli.run_headless("p")
+    assert out["usage"] is None
+    assert out["session_id"] is None
+    assert out["exit"] == 0
+
+
+def test_spawn_failures_still_carry_the_new_keys(monkeypatch):
+    """127/124 already had a documented shape; the added keys must be present
+    there too, or callers need a branch for 'which failure was it'."""
+    import subprocess as sp
+
+    def not_found(*a, **k):
+        raise FileNotFoundError("no claude")
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", not_found)
+    out = claude_cli.run_headless("x")
+    assert out["exit"] == 127 and out["stdout"] == ""
+    assert out["usage"] is None and out["session_id"] is None
+
+    def timed_out(*a, **k):
+        raise sp.TimeoutExpired(cmd="claude", timeout=1)
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", timed_out)
+    out = claude_cli.run_headless("x")
+    assert out["exit"] == 124 and out["usage"] is None

@@ -50,12 +50,47 @@ def _child_env(extra):
     return merged
 
 
+def _envelope_extras(stdout: str) -> dict:
+    """``{"usage": dict|None, "session_id": str|None}`` read off the envelope.
+
+    Both are ``None`` unless the envelope parses AND reports success. An
+    ``is_error`` envelope means the CLI ran and the model never worked, so
+    there is no honest usage figure to report — and zeros presented as fact
+    would read as "this session is carrying no context", suppressing a
+    rotation that may well be due."""
+    obj = _parse(stdout)
+    if obj is None or obj.get("is_error"):
+        return {"usage": None, "session_id": None}
+    usage = obj.get("usage")
+    sid = obj.get("session_id")
+    return {"usage": usage if isinstance(usage, dict) else None,
+            "session_id": str(sid) if sid else None}
+
+
 def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
                  permission_mode: str | None = None,
-                 cwd: str | None = None, env: dict | None = None) -> dict:
+                 cwd: str | None = None, env: dict | None = None,
+                 session_id: str | None = None) -> dict:
     """One-shot `claude --output-format json -p` with the prompt fed via stdin.
-    Returns ``{"exit": int, "stdout": str}``. Spawn failures map to conventional
-    exit codes (127 not-found, 124 timeout) so callers treat them uniformly.
+
+    Returns ``{"exit": int, "stdout": str, "usage": dict|None,
+    "session_id": str|None}``. Spawn failures map to conventional exit codes
+    (127 not-found, 124 timeout) so callers treat them uniformly, and carry the
+    same four keys so no caller needs a branch for which failure it was.
+
+    ``usage`` and ``session_id`` exist for the smart-zone gate: without the
+    first, nothing could see how much context a run was carrying, and without
+    the second there was no session to rotate FROM. ``usage`` is handed back as
+    the raw envelope mapping rather than a typed shape, deliberately — the loop
+    driver already owns a ``Usage`` dataclass for its own richer argv, and a
+    second copy here is how the two begin to disagree. Callers compute
+    occupancy with `loop.context.occupancy_from`.
+
+    ``session_id`` resumes an existing conversation with ``--resume <id>``,
+    always by explicit id and never ``--continue``: continue can hijack the
+    most-recent session in the directory, which in a fleet of concurrent
+    worktree agents means one task silently resuming another's conversation.
+    A blank or whitespace-only id is treated as absent.
 
     ``model=None`` omits the flag so the CLI's own configured default decides
     (the auto-resume delivery wants the user's model, not the reflection
@@ -78,6 +113,8 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
         argv += ["--model", model]
     if permission_mode:
         argv += ["--permission-mode", permission_mode]
+    if session_id and str(session_id).strip():
+        argv += ["--resume", str(session_id).strip()]
     argv += ["-p"]
     # Recursion guard (KTD3): every hooks/*.ps1 exits immediately when this
     # variable is set, so a headless session spawned here can never re-fire the
@@ -88,11 +125,13 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
                               env=child_env, input=prompt, cwd=cwd or None,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return {"exit": proc.returncode, "stdout": proc.stdout or ""}
+        out = proc.stdout or ""
+        return {"exit": proc.returncode, "stdout": out, **_envelope_extras(out)}
     except FileNotFoundError:
-        return {"exit": 127, "stdout": ""}          # claude CLI not installed
+        # claude CLI not installed
+        return {"exit": 127, "stdout": "", "usage": None, "session_id": None}
     except subprocess.TimeoutExpired:
-        return {"exit": 124, "stdout": ""}
+        return {"exit": 124, "stdout": "", "usage": None, "session_id": None}
 
 
 def _parse(stdout: str):

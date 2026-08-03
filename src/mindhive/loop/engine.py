@@ -84,7 +84,8 @@ def run_loop(project, loop_dir, cfg, driver, *,
 
     cb = safeguards.CircuitBreaker(safeguards.BreakerConfig(
         cfg.no_progress_threshold, cfg.same_error_threshold, cfg.cooldown_seconds))
-    ccfg = ctx_mod.ContextConfig(cfg.context_window, cfg.smart_zone_ratio)
+    ccfg = ctx_mod.ContextConfig(cfg.context_window, cfg.smart_zone_ratio,
+                                 cfg.absolute_ceiling)
 
     bcfg = budget_mod.BudgetConfig(cfg.window_hours, cfg.window_token_budget,
                                    cfg.window_cost_budget_usd)
@@ -155,6 +156,12 @@ def run_loop(project, loop_dir, cfg, driver, *,
             # like a rate-limit, so repeated failures open it instead of crashing.
             error_sig = "rate_limited" if result.rate_limited else result.error
             occupancy = result.usage.context_occupancy
+            # Resolved against the model that actually ran, not a single shared
+            # scalar — the routing tiers span a 200K model and 1M models, so one
+            # number cannot be right for all of them. `window_source` records
+            # whether the id was recognised: a silent fallback and a real
+            # resolution look identical downstream otherwise.
+            window, window_source = ctx_mod.resolve_window(model, ccfg)
 
             # The payload's `summary` is one line captured by `summary:\s*(.+)`
             # and is "" whenever the model omits that field — which used to make
@@ -174,7 +181,9 @@ def run_loop(project, loop_dir, cfg, driver, *,
                 "progress": progressed,
                 "cost_usd": result.usage.cost_usd,
                 "total_tokens": result.usage.total_tokens,
-                "context_fill_ratio": ctx_mod.fill_ratio(occupancy, cfg.context_window),
+                "context_fill_ratio": ctx_mod.fill_ratio(occupancy, window),
+                "context_window": window,
+                "context_window_source": window_source,
                 "breaker_state": cb.state,
                 "session_id": result.session_id,
             }, project=project)
@@ -216,10 +225,13 @@ def run_loop(project, loop_dir, cfg, driver, *,
             if result.error:
                 session_id = None
             # context smart-zone: keep session warm, or reset before the dumb zone
-            elif ctx_mod.needs_reset(occupancy, ccfg):
+            elif ctx_mod.needs_reset(occupancy, ccfg, model):
                 events.append_event("compaction",
-                                    {"text": f"loop context reset at fill "
-                                             f"{ctx_mod.fill_ratio(occupancy, cfg.context_window):.2f}"},
+                                    {"text": f"loop context reset at "
+                                             f"{occupancy} tokens (fill "
+                                             f"{ctx_mod.fill_ratio(occupancy, window):.2f} "
+                                             f"of {window}, window from "
+                                             f"{window_source})"},
                                     project=project)
                 session_id = None
             else:

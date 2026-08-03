@@ -20,7 +20,12 @@ class Usage:
 
     @property
     def context_occupancy(self) -> int:
-        return self.input_tokens + self.cache_read_input_tokens
+        # All three prompt terms, per the API's own accounting. Omitting
+        # cache_creation_input_tokens — as this once did — reads correctly in
+        # steady state but reports near-zero on a session's opening turns,
+        # where everything is a cache WRITE and nothing is a cache read yet.
+        return (self.input_tokens + self.cache_creation_input_tokens
+                + self.cache_read_input_tokens)
 
 
 @dataclass

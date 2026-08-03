@@ -45,6 +45,8 @@ version rather than a parallel one that eats work.
 """
 from __future__ import annotations
 
+import time
+
 from .. import claude_cli, runlog
 from . import executor as x_mod
 from . import phases as ph_mod
@@ -56,6 +58,12 @@ DEFAULT_TIMEOUT_S = 1800
 
 # How many agents may share one working tree. One. See the module docstring.
 MAX_SAFE_WORKERS = 1
+
+# Ceiling on spawns per task when the smart-zone chain is active. A runaway
+# backstop, not a budget — the wall-clock cap and the agent's own EXIT_SIGNAL
+# are what normally end a chain. Sized so a task that genuinely needs several
+# rotations can have them, while a non-terminating agent cannot spawn forever.
+DEFAULT_MAX_ITERATIONS = 8
 
 # Kept verbatim from `claude_cli.run_headless`'s documented contract rather than
 # re-derived: 127 is "CLI not installed", 124 is "timed out".
@@ -176,9 +184,66 @@ def _artifact(run_key, text, project=None):
         return None
 
 
+def _iteration_prompt(base_prompt, iteration, rotated) -> str:
+    """What the agent is asked on iteration *n*.
+
+    The first iteration is the caller's prompt verbatim — unchanged from the
+    one-shot era. A RESUMED iteration needs almost nothing, because the
+    conversation is still there. A ROTATED one needs everything: the fresh
+    session has no history at all, so the original ask is restated in full or
+    the agent works on nothing."""
+    if iteration == 1:
+        return base_prompt
+    if not rotated:
+        return ("Continue the task. When the whole task is genuinely finished "
+                "and verified, say so plainly and set EXIT_SIGNAL: true.")
+    return (
+        "# Continuing after a session rotation\n\n"
+        "Your previous session reached the context ceiling and was ended to "
+        "keep you in the zone where you work best. This session has NONE of "
+        "that conversation — treat the task below as the whole of what you "
+        "know, and re-read any files you need rather than relying on memory "
+        "of them.\n\n"
+        "## The task, restated in full\n\n"
+        f"{base_prompt}\n\n"
+        "Work out what is already done by INSPECTING the tree (git status, "
+        "git diff, the files themselves) rather than assuming — then continue "
+        "from there. Do not start over, and do not redo work that is already "
+        "applied."
+    )
+
+
 def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
-        env=None, model=None, permission_mode=None) -> x_mod.RunResult:
-    """Spawn one headless agent for *prompt*; answer an `executor.RunResult`.
+        env=None, model=None, permission_mode=None,
+        context_cfg=None, max_iterations=DEFAULT_MAX_ITERATIONS,
+        guard=None, now_fn=time.monotonic) -> x_mod.RunResult:
+    """Spawn a headless agent for *prompt*; answer an `executor.RunResult`.
+
+    ## One shot, or a chain
+
+    With ``context_cfg=None`` — every caller before the smart-zone gate existed
+    — this is exactly the single spawn it always was, and the tests assert that
+    verbatim. Given a `loop.context.ContextConfig` it becomes a CHAIN: each
+    call resumes the previous session, and the gate runs between calls.
+
+    That boundary is the whole point. A task used to be one `claude -p` capped
+    at 1800s with no ``--resume``, so its context could be neither measured nor
+    rotated — there was no point at which anything could be done about it. The
+    chain gives the gate somewhere to stand, and it stands BETWEEN calls, never
+    inside one: killing a child mid-edit is precisely the half-written-tree
+    hazard the timeout path below already warns about.
+
+    ## The budget is the task's, not the call's
+
+    ``timeout_s`` bounds the WHOLE chain. Sizing it per-iteration instead would
+    let a ten-iteration run park the machine for five hours under a cap that
+    reads as thirty minutes.
+
+    ## Rotation is not evidence
+
+    A rotated run reports exactly what an unrotated one reports. Rotation
+    changes where the work pauses; it says nothing about whether the work is
+    done, and `RESULT_RAN_UNVERIFIED` remains the answer for a clean exit.
 
     The return type is `executor.RunResult` on purpose, not a shape of its own:
     the orchestrator classifies outcomes through `RESULT_STATUS` /
@@ -199,27 +264,152 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
               f"perm:      {permission_mode or '(cli default)'}\n"
               f"\n--- prompt ---\n{prompt}\n")
 
-    try:
-        out = claude_cli.run_headless(
-            prompt, model=model, timeout_s=int(timeout_s),
-            permission_mode=permission_mode, env=env,
-            cwd=str(root) if root else None)
-    except Exception as exc:                            # noqa: BLE001
-        # `run_headless` maps its own faults to exit codes, so reaching here
-        # means something unforeseen. Report it as never-started: the safe
-        # direction is a task that stays PENDING.
-        detail = f"agent spawn raised {type(exc).__name__}: {exc}"
-        return x_mod.RunResult(
-            result="spawn-failed", reason=detail, exit_code=_EXIT_NOT_FOUND,
-            executed=False, run_key=key, cwd=str(root or ""),
-            artifact=_artifact(key, header + "\n" + detail, project))
+    # --- the chain ------------------------------------------------------------
+    # `iterations` is 1 unless a context config was supplied, which keeps every
+    # pre-existing caller on precisely the one-shot path they were written
+    # against — asserted directly by
+    # `test_without_a_context_cfg_the_run_stays_a_single_shot`.
+    iterations = max(1, int(max_iterations)) if context_cfg is not None else 1
+    if guard is None and context_cfg is not None:
+        # PER RUN, never shared. The guard's job is to HALT, and a wave runs
+        # agents concurrently in threads — one instance across the wave would
+        # be shared mutable state whose failure mode is one task's rotations
+        # stopping a different task that had done nothing wrong.
+        from ..loop import safeguards as sg_mod
+        guard = sg_mod.RotationGuard(sg_mod.RotationGuardConfig())
+    session_id = None
+    deadline = None
+    rotated = False
+    transcript = []
+    out = None
+    code = 0
+    stdout = ""
 
-    code = int(out.get("exit", 1))
-    stdout = out.get("stdout", "") or ""
-    body = header + "\n--- stdout ---\n" + stdout + f"\n--- exit {code} ---\n"
+    for iteration in range(1, iterations + 1):
+        now = now_fn()
+        if deadline is None:
+            deadline = now + float(timeout_s)
+        remaining = deadline - now
+        if iteration > 1 and remaining <= 0:
+            # The task's own budget is spent. Stop rather than starting a call
+            # that would run past the cap the operator set.
+            break
+
+        step_prompt = _iteration_prompt(prompt, iteration, rotated)
+        rotated = False
+
+        try:
+            out = claude_cli.run_headless(
+                step_prompt, model=model, timeout_s=int(max(1, remaining)),
+                permission_mode=permission_mode, env=env,
+                cwd=str(root) if root else None, session_id=session_id)
+        except Exception as exc:                        # noqa: BLE001
+            return _spawn_raised(exc, key, header, transcript, root, project)
+
+        code = int(out.get("exit", 1))
+        stdout = out.get("stdout", "") or ""
+        transcript.append(
+            f"\n--- iteration {iteration} (session={session_id or 'new'}) ---\n"
+            f"{stdout}\n--- exit {code} ---\n")
+
+        # A terminal outcome ends the chain immediately and is reported exactly
+        # as the one-shot path always reported it. Only a CLEAN, UNFINISHED
+        # reply is allowed to continue.
+        if not _is_clean_reply(stdout, code):
+            break
+        if _says_finished(stdout):
+            break
+        if iteration >= iterations:
+            break
+
+        occupancy, measurable = _occupancy_of(out)
+        if measurable and ctx_needs_reset(occupancy, context_cfg, model):
+            if guard is not None:
+                if not guard.allow(now=now_fn()):
+                    break
+                guard.record(now=now_fn(), turns_in_session=iteration)
+                if guard.state == "HALTED":
+                    break
+            session_id = None
+            rotated = True
+        else:
+            session_id = out.get("session_id") or session_id
+
+    body = header + "".join(transcript)
     artifact = _artifact(key, body, project)
     text = claude_cli.result_text(stdout)
     excerpt = (text or stdout)[:runlog.EXCERPT_CHARS]
+    return _classify(code, stdout, timeout_s, key, root, artifact, excerpt)
+
+
+def _spawn_raised(exc, key, header, transcript, root, project):
+    """`run_headless` maps its own faults to exit codes, so reaching here means
+    something unforeseen. Reported as never-started: the safe direction is a
+    task that stays PENDING rather than one whose subtree is deleted."""
+    detail = f"agent spawn raised {type(exc).__name__}: {exc}"
+    return x_mod.RunResult(
+        result="spawn-failed", reason=detail, exit_code=_EXIT_NOT_FOUND,
+        executed=False, run_key=key, cwd=str(root or ""),
+        artifact=_artifact(key, header + "".join(transcript) + "\n" + detail,
+                           project))
+
+
+def _occupancy_of(out) -> tuple:
+    """``(occupancy, measurable)`` for one spawn's usage block.
+
+    ``measurable`` is separate from a zero occupancy on purpose. `run_headless`
+    answers ``usage: None`` whenever the envelope did not parse or reported
+    ``is_error`` — and treating "we could not measure" as "carrying nothing"
+    would suppress a rotation that may well be due."""
+    usage = (out or {}).get("usage")
+    if not isinstance(usage, dict):
+        return 0, False
+    from ..loop import context as ctx_mod
+    return ctx_mod.occupancy_from(
+        usage.get("input_tokens", 0),
+        usage.get("cache_creation_input_tokens", 0),
+        usage.get("cache_read_input_tokens", 0)), True
+
+
+def ctx_needs_reset(occupancy, cfg, model):
+    """The smart-zone gate, imported lazily so this module keeps no hard
+    dependency on the loop package at import time."""
+    from ..loop import context as ctx_mod
+    return ctx_mod.needs_reset(occupancy, cfg, model)
+
+
+def _is_clean_reply(stdout: str, code: int) -> bool:
+    """Whether this spawn is the one shape the chain may continue from: the CLI
+    ran, the envelope parsed, it reported no error, and the process exited 0.
+    Everything else is terminal and keeps its existing classification."""
+    if not stdout:
+        return False
+    if claude_cli.error_text(stdout):
+        return False
+    if not claude_cli.envelope_ok(stdout):
+        return False
+    return code == 0
+
+
+def _says_finished(stdout: str) -> bool:
+    """Whether the agent signalled the whole task is done.
+
+    Reuses `loop.contract.parse_status` rather than re-deriving the signal —
+    invariant 10, and a second reading of EXIT_SIGNAL is how the two begin to
+    disagree. An agent that says nothing is treated as UNFINISHED, so the
+    absent-contract case ends the chain via the iteration cap rather than by
+    silently declaring success."""
+    from ..loop.contract import parse_status
+    try:
+        return parse_status(claude_cli.result_text(stdout)).exit_signal is True
+    except Exception:                                   # noqa: BLE001
+        return True         # unreadable contract: do not keep spawning
+
+
+def _classify(code, stdout, timeout_s, key, root, artifact, excerpt):
+    """The outcome mapping, unchanged from the one-shot era and deliberately
+    factored out whole rather than rewritten: the ORDER of these checks is the
+    correctness of this module, and it is not the chain's business."""
 
     def result(kind, reason, executed):
         return x_mod.RunResult(
