@@ -55,6 +55,24 @@ _PAGE = """<!doctype html>
   .chip .dot { width:7px; height:7px; border-radius:50%; background:#3a4054; }
   .chip .dot.running { background:#e0b341; animation:pulse 1s infinite; }
   .chip .dot.done { background:#46c46a; } .chip .dot.error { background:#ff6b6b; }
+  /* The node cat bobs while its agent is actually running — the same motion the
+     faculty strip uses, from the SAME keyframes. `mn-bob` arrives below with
+     `cat_board.CSS`; declaring a second copy here is precisely the drift
+     invariant 10 forbids, and it would be invisible until one page's cats bobbed
+     at a different rate than the other's. The status comes off the agent
+     snapshot, so "moving" means "the server says this agent is running" and
+     never a guess the page made on its own. */
+  .chip.running .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
+  /* This page's OWN motion, silenced by the same preference. `cat_board.CSS`
+     carries the guard for every cat sprite, but it cannot name `.dot`/`.badge` —
+     those are this page's furniture and do not exist on the dashboard. Without
+     this block a reduced-motion user would keep the pulsing dots and the pulsing
+     badge and lose only the animation this change added, which is the opposite
+     of honouring the preference. `running` survives without motion either way:
+     the dot stays amber against grey for every other state. */
+  @media (prefers-reduced-motion: reduce) {
+    .chip .dot.running, .badge.run { animation:none; }
+  }
   #insp { width:340px; flex:0 0 auto; background:#161b22; border-left:1px solid #30363d;
     padding:12px; overflow-y:auto; display:none; }
   #insp h2 { margin:0 0 6px; font-size:14px; }
@@ -87,6 +105,13 @@ _PAGE = """<!doctype html>
     padding:5px 14px; background:#12161d; border-bottom:1px solid #30363d;
     min-height:44px; overflow-x:auto; }
   #mn-cats .lbl { margin-right:2px; }
+  /* The session strip is this page's own box, like `#mn-cats` — `cat_board.CSS`
+     owns the cats and pills, each page owns where they sit. Its own band under
+     the faculty strip so the two are never read as one list. */
+  #mn-sessions { flex:0 0 auto; display:flex; align-items:center; gap:6px;
+    padding:4px 14px; background:#0f1319; border-bottom:1px solid #30363d;
+    min-height:32px; overflow-x:auto; }
+  #mn-sessions .lbl { margin-right:2px; }
 /*__CAT_CSS__*/
 </style></head>
 <body>
@@ -144,9 +169,10 @@ _PAGE = """<!doctype html>
   // only its own consumer: a node's cat is picked deterministically from its agent
   // id, so it is random per new node and stable across refreshes.
 /*__CAT_JS__*/
-  function catFor(id){
-    return (parseInt(String(id).slice(0,4), 16) || 0) % CAT_PALETTES.length;
-  }
+  // Delegates to the shared derivation above — the same stable-number-from-an-id
+  // rule the session cats use for their palette and their bob phase. Kept as a
+  // named function because this page's node cats read better as `catFor(a.id)`.
+  function catFor(id){ return idCat(id); }
   function api(path){ return fetch(withP(path) + (path.includes('?')?'&':'?') + 'token='
       + encodeURIComponent(TOKEN), {headers:{'X-Hive-Token':TOKEN}}).then(r=>r.json()); }
   function apiPost(path, body){
@@ -226,6 +252,9 @@ _PAGE = """<!doctype html>
 
   // --- mission tree layout: coordinator center, role-grouped branches ---
   let AGENTS = [], SEL = null, CURSOR = 0;
+  // The markup `#chips` was last painted with. See `paint()` for why this is
+  // remembered rather than read back off the DOM.
+  let CHIPS_HTML = '';
   function positions(swarm){
     const W = document.getElementById('stage').clientWidth || 900;
     const H = document.getElementById('stage').clientHeight || 600;
@@ -262,16 +291,37 @@ _PAGE = """<!doctype html>
         +' L'+p.x+' '+p.y+'" fill="none" stroke="'+(ROLE_STYLE[a.role]||'#888')
         +'" stroke-width="1.6" stroke-opacity="0.75"/>';
     }).join('');
-    chips.innerHTML = swarm.map(a => {
+    const chipHTML = swarm.map(a => {
       const p = pos[a.id] || {x:0, y:0}, col = ROLE_STYLE[a.role] || '#888';
-      return '<div class="chip'+(SEL===a.id?' sel':'')+'" data-id="'+a.id
+      // The agent's status rides on the chip itself, not just on its dot: that
+      // is what lets the node cat animate. Safe as a class because `status` is
+      // server-owned and drawn from a fixed vocabulary (idle | running | done |
+      // error | stopped — workspace.py's Agent), unlike `a.name`, which is
+      // escaped below because it is not.
+      return '<div class="chip '+a.status+(SEL===a.id?' sel':'')+'" data-id="'+a.id
         +'" style="left:'+p.x+'px;top:'+p.y+'px;border-color:'+col+';color:'+col+'">'
         + catSVG(catFor(a.id), 30)
         + '<span class="row">'+(ROLE_ICON[a.role]||'') + ' ' + esc(a.name)
         + ' <span class="dot '+a.status+'"></span></span></div>';
     }).join('');
-    chips.querySelectorAll('.chip').forEach(el =>
-      el.onclick = ev => { ev.stopPropagation(); inspect(el.dataset.id); });
+    // Only touch the DOM when the markup actually changed. `paint()` runs on
+    // every 1.2 s poll and the cat's bob is a 1.6 s cycle, so an unconditional
+    // rebuild tore down every sprite and restarted its animation before it could
+    // finish — the cat rose and snapped back mid-descent, forever, never
+    // completing a bob. The same applies to the dot's 1 s pulse, which fit
+    // inside the old window only by luck.
+    //
+    // Compared against a remembered string rather than reading `chips.innerHTML`
+    // back: the browser re-serializes markup it parses, so the round-trip would
+    // never compare equal and the guard would silently never fire. Anything that
+    // genuinely changes a chip — status, selection, name, or a stage resize
+    // moving its coordinates — changes this string and rebuilds.
+    if (CHIPS_HTML !== chipHTML) {
+      CHIPS_HTML = chipHTML;
+      chips.innerHTML = chipHTML;
+      chips.querySelectorAll('.chip').forEach(el =>
+        el.onclick = ev => { ev.stopPropagation(); inspect(el.dataset.id); });
+    }
     // mission badge + command targets
     const running = swarm.some(a => a.status === 'running');
     const ms = document.getElementById('mstate');
@@ -344,7 +394,14 @@ _PAGE = """<!doctype html>
   // the poll that feeds it.
 
   async function pollCats(){
-    try { paintCats((await api('/api/mindnet/cats')).cats || []); } catch(_){}
+    // ONE fetch feeds both strips: the faculty board and the session board are
+    // two answers in the same payload, and a second request would double this
+    // page's poll rate for data already in hand.
+    try {
+      const board = await api('/api/mindnet/cats');
+      paintCats(board.cats || []);
+      paintSessions(board);
+    } catch(_){}
   }
 
   // --- poll loop ---

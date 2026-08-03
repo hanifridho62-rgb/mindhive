@@ -147,6 +147,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
      appear and vanish. */
   #mn-cats { display:flex; align-items:flex-end; gap:5px; margin-left:auto;
     flex:0 1 auto; overflow-x:auto; max-width:52%; }
+  /* The session strip sits beside the faculty one rather than under it: this
+     header is a single row, and a second band would push the whole page down
+     every time a Claude starts working. Narrower cap so the faculty cats — the
+     fixed seven — never get squeezed out by an unbounded session list. */
+  #mn-sessions { display:flex; align-items:center; gap:5px; flex:0 1 auto;
+    overflow-x:auto; max-width:34%; margin-left:8px; }
 /*__CAT_CSS__*/
   /*__TASKS_CSS__*/
 </style></head>
@@ -1803,7 +1809,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // must not take out the board.
   async function pollCats(){
     if (!liveOn || document.hidden) return;
-    try { paintCats((await apiGet('/api/mindnet/cats')).cats || []); } catch(_){}
+    // ONE fetch feeds both strips — see the swarm page's poll for why.
+    try {
+      const board = await apiGet('/api/mindnet/cats');
+      paintCats(board.cats || []);
+      paintSessions(board);
+    } catch(_){}
   }
   setInterval(pollCats, LIVE_MS);
 

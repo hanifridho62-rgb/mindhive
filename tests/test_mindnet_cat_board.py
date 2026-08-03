@@ -331,3 +331,93 @@ def test_the_token_is_still_escaped_in_the_rendered_page():
     page = render_swarm("</script><script>alert(1)</script>")
     assert "</script><script>alert(1)" not in page
     assert "\\u003c" in page
+
+
+# --- MN-19: session cats ride the same poll ---------------------------------------
+
+def _prompt(session_id="sess-live", ago=2, text="fixing the parser"):
+    """A real `user_prompt` row — one of `oversee._ACTIVITY_TYPES`, i.e. the
+    telemetry that already means "this session is doing something"."""
+    from datetime import datetime, timedelta, timezone
+
+    from mindhive import events as ev_mod
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=ago)) \
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    return ev_mod.append_event("user_prompt", {"text": text},
+                               session_id=session_id, ts=ts)
+
+
+def test_the_payload_carries_both_boards_and_the_producer_map(server):
+    """One poll, two questions. A second endpoint would double the request rate of
+    a strip that already polls every 1.2 s for data this fold has in hand."""
+    base, token = server
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    for key in ("cats", "sessions", "sessions_total", "sessions_hidden",
+                "producers", "online_after_secs"):
+        assert key in body, f"payload is missing {key}"
+
+
+def test_the_faculty_shape_is_unchanged_for_existing_consumers(server):
+    """The session board is additive. `paintCats` and its tests predate it and
+    must keep reading exactly what they read before."""
+    base, token = server
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    for key in ("cats", "dim_after_secs", "hide_after_secs", "idle_vanish_secs"):
+        assert key in body
+
+
+def test_a_working_session_appears_even_with_no_faculty_rows(server):
+    """The operator's actual situation: sessions running, faculty feed empty. The
+    board previously had nothing to say in that state, which read as "nothing is
+    happening"."""
+    base, token = server
+    _prompt("sess-live", ago=2)
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    assert body["cats"] == [], "no faculty rows were written by this test"
+    ids = [s["session_id"] for s in body["sessions"]]
+    assert "sess-live" in ids, body["sessions"]
+    row = next(s for s in body["sessions"] if s["session_id"] == "sess-live")
+    assert row["display"] == "working"
+
+
+def test_a_quiet_session_still_renders_but_not_as_working(server):
+    """Past the online window it is resting, not gone — the session has not ended,
+    and hiding it would lose the operator's place."""
+    base, token = server
+    from mindhive import oversee
+    _prompt("sess-quiet", ago=int(oversee.ONLINE_WINDOW_SECONDS) + 30)
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    row = next((s for s in body["sessions"] if s["session_id"] == "sess-quiet"), None)
+    assert row is not None and row["display"] == "resting"
+
+
+def test_the_producer_map_reports_this_builds_signals(server):
+    """The gap that cost this repo an entire investigation: a checkout with no
+    `playbook` module rendered identically to a quiet one. Asserted by asking the
+    same question the endpoint does, not by restating an expected literal."""
+    base, token = server
+    from mindhive.mindnet import telemetry as tel_mod
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    assert body["producers"] == tel_mod.producers()
+    assert set(body["producers"]) >= {"faculty", "swarm", "session"}
+
+
+def test_the_session_thresholds_come_from_the_server(server):
+    """Invariant 10: the page must never restate a number the server owns."""
+    base, token = server
+    from mindhive import oversee
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    assert body["online_after_secs"] == oversee.ONLINE_WINDOW_SECONDS
+
+
+def test_the_overflow_is_reported_rather_than_dropped(server):
+    """A capped strip that under-reports is a strip that lies about how much is
+    running."""
+    base, token = server
+    from mindhive.mindnet import ui_sessions as sess_mod
+    for i in range(sess_mod.SESSION_CAP + 3):
+        _prompt(f"sess-{i}", ago=2 + i)
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    assert len(body["sessions"]) == sess_mod.SESSION_CAP
+    assert body["sessions_total"] >= sess_mod.SESSION_CAP + 3
+    assert body["sessions_hidden"] == body["sessions_total"] - sess_mod.SESSION_CAP

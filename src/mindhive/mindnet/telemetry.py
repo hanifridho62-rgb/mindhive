@@ -63,6 +63,29 @@ however many events the feed carries.
 This module is deliberately NOT wired into `controller.py` or `executor.py` —
 where the emit calls belong is a seam to decide explicitly, not a side effect of
 adding the producer.
+
+## The seams decided so far
+
+This list is the whole producer set. A faculty absent from it has a labelled cat
+and nothing that lights it, which is the one way R16's "a missing cat means a
+real bug" can be false for a reason that is not a bug:
+
+- `__main__._mn_work` — a mutating `hive mindnet` command (`task-graph`).
+- `orchestrator` — an executed wave (`task-graph`) and the completion gate
+  (`pr-green`).
+- `enforce.hook_decision` — MN-4's language lock (`compatibility`).
+- `promptgate.record_direction` — the prompt catalog, via `playbook.engaged`
+  (`skill-plugin`, `history`).
+- `__main__`'s UserPromptSubmit hook — the consulted spine, via
+  `inject.engaged_faculties` (`sop`, `improvements`).
+- `workspace.Manager._sync_faculty` — a running MindSwarm mission
+  (`task-graph`).
+
+The last was the gap that made the board untrustworthy in practice rather than
+in principle. MindSwarm is the surface an operator commands work from, and it
+had no producer at all: its strip read "no MindNetwork activity" however many
+agents were running, so on that page "not running" and "never wired" rendered
+identically — which is exactly what R16 exists to rule out.
 """
 from __future__ import annotations
 
@@ -189,6 +212,40 @@ def busy(faculty, task_id=None, phase=None, project=None, session_id=None):
 
 
 # --- reading -------------------------------------------------------------------------
+
+# What each producer needs to exist at all, for `producers()` below. Checked by
+# INSPECTION rather than kept as a hand-maintained boolean, because a stale
+# literal here would recreate the exact failure this function exists to expose.
+_PRODUCER_PROBES = (
+    ("faculty", "mindhive.playbook", "engaged"),
+    ("swarm", "mindhive.workspace", "SWARM_FACULTY"),
+    ("session", "mindhive.oversee", "interactive_sessions"),
+)
+
+
+def producers() -> dict:
+    """``{signal: bool}`` — which producers THIS BUILD actually carries.
+
+    The board's founding claim is that a missing cat means a real bug. That claim
+    is false in one specific way the board could not previously express: a build
+    whose branch simply predates a producer renders exactly like a build where
+    nothing is running. An operator hunting a silent faculty then has no way to
+    tell "not running" from "cannot possibly know" — and this repo lost real hours
+    to precisely that, with a checkout that had no `playbook` module at all while
+    the strip cheerfully read "no MindNetwork activity".
+
+    Never raises: an unimportable module is a `False`, which is the honest answer
+    and the whole point. A probe that threw would take out the poll that was
+    trying to report the gap."""
+    out: dict = {}
+    for name, module, attr in _PRODUCER_PROBES:
+        try:
+            import importlib
+            out[name] = hasattr(importlib.import_module(module), attr)
+        except Exception:                   # noqa: BLE001
+            out[name] = False
+    return out
+
 
 def fold(evs) -> dict:
     """Deterministic, total fold of `mindnet_activity` into

@@ -6,6 +6,8 @@ tests/test_graphview.py — these assert on the rendered string: every shipped
 requirement of the Workspace feature is pinned here so a template edit can't
 silently drop it.
 """
+import re
+
 from mindhive.swarm_page import render_swarm
 from mindhive.workspace_page import render_parallel
 
@@ -236,7 +238,13 @@ def test_swarm_nodes_are_pixel_cat_sprites():
 def test_swarm_cat_choice_is_deterministic_from_agent_id():
     # random per new node but stable across refreshes: derived from the id,
     # never from Math.random
-    assert "parseInt(String(id).slice(0,4), 16)" in SWARM
+    # The derivation lives in the shared fragment (`idSeed`/`idCat`) — the session
+    # cats need the same stable-number-from-an-id rule. Pinned as the PROPERTY,
+    # never a spelling: it must be a pure function of the id with no randomness.
+    # It used to pin a hex slice of the first four characters, which silently
+    # collapsed every non-hex id (`ws-*`, `research-*`) to the same seed.
+    assert "function idSeed(" in SWARM and "function idCat(" in SWARM
+    assert "catFor" in SWARM
     # The bound is taken from the palette table's own length, not a literal.
     # This used to assert `"% 6" in SWARM`; MN-7 gave each of the seven
     # `telemetry.FACULTIES` its own cat, which needed a seventh palette — and a
@@ -247,6 +255,89 @@ def test_swarm_cat_choice_is_deterministic_from_agent_id():
     assert "% CAT_PALETTES.length" in SWARM
     assert "% 6" not in SWARM
     assert "Math.random" not in SWARM
+
+
+# --- the node cat is a status light, not decoration -------------------------------
+
+def test_a_node_cat_moves_only_while_its_own_agent_is_running():
+    """The reported bug. Every chip drew a cat and NONE of them ever moved: the only
+    `mn-bob` rule was scoped to `.mn-cat.active`, a class a chip has never carried, so
+    the sprite was inert whatever the agent was doing. The operator read that as "the
+    animation is broken" rather than "these are two unrelated cat systems"."""
+    m = re.search(r"\.chip\.running \.mn-cat-sprite\s*\{[^}]*animation:\s*"
+                  r"([A-Za-z0-9_-]+)", SWARM)
+    assert m, "no rule animates a running agent's cat; the chips are inert again"
+    # The animation NAME must resolve, not merely look plausible. A substring
+    # check passed for `mn-bob2` as happily as for `mn-bob`, and an animation
+    # naming keyframes that do not exist is silently inert in every browser —
+    # which is the exact bug this test exists to catch, wearing a typo.
+    declared = set(re.findall(r"@keyframes\s+([A-Za-z0-9_-]+)", SWARM))
+    assert m.group(1) in declared, (
+        f"the running chip's cat animates with '{m.group(1)}', which no "
+        f"@keyframes on this page declares (declared: {sorted(declared)})")
+
+
+def test_a_settled_agents_cat_holds_still():
+    """The other half of the signal, and the half a "just animate the cats" fix
+    silently loses. A cat that bobs whether or not its agent is working reports
+    nothing — it is the unconditional rule, not the missing one, that would make this
+    feature a lie."""
+    assert not re.search(r"\.chip\s+\.mn-cat-sprite\s*\{", SWARM), (
+        "a rule animates every chip cat regardless of status; motion then means "
+        "nothing about whether the agent is running")
+
+
+def test_the_chip_carries_its_agents_status_as_a_class():
+    """What joins the two tests above to real agent state. Without the status on the
+    chip element itself the CSS has nothing to key on — the status was previously only
+    on the inner `.dot`, which is why the cat could not see it."""
+    assert '<div class="chip \'+a.status+' in SWARM
+    # the selection ring must survive the addition — it shares the same attribute
+    assert "(SEL===a.id?' sel':'')" in SWARM
+
+
+def test_the_chip_repaint_does_not_restart_the_cats_animation():
+    """`paint()` runs every 1.2 s and the bob is a 1.6 s cycle, so rebuilding
+    `#chips` unconditionally tore every sprite out of the DOM and restarted its
+    animation before it could finish — the cat rose and snapped back mid-descent
+    forever. Motion was technically present and visibly broken.
+
+    The guard compares against a remembered string, NOT `chips.innerHTML`: a
+    browser re-serializes the markup it parses, so reading it back would never
+    compare equal and the guard would silently never fire."""
+    assert "CHIPS_HTML !== chipHTML" in SWARM, (
+        "the chip repaint is unguarded; the node cat's bob restarts every poll")
+    assert not re.search(r"chips\.innerHTML\s*=\s*swarm\.map", SWARM), (
+        "the unconditional rebuild is still there")
+    guard = SWARM[SWARM.index("CHIPS_HTML !== chipHTML"):]
+    guard = guard[:guard.index("\n    }")]
+    assert "chips.innerHTML = chipHTML" in guard, "the rebuild escaped the guard"
+    assert "onclick" in guard, (
+        "click handlers are attached outside the guard, so a skipped repaint "
+        "would leave the chips unclickable")
+
+
+def test_the_pages_own_animations_honour_reduced_motion():
+    """`cat_board.CSS` carries the guard for cat sprites, but it cannot name
+    `.dot`/`.badge` — those are this page's furniture and do not exist on the
+    dashboard. Without a page-local block a reduced-motion user would keep every
+    pre-existing pulse and lose only the animation this change added, which is
+    the opposite of honouring the preference."""
+    blocks = re.findall(r"@media \(prefers-reduced-motion: reduce\)\s*\{"
+                        r"(.*?)\n  \}", SWARM, re.S)
+    assert blocks, "the swarm page ships no reduced-motion guard of its own"
+    covered = " ".join(blocks)
+    assert ".dot.running" in covered and ".badge.run" in covered, (
+        f"the page's own pulses keep animating under reduced motion: {covered}")
+
+
+def test_the_swarm_page_does_not_declare_its_own_bob_keyframes():
+    """One motion, one definition. A local `@keyframes mn-bob` beside the shared one
+    would drift — the strip's cats and the node cats bobbing at different rates, with
+    nothing to say which page was wrong. Counting is the whole assertion."""
+    assert SWARM.count("@keyframes mn-bob") == 1, (
+        "the swarm page carries a second mn-bob definition; it must reuse the one "
+        "that arrives with cat_board.CSS")
 
 
 # --- node inspector: skills used + run info (2026-07-11 plan R5) -------------------
