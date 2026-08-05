@@ -31,7 +31,7 @@ Console entry point: `hive` → `mindhive.__main__:main` (`pyproject.toml`
 directives context packs verify selftest premise recall consolidate gc export
 embed briefing review log sop roadmap mindnet autoresume graph plugins skills
 clusters sync dashboard harvest autosync loop flag failures rules triggers
-enrich`.
+enrich replenish`.
 
 > **Probing the CLI from a worktree gives you the wrong branch.** The venv's
 > editable install points at `C:\Users\hanif\mindhive`, so a bare
@@ -81,6 +81,8 @@ All paths relative to `src/mindhive/`.
 | `directives.py` | The operating directives injected at SessionStart. |
 | `roadmap.py`, `autoresume.py` | The ask/plan/progress registry, and post-cooldown delivery of an interrupted plan's marker back into Claude. |
 | `plugins.py`, `recommend.py`, `invoker.py`, `playbook.py` | Skill/plugin catalog (backs both `hive plugins` and `hive skills`), deterministic recommendation, the invoke channel, and the per-prompt playbook (MN-15). |
+| `replenish.py` | Adaptive work injection — the **decision** half. Lenses fold the ledger for work the record proves outstanding, a value gate refuses anything without evidence and dedups by fingerprint, caps bound the round. State is the `work_injected` fold, never a sidecar. Knows **nothing** about surfaces: the sink is a parameter, and `tests/test_replenish.py` asserts the module does not import one. |
+| `replenish_sinks.py` | The **landing** half, one sink per surface. `roadmap_sink` appends steps to the plan whose `plan_id` is the session id, marked `new`; `roadmap.autoclose_session` then interrupts it and `roadmap.notice` carries it into the next session's auto-loaded STATE.md — that hop is the forcing mechanism, not prose. The loop sink (checklist items that raise `loop.task.required_remaining_count`) is a later phase. |
 
 ### `mindnet/` — the phase spine (MindNetwork)
 
@@ -190,7 +192,7 @@ Python so they are unit-testable.
 | `post_tool_use.ps1` | PostToolUse | `hook post_tool_use` → `hookcapture.record_post_tool_use` (+ faculty beat) |
 | `post_tool_use_failure.ps1` | **none — built but registered nowhere.** No Claude Code event fires it; `~/.claude/settings.json` registers seven hooks and this is not one of them. | `hook post_tool_use_failure` → `hookcapture.record_post_tool_use_failure` |
 | `pre_compact.ps1` | PreCompact | `append compaction` |
-| `session_end.ps1` | SessionEnd | `append session_end`, `project`, `briefing`, `graph build`, `sync`, `review queue`, `log queue`, `roadmap autoclose`; detached auto-reflection |
+| `session_end.ps1` | SessionEnd | `append session_end`, `replenish run`, `roadmap autoclose`, `review queue`, `log queue`, `project`, `briefing`, `graph build`, `sync`; detached auto-reflection. **The order of the first three is load-bearing and silent when wrong:** injected steps added *after* the autoclose still exist, but the plan is already interrupted, so `notice()` never renders them and the next session never sees the work. `tests/test_replenish_cli.py` asserts the ordering against this file. |
 | `stop.ps1` | Stop | `hook stop` → `rotation.hook.hook_decision` |
 | `autosync.ps1` | *not a hook* — and **not actually on the schedule either**: the registered `\MindHive-AutoSync` task runs `pythonw.exe -m mindhive autosync` directly, bypassing this wrapper. Editing it changes nothing. | (wrapper would call `autosync` via `pythonw.exe`) |
 
