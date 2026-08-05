@@ -149,7 +149,13 @@ def block_for(text, project=None) -> str:
     try:
         if _is_injected(text):
             return ""
-        data = sop.read_sidecar(project)
+        # GLOBAL, not per-project. "Mandatory" was asked for as *every
+        # session*; `paths.detect_project` gives each repo its own namespace,
+        # so reading the per-project sidecar would silently mean "every session
+        # in the repo where you happened to register it" — the hook is
+        # registered globally and fires everywhere, so the data has to be
+        # global too or the reach is a fiction.
+        data = sop.read_global_sidecar()
         return render(data.get("sops") if isinstance(data, dict) else None)
     except Exception:                                       # noqa: BLE001
         return ""

@@ -297,21 +297,83 @@ def sidecar_path(project=None):
     return paths.project_dir(project) / SIDECAR_NAME
 
 
+def global_sidecar_path():
+    """The cross-namespace sidecar, one level above every project dir.
+
+    "Mandatory" was asked for as *every session*, and a per-project file cannot
+    mean that. `paths.detect_project` resolves a namespace per repo, so a
+    procedure registered while working in one repo would be invisible in the
+    next — even though the UserPromptSubmit hook is registered globally in
+    ~/.claude/settings.json and fires in all of them. The global file is what
+    closes that gap; the per-project one stays as the registry's own view.
+
+    A FILE at the store root, which `paths.list_namespaces` ignores because it
+    only walks directories."""
+    return paths.store_home() / SIDECAR_NAME
+
+
+def _project_rows(project, evs) -> list:
+    name = project or paths.detect_project()
+    return [{"project": name, "sop_id": r["sop_id"], "title": r["title"],
+             "text": r["text"], "version": r["version"]}
+            for r in mandatory(evs)]
+
+
 def write_sidecar(project=None, evs=None) -> dict:
-    """Materialize the active mandatory SOPs to the sidecar and return what was
-    written. Raises on an unwritable path — callers on a best-effort path wrap
-    it; callers that want to know (the CLI) do not."""
+    """Materialize the active mandatory SOPs and return the per-project view.
+
+    Writes TWO files. The per-project sidecar is the registry's own
+    materialization. The global one is what `sopgate` actually reads, so a
+    mandatory SOP reaches every session on the machine rather than only
+    sessions whose detected project happens to be the one it was registered in.
+
+    The global write is a read-modify-write that replaces only THIS project's
+    slice, leaving other projects' rows intact. Raises on an unwritable path —
+    callers on a best-effort path wrap it; callers that want to know (the CLI)
+    do not."""
     if evs is None:
         evs = ev_mod.read_all(project)
+    rows = _project_rows(project, evs)
     data = {
         "written_at": ev_mod.now_iso(),
-        "sops": [{"sop_id": r["sop_id"], "title": r["title"],
-                  "text": r["text"], "version": r["version"]}
-                 for r in mandatory(evs)],
+        "sops": [{k: v for k, v in r.items() if k != "project"} for r in rows],
     }
     paths.write_text_atomic(sidecar_path(project),
                             json.dumps(data, indent=2, ensure_ascii=False))
+
+    name = project or paths.detect_project()
+    merged = [r for r in (read_global_sidecar().get("sops") or [])
+              if isinstance(r, dict) and r.get("project") != name]
+    merged += rows
+    # Group by project, and ONLY by project: the sort is stable, so each
+    # project's rows keep the `(created, sop_id)` order `mandatory()` gave
+    # them. Sorting on sop_id too would re-alphabetize within a project and
+    # reshuffle procedures already in force whenever a new one is added —
+    # which is exactly the delivery order the registry promises not to churn.
+    merged.sort(key=lambda r: str(r.get("project") or ""))
+    # KNOWN RACE, accepted rather than fixed — the same one `style._write_modes`
+    # documents. Each write is atomic, but the read-modify-write around it is
+    # not, so two projects writing simultaneously can drop one slice. Blast
+    # radius is one project's mandatory SOPs missing until its next `hive state`
+    # or `hive project`, both of which rewrite the slice.
+    paths.write_text_atomic(
+        global_sidecar_path(),
+        json.dumps({"written_at": data["written_at"], "sops": merged},
+                   indent=2, ensure_ascii=False))
     return data
+
+
+def read_global_sidecar() -> dict:
+    """The cross-namespace sidecar as a dict, or ``{}`` when missing,
+    unreadable, corrupt, or wrong-shaped. Total, for the same reason
+    ``read_sidecar`` is: its caller runs on every prompt."""
+    try:
+        data = json.loads(global_sidecar_path().read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("sops"), list):
+            return {}
+        return data
+    except Exception:                                       # noqa: BLE001
+        return {}
 
 
 def read_sidecar(project=None) -> dict:
