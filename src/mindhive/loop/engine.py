@@ -18,7 +18,47 @@ from .driver import preflight
 # Run-end reasons that mean "usage ran out mid-plan": the Claude usage/rate
 # limit (api_cap) and the local budget gate (budget_cap). These get the
 # roadmap interruption marker so the next session inherits the big picture.
-USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap")
+# `max_hours` joins the two usage caps: a run that ran out of wall clock has
+# exactly the same unfinished plan as one that ran out of quota, and the next
+# session needs the baton either way.
+USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap", "max_hours")
+
+
+def _relay_state(project, run_id, cause, steps) -> dict:
+    """The baton: what the next session needs that the steps alone do not carry.
+
+    Three fields, and one of them is a CACHE rather than a source of truth. The
+    spent fingerprints are already recoverable by folding `work_injected` — that
+    is the whole reason `replenish` has no sidecar — so this copy exists only to
+    save a re-mine after a five-hour cooldown. `autoresume` unions it with the
+    fresh fold and lets the fold win, which means a stale or truncated cache can
+    only ever cost a candidate that the ledger would also have skipped. A cache
+    that could REMOVE something from the spent set would be the invisible drift
+    the no-sidecar rule exists to prevent.
+
+    Best-effort: this runs inside the snapshot's own try, and a relay that cannot
+    be computed must not cost the marker itself."""
+    try:
+        from .. import replenish as rp_mod
+        from .. import roadmap as roadmap_mod
+
+        hist = rp_mod.history(events.read_all(project), surface="loop",
+                              run_id=run_id)
+        injected = sum(1 for s in steps if s.get("new"))
+        remaining = sum(1 for s in steps
+                        if s.get("status") in ("active", "pending"))
+        context = (f"loop run {run_id} stopped on {cause} with {remaining} "
+                   f"step(s) open, {injected} of them added by the injector. "
+                   f"Steps marked (new) were mined from the record, not planned "
+                   f"at the start.")
+        return {
+            "relay_context": context[:roadmap_mod.MAX_RELAY_CONTEXT_CHARS],
+            "spent_fingerprints":
+                sorted(hist.fingerprints)[:roadmap_mod.MAX_RELAY_FINGERPRINTS],
+            "dry_rounds": hist.dry_rounds,
+        }
+    except Exception:                                           # noqa: BLE001
+        return {}
 
 
 def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
@@ -47,6 +87,7 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
                        "steps": steps}
         int_payload = {"action": "interrupt", "plan_id": run_id,
                        "cause": cause}
+        int_payload.update(_relay_state(project, run_id, cause, steps))
         roadmap_mod.validate_payload(set_payload)
         roadmap_mod.validate_payload(int_payload)
         events.append_event("roadmap", set_payload, tags=["roadmap"],

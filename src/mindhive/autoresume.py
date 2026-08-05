@@ -227,6 +227,28 @@ def pending(evs) -> list:
 _GLYPHS = {"done": "[x]", "active": "[>]", "pending": "[ ]", "skipped": "[-]"}
 
 
+def rehydrate_spent(rec, evs) -> frozenset:
+    """The spent-fingerprint set a resumed run should start from.
+
+    The UNION of the fresh fold and the interrupt's cache, and the fold is the
+    authority. `replenish` has no sidecar precisely because a second source of
+    truth drifts invisibly, so this cache is allowed to ADD to the spent set and
+    never to remove from it: the worst a stale or truncated cache can do is skip a
+    candidate the ledger would also have skipped, while a cache that could
+    un-spend a fingerprint would silently re-propose finished work.
+
+    Total on a malformed record: a corrupt or non-list cache is ignored and the
+    fold alone is used."""
+    from . import replenish as replenish_mod
+
+    folded = replenish_mod.history(evs).fingerprints
+    cached = rec.get("spent_fingerprints") if isinstance(rec, dict) else None
+    if not isinstance(cached, list):
+        return folded
+    return folded | frozenset(f for f in cached
+                              if isinstance(f, str) and f.strip())
+
+
 def resume_prompt(rec, attempt=1) -> str:
     """Compose the interrupted plan into the self-contained prompt that goes
     straight to Claude: the original ask verbatim, every step with its index
@@ -245,6 +267,23 @@ def resume_prompt(rec, attempt=1) -> str:
         f"scheduled to re-enter Claude after the usage cooldown; this is "
         f"delivery attempt {attempt}.",
         "",
+    ]
+    # A loop-origin plan says what stopped it and what the marker means. Only when
+    # the interrupt actually carried a relay — a session-origin plan, or any
+    # interrupt written before the relay existed, reads exactly as it did before.
+    relay = str(rec.get("relay_context") or "").strip()
+    if relay:
+        lines += [
+            "## You are resuming an autonomous loop run",
+            relay,
+            "",
+            "Steps below carrying the `(new)` marker were mined from the record "
+            "by the replenishment injector rather than planned at the start. "
+            "They are work the ledger proved outstanding; treat them as real "
+            "requirements, not suggestions.",
+            "",
+        ]
+    lines += [
         "## The original ask (what the user wants — verbatim)",
         rec["prompt"],
         "",

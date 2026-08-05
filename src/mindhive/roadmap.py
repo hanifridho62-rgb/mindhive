@@ -165,7 +165,51 @@ def validate_payload(payload) -> None:
         if len(cause) > MAX_CAUSE_CHARS:
             raise ValueError(
                 f"roadmap cause exceeds {MAX_CAUSE_CHARS} chars")
+        _validate_relay(payload)
     # resume / complete: plan_id is enough.
+
+
+# The relay: what an interrupted loop hands the next session.
+MAX_RELAY_CONTEXT_CHARS = 1000
+MAX_RELAY_FINGERPRINTS = 64
+
+
+def _validate_relay(payload) -> None:
+    """Check the optional relay fields an interrupted LOOP plan may carry.
+
+    Capped and rejected rather than truncated, like every neighbouring field: a
+    silently shortened fingerprint list would be a cache that looks complete and
+    is not, and the failure it causes — work re-proposed that was already spent —
+    would be invisible.
+
+    All three are optional. An interrupt written by `hive roadmap interrupt`, or
+    by any version of this code before the relay existed, carries none of them."""
+    context = payload.get("relay_context")
+    if context is not None:
+        if not isinstance(context, str):
+            raise ValueError("roadmap relay_context must be text")
+        if len(context) > MAX_RELAY_CONTEXT_CHARS:
+            raise ValueError(
+                f"roadmap relay_context exceeds {MAX_RELAY_CONTEXT_CHARS} chars")
+
+    fingerprints = payload.get("spent_fingerprints")
+    if fingerprints is not None:
+        if not isinstance(fingerprints, list):
+            raise ValueError("roadmap spent_fingerprints must be a list")
+        if len(fingerprints) > MAX_RELAY_FINGERPRINTS:
+            raise ValueError(
+                f"roadmap spent_fingerprints exceeds {MAX_RELAY_FINGERPRINTS} "
+                f"entries")
+        for entry in fingerprints:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(
+                    "roadmap spent_fingerprints entries must be non-empty text")
+
+    dry_rounds = payload.get("dry_rounds")
+    if dry_rounds is not None:
+        if isinstance(dry_rounds, bool) or not isinstance(dry_rounds, int) \
+                or dry_rounds < 0:
+            raise ValueError("roadmap dry_rounds must be a non-negative integer")
 
 
 def _progress(steps) -> dict:
@@ -257,11 +301,29 @@ def fold(evs) -> dict:
             note = str(p.get("note") or "").strip()
             if note:
                 rec["interrupt_note"] = note
+            # The relay, carried only when the interrupt supplied it. Read
+            # defensively: an interrupt written by `hive roadmap interrupt`, or by
+            # any version before the relay existed, has none of these, and the
+            # fold must not invent them.
+            context = str(p.get("relay_context") or "").strip()
+            if context:
+                rec["relay_context"] = context
+            spent = p.get("spent_fingerprints")
+            if isinstance(spent, list):
+                rec["spent_fingerprints"] = [f for f in spent
+                                             if isinstance(f, str) and f.strip()]
+            dry = p.get("dry_rounds")
+            if isinstance(dry, int) and not isinstance(dry, bool) and dry >= 0:
+                rec["dry_rounds"] = dry
         elif action == "resume":
             rec["status"] = "active"
             rec["cause"] = ""
             rec["interrupted_at"] = ""
             rec.pop("interrupt_note", None)
+            # The relay was consumed by the resume; keeping it would let a later
+            # reader treat a live plan's stale baton as current.
+            for key in ("relay_context", "spent_fingerprints", "dry_rounds"):
+                rec.pop(key, None)
         elif action == "complete":
             rec["status"] = "completed"
         rec["updated"] = ev.ts
