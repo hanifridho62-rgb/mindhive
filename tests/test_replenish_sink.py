@@ -82,6 +82,48 @@ def test_completing_a_new_step_does_not_clear_the_flag():
     assert step["new"] is True
 
 
+def test_the_relay_prompt_marks_injected_steps():
+    # This is the leg that delivers an interrupted plan back INTO Claude. An
+    # agent picking the work up could not tell injected work from the plan the
+    # session started with — the one renderer where that matters most.
+    from mindhive import autoresume
+    _set([{"text": "from the plan", "status": "done"},
+          {"text": "injected work", "status": "pending", "new": True}])
+    events.append_event("roadmap",
+                        {"action": "interrupt", "plan_id": SID,
+                         "cause": "api_cap"}, session_id=SID, tags=["roadmap"])
+    text = autoresume.resume_prompt(_rec())
+    assert "(new) injected work" in text
+    assert "(new) from the plan" not in text
+
+
+def test_the_ledger_body_marks_injected_steps():
+    # The LEDGER projection feeds keyword recall; without the marker, recall
+    # cannot tell injected work from planned work.
+    body = roadmap.ledger_body(
+        {"action": "set", "plan_id": SID, "prompt": "ask",
+         "steps": [{"text": "from the plan", "status": "done"},
+                   {"text": "injected work", "status": "pending", "new": True}]})
+    assert "(new) injected work" in body
+    assert "(new) from the plan" not in body
+
+
+def test_roadmap_show_marks_injected_steps(capsys):
+    from mindhive.__main__ import main
+    _set([{"text": "injected work", "status": "pending", "new": True}])
+    assert main(["roadmap", "show", SID]) == 0
+    assert "(new) injected work" in capsys.readouterr().out
+
+
+def test_every_renderer_shares_one_marker():
+    # Three renderers shipped without the marker because it was three separate
+    # string literals. A fourth must not be able to drift the same way.
+    assert roadmap.new_prefix({"new": True}) == roadmap.NEW_MARKER
+    assert roadmap.new_prefix({"new": False}) == ""
+    assert roadmap.new_prefix({}) == ""
+    assert roadmap.new_prefix(None) == ""
+
+
 def test_the_state_notice_distinguishes_a_new_step():
     _set([{"text": "from the plan", "status": "done"},
           {"text": "injected work", "status": "pending", "new": True}])

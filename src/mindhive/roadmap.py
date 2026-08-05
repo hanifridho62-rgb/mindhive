@@ -43,6 +43,20 @@ MAX_CAUSE_CHARS = 120
 _NOTICE_DONE_TAIL = 3
 _NOTICE_PENDING_HEAD = 3
 
+# The provenance marker for an injected step, in ONE place. It shipped as three
+# separate string literals and three of the renderers that read the same step
+# dicts never got one — including `autoresume.resume_prompt`, the leg that
+# delivers an interrupted plan back into Claude, so the resumed agent could not
+# tell injected work from the plan it started with. A shared helper is what makes
+# "marked wherever rendered" checkable instead of aspirational.
+NEW_MARKER = "(new) "
+
+
+def new_prefix(step) -> str:
+    """``NEW_MARKER`` when *step* was added by the replenishment injector, else
+    "". Every text renderer of a roadmap step goes through this."""
+    return NEW_MARKER if (step or {}).get("new") else ""
+
 
 def _norm_steps(raw):
     """Normalize a ``set`` payload's steps into ``[{text, status, note, new}]``.
@@ -500,11 +514,7 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
 
 def _step_line(s, marker) -> str:
     note = f" — {s['note']}" if s.get("note") else ""
-    # The marker rides the auto-loaded STATE.md, which is where the next session
-    # meets this work: it has to say "this was not in the plan you started from"
-    # there, not only on the dashboard.
-    new = "(new) " if s.get("new") else ""
-    return f"- {marker} {new}{s['text']}{note}"
+    return f"- {marker} {new_prefix(s)}{s['text']}{note}"
 
 
 def notice(evs) -> str:
@@ -585,7 +595,10 @@ def ledger_body(payload) -> str:
         lines = []
         for s in steps:
             if isinstance(s, dict):
+                # The marker rides the LEDGER body too, so keyword recall can
+                # tell injected work from planned work.
                 lines.append(f"- [{s.get('status', 'pending')}] "
+                             f"{new_prefix(s)}"
                              f"{str(s.get('text') or '').strip()}")
             else:
                 lines.append(f"- {str(s).strip()}")

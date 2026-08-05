@@ -253,7 +253,11 @@ def resume_prompt(rec, attempt=1) -> str:
     for i, s in enumerate(rec["steps"]):
         note = f" — {s['note']}" if s.get("note") else ""
         mark = "  <- NEXT" if s is nxt else ""
-        lines.append(f"{i}. {_GLYPHS[s['status']]} {s['text']}{note}{mark}")
+        # This prompt IS the relay: it re-enters Claude carrying the plan. An
+        # agent picking the work back up has to know which steps were not in the
+        # plan the session started from.
+        lines.append(f"{i}. {_GLYPHS[s['status']]} {roadmap.new_prefix(s)}"
+                     f"{s['text']}{note}{mark}")
     lines += [
         "",
         "## Directives",

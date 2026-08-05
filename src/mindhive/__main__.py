@@ -1019,7 +1019,8 @@ def cmd_roadmap_show(args) -> int | None:
               "skipped": "[-]"}
     for i, s in enumerate(rec["steps"]):
         note = f"  — {s['note']}" if s.get("note") else ""
-        print(f"  {i}. {glyphs[s['status']]} {s['text']}{note}")
+        print(f"  {i}. {glyphs[s['status']]} {roadmap_mod.new_prefix(s)}"
+              f"{s['text']}{note}")
     print("\nhistory (oldest first):")
     for e in hist:
         print(f"  {e['ts']}  {e['action']:9s}  session {e['session']}")
