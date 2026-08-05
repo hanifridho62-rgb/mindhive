@@ -18,7 +18,7 @@ def _landed(**over):
                "lens": "evidence-gap", "title": "run the suite",
                "fingerprint": "evidence-gap:2026-08-05T00:00:00Z",
                "evidence": ["code_change @ 2026-08-05T00:00:00Z"],
-               "score": 1.0}
+               "score": 30}
     payload.update(over)
     return payload
 
@@ -168,7 +168,7 @@ def test_score_is_optional():
 
 def _cand(fp="fp-1", **over):
     kw = {"lens": "test-lens", "title": "do the thing", "fingerprint": fp,
-          "evidence": ("code_change @ ts",), "score": 1.0}
+          "evidence": ("code_change @ ts",), "score": replenish.BASE_SCORE}
     kw.update(over)
     return replenish.Candidate(**kw)
 
@@ -217,10 +217,25 @@ def test_two_lenses_proposing_the_same_condition_produce_one_piece_of_work():
 
 
 def test_a_candidate_below_min_score_is_refused():
-    cfg = replenish.ReplenishConfig(min_score=0.9)
-    kept, refused = replenish.gate([_cand(score=0.1)], frozenset(), cfg)
+    # Integer scale: thresholds are the ambition dial's numbers, and a bare
+    # base-score candidate must not clear `balanced`.
+    cfg = replenish.ReplenishConfig(min_score=25)
+    kept, refused = replenish.gate([_cand(score=replenish.BASE_SCORE)],
+                                   frozenset(), cfg)
     assert kept == []
     assert "below the round's minimum" in refused[0][1]
+
+
+def test_a_candidate_exactly_at_the_threshold_is_kept():
+    cfg = replenish.ReplenishConfig(min_score=25)
+    kept, _refused = replenish.gate([_cand(score=25)], frozenset(), cfg)
+    assert len(kept) == 1
+
+
+def test_the_bare_config_has_no_score_floor():
+    # 0 is deliberate, not an oversight: the threshold belongs to the dial, and a
+    # hard-coded default here would be a fourth ambition position nobody chose.
+    assert replenish.ReplenishConfig().min_score == 0
 
 
 def test_history_is_recovered_from_the_ledger_with_no_sidecar():
@@ -471,6 +486,190 @@ def test_a_spent_fingerprint_outranks_every_other_refusal_reason():
                                     frozenset({"fp-1"}),
                                     replenish.ReplenishConfig())
     assert refused[0][1] == replenish.DUPLICATE_REASON
+
+
+# --- the score ----------------------------------------------------------------
+# The scale is what makes a threshold mean anything, so each term is asserted
+# alone as well as in combination. A single test on the sum would pass with two
+# terms swapped.
+
+def test_a_lone_condition_scores_exactly_the_base():
+    assert replenish.score_candidate(_cand()).total == 10
+
+
+def test_recurrence_adds_five_per_repeat_beyond_the_first():
+    # Four occurrences is three repeats: 10 + 15 = 25.
+    assert replenish.score_candidate(_cand(occurrences=4)).total == 25
+
+
+def test_severity_adds_twenty():
+    assert replenish.score_candidate(_cand(severity=True)).total == 30
+
+
+def test_severity_absent_adds_nothing():
+    assert replenish.score_candidate(_cand(severity=False)).severity == 0
+
+
+def test_the_terms_sum_and_stay_separately_readable():
+    breakdown = replenish.score_candidate(_cand(occurrences=3, severity=True))
+    assert (breakdown.base, breakdown.recurrence, breakdown.severity) == (10, 10, 20)
+    assert breakdown.total == 40
+
+
+def test_occurrences_that_are_not_a_count_degrade_to_seen_once():
+    # A lens is the one input here with no boundary validation, so junk must
+    # degrade rather than poison the arithmetic. bool is an int subclass; True
+    # would otherwise read as 1 occurrence by accident rather than by rule.
+    for bad in (None, "4", True, 0, -3):
+        assert replenish.score_candidate(_cand(occurrences=bad)).recurrence == 0
+
+
+def test_a_deferring_prevention_rule_vetoes_the_candidate(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "edit:not-read",
+         "active_rule": "Deferred — this is by design, do not chase it."}])
+    index = replenish.build_deferral_index([])
+    breakdown = replenish.score_candidate(
+        _cand(deferral_key="edit:not-read"), index)
+    assert breakdown.total == 0
+    assert breakdown.vetoed
+    assert "prevention rule" in breakdown.veto_reason
+
+
+def test_a_prevention_rule_that_does_not_defer_does_not_veto(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "edit:not-read",
+         "active_rule": "Read the exact path before editing it."}])
+    index = replenish.build_deferral_index([])
+    breakdown = replenish.score_candidate(
+        _cand(deferral_key="edit:not-read"), index)
+    assert not breakdown.vetoed
+    assert breakdown.total == 10
+
+
+def test_a_pinned_caveat_that_defers_vetoes_by_substring(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [])
+    events.append_event("caveat", {"text": "src/mindhive/__main__.py is over "
+                                           "the line threshold; deferred until "
+                                           "the CLI split."},
+                        tags=["pinned"])
+    index = replenish.build_deferral_index(events.read_all())
+    breakdown = replenish.score_candidate(
+        _cand(deferral_key="src/mindhive/__main__.py"), index)
+    assert breakdown.vetoed
+    assert "caveat" in breakdown.veto_reason
+
+
+def test_an_unpinned_deferring_caveat_does_not_veto(monkeypatch):
+    # Pinned is the marker for a STANDING decision; an ordinary caveat is an
+    # observation, and treating it as a veto would let any passing remark
+    # switch a lens off.
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [])
+    events.append_event("caveat", {"text": "deferred for now, src/mindhive/x.py"},
+                        tags=["memo"])
+    index = replenish.build_deferral_index(events.read_all())
+    assert not replenish.score_candidate(
+        _cand(deferral_key="src/mindhive/x.py"), index).vetoed
+
+
+def test_a_candidate_with_no_deferral_key_is_never_vetoed(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "", "active_rule": "deferred"}])
+    index = replenish.build_deferral_index([])
+    assert not replenish.score_candidate(_cand(deferral_key=""), index).vetoed
+
+
+def test_the_deferral_index_is_total_on_malformed_input(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries",
+                        lambda _p=None: ["not a dict", None, {}])
+    events.append_event("caveat", {"nope": 1}, tags=["pinned"])
+    index = replenish.build_deferral_index(events.read_all())   # must not raise
+    assert index.rule_reasons == {}
+
+
+def test_an_unreadable_incident_store_still_yields_a_usable_index(monkeypatch):
+    # A round that cannot read the deferrals must still run. The cost of a
+    # missing deferral is a candidate proposed again, not a broken round.
+    from mindhive import incidents
+
+    def boom(_p=None):
+        raise OSError("incident dir gone")
+
+    monkeypatch.setattr(incidents, "summaries", boom)
+    index = replenish.build_deferral_index([])                  # must not raise
+    assert index.rule_reasons == {} and index.caveat_texts == ()
+
+
+def test_a_vetoed_candidate_is_refused_with_the_records_own_words(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "sig-x", "active_rule": "wontfix — accepted risk"}])
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(),
+        lenses={"l": lambda _e: [_cand(deferral_key="sig-x")]})
+    assert res.landed == []
+    assert "already declined" in res.refused[0][1]
+
+
+def test_the_veto_holds_even_with_no_threshold_configured(monkeypatch):
+    # The bug this pins: a veto zeroes the score, but the bare config has no
+    # score floor — so a veto expressed only as arithmetic would let every
+    # declined candidate straight through.
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "sig-y", "active_rule": "deferred by design"}])
+    cfg = replenish.ReplenishConfig(min_score=0)
+    index = replenish.build_deferral_index([])
+    scored = replenish.score_candidate(_cand(deferral_key="sig-y"), index)
+    candidate = _cand(deferral_key="sig-y", score=scored.total,
+                      veto_reason=scored.veto_reason)
+    kept, refused = replenish.gate([candidate], frozenset(), cfg)
+    assert kept == [] and "already declined" in refused[0][1]
+
+
+def test_the_round_overwrites_whatever_score_a_lens_set():
+    # Scoring belongs to the round: a lens that scored itself would make the
+    # threshold meaningless the moment two lenses disagreed about what 25 meant.
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(),
+        lenses={"l": lambda _e: [_cand(score=999)]})
+    assert res.landed[0][0].score == 10
+
+
+def test_normalise_carries_the_fields_it_does_not_clamp():
+    # The drop this pins: rebuilding a Candidate field-by-field silently loses
+    # every field added later — including the two the gate reads.
+    kept, _refused = replenish.gate(
+        [_cand(occurrences=4, severity=True, depth=2, deferral_key="k")],
+        frozenset(), replenish.ReplenishConfig())
+    assert (kept[0].occurrences, kept[0].severity) == (4, True)
+    assert (kept[0].depth, kept[0].deferral_key) == (2, "k")
+
+
+def test_a_candidate_deeper_than_the_max_is_refused():
+    cfg = replenish.ReplenishConfig(max_depth=2)
+    kept, refused = replenish.gate([_cand(depth=3)], frozenset(), cfg)
+    assert kept == []
+    assert "exceeds the maximum injection depth" in refused[0][1]
+
+
+def test_a_candidate_at_the_max_depth_is_kept():
+    cfg = replenish.ReplenishConfig(max_depth=2)
+    kept, _refused = replenish.gate([_cand(depth=2)], frozenset(), cfg)
+    assert len(kept) == 1
+
+
+def test_the_threshold_floor_is_the_base_score():
+    # The auto-tuner clamps to this. Below the base score every candidate any
+    # lens emitted would clear the gate, which is the quota-filling failure the
+    # gate exists to prevent.
+    assert replenish.MIN_THRESHOLD == replenish.BASE_SCORE
 
 
 def test_an_evidence_less_candidate_is_recorded_once_not_every_round():

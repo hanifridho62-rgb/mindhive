@@ -44,7 +44,8 @@ recorded fact, not the absence of one: the two-consecutive-empty-rounds exit
 cannot be derived from silence.
 """
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 
 from . import events as ev_mod
 
@@ -137,6 +138,147 @@ def validate_payload(payload) -> None:
         raise ValueError("work_injected score must be a number when present")
 
 
+# --- the score ---------------------------------------------------------------
+# A score answers one question: how hard does the record insist this work
+# matters? Every term is read off the record rather than judged, so two rounds
+# over the same ledger score identically — which is what makes a threshold
+# meaningful at all.
+
+BASE_SCORE = 10
+RECURRENCE_STEP = 5          # per repeat beyond the first
+SEVERITY_BONUS = 20          # a condition that is already blocking something
+
+# The floor a tuned threshold may never cross. A threshold below the base score
+# would admit every candidate any lens emitted, which is precisely the
+# inject-to-fill-a-quota failure the gate exists to prevent.
+MIN_THRESHOLD = BASE_SCORE
+
+# A standing decision NOT to act, in the record's own words. Matched against
+# active prevention rules and pinned caveats, because those are the two places
+# this project records "known, and not now". Re-proposing work a human already
+# declined is the loop that would make the injector adversarial rather than
+# useful, so it is a veto and not merely a penalty.
+_DEFERRAL_RE = re.compile(
+    r"\b(defer|deferred|deferring|deferral|wont ?fix|won't ?fix|"
+    r"not worth|out of scope|by design|accepted risk|as designed)\b",
+    re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ScoreBreakdown:
+    """Why a candidate scored what it did.
+
+    A bare integer makes a refusal unexplainable — "below the minimum" is not
+    something a reader can act on, while "base 10, recurrence 0, severity 0" says
+    which term was missing. The terms also have to survive past the sum because
+    the auto-tuner reasons about them."""
+
+    base: int = BASE_SCORE
+    recurrence: int = 0
+    severity: int = 0
+    veto_reason: str = ""
+
+    @property
+    def vetoed(self) -> bool:
+        return bool(self.veto_reason)
+
+    @property
+    def total(self) -> int:
+        return 0 if self.vetoed else self.base + self.recurrence + self.severity
+
+
+@dataclass(frozen=True)
+class DeferralIndex:
+    """What the record has already declined to act on, folded ONCE per round.
+
+    Only the veto lives here, and that asymmetry is deliberate. The recurrence
+    count does NOT: the lens that grouped the rows already counted them, so
+    re-deriving it would need a second fold plus a mapping from candidate back to
+    event type that only the lens can supply. `Candidate.occurrences` carries it
+    instead.
+
+    `rule_reasons` is keyed exactly (a prevention rule names its signature);
+    `caveat_texts` has to be scanned, because a caveat is prose that mentions a
+    signature rather than a record keyed by one. Both are small — active rules are
+    capped at `incidents.INJECT_CAP` for injection and pinned caveats are few by
+    construction."""
+
+    rule_reasons: dict = field(default_factory=dict)
+    caveat_texts: tuple = ()
+
+    def veto_reason_for(self, candidate) -> str:
+        """The record's own words declining this candidate, or "".
+
+        Matched on `deferral_key`, which a lens sets to whatever the record would
+        name — a failure signature, a file path. A candidate that names no key
+        cannot be matched against a decision about a key, and gets no veto rather
+        than a guessed one."""
+        key = str(getattr(candidate, "deferral_key", "") or "").strip()
+        if not key:
+            return ""
+        exact = self.rule_reasons.get(key)
+        if exact:
+            return exact
+        for text in self.caveat_texts:
+            if key in text:
+                return f"a pinned caveat defers this: {text[:200]}"
+        return ""
+
+
+def build_deferral_index(evs=None, project=None) -> DeferralIndex:
+    """Fold the record's standing deferrals. Total — never raises.
+
+    Reads incident records through `incidents.summaries()` (the public accessor,
+    not the private rule walker) and pinned caveats out of *evs*. Either source
+    being unavailable yields an emptier index, never an exception: a round that
+    could not read the deferrals must still run, and the cost of missing one is a
+    candidate proposed again, not a corrupted ledger."""
+    rule_reasons, caveat_texts = {}, []
+
+    try:
+        from . import incidents as incidents_mod
+        for record in incidents_mod.summaries(project) or []:
+            if not isinstance(record, dict):
+                continue
+            signature = str(record.get("signature") or "").strip()
+            rule = str(record.get("active_rule") or "")
+            if signature and rule and _DEFERRAL_RE.search(rule):
+                rule_reasons[signature] = (
+                    f"an active prevention rule defers this: {rule[:200]}")
+    except Exception:                                           # noqa: BLE001
+        pass
+
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "caveat":
+            continue
+        if "pinned" not in (getattr(ev, "tags", None) or []):
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("text") or "")
+        if text and _DEFERRAL_RE.search(text):
+            caveat_texts.append(text)
+
+    return DeferralIndex(rule_reasons, tuple(caveat_texts))
+
+
+def score_candidate(candidate, index=None) -> ScoreBreakdown:
+    """Score one candidate against the record. Pure, and total on junk input.
+
+    `occurrences` is coerced rather than trusted because a lens is the one thing
+    here that is not validated at a boundary — a lens returning ``None`` or a
+    bool must degrade to "seen once", not poison the arithmetic."""
+    occurrences = getattr(candidate, "occurrences", 1)
+    if isinstance(occurrences, bool) or not isinstance(occurrences, int):
+        occurrences = 1
+    recurrence = RECURRENCE_STEP * max(0, occurrences - 1)
+    severity = SEVERITY_BONUS if getattr(candidate, "severity", False) else 0
+    veto = index.veto_reason_for(candidate) if index is not None else ""
+    return ScoreBreakdown(recurrence=recurrence, severity=severity,
+                          veto_reason=veto)
+
+
 # --- the core ----------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -147,13 +289,28 @@ class Candidate:
     or signature that a reader can go and check. `fingerprint` identifies the
     CONDITION INSTANCE, not the condition — keyed on the bare lens name a
     candidate would fire once ever, and keyed on something that changes every
-    round it would never dedup."""
+    round it would never dedup.
+
+    Three fields are set by the LENS, because only the lens knows them:
+    `occurrences` (how many times its fold saw this condition), `severity`
+    (whether what it found is already blocking something), and `deferral_key`
+    (what the record would call this, so a standing deferral can be matched).
+
+    Two are set by the ROUND, overwriting whatever a lens put there: `score` and
+    `veto_reason`. Scoring lives in the round rather than the lens so one scale
+    governs every lens; a lens that scored itself would make the threshold
+    meaningless the moment two lenses disagreed about what 25 meant."""
 
     lens: str
     title: str
     fingerprint: str
     evidence: tuple = ()
-    score: float = 1.0
+    occurrences: int = 1
+    severity: bool = False
+    deferral_key: str = ""
+    depth: int = 1
+    score: float = BASE_SCORE
+    veto_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -169,7 +326,15 @@ class Placement:
 @dataclass
 class ReplenishConfig:
     enabled: bool = True
-    min_score: float = 0.5
+    # 0 means NO score floor, and that is the right bare default: the threshold
+    # is the ambition dial's to set (`ReplenishConfig.for_profile`), and a
+    # hard-coded one here would silently be a fourth ambition position that no
+    # operator chose. Phase 1's 0.5 was a placeholder on a scale that no longer
+    # exists — scores are integers now, base `BASE_SCORE`.
+    min_score: int = 0
+    # An injected step may itself propose work; that work may not. Depth 2 is
+    # where the tree stops being a plan and starts being a fan-out.
+    max_depth: int = 2
     # Deliberately small. A round that proposes more than a person will look at
     # is how an injector becomes noise, and phase 1 has no backpressure yet.
     max_per_round: int = 3
@@ -277,6 +442,17 @@ def refusal_reason(candidate, spent, cfg) -> str:
     if not evidence:
         return ("no evidence — a candidate must point at a real ledger row, "
                 "file, or signature")
+    if candidate.veto_reason:
+        # Its own branch rather than a score comparison: a veto zeroes the score,
+        # but the bare config has no score floor, so relying on the arithmetic
+        # would let a declined candidate through whenever no threshold was set.
+        # It also states WHICH record declined it, which "below the minimum"
+        # cannot.
+        return f"already declined — {candidate.veto_reason}"
+    if candidate.depth > cfg.max_depth:
+        return (f"depth {candidate.depth} exceeds the maximum injection depth "
+                f"{cfg.max_depth} — an injected step may propose work, its "
+                f"proposals may not")
     if candidate.score < cfg.min_score:
         return (f"score {candidate.score} below the round's minimum "
                 f"{cfg.min_score}")
@@ -297,10 +473,15 @@ def normalise(candidate) -> Candidate:
     evidence = tuple(e[:MAX_EVIDENCE_CHARS]
                      for e in (candidate.evidence or [])
                      if isinstance(e, str) and e.strip())[:MAX_EVIDENCE_ITEMS]
-    return Candidate(lens=str(candidate.lens)[:64],
-                     title=str(candidate.title)[:MAX_TITLE_CHARS],
-                     fingerprint=str(candidate.fingerprint)[:128],
-                     evidence=evidence, score=candidate.score)
+    # `replace` rather than a fresh construction: rebuilding field-by-field
+    # silently DROPS every field added later, and the fields most likely to be
+    # added are exactly the ones the gate reads (a veto, a depth). Clamp what has
+    # a contract cap; carry the rest through untouched.
+    return replace(candidate,
+                   lens=str(candidate.lens)[:64],
+                   title=str(candidate.title)[:MAX_TITLE_CHARS],
+                   fingerprint=str(candidate.fingerprint)[:128],
+                   evidence=evidence)
 
 
 def gate(candidates, spent, cfg):
@@ -397,7 +578,21 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
             # lens that keeps breaking becomes a prevention rule on its own.
             lens_errors.append((name, f"{type(exc).__name__}: {exc}"))
 
-    kept, refused = gate(candidates, hist.fingerprints, cfg)
+    # Scoring happens HERE rather than in each lens, so one scale governs all of
+    # them — the moment two lenses decide for themselves what 25 means, the
+    # threshold stops being a threshold. The deferral index is folded once for the
+    # whole round; per candidate it would be a ledger pass each.
+    deferrals = build_deferral_index(evs, project=project)
+    scored = []
+    for candidate in candidates:
+        if not isinstance(candidate, Candidate):
+            scored.append(candidate)        # gate() is where junk gets dropped
+            continue
+        breakdown = score_candidate(candidate, deferrals)
+        scored.append(replace(candidate, score=breakdown.total,
+                              veto_reason=breakdown.veto_reason))
+
+    kept, refused = gate(scored, hist.fingerprints, cfg)
     # R16 asks whether anything QUALIFIED, which is decided here. A round the cap
     # trimmed or the sink could not place found real work and must not report
     # itself dry — the CLI was printing "N candidate(s) did not fit" and
@@ -529,9 +724,15 @@ def evidence_gap(evs) -> list:
          else "no passing verification has ever been recorded"),
     ]
     evidence += [f"changed: {f}" for f in files[:_EVIDENCE_FILES]]
+    # `occurrences` is the change count the fold above already produced, and
+    # `severity` is asserted because unverified code IS the blocking condition
+    # (SOP change-audit §3) rather than a preference. No `deferral_key`: "run the
+    # suite" is not a thing the record can stand down from, so there is nothing
+    # for a deferral to match.
     return [Candidate(lens="evidence-gap", title=title[:MAX_TITLE_CHARS],
                       fingerprint=f"evidence-gap:{newest_ts}",
-                      evidence=tuple(evidence))]
+                      evidence=tuple(evidence),
+                      occurrences=count, severity=True)]
 
 
 LENSES["evidence-gap"] = evidence_gap
