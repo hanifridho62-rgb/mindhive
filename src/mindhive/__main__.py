@@ -600,10 +600,18 @@ def cmd_replenish_run(args) -> int | None:
     # hook, which already pays for several full ledger reads, and the sink would
     # otherwise read all 27k+ events a second time. Nothing is appended between
     # this read and the sink, so the snapshot is current.
+    # The session surface runs a PROFILE, not the whole registry. Without this it
+    # would run every registered lens — including `innovation`, which is gated to
+    # `ambitious` because it spends a model call, and which would therefore fire a
+    # headless `claude` on every single session end. There is no loop.toml here, so
+    # the surface takes the documented default position.
+    profile = rp_mod.PROFILES[rp_mod.DEFAULT_AMBITION]
     try:
         res = rp_mod.run_round(evs, surface="session",
                                sink=sink_mod.roadmap_sink(sid, evs=evs,
                                                           append=write),
+                               cfg=rp_mod.ReplenishConfig.for_profile(profile),
+                               lenses=rp_mod.lenses_for(profile),
                                session_id=sid, append=write)
     except Exception as exc:                                    # noqa: BLE001
         # The SessionEnd hook pipes stdout to Out-Null and a native non-zero

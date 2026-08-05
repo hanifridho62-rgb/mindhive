@@ -172,20 +172,19 @@ def test_a_crash_is_reported_on_stderr_and_exits_non_zero(monkeypatch, capsys):
     assert "replenish failed" in err and "the round exploded" in err
 
 
-def test_a_lens_failure_is_reported_and_does_not_claim_a_clean_record(capsys):
-    from mindhive import replenish as rp_mod
-
-    def boom(_evs):
+def test_a_lens_failure_is_reported_and_does_not_claim_a_clean_record(
+        monkeypatch, capsys):
+    # Patched over a lens the PROFILE actually runs. Registering a new name in
+    # LENSES no longer works, because this command runs the profile's lens set
+    # rather than the whole registry — which is the point of that change.
+    def boom(_ctx):
         raise RuntimeError("lens exploded")
 
-    rp_mod.LENSES["probe-boom"] = boom
-    try:
-        events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
-        assert main(["replenish", "run", "--session", SID]) == 0
-    finally:
-        rp_mod.LENSES.pop("probe-boom", None)
+    monkeypatch.setitem(replenish.LENSES, "coverage", boom)
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    assert main(["replenish", "run", "--session", SID]) == 0
     out = capsys.readouterr()
-    assert "lens probe-boom failed" in out.err
+    assert "lens coverage failed" in out.err
     assert "the record was not fully read" in out.out
     assert "nothing outstanding that the record proves" not in out.out
 
@@ -232,7 +231,10 @@ def test_the_cli_surfaces_real_tree_candidates(tmp_path, monkeypatch, capsys):
     tests_root = tmp_path / "tests"
     src_root.mkdir(parents=True)
     tests_root.mkdir(parents=True)
-    (src_root / "enormous.py").write_text("# line\n" * 1200, encoding="utf-8")
+    # Four thresholds deep, so it clears the session surface's `balanced` bar.
+    # A file barely over the line scores the base and is correctly refused —
+    # see test_a_module_barely_over_the_threshold_does_not_interrupt_work.
+    (src_root / "enormous.py").write_text("# line\n" * 4200, encoding="utf-8")
     monkeypatch.setattr(
         replenish, "resolve_trees",
         lambda _ctx: replenish.SourceTrees(str(src_root), str(tests_root),
@@ -244,3 +246,42 @@ def test_the_cli_surfaces_real_tree_candidates(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "injected [tech-debt]" in out
     assert "enormous.py" in out
+
+
+def test_the_session_surface_never_spends_a_model_call(monkeypatch, capsys):
+    """The defect this pins: `run_round` with no lens set runs the WHOLE registry.
+
+    `innovation` is gated to `ambitious` because it costs a model call, and this
+    command runs inside the SessionEnd hook — so without a profile every session
+    end on this machine would fire a headless `claude`."""
+    fired = {"n": 0}
+
+    def tripwire(_ctx):
+        fired["n"] += 1
+        return []
+
+    monkeypatch.setitem(replenish.LENSES, "innovation", tripwire)
+    _outstanding()
+    assert main(["replenish", "run", "--session", SID]) == 0
+    capsys.readouterr()
+    assert fired["n"] == 0
+
+
+def test_the_session_surface_runs_the_deterministic_lenses(monkeypatch, capsys):
+    # The mirror of the test above: proving innovation is skipped is only
+    # meaningful if the other lenses are demonstrably reached.
+    reached = set()
+
+    def spy(name):
+        def lens(_ctx):
+            reached.add(name)
+            return []
+        return lens
+
+    for name in replenish.PROFILES[replenish.DEFAULT_AMBITION].lens_names:
+        monkeypatch.setitem(replenish.LENSES, name, spy(name))
+    _outstanding()
+    main(["replenish", "run", "--session", SID])
+    capsys.readouterr()
+    assert reached == set(
+        replenish.PROFILES[replenish.DEFAULT_AMBITION].lens_names)

@@ -669,3 +669,32 @@ def test_coverage_on_a_missing_tree_yields_nothing_and_does_not_raise():
 
 def test_the_coverage_lens_is_registered():
     assert replenish.LENSES["coverage"] is replenish.coverage
+
+
+def test_a_module_barely_over_the_threshold_does_not_interrupt_work(tmp_path):
+    # Base 10 only, which is below every dial position. Deliberate: a file just
+    # past the line is debt accruing, not a reason to add work to a plan.
+    ctx = _trees(tmp_path, modules=[("just_over.py", 1100)])
+    cand = replenish.technical_debt(ctx)[0]
+    assert replenish.score_candidate(cand).total == 10
+    assert (replenish.score_candidate(cand).total
+            < min(p.min_score for p in replenish.PROFILES.values()))
+
+
+def test_a_badly_oversized_module_does_land(tmp_path):
+    # The bug this pins: without a magnitude term the line condition was DEAD —
+    # no oversized module could ever have cleared any threshold.
+    ctx = _trees(tmp_path, modules=[("enormous.py", 4200)])
+    cand = replenish.technical_debt(ctx)[0]
+    assert cand.occurrences == 4
+    assert (replenish.score_candidate(cand).total
+            >= replenish.PROFILES["balanced"].min_score)
+
+
+def test_debt_score_rises_with_how_far_past_the_threshold_a_module_is(tmp_path):
+    scores = []
+    for index, lines in enumerate((1100, 2100, 3100)):
+        ctx = _trees(tmp_path / f"t{index}", modules=[("m.py", lines)])
+        scores.append(replenish.score_candidate(
+            replenish.technical_debt(ctx)[0]).total)
+    assert scores == sorted(scores) and len(set(scores)) == 3

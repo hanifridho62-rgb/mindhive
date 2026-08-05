@@ -1356,6 +1356,13 @@ def technical_debt(arg) -> list:
             evidence=(f"{relative} is {lines} lines",
                       f"threshold is {LINE_THRESHOLD} lines",
                       f"module {stem}"),
+            # How many thresholds deep it is. Without this term the condition was
+            # DEAD: base 10 alone is below every dial position, so no oversized
+            # module could ever have landed anywhere. Magnitude is the honest
+            # signal here — a file at three times the threshold is one the record
+            # insists on three times as hard as one barely over it, and a file
+            # barely over it genuinely should not interrupt the operator's work.
+            occurrences=max(1, lines // LINE_THRESHOLD),
             deferral_key=relative))
 
     for path in _pending_review_files(ctx.project):
