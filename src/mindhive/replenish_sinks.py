@@ -23,8 +23,13 @@ Phase 3's loop sink lands checklist items instead, so that
 `loop.task.required_remaining_count` rises and `loop.safeguards.should_exit`
 refuses to exit. Same core, different sink.
 """
+import re
+from pathlib import Path
+
 from . import events as ev_mod
+from . import paths as paths_mod
 from . import roadmap as rm_mod
+from .loop.task import _FUTURE_HEADING
 from .replenish import Placement
 from .sop import ID_RE
 
@@ -93,5 +98,118 @@ def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
         placements = [Placement(c.fingerprint, sid, len(existing) + i)
                       for i, c in enumerate(take)]
         return placements, dropped
+
+    return sink
+
+
+# --- the loop surface ---------------------------------------------------------
+
+# The marker, written exactly as `roadmap.NEW_MARKER` spells it and exactly as
+# `loop.task._NEW_MARKER` parses it back.
+_NEW = rm_mod.NEW_MARKER
+
+# Anything that could turn one line into two checklist items, or forge a heading.
+# A title is derived from ledger text and file paths, so it is not hostile — but
+# it is not controlled either, and a title able to inflate
+# `required_remaining_count` would let one candidate refuse the exit forever.
+_LINE_BREAKING = re.compile(r"\s+")
+_ITEM_MARKER = re.compile(r"^\s*(?:[-*]\s*\[[^\]]*\]|#+)\s*")
+
+# A checklist line long enough to wrap is a line nobody reads. Matches
+# `roadmap.MAX_STEP_CHARS` so the same work reads identically on both surfaces.
+MAX_LINE_CHARS = rm_mod.MAX_STEP_CHARS
+
+
+def _one_line(text) -> str:
+    """Collapse *text* to a single safe checklist fragment."""
+    flat = _LINE_BREAKING.sub(" ", str(text or "")).strip()
+    # Repeatedly, because "- [ ] - [ ] x" would otherwise survive one pass and
+    # still forge an item.
+    while True:
+        stripped = _ITEM_MARKER.sub("", flat)
+        if stripped == flat:
+            break
+        flat = stripped
+    return " ".join(flat.split())
+
+
+def fix_plan_line(candidate) -> str:
+    """One `fix_plan.md` checklist line for a kept candidate.
+
+    Shaped `- [ ] (new) <title>: <why>`. The `why` is the lens plus its first
+    piece of evidence, which is what makes the line actionable for the agent that
+    reads this file — it can see both the task and the fact that produced it
+    without going to the ledger."""
+    title = _one_line(candidate.title) or "(untitled)"
+    first_evidence = next((e for e in (candidate.evidence or ())
+                           if isinstance(e, str) and e.strip()), "")
+    why = _one_line(f"{candidate.lens} lens"
+                    + (f" — {first_evidence}" if first_evidence else ""))
+    line = f"- [ ] {_NEW}{title}: {why}"
+    return line[:MAX_LINE_CHARS]
+
+
+def _insertion_index(lines) -> int:
+    """Where a required item goes: immediately before the first Future/Optional
+    heading, or at the end when there is none.
+
+    `_FUTURE_HEADING` is imported from `loop.task` rather than re-expressed. That
+    regex is what `required_remaining_count` and `plan_items` already split on, so
+    a second copy here would diverge the first time the scaffold's wording moved —
+    and the symptom would be injected work landing below the line that makes it
+    non-blocking, i.e. an injector that no longer forces anything."""
+    for index, line in enumerate(lines):
+        if _FUTURE_HEADING.match(line):
+            return index
+    return len(lines)
+
+
+def fix_plan_sink(loop_dir, run_id="", append=True):
+    """A sink that lands kept candidates as REQUIRED checklist items.
+
+    Returns ``(placements, dropped)``, the same contract `roadmap_sink` honours.
+    The forcing mechanism is the count, not the marker: an unchecked item above
+    the Future heading raises `loop.task.required_remaining_count`, and
+    `loop.safeguards.should_exit` already refuses to exit while any remains.
+    Nothing in a prompt asks the agent to keep going (SOP `agentic-loops` §1).
+
+    A missing `fix_plan.md` reports everything as dropped and writes nothing. It
+    does not create the file: the loop scaffolds its own directory, so an absent
+    checklist means this sink was pointed somewhere that is not a loop — and
+    inventing one there would put required work where no run will ever read it.
+    The dropped candidates keep their fingerprints unspent, so the next round may
+    try again."""
+    plan_path = Path(loop_dir) / "fix_plan.md"
+
+    def sink(kept):
+        candidates = list(kept)
+        if not candidates:
+            return [], 0
+        try:
+            original = plan_path.read_text(encoding="utf-8")
+        except OSError:
+            return [], len(candidates)
+
+        lines = original.splitlines()
+        # Index among REQUIRED items, which is what a placement addresses — a raw
+        # line number would move whenever anything above it was edited.
+        required_before = sum(
+            1 for line in lines[:_insertion_index(lines)]
+            if line.lstrip().startswith(("- [", "* [")))
+
+        at = _insertion_index(lines)
+        new_lines = lines[:at] + [fix_plan_line(c) for c in candidates] + lines[at:]
+        text = "\n".join(new_lines)
+        if original.endswith("\n"):
+            text += "\n"
+
+        if append:
+            # Atomic: a torn write would corrupt the loop's only source of
+            # required work, and the run reads this file every iteration.
+            paths_mod.write_text_atomic(plan_path, text)
+        placements = [Placement(c.fingerprint, str(run_id or ""),
+                                required_before + i)
+                      for i, c in enumerate(candidates)]
+        return placements, 0
 
     return sink
