@@ -162,3 +162,203 @@ def test_score_is_optional():
     payload = _landed()
     del payload["score"]
     _check(payload)
+
+
+# --- the core ----------------------------------------------------------------
+
+def _cand(fp="fp-1", **over):
+    kw = {"lens": "test-lens", "title": "do the thing", "fingerprint": fp,
+          "evidence": ("code_change @ ts",), "score": 1.0}
+    kw.update(over)
+    return replenish.Candidate(**kw)
+
+
+def _sink(placed_plan="plan-1", drop=0):
+    """A stub sink. Its existence is the point of the design: the core takes the
+    sink as a parameter, so a full round runs with no surface present."""
+    def sink(kept):
+        keep = kept[:len(kept) - drop] if drop else kept
+        return ([replenish.Placement(c.fingerprint, placed_plan, i)
+                 for i, c in enumerate(keep)], drop)
+    return sink
+
+
+def _rows():
+    return [e.payload for e in events.read_all() if e.type == "work_injected"]
+
+
+def test_a_candidate_without_evidence_is_refused_with_a_reason():
+    kept, refused = replenish.gate([_cand(evidence=())], frozenset(),
+                                   replenish.ReplenishConfig())
+    assert kept == []
+    assert "no evidence" in refused[0][1]
+
+
+def test_a_candidate_whose_evidence_is_blank_is_refused():
+    # AE2: the pointer must resolve to something, not merely exist.
+    kept, refused = replenish.gate([_cand(evidence=("   ",))], frozenset(),
+                                   replenish.ReplenishConfig())
+    assert kept == []
+    assert "no evidence" in refused[0][1]
+
+
+def test_a_spent_fingerprint_is_refused_as_a_duplicate():
+    kept, refused = replenish.gate([_cand()], frozenset({"fp-1"}),
+                                   replenish.ReplenishConfig())
+    assert kept == []
+    assert "already proposed" in refused[0][1]
+
+
+def test_two_lenses_proposing_the_same_condition_produce_one_piece_of_work():
+    kept, refused = replenish.gate([_cand(), _cand(lens="other")], frozenset(),
+                                   replenish.ReplenishConfig())
+    assert len(kept) == 1
+    assert len(refused) == 1
+
+
+def test_a_candidate_below_min_score_is_refused():
+    cfg = replenish.ReplenishConfig(min_score=0.9)
+    kept, refused = replenish.gate([_cand(score=0.1)], frozenset(), cfg)
+    assert kept == []
+    assert "below the round's minimum" in refused[0][1]
+
+
+def test_history_is_recovered_from_the_ledger_with_no_sidecar():
+    # AE3 precursor: the injector's state must survive a process boundary
+    # without a file, because a sidecar is a second source of truth.
+    replenish.run_round([], surface="session", sink=_sink(),
+                        lenses={"l": lambda _e: [_cand("fp-a")]})
+    hist = replenish.history(events.read_all())
+    assert "fp-a" in hist.fingerprints
+    assert hist.last_round == 1
+    assert hist.dry_rounds == 0
+
+
+def test_a_refused_candidates_fingerprint_is_also_spent():
+    replenish.run_round([], surface="session", sink=_sink(),
+                        lenses={"l": lambda _e: [_cand("fp-b", evidence=())]})
+    assert "fp-b" in replenish.history(events.read_all()).fingerprints
+
+
+def test_history_skips_a_malformed_row_without_raising():
+    events.append_event("work_injected", ["not", "a", "dict"])
+    events.append_event("work_injected", {"outcome": "from-the-future",
+                                          "round": 9, "surface": "session"})
+    events.append_event("work_injected",
+                        {"outcome": "landed", "round": 2, "surface": "session",
+                         "lens": "l", "title": "t", "fingerprint": "fp-c",
+                         "evidence": ["e"]})
+    hist = replenish.history(events.read_all())
+    assert hist.fingerprints == frozenset({"fp-c"})
+    assert hist.last_round == 2
+
+
+def test_a_cap_that_truncates_a_round_is_recorded():
+    # AE5: a silent cut reads as "nothing more was found".
+    cfg = replenish.ReplenishConfig(max_per_round=1)
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(), cfg=cfg,
+        lenses={"l": lambda _e: [_cand("fp-1"), _cand("fp-2")]})
+    assert len(res.landed) == 1
+    assert res.dropped == 1
+    truncated = [r for r in _rows() if r["outcome"] == "truncated"]
+    assert truncated and truncated[0]["dropped"] == 1
+
+
+def test_a_truncated_candidate_stays_unspent_so_it_returns_next_round():
+    cfg = replenish.ReplenishConfig(max_per_round=1)
+    lenses = {"l": lambda _e: [_cand("fp-1"), _cand("fp-2")]}
+    replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                        lenses=lenses)
+    hist = replenish.history(events.read_all())
+    assert "fp-1" in hist.fingerprints
+    assert "fp-2" not in hist.fingerprints
+
+
+def test_a_candidate_the_sink_could_not_place_gets_no_row():
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(drop=1),
+        lenses={"l": lambda _e: [_cand("fp-1"), _cand("fp-2")]})
+    assert len(res.landed) == 1
+    assert res.dropped == 1
+    assert "fp-2" not in replenish.history(events.read_all()).fingerprints
+
+
+def test_a_round_that_lands_nothing_records_a_dry_row():
+    res = replenish.run_round([], surface="session", sink=_sink(),
+                              lenses={"l": lambda _e: []})
+    assert res.dry
+    assert [r for r in _rows() if r["outcome"] == "dry"]
+
+
+def test_two_dry_rounds_end_replenishment_and_no_lens_runs():
+    calls = []
+
+    def lens(_evs):
+        calls.append(1)
+        return []
+
+    for _ in range(2):
+        replenish.run_round(events.read_all(), surface="session",
+                            sink=_sink(), lenses={"l": lens})
+    assert len(calls) == 2
+
+    res = replenish.run_round(events.read_all(), surface="session",
+                              sink=_sink(), lenses={"l": lens})
+    assert not res.ran
+    assert res.skipped == "dry rounds exhausted"
+    assert len(calls) == 2          # the third round never invoked the lens
+
+
+def test_work_landing_breaks_the_dry_streak():
+    replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                        lenses={"l": lambda _e: []})
+    replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                        lenses={"l": lambda _e: [_cand("fp-x")]})
+    assert replenish.history(events.read_all()).dry_rounds == 0
+
+
+def test_a_broken_lens_does_not_cost_the_round():
+    def boom(_evs):
+        raise RuntimeError("lens exploded")
+
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(),
+        lenses={"bad": boom, "good": lambda _e: [_cand("fp-good")]})
+    assert len(res.landed) == 1
+
+
+def test_a_disabled_round_does_nothing_at_all():
+    cfg = replenish.ReplenishConfig(enabled=False)
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses={"l": lambda _e: [_cand()]})
+    assert not res.ran
+    assert _rows() == []
+
+
+def test_append_false_decides_without_writing():
+    res = replenish.run_round([], surface="session", sink=_sink(),
+                              append=False,
+                              lenses={"l": lambda _e: [_cand()]})
+    assert len(res.landed) == 1
+    assert _rows() == []
+
+
+def test_landed_row_points_at_the_work_it_produced():
+    replenish.run_round([], surface="session", sink=_sink("session-42"),
+                        lenses={"l": lambda _e: [_cand()]})
+    landed = [r for r in _rows() if r["outcome"] == "landed"][0]
+    assert landed["plan_id"] == "session-42"
+    assert landed["step_index"] == 0
+    assert landed["evidence"] == ["code_change @ ts"]
+
+
+def test_the_core_does_not_import_a_sink():
+    # The whole reason `sink` is a parameter: the loop sink lands checklist
+    # items, the session sink lands roadmap steps, and the decision layer must
+    # not know which surface called it.
+    src = (replenish.__file__)
+    with open(src, encoding="utf-8") as fh:
+        body = fh.read()
+    assert "import roadmap" not in body
+    assert "from .roadmap" not in body

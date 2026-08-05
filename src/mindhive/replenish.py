@@ -44,6 +44,10 @@ recorded fact, not the absence of one: the two-consecutive-empty-rounds exit
 cannot be derived from silence.
 """
 
+from dataclasses import dataclass, field
+
+from . import events as ev_mod
+
 # Outcome vocabulary. `landed` and `refused` are per-candidate; `truncated` and
 # `dry` are per-round facts about the round itself.
 OUTCOMES = ("landed", "refused", "truncated", "dry")
@@ -124,3 +128,238 @@ def validate_payload(payload) -> None:
     if score is not None and (isinstance(score, bool)
                               or not isinstance(score, (int, float))):
         raise ValueError("work_injected score must be a number when present")
+
+
+# --- the core ----------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Candidate:
+    """One proposal from one lens.
+
+    `evidence` is what makes it admissible: a pointer to a real ledger row, file,
+    or signature that a reader can go and check. `fingerprint` identifies the
+    CONDITION INSTANCE, not the condition — keyed on the bare lens name a
+    candidate would fire once ever, and keyed on something that changes every
+    round it would never dedup."""
+
+    lens: str
+    title: str
+    fingerprint: str
+    evidence: tuple = ()
+    score: float = 1.0
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where a landed candidate actually went. Returned by the sink, recorded on
+    the `landed` row, so an audit row points at the work it produced."""
+
+    fingerprint: str
+    plan_id: str = ""
+    step_index: int = -1
+
+
+@dataclass
+class ReplenishConfig:
+    enabled: bool = True
+    min_score: float = 0.5
+    # Deliberately small. A round that proposes more than a person will look at
+    # is how an injector becomes noise, and phase 1 has no backpressure yet.
+    max_per_round: int = 3
+    dry_rounds_to_exit: int = 2
+
+
+@dataclass(frozen=True)
+class History:
+    """The injector's state, recovered from the ledger alone."""
+
+    fingerprints: frozenset = frozenset()
+    last_round: int = 0
+    dry_rounds: int = 0
+
+
+@dataclass
+class RoundResult:
+    round_no: int = 0
+    landed: list = field(default_factory=list)      # [(Candidate, Placement)]
+    refused: list = field(default_factory=list)     # [(Candidate, reason)]
+    dropped: int = 0
+    dry: bool = False
+    skipped: str = ""
+
+    @property
+    def ran(self) -> bool:
+        return not self.skipped
+
+
+# Lens registry: name -> callable(evs) -> [Candidate]. Populated at module level
+# by each lens below, so a caller can run the standard set without naming them
+# and a test can pass its own.
+LENSES: dict = {}
+
+
+def history(evs) -> History:
+    """Fold `work_injected` rows into the state a round needs.
+
+    Total, per the ledger's read contract: a row whose payload is not a dict, or
+    whose `outcome` is not one this version knows, is skipped rather than
+    raising. The ledger holds history written by every past version of this code
+    and will hold rows written by future ones.
+
+    A REFUSED candidate's fingerprint is spent too. That is deliberate: re-
+    proposing something already judged not worth doing is exactly the loop the
+    dedup exists to prevent, and without it a refused candidate would return
+    every single round forever."""
+    spent, last, dry = set(), 0, 0
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "work_injected":
+            continue
+        p = getattr(ev, "payload", None)
+        if not isinstance(p, dict):
+            continue
+        outcome = p.get("outcome")
+        if outcome not in OUTCOMES:
+            continue
+        r = p.get("round")
+        if isinstance(r, int) and not isinstance(r, bool) and r > last:
+            last = r
+        fp = p.get("fingerprint")
+        if isinstance(fp, str) and fp.strip():
+            spent.add(fp)
+        if outcome == "dry":
+            dry += 1
+        elif outcome == "landed":
+            dry = 0            # real work landed: the streak is broken
+    return History(frozenset(spent), last, dry)
+
+
+def refusal_reason(candidate, spent, cfg) -> str:
+    """Why this candidate may not become work, or "" when it may.
+
+    Evidence is checked first and unconditionally. Everything else here is a
+    policy knob an operator can loosen; this one is the rule that separates
+    replenishment from inventing work to fill a quota."""
+    evidence = [e for e in (candidate.evidence or [])
+                if isinstance(e, str) and e.strip()]
+    if not evidence:
+        return ("no evidence — a candidate must point at a real ledger row, "
+                "file, or signature")
+    if not (candidate.fingerprint or "").strip():
+        return "no fingerprint — this candidate could never be deduplicated"
+    if candidate.fingerprint in spent:
+        return "already proposed — this fingerprint is spent"
+    if candidate.score < cfg.min_score:
+        return (f"score {candidate.score} below the round's minimum "
+                f"{cfg.min_score}")
+    return ""
+
+
+def gate(candidates, spent, cfg):
+    """``(kept, refused)`` — refused entries carry their reason.
+
+    Fingerprints of kept candidates join the spent set as we go, so two lenses
+    proposing the same condition in one round produce one piece of work and one
+    recorded duplicate refusal, not two pieces of work."""
+    kept, refused = [], []
+    seen = set(spent)
+    for c in candidates or []:
+        if not isinstance(c, Candidate):
+            continue           # a lens returning junk is a bug, not a decision
+        reason = refusal_reason(c, seen, cfg)
+        if reason:
+            refused.append((c, reason))
+            continue
+        seen.add(c.fingerprint)
+        kept.append(c)
+    return kept, refused
+
+
+def _row(outcome, round_no, surface, **extra) -> dict:
+    payload = {"outcome": outcome, "round": round_no, "surface": surface}
+    payload.update({k: v for k, v in extra.items() if v not in (None, "")})
+    return payload
+
+
+def _record(rows, project=None, session_id=None) -> list:
+    """Append each row after validating it. A row that fails its own contract is
+    a bug here, not in the ledger — surface it rather than writing a payload the
+    fold would later have to skip."""
+    out = []
+    for payload in rows:
+        validate_payload(payload)
+        out.append(ev_mod.append_event(
+            "work_injected", payload, session_id=session_id,
+            tags=["replenish", payload["outcome"]], project=project))
+    return out
+
+
+def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
+              session_id=None, append=True) -> RoundResult:
+    """Run one replenishment round and record what it decided.
+
+    *sink* is a parameter, not an import: deciding what is outstanding is
+    surface-independent, forcing it is not. It is called with the kept
+    candidates and returns ``(placements, dropped)``.
+
+    A candidate the sink could not place gets NO row, so its fingerprint stays
+    unspent and it can be proposed again next round. Same for candidates the cap
+    cut — a truncation is "not now", not "never"."""
+    cfg = cfg or ReplenishConfig()
+    if not cfg.enabled:
+        return RoundResult(skipped="disabled")
+
+    hist = history(evs)
+    if hist.dry_rounds >= cfg.dry_rounds_to_exit:
+        return RoundResult(round_no=hist.last_round,
+                           skipped="dry rounds exhausted")
+    round_no = hist.last_round + 1
+
+    candidates = []
+    for name, lens in (LENSES if lenses is None else lenses).items():
+        try:
+            candidates.extend(lens(evs) or [])
+        except Exception:                                       # noqa: BLE001
+            # One broken lens must not cost the round every other lens found.
+            continue
+
+    kept, refused = gate(candidates, hist.fingerprints, cfg)
+    dropped = 0
+    if len(kept) > cfg.max_per_round:
+        dropped = len(kept) - cfg.max_per_round
+        kept = kept[:cfg.max_per_round]
+
+    placements, sink_dropped = ([], 0)
+    if kept:
+        placements, sink_dropped = sink(kept)
+    dropped += max(0, int(sink_dropped or 0))
+
+    placed = {p.fingerprint: p for p in (placements or [])}
+    landed = [(c, placed[c.fingerprint]) for c in kept
+              if c.fingerprint in placed]
+
+    rows = []
+    for c, pl in landed:
+        rows.append(_row("landed", round_no, surface, lens=c.lens,
+                         title=c.title[:MAX_TITLE_CHARS],
+                         fingerprint=c.fingerprint,
+                         evidence=[str(e)[:MAX_EVIDENCE_CHARS]
+                                   for e in c.evidence][:MAX_EVIDENCE_ITEMS],
+                         score=c.score, plan_id=pl.plan_id,
+                         step_index=pl.step_index if pl.step_index >= 0 else None))
+    for c, reason in refused:
+        rows.append(_row("refused", round_no, surface, lens=c.lens,
+                         title=(c.title or "(untitled)")[:MAX_TITLE_CHARS],
+                         fingerprint=c.fingerprint or "unfingerprinted",
+                         reason=reason[:MAX_REASON_CHARS]))
+    if dropped:
+        # R15: a cap that cut silently would read as "nothing more was found".
+        rows.append(_row("truncated", round_no, surface, dropped=dropped))
+    dry = not landed
+    if dry:
+        rows.append(_row("dry", round_no, surface))
+
+    if append:
+        _record(rows, project=project, session_id=session_id)
+
+    return RoundResult(round_no=round_no, landed=landed, refused=refused,
+                       dropped=dropped, dry=dry)
