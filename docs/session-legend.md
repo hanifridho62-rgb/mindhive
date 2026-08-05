@@ -1,92 +1,259 @@
-# Session Legend — autonomous close-out of PR #49 (Self-Reliant)
+# Session Legend — the MindHive address map
 
-This is the handoff map for scheduled, no-human-input sessions. Read it first;
-it tells you what this project is, where the work stands, exactly what to do,
-and how to budget the session. **The mission ends when PR #49 is green and
-merged into master** — after that, disable/delete the recurring schedule and
-stop.
+Where things live and which module owns what. This is the "MAP THE ADDRESSES"
+document that SOP `execution-discipline` (§7) asks for: read it to find the
+right file fast, not to learn what to work on.
 
-## Final goal
+It maps **code**. Two neighbours own the other halves, and this file
+deliberately does not duplicate them:
 
-- **PR:** https://github.com/hanifridho62-rgb/Lintester-project/pull/49
-  (`claude/phase-2-roadmap-1cfa15` → `master`)
-- **Done means:** all 4 CI checks green (ubuntu/windows × py3.11/3.12), no
-  unresolved review comments, no merge conflicts, PR merged (this repo uses
-  plain merge commits — see `git log` on master), branch deleted, and the
-  recurring schedule removed.
+- [`docs/DATA_MODEL.md`](DATA_MODEL.md) — the store contract: tables, event
+  schema, payload contracts, invariants, how to add an event type. **When this
+  file and the code disagree, the code wins. When this file and DATA_MODEL.md
+  disagree about the store, DATA_MODEL.md wins.**
+- `../CLAUDE.md` — the standing project rules (dashboard, change-log, Stop
+  hook, land-green). Those are binding; this file is a map.
 
-## What this project is (60-second map)
+Current state of the work lives in the ledger, not here: `hive state`,
+`hive briefing`, `hive sop list`, `hive recall "<topic>"`.
+
+## 60-second orientation
 
 **MindHive** is a deterministic, event-sourced memory system for Claude Code.
-Append-only events (`src/mindhive/events.py`) flow into projections: recall,
-graph, briefing, incidents → reflection → prevention rules ("Improvements"),
-and a local dashboard (`src/mindhive/dashboard.py`, fixed port 54461).
+Append-only events are the single source of truth; every `.md`/`.json` beside
+them is a rebuildable projection. On top of that ledger sit three governing
+layers: deterministic **hooks** that fire on every session/prompt/tool call, a
+**phase spine** (MindNetwork) that gates how work proceeds, and a local
+**dashboard** that renders all of it.
 
-Key surfaces:
-- **Dashboard** — `dashboard.py` (HTTP routes) + `dashboard_page.py` (shell UI);
-  full-page iframe views: `workspace_page.py` (MindParallel), `swarm_page.py`
-  (MindSwarm), `research_page.py` (Self-Reliant, NEW in this PR).
-- **Workspace** — `workspace.py`: fleet of headless `claude` subprocess agents
-  (Manager/Agent), account profiles via `CLAUDE_CONFIG_DIR`, recipes, kanban.
-- **Self-Reliant** (this PR) — `research.py`: autonomous autoresearch loop.
-  Researcher agent edits `train.py`; Python enforces a 5-min training watchdog,
-  leaderboard, terminators, and memory write-back. WSL bring-up (U1) is
-  manual-gated: `scripts/self_reliant/bring_up.sh` — **never run it yourself**.
-- **Plan executed:** `docs/plans/2026-07-12-001-feat-self-reliant-autoresearch-plan.md`
-  (U2–U11 shipped; read it for design rationale KTD1–KTD11).
+Console entry point: `hive` → `mindhive.__main__:main` (`pyproject.toml`
+`[project.scripts]`). Subcommands: `append hook session project state projects
+directives context packs verify selftest premise recall consolidate gc export
+embed briefing review log sop roadmap mindnet autoresume graph plugins skills
+clusters sync dashboard harvest autosync loop flag failures rules triggers
+enrich`.
 
-## Session playbook (run this every session, in order)
+> **Probing the CLI from a worktree gives you the wrong branch.** The venv's
+> editable install points at `C:\Users\hanif\mindhive`, so a bare
+> `python -m mindhive …` runs the *main checkout's* branch no matter which
+> worktree you are in — `hive session` was silently absent from `--help` for
+> exactly this reason while writing this file. Scope it explicitly:
+> `PYTHONPATH=<worktree>/src`. (pytest is already handled by the root
+> `conftest.py`; subprocesses are not.)
 
-1. `gh pr view 49 --json state,mergeable,reviewDecision,statusCheckRollup`
-   - **MERGED** → delete the recurring schedule, append a `decision` to the
-     hive ledger, stop. Mission complete.
-   - **CLOSED (not merged)** → stop and leave a note for the human; do not
-     reopen or force anything.
-2. **CI failing?** Check out `claude/phase-2-roadmap-1cfa15` in a worktree,
-   reproduce with `C:/Users/hanif/mindhive/.venv/Scripts/python.exe -m pytest tests -q`
-   (from the worktree; bare `python` is not on PATH). Fix root-cause (use
-   systematic-debugging), commit, push. Likely weak spots: timing-sensitive
-   controller tests on slow CI runners (`tests/test_research.py` — widen
-   waits/timeouts rather than deleting assertions), POSIX vs Windows process
-   semantics in `run_experiment`/`_kill_tree`.
-3. **CI pending?** Don't burn the session waiting. If nothing else is
-   actionable, end the session early — the next scheduled run will see the
-   result.
-4. **Review comments?** Address each root-cause (ce-resolve-pr-feedback shape:
-   assess validity, fix, reply), commit, push.
-5. **Merge conflicts with master?** Merge master into the branch, resolve,
-   run the full suite, push.
-6. **All green + no comments + mergeable?** Merge:
-   `gh pr merge 49 --merge --delete-branch`. Then do step 1's MERGED actions.
-7. Whatever you did, record it: `python -m mindhive append decision|caveat "<one line>" --tags self-reliant, pr-49`
-   (use the repo venv python).
+## Module ownership
 
-## Usage budget (estimate + rule)
+All paths relative to `src/mindhive/`.
 
-The building session that produced this PR (ported Phase 1, built the
-controller + terminator matrix + UI + routes, 62 tests, browser verification)
-consumed roughly one full 5-hour usage window on Fable 5 — treat that as the
-ceiling of what one session can build. Scheduled close-out sessions are much
-cheaper; budget rule:
+### The spine of the CLI
 
-- **CI-fix iteration:** ~5–15% of a window each — you can afford several.
-- **Review-response round:** ~10–20%.
-- **Full-suite local run:** cheap in tokens, ~2 min wall-clock.
-- **Decision rule:** at session start, pick the single smallest action that
-  advances PR #49 (steps above are already ordered). Do not start new feature
-  work in these sessions; if the PR is blocked on something only the human can
-  do (e.g. a review), say so in the session output and end early. Ending early
-  is success, not failure — the 5-hour cadence exists because usage refreshes
-  every 5 hours.
+| Module | Owns |
+|---|---|
+| `__main__.py` | The whole argparse tree **and** the live-hook dispatcher (`cmd_hook`). ~3.4k lines — past the thermo-nuclear 1000-line threshold; a known standing caveat, treat additions here with suspicion. |
+| `paths.py` | **Every on-disk location.** `store_home()`, `detect_project()`, `project_dir()`, `events_dir()`, `runs_dir()`, plus `write_text_atomic`. Never hand-build a store path; call these. |
+| `events.py` | The event record: schema, `VALID_TYPES` registry, `canonical_json`, `append_event`. A new event type starts here (procedure: DATA_MODEL.md §6). |
+
+### Ledger → projections
+
+| Module | Owns |
+|---|---|
+| `projector.py` | The fold. Events → `STATE.md`, `LEDGER/*.md`, `index.json`. Also where the SOP block gets embedded into STATE (`sop.block(evs)`). |
+| `chain.py` | Tamper-evident hash chain over **every** event in the ledger — no type filter, telemetry included. Prefix-consistency check against the `chain.json` checkpoint (`hive verify`). "Deterministic" means off the *semantic* layer, not off the chain (DATA_MODEL.md §3.1). |
+| `briefing.py` / `sync.py` | `BRIEFING.md`, and the auto-loaded `MEMORY.md` that Claude reads at session start. |
+| `recall.py`, `vectors.py` | Search over the LEDGER corpus; `vectors` is the optional `--semantic` index. |
+| `dedupe.py`, `consolidate.py` | Meaning-aware dedup; the "dreaming" pass that folds reworded repeats. |
+| `graph.py`, `graphview.py` | Knowledge graph build + its rendered view. |
+| `harvest.py`, `hookcapture.py`, `failures.py` | Getting events *in*: transcript harvest (cursored), live hook capture, tool-failure capture. |
+| `export.py`, `runlog.py`, `hygiene.py`, `migrate.py` | Portable handoff (`hive export`), per-run artifacts under `runs/`, store health (`hive gc` → `hygiene.report`/`prune`), and a one-off import from a legacy memory file / Pensyve (`migrate.py`). **`migrate.py` is not a schema migration and has no CLI subcommand** — its only non-self caller is `tests/test_migrate.py`. The ledger itself is never migrated (`events.py`). |
+
+### Governance — the deterministic policy tier
+
+| Module | Owns |
+|---|---|
+| `sop.py` | The managed SOP registry — `hive sop {add,update,delete,list,show}`. (**`hive sop preflight` does not exist**, despite SOP `execution-discipline` §1 telling every session to run it.) **There is no `sopgate.py`** — SOPs reach a *Claude session* through two paths only: `projector.py` embeds `sop.block()` into STATE.md, and `mindnet/advice.py` resolves them per-phase into the injected block. (`dashboard.py` also renders the Sops section, and `hive sop` edits the registry; every other module importing `sop` takes only `ID_RE`, the id regex — not the content.) |
+| `promptgate.py` | The UserPromptSubmit prompt-quality gate: assess the typed prompt, inject proven-skill directives, train/store trigger rules, record the causal "directed by prompt-gate" trace, beat the faculty cats. |
+| `premise.py` | The premise gate — mechanically checks the checkable claims a prompt makes (file paths, roadmap ids, test counts) against the record. |
+| `style.py` | The standing reply-style pass (caveman by default, prose when asked to teach). Mode persisted in `style_mode.json`. |
+| `enrich.py` | Clarifying questions appended to a fired gate context; also the Oversee enrichment. |
+| `enforce.py` + `gateguard.py` | The PreToolUse **deny** rung. `enforce.hook_decision` is the decision function; `gateguard` holds the pure classifiers behind the static policy tier. |
+| `incidents.py`, `signature.py`, `reflect.py`, `resolve.py` | The failure loop: `tool_failed` → canonical signature → incident record → prevention rule → resolution. |
+| `changelog.py`, `review.py`, `verify.py` | The three blocking gates: mandatory code change-log, thermo-nuclear review queue, mechanical test-run evidence. |
+| `directives.py` | The operating directives injected at SessionStart. |
+| `roadmap.py`, `autoresume.py` | The ask/plan/progress registry, and post-cooldown delivery of an interrupted plan's marker back into Claude. |
+| `plugins.py`, `recommend.py`, `invoker.py`, `playbook.py` | Skill/plugin catalog (backs both `hive plugins` and `hive skills`), deterministic recommendation, the invoke channel, and the per-prompt playbook (MN-15). |
+
+### `mindnet/` — the phase spine (MindNetwork)
+
+Units are MN-numbered; the number in each docstring is the address.
+
+| Module | Owns |
+|---|---|
+| `controller.py` | MN-1 — the phase state machine: where a task is, what evidence cleared each exit. |
+| `phases.py` | MN-1 — per-phase evidence descriptors, the `mindnet_phase` contract. |
+| `tasks.py` | MN-2 — the dynamic hierarchical task graph. |
+| `sidecar.py` | MN-1 U5 — the phase projection sidecar at `<project>/mindnet/state.json`, and its `rebuild`. |
+| `advice.py` | MN-3 U2 — the advice resolver; makes injection mechanical. |
+| `enforcer.py` | MN-4 — the teeth; where the spine refuses instead of describing. |
+| `inject.py` | MN-1 U9 — phase-aware injection into the prompt context. |
+| `optin.py` | MN-6 — the blast-radius gate. Enforcement is **opt-in, per checkout**. |
+| `orchestrator.py` | MN-7 — the parallel orchestrator that walks the graph in waves. |
+| `agent.py` | MN-8 — what a spawned agent actually runs for a task. |
+| `worktree.py` | MN-9 — one isolated checkout per orchestrated task. |
+| `decompose.py` | MN-11 — a task proposing its own subtasks. |
+| `executor.py` | MN-1 U6 — the validation executor (holds the denylist, DATA_MODEL.md §4.2). |
+| `autodeclare.py` | MN-18 — decide whether a prompt should mint a task at all. |
+| `telemetry.py`, `ui_cats.py`, `ui_sessions.py` | MN-1 U10 / MN-5 U8 / MN-19 — the faculty activity feed (`mindnet_activity`) and the two cat boards. **MN-10 is a different slice**: the pr-green completion gate in `orchestrator.py` (DATA_MODEL.md §4.9). |
+
+### `rotation/` — smart-zone session rotation
+
+Interactive sessions only, and **opt-in**: inert unless `MINDHIVE_ROTATION` is
+set, which only `hive session run` does for its children.
+
+| Module | Owns |
+|---|---|
+| `occupancy.py` | True context occupancy read from the Claude Code transcript (tail-read — these reach 20MB+). |
+| `window.py` | Model id → context window → rotation threshold. |
+| `hook.py` | The Stop-hook decision. **Never emits `{"decision":"block"}`** — for a Stop hook that means *keep working*, the exact opposite of rotating. |
+| `artifact.py` | `ROTATION_PENDING` at `project_dir()/ROTATION_PENDING` — the only channel between hook and supervisor. |
+| `supervisor.py` | `hive session run` — the outer loop around an interactive session. Nothing inside an interactive session can clear its own context, so the loop lives outside it. |
+| `install.py` | Idempotent registration of the Stop hook in a `settings.json` (`hive session install-hook`). |
+
+### `loop/` — the autonomous headless loop (`hive loop`, `/circle`)
+
+`engine.py` (the loop), `driver.py`, `config.py` (`.hive-loop/`), `context.py`
+(the smart zone), `router.py` (model-tier routing), `budget.py`,
+`safeguards.py`, `contract.py`, `state.py`, `prompt.py`, `scaffold.py`,
+`task.py`, `progress.py`. Termination is **gated, not free-form** — but read
+the code before quoting SOP `agentic-loops` §1 at it: the hard stops (rate-limit
+→ `api_cap`, token/cost budget, `max_iterations`/`max_hours`) and the circuit
+breaker are structural, while *graceful completion* runs through the
+dual-condition exit gate, which does read the reply text — `contract.parse_status`
+scrapes `EXIT_SIGNAL`/`STATUS` out of the reply and `safeguards.should_exit`
+additionally requires ≥`min_completion_heuristics` natural-language completion
+signals plus zero remaining required work. Prose alone cannot end a run; prose is
+one of two conditions.
+
+### Dashboard (port 54461)
+
+| Module | Owns |
+|---|---|
+| `dashboard.py` | HTTP routes + server. |
+| `dashboard_page.py` | The shell UI and its sections. Section render/show pairs: `Overview`, `State`, `Memory`, `Log`, `Sops`, `Improvements`, `Oversee`, `Sessions`. The **Skill & Plugin** section breaks the pattern — `renderPlugins`/`paintPlugins`, entered via `showSkillPanel()` (there is no `showPlugins`). Plus `showBriefing`/`showRecall`/`showGraph`/`showAppend`/`showWorkspace`. |
+| `workspace.py` + `workspace_page.py` | MindParallel — the fleet of headless `claude` subprocess agents. |
+| `swarm_page.py` | MindSwarm — the mission view. |
+| `research.py` + `research_page.py` | Self-Reliant autoresearch. |
+| `oversee.py`, `taskview.py`, `cat_board.py` | Oversee projection, the Sessions notification center, the faculty cat board fragment. |
+| `claude_cli.py` | The shared **one-shot** headless `claude` call (`-p --output-format json`), plus exe resolution and envelope parsing — used by `invoker.py`, `reflect.py`, `autoresume.py`, `mindnet/agent.py`. `loop/driver.py` and `workspace.py` deliberately build their own argv (stream-json, `--resume`, `--permission-mode`) and borrow only `resolve_exe`. |
+
+**Not dashboard-wired** despite sitting near it: `clusters.py`, `packs.py` and
+`context.py` are CLI-only analyzers (`hive clusters`, `hive packs`,
+`hive context`) — no route in `dashboard.py`, no import in `dashboard_page.py`.
+
+## Where the data lives
+
+Store home `~/.mindhive/` (override `MINDHIVE_HOME`), one directory per project
+namespace. **All git worktrees of a repo collapse onto the main repo's
+namespace** — `paths.detect_project()` resolves `git rev-parse
+--git-common-dir` on purpose (SOP `session-lifecycle` §3). `paths.worktree_root()`
+is the deliberately *different* function for per-checkout evidence paths;
+conflating the two is a real bug.
+
+Under `paths.project_dir()`:
+
+- **Source of truth:** `events/<session_id>.jsonl` — append-only, one canonical
+  JSON event per line. Never edit; corrections are new events.
+- **Projections** (rebuildable, but *not all by one command*): `STATE.md`,
+  `LEDGER/*.md`, `index.json`, `chain.json` ← `hive project`; `BRIEFING.md` ←
+  `hive briefing`; `graph.json` ← `hive graph build`; `graph.html` ←
+  `hive graph export`; `handoff.md` ← `hive export`.
+- **Sidecars & cursors** (stateful, *not* rebuildable): `mindnet/state.json`
+  (phase spine), `rules/` (prevention rules), `SOUL.md` (promoted rules),
+  `runs/` (run artifacts), `pending_review.json`, `pending_changelog.json`,
+  `harvest_state.json`, `style_mode.json`, `plugin_catalog.json`,
+  `context_budget.json`, `enrich.json`, `faculty_beat-<session>.json`,
+  `ROTATION_PENDING`, `chroma/`.
+
+The auto-loaded memory file lives **outside** the store, at
+`~/.claude/projects/<encoded-folder>/memory/MEMORY.md`, composed by
+`sync.sync()`. Full table: DATA_MODEL.md §1.
+
+## Hook wiring (`hooks/*.ps1`)
+
+Every hook is a thin PowerShell pipe; the parsing and the decision live in
+Python so they are unit-testable.
+
+| Script | Claude Code event | Python it calls |
+|---|---|---|
+| `session_start.ps1` | SessionStart | `append session_start`, `state` (injects STATE.md), `directives`; detached `plugins autoscan` + trigger refresh |
+| `user_prompt_submit.ps1` | UserPromptSubmit | `hook user_prompt_submit` |
+| `pre_tool_use.ps1` | PreToolUse | `hook pre_tool_use` → `enforce.hook_decision` |
+| `post_tool_use.ps1` | PostToolUse | `hook post_tool_use` → `hookcapture.record_post_tool_use` (+ faculty beat) |
+| `post_tool_use_failure.ps1` | **none — built but registered nowhere.** No Claude Code event fires it; `~/.claude/settings.json` registers seven hooks and this is not one of them. | `hook post_tool_use_failure` → `hookcapture.record_post_tool_use_failure` |
+| `pre_compact.ps1` | PreCompact | `append compaction` |
+| `session_end.ps1` | SessionEnd | `append session_end`, `project`, `briefing`, `graph build`, `sync`, `review queue`, `log queue`, `roadmap autoclose`; detached auto-reflection |
+| `stop.ps1` | Stop | `hook stop` → `rotation.hook.hook_decision` |
+| `autosync.ps1` | *not a hook* — and **not actually on the schedule either**: the registered `\MindHive-AutoSync` task runs `pythonw.exe -m mindhive autosync` directly, bypassing this wrapper. Editing it changes nothing. | (wrapper would call `autosync` via `pythonw.exe`) |
+
+Properties that hold for all of them — do not weaken:
+
+- **Headless guard.** Every script exits 0 immediately when
+  `MINDHIVE_HEADLESS=1`, so spawned reflection sessions cannot re-fire hooks or
+  mint phantom events. (`stop.ps1` included — relevant if you expect rotation
+  during a headless run.)
+- **stdout is the decision/context channel — for the gate hooks only.** In
+  `pre_tool_use.ps1`, `user_prompt_submit.ps1` and `stop.ps1` nothing may print
+  there except the Python decision/context JSON, and silence = allow / no
+  injection. `session_start.ps1` (`directives` + `state`) and `pre_compact.ps1`
+  deliberately emit plain markdown/text to stdout — that *is* their injection
+  mechanism. Do not "fix" them to be silent.
+- **Fail-open and hang-proof.** Any error allows the tool and injects nothing.
+  Parse/record failures on the `post_tool_use` and `post_tool_use_failure` paths
+  land in `hooks_errors.log` (`hookcapture.log_hook_error`, the only writer);
+  the other seven scripts fail open via a bare `catch {}` and leave no trace.
+- **Absolute interpreter path.** All use
+  `C:\Users\hanif\mindhive\.venv\Scripts\python.exe`.
+
+### What composes a prompt's injected context
+
+`__main__.cmd_hook`, stage `user_prompt_submit`, in this order:
+
+1. `promptgate.hook_context(raw)` — fires only on an underspecified prompt.
+2. `enrich.extend_hook_context` — **only if** the gate above fired.
+3. `mindnet.inject.extend_hook_context` — unconditional (the spine steers every
+   turn); sidecar is read **once** here and threaded in.
+4. `premise.extend_hook_context` — unconditional.
+5. `style.extend_hook_context` — **last**, so it prepends to whatever the
+   earlier passes produced. Like `mindnet.inject` and `premise`, it can build a
+   context from a `None`/empty one when every earlier pass stayed silent.
+6. `print(json.dumps(context))` — then, strictly *after* the print, the
+   side-effect layer: `record_direction`, `announce_faculties`, autodeclare.
+
+That ordering is load-bearing. New passes go before step 5, and anything that
+writes to the ledger goes after step 6.
 
 ## Hazards (learned the hard way — do not repeat)
 
 - The **live dashboard** at http://127.0.0.1:54461 belongs to the human. Never
-  kill or restart it. If you must serve a dashboard, use another port from a
-  worktree and kill only that PID.
-- **Never run `scripts/self_reliant/bring_up.sh`** — it downloads gigabytes
-  and is gated on explicit human intent (plan KTD9).
+  kill or restart it, and **never repoint it via `PYTHONPATH`/`sys.path`** — it
+  serves whatever branch `C:\Users\hanif\mindhive` has checked out, by way of
+  the editable install, and that is the mechanism working correctly. To preview
+  an unmerged branch, serve it on another port from its own worktree. After any
+  restart, grep the served page for a known hook (`showOversee`,
+  `renderOversee`) — HTTP 200 is not evidence.
 - Work in a **git worktree**, never directly on master.
-- Read-gate: **Read every file before you Edit it** in the same session.
-- `python` is not on PATH on this machine — use
-  `C:/Users/hanif/mindhive/.venv/Scripts/python.exe`.
+- **Read every file before you Edit it** in the same session. A Grep/Glob hit
+  does not satisfy the read-gate.
+- **`python` is not on PATH** on this machine — use
+  `C:/Users/hanif/mindhive/.venv/Scripts/python.exe`. From a worktree,
+  subprocesses need `PYTHONPATH=<worktree>/src` explicitly.
+- **Never run `scripts/self_reliant/bring_up.sh`** — it downloads gigabytes and
+  is gated on explicit human intent.
+- The Stop hook is **global**: once registered it fires in every Claude Code
+  session on this machine. Keep it fail-open and opt-in (`../CLAUDE.md`).
+- Every change to `src/mindhive/` or `tests/` needs `hive log <category> "…"`
+  before the work is done. The suite must be green before "done".
+
+---
+
+*Predecessor: [`docs/archive/2026-07-12-session-legend-pr-49.md`](archive/2026-07-12-session-legend-pr-49.md)
+— a mission playbook for a PR that merged 2026-07-12, archived unmaintained.*
