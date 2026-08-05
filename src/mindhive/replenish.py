@@ -407,7 +407,8 @@ _ALL_DETERMINISTIC = _REPAIR_AND_GAP + ("tech-debt", "audit", "caveat", "coverag
 PROFILES = {
     "conservative": AmbitionProfile("conservative", 40, _REPAIR_AND_GAP, 3),
     "balanced": AmbitionProfile("balanced", 25, _ALL_DETERMINISTIC, 10),
-    "ambitious": AmbitionProfile("ambitious", 15, _ALL_DETERMINISTIC, 25),
+    "ambitious": AmbitionProfile("ambitious", 15,
+                                 _ALL_DETERMINISTIC + ("innovation",), 25),
 }
 
 DEFAULT_AMBITION = "balanced"
@@ -500,6 +501,11 @@ class LensContext:
     tests_root: str = ""            # defaults to the checkout's tests
     repo_root: str = ""             # defaults to the checkout root
     run_id: str = ""                # loop surface only; "" on a session round
+    # Paths the surface knows changed, and the model seam. Both exist for the one
+    # agentic lens: the paths are the only evidence it is allowed to cite, and the
+    # seam is how the suite drives it without a model call.
+    changed_paths: tuple = ()
+    runner: object = None
 
 
 def _as_context(arg, project=None) -> LensContext:
@@ -1445,3 +1451,160 @@ def _modules_mentioned_by_tests(tests_root) -> set:
 
 
 LENSES["coverage"] = coverage
+
+
+# --- the agentic lens ---------------------------------------------------------
+# The only lens that spends a model call, so the only one gated to `ambitious`.
+# Its output is untrusted in the strong sense: the model may propose anything, and
+# nothing it SAYS is treated as a fact about the record.
+
+# Five, not `decompose.MAX_PROPOSED`'s twelve. A decomposition is asked for once
+# per task; this fires at the end of every loop round, so its blast radius is the
+# run rather than one node.
+INNOVATION_MAX_PROPOSALS = 5
+
+# The light tier. This call proposes work, it does not do the work — the loop's own
+# router decides what tier executes what lands.
+INNOVATION_MODEL = "claude-haiku-4-5"
+INNOVATION_TIMEOUT_S = 120
+
+# How much of the record rides the prompt. Bounded because this runs inside a loop
+# that is already spending context (SOP `context-reliability` §3).
+_INNOVATION_CONTEXT_ITEMS = 8
+
+
+def innovation_prompt(changed_paths, failure_signatures, completed) -> str:
+    """Ask for proposals, and only proposals.
+
+    The output contract is stated as a schema AND as a rule about what not to
+    include, following `decompose.prompt_for` — the parser tolerates prose around
+    the object but cannot recover from a different shape."""
+    lines = ["You are proposing follow-up engineering work for a repository.",
+             "",
+             "Recently changed files:"]
+    shown = [f"- {p}" for p in changed_paths[:_INNOVATION_CONTEXT_ITEMS]]
+    lines += shown if shown else ["- (none)"]
+    if failure_signatures:
+        lines += ["", "Recently recorded tool-failure signatures:"]
+        lines += [f"- {s}" for s in failure_signatures[:_INNOVATION_CONTEXT_ITEMS]]
+    if completed:
+        lines += ["", "Work just completed:"]
+        lines += [f"- {c}" for c in completed[:_INNOVATION_CONTEXT_ITEMS]]
+    lines += [
+        "",
+        f"Propose at most {INNOVATION_MAX_PROPOSALS} concrete improvements that "
+        "follow from the above — edge cases left unhandled, missing "
+        "parameterisation, structural simplifications, hardening.",
+        "",
+        "Reply with ONLY this JSON object and nothing else:",
+        '{"subtasks": [{"title": "...", "description": "..."}]}',
+        "",
+        "Do not include commentary, a plan, or any key other than subtasks.",
+    ]
+    return "\n".join(lines)
+
+
+def _default_innovation_runner(prompt):
+    """The real seam: one headless `claude` call through the shared helper."""
+    from . import claude_cli
+    return claude_cli.run_headless(prompt, model=INNOVATION_MODEL,
+                                   timeout_s=INNOVATION_TIMEOUT_S)
+
+
+def _recent_failure_signatures(evs) -> list:
+    """Distinct `tool_failed` signatures, newest last. Total on malformed rows."""
+    seen = []
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "tool_failed":
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        sig = _failure_signature(payload)
+        if sig and sig not in seen:
+            seen.append(sig)
+    return seen[-_INNOVATION_CONTEXT_ITEMS:]
+
+
+def innovation(arg) -> list:
+    """Model-proposed work the folds cannot see.
+
+    Three properties make this safe enough to run inside an autonomous loop.
+
+    **Its evidence is ours, never the model's.** A candidate cites the changed
+    paths and failure signatures that were put IN the prompt — facts this process
+    already knew. The model's own claims about the record are exactly what cannot
+    be checked, and a candidate whose evidence came from the model would launder an
+    invention into the audit row. With nothing to cite the lens returns nothing
+    rather than proposing ungrounded work; the value gate would refuse it anyway.
+
+    **Failure raises; emptiness returns.** An unparseable reply, a non-zero exit
+    and a timeout all raise, so `run_round` records one `lens:innovation` failure.
+    A model that legitimately proposes nothing returns `[]`. Collapsing those two
+    into an empty list would make a broken lens read as "the system is robust",
+    which is the specific lie this project's honesty rule exists to prevent.
+
+    **The graph checks from `decompose.validate` are deliberately NOT applied.**
+    That function validates proposals against a MindNetwork task graph — id
+    collisions, dependency cycles, depth. A replenishment round has no graph: these
+    are flat candidates for a checklist. Running a cycle check over a list with no
+    edges would be theatre. What does transfer is reused verbatim: `decompose.parse`
+    for the tolerant parse, and `decompose.slugify` for the id, so a proposal that
+    cannot be given a well-formed identity is dropped with a reason."""
+    ctx = _as_context(arg)
+    changed = [str(p) for p in (ctx.changed_paths or ()) if str(p).strip()]
+    signatures = _recent_failure_signatures(ctx.evs)
+    if not (changed or signatures):
+        # Nothing to ground a proposal in. Asking anyway would spend a model call
+        # to produce candidates the gate must then refuse for having no evidence.
+        return []
+
+    runner = ctx.runner or _default_innovation_runner
+    result = runner(innovation_prompt(changed, signatures, []))
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"innovation runner returned {type(result).__name__}, not a result "
+            f"mapping")
+    exit_code = result.get("exit")
+    if exit_code != 0:
+        raise RuntimeError(
+            f"innovation model call exited {exit_code}: "
+            f"{str(result.get('stdout') or '')[:200]}")
+
+    from .mindnet import decompose as decompose_mod
+    pairs, reason = decompose_mod.parse(result.get("stdout") or "")
+    if reason:
+        raise RuntimeError(f"innovation reply unusable: {reason}")
+
+    evidence = tuple([f"changed: {p}" for p in changed[:_EVIDENCE_FILES]]
+                     + [f"recorded failure: {s}" for s in signatures[:2]])
+    taken, out = [], []
+    for title, description in pairs[:INNOVATION_MAX_PROPOSALS]:
+        slug = decompose_mod.slugify(title, taken=tuple(taken))
+        if not slug:
+            continue                # no well-formed identity: not proposable
+        taken.append(slug)
+        headline = title if not description else f"{title} — {description}"
+        out.append(Candidate(
+            lens="innovation",
+            title=headline[:MAX_TITLE_CHARS],
+            # Keyed on the slug, so the same proposal twice is one piece of work.
+            fingerprint=f"innovation:{slug}",
+            evidence=evidence,
+            # `occurrences` is HOW MUCH RECORD the proposal rests on, which is the
+            # honest reading of the recurrence term for this lens: a suggestion
+            # grounded in three recorded facts is one the record insists on harder
+            # than a suggestion grounded in one. It is also what makes the lens
+            # able to land at all — base 10 alone is below `ambitious`'s threshold
+            # of 15, so a proposal that cited nothing would be permanently
+            # unlandable and the lens would be dead config.
+            #
+            # NO severity. The record cannot say a suggestion about the future is
+            # blocking anything, and asserting it would put a fabricated +20 on
+            # every model proposal.
+            occurrences=len(evidence),
+            deferral_key=slug))
+    return out
+
+
+LENSES["innovation"] = innovation

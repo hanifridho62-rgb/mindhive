@@ -64,7 +64,7 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
         pass
 
 
-def _replenish_before_exit(project, loop_dir, cfg, run_id) -> int:
+def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None) -> int:
     """Mine the record for outstanding work and land it as required checklist
     items. Returns how many pieces landed.
 
@@ -93,13 +93,18 @@ def _replenish_before_exit(project, loop_dir, cfg, run_id) -> int:
             max_rounds_per_run=getattr(cfg, "replenish_max_rounds", 5),
             bounded_run=True)
         evs = events.read_all(project)
+        # The agentic lens may cite ONLY facts this process already knows, and the
+        # changed paths are its share of those. A tracker-less run (tests inject
+        # their own progress_fn) simply gives it less to stand on, which the score
+        # then reflects rather than hides.
+        changed = tuple(tracker.changed_paths()) if tracker is not None else ()
         result = rp_mod.run_round(
             evs, surface="loop",
             sink=sink_mod.fix_plan_sink(loop_dir, run_id=run_id),
             lenses=rp_mod.lenses_for(choice.profile),
             cfg=round_cfg, project=project, run_id=run_id,
             ctx=rp_mod.LensContext(evs=tuple(evs), project=project,
-                                   run_id=run_id))
+                                   run_id=run_id, changed_paths=changed))
         if choice.fell_back and result.round_no == 1:
             # Once per run, not once per round: an operator misspelling the dial
             # deserves to be told, and deserves not to have it repeated into every
@@ -136,12 +141,16 @@ def run_loop(project, loop_dir, cfg, driver, *,
     loop_dir = Path(loop_dir)
     guard.ensure_safe(force=force)              # LIVE_LOCK check
 
+    # Held so the replenishment round can ask WHICH files moved, not just whether
+    # any did. `changed_paths()` is non-destructive, so reading it does not consume
+    # the snapshot the progress detector below depends on.
+    tracker = None
     if progress_fn is None:
         from .progress import MtimeTracker
-        _tracker = MtimeTracker(loop_dir.parent)
-        _tracker.snapshot()
+        tracker = MtimeTracker(loop_dir.parent)
+        tracker.snapshot()
 
-        def progress_fn(_i, _t=_tracker):   # noqa: E306
+        def progress_fn(_i, _t=tracker):   # noqa: E306
             return _t.changed()
 
     cb = safeguards.CircuitBreaker(safeguards.BreakerConfig(
@@ -267,7 +276,8 @@ def run_loop(project, loop_dir, cfg, driver, *,
                 # the record before honouring that: a run that stops here while
                 # the ledger still proves work outstanding is the quiet ending
                 # this whole feature exists to prevent.
-                if _replenish_before_exit(project, loop_dir, cfg, run_id):
+                if _replenish_before_exit(project, loop_dir, cfg, run_id,
+                                         tracker):
                     # Required items now remain, so `should_exit` will refuse on
                     # its own next iteration — the count does the forcing, not
                     # this branch. The breaker resets because finding

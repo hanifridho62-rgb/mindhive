@@ -679,7 +679,7 @@ def test_the_threshold_floor_is_the_base_score():
 def test_the_three_positions_carry_their_documented_settings():
     expected = {"conservative": (40, 2, 3),
                 "balanced": (25, 6, 10),
-                "ambitious": (15, 6, 25)}
+                "ambitious": (15, 7, 25)}
     actual = {name: (p.min_score, len(p.lens_names), p.max_injections_per_run)
               for name, p in replenish.PROFILES.items()}
     assert actual == expected
@@ -695,6 +695,13 @@ def test_conservative_runs_exactly_repair_and_evidence_gap():
 def test_balanced_runs_every_deterministic_lens():
     assert set(replenish.PROFILES["balanced"].lens_names) == {
         "repair", "evidence-gap", "tech-debt", "audit", "caveat", "coverage"}
+
+
+def test_only_ambitious_spends_a_model_call():
+    # The agentic lens is the only one that costs money per round, so it is the
+    # only one gated to the most aggressive position.
+    for name, profile in replenish.PROFILES.items():
+        assert ("innovation" in profile.lens_names) == (name == "ambitious")
 
 
 def test_a_more_ambitious_position_is_never_more_selective():
