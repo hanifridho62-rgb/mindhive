@@ -171,6 +171,32 @@ def test_the_sink_lands_what_fits_and_reports_the_rest():
     assert len(placements) == 1 and dropped == 1
 
 
+def test_a_later_todowrite_sync_does_not_delete_injected_steps():
+    # `set` replaces the step list wholesale and sync_from_todos builds that
+    # list from TodoWrite alone. One more TodoWrite after an injection — a
+    # resumed session is enough — silently deleted the injected work.
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    roadmap.sync_from_todos(SID, [{"content": "todo one",
+                                   "status": "in_progress"}])
+    replenish_sinks.roadmap_sink(SID)([_cand()])
+    roadmap.sync_from_todos(SID, [{"content": "todo one", "status": "completed"},
+                                  {"content": "todo two", "status": "pending"}])
+    steps = _rec()["steps"]
+    assert [s["text"] for s in steps] == ["todo one", "todo two",
+                                          "Run the test suite"]
+    assert [s["new"] for s in steps] == [False, False, True]
+
+
+def test_a_todowrite_sync_that_changes_nothing_stays_a_no_op():
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    roadmap.sync_from_todos(SID, [{"content": "todo one", "status": "pending"}])
+    replenish_sinks.roadmap_sink(SID)([_cand()])
+    before = len([e for e in events.read_all() if e.type == "roadmap"])
+    assert roadmap.sync_from_todos(
+        SID, [{"content": "todo one", "status": "pending"}]) is None
+    assert len([e for e in events.read_all() if e.type == "roadmap"]) == before
+
+
 def test_append_false_previews_without_writing_the_plan():
     # The core's own append flag governs only the audit rows. Without this one a
     # --dry-run would still leave a real roadmap step behind.

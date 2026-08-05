@@ -579,8 +579,14 @@ def cmd_replenish_run(args) -> int | None:
     # BOTH flags: the core's governs the audit rows, the sink's governs the work
     # itself. Passing only the first would leave a real roadmap step behind on a
     # run the operator asked to be a preview.
+    #
+    # `evs=evs` is not an optimisation detail: this runs inside the SessionEnd
+    # hook, which already pays for several full ledger reads, and the sink would
+    # otherwise read all 27k+ events a second time. Nothing is appended between
+    # this read and the sink, so the snapshot is current.
     res = rp_mod.run_round(evs, surface="session",
-                           sink=sink_mod.roadmap_sink(sid, append=write),
+                           sink=sink_mod.roadmap_sink(sid, evs=evs,
+                                                      append=write),
                            session_id=sid, append=write)
     if not res.ran:
         print(f"replenish skipped: {res.skipped}")
@@ -605,8 +611,9 @@ def cmd_replenish_run(args) -> int | None:
 def cmd_replenish_status(args) -> int | None:
     """What the injector knows, folded from the ledger — there is no sidecar."""
     from . import replenish as rp_mod
-    hist = rp_mod.history(events.read_all())
+    hist = rp_mod.history(events.read_all(), surface="session")
     print(json.dumps({
+        "surface": "session",
         "last_round": hist.last_round,
         "dry_rounds": hist.dry_rounds,
         "spent_fingerprints": sorted(hist.fingerprints),

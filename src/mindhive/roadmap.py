@@ -357,7 +357,14 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
     wholesale and revives interrupted plans), and only on a material change —
     identical steps and prompt are a no-op so routine re-writes don't bloat
     the ledger. Plans not tagged ``auto`` are human-declared and never
-    touched. Returns the appended event, or None when nothing applies."""
+    touched. Returns the appended event, or None when nothing applies.
+
+    Steps marked ``new`` are CARRIED FORWARD. A ``set`` replaces the step list
+    wholesale, and this writer builds that list from TodoWrite alone — so
+    without this, one more TodoWrite after the replenishment injector had
+    written (a resumed session is enough) would silently delete the injected
+    work. TodoWrite stays authoritative for its own steps; the injected ones
+    ride along behind them."""
     sid = str(session_id or "")
     if not ID_RE.match(sid):
         return None
@@ -369,10 +376,16 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
     rec = fold(evs).get(sid)
     if rec is not None and AUTO_TAG not in (rec.get("tags") or []):
         return None
+    if rec is not None:
+        seen = {s["text"] for s in steps}
+        steps = (steps + [dict(s) for s in rec["steps"]
+                          if s.get("new") and s["text"] not in seen])[:MAX_STEPS]
     prompt = _session_prompt(evs, sid)
     if rec is not None and rec["prompt"] == prompt \
-            and [(s["text"], s["status"]) for s in rec["steps"]] \
-            == [(s["text"], s["status"]) for s in steps]:
+            and [(s["text"], s["status"], bool(s.get("new")))
+                 for s in rec["steps"]] \
+            == [(s["text"], s["status"], bool(s.get("new")))
+                for s in steps]:
         return None
     payload = {"action": "set", "plan_id": sid, "prompt": prompt,
                "title": prompt[:MAX_TITLE_CHARS], "steps": steps}

@@ -59,12 +59,24 @@ def test_dry_run_decides_without_writing(capsys):
     assert _plan() is None
 
 
-def test_run_on_a_clean_ledger_records_only_the_dry_round(capsys):
+def test_run_on_a_clean_ledger_writes_nothing(capsys):
     events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
     assert main(["replenish", "run", "--session", SID]) == 0
     assert "nothing outstanding" in capsys.readouterr().out
-    assert [r["outcome"] for r in _rows()] == ["dry"]
+    # A dry row here would be an identical event per session forever, and the
+    # session surface has no dry-round exit to read it.
+    assert _rows() == []
     assert _plan() is None
+
+
+def test_repeated_quiet_sessions_do_not_switch_the_injector_off(capsys):
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    for _ in range(4):
+        assert main(["replenish", "run", "--session", SID]) == 0
+    capsys.readouterr()
+    _outstanding()
+    assert main(["replenish", "run", "--session", SID]) == 0
+    assert "injected [evidence-gap]" in capsys.readouterr().out
 
 
 def test_run_without_a_session_id_exits_non_zero(monkeypatch, capsys):
@@ -106,7 +118,7 @@ def test_status_reports_the_folded_state(capsys):
 def test_status_on_an_empty_ledger(capsys):
     assert main(["replenish", "status"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data == {"last_round": 0, "dry_rounds": 0,
+    assert data == {"surface": "session", "last_round": 0, "dry_rounds": 0,
                     "spent_fingerprints": [], "lenses": ["evidence-gap"]}
 
 

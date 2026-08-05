@@ -284,11 +284,28 @@ def test_a_candidate_the_sink_could_not_place_gets_no_row():
     assert "fp-2" not in replenish.history(events.read_all()).fingerprints
 
 
-def test_a_round_that_lands_nothing_records_a_dry_row():
-    res = replenish.run_round([], surface="session", sink=_sink(),
+def _dry_cfg(n=2):
+    """A config with the dry-round exit ON. It is OFF by default because the
+    session surface runs one round per session and nothing could ever reset the
+    counter; the exit belongs to the loop surface, which runs rounds back to
+    back."""
+    return replenish.ReplenishConfig(dry_rounds_to_exit=n)
+
+
+def test_a_round_that_lands_nothing_records_a_dry_row_only_when_read():
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=_dry_cfg(),
                               lenses={"l": lambda _e: []})
     assert res.dry
     assert [r for r in _rows() if r["outcome"] == "dry"]
+
+
+def test_no_dry_row_is_written_when_nothing_consumes_it():
+    # Default config: the exit is off, so a dry row would be an identical event
+    # appended once per session forever, hashed by every `hive verify`.
+    res = replenish.run_round([], surface="session", sink=_sink(),
+                              lenses={"l": lambda _e: []})
+    assert res.dry
+    assert _rows() == []
 
 
 def test_two_dry_rounds_end_replenishment_and_no_lens_runs():
@@ -300,22 +317,73 @@ def test_two_dry_rounds_end_replenishment_and_no_lens_runs():
 
     for _ in range(2):
         replenish.run_round(events.read_all(), surface="session",
-                            sink=_sink(), lenses={"l": lens})
+                            sink=_sink(), cfg=_dry_cfg(), lenses={"l": lens})
     assert len(calls) == 2
 
     res = replenish.run_round(events.read_all(), surface="session",
-                              sink=_sink(), lenses={"l": lens})
+                              sink=_sink(), cfg=_dry_cfg(), lenses={"l": lens})
     assert not res.ran
     assert res.skipped == "dry rounds exhausted"
     assert len(calls) == 2          # the third round never invoked the lens
 
 
+def test_the_dry_exit_is_off_by_default_so_quiet_sessions_keep_working():
+    # The bug this guards: nothing resets the dry counter except work landing,
+    # and work can only land if a round runs. With the exit on by default, two
+    # quiet sessions switched the injector off permanently, project-wide.
+    calls = []
+
+    def lens(_evs):
+        calls.append(1)
+        return []
+
+    for _ in range(5):
+        res = replenish.run_round(events.read_all(), surface="session",
+                                  sink=_sink(), lenses={"l": lens})
+        assert res.ran
+    assert len(calls) == 5
+
+
+def test_a_quiet_loop_cannot_switch_off_the_session_surface():
+    for _ in range(3):
+        replenish.run_round(events.read_all(), surface="loop", sink=_sink(),
+                            cfg=_dry_cfg(), lenses={"l": lambda _e: []})
+    res = replenish.run_round(events.read_all(), surface="session",
+                              sink=_sink(), cfg=_dry_cfg(),
+                              lenses={"l": lambda _e: [_cand("fp-s")]})
+    assert res.ran and len(res.landed) == 1
+
+
+def test_fingerprints_are_shared_across_surfaces():
+    # The dry streak is per-surface; "has this been proposed" is not. A loop and
+    # a session must not each mint a step for the same outstanding fact.
+    replenish.run_round(events.read_all(), surface="loop", sink=_sink(),
+                        lenses={"l": lambda _e: [_cand("fp-shared")]})
+    res = replenish.run_round(events.read_all(), surface="session",
+                              sink=_sink(),
+                              lenses={"l": lambda _e: [_cand("fp-shared")]})
+    assert res.landed == []
+    assert res.refused[0][1] == replenish.DUPLICATE_REASON
+
+
+def test_a_duplicate_refusal_is_not_recorded_twice():
+    lenses = {"l": lambda _e: [_cand("fp-dup")]}
+    replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                        lenses=lenses)
+    before = len(_rows())
+    for _ in range(3):
+        replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                            lenses=lenses)
+    assert len(_rows()) == before      # no byte-identical row per round forever
+
+
 def test_work_landing_breaks_the_dry_streak():
     replenish.run_round(events.read_all(), surface="session", sink=_sink(),
-                        lenses={"l": lambda _e: []})
+                        cfg=_dry_cfg(), lenses={"l": lambda _e: []})
     replenish.run_round(events.read_all(), surface="session", sink=_sink(),
-                        lenses={"l": lambda _e: [_cand("fp-x")]})
-    assert replenish.history(events.read_all()).dry_rounds == 0
+                        cfg=_dry_cfg(), lenses={"l": lambda _e: [_cand("fp-x")]})
+    assert replenish.history(events.read_all(),
+                             surface="session").dry_rounds == 0
 
 
 def test_a_broken_lens_does_not_cost_the_round():

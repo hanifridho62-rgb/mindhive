@@ -59,6 +59,13 @@ MAX_REASON_CHARS = 500
 MAX_EVIDENCE_ITEMS = 12
 MAX_EVIDENCE_CHARS = 300
 
+# The one refusal that carries NO new information: the fingerprint is spent, so
+# the ledger already holds the row that spent it. Recording it again would add a
+# byte-identical row per round forever — and `chain.compute_chain` hashes every
+# event with no type filter, so the cost lands on `hive verify` for the life of
+# the store.
+DUPLICATE_REASON = "already proposed — this fingerprint is spent"
+
 
 def _require_str(payload, key, cap, *, what):
     value = payload.get(key)
@@ -166,7 +173,13 @@ class ReplenishConfig:
     # Deliberately small. A round that proposes more than a person will look at
     # is how an injector becomes noise, and phase 1 has no backpressure yet.
     max_per_round: int = 3
-    dry_rounds_to_exit: int = 2
+    # 0 DISABLES the dry-round exit, and that is the right setting for any
+    # surface whose own lifecycle already bounds the rounds. The exit exists for
+    # a loop, which runs many rounds back to back and must stop spinning. On a
+    # surface that runs one round per session it is actively wrong: nothing can
+    # reset the counter except work landing, and work can only land if a round
+    # runs, so two quiet sessions would switch the injector off permanently.
+    dry_rounds_to_exit: int = 0
 
 
 @dataclass(frozen=True)
@@ -198,7 +211,7 @@ class RoundResult:
 LENSES: dict = {}
 
 
-def history(evs) -> History:
+def history(evs, surface=None) -> History:
     """Fold `work_injected` rows into the state a round needs.
 
     Total, per the ledger's read contract: a row whose payload is not a dict, or
@@ -209,7 +222,15 @@ def history(evs) -> History:
     A REFUSED candidate's fingerprint is spent too. That is deliberate: re-
     proposing something already judged not worth doing is exactly the loop the
     dedup exists to prevent, and without it a refused candidate would return
-    every single round forever."""
+    every single round forever.
+
+    *surface* scopes the ROUND COUNTER and the DRY STREAK but never the spent
+    fingerprints. The two answer different questions. "Has this condition
+    already been proposed?" is about the work and holds no matter which surface
+    proposed it — a loop and a session must not each mint a step for the same
+    outstanding fact. "How many rounds has this surface run without finding
+    anything?" is about one surface's own pacing, and mixing surfaces there
+    would let a quiet loop switch off a session's injector."""
     spent, last, dry = set(), 0, 0
     for ev in evs or []:
         if getattr(ev, "type", None) != "work_injected":
@@ -220,12 +241,14 @@ def history(evs) -> History:
         outcome = p.get("outcome")
         if outcome not in OUTCOMES:
             continue
+        fp = p.get("fingerprint")
+        if isinstance(fp, str) and fp.strip():
+            spent.add(fp)                       # global, always
+        if surface is not None and p.get("surface") != surface:
+            continue
         r = p.get("round")
         if isinstance(r, int) and not isinstance(r, bool) and r > last:
             last = r
-        fp = p.get("fingerprint")
-        if isinstance(fp, str) and fp.strip():
-            spent.add(fp)
         if outcome == "dry":
             dry += 1
         elif outcome == "landed":
@@ -247,7 +270,7 @@ def refusal_reason(candidate, spent, cfg) -> str:
     if not (candidate.fingerprint or "").strip():
         return "no fingerprint — this candidate could never be deduplicated"
     if candidate.fingerprint in spent:
-        return "already proposed — this fingerprint is spent"
+        return DUPLICATE_REASON
     if candidate.score < cfg.min_score:
         return (f"score {candidate.score} below the round's minimum "
                 f"{cfg.min_score}")
@@ -308,8 +331,8 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     if not cfg.enabled:
         return RoundResult(skipped="disabled")
 
-    hist = history(evs)
-    if hist.dry_rounds >= cfg.dry_rounds_to_exit:
+    hist = history(evs, surface=surface)
+    if cfg.dry_rounds_to_exit > 0 and hist.dry_rounds >= cfg.dry_rounds_to_exit:
         return RoundResult(round_no=hist.last_round,
                            skipped="dry rounds exhausted")
     round_no = hist.last_round + 1
@@ -347,6 +370,8 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                          score=c.score, plan_id=pl.plan_id,
                          step_index=pl.step_index if pl.step_index >= 0 else None))
     for c, reason in refused:
+        if reason == DUPLICATE_REASON:
+            continue          # the row that spent this fingerprint IS the record
         rows.append(_row("refused", round_no, surface, lens=c.lens,
                          title=(c.title or "(untitled)")[:MAX_TITLE_CHARS],
                          fingerprint=c.fingerprint or "unfingerprinted",
@@ -355,7 +380,10 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
         # R15: a cap that cut silently would read as "nothing more was found".
         rows.append(_row("truncated", round_no, surface, dropped=dropped))
     dry = not landed
-    if dry:
+    # The dry row exists to feed the dry-round exit. Where that exit is off, it
+    # is a row nobody reads, appended once per session forever — so it is only
+    # written when something actually consumes it.
+    if dry and cfg.dry_rounds_to_exit > 0:
         rows.append(_row("dry", round_no, surface))
 
     if append:
