@@ -45,10 +45,16 @@ _NOTICE_PENDING_HEAD = 3
 
 
 def _norm_steps(raw):
-    """Normalize a ``set`` payload's steps into ``[{text, status, note}]``.
+    """Normalize a ``set`` payload's steps into ``[{text, status, note, new}]``.
     Plain strings default to pending; when no step carries an explicit
     status, the first becomes active so the roadmap always shows where work
-    starts. Assumes validate_payload already accepted *raw*."""
+    starts. Assumes validate_payload already accepted *raw*.
+
+    ``new`` marks a step that was NOT in the plan the work started from — one
+    the replenishment injector added because the record proved it outstanding
+    (see replenish.py). It defaults to False, so every historical event folds
+    exactly as it did before the key existed, and it is provenance rather than
+    recency: nothing clears it, including completing the step."""
     steps, explicit = [], False
     for s in raw:
         if isinstance(s, dict):
@@ -56,10 +62,11 @@ def _norm_steps(raw):
             explicit = explicit or bool(s.get("status"))
             steps.append({"text": str(s.get("text", "")).strip(),
                           "status": status,
-                          "note": str(s.get("note") or "").strip()})
+                          "note": str(s.get("note") or "").strip(),
+                          "new": bool(s.get("new"))})
         else:
             steps.append({"text": str(s).strip(), "status": "pending",
-                          "note": ""})
+                          "note": "", "new": False})
     if steps and not explicit:
         steps[0]["status"] = "active"
     return steps
@@ -112,6 +119,14 @@ def validate_payload(payload) -> None:
                     raise ValueError(
                         "roadmap step status must be one of: "
                         + ", ".join(STATUSES))
+                # Checked rather than coerced: `_norm_steps` runs bool() over
+                # whatever arrives, so a string "false" would fold as True and
+                # permanently mislabel a step as injected work.
+                if "new" in s and not isinstance(s.get("new"), bool):
+                    raise ValueError(
+                        "roadmap step 'new' must be true or false — it marks a "
+                        "step the replenishment injector added, not one from "
+                        "the original plan")
             else:
                 text = str(s).strip()
             if not text:
@@ -458,7 +473,11 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
 
 def _step_line(s, marker) -> str:
     note = f" — {s['note']}" if s.get("note") else ""
-    return f"- {marker} {s['text']}{note}"
+    # The marker rides the auto-loaded STATE.md, which is where the next session
+    # meets this work: it has to say "this was not in the plan you started from"
+    # there, not only on the dashboard.
+    new = "(new) " if s.get("new") else ""
+    return f"- {marker} {new}{s['text']}{note}"
 
 
 def notice(evs) -> str:
