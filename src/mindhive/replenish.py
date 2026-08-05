@@ -42,8 +42,15 @@ so `hive append` and `POST /api/append` enforce it too):
 `dry` exists as its own outcome because "this round found nothing" has to be a
 recorded fact, not the absence of one: the two-consecutive-empty-rounds exit
 cannot be derived from silence.
+
+`fingerprint` is a SHA-256 digest minted by `generate_fingerprint`, not a readable
+key. The field is capped, and a readable key long enough to be clamped to that cap
+would let two different conditions share one identity — which reads as "already
+proposed" and silences the lens. `kind` carries the readable classification the
+digest gives up, for the lenses that observe more than one kind of condition.
 """
 
+import hashlib
 import re
 from dataclasses import dataclass, field, replace
 
@@ -60,12 +67,50 @@ MAX_REASON_CHARS = 500
 MAX_EVIDENCE_ITEMS = 12
 MAX_EVIDENCE_CHARS = 300
 
+# The contract cap on `fingerprint`, and the reason `generate_fingerprint` hashes.
+# A readable key long enough to be clamped to this length lets two different
+# conditions collide on one identity — which reads as "already proposed" and
+# silences the lens that found the second one.
+MAX_FINGERPRINT_CHARS = 128
+
+# How long a lens's own sub-condition label may be. Short on purpose: it is a
+# classifier ("lines", "review"), not a description.
+MAX_KIND_CHARS = 32
+
 # The one refusal that carries NO new information: the fingerprint is spent, so
 # the ledger already holds the row that spent it. Recording it again would add a
 # byte-identical row per round forever — and `chain.compute_chain` hashes every
 # event with no type filter, so the cost lands on `hive verify` for the life of
 # the store.
 DUPLICATE_REASON = "already proposed — this fingerprint is spent"
+
+
+def generate_fingerprint(lens_name, parts) -> str:
+    """A bounded, collision-resistant identity for one condition instance.
+
+    Every lens mints its fingerprint through here rather than formatting one
+    itself, because a hand-built key is only as bounded as its longest component
+    and the contract caps the field at `MAX_FINGERPRINT_CHARS`. The audit lens is
+    the proof of what that costs: keyed on `"audit:" + ",".join(uncovered)`, six
+    modified source files already produce a 166-character key, `normalise` clamps
+    it to 128, and two DIFFERENT change-sets that share a 128-character prefix
+    become the SAME fingerprint — so the second one is refused as already
+    proposed, for as long as the prefix holds. Silent, and exactly the class of
+    failure this module keeps no sidecar in order to avoid.
+
+    A digest is 64 characters whatever it is fed, so the clamp can never fire.
+
+    *parts* are the identity components the LENS chooses, not its evidence list.
+    Each lens decides what makes its condition the same condition — a signature
+    plus its newest failure, a path plus a line bucket — and that judgement is the
+    one thing this function must not second-guess. They are sorted, so a set-
+    shaped key keeps one identity however its members are ordered, and joined on a
+    character no component can contain, so ("a", "bc") and ("ab", "c") stay
+    distinct instead of concatenating to the same blob."""
+    items = sorted(str(p) for p in (parts or ()) if str(p).strip())
+    blob = "\x1f".join([str(lens_name or "")] + items)
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return digest[:MAX_FINGERPRINT_CHARS]
 
 
 def _require_str(payload, key, cap, *, what):
@@ -120,7 +165,19 @@ def validate_payload(payload) -> None:
     # landed / refused are per-candidate and carry the candidate's identity.
     _require_str(payload, "lens", 64, what=outcome)
     _require_str(payload, "title", MAX_TITLE_CHARS, what=outcome)
-    _require_str(payload, "fingerprint", 128, what=outcome)
+    _require_str(payload, "fingerprint", MAX_FINGERPRINT_CHARS, what=outcome)
+    # Optional, and only a lens with more than one condition kind sets it. It
+    # carries the readable classification the fingerprint gave up when it became a
+    # digest: `tech-debt` proposes both oversized modules and uncleared review
+    # entries, and after hashing nothing else on the row tells the two apart.
+    kind = payload.get("kind")
+    if kind is not None:
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError(
+                "work_injected kind must be non-empty text when present")
+        if len(kind) > MAX_KIND_CHARS:
+            raise ValueError(
+                f"work_injected kind exceeds {MAX_KIND_CHARS} chars")
 
     if outcome == "refused":
         _require_str(payload, "reason", MAX_REASON_CHARS, what="refused")
@@ -300,10 +357,12 @@ class Candidate:
     candidate would fire once ever, and keyed on something that changes every
     round it would never dedup.
 
-    Three fields are set by the LENS, because only the lens knows them:
+    Four fields are set by the LENS, because only the lens knows them:
     `occurrences` (how many times its fold saw this condition), `severity`
-    (whether what it found is already blocking something), and `deferral_key`
-    (what the record would call this, so a standing deferral can be matched).
+    (whether what it found is already blocking something), `deferral_key`
+    (what the record would call this, so a standing deferral can be matched), and
+    `kind` (which of its own condition kinds this is, for a lens that has more
+    than one).
 
     Two are set by the ROUND, overwriting whatever a lens put there: `score` and
     `veto_reason`. Scoring lives in the round rather than the lens so one scale
@@ -320,6 +379,9 @@ class Candidate:
     depth: int = 1
     score: float = BASE_SCORE
     veto_reason: str = ""
+    # Lens-set, but declared last so adding it cannot shift any positional
+    # construction of the fields above it.
+    kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -363,16 +425,32 @@ class ReplenishConfig:
 
     @classmethod
     def for_profile(cls, profile, *, enabled=True, dry_rounds_to_exit=0,
-                    max_rounds_per_run=0, bounded_run=False):
+                    max_rounds_per_run=0, bounded_run=False,
+                    min_score=None, max_per_round=None):
         """A round's config, taken from an ambition position.
 
         `bounded_run` is what a loop passes. It turns the profile's per-run cap
         into a real budget folded from the run's landed rows, on top of the
         per-round trim — one dial, two enforcement points, so five rounds cannot
         inject five times the cap. A session leaves it off: a session runs one
-        round and its own lifecycle is the bound."""
-        return cls(enabled=enabled, min_score=profile.min_score,
-                   max_per_round=profile.max_injections_per_run,
+        round and its own lifecycle is the bound.
+
+        `min_score` and `max_per_round` are the operator's escape hatch: the dial
+        sets both, and an explicit value in `loop.toml` overrides the one the
+        position chose — which is how an operator keeps `ambitious`'s lens set
+        while raising its bar. `None` means "take the profile's", and it has to be
+        `None` rather than 0 because 0 is itself a legal `min_score`, meaning no
+        floor at all.
+
+        An explicit `max_per_round` trims the ROUND only. The run's total stays
+        the dial's, because the two caps answer different questions (see the field
+        comments) and an operator widening one round has not thereby agreed to
+        five times the run's appetite."""
+        return cls(enabled=enabled,
+                   min_score=(profile.min_score if min_score is None
+                              else min_score),
+                   max_per_round=(profile.max_injections_per_run
+                                  if max_per_round is None else max_per_round),
                    max_injections_per_run=(profile.max_injections_per_run
                                            if bounded_run else 0),
                    max_rounds_per_run=max_rounds_per_run,
@@ -746,7 +824,8 @@ def normalise(candidate) -> Candidate:
     return replace(candidate,
                    lens=str(candidate.lens)[:64],
                    title=str(candidate.title)[:MAX_TITLE_CHARS],
-                   fingerprint=str(candidate.fingerprint)[:128],
+                   fingerprint=str(candidate.fingerprint)[:MAX_FINGERPRINT_CHARS],
+                   kind=str(candidate.kind or "")[:MAX_KIND_CHARS],
                    evidence=evidence)
 
 
@@ -953,7 +1032,7 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                          fingerprint=c.fingerprint,
                          evidence=[str(e)[:MAX_EVIDENCE_CHARS]
                                    for e in c.evidence][:MAX_EVIDENCE_ITEMS],
-                         score=c.score, plan_id=pl.plan_id,
+                         score=c.score, kind=c.kind, plan_id=pl.plan_id,
                          step_index=pl.step_index if pl.step_index >= 0 else None))
     for c, reason in refused:
         if reason == DUPLICATE_REASON:
@@ -966,7 +1045,7 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
             continue
         rows.append(_row("refused", round_no, surface, run_id, lens=c.lens,
                          title=c.title or "(untitled)",
-                         fingerprint=c.fingerprint,
+                         fingerprint=c.fingerprint, kind=c.kind,
                          reason=reason[:MAX_REASON_CHARS]))
     if dropped:
         # R15: a cap that cut silently would read as "nothing more was found".
@@ -1065,7 +1144,8 @@ def evidence_gap(arg) -> list:
     # suite" is not a thing the record can stand down from, so there is nothing
     # for a deferral to match.
     return [Candidate(lens="evidence-gap", title=title[:MAX_TITLE_CHARS],
-                      fingerprint=f"evidence-gap:{newest_ts}",
+                      fingerprint=generate_fingerprint("evidence-gap",
+                                                       (newest_ts,)),
                       evidence=tuple(evidence),
                       occurrences=count, severity=True)]
 
@@ -1161,7 +1241,8 @@ def repair(arg) -> list:
             # Keyed on the newest failure: once the cause is fixed the signature
             # stops recurring, and a later recurrence is a NEW instance that
             # deserves proposing again rather than being silently deduped away.
-            fingerprint=f"repair:{sig}:{newest.get(sig, '')}",
+            fingerprint=generate_fingerprint("repair",
+                                             (sig, newest.get(sig, ""))),
             evidence=tuple([f"signature: {sig}",
                             f"{len(timestamps[sig])} recorded failure(s), "
                             f"no active prevention rule"]
@@ -1241,8 +1322,19 @@ def caveat(arg) -> list:
         out.append(Candidate(
             lens="caveat",
             title=f"Resolve pinned architectural caveat: {headline}"[:MAX_TITLE_CHARS],
-            fingerprint=f"caveat:{ts}",
+            fingerprint=generate_fingerprint("caveat", (ts,)),
             evidence=tuple(evidence),
+            # Asserted, and the record is what asserts it: this lens is scoped to
+            # caveats tagged `pinned`, and SOP memo-hygiene §4 defines that tag as
+            # the one reserved for SAFETY-CRITICAL caveats. An unresolved
+            # safety-critical hazard is a blocking condition by the project's own
+            # definition, so the severity term is read off the tag rather than
+            # judged here.
+            #
+            # Without it this lens was DEAD: base 10 alone sits below both
+            # thresholds it runs under (balanced 25, ambitious 15), so no pinned
+            # caveat could ever have landed anywhere, in silence.
+            severity=True,
             # The path is what a standing deferral would name, so it is also what
             # a veto matches on. Prose cannot be a deferral key.
             deferral_key=sorted(referents)[0] if referents else ""))
@@ -1352,7 +1444,9 @@ def technical_debt(arg) -> list:
             # Bucketed by hundreds, not the exact count: keyed on the raw number a
             # single added line would mint a fresh instance and re-propose the same
             # refactor every round.
-            fingerprint=f"tech-debt:lines:{relative}:{lines // 100}",
+            fingerprint=generate_fingerprint(
+                "tech-debt", ("lines", relative, lines // 100)),
+            kind="lines",
             evidence=(f"{relative} is {lines} lines",
                       f"threshold is {LINE_THRESHOLD} lines",
                       f"module {stem}"),
@@ -1370,7 +1464,8 @@ def technical_debt(arg) -> list:
         out.append(Candidate(
             lens="tech-debt",
             title=f"Clear the thermo-nuclear review queue for {relative}"[:MAX_TITLE_CHARS],
-            fingerprint=f"tech-debt:review:{relative}",
+            fingerprint=generate_fingerprint("tech-debt", ("review", relative)),
+            kind="review",
             evidence=(f"{relative} is queued in pending_review.json",
                       "SOP change-audit §4: the notice is a gate, not a "
                       "suggestion"),
@@ -1479,7 +1574,7 @@ def audit(arg) -> list:
                f"source file(s): {', '.join(shown)}{suffix}")[:MAX_TITLE_CHARS],
         # Keyed on the uncovered SET: log one of them and the set changes, which
         # is a different outstanding fact and deserves a fresh proposal.
-        fingerprint="audit:" + ",".join(uncovered),
+        fingerprint=generate_fingerprint("audit", uncovered),
         evidence=tuple([f"modified, no code_change: {p}" for p in shown]
                        + ["SOP change-audit §1: `hive log` is mandatory before "
                           "the work is called done"]),
@@ -1498,30 +1593,47 @@ def _in_review_scope(path) -> bool:
         return False
 
 
-def _logged_files(evs) -> set:
-    """Paths any `code_change` event claims. Basenames are matched too, because
-    the ledger holds worktree-absolute paths from every past checkout while git
-    reports repo-relative ones — comparing them literally would call everything
-    unlogged."""
-    logged = set()
+def _path_spellings(normalised) -> set:
+    """Every spelling of one path a ledger entry should match.
+
+    The ledger holds worktree-absolute paths written by every past checkout while
+    git reports repo-relative ones, so comparing them literally would call
+    everything unlogged."""
+    out = {normalised.lstrip("./")}
+    for marker, prefix in (("/src/mindhive/", "src/mindhive/"),
+                           ("/tests/", "tests/")):
+        if marker in normalised:
+            out.add(prefix + normalised.split(marker, 1)[1])
+    return out
+
+
+def _change_counts(evs) -> dict:
+    """How many `code_change` events name each path.
+
+    Counted per EVENT, not per listed file: one entry naming the same path twice
+    is one change to it. The count is what the coverage lens's recurrence term
+    reads — a module the record keeps changing without ever testing it is one the
+    record insists on, and how often is the only honest measure of how hard."""
+    counts = {}
     for ev in evs or []:
         if getattr(ev, "type", None) != "code_change":
             continue
         payload = getattr(ev, "payload", None)
         if not isinstance(payload, dict):
             continue
+        seen = set()
         for path in (payload.get("files") or []):
             if not isinstance(path, str):
                 continue
-            normalised = path.replace("\\", "/")
-            logged.add(normalised.lstrip("./"))
-            marker = "/src/mindhive/"
-            if marker in normalised:
-                logged.add("src/mindhive/" + normalised.split(marker, 1)[1])
-            marker = "/tests/"
-            if marker in normalised:
-                logged.add("tests/" + normalised.split(marker, 1)[1])
-    return logged
+            seen |= _path_spellings(path.replace("\\", "/"))
+        for spelling in seen:
+            counts[spelling] = counts.get(spelling, 0) + 1
+    return counts
+
+
+def _logged_files(evs) -> set:
+    """Paths any `code_change` event claims."""
+    return set(_change_counts(evs))
 
 
 LENSES["audit"] = audit
@@ -1542,6 +1654,7 @@ def coverage(arg) -> list:
         return []
 
     mentioned = _modules_mentioned_by_tests(trees.tests_root)
+    changes = _change_counts(ctx.evs)
     out = []
     for stem, path in _python_modules(trees.src_root):
         try:
@@ -1555,10 +1668,22 @@ def coverage(arg) -> list:
         out.append(Candidate(
             lens="coverage",
             title=f"Bootstrap a unit test suite for {relative}"[:MAX_TITLE_CHARS],
-            fingerprint=f"coverage:{relative}",
+            fingerprint=generate_fingerprint("coverage", (relative,)),
             evidence=(f"{relative} has no test module",
                       f"expected tests/test_{stem}.py, and no test file names "
-                      f"`{stem}`"),
+                      f"`{stem}`",
+                      f"{changes.get(relative, 0)} recorded change(s) to it"),
+            # How many times the record changed this module while it still had no
+            # test. NO severity: an untested module is not blocking anything, and
+            # asserting otherwise would put a fabricated +20 on every module in
+            # the tree. Recurrence is the honest term — a module nobody touches
+            # should not interrupt the operator, and one being changed repeatedly
+            # without cover is one the record insists on each time.
+            #
+            # Without this the lens was DEAD: base 10 alone sits below both
+            # thresholds it runs under (balanced 25, ambitious 15), so no missing
+            # test suite could ever have landed anywhere, in silence.
+            occurrences=max(1, changes.get(relative, 0)),
             deferral_key=relative))
     return out
 
@@ -1737,7 +1862,7 @@ def innovation(arg) -> list:
             lens="innovation",
             title=headline[:MAX_TITLE_CHARS],
             # Keyed on the slug, so the same proposal twice is one piece of work.
-            fingerprint=f"innovation:{slug}",
+            fingerprint=generate_fingerprint("innovation", (slug,)),
             evidence=evidence,
             # `occurrences` is HOW MUCH RECORD the proposal rests on, which is the
             # honest reading of the recurrence term for this lens: a suggestion

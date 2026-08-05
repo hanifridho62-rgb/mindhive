@@ -52,6 +52,17 @@ class LoopConfig:
     # already found and injected five rounds' worth of work is a run whose plan
     # the operator should look at before it grows again.
     replenish_max_rounds: int = 5
+    # Per-setting escape hatches. `None` means "take the ambition position's
+    # number"; an explicit value overrides the dial for that one setting, which is
+    # how an operator keeps a position's lens set while tuning its bar. They are
+    # `None` rather than 0 because 0 is itself a legal `min_score` — no floor.
+    replenish_min_score: int | None = None
+    replenish_max_per_round: int | None = None
+    # Two consecutive rounds that find nothing end the run. Exposed because it is
+    # the one structural stop whose right value depends on how much outstanding
+    # work a project usually carries, and it is safe to expose only because the
+    # streak is scoped to a single run_id.
+    replenish_dry_rounds_to_exit: int = 2
 
     @property
     def cooldown_seconds(self) -> float:
@@ -106,4 +117,9 @@ def load_config(path: Path) -> LoopConfig:
         replenish_ambition=replenish.get("ambition", cfg.replenish_ambition),
         replenish_max_rounds=replenish.get("max_rounds",
                                            cfg.replenish_max_rounds),
+        replenish_min_score=replenish.get("min_score", cfg.replenish_min_score),
+        replenish_max_per_round=replenish.get("max_per_round",
+                                              cfg.replenish_max_per_round),
+        replenish_dry_rounds_to_exit=replenish.get(
+            "dry_rounds_to_exit", cfg.replenish_dry_rounds_to_exit),
     )

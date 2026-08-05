@@ -443,6 +443,113 @@ def test_reporting_a_lens_failure_never_fails_the_round(monkeypatch):
     assert res.ran and res.lens_errors
 
 
+# --- the fingerprint ----------------------------------------------------------
+# The identity of ONE condition instance. It is a digest rather than a readable
+# key for one demonstrated reason: the contract caps the field, and a readable key
+# long enough to be clamped to that cap lets two DIFFERENT conditions share one
+# identity — at which point the second is refused as "already proposed" and the
+# lens that found it goes quiet with nothing on the record to say so.
+
+def test_a_fingerprint_is_a_bounded_hex_digest():
+    fp = replenish.generate_fingerprint("audit", ("a.py", "b.py"))
+    assert len(fp) == 64
+    assert len(fp) <= replenish.MAX_FINGERPRINT_CHARS
+    assert all(ch in "0123456789abcdef" for ch in fp)
+
+
+def test_the_same_parts_always_mint_the_same_identity():
+    assert (replenish.generate_fingerprint("repair", ("sig", "ts"))
+            == replenish.generate_fingerprint("repair", ("sig", "ts")))
+
+
+def test_the_lens_name_is_part_of_the_identity():
+    # The spent set is global across lenses by design, so without the lens name
+    # two lenses observing the same fact would dedup each other away.
+    assert (replenish.generate_fingerprint("repair", ("x",))
+            != replenish.generate_fingerprint("caveat", ("x",)))
+
+
+def test_part_order_does_not_change_the_identity():
+    # The audit lens's key is a SET of paths: the same change-set however ordered.
+    assert (replenish.generate_fingerprint("audit", ("a.py", "b.py"))
+            == replenish.generate_fingerprint("audit", ("b.py", "a.py")))
+
+
+def test_different_parts_mint_different_identities():
+    assert (replenish.generate_fingerprint("audit", ("a.py",))
+            != replenish.generate_fingerprint("audit", ("a.py", "b.py")))
+
+
+def test_parts_cannot_run_together_into_one_blob():
+    # Joined on a separator no component can contain. Bare concatenation would
+    # make ("ab", "c") and ("a", "bc") the same condition.
+    assert (replenish.generate_fingerprint("l", ("ab", "c"))
+            != replenish.generate_fingerprint("l", ("a", "bc")))
+
+
+def test_a_blank_part_is_dropped_rather_than_shifting_the_identity():
+    assert (replenish.generate_fingerprint("repair", ("sig", ""))
+            == replenish.generate_fingerprint("repair", ("sig",)))
+
+
+def test_an_enormous_part_list_still_satisfies_the_payload_contract():
+    fp = replenish.generate_fingerprint("audit", tuple(
+        f"src/mindhive/module_with_a_fairly_long_name_{i}.py" for i in range(200)))
+    assert len(fp) == 64
+    _check({"outcome": "refused", "round": 1, "surface": "loop", "lens": "audit",
+            "title": "t", "fingerprint": fp, "reason": "r"})
+
+
+def test_two_large_change_sets_do_not_collide_through_the_gate():
+    # THE REGRESSION, end to end. Under the old readable key six modified source
+    # files produced a 166-character fingerprint, `normalise` clamped it to 128,
+    # and a second change-set sharing that prefix was refused as a duplicate.
+    shared = [f"src/mindhive/loop/module_number_{i}.py" for i in range(5)]
+    a = replenish.generate_fingerprint("audit", tuple(shared + ["src/mindhive/aaa.py"]))
+    b = replenish.generate_fingerprint("audit", tuple(shared + ["src/mindhive/bbb.py"]))
+    assert a != b
+    spent = {replenish.normalise(replenish.Candidate(
+        lens="audit", title="A", fingerprint=a, evidence=("pointer",))).fingerprint}
+    kept, refused = replenish.gate(
+        [replenish.Candidate(lens="audit", title="B", fingerprint=b,
+                             evidence=("pointer",))],
+        spent, replenish.ReplenishConfig())
+    assert len(kept) == 1
+    assert refused == []
+
+
+# --- the kind classifier ------------------------------------------------------
+# What the digest gave up. `tech-debt` proposes both oversized modules and
+# uncleared review entries, and after hashing nothing else on the row tells them
+# apart.
+
+def test_a_kind_rides_the_payload():
+    _check(_landed(kind="lines"))
+
+
+def test_a_payload_with_no_kind_is_still_valid():
+    payload = _landed()
+    payload.pop("kind", None)
+    _check(payload)
+
+
+def test_a_blank_kind_is_rejected():
+    with pytest.raises(ValueError):
+        _check(_landed(kind="   "))
+
+
+def test_an_oversized_kind_is_rejected():
+    with pytest.raises(ValueError):
+        _check(_landed(kind="k" * (replenish.MAX_KIND_CHARS + 1)))
+
+
+def test_normalise_clamps_an_oversized_kind():
+    c = replenish.normalise(replenish.Candidate(
+        lens="tech-debt", title="t", fingerprint="fp", evidence=("e",),
+        kind="k" * 99))
+    assert len(c.kind) == replenish.MAX_KIND_CHARS
+
+
 # --- normalisation: the two-phase write window -------------------------------
 
 def test_a_blank_evidence_item_is_stripped_rather_than_reaching_the_contract():
@@ -764,6 +871,36 @@ def test_a_profile_config_can_enable_the_dry_round_exit():
     cfg = replenish.ReplenishConfig.for_profile(
         replenish.PROFILES["balanced"], dry_rounds_to_exit=2)
     assert cfg.dry_rounds_to_exit == 2
+
+
+def test_no_overrides_leaves_the_position_in_charge():
+    cfg = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["conservative"])
+    assert (cfg.min_score, cfg.max_per_round) == (40, 3)
+
+
+def test_an_explicit_min_score_overrides_the_position():
+    cfg = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["ambitious"], min_score=40)
+    assert cfg.min_score == 40
+
+
+def test_a_zero_min_score_is_an_override_and_not_an_absent_one():
+    # 0 is a legal threshold meaning "no floor". The sentinel therefore has to be
+    # None: were it 0, an operator asking for no floor would silently be given
+    # whichever number the dial position happened to carry.
+    cfg = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["ambitious"], min_score=0)
+    assert cfg.min_score == 0
+
+
+def test_an_explicit_max_per_round_trims_the_round_but_not_the_run():
+    # The two caps answer different questions. Widening one round is not an
+    # agreement to five times the run's appetite.
+    cfg = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["ambitious"], max_per_round=2, bounded_run=True)
+    assert cfg.max_per_round == 2
+    assert cfg.max_injections_per_run == 25
 
 
 def test_a_disabled_round_writes_nothing():

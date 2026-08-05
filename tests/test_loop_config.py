@@ -90,3 +90,47 @@ def test_a_replenish_key_that_is_not_a_table_falls_back(tmp_path):
     cfg = config.load_config(p)
     assert cfg.replenish_ambition == "balanced"
     assert cfg.max_iterations == 7        # the rest of the file still parsed
+
+
+def test_the_per_setting_overrides_default_to_the_dial(tmp_path):
+    # None rather than 0: the position supplies the number unless an operator
+    # names one, and 0 is itself a legal min_score meaning "no floor".
+    cfg = config.load_config(tmp_path / "missing.toml")
+    assert cfg.replenish_min_score is None
+    assert cfg.replenish_max_per_round is None
+    assert cfg.replenish_dry_rounds_to_exit == 2
+
+
+def test_the_per_setting_overrides_are_read(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nambition = "ambitious"\nmin_score = 40\n'
+                 'max_per_round = 2\ndry_rounds_to_exit = 3\n', encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_min_score == 40
+    assert cfg.replenish_max_per_round == 2
+    assert cfg.replenish_dry_rounds_to_exit == 3
+
+
+def test_a_zero_min_score_in_the_file_is_honoured(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nmin_score = 0\n', encoding="utf-8")
+    assert config.load_config(p).replenish_min_score == 0
+
+
+def test_an_override_beats_the_position_it_sits_beside(tmp_path):
+    # The point of the escape hatch: keep `ambitious`'s seven lenses and raise its
+    # bar. A dial that could only move all three settings together could not
+    # express that, and the per-run cap stays the position's either way.
+    from mindhive import replenish
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nambition = "ambitious"\nmin_score = 40\n',
+                 encoding="utf-8")
+    cfg = config.load_config(p)
+    profile = replenish.resolve_ambition(cfg.replenish_ambition).profile
+    round_cfg = replenish.ReplenishConfig.for_profile(
+        profile, min_score=cfg.replenish_min_score,
+        max_per_round=cfg.replenish_max_per_round, bounded_run=True)
+    assert round_cfg.min_score == 40
+    assert round_cfg.max_per_round == 25
+    assert round_cfg.max_injections_per_run == 25
+    assert "innovation" in profile.lens_names

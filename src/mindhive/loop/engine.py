@@ -127,11 +127,15 @@ def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None) -> int:
         choice = rp_mod.resolve_ambition(cfg.replenish_ambition)
         round_cfg = rp_mod.ReplenishConfig.for_profile(
             choice.profile,
-            # Two consecutive rounds that find nothing end the run. Safe here and
+            # Consecutive rounds that find nothing end the run. Safe here and
             # only here: the streak is scoped to this run_id, so a quiet run
             # cannot switch the loop surface off for the next one.
-            dry_rounds_to_exit=2,
+            dry_rounds_to_exit=getattr(cfg, "replenish_dry_rounds_to_exit", 2),
             max_rounds_per_run=getattr(cfg, "replenish_max_rounds", 5),
+            # `None` unless the operator set one, in which case it overrides the
+            # dial for that setting alone.
+            min_score=getattr(cfg, "replenish_min_score", None),
+            max_per_round=getattr(cfg, "replenish_max_per_round", None),
             bounded_run=True)
         evs = events.read_all(project)
         # The agentic lens may cite ONLY facts this process already knows, and the

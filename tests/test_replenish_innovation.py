@@ -79,7 +79,10 @@ def test_the_fingerprint_is_the_slug_so_the_same_proposal_dedups():
     first = replenish.innovation(_ctx(lambda _p: _reply("Harden the fold")))
     second = replenish.innovation(_ctx(lambda _p: _reply("Harden the fold")))
     assert first[0].fingerprint == second[0].fingerprint
-    assert first[0].fingerprint.startswith("innovation:")
+    # Keyed on the slug, which the candidate also carries as its deferral key —
+    # asserted exactly rather than by prefix, because the fingerprint is a digest.
+    assert first[0].fingerprint == replenish.generate_fingerprint(
+        "innovation", (first[0].deferral_key,))
 
 
 def test_two_proposals_with_the_same_title_get_distinct_ids():
