@@ -171,6 +171,16 @@ def test_the_sink_lands_what_fits_and_reports_the_rest():
     assert len(placements) == 1 and dropped == 1
 
 
+def test_append_false_previews_without_writing_the_plan():
+    # The core's own append flag governs only the audit rows. Without this one a
+    # --dry-run would still leave a real roadmap step behind.
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    placements, dropped = replenish_sinks.roadmap_sink(SID, append=False)(
+        [_cand()])
+    assert len(placements) == 1 and dropped == 0
+    assert _rec() is None
+
+
 def test_an_unusable_session_id_is_reported_not_swallowed():
     with pytest.raises(ValueError, match="plan_id"):
         replenish_sinks.roadmap_sink("NOT A VALID ID")

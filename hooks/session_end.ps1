@@ -13,6 +13,12 @@ if (-not $sid) { $sid = "unknown" }
 $env:MINDHIVE_SESSION = $sid
 try {
     & $py -m mindhive append session_end "session closed" | Out-Null
+    # Adaptive work injection (replenish.py) runs BEFORE the autoclose below,
+    # and therefore before the projections rebuild. The ordering is load-bearing
+    # and silent when wrong: injected steps added AFTER the plan is closed still
+    # exist, but the plan is already interrupted, so notice() never renders them
+    # and the next session never sees the work.
+    & $py -m mindhive replenish run --session $sid | Out-Null
     # Close the session's auto-synced roadmap (roadmap.py autoclose) BEFORE the
     # projections rebuild: all steps done -> complete (leaves every view);
     # unfinished -> interrupt, so the plan's creation context rides STATE.md

@@ -29,12 +29,18 @@ from .replenish import Placement
 from .sop import ID_RE
 
 
-def roadmap_sink(session_id, project=None, evs=None, ts=None):
+def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
     """A sink that appends kept candidates to *session_id*'s roadmap plan.
 
     Returns ``(placements, dropped)``. `dropped` is what did not fit under
     `roadmap.MAX_STEPS`; those candidates get no audit row, so their fingerprints
-    stay unspent and the next round may propose them again."""
+    stay unspent and the next round may propose them again.
+
+    ``append=False`` runs the identical placement math and writes nothing. The
+    flag lives here rather than in a separate preview sink because a dry run that
+    exercised different code would be answering a different question — and the
+    core's own ``append`` flag only governs the audit rows, so without this one a
+    `--dry-run` would still leave a real roadmap step behind."""
     sid = str(session_id or "")
     if not ID_RE.match(sid):
         # Not silently degraded to "nothing landed": a session id that cannot be
@@ -66,13 +72,16 @@ def roadmap_sink(session_id, project=None, evs=None, ts=None):
         prompt = rec["prompt"] if rec else rm_mod._session_prompt(rows, sid)
         payload = {"action": "set", "plan_id": sid, "prompt": prompt,
                    "title": prompt[:rm_mod.MAX_TITLE_CHARS], "steps": steps}
+        # Validated even on a dry run: a preview that skipped the contract could
+        # promise work the real run would then refuse to write.
         rm_mod.validate_payload(payload)
-        # AUTO_TAG is load-bearing, not decoration: `autoclose_session` leaves
-        # human-declared plans alone, so without it the plan would never be
-        # marked interrupted and would never reach STATE.md.
-        ev_mod.append_event("roadmap", payload, session_id=sid,
-                            tags=["roadmap", rm_mod.AUTO_TAG, "replenish"],
-                            ts=ts, project=project)
+        if append:
+            # AUTO_TAG is load-bearing, not decoration: `autoclose_session`
+            # leaves human-declared plans alone, so without it the plan would
+            # never be marked interrupted and would never reach STATE.md.
+            ev_mod.append_event("roadmap", payload, session_id=sid,
+                                tags=["roadmap", rm_mod.AUTO_TAG, "replenish"],
+                                ts=ts, project=project)
         placements = [Placement(c.fingerprint, sid, len(existing) + i)
                       for i, c in enumerate(take)]
         return placements, dropped

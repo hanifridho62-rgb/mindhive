@@ -564,6 +564,57 @@ def cmd_log_pending(args) -> int | None:
     return None
 
 
+def cmd_replenish_run(args) -> int | None:
+    """One replenishment round for a session. Run by session_end BEFORE
+    `roadmap autoclose`, so the injected steps exist when the plan is closed and
+    therefore reach STATE.md in the same pass."""
+    from . import replenish as rp_mod, replenish_sinks as sink_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    if not sid:
+        print("no session id — pass --session or set MINDHIVE_SESSION",
+              file=sys.stderr)
+        return 2
+    evs = events.read_all()
+    write = not args.dry_run
+    # BOTH flags: the core's governs the audit rows, the sink's governs the work
+    # itself. Passing only the first would leave a real roadmap step behind on a
+    # run the operator asked to be a preview.
+    res = rp_mod.run_round(evs, surface="session",
+                           sink=sink_mod.roadmap_sink(sid, append=write),
+                           session_id=sid, append=write)
+    if not res.ran:
+        print(f"replenish skipped: {res.skipped}")
+        return None
+    prefix = "would inject" if args.dry_run else "injected"
+    for cand, place in res.landed:
+        print(f"{prefix} [{cand.lens}] {cand.title}")
+        for item in cand.evidence:
+            print(f"    evidence: {item}")
+        if not args.dry_run:
+            print(f"    landed on roadmap {place.plan_id} step "
+                  f"{place.step_index}")
+    for cand, reason in res.refused:
+        print(f"refused [{cand.lens}] {cand.title} — {reason}")
+    if res.dropped:
+        print(f"{res.dropped} candidate(s) did not fit this round")
+    if res.dry:
+        print("nothing outstanding that the record proves")
+    return None
+
+
+def cmd_replenish_status(args) -> int | None:
+    """What the injector knows, folded from the ledger — there is no sidecar."""
+    from . import replenish as rp_mod
+    hist = rp_mod.history(events.read_all())
+    print(json.dumps({
+        "last_round": hist.last_round,
+        "dry_rounds": hist.dry_rounds,
+        "spent_fingerprints": sorted(hist.fingerprints),
+        "lenses": sorted(rp_mod.LENSES),
+    }, indent=2))
+    return None
+
+
 def _sop_body(args) -> str | None:
     """Resolve an SOP body from --text / --file / --stdin (at most one). A
     procedure body is usually multi-line markdown, which is painful to pass as
@@ -2914,6 +2965,22 @@ def _build_parser() -> argparse.ArgumentParser:
     lgq.set_defaults(func=cmd_log_queue)
     lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
     lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
+
+    # --- replenish (adaptive work injection) ---
+    rp = sub.add_parser("replenish",
+                        help="propose work the record proves is outstanding "
+                             "(run by session_end)")
+    rpsub = rp.add_subparsers(dest="replenish_cmd", required=True)
+    rpr = rpsub.add_parser("run", help="run one replenishment round for a session")
+    rpr.add_argument("--session", default=None,
+                     help="session id to replenish (default: $MINDHIVE_SESSION)")
+    rpr.add_argument("--dry-run", action="store_true",
+                     help="decide and print without appending anything")
+    rpr.set_defaults(func=cmd_replenish_run)
+    rpsub.add_parser("status",
+                     help="what the injector knows: rounds, dry streak, spent "
+                          "fingerprints, active lenses"
+                     ).set_defaults(func=cmd_replenish_status)
 
     # --- sop (managed standard operating procedures) ---
     so = sub.add_parser("sop", help="standard operating procedures "
