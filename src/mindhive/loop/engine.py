@@ -103,6 +103,9 @@ def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None) -> int:
             sink=sink_mod.fix_plan_sink(loop_dir, run_id=run_id),
             lenses=rp_mod.lenses_for(choice.profile),
             cfg=round_cfg, project=project, run_id=run_id,
+            # The loop is the surface with an outcome history to tune on: it runs
+            # rounds back to back and can see what its own injections produced.
+            tune=True,
             ctx=rp_mod.LensContext(evs=tuple(evs), project=project,
                                    run_id=run_id, changed_paths=changed))
         if choice.fell_back and result.round_no == 1:

@@ -579,6 +579,115 @@ def history(evs, surface=None, run_id=None) -> History:
     return History(frozenset(spent), last, dry, landed)
 
 
+# --- the auto-tuner -----------------------------------------------------------
+# Homeostasis, not learning. The threshold moves in response to what injected work
+# actually DID, on two windows chosen so the two directions are asymmetric: it
+# takes 3 bad outcomes to become more cautious and 5 good ones to become bolder.
+# Retreating faster than it advances is the correct bias for a mechanism that can
+# spend an operator's quota.
+
+TUNE_RAISE_WINDOW = 3
+TUNE_RAISE_DELTA = 10
+TUNE_LOWER_WINDOW = 5
+TUNE_LOWER_DELTA = -5
+
+# How far the tuner may wander from the dial's own number. Without a ceiling a
+# long unlucky streak could raise the threshold past any candidate's reachable
+# score and switch the injector off in a way no operator chose.
+TUNE_MAX_DRIFT = 20
+
+
+@dataclass(frozen=True)
+class ThresholdAdjustment:
+    """A shift in how selective the gate is, and why.
+
+    `delta` of 0 means the record said nothing conclusive, which is the common
+    case and must stay distinguishable from "the record said stay put" — the
+    caller writes a `decision` row only when something moved."""
+
+    delta: int = 0
+    reason: str = ""
+    window: int = 0
+
+    @property
+    def shifts(self) -> bool:
+        return self.delta != 0
+
+
+def _outcome_after(evs, ts) -> str:
+    """What the record shows happened FIRST after *ts*: "failed", "verified", "".
+
+    First, not eventually: a run that broke and was later fixed says something
+    different about the injected work than one that passed immediately, and taking
+    the earliest signal is what keeps the two apart."""
+    for ev in evs or []:
+        if (getattr(ev, "ts", "") or "") <= ts:
+            continue
+        etype = getattr(ev, "type", None)
+        payload = getattr(ev, "payload", None)
+        if etype == "tool_failed":
+            return "failed"
+        if etype == "loop_run_end" and isinstance(payload, dict) \
+                and payload.get("reason") == "breaker_open":
+            return "failed"
+        if etype == "verification" and isinstance(payload, dict):
+            code = payload.get("exit_code")
+            if isinstance(code, int) and not isinstance(code, bool):
+                return "verified" if code == 0 else "failed"
+    return ""
+
+
+def tune_threshold(evs, surface=None) -> ThresholdAdjustment:
+    """How far the gate should move, read off what injected work produced.
+
+    Pure and total: it appends nothing and raises on nothing, so a caller can ask
+    without committing. A malformed row is skipped like everywhere else — the
+    ledger holds history written by every past version of this code."""
+    landed = []
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "work_injected":
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict) or payload.get("outcome") != "landed":
+            continue
+        if surface is not None and payload.get("surface") != surface:
+            continue
+        landed.append(getattr(ev, "ts", "") or "")
+
+    outcomes = [_outcome_after(evs, ts) for ts in landed if ts]
+
+    recent_bad = outcomes[-TUNE_RAISE_WINDOW:]
+    if len(recent_bad) == TUNE_RAISE_WINDOW and all(o == "failed"
+                                                    for o in recent_bad):
+        return ThresholdAdjustment(
+            TUNE_RAISE_DELTA,
+            f"the last {TUNE_RAISE_WINDOW} injections were each followed by a "
+            f"failure or a tripped breaker — raising the bar",
+            TUNE_RAISE_WINDOW)
+
+    recent_good = outcomes[-TUNE_LOWER_WINDOW:]
+    if len(recent_good) == TUNE_LOWER_WINDOW and all(o == "verified"
+                                                     for o in recent_good):
+        return ThresholdAdjustment(
+            TUNE_LOWER_DELTA,
+            f"the last {TUNE_LOWER_WINDOW} injections each verified green — "
+            f"lowering the bar",
+            TUNE_LOWER_WINDOW)
+
+    return ThresholdAdjustment()
+
+
+def tuned_threshold(base, adjustment) -> int:
+    """*base* shifted by *adjustment*, clamped twice.
+
+    `MIN_THRESHOLD` is the hard floor — below the base score every candidate any
+    lens emitted would clear the gate. `TUNE_MAX_DRIFT` bounds the other end so an
+    unlucky streak cannot raise the bar out of every candidate's reach and switch
+    the injector off in a way no operator chose."""
+    delta = max(-TUNE_MAX_DRIFT, min(TUNE_MAX_DRIFT, adjustment.delta))
+    return max(MIN_THRESHOLD, base + delta)
+
+
 def refusal_reason(candidate, spent, cfg) -> str:
     """Why this candidate may not become work, or "" when it may.
 
@@ -688,6 +797,27 @@ def _record(rows, project=None, session_id=None) -> list:
     return out
 
 
+def _record_tuning(adjustment, effective, surface, project=None,
+                   session_id=None) -> None:
+    """Put a threshold shift on the record as a `decision`.
+
+    Only when something moved. A row per round would flood the ledger and every
+    future briefing (SOP `memo-hygiene` §3), and "the tuner looked and did
+    nothing" is not a decision. Best-effort: a round must not fail because it
+    could not narrate itself."""
+    try:
+        ev_mod.append_event(
+            "decision",
+            {"text": f"replenish value gate {'raised' if adjustment.delta > 0 else 'lowered'} "
+                     f"by {abs(adjustment.delta)} to {effective} on the {surface} "
+                     f"surface: {adjustment.reason} (window: last "
+                     f"{adjustment.window} injections)"[:500]},
+            session_id=session_id, tags=["replenish", "auto-tune"],
+            project=project)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
     """Put a broken lens on the record, under the signature the failure loop
     already audits. Best-effort: a round must not fail because it could not
@@ -706,7 +836,8 @@ def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
 
 
 def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
-              session_id=None, append=True, ctx=None, run_id="") -> RoundResult:
+              session_id=None, append=True, ctx=None, run_id="",
+              tune=False) -> RoundResult:
     """Run one replenishment round and record what it decided.
 
     *sink* is a parameter, not an import: deciding what is outstanding is
@@ -744,6 +875,16 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
         return RoundResult(round_no=hist.last_round,
                            skipped="injection budget exhausted")
     round_no = hist.last_round + 1
+
+    # Homeostasis. Off by default because a surface that runs one round per
+    # session has no outcome history to tune on; the loop turns it on.
+    adjustment = tune_threshold(evs, surface=surface) if tune \
+        else ThresholdAdjustment()
+    if adjustment.shifts:
+        cfg = replace(cfg, min_score=tuned_threshold(cfg.min_score, adjustment))
+        if append:
+            _record_tuning(adjustment, cfg.min_score, surface,
+                           project=project, session_id=session_id)
 
     # One context for the whole round: the lenses that read a tree or a project
     # get those from here rather than resolving them, which is what makes them
