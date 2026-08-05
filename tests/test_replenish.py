@@ -396,6 +396,119 @@ def test_a_broken_lens_does_not_cost_the_round():
     assert len(res.landed) == 1
 
 
+def _boom(_evs):
+    raise RuntimeError("lens exploded")
+
+
+def test_a_broken_lens_is_recorded_under_the_signature_the_failure_loop_audits():
+    replenish.run_round([], surface="session", sink=_sink(),
+                        lenses={"bad": _boom})
+    failures = [e.payload for e in events.read_all() if e.type == "tool_failed"]
+    assert len(failures) == 1
+    assert failures[0]["signature"] == "lens:bad"
+    assert "lens exploded" in failures[0]["text"]
+
+
+def test_a_round_where_every_lens_broke_is_distinguishable_from_a_quiet_one():
+    # The false statement this prevents: an all-lenses-fail round wrote nothing
+    # and the CLI reported "nothing outstanding that the record proves".
+    broken = replenish.run_round([], surface="session", sink=_sink(),
+                                 lenses={"bad": _boom})
+    quiet = replenish.run_round([], surface="session", sink=_sink(),
+                                lenses={"ok": lambda _e: []})
+    assert broken.lens_errors and not quiet.lens_errors
+    assert broken.dry and quiet.dry          # both found nothing, and say so
+
+
+def test_reporting_a_lens_failure_never_fails_the_round(monkeypatch):
+    monkeypatch.setattr(replenish.ev_mod, "append_event",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    res = replenish.run_round([], surface="session", sink=_sink(),
+                              lenses={"bad": _boom})
+    assert res.ran and res.lens_errors
+
+
+# --- normalisation: the two-phase write window -------------------------------
+
+def test_a_blank_evidence_item_is_stripped_rather_than_reaching_the_contract():
+    # The demonstrated failure: gate() filtered blanks only to DECIDE, kept the
+    # raw tuple, the sink wrote the work, and validate_payload then rejected the
+    # row — leaving a step with no landed row and an unspent fingerprint.
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(),
+        lenses={"l": lambda _e: [_cand(evidence=("   ", "a real pointer"))]})
+    assert len(res.landed) == 1
+    row = [r for r in _rows() if r["outcome"] == "landed"][0]
+    assert row["evidence"] == ["a real pointer"]
+
+
+def test_every_gate_survivor_produces_a_contract_legal_row():
+    long_title = "t" * (replenish.MAX_TITLE_CHARS + 50)
+    kept, _refused = replenish.gate(
+        [_cand(title=long_title,
+               evidence=tuple(f"e{i}" for i in range(40)))],
+        frozenset(), replenish.ReplenishConfig())
+    payload = replenish._row("landed", 1, "session", lens=kept[0].lens,
+                             title=kept[0].title,
+                             fingerprint=kept[0].fingerprint,
+                             evidence=list(kept[0].evidence), score=1.0)
+    replenish.validate_payload(payload)          # must not raise
+
+
+def test_normalise_does_not_rescue_a_candidate_with_nothing_real():
+    kept, refused = replenish.gate([_cand(evidence=("  ", ""))], frozenset(),
+                                   replenish.ReplenishConfig())
+    assert kept == [] and "no evidence" in refused[0][1]
+
+
+# --- refusal ordering ---------------------------------------------------------
+
+def test_a_spent_fingerprint_outranks_every_other_refusal_reason():
+    # The ordering bug: evidence was checked first, so an evidence-less
+    # candidate never reached the duplicate branch and its identical refusal row
+    # was appended every round forever.
+    _kept, refused = replenish.gate([_cand(evidence=())],
+                                    frozenset({"fp-1"}),
+                                    replenish.ReplenishConfig())
+    assert refused[0][1] == replenish.DUPLICATE_REASON
+
+
+def test_an_evidence_less_candidate_is_recorded_once_not_every_round():
+    lenses = {"l": lambda _e: [_cand("fp-noev", evidence=())]}
+    for _ in range(4):
+        replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                            lenses=lenses)
+    assert len([r for r in _rows() if r["outcome"] == "refused"]) == 1
+
+
+def test_a_fingerprint_less_candidate_gets_no_row_at_all():
+    lenses = {"l": lambda _e: [_cand("")]}
+    for _ in range(3):
+        replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                            lenses=lenses)
+    assert _rows() == []
+
+
+# --- dry means "nothing qualified", not "nothing landed" ---------------------
+
+def test_a_capped_round_is_not_dry():
+    # It was printing "N candidate(s) did not fit" and "nothing outstanding" in
+    # the same breath.
+    cfg = replenish.ReplenishConfig(max_per_round=1)
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(), cfg=cfg,
+        lenses={"l": lambda _e: [_cand("fp-1"), _cand("fp-2")]})
+    assert res.dropped == 1
+    assert not res.dry
+
+
+def test_a_round_the_sink_could_not_place_is_not_dry():
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(drop=1),
+        lenses={"l": lambda _e: [_cand("fp-1")]})
+    assert res.landed == [] and not res.dry
+
+
 def test_a_disabled_round_does_nothing_at_all():
     cfg = replenish.ReplenishConfig(enabled=False)
     res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,

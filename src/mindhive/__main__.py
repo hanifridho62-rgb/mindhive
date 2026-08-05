@@ -584,10 +584,18 @@ def cmd_replenish_run(args) -> int | None:
     # hook, which already pays for several full ledger reads, and the sink would
     # otherwise read all 27k+ events a second time. Nothing is appended between
     # this read and the sink, so the snapshot is current.
-    res = rp_mod.run_round(evs, surface="session",
-                           sink=sink_mod.roadmap_sink(sid, evs=evs,
-                                                      append=write),
-                           session_id=sid, append=write)
+    try:
+        res = rp_mod.run_round(evs, surface="session",
+                               sink=sink_mod.roadmap_sink(sid, evs=evs,
+                                                          append=write),
+                               session_id=sid, append=write)
+    except Exception as exc:                                    # noqa: BLE001
+        # The SessionEnd hook pipes stdout to Out-Null and a native non-zero
+        # exit does not reach PowerShell's catch, so an unhandled traceback here
+        # is invisible: the injector would stop working and nobody would learn
+        # it had. Say so on stderr in one line, and fail deliberately.
+        print(f"replenish failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     if not res.ran:
         print(f"replenish skipped: {res.skipped}")
         return None
@@ -603,8 +611,15 @@ def cmd_replenish_run(args) -> int | None:
         print(f"refused [{cand.lens}] {cand.title} — {reason}")
     if res.dropped:
         print(f"{res.dropped} candidate(s) did not fit this round")
+    for name, message in res.lens_errors:
+        print(f"lens {name} failed: {message}", file=sys.stderr)
     if res.dry:
-        print("nothing outstanding that the record proves")
+        # Only honest when every lens actually ran. A round where they all threw
+        # also finds nothing, and claiming the record proves nothing outstanding
+        # would be a statement about the ledger that was never checked.
+        print("nothing outstanding that the record proves" if not res.lens_errors
+              else f"no candidates — but {len(res.lens_errors)} lens(es) failed, "
+                   "so the record was not fully read")
     return None
 
 
@@ -614,7 +629,11 @@ def cmd_replenish_status(args) -> int | None:
     hist = rp_mod.history(events.read_all(), surface="session")
     print(json.dumps({
         "surface": "session",
-        "last_round": hist.last_round,
+        # Named for what it is. A round that writes no rows — every candidate a
+        # spent duplicate, nothing landed, no cap hit — leaves the counter where
+        # it was, so this is the last round that RECORDED something, not the
+        # number of rounds the surface has run.
+        "last_recorded_round": hist.last_round,
         "dry_rounds": hist.dry_rounds,
         "spent_fingerprints": sorted(hist.fingerprints),
         "lenses": sorted(rp_mod.LENSES),

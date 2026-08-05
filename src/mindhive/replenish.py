@@ -199,6 +199,7 @@ class RoundResult:
     dropped: int = 0
     dry: bool = False
     skipped: str = ""
+    lens_errors: list = field(default_factory=list)   # [(lens_name, message)]
 
     @property
     def ran(self) -> bool:
@@ -259,22 +260,47 @@ def history(evs, surface=None) -> History:
 def refusal_reason(candidate, spent, cfg) -> str:
     """Why this candidate may not become work, or "" when it may.
 
-    Evidence is checked first and unconditionally. Everything else here is a
-    policy knob an operator can loosen; this one is the rule that separates
-    replenishment from inventing work to fill a quota."""
+    The spent check comes FIRST. It used to sit third, behind evidence and
+    fingerprint presence, which meant an evidence-less candidate never reached
+    the duplicate branch — so its identical refusal row was appended every
+    round forever, the exact unbounded cost `DUPLICATE_REASON` exists to
+    prevent. The reasons are not peers: "we already decided this" outranks
+    every other reason not to act. Evidence remains the rule that separates
+    replenishment from inventing work to fill a quota; it is simply not the
+    first question."""
+    if not (candidate.fingerprint or "").strip():
+        return "no fingerprint — this candidate could never be deduplicated"
+    if candidate.fingerprint in spent:
+        return DUPLICATE_REASON
     evidence = [e for e in (candidate.evidence or [])
                 if isinstance(e, str) and e.strip()]
     if not evidence:
         return ("no evidence — a candidate must point at a real ledger row, "
                 "file, or signature")
-    if not (candidate.fingerprint or "").strip():
-        return "no fingerprint — this candidate could never be deduplicated"
-    if candidate.fingerprint in spent:
-        return DUPLICATE_REASON
     if candidate.score < cfg.min_score:
         return (f"score {candidate.score} below the round's minimum "
                 f"{cfg.min_score}")
     return ""
+
+
+def normalise(candidate) -> Candidate:
+    """Clamp a candidate to the shapes the audit contract accepts.
+
+    This is what closes the two-phase write window all three reviewers flagged.
+    The sink appends the WORK before `_record` validates the audit rows, so a
+    candidate that survives the gate but yields an illegal payload leaves the
+    step written, no `landed` row, an unspent fingerprint, and a duplicate step
+    next round. Guaranteeing at the gate that every survivor produces a legal
+    row removes the failure rather than compensating for it. The demonstrated
+    case was evidence like ``('   ', 'a real pointer')`` — the gate filters
+    blanks only to DECIDE, and the contract then rejected the blank item."""
+    evidence = tuple(e[:MAX_EVIDENCE_CHARS]
+                     for e in (candidate.evidence or [])
+                     if isinstance(e, str) and e.strip())[:MAX_EVIDENCE_ITEMS]
+    return Candidate(lens=str(candidate.lens)[:64],
+                     title=str(candidate.title)[:MAX_TITLE_CHARS],
+                     fingerprint=str(candidate.fingerprint)[:128],
+                     evidence=evidence, score=candidate.score)
 
 
 def gate(candidates, spent, cfg):
@@ -282,12 +308,15 @@ def gate(candidates, spent, cfg):
 
     Fingerprints of kept candidates join the spent set as we go, so two lenses
     proposing the same condition in one round produce one piece of work and one
-    recorded duplicate refusal, not two pieces of work."""
+    recorded duplicate refusal, not two pieces of work. Every entry returned —
+    kept or refused — has been normalised, so nothing downstream has to cope
+    with a shape the audit contract would reject."""
     kept, refused = [], []
     seen = set(spent)
     for c in candidates or []:
         if not isinstance(c, Candidate):
             continue           # a lens returning junk is a bug, not a decision
+        c = normalise(c)
         reason = refusal_reason(c, seen, cfg)
         if reason:
             refused.append((c, reason))
@@ -316,6 +345,23 @@ def _record(rows, project=None, session_id=None) -> list:
     return out
 
 
+def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
+    """Put a broken lens on the record, under the signature the failure loop
+    already audits. Best-effort: a round must not fail because it could not
+    report that something else failed."""
+    for name, message in errors or []:
+        try:
+            ev_mod.append_event(
+                "tool_failed",
+                {"text": f"replenish lens {name} raised: {message}"[:500],
+                 "signature": f"lens:{name}",
+                 "action": f"run the {name} lens on the {surface} surface"},
+                session_id=session_id, tags=["replenish", "lens", "failure"],
+                project=project)
+        except Exception:                                       # noqa: BLE001
+            continue
+
+
 def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
               session_id=None, append=True) -> RoundResult:
     """Run one replenishment round and record what it decided.
@@ -337,15 +383,26 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                            skipped="dry rounds exhausted")
     round_no = hist.last_round + 1
 
-    candidates = []
+    candidates, lens_errors = [], []
     for name, lens in (LENSES if lenses is None else lenses).items():
         try:
             candidates.extend(lens(evs) or [])
-        except Exception:                                       # noqa: BLE001
-            # One broken lens must not cost the round every other lens found.
-            continue
+        except Exception as exc:                                # noqa: BLE001
+            # One broken lens must not cost the round every other lens found —
+            # but silence here is worse than the crash. A round where every lens
+            # threw wrote nothing and reported "nothing outstanding that the
+            # record proves", which is a false statement about the ledger. The
+            # failure goes to `tool_failed` under a `lens:<name>` signature,
+            # which is the signature `incidents`/`reflect` already audit, so a
+            # lens that keeps breaking becomes a prevention rule on its own.
+            lens_errors.append((name, f"{type(exc).__name__}: {exc}"))
 
     kept, refused = gate(candidates, hist.fingerprints, cfg)
+    # R16 asks whether anything QUALIFIED, which is decided here. A round the cap
+    # trimmed or the sink could not place found real work and must not report
+    # itself dry — the CLI was printing "N candidate(s) did not fit" and
+    # "nothing outstanding" in the same breath.
+    dry = not kept
     dropped = 0
     if len(kept) > cfg.max_per_round:
         dropped = len(kept) - cfg.max_per_round
@@ -372,14 +429,19 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     for c, reason in refused:
         if reason == DUPLICATE_REASON:
             continue          # the row that spent this fingerprint IS the record
+        if not c.fingerprint:
+            # Nothing to dedup on, so this row would repeat every round for as
+            # long as the lens keeps emitting it. A fingerprint-less candidate
+            # is a lens defect; the lens-error channel above is where that
+            # belongs, not an unbounded run of identical refusals.
+            continue
         rows.append(_row("refused", round_no, surface, lens=c.lens,
-                         title=(c.title or "(untitled)")[:MAX_TITLE_CHARS],
-                         fingerprint=c.fingerprint or "unfingerprinted",
+                         title=c.title or "(untitled)",
+                         fingerprint=c.fingerprint,
                          reason=reason[:MAX_REASON_CHARS]))
     if dropped:
         # R15: a cap that cut silently would read as "nothing more was found".
         rows.append(_row("truncated", round_no, surface, dropped=dropped))
-    dry = not landed
     # The dry row exists to feed the dry-round exit. Where that exit is off, it
     # is a row nobody reads, appended once per session forever — so it is only
     # written when something actually consumes it.
@@ -388,9 +450,11 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     if append:
         _record(rows, project=project, session_id=session_id)
+        _record_lens_errors(lens_errors, surface, project=project,
+                            session_id=session_id)
 
     return RoundResult(round_no=round_no, landed=landed, refused=refused,
-                       dropped=dropped, dry=dry)
+                       dropped=dropped, dry=dry, lens_errors=lens_errors)
 
 
 # --- lenses ------------------------------------------------------------------

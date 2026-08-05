@@ -109,7 +109,7 @@ def test_status_reports_the_folded_state(capsys):
     capsys.readouterr()
     assert main(["replenish", "status"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["last_round"] == 1
+    assert data["last_recorded_round"] == 1
     assert data["dry_rounds"] == 0
     assert data["lenses"] == ["evidence-gap"]
     assert any(f.startswith("evidence-gap:") for f in data["spent_fingerprints"])
@@ -118,8 +118,41 @@ def test_status_reports_the_folded_state(capsys):
 def test_status_on_an_empty_ledger(capsys):
     assert main(["replenish", "status"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data == {"surface": "session", "last_round": 0, "dry_rounds": 0,
-                    "spent_fingerprints": [], "lenses": ["evidence-gap"]}
+    assert data == {"surface": "session", "last_recorded_round": 0,
+                    "dry_rounds": 0, "spent_fingerprints": [],
+                    "lenses": ["evidence-gap"]}
+
+
+def test_a_crash_is_reported_on_stderr_and_exits_non_zero(monkeypatch, capsys):
+    # Inside session_end.ps1 stdout goes to Out-Null and a native non-zero exit
+    # does not reach PowerShell's catch, so an unhandled traceback would make
+    # the injector fail permanently and silently.
+    from mindhive import replenish as rp_mod
+    monkeypatch.setattr(rp_mod, "run_round",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("the round exploded")))
+    _outstanding()
+    assert main(["replenish", "run", "--session", SID]) == 1
+    err = capsys.readouterr().err
+    assert "replenish failed" in err and "the round exploded" in err
+
+
+def test_a_lens_failure_is_reported_and_does_not_claim_a_clean_record(capsys):
+    from mindhive import replenish as rp_mod
+
+    def boom(_evs):
+        raise RuntimeError("lens exploded")
+
+    rp_mod.LENSES["probe-boom"] = boom
+    try:
+        events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+        assert main(["replenish", "run", "--session", SID]) == 0
+    finally:
+        rp_mod.LENSES.pop("probe-boom", None)
+    out = capsys.readouterr()
+    assert "lens probe-boom failed" in out.err
+    assert "the record was not fully read" in out.out
+    assert "nothing outstanding that the record proves" not in out.out
 
 
 # --- the hook leg -------------------------------------------------------------
