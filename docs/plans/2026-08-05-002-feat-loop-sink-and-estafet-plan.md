@@ -2,7 +2,18 @@
 date: 2026-08-05
 type: feat
 origin: docs/brainstorms/2026-08-05-adaptive-work-injection-requirements.md
+superseded_by: docs/plans/2026-08-05-003-feat-replenish-lenses-and-ambition-dial-plan.md
 ---
+
+> **Superseded — do not execute this plan.** Its units were never implemented and
+> are carried forward, with two corrections, into
+> [`003-feat-replenish-lenses-and-ambition-dial-plan.md`](2026-08-05-003-feat-replenish-lenses-and-ambition-dial-plan.md),
+> which shipped. The corrections: the checklist marker is `(new)` — the same one
+> `roadmap.NEW_MARKER` already rendered — rather than the `[NEW]` / `[FIX:sig]` /
+> `[PARALLEL]` bracket vocabulary proposed below, because one fact deserves one
+> spelling; and candidate scores are integers on the ambition dial's scale rather
+> than the float placeholder. Kept for the reasoning in its Key Technical
+> Decisions, which 003 builds on.
 
 # feat: The loop sink, the model lens, and the estafet (phase 3)
 

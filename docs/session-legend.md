@@ -81,8 +81,8 @@ All paths relative to `src/mindhive/`.
 | `directives.py` | The operating directives injected at SessionStart. |
 | `roadmap.py`, `autoresume.py` | The ask/plan/progress registry, and post-cooldown delivery of an interrupted plan's marker back into Claude. |
 | `plugins.py`, `recommend.py`, `invoker.py`, `playbook.py` | Skill/plugin catalog (backs both `hive plugins` and `hive skills`), deterministic recommendation, the invoke channel, and the per-prompt playbook (MN-15). |
-| `replenish.py` | Adaptive work injection — the **decision** half. Lenses fold the ledger for work the record proves outstanding, a value gate refuses anything without evidence and dedups by fingerprint, caps bound the round. State is the `work_injected` fold, never a sidecar. Knows **nothing** about surfaces: the sink is a parameter, and `tests/test_replenish.py` asserts the module does not import one. |
-| `replenish_sinks.py` | The **landing** half, one sink per surface. `roadmap_sink` appends steps to the plan whose `plan_id` is the session id, marked `new`; `roadmap.autoclose_session` then interrupts it and `roadmap.notice` carries it into the next session's auto-loaded STATE.md — that hop is the forcing mechanism, not prose. The loop sink (checklist items that raise `loop.task.required_remaining_count`) is a later phase. |
+| `replenish.py` | Adaptive work injection — the **decision** half. Seven lenses (`repair`, `evidence-gap`, `tech-debt`, `audit`, `caveat`, `coverage`, and the agentic `innovation`) fold the record for work it proves outstanding; a value gate scores each candidate on an integer scale (base 10, +5 per recurrence, +20 severity, veto to 0 when a prevention rule or pinned caveat already declined it), refuses anything without evidence, and dedups by fingerprint. **Scoring lives in `run_round`, not in the lenses** — one scale has to govern all of them or the threshold means nothing. The `AmbitionProfile` dial (`conservative`/`balanced`/`ambitious`) resolves threshold + lens set + per-run cap together. State is the `work_injected` fold, never a sidecar. Knows **nothing** about surfaces: the sink is a parameter, and `tests/test_replenish.py` asserts the module does not import one. A lens receives one `LensContext` (events, project, tree roots, changed paths, model runner) so the tree-reading and model-driven lenses are testable without the real repo or a real model. |
+| `replenish_sinks.py` | The **landing** half, one sink per surface. `roadmap_sink` appends steps to the plan whose `plan_id` is the session id, marked `new`; `roadmap.autoclose_session` then interrupts it and `roadmap.notice` carries it into the next session's auto-loaded STATE.md. `fix_plan_sink` writes `- [ ] (new) <title>: <why>` **above** the first Future/Optional heading (reusing `loop.task._FUTURE_HEADING`, never a second parser) so `loop.task.required_remaining_count` rises and `loop.safeguards.should_exit` refuses. On both surfaces the forcing mechanism is that hop, not prose. |
 
 ### `mindnet/` — the phase spine (MindNetwork)
 
@@ -134,6 +134,29 @@ scrapes `EXIT_SIGNAL`/`STATUS` out of the reply and `safeguards.should_exit`
 additionally requires ≥`min_completion_heuristics` natural-language completion
 signals plus zero remaining required work. Prose alone cannot end a run; prose is
 one of two conditions.
+
+**A `completed` exit is now provisional.** `engine._replenish_before_exit` runs a
+replenishment round on `surface="loop"` at that exact moment; anything it lands
+raises `required_remaining_count`, so the next `should_exit` refuses on its own —
+the count does the forcing, not the branch that called the injector. Four
+structural stops bound it, all counters folded from `work_injected` rather than
+held in memory (so a resumed run inherits its spent budget): a **dry streak**
+scoped to `run_id` (2), a per-run **injection budget** from the dial, a per-run
+**round ceiling** (`replenish_max_rounds`, 5), and a candidate **depth** ceiling
+(2, enforced in the gate). Every failure path returns 0 = honour the exit, because
+an injector able to pin a run open is worse than one that misses a round — but the
+fault is recorded as `tool_failed` under `replenish:round` or `lens:<name>`.
+
+`CircuitBreaker.reset()` is public and the engine calls it when work lands:
+finding evidence-backed work IS progress, and carrying a no-progress streak across
+it would trip the breaker for succeeding.
+
+On `api_cap`, `budget_cap` **or `max_hours`**, `_snapshot_interrupted_plan` hands
+over a baton — steps with their `new` flags, a `relay_context`, and a
+spent-fingerprint **cache**. `autoresume.rehydrate_spent` unions that cache with a
+fresh fold and **the fold wins**: the cache may only add to the spent set, so a
+stale one costs a candidate the ledger would also have skipped, while one able to
+remove an entry would silently re-propose finished work.
 
 ### Dashboard (port 54461)
 
