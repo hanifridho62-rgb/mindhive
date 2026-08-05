@@ -29,9 +29,9 @@ layers: deterministic **hooks** that fire on every session/prompt/tool call, a
 Console entry point: `hive` → `mindhive.__main__:main` (`pyproject.toml`
 `[project.scripts]`). Subcommands: `append hook session project state projects
 directives context packs verify selftest premise recall consolidate gc export
-embed briefing review log sop roadmap mindnet autoresume graph plugins skills
-clusters sync dashboard harvest autosync loop flag failures rules triggers
-enrich replenish`.
+embed briefing review log replenish sop roadmap mindnet autoresume graph plugins
+skills clusters sync dashboard harvest autosync loop flag failures rules triggers
+enrich`.
 
 > **Probing the CLI from a worktree gives you the wrong branch.** The venv's
 > editable install points at `C:\Users\hanif\mindhive`, so a bare

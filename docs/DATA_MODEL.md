@@ -210,8 +210,13 @@ Key joins an AI reader should know:
   (`sop.fold`); `files[]` in `code_change` joins audit entries to the
   `file_touched` telemetry that queued the gate.
 - `plan_id` threads a roadmap's lifecycle events into one plan record
-  (`roadmap.fold`) and joins the `autoresume` delivery telemetry
-  (`autoresume.fold`) to the interrupted plan whose marker it re-delivers.
+  (`roadmap.fold`), joins the `autoresume` delivery telemetry
+  (`autoresume.fold`) to the interrupted plan whose marker it re-delivers, and
+  — on a `landed` `work_injected` row, together with `step_index` — points at
+  the roadmap step the injector actually produced. That is the only link from an
+  audit row to its work: the row explains WHY a step exists, the step IS the
+  work. The key is optional on the row because a future sink need not land in a
+  roadmap at all (the loop's checklist sink has no `plan_id`).
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
 - `task_id` is MindNetwork's join key and threads **three** streams:
