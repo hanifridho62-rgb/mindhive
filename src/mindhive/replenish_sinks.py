@@ -53,6 +53,14 @@ def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
     def sink(kept):
         rows = ev_mod.read_all(project) if evs is None else evs
         rec = rm_mod.fold(rows).get(sid)
+        if rec is not None and rm_mod.AUTO_TAG not in (rec.get("tags") or []):
+            # The guard `sync_from_todos` and `autoclose_session` both enforce.
+            # A `set` overwrites the record's tags and title wholesale, so
+            # without this a human-declared plan that happened to share the
+            # session id would be silently converted to an auto-managed one and
+            # become subject to autoclose. Report the candidates as unplaced —
+            # they stay unspent and the next round may try again.
+            return [], len(kept)
         # dict() per step: the fold hands back its own records, and the payload
         # we are about to build must not alias them.
         existing = [dict(s) for s in (rec["steps"] if rec else [])]

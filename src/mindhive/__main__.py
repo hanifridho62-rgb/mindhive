@@ -564,6 +564,11 @@ def cmd_log_pending(args) -> int | None:
     return None
 
 
+# Session ids that exist but cannot own work: the hook's stdin-parse fallback and
+# the store's default for anything appended outside a session.
+_UNATTRIBUTABLE_SESSIONS = ("unknown", "manual")
+
+
 def cmd_replenish_run(args) -> int | None:
     """One replenishment round for a session. Run by session_end BEFORE
     `roadmap autoclose`, so the injected steps exist when the plan is closed and
@@ -571,9 +576,20 @@ def cmd_replenish_run(args) -> int | None:
     from . import replenish as rp_mod, replenish_sinks as sink_mod
     sid = args.session or os.environ.get("MINDHIVE_SESSION")
     if not sid:
+        # Exit 2 rather than the silent no-op `log queue` and `review queue` use
+        # in the same spot. Their work is idempotent lifecycle bookkeeping; this
+        # writes real steps under a plan id, so an unattributable run is an
+        # operator error worth reporting, not something to absorb.
         print("no session id — pass --session or set MINDHIVE_SESSION",
               file=sys.stderr)
         return 2
+    if sid in _UNATTRIBUTABLE_SESSIONS:
+        # session_end.ps1 falls back to "unknown" when it cannot parse the id off
+        # stdin. That was harmless while the hook only ran idempotent lifecycle
+        # actions; injecting under it would pile every unparsed session's work
+        # into one shared plan that never closes cleanly. Decline, and say so.
+        print(f"session id {sid!r} cannot own a plan — skipping this round")
+        return None
     evs = events.read_all()
     write = not args.dry_run
     # BOTH flags: the core's governs the audit rows, the sink's governs the work

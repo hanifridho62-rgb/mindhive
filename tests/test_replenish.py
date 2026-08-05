@@ -502,6 +502,23 @@ def test_a_capped_round_is_not_dry():
     assert not res.dry
 
 
+def test_row_growth_tracks_unresolved_conditions_not_session_count():
+    # The bound the performance review confirmed by reading the code. Pinned
+    # here so it survives the higher-cardinality lenses phases 2 and 4 add:
+    # rows must follow genuine unresolved evidence, never the number of rounds.
+    for _ in range(10):
+        replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                            lenses={"quiet": lambda _e: []})
+    assert _rows() == []                      # ten quiet rounds, zero rows
+
+    lenses = {"l": lambda _e: [_cand("fp-standing")]}
+    for _ in range(10):
+        replenish.run_round(events.read_all(), surface="session", sink=_sink(),
+                            lenses=lenses)
+    # One standing condition, written once — not once per round.
+    assert len(_rows()) == 1
+
+
 def test_a_round_the_sink_could_not_place_is_not_dry():
     res = replenish.run_round(
         [], surface="session", sink=_sink(drop=1),
@@ -538,8 +555,23 @@ def test_the_core_does_not_import_a_sink():
     # The whole reason `sink` is a parameter: the loop sink lands checklist
     # items, the session sink lands roadmap steps, and the decision layer must
     # not know which surface called it.
-    src = (replenish.__file__)
-    with open(src, encoding="utf-8") as fh:
-        body = fh.read()
-    assert "import roadmap" not in body
-    assert "from .roadmap" not in body
+    #
+    # Asserted against the real import graph, not the source text. The first cut
+    # grepped for the literals "import roadmap" and "from .roadmap", which
+    # `import mindhive.roadmap as rm_mod` walks straight past while
+    # reintroducing exactly the coupling this exists to prevent.
+    import ast
+
+    with open(replenish.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = ("." * node.level) + (node.module or "")
+            imported.update(f"{base}.{a.name}".lstrip(".") for a in node.names)
+            imported.add(base.lstrip("."))
+    leaves = {name.rsplit(".", 1)[-1] for name in imported}
+    assert "roadmap" not in leaves
+    assert "replenish_sinks" not in leaves

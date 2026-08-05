@@ -291,6 +291,28 @@ def test_append_false_previews_without_writing_the_plan():
     assert _rec() is None
 
 
+def test_the_sink_refuses_to_convert_a_human_declared_plan():
+    # sync_from_todos and autoclose_session both bail without AUTO_TAG. A `set`
+    # overwrites tags wholesale, so without the same guard a human plan sharing
+    # the session id would be silently re-tagged auto and become autocloseable.
+    _set([{"text": "mine", "status": "active"}], tags=("roadmap",))
+    placements, dropped = replenish_sinks.roadmap_sink(SID)([_cand()])
+    assert placements == [] and dropped == 1
+    rec = _rec()
+    assert rec["tags"] == ["roadmap"]
+    assert [s["text"] for s in rec["steps"]] == ["mine"]
+
+
+def test_a_refused_conversion_leaves_the_fingerprint_unspent():
+    _set([{"text": "mine", "status": "active"}], tags=("roadmap",))
+    res = replenish.run_round(
+        events.read_all(), surface="session",
+        sink=replenish_sinks.roadmap_sink(SID),
+        lenses={"l": lambda _e: [_cand()]}, session_id=SID)
+    assert res.landed == [] and res.dropped == 1
+    assert "fp-1" not in replenish.history(events.read_all()).fingerprints
+
+
 def test_an_unusable_session_id_is_reported_not_swallowed():
     with pytest.raises(ValueError, match="plan_id"):
         replenish_sinks.roadmap_sink("NOT A VALID ID")

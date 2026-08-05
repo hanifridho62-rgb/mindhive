@@ -85,6 +85,20 @@ def test_run_without_a_session_id_exits_non_zero(monkeypatch, capsys):
     assert "no session id" in capsys.readouterr().err
 
 
+def test_the_hooks_unknown_fallback_cannot_own_a_plan(capsys):
+    # session_end.ps1 falls back to "unknown" when it cannot parse the id off
+    # stdin. Harmless while the hook only ran idempotent lifecycle actions;
+    # injecting under it would pile every unparsed session into one shared plan.
+    events.append_event(
+        "code_change",
+        {"text": "changed something real", "category": "update",
+         "files": ["src/mindhive/replenish.py"]}, ts="2026-08-02T00:00:00Z")
+    assert main(["replenish", "run", "--session", "unknown"]) == 0
+    assert "cannot own a plan" in capsys.readouterr().out
+    assert _rows() == []
+    assert roadmap.fold(events.read_all()).get("unknown") is None
+
+
 def test_run_reads_the_session_from_the_environment(monkeypatch, capsys):
     monkeypatch.setenv("MINDHIVE_SESSION", SID)
     _outstanding()
