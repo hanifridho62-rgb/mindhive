@@ -77,6 +77,20 @@ class CircuitBreaker:
             return False
         return True
 
+    def reset(self) -> None:
+        """Clear the failure counters. Public, and the engine calls it.
+
+        Landing evidence-backed work IS progress: the run found something the
+        record proves is outstanding and wrote it into the plan. Letting the
+        no-progress counter carry across that would trip the breaker on the exact
+        behaviour the replenishment feature exists to produce, and the breaker
+        would then kill the run for succeeding.
+
+        It exists as a public method rather than the engine calling `_close()`
+        because a private call from another module is a boundary violation that
+        reads as an accident; this one is deliberate."""
+        self._close()
+
     def _open(self, now):
         self.state = "OPEN"
         self.opened_at = now

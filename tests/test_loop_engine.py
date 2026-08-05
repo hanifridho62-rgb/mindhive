@@ -1,9 +1,26 @@
 # tests/test_loop_engine.py
 from pathlib import Path
 
+import pytest
+
 from mindhive import events, runlog
 from mindhive.loop import engine, config
 from mindhive.loop.driver import DriverResult, Usage
+
+
+@pytest.fixture(autouse=True)
+def _no_replenishment(monkeypatch):
+    """Silence the injector for the tests that are about something else.
+
+    The replenishment round fires at the exact moment a run would exit cleanly,
+    and its lenses read THIS repository — so with it live, every exit assertion
+    in this file would depend on whether the working tree currently has an
+    unlogged change. It does, most of the time, while this file is being edited.
+
+    The tests that ARE about the injector opt back in explicitly by patching this
+    seam themselves."""
+    monkeypatch.setattr(engine, "_replenish_before_exit",
+                        lambda *_a, **_k: 0)
 
 
 def _setup(tmp_path, monkeypatch):

@@ -64,6 +64,68 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
         pass
 
 
+def _replenish_before_exit(project, loop_dir, cfg, run_id) -> int:
+    """Mine the record for outstanding work and land it as required checklist
+    items. Returns how many pieces landed.
+
+    Called at the one moment a run would otherwise finish cleanly, which is why it
+    is best-effort in the same sense as the interruption snapshot: an injector
+    fault must not turn a completed run into a crashed one, and it must never be
+    able to pin a run open. Every failure path returns 0, which means "honour the
+    exit" — the safe direction.
+
+    Silence is not one of the failure modes, though. `replenish` records a broken
+    lens through the `tool_failed` channel the failure loop already audits, and an
+    outer fault is recorded here for the same reason: an injector that quietly
+    stopped working would look exactly like a project with no outstanding work."""
+    if not getattr(cfg, "replenish_enabled", True):
+        return 0
+    try:
+        from .. import replenish as rp_mod, replenish_sinks as sink_mod
+
+        choice = rp_mod.resolve_ambition(cfg.replenish_ambition)
+        round_cfg = rp_mod.ReplenishConfig.for_profile(
+            choice.profile,
+            # Two consecutive rounds that find nothing end the run. Safe here and
+            # only here: the streak is scoped to this run_id, so a quiet run
+            # cannot switch the loop surface off for the next one.
+            dry_rounds_to_exit=2,
+            max_rounds_per_run=getattr(cfg, "replenish_max_rounds", 5),
+            bounded_run=True)
+        evs = events.read_all(project)
+        result = rp_mod.run_round(
+            evs, surface="loop",
+            sink=sink_mod.fix_plan_sink(loop_dir, run_id=run_id),
+            lenses=rp_mod.lenses_for(choice.profile),
+            cfg=round_cfg, project=project, run_id=run_id,
+            ctx=rp_mod.LensContext(evs=tuple(evs), project=project,
+                                   run_id=run_id))
+        if choice.fell_back and result.round_no == 1:
+            # Once per run, not once per round: an operator misspelling the dial
+            # deserves to be told, and deserves not to have it repeated into every
+            # future briefing (SOP memo-hygiene §3).
+            events.append_event(
+                "decision",
+                {"text": f"replenish ambition {choice.requested!r} is not a "
+                         f"known position — running {choice.profile.name} "
+                         f"instead. Valid: "
+                         f"{', '.join(sorted(rp_mod.PROFILES))}."},
+                tags=["replenish", "config"], project=project)
+        return len(result.landed)
+    except Exception as exc:                                    # noqa: BLE001
+        try:
+            events.append_event(
+                "tool_failed",
+                {"text": f"replenish round failed: {type(exc).__name__}: "
+                         f"{exc}"[:500],
+                 "signature": "replenish:round",
+                 "action": "run a replenishment round before the loop exits"},
+                tags=["replenish", "failure"], project=project)
+        except Exception:                                       # noqa: BLE001
+            pass
+        return 0
+
+
 def run_loop(project, loop_dir, cfg, driver, *,
              now_fn=time.time, sleep_fn=time.sleep, progress_fn=None,
              live=False, force=False):
@@ -201,6 +263,18 @@ def run_loop(project, loop_dir, cfg, driver, *,
                 status, required_remaining, json_mode=not live,
                 min_heuristics=cfg.min_completion_heuristics)
             if done:
+                # The run believes it is finished and the checklist agrees. Ask
+                # the record before honouring that: a run that stops here while
+                # the ledger still proves work outstanding is the quiet ending
+                # this whole feature exists to prevent.
+                if _replenish_before_exit(project, loop_dir, cfg, run_id):
+                    # Required items now remain, so `should_exit` will refuse on
+                    # its own next iteration — the count does the forcing, not
+                    # this branch. The breaker resets because finding
+                    # evidence-backed work IS progress; carrying a no-progress
+                    # streak across it would trip the breaker for succeeding.
+                    cb.reset()
+                    continue
                 reason = "completed"
                 break
 

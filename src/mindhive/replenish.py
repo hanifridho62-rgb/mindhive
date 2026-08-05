@@ -100,6 +100,15 @@ def validate_payload(payload) -> None:
             "work_injected requires an outcome — one of: " + ", ".join(OUTCOMES))
     _require_positive_int(payload, "round")
     _require_str(payload, "surface", 64, what="event")
+    # Optional, and only the loop surface sets it. It scopes the round counter and
+    # the dry streak to ONE run; a session round has no run to belong to.
+    run_id = payload.get("run_id")
+    if run_id is not None:
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("work_injected run_id must be non-empty text when "
+                             "present")
+        if len(run_id) > 64:
+            raise ValueError("work_injected run_id exceeds 64 chars")
 
     if outcome == "dry":
         return
@@ -338,6 +347,12 @@ class ReplenishConfig:
     # Deliberately small. A round that proposes more than a person will look at
     # is how an injector becomes noise, and phase 1 has no backpressure yet.
     max_per_round: int = 3
+    # Per-run ceilings, both 0 = unlimited. They are separate from
+    # `max_per_round` because they answer a different question: that one bounds
+    # one round's noise, these bound a whole run's appetite. A session round
+    # leaves them off — a session runs one round and its own lifecycle ends it.
+    max_injections_per_run: int = 0
+    max_rounds_per_run: int = 0
     # 0 DISABLES the dry-round exit, and that is the right setting for any
     # surface whose own lifecycle already bounds the rounds. The exit exists for
     # a loop, which runs many rounds back to back and must stop spinning. On a
@@ -347,15 +362,20 @@ class ReplenishConfig:
     dry_rounds_to_exit: int = 0
 
     @classmethod
-    def for_profile(cls, profile, *, enabled=True, dry_rounds_to_exit=0):
+    def for_profile(cls, profile, *, enabled=True, dry_rounds_to_exit=0,
+                    max_rounds_per_run=0, bounded_run=False):
         """A round's config, taken from an ambition position.
 
-        `max_per_round` takes the profile's per-run cap because they are one dial
-        enforced at two points: this trim stops a single round flooding the plan,
-        and the caller folds the run's own landed rows to stop five rounds
-        injecting five times the cap."""
+        `bounded_run` is what a loop passes. It turns the profile's per-run cap
+        into a real budget folded from the run's landed rows, on top of the
+        per-round trim — one dial, two enforcement points, so five rounds cannot
+        inject five times the cap. A session leaves it off: a session runs one
+        round and its own lifecycle is the bound."""
         return cls(enabled=enabled, min_score=profile.min_score,
                    max_per_round=profile.max_injections_per_run,
+                   max_injections_per_run=(profile.max_injections_per_run
+                                           if bounded_run else 0),
+                   max_rounds_per_run=max_rounds_per_run,
                    dry_rounds_to_exit=dry_rounds_to_exit)
 
 
@@ -439,6 +459,11 @@ class History:
     fingerprints: frozenset = frozenset()
     last_round: int = 0
     dry_rounds: int = 0
+    # How much work actually landed in the scope this was folded for. The per-run
+    # injection cap is enforced against this rather than against a counter held in
+    # memory, so a run that resumes after an interruption inherits its own budget
+    # instead of starting over with a full one.
+    landed_count: int = 0
 
 
 @dataclass
@@ -494,7 +519,7 @@ def _as_context(arg, project=None) -> LensContext:
 LENSES: dict = {}
 
 
-def history(evs, surface=None) -> History:
+def history(evs, surface=None, run_id=None) -> History:
     """Fold `work_injected` rows into the state a round needs.
 
     Total, per the ledger's read contract: a row whose payload is not a dict, or
@@ -513,8 +538,14 @@ def history(evs, surface=None) -> History:
     proposed it — a loop and a session must not each mint a step for the same
     outstanding fact. "How many rounds has this surface run without finding
     anything?" is about one surface's own pacing, and mixing surfaces there
-    would let a quiet loop switch off a session's injector."""
-    spent, last, dry = set(), 0, 0
+    would let a quiet loop switch off a session's injector.
+
+    *run_id* narrows that same pair to ONE run, and shipping it is a prerequisite
+    of enabling the dry-round exit for the loop. Without it the streak folds over
+    the surface's whole history and only a landed row resets it, so the first run
+    that went quiet twice would disable `surface="loop"` project-wide and
+    permanently — strictly worse than having no exit at all."""
+    spent, last, dry, landed = set(), 0, 0, 0
     for ev in evs or []:
         if getattr(ev, "type", None) != "work_injected":
             continue
@@ -529,6 +560,8 @@ def history(evs, surface=None) -> History:
             spent.add(fp)                       # global, always
         if surface is not None and p.get("surface") != surface:
             continue
+        if run_id is not None and p.get("run_id") != run_id:
+            continue
         r = p.get("round")
         if isinstance(r, int) and not isinstance(r, bool) and r > last:
             last = r
@@ -536,7 +569,8 @@ def history(evs, surface=None) -> History:
             dry += 1
         elif outcome == "landed":
             dry = 0            # real work landed: the streak is broken
-    return History(frozenset(spent), last, dry)
+            landed += 1
+    return History(frozenset(spent), last, dry, landed)
 
 
 def refusal_reason(candidate, spent, cfg) -> str:
@@ -624,8 +658,13 @@ def gate(candidates, spent, cfg):
     return kept, refused
 
 
-def _row(outcome, round_no, surface, **extra) -> dict:
+def _row(outcome, round_no, surface, run_id="", **extra) -> dict:
     payload = {"outcome": outcome, "round": round_no, "surface": surface}
+    if run_id:
+        # Omitted rather than written empty: the contract treats a present
+        # `run_id` as a scoping key, and "" would make every session round look
+        # like one run.
+        payload["run_id"] = run_id
     payload.update({k: v for k, v in extra.items() if v not in (None, "")})
     return payload
 
@@ -661,7 +700,7 @@ def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
 
 
 def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
-              session_id=None, append=True, ctx=None) -> RoundResult:
+              session_id=None, append=True, ctx=None, run_id="") -> RoundResult:
     """Run one replenishment round and record what it decided.
 
     *sink* is a parameter, not an import: deciding what is outstanding is
@@ -670,15 +709,34 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     A candidate the sink could not place gets NO row, so its fingerprint stays
     unspent and it can be proposed again next round. Same for candidates the cap
-    cut — a truncation is "not now", not "never"."""
+    cut — a truncation is "not now", not "never".
+
+    *run_id* scopes the round counter, the dry streak and the injection budget to
+    one loop run. Three of the four structural stops are enforced here — the dry
+    streak, the per-run injection cap, and the per-run round ceiling — and all
+    three are folded from `work_injected` rows rather than counted in memory, so
+    a run that resumes after an interruption inherits its own spent budget
+    instead of starting again with a full one. The fourth stop is depth, which
+    lives in the gate because it is a property of a candidate."""
     cfg = cfg or ReplenishConfig()
     if not cfg.enabled:
         return RoundResult(skipped="disabled")
 
-    hist = history(evs, surface=surface)
+    scope = run_id or None
+    hist = history(evs, surface=surface, run_id=scope)
     if cfg.dry_rounds_to_exit > 0 and hist.dry_rounds >= cfg.dry_rounds_to_exit:
         return RoundResult(round_no=hist.last_round,
                            skipped="dry rounds exhausted")
+    if cfg.max_rounds_per_run > 0 and hist.last_round >= cfg.max_rounds_per_run:
+        # A run that has already mined this many times is one whose plan the
+        # operator should look at before it grows again.
+        return RoundResult(round_no=hist.last_round,
+                           skipped="injection rounds exhausted")
+    injection_budget = (cfg.max_injections_per_run - hist.landed_count
+                        if cfg.max_injections_per_run > 0 else None)
+    if injection_budget is not None and injection_budget <= 0:
+        return RoundResult(round_no=hist.last_round,
+                           skipped="injection budget exhausted")
     round_no = hist.last_round + 1
 
     # One context for the whole round: the lenses that read a tree or a project
@@ -722,9 +780,15 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     # "nothing outstanding" in the same breath.
     dry = not kept
     dropped = 0
-    if len(kept) > cfg.max_per_round:
-        dropped = len(kept) - cfg.max_per_round
-        kept = kept[:cfg.max_per_round]
+    # Two ceilings, smaller wins: what one round may propose, and what is left of
+    # the run's whole budget. Without the second, five rounds could each inject a
+    # full round's worth and blow the dial's per-run cap five times over.
+    ceiling = cfg.max_per_round
+    if injection_budget is not None:
+        ceiling = min(ceiling, injection_budget)
+    if len(kept) > ceiling:
+        dropped = len(kept) - ceiling
+        kept = kept[:ceiling]
 
     placements, sink_dropped = ([], 0)
     if kept:
@@ -737,7 +801,7 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     rows = []
     for c, pl in landed:
-        rows.append(_row("landed", round_no, surface, lens=c.lens,
+        rows.append(_row("landed", round_no, surface, run_id, lens=c.lens,
                          title=c.title[:MAX_TITLE_CHARS],
                          fingerprint=c.fingerprint,
                          evidence=[str(e)[:MAX_EVIDENCE_CHARS]
@@ -753,18 +817,18 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
             # is a lens defect; the lens-error channel above is where that
             # belongs, not an unbounded run of identical refusals.
             continue
-        rows.append(_row("refused", round_no, surface, lens=c.lens,
+        rows.append(_row("refused", round_no, surface, run_id, lens=c.lens,
                          title=c.title or "(untitled)",
                          fingerprint=c.fingerprint,
                          reason=reason[:MAX_REASON_CHARS]))
     if dropped:
         # R15: a cap that cut silently would read as "nothing more was found".
-        rows.append(_row("truncated", round_no, surface, dropped=dropped))
+        rows.append(_row("truncated", round_no, surface, run_id, dropped=dropped))
     # The dry row exists to feed the dry-round exit. Where that exit is off, it
     # is a row nobody reads, appended once per session forever — so it is only
     # written when something actually consumes it.
     if dry and cfg.dry_rounds_to_exit > 0:
-        rows.append(_row("dry", round_no, surface))
+        rows.append(_row("dry", round_no, surface, run_id))
 
     if append:
         _record(rows, project=project, session_id=session_id)
