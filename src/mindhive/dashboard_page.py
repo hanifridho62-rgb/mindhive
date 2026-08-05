@@ -871,6 +871,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       return '<div class="rmstep'+edge+'" data-key="'+escAttr(key)
         + '" title="click for step detail">'
         + '<span class="rmnode '+g[1]+'">'+g[0]+'</span>'
+        // Provenance, not recency: this step was not in the plan the work
+        // started from — the replenishment injector added it because the record
+        // proved it outstanding. It stays marked after the step is done.
+        + (s.new ? '<span class="pill rmnew" title="not in the original plan '
+                   + '\\u2014 added because the record proved it outstanding">'
+                   + 'new</span> ' : '')
         + '<span'+(s.status === 'skipped' ? ' class="dup"' : '')+'>'+esc(s.text)+'</span>'
         + (RM_NODE_OPEN.has(key)
             ? '<div class="rmdetail">status: '+esc(s.status)
