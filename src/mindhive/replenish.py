@@ -363,3 +363,83 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     return RoundResult(round_no=round_no, landed=landed, refused=refused,
                        dropped=dropped, dry=dry)
+
+
+# --- lenses ------------------------------------------------------------------
+# Each lens answers ONE question about the record and returns candidates. They
+# are plain folds: no model, no subprocess, no network. A lens that needs a model
+# is a later phase and runs through the agent seam, not here.
+
+# How many changed files ride the evidence list. Enough to recognise the
+# change-set, bounded so one enormous commit cannot blow the row.
+_EVIDENCE_FILES = 6
+
+
+def _passing_verification_ts(evs) -> str:
+    """Timestamp of the newest verification whose SUBPROCESS SUCCEEDED, or "".
+
+    The exit code is the observed fact — `verify.py` is explicit that the
+    `verified_by` stamp attaches to it and not to the counts, because an
+    unparseable summary records counts absent rather than zero. So a run with a
+    zero exit code and no parsed counts is a pass here, and a run with counts but
+    a non-zero exit code is not."""
+    newest = ""
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "verification":
+            continue
+        p = getattr(ev, "payload", None)
+        if not isinstance(p, dict):
+            continue
+        code = p.get("exit_code")
+        if isinstance(code, bool) or not isinstance(code, int) or code != 0:
+            continue
+        ts = ev.ts or ""
+        if ts > newest:
+            newest = ts
+    return newest
+
+
+def evidence_gap(evs) -> list:
+    """Code changed and nothing has verified it since.
+
+    ONE candidate, not one per file. The outstanding fact is singular — "the
+    suite has not run against the current tree" — and emitting a step per changed
+    file would bury the plan and blow `roadmap.MAX_STEPS` on a busy week.
+
+    The fingerprint keys on the newest covered `code_change` timestamp, which is
+    the CONDITION INSTANCE: once the suite runs the condition clears, and a later
+    change mints a fresh instance so the lens may fire again. Keying on the bare
+    lens name would let it fire exactly once in the life of the project."""
+    newest_ts, newest_payload, count = "", None, 0
+    verified_ts = _passing_verification_ts(evs)
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "code_change":
+            continue
+        p = getattr(ev, "payload", None)
+        if not isinstance(p, dict):
+            continue
+        ts = ev.ts or ""
+        if ts > verified_ts:
+            count += 1
+        if ts > newest_ts:
+            newest_ts, newest_payload = ts, p
+    if not newest_ts or newest_ts <= verified_ts:
+        return []
+
+    files = [str(f) for f in (newest_payload.get("files") or [])
+             if isinstance(f, str)]
+    plural = "" if count == 1 else "s"
+    title = (f"Run the test suite: {count} code change{plural} since the last "
+             f"passing verification")
+    evidence = [
+        f"newest code_change @ {newest_ts}",
+        (f"last passing verification @ {verified_ts}" if verified_ts
+         else "no passing verification has ever been recorded"),
+    ]
+    evidence += [f"changed: {f}" for f in files[:_EVIDENCE_FILES]]
+    return [Candidate(lens="evidence-gap", title=title[:MAX_TITLE_CHARS],
+                      fingerprint=f"evidence-gap:{newest_ts}",
+                      evidence=tuple(evidence))]
+
+
+LENSES["evidence-gap"] = evidence_gap
