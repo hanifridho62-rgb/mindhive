@@ -133,7 +133,22 @@ attaches to the **exit code**, which was observed — `counts` is a parse, and a
 unparseable summary records counts **absent rather than zero**, because "we
 could not tell" and "nothing passed" are different facts. Full output goes to
 `runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
-path).
+path),
+`work_injected` (`{outcome, round, surface, lens?, title?, evidence[]?,
+fingerprint?, score?, reason?, dropped?, plan_id?, step_index?}` — one row per
+replenishment decision, written by `replenish.py`: `outcome` ∈ landed, refused,
+truncated, dry. `landed` and `refused` are per-candidate and carry `lens`,
+`title` and `fingerprint`; `landed` additionally requires a **non-empty**
+`evidence` list, because a candidate with nothing to point at is exactly what
+the value gate refuses and the contract must not let one in through the raw
+surface. `truncated` carries `dropped` — a cap that silently cut a round would
+read as "nothing more was found". `dry` carries nothing extra and exists as its
+own outcome because "this round found nothing" has to be a recorded fact: the
+two-consecutive-empty-rounds exit cannot be derived from silence. These rows are
+the injector's **only** persistent state — spent fingerprints, the round counter
+and the dry-round count are folded back out of them, so there is no sidecar that
+can drift. The work itself is not here: a landed candidate becomes a `roadmap`
+step, which is semantic and rides the LEDGER, the chain and recall).
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
