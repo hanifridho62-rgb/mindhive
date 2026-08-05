@@ -672,6 +672,113 @@ def test_the_threshold_floor_is_the_base_score():
     assert replenish.MIN_THRESHOLD == replenish.BASE_SCORE
 
 
+# --- the ambition dial --------------------------------------------------------
+# Three settings vary together, so they are asserted together. Testing the
+# threshold alone would pass with the lens sets swapped.
+
+def test_the_three_positions_carry_their_documented_settings():
+    expected = {"conservative": (40, 2, 3),
+                "balanced": (25, 6, 10),
+                "ambitious": (15, 6, 25)}
+    actual = {name: (p.min_score, len(p.lens_names), p.max_injections_per_run)
+              for name, p in replenish.PROFILES.items()}
+    assert actual == expected
+
+
+def test_conservative_runs_exactly_repair_and_evidence_gap():
+    # Asserted by name against the registry, not by count: adding a lens must
+    # not silently join the most selective position.
+    assert set(replenish.PROFILES["conservative"].lens_names) == {
+        "repair", "evidence-gap"}
+
+
+def test_balanced_runs_every_deterministic_lens():
+    assert set(replenish.PROFILES["balanced"].lens_names) == {
+        "repair", "evidence-gap", "tech-debt", "audit", "caveat", "coverage"}
+
+
+def test_a_more_ambitious_position_is_never_more_selective():
+    order = ["conservative", "balanced", "ambitious"]
+    thresholds = [replenish.PROFILES[n].min_score for n in order]
+    caps = [replenish.PROFILES[n].max_injections_per_run for n in order]
+    assert thresholds == sorted(thresholds, reverse=True)
+    assert caps == sorted(caps)
+
+
+def test_every_lens_a_profile_names_is_actually_registered():
+    # A typo in a profile is a lens the operator believes is running and is not,
+    # which is invisible from every surface. It has to be a test failure.
+    for profile in replenish.PROFILES.values():
+        resolved = replenish.lenses_for(profile)
+        assert set(resolved) == set(profile.lens_names)
+
+
+def test_a_profile_naming_an_unregistered_lens_raises():
+    ghost = replenish.AmbitionProfile("ghost", 10, ("no-such-lens",), 1)
+    with pytest.raises(KeyError, match="no-such-lens"):
+        replenish.lenses_for(ghost)
+
+
+def test_resolve_ambition_returns_the_named_position():
+    choice = replenish.resolve_ambition("conservative")
+    assert choice.profile.name == "conservative"
+    assert not choice.fell_back
+
+
+def test_resolve_ambition_is_case_and_whitespace_tolerant():
+    assert replenish.resolve_ambition("  AMBITIOUS ").profile.name == "ambitious"
+
+
+def test_an_unknown_ambition_falls_back_to_balanced_and_says_so():
+    # A typo'd dial that quietly runs at a different aggression than the operator
+    # set is worse than a loud one — the operator's next move should be to fix a
+    # spelling, not to wonder why the injector is behaving strangely.
+    choice = replenish.resolve_ambition("aggressive")
+    assert choice.profile.name == "balanced"
+    assert choice.fell_back
+    assert choice.requested == "aggressive"
+
+
+def test_an_empty_ambition_is_the_default_not_a_fallback():
+    # Nothing configured is not the same as something misspelled.
+    choice = replenish.resolve_ambition("")
+    assert choice.profile.name == "balanced"
+    assert not choice.fell_back
+
+
+def test_a_config_built_from_a_profile_takes_its_threshold_and_cap():
+    cfg = replenish.ReplenishConfig.for_profile(replenish.PROFILES["ambitious"])
+    assert cfg.min_score == 15
+    assert cfg.max_per_round == 25
+    assert cfg.enabled is True
+
+
+def test_a_profile_config_can_enable_the_dry_round_exit():
+    cfg = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["balanced"], dry_rounds_to_exit=2)
+    assert cfg.dry_rounds_to_exit == 2
+
+
+def test_a_disabled_round_writes_nothing():
+    cfg = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["balanced"], enabled=False)
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses={"l": lambda _c: [_cand()]})
+    assert res.skipped == "disabled"
+    assert _rows() == []
+
+
+def test_a_conservative_threshold_refuses_what_balanced_would_keep():
+    # The dial has to actually change the answer, not just the number.
+    candidate = _cand(score=30)
+    conservative = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["conservative"])
+    balanced = replenish.ReplenishConfig.for_profile(
+        replenish.PROFILES["balanced"])
+    assert replenish.gate([candidate], frozenset(), conservative)[0] == []
+    assert len(replenish.gate([candidate], frozenset(), balanced)[0]) == 1
+
+
 def test_an_evidence_less_candidate_is_recorded_once_not_every_round():
     lenses = {"l": lambda _e: [_cand("fp-noev", evidence=())]}
     for _ in range(4):

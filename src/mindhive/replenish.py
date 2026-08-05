@@ -346,6 +346,91 @@ class ReplenishConfig:
     # runs, so two quiet sessions would switch the injector off permanently.
     dry_rounds_to_exit: int = 0
 
+    @classmethod
+    def for_profile(cls, profile, *, enabled=True, dry_rounds_to_exit=0):
+        """A round's config, taken from an ambition position.
+
+        `max_per_round` takes the profile's per-run cap because they are one dial
+        enforced at two points: this trim stops a single round flooding the plan,
+        and the caller folds the run's own landed rows to stop five rounds
+        injecting five times the cap."""
+        return cls(enabled=enabled, min_score=profile.min_score,
+                   max_per_round=profile.max_injections_per_run,
+                   dry_rounds_to_exit=dry_rounds_to_exit)
+
+
+@dataclass(frozen=True)
+class AmbitionProfile:
+    """One position on the operator's dial.
+
+    Three settings vary together — how selective the gate is, which lenses run,
+    and how much one run may inject — so they live in one record. Scattered across
+    three conditionals the relationship between them would be invisible, and the
+    reason `conservative` runs two lenses AND wants a score of 40 is precisely
+    that relationship: fewer sources, higher bar, smaller budget.
+
+    `lens_names` is resolved against `LENSES` rather than holding callables, so a
+    profile naming a lens that does not exist is a loud error instead of a lens
+    that silently never runs."""
+
+    name: str
+    min_score: int
+    lens_names: tuple
+    max_injections_per_run: int
+
+
+# The six deterministic lenses, cheapest-signal-first. `innovation` is not here:
+# it is the only lens that spends a model call, so it joins `ambitious` alone.
+_REPAIR_AND_GAP = ("repair", "evidence-gap")
+_ALL_DETERMINISTIC = _REPAIR_AND_GAP + ("tech-debt", "audit", "caveat", "coverage")
+
+PROFILES = {
+    "conservative": AmbitionProfile("conservative", 40, _REPAIR_AND_GAP, 3),
+    "balanced": AmbitionProfile("balanced", 25, _ALL_DETERMINISTIC, 10),
+    "ambitious": AmbitionProfile("ambitious", 15, _ALL_DETERMINISTIC, 25),
+}
+
+DEFAULT_AMBITION = "balanced"
+
+
+@dataclass(frozen=True)
+class AmbitionChoice:
+    """The resolved profile, plus whether the operator's word was understood.
+
+    The fallback is reported rather than swallowed: a typo'd dial that quietly
+    runs at a different aggression than the operator set is worse than a loud one,
+    because the operator's next move is to wonder why the injector is behaving
+    strangely rather than to fix a spelling."""
+
+    profile: AmbitionProfile
+    requested: str = ""
+
+    @property
+    def fell_back(self) -> bool:
+        return bool(self.requested) and self.requested != self.profile.name
+
+
+def resolve_ambition(name) -> AmbitionChoice:
+    """Look up an ambition position by name, falling back to `balanced`."""
+    requested = str(name or "").strip().lower()
+    return AmbitionChoice(PROFILES.get(requested, PROFILES[DEFAULT_AMBITION]),
+                          requested)
+
+
+def lenses_for(profile, registry=None) -> dict:
+    """The profile's lenses, resolved against the registry.
+
+    Raises on a name the registry does not hold. That is deliberate: the failure
+    mode of returning what it could find is a lens the operator believes is
+    running and is not, which is invisible from every surface."""
+    available = LENSES if registry is None else registry
+    missing = [n for n in profile.lens_names if n not in available]
+    if missing:
+        raise KeyError(
+            f"ambition profile {profile.name!r} names lenses that are not "
+            f"registered: {', '.join(missing)}")
+    return {n: available[n] for n in profile.lens_names}
+
 
 @dataclass(frozen=True)
 class History:
@@ -371,9 +456,41 @@ class RoundResult:
         return not self.skipped
 
 
-# Lens registry: name -> callable(evs) -> [Candidate]. Populated at module level
-# by each lens below, so a caller can run the standard set without naming them
-# and a test can pass its own.
+@dataclass(frozen=True)
+class LensContext:
+    """Everything a lens is allowed to read, named.
+
+    A lens started life as `callable(evs)`, which was right while one lens read
+    only the ledger. It stopped being right the moment lenses needed a project
+    (to resolve incident records), a source tree (to count lines), and a working
+    tree (to diff) — passing those positionally is how a signature becomes
+    unreadable, and passing them as a bare dict loses which is which.
+
+    The roots are injectable rather than resolved internally because a lens that
+    resolved its own tree could only ever be tested against the real repo."""
+
+    evs: tuple = ()
+    project: str | None = None
+    src_root: str = ""              # defaults to the checkout's src/mindhive
+    tests_root: str = ""            # defaults to the checkout's tests
+    repo_root: str = ""             # defaults to the checkout root
+    run_id: str = ""                # loop surface only; "" on a session round
+
+
+def _as_context(arg, project=None) -> LensContext:
+    """Normalise a lens argument to a `LensContext`.
+
+    Existing callers — and every test stub — pass a bare event list. Normalising
+    once here rather than branching inside each lens is the whole reason the
+    lenses below have no special cases: they read `ctx.evs`, always."""
+    if isinstance(arg, LensContext):
+        return arg
+    return LensContext(evs=tuple(arg or ()), project=project)
+
+
+# Lens registry: name -> callable(LensContext) -> [Candidate]. Populated at module
+# level by each lens below, so a caller can run the standard set without naming
+# them and a test can pass its own.
 LENSES: dict = {}
 
 
@@ -544,7 +661,7 @@ def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
 
 
 def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
-              session_id=None, append=True) -> RoundResult:
+              session_id=None, append=True, ctx=None) -> RoundResult:
     """Run one replenishment round and record what it decided.
 
     *sink* is a parameter, not an import: deciding what is outstanding is
@@ -564,10 +681,15 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                            skipped="dry rounds exhausted")
     round_no = hist.last_round + 1
 
+    # One context for the whole round: the lenses that read a tree or a project
+    # get those from here rather than resolving them, which is what makes them
+    # testable without the real repo.
+    lens_ctx = ctx if ctx is not None else _as_context(evs, project)
+
     candidates, lens_errors = [], []
     for name, lens in (LENSES if lenses is None else lenses).items():
         try:
-            candidates.extend(lens(evs) or [])
+            candidates.extend(lens(lens_ctx) or [])
         except Exception as exc:                                # noqa: BLE001
             # One broken lens must not cost the round every other lens found —
             # but silence here is worse than the crash. A round where every lens
@@ -582,7 +704,8 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     # them — the moment two lenses decide for themselves what 25 means, the
     # threshold stops being a threshold. The deferral index is folded once for the
     # whole round; per candidate it would be a ledger pass each.
-    deferrals = build_deferral_index(evs, project=project)
+    deferrals = build_deferral_index(lens_ctx.evs or evs,
+                                     project=lens_ctx.project)
     scored = []
     for candidate in candidates:
         if not isinstance(candidate, Candidate):
@@ -686,7 +809,7 @@ def _passing_verification_ts(evs) -> str:
     return newest
 
 
-def evidence_gap(evs) -> list:
+def evidence_gap(arg) -> list:
     """Code changed and nothing has verified it since.
 
     ONE candidate, not one per file. The outstanding fact is singular — "the
@@ -697,6 +820,7 @@ def evidence_gap(evs) -> list:
     the CONDITION INSTANCE: once the suite runs the condition clears, and a later
     change mints a fresh instance so the lens may fire again. Keying on the bare
     lens name would let it fire exactly once in the life of the project."""
+    evs = _as_context(arg).evs
     newest_ts, newest_payload, count = "", None, 0
     verified_ts = _passing_verification_ts(evs)
     for ev in evs or []:
@@ -736,3 +860,524 @@ def evidence_gap(evs) -> list:
 
 
 LENSES["evidence-gap"] = evidence_gap
+
+
+# How many failure timestamps ride a repair candidate's evidence list. Enough to
+# show the pattern is real, bounded so a signature that fired 200 times cannot
+# blow the row.
+_EVIDENCE_TIMESTAMPS = 5
+
+
+def _signatures_with_an_active_rule(project) -> set:
+    """Signatures the failure loop has already turned into an enforced rule.
+
+    Read through `incidents.summaries()` — the public accessor — rather than the
+    private rule walker beside it, so this does not break the next time the
+    incident file format moves. Total: an unreadable incident store yields an
+    empty set, which proposes work rather than hiding it."""
+    covered = set()
+    try:
+        from . import incidents as incidents_mod
+        for record in incidents_mod.summaries(project) or []:
+            if not isinstance(record, dict):
+                continue
+            signature = str(record.get("signature") or "").strip()
+            if signature and str(record.get("active_rule") or "").strip():
+                covered.add(signature)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return covered
+
+
+def _failure_signature(payload) -> str:
+    """The canonical signature for one `tool_failed` row.
+
+    Prefers the recorded `signature` and derives one from the text otherwise.
+    That order matters: SOP `tool-mcp-integration` §1 records that 260 existing
+    rows carry no parseable fields, so deriving is the common path for history and
+    reading is the common path for anything written since."""
+    recorded = str(payload.get("signature") or "").strip()
+    if recorded:
+        return recorded
+    text = str(payload.get("text") or payload.get("error") or "").strip()
+    if not text:
+        return ""
+    try:
+        from . import signature as signature_mod
+        return signature_mod.signature(text)
+    except Exception:                                           # noqa: BLE001
+        return ""
+
+
+def repair(arg) -> list:
+    """A recorded failure that never became a prevention rule.
+
+    The failure loop already turns a recurring signature into an enforced rule
+    (`incidents` → `reflect` → `rules enforce`). What it does not do is fix the
+    CAUSE — a rule stops the agent repeating the mistake, it does not remove the
+    thing that made the mistake possible. This lens proposes that work, and only
+    where no rule exists yet: a signature with an active rule is already handled
+    as well as this mechanism can handle it, and proposing on top would double-
+    count the same fact the rule already covers.
+
+    One candidate per signature, not per failure. `occurrences` is the live count,
+    which is what earns the recurrence term — a signature seen four times has to
+    outscore one seen once, and that is the whole reason the term exists."""
+    ctx = _as_context(arg)
+    covered = _signatures_with_an_active_rule(ctx.project)
+
+    timestamps, newest = {}, {}
+    for ev in ctx.evs or []:
+        if getattr(ev, "type", None) != "tool_failed":
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        sig = _failure_signature(payload)
+        if not sig or sig in covered:
+            continue
+        ts = getattr(ev, "ts", "") or ""
+        timestamps.setdefault(sig, []).append(ts)
+        if ts > newest.get(sig, ""):
+            newest[sig] = ts
+
+    out = []
+    for sig in sorted(timestamps):
+        seen = sorted(t for t in timestamps[sig] if t)
+        out.append(Candidate(
+            lens="repair",
+            title=f"Investigate and patch the root cause of {sig}"[:MAX_TITLE_CHARS],
+            # Keyed on the newest failure: once the cause is fixed the signature
+            # stops recurring, and a later recurrence is a NEW instance that
+            # deserves proposing again rather than being silently deduped away.
+            fingerprint=f"repair:{sig}:{newest.get(sig, '')}",
+            evidence=tuple([f"signature: {sig}",
+                            f"{len(timestamps[sig])} recorded failure(s), "
+                            f"no active prevention rule"]
+                           + [f"failed @ {t}"
+                              for t in seen[-_EVIDENCE_TIMESTAMPS:]]),
+            occurrences=len(timestamps[sig]),
+            deferral_key=sig))
+    return out
+
+
+LENSES["repair"] = repair
+
+
+# What a caveat can be said to be ABOUT, for the purpose of deciding whether
+# later work addressed it. Deliberately narrow — a Python path is unambiguous,
+# whereas matching prose against prose would make "addressed" a guess. A caveat
+# naming no path stays outstanding, which is the safe direction: the fingerprint
+# spends after one proposal, so it is proposed once and never again rather than
+# every round forever.
+_PY_REFERENT_RE = re.compile(r"[\w./\\-]+\.py")
+
+
+def _addressed_referents(evs) -> set:
+    """Paths that a later `code_change` or `experiment_result` names."""
+    touched = set()
+    for ev in evs or []:
+        etype = getattr(ev, "type", None)
+        if etype not in ("code_change", "experiment_result"):
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        for path in (payload.get("files") or []):
+            if isinstance(path, str):
+                touched.add(path.replace("\\", "/").lstrip("./"))
+        for match in _PY_REFERENT_RE.findall(str(payload.get("text") or "")):
+            touched.add(match.replace("\\", "/").lstrip("./"))
+    return touched
+
+
+def caveat(arg) -> list:
+    """A pinned caveat nothing has since addressed.
+
+    Pinned is the discriminating tag, not decoration: SOP `memo-hygiene` §4 makes
+    it the marker for a safety-critical fact that survives the MEMORY.md cap
+    rotation and that consolidation never folds away. An unpinned caveat is an
+    observation; treating those as outstanding work would turn every passing
+    remark into a task.
+
+    "Addressed" is decided on paths rather than prose. A caveat naming
+    `src/mindhive/foo.py` is answered by a later `code_change` touching that file;
+    a caveat naming nothing checkable stays outstanding and is proposed exactly
+    once, because its fingerprint spends on the first round."""
+    ctx = _as_context(arg)
+    addressed = _addressed_referents(ctx.evs)
+
+    out = []
+    for ev in ctx.evs or []:
+        if getattr(ev, "type", None) != "caveat":
+            continue
+        if "pinned" not in (getattr(ev, "tags", None) or []):
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            continue                     # nothing to title the work with
+        referents = {m.replace("\\", "/").lstrip("./")
+                     for m in _PY_REFERENT_RE.findall(text)}
+        if referents & addressed:
+            continue
+        headline = text.splitlines()[0].strip()
+        ts = getattr(ev, "ts", "") or ""
+        evidence = [f"pinned caveat @ {ts}"]
+        evidence += [f"names: {r}" for r in sorted(referents)][:_EVIDENCE_FILES]
+        out.append(Candidate(
+            lens="caveat",
+            title=f"Resolve pinned architectural caveat: {headline}"[:MAX_TITLE_CHARS],
+            fingerprint=f"caveat:{ts}",
+            evidence=tuple(evidence),
+            # The path is what a standing deferral would name, so it is also what
+            # a veto matches on. Prose cannot be a deferral key.
+            deferral_key=sorted(referents)[0] if referents else ""))
+    return out
+
+
+LENSES["caveat"] = caveat
+
+
+# --- the surface lenses -------------------------------------------------------
+# These three read the checkout rather than the ledger. Their roots arrive on the
+# LensContext because a lens that resolved its own tree could only ever be tested
+# against the real repo — and the real repo is 4000 tests wide.
+
+# The thermo-nuclear threshold. Not a new opinion: `docs/session-legend.md`
+# already records `__main__.py` sitting past this line as a standing caveat, and
+# the review skill checks against the same number.
+LINE_THRESHOLD = 1000
+
+
+@dataclass(frozen=True)
+class SourceTrees:
+    """The three directories the surface lenses read, resolved once."""
+
+    src_root: str = ""
+    tests_root: str = ""
+    repo_root: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.src_root and self.tests_root)
+
+
+def resolve_trees(ctx) -> SourceTrees:
+    """Where this checkout's source and tests live.
+
+    `paths.worktree_root()`, deliberately, and not `project_dir()`: these lenses
+    read THIS checkout's files, while the store collapses every worktree of a repo
+    onto one namespace on purpose (SOP `session-lifecycle` §3). Conflating the two
+    is a real bug, so the choice is stated here rather than left incidental."""
+    src_root, tests_root = ctx.src_root, ctx.tests_root
+    repo_root = ctx.repo_root
+    if not (src_root and tests_root):
+        try:
+            from . import paths
+            root = paths.worktree_root()
+            if root is not None:
+                repo_root = str(root)
+                src_root = src_root or str(root / "src" / "mindhive")
+                tests_root = tests_root or str(root / "tests")
+        except Exception:                                       # noqa: BLE001
+            pass
+    if not repo_root and src_root:
+        # src/mindhive -> the checkout two levels up, so the audit lens can diff
+        # without a second resolution path.
+        try:
+            from pathlib import Path
+            repo_root = str(Path(src_root).parent.parent)
+        except Exception:                                       # noqa: BLE001
+            pass
+    return SourceTrees(src_root, tests_root, repo_root)
+
+
+def _python_modules(root):
+    """`(stem, absolute path)` for each first-party module directly under *root*.
+
+    Non-recursive on purpose: the packages below (`loop/`, `mindnet/`,
+    `rotation/`) have their own test-naming conventions, and a lens that walked
+    into them would emit confident nonsense about files it had no rule for."""
+    out = []
+    try:
+        from pathlib import Path
+        directory = Path(root)
+        if not directory.is_dir():
+            return out
+        for path in sorted(directory.glob("*.py")):
+            if path.name.startswith("__"):
+                continue                 # __init__ / __main__ are not modules
+                                         # with a test-file convention
+            out.append((path.stem, str(path)))
+    except OSError:
+        pass
+    return out
+
+
+def technical_debt(arg) -> list:
+    """A module past the line threshold, or a file stuck in the review queue.
+
+    Two conditions, one lens, because both answer "what in this tree is already
+    known to be too big to reason about". The queue entry carries `severity`: a
+    file sitting in `pending_review.json` is blocking a gate right now (SOP
+    `change-audit` §4 makes the notice a gate, not a suggestion), whereas an
+    oversized module is debt that is merely accruing."""
+    ctx = _as_context(arg)
+    trees = resolve_trees(ctx)
+    out = []
+
+    for stem, path in _python_modules(trees.src_root):
+        lines = _line_count(path)
+        if lines <= LINE_THRESHOLD:
+            continue
+        relative = _repo_relative(path, trees.repo_root)
+        out.append(Candidate(
+            lens="tech-debt",
+            title=(f"Refactor and reduce line count in {relative} "
+                   f"({lines} lines, threshold {LINE_THRESHOLD})")[:MAX_TITLE_CHARS],
+            # Bucketed by hundreds, not the exact count: keyed on the raw number a
+            # single added line would mint a fresh instance and re-propose the same
+            # refactor every round.
+            fingerprint=f"tech-debt:lines:{relative}:{lines // 100}",
+            evidence=(f"{relative} is {lines} lines",
+                      f"threshold is {LINE_THRESHOLD} lines",
+                      f"module {stem}"),
+            deferral_key=relative))
+
+    for path in _pending_review_files(ctx.project):
+        relative = _repo_relative(path, trees.repo_root)
+        out.append(Candidate(
+            lens="tech-debt",
+            title=f"Clear the thermo-nuclear review queue for {relative}"[:MAX_TITLE_CHARS],
+            fingerprint=f"tech-debt:review:{relative}",
+            evidence=(f"{relative} is queued in pending_review.json",
+                      "SOP change-audit §4: the notice is a gate, not a "
+                      "suggestion"),
+            severity=True,
+            deferral_key=relative))
+    return out
+
+
+def _line_count(path) -> int:
+    """Delegated to `review._line_count` so "how long is this file" has exactly
+    one answer in this codebase; falls back to 0 (treated as absent) if review
+    cannot be imported."""
+    try:
+        from . import review as review_mod
+        return review_mod._line_count(str(path))
+    except Exception:                                           # noqa: BLE001
+        return 0
+
+
+def _pending_review_files(project) -> list:
+    """Files sitting uncleared in the thermo-nuclear queue. Total on a missing or
+    corrupt marker — `review.load_pending` already returns None for both."""
+    try:
+        from . import review as review_mod
+        marker = review_mod.load_pending(project)
+    except Exception:                                           # noqa: BLE001
+        return []
+    if not isinstance(marker, dict):
+        return []
+    return [f for f in (marker.get("files") or []) if isinstance(f, str) and f.strip()]
+
+
+def _repo_relative(path, repo_root) -> str:
+    """A repo-relative, forward-slashed path. Absolute paths in a candidate title
+    would leak one machine's layout into the ledger and the dashboard."""
+    text = str(path).replace("\\", "/")
+    root = str(repo_root or "").replace("\\", "/").rstrip("/")
+    if root and text.startswith(root + "/"):
+        return text[len(root) + 1:]
+    return text
+
+
+LENSES["tech-debt"] = technical_debt
+
+
+def git_modified_paths(repo_root) -> list:
+    """Working-tree paths git reports as changed. The single git seam.
+
+    One function so a test can replace it, and so a git failure has exactly one
+    place to be handled. Raises on failure rather than returning empty: the audit
+    lens must be able to tell "nothing is modified" from "I could not look", and
+    the second one has to reach the lens-error channel."""
+    import subprocess
+    completed = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(repo_root),
+        capture_output=True, text=True, timeout=30)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"git status failed ({completed.returncode}): "
+            f"{(completed.stderr or '').strip()[:200]}")
+    paths_out = []
+    for line in (completed.stdout or "").splitlines():
+        # Porcelain v1: two status chars, a space, then the path. A rename
+        # carries "old -> new"; the new name is the one that exists to review.
+        entry = line[3:].strip().strip('"')
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1].strip().strip('"')
+        if entry:
+            paths_out.append(entry.replace("\\", "/"))
+    return paths_out
+
+
+def audit(arg) -> list:
+    """Source modified in the working tree with no change-log entry covering it.
+
+    This is SOP `change-audit` §1 read back off the record: the entry is mandatory
+    before the work is called done, and the two halves of the fact live in
+    different places — the modification is in the working tree, the entry is in
+    the ledger. Nothing else compares them.
+
+    ONE candidate for the whole uncovered set. The outstanding fact is singular
+    ("this change-set has no entry"), and a candidate per file would blow
+    `roadmap.MAX_STEPS` on any ordinary day's work."""
+    ctx = _as_context(arg)
+    trees = resolve_trees(ctx)
+    if not trees.repo_root:
+        return []
+
+    modified = [p for p in git_modified_paths(trees.repo_root)
+                if _in_review_scope(p)]
+    if not modified:
+        return []
+
+    logged = _logged_files(ctx.evs)
+    uncovered = sorted(p for p in modified
+                       if p.replace("\\", "/").lstrip("./") not in logged)
+    if not uncovered:
+        return []
+
+    shown = uncovered[:_EVIDENCE_FILES]
+    more = len(uncovered) - len(shown)
+    suffix = f" (+{more} more)" if more > 0 else ""
+    return [Candidate(
+        lens="audit",
+        title=(f"Record a change-log entry for {len(uncovered)} modified "
+               f"source file(s): {', '.join(shown)}{suffix}")[:MAX_TITLE_CHARS],
+        # Keyed on the uncovered SET: log one of them and the set changes, which
+        # is a different outstanding fact and deserves a fresh proposal.
+        fingerprint="audit:" + ",".join(uncovered),
+        evidence=tuple([f"modified, no code_change: {p}" for p in shown]
+                       + ["SOP change-audit §1: `hive log` is mandatory before "
+                          "the work is called done"]),
+        severity=True,
+        deferral_key=uncovered[0])]
+
+
+def _in_review_scope(path) -> bool:
+    """`review.in_scope` expects an absolute-ish path with `/src/mindhive/` or
+    `/tests/` in it; git reports repo-relative ones. Prefixing a slash makes the
+    two agree without duplicating the rule."""
+    try:
+        from . import review as review_mod
+        return review_mod.in_scope("/" + str(path).replace("\\", "/").lstrip("/"))
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+def _logged_files(evs) -> set:
+    """Paths any `code_change` event claims. Basenames are matched too, because
+    the ledger holds worktree-absolute paths from every past checkout while git
+    reports repo-relative ones — comparing them literally would call everything
+    unlogged."""
+    logged = set()
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "code_change":
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        for path in (payload.get("files") or []):
+            if not isinstance(path, str):
+                continue
+            normalised = path.replace("\\", "/")
+            logged.add(normalised.lstrip("./"))
+            marker = "/src/mindhive/"
+            if marker in normalised:
+                logged.add("src/mindhive/" + normalised.split(marker, 1)[1])
+            marker = "/tests/"
+            if marker in normalised:
+                logged.add("tests/" + normalised.split(marker, 1)[1])
+    return logged
+
+
+LENSES["audit"] = audit
+
+
+def coverage(arg) -> list:
+    """A module no test file names.
+
+    The naive rule — `tests/test_<stem>.py` must exist — is wrong here and would
+    emit confident nonsense: `dashboard_page.py` is exercised from
+    `test_dashboard.py`, and several modules are covered by suites named for the
+    behaviour rather than the file. So a module counts as covered when a test file
+    of that name exists OR any test file mentions the module by name. The mention
+    scan is one pass over `tests/`, shared across every module."""
+    ctx = _as_context(arg)
+    trees = resolve_trees(ctx)
+    if not trees.usable:
+        return []
+
+    mentioned = _modules_mentioned_by_tests(trees.tests_root)
+    out = []
+    for stem, path in _python_modules(trees.src_root):
+        try:
+            from pathlib import Path
+            named = (Path(trees.tests_root) / f"test_{stem}.py").exists()
+        except OSError:
+            named = False
+        if named or stem in mentioned:
+            continue
+        relative = _repo_relative(path, trees.repo_root)
+        out.append(Candidate(
+            lens="coverage",
+            title=f"Bootstrap a unit test suite for {relative}"[:MAX_TITLE_CHARS],
+            fingerprint=f"coverage:{relative}",
+            evidence=(f"{relative} has no test module",
+                      f"expected tests/test_{stem}.py, and no test file names "
+                      f"`{stem}`"),
+            deferral_key=relative))
+    return out
+
+
+# How a test file says which module it exercises: `from mindhive import x, y`,
+# or any `mindhive.x` attribute path.
+_MODULE_MENTION_RE = re.compile(
+    r"from\s+mindhive\s+import\s+([\w,\s]+)|mindhive\.(\w+)")
+
+
+def _modules_mentioned_by_tests(tests_root) -> set:
+    """Module names any test file references. One pass, shared by every module.
+
+    Reads the text rather than importing: importing each test module to inspect
+    what it touches would execute the suite as a side effect of asking a
+    question about it."""
+    mentioned = set()
+    try:
+        from pathlib import Path
+        directory = Path(tests_root)
+        if not directory.is_dir():
+            return mentioned
+        for path in sorted(directory.rglob("test_*.py")):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for grouped, attribute in _MODULE_MENTION_RE.findall(text):
+                if attribute:
+                    mentioned.add(attribute)
+                for name in grouped.split(","):
+                    name = name.strip()
+                    if name:
+                        mentioned.add(name)
+    except OSError:
+        pass
+    return mentioned
+
+
+LENSES["coverage"] = coverage

@@ -41,6 +41,17 @@ class LoopConfig:
     no_progress_threshold: int = 3
     same_error_threshold: int = 5
     cooldown_minutes: int = 30
+    # [replenish] — the ambition dial. Two keys only: whether the injector runs
+    # at all, and how hard it pushes. Everything else the dial governs (score
+    # threshold, active lens set, per-run cap) is derived from the position by
+    # `replenish.PROFILES`, so an operator tunes one word instead of keeping
+    # three numbers consistent by hand.
+    replenish_enabled: bool = True
+    replenish_ambition: str = "balanced"
+    # How many times one run may mine. A ceiling, not a target: a run that has
+    # already found and injected five rounds' worth of work is a run whose plan
+    # the operator should look at before it grows again.
+    replenish_max_rounds: int = 5
 
     @property
     def cooldown_seconds(self) -> float:
@@ -63,6 +74,12 @@ def load_config(path: Path) -> LoopConfig:
     budget = data.get("budget", {})
     loop = data.get("loop", {})
     breaker = data.get("breaker", {})
+    # `[replenish]` present but not a table (a bare `replenish = "on"`) must fall
+    # back to defaults rather than raise: this file is hand-edited, and a typo in
+    # one section has no business stopping a run.
+    replenish = data.get("replenish", {})
+    if not isinstance(replenish, dict):
+        replenish = {}
     return LoopConfig(
         context_window=model.get("context_window", cfg.context_window),
         smart_zone_ratio=model.get("smart_zone_ratio", cfg.smart_zone_ratio),
@@ -85,4 +102,8 @@ def load_config(path: Path) -> LoopConfig:
         no_progress_threshold=breaker.get("no_progress_threshold", cfg.no_progress_threshold),
         same_error_threshold=breaker.get("same_error_threshold", cfg.same_error_threshold),
         cooldown_minutes=breaker.get("cooldown_minutes", cfg.cooldown_minutes),
+        replenish_enabled=replenish.get("enabled", cfg.replenish_enabled),
+        replenish_ambition=replenish.get("ambition", cfg.replenish_ambition),
+        replenish_max_rounds=replenish.get("max_rounds",
+                                           cfg.replenish_max_rounds),
     )

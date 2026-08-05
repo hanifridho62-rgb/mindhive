@@ -52,3 +52,41 @@ def test_min_completion_heuristics_default_and_override(tmp_path):
     p = tmp_path / "loop.toml"
     p.write_text("[loop]\nmin_completion_heuristics = 0\n", encoding="utf-8")
     assert cfg_mod.load_config(p).min_completion_heuristics == 0
+
+
+# --- [replenish]: the ambition dial -------------------------------------------
+
+def test_no_replenish_section_means_enabled_and_balanced(tmp_path):
+    cfg = config.load_config(tmp_path / "missing.toml")
+    assert cfg.replenish_enabled is True
+    assert cfg.replenish_ambition == "balanced"
+    assert cfg.replenish_max_rounds == 5
+
+
+def test_the_replenish_section_is_read(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nenabled = false\nambition = "ambitious"\n'
+                 'max_rounds = 2\n', encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_enabled is False
+    assert cfg.replenish_ambition == "ambitious"
+    assert cfg.replenish_max_rounds == 2
+
+
+def test_a_partial_replenish_section_keeps_the_other_defaults(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nambition = "conservative"\n', encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_ambition == "conservative"
+    assert cfg.replenish_enabled is True
+
+
+def test_a_replenish_key_that_is_not_a_table_falls_back(tmp_path):
+    # This file is hand-edited. A typo in one section has no business stopping a
+    # run, so a scalar where a table belongs degrades to defaults.
+    p = tmp_path / "loop.toml"
+    p.write_text('replenish = "on"\n[loop]\nmax_iterations = 7\n',
+                 encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_ambition == "balanced"
+    assert cfg.max_iterations == 7        # the rest of the file still parsed

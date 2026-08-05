@@ -7,6 +7,8 @@ and not to the counts, which are a best-effort parse recorded absent rather than
 zero when they cannot be read. A lens that judged on counts would call an
 unparsed green run a failure and re-propose work that was already done.
 """
+from pathlib import Path
+
 from mindhive import events, replenish
 
 
@@ -123,3 +125,547 @@ def test_the_fingerprint_changes_after_a_newer_code_change():
 
 def test_the_lens_is_registered():
     assert replenish.LENSES["evidence-gap"] is replenish.evidence_gap
+
+
+def test_evidence_gap_asserts_severity_and_carries_the_change_count():
+    # Unverified code IS the blocking condition (SOP change-audit §3), so the
+    # severity term is asserted by the lens rather than inferred by the scorer.
+    _code_change("2026-08-02T00:00:00Z")
+    _code_change("2026-08-03T00:00:00Z")
+    cand = _gap()[0]
+    assert cand.severity is True
+    assert cand.occurrences == 2
+
+
+def test_evidence_gap_clears_the_balanced_threshold():
+    # The regression the integer-scale migration could have caused: the shipped
+    # lens used to carry score 1.0, which is below every threshold on the new
+    # scale, so it would have been refused everywhere in silence.
+    _code_change("2026-08-02T00:00:00Z")
+    breakdown = replenish.score_candidate(_gap()[0])
+    assert breakdown.total >= replenish.PROFILES["balanced"].min_score
+
+
+# --- the lens interface -------------------------------------------------------
+
+def test_a_lens_accepts_a_bare_event_list_or_a_context():
+    # Normalising once in `_as_context` is why no lens below has a special case.
+    # Both call shapes must land on the same answer.
+    _code_change("2026-08-02T00:00:00Z")
+    evs = events.read_all()
+    assert (replenish.evidence_gap(evs)[0].fingerprint
+            == replenish.evidence_gap(replenish.LensContext(evs=tuple(evs)))[0]
+            .fingerprint)
+
+
+# --- the repair lens ----------------------------------------------------------
+# A prevention rule stops the agent repeating a mistake; it does not remove what
+# made the mistake possible. This lens proposes that, and only where no rule
+# already covers the signature.
+
+def _failure(ts, signature="", text="boom"):
+    payload = {"text": text, "action": "do the thing"}
+    if signature:
+        payload["signature"] = signature
+    return events.append_event("tool_failed", payload, ts=ts)
+
+
+def _no_rules(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [])
+
+
+def _repair():
+    return replenish.repair(events.read_all())
+
+
+def test_a_signature_with_no_rule_yields_one_candidate(monkeypatch):
+    _no_rules(monkeypatch)
+    _failure("2026-08-02T00:00:00Z", signature="edit:not-read")
+    cands = _repair()
+    assert len(cands) == 1
+    assert "edit:not-read" in cands[0].title
+    assert cands[0].lens == "repair"
+
+
+def test_a_signature_with_an_active_rule_yields_nothing(monkeypatch):
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "edit:not-read",
+         "active_rule": "Read the exact path before editing it."}])
+    _failure("2026-08-02T00:00:00Z", signature="edit:not-read")
+    assert _repair() == []
+
+
+def test_a_record_with_no_active_rule_does_not_suppress(monkeypatch):
+    # An incident record exists but the reflection pass has not produced a rule.
+    # The cause is still unaddressed, so the work is still outstanding.
+    from mindhive import incidents
+    monkeypatch.setattr(incidents, "summaries", lambda _p=None: [
+        {"signature": "edit:not-read", "active_rule": ""}])
+    _failure("2026-08-02T00:00:00Z", signature="edit:not-read")
+    assert len(_repair()) == 1
+
+
+def test_four_failures_of_one_signature_yield_one_candidate(monkeypatch):
+    _no_rules(monkeypatch)
+    for day in range(2, 6):
+        _failure(f"2026-08-0{day}T00:00:00Z", signature="edit:not-read")
+    cands = _repair()
+    assert len(cands) == 1
+    assert cands[0].occurrences == 4
+    assert sum("failed @" in e for e in cands[0].evidence) == 4
+
+
+def test_recurrence_makes_a_repeated_signature_outscore_a_lone_one(monkeypatch):
+    _no_rules(monkeypatch)
+    for day in range(2, 6):
+        _failure(f"2026-08-0{day}T00:00:00Z", signature="repeated")
+    _failure("2026-08-07T00:00:00Z", signature="once")
+    scores = {c.fingerprint.split(":")[1]: replenish.score_candidate(c).total
+              for c in _repair()}
+    assert scores["repeated"] == 25
+    assert scores["once"] == 10
+
+
+def test_two_distinct_signatures_yield_two_candidates(monkeypatch):
+    _no_rules(monkeypatch)
+    _failure("2026-08-02T00:00:00Z", signature="sig-a")
+    _failure("2026-08-03T00:00:00Z", signature="sig-b")
+    assert len(_repair()) == 2
+
+
+def test_an_unsignatured_failure_is_canonicalised_from_its_text(monkeypatch):
+    # SOP tool-mcp-integration §1: 260 historical rows carry no parseable
+    # fields, so deriving the signature is the common path for history.
+    _no_rules(monkeypatch)
+    _failure("2026-08-02T00:00:00Z", text="ModuleNotFoundError: No module named 'tools'")
+    cands = _repair()
+    assert len(cands) == 1
+    assert cands[0].fingerprint.startswith("repair:")
+
+
+def test_a_failure_with_neither_signature_nor_text_is_skipped(monkeypatch):
+    _no_rules(monkeypatch)
+    events.append_event("tool_failed", {"action": "nothing"},
+                        ts="2026-08-02T00:00:00Z")
+    assert _repair() == []
+
+
+def test_a_malformed_failure_row_does_not_break_the_repair_lens(monkeypatch):
+    _no_rules(monkeypatch)
+    events.append_event("tool_failed", ["not", "a", "dict"],
+                        ts="2026-08-01T00:00:00Z")
+    _failure("2026-08-02T00:00:00Z", signature="sig-a")
+    assert len(_repair()) == 1
+
+
+def test_the_repair_fingerprint_tracks_the_newest_failure(monkeypatch):
+    # A signature that recurs after being fixed is a NEW instance and must be
+    # proposable again; keying on the bare signature would dedup it away forever.
+    _no_rules(monkeypatch)
+    _failure("2026-08-02T00:00:00Z", signature="sig-a")
+    first = _repair()[0].fingerprint
+    _failure("2026-08-09T00:00:00Z", signature="sig-a")
+    assert _repair()[0].fingerprint != first
+
+
+def test_the_repair_candidate_carries_the_signature_as_its_deferral_key(monkeypatch):
+    _no_rules(monkeypatch)
+    _failure("2026-08-02T00:00:00Z", signature="sig-a")
+    assert _repair()[0].deferral_key == "sig-a"
+
+
+def test_an_unreadable_incident_store_still_proposes(monkeypatch):
+    # Failing open toward proposing: hiding outstanding work is worse than
+    # proposing something already covered, which the dedup will refuse anyway.
+    from mindhive import incidents
+
+    def boom(_p=None):
+        raise OSError("gone")
+
+    monkeypatch.setattr(incidents, "summaries", boom)
+    _failure("2026-08-02T00:00:00Z", signature="sig-a")
+    assert len(_repair()) == 1
+
+
+def test_repair_on_an_empty_ledger_does_not_raise(monkeypatch):
+    _no_rules(monkeypatch)
+    assert replenish.repair([]) == []
+
+
+def test_the_repair_lens_is_registered():
+    assert replenish.LENSES["repair"] is replenish.repair
+
+
+# --- the caveat lens ----------------------------------------------------------
+# Pinned is the discriminating tag (SOP memo-hygiene §4): a standing
+# safety-critical fact, not a passing observation.
+
+def _caveat(ts, text, tags=("pinned",)):
+    return events.append_event("caveat", {"text": text}, ts=ts, tags=list(tags))
+
+
+def _caveats():
+    return replenish.caveat(events.read_all())
+
+
+def test_a_pinned_caveat_with_nothing_addressing_it_yields_a_candidate():
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/oversee.py folds untrusted rows")
+    cands = _caveats()
+    assert len(cands) == 1
+    assert "Resolve pinned architectural caveat" in cands[0].title
+    assert "src/mindhive/oversee.py" in cands[0].title
+
+
+def test_a_pinned_caveat_a_later_code_change_addressed_yields_nothing():
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/oversee.py folds untrusted rows")
+    _code_change("2026-08-03T00:00:00Z", files=["src/mindhive/oversee.py"])
+    assert _caveats() == []
+
+
+def test_a_code_change_to_a_different_file_does_not_address_it():
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/oversee.py folds untrusted rows")
+    _code_change("2026-08-03T00:00:00Z", files=["src/mindhive/graph.py"])
+    assert len(_caveats()) == 1
+
+
+def test_an_experiment_result_naming_the_path_addresses_it():
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/oversee.py folds untrusted rows")
+    events.append_event("experiment_result",
+                        {"text": "hardened src/mindhive/oversee.py, fold is total"},
+                        ts="2026-08-03T00:00:00Z")
+    assert _caveats() == []
+
+
+def test_an_unpinned_caveat_is_ignored():
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/oversee.py is fragile",
+            tags=("memo",))
+    assert _caveats() == []
+
+
+def test_a_caveat_with_no_text_yields_no_candidate():
+    events.append_event("caveat", {"text": "   "}, ts="2026-08-02T00:00:00Z",
+                        tags=["pinned"])
+    assert _caveats() == []
+
+
+def test_a_caveat_naming_no_path_is_still_outstanding_but_has_no_deferral_key():
+    _caveat("2026-08-02T00:00:00Z", "the loop breaker must never fire on success")
+    cands = _caveats()
+    assert len(cands) == 1
+    assert cands[0].deferral_key == ""
+
+
+def test_the_caveat_title_takes_only_the_headline_line():
+    _caveat("2026-08-02T00:00:00Z", "headline fact\nsecond line of detail")
+    assert "second line" not in _caveats()[0].title
+
+
+def test_a_malformed_caveat_row_does_not_break_the_lens():
+    events.append_event("caveat", "not a dict", ts="2026-08-01T00:00:00Z",
+                        tags=["pinned"])
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/x.py needs work")
+    assert len(_caveats()) == 1
+
+
+def test_the_caveat_fingerprint_is_stable_for_one_caveat():
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/x.py needs work")
+    assert _caveats()[0].fingerprint == "caveat:2026-08-02T00:00:00Z"
+
+
+def test_caveat_on_an_empty_ledger_does_not_raise():
+    assert replenish.caveat([]) == []
+
+
+def test_the_caveat_lens_is_registered():
+    assert replenish.LENSES["caveat"] is replenish.caveat
+
+
+# --- the surface lenses -------------------------------------------------------
+# These read a tree, so every test builds its own. A lens that resolved its own
+# root could only be tested against the real repo — which has real oversized
+# modules, so the assertions would change the day someone refactored one.
+
+def _trees(tmp_path, modules=(), test_files=()):
+    """A throwaway checkout. `modules` is (name, line_count); `test_files` is
+    (name, text)."""
+    src_root = tmp_path / "src" / "mindhive"
+    tests_root = tmp_path / "tests"
+    src_root.mkdir(parents=True)
+    tests_root.mkdir(parents=True)
+    for name, lines in modules:
+        (src_root / name).write_text("# line\n" * lines, encoding="utf-8")
+    for name, text in test_files:
+        (tests_root / name).write_text(text, encoding="utf-8")
+    return replenish.LensContext(src_root=str(src_root),
+                                 tests_root=str(tests_root),
+                                 repo_root=str(tmp_path))
+
+
+# --- technical debt ---
+
+def test_a_module_past_the_threshold_is_flagged(tmp_path):
+    ctx = _trees(tmp_path, modules=[("huge.py", 1200)])
+    cands = [c for c in replenish.technical_debt(ctx)
+             if c.fingerprint.startswith("tech-debt:lines:")]
+    assert len(cands) == 1
+    assert "huge.py" in cands[0].title
+    assert any("1200 lines" in e for e in cands[0].evidence)
+
+
+def test_a_module_under_the_threshold_is_not_flagged(tmp_path):
+    ctx = _trees(tmp_path, modules=[("small.py", 400)])
+    assert [c for c in replenish.technical_debt(ctx)
+            if c.fingerprint.startswith("tech-debt:lines:")] == []
+
+
+def test_the_threshold_is_exclusive_at_exactly_the_limit(tmp_path):
+    # 1000 lines is AT the threshold, not past it. An off-by-one here would flag
+    # every file the review skill considers acceptable.
+    ctx = _trees(tmp_path, modules=[("exact.py", replenish.LINE_THRESHOLD)])
+    assert [c for c in replenish.technical_debt(ctx)
+            if c.fingerprint.startswith("tech-debt:lines:")] == []
+    ctx = _trees(tmp_path / "b", modules=[("over.py", replenish.LINE_THRESHOLD + 1)])
+    assert len([c for c in replenish.technical_debt(ctx)
+                if c.fingerprint.startswith("tech-debt:lines:")]) == 1
+
+
+def test_the_debt_fingerprint_is_bucketed_so_one_added_line_does_not_re_propose(tmp_path):
+    first = replenish.technical_debt(_trees(tmp_path, modules=[("huge.py", 1200)]))
+    second = replenish.technical_debt(
+        _trees(tmp_path / "b", modules=[("huge.py", 1201)]))
+    assert first[0].fingerprint.split(":")[-1] == second[0].fingerprint.split(":")[-1]
+
+
+def test_a_hundred_more_lines_does_mint_a_new_debt_instance(tmp_path):
+    first = replenish.technical_debt(_trees(tmp_path, modules=[("huge.py", 1200)]))
+    second = replenish.technical_debt(
+        _trees(tmp_path / "b", modules=[("huge.py", 1350)]))
+    assert first[0].fingerprint != second[0].fingerprint
+
+
+def test_dunder_modules_are_not_line_flagged(tmp_path):
+    # `__main__.py` IS over the threshold in this repo and is a standing caveat
+    # rather than a task this lens should mint every round.
+    ctx = _trees(tmp_path, modules=[("__main__.py", 3400)])
+    assert replenish.technical_debt(ctx) == []
+
+
+def test_a_queued_review_file_is_flagged_with_severity(tmp_path, monkeypatch):
+    from mindhive import review
+    monkeypatch.setattr(review, "load_pending",
+                        lambda _p=None: {"files": ["src/mindhive/queued.py"]})
+    ctx = _trees(tmp_path)
+    cands = [c for c in replenish.technical_debt(ctx)
+             if c.fingerprint.startswith("tech-debt:review:")]
+    assert len(cands) == 1
+    assert cands[0].severity is True
+    assert "Clear the thermo-nuclear review queue" in cands[0].title
+
+
+def test_a_queued_review_file_outscores_an_oversized_module(tmp_path, monkeypatch):
+    # A gate that is blocking right now must outrank debt that is merely
+    # accruing, and that ordering is the severity term's entire job.
+    from mindhive import review
+    monkeypatch.setattr(review, "load_pending",
+                        lambda _p=None: {"files": ["src/mindhive/queued.py"]})
+    ctx = _trees(tmp_path, modules=[("huge.py", 1200)])
+    by_kind = {c.fingerprint.split(":")[1]: replenish.score_candidate(c).total
+               for c in replenish.technical_debt(ctx)}
+    assert by_kind["review"] > by_kind["lines"]
+
+
+def test_an_absent_review_marker_yields_no_queue_candidates(tmp_path, monkeypatch):
+    from mindhive import review
+    monkeypatch.setattr(review, "load_pending", lambda _p=None: None)
+    assert replenish.technical_debt(_trees(tmp_path)) == []
+
+
+def test_a_corrupt_review_marker_does_not_raise(tmp_path, monkeypatch):
+    from mindhive import review
+    monkeypatch.setattr(review, "load_pending", lambda _p=None: "not a dict")
+    assert replenish.technical_debt(_trees(tmp_path)) == []
+
+
+def test_debt_titles_carry_repo_relative_paths(tmp_path):
+    # An absolute path in a title would leak one machine's layout into the
+    # ledger and the dashboard.
+    cands = replenish.technical_debt(_trees(tmp_path, modules=[("huge.py", 1200)]))
+    assert cands[0].title.count(str(tmp_path)) == 0
+    assert "src/mindhive/huge.py" in cands[0].title
+
+
+def test_technical_debt_on_a_missing_tree_does_not_raise():
+    assert replenish.technical_debt(
+        replenish.LensContext(src_root="/nope/does/not/exist",
+                              tests_root="/nope/tests", repo_root="/nope")) == []
+
+
+def test_the_tech_debt_lens_is_registered():
+    assert replenish.LENSES["tech-debt"] is replenish.technical_debt
+
+
+# --- audit ---
+
+def _audit(ctx, modified):
+    import mindhive.replenish as rp
+
+    original = rp.git_modified_paths
+    rp.git_modified_paths = lambda _root: list(modified)
+    try:
+        return rp.audit(ctx)
+    finally:
+        rp.git_modified_paths = original
+
+
+def test_a_modified_source_file_with_no_change_log_is_flagged(tmp_path):
+    ctx = _trees(tmp_path)
+    cands = _audit(ctx, ["src/mindhive/foo.py"])
+    assert len(cands) == 1
+    assert "src/mindhive/foo.py" in cands[0].title
+    assert cands[0].severity is True
+
+
+def test_two_uncovered_files_yield_one_candidate_naming_both(tmp_path):
+    # One candidate, not one per file: the outstanding fact is singular, and a
+    # candidate per file would blow the roadmap step ceiling on an ordinary day.
+    cands = _audit(_trees(tmp_path),
+                   ["src/mindhive/foo.py", "tests/test_foo.py"])
+    assert len(cands) == 1
+    assert "foo.py" in cands[0].title and "test_foo.py" in cands[0].title
+
+
+def test_a_file_a_code_change_already_names_is_not_flagged(tmp_path):
+    _code_change("2026-08-02T00:00:00Z", files=["src/mindhive/foo.py"])
+    ctx = replenish.LensContext(evs=tuple(events.read_all()),
+                                src_root=str(tmp_path / "src" / "mindhive"),
+                                tests_root=str(tmp_path / "tests"),
+                                repo_root=str(tmp_path))
+    assert _audit(ctx, ["src/mindhive/foo.py"]) == []
+
+
+def test_a_worktree_absolute_logged_path_still_matches_a_relative_one(tmp_path):
+    # The ledger holds worktree-absolute paths from every past checkout while git
+    # reports repo-relative ones. Comparing them literally called everything
+    # unlogged, which is the failure this normalisation exists to prevent.
+    _code_change("2026-08-02T00:00:00Z",
+                 files=["C:/Users/x/.claude/worktrees/abc/src/mindhive/foo.py"])
+    ctx = replenish.LensContext(evs=tuple(events.read_all()),
+                                src_root=str(tmp_path / "src" / "mindhive"),
+                                tests_root=str(tmp_path / "tests"),
+                                repo_root=str(tmp_path))
+    assert _audit(ctx, ["src/mindhive/foo.py"]) == []
+
+
+def test_an_out_of_scope_modification_is_ignored(tmp_path):
+    assert _audit(_trees(tmp_path), ["README.md", "docs/plans/x.md"]) == []
+
+
+def test_a_clean_working_tree_yields_nothing(tmp_path):
+    assert _audit(_trees(tmp_path), []) == []
+
+
+def test_a_renamed_path_is_read_as_its_new_name(tmp_path):
+    # Porcelain reports "old -> new"; the new name is the one that exists to log.
+    import mindhive.replenish as rp
+    import subprocess
+
+    class _Done:
+        returncode = 0
+        stdout = 'R  src/mindhive/old.py -> src/mindhive/new.py\n'
+        stderr = ""
+
+    original = subprocess.run
+    subprocess.run = lambda *a, **k: _Done()
+    try:
+        assert rp.git_modified_paths(str(tmp_path)) == ["src/mindhive/new.py"]
+    finally:
+        subprocess.run = original
+
+
+def test_a_git_failure_reaches_the_lens_error_channel(tmp_path):
+    # Not an empty result: the lens must be able to tell "nothing is modified"
+    # from "I could not look", and only the second belongs in tool_failed.
+    import mindhive.replenish as rp
+
+    def boom(_root):
+        raise RuntimeError("git status failed (128): not a repository")
+
+    original = rp.git_modified_paths
+    rp.git_modified_paths = boom
+    try:
+        res = replenish.run_round([], surface="session",
+                                  sink=lambda kept: ([], 0),
+                                  lenses={"audit": rp.audit},
+                                  ctx=_trees(tmp_path), append=False)
+    finally:
+        rp.git_modified_paths = original
+    assert res.lens_errors and res.lens_errors[0][0] == "audit"
+
+
+def test_the_audit_lens_is_registered():
+    assert replenish.LENSES["audit"] is replenish.audit
+
+
+# --- coverage ---
+
+def test_a_module_with_no_test_file_is_flagged(tmp_path):
+    ctx = _trees(tmp_path, modules=[("lonely.py", 50)])
+    cands = replenish.coverage(ctx)
+    assert len(cands) == 1
+    assert "src/mindhive/lonely.py" in cands[0].title
+
+
+def test_a_module_with_a_matching_test_file_is_covered(tmp_path):
+    ctx = _trees(tmp_path, modules=[("paired.py", 50)],
+                 test_files=[("test_paired.py", "def test_x(): pass\n")])
+    assert replenish.coverage(ctx) == []
+
+
+def test_a_module_a_differently_named_test_imports_is_covered(tmp_path):
+    # The naive rule is wrong here and would emit confident nonsense:
+    # dashboard_page.py is exercised from test_dashboard.py, and several modules
+    # are covered by suites named for the behaviour rather than the file.
+    ctx = _trees(tmp_path, modules=[("dashboard_page.py", 50)],
+                 test_files=[("test_dashboard.py",
+                              "from mindhive import dashboard_page\n")])
+    assert replenish.coverage(ctx) == []
+
+
+def test_a_dotted_attribute_reference_also_counts_as_coverage(tmp_path):
+    ctx = _trees(tmp_path, modules=[("oversee.py", 50)],
+                 test_files=[("test_ui.py", "assert mindhive.oversee.fold\n")])
+    assert replenish.coverage(ctx) == []
+
+
+def test_a_grouped_import_covers_every_name_in_it(tmp_path):
+    ctx = _trees(tmp_path, modules=[("alpha.py", 10), ("beta.py", 10)],
+                 test_files=[("test_both.py",
+                              "from mindhive import alpha, beta\n")])
+    assert replenish.coverage(ctx) == []
+
+
+def test_a_test_file_in_a_subdirectory_is_still_scanned(tmp_path):
+    ctx = _trees(tmp_path, modules=[("nested.py", 10)])
+    sub = Path(ctx.tests_root) / "unit"
+    sub.mkdir()
+    (sub / "test_nested_behaviour.py").write_text(
+        "from mindhive import nested\n", encoding="utf-8")
+    assert replenish.coverage(ctx) == []
+
+
+def test_dunder_modules_are_excluded_from_coverage(tmp_path):
+    ctx = _trees(tmp_path, modules=[("__init__.py", 3), ("__main__.py", 40)])
+    assert replenish.coverage(ctx) == []
+
+
+def test_coverage_on_a_missing_tree_yields_nothing_and_does_not_raise():
+    assert replenish.coverage(
+        replenish.LensContext(src_root="/nope/src/mindhive",
+                              tests_root="/nope/tests",
+                              repo_root="/nope")) == []
+
+
+def test_the_coverage_lens_is_registered():
+    assert replenish.LENSES["coverage"] is replenish.coverage

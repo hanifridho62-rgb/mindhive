@@ -11,11 +11,29 @@ asserted directly.
 import json
 from pathlib import Path
 
-from mindhive import events, roadmap
+import pytest
+
+from mindhive import events, replenish, roadmap
 from mindhive.__main__ import main
 
 SID = "sess-cli-01"
 HOOK = Path(__file__).resolve().parents[1] / "hooks" / "session_end.ps1"
+
+
+@pytest.fixture(autouse=True)
+def _blind_to_the_real_checkout(monkeypatch):
+    """Point the surface lenses at nothing.
+
+    These tests are about the CLI's plumbing — does a round land steps, honour
+    `--dry-run`, report a broken lens — and the surface lenses read THIS
+    repository, which genuinely has oversized modules and untested files. Left
+    live, every assertion here would depend on the current state of the checkout
+    and would change the day someone refactored `workspace.py`. The lenses that
+    read the tree get their own tests with their own temporary trees;
+    `test_the_cli_surfaces_real_tree_candidates` below is the one case that opts
+    back in."""
+    monkeypatch.setattr(replenish, "resolve_trees",
+                        lambda _ctx: replenish.SourceTrees())
 
 
 def _outstanding():
@@ -125,7 +143,10 @@ def test_status_reports_the_folded_state(capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["last_recorded_round"] == 1
     assert data["dry_rounds"] == 0
-    assert data["lenses"] == ["evidence-gap"]
+    # Against the registry, not a frozen literal: `status` reports which lenses
+    # are installed, so the invariant is "it agrees with the registry" — pinning
+    # the list meant every new lens broke this test for no reason.
+    assert data["lenses"] == sorted(replenish.LENSES)
     assert any(f.startswith("evidence-gap:") for f in data["spent_fingerprints"])
 
 
@@ -134,7 +155,7 @@ def test_status_on_an_empty_ledger(capsys):
     data = json.loads(capsys.readouterr().out)
     assert data == {"surface": "session", "last_recorded_round": 0,
                     "dry_rounds": 0, "spent_fingerprints": [],
-                    "lenses": ["evidence-gap"]}
+                    "lenses": sorted(replenish.LENSES)}
 
 
 def test_a_crash_is_reported_on_stderr_and_exits_non_zero(monkeypatch, capsys):
@@ -199,3 +220,27 @@ def test_the_replenish_leg_stays_inside_the_fail_open_try():
     text = _hook_text()
     call = text.index("replenish run")
     assert text.rindex("try {", 0, call) < call < text.index("} catch {}", call)
+
+
+def test_the_cli_surfaces_real_tree_candidates(tmp_path, monkeypatch, capsys):
+    """The one case that opts out of the blindfold above.
+
+    Without it, nothing would prove the CLI reaches the tree-reading lenses at
+    all — every other test here is deliberately blind to the checkout, and a
+    plumbing bug that disconnected them would pass the whole file."""
+    src_root = tmp_path / "src" / "mindhive"
+    tests_root = tmp_path / "tests"
+    src_root.mkdir(parents=True)
+    tests_root.mkdir(parents=True)
+    (src_root / "enormous.py").write_text("# line\n" * 1200, encoding="utf-8")
+    monkeypatch.setattr(
+        replenish, "resolve_trees",
+        lambda _ctx: replenish.SourceTrees(str(src_root), str(tests_root),
+                                           str(tmp_path)))
+    monkeypatch.setattr(replenish, "git_modified_paths", lambda _root: [])
+
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    assert main(["replenish", "run", "--session", SID]) == 0
+    out = capsys.readouterr().out
+    assert "injected [tech-debt]" in out
+    assert "enormous.py" in out
