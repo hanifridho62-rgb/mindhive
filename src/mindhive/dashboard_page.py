@@ -767,9 +767,17 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
     return ['\\u25a0', 'snone', r.status || 'ended'];
   }
-  function ovRow(glyph, cls, text, dim){
+  // Provenance pill, shared by ovRow and rmPanel so the two surfaces cannot
+  // drift into describing the same fact differently.
+  const OV_NEW_PILL = '<span class="pill rmnew" title="not in the original plan '
+    + '\\u2014 added because the record proved it outstanding">new</span> ';
+  function ovRow(glyph, cls, item, dim){
+    // Records now; bare strings historically, and `r.doing` is still one. A
+    // renderer that assumed either shape would print [object Object] on half the
+    // ledger, so normalise instead of branching at every call site.
+    const rec = (item && typeof item === 'object') ? item : {text: item};
     return '<div class="snip'+(dim?' dup':'')+'"><span class="'+cls+'">'+glyph
-      + '</span> '+esc(text)+'</div>';
+      + '</span> '+(rec.new ? OV_NEW_PILL : '')+esc(rec.text || '')+'</div>';
   }
   function ovGroup(items, glyph, cls, dim){
     return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');
@@ -874,9 +882,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         // Provenance, not recency: this step was not in the plan the work
         // started from — the replenishment injector added it because the record
         // proved it outstanding. It stays marked after the step is done.
-        + (s.new ? '<span class="pill rmnew" title="not in the original plan '
-                   + '\\u2014 added because the record proved it outstanding">'
-                   + 'new</span> ' : '')
+        + (s.new ? OV_NEW_PILL : '')
         + '<span'+(s.status === 'skipped' ? ' class="dup"' : '')+'>'+esc(s.text)+'</span>'
         + (RM_NODE_OPEN.has(key)
             ? '<div class="rmdetail">status: '+esc(s.status)
@@ -916,6 +922,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (chat && r.skills_total ? ' <span class="pill">'+r.skills_total
           + ' skill'+(r.skills_total===1?'':'s')+'</span>' : '')
       + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
+      // What the run added to its OWN plan. Absent when it added nothing, so a
+      // normal run is not decorated with a zero — the pill exists to make the
+      // loop growing its own work visible, and a cost the operator can see.
+      + (r.injected_count ? ' <span class="pill rmnew" title="work the injector '
+          + 'added to this run\\u2019s plan from the record">'+r.injected_count
+          + ' injected</span>' : '')
       + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
                     + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';

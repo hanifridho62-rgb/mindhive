@@ -66,9 +66,36 @@ def _fix_plan_items(goal_dir: str) -> dict:
         fp = d / "fix_plan.md"
         if not fp.is_file() or fp.stat().st_size > _FIX_PLAN_MAX_BYTES:
             return empty
-        return task_mod.plan_items(fp.read_text(encoding="utf-8"))
+        parsed = task_mod.plan_items(fp.read_text(encoding="utf-8"))
+        # Records, not `PlanItem`s: this dict goes straight onto the Oversee wire
+        # as JSON, and a dataclass cannot cross that boundary. The marker rides
+        # along as `new` so the card can show where an item came from.
+        return {group: [it.as_record() for it in items]
+                for group, items in parsed.items()}
     except OSError:
         return empty
+
+
+def _injected_counts(evs) -> dict:
+    """`run_id -> how many pieces of work the injector LANDED in that run`.
+
+    Landed only. A refusal or a dry round is a decision the injector recorded, not
+    work it created, and counting those would tell the operator the loop grew its
+    plan when it had in fact declined to. Total, like every fold that feeds a
+    dashboard projection: a malformed row is skipped, never raised."""
+    counts = {}
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "work_injected":
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("outcome") != "landed":
+            continue
+        run_id = payload.get("run_id") or payload.get("plan_id")
+        if isinstance(run_id, str) and run_id:
+            counts[run_id] = counts.get(run_id, 0) + 1
+    return counts
 
 
 def list_runs(project=None, *, now_fn=time.time,
@@ -78,7 +105,12 @@ def list_runs(project=None, *, now_fn=time.time,
     Dismissed runs (graceful exit, breaker trip, manual delete) are excluded —
     only their count is reported. Events written before run_id stamping group
     into synthetic per-start legacy buckets, so old ledgers still render."""
-    evs = [e for e in events.read_all(project) if e.type in _LOOP_TYPES]
+    # One read, split two ways. The injected counts come off `work_injected`
+    # rows, which are not loop events, and a second `read_all` for them would
+    # double the cost of the single-threaded dashboard's hottest projection.
+    all_evs = events.read_all(project)
+    evs = [e for e in all_evs if e.type in _LOOP_TYPES]
+    injected = _injected_counts(all_evs)
     runs, order, dismissed = {}, [], {}
     legacy = None
 
@@ -148,9 +180,15 @@ def list_runs(project=None, *, now_fn=time.time,
         items = _fix_plan_items(r["goal_dir"])
         r["doing"] = summaries[-1][1] if (running and summaries) else None
         past = summaries[:-1] if running else summaries
-        r["done"] = [f"iter {i}: {s}" for i, s in past] + items["done"]
+        # Every group is a list of records with the SAME keys, including the
+        # iteration summaries. A mixed list — bare strings beside records — is
+        # what would break the Oversee renderer, and it would break it silently
+        # on runs that happened to have both.
+        r["done"] = ([{"text": f"iter {i}: {s}", "new": False, "status": "done"}
+                      for i, s in past] + items["done"])
         r["planned"] = items["planned"]
         r["not_yet"] = items["not_yet"]
+        r["injected_count"] = injected.get(r["run_id"], 0)
         out.append(r)
     out.reverse()
     return {"runs": out, "dismissed": excluded}

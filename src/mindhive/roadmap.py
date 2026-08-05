@@ -311,14 +311,29 @@ def steps_from_plan_items(items) -> list:
     Texts are truncated to the contract cap so an oversized checklist item can
     never invalidate (and thereby silently drop) the whole marker."""
     steps = []
-    for t in items.get("done") or []:
-        steps.append({"text": t[:MAX_STEP_CHARS], "status": "done"})
-    for i, t in enumerate(items.get("planned") or []):
-        steps.append({"text": t[:MAX_STEP_CHARS],
-                      "status": "active" if i == 0 else "pending"})
-    for t in items.get("not_yet") or []:
-        steps.append({"text": t[:MAX_STEP_CHARS], "status": "skipped"})
+    for it in items.get("done") or []:
+        steps.append(_step_from_item(it, "done"))
+    for i, it in enumerate(items.get("planned") or []):
+        steps.append(_step_from_item(it, "active" if i == 0 else "pending"))
+    for it in items.get("not_yet") or []:
+        steps.append(_step_from_item(it, "skipped"))
     return steps[:MAX_STEPS]
+
+
+def _step_from_item(item, status: str) -> dict:
+    """One roadmap step from one parsed checklist item.
+
+    This is where the loop surface's `(new)` marker becomes the roadmap step's
+    `new` boolean — the single hop that lets injected work survive an interruption
+    with its provenance intact and render through the five existing consumers of
+    that flag rather than needing a sixth.
+
+    Accepts a bare string as well as a `PlanItem` so a caller holding a plain
+    checklist line (and every stored payload written before the parse existed)
+    still folds."""
+    text = getattr(item, "text", item)
+    return {"text": str(text)[:MAX_STEP_CHARS], "status": status,
+            "new": bool(getattr(item, "is_new", False))}
 
 
 # --- session auto-sync (TodoWrite -> roadmap) --------------------------------
