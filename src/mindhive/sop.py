@@ -16,11 +16,23 @@ so every session starts with the SOPs in context. The block is budgeted:
 bodies beyond BLOCK_FULL_BUDGET render as title-only pointers instead of
 growing context cost forever (full text stays one `hive sop show` away).
 
+Two tiers. An ordinary SOP is scope-matched: follow it when the task falls in
+its scope. A **mandatory** SOP (``mandatory: true`` on the event, `hive sop
+add --mandatory`) holds on every task in every session, and gets the delivery
+to match — it renders first and un-elided in the STATE.md block, and its body
+is re-asserted on every user prompt by ``sopgate``, which reads the
+``mandatory_sops.json`` sidecar this module writes rather than folding the
+ledger on the hook's hot path. The tier exists because a session-start
+instruction about behaviour that must hold at turn 80 is exactly the kind that
+decays; ``style.py`` documents that failure and its per-prompt remedy.
+
 Like the code change-log, SOPs are registry/audit content: consolidation
 never absorbs them and display-time dedupe never collapses them.
 """
+import json
 import re
 from . import events as ev_mod
+from . import paths
 
 ACTIONS = ("add", "update", "delete")
 
@@ -57,6 +69,11 @@ def validate_payload(payload) -> None:
         raise ValueError(
             "sop requires a kebab-case sop_id (lowercase letters, digits, "
             "hyphens; max 64 chars), e.g. 'memo-hygiene'")
+    if "mandatory" in payload and not isinstance(payload["mandatory"], bool):
+        raise ValueError(
+            "sop mandatory must be true or false — a mandatory SOP is "
+            "re-asserted on every prompt, so the flag is validated rather "
+            "than coerced (1 / 'yes' / 'true' are rejected on purpose)")
     title = payload.get("title")
     text = payload.get("text")
     if title is not None and not (
@@ -71,8 +88,12 @@ def validate_payload(payload) -> None:
                 "sop add requires a real procedure body "
                 f"(at least {MIN_TEXT_CHARS} characters)")
     elif action == "update":
-        if not (title or "").strip() and not (text or "").strip():
-            raise ValueError("sop update requires --title and/or a new body")
+        # A tier change alone is a real update — `hive sop update x
+        # --no-mandatory` must not be rejected for carrying no new prose.
+        if (not (title or "").strip() and not (text or "").strip()
+                and "mandatory" not in payload):
+            raise ValueError("sop update requires --title, a new body, "
+                             "and/or --mandatory / --no-mandatory")
         if text is not None and len(text.strip()) < MIN_TEXT_CHARS:
             raise ValueError(
                 "sop body too short to be a procedure "
@@ -96,6 +117,13 @@ def fold(evs):
     partial update on an unknown or deleted id is skipped; ``delete`` on an
     unknown id is a no-op. Re-adding a deleted id revives it, keeping the
     original created ts and continuing its version count.
+
+    The ``mandatory`` flag follows the same never-lose-data discipline: it is
+    written only when the event actually carries the key, so a title-only
+    update can never silently demote a mandatory procedure to an ordinary one.
+    A first ``add`` that omits it defaults to False; an ``add`` that revives a
+    deleted id and omits it keeps whatever the id had, because there the key's
+    absence means "unchanged" rather than "unset".
     """
     active: dict = {}
     deleted: dict = {}
@@ -121,6 +149,7 @@ def fold(evs):
                 continue  # partial update on an unknown id: nothing to build
             active[sop_id] = {
                 "sop_id": sop_id, "title": title, "text": text,
+                "mandatory": bool(p.get("mandatory")),
                 "created": ev.ts, "updated": ev.ts, "version": 1,
                 "session_id": ev.session_id, "tags": list(ev.tags or []),
             }
@@ -132,6 +161,11 @@ def fold(evs):
             rec["title"] = title
         if text:
             rec["text"] = text
+        if "mandatory" in p:
+            rec["mandatory"] = bool(p["mandatory"])
+        # No else: every record reaching here was built by the literal above,
+        # which always sets the key, so the absence of `mandatory` on THIS
+        # event means "unchanged" and there is nothing to default.
         rec["updated"] = ev.ts
         rec["version"] = rec["version"] + 1
         rec["session_id"] = ev.session_id
@@ -146,6 +180,19 @@ def current(evs) -> list:
     active, _ = fold(evs)
     return sorted(active.values(),
                   key=lambda r: (r["created"], r["sop_id"]))
+
+
+def mandatory(evs) -> list:
+    """Active MANDATORY SOP records, in the same ``(created, sop_id)`` delivery
+    order ``current()`` uses.
+
+    Mandatory is a tier, not a label: these are the procedures that hold on
+    every task in every session, so they render first and un-elided in the
+    STATE.md block (see ``block``) and are the only ones re-asserted on every
+    prompt (see ``sopgate``). Deriving them here rather than at each consumer
+    keeps one definition of "mandatory" for the block, the sidecar, and the
+    CLI."""
+    return [r for r in current(evs) if r.get("mandatory")]
 
 
 def get(evs, sop_id):
@@ -180,7 +227,7 @@ def entries(evs, project=None) -> list:
 
 
 def record(action, sop_id, title=None, text=None, tags=None,
-           session_id=None, project=None, evs=None):
+           session_id=None, project=None, evs=None, mandatory=None):
     """Append one sop event after registry-aware guards: adding an existing id
     or updating/deleting a missing one is almost always a typo — fail with the
     corrective command instead of silently forking the registry. (The raw
@@ -191,6 +238,11 @@ def record(action, sop_id, title=None, text=None, tags=None,
         payload["title"] = title.strip()
     if text is not None:
         payload["text"] = text.strip()
+    if mandatory is not None:
+        # Passed through uncoerced so `validate_payload` can reject a
+        # non-boolean. ``None`` means "leave the tier as it is", which is what
+        # keeps a title-only update from demoting a mandatory procedure.
+        payload["mandatory"] = mandatory
     validate_payload(payload)
     if evs is None:
         evs = ev_mod.read_all(project)
@@ -205,16 +257,145 @@ def record(action, sop_id, title=None, text=None, tags=None,
         known = ", ".join(sorted(active)) or "(none)"
         raise ValueError(
             f"no active SOP '{sop_id}'{hint} — active ids: {known}")
-    return ev_mod.append_event(
+    ev = ev_mod.append_event(
         "sop", payload, session_id=session_id,
         tags=["sop"] + [t for t in (tags or []) if t != "sop"],
         project=project)
+    # Refresh the hot-path cache from the events we ALREADY hold plus the one
+    # just appended, rather than re-reading the store: `read_all` measures
+    # 0.36 s on the live ledger, and paying that twice per write to derive a
+    # file we can derive for free would be pure waste. Best-effort — the
+    # ledger is the source of truth and an unwritable sidecar must never fail
+    # an append that already succeeded (the same contract
+    # `promptgate.train_and_store` keeps for its audit event).
+    try:
+        write_sidecar(project=project, evs=list(evs) + [ev])
+    except Exception:                                       # noqa: BLE001
+        pass
+    return ev
+
+
+# --- the mandatory-SOP sidecar (hot-path cache) --------------------------------
+#
+# `sopgate` re-asserts mandatory SOPs on EVERY user prompt. It must not fold the
+# ledger to do it: `events.read_all` measures 0.36 s on this store (26k events)
+# and the whole UserPromptSubmit hook currently costs about that much, so a live
+# fold there would double the latency of every prompt the user types. So the
+# mandatory set is materialized here, exactly as `promptgate` materializes
+# `rules/triggers.json` and `playbook` is built at train time — derived,
+# regenerable data stays out of the append-only chain and off the hot path.
+#
+# Written on every `record()` and refreshed at session start (`hive hook
+# session_start`), which is the ONLY self-healing path: reads deliberately have
+# no ledger fallback, because a fallback would reintroduce the 0.36 s cost on
+# precisely the path this cache exists to protect.
+
+SIDECAR_NAME = "mandatory_sops.json"
+
+
+def sidecar_path(project=None):
+    return paths.project_dir(project) / SIDECAR_NAME
+
+
+def global_sidecar_path():
+    """The cross-namespace sidecar, one level above every project dir.
+
+    "Mandatory" was asked for as *every session*, and a per-project file cannot
+    mean that. `paths.detect_project` resolves a namespace per repo, so a
+    procedure registered while working in one repo would be invisible in the
+    next — even though the UserPromptSubmit hook is registered globally in
+    ~/.claude/settings.json and fires in all of them. The global file is what
+    closes that gap; the per-project one stays as the registry's own view.
+
+    A FILE at the store root, which `paths.list_namespaces` ignores because it
+    only walks directories."""
+    return paths.store_home() / SIDECAR_NAME
+
+
+def _project_rows(project, evs) -> list:
+    name = project or paths.detect_project()
+    return [{"project": name, "sop_id": r["sop_id"], "title": r["title"],
+             "text": r["text"], "version": r["version"]}
+            for r in mandatory(evs)]
+
+
+def write_sidecar(project=None, evs=None) -> dict:
+    """Materialize the active mandatory SOPs and return the per-project view.
+
+    Writes TWO files. The per-project sidecar is the registry's own
+    materialization. The global one is what `sopgate` actually reads, so a
+    mandatory SOP reaches every session on the machine rather than only
+    sessions whose detected project happens to be the one it was registered in.
+
+    The global write is a read-modify-write that replaces only THIS project's
+    slice, leaving other projects' rows intact. Raises on an unwritable path —
+    callers on a best-effort path wrap it; callers that want to know (the CLI)
+    do not."""
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    rows = _project_rows(project, evs)
+    data = {
+        "written_at": ev_mod.now_iso(),
+        "sops": [{k: v for k, v in r.items() if k != "project"} for r in rows],
+    }
+    paths.write_text_atomic(sidecar_path(project),
+                            json.dumps(data, indent=2, ensure_ascii=False))
+
+    name = project or paths.detect_project()
+    merged = [r for r in (read_global_sidecar().get("sops") or [])
+              if isinstance(r, dict) and r.get("project") != name]
+    merged += rows
+    # Group by project, and ONLY by project: the sort is stable, so each
+    # project's rows keep the `(created, sop_id)` order `mandatory()` gave
+    # them. Sorting on sop_id too would re-alphabetize within a project and
+    # reshuffle procedures already in force whenever a new one is added —
+    # which is exactly the delivery order the registry promises not to churn.
+    merged.sort(key=lambda r: str(r.get("project") or ""))
+    # KNOWN RACE, accepted rather than fixed — the same one `style._write_modes`
+    # documents. Each write is atomic, but the read-modify-write around it is
+    # not, so two projects writing simultaneously can drop one slice. Blast
+    # radius is one project's mandatory SOPs missing until its next `hive state`
+    # or `hive project`, both of which rewrite the slice.
+    paths.write_text_atomic(
+        global_sidecar_path(),
+        json.dumps({"written_at": data["written_at"], "sops": merged},
+                   indent=2, ensure_ascii=False))
+    return data
+
+
+def read_global_sidecar() -> dict:
+    """The cross-namespace sidecar as a dict, or ``{}`` when missing,
+    unreadable, corrupt, or wrong-shaped. Total, for the same reason
+    ``read_sidecar`` is: its caller runs on every prompt."""
+    try:
+        data = json.loads(global_sidecar_path().read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("sops"), list):
+            return {}
+        return data
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def read_sidecar(project=None) -> dict:
+    """The sidecar as a dict, or ``{}`` for missing, unreadable, corrupt, or
+    wrong-shaped. Total, like ``style._read_modes``: the caller is a hook on
+    every prompt, and injecting nothing is always a safe failure while raising
+    there is a user-visible outage."""
+    try:
+        data = json.loads(sidecar_path(project).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("sops"), list):
+            return {}
+        return data
+    except Exception:                                       # noqa: BLE001
+        return {}
 
 
 def ledger_body(payload) -> str:
     """Self-describing markdown body for this event's LEDGER entry, so keyword
     recall finds SOPs by id, title, or body text. Used by the projector."""
     head = f"[{payload.get('action', '')}] SOP {payload.get('sop_id', '')}"
+    if payload.get("mandatory") is True:
+        head += " (MANDATORY)"
     title = (payload.get("title") or "").strip()
     if title:
         head += f" — {title}"
@@ -225,10 +406,20 @@ def ledger_body(payload) -> str:
 def block(evs) -> str:
     """The STANDARD OPERATING PROCEDURES block for STATE.md (and therefore the
     auto-loaded MEMORY.md). Empty string when no SOP is active. Deterministic;
-    budgeted by BLOCK_FULL_BUDGET (see module docstring)."""
+    budgeted by BLOCK_FULL_BUDGET (see module docstring).
+
+    MANDATORY SOPs render FIRST and are EXEMPT from BLOCK_FULL_BUDGET. Both
+    halves matter. A procedure declared to hold on every task, degraded to a
+    one-line pointer because ten optional SOPs happened to be created before
+    it, is a silent failure of the exact property the tier exists to state —
+    and it would fail quietly, since an elided body still looks like a
+    delivered SOP. The budget then applies to the ordinary SOPs alone, so it
+    still bounds the part of the block that can grow without limit."""
     sops = current(evs)
     if not sops:
         return ""
+    must = [r for r in sops if r.get("mandatory")]
+    rest = [r for r in sops if not r.get("mandatory")]
     out = [
         "# STANDARD OPERATING PROCEDURES (managed — `hive sop`)",
         "_Standing procedures for this project: when a task matches an SOP's "
@@ -236,8 +427,21 @@ def block(evs) -> str:
         "`hive sop show <id>`. Manage: `hive sop add|update|delete`._",
         "",
     ]
+    if must:
+        out += [
+            "## MANDATORY — follow these on every task, without being asked",
+            "_Not scope-matched like the SOPs below: these hold for every "
+            "prompt in every session. They are also re-asserted on each prompt "
+            "so they cannot decay over a long session._",
+            "",
+        ]
+        for i, r in enumerate(must, 1):
+            out.append(f"### MANDATORY SOP {i}: {r['title']}  "
+                       f"`[{r['sop_id']} v{r['version']}]`")
+            out.append(r["text"])
+            out.append("")
     spent = 0
-    for i, r in enumerate(sops, 1):
+    for i, r in enumerate(rest, 1):
         out.append(f"## SOP {i}: {r['title']}  `[{r['sop_id']} v{r['version']}]`")
         if spent + len(r["text"]) <= BLOCK_FULL_BUDGET:
             out.append(r["text"])

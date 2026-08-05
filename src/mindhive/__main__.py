@@ -105,7 +105,7 @@ def cmd_hook(args) -> int | None:
         # prompt enrichment is enabled (the default), the fired context also
         # carries the clarifying questions (see enrich.extend_hook_context —
         # additive, sidecar-only read, fail-open).
-        from . import enrich, premise, promptgate, style
+        from . import enrich, premise, promptgate, sopgate, style
         from .mindnet import inject as mn_inject
         context = promptgate.hook_context(raw)
         if context:
@@ -133,6 +133,13 @@ def cmd_hook(args) -> int | None:
         # gate never sees. Additive and fail-open: it returns `context`
         # unchanged whenever nothing is contradicted or anything goes wrong.
         context = premise.extend_hook_context(context, raw)
+        # The MANDATORY SOP pass: the user's own standing procedures, verbatim,
+        # on every prompt. Unconditional for the same reason the spine and the
+        # style pass are — a procedure declared to hold on every task, delivered
+        # only at session start, is exactly the instruction that decays by turn
+        # 80. Reads the materialized sidecar, never the ledger: `read_all` is
+        # 0.36 s on the live store and this sits on the per-prompt hot path.
+        context = sopgate.extend_hook_context(context, raw)
         # The standing reply-style pass: caveman by default, normal prose when
         # the prompt asks to be taught. Unconditional on human-typed prompts for
         # the same reason the spine above is — a style that only re-asserts
@@ -235,6 +242,21 @@ def cmd_state(args) -> int | None:
     try:
         from .mindnet import autodeclare as mn_auto
         mn_auto.refresh_projection(project)
+    except Exception:                                       # noqa: BLE001
+        pass
+    # Self-heal the mandatory-SOP sidecar. `sop.record` writes it on every
+    # change, so this only fires for a store that never had one (fresh clone,
+    # new worktree) or one that was corrupted — and those are exactly the cases
+    # that would otherwise fail SILENTLY forever, since `sopgate` deliberately
+    # has no ledger fallback and a missing sidecar simply injects nothing.
+    # Gated on a parse of the small sidecar rather than on `exists()`, so a
+    # corrupt file heals too; the 0.36 s `read_all` is only paid when it is
+    # actually broken. Session start is the right place: this is the one
+    # command in that hook that belongs to this repo.
+    try:
+        from . import sop as _sop
+        if not _sop.read_sidecar(project):
+            _sop.write_sidecar(project)
     except Exception:                                       # noqa: BLE001
         pass
     s = paths.project_dir(project) / "STATE.md"
@@ -567,7 +589,8 @@ def _cmd_sop_write(args, action) -> int | None:
         tags = [t for t in (getattr(args, "tags", "") or "").split(",") if t]
         ev = sop_mod.record(action, args.sop_id,
                             title=getattr(args, "title", None), text=text,
-                            tags=tags, session_id=sid)
+                            tags=tags, session_id=sid,
+                            mandatory=getattr(args, "mandatory", None))
     except (ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -597,10 +620,15 @@ def cmd_sop_list(args) -> int | None:
         print('(no active SOPs — add one: hive sop add <id> --title "…" '
               '--file <body.md>)')
         return None
+    n_must = 0
     for i, r in enumerate(sops, 1):
-        print(f"  {i}. [{r['sop_id']} v{r['version']}] {r['title']}  "
+        tier = "MANDATORY " if r.get("mandatory") else ""
+        n_must += 1 if r.get("mandatory") else 0
+        print(f"  {i}. {tier}[{r['sop_id']} v{r['version']}] {r['title']}  "
               f"(updated {r['updated']})")
-    print(f"\n{len(sops)} active SOP(s)")
+    tail = (f" ({n_must} mandatory — re-asserted on every prompt)"
+            if n_must else "")
+    print(f"\n{len(sops)} active SOP(s){tail}")
     return None
 
 
@@ -625,6 +653,130 @@ def cmd_sop_show(args) -> int | None:
     print("\nhistory (newest first):")
     for e in hist:
         print(f"  {e['ts']}  {e['action']:6s}  session {e['session']}")
+    return None
+
+
+def _preflight_report(project=None) -> dict:
+    """The pre-execution report the mandatory SOP names, as data.
+
+    Exists because an instruction with no verifier is a wish. "Confirm from the
+    ledger whether this session is new or a continuation" and "prepare the
+    tools, ledgers and improvements before executing" are both claims an
+    assistant can *say* it did; this makes them claims it can only make by
+    running something whose output is quotable. Split from the printer so the
+    verdict is testable without parsing stdout."""
+    from . import changelog as changelog_mod
+    from . import incidents as inc
+    from . import review as review_mod
+    from . import roadmap as roadmap_mod
+    from . import sop as sop_mod
+    evs = events.read_all(project)
+    here = os.environ.get("MINDHIVE_SESSION") or ""
+
+    prior, latest_ts, latest_sid = set(), "", ""
+    for e in evs:
+        sid = getattr(e, "session_id", None)
+        # "manual" is the shared id detached background writers stamp (see
+        # promptgate.train_and_store) — it is not a session anyone worked in,
+        # so counting it would report a CONTINUATION on a store whose only
+        # other rows were written by a trainer.
+        if not sid or sid == here or sid == "manual":
+            continue
+        prior.add(sid)
+        if (e.ts or "") > latest_ts:
+            latest_ts, latest_sid = e.ts or "", sid
+
+    evidence = []
+    if prior:
+        evidence.append(
+            f"{len(prior)} prior session(s) in this project's ledger"
+            + (f" — latest {latest_sid} at {latest_ts}" if latest_sid else ""))
+    interrupted = roadmap_mod.interrupted(evs)
+    for rec in interrupted:
+        nxt = roadmap_mod.next_step(rec)
+        evidence.append(
+            f"interrupted plan '{rec.get('plan_id')}' — {rec.get('title') or ''}"
+            + (f" (next: {nxt.get('text')})" if isinstance(nxt, dict) else ""))
+    rev = review_mod.load_pending(project) or {}
+    if rev:
+        evidence.append(
+            f"pending thermo-nuclear review: {len(rev.get('files') or [])} file(s)")
+    unlogged = changelog_mod.load_pending(project) or {}
+    if unlogged:
+        evidence.append(
+            f"unlogged code changes: {len(unlogged.get('files') or [])} file(s)")
+
+    try:
+        acc = inc._collect(project) or {}
+    except Exception:                                       # noqa: BLE001
+        acc = {}
+    rules = sorted(
+        ({"signature": sig,
+          "occurrences": rec.get("occurrences", 0),
+          "status": ("active" if rec.get("occurrences", 0)
+                     >= inc._threshold_for(sig) else "candidate")}
+         for sig, rec in acc.items()),
+        key=lambda r: -r["occurrences"])
+
+    try:
+        from . import plugins as plugins_mod
+        from . import recommend
+        inv = plugins_mod.live_inventory()["inventory"]
+        skills = recommend.flatten_inventory(inv)
+        catalog = {"skills": len(skills), "plugins": len(inv or [])}
+    except Exception:                                       # noqa: BLE001
+        catalog = {"skills": 0, "plugins": 0, "error": "inventory unavailable"}
+
+    return {
+        "project": project or paths.detect_project(),
+        "session": here or "(unset)",
+        "verdict": "CONTINUATION" if evidence else "NEW",
+        "evidence": evidence,
+        "mandatory_sops": [{"sop_id": r["sop_id"], "title": r["title"],
+                            "version": r["version"]}
+                           for r in sop_mod.mandatory(evs)],
+        "improvements": {
+            "active": sum(1 for r in rules if r["status"] == "active"),
+            "candidate": sum(1 for r in rules if r["status"] == "candidate"),
+            "top": rules[:10],
+        },
+        "catalog": catalog,
+    }
+
+
+def cmd_sop_preflight(args) -> int | None:
+    rep = _preflight_report(getattr(args, "project", None))
+    if args.json:
+        print(json.dumps(rep, indent=2, ensure_ascii=False))
+        return None
+    print(f"SESSION PREFLIGHT — project {rep['project']}  "
+          f"session {rep['session']}\n")
+    print(f"Continuity: {rep['verdict']}")
+    for line in rep["evidence"]:
+        print(f"  - {line}")
+    if rep["verdict"] == "CONTINUATION":
+        print("  -> absorb the prior context BEFORE working: `hive state`, "
+              "`hive briefing`, `hive recall \"<topic>\"`.")
+    else:
+        print("  - no prior sessions, interrupted plans, or pending markers.")
+    must = rep["mandatory_sops"]
+    print(f"\nMandatory SOPs ({len(must)}):")
+    for r in must:
+        print(f"  - [{r['sop_id']} v{r['version']}] {r['title']}")
+    if not must:
+        print("  (none — add one: hive sop add <id> --title … --file … "
+              "--mandatory)")
+    imp = rep["improvements"]
+    print(f"\nImprovements — prevention rules "
+          f"({imp['active']} active / {imp['candidate']} candidate):")
+    for r in imp["top"]:
+        print(f"  {r['occurrences']:>3}x  [{r['status']:9}] {r['signature']}")
+    if not imp["top"]:
+        print("  (no recorded incidents yet)")
+    cat = rep["catalog"]
+    print(f"\nCatalog: {cat['skills']} skill(s), {cat['plugins']} plugin(s)"
+          + (f" — {cat['error']}" if cat.get("error") else "")
+          + "  (hive skills list / hive plugins list)")
     return None
 
 
@@ -2776,6 +2928,15 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="read the body from stdin")
     soa.add_argument("--tags", default="")
     soa.add_argument("--session", default=None)
+    # Tri-state on purpose (None = leave the tier alone). A plain store_true
+    # would default to False, and every title-only `sop update` would then
+    # silently demote a mandatory procedure to an ordinary one.
+    soa.add_argument("--mandatory", dest="mandatory", action="store_true",
+                     default=None,
+                     help="holds on EVERY task: rendered first and un-elided "
+                          "in STATE.md and re-asserted on every prompt")
+    soa.add_argument("--no-mandatory", dest="mandatory", action="store_false",
+                     help="ordinary, scope-matched SOP (the default)")
     soa.set_defaults(func=cmd_sop_add)
     sou = sosub.add_parser("update", help="revise an SOP's title and/or body")
     sou.add_argument("sop_id")
@@ -2785,6 +2946,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sou.add_argument("--stdin", action="store_true")
     sou.add_argument("--tags", default="")
     sou.add_argument("--session", default=None)
+    sou.add_argument("--mandatory", dest="mandatory", action="store_true",
+                     default=None, help="promote to the mandatory tier")
+    sou.add_argument("--no-mandatory", dest="mandatory", action="store_false",
+                     help="demote to an ordinary, scope-matched SOP")
     sou.set_defaults(func=cmd_sop_update)
     sod = sosub.add_parser("delete", help="retire an SOP (append-only tombstone)")
     sod.add_argument("sop_id")
@@ -2800,6 +2965,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sos.add_argument("--project", default=None)
     sos.add_argument("--json", action="store_true")
     sos.set_defaults(func=cmd_sop_show)
+    sop_pf = sosub.add_parser(
+        "preflight",
+        help="pre-execution report: is this session NEW or a CONTINUATION "
+             "(with the ledger evidence), which SOPs are mandatory, what the "
+             "improvements record already warns about, and what is in the "
+             "catalog")
+    sop_pf.add_argument("--project", default=None)
+    sop_pf.add_argument("--json", action="store_true")
+    sop_pf.set_defaults(func=cmd_sop_preflight)
 
     # --- roadmap (event-sourced plan registry + interruption markers) ---
     from .roadmap import STATUSES as _RM_STATUSES

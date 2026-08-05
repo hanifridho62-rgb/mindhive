@@ -213,6 +213,16 @@ def project(project=None, evs=None, suggestions=None) -> dict:
                    encoding="utf-8")
     tmp.replace(pdir / "STATE.md")
 
+    # The mandatory-SOP sidecar is derived state like everything else written
+    # here, and this is the one place that already holds `evs` — so a full
+    # rebuild refreshes it for free rather than paying a second `read_all`.
+    # Best-effort: STATE.md and the LEDGER are this function's product, and a
+    # hot-path cache must never be able to fail the rebuild that feeds them.
+    try:
+        sop.write_sidecar(project, evs=evs)
+    except Exception:                                       # noqa: BLE001
+        pass
+
     ldir = pdir / "LEDGER"
     ldir.mkdir(exist_ok=True)
     entries = build_ledger_entries(evs)
