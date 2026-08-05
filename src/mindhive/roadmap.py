@@ -364,7 +364,15 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
     without this, one more TodoWrite after the replenishment injector had
     written (a resumed session is enough) would silently delete the injected
     work. TodoWrite stays authoritative for its own steps; the injected ones
-    ride along behind them."""
+    ride along behind them.
+
+    **Injected steps win the ``MAX_STEPS`` tie-break, and todos are trimmed to
+    make room.** The first cut appended them and re-capped, which meant a
+    session at the 50-todo cap dropped every injected step — permanently, since
+    the fingerprint was already spent and every later round refuses the
+    condition as a duplicate. The two losses are not symmetric: a trimmed todo
+    reappears on the next TodoWrite, an evidence-backed injected step never
+    comes back."""
     sid = str(session_id or "")
     if not ID_RE.match(sid):
         return None
@@ -377,9 +385,15 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
     if rec is not None and AUTO_TAG not in (rec.get("tags") or []):
         return None
     if rec is not None:
-        seen = {s["text"] for s in steps}
-        steps = (steps + [dict(s) for s in rec["steps"]
-                          if s.get("new") and s["text"] not in seen])[:MAX_STEPS]
+        carried = {s["text"]: dict(s) for s in rec["steps"] if s.get("new")}
+        # A todo whose text matches an injected step INHERITS the flag rather
+        # than replacing it. Copying the step into TodoWrite is the natural
+        # response to reading "(new) …" in STATE.md, and dropping the carried
+        # copy there would quietly erase provenance the flag promises to keep.
+        merged = [dict(s, new=True) if carried.pop(s["text"], None) else s
+                  for s in steps]
+        room = max(0, MAX_STEPS - len(carried))
+        steps = merged[:room] + list(carried.values())[:MAX_STEPS]
     prompt = _session_prompt(evs, sid)
     if rec is not None and rec["prompt"] == prompt \
             and [(s["text"], s["status"], bool(s.get("new")))

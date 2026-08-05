@@ -187,6 +187,48 @@ def test_a_later_todowrite_sync_does_not_delete_injected_steps():
     assert [s["new"] for s in steps] == [False, False, True]
 
 
+def test_injected_steps_survive_a_todo_list_at_the_max_steps_cap():
+    # The tie-break both reviewers caught: the first cut appended carried steps
+    # then re-capped, so at exactly MAX_STEPS todos every injected step was
+    # dropped — permanently, because the fingerprint was already spent.
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    replenish_sinks.roadmap_sink(SID)([_cand()])
+    todos = [{"content": f"todo {i}", "status": "pending"}
+             for i in range(roadmap.MAX_STEPS)]
+    roadmap.sync_from_todos(SID, todos)
+    steps = _rec()["steps"]
+    assert len(steps) == roadmap.MAX_STEPS
+    assert steps[-1]["text"] == "Run the test suite"
+    assert steps[-1]["new"] is True
+
+
+def test_the_trimmed_todo_is_the_one_that_gives_way():
+    # Asymmetric on purpose: a trimmed todo returns on the next TodoWrite, an
+    # injected step never does.
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    replenish_sinks.roadmap_sink(SID)([_cand("fp-1", "injected one"),
+                                       _cand("fp-2", "injected two")])
+    todos = [{"content": f"todo {i}", "status": "pending"}
+             for i in range(roadmap.MAX_STEPS)]
+    roadmap.sync_from_todos(SID, todos)
+    texts = [s["text"] for s in _rec()["steps"]]
+    assert texts[-2:] == ["injected one", "injected two"]
+    assert "todo 47" in texts and "todo 48" not in texts
+
+
+def test_a_todo_matching_an_injected_step_inherits_the_flag():
+    # Copying "(new) Run the test suite" out of STATE.md into TodoWrite must not
+    # quietly downgrade it to ordinary planned work.
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    replenish_sinks.roadmap_sink(SID)([_cand()])
+    roadmap.sync_from_todos(SID, [{"content": "Run the test suite",
+                                   "status": "in_progress"}])
+    steps = _rec()["steps"]
+    assert len(steps) == 1
+    assert steps[0]["status"] == "active"      # _TODO_STATUS maps in_progress
+    assert steps[0]["new"] is True
+
+
 def test_a_todowrite_sync_that_changes_nothing_stays_a_no_op():
     events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
     roadmap.sync_from_todos(SID, [{"content": "todo one", "status": "pending"}])
