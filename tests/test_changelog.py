@@ -1,8 +1,111 @@
 # tests/test_changelog.py
 """Mandatory code change-log: recording, the pending gate, its STATE.md
 notice, and the `hive log` CLI."""
+import subprocess
+from pathlib import Path
+
 import pytest
 from mindhive import __main__ as cli_mod, changelog, events, paths, projector
+
+
+# --- the git seam -------------------------------------------------------------
+# Its first real coverage. Of the 33 tests this file used to carry, exactly two
+# reached the git branch and both monkeypatched the function out, so what it
+# actually ran had never been asserted — which is how it came to diff the whole
+# branch against master and report 61 files for a 14-file change-set.
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=str(cwd), check=True,
+                   capture_output=True, text=True)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """A real scratch repo with one committed file, so the branch has history to
+    wrongly report."""
+    root = tmp_path / "repo"
+    (root / "src" / "mindhive").mkdir(parents=True)
+    (root / "tests").mkdir()
+    _git(tmp_path, "init", "-q", "-b", "master", "repo")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "Test")
+    (root / "src" / "mindhive" / "committed.py").write_text("x = 1\n",
+                                                            encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "seed")
+    return root
+
+
+def test_the_git_seam_reports_the_working_tree_not_the_branch(repo):
+    """The 61-file over-claim, end to end.
+
+    `committed.py` is on the branch and untouched in the working tree. The old
+    merge-base diff reported every such file; the working tree has nothing to say
+    about it."""
+    (repo / "src" / "mindhive" / "modified.py").write_text("y = 2\n",
+                                                           encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "second")
+    (repo / "src" / "mindhive" / "modified.py").write_text("y = 3\n",
+                                                           encoding="utf-8")
+
+    found = changelog._git_changed_files(root=repo)
+    assert "src/mindhive/modified.py" in found
+    assert "src/mindhive/committed.py" not in found
+
+
+def test_the_git_seam_reports_untracked_files(repo):
+    # The regression that omitted three brand-new test files: `git diff` cannot
+    # list an untracked path in any form.
+    (repo / "tests" / "test_brand_new.py").write_text("def test_x(): pass\n",
+                                                      encoding="utf-8")
+    assert "tests/test_brand_new.py" in changelog._git_changed_files(root=repo)
+
+
+def test_the_git_seam_reaches_inside_a_new_untracked_directory(repo):
+    """`-uall`, and why the default is not enough.
+
+    `-unormal` collapses a new directory into one `?? src/mindhive/pkg/` entry,
+    which `in_scope` then rejects for not ending in `.py` — so every source file
+    in a new package would stay invisible."""
+    pkg = repo / "src" / "mindhive" / "newpkg"
+    pkg.mkdir()
+    (pkg / "thing.py").write_text("z = 1\n", encoding="utf-8")
+    assert "src/mindhive/newpkg/thing.py" in changelog._git_changed_files(
+        root=repo)
+
+
+def test_the_git_seam_filters_out_of_scope_paths(repo):
+    (repo / "README.md").write_text("# hi\n", encoding="utf-8")
+    (repo / "src" / "mindhive" / "in_scope.py").write_text("a = 1\n",
+                                                           encoding="utf-8")
+    found = changelog._git_changed_files(root=repo)
+    assert found == ["src/mindhive/in_scope.py"]
+
+
+def test_the_git_seam_reports_a_rename_by_its_new_name(repo):
+    _git(repo, "mv", "src/mindhive/committed.py", "src/mindhive/renamed.py")
+    found = changelog._git_changed_files(root=repo)
+    assert "src/mindhive/renamed.py" in found
+    assert not any("->" in f for f in found)
+
+
+def test_the_git_seam_handles_a_path_containing_a_space(repo):
+    (repo / "src" / "mindhive" / "with space.py").write_text("s = 1\n",
+                                                             encoding="utf-8")
+    assert "src/mindhive/with space.py" in changelog._git_changed_files(
+        root=repo)
+
+
+def test_the_git_seam_is_empty_outside_a_worktree(tmp_path, monkeypatch):
+    # Not a guess made from wherever the process happens to be standing.
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: None)
+    assert changelog._git_changed_files() == []
+
+
+def test_the_git_seam_degrades_to_empty_when_git_fails(tmp_path):
+    # A plain directory, not a repo: `git status` exits non-zero.
+    assert changelog._git_changed_files(root=tmp_path) == []
 
 
 # Default touch ts is in the PAST relative to the real clock: record() stamps
@@ -138,9 +241,26 @@ def test_record_falls_back_to_session_touched_files(tmp_path):
 
 
 def test_record_errors_when_nothing_detected(monkeypatch):
-    monkeypatch.setattr(changelog, "_git_changed_files", lambda: [])
+    monkeypatch.setattr(changelog, "_git_changed_files", lambda root=None: [])
     with pytest.raises(ValueError, match="--files"):
         changelog.record("update", "an explanation with no files anywhere")
+
+
+def test_a_clean_tree_says_so_rather_than_reporting_a_malfunction(monkeypatch):
+    """The message an operator who logged after committing actually gets.
+
+    All three empty cases used to collapse into "no changed files detected",
+    which reads as a broken detector precisely when it is working correctly."""
+    monkeypatch.setattr(changelog, "_git_changed_files", lambda root=None: [])
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: Path("/repo"))
+    with pytest.raises(ValueError, match="working tree is clean"):
+        changelog.record("update", "logged this one after committing it")
+
+
+def test_outside_a_worktree_says_that_instead(monkeypatch):
+    monkeypatch.setattr(paths, "worktree_root", lambda cwd=None: None)
+    with pytest.raises(ValueError, match="not inside a git worktree"):
+        changelog.record("update", "run from somewhere with no repo at all")
 
 
 # --- queue / gate lifecycle ---------------------------------------------------
@@ -206,7 +326,7 @@ def test_record_without_session_does_not_sweep_history(tmp_path, monkeypatch):
     # touched across all sessions to this entry — it falls to git detection.
     _touch("src/mindhive/old.py", tmp_path, session="s1")
     monkeypatch.setattr(changelog, "_git_changed_files",
-                        lambda: ["src/mindhive/fresh.py"])
+                        lambda root=None: ["src/mindhive/fresh.py"])
     ev = changelog.record("update", "recorded outside any known session",
                           session_id=None)
     assert ev.payload["files"] == ["src/mindhive/fresh.py"]

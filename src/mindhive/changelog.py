@@ -166,31 +166,71 @@ def clear(project=None) -> bool:
     return existed
 
 
-def _git_changed_files() -> list:
-    """Fallback file detection for manual use outside a hooked session: files
-    changed on this branch vs the merge-base with master, plus uncommitted
-    changes. Empty list on any git failure — the caller errors out asking for
-    explicit --files instead of guessing."""
-    files = []
+def _git_changed_files(root=None) -> list:
+    """Fallback file detection for manual use outside a hooked session: the
+    in-scope files this WORKING TREE has changed.
+
+    The working tree, not the branch. This used to run
+    `git diff --name-only <merge-base master HEAD> HEAD`, which is the whole
+    committed history of the branch — measured on one ordinary feature branch,
+    that returned 81 files where the working tree had 0, and it is why a 14-file
+    change-set was recorded as 61 files including modules the change never opened.
+    An entry naming files a change never touched is a false record, and the ledger
+    is append-only: it can be corrected by a following entry but never edited.
+
+    `git diff` also cannot list untracked paths in any form, which is why three
+    brand-new test files were absent from that same entry. `--porcelain -uall` is
+    what fixes both. `-uall` rather than the default `-unormal` is load-bearing:
+    `-unormal` collapses a new untracked directory into one `?? src/mindhive/pkg/`
+    entry, and `in_scope` rejects it for not ending in `.py`, so every source file
+    in a new package would stay invisible — the same silent omission in a new
+    costume. This repo adds packages (`loop/`, `mindnet/`, `rotation/`).
+
+    *root* is explicit because the resolution has to be a decision rather than an
+    accident: this used to inherit the process working directory, which is not the
+    repo root for every caller. `None` resolves through `paths.worktree_root()`,
+    and when THAT is `None` — running outside any worktree — the answer is an
+    empty list rather than a guess made from wherever the process happens to be.
+
+    Empty list on any git failure; the caller reports which of the three empty
+    cases it was."""
+    root = root or paths.worktree_root()
+    if root is None:
+        return []
+    files, seen = [], set()
     try:
-        base = subprocess.run(
-            ["git", "merge-base", "master", "HEAD"],
-            capture_output=True, text=True, timeout=15).stdout.strip()
-        cmds = [["git", "diff", "--name-only", "HEAD"]]
-        if base:
-            cmds.append(["git", "diff", "--name-only", base, "HEAD"])
-        seen = set()
-        for cmd in cmds:
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=15).stdout
-            for line in out.splitlines():
-                line = line.strip()
-                if line and line not in seen and in_scope(line):
-                    seen.add(line)
-                    files.append(line)
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "-uall"], cwd=str(root),
+            capture_output=True, text=True, timeout=15)
+        if completed.returncode != 0:
+            return []
+        for line in (completed.stdout or "").splitlines():
+            # Porcelain v1: two status characters, a space, then the path. A
+            # rename carries "old -> new"; the new name is the one that exists.
+            entry = line[3:].strip().strip('"')
+            if " -> " in entry:
+                entry = entry.split(" -> ", 1)[1].strip().strip('"')
+            entry = _norm(entry)
+            if entry and entry not in seen and in_scope(entry):
+                seen.add(entry)
+                files.append(entry)
     except (OSError, subprocess.SubprocessError):
         return []
     return files
+
+
+def _no_files_message() -> str:
+    """Say WHICH empty case this was.
+
+    All three used to collapse into "no changed files detected", which is
+    unhelpful precisely when it fires most: an operator who logs after committing
+    has a clean tree, and the generic message reads as a malfunction rather than
+    as "there is nothing here to detect"."""
+    if paths.worktree_root() is None:
+        return ("not inside a git worktree, so the change-set cannot be "
+                "detected — pass the files explicitly with --files")
+    return ("the working tree is clean, so there is nothing to detect — log "
+            "before committing, or pass the files explicitly with --files")
 
 
 def validate_payload(payload) -> None:
@@ -267,8 +307,7 @@ def record(category, text, files=None, session_id=None, project=None,
         if not files:
             files = _git_changed_files()
     if not files:
-        raise ValueError(
-            "no changed files detected — pass them explicitly with --files")
+        raise ValueError(_no_files_message())
     payload = {"text": text, "category": category, "files": list(files)}
     if task_id is not None:
         if not ID_RE.match(str(task_id)):
