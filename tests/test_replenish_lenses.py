@@ -473,11 +473,34 @@ def test_the_debt_fingerprint_is_bucketed_so_one_added_line_does_not_re_propose(
     assert first[0].fingerprint == second[0].fingerprint
 
 
-def test_a_hundred_more_lines_does_mint_a_new_debt_instance(tmp_path):
-    first = replenish.technical_debt(_trees(tmp_path, modules=[("huge.py", 1200)]))
+def test_crossing_a_magnitude_step_mints_a_new_debt_instance(tmp_path):
+    step = replenish.MAGNITUDE_LINES_STEP
+    first = replenish.technical_debt(
+        _trees(tmp_path, modules=[("huge.py", replenish.LINE_THRESHOLD + 1)]))
     second = replenish.technical_debt(
-        _trees(tmp_path / "b", modules=[("huge.py", 1350)]))
+        _trees(tmp_path / "b",
+               modules=[("huge.py", replenish.LINE_THRESHOLD + step + 1)]))
     assert first[0].fingerprint != second[0].fingerprint
+
+
+def test_a_fresh_debt_identity_always_comes_with_a_higher_score(tmp_path):
+    """Identity and score are bucketed by ONE constant, so they cannot drift.
+
+    They used to be bucketed by two — identity on `lines // 100`, score on
+    `lines // 1000`. A module growing from 1400 to 1500 lines therefore minted a
+    brand new fingerprint, was proposed all over again as a condition nobody had
+    seen, and arrived carrying the exact same score. A new identity has to mean
+    the condition actually got worse, or the dedup set is just noise."""
+    step = replenish.MAGNITUDE_LINES_STEP
+    seen = {}
+    for index in range(4):
+        lines = replenish.LINE_THRESHOLD + step * index + 1
+        cand = replenish.technical_debt(
+            _trees(tmp_path / f"t{index}", modules=[("m.py", lines)]))[0]
+        score = replenish.score_candidate(cand).total
+        assert cand.fingerprint not in seen, "same identity at a different size"
+        assert all(score > previous for previous in seen.values())
+        seen[cand.fingerprint] = score
 
 
 def test_dunder_modules_are_not_line_flagged(tmp_path):
@@ -762,6 +785,89 @@ def test_the_coverage_lens_is_registered():
     assert replenish.LENSES["coverage"] is replenish.coverage
 
 
+# --- path normalisation, shared by three lenses -------------------------------
+
+def test_a_hidden_directory_keeps_its_leading_dot():
+    """`lstrip("./")` takes a CHARACTER SET, not a prefix.
+
+    It ate the leading dot of every hidden path — `.hidden/x.py` became
+    `hidden/x.py` — so two spellings of one path stopped matching, and the
+    "has this been logged / addressed" comparisons that are the whole point of
+    normalising silently answered no."""
+    assert replenish.normalise_path(".hidden/x.py") == ".hidden/x.py"
+    assert replenish.normalise_path(".claude/hooks/stop.ps1") \
+        == ".claude/hooks/stop.ps1"
+
+
+def test_a_relative_prefix_is_stripped_and_slashes_are_normalised():
+    assert replenish.normalise_path("./src/mindhive/x.py") == "src/mindhive/x.py"
+    assert replenish.normalise_path(".\\src\\mindhive\\x.py") \
+        == "src/mindhive/x.py"
+    assert replenish.normalise_path("././a.py") == "a.py"
+
+
+def test_a_path_of_only_dots_is_not_annihilated():
+    assert replenish.normalise_path("...") == "..."
+
+
+# --- the coverage recurrence window -------------------------------------------
+
+def _changes(path, stamps):
+    for ts in stamps:
+        events.append_event("code_change",
+                            {"category": "update", "text": "touched it",
+                             "files": [path]}, ts=ts)
+
+
+def _uncovered(tmp_path):
+    return _trees(tmp_path, modules=[("lonely.py", 40)],
+                  test_files=[("test_other.py", "from mindhive import events\n")])
+
+
+def test_coverage_recurrence_counts_churn_rather_than_the_whole_history(tmp_path):
+    """The lifetime count only ever grows.
+
+    In an ageing store every untested module eventually crosses every threshold
+    on nothing but the passage of time, and a score that rises without the
+    condition worsening is not a measurement. Two changes a year apart are not
+    the same signal as two in one week."""
+    _changes("src/mindhive/lonely.py",
+             [f"20{year}-01-01T00:00:00Z" for year in range(18, 26)])
+    ctx = replenish.replace(_uncovered(tmp_path),
+                            evs=tuple(events.read_all()))
+    cand = [c for c in replenish.coverage(ctx)][0]
+    assert cand.occurrences == 1, "eight changes across eight years is not churn"
+
+
+def test_coverage_recurrence_rises_with_a_real_burst(tmp_path):
+    # The discriminating half: without it the test above would pass against a
+    # lens that had simply stopped counting.
+    _changes("src/mindhive/lonely.py",
+             [f"2026-08-0{day}T00:00:00Z" for day in range(1, 6)])
+    ctx = replenish.replace(_uncovered(tmp_path),
+                            evs=tuple(events.read_all()))
+    assert replenish.coverage(ctx)[0].occurrences == 5
+
+
+def test_coverage_reports_the_total_alongside_the_churn(tmp_path):
+    # The window bounds the SCORE; it must not hide the history from the reader.
+    _changes("src/mindhive/lonely.py", ["2019-01-01T00:00:00Z",
+                                        "2026-08-01T00:00:00Z"])
+    ctx = replenish.replace(_uncovered(tmp_path),
+                            evs=tuple(events.read_all()))
+    evidence = " ".join(replenish.coverage(ctx)[0].evidence)
+    assert "1 recorded change(s) to it within 30 days" in evidence
+    assert "2 in total" in evidence
+
+
+def test_coverage_carries_the_newest_change_as_its_observed_moment(tmp_path):
+    _changes("src/mindhive/lonely.py", ["2026-08-01T00:00:00Z",
+                                        "2026-08-04T00:00:00Z"])
+    ctx = replenish.replace(_uncovered(tmp_path),
+                            evs=tuple(events.read_all()))
+    assert replenish.coverage(ctx)[0].observed_ts == "2026-08-04T00:00:00Z"
+
+
 def test_a_module_barely_over_the_threshold_does_not_interrupt_work(tmp_path):
     # Base 10 only, which is below every dial position. Deliberate: a file just
     # past the line is debt accruing, not a reason to add work to a plan.
@@ -777,9 +883,26 @@ def test_a_badly_oversized_module_does_land(tmp_path):
     # no oversized module could ever have cleared any threshold.
     ctx = _trees(tmp_path, modules=[("enormous.py", 4200)])
     cand = replenish.technical_debt(ctx)[0]
-    assert cand.occurrences == 4
+    assert cand.excess_steps == (4200 - replenish.LINE_THRESHOLD) \
+        // replenish.MAGNITUDE_LINES_STEP
     assert (replenish.score_candidate(cand).total
             >= replenish.PROFILES["balanced"].min_score)
+
+
+def test_an_oversized_module_reports_no_occurrences(tmp_path):
+    """`occurrences` means "how many times the fold saw this condition" and a
+    file has no such number — it has a size.
+
+    Overloading the field is what made the condition dead: integer division of
+    every real module's line count by the threshold produced 1 across the whole
+    tree, so five modules between 1353 and 1940 lines all scored the bare base and
+    cleared no dial position. Magnitude has its own term now, and this asserts the
+    overload has not crept back."""
+    ctx = _trees(tmp_path, modules=[("enormous.py", 4200)])
+    cand = replenish.technical_debt(ctx)[0]
+    assert cand.occurrences == 1
+    assert replenish.score_candidate(cand).recurrence == 0
+    assert replenish.score_candidate(cand).magnitude > 0
 
 
 def test_debt_score_rises_with_how_far_past_the_threshold_a_module_is(tmp_path):
@@ -789,3 +912,56 @@ def test_debt_score_rises_with_how_far_past_the_threshold_a_module_is(tmp_path):
         scores.append(replenish.score_candidate(
             replenish.technical_debt(ctx)[0]).total)
     assert scores == sorted(scores) and len(set(scores)) == 3
+
+
+def test_the_first_magnitude_step_clears_ambitious_but_not_balanced(tmp_path):
+    """The documented gradient, asserted at its two decision points.
+
+    `Branch D`'s whole claim is that a file barely over the line stays quiet while
+    one a step past it starts to matter — and the numbers were chosen against the
+    real tree, so if either boundary moves the constants need re-deriving rather
+    than the test relaxing."""
+    step, base = replenish.MAGNITUDE_LINES_STEP, replenish.LINE_THRESHOLD
+    one_step = replenish.score_candidate(replenish.technical_debt(
+        _trees(tmp_path / "a", modules=[("m.py", base + step)]))[0]).total
+    assert one_step >= replenish.PROFILES["ambitious"].min_score
+    assert one_step < replenish.PROFILES["balanced"].min_score
+
+    three_steps = replenish.score_candidate(replenish.technical_debt(
+        _trees(tmp_path / "b", modules=[("m.py", base + step * 3)]))[0]).total
+    assert three_steps >= replenish.PROFILES["balanced"].min_score
+
+
+def test_the_line_condition_lands_on_this_repository(tmp_path):
+    """The measurement the whole phase turns on, run against the REAL tree.
+
+    Every unit test above builds a synthetic module of whatever size it needs,
+    which is exactly why the dead condition survived: a fixture at 4200 lines
+    proved the arithmetic worked for a file this repository does not contain. The
+    real tree's largest modules sit between 1353 and 1940 lines, and under the
+    previous scoring not one of them could clear a single dial position.
+
+    Skipped rather than failed if the checkout has no oversized module left —
+    that would mean the debt was paid off, which is not a regression."""
+    from pathlib import Path
+
+    import mindhive
+
+    src_root = Path(mindhive.__file__).parent
+    ctx = replenish.LensContext(src_root=str(src_root),
+                                tests_root=str(src_root.parent.parent / "tests"),
+                                repo_root=str(src_root.parent.parent))
+    lines_kind = [c for c in replenish.technical_debt(ctx) if c.kind == "lines"]
+    if not lines_kind:
+        import pytest
+        pytest.skip("no module in this checkout is past the line threshold")
+
+    lowest = min(p.min_score for p in replenish.PROFILES.values()
+                 if "tech-debt" in p.lens_names)
+    landing = [c for c in lines_kind
+               if replenish.score_candidate(c).total >= lowest]
+    assert landing, (
+        "no oversized module in this checkout can clear any dial position it "
+        "runs under — the condition is dead config again: "
+        + ", ".join(f"{c.title} -> {replenish.score_candidate(c).total}"
+                    for c in lines_kind))

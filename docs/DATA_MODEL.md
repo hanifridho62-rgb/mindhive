@@ -135,17 +135,29 @@ could not tell" and "nothing passed" are different facts. Full output goes to
 `runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
 path),
 `work_injected` (`{outcome, round, surface, run_id?, lens?, title?, evidence[]?,
-fingerprint?, kind?, score?, reason?, dropped?, plan_id?, step_index?}` — one row
-per replenishment decision, written by `replenish.py`: `outcome` ∈ landed,
+fingerprint?, kind?, score?, terms?, reason?, dropped?, plan_id?, step_index?}` —
+one row per replenishment decision, written by `replenish.py`: `outcome` ∈ landed,
 refused, truncated, dry. `landed` and `refused` are per-candidate and carry
 `lens`, `title` and `fingerprint`. `fingerprint` is a SHA-256 digest minted by
 `replenish.generate_fingerprint`, never a readable key: the field is capped, and a
 readable key long enough to be clamped to that cap would let two different
 conditions share one identity — which reads as "already proposed" and silences the
-lens that found the second one. `kind` is optional and carries the readable
-classification the digest gives up, for a lens that observes more than one kind of
-condition (`tech-debt` proposes both oversized modules and uncleared review
-entries). Not every refusal is recorded: a candidate refused only for scoring
+lens that found the second one. The digest is built from a **length-prefixed**
+encoding of the lens name and the lens's chosen identity parts, so no component's
+content can forge a separator and collide with another (`repair` derives its parts
+from arbitrary captured error text). Parts are sorted, which is a deliberate SET
+contract for keys made of unordered collections such as `audit`'s uncovered file
+set. `kind` is optional and carries the readable classification the digest gives
+up, for a lens that observes more than one kind of condition (`tech-debt` proposes
+both oversized modules and uncleared review entries); a FUSED systemic candidate
+carries `lens: "resonance"`, `kind: "systemic"`. `terms` is optional and appears on
+`landed` rows only: the named score terms (`base`, `recurrence`, `severity`,
+`magnitude`, `innovation`, `resonance`, `decay`) with their integer values plus
+`total`, zero terms omitted. It exists because `score` alone says a candidate
+cleared the bar and only the terms say *how* — on magnitude, on a recurrence the
+record kept adding to, or on several lenses resonating about one file. Rows
+written before the field existed simply lack it, and the fold reads them
+unchanged. Not every refusal is recorded: a candidate refused only for scoring
 below the round's threshold writes **no row**, because a recorded refusal spends
 the fingerprint and "below the bar" is *not yet* rather than *no*. `landed`
 additionally requires a **non-empty**

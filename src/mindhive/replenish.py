@@ -32,7 +32,8 @@ so `hive append` and `POST /api/append` enforce it too):
 
     {"outcome": "landed",    "round": 1, "surface": "session",
      "lens": "evidence-gap", "title": "…", "evidence": ["…"],
-     "fingerprint": "…", "score": 1.0, "plan_id": "…", "step_index": 3}
+     "fingerprint": "…", "score": 35, "plan_id": "…", "step_index": 3,
+     "terms": {"base": 10, "severity": 20, "recurrence": 5, "total": 35}}
     {"outcome": "refused",   "round": 1, "surface": "session",
      "lens": "evidence-gap", "title": "…", "fingerprint": "…",
      "reason": "no evidence"}
@@ -77,6 +78,11 @@ MAX_FINGERPRINT_CHARS = 128
 # classifier ("lines", "review"), not a description.
 MAX_KIND_CHARS = 32
 
+# How many named score terms a `landed` row may carry. Comfortably above the
+# breakdown's own term count, so adding a term is a code change rather than a
+# contract change — and still bounded, because the row is append-only forever.
+MAX_SCORE_TERMS = 12
+
 # The one refusal that carries NO new information: the fingerprint is spent, so
 # the ledger already holds the row that spent it. Recording it again would add a
 # byte-identical row per round forever — and `chain.compute_chain` hashes every
@@ -103,12 +109,32 @@ def generate_fingerprint(lens_name, parts) -> str:
     *parts* are the identity components the LENS chooses, not its evidence list.
     Each lens decides what makes its condition the same condition — a signature
     plus its newest failure, a path plus a line bucket — and that judgement is the
-    one thing this function must not second-guess. They are sorted, so a set-
-    shaped key keeps one identity however its members are ordered, and joined on a
-    character no component can contain, so ("a", "bc") and ("ab", "c") stay
-    distinct instead of concatenating to the same blob."""
+    one thing this function must not second-guess.
+
+    The encoding is LENGTH-PREFIXED, not separator-joined, and that is a
+    correctness fix rather than a style preference. Joining on `\\x1f` was safe
+    only while no component could contain that byte, which was asserted in prose
+    and never enforced — and `repair` derives its components from arbitrary
+    captured error text. With a separator, ``("a\\x1fb", "c")`` and
+    ``("a", "b\\x1fc")`` produce the identical blob and therefore the identical
+    identity, so one condition silently reads as "already proposed" and its lens
+    goes quiet about the other. A length prefix cannot be forged by content, so
+    the assertion is no longer needed: the encoding simply is injective.
+
+    Parts are still SORTED, deliberately, and that IS a set contract: a key made
+    of an unordered collection (`audit` keys on its uncovered file set) must keep
+    one identity however its members come out of the fold. The lenses that pass
+    components positionally — a signature and its newest failure, a path and a
+    bucket — are unaffected, because their components are drawn from disjoint
+    vocabularies and cannot swap places.
+
+    Changing the encoding retires every fingerprint minted by the previous one.
+    That is a one-time re-proposal of conditions that are genuinely still
+    outstanding, which is the correct direction: the alternative is keeping a
+    collision path alive to protect a dedup set."""
     items = sorted(str(p) for p in (parts or ()) if str(p).strip())
-    blob = "\x1f".join([str(lens_name or "")] + items)
+    blob = "".join(f"{len(item)}\x1f{item}"
+                   for item in [str(lens_name or "")] + items)
     # `surrogatepass`, because a strict encode would RAISE here. Parts include
     # signatures derived from arbitrary captured error text, the ledger round-trips
     # a lone surrogate through JSON, and the exception would escape into the
@@ -208,6 +234,28 @@ def validate_payload(payload) -> None:
     if score is not None and (isinstance(score, bool)
                               or not isinstance(score, (int, float))):
         raise ValueError("work_injected score must be a number when present")
+    # The arithmetic behind `score`, one named term per entry plus `total`.
+    # Validated rather than trusted for the same reason as everything else on this
+    # row: it is the only durable explanation of why a piece of work was chosen,
+    # and a malformed one would be a lie the fold could not detect.
+    terms = payload.get("terms")
+    if terms is None:
+        return
+    if not isinstance(terms, dict):
+        raise ValueError("work_injected terms must be an object when present")
+    if len(terms) > MAX_SCORE_TERMS:
+        raise ValueError(f"work_injected terms exceeds {MAX_SCORE_TERMS} entries")
+    for name, value in terms.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("work_injected term names must be non-empty text")
+        if len(name) > MAX_KIND_CHARS:
+            raise ValueError(
+                f"work_injected term name exceeds {MAX_KIND_CHARS} chars")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"work_injected term {name!r} must be a whole number — the score "
+                f"scale is integers, and a float here would mean some term "
+                f"stopped being one")
 
 
 # --- the score ---------------------------------------------------------------
@@ -219,6 +267,51 @@ def validate_payload(payload) -> None:
 BASE_SCORE = 10
 RECURRENCE_STEP = 5          # per repeat beyond the first
 SEVERITY_BONUS = 20          # a condition that is already blocking something
+
+# Per step of MAGNITUDE — how far past its own limit the condition sits. It is a
+# separate term from `RECURRENCE_STEP` for a reason that cost this subsystem a
+# whole phase: `occurrences` means "how many times the fold SAW this condition",
+# and the tech-debt lens has no occurrences at all — a file has a SIZE. Riding
+# size on the recurrence field made a 1940-line module indistinguishable from one
+# seen once, scored it at the bare base, and left the condition unable to clear
+# any dial position on this repository. Naming the second quantity is the fix;
+# tuning the first one's divisor would only have hidden it again.
+MAGNITUDE_STEP = 5
+
+# What the agentic lens is worth WHEN THE RECORD SAYS THE SYSTEM IS HEALTHY. The
+# only lens-specific term, and it is deliberate rather than an oversight: every
+# other term is read off the condition, while this one is read off the run's own
+# outcome history. A run whose last `TUNE_LOWER_WINDOW` injections all verified
+# green has earned the right to spend attention on improvement instead of repair,
+# and without this term a model proposal can never outrank the tech debt that is
+# always there. It is zero on an unproven or a struggling run, which is the safe
+# direction: innovation is the first thing a strained system should stop doing.
+INNOVATION_BONUS = 15
+
+# Resonance: the 1.5x multiplier a fused systemic intervention earns, expressed
+# as an ADDITIVE term (half the fused subtotal) so the arithmetic stays one sum of
+# named parts. A multiplier applied to the total would make `ScoreBreakdown.total`
+# stop equalling its terms, and that identity is the only thing that makes a
+# refusal explainable.
+RESONANCE_DIVISOR = 2
+
+# Temporal decay. A condition the record proved YESTERDAY and one it proved two
+# months ago are not the same claim, and treating them alike lets a long-dead
+# signature outrank a live one purely by having recurred more often back then.
+# Two anchors, linear between them: fresh work keeps its full history-derived
+# weight, work past `DECAY_STALE_DAYS` keeps half. Never less than half — decay
+# expresses fading urgency, not disproof, and a condition nothing has addressed is
+# still outstanding however old it is.
+DECAY_FRESH_DAYS = 1.0
+DECAY_STALE_DAYS = 7.0
+DECAY_FLOOR = 0.5
+
+# A localised burst of the same failure signature: this many recorded failures
+# inside this window. A spike is the one signal that outranks the score floor,
+# because "this is breaking right now, repeatedly" is precisely the case the
+# floor's "not yet" answer gets wrong.
+SPIKE_COUNT = 3
+SPIKE_WINDOW_DAYS = 1.0
 
 # The floor a tuned threshold may never cross. A threshold below the base score
 # would admit every candidate any lens emitted, which is precisely the
@@ -238,16 +331,38 @@ _DEFERRAL_RE = re.compile(
 
 @dataclass(frozen=True)
 class ScoreBreakdown:
-    """Why a candidate scored what it did.
+    """Why a candidate scored what it did — every term named, and the sum of the
+    named terms IS the total.
 
-    A bare integer makes a refusal unexplainable — "below the minimum" is not
-    something a reader can act on, while "base 10, recurrence 0, severity 0" says
-    which term was missing. The terms also have to survive past the sum because
-    the auto-tuner reasons about them."""
+    A bare integer makes a refusal unexplainable: "below the minimum" is not
+    something a reader can act on, while "base 10, magnitude 15, decay -5" says
+    which term decided it. The terms also have to survive past the sum because the
+    auto-tuner reasons about them and `hive replenish explain` prints them.
+
+    That the total is a plain sum is a constraint, not an accident. Both later
+    terms are conceptually multiplicative — resonance is 1.5x, decay is a
+    fraction of the history-derived weight — and both are stored as the ADDITIVE
+    difference they work out to, because the moment a multiplier is applied to the
+    total instead, `total` stops equalling its parts and the breakdown becomes a
+    story about the score rather than the score itself.
+
+    Term ownership, since it is not guessable from the names alone:
+      `base`        every admissible candidate pays the same admission price
+      `recurrence`  how many times the fold SAW the condition        (the lens)
+      `severity`    the condition is already blocking something      (the lens)
+      `magnitude`   how far past its own limit the condition sits    (the lens)
+      `innovation`  the agentic lens, on a run the record proves healthy (the round)
+      `resonance`   half the subtotal of a fused systemic intervention (the round)
+      `decay`       negative; the history-derived terms fading with age (the round)
+    """
 
     base: int = BASE_SCORE
     recurrence: int = 0
     severity: int = 0
+    magnitude: int = 0
+    innovation: int = 0
+    resonance: int = 0
+    decay: int = 0
     veto_reason: str = ""
 
     @property
@@ -255,8 +370,35 @@ class ScoreBreakdown:
         return bool(self.veto_reason)
 
     @property
+    def history_terms(self) -> int:
+        """The part of the score read off past ledger rows, which is the part age
+        is allowed to discount. `base` is the flat admission price and `magnitude`
+        is measured off the tree as it stands now — neither gets older."""
+        return self.recurrence + self.severity
+
+    @property
     def total(self) -> int:
-        return 0 if self.vetoed else self.base + self.recurrence + self.severity
+        if self.vetoed:
+            return 0
+        # Clamped at zero: decay is the one negative term, and a score below zero
+        # would compare strangely against a threshold whose floor is `BASE_SCORE`.
+        return max(0, self.base + self.recurrence + self.severity
+                   + self.magnitude + self.innovation + self.resonance
+                   + self.decay)
+
+    def as_terms(self) -> dict:
+        """The non-zero terms, for the audit row and the explain surface.
+
+        Zeroes are dropped because a row listing six terms that did nothing buries
+        the one that decided the outcome — and the payload has a size contract to
+        respect. `total` rides along so a reader never has to re-add them."""
+        terms = {"base": self.base, "recurrence": self.recurrence,
+                 "severity": self.severity, "magnitude": self.magnitude,
+                 "innovation": self.innovation, "resonance": self.resonance,
+                 "decay": self.decay}
+        out = {name: value for name, value in terms.items() if value}
+        out["total"] = self.total
+        return out
 
 
 @dataclass(frozen=True)
@@ -335,20 +477,122 @@ def build_deferral_index(evs=None, project=None) -> DeferralIndex:
     return DeferralIndex(rule_reasons, tuple(caveat_texts))
 
 
-def score_candidate(candidate, index=None) -> ScoreBreakdown:
+def _whole(value, default=0) -> int:
+    """*value* as a non-negative int, or *default*. Total on junk.
+
+    A lens is the one thing here not validated at a boundary, so a lens returning
+    ``None``, a bool, or a float must degrade to the default rather than poison
+    the arithmetic — `bool` explicitly, because it is an `int` subclass and `True`
+    would otherwise read as a legitimate count of one."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return default
+    return value
+
+
+def _parse_ts(text):
+    """One ledger timestamp as a datetime, or ``None``.
+
+    Total on anything unparseable, and that matters more than it looks: the
+    ledger holds timestamps written by every past version of this code, and the
+    caller's response to ``None`` is "apply no decay" — the conservative
+    direction, since decay can only ever lower a score."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def age_in_days(observed_ts, now_ts):
+    """How old *observed_ts* is, in days, or ``None`` if either is unreadable.
+
+    Negative ages are clamped to zero rather than rejected: a row stamped
+    slightly in the future is a clock skew, not evidence of extra urgency."""
+    observed, now = _parse_ts(observed_ts), _parse_ts(now_ts)
+    if observed is None or now is None:
+        return None
+    if (observed.tzinfo is None) != (now.tzinfo is None):
+        # One naive, one aware — subtracting them raises. The ledger writes UTC
+        # with a `Z`, so a naive row is a legacy one; read it as UTC rather than
+        # discarding it.
+        from datetime import timezone
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        else:
+            now = now.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - observed).total_seconds() / 86400.0)
+
+
+def count_within(timestamps, anchor, window_days) -> int:
+    """How many of *timestamps* fall in the *window_days* leading up to *anchor*.
+
+    The shared shape behind every "is this a burst or a dribble" question in this
+    module. An unreadable stamp counts as outside the window, always: both callers
+    use the result to RAISE a score, so an ambiguous row must never help.
+
+    Both callers anchor on the newest stamp in the set they are measuring, which
+    is what makes this clock-free — "how much of this happened close together"
+    is answerable without knowing when now is. How long ago the burst itself was
+    is a separate question, and the decay term is what answers it."""
+    total = 0
+    for stamp in timestamps or ():
+        age = age_in_days(stamp, anchor)
+        if age is not None and age <= window_days:
+            total += 1
+    return total
+
+
+def decay_factor(age_days) -> float:
+    """What fraction of its history-derived weight a condition this old keeps.
+
+    ``1.0`` up to `DECAY_FRESH_DAYS`, `DECAY_FLOOR` from `DECAY_STALE_DAYS`
+    onward, linear between. An unknown age keeps full weight — decay only ever
+    lowers a score, so "I could not tell how old this is" must not silently
+    suppress work."""
+    if age_days is None or age_days <= DECAY_FRESH_DAYS:
+        return 1.0
+    if age_days >= DECAY_STALE_DAYS:
+        return DECAY_FLOOR
+    span = DECAY_STALE_DAYS - DECAY_FRESH_DAYS
+    travelled = (age_days - DECAY_FRESH_DAYS) / span
+    return 1.0 - travelled * (1.0 - DECAY_FLOOR)
+
+
+def score_candidate(candidate, index=None, *, healthy=False,
+                    now_ts="") -> ScoreBreakdown:
     """Score one candidate against the record. Pure, and total on junk input.
 
-    `occurrences` is coerced rather than trusted because a lens is the one thing
-    here that is not validated at a boundary — a lens returning ``None`` or a
-    bool must degrade to "seen once", not poison the arithmetic."""
-    occurrences = getattr(candidate, "occurrences", 1)
-    if isinstance(occurrences, bool) or not isinstance(occurrences, int):
-        occurrences = 1
-    recurrence = RECURRENCE_STEP * max(0, occurrences - 1)
+    *healthy* and *now_ts* come from the ROUND, not the candidate: whether the
+    run's recent injections verified green, and what "now" is for the decay
+    clock. Both are parameters rather than reads of the wall clock or the ledger
+    so that scoring stays a pure function — two rounds over the same inputs must
+    score identically, which is the whole reason a threshold means anything.
+
+    Resonance is NOT set here. It is a property of a candidate's relationship to
+    the other candidates in the same round, which one candidate cannot see;
+    `resonate` computes it and rewrites the breakdown."""
+    recurrence = RECURRENCE_STEP * max(
+        0, _whole(getattr(candidate, "occurrences", 1), 1) - 1)
     severity = SEVERITY_BONUS if getattr(candidate, "severity", False) else 0
+    magnitude = MAGNITUDE_STEP * _whole(getattr(candidate, "excess_steps", 0))
+    innovation = (INNOVATION_BONUS
+                  if healthy and getattr(candidate, "lens", "") == "innovation"
+                  else 0)
+
+    # Decay is charged against the history-derived terms only, and only for a
+    # candidate that told us WHEN its evidence was recorded. The tree-reading
+    # lenses set no `observed_ts` because a file's current line count has no age.
+    factor = decay_factor(age_in_days(getattr(candidate, "observed_ts", ""),
+                                      now_ts))
+    decay = -round((recurrence + severity) * (1.0 - factor))
+
     veto = index.veto_reason_for(candidate) if index is not None else ""
     return ScoreBreakdown(recurrence=recurrence, severity=severity,
-                          veto_reason=veto)
+                          magnitude=magnitude, innovation=innovation,
+                          decay=int(decay), veto_reason=veto)
 
 
 # --- the core ----------------------------------------------------------------
@@ -363,17 +607,34 @@ class Candidate:
     candidate would fire once ever, and keyed on something that changes every
     round it would never dedup.
 
-    Four fields are set by the LENS, because only the lens knows them:
-    `occurrences` (how many times its fold saw this condition), `severity`
-    (whether what it found is already blocking something), `deferral_key`
-    (what the record would call this, so a standing deferral can be matched), and
-    `kind` (which of its own condition kinds this is, for a lens that has more
-    than one).
+    Seven fields are set by the LENS, because only the lens knows them:
 
-    Two are set by the ROUND, overwriting whatever a lens put there: `score` and
-    `veto_reason`. Scoring lives in the round rather than the lens so one scale
-    governs every lens; a lens that scored itself would make the threshold
-    meaningless the moment two lenses disagreed about what 25 meant."""
+      `occurrences`   how many times its fold saw this condition — and ONLY
+                      that. It is not a slot for any other quantity a lens would
+                      like scored; the phase that made file size ride here is why
+                      `excess_steps` exists.
+      `excess_steps`  how far past its own limit the condition sits, in whatever
+                      unit the lens counts (line-blocks for tech-debt). A lens
+                      with no notion of "too big" leaves it at 0.
+      `severity`      whether what it found is already blocking something
+      `observed_ts`   when the record recorded this, for the decay clock. Set by
+                      the lenses that read HISTORY; left blank by the ones that
+                      read the tree, because a file's current size has no age.
+      `spike`         a burst of the same condition happening right now, which is
+                      the one signal allowed past the score floor
+      `deferral_key`  what the record would call this, so a standing deferral can
+                      be matched — and, when two lenses name the same one, what
+                      makes them resonate
+      `kind`          which of its own condition kinds this is, for a lens that
+                      has more than one
+
+    Three are set by the ROUND, overwriting whatever a lens put there:
+    `breakdown`, `score` and `veto_reason`. Scoring lives in the round rather
+    than the lens so one scale governs every lens; a lens that scored itself
+    would make the threshold meaningless the moment two lenses disagreed about
+    what 25 meant. `score` duplicates `breakdown.total` deliberately — the gate
+    and the sink compare it on every candidate, and reaching through an optional
+    record to do that would put a `None` check on the hot path."""
 
     lens: str
     title: str
@@ -385,9 +646,18 @@ class Candidate:
     depth: int = 1
     score: float = BASE_SCORE
     veto_reason: str = ""
-    # Lens-set, but declared last so adding it cannot shift any positional
-    # construction of the fields above it.
+    # Lens-set, but declared last so adding them cannot shift any positional
+    # construction of the fields above.
     kind: str = ""
+    excess_steps: int = 0
+    observed_ts: str = ""
+    spike: bool = False
+    breakdown: object = None
+    # The lenses a FUSED candidate was built from; empty for one that came from a
+    # single lens. It is what lets a reader ask which dial positions could have
+    # produced this row, since `lens` on a fused candidate names no registered
+    # lens at all.
+    members: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -537,6 +807,125 @@ def lenses_for(profile, registry=None) -> dict:
     return {n: available[n] for n in profile.lens_names}
 
 
+# --- the auto-tuner -----------------------------------------------------------
+# Homeostasis, not learning. The threshold moves in response to what injected work
+# actually DID, on two windows chosen so the two directions are asymmetric: it
+# takes 3 bad outcomes to become more cautious and 5 good ones to become bolder.
+# Retreating faster than it advances is the correct bias for a mechanism that can
+# spend an operator's quota.
+
+TUNE_RAISE_WINDOW = 3
+TUNE_RAISE_DELTA = 10
+TUNE_LOWER_WINDOW = 5
+TUNE_LOWER_DELTA = -5
+
+# How far the tuner may wander from the dial's own number. Without a ceiling a
+# long unlucky streak could raise the threshold past any candidate's reachable
+# score and switch the injector off in a way no operator chose.
+TUNE_MAX_DRIFT = 20
+
+
+@dataclass(frozen=True)
+class ThresholdAdjustment:
+    """A shift in how selective the gate is, and why.
+
+    `delta` of 0 means the record said nothing conclusive, which is the common
+    case and must stay distinguishable from "the record said stay put" — the
+    caller writes a `decision` row only when something moved."""
+
+    delta: int = 0
+    reason: str = ""
+    window: int = 0
+
+    @property
+    def shifts(self) -> bool:
+        return self.delta != 0
+
+
+@dataclass(frozen=True)
+class AutoTuningProfile:
+    """What injected work actually produced, as two streaks.
+
+    This is the record's answer to "is this system currently coping?", and it
+    drives three separate decisions, which is why it is a named record rather
+    than a number computed at each site: how selective the gate becomes
+    (`adjustment`), whether the agentic lens earns its bonus (`healthy`), and
+    whether a run claiming to be finished still has capacity it never spent (the
+    loop's anti-lazy hold).
+
+    Streaks, not totals. A project with two hundred green verifications and three
+    fresh failures is a struggling system, and any measure that averaged over its
+    whole history would say the opposite — the only honest question is what
+    happened LAST."""
+
+    success_streak: int = 0
+    failure_streak: int = 0
+    # Every resolved outcome, oldest first. Kept so `hive replenish explain` can
+    # show the window the tuner read rather than only its verdict.
+    outcomes: tuple = ()
+
+    @property
+    def healthy(self) -> bool:
+        return self.success_streak >= TUNE_LOWER_WINDOW
+
+    @property
+    def strained(self) -> bool:
+        return self.failure_streak >= TUNE_RAISE_WINDOW
+
+    @property
+    def adjustment(self) -> ThresholdAdjustment:
+        """How far the gate should move. Strain is checked FIRST: the two streaks
+        cannot both be satisfied, but stating the precedence makes the bias
+        explicit rather than an accident of evaluation order."""
+        if self.strained:
+            return ThresholdAdjustment(
+                TUNE_RAISE_DELTA,
+                f"the last {TUNE_RAISE_WINDOW} injections were each followed by "
+                f"a failure or a tripped breaker — raising the bar",
+                TUNE_RAISE_WINDOW)
+        if self.healthy:
+            return ThresholdAdjustment(
+                TUNE_LOWER_DELTA,
+                f"the last {TUNE_LOWER_WINDOW} injections each verified green — "
+                f"lowering the bar",
+                TUNE_LOWER_WINDOW)
+        return ThresholdAdjustment()
+
+
+def iteration_outcome(ev) -> str:
+    """What one event says happened: "failed", "verified", or "" for neither.
+
+    Split out of the fold so that "which events count as a verdict on injected
+    work" has exactly one definition. A `verification` row is judged on its exit
+    code, per `verify.py`'s own rule that the stamp attaches to the code and not
+    to the parsed counts."""
+    etype = getattr(ev, "type", None)
+    payload = getattr(ev, "payload", None)
+    if etype == "tool_failed":
+        return "failed"
+    if etype == "loop_run_end" and isinstance(payload, dict) \
+            and payload.get("reason") == "breaker_open":
+        return "failed"
+    if etype == "verification" and isinstance(payload, dict):
+        code = payload.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            return "verified" if code == 0 else "failed"
+    return ""
+
+
+def _streaks(outcomes) -> tuple:
+    """``(success_streak, failure_streak)`` — the trailing run of each verdict."""
+    success = failure = 0
+    for verdict in reversed(outcomes):
+        if verdict == "verified" and failure == 0:
+            success += 1
+        elif verdict == "failed" and success == 0:
+            failure += 1
+        else:
+            break
+    return success, failure
+
+
 @dataclass(frozen=True)
 class History:
     """The injector's state, recovered from the ledger alone."""
@@ -549,6 +938,10 @@ class History:
     # memory, so a run that resumes after an interruption inherits its own budget
     # instead of starting over with a full one.
     landed_count: int = 0
+    # What those injections then produced. Folded in the SAME pass rather than by
+    # a second walk: resolving each landed row's outcome by re-scanning the ledger
+    # from its timestamp is quadratic, and this store is already past 28k events.
+    tuning: AutoTuningProfile = AutoTuningProfile()
 
 
 @dataclass
@@ -585,6 +978,10 @@ class LensContext:
     tests_root: str = ""            # defaults to the checkout's tests
     repo_root: str = ""             # defaults to the checkout root
     run_id: str = ""                # loop surface only; "" on a session round
+    # What the round calls "now". Injected rather than read from the wall clock so
+    # a lens that reasons about recency — is this failure signature spiking? — can
+    # be driven to a fixed instant by a test instead of to whenever the suite ran.
+    now_ts: str = ""
     # Paths the surface knows changed, and the model seam. Both exist for the one
     # agentic lens: the paths are the only evidence it is allowed to cite, and the
     # seam is how the suite drives it without a model call.
@@ -636,8 +1033,17 @@ def history(evs, surface=None, run_id=None) -> History:
     that went quiet twice would disable `surface="loop"` project-wide and
     permanently — strictly worse than having no exit at all."""
     spent, last, dry, landed = set(), 0, 0, 0
+    # The tuner's half of the fold. `awaiting` counts landed rows that have not yet
+    # been answered by anything; the next verdict-bearing event answers all of them
+    # at once, which is what "the FIRST outcome after this injection" means when
+    # the walk is forward-only.
+    awaiting, outcomes = 0, []
     for ev in evs or []:
         if getattr(ev, "type", None) != "work_injected":
+            verdict = iteration_outcome(ev)
+            if verdict and awaiting:
+                outcomes.extend([verdict] * awaiting)
+                awaiting = 0
             continue
         p = getattr(ev, "payload", None)
         if not isinstance(p, dict):
@@ -650,6 +1056,12 @@ def history(evs, surface=None, run_id=None) -> History:
             spent.add(fp)                       # global, always
         if surface is not None and p.get("surface") != surface:
             continue
+        # Tuning is scoped by SURFACE and never by run: a run asks what this
+        # surface's injections have been producing lately, and its own first
+        # injection has by definition produced nothing yet. Narrowing to the run
+        # would make the tuner permanently silent on every fresh run.
+        if outcome == "landed":
+            awaiting += 1
         if run_id is not None and p.get("run_id") != run_id:
             continue
         r = p.get("round")
@@ -660,65 +1072,18 @@ def history(evs, surface=None, run_id=None) -> History:
         elif outcome == "landed":
             dry = 0            # real work landed: the streak is broken
             landed += 1
-    return History(frozenset(spent), last, dry, landed)
+
+    success, failure = _streaks(outcomes)
+    return History(frozenset(spent), last, dry, landed,
+                   AutoTuningProfile(success, failure, tuple(outcomes)))
 
 
-# --- the auto-tuner -----------------------------------------------------------
-# Homeostasis, not learning. The threshold moves in response to what injected work
-# actually DID, on two windows chosen so the two directions are asymmetric: it
-# takes 3 bad outcomes to become more cautious and 5 good ones to become bolder.
-# Retreating faster than it advances is the correct bias for a mechanism that can
-# spend an operator's quota.
+def tuning_profile(evs, surface=None) -> AutoTuningProfile:
+    """What this surface's injections have been producing lately.
 
-TUNE_RAISE_WINDOW = 3
-TUNE_RAISE_DELTA = 10
-TUNE_LOWER_WINDOW = 5
-TUNE_LOWER_DELTA = -5
-
-# How far the tuner may wander from the dial's own number. Without a ceiling a
-# long unlucky streak could raise the threshold past any candidate's reachable
-# score and switch the injector off in a way no operator chose.
-TUNE_MAX_DRIFT = 20
-
-
-@dataclass(frozen=True)
-class ThresholdAdjustment:
-    """A shift in how selective the gate is, and why.
-
-    `delta` of 0 means the record said nothing conclusive, which is the common
-    case and must stay distinguishable from "the record said stay put" — the
-    caller writes a `decision` row only when something moved."""
-
-    delta: int = 0
-    reason: str = ""
-    window: int = 0
-
-    @property
-    def shifts(self) -> bool:
-        return self.delta != 0
-
-
-def _outcome_after(evs, ts) -> str:
-    """What the record shows happened FIRST after *ts*: "failed", "verified", "".
-
-    First, not eventually: a run that broke and was later fixed says something
-    different about the injected work than one that passed immediately, and taking
-    the earliest signal is what keeps the two apart."""
-    for ev in evs or []:
-        if (getattr(ev, "ts", "") or "") <= ts:
-            continue
-        etype = getattr(ev, "type", None)
-        payload = getattr(ev, "payload", None)
-        if etype == "tool_failed":
-            return "failed"
-        if etype == "loop_run_end" and isinstance(payload, dict) \
-                and payload.get("reason") == "breaker_open":
-            return "failed"
-        if etype == "verification" and isinstance(payload, dict):
-            code = payload.get("exit_code")
-            if isinstance(code, int) and not isinstance(code, bool):
-                return "verified" if code == 0 else "failed"
-    return ""
+    A thin name over the fold, because three callers want the profile and only
+    one of them wants the rest of the `History` record."""
+    return history(evs, surface=surface).tuning
 
 
 def tune_threshold(evs, surface=None) -> ThresholdAdjustment:
@@ -727,38 +1092,7 @@ def tune_threshold(evs, surface=None) -> ThresholdAdjustment:
     Pure and total: it appends nothing and raises on nothing, so a caller can ask
     without committing. A malformed row is skipped like everywhere else — the
     ledger holds history written by every past version of this code."""
-    landed = []
-    for ev in evs or []:
-        if getattr(ev, "type", None) != "work_injected":
-            continue
-        payload = getattr(ev, "payload", None)
-        if not isinstance(payload, dict) or payload.get("outcome") != "landed":
-            continue
-        if surface is not None and payload.get("surface") != surface:
-            continue
-        landed.append(getattr(ev, "ts", "") or "")
-
-    outcomes = [_outcome_after(evs, ts) for ts in landed if ts]
-
-    recent_bad = outcomes[-TUNE_RAISE_WINDOW:]
-    if len(recent_bad) == TUNE_RAISE_WINDOW and all(o == "failed"
-                                                    for o in recent_bad):
-        return ThresholdAdjustment(
-            TUNE_RAISE_DELTA,
-            f"the last {TUNE_RAISE_WINDOW} injections were each followed by a "
-            f"failure or a tripped breaker — raising the bar",
-            TUNE_RAISE_WINDOW)
-
-    recent_good = outcomes[-TUNE_LOWER_WINDOW:]
-    if len(recent_good) == TUNE_LOWER_WINDOW and all(o == "verified"
-                                                     for o in recent_good):
-        return ThresholdAdjustment(
-            TUNE_LOWER_DELTA,
-            f"the last {TUNE_LOWER_WINDOW} injections each verified green — "
-            f"lowering the bar",
-            TUNE_LOWER_WINDOW)
-
-    return ThresholdAdjustment()
+    return tuning_profile(evs, surface=surface).adjustment
 
 
 def tuned_threshold(base, adjustment) -> int:
@@ -803,7 +1137,14 @@ def refusal_reason(candidate, spent, cfg) -> str:
         return (f"depth {candidate.depth} exceeds the maximum injection depth "
                 f"{cfg.max_depth} — an injected step may propose work, its "
                 f"proposals may not")
-    if candidate.score < cfg.min_score:
+    if candidate.score < cfg.min_score and not candidate.spike:
+        # The spike bypass, and the ONLY rule allowed past. A spike means the same
+        # condition is recurring right now, in a burst — which is exactly the case
+        # the floor's answer ("not yet, the record has not insisted hard enough")
+        # gets wrong, because the record is insisting as we read it. It bypasses
+        # this rule alone: a spiking candidate with no evidence, a spent identity,
+        # a standing deferral or an illegal depth is still refused above, because
+        # none of those become acceptable for being urgent.
         return (f"score {candidate.score} below the round's minimum "
                 f"{cfg.min_score}")
     return ""
@@ -865,6 +1206,127 @@ def normalise(candidate) -> Candidate:
                    # two-phase write window this function exists to close.
                    kind=str(candidate.kind or "").strip()[:MAX_KIND_CHARS],
                    evidence=evidence)
+
+
+# How many constituent titles and evidence lines ride a fused candidate. The row
+# has a hard contract cap; titles come first because they say what the lenses
+# actually found, and raw evidence fills whatever is left.
+_RESONANCE_TITLES = 4
+
+
+def resonate(scored, spent=frozenset()) -> list:
+    """Fuse candidates that independently name the same target into one task.
+
+    A module that is simultaneously oversized, untested and implicated in a
+    recorded failure is not three pieces of work — it is one, and the three lenses
+    agreeing is itself the strongest evidence in the round. Left unfused they
+    compete: each carries its own middling score, each is capped separately, and
+    the per-round trim can drop two of the three so the plan never shows that they
+    were the same file.
+
+    Fusing is decided on `deferral_key`, which already means "what the record
+    would call this" and is therefore the only field in a `Candidate` that two
+    different lenses can be expected to spell the same way. Agreement must come
+    from DISTINCT lenses: one lens emitting two conditions about one path is that
+    lens's own business, not corroboration.
+
+    Three exclusions, each for a different reason. A VETOED candidate is left out
+    because a fused row would swallow the record's own words declining it. A SPENT
+    one is left out because it is already refused as a duplicate, and folding it in
+    would let a dead condition inflate a live one's score. A candidate with no
+    `deferral_key` names no target, so there is nothing for it to agree with.
+
+    Order is preserved for everything that does not fuse, and each fused
+    candidate takes the position of its first constituent, so the registry order
+    the round relies on for stable tie-breaking survives."""
+    groups, order = {}, []
+    for candidate in scored:
+        if not isinstance(candidate, Candidate):
+            continue
+        target = str(candidate.deferral_key or "").strip()
+        if (not target or candidate.veto_reason
+                or candidate.fingerprint in spent):
+            continue
+        if target not in groups:
+            order.append(target)
+        groups.setdefault(target, []).append(candidate)
+
+    fused_by_target = {}
+    for target in order:
+        members = groups[target]
+        if len({m.lens for m in members}) < 2:
+            continue                # one lens agreeing with itself is not evidence
+        fused_by_target[target] = _fuse(target, members)
+
+    if not fused_by_target:
+        return list(scored)
+
+    absorbed = {id(m) for members in
+                (groups[t] for t in fused_by_target) for m in members}
+    out, emitted = [], set()
+    for candidate in scored:
+        if id(candidate) not in absorbed:
+            out.append(candidate)
+            continue
+        target = str(candidate.deferral_key or "").strip()
+        if target not in emitted:
+            emitted.add(target)
+            out.append(fused_by_target[target])
+    return out
+
+
+def _fuse(target, members) -> Candidate:
+    """One systemic intervention standing in for *members*, at 1.5x their sum."""
+    lenses = sorted({m.lens for m in members})
+    parts = [m.breakdown if isinstance(m.breakdown, ScoreBreakdown)
+             else ScoreBreakdown() for m in members]
+    combined = ScoreBreakdown(
+        base=sum(p.base for p in parts),
+        recurrence=sum(p.recurrence for p in parts),
+        severity=sum(p.severity for p in parts),
+        magnitude=sum(p.magnitude for p in parts),
+        innovation=sum(p.innovation for p in parts),
+        decay=sum(p.decay for p in parts))
+    # The multiplier, stored as the addition it works out to (see
+    # `RESONANCE_DIVISOR`). Read off `combined.total` rather than re-adding the
+    # terms here, so there is one definition of what the terms sum to.
+    combined = replace(combined,
+                       resonance=combined.total // RESONANCE_DIVISOR)
+
+    evidence = [f"[{m.lens}] {m.title}" for m in members[:_RESONANCE_TITLES]]
+    for member in members:
+        evidence.extend(member.evidence)
+    # Deduplicated in first-seen order: two lenses looking at one file routinely
+    # cite the same path, and a row that repeats it wastes the evidence cap.
+    seen, unique = set(), []
+    for item in evidence:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+
+    return Candidate(
+        # Not a registered lens, and deliberately so: this candidate came from the
+        # round noticing agreement, not from any one lens, and attributing it to a
+        # member would misreport which fold found it.
+        lens="resonance",
+        kind="systemic",
+        title=(f"Systemic intervention on {target} — {len(lenses)} lenses agree "
+               f"({', '.join(lenses)})")[:MAX_TITLE_CHARS],
+        # Keyed on the target AND every constituent identity, so the fused task is
+        # re-proposable the moment any member becomes a different instance — which
+        # is the same rule each member follows on its own.
+        fingerprint=generate_fingerprint(
+            "resonance", [target] + sorted(m.fingerprint for m in members)),
+        evidence=tuple(unique[:MAX_EVIDENCE_ITEMS]),
+        severity=any(m.severity for m in members),
+        spike=any(getattr(m, "spike", False) for m in members),
+        # The deepest member's depth: fusing must not launder a too-deep
+        # proposal past the depth stop by averaging it with shallower ones.
+        depth=max(m.depth for m in members),
+        deferral_key=target,
+        members=tuple(lenses),
+        breakdown=combined,
+        score=combined.total)
 
 
 def gate(candidates, spent, cfg):
@@ -954,7 +1416,7 @@ def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
 
 def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
               session_id=None, append=True, ctx=None, run_id="",
-              tune=False) -> RoundResult:
+              tune=False, now_ts="") -> RoundResult:
     """Run one replenishment round and record what it decided.
 
     *sink* is a parameter, not an import: deciding what is outstanding is
@@ -994,19 +1456,31 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     round_no = hist.last_round + 1
 
     # Homeostasis. Off by default because a surface that runs one round per
-    # session has no outcome history to tune on; the loop turns it on.
-    adjustment = tune_threshold(evs, surface=surface) if tune \
-        else ThresholdAdjustment()
+    # session has no outcome history to tune on; the loop turns it on. The
+    # profile comes off the fold already done above rather than a second pass —
+    # `history` scopes its tuning half by surface alone, which is exactly the
+    # scope the tuner wants.
+    adjustment = hist.tuning.adjustment if tune else ThresholdAdjustment()
     if adjustment.shifts:
         cfg = replace(cfg, min_score=tuned_threshold(cfg.min_score, adjustment))
         if append:
             _record_tuning(adjustment, cfg.min_score, surface,
                            project=project, session_id=session_id)
 
+    # One clock for the whole round, read once. Passed down rather than read
+    # inside the lenses and the scorer so that both stay pure functions of their
+    # arguments — a round that scored against the wall clock could not be replayed
+    # from the ledger, and replayability is what makes the threshold auditable.
+    clock = now_ts or ev_mod.now_iso()
+
     # One context for the whole round: the lenses that read a tree or a project
     # get those from here rather than resolving them, which is what makes them
     # testable without the real repo.
     lens_ctx = ctx if ctx is not None else _as_context(evs, project)
+    if not lens_ctx.now_ts:
+        # A caller that pinned its own instant keeps it; everyone else inherits
+        # the round's, so "now" means one thing across every lens in the round.
+        lens_ctx = replace(lens_ctx, now_ts=clock)
 
     candidates, lens_errors = [], []
     for name, lens in (LENSES if lenses is None else lenses).items():
@@ -1028,14 +1502,23 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     # whole round; per candidate it would be a ledger pass each.
     deferrals = build_deferral_index(lens_ctx.evs or evs,
                                      project=lens_ctx.project)
+    healthy = hist.tuning.healthy
     scored = []
     for candidate in candidates:
         if not isinstance(candidate, Candidate):
             scored.append(candidate)        # gate() is where junk gets dropped
             continue
-        breakdown = score_candidate(candidate, deferrals)
+        breakdown = score_candidate(candidate, deferrals, healthy=healthy,
+                                    now_ts=clock)
         scored.append(replace(candidate, score=breakdown.total,
-                              veto_reason=breakdown.veto_reason))
+                              veto_reason=breakdown.veto_reason,
+                              breakdown=breakdown))
+
+    # Cross-lens synthesis, AFTER scoring because a fused score is the sum of its
+    # members' scores, and BEFORE the gate because fusing changes what the gate is
+    # deciding about. The spent set rides along so a dead constituent cannot
+    # inflate a live one (see `resonate`).
+    scored = resonate(scored, hist.fingerprints)
 
     kept, refused = gate(scored, hist.fingerprints, cfg)
     # R16 asks whether anything QUALIFIED, which is decided here. A round the cap
@@ -1078,6 +1561,15 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                          evidence=[str(e)[:MAX_EVIDENCE_CHARS]
                                    for e in c.evidence][:MAX_EVIDENCE_ITEMS],
                          score=c.score, kind=c.kind, plan_id=pl.plan_id,
+                         # Why it scored what it did, term by term. The bare score
+                         # says a candidate cleared the bar; only the terms say
+                         # whether it did so on magnitude, on a recurrence the
+                         # record kept adding to, or on three lenses resonating —
+                         # and that is the difference between an auditable
+                         # decision and a number nobody can check.
+                         terms=(c.breakdown.as_terms()
+                                if isinstance(c.breakdown, ScoreBreakdown)
+                                else None),
                          step_index=pl.step_index if pl.step_index >= 0 else None))
     for c, reason in refused:
         if reason == DUPLICATE_REASON:
@@ -1114,6 +1606,125 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     return RoundResult(round_no=round_no, landed=landed, refused=refused,
                        dropped=dropped, dry=dry, lens_errors=lens_errors)
+
+
+# --- explaining a round without running one -----------------------------------
+
+def landing_positions(candidate) -> list:
+    """Dial positions that would both RUN and ADMIT this candidate.
+
+    Two conditions, and only checking the second is the mistake that makes a
+    report misleading: a tech-debt candidate scoring 45 does not land at
+    `conservative`, because `conservative` never runs the tech-debt lens at all.
+    A fused candidate needs every lens it was built from, since a position that
+    ran only some of them would have produced a different, smaller fusion."""
+    needed = set(getattr(candidate, "members", ()) or (candidate.lens,))
+    return sorted(
+        p.name for p in PROFILES.values()
+        if needed <= set(p.lens_names) and candidate.score >= p.min_score)
+
+
+def explain(evs, *, ctx=None, project=None, lenses=None, now_ts="",
+            tune=False) -> dict:
+    """What a round WOULD decide, computed without deciding it.
+
+    The tool that would have caught this subsystem's recurring failure in one
+    command. A dead lens is invisible from a round's output — it simply produces
+    nothing, exactly like a lens with nothing to report — and invisible from the
+    ledger, because a below-the-bar refusal is deliberately not recorded (writing
+    it would spend the fingerprint it refused). The only place the difference
+    shows is a per-candidate score next to the thresholds it was measured
+    against, which is what this returns.
+
+    Side-effect free, and that is a contract rather than an implementation
+    detail: no sink is called, no event is appended, and no fingerprint is spent.
+    A diagnostic that changed what it was diagnosing would be worse than none —
+    running it once would silence every condition it reported.
+
+    The agentic lens is NOT in the default set. It spends a model call, and an
+    operator asking what the record currently holds has not thereby asked to pay
+    for a proposal. Pass it explicitly in *lenses* to include it."""
+    hist = history(evs)
+    clock = now_ts or ev_mod.now_iso()
+    lens_ctx = ctx if ctx is not None else _as_context(evs, project)
+    if not lens_ctx.now_ts:
+        lens_ctx = replace(lens_ctx, now_ts=clock)
+    registry = lenses if lenses is not None else {
+        name: LENSES[name] for name in _ALL_DETERMINISTIC if name in LENSES}
+
+    raw, lens_errors = [], []
+    for name, lens in registry.items():
+        try:
+            raw.extend(lens(lens_ctx) or [])
+        except Exception as exc:                                # noqa: BLE001
+            lens_errors.append({"lens": name,
+                                "error": f"{type(exc).__name__}: {exc}"})
+
+    deferrals = build_deferral_index(lens_ctx.evs or evs,
+                                     project=lens_ctx.project)
+    healthy = hist.tuning.healthy
+    scored = []
+    for candidate in raw:
+        if not isinstance(candidate, Candidate):
+            continue
+        breakdown = score_candidate(candidate, deferrals, healthy=healthy,
+                                    now_ts=clock)
+        scored.append(normalise(replace(candidate, score=breakdown.total,
+                                        veto_reason=breakdown.veto_reason,
+                                        breakdown=breakdown)))
+    scored = resonate(scored, hist.fingerprints)
+
+    rows = []
+    for candidate in scored:
+        breakdown = (candidate.breakdown
+                     if isinstance(candidate.breakdown, ScoreBreakdown)
+                     else ScoreBreakdown())
+        rows.append({
+            "lens": candidate.lens,
+            "kind": candidate.kind,
+            "title": candidate.title,
+            "score": candidate.score,
+            "terms": breakdown.as_terms(),
+            "fingerprint": candidate.fingerprint,
+            # Already proposed once. Shown rather than filtered out, because
+            # "this lens is finding things and they are all spent" and "this lens
+            # is finding nothing" are different diagnoses.
+            "spent": candidate.fingerprint in hist.fingerprints,
+            "spike": bool(candidate.spike),
+            "veto_reason": candidate.veto_reason,
+            "members": list(candidate.members),
+            "lands_at": landing_positions(candidate),
+            "evidence": list(candidate.evidence),
+        })
+    # Highest first: the reader's question is almost always "what would land",
+    # and a dead lens shows up as a long tail of zeroes in `lands_at`.
+    rows.sort(key=lambda row: row["score"], reverse=True)
+
+    adjustment = hist.tuning.adjustment if tune else ThresholdAdjustment()
+    return {
+        "now": clock,
+        "lenses": sorted(registry),
+        "positions": {p.name: {"threshold": p.min_score,
+                               "lenses": list(p.lens_names),
+                               "max_per_run": p.max_injections_per_run}
+                      for p in PROFILES.values()},
+        "tuning": {"success_streak": hist.tuning.success_streak,
+                   "failure_streak": hist.tuning.failure_streak,
+                   "healthy": hist.tuning.healthy,
+                   "strained": hist.tuning.strained,
+                   "threshold_delta": adjustment.delta,
+                   "reason": adjustment.reason},
+        "spent_fingerprints": len(hist.fingerprints),
+        "lens_errors": lens_errors,
+        "candidates": rows,
+        # A lens that ran, raised nothing, and produced nothing. Named explicitly
+        # rather than left as an absence, because an absence is what a dead lens
+        # and a quiet lens both look like.
+        "silent_lenses": sorted(
+            set(registry) - {row["lens"] for row in rows}
+            - {name for row in rows for name in row["members"]}
+            - {err["lens"] for err in lens_errors}),
+    }
 
 
 # --- lenses ------------------------------------------------------------------
@@ -1198,7 +1809,11 @@ def evidence_gap(arg) -> list:
                       fingerprint=generate_fingerprint("evidence-gap",
                                                        (newest_ts,)),
                       evidence=tuple(evidence),
-                      occurrences=count, severity=True)]
+                      occurrences=count, severity=True,
+                      # The condition's own age: unverified code from this
+                      # morning and unverified code from last quarter are not
+                      # equally urgent, and this is what lets the score say so.
+                      observed_ts=newest_ts)]
 
 
 LENSES["evidence-gap"] = evidence_gap
@@ -1267,6 +1882,7 @@ def repair(arg) -> list:
     outscore one seen once, and that is the whole reason the term exists."""
     ctx = _as_context(arg)
     covered = _signatures_with_an_active_rule(ctx.project)
+    now = ctx.now_ts
 
     timestamps, newest = {}, {}
     for ev in ctx.evs or []:
@@ -1300,8 +1916,36 @@ def repair(arg) -> list:
                            + [f"failed @ {t}"
                               for t in seen[-_EVIDENCE_TIMESTAMPS:]]),
             occurrences=len(timestamps[sig]),
+            # The newest failure, which is both what the fingerprint keys on and
+            # what the decay clock measures: a signature that stopped recurring
+            # months ago should not outscore a live one on recurrence count alone.
+            observed_ts=newest.get(sig, ""),
+            spike=is_spiking(seen, now),
             deferral_key=sig))
     return out
+
+
+def is_spiking(timestamps, now_ts) -> bool:
+    """Whether these failures are a burst happening NOW.
+
+    Two conditions, and both are required. DENSITY: at least `SPIKE_COUNT` of
+    them fall inside `SPIKE_WINDOW_DAYS` of the newest — a signature that failed
+    four times over four months is chronic, not spiking. FRESHNESS: that newest
+    one is itself inside the same window of *now* — a burst that happened last
+    spring was a spike then and is history now.
+
+    Freshness is what stops the bypass from being a back door. Density alone
+    would let any long-dead flurry walk past the score floor forever, and the
+    floor is the only thing standing between the injector and a plan full of work
+    nobody asked for."""
+    ordered = sorted(t for t in (timestamps or []) if str(t or "").strip())
+    if len(ordered) < SPIKE_COUNT:
+        return False
+    newest = ordered[-1]
+    since_newest = age_in_days(newest, now_ts)
+    if since_newest is None or since_newest > SPIKE_WINDOW_DAYS:
+        return False
+    return count_within(ordered, newest, SPIKE_WINDOW_DAYS) >= SPIKE_COUNT
 
 
 LENSES["repair"] = repair
@@ -1328,9 +1972,9 @@ def _addressed_referents(evs) -> set:
             continue
         for path in (payload.get("files") or []):
             if isinstance(path, str):
-                touched.add(path.replace("\\", "/").lstrip("./"))
+                touched.add(normalise_path(path))
         for match in _PY_REFERENT_RE.findall(str(payload.get("text") or "")):
-            touched.add(match.replace("\\", "/").lstrip("./"))
+            touched.add(normalise_path(match))
     return touched
 
 
@@ -1362,7 +2006,7 @@ def caveat(arg) -> list:
         text = str(payload.get("text") or "").strip()
         if not text:
             continue                     # nothing to title the work with
-        referents = {m.replace("\\", "/").lstrip("./")
+        referents = {normalise_path(m)
                      for m in _PY_REFERENT_RE.findall(text)}
         if referents & addressed:
             continue
@@ -1392,6 +2036,11 @@ def caveat(arg) -> list:
             # thresholds it runs under (balanced 25, ambitious 15), so no pinned
             # caveat could ever have landed anywhere, in silence.
             severity=True,
+            # When the caveat was pinned. A hazard recorded this week and one
+            # recorded a year ago are not equally urgent — and this lens is the
+            # one most exposed to that, because a pinned caveat is never folded
+            # away by consolidation and so can sit in the record indefinitely.
+            observed_ts=ts,
             # The path is what a standing deferral would name, so it is also what
             # a veto matches on. Prose cannot be a deferral key.
             deferral_key=sorted(referents)[0] if referents else ""))
@@ -1410,6 +2059,21 @@ LENSES["caveat"] = caveat
 # already records `__main__.py` sitting past this line as a standing caveat, and
 # the review skill checks against the same number.
 LINE_THRESHOLD = 1000
+
+# How many lines past the threshold make one step of magnitude. It does double
+# duty on purpose, and that is the point: it buckets the SCORE and it buckets the
+# FINGERPRINT, so a module cannot quietly mint a fresh identity — and be proposed
+# again — without also having become measurably worse. The two used to be
+# different numbers (identity on hundreds, score on thousands), which meant a file
+# growing from 1400 to 1500 lines was a brand new condition worth re-proposing at
+# exactly the same score.
+#
+# 250 is chosen against the real tree rather than picked round. At this size the
+# largest modules here (1848 and 1940 lines) reach `balanced`, the mid-sized ones
+# (1353-1462) reach `ambitious` only, and a file barely over the line scores the
+# bare base and lands nowhere — which is the behaviour the lens's own docstring
+# always claimed and, before the magnitude term existed, never had.
+MAGNITUDE_LINES_STEP = 250
 
 
 @dataclass(frozen=True)
@@ -1494,26 +2158,34 @@ def technical_debt(arg) -> list:
         if lines <= LINE_THRESHOLD:
             continue
         relative = _repo_relative(path, trees.repo_root)
+        # How many `MAGNITUDE_LINES_STEP` blocks past the threshold this module
+        # sits. It is the SCORE bucket and the IDENTITY bucket both, which is what
+        # makes the two impossible to drift apart.
+        excess_steps = (lines - LINE_THRESHOLD) // MAGNITUDE_LINES_STEP
         out.append(Candidate(
             lens="tech-debt",
             title=(f"Refactor and reduce line count in {relative} "
                    f"({lines} lines, threshold {LINE_THRESHOLD})")[:MAX_TITLE_CHARS],
-            # Bucketed by hundreds, not the exact count: keyed on the raw number a
-            # single added line would mint a fresh instance and re-propose the same
+            # Bucketed, not the exact count: keyed on the raw number a single
+            # added line would mint a fresh instance and re-propose the same
             # refactor every round.
             fingerprint=generate_fingerprint(
-                "tech-debt", ("lines", relative, lines // 100)),
+                "tech-debt", ("lines", relative, excess_steps)),
             kind="lines",
             evidence=(f"{relative} is {lines} lines",
                       f"threshold is {LINE_THRESHOLD} lines",
                       f"module {stem}"),
-            # How many thresholds deep it is. Without this term the condition was
-            # DEAD: base 10 alone is below every dial position, so no oversized
-            # module could ever have landed anywhere. Magnitude is the honest
-            # signal here — a file at three times the threshold is one the record
-            # insists on three times as hard as one barely over it, and a file
-            # barely over it genuinely should not interrupt the operator's work.
-            occurrences=max(1, lines // LINE_THRESHOLD),
+            # Magnitude, in its own named term. It rode `occurrences` for one
+            # phase and the cost was total: a file has no occurrences, integer
+            # division by the threshold gave every module in this repository the
+            # same value of 1, and the condition could not clear a single dial
+            # position — measurably, on the real tree, in silence, with a green
+            # suite. `occurrences` is left at its default here because this lens
+            # genuinely does not have one.
+            excess_steps=excess_steps,
+            # No `observed_ts`: a file's current line count is a fact about the
+            # tree as it stands, not a ledger row that gets older. Decay would be
+            # lying about it.
             deferral_key=relative))
 
     for path in _pending_review_files(ctx.project):
@@ -1618,7 +2290,7 @@ def audit(arg) -> list:
 
     logged = _logged_files(ctx.evs)
     uncovered = sorted(p for p in modified
-                       if p.replace("\\", "/").lstrip("./") not in logged)
+                       if normalise_path(p) not in logged)
     if not uncovered:
         return []
 
@@ -1650,13 +2322,28 @@ def _in_review_scope(path) -> bool:
         return False
 
 
+def normalise_path(text) -> str:
+    """One path, forward-slashed, with any leading `./` segments removed.
+
+    A single function because the alternative was `lstrip("./")` repeated at five
+    call sites — and `lstrip` takes a CHARACTER SET, not a prefix, so it ate the
+    leading dot of every hidden path: `.hidden/x.py` became `hidden/x.py`, and
+    `...` became "". Two spellings of one path that no longer match are two paths
+    as far as every fold here is concerned, which silently breaks the "has this
+    been logged / addressed" comparisons that are the point of normalising."""
+    out = str(text or "").replace("\\", "/")
+    while out.startswith("./"):
+        out = out[2:]
+    return out
+
+
 def _path_spellings(normalised) -> set:
     """Every spelling of one path a ledger entry should match.
 
     The ledger holds worktree-absolute paths written by every past checkout while
     git reports repo-relative ones, so comparing them literally would call
     everything unlogged."""
-    out = {normalised.lstrip("./")}
+    out = {normalise_path(normalised)}
     for marker, prefix in (("/src/mindhive/", "src/mindhive/"),
                            ("/tests/", "tests/")):
         if marker in normalised:
@@ -1664,14 +2351,17 @@ def _path_spellings(normalised) -> set:
     return out
 
 
-def _change_counts(evs) -> dict:
-    """How many `code_change` events name each path.
+def _change_timestamps(evs) -> dict:
+    """`{path spelling: [ts, …]}` — when each path was named by a `code_change`.
 
-    Counted per EVENT, not per listed file: one entry naming the same path twice
-    is one change to it. The count is what the coverage lens's recurrence term
-    reads — a module the record keeps changing without ever testing it is one the
-    record insists on, and how often is the only honest measure of how hard."""
-    counts = {}
+    Timestamps rather than a bare count, because the two callers want different
+    slices of the same fold: `audit` only asks whether a path appears at all,
+    while `coverage` asks how often it appeared RECENTLY. Returning the raw
+    instants lets each answer its own question off one pass.
+
+    Recorded per EVENT, not per listed file: one entry naming the same path twice
+    is one change to it."""
+    stamps = {}
     for ev in evs or []:
         if getattr(ev, "type", None) != "code_change":
             continue
@@ -1682,15 +2372,16 @@ def _change_counts(evs) -> dict:
         for path in (payload.get("files") or []):
             if not isinstance(path, str):
                 continue
-            seen |= _path_spellings(path.replace("\\", "/"))
+            seen |= _path_spellings(path)
+        ts = getattr(ev, "ts", "") or ""
         for spelling in seen:
-            counts[spelling] = counts.get(spelling, 0) + 1
-    return counts
+            stamps.setdefault(spelling, []).append(ts)
+    return stamps
 
 
 def _logged_files(evs) -> set:
     """Paths any `code_change` event claims."""
-    return set(_change_counts(evs))
+    return set(_change_timestamps(evs))
 
 
 LENSES["audit"] = audit
@@ -1711,7 +2402,7 @@ def coverage(arg) -> list:
         return []
 
     mentioned = _modules_mentioned_by_tests(trees.tests_root)
-    changes = _change_counts(ctx.evs)
+    changes = _change_timestamps(ctx.evs)
     out = []
     for stem, path in _python_modules(trees.src_root):
         try:
@@ -1722,6 +2413,16 @@ def coverage(arg) -> list:
         if named or stem in mentioned:
             continue
         relative = _repo_relative(path, trees.repo_root)
+        stamps = sorted(t for t in changes.get(relative, ()) if t)
+        newest = stamps[-1] if stamps else ""
+        # Changes clustered around the most recent one, NOT the lifetime total.
+        # The lifetime count only ever grows, so in an ageing store every module
+        # eventually crosses every threshold on nothing but the passage of time —
+        # a score that rises without the condition worsening is not a measurement.
+        # Anchored on the newest change rather than on the wall clock, so the lens
+        # stays a pure fold; how long ago that burst was is the decay term's
+        # question, and `observed_ts` below is what lets it ask.
+        churn = count_within(stamps, newest, COVERAGE_CHURN_WINDOW_DAYS)
         out.append(Candidate(
             lens="coverage",
             title=f"Bootstrap a unit test suite for {relative}"[:MAX_TITLE_CHARS],
@@ -1729,20 +2430,31 @@ def coverage(arg) -> list:
             evidence=(f"{relative} has no test module",
                       f"expected tests/test_{stem}.py, and no test file names "
                       f"`{stem}`",
-                      f"{changes.get(relative, 0)} recorded change(s) to it"),
-            # How many times the record changed this module while it still had no
-            # test. NO severity: an untested module is not blocking anything, and
-            # asserting otherwise would put a fabricated +20 on every module in
-            # the tree. Recurrence is the honest term — a module nobody touches
-            # should not interrupt the operator, and one being changed repeatedly
-            # without cover is one the record insists on each time.
+                      f"{churn} recorded change(s) to it within "
+                      f"{int(COVERAGE_CHURN_WINDOW_DAYS)} days of the newest, "
+                      f"{len(stamps)} in total"),
+            # How many times the record changed this module, recently, while it
+            # still had no test. NO severity: an untested module is not blocking
+            # anything, and asserting otherwise would put a fabricated +20 on
+            # every module in the tree. Recurrence is the honest term — a module
+            # nobody touches should not interrupt the operator, and one being
+            # changed repeatedly without cover is one the record insists on each
+            # time.
             #
             # Without this the lens was DEAD: base 10 alone sits below both
             # thresholds it runs under (balanced 25, ambitious 15), so no missing
             # test suite could ever have landed anywhere, in silence.
-            occurrences=max(1, changes.get(relative, 0)),
+            occurrences=max(1, churn),
+            observed_ts=newest,
             deferral_key=relative))
     return out
+
+
+# How close together changes have to be to count as churn for the coverage lens.
+# A month, because that is roughly the span over which "this module is under
+# active development and still has no tests" is a true statement rather than a
+# summary of its whole history.
+COVERAGE_CHURN_WINDOW_DAYS = 30.0
 
 
 # How a test file says which module it exercises: `from mindhive import x, y`,
@@ -1801,6 +2513,19 @@ INNOVATION_TIMEOUT_S = 120
 # How much of the record rides the prompt. Bounded because this runs inside a loop
 # that is already spending context (SOP `context-reliability` §3).
 _INNOVATION_CONTEXT_ITEMS = 8
+
+# The fewest recorded facts a proposal may rest on before the model is worth
+# calling. Derived, not chosen: a candidate's grounding count IS its recurrence
+# term, so at one fact the score is the bare `BASE_SCORE`, which sits below
+# `ambitious` — the only position that runs this lens. Below this line the call
+# spends real money to produce candidates the gate is guaranteed to refuse, and
+# refuse transiently, so nothing is even recorded to explain where it went.
+#
+# `test_the_innovation_grounding_floor_matches_the_dial` asserts this constant
+# against `PROFILES` rather than trusting the arithmetic above to stay true, per
+# the standing caveat: when a threshold or a lens moves, assert the lens still
+# clears its own dial position — a green suite does not catch this.
+INNOVATION_MIN_GROUNDING = 2
 
 
 def innovation_prompt(changed_paths, failure_signatures, completed) -> str:
@@ -1884,9 +2609,14 @@ def innovation(arg) -> list:
     ctx = _as_context(arg)
     changed = [str(p) for p in (ctx.changed_paths or ()) if str(p).strip()]
     signatures = _recent_failure_signatures(ctx.evs)
-    if not (changed or signatures):
-        # Nothing to ground a proposal in. Asking anyway would spend a model call
-        # to produce candidates the gate must then refuse for having no evidence.
+    # The facts a candidate would be allowed to cite, counted BEFORE the model is
+    # called, because the count decides whether any answer could survive the gate.
+    # It used to check only that this list was non-empty, which left a real and
+    # ordinary window — one changed file, no recorded failures — where the lens
+    # spent a model call on a proposal that scored `BASE_SCORE` and was then
+    # refused for sitting below `ambitious`. The liveness guard found it.
+    grounding = min(len(changed), _EVIDENCE_FILES) + min(len(signatures), 2)
+    if grounding < INNOVATION_MIN_GROUNDING:
         return []
 
     runner = ctx.runner or _default_innovation_runner
@@ -1921,18 +2651,19 @@ def innovation(arg) -> list:
             # Keyed on the slug, so the same proposal twice is one piece of work.
             fingerprint=generate_fingerprint("innovation", (slug,)),
             evidence=evidence,
-            # `occurrences` is HOW MUCH RECORD the proposal rests on, which is the
-            # honest reading of the recurrence term for this lens: a suggestion
-            # grounded in three recorded facts is one the record insists on harder
-            # than a suggestion grounded in one. It is also what makes the lens
-            # able to land at all — base 10 alone is below `ambitious`'s threshold
-            # of 15, so a proposal that cited nothing would be permanently
-            # unlandable and the lens would be dead config.
+            # Each cited fact is one INDEPENDENT observation of the condition
+            # "recent activity has follow-ups nobody handled", so counting them is
+            # what `occurrences` means rather than a reuse of the field. The
+            # distinction matters: the tech-debt lens spent a phase riding a file's
+            # SIZE here, which is not a count of anything, and the condition was
+            # dead for as long as it did. Grounding genuinely is a count.
             #
             # NO severity. The record cannot say a suggestion about the future is
             # blocking anything, and asserting it would put a fabricated +20 on
             # every model proposal.
             occurrences=len(evidence),
+            # No `observed_ts` either: a proposal is about work still to do, so
+            # there is no moment for it to be old relative to.
             deferral_key=slug))
     return out
 

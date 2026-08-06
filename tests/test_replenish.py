@@ -557,10 +557,29 @@ def test_different_parts_mint_different_identities():
 
 
 def test_parts_cannot_run_together_into_one_blob():
-    # Joined on a separator no component can contain. Bare concatenation would
-    # make ("ab", "c") and ("a", "bc") the same condition.
+    # Length-prefixed, so bare concatenation cannot make ("ab", "c") and
+    # ("a", "bc") the same condition.
     assert (replenish.generate_fingerprint("l", ("ab", "c"))
             != replenish.generate_fingerprint("l", ("a", "bc")))
+
+
+def test_a_part_containing_the_separator_cannot_forge_another_identity():
+    """The collision the separator-joined encoding actually had.
+
+    It was safe only while no component could contain `\\x1f`, which was asserted
+    in prose and never enforced — and `repair` derives its components from
+    arbitrary captured error text. Joined on the separator, these two produce the
+    identical blob, so one condition reads as "already proposed" and its lens goes
+    quiet about the other. A length prefix cannot be forged by content."""
+    assert (replenish.generate_fingerprint("l", ("a\x1fb", "c"))
+            != replenish.generate_fingerprint("l", ("a", "b\x1fc")))
+
+
+def test_a_part_that_looks_like_a_length_prefix_cannot_forge_one_either():
+    # The encoding reads exactly `len` characters after each prefix, so digits in
+    # the content are just content.
+    assert (replenish.generate_fingerprint("l", ("1\x1fx", "yy"))
+            != replenish.generate_fingerprint("l", ("1", "\x1fxyy")))
 
 
 def test_a_blank_part_is_dropped_rather_than_shifting_the_identity():

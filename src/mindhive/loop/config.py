@@ -63,6 +63,12 @@ class LoopConfig:
     # work a project usually carries, and it is safe to expose only because the
     # streak is scoped to a single run_id.
     replenish_dry_rounds_to_exit: int = 2
+    # The anti-lazy hold: a run the record proves healthy, which claims to be
+    # finished and has never once proposed improvement work, is held open ONCE to
+    # spend that capacity. Exposed because holding a run open is the single most
+    # intrusive thing this feature does, and an operator who wants a loop that
+    # stops the moment it says it is done must be able to say so in one line.
+    replenish_anti_lazy: bool = True
 
     @property
     def cooldown_seconds(self) -> float:
@@ -157,4 +163,5 @@ def load_config(path: Path) -> LoopConfig:
         replenish_dry_rounds_to_exit=_int_or(
             replenish.get("dry_rounds_to_exit"),
             cfg.replenish_dry_rounds_to_exit),
+        replenish_anti_lazy=replenish.get("anti_lazy", cfg.replenish_anti_lazy),
     )

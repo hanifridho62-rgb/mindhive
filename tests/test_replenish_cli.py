@@ -54,6 +54,86 @@ def _rows():
     return [e.payload for e in events.read_all() if e.type == "work_injected"]
 
 
+# --- explain ------------------------------------------------------------------
+# The surface that makes a dead lens visible. Everything about it is diagnostic,
+# which is exactly why the side-effect tests below are the important ones: a
+# diagnostic that changed what it was diagnosing would be worse than none, since
+# running it once would spend the fingerprints it reported and silence them.
+
+def test_explain_appends_nothing_and_spends_nothing(capsys):
+    _outstanding()
+    before = [(e.type, e.ts) for e in events.read_all()]
+    assert main(["replenish", "explain"]) == 0
+    assert [(e.type, e.ts) for e in events.read_all()] == before
+
+
+def test_explain_does_not_call_a_sink(monkeypatch, capsys):
+    """No roadmap step, no checklist item. `explain` never reaches a sink at all,
+    and the plan staying empty is what proves it."""
+    _outstanding()
+    main(["replenish", "explain"])
+    assert _plan() is None
+
+
+def test_explain_scores_each_candidate_against_the_positions(capsys):
+    _outstanding()
+    main(["replenish", "explain"])
+    out = capsys.readouterr().out
+    assert "conservative>=40" in out and "ambitious>=15" in out
+    assert "Run the test suite" in out
+    assert "terms: base +10" in out
+
+
+def test_explain_reports_where_a_candidate_would_land(capsys):
+    _outstanding()
+    main(["replenish", "explain", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    gap = [row for row in report["candidates"]
+           if row["lens"] == "evidence-gap"][0]
+    assert gap["terms"]["total"] == gap["score"]
+    # Not `conservative`: it needs 40, and it does not run this lens's peers
+    # either. Both halves of `landing_positions` matter — a report that checked
+    # only the threshold would claim positions that could never have run it.
+    assert gap["lands_at"] == ["ambitious", "balanced"]
+
+
+def test_explain_names_the_lenses_that_found_nothing(capsys):
+    """A dead lens and a quiet lens both look like an absence, so the absence is
+    named rather than left to be inferred."""
+    _outstanding()
+    main(["replenish", "explain", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert "coverage" in report["silent_lenses"]
+
+
+def test_explain_never_spends_a_model_call_by_default(monkeypatch, capsys):
+    fired = {"n": 0}
+
+    def tripwire(_ctx):
+        fired["n"] += 1
+        return []
+
+    monkeypatch.setitem(replenish.LENSES, "innovation", tripwire)
+    main(["replenish", "explain"])
+    main(["replenish", "explain", "--ambition", "ambitious"])
+    assert fired["n"] == 0, (
+        "asking what the record holds is not asking to pay for a proposal")
+    main(["replenish", "explain", "--with-agentic"])
+    assert fired["n"] == 1
+
+
+def test_explain_scopes_to_one_position(capsys):
+    _outstanding()
+    main(["replenish", "explain", "--ambition", "conservative", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert report["lenses"] == ["evidence-gap", "repair"]
+
+
+def test_explain_says_so_when_the_dial_word_is_not_understood(capsys):
+    main(["replenish", "explain", "--ambition", "aggressive"])
+    assert "unknown ambition" in capsys.readouterr().err
+
+
 def test_run_injects_work_and_records_both_events(capsys):
     _outstanding()
     assert main(["replenish", "run", "--session", SID]) == 0
@@ -252,8 +332,13 @@ def test_the_cli_surfaces_real_tree_candidates(tmp_path, monkeypatch, capsys):
     events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
     assert main(["replenish", "run", "--session", SID]) == 0
     out = capsys.readouterr().out
-    assert "injected [tech-debt]" in out
+    # An oversized module with no test file is BOTH oversized and uncovered, so
+    # two lenses name the same path and the round fuses them into one systemic
+    # intervention rather than two competing steps. The constituent lens still has
+    # to be visible in the evidence — that is what proves the tree was read.
+    assert "injected [resonance]" in out
     assert "enormous.py" in out
+    assert "[tech-debt] Refactor and reduce line count" in out
 
 
 def test_the_session_surface_never_spends_a_model_call(monkeypatch, capsys):

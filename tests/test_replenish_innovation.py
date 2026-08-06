@@ -105,11 +105,16 @@ def test_evidence_cites_the_changed_paths_that_went_into_the_prompt():
 
 
 def test_evidence_cites_recorded_failure_signatures():
+    # Two signatures, no changed paths: the lens has to be able to ground itself
+    # entirely in recorded failures. One would be below `INNOVATION_MIN_GROUNDING`
+    # and the lens would decline to call the model at all.
     _failure("2026-08-02T00:00:00Z", "edit:not-read")
+    _failure("2026-08-02T01:00:00Z", "pscmd:hive")
     cands = replenish.innovation(
         _ctx(lambda _p: _reply("Do the thing"), changed=(),
              evs=events.read_all()))
     assert any("edit:not-read" in e for e in cands[0].evidence)
+    assert any("pscmd:hive" in e for e in cands[0].evidence)
 
 
 def test_a_model_supplied_evidence_field_is_ignored():
@@ -238,15 +243,24 @@ def test_a_proposal_scores_by_how_much_record_it_rests_on():
     assert replenish.score_candidate(cand).total == 15
 
 
-def test_a_weakly_grounded_proposal_does_not_clear_the_ambitious_threshold():
-    # One cited fact scores the bare base, which is below 15. A lens that could
-    # always land regardless of grounding would be a quota-filler.
-    cand = replenish.innovation(
-        _ctx(lambda _p: _reply("Do the thing"),
-             changed=("src/mindhive/replenish.py",)))[0]
-    assert len(cand.evidence) == 1
-    assert (replenish.score_candidate(cand).total
-            < replenish.PROFILES["ambitious"].min_score)
+def test_a_weakly_grounded_proposal_is_never_asked_for():
+    """One cited fact scores the bare base, which `ambitious` refuses.
+
+    The lens used to ask anyway: it checked only that SOMETHING was groundable,
+    spent a real model call, and produced a candidate the gate then refused for
+    sitting below the threshold — transiently, so nothing was even recorded to
+    say where the money went. The liveness guard found it. Declining before the
+    call is the fix; a lens that could always land regardless of grounding would
+    be a quota-filler, and one that pays to be refused is worse."""
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        return _reply("Do the thing")
+
+    assert replenish.innovation(
+        _ctx(runner, changed=("src/mindhive/replenish.py",))) == []
+    assert calls == []
 
 
 def test_a_well_grounded_proposal_clears_ambitious_but_not_balanced():

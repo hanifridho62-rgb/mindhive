@@ -647,6 +647,73 @@ def cmd_replenish_run(args) -> int | None:
     return None
 
 
+def cmd_replenish_explain(args) -> int | None:
+    """Score every lens's candidates against every dial position, and change
+    nothing.
+
+    The command this subsystem needed and did not have. A lens whose best score
+    sits below every threshold it runs under produces candidates the gate is
+    guaranteed to refuse — dead config — and that is invisible from every other
+    surface: a round prints nothing, the ledger holds nothing (a below-the-bar
+    refusal is deliberately never recorded, because recording it would spend the
+    fingerprint), and the test suite stays green because producing a doomed
+    candidate looks exactly like working. Here it shows up as a `lands at` column
+    reading `nowhere`."""
+    from . import replenish as rp_mod
+    lenses = None
+    if args.ambition:
+        choice = rp_mod.resolve_ambition(args.ambition)
+        if choice.fell_back:
+            print(f"unknown ambition {args.ambition!r} — reporting "
+                  f"{choice.profile.name} instead. Valid: "
+                  f"{', '.join(sorted(rp_mod.PROFILES))}", file=sys.stderr)
+        lenses = rp_mod.lenses_for(choice.profile)
+    if lenses is not None and not args.with_agentic:
+        # The agentic lens spends a real model call. Asking what the record
+        # currently holds is not the same as asking to pay for a proposal, so it
+        # takes its own flag even when the chosen position would run it.
+        lenses = {n: l for n, l in lenses.items() if n != "innovation"}
+    elif lenses is None and args.with_agentic:
+        lenses = dict(rp_mod.LENSES)
+
+    report = rp_mod.explain(events.read_all(), lenses=lenses, tune=True)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return None
+
+    positions = report["positions"]
+    print(f"as of {report['now']} · lenses: {', '.join(report['lenses'])} · "
+          f"{report['spent_fingerprints']} spent fingerprint(s)")
+    print("positions: " + "  ".join(
+        f"{name}>={info['threshold']}" for name, info in sorted(
+            positions.items(), key=lambda kv: -kv[1]["threshold"])))
+    tuning = report["tuning"]
+    print(f"tuning: {tuning['success_streak']} green in a row, "
+          f"{tuning['failure_streak']} bad in a row"
+          + (f" · {tuning['reason']}" if tuning["reason"] else ""))
+    print()
+
+    if not report["candidates"]:
+        print("no lens found a candidate")
+    for row in report["candidates"]:
+        lands = ", ".join(row["lands_at"]) or "nowhere"
+        flags = "".join([" [spent]" if row["spent"] else "",
+                         " [spike]" if row["spike"] else "",
+                         " [vetoed]" if row["veto_reason"] else ""])
+        kind = f"/{row['kind']}" if row["kind"] else ""
+        print(f"{row['score']:>5}  {row['lens']}{kind}  -> {lands}{flags}")
+        print(f"       {row['title']}")
+        print("       terms: " + ", ".join(
+            f"{name} {value:+d}" if name != "total" else f"total {value}"
+            for name, value in row["terms"].items()))
+    if report["silent_lenses"]:
+        print()
+        print("found nothing: " + ", ".join(report["silent_lenses"]))
+    for err in report["lens_errors"]:
+        print(f"lens {err['lens']} failed: {err['error']}", file=sys.stderr)
+    return None
+
+
 def cmd_replenish_status(args) -> int | None:
     """What the injector knows, folded from the ledger — there is no sidecar."""
     from . import replenish as rp_mod
@@ -3028,6 +3095,19 @@ def _build_parser() -> argparse.ArgumentParser:
     rpr.add_argument("--dry-run", action="store_true",
                      help="decide and print without appending anything")
     rpr.set_defaults(func=cmd_replenish_run)
+    rpe = rpsub.add_parser("explain",
+                           help="score every lens's candidates against every "
+                                "dial position, changing nothing")
+    rpe.add_argument("--ambition", default=None,
+                     help="report only the lenses this position runs "
+                          "(conservative / balanced / ambitious)")
+    rpe.add_argument("--with-agentic", action="store_true",
+                     help="include the innovation lens, which spends a model "
+                          "call (excluded by default even at --ambition "
+                          "ambitious)")
+    rpe.add_argument("--json", action="store_true",
+                     help="machine-readable report")
+    rpe.set_defaults(func=cmd_replenish_explain)
     rpsub.add_parser("status",
                      help="what the injector knows: rounds, dry streak, spent "
                           "fingerprints, active lenses"

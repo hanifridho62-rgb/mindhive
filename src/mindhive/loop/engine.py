@@ -105,7 +105,44 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
         pass
 
 
-def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None) -> int:
+def _innovation_capacity(project, run_id, held):
+    """Whether this run still has innovation capacity it never spent.
+
+    Total, and it fails toward EXITING: any unreadable record, any exception,
+    yields the default capacity, which withholds nothing. A check that cannot see
+    the ledger must never be the reason a run refuses to stop — that failure mode
+    is a pinned session, and it is the one this project's Stop-hook rules single
+    out as unacceptable.
+
+    "Proposed" is read off the `lens` field of this run's landed rows. A fused
+    systemic row would name `resonance` rather than its members, which would read
+    as "not proposed" — unreachable in practice, because `innovation` keys its
+    deferral on a title slug and no other lens ever produces one to collide with,
+    so it has nothing to fuse with. The cost if that ever changed is one extra
+    held iteration, which the one-shot flag bounds."""
+    from .safeguards import InnovationCapacity
+    try:
+        from .. import replenish as rp_mod
+        evs = events.read_all(project)
+        profile = rp_mod.tuning_profile(evs, surface="loop")
+        proposed = False
+        for ev in evs:
+            payload = getattr(ev, "payload", None)
+            if getattr(ev, "type", None) != "work_injected" \
+                    or not isinstance(payload, dict):
+                continue
+            if (payload.get("run_id") == run_id
+                    and payload.get("outcome") == "landed"
+                    and payload.get("lens") == "innovation"):
+                proposed = True
+                break
+        return InnovationCapacity(profile.healthy, proposed, held)
+    except Exception:                                           # noqa: BLE001
+        return InnovationCapacity()
+
+
+def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None,
+                           ambition=None) -> int:
     """Mine the record for outstanding work and land it as required checklist
     items. Returns how many pieces landed.
 
@@ -124,7 +161,12 @@ def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None) -> int:
     try:
         from .. import replenish as rp_mod, replenish_sinks as sink_mod
 
-        choice = rp_mod.resolve_ambition(cfg.replenish_ambition)
+        # *ambition* overrides the operator's dial for ONE round, and only the
+        # anti-lazy hold passes it: that hold exists precisely to spend innovation
+        # capacity, and the innovation lens runs at `ambitious` alone. Overriding
+        # the dial for the round that was called to do that is the point; doing it
+        # on any other round would silently ignore the operator's setting.
+        choice = rp_mod.resolve_ambition(ambition or cfg.replenish_ambition)
         round_cfg = rp_mod.ReplenishConfig.for_profile(
             choice.profile,
             # Consecutive rounds that find nothing end the run. Safe here and
@@ -209,6 +251,12 @@ def run_loop(project, loop_dir, cfg, driver, *,
     bcfg = budget_mod.BudgetConfig(cfg.window_hours, cfg.window_token_budget,
                                    cfg.window_cost_budget_usd)
     budget_entries = []
+
+    # The anti-lazy hold is once per RUN, so its flag lives here rather than in
+    # the iteration. Folding it out of the ledger instead would be the wrong
+    # trade: the flag has to survive a forced round that proposes nothing, and
+    # that round leaves no row to fold.
+    anti_lazy_held = False
 
     run_id = uuid.uuid4().hex[:12]
     tasks0 = task_mod.load_tasks(loop_dir)
@@ -331,6 +379,41 @@ def run_loop(project, loop_dir, cfg, driver, *,
                     # this branch. The breaker resets because finding
                     # evidence-backed work IS progress; carrying a no-progress
                     # streak across it would trip the breaker for succeeding.
+                    cb.reset()
+                    continue
+
+                # The record proves nothing outstanding. One question left, and
+                # it is the only one the record cannot answer by itself: has this
+                # run, on a system its own outcome history proves healthy, ever
+                # proposed an improvement? A run that never did has not finished
+                # so much as taken the cheapest path to a completion signal.
+                #
+                # Asked HERE rather than on the first `should_exit` call above
+                # because it is the last question, not the first: it is only
+                # meaningful once every structural stop has been satisfied and
+                # the replenishment round has come back empty. Asking earlier
+                # would also cost a full ledger read on every iteration.
+                capacity = _innovation_capacity(project, run_id, anti_lazy_held) \
+                    if cfg.replenish_anti_lazy else None
+                done, exit_reason = safeguards.should_exit(
+                    status, required_remaining, json_mode=not live,
+                    min_heuristics=cfg.min_completion_heuristics,
+                    capacity=capacity)
+                if not done:
+                    # One-shot, and the flag is set BEFORE the forced round so
+                    # that a round which proposes nothing still cannot hold the
+                    # run again. A hold that could repeat would pin the run open
+                    # forever, which is strictly worse than an early exit.
+                    anti_lazy_held = True
+                    events.append_event(
+                        "decision",
+                        {"text": f"loop run {run_id} claimed completion with no "
+                                 f"innovation work proposed and a healthy "
+                                 f"outcome streak — holding the exit once to "
+                                 f"spend that capacity at ambitious"[:500]},
+                        tags=["replenish", "anti-lazy"], project=project)
+                    _replenish_before_exit(project, loop_dir, cfg, run_id,
+                                           tracker, ambition="ambitious")
                     cb.reset()
                     continue
                 reason = "completed"
