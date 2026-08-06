@@ -268,6 +268,39 @@ BASE_SCORE = 10
 RECURRENCE_STEP = 5          # per repeat beyond the first
 SEVERITY_BONUS = 20          # a condition that is already blocking something
 
+# The most repeats recurrence will pay for. Unbounded, this one term stopped
+# participating in the scale and replaced it: measured on the real ledger, a
+# signature seen 263 times carried a recurrence of 1310 and a total of 1118 while
+# every other candidate in the round sat between 25 and 63. An audit row reading
+# `total 1118` cannot tell a reader whether the record insists on the work or the
+# arithmetic ran away, and `explain` exists so that question is answerable.
+#
+# 20 is DERIVED, not chosen, and the derivation has to live here because the
+# smaller numbers look safer and are not. `repair` is the lens with the least
+# score support — no severity, and it always sets `observed_ts`, so a signature
+# whose newest failure is past `DECAY_STALE_DAYS` keeps only half its history
+# weight. At the ceiling that lens scores
+# `BASE_SCORE + RECURRENCE_STEP*c - round(RECURRENCE_STEP*c*DECAY_FLOOR)`:
+#
+#     ceiling  4 ->  20   below conservative's 40: the lens is DEAD there
+#     ceiling  8 ->  30   below conservative: DEAD
+#     ceiling 12 ->  40   clears conservative by ZERO margin, and fails the
+#                         moment the tuner raises the bar
+#     ceiling 20 ->  60   clears conservative even at maximum tuner drift
+#
+# The tuner raising the bar is not hypothetical: `TUNE_RAISE_DELTA` fires after
+# three bad outcomes and `TUNE_MAX_DRIFT` allows +20 on top of conservative's 40.
+# 20 is the smallest ceiling surviving full decay AND full drift together, which
+# is why tightening it for a rounder-looking scale is a regression rather than a
+# tidy-up. `test_the_recurrence_ceiling_matches_the_dial` asserts the derivation
+# against `PROFILES` so the arithmetic cannot rot into a comment.
+#
+# The cost is honest: the outlier lands at 95 rather than 61, above the 52-63
+# cluster instead of inside it. Worse scale hygiene, better liveness — hygiene is
+# a readability preference, a dead lens is a defect this subsystem shipped five
+# times before anyone noticed.
+RECURRENCE_MAX_STEPS = 20
+
 # Per step of MAGNITUDE — how far past its own limit the condition sits. It is a
 # separate term from `RECURRENCE_STEP` for a reason that cost this subsystem a
 # whole phase: `occurrences` means "how many times the fold SAW this condition",
@@ -574,8 +607,13 @@ def score_candidate(candidate, index=None, *, healthy=False,
     Resonance is NOT set here. It is a property of a candidate's relationship to
     the other candidates in the same round, which one candidate cannot see;
     `resonate` computes it and rewrites the breakdown."""
-    recurrence = RECURRENCE_STEP * max(
-        0, _whole(getattr(candidate, "occurrences", 1), 1) - 1)
+    # Clamped on the STEPS, not on the product, so the ceiling reads in the unit
+    # `RECURRENCE_MAX_STEPS` is named for. A candidate seen 263 times and one seen
+    # 21 times pay the same recurrence: past the ceiling the record has already
+    # insisted as hard as this scale can express.
+    steps = min(RECURRENCE_MAX_STEPS,
+                max(0, _whole(getattr(candidate, "occurrences", 1), 1) - 1))
+    recurrence = RECURRENCE_STEP * steps
     severity = SEVERITY_BONUS if getattr(candidate, "severity", False) else 0
     magnitude = MAGNITUDE_STEP * _whole(getattr(candidate, "excess_steps", 0))
     innovation = (INNOVATION_BONUS

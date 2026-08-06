@@ -143,12 +143,28 @@ LIVENESS = {
 }
 
 
+def _positions_running(lens_name) -> list:
+    """Every dial position that actually runs this lens, easiest bar first."""
+    running = sorted((p for p in replenish.PROFILES.values()
+                      if lens_name in p.lens_names),
+                     key=lambda p: p.min_score)
+    assert running, f"{lens_name} is registered but no dial position runs it"
+    return running
+
+
 def _lowest_threshold_running(lens_name) -> int:
     """The most permissive dial position that actually runs this lens."""
-    running = [p.min_score for p in replenish.PROFILES.values()
-               if lens_name in p.lens_names]
-    assert running, f"{lens_name} is registered but no dial position runs it"
-    return min(running)
+    return _positions_running(lens_name)[0].min_score
+
+
+def _hardest_threshold_running(lens_name) -> int:
+    """The strictest bar this lens must still be able to clear.
+
+    Strictest means the highest position that runs it PLUS the furthest the
+    auto-tuner may raise that position. `TUNE_MAX_DRIFT` is not hypothetical:
+    `TUNE_RAISE_DELTA` fires after three injections each followed by a failure,
+    which is an ordinary bad week rather than a pathological ledger."""
+    return _positions_running(lens_name)[-1].min_score + replenish.TUNE_MAX_DRIFT
 
 
 def test_the_innovation_grounding_floor_matches_the_dial():
@@ -192,6 +208,112 @@ def test_every_registered_lens_has_a_liveness_row():
         "a lens was registered without a liveness fixture. Add one: a lens whose "
         "best score cannot clear its own dial position is dead config, and no "
         "other test in this suite asks that question.")
+
+
+# The lenses whose `occurrences` can actually reach the recurrence ceiling, and
+# whether each carries `severity` and an `observed_ts` (so decay applies).
+# `innovation` is deliberately absent: its grounding count is bounded well below
+# the ceiling, which `test_the_ceiling_is_a_no_op_for_the_agentic_lens` asserts
+# rather than assumes.
+CEILING_REACHING = {
+    "repair": {"severity": False},
+    "evidence-gap": {"severity": True},
+    "coverage": {"severity": False},
+}
+
+
+def _at_ceiling(lens_name, severity):
+    """A candidate of this lens pinned to the worst case the clamp allows.
+
+    Worst case is both extremes at once: recurrence pinned AT the ceiling (so the
+    clamp is what decides the term) and evidence old enough that decay takes the
+    full `DECAY_FLOOR` bite out of it. Testing either alone passes while the
+    combination fails, which is exactly how a ceiling of 12 would have shipped."""
+    return replenish.Candidate(
+        lens=lens_name, title=f"{lens_name} at the ceiling",
+        fingerprint=f"fp-{lens_name}", evidence=("a real pointer",),
+        occurrences=replenish.RECURRENCE_MAX_STEPS + 1, severity=severity,
+        observed_ts="2020-01-01T00:00:00Z")
+
+
+def test_the_recurrence_ceiling_matches_the_dial():
+    """`RECURRENCE_MAX_STEPS` is derived, and this is the derivation.
+
+    The ceiling must be the SMALLEST value at which the least-supported lens
+    (`repair`: no severity, always dated) still clears the strictest bar it runs
+    under while fully decayed. Both directions matter. Too low and the lens goes
+    dead at `conservative` — the failure class this file exists for, and the
+    reason 12 was rejected despite looking tidier. Too high and the term is
+    unbounded again in every case that matters."""
+    hardest = _hardest_threshold_running("repair")
+
+    def aged_total_at(ceiling):
+        term = replenish.RECURRENCE_STEP * ceiling
+        return replenish.BASE_SCORE + term - round(term * replenish.DECAY_FLOOR)
+
+    assert aged_total_at(replenish.RECURRENCE_MAX_STEPS) >= hardest, (
+        f"a fully decayed repair candidate at the ceiling scores "
+        f"{aged_total_at(replenish.RECURRENCE_MAX_STEPS)} and cannot clear "
+        f"{hardest} — the lens is dead at its strictest position")
+    assert aged_total_at(replenish.RECURRENCE_MAX_STEPS - 1) < hardest, (
+        "the ceiling is higher than the derivation requires; lower it to the "
+        "smallest value that still clears the strictest bar")
+
+
+@pytest.mark.parametrize("lens_name", sorted(CEILING_REACHING))
+def test_a_clamped_aged_candidate_still_clears_its_hardest_dial(lens_name):
+    """R-B, per lens, at the worst case the clamp can produce.
+
+    The table-driven liveness check below cannot answer this: it scores each lens
+    against `_lowest_threshold_running`, which is 15 for `repair` and
+    `evidence-gap`, so it would pass unchanged for a ceiling of 2. Capping raises
+    the opposite question — can the lens still clear its HARDEST dial — and this
+    is where that is asked."""
+    breakdown = replenish.score_candidate(
+        _at_ceiling(lens_name, CEILING_REACHING[lens_name]["severity"]),
+        None, now_ts=NOW)
+    hardest = _hardest_threshold_running(lens_name)
+    assert breakdown.total >= hardest, (
+        f"{lens_name} clamped and fully decayed scores {breakdown.total} "
+        f"({breakdown.as_terms()}), below the {hardest} its strictest position "
+        f"can demand — the clamp made it dead there")
+
+
+def test_the_ceiling_is_a_no_op_for_the_agentic_lens():
+    """`innovation` counts grounding facts, which are bounded far below the
+    ceiling, so the clamp cannot reach it.
+
+    Asserted rather than assumed because the bound is the sum of two independent
+    caps in the lens, and either one growing would silently put `innovation` in
+    the clamp's reach without anyone revisiting `CEILING_REACHING`."""
+    max_grounding = replenish._EVIDENCE_FILES + 2
+    assert max_grounding - 1 < replenish.RECURRENCE_MAX_STEPS, (
+        "innovation's grounding can now reach the recurrence ceiling — add it to "
+        "CEILING_REACHING and give it a worst-case liveness row")
+
+
+@pytest.mark.parametrize("lens_name", sorted(LIVENESS))
+def test_the_lens_clears_every_position_that_runs_it(lens_name, tmp_path,
+                                                     monkeypatch):
+    """A lens has to be able to land at each dial its profile set includes.
+
+    Driven from `PROFILES` rather than a hand-written list, so adding a position —
+    or adding a lens to one — cannot escape the check by nobody remembering to
+    update this file."""
+    ctx = LIVENESS[lens_name](tmp_path, monkeypatch)
+    candidates = replenish.LENSES[lens_name](ctx)
+    assert candidates, f"{lens_name} produced no candidate from its own fixture"
+    best = max(replenish.score_candidate(c, None, healthy=False,
+                                         now_ts=NOW).total
+               for c in candidates)
+
+    reachable = [p.name for p in _positions_running(lens_name)
+                 if best >= p.min_score]
+    assert reachable, (
+        f"{lens_name} is DEAD at every position that runs it: its best fixture "
+        f"candidate scores {best}, and the positions running it need "
+        + ", ".join(f"{p.name}>={p.min_score}"
+                    for p in _positions_running(lens_name)))
 
 
 @pytest.mark.parametrize("lens_name", sorted(LIVENESS))

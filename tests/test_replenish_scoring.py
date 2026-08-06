@@ -83,6 +83,84 @@ def test_occurrences_and_magnitude_are_independent_terms():
     assert breakdown.magnitude == replenish.MAGNITUDE_STEP * 2
 
 
+# --- the recurrence ceiling ---------------------------------------------------
+# Unbounded, this term stopped participating in the scale and replaced it: one
+# signature reached a recurrence of 1310 against siblings in the 25-63 band. The
+# ceiling is derived rather than chosen — `test_the_recurrence_ceiling_matches_the_dial`
+# in the liveness suite owns that derivation; these own its arithmetic.
+
+CEILING = replenish.RECURRENCE_MAX_STEPS
+
+
+def test_recurrence_stops_paying_past_the_ceiling():
+    at = replenish.score_candidate(_cand(occurrences=CEILING + 1))
+    past = replenish.score_candidate(_cand(occurrences=CEILING + 500))
+    assert at.recurrence == past.recurrence == replenish.RECURRENCE_STEP * CEILING
+    assert at.total == past.total
+
+
+def test_the_clamp_bites_only_at_the_ceiling():
+    # The discriminating half: a clamp that fired early would flatten the whole
+    # gradient while still passing the assertion above.
+    below = replenish.score_candidate(_cand(occurrences=CEILING))
+    assert below.recurrence == replenish.RECURRENCE_STEP * (CEILING - 1)
+    assert below.recurrence < replenish.RECURRENCE_STEP * CEILING
+
+
+def test_the_gradient_below_the_ceiling_is_preserved():
+    scores = [replenish.score_candidate(_cand(occurrences=n)).total
+              for n in (1, 5, 12, CEILING + 1)]
+    assert scores == sorted(scores) and len(set(scores)) == 4
+
+
+def test_the_total_still_sums_its_terms_with_the_clamp_active():
+    breakdown = replenish.score_candidate(
+        _cand(occurrences=CEILING + 40, severity=True, excess_steps=3))
+    assert breakdown.total == (breakdown.base + breakdown.recurrence
+                               + breakdown.severity + breakdown.magnitude
+                               + breakdown.innovation + breakdown.resonance
+                               + breakdown.decay)
+
+
+def test_the_audit_row_reports_the_clamped_recurrence():
+    # No separate "capped" flag: the terms ARE the arithmetic, so a reader
+    # comparing `recurrence` against the evidence line's occurrence count can see
+    # the clamp fired without a second source of truth about one number.
+    terms = replenish.score_candidate(_cand(occurrences=CEILING + 300)).as_terms()
+    assert terms["recurrence"] == replenish.RECURRENCE_STEP * CEILING
+    assert "capped" not in terms
+
+
+def test_decay_is_charged_against_the_clamped_terms_not_the_raw_ones():
+    """Order matters: decay takes its fraction AFTER the clamp.
+
+    Charged against the pre-clamp value instead, a 263-occurrence signature would
+    lose ~650 points to decay from a term worth 100 and land at zero — the clamp
+    would have created the dead condition it exists to prevent."""
+    breakdown = replenish.score_candidate(
+        _cand(occurrences=CEILING + 243, observed_ts="2020-01-01T00:00:00Z"),
+        now_ts=NOW)
+    clamped = replenish.RECURRENCE_STEP * CEILING
+    assert breakdown.recurrence == clamped
+    assert breakdown.decay == -round(clamped * (1 - replenish.DECAY_FLOOR))
+    assert breakdown.total > 0
+
+
+def test_fusion_sums_clamped_members_and_is_not_clamped_again():
+    """The clamp is per-candidate, and a fused row is a sum across DISTINCT
+    conditions rather than one condition's recurrence.
+
+    Re-clamping at the fusion level would make three separate findings about one
+    module score no more than one of them, which is the opposite of what
+    resonance is for."""
+    members = [_scored("tech-debt", "src/a.py", "x", occurrences=CEILING + 9),
+               _scored("repair", "src/a.py", "y", occurrences=CEILING + 9)]
+    fused = replenish.resonate(members)[0]
+    per_member = replenish.RECURRENCE_STEP * CEILING
+    assert fused.breakdown.recurrence == per_member * 2
+    assert fused.score > max(m.score for m in members)
+
+
 @pytest.mark.parametrize("junk", [None, True, -4, "3", 2.5])
 def test_a_lens_returning_junk_for_a_count_degrades_rather_than_poisons(junk):
     # A lens is the one thing here not validated at a boundary.
