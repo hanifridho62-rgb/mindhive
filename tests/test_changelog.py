@@ -409,13 +409,132 @@ def test_record_survives_locked_marker_file(monkeypatch):
     # Windows AV/indexer can hold pending_changelog.json; the entry is already
     # appended by then, so record must not raise (a failure exit would invite
     # a duplicate entry). The marker self-heals at the next queue().
-    def _locked(project=None):
+    #
+    # Pointed at `discharge`, not `clear`: `record()` stopped calling `clear`
+    # when the discharge became subtractive, so guarding `clear` here would leave
+    # the guard passing while protecting nothing — and the write path it protects
+    # is precisely the one that now rewrites the marker file.
+    def _locked(files, project=None):
         raise OSError("file in use")
-    monkeypatch.setattr(changelog, "clear", _locked)
+    monkeypatch.setattr(changelog, "discharge", _locked)
     ev = changelog.record("update", "entry lands despite a locked marker",
                           files=["src/mindhive/a.py"])
     assert ev.type == "code_change"
     assert len(events.read_all()) == 1
+
+
+# --- subtractive discharge ----------------------------------------------------
+# Recording an entry used to unlink the whole marker regardless of what it
+# covered, so logging one file silently discharged everyone else's debt and the
+# next session_end rebuilt it — which made the gate look flaky rather than wrong.
+
+def _queued_three(tmp_path):
+    a = _touch("src/mindhive/a.py", tmp_path)
+    b = _touch("src/mindhive/b.py", tmp_path)
+    c = _touch("src/mindhive/c.py", tmp_path)
+    marker = changelog.queue(events.read_all(), session_id="s1")
+    assert len(marker["files"]) == 3
+    return a, b, c, marker
+
+
+def test_logging_one_file_leaves_the_others_queued(tmp_path):
+    a, b, c, _m = _queued_three(tmp_path)
+    changelog.record("update", "logged just the first of the three", files=[a])
+    remaining = changelog.load_pending()["files"]
+    assert sorted(remaining) == sorted([b, c])
+
+
+def test_logging_every_queued_file_removes_the_marker(tmp_path):
+    a, b, c, _m = _queued_three(tmp_path)
+    changelog.record("update", "logged all three together", files=[a, b, c])
+    assert changelog.load_pending() is None
+
+
+def test_discharging_an_unqueued_file_is_a_no_op_not_an_error(tmp_path):
+    a, _b, _c, _m = _queued_three(tmp_path)
+    changelog.record("update", "logged something never queued",
+                     files=["src/mindhive/never_queued.py"])
+    assert len(changelog.load_pending()["files"]) == 3
+    assert a in changelog.load_pending()["files"]
+
+
+def test_the_discharge_preserves_created_at(tmp_path):
+    """`queue()` uses `created_at` as its coverage floor.
+
+    A fresh stamp would invalidate every entry recorded before this run, so files
+    that were genuinely logged would be carried forward again — reintroducing the
+    phantom debt the subtraction exists to remove."""
+    a, _b, _c, marker = _queued_three(tmp_path)
+    before = marker["created_at"]
+    changelog.record("update", "logged one, marker must keep its floor",
+                     files=[a])
+    assert changelog.load_pending()["created_at"] == before
+
+
+def test_the_discharge_is_spelling_aware(tmp_path):
+    a, _b, _c, _m = _queued_three(tmp_path)
+    assert a.endswith("a.py") and a != "src/mindhive/a.py"
+    # The marker holds the absolute spelling; the entry names the relative one.
+    changelog.record("update", "logged it under the other spelling",
+                     files=["src/mindhive/a.py"])
+    assert a not in changelog.load_pending()["files"]
+
+
+def test_an_earlier_sessions_debt_does_not_ride_a_later_entry(tmp_path):
+    """KTD-6. The marker legitimately retains another session's debt now, so
+    preferring it over the session sweep would put files this change-set never
+    touched into this entry — the same false record, by a new route."""
+    old = _touch("src/mindhive/abandoned.py", tmp_path, session="s1")
+    changelog.queue(events.read_all(), session_id="s1")
+    fresh = _touch("src/mindhive/fresh.py", tmp_path, session="s2",
+                   ts="2026-07-16T10:00:00Z")
+    ev = changelog.record("update", "s2 logs only what s2 touched",
+                          session_id="s2")
+    assert ev.payload["files"] == [fresh]
+    assert old in changelog.load_pending()["files"]
+
+
+# --- the exit -----------------------------------------------------------------
+
+def test_dismiss_discharges_debt_no_entry_will_cover(tmp_path):
+    a, b, c, _m = _queued_three(tmp_path)
+    changelog.dismiss([a, b], session_id="s1")
+    assert changelog.load_pending()["files"] == [c]
+
+
+def test_dismiss_records_the_dismissal(tmp_path):
+    a, _b, _c, _m = _queued_three(tmp_path)
+    changelog.dismiss([a], session_id="s1")
+    decisions = [e for e in events.read_all()
+                 if e.type == "decision" and "dismiss" in (e.tags or [])]
+    assert len(decisions) == 1
+    assert "a.py" in decisions[0].payload["text"]
+
+
+def test_dismiss_refuses_an_empty_file_list(tmp_path):
+    _queued_three(tmp_path)
+    with pytest.raises(ValueError, match="name the files"):
+        changelog.dismiss([])
+
+
+def test_the_gate_always_has_an_exit(tmp_path):
+    """The property that makes the subtractive discharge safe to ship.
+
+    Without `dismiss`, a queued path that no honest entry will ever name — a
+    reverted experiment, an abandoned worktree's file — blocks STATE.md forever,
+    and the operator's only remaining moves are deleting a sidecar by hand or
+    writing an entry naming files they did not change."""
+    a, b, c, _m = _queued_three(tmp_path)
+    assert changelog.dismiss([a, b, c], session_id="s1") is None
+    assert changelog.load_pending() is None
+    assert changelog.notice(changelog.load_pending()) == ""
+
+
+def test_the_cli_dismiss_subcommand_reports_what_remains(tmp_path, capsys):
+    a, _b, _c, _m = _queued_three(tmp_path)
+    assert cli_mod.main(["log", "dismiss", "--files", a,
+                         "--session", "s1"]) == 0
+    assert "dismissed 1 file(s); 2 still queued" in capsys.readouterr().out
 
 
 def test_cli_append_enforces_code_change_contract(capsys):

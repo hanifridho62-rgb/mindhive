@@ -160,10 +160,82 @@ def load_pending(project=None):
 
 
 def clear(project=None) -> bool:
+    """Drop the marker entirely. `queue()`'s empty case only — `record()` used to
+    call this too, and that was the bug `discharge` replaces."""
     path = pending_path(project)
     existed = path.exists()
     path.unlink(missing_ok=True)
     return existed
+
+
+def _write_marker(marker, project=None) -> None:
+    """Persist the marker through the module's own temp-file-plus-replace idiom."""
+    path = pending_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def discharge(files, project=None) -> dict | None:
+    """Remove *files* from the pending marker, leaving everything else queued.
+
+    `record()` used to `clear()` the whole marker regardless of what the entry
+    covered, so logging one file silently discharged debt for every other file in
+    the queue — and the next `session_end` rebuilt it, which made the gate look
+    flaky rather than wrong.
+
+    `created_at` and `session_id` SURVIVE the rewrite, and that is the part worth
+    guarding. `queue()` uses `created_at` as the coverage floor and only drops a
+    carried-forward file when a covering entry postdates it; a fresh stamp would
+    invalidate every entry recorded before this run and re-queue files that were
+    genuinely logged — reintroducing the phantom debt this function exists to
+    stop. Returns the surviving marker, or None once it empties."""
+    marker = load_pending(project)
+    if not marker or not marker.get("files"):
+        return None
+    discharged = set()
+    for f in files or []:
+        if isinstance(f, str):
+            discharged |= paths.path_spellings(f)
+    survivors = [f for f in marker["files"]
+                 if not (paths.path_spellings(f) & discharged)]
+    if survivors == marker["files"]:
+        return marker
+    if not survivors:
+        clear(project)
+        return None
+    marker = dict(marker, files=survivors)
+    _write_marker(marker, project)
+    return marker
+
+
+def dismiss(files, project=None, session_id=None):
+    """Discharge debt no honest entry will ever name, on the record.
+
+    Making `record()` subtractive removed the gate's only exit: before, any
+    `hive log` unlinked the whole marker, so a wedged notice always had a way out.
+    Without this, a path nothing will ever legitimately cover — a reverted
+    experiment, a file touched in an abandoned worktree, debt accumulated by the
+    detection bug itself — becomes permanent blocking debt, and the operator's
+    only remaining moves are hand-deleting a sidecar (which this project forbids)
+    or writing an entry naming files they did not change, which is the false
+    record the whole change is meant to prevent.
+
+    Recorded as a `decision` rather than a new event type: a dismissal IS a
+    decision not to log, it rides MEMORY.md where the next session will see it,
+    and the ledger's registered vocabulary does not need widening for it."""
+    named = [f for f in (files or []) if isinstance(f, str) and f.strip()]
+    if not named:
+        raise ValueError("name the files to dismiss with --files")
+    marker = discharge(named, project)
+    ev_mod.append_event(
+        "decision",
+        {"text": "dismissed unlogged-changes debt for "
+                 f"{len(named)} file(s) with no change-log entry coming: "
+                 + ", ".join(named)[:400]},
+        session_id=session_id, tags=["changelog", "dismiss"], project=project)
+    return marker
 
 
 def _git_changed_files(root=None) -> list:
@@ -294,16 +366,24 @@ def record(category, text, files=None, session_id=None, project=None,
             "explanation is mandatory: briefly describe what changed "
             f"(at least {MIN_EXPLANATION_CHARS} characters)")
     if not files:
-        pending = load_pending(project)
-        if pending and pending.get("files"):
-            files = pending["files"]
-        elif session_id:
+        # THIS session's own unlogged work first, and the marker only as the
+        # fallback for a session-less invocation. The order used to be the other
+        # way round, which was harmless only because the wholesale clear kept the
+        # marker usually absent. Now that the marker legitimately RETAINS another
+        # session's undischarged debt, preferring it would make the next bare
+        # `hive log` name files this change-set never touched — the same false
+        # record, arriving by a route the subtractive fix created.
+        if session_id:
             # Only sweep the ledger when a concrete session bounds the sweep —
             # session_id=None would return every in-scope file ever touched
             # across all sessions, silently attributing history to this entry.
             if evs is None:
                 evs = ev_mod.read_all(project)
             files = unlogged_files(evs, session_id=session_id)
+        if not files:
+            pending = load_pending(project)
+            if pending and pending.get("files"):
+                files = pending["files"]
         if not files:
             files = _git_changed_files()
     if not files:
@@ -321,7 +401,7 @@ def record(category, text, files=None, session_id=None, project=None,
         "code_change", payload,
         session_id=session_id, tags=["changelog"], project=project)
     try:
-        clear(project)
+        discharge(payload["files"], project)
     except OSError:
         # The entry is already in the ledger; a locked marker file (AV or
         # indexer holding pending_changelog.json) must not make the CLI
