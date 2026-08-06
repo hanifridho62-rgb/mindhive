@@ -785,31 +785,6 @@ def test_the_coverage_lens_is_registered():
     assert replenish.LENSES["coverage"] is replenish.coverage
 
 
-# --- path normalisation, shared by three lenses -------------------------------
-
-def test_a_hidden_directory_keeps_its_leading_dot():
-    """`lstrip("./")` takes a CHARACTER SET, not a prefix.
-
-    It ate the leading dot of every hidden path — `.hidden/x.py` became
-    `hidden/x.py` — so two spellings of one path stopped matching, and the
-    "has this been logged / addressed" comparisons that are the whole point of
-    normalising silently answered no."""
-    assert replenish.normalise_path(".hidden/x.py") == ".hidden/x.py"
-    assert replenish.normalise_path(".claude/hooks/stop.ps1") \
-        == ".claude/hooks/stop.ps1"
-
-
-def test_a_relative_prefix_is_stripped_and_slashes_are_normalised():
-    assert replenish.normalise_path("./src/mindhive/x.py") == "src/mindhive/x.py"
-    assert replenish.normalise_path(".\\src\\mindhive\\x.py") \
-        == "src/mindhive/x.py"
-    assert replenish.normalise_path("././a.py") == "a.py"
-
-
-def test_a_path_of_only_dots_is_not_annihilated():
-    assert replenish.normalise_path("...") == "..."
-
-
 # --- the coverage recurrence window -------------------------------------------
 
 def _changes(path, stamps):

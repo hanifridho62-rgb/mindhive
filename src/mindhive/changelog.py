@@ -67,22 +67,42 @@ def unlogged_files(evs, session_id=None):
             first_touch[key] = ev.ts or ""
             order.append(p)
     covered = _covered_map(evs)
-    return [p for p in order
-            if _norm(p) not in covered
-            or covered[_norm(p)] < first_touch[_norm(p)]]
+    out = []
+    for p in order:
+        cov = _covered_at(covered, p)
+        if not cov or cov < first_touch[_norm(p)]:
+            out.append(p)
+    return out
 
 
 def _covered_map(evs):
-    """Normalized file path -> newest code_change ts listing it."""
+    """Every SPELLING of each logged file path -> newest code_change ts listing it.
+
+    Expanded on both sides rather than compared literally, because the two sides
+    are written by different producers with different conventions: `file_touched`
+    rows carry worktree-absolute paths (3716 of them against 3 relative, measured
+    on the live store) while `code_change` entries carry repo-relative ones (1026
+    against 17). Compared as written, the sets essentially never intersect — so
+    coverage subtracted nothing, every touched file stayed "unlogged" no matter
+    how many entries named it, and the pending marker grew without bound."""
     covered = {}
     for ev in evs:
         if ev.type != "code_change" or not isinstance(ev.payload, dict):
             continue
+        ts = ev.ts or ""
         for f in ev.payload.get("files") or []:
-            k = _norm(f)
-            if (ev.ts or "") >= covered.get(k, ""):
-                covered[k] = ev.ts or ""
+            if not isinstance(f, str):
+                continue
+            for k in paths.path_spellings(f):
+                if ts >= covered.get(k, ""):
+                    covered[k] = ts
     return covered
+
+
+def _covered_at(covered, path) -> str:
+    """The newest entry ts covering *path* under any of its spellings, or ""."""
+    return max((covered.get(k, "") for k in paths.path_spellings(path)),
+               default="")
 
 
 def queue(evs, session_id=None, project=None):
@@ -100,13 +120,19 @@ def queue(evs, session_id=None, project=None):
     if prev and prev.get("files"):
         floor = prev.get("created_at") or ""
         covered = _covered_map(evs)
-        seen = {_norm(f) for f in files}
+        # Spelling-aware on both axes: a carried-forward path must not be added
+        # twice because this session touched it under a different spelling, and
+        # must not survive because the entry that covered it spelled it the other
+        # way.
+        seen = set()
+        for f in files:
+            seen |= paths.path_spellings(f)
         for f in prev["files"]:
-            k = _norm(f)
-            if k in seen or covered.get(k, "") >= floor:
+            spellings = paths.path_spellings(f)
+            if spellings & seen or _covered_at(covered, f) >= floor:
                 continue
             files.append(f)
-            seen.add(k)
+            seen |= spellings
     path = pending_path(project)
     if not files:
         path.unlink(missing_ok=True)

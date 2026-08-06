@@ -55,7 +55,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field, replace
 
-from . import events as ev_mod
+from . import events as ev_mod, paths
 
 # Outcome vocabulary. `landed` and `refused` are per-candidate; `truncated` and
 # `dry` are per-round facts about the round itself.
@@ -2015,9 +2015,9 @@ def _addressed_referents(evs) -> set:
             continue
         for path in (payload.get("files") or []):
             if isinstance(path, str):
-                touched.add(normalise_path(path))
+                touched.add(paths.normalise_path(path))
         for match in _PY_REFERENT_RE.findall(str(payload.get("text") or "")):
-            touched.add(normalise_path(match))
+            touched.add(paths.normalise_path(match))
     return touched
 
 
@@ -2049,7 +2049,7 @@ def caveat(arg) -> list:
         text = str(payload.get("text") or "").strip()
         if not text:
             continue                     # nothing to title the work with
-        referents = {normalise_path(m)
+        referents = {paths.normalise_path(m)
                      for m in _PY_REFERENT_RE.findall(text)}
         if referents & addressed:
             continue
@@ -2333,7 +2333,7 @@ def audit(arg) -> list:
 
     logged = _logged_files(ctx.evs)
     uncovered = sorted(p for p in modified
-                       if normalise_path(p) not in logged)
+                       if paths.normalise_path(p) not in logged)
     if not uncovered:
         return []
 
@@ -2365,35 +2365,6 @@ def _in_review_scope(path) -> bool:
         return False
 
 
-def normalise_path(text) -> str:
-    """One path, forward-slashed, with any leading `./` segments removed.
-
-    A single function because the alternative was `lstrip("./")` repeated at five
-    call sites — and `lstrip` takes a CHARACTER SET, not a prefix, so it ate the
-    leading dot of every hidden path: `.hidden/x.py` became `hidden/x.py`, and
-    `...` became "". Two spellings of one path that no longer match are two paths
-    as far as every fold here is concerned, which silently breaks the "has this
-    been logged / addressed" comparisons that are the point of normalising."""
-    out = str(text or "").replace("\\", "/")
-    while out.startswith("./"):
-        out = out[2:]
-    return out
-
-
-def _path_spellings(normalised) -> set:
-    """Every spelling of one path a ledger entry should match.
-
-    The ledger holds worktree-absolute paths written by every past checkout while
-    git reports repo-relative ones, so comparing them literally would call
-    everything unlogged."""
-    out = {normalise_path(normalised)}
-    for marker, prefix in (("/src/mindhive/", "src/mindhive/"),
-                           ("/tests/", "tests/")):
-        if marker in normalised:
-            out.add(prefix + normalised.split(marker, 1)[1])
-    return out
-
-
 def _change_timestamps(evs) -> dict:
     """`{path spelling: [ts, …]}` — when each path was named by a `code_change`.
 
@@ -2415,7 +2386,7 @@ def _change_timestamps(evs) -> dict:
         for path in (payload.get("files") or []):
             if not isinstance(path, str):
                 continue
-            seen |= _path_spellings(path)
+            seen |= paths.path_spellings(path)
         ts = getattr(ev, "ts", "") or ""
         for spelling in seen:
             stamps.setdefault(spelling, []).append(ts)

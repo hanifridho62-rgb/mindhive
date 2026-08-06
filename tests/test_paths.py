@@ -3,6 +3,71 @@ import os
 from pathlib import Path
 from mindhive import paths
 
+
+# --- path equivalence ---------------------------------------------------------
+# Shared by `replenish` (has this caveat been addressed / this file logged) and
+# `changelog` (does this entry cover this touched file). It lives in `paths`
+# rather than in either of them because the change-log must not depend on the
+# injector to compare two strings.
+
+def test_a_hidden_directory_keeps_its_leading_dot():
+    """`lstrip("./")` takes a CHARACTER SET, not a prefix.
+
+    It ate the leading dot of every hidden path — `.hidden/x.py` became
+    `hidden/x.py` — so two spellings of one path stopped matching, and the
+    "has this been logged / addressed" comparisons that are the whole point of
+    normalising silently answered no."""
+    assert paths.normalise_path(".hidden/x.py") == ".hidden/x.py"
+    assert paths.normalise_path(".claude/hooks/stop.ps1") \
+        == ".claude/hooks/stop.ps1"
+
+
+def test_a_relative_prefix_is_stripped_and_slashes_are_normalised():
+    assert paths.normalise_path("./src/mindhive/x.py") == "src/mindhive/x.py"
+    assert paths.normalise_path(".\\src\\mindhive\\x.py") == "src/mindhive/x.py"
+    assert paths.normalise_path("././a.py") == "a.py"
+
+
+def test_a_path_of_only_dots_is_not_annihilated():
+    assert paths.normalise_path("...") == "..."
+
+
+def test_normalise_path_is_total_on_junk():
+    assert paths.normalise_path(None) == ""
+    assert paths.normalise_path("") == ""
+
+
+def test_an_absolute_worktree_path_yields_its_repo_relative_spelling():
+    """The reconciliation this exists for.
+
+    The ledger holds worktree-absolute paths written by every past checkout while
+    git reports repo-relative ones. Measured on the live store, 3716 `file_touched`
+    paths are absolute against 3 relative, while 1026 `code_change` entries are
+    relative against 17 absolute — so a literal comparison subtracts nothing."""
+    spellings = paths.path_spellings(
+        "C:/Users/x/mindhive/src/mindhive/replenish.py")
+    assert "src/mindhive/replenish.py" in spellings
+
+
+def test_a_backslash_absolute_path_also_yields_the_relative_spelling():
+    # Normalisation has to happen BEFORE the marker search, or every Windows
+    # ledger path misses the reconciliation entirely.
+    spellings = paths.path_spellings(
+        "C:\\Users\\x\\mindhive\\tests\\test_paths.py")
+    assert "tests/test_paths.py" in spellings
+
+
+def test_a_repo_relative_path_is_its_own_only_spelling():
+    assert paths.path_spellings("src/mindhive/x.py") == {"src/mindhive/x.py"}
+
+
+def test_two_files_sharing_a_suffix_do_not_collapse():
+    # The discriminating half: an over-eager reconciliation would call every
+    # `x.py` in the tree the same file and silently discharge real debt.
+    assert not (paths.path_spellings("src/mindhive/loop/x.py")
+                & paths.path_spellings("src/mindhive/mindnet/x.py"))
+
+
 def test_normalize():
     assert paths.normalize("FABIO HFT V18") == "fabio-hft-v18"
     assert paths.normalize("") == "default"

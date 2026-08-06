@@ -27,6 +27,76 @@ def test_in_scope_accepts_repo_relative_git_paths():
     assert not changelog.in_scope("README.md")
 
 
+# --- path-spelling reconciliation --------------------------------------------
+# The two sides of the coverage comparison are written by different producers
+# with different conventions: `file_touched` carries worktree-absolute paths
+# (3716 against 3 relative on the live store), `code_change` carries repo-relative
+# ones (1026 against 17). Compared literally they never intersect, so coverage
+# subtracted nothing and the marker grew without bound.
+
+def _entry(files, ts="2026-07-15T10:00:00Z"):
+    return events.append_event(
+        "code_change",
+        {"text": "recorded the change-set", "category": "update",
+         "files": list(files)}, ts=ts)
+
+
+def test_an_absolute_touch_is_covered_by_a_relative_entry(tmp_path):
+    absolute = _touch("src/mindhive/a.py", tmp_path)
+    assert absolute != "src/mindhive/a.py"          # the fixture is the real shape
+    _entry(["src/mindhive/a.py"])
+    assert changelog.unlogged_files(events.read_all(), session_id="s1") == []
+
+
+def test_a_relative_touch_is_covered_by_an_absolute_entry(tmp_path):
+    events.append_event("file_touched", {"text": "src/mindhive/b.py"},
+                        session_id="s1", ts="2026-07-14T10:00:00Z")
+    _entry([str(tmp_path / "src" / "mindhive" / "b.py")])
+    assert changelog.unlogged_files(events.read_all(), session_id="s1") == []
+
+
+def test_an_uncovered_file_is_still_reported(tmp_path):
+    # The discriminating half: without it the two tests above would pass against
+    # a reconciliation that simply called everything covered.
+    _touch("src/mindhive/c.py", tmp_path)
+    _entry(["src/mindhive/somewhere_else.py"])
+    assert len(changelog.unlogged_files(events.read_all(), session_id="s1")) == 1
+
+
+def test_two_files_sharing_a_basename_are_not_confused(tmp_path):
+    _touch("src/mindhive/loop/x.py", tmp_path)
+    _entry(["src/mindhive/mindnet/x.py"])
+    unlogged = changelog.unlogged_files(events.read_all(), session_id="s1")
+    assert len(unlogged) == 1 and "loop" in unlogged[0]
+
+
+def test_an_entry_older_than_the_touch_does_not_cover_it(tmp_path):
+    # Time-awareness survives the spelling expansion: a stale entry from an
+    # earlier change-set must not exempt work done after it.
+    _touch("src/mindhive/d.py", tmp_path, ts="2026-07-14T10:00:00Z")
+    _entry(["src/mindhive/d.py"], ts="2026-07-01T00:00:00Z")
+    assert len(changelog.unlogged_files(events.read_all(), session_id="s1")) == 1
+
+
+def test_queue_does_not_carry_forward_a_file_covered_under_another_spelling(
+        tmp_path):
+    absolute = _touch("src/mindhive/e.py", tmp_path)
+    marker = changelog.queue(events.read_all(), session_id="s1")
+    assert marker["files"] == [absolute]
+    # A later entry names it repo-relative. The carry-forward has to see that.
+    _entry(["src/mindhive/e.py"], ts=events.now_iso())
+    assert changelog.queue(events.read_all(), session_id="s2") is None
+
+
+def test_a_malformed_file_entry_is_skipped_rather_than_raising(tmp_path):
+    _touch("src/mindhive/f.py", tmp_path)
+    events.append_event(
+        "code_change",
+        {"text": "a payload with junk in its files list", "category": "update",
+         "files": [None, 42, "src/mindhive/f.py"]}, ts="2026-07-15T10:00:00Z")
+    assert changelog.unlogged_files(events.read_all(), session_id="s1") == []
+
+
 # --- record -----------------------------------------------------------------
 
 def test_record_appends_event_and_clears_marker(tmp_path):
