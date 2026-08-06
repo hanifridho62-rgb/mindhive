@@ -564,6 +564,62 @@ def test_the_tech_debt_lens_is_registered():
     assert replenish.LENSES["tech-debt"] is replenish.technical_debt
 
 
+# --- deferring a refactor without arguing about it every round ----------------
+
+def _pinned(text):
+    return events.append_event("caveat", {"text": text}, tags=["pinned"],
+                               ts="2026-08-06T00:00:00Z")
+
+
+def _debt(tmp_path, evs=()):
+    trees = _trees(tmp_path, modules=[("huge.py", 2600)])
+    ctx = replenish.replace(trees, evs=tuple(evs))
+    cand = [c for c in replenish.technical_debt(ctx) if c.kind == "lines"][0]
+    return cand, replenish.build_deferral_index(evs)
+
+
+def test_a_pinned_deferral_caveat_vetoes_the_refactor_it_names(tmp_path):
+    """A documentation note is invisible to the injector; a pinned caveat is not.
+
+    The tech-debt lens sets `deferral_key` to the repo-relative module path, and
+    `veto_reason_for` matches that against pinned caveat text — so recording the
+    deferral in the ledger stops the round re-proposing a refactor someone already
+    decided to postpone, which a note in a map file cannot do."""
+    _pinned("Splitting src/mindhive/huge.py is DEFERRED: the module-global "
+            "rebinding test seam breaks silently across submodules.")
+    cand, index = _debt(tmp_path, events.read_all())
+    reason = index.veto_reason_for(cand)
+    assert reason and "pinned caveat defers this" in reason
+    _kept, refused = replenish.gate(
+        [replenish.replace(cand, veto_reason=reason, score=0)],
+        frozenset(), replenish.ReplenishConfig())
+    assert "already declined" in refused[0][1]
+
+
+def test_a_caveat_without_deferral_language_does_not_veto(tmp_path):
+    """`_DEFERRAL_RE` is what makes it a standing decision rather than an
+    observation — the load-bearing detail when writing one of these by hand."""
+    _pinned("src/mindhive/huge.py is large and the tests are slow.")
+    cand, index = _debt(tmp_path, events.read_all())
+    assert index.veto_reason_for(cand) == ""
+
+
+def test_an_unpinned_deferral_caveat_does_not_veto(tmp_path):
+    events.append_event(
+        "caveat",
+        {"text": "Splitting src/mindhive/huge.py is deferred for now."},
+        ts="2026-08-06T00:00:00Z")
+    cand, index = _debt(tmp_path, events.read_all())
+    assert index.veto_reason_for(cand) == ""
+
+
+def test_a_deferral_naming_another_module_does_not_veto_this_one(tmp_path):
+    # The discriminating half: a veto keyed loosely would silence the whole lens.
+    _pinned("Splitting src/mindhive/elsewhere.py is DEFERRED for now.")
+    cand, index = _debt(tmp_path, events.read_all())
+    assert index.veto_reason_for(cand) == ""
+
+
 # --- audit ---
 
 def _audit(ctx, modified):
