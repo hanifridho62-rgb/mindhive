@@ -109,7 +109,13 @@ def generate_fingerprint(lens_name, parts) -> str:
     distinct instead of concatenating to the same blob."""
     items = sorted(str(p) for p in (parts or ()) if str(p).strip())
     blob = "\x1f".join([str(lens_name or "")] + items)
-    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    # `surrogatepass`, because a strict encode would RAISE here. Parts include
+    # signatures derived from arbitrary captured error text, the ledger round-trips
+    # a lone surrogate through JSON, and the exception would escape into the
+    # per-lens guard — costing that lens every candidate, every round, for as long
+    # as the row survives. Identity beats purity: an unpaired surrogate still
+    # hashes to one stable digest.
+    digest = hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()
     return digest[:MAX_FINGERPRINT_CHARS]
 
 
@@ -803,6 +809,33 @@ def refusal_reason(candidate, spent, cfg) -> str:
     return ""
 
 
+# The one refusal on that ladder that is NOT a decision. Every other reason —
+# spent, no evidence, declined, too deep — is an answer that will still be true
+# next round. "Below the bar" is "not yet": the score is read off the record, and
+# the record grows.
+#
+# The distinction is load-bearing because `history()` folds every RECORDED refusal
+# into the spent set. Writing a row for a below-the-bar candidate therefore SPENDS
+# its identity, and the spent check runs FIRST — so the candidate can never be
+# proposed again even once its score clears the threshold, and the duplicate
+# refusal that blocks it writes no row, leaving nothing on the ledger to say why.
+# Demonstrated: a module refused at score 15 under a threshold of 25 was still
+# refused after eight further changes had taken it to 55.
+#
+# It is also what made refusal rows unbounded: one balanced round against the real
+# ledger wrote 257 of them, and `repair` mints a fresh identity on every
+# recurrence, so each future failure would add another.
+_SCORE_FLOOR_RE = re.compile(r"^score \S+ below the round's minimum \S+$")
+
+
+def is_transient_refusal(reason) -> bool:
+    """Whether *reason* means "not yet" rather than "no".
+
+    A transient refusal is returned to the caller but never recorded, so it cannot
+    spend the fingerprint it refused."""
+    return bool(_SCORE_FLOOR_RE.match(str(reason or "")))
+
+
 def normalise(candidate) -> Candidate:
     """Clamp a candidate to the shapes the audit contract accepts.
 
@@ -825,7 +858,12 @@ def normalise(candidate) -> Candidate:
                    lens=str(candidate.lens)[:64],
                    title=str(candidate.title)[:MAX_TITLE_CHARS],
                    fingerprint=str(candidate.fingerprint)[:MAX_FINGERPRINT_CHARS],
-                   kind=str(candidate.kind or "")[:MAX_KIND_CHARS],
+                   # Stripped, not merely clamped: `validate_payload` rejects a
+                   # present-but-blank `kind`, while `_row` only drops "" — so a
+                   # whitespace-only kind passed both and then failed validation
+                   # AFTER the sink had written the work, which is exactly the
+                   # two-phase write window this function exists to close.
+                   kind=str(candidate.kind or "").strip()[:MAX_KIND_CHARS],
                    evidence=evidence)
 
 
@@ -1013,6 +1051,13 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     if injection_budget is not None:
         ceiling = min(ceiling, injection_budget)
     if len(kept) > ceiling:
+        # Highest score first, so a cap cuts the work the record insists on LEAST.
+        # Trimmed in gate order the cap cut by lens registration instead: measured
+        # against the real ledger under `balanced`, 22 candidates cleared the gate
+        # and `kept[:10]` kept ten `repair` rows scoring 25-65 while dropping a
+        # repair scoring 1320, an evidence-gap scoring 100, and every pinned
+        # caveat. Sorting is stable, so equal scores keep that registry order.
+        kept = sorted(kept, key=lambda c: c.score, reverse=True)
         dropped = len(kept) - ceiling
         kept = kept[:ceiling]
 
@@ -1037,6 +1082,12 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     for c, reason in refused:
         if reason == DUPLICATE_REASON:
             continue          # the row that spent this fingerprint IS the record
+        if is_transient_refusal(reason):
+            # "Not yet" is not a decision, and recording it would spend the
+            # fingerprint (see `is_transient_refusal`). The refusal still rides
+            # `RoundResult.refused`, so the CLI keeps printing it — only the
+            # ledger row is skipped.
+            continue
         if not c.fingerprint:
             # Nothing to dedup on, so this row would repeat every round for as
             # long as the lens keeps emitting it. A fingerprint-less candidate
@@ -1322,7 +1373,13 @@ def caveat(arg) -> list:
         out.append(Candidate(
             lens="caveat",
             title=f"Resolve pinned architectural caveat: {headline}"[:MAX_TITLE_CHARS],
-            fingerprint=generate_fingerprint("caveat", (ts,)),
+            # The headline joins the timestamp because a timestamp alone is not
+            # an identity here: ledger `ts` is second-granular, so two caveats
+            # appended in the same second collapsed onto one fingerprint, and a
+            # row whose `ts` is absent entirely dropped to a blank part — leaving
+            # the digest of the bare lens name, shared by EVERY such caveat. That
+            # only became reachable once this lens could land at all.
+            fingerprint=generate_fingerprint("caveat", (ts, headline)),
             evidence=tuple(evidence),
             # Asserted, and the record is what asserts it: this lens is scoped to
             # caveats tagged `pinned`, and SOP memo-hygiene §4 defines that tag as

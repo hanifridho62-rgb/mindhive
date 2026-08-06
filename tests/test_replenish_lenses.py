@@ -379,8 +379,9 @@ def test_a_malformed_caveat_row_does_not_break_the_lens():
 def test_the_caveat_fingerprint_is_stable_for_one_caveat():
     _caveat("2026-08-02T00:00:00Z", "src/mindhive/x.py needs work")
     assert (_caveats()[0].fingerprint
-            == replenish.generate_fingerprint("caveat",
-                                              ("2026-08-02T00:00:00Z",)))
+            == replenish.generate_fingerprint(
+                "caveat", ("2026-08-02T00:00:00Z",
+                           "src/mindhive/x.py needs work")))
 
 
 def test_a_pinned_caveat_can_actually_land():
@@ -394,6 +395,18 @@ def test_a_pinned_caveat_can_actually_land():
     assert cand.severity is True
     assert (replenish.score_candidate(cand).total
             >= replenish.PROFILES["balanced"].min_score)
+
+
+def test_two_pinned_caveats_in_the_same_second_stay_distinct():
+    # Ledger `ts` is second-granular and the identity used to be the timestamp
+    # alone, so two caveats appended in one second collapsed onto one fingerprint
+    # and the second was refused as already proposed -- a refusal that writes no
+    # row, so nothing said why. Only reachable once this lens could land at all.
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/a.py needs a guard")
+    _caveat("2026-08-02T00:00:00Z", "src/mindhive/b.py needs a guard")
+    cands = _caveats()
+    assert len(cands) == 2
+    assert len({c.fingerprint for c in cands}) == 2
 
 
 def test_caveat_on_an_empty_ledger_does_not_raise():

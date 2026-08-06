@@ -119,8 +119,12 @@ def test_a_candidate_below_the_threshold_never_lands(tmp_path, monkeypatch):
                           monkeypatch=monkeypatch)
     assert result["reason"] == "completed"
     assert driver.turns == 1
-    assert any("below the round's minimum" in r.get("reason", "")
-               for r in _rows("refused"))
+    assert _rows("landed") == []
+    # And the refusal is NOT recorded. "Below the bar" is "not yet", not "no": a
+    # recorded refusal spends the fingerprint (history() folds refused rows into
+    # the spent set), which would make this condition unproposable forever — even
+    # once the record insists on it hard enough to clear the threshold.
+    assert _rows("refused") == []
 
 
 def test_a_run_whose_round_injects_nothing_ends_completed(tmp_path, monkeypatch):

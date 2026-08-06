@@ -134,11 +134,21 @@ unparseable summary records counts **absent rather than zero**, because "we
 could not tell" and "nothing passed" are different facts. Full output goes to
 `runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
 path),
-`work_injected` (`{outcome, round, surface, lens?, title?, evidence[]?,
-fingerprint?, score?, reason?, dropped?, plan_id?, step_index?}` — one row per
-replenishment decision, written by `replenish.py`: `outcome` ∈ landed, refused,
-truncated, dry. `landed` and `refused` are per-candidate and carry `lens`,
-`title` and `fingerprint`; `landed` additionally requires a **non-empty**
+`work_injected` (`{outcome, round, surface, run_id?, lens?, title?, evidence[]?,
+fingerprint?, kind?, score?, reason?, dropped?, plan_id?, step_index?}` — one row
+per replenishment decision, written by `replenish.py`: `outcome` ∈ landed,
+refused, truncated, dry. `landed` and `refused` are per-candidate and carry
+`lens`, `title` and `fingerprint`. `fingerprint` is a SHA-256 digest minted by
+`replenish.generate_fingerprint`, never a readable key: the field is capped, and a
+readable key long enough to be clamped to that cap would let two different
+conditions share one identity — which reads as "already proposed" and silences the
+lens that found the second one. `kind` is optional and carries the readable
+classification the digest gives up, for a lens that observes more than one kind of
+condition (`tech-debt` proposes both oversized modules and uncleared review
+entries). Not every refusal is recorded: a candidate refused only for scoring
+below the round's threshold writes **no row**, because a recorded refusal spends
+the fingerprint and "below the bar" is *not yet* rather than *no*. `landed`
+additionally requires a **non-empty**
 `evidence` list, because a candidate with nothing to point at is exactly what
 the value gate refuses and the contract must not let one in through the raw
 surface. `truncated` carries `dropped` — a cap that silently cut a round would

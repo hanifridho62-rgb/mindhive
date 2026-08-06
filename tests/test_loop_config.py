@@ -117,6 +117,34 @@ def test_a_zero_min_score_in_the_file_is_honoured(tmp_path):
     assert config.load_config(p).replenish_min_score == 0
 
 
+def test_a_quoted_number_is_coerced_rather_than_disabling_the_injector(tmp_path):
+    # `ambition = "balanced"` sits in the same table, so quoting a number is the
+    # natural hand-edit. Uncoerced, the string reached a `<` against a number,
+    # raised TypeError inside the injector, and the loop's blanket guard turned
+    # that into "honour the exit" -- the injector silently off for every run.
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nmin_score = "40"\ndry_rounds_to_exit = "3"\n',
+                 encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_min_score == 40
+    assert cfg.replenish_dry_rounds_to_exit == 3
+
+
+def test_an_uncoercible_value_falls_back_to_the_default(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nmin_score = "aggressive"\n', encoding="utf-8")
+    assert config.load_config(p).replenish_min_score is None
+
+
+def test_a_non_positive_max_per_round_falls_back_to_the_dial(tmp_path):
+    # 0 would trim every survivor while the round's dry flag is computed BEFORE
+    # the trim, so the round reports neither work nor dryness and the dry-round
+    # exit can never fire. `enabled = false` is the off switch.
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nmax_per_round = 0\n', encoding="utf-8")
+    assert config.load_config(p).replenish_max_per_round is None
+
+
 def test_an_override_beats_the_position_it_sits_beside(tmp_path):
     # The point of the escape hatch: keep `ambitious`'s seven lenses and raise its
     # bar. A dial that could only move all three settings together could not

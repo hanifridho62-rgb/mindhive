@@ -226,6 +226,82 @@ def test_a_candidate_below_min_score_is_refused():
     assert "below the round's minimum" in refused[0][1]
 
 
+# --- "not yet" is not "no" ----------------------------------------------------
+# A RECORDED refusal spends the fingerprint, because `history()` folds refused
+# rows into the spent set. That is right for a decision and catastrophic for a
+# score-floor refusal: the spent check runs first, so a candidate refused at 15
+# under a threshold of 25 could never be proposed again even at 55 — and the
+# duplicate refusal blocking it writes no row, so nothing on the ledger says why.
+
+def test_the_score_floor_reason_is_recognised_as_transient():
+    # Pinned against the reason `refusal_reason` actually produces, so the two
+    # cannot drift apart into a predicate that silently matches nothing.
+    cfg = replenish.ReplenishConfig(min_score=25)
+    reason = replenish.refusal_reason(_cand(score=10), frozenset(), cfg)
+    assert replenish.is_transient_refusal(reason)
+
+
+def test_a_decision_is_not_transient():
+    for reason in (replenish.DUPLICATE_REASON,
+                   "no evidence — a candidate must point at a real ledger row",
+                   "already declined — a rule defers it"):
+        assert not replenish.is_transient_refusal(reason)
+
+
+def test_a_below_threshold_refusal_writes_no_row_and_spends_nothing():
+    cfg = replenish.ReplenishConfig(min_score=25)
+    replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                        lenses={"l": lambda _c: [_cand(score=10)]})
+    assert _rows() == []
+    assert replenish.history(events.read_all()).fingerprints == frozenset()
+
+
+def test_a_candidate_refused_below_the_bar_can_land_once_its_score_rises():
+    # THE REGRESSION. Round 1 refuses at 10; round 2 the same condition scores 30
+    # because the record grew. If the first refusal had been recorded it would
+    # have spent the identity and round 2 would refuse it as a duplicate instead.
+    # The score rises through `occurrences`, not through a lens-supplied number:
+    # `run_round` recomputes every candidate's score before the gate, so a lens
+    # cannot set it directly. One occurrence scores 10; four score 10 + 5x3 = 25.
+    cfg = replenish.ReplenishConfig(min_score=25)
+    seen = {"n": 1}
+    lenses = {"l": lambda _c: [_cand(occurrences=seen["n"])]}
+    replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                        lenses=lenses)
+    seen["n"] = 4
+    res = replenish.run_round(events.read_all(), surface="session",
+                              sink=_sink(), cfg=cfg, lenses=lenses)
+    assert [c.fingerprint for c, _pl in res.landed] == ["fp-1"]
+
+
+def test_a_recorded_refusal_still_spends_its_fingerprint():
+    # The other half: a real decision must keep spending, or a declined candidate
+    # returns every round forever.
+    cfg = replenish.ReplenishConfig()
+    replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                        lenses={"l": lambda _c: [_cand(veto_reason="a rule defers it")]})
+    assert replenish.history(events.read_all()).fingerprints == frozenset({"fp-1"})
+
+
+# --- the cap cuts the least-insisted-on work ----------------------------------
+
+def test_the_round_cap_keeps_the_highest_scoring_candidates():
+    # Trimmed in gate order the cap cut by lens registration: measured against the
+    # real ledger, ten repair rows scoring 25-65 survived while a repair scoring
+    # 1320 and every pinned caveat were dropped.
+    # Scores come from the round's own scorer, so they are varied through the
+    # terms it reads: 10 base, +5 per repeat, +20 for severity.
+    cfg = replenish.ReplenishConfig(min_score=0, max_per_round=2)
+    lenses = {"l": lambda _c: [_cand(fp="low", occurrences=1),          # 10
+                               _cand(fp="high", occurrences=5,
+                                     severity=True),                    # 50
+                               _cand(fp="mid", occurrences=3)]}         # 20
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses=lenses)
+    assert [c.fingerprint for c, _pl in res.landed] == ["high", "mid"]
+    assert res.dropped == 1
+
+
 def test_a_candidate_exactly_at_the_threshold_is_kept():
     cfg = replenish.ReplenishConfig(min_score=25)
     kept, _refused = replenish.gate([_cand(score=25)], frozenset(), cfg)
@@ -541,6 +617,35 @@ def test_a_blank_kind_is_rejected():
 def test_an_oversized_kind_is_rejected():
     with pytest.raises(ValueError):
         _check(_landed(kind="k" * (replenish.MAX_KIND_CHARS + 1)))
+
+
+def test_normalise_drops_a_whitespace_only_kind():
+    c = replenish.normalise(replenish.Candidate(
+        lens="tech-debt", title="t", fingerprint="fp", evidence=("e",),
+        kind="   "))
+    assert c.kind == ""
+
+
+def test_a_round_survives_a_lens_that_sets_a_blank_kind():
+    # The failure was two-phase: `kind` was clamped but not stripped, so "   "
+    # passed normalise and `_row`'s empty-filter, the sink wrote the work, and
+    # THEN `_record` raised on the blank kind — leaving the step written, no
+    # landed row, and an unspent fingerprint, so the same step was written again
+    # next round. That is exactly what normalise exists to prevent.
+    res = replenish.run_round([], surface="session", sink=_sink(),
+                              cfg=replenish.ReplenishConfig(),
+                              lenses={"l": lambda _c: [_cand(kind="   ")]})
+    assert len(res.landed) == 1
+    assert [r["outcome"] for r in _rows()] == ["landed"]
+
+
+def test_a_lone_surrogate_in_a_part_does_not_kill_the_lens():
+    # Signatures are derived from arbitrary captured error text, and the ledger
+    # round-trips a lone surrogate through JSON. A strict encode would RAISE here,
+    # and the exception would escape into the per-lens guard — costing that lens
+    # every candidate, every round, for as long as the row survives.
+    assert len(replenish.generate_fingerprint(
+        "repair", ("\udc80bad-signature", "2026-01-01T00:00:00Z"))) == 64
 
 
 def test_normalise_clamps_an_oversized_kind():

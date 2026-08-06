@@ -147,11 +147,15 @@ def test_status_reports_the_folded_state(capsys):
     # are installed, so the invariant is "it agrees with the registry" — pinning
     # the list meant every new lens broke this test for no reason.
     assert data["lenses"] == sorted(replenish.LENSES)
-    # A digest carries no readable prefix, so lens attribution lives in the row's
-    # own `lens` field (asserted by the refusal test above). What matters here is
-    # that the fold recovered exactly the one fingerprint this round spent.
-    assert len(data["spent_fingerprints"]) == 1
-    assert len(data["spent_fingerprints"][0]) == 64
+    # A digest carries no readable prefix, so lens attribution comes from the
+    # row's own `lens` field — read back here rather than inferred. A bare
+    # length-64 check would pass for a fingerprint minted by ANY lens, which is
+    # weaker than the readable-prefix assertion this replaced.
+    landed = [e.payload for e in events.read_all()
+              if e.type == "work_injected"
+              and (e.payload or {}).get("outcome") == "landed"]
+    assert [p["lens"] for p in landed] == ["evidence-gap"]
+    assert data["spent_fingerprints"] == [landed[0]["fingerprint"]]
 
 
 def test_status_on_an_empty_ledger(capsys):

@@ -73,6 +73,39 @@ class LoopConfig:
         return self.iteration_timeout_minutes * 60
 
 
+def _int_or(value, default):
+    """A hand-edited TOML value read as an int, or *default*.
+
+    `min_score = "40"` is the natural slip in a table whose neighbour reads
+    `ambition = "balanced"`, and an uncoerced string reaches a `<` comparison
+    against a number. That raises TypeError inside the injector, where the loop's
+    blanket guard turns it into "honour the exit" — so the symptom of a stray pair
+    of quotes is a silently disabled injector and a plan that never grows.
+    Coercing what can be coerced, and falling back on what cannot, keeps a typo
+    from switching the feature off."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_int_or(value, default):
+    """`_int_or`, refusing anything below 1.
+
+    A `max_per_round` of 0 would trim every survivor while the round's dry flag is
+    computed BEFORE the trim — so the round reports neither landed work nor
+    dryness, and the dry-round exit can never fire. The off switch is
+    `enabled = false`."""
+    coerced = _int_or(value, default)
+    if isinstance(coerced, int) and coerced < 1:
+        return default
+    return coerced
+
+
 def load_config(path: Path) -> LoopConfig:
     """Load loop.toml, falling back to defaults for any missing key/section."""
     cfg = LoopConfig()
@@ -117,9 +150,11 @@ def load_config(path: Path) -> LoopConfig:
         replenish_ambition=replenish.get("ambition", cfg.replenish_ambition),
         replenish_max_rounds=replenish.get("max_rounds",
                                            cfg.replenish_max_rounds),
-        replenish_min_score=replenish.get("min_score", cfg.replenish_min_score),
-        replenish_max_per_round=replenish.get("max_per_round",
-                                              cfg.replenish_max_per_round),
-        replenish_dry_rounds_to_exit=replenish.get(
-            "dry_rounds_to_exit", cfg.replenish_dry_rounds_to_exit),
+        replenish_min_score=_int_or(replenish.get("min_score"),
+                                    cfg.replenish_min_score),
+        replenish_max_per_round=_positive_int_or(
+            replenish.get("max_per_round"), cfg.replenish_max_per_round),
+        replenish_dry_rounds_to_exit=_int_or(
+            replenish.get("dry_rounds_to_exit"),
+            cfg.replenish_dry_rounds_to_exit),
     )
