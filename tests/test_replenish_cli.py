@@ -37,13 +37,23 @@ def _blind_to_the_real_checkout(monkeypatch):
 
 
 def _outstanding():
-    """A ledger where code changed and nothing verified it since."""
+    """A ledger where code changed and nothing verified it since.
+
+    The `code_change` is stamped NOW, not at a fixed date, and that is load-
+    bearing rather than tidiness. The score carries a temporal decay term, and the
+    CLI has no clock parameter — it reads the wall clock, as it should. A fixture
+    frozen at a calendar date therefore ages between one test run and the next: the
+    evidence-gap candidate here scored 25 against a threshold of 25 at 05:00 and 24
+    at 11:00 on the same day, so the suite went red on nothing but the clock
+    advancing. Tests that need to pin an instant do it explicitly through
+    `run_round(now_ts=...)`; these are CLI plumbing tests and want the ordinary
+    case, which is a change that just happened."""
     events.append_event("user_prompt", {"text": "add the parser"},
-                        session_id=SID, ts="2026-08-01T00:00:00Z")
+                        session_id=SID)
     events.append_event(
         "code_change",
         {"text": "changed something real", "category": "update",
-         "files": ["src/mindhive/replenish.py"]}, ts="2026-08-02T00:00:00Z")
+         "files": ["src/mindhive/replenish.py"]})
 
 
 def _plan():
@@ -190,7 +200,7 @@ def test_the_hooks_unknown_fallback_cannot_own_a_plan(capsys):
     events.append_event(
         "code_change",
         {"text": "changed something real", "category": "update",
-         "files": ["src/mindhive/replenish.py"]}, ts="2026-08-02T00:00:00Z")
+         "files": ["src/mindhive/replenish.py"]})
     assert main(["replenish", "run", "--session", "unknown"]) == 0
     assert "cannot own a plan" in capsys.readouterr().out
     assert _rows() == []

@@ -120,7 +120,6 @@ def _innovation_capacity(project, run_id, held):
     deferral on a title slug and no other lens ever produces one to collide with,
     so it has nothing to fuse with. The cost if that ever changed is one extra
     held iteration, which the one-shot flag bounds."""
-    from .safeguards import InnovationCapacity
     try:
         from .. import replenish as rp_mod
         evs = events.read_all(project)
@@ -136,9 +135,10 @@ def _innovation_capacity(project, run_id, held):
                     and payload.get("lens") == "innovation"):
                 proposed = True
                 break
-        return InnovationCapacity(profile.healthy, proposed, held)
+        return safeguards.InnovationCapacity(profile.healthy, proposed,
+                                             held)
     except Exception:                                           # noqa: BLE001
-        return InnovationCapacity()
+        return safeguards.InnovationCapacity()
 
 
 def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None,

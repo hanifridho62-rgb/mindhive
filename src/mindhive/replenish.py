@@ -582,17 +582,22 @@ def score_candidate(candidate, index=None, *, healthy=False,
                   if healthy and getattr(candidate, "lens", "") == "innovation"
                   else 0)
 
+    breakdown = ScoreBreakdown(
+        recurrence=recurrence, severity=severity, magnitude=magnitude,
+        innovation=innovation,
+        veto_reason=index.veto_reason_for(candidate) if index is not None else "")
+
     # Decay is charged against the history-derived terms only, and only for a
     # candidate that told us WHEN its evidence was recorded. The tree-reading
     # lenses set no `observed_ts` because a file's current line count has no age.
+    # Applied as a second step so the term it discounts is named by the record it
+    # comes off — `history_terms` — rather than re-added by hand here.
     factor = decay_factor(age_in_days(getattr(candidate, "observed_ts", ""),
                                       now_ts))
-    decay = -round((recurrence + severity) * (1.0 - factor))
-
-    veto = index.veto_reason_for(candidate) if index is not None else ""
-    return ScoreBreakdown(recurrence=recurrence, severity=severity,
-                          magnitude=magnitude, innovation=innovation,
-                          decay=int(decay), veto_reason=veto)
+    if factor >= 1.0:
+        return breakdown
+    return replace(breakdown,
+                   decay=-round(breakdown.history_terms * (1.0 - factor)))
 
 
 # --- the core ----------------------------------------------------------------
