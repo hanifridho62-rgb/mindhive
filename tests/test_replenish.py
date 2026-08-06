@@ -639,6 +639,16 @@ def test_a_round_survives_a_lens_that_sets_a_blank_kind():
     assert [r["outcome"] for r in _rows()] == ["landed"]
 
 
+def test_a_lens_kind_reaches_the_ledger_row():
+    # The wiring, not just the schema: `kind` is validated in one test and set by
+    # the tech-debt lens in another, but nothing asserted it survives run_round
+    # onto the row — which is the only reason it exists.
+    replenish.run_round([], surface="session", sink=_sink(),
+                        cfg=replenish.ReplenishConfig(),
+                        lenses={"l": lambda _c: [_cand(kind="lines")]})
+    assert [r.get("kind") for r in _rows()] == ["lines"]
+
+
 def test_a_lone_surrogate_in_a_part_does_not_kill_the_lens():
     # Signatures are derived from arbitrary captured error text, and the ledger
     # round-trips a lone surrogate through JSON. A strict encode would RAISE here,
