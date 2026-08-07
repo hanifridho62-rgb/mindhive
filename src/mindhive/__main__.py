@@ -564,26 +564,6 @@ def cmd_log_pending(args) -> int | None:
     return None
 
 
-def cmd_log_dismiss(args) -> int | None:
-    """Discharge queued debt no change-log entry will ever cover.
-
-    The gate's exit. `record()` only discharges what its own entry named, so
-    without this a path nothing will legitimately cover — a reverted experiment,
-    an abandoned worktree's file — would block STATE.md forever, and the only
-    ways out would be deleting a sidecar by hand or writing an entry naming files
-    that were never changed. Both are worse than an audited dismissal."""
-    from . import changelog as changelog_mod
-    sid = args.session or os.environ.get("MINDHIVE_SESSION")
-    try:
-        marker = changelog_mod.dismiss(args.files, session_id=sid)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    remaining = len(marker["files"]) if marker else 0
-    print(f"dismissed {len(args.files)} file(s); {remaining} still queued")
-    return None
-
-
 # Session ids that exist but cannot own work: the hook's stdin-parse fallback and
 # the store's default for anything appended outside a session.
 _UNATTRIBUTABLE_SESSIONS = ("unknown", "manual")
@@ -3103,15 +3083,6 @@ def _build_parser() -> argparse.ArgumentParser:
     lgq.set_defaults(func=cmd_log_queue)
     lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
     lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
-    lgd = lgsub.add_parser("dismiss",
-                           help="discharge queued files no change-log entry "
-                                "will cover (records the dismissal)")
-    lgd.add_argument("--files", nargs="+", required=True,
-                     help="paths to drop from the pending marker")
-    lgd.add_argument("--session", default=None,
-                     help="session id to attribute the dismissal to "
-                          "(default: $MINDHIVE_SESSION)")
-    lgd.set_defaults(func=cmd_log_dismiss)
 
     # --- replenish (adaptive work injection) ---
     rp = sub.add_parser("replenish",

@@ -21,27 +21,55 @@ def _git(cwd, *args):
 
 @pytest.fixture
 def repo(tmp_path):
-    """A real scratch repo with one committed file, so the branch has history to
-    wrongly report."""
+    """A scratch repo whose HEAD has DIVERGED from master.
+
+    The divergence is the whole point and an earlier version of this fixture
+    lacked it. Staying on `master` makes `git merge-base master HEAD` return HEAD
+    itself, so the removed branch-vs-master query diffs an empty range and returns
+    the same answer as the working-tree query — the regression test would have
+    passed against the very implementation it exists to keep out. `branch_only.py`
+    is committed on the feature branch and absent from master, so the old
+    algorithm reports it and the new one must not."""
     root = tmp_path / "repo"
     (root / "src" / "mindhive").mkdir(parents=True)
     (root / "tests").mkdir()
     _git(tmp_path, "init", "-q", "-b", "master", "repo")
     _git(root, "config", "user.email", "test@example.com")
     _git(root, "config", "user.name", "Test")
+    _git(root, "config", "commit.gpgsign", "false")
     (root / "src" / "mindhive" / "committed.py").write_text("x = 1\n",
                                                             encoding="utf-8")
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "seed")
+
+    _git(root, "checkout", "-q", "-b", "feature")
+    (root / "src" / "mindhive" / "branch_only.py").write_text("b = 1\n",
+                                                              encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "branch work master never saw")
     return root
+
+
+def _merge_base_diff(root):
+    """What the REMOVED implementation would have reported, run for real.
+
+    Asserting against the old algorithm's actual output rather than a remembered
+    description is what makes the regression test discriminating: if this returns
+    the same set as the new implementation, the fixture is not exercising the
+    defect and the test proves nothing."""
+    base = subprocess.run(["git", "merge-base", "master", "HEAD"], cwd=str(root),
+                          capture_output=True, text=True).stdout.strip()
+    out = subprocess.run(["git", "diff", "--name-only", base, "HEAD"],
+                         cwd=str(root), capture_output=True, text=True).stdout
+    return {line.strip() for line in out.splitlines() if line.strip()}
 
 
 def test_the_git_seam_reports_the_working_tree_not_the_branch(repo):
     """The 61-file over-claim, end to end.
 
-    `committed.py` is on the branch and untouched in the working tree. The old
-    merge-base diff reported every such file; the working tree has nothing to say
-    about it."""
+    `branch_only.py` is committed on this branch and untouched in the working
+    tree. The old merge-base diff reported every such file — measured at 86 on the
+    real branch where the working tree had 2."""
     (repo / "src" / "mindhive" / "modified.py").write_text("y = 2\n",
                                                            encoding="utf-8")
     _git(repo, "add", "-A")
@@ -49,8 +77,12 @@ def test_the_git_seam_reports_the_working_tree_not_the_branch(repo):
     (repo / "src" / "mindhive" / "modified.py").write_text("y = 3\n",
                                                            encoding="utf-8")
 
+    # The fixture must actually reproduce the defect, or what follows is theatre.
+    assert "src/mindhive/branch_only.py" in _merge_base_diff(repo)
+
     found = changelog._git_changed_files(root=repo)
     assert "src/mindhive/modified.py" in found
+    assert "src/mindhive/branch_only.py" not in found
     assert "src/mindhive/committed.py" not in found
 
 
@@ -189,6 +221,25 @@ def test_queue_does_not_carry_forward_a_file_covered_under_another_spelling(
     # A later entry names it repo-relative. The carry-forward has to see that.
     _entry(["src/mindhive/e.py"], ts=events.now_iso())
     assert changelog.queue(events.read_all(), session_id="s2") is None
+
+
+@pytest.mark.parametrize("body", ['["a list, not a dict"]', '"a bare string"',
+                                  '{"files": "not a list"}', '42'])
+def test_a_marker_of_the_wrong_shape_reads_as_absent(body, tmp_path):
+    """Valid JSON, wrong shape — and `discharge()` indexes `marker["files"]`.
+
+    An `AttributeError` there is not an `OSError`, so `record()`'s guard would not
+    catch it, and it would escape AFTER the `code_change` event was already
+    appended: the CLI reports failure on a change that succeeded, and the operator
+    writes a duplicate entry."""
+    path = changelog.pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    assert changelog.load_pending() is None
+    assert changelog.discharge(["src/mindhive/a.py"]) is None
+    ev = changelog.record("update", "lands despite a corrupt marker",
+                          files=["src/mindhive/a.py"])
+    assert ev.type == "code_change"
 
 
 def test_a_malformed_file_entry_is_skipped_rather_than_raising(tmp_path):
@@ -492,49 +543,6 @@ def test_an_earlier_sessions_debt_does_not_ride_a_later_entry(tmp_path):
                           session_id="s2")
     assert ev.payload["files"] == [fresh]
     assert old in changelog.load_pending()["files"]
-
-
-# --- the exit -----------------------------------------------------------------
-
-def test_dismiss_discharges_debt_no_entry_will_cover(tmp_path):
-    a, b, c, _m = _queued_three(tmp_path)
-    changelog.dismiss([a, b], session_id="s1")
-    assert changelog.load_pending()["files"] == [c]
-
-
-def test_dismiss_records_the_dismissal(tmp_path):
-    a, _b, _c, _m = _queued_three(tmp_path)
-    changelog.dismiss([a], session_id="s1")
-    decisions = [e for e in events.read_all()
-                 if e.type == "decision" and "dismiss" in (e.tags or [])]
-    assert len(decisions) == 1
-    assert "a.py" in decisions[0].payload["text"]
-
-
-def test_dismiss_refuses_an_empty_file_list(tmp_path):
-    _queued_three(tmp_path)
-    with pytest.raises(ValueError, match="name the files"):
-        changelog.dismiss([])
-
-
-def test_the_gate_always_has_an_exit(tmp_path):
-    """The property that makes the subtractive discharge safe to ship.
-
-    Without `dismiss`, a queued path that no honest entry will ever name — a
-    reverted experiment, an abandoned worktree's file — blocks STATE.md forever,
-    and the operator's only remaining moves are deleting a sidecar by hand or
-    writing an entry naming files they did not change."""
-    a, b, c, _m = _queued_three(tmp_path)
-    assert changelog.dismiss([a, b, c], session_id="s1") is None
-    assert changelog.load_pending() is None
-    assert changelog.notice(changelog.load_pending()) == ""
-
-
-def test_the_cli_dismiss_subcommand_reports_what_remains(tmp_path, capsys):
-    a, _b, _c, _m = _queued_three(tmp_path)
-    assert cli_mod.main(["log", "dismiss", "--files", a,
-                         "--session", "s1"]) == 0
-    assert "dismissed 1 file(s); 2 still queued" in capsys.readouterr().out
 
 
 def test_cli_append_enforces_code_change_contract(capsys):

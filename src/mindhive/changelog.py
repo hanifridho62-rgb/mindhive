@@ -32,7 +32,15 @@ def pending_path(project=None):
 
 
 def _norm(p: str) -> str:
-    return p.replace("\\", "/")
+    """One spelling of a path, via the shared primitive.
+
+    Kept as a one-line alias rather than inlined at the five call sites so the
+    name this module has always used still reads locally — but it delegates now.
+    It used to convert backslashes and nothing else, which left a THIRD definition
+    of path equality in the tree beside `paths.normalise_path` and `review._norm`,
+    and the whole point of moving the primitive to `paths` was that the leading-dot
+    bug must not have to be fixed in more than one place."""
+    return paths.normalise_path(p)
 
 
 def in_scope(path: str) -> bool:
@@ -150,13 +158,26 @@ def queue(evs, session_id=None, project=None):
 
 
 def load_pending(project=None):
+    """The marker, or None when it is absent, unreadable, or the wrong SHAPE.
+
+    Shape is checked, not assumed. `discharge()` reaches into `marker["files"]`,
+    and a sidecar that is valid JSON of the wrong shape — a legacy format, a
+    hand-edit, an externally corrupted file — would raise `AttributeError` or
+    `TypeError` there. Neither is an `OSError`, so neither is caught by the guard
+    `record()` wraps the discharge in, and the exception would escape AFTER the
+    `code_change` event was already durably appended: the CLI reports failure on a
+    change that actually succeeded, and the operator re-runs `hive log` and writes
+    a duplicate. Reads stay total, as everywhere else in this store."""
     path = pending_path(project)
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        marker = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(marker, dict) or not isinstance(marker.get("files"), list):
+        return None
+    return marker
 
 
 def clear(project=None) -> bool:
@@ -207,34 +228,6 @@ def discharge(files, project=None) -> dict | None:
         return None
     marker = dict(marker, files=survivors)
     _write_marker(marker, project)
-    return marker
-
-
-def dismiss(files, project=None, session_id=None):
-    """Discharge debt no honest entry will ever name, on the record.
-
-    Making `record()` subtractive removed the gate's only exit: before, any
-    `hive log` unlinked the whole marker, so a wedged notice always had a way out.
-    Without this, a path nothing will ever legitimately cover — a reverted
-    experiment, a file touched in an abandoned worktree, debt accumulated by the
-    detection bug itself — becomes permanent blocking debt, and the operator's
-    only remaining moves are hand-deleting a sidecar (which this project forbids)
-    or writing an entry naming files they did not change, which is the false
-    record the whole change is meant to prevent.
-
-    Recorded as a `decision` rather than a new event type: a dismissal IS a
-    decision not to log, it rides MEMORY.md where the next session will see it,
-    and the ledger's registered vocabulary does not need widening for it."""
-    named = [f for f in (files or []) if isinstance(f, str) and f.strip()]
-    if not named:
-        raise ValueError("name the files to dismiss with --files")
-    marker = discharge(named, project)
-    ev_mod.append_event(
-        "decision",
-        {"text": "dismissed unlogged-changes debt for "
-                 f"{len(named)} file(s) with no change-log entry coming: "
-                 + ", ".join(named)[:400]},
-        session_id=session_id, tags=["changelog", "dismiss"], project=project)
     return marker
 
 
