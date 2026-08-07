@@ -35,6 +35,46 @@ def normalize(name: str) -> str:
     return slug or "default"
 
 
+# --- path equivalence ---------------------------------------------------------
+# Three modules ask the same question — "are these two strings the same file?" —
+# and get it wrong in the same way when they answer it locally. It lives here
+# rather than in any one of them because `changelog` must not depend on the
+# injector to compare paths, and both already import this module.
+
+def normalise_path(text) -> str:
+    """One path, forward-slashed, with any leading `./` segments removed.
+
+    A single function because the alternative was `lstrip("./")` repeated at five
+    call sites — and `lstrip` takes a CHARACTER SET, not a prefix, so it ate the
+    leading dot of every hidden path: `.hidden/x.py` became `hidden/x.py`, and
+    `...` became "". Two spellings of one path that no longer match are two paths
+    as far as every fold is concerned, which silently breaks the "has this been
+    logged / addressed" comparisons that are the point of normalising."""
+    out = str(text or "").replace("\\", "/")
+    while out.startswith("./"):
+        out = out[2:]
+    return out
+
+
+def path_spellings(normalised) -> set:
+    """Every spelling of one path a ledger entry should match.
+
+    The ledger holds worktree-absolute paths written by every past checkout while
+    git reports repo-relative ones, so comparing them literally calls everything
+    unlogged. Measured on the live store: 3716 `file_touched` paths are
+    worktree-absolute against 3 relative, while 1026 `code_change` entries are
+    repo-relative against 17 absolute — the two sets essentially never intersect,
+    so a literal comparison subtracts nothing and the pending-changelog marker
+    grows without bound."""
+    normalised = normalise_path(normalised)
+    out = {normalised}
+    for marker, prefix in (("/src/mindhive/", "src/mindhive/"),
+                           ("/tests/", "tests/")):
+        if marker in normalised:
+            out.add(prefix + normalised.split(marker, 1)[1])
+    return out
+
+
 def detect_project(cwd: Path | None = None) -> str:
     env = os.environ.get("MINDHIVE_PROJECT")
     if env:

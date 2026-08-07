@@ -564,6 +564,174 @@ def cmd_log_pending(args) -> int | None:
     return None
 
 
+# Session ids that exist but cannot own work: the hook's stdin-parse fallback and
+# the store's default for anything appended outside a session.
+_UNATTRIBUTABLE_SESSIONS = ("unknown", "manual")
+
+
+def cmd_replenish_run(args) -> int | None:
+    """One replenishment round for a session. Run by session_end BEFORE
+    `roadmap autoclose`, so the injected steps exist when the plan is closed and
+    therefore reach STATE.md in the same pass."""
+    from . import replenish as rp_mod, replenish_sinks as sink_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    if not sid:
+        # Exit 2 rather than the silent no-op `log queue` and `review queue` use
+        # in the same spot. Their work is idempotent lifecycle bookkeeping; this
+        # writes real steps under a plan id, so an unattributable run is an
+        # operator error worth reporting, not something to absorb.
+        print("no session id — pass --session or set MINDHIVE_SESSION",
+              file=sys.stderr)
+        return 2
+    if sid in _UNATTRIBUTABLE_SESSIONS:
+        # session_end.ps1 falls back to "unknown" when it cannot parse the id off
+        # stdin. That was harmless while the hook only ran idempotent lifecycle
+        # actions; injecting under it would pile every unparsed session's work
+        # into one shared plan that never closes cleanly. Decline, and say so.
+        print(f"session id {sid!r} cannot own a plan — skipping this round")
+        return None
+    evs = events.read_all()
+    write = not args.dry_run
+    # BOTH flags: the core's governs the audit rows, the sink's governs the work
+    # itself. Passing only the first would leave a real roadmap step behind on a
+    # run the operator asked to be a preview.
+    #
+    # `evs=evs` is not an optimisation detail: this runs inside the SessionEnd
+    # hook, which already pays for several full ledger reads, and the sink would
+    # otherwise read all 27k+ events a second time. Nothing is appended between
+    # this read and the sink, so the snapshot is current.
+    # The session surface runs a PROFILE, not the whole registry. Without this it
+    # would run every registered lens — including `innovation`, which is gated to
+    # `ambitious` because it spends a model call, and which would therefore fire a
+    # headless `claude` on every single session end. There is no loop.toml here, so
+    # the surface takes the documented default position.
+    profile = rp_mod.PROFILES[rp_mod.DEFAULT_AMBITION]
+    try:
+        res = rp_mod.run_round(evs, surface="session",
+                               sink=sink_mod.roadmap_sink(sid, evs=evs,
+                                                          append=write),
+                               cfg=rp_mod.ReplenishConfig.for_profile(profile),
+                               lenses=rp_mod.lenses_for(profile),
+                               session_id=sid, append=write)
+    except Exception as exc:                                    # noqa: BLE001
+        # The SessionEnd hook pipes stdout to Out-Null and a native non-zero
+        # exit does not reach PowerShell's catch, so an unhandled traceback here
+        # is invisible: the injector would stop working and nobody would learn
+        # it had. Say so on stderr in one line, and fail deliberately.
+        print(f"replenish failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    if not res.ran:
+        print(f"replenish skipped: {res.skipped}")
+        return None
+    prefix = "would inject" if args.dry_run else "injected"
+    for cand, place in res.landed:
+        print(f"{prefix} [{cand.lens}] {cand.title}")
+        for item in cand.evidence:
+            print(f"    evidence: {item}")
+        if not args.dry_run:
+            print(f"    landed on roadmap {place.plan_id} step "
+                  f"{place.step_index}")
+    for cand, reason in res.refused:
+        print(f"refused [{cand.lens}] {cand.title} — {reason}")
+    if res.dropped:
+        print(f"{res.dropped} candidate(s) did not fit this round")
+    for name, message in res.lens_errors:
+        print(f"lens {name} failed: {message}", file=sys.stderr)
+    if res.dry:
+        # Only honest when every lens actually ran. A round where they all threw
+        # also finds nothing, and claiming the record proves nothing outstanding
+        # would be a statement about the ledger that was never checked.
+        print("nothing outstanding that the record proves" if not res.lens_errors
+              else f"no candidates — but {len(res.lens_errors)} lens(es) failed, "
+                   "so the record was not fully read")
+    return None
+
+
+def cmd_replenish_explain(args) -> int | None:
+    """Score every lens's candidates against every dial position, and change
+    nothing.
+
+    The command this subsystem needed and did not have. A lens whose best score
+    sits below every threshold it runs under produces candidates the gate is
+    guaranteed to refuse — dead config — and that is invisible from every other
+    surface: a round prints nothing, the ledger holds nothing (a below-the-bar
+    refusal is deliberately never recorded, because recording it would spend the
+    fingerprint), and the test suite stays green because producing a doomed
+    candidate looks exactly like working. Here it shows up as a `lands at` column
+    reading `nowhere`."""
+    from . import replenish as rp_mod
+    lenses = None
+    if args.ambition:
+        choice = rp_mod.resolve_ambition(args.ambition)
+        if choice.fell_back:
+            print(f"unknown ambition {args.ambition!r} — reporting "
+                  f"{choice.profile.name} instead. Valid: "
+                  f"{', '.join(sorted(rp_mod.PROFILES))}", file=sys.stderr)
+        lenses = rp_mod.lenses_for(choice.profile)
+    if lenses is not None and not args.with_agentic:
+        # The agentic lens spends a real model call. Asking what the record
+        # currently holds is not the same as asking to pay for a proposal, so it
+        # takes its own flag even when the chosen position would run it.
+        lenses = {n: l for n, l in lenses.items() if n != "innovation"}
+    elif lenses is None and args.with_agentic:
+        lenses = dict(rp_mod.LENSES)
+
+    report = rp_mod.explain(events.read_all(), lenses=lenses, tune=True)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return None
+
+    positions = report["positions"]
+    print(f"as of {report['now']} · lenses: {', '.join(report['lenses'])} · "
+          f"{report['spent_fingerprints']} spent fingerprint(s)")
+    print("positions: " + "  ".join(
+        f"{name}>={info['threshold']}" for name, info in sorted(
+            positions.items(), key=lambda kv: -kv[1]["threshold"])))
+    tuning = report["tuning"]
+    print(f"tuning: {tuning['success_streak']} green in a row, "
+          f"{tuning['failure_streak']} bad in a row"
+          + (f" · {tuning['reason']}" if tuning["reason"] else ""))
+    print()
+
+    if not report["candidates"]:
+        print("no lens found a candidate")
+    for row in report["candidates"]:
+        lands = ", ".join(row["lands_at"]) or "nowhere"
+        flags = "".join([" [spent]" if row["spent"] else "",
+                         " [spike]" if row["spike"] else "",
+                         " [vetoed]" if row["veto_reason"] else ""])
+        kind = f"/{row['kind']}" if row["kind"] else ""
+        print(f"{row['score']:>5}  {row['lens']}{kind}  -> {lands}{flags}")
+        print(f"       {row['title']}")
+        print("       terms: " + ", ".join(
+            f"{name} {value:+d}" if name != "total" else f"total {value}"
+            for name, value in row["terms"].items()))
+    if report["silent_lenses"]:
+        print()
+        print("found nothing: " + ", ".join(report["silent_lenses"]))
+    for err in report["lens_errors"]:
+        print(f"lens {err['lens']} failed: {err['error']}", file=sys.stderr)
+    return None
+
+
+def cmd_replenish_status(args) -> int | None:
+    """What the injector knows, folded from the ledger — there is no sidecar."""
+    from . import replenish as rp_mod
+    hist = rp_mod.history(events.read_all(), surface="session")
+    print(json.dumps({
+        "surface": "session",
+        # Named for what it is. A round that writes no rows — every candidate a
+        # spent duplicate, nothing landed, no cap hit — leaves the counter where
+        # it was, so this is the last round that RECORDED something, not the
+        # number of rounds the surface has run.
+        "last_recorded_round": hist.last_round,
+        "dry_rounds": hist.dry_rounds,
+        "spent_fingerprints": sorted(hist.fingerprints),
+        "lenses": sorted(rp_mod.LENSES),
+    }, indent=2))
+    return None
+
+
 def _sop_body(args) -> str | None:
     """Resolve an SOP body from --text / --file / --stdin (at most one). A
     procedure body is usually multi-line markdown, which is painful to pass as
@@ -942,7 +1110,8 @@ def cmd_roadmap_show(args) -> int | None:
               "skipped": "[-]"}
     for i, s in enumerate(rec["steps"]):
         note = f"  — {s['note']}" if s.get("note") else ""
-        print(f"  {i}. {glyphs[s['status']]} {s['text']}{note}")
+        print(f"  {i}. {glyphs[s['status']]} {roadmap_mod.new_prefix(s)}"
+              f"{s['text']}{note}")
     print("\nhistory (oldest first):")
     for e in hist:
         print(f"  {e['ts']}  {e['action']:9s}  session {e['session']}")
@@ -2914,6 +3083,35 @@ def _build_parser() -> argparse.ArgumentParser:
     lgq.set_defaults(func=cmd_log_queue)
     lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
     lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
+
+    # --- replenish (adaptive work injection) ---
+    rp = sub.add_parser("replenish",
+                        help="propose work the record proves is outstanding "
+                             "(run by session_end)")
+    rpsub = rp.add_subparsers(dest="replenish_cmd", required=True)
+    rpr = rpsub.add_parser("run", help="run one replenishment round for a session")
+    rpr.add_argument("--session", default=None,
+                     help="session id to replenish (default: $MINDHIVE_SESSION)")
+    rpr.add_argument("--dry-run", action="store_true",
+                     help="decide and print without appending anything")
+    rpr.set_defaults(func=cmd_replenish_run)
+    rpe = rpsub.add_parser("explain",
+                           help="score every lens's candidates against every "
+                                "dial position, changing nothing")
+    rpe.add_argument("--ambition", default=None,
+                     help="report only the lenses this position runs "
+                          "(conservative / balanced / ambitious)")
+    rpe.add_argument("--with-agentic", action="store_true",
+                     help="include the innovation lens, which spends a model "
+                          "call (excluded by default even at --ambition "
+                          "ambitious)")
+    rpe.add_argument("--json", action="store_true",
+                     help="machine-readable report")
+    rpe.set_defaults(func=cmd_replenish_explain)
+    rpsub.add_parser("status",
+                     help="what the injector knows: rounds, dry streak, spent "
+                          "fingerprints, active lenses"
+                     ).set_defaults(func=cmd_replenish_status)
 
     # --- sop (managed standard operating procedures) ---
     so = sub.add_parser("sop", help="standard operating procedures "

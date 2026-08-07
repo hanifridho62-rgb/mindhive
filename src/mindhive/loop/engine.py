@@ -18,7 +18,47 @@ from .driver import preflight
 # Run-end reasons that mean "usage ran out mid-plan": the Claude usage/rate
 # limit (api_cap) and the local budget gate (budget_cap). These get the
 # roadmap interruption marker so the next session inherits the big picture.
-USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap")
+# `max_hours` joins the two usage caps: a run that ran out of wall clock has
+# exactly the same unfinished plan as one that ran out of quota, and the next
+# session needs the baton either way.
+USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap", "max_hours")
+
+
+def _relay_state(project, run_id, cause, steps) -> dict:
+    """The baton: what the next session needs that the steps alone do not carry.
+
+    Three fields, and one of them is a CACHE rather than a source of truth. The
+    spent fingerprints are already recoverable by folding `work_injected` — that
+    is the whole reason `replenish` has no sidecar — so this copy exists only to
+    save a re-mine after a five-hour cooldown. `autoresume` unions it with the
+    fresh fold and lets the fold win, which means a stale or truncated cache can
+    only ever cost a candidate that the ledger would also have skipped. A cache
+    that could REMOVE something from the spent set would be the invisible drift
+    the no-sidecar rule exists to prevent.
+
+    Best-effort: this runs inside the snapshot's own try, and a relay that cannot
+    be computed must not cost the marker itself."""
+    try:
+        from .. import replenish as rp_mod
+        from .. import roadmap as roadmap_mod
+
+        hist = rp_mod.history(events.read_all(project), surface="loop",
+                              run_id=run_id)
+        injected = sum(1 for s in steps if s.get("new"))
+        remaining = sum(1 for s in steps
+                        if s.get("status") in ("active", "pending"))
+        context = (f"loop run {run_id} stopped on {cause} with {remaining} "
+                   f"step(s) open, {injected} of them added by the injector. "
+                   f"Steps marked (new) were mined from the record, not planned "
+                   f"at the start.")
+        return {
+            "relay_context": context[:roadmap_mod.MAX_RELAY_CONTEXT_CHARS],
+            "spent_fingerprints":
+                sorted(hist.fingerprints)[:roadmap_mod.MAX_RELAY_FINGERPRINTS],
+            "dry_rounds": hist.dry_rounds,
+        }
+    except Exception:                                           # noqa: BLE001
+        return {}
 
 
 def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
@@ -47,6 +87,7 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
                        "steps": steps}
         int_payload = {"action": "interrupt", "plan_id": run_id,
                        "cause": cause}
+        int_payload.update(_relay_state(project, run_id, cause, steps))
         roadmap_mod.validate_payload(set_payload)
         roadmap_mod.validate_payload(int_payload)
         events.append_event("roadmap", set_payload, tags=["roadmap"],
@@ -64,6 +105,122 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
         pass
 
 
+def _innovation_capacity(project, run_id, held):
+    """Whether this run still has innovation capacity it never spent.
+
+    Total, and it fails toward EXITING: any unreadable record, any exception,
+    yields the default capacity, which withholds nothing. A check that cannot see
+    the ledger must never be the reason a run refuses to stop — that failure mode
+    is a pinned session, and it is the one this project's Stop-hook rules single
+    out as unacceptable.
+
+    "Proposed" is read off the `lens` field of this run's landed rows. A fused
+    systemic row would name `resonance` rather than its members, which would read
+    as "not proposed" — unreachable in practice, because `innovation` keys its
+    deferral on a title slug and no other lens ever produces one to collide with,
+    so it has nothing to fuse with. The cost if that ever changed is one extra
+    held iteration, which the one-shot flag bounds."""
+    try:
+        from .. import replenish as rp_mod
+        evs = events.read_all(project)
+        profile = rp_mod.tuning_profile(evs, surface="loop")
+        proposed = False
+        for ev in evs:
+            payload = getattr(ev, "payload", None)
+            if getattr(ev, "type", None) != "work_injected" \
+                    or not isinstance(payload, dict):
+                continue
+            if (payload.get("run_id") == run_id
+                    and payload.get("outcome") == "landed"
+                    and payload.get("lens") == "innovation"):
+                proposed = True
+                break
+        return safeguards.InnovationCapacity(profile.healthy, proposed,
+                                             held)
+    except Exception:                                           # noqa: BLE001
+        return safeguards.InnovationCapacity()
+
+
+def _replenish_before_exit(project, loop_dir, cfg, run_id, tracker=None,
+                           ambition=None) -> int:
+    """Mine the record for outstanding work and land it as required checklist
+    items. Returns how many pieces landed.
+
+    Called at the one moment a run would otherwise finish cleanly, which is why it
+    is best-effort in the same sense as the interruption snapshot: an injector
+    fault must not turn a completed run into a crashed one, and it must never be
+    able to pin a run open. Every failure path returns 0, which means "honour the
+    exit" — the safe direction.
+
+    Silence is not one of the failure modes, though. `replenish` records a broken
+    lens through the `tool_failed` channel the failure loop already audits, and an
+    outer fault is recorded here for the same reason: an injector that quietly
+    stopped working would look exactly like a project with no outstanding work."""
+    if not getattr(cfg, "replenish_enabled", True):
+        return 0
+    try:
+        from .. import replenish as rp_mod, replenish_sinks as sink_mod
+
+        # *ambition* overrides the operator's dial for ONE round, and only the
+        # anti-lazy hold passes it: that hold exists precisely to spend innovation
+        # capacity, and the innovation lens runs at `ambitious` alone. Overriding
+        # the dial for the round that was called to do that is the point; doing it
+        # on any other round would silently ignore the operator's setting.
+        choice = rp_mod.resolve_ambition(ambition or cfg.replenish_ambition)
+        round_cfg = rp_mod.ReplenishConfig.for_profile(
+            choice.profile,
+            # Consecutive rounds that find nothing end the run. Safe here and
+            # only here: the streak is scoped to this run_id, so a quiet run
+            # cannot switch the loop surface off for the next one.
+            dry_rounds_to_exit=getattr(cfg, "replenish_dry_rounds_to_exit", 2),
+            max_rounds_per_run=getattr(cfg, "replenish_max_rounds", 5),
+            # `None` unless the operator set one, in which case it overrides the
+            # dial for that setting alone.
+            min_score=getattr(cfg, "replenish_min_score", None),
+            max_per_round=getattr(cfg, "replenish_max_per_round", None),
+            bounded_run=True)
+        evs = events.read_all(project)
+        # The agentic lens may cite ONLY facts this process already knows, and the
+        # changed paths are its share of those. A tracker-less run (tests inject
+        # their own progress_fn) simply gives it less to stand on, which the score
+        # then reflects rather than hides.
+        changed = tuple(tracker.changed_paths()) if tracker is not None else ()
+        result = rp_mod.run_round(
+            evs, surface="loop",
+            sink=sink_mod.fix_plan_sink(loop_dir, run_id=run_id),
+            lenses=rp_mod.lenses_for(choice.profile),
+            cfg=round_cfg, project=project, run_id=run_id,
+            # The loop is the surface with an outcome history to tune on: it runs
+            # rounds back to back and can see what its own injections produced.
+            tune=True,
+            ctx=rp_mod.LensContext(evs=tuple(evs), project=project,
+                                   run_id=run_id, changed_paths=changed))
+        if choice.fell_back and result.round_no == 1:
+            # Once per run, not once per round: an operator misspelling the dial
+            # deserves to be told, and deserves not to have it repeated into every
+            # future briefing (SOP memo-hygiene §3).
+            events.append_event(
+                "decision",
+                {"text": f"replenish ambition {choice.requested!r} is not a "
+                         f"known position — running {choice.profile.name} "
+                         f"instead. Valid: "
+                         f"{', '.join(sorted(rp_mod.PROFILES))}."},
+                tags=["replenish", "config"], project=project)
+        return len(result.landed)
+    except Exception as exc:                                    # noqa: BLE001
+        try:
+            events.append_event(
+                "tool_failed",
+                {"text": f"replenish round failed: {type(exc).__name__}: "
+                         f"{exc}"[:500],
+                 "signature": "replenish:round",
+                 "action": "run a replenishment round before the loop exits"},
+                tags=["replenish", "failure"], project=project)
+        except Exception:                                       # noqa: BLE001
+            pass
+        return 0
+
+
 def run_loop(project, loop_dir, cfg, driver, *,
              now_fn=time.time, sleep_fn=time.sleep, progress_fn=None,
              live=False, force=False):
@@ -74,12 +231,16 @@ def run_loop(project, loop_dir, cfg, driver, *,
     loop_dir = Path(loop_dir)
     guard.ensure_safe(force=force)              # LIVE_LOCK check
 
+    # Held so the replenishment round can ask WHICH files moved, not just whether
+    # any did. `changed_paths()` is non-destructive, so reading it does not consume
+    # the snapshot the progress detector below depends on.
+    tracker = None
     if progress_fn is None:
         from .progress import MtimeTracker
-        _tracker = MtimeTracker(loop_dir.parent)
-        _tracker.snapshot()
+        tracker = MtimeTracker(loop_dir.parent)
+        tracker.snapshot()
 
-        def progress_fn(_i, _t=_tracker):   # noqa: E306
+        def progress_fn(_i, _t=tracker):   # noqa: E306
             return _t.changed()
 
     cb = safeguards.CircuitBreaker(safeguards.BreakerConfig(
@@ -90,6 +251,12 @@ def run_loop(project, loop_dir, cfg, driver, *,
     bcfg = budget_mod.BudgetConfig(cfg.window_hours, cfg.window_token_budget,
                                    cfg.window_cost_budget_usd)
     budget_entries = []
+
+    # The anti-lazy hold is once per RUN, so its flag lives here rather than in
+    # the iteration. Folding it out of the ledger instead would be the wrong
+    # trade: the flag has to survive a forced round that proposes nothing, and
+    # that round leaves no row to fold.
+    anti_lazy_held = False
 
     run_id = uuid.uuid4().hex[:12]
     tasks0 = task_mod.load_tasks(loop_dir)
@@ -201,6 +368,54 @@ def run_loop(project, loop_dir, cfg, driver, *,
                 status, required_remaining, json_mode=not live,
                 min_heuristics=cfg.min_completion_heuristics)
             if done:
+                # The run believes it is finished and the checklist agrees. Ask
+                # the record before honouring that: a run that stops here while
+                # the ledger still proves work outstanding is the quiet ending
+                # this whole feature exists to prevent.
+                if _replenish_before_exit(project, loop_dir, cfg, run_id,
+                                         tracker):
+                    # Required items now remain, so `should_exit` will refuse on
+                    # its own next iteration — the count does the forcing, not
+                    # this branch. The breaker resets because finding
+                    # evidence-backed work IS progress; carrying a no-progress
+                    # streak across it would trip the breaker for succeeding.
+                    cb.reset()
+                    continue
+
+                # The record proves nothing outstanding. One question left, and
+                # it is the only one the record cannot answer by itself: has this
+                # run, on a system its own outcome history proves healthy, ever
+                # proposed an improvement? A run that never did has not finished
+                # so much as taken the cheapest path to a completion signal.
+                #
+                # Asked HERE rather than on the first `should_exit` call above
+                # because it is the last question, not the first: it is only
+                # meaningful once every structural stop has been satisfied and
+                # the replenishment round has come back empty. Asking earlier
+                # would also cost a full ledger read on every iteration.
+                capacity = _innovation_capacity(project, run_id, anti_lazy_held) \
+                    if cfg.replenish_anti_lazy else None
+                done, exit_reason = safeguards.should_exit(
+                    status, required_remaining, json_mode=not live,
+                    min_heuristics=cfg.min_completion_heuristics,
+                    capacity=capacity)
+                if not done:
+                    # One-shot, and the flag is set BEFORE the forced round so
+                    # that a round which proposes nothing still cannot hold the
+                    # run again. A hold that could repeat would pin the run open
+                    # forever, which is strictly worse than an early exit.
+                    anti_lazy_held = True
+                    events.append_event(
+                        "decision",
+                        {"text": f"loop run {run_id} claimed completion with no "
+                                 f"innovation work proposed and a healthy "
+                                 f"outcome streak — holding the exit once to "
+                                 f"spend that capacity at ambitious"[:500]},
+                        tags=["replenish", "anti-lazy"], project=project)
+                    _replenish_before_exit(project, loop_dir, cfg, run_id,
+                                           tracker, ambition="ambitious")
+                    cb.reset()
+                    continue
                 reason = "completed"
                 break
 

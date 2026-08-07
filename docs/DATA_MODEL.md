@@ -133,7 +133,44 @@ attaches to the **exit code**, which was observed — `counts` is a parse, and a
 unparseable summary records counts **absent rather than zero**, because "we
 could not tell" and "nothing passed" are different facts. Full output goes to
 `runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
-path).
+path),
+`work_injected` (`{outcome, round, surface, run_id?, lens?, title?, evidence[]?,
+fingerprint?, kind?, score?, terms?, reason?, dropped?, plan_id?, step_index?}` —
+one row per replenishment decision, written by `replenish.py`: `outcome` ∈ landed,
+refused, truncated, dry. `landed` and `refused` are per-candidate and carry
+`lens`, `title` and `fingerprint`. `fingerprint` is a SHA-256 digest minted by
+`replenish.generate_fingerprint`, never a readable key: the field is capped, and a
+readable key long enough to be clamped to that cap would let two different
+conditions share one identity — which reads as "already proposed" and silences the
+lens that found the second one. The digest is built from a **length-prefixed**
+encoding of the lens name and the lens's chosen identity parts, so no component's
+content can forge a separator and collide with another (`repair` derives its parts
+from arbitrary captured error text). Parts are sorted, which is a deliberate SET
+contract for keys made of unordered collections such as `audit`'s uncovered file
+set. `kind` is optional and carries the readable classification the digest gives
+up, for a lens that observes more than one kind of condition (`tech-debt` proposes
+both oversized modules and uncleared review entries); a FUSED systemic candidate
+carries `lens: "resonance"`, `kind: "systemic"`. `terms` is optional and appears on
+`landed` rows only: the named score terms (`base`, `recurrence`, `severity`,
+`magnitude`, `innovation`, `resonance`, `decay`) with their integer values plus
+`total`, zero terms omitted. It exists because `score` alone says a candidate
+cleared the bar and only the terms say *how* — on magnitude, on a recurrence the
+record kept adding to, or on several lenses resonating about one file. Rows
+written before the field existed simply lack it, and the fold reads them
+unchanged. Not every refusal is recorded: a candidate refused only for scoring
+below the round's threshold writes **no row**, because a recorded refusal spends
+the fingerprint and "below the bar" is *not yet* rather than *no*. `landed`
+additionally requires a **non-empty**
+`evidence` list, because a candidate with nothing to point at is exactly what
+the value gate refuses and the contract must not let one in through the raw
+surface. `truncated` carries `dropped` — a cap that silently cut a round would
+read as "nothing more was found". `dry` carries nothing extra and exists as its
+own outcome because "this round found nothing" has to be a recorded fact: the
+two-consecutive-empty-rounds exit cannot be derived from silence. These rows are
+the injector's **only** persistent state — spent fingerprints, the round counter
+and the dry-round count are folded back out of them, so there is no sidecar that
+can drift. The work itself is not here: a landed candidate becomes a `roadmap`
+step, which is semantic and rides the LEDGER, the chain and recall).
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
@@ -195,8 +232,13 @@ Key joins an AI reader should know:
   (`sop.fold`); `files[]` in `code_change` joins audit entries to the
   `file_touched` telemetry that queued the gate.
 - `plan_id` threads a roadmap's lifecycle events into one plan record
-  (`roadmap.fold`) and joins the `autoresume` delivery telemetry
-  (`autoresume.fold`) to the interrupted plan whose marker it re-delivers.
+  (`roadmap.fold`), joins the `autoresume` delivery telemetry
+  (`autoresume.fold`) to the interrupted plan whose marker it re-delivers, and
+  — on a `landed` `work_injected` row, together with `step_index` — points at
+  the roadmap step the injector actually produced. That is the only link from an
+  audit row to its work: the row explains WHY a step exists, the step IS the
+  work. The key is optional on the row because a future sink need not land in a
+  roadmap at all (the loop's checklist sink has no `plan_id`).
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
 - `task_id` is MindNetwork's join key and threads **three** streams:

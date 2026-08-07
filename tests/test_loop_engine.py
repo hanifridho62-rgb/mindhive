@@ -1,9 +1,30 @@
 # tests/test_loop_engine.py
 from pathlib import Path
 
+import pytest
+
 from mindhive import events, runlog
 from mindhive.loop import engine, config
 from mindhive.loop.driver import DriverResult, Usage
+
+# Captured at import, BEFORE the autouse fixture below replaces the attribute —
+# the only way a test in this file can reach the real function.
+_REAL_REPLENISH_BEFORE_EXIT = engine._replenish_before_exit
+
+
+@pytest.fixture(autouse=True)
+def _no_replenishment(monkeypatch):
+    """Silence the injector for the tests that are about something else.
+
+    The replenishment round fires at the exact moment a run would exit cleanly,
+    and its lenses read THIS repository — so with it live, every exit assertion
+    in this file would depend on whether the working tree currently has an
+    unlogged change. It does, most of the time, while this file is being edited.
+
+    The tests that ARE about the injector opt back in explicitly by patching this
+    seam themselves."""
+    monkeypatch.setattr(engine, "_replenish_before_exit",
+                        lambda *_a, **_k: 0)
 
 
 def _setup(tmp_path, monkeypatch):
@@ -14,6 +35,36 @@ def _setup(tmp_path, monkeypatch):
     (d / "PROMPT.md").write_text("Build it", encoding="utf-8")
     (d / "fix_plan.md").write_text("- [ ] step one\n", encoding="utf-8")
     return d
+
+
+def test_the_loop_passes_its_replenish_overrides_into_the_round(tmp_path,
+                                                                monkeypatch):
+    # `_replenish_before_exit` is stubbed out by the autouse fixture for every
+    # other test in this file, so its own reads of the per-setting overrides were
+    # never executed: a typo in one `getattr` name would silently fall back to the
+    # default and no test would notice.
+    loop_dir = _setup(tmp_path, monkeypatch)
+    from mindhive import replenish as rp
+
+    seen = {}
+
+    def _capture(_evs, **kw):
+        seen["cfg"] = kw["cfg"]
+        return rp.RoundResult(round_no=1)
+
+    monkeypatch.setattr(rp, "run_round", _capture)
+    cfg = config.LoopConfig(replenish_ambition="ambitious",
+                            replenish_min_score=40,
+                            replenish_max_per_round=2,
+                            replenish_dry_rounds_to_exit=3,
+                            replenish_max_rounds=7)
+    _REAL_REPLENISH_BEFORE_EXIT("test", loop_dir, cfg, "run-1")
+    round_cfg = seen["cfg"]
+    assert (round_cfg.min_score, round_cfg.max_per_round) == (40, 2)
+    assert round_cfg.dry_rounds_to_exit == 3
+    assert round_cfg.max_rounds_per_run == 7
+    # The per-run cap still comes from the position, not from the round override.
+    assert round_cfg.max_injections_per_run == 25
 
 
 class FakeDriver:
@@ -236,10 +287,10 @@ def test_api_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
     assert all(e.payload["plan_id"] == result["run_id"] for e in rms)
     assert rms[0].payload["prompt"] == "Build it"
     assert rms[0].payload["steps"] == [
-        {"text": "done step", "status": "done"},
-        {"text": "step one", "status": "active"},
-        {"text": "step two", "status": "pending"},
-        {"text": "someday", "status": "skipped"},
+        {"text": "done step", "status": "done", "new": False},
+        {"text": "step one", "status": "active", "new": False},
+        {"text": "step two", "status": "pending", "new": False},
+        {"text": "someday", "status": "skipped", "new": False},
     ]
     assert rms[1].payload["cause"] == "api_cap"
     types = [e.type for e in evs]

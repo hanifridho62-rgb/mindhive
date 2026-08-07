@@ -43,12 +43,32 @@ MAX_CAUSE_CHARS = 120
 _NOTICE_DONE_TAIL = 3
 _NOTICE_PENDING_HEAD = 3
 
+# The provenance marker for an injected step, in ONE place. It shipped as three
+# separate string literals and three of the renderers that read the same step
+# dicts never got one — including `autoresume.resume_prompt`, the leg that
+# delivers an interrupted plan back into Claude, so the resumed agent could not
+# tell injected work from the plan it started with. A shared helper is what makes
+# "marked wherever rendered" checkable instead of aspirational.
+NEW_MARKER = "(new) "
+
+
+def new_prefix(step) -> str:
+    """``NEW_MARKER`` when *step* was added by the replenishment injector, else
+    "". Every text renderer of a roadmap step goes through this."""
+    return NEW_MARKER if (step or {}).get("new") else ""
+
 
 def _norm_steps(raw):
-    """Normalize a ``set`` payload's steps into ``[{text, status, note}]``.
+    """Normalize a ``set`` payload's steps into ``[{text, status, note, new}]``.
     Plain strings default to pending; when no step carries an explicit
     status, the first becomes active so the roadmap always shows where work
-    starts. Assumes validate_payload already accepted *raw*."""
+    starts. Assumes validate_payload already accepted *raw*.
+
+    ``new`` marks a step that was NOT in the plan the work started from — one
+    the replenishment injector added because the record proved it outstanding
+    (see replenish.py). It defaults to False, so every historical event folds
+    exactly as it did before the key existed, and it is provenance rather than
+    recency: nothing clears it, including completing the step."""
     steps, explicit = [], False
     for s in raw:
         if isinstance(s, dict):
@@ -56,10 +76,11 @@ def _norm_steps(raw):
             explicit = explicit or bool(s.get("status"))
             steps.append({"text": str(s.get("text", "")).strip(),
                           "status": status,
-                          "note": str(s.get("note") or "").strip()})
+                          "note": str(s.get("note") or "").strip(),
+                          "new": bool(s.get("new"))})
         else:
             steps.append({"text": str(s).strip(), "status": "pending",
-                          "note": ""})
+                          "note": "", "new": False})
     if steps and not explicit:
         steps[0]["status"] = "active"
     return steps
@@ -112,6 +133,14 @@ def validate_payload(payload) -> None:
                     raise ValueError(
                         "roadmap step status must be one of: "
                         + ", ".join(STATUSES))
+                # Checked rather than coerced: `_norm_steps` runs bool() over
+                # whatever arrives, so a string "false" would fold as True and
+                # permanently mislabel a step as injected work.
+                if "new" in s and not isinstance(s.get("new"), bool):
+                    raise ValueError(
+                        "roadmap step 'new' must be true or false — it marks a "
+                        "step the replenishment injector added, not one from "
+                        "the original plan")
             else:
                 text = str(s).strip()
             if not text:
@@ -136,7 +165,51 @@ def validate_payload(payload) -> None:
         if len(cause) > MAX_CAUSE_CHARS:
             raise ValueError(
                 f"roadmap cause exceeds {MAX_CAUSE_CHARS} chars")
+        _validate_relay(payload)
     # resume / complete: plan_id is enough.
+
+
+# The relay: what an interrupted loop hands the next session.
+MAX_RELAY_CONTEXT_CHARS = 1000
+MAX_RELAY_FINGERPRINTS = 64
+
+
+def _validate_relay(payload) -> None:
+    """Check the optional relay fields an interrupted LOOP plan may carry.
+
+    Capped and rejected rather than truncated, like every neighbouring field: a
+    silently shortened fingerprint list would be a cache that looks complete and
+    is not, and the failure it causes — work re-proposed that was already spent —
+    would be invisible.
+
+    All three are optional. An interrupt written by `hive roadmap interrupt`, or
+    by any version of this code before the relay existed, carries none of them."""
+    context = payload.get("relay_context")
+    if context is not None:
+        if not isinstance(context, str):
+            raise ValueError("roadmap relay_context must be text")
+        if len(context) > MAX_RELAY_CONTEXT_CHARS:
+            raise ValueError(
+                f"roadmap relay_context exceeds {MAX_RELAY_CONTEXT_CHARS} chars")
+
+    fingerprints = payload.get("spent_fingerprints")
+    if fingerprints is not None:
+        if not isinstance(fingerprints, list):
+            raise ValueError("roadmap spent_fingerprints must be a list")
+        if len(fingerprints) > MAX_RELAY_FINGERPRINTS:
+            raise ValueError(
+                f"roadmap spent_fingerprints exceeds {MAX_RELAY_FINGERPRINTS} "
+                f"entries")
+        for entry in fingerprints:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(
+                    "roadmap spent_fingerprints entries must be non-empty text")
+
+    dry_rounds = payload.get("dry_rounds")
+    if dry_rounds is not None:
+        if isinstance(dry_rounds, bool) or not isinstance(dry_rounds, int) \
+                or dry_rounds < 0:
+            raise ValueError("roadmap dry_rounds must be a non-negative integer")
 
 
 def _progress(steps) -> dict:
@@ -228,11 +301,29 @@ def fold(evs) -> dict:
             note = str(p.get("note") or "").strip()
             if note:
                 rec["interrupt_note"] = note
+            # The relay, carried only when the interrupt supplied it. Read
+            # defensively: an interrupt written by `hive roadmap interrupt`, or by
+            # any version before the relay existed, has none of these, and the
+            # fold must not invent them.
+            context = str(p.get("relay_context") or "").strip()
+            if context:
+                rec["relay_context"] = context
+            spent = p.get("spent_fingerprints")
+            if isinstance(spent, list):
+                rec["spent_fingerprints"] = [f for f in spent
+                                             if isinstance(f, str) and f.strip()]
+            dry = p.get("dry_rounds")
+            if isinstance(dry, int) and not isinstance(dry, bool) and dry >= 0:
+                rec["dry_rounds"] = dry
         elif action == "resume":
             rec["status"] = "active"
             rec["cause"] = ""
             rec["interrupted_at"] = ""
             rec.pop("interrupt_note", None)
+            # The relay was consumed by the resume; keeping it would let a later
+            # reader treat a live plan's stale baton as current.
+            for key in ("relay_context", "spent_fingerprints", "dry_rounds"):
+                rec.pop(key, None)
         elif action == "complete":
             rec["status"] = "completed"
         rec["updated"] = ev.ts
@@ -282,14 +373,29 @@ def steps_from_plan_items(items) -> list:
     Texts are truncated to the contract cap so an oversized checklist item can
     never invalidate (and thereby silently drop) the whole marker."""
     steps = []
-    for t in items.get("done") or []:
-        steps.append({"text": t[:MAX_STEP_CHARS], "status": "done"})
-    for i, t in enumerate(items.get("planned") or []):
-        steps.append({"text": t[:MAX_STEP_CHARS],
-                      "status": "active" if i == 0 else "pending"})
-    for t in items.get("not_yet") or []:
-        steps.append({"text": t[:MAX_STEP_CHARS], "status": "skipped"})
+    for it in items.get("done") or []:
+        steps.append(_step_from_item(it, "done"))
+    for i, it in enumerate(items.get("planned") or []):
+        steps.append(_step_from_item(it, "active" if i == 0 else "pending"))
+    for it in items.get("not_yet") or []:
+        steps.append(_step_from_item(it, "skipped"))
     return steps[:MAX_STEPS]
+
+
+def _step_from_item(item, status: str) -> dict:
+    """One roadmap step from one parsed checklist item.
+
+    This is where the loop surface's `(new)` marker becomes the roadmap step's
+    `new` boolean — the single hop that lets injected work survive an interruption
+    with its provenance intact and render through the five existing consumers of
+    that flag rather than needing a sixth.
+
+    Accepts a bare string as well as a `PlanItem` so a caller holding a plain
+    checklist line (and every stored payload written before the parse existed)
+    still folds."""
+    text = getattr(item, "text", item)
+    return {"text": str(text)[:MAX_STEP_CHARS], "status": status,
+            "new": bool(getattr(item, "is_new", False))}
 
 
 # --- session auto-sync (TodoWrite -> roadmap) --------------------------------
@@ -342,7 +448,22 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
     wholesale and revives interrupted plans), and only on a material change —
     identical steps and prompt are a no-op so routine re-writes don't bloat
     the ledger. Plans not tagged ``auto`` are human-declared and never
-    touched. Returns the appended event, or None when nothing applies."""
+    touched. Returns the appended event, or None when nothing applies.
+
+    Steps marked ``new`` are CARRIED FORWARD. A ``set`` replaces the step list
+    wholesale, and this writer builds that list from TodoWrite alone — so
+    without this, one more TodoWrite after the replenishment injector had
+    written (a resumed session is enough) would silently delete the injected
+    work. TodoWrite stays authoritative for its own steps; the injected ones
+    ride along behind them.
+
+    **Injected steps win the ``MAX_STEPS`` tie-break, and todos are trimmed to
+    make room.** The first cut appended them and re-capped, which meant a
+    session at the 50-todo cap dropped every injected step — permanently, since
+    the fingerprint was already spent and every later round refuses the
+    condition as a duplicate. The two losses are not symmetric: a trimmed todo
+    reappears on the next TodoWrite, an evidence-backed injected step never
+    comes back."""
     sid = str(session_id or "")
     if not ID_RE.match(sid):
         return None
@@ -354,10 +475,22 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
     rec = fold(evs).get(sid)
     if rec is not None and AUTO_TAG not in (rec.get("tags") or []):
         return None
+    if rec is not None:
+        carried = {s["text"]: dict(s) for s in rec["steps"] if s.get("new")}
+        # A todo whose text matches an injected step INHERITS the flag rather
+        # than replacing it. Copying the step into TodoWrite is the natural
+        # response to reading "(new) …" in STATE.md, and dropping the carried
+        # copy there would quietly erase provenance the flag promises to keep.
+        merged = [dict(s, new=True) if carried.pop(s["text"], None) else s
+                  for s in steps]
+        room = max(0, MAX_STEPS - len(carried))
+        steps = merged[:room] + list(carried.values())[:MAX_STEPS]
     prompt = _session_prompt(evs, sid)
     if rec is not None and rec["prompt"] == prompt \
-            and [(s["text"], s["status"]) for s in rec["steps"]] \
-            == [(s["text"], s["status"]) for s in steps]:
+            and [(s["text"], s["status"], bool(s.get("new")))
+                 for s in rec["steps"]] \
+            == [(s["text"], s["status"], bool(s.get("new")))
+                for s in steps]:
         return None
     payload = {"action": "set", "plan_id": sid, "prompt": prompt,
                "title": prompt[:MAX_TITLE_CHARS], "steps": steps}
@@ -458,7 +591,7 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
 
 def _step_line(s, marker) -> str:
     note = f" — {s['note']}" if s.get("note") else ""
-    return f"- {marker} {s['text']}{note}"
+    return f"- {marker} {new_prefix(s)}{s['text']}{note}"
 
 
 def notice(evs) -> str:
@@ -539,7 +672,10 @@ def ledger_body(payload) -> str:
         lines = []
         for s in steps:
             if isinstance(s, dict):
+                # The marker rides the LEDGER body too, so keyword recall can
+                # tell injected work from planned work.
                 lines.append(f"- [{s.get('status', 'pending')}] "
+                             f"{new_prefix(s)}"
                              f"{str(s.get('text') or '').strip()}")
             else:
                 lines.append(f"- {str(s).strip()}")

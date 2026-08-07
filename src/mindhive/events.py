@@ -129,6 +129,24 @@ DETERMINISTIC_TYPES = {
     # hand. Only `verify.run_and_record`, which actually spawned the process,
     # may stamp it.
     "verification",
+    # One row per replenishment decision: a candidate that landed as work, one
+    # that was refused (with the reason), a cap that truncated the round, or a
+    # round that found nothing (see replenish.py). This is the injector's ONLY
+    # persistent state — spent fingerprints, the round counter and the
+    # consecutive dry-round count are folded back out of these rows, so there is
+    # no sidecar that can drift from the ledger.
+    #
+    # Deterministic, for the same reason as `verification` and `policy_denied`:
+    # it is machine-generated audit telemetry carrying no human intent, and a
+    # round can emit several rows. Semantic membership would put a LEDGER
+    # markdown file, a Memory-view row and a recall-corpus entry on disk per
+    # decision — including per REFUSAL, which is the high-volume case.
+    #
+    # The work itself is not here. A landed candidate becomes a `roadmap` step,
+    # which IS semantic and rides the LEDGER, the chain and recall; this row is
+    # the audit trail explaining why that step exists. Registry/audit content:
+    # consolidation never absorbs it.
+    "work_injected",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
@@ -182,6 +200,12 @@ _PAYLOAD_CONTRACTS = {
     # that one here would let a hand-written append forge the evidence the
     # premise gate reads.
     "verification": (".verify", "hive selftest — it records the run"),
+    # The replenishment audit row. Registered because the round's own state is
+    # folded back out of these events: a hand-appended row with a bogus
+    # `outcome` or a missing `fingerprint` would silently corrupt the dedup set
+    # and the dry-round counter, and the damage would only show up as work that
+    # stopped being proposed.
+    "work_injected": (".replenish", "hive replenish run --session <id>"),
 }
 
 

@@ -2,17 +2,66 @@
 from dataclasses import dataclass
 
 
+# --- the anti-lazy hold ---
+@dataclass(frozen=True)
+class InnovationCapacity:
+    """Whether a run that says it is finished still has capacity it never spent.
+
+    A run can satisfy every structural stop and still have stopped short: the
+    checklist is empty, the record proves nothing outstanding, and the agent
+    never once proposed an improvement. That is not completion, it is a run that
+    took the cheapest path to a completion signal.
+
+    Three conditions, and ALL of them are required, because the cost of getting
+    this wrong is a run pinned open — the exact failure this project's Stop-hook
+    rules exist to prevent.
+
+      `healthy`             the record proves it: `TUNE_LOWER_WINDOW` consecutive
+                            injections that each verified green. A struggling run
+                            must be allowed to stop; pushing a system that is
+                            already failing to also innovate is how a bad run
+                            becomes a worse one.
+      `innovation_proposed` this run has already spent the capacity, so there is
+                            nothing left to hold it open for.
+      `already_held`        the hold is ONE-SHOT per run. Without this it is a
+                            trap: if the forced round finds nothing to propose,
+                            the same three conditions hold on the next iteration
+                            and every one after it, and the run never ends.
+
+    Default-constructed it withholds nothing, which is what every caller that
+    cannot read the record must fall back to. Failing toward EXIT is the only
+    safe direction for a mechanism whose failure mode is "never stops"."""
+
+    healthy: bool = False
+    innovation_proposed: bool = False
+    already_held: bool = False
+
+    @property
+    def withholds_exit(self) -> bool:
+        return (self.healthy and not self.innovation_proposed
+                and not self.already_held)
+
+
 # --- dual-condition exit gate ---
 def should_exit(status, required_remaining: int, json_mode: bool,
-                min_heuristics: int = 0):
+                min_heuristics: int = 0, capacity=None):
     """Return (should_exit, reason). Stops only when ALL hold:
       - explicit EXIT_SIGNAL is true (authoritative), AND
       - at least ``min_heuristics`` natural-language completion signals
         corroborate it in the reply text, AND
-      - no required fix_plan items remain.
+      - no required fix_plan items remain, AND
+      - *capacity*, when supplied, is not withholding the exit.
     Explicit EXIT_SIGNAL: false always continues. In JSON mode, a missing
     explicit signal can never trigger exit (keyword-only exit suppressed).
-    ``min_heuristics=0`` restores the explicit-signal-only gate."""
+    ``min_heuristics=0`` restores the explicit-signal-only gate.
+
+    *capacity* is an `InnovationCapacity` or ``None``. It is checked LAST, after
+    every structural stop, and that order is the whole design: the hold is the
+    weakest of the reasons to keep going, so it may only ever be the reason a run
+    that would otherwise have stopped does one more iteration — never the reason
+    a run that had a real reason to continue reports the wrong one. ``None``
+    restores the gate exactly as it was, so a caller that does not opt in cannot
+    be held open by accident."""
     if status.exit_signal is False:
         return False, "explicit_continue"
     explicit_done = status.exit_signal is True
@@ -23,6 +72,8 @@ def should_exit(status, required_remaining: int, json_mode: bool,
         return False, "insufficient_completion_heuristics"
     if required_remaining > 0:
         return False, "required_items_remain"
+    if capacity is not None and capacity.withholds_exit:
+        return False, "unused_innovation_capacity"
     return True, "completed"
 
 
@@ -76,6 +127,20 @@ class CircuitBreaker:
                 return True
             return False
         return True
+
+    def reset(self) -> None:
+        """Clear the failure counters. Public, and the engine calls it.
+
+        Landing evidence-backed work IS progress: the run found something the
+        record proves is outstanding and wrote it into the plan. Letting the
+        no-progress counter carry across that would trip the breaker on the exact
+        behaviour the replenishment feature exists to produce, and the breaker
+        would then kill the run for succeeding.
+
+        It exists as a public method rather than the engine calling `_close()`
+        because a private call from another module is a boundary violation that
+        reads as an accident; this one is deliberate."""
+        self._close()
 
     def _open(self, now):
         self.state = "OPEN"

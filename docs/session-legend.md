@@ -29,8 +29,8 @@ layers: deterministic **hooks** that fire on every session/prompt/tool call, a
 Console entry point: `hive` → `mindhive.__main__:main` (`pyproject.toml`
 `[project.scripts]`). Subcommands: `append hook session project state projects
 directives context packs verify selftest premise recall consolidate gc export
-embed briefing review log sop roadmap mindnet autoresume graph plugins skills
-clusters sync dashboard harvest autosync loop flag failures rules triggers
+embed briefing review log replenish sop roadmap mindnet autoresume graph plugins
+skills clusters sync dashboard harvest autosync loop flag failures rules triggers
 enrich`.
 
 > **Probing the CLI from a worktree gives you the wrong branch.** The venv's
@@ -50,7 +50,7 @@ All paths relative to `src/mindhive/`.
 | Module | Owns |
 |---|---|
 | `__main__.py` | The whole argparse tree **and** the live-hook dispatcher (`cmd_hook`). ~3.4k lines — past the thermo-nuclear 1000-line threshold; a known standing caveat, treat additions here with suspicion. |
-| `paths.py` | **Every on-disk location.** `store_home()`, `detect_project()`, `project_dir()`, `events_dir()`, `runs_dir()`, plus `write_text_atomic`. Never hand-build a store path; call these. |
+| `paths.py` | **Every on-disk location**, and **path equality**. `store_home()`, `detect_project()`, `project_dir()`, `events_dir()`, `runs_dir()`, plus `write_text_atomic`. Never hand-build a store path; call these. It also owns `normalise_path()` and `path_spellings()` — the one answer to "are these two strings the same file?", used by `changelog` (does this entry cover this touched file) and `replenish` (has this caveat been addressed). They live here rather than in either caller because the change-log must not depend on the injector to compare two strings, and because the ledger holds worktree-absolute paths while git reports repo-relative ones: compared literally the two sets never intersect, which is what let the unlogged-changes marker grow without bound. |
 | `events.py` | The event record: schema, `VALID_TYPES` registry, `canonical_json`, `append_event`. A new event type starts here (procedure: DATA_MODEL.md §6). |
 
 ### Ledger → projections
@@ -77,10 +77,12 @@ All paths relative to `src/mindhive/`.
 | `enrich.py` | Clarifying questions appended to a fired gate context; also the Oversee enrichment. |
 | `enforce.py` + `gateguard.py` | The PreToolUse **deny** rung. `enforce.hook_decision` is the decision function; `gateguard` holds the pure classifiers behind the static policy tier. |
 | `incidents.py`, `signature.py`, `reflect.py`, `resolve.py` | The failure loop: `tool_failed` → canonical signature → incident record → prevention rule → resolution. |
-| `changelog.py`, `review.py`, `verify.py` | The three blocking gates: mandatory code change-log, thermo-nuclear review queue, mechanical test-run evidence. |
+| `changelog.py`, `review.py`, `verify.py` | The three blocking gates: mandatory code change-log, thermo-nuclear review queue, mechanical test-run evidence. `changelog.record()` resolves its file list in the order **explicit `--files` -> this session's unlogged sweep -> the pending marker -> git**, and the git leg reads the **working tree** (`git status --porcelain -uall` against an explicitly resolved root), never the branch — diffing branch-vs-master once recorded 61 files for a 14-file change-set, and `git diff` cannot see untracked paths at all. Recording an entry **discharges only the paths that entry named** (`discharge()`, preserving the marker's `created_at`, which `queue()` uses as its coverage floor); the wholesale unlink it replaced silently cleared everyone else's debt. To clear debt no ordinary entry covers — a reverted experiment, an abandoned worktree's file — log it explicitly: `hive log <category> "<why it is not a real change>" --files <paths>`. That is the only sanctioned exit, per CLAUDE.md's "do not clear the notice any other way — write the entry". |
 | `directives.py` | The operating directives injected at SessionStart. |
 | `roadmap.py`, `autoresume.py` | The ask/plan/progress registry, and post-cooldown delivery of an interrupted plan's marker back into Claude. |
 | `plugins.py`, `recommend.py`, `invoker.py`, `playbook.py` | Skill/plugin catalog (backs both `hive plugins` and `hive skills`), deterministic recommendation, the invoke channel, and the per-prompt playbook (MN-15). |
+| `replenish.py` | Adaptive work injection — the **decision** half. Seven lenses (`repair`, `evidence-gap`, `tech-debt`, `audit`, `caveat`, `coverage`, and the agentic `innovation`) fold the record for work it proves outstanding; a value gate scores each candidate and refuses anything without evidence, deduping by fingerprint. The scale is integers and every term is named, with `ScoreBreakdown.total` equal to the sum of its parts: base 10, +5 per recurrence (**how many times the fold saw the condition — nothing else**) capped at `RECURRENCE_MAX_STEPS` 20 steps, +20 severity, +5 per magnitude step (`excess_steps` — how far past its own limit the condition sits), +15 for the agentic lens on a record the tuner proves healthy, +50% resonance when several lenses name one target, and a negative decay term as history-derived weight fades with age (full inside a day, half past a week). A veto zeroes it when a prevention rule or pinned caveat already declined the work. `resonate` fuses multi-lens agreement about one `deferral_key` into a single `lens: "resonance"` systemic intervention; `is_spiking` marks a live burst of one failure signature, which is the only signal allowed past the score floor. **Scoring lives in `run_round`, not in the lenses** — one scale has to govern all of them or the threshold means nothing. The `AmbitionProfile` dial (`conservative`/`balanced`/`ambitious`) resolves threshold + lens set + per-run cap together, and `AutoTuningProfile` (folded out of `work_injected` in the same pass as everything else) shifts the threshold on what injected work actually produced. State is the `work_injected` fold, never a sidecar. Knows **nothing** about surfaces: the sink is a parameter, and `tests/test_replenish.py` asserts the module does not import one. A lens receives one `LensContext` (events, project, tree roots, changed paths, clock, model runner) so the tree-reading and model-driven lenses are testable without the real repo or a real model. `explain()` runs the whole pipeline read-only and is what `hive replenish explain` prints — the surface that makes a dead lens (one whose best score cannot clear any position it runs under) visible in one command. **Splitting this module is wanted and DEFERRED** (~2.7k lines, past the thermo-nuclear threshold; the injector proposes it at score 40, and a pinned caveat vetoes that proposal so it is not re-argued every round). Three constraints have to be designed around before anyone tries: (1) the test seam is **module-global rebinding** — `monkeypatch.setattr(replenish, "lenses_for", …)` and the same for `git_modified_paths`, `resolve_trees`, `run_round` — which works only because internal callers reference those names unqualified, so moving them to submodules breaks the seam **silently**, patching a name nothing reads any more; (2) `events.py` hardcodes the module path `".replenish"` for the `work_injected` payload contract, so the file cannot simply move; (3) `loop/`, `mindnet/` and `rotation/` re-export nothing from their `__init__.py`, so the existing split precedent offers no compatibility shim to copy for the ~60 `replenish.<name>` references across `tests/`. |
+| `replenish_sinks.py` | The **landing** half, one sink per surface. `roadmap_sink` appends steps to the plan whose `plan_id` is the session id, marked `new`; `roadmap.autoclose_session` then interrupts it and `roadmap.notice` carries it into the next session's auto-loaded STATE.md. `fix_plan_sink` writes `- [ ] (new) <title>: <why>` **above** the first Future/Optional heading (reusing `loop.task._FUTURE_HEADING`, never a second parser) so `loop.task.required_remaining_count` rises and `loop.safeguards.should_exit` refuses. On both surfaces the forcing mechanism is that hop, not prose. |
 
 ### `mindnet/` — the phase spine (MindNetwork)
 
@@ -132,6 +134,29 @@ scrapes `EXIT_SIGNAL`/`STATUS` out of the reply and `safeguards.should_exit`
 additionally requires ≥`min_completion_heuristics` natural-language completion
 signals plus zero remaining required work. Prose alone cannot end a run; prose is
 one of two conditions.
+
+**A `completed` exit is now provisional.** `engine._replenish_before_exit` runs a
+replenishment round on `surface="loop"` at that exact moment; anything it lands
+raises `required_remaining_count`, so the next `should_exit` refuses on its own —
+the count does the forcing, not the branch that called the injector. Four
+structural stops bound it, all counters folded from `work_injected` rather than
+held in memory (so a resumed run inherits its spent budget): a **dry streak**
+scoped to `run_id` (2), a per-run **injection budget** from the dial, a per-run
+**round ceiling** (`replenish_max_rounds`, 5), and a candidate **depth** ceiling
+(2, enforced in the gate). Every failure path returns 0 = honour the exit, because
+an injector able to pin a run open is worse than one that misses a round — but the
+fault is recorded as `tool_failed` under `replenish:round` or `lens:<name>`.
+
+`CircuitBreaker.reset()` is public and the engine calls it when work lands:
+finding evidence-backed work IS progress, and carrying a no-progress streak across
+it would trip the breaker for succeeding.
+
+On `api_cap`, `budget_cap` **or `max_hours`**, `_snapshot_interrupted_plan` hands
+over a baton — steps with their `new` flags, a `relay_context`, and a
+spent-fingerprint **cache**. `autoresume.rehydrate_spent` unions that cache with a
+fresh fold and **the fold wins**: the cache may only add to the spent set, so a
+stale one costs a candidate the ledger would also have skipped, while one able to
+remove an entry would silently re-propose finished work.
 
 ### Dashboard (port 54461)
 
@@ -190,7 +215,7 @@ Python so they are unit-testable.
 | `post_tool_use.ps1` | PostToolUse | `hook post_tool_use` → `hookcapture.record_post_tool_use` (+ faculty beat) |
 | `post_tool_use_failure.ps1` | **none — built but registered nowhere.** No Claude Code event fires it; `~/.claude/settings.json` registers seven hooks and this is not one of them. | `hook post_tool_use_failure` → `hookcapture.record_post_tool_use_failure` |
 | `pre_compact.ps1` | PreCompact | `append compaction` |
-| `session_end.ps1` | SessionEnd | `append session_end`, `project`, `briefing`, `graph build`, `sync`, `review queue`, `log queue`, `roadmap autoclose`; detached auto-reflection |
+| `session_end.ps1` | SessionEnd | `append session_end`, `replenish run`, `roadmap autoclose`, `review queue`, `log queue`, `project`, `briefing`, `graph build`, `sync`; detached auto-reflection. **The order of the first three is load-bearing and silent when wrong:** injected steps added *after* the autoclose still exist, but the plan is already interrupted, so `notice()` never renders them and the next session never sees the work. `tests/test_replenish_cli.py` asserts the ordering against this file. |
 | `stop.ps1` | Stop | `hook stop` → `rotation.hook.hook_decision` |
 | `autosync.ps1` | *not a hook* — and **not actually on the schedule either**: the registered `\MindHive-AutoSync` task runs `pythonw.exe -m mindhive autosync` directly, bypassing this wrapper. Editing it changes nothing. | (wrapper would call `autosync` via `pythonw.exe`) |
 

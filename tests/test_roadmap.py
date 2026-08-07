@@ -158,12 +158,14 @@ def test_plans_order_by_created_then_id():
 
 
 def test_steps_from_plan_items_maps_statuses():
+    # Bare strings on purpose: the helper must still fold a plain checklist line,
+    # because every payload stored before the parse existed holds those.
     steps = roadmap.steps_from_plan_items(
         {"done": ["a"], "planned": ["b", "c"], "not_yet": ["d"]})
-    assert steps == [{"text": "a", "status": "done"},
-                     {"text": "b", "status": "active"},
-                     {"text": "c", "status": "pending"},
-                     {"text": "d", "status": "skipped"}]
+    assert steps == [{"text": "a", "status": "done", "new": False},
+                     {"text": "b", "status": "active", "new": False},
+                     {"text": "c", "status": "pending", "new": False},
+                     {"text": "d", "status": "skipped", "new": False}]
     assert roadmap.steps_from_plan_items(
         {"done": [], "planned": [], "not_yet": []}) == []
     # oversize checklist items truncate instead of invalidating the marker

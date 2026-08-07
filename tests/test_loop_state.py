@@ -103,10 +103,15 @@ def test_list_runs_progress_groups(tmp_path):
     r = res["runs"][0]
     assert r["title"] == "wiring now"          # latest summary supersedes PROMPT title
     assert r["doing"] == "wiring now"
-    assert "iter 1: did scaffold" in r["done"]
-    assert "scaffold" in r["done"]
-    assert r["planned"] == ["wire API"]
-    assert r["not_yet"] == ["polish"]
+    # Records, and every group has the SAME keys — including the iteration
+    # summaries. A list mixing bare strings with records is what would break the
+    # Oversee renderer, silently, and only on runs that happened to have both.
+    assert [d["text"] for d in r["done"]] == ["iter 1: did scaffold", "scaffold"]
+    assert all(set(d) == {"text", "new", "status"} for d in r["done"])
+    assert r["planned"] == [{"text": "wire API", "new": False,
+                             "status": "pending"}]
+    assert r["not_yet"] == [{"text": "polish", "new": False,
+                             "status": "pending"}]
 
 
 def test_dismissed_live_run_resurfaces_on_new_events():
