@@ -346,3 +346,167 @@ def test_a_malformed_caveat_row_does_not_break_the_lens():
 
 def test_the_caveat_lens_is_registered():
     assert replenish.LENSES["caveat"] is replenish.caveat
+
+
+# --- the filesystem lenses (U4) ----------------------------------------------
+# Injectable root throughout: a lens that could only be tested against the real
+# repo would make every assertion depend on the current state of this checkout.
+
+import json                                                        # noqa: E402
+from mindhive import review                                        # noqa: E402
+
+
+def _tree(root, files):
+    """Write ``{repo-relative path: line count}`` under *root*."""
+    for rel, lines in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(f"# line {i}" for i in range(lines)),
+                     encoding="utf-8")
+    return root
+
+
+def _debt(root, **kw):
+    return replenish.debt(events.read_all(), root=root, **kw)
+
+
+def test_a_file_past_the_threshold_is_proposed(tmp_path):
+    _tree(tmp_path, {"src/mindhive/big.py": 1600})
+    cands = _debt(tmp_path)
+    assert len(cands) == 1
+    assert cands[0].lens == "debt"
+    assert "src/mindhive/big.py" in cands[0].title
+    assert any("1600 lines" in e for e in cands[0].evidence)
+
+
+def test_a_file_under_the_threshold_is_not_proposed(tmp_path):
+    _tree(tmp_path, {"src/mindhive/small.py": 40})
+    assert _debt(tmp_path) == []
+
+
+def test_a_bigger_file_outranks_a_smaller_one(tmp_path):
+    _tree(tmp_path, {"src/mindhive/a.py": 1100, "src/mindhive/b.py": 3000})
+    by_name = {c.title.rsplit("/", 1)[-1]: c for c in _debt(tmp_path)}
+    assert by_name["b.py"].recurrence > by_name["a.py"].recurrence
+
+
+def _queue(root, rel):
+    review.pending_path(None).parent.mkdir(parents=True, exist_ok=True)
+    review.pending_path(None).write_text(
+        json.dumps({"files": [str(root / rel)], "batches": [[str(root / rel)]],
+                    "batch_count": 1}), encoding="utf-8")
+
+
+def test_a_queued_file_is_severe_even_when_small(tmp_path):
+    _tree(tmp_path, {"src/mindhive/queued.py": 30})
+    _queue(tmp_path, "src/mindhive/queued.py")
+    cands = _debt(tmp_path)
+    assert len(cands) == 1 and cands[0].severity is True
+
+
+def test_a_file_that_is_both_oversized_and_queued_yields_one_candidate(tmp_path):
+    _tree(tmp_path, {"src/mindhive/both.py": 2000})
+    _queue(tmp_path, "src/mindhive/both.py")
+    cands = _debt(tmp_path)
+    assert len(cands) == 1
+    assert cands[0].severity is True
+    assert any("threshold" in e and "thermo-nuclear" in e
+               for e in cands[0].evidence)
+
+
+def test_growth_inside_a_bucket_keeps_the_fingerprint(tmp_path):
+    _tree(tmp_path, {"src/mindhive/g.py": 1600})
+    first = _debt(tmp_path)[0].fingerprint
+    _tree(tmp_path, {"src/mindhive/g.py": 1700})
+    assert _debt(tmp_path)[0].fingerprint == first
+
+
+def test_crossing_into_a_worse_bucket_changes_the_fingerprint(tmp_path):
+    _tree(tmp_path, {"src/mindhive/g.py": 1600})
+    first = _debt(tmp_path)[0].fingerprint
+    _tree(tmp_path, {"src/mindhive/g.py": 2600})
+    assert _debt(tmp_path)[0].fingerprint != first
+
+
+def test_out_of_scope_files_are_ignored(tmp_path):
+    _tree(tmp_path, {"src/other/huge.py": 5000, "docs/huge.py": 5000})
+    assert _debt(tmp_path) == []
+
+
+def test_a_missing_tree_yields_nothing(tmp_path):
+    assert _debt(tmp_path / "nope") == []
+
+
+def test_the_walk_is_bounded_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(replenish, "SCAN_MAX_FILES", 2)
+    _tree(tmp_path, {f"src/mindhive/m{i}.py": 1600 for i in range(5)})
+    cands = _debt(tmp_path)
+    # Bounded, and the truncation rides the evidence — a silent cut would read
+    # as "these are the only oversized files in the tree".
+    assert 0 < len(cands) <= 2
+    assert any("scan stopped at 2 files" in e for e in cands[0].evidence)
+
+
+def test_the_debt_lens_is_registered():
+    assert replenish.LENSES["debt"] is replenish.debt
+
+
+def _cov(root):
+    return replenish.coverage(events.read_all(), root=root)
+
+
+def test_a_module_with_no_test_counterpart_is_proposed(tmp_path):
+    _tree(tmp_path, {"src/mindhive/foo.py": 20})
+    cands = _cov(tmp_path)
+    assert len(cands) == 1
+    assert cands[0].lens == "coverage"
+    assert "src/mindhive/foo.py" in cands[0].title
+
+
+def test_a_module_with_a_matching_test_is_not_proposed(tmp_path):
+    _tree(tmp_path, {"src/mindhive/foo.py": 20, "tests/test_foo.py": 5})
+    assert _cov(tmp_path) == []
+
+
+def test_a_package_module_matched_by_the_prefixed_name(tmp_path):
+    _tree(tmp_path, {"src/mindhive/loop/task.py": 20,
+                     "tests/test_loop_task.py": 5})
+    assert _cov(tmp_path) == []
+
+
+def test_a_package_module_matched_by_the_bare_name(tmp_path):
+    # Both conventions are live in this repo; accepting only one would propose
+    # work for modules that are in fact tested.
+    _tree(tmp_path, {"src/mindhive/loop/task.py": 20, "tests/test_task.py": 5})
+    assert _cov(tmp_path) == []
+
+
+def test_package_markers_and_the_cli_entry_point_are_skipped(tmp_path):
+    _tree(tmp_path, {"src/mindhive/__init__.py": 3,
+                     "src/mindhive/__main__.py": 900})
+    assert _cov(tmp_path) == []
+
+
+def test_recorded_churn_raises_the_coverage_recurrence(tmp_path):
+    _tree(tmp_path, {"src/mindhive/foo.py": 20})
+    for ts in ("2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z"):
+        _code_change(ts, files=["src/mindhive/foo.py"])
+    assert _cov(tmp_path)[0].recurrence == 2
+
+
+def test_an_untouched_module_does_not_clear_the_balanced_threshold(tmp_path):
+    # A coverage proposal has to earn its slot with recorded churn; without it
+    # the module is a cheaper problem than everything else in the round.
+    _tree(tmp_path, {"src/mindhive/foo.py": 20})
+    kept, refused = replenish.gate(_cov(tmp_path), frozenset(),
+                                   replenish.ReplenishConfig())
+    assert kept == [] and "below the round's minimum" in refused[0][1]
+
+
+def test_tests_themselves_are_never_proposed_for_coverage(tmp_path):
+    _tree(tmp_path, {"tests/test_thing.py": 20})
+    assert _cov(tmp_path) == []
+
+
+def test_the_coverage_lens_is_registered():
+    assert replenish.LENSES["coverage"] is replenish.coverage

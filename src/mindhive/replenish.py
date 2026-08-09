@@ -816,3 +816,209 @@ def caveat(evs) -> list:
 
 
 LENSES["caveat"] = caveat
+
+
+# --- the tree the filesystem lenses read --------------------------------------
+# Derived from this module's own location, never from cwd: `debt` and `coverage`
+# run inside the SessionEnd hook, and SOP `tool-failure-prevention` §3 records
+# seven "file does not exist" failures in this ledger caused by cwd drift
+# between calls. An editable install resolves this to the checkout actually
+# being served, which is the tree the operator is working in.
+def repo_root():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[2]
+
+
+# Only the two directories `review.in_scope` accepts. Walking the repo root
+# would drag in .venv, node_modules and .git for nothing.
+_SCAN_DIRS = ("src", "tests")
+# Bounds on the walk. A lens that stalls the SessionEnd hook is worse than a
+# lens that does not exist, and the tree is not something the injector controls.
+SCAN_MAX_FILES = 4000
+SCAN_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _scan_source(root):
+    """``(path -> line count, truncated)`` for in-scope source under *root*.
+
+    Total by construction: an unreadable or oversized file is skipped, never
+    raised on. Returns paths in the repo-relative POSIX form the evidence rows
+    and fingerprints use, so a candidate reads the same on Windows and CI."""
+    from pathlib import Path
+    from . import review as review_mod
+    root = Path(root)
+    out, seen, truncated = {}, 0, False
+    for sub in _SCAN_DIRS:
+        base = root / sub
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*.py")):
+            if seen >= SCAN_MAX_FILES:
+                truncated = True
+                break
+            posix = p.as_posix()
+            if not review_mod.in_scope(posix):
+                continue
+            seen += 1
+            try:
+                if p.stat().st_size > SCAN_MAX_BYTES:
+                    continue
+                with p.open(encoding="utf-8", errors="replace") as fh:
+                    out[p.relative_to(root).as_posix()] = sum(1 for _ in fh)
+            except OSError:
+                continue
+        if truncated:
+            break
+    return out, truncated
+
+
+# --- lens: debt ---------------------------------------------------------------
+
+# The master prompt's number. The bucket is what turns "past the threshold" into
+# a ranking, and 250 is chosen so the BALANCED gate (25) first bites at 1500
+# lines — `review.BATCH_LINE_LIMIT`, the size this project already treats as one
+# reviewable unit. Below that a file is large; at that point it stops fitting in
+# a single review pass, which is the concrete cost.
+DEBT_LINE_THRESHOLD = 1000
+DEBT_BUCKET_LINES = 250
+
+
+def _debt_bucket(lines) -> int:
+    """How many buckets past the threshold — 1 the moment it is crossed, so a
+    file exactly at the threshold still ranks above one that is not."""
+    return (lines - DEBT_LINE_THRESHOLD) // DEBT_BUCKET_LINES + 1
+
+
+def debt(evs=None, *, root=None, project=None) -> list:
+    """A file too big to hold in one review pass, or one the review queue is
+    already blocking on.
+
+    ONE candidate per file, even when both conditions hold — the outstanding
+    fact is "this file needs reducing", and two candidates would spend two of
+    the round's slots on it and mint two fingerprints for one condition.
+
+    The fingerprint keys on the path plus the size bucket, not the raw line
+    count. A file that keeps growing inside one bucket is the SAME outstanding
+    condition and must not be re-proposed every round; crossing into a worse
+    bucket genuinely is a new one."""
+    from . import review as review_mod
+    sizes, truncated = _scan_source(root or repo_root())
+    # The queue records ABSOLUTE paths (review.queue writes whatever
+    # `file_touched` carried); the scan yields repo-relative ones. Match by
+    # suffix rather than normalising either side into the other's shape — the
+    # marker may have been written from a different worktree of the same repo.
+    marker = review_mod.load_pending(project)
+    queued = [f.replace("\\", "/") for f in
+              ((marker.get("files") or []) if isinstance(marker, dict) else [])
+              if isinstance(f, str)]
+    scan_note = (f"scan stopped at {SCAN_MAX_FILES} files — this list is not "
+                 "the whole tree") if truncated else ""
+
+    out = []
+    for rel, lines in sorted(sizes.items()):
+        in_queue = any(q.endswith("/" + rel) or q == rel for q in queued)
+        over = lines >= DEBT_LINE_THRESHOLD
+        if not over and not in_queue:
+            continue
+        bucket = _debt_bucket(lines) if over else 0
+        reasons = []
+        if over:
+            reasons.append(f"{lines} lines, past the {DEBT_LINE_THRESHOLD}-line "
+                           "threshold")
+        if in_queue:
+            reasons.append("queued for thermo-nuclear review")
+        evidence = [f"{rel}: " + "; ".join(reasons)]
+        if scan_note:
+            evidence.append(scan_note)
+        out.append(Candidate(
+            lens="debt",
+            title=f"Refactor and reduce line count/complexity in {rel}",
+            fingerprint=fingerprint("debt", f"{rel}:{bucket}"),
+            evidence=tuple(evidence),
+            recurrence=max(0, bucket),
+            # The review queue is the project's own blocking notice: STATE.md
+            # renders it as a gate, not a suggestion (SOP `change-audit` §4).
+            severity=in_queue))
+    return out
+
+
+LENSES["debt"] = debt
+
+
+# --- lens: coverage -----------------------------------------------------------
+
+# Modules with no test counterpart by design, not by omission: a package marker
+# and the CLI entry point, whose behaviour is covered through the subcommand
+# suites rather than a file named after it.
+_COVERAGE_SKIP = ("__init__.py", "__main__.py")
+
+
+def _test_names(rel: str):
+    """The test file names that would count as covering *rel*.
+
+    Both conventions are live in this repo: `src/mindhive/loop/task.py` is
+    covered by `tests/test_loop_task.py`, and `src/mindhive/mindnet/agent.py` by
+    `tests/test_mindnet_agent.py` — but several package modules are covered by a
+    bare `tests/test_<name>.py`. Accepting both is what keeps the lens from
+    proposing work for modules that are, in fact, tested."""
+    parts = rel.split("/")
+    if len(parts) < 3:                       # not under src/mindhive/
+        return ()
+    stem = parts[-1][:-3]
+    pkg = parts[2:-1]                        # src / mindhive / <pkg...> / name
+    names = [f"tests/test_{stem}.py"]
+    if pkg:
+        names.insert(0, "tests/test_" + "_".join(pkg + [stem]) + ".py")
+    return tuple(names)
+
+
+def coverage(evs=None, *, root=None) -> list:
+    """A source module with no test file named after it.
+
+    `recurrence` is how many `code_change` entries have named the module, which
+    is the discriminating fact: an untested module nobody touches is a different
+    (and much cheaper) problem from an untested module under active change. It
+    is also what keeps the lens off the bottom of the scale — a bare candidate
+    scores the base and would never clear the balanced threshold, so a coverage
+    proposal has to earn its place with recorded churn."""
+    sizes, truncated = _scan_source(root or repo_root())
+    existing = {rel for rel in sizes if rel.startswith("tests/")}
+    churn = {}
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "code_change":
+            continue
+        p = getattr(ev, "payload", None)
+        if not isinstance(p, dict):
+            continue
+        for f in p.get("files") or []:
+            if isinstance(f, str):
+                key = f.replace("\\", "/")
+                churn[key] = churn.get(key, 0) + 1
+
+    scan_note = (f"scan stopped at {SCAN_MAX_FILES} files — this list is not "
+                 "the whole tree") if truncated else ""
+    out = []
+    for rel in sorted(sizes):
+        if not rel.startswith("src/mindhive/"):
+            continue
+        if rel.rsplit("/", 1)[-1] in _COVERAGE_SKIP:
+            continue
+        wanted = _test_names(rel)
+        if not wanted or any(n in existing for n in wanted):
+            continue
+        changes = sum(n for path, n in churn.items() if path.endswith(rel))
+        evidence = [f"{rel} has no test counterpart",
+                    "looked for: " + ", ".join(wanted),
+                    f"{changes} change-log entr(ies) name it"]
+        if scan_note:
+            evidence.append(scan_note)
+        out.append(Candidate(
+            lens="coverage",
+            title=f"Bootstrap unit test suite for {rel}",
+            fingerprint=fingerprint("coverage", rel),
+            evidence=tuple(evidence),
+            recurrence=changes))
+    return out
+
+
+LENSES["coverage"] = coverage

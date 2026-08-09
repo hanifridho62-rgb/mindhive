@@ -11,11 +11,26 @@ asserted directly.
 import json
 from pathlib import Path
 
-from mindhive import events, roadmap
+import pytest
+
+from mindhive import events, replenish, roadmap
 from mindhive.__main__ import main
 
 SID = "sess-cli-01"
 HOOK = Path(__file__).resolve().parents[1] / "hooks" / "session_end.ps1"
+
+
+@pytest.fixture(autouse=True)
+def ledger_only_lenses(monkeypatch):
+    """Run the CLI against the lenses whose evidence is the ISOLATED store.
+
+    `isolate_store` redirects `MINDHIVE_HOME`; it cannot redirect the source
+    tree, so `debt` and `coverage` read this checkout's real files. Left in,
+    every assertion here would depend on the current line count of
+    `src/mindhive/__main__.py` — which is exactly what broke when those two
+    lenses landed. The CLI is what this file tests; the lenses have their own."""
+    monkeypatch.setattr(replenish, "LENSES",
+                        {"evidence-gap": replenish.evidence_gap})
 
 
 def _outstanding():
