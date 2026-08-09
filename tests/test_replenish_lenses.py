@@ -111,7 +111,35 @@ def test_the_title_counts_only_changes_since_the_last_pass():
 def test_the_fingerprint_is_stable_on_an_unchanged_ledger():
     _code_change("2026-08-02T00:00:00Z")
     assert _gap()[0].fingerprint == _gap()[0].fingerprint
-    assert _gap()[0].fingerprint == "evidence-gap:2026-08-02T00:00:00Z"
+    # Content-addressed now (U1), but keyed on exactly what it was keyed on
+    # before: the newest covered code_change timestamp.
+    assert _gap()[0].fingerprint == replenish.fingerprint(
+        "evidence-gap", "2026-08-02T00:00:00Z")
+
+
+def test_the_lens_reports_recurrence_and_severity_rather_than_a_score():
+    # The gate computes the score; the lens reports what it observed. Three
+    # unverified changes is a recurrence of three, and the project's own rule
+    # ("must land green") is what makes it severe.
+    _verification("2026-08-01T00:00:00Z")
+    _code_change("2026-08-02T00:00:00Z")
+    _code_change("2026-08-03T00:00:00Z")
+    _code_change("2026-08-04T00:00:00Z")
+    cand = _gap()[0]
+    assert cand.recurrence == 3
+    assert cand.severity is True
+    assert cand.rule_covered is False
+
+
+def test_the_candidate_clears_the_default_threshold():
+    # One unverified change scores 10 + 5 + 20 = 35 against a default of 25.
+    # If this ever stops holding, the phase-1 session surface silently stops
+    # proposing anything at all.
+    _code_change("2026-08-02T00:00:00Z")
+    kept, refused = replenish.gate(_gap(), frozenset(),
+                                   replenish.ReplenishConfig())
+    assert len(kept) == 1 and refused == []
+    assert kept[0].score == 35
 
 
 def test_the_fingerprint_changes_after_a_newer_code_change():

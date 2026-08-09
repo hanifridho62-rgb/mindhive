@@ -44,7 +44,8 @@ def _inject():
                         session_id=SID)
     replenish_sinks.roadmap_sink(SID)([
         Candidate(lens="evidence-gap", title="Run the test suite",
-                  fingerprint="fp-1", evidence=("a real pointer",))])
+                  fingerprint="fp-1", evidence=("a real pointer",),
+                  severity=True)])
 
 
 def test_the_oversee_api_carries_the_new_flag(server):

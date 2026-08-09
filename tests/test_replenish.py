@@ -167,8 +167,13 @@ def test_score_is_optional():
 # --- the core ----------------------------------------------------------------
 
 def _cand(fp="fp-1", **over):
+    # `severity=True` is what makes the stub admissible on the real scale: the
+    # gate computes the score (base 10, +20 for severity = 30) and the default
+    # threshold is 25. A stub scoring the bare base would be refused by every
+    # round here, and each test would be asserting the threshold rather than the
+    # thing it names.
     kw = {"lens": "test-lens", "title": "do the thing", "fingerprint": fp,
-          "evidence": ("code_change @ ts",), "score": 1.0}
+          "evidence": ("code_change @ ts",), "severity": True}
     kw.update(over)
     return replenish.Candidate(**kw)
 
@@ -217,10 +222,118 @@ def test_two_lenses_proposing_the_same_condition_produce_one_piece_of_work():
 
 
 def test_a_candidate_below_min_score_is_refused():
-    cfg = replenish.ReplenishConfig(min_score=0.9)
-    kept, refused = replenish.gate([_cand(score=0.1)], frozenset(), cfg)
+    # A bare candidate scores the base (10) and the default threshold is 25.
+    kept, refused = replenish.gate([_cand(severity=False)], frozenset(),
+                                   replenish.ReplenishConfig())
     assert kept == []
     assert "below the round's minimum" in refused[0][1]
+
+
+# --- fingerprints (U1) -------------------------------------------------------
+
+def test_the_same_lens_and_key_hash_the_same():
+    assert (replenish.fingerprint("repair", "sig-a")
+            == replenish.fingerprint("repair", "sig-a"))
+
+
+def test_two_lenses_with_the_same_key_do_not_collide():
+    # The lens name is INSIDE the hash, not a prefix on it — otherwise `debt`
+    # and `coverage` both keyed on a path would dedup each other's work.
+    assert (replenish.fingerprint("debt", "src/mindhive/x.py")
+            != replenish.fingerprint("coverage", "src/mindhive/x.py"))
+
+
+def test_a_key_cannot_be_split_into_a_different_lens_and_key():
+    # Without the length prefix these two encode to identical bytes, so two
+    # unrelated conditions would share one fingerprint forever.
+    assert (replenish.fingerprint("a", "bc") != replenish.fingerprint("ab", "c"))
+
+
+def test_an_empty_key_raises_rather_than_hashing_nothing():
+    # A digest over "" would collapse every such candidate onto one fingerprint,
+    # which then reads as "already proposed" for the life of the store.
+    with pytest.raises(ValueError, match="key"):
+        replenish.fingerprint("repair", "")
+    with pytest.raises(ValueError, match="key"):
+        replenish.fingerprint("repair", "   ")
+
+
+def test_an_empty_lens_raises():
+    with pytest.raises(ValueError, match="lens"):
+        replenish.fingerprint("", "sig-a")
+
+
+def test_a_non_ascii_key_hashes_deterministically():
+    # Explicit utf-8, not the platform default: the same ledger must dedup the
+    # same way on Windows and on CI.
+    first = replenish.fingerprint("caveat", "jangan ubah — pinned")
+    assert first == replenish.fingerprint("caveat", "jangan ubah — pinned")
+    assert len(first) == 64
+
+
+# --- scoring (U2) ------------------------------------------------------------
+
+def test_a_plain_candidate_scores_the_base():
+    assert replenish.score_for(_cand(severity=False)) == replenish.BASE_SCORE
+
+
+def test_recurrence_adds_a_step_each():
+    assert (replenish.score_for(_cand(severity=False, recurrence=3))
+            == replenish.BASE_SCORE + 3 * replenish.RECURRENCE_STEP)
+
+
+def test_severity_adds_its_bonus_and_stacks_with_recurrence():
+    assert (replenish.score_for(_cand(severity=True, recurrence=2))
+            == replenish.BASE_SCORE + 2 * replenish.RECURRENCE_STEP
+            + replenish.SEVERITY_BONUS)
+
+
+def test_a_rule_covered_candidate_scores_zero_and_names_the_rule():
+    kept, refused = replenish.gate([_cand(rule_covered=True)], frozenset(),
+                                   replenish.ReplenishConfig())
+    assert kept == []
+    # Not the generic below-threshold text: the lens is right and the condition
+    # is real, the project simply already wrote the fix down.
+    assert "prevention rule" in refused[0][1]
+    assert "below the round's minimum" not in refused[0][1]
+
+
+def test_a_candidate_exactly_at_the_threshold_is_admitted():
+    cfg = replenish.ReplenishConfig(min_score=30)
+    kept, _ = replenish.gate([_cand()], frozenset(), cfg)      # severity -> 30
+    assert len(kept) == 1
+
+
+def test_a_candidate_one_point_below_the_threshold_is_refused():
+    cfg = replenish.ReplenishConfig(min_score=31)
+    kept, refused = replenish.gate([_cand()], frozenset(), cfg)
+    assert kept == [] and "below the round's minimum" in refused[0][1]
+
+
+def test_a_score_the_lens_set_itself_is_overwritten():
+    # A lens that could assert its own number could outrank every other lens.
+    kept, _ = replenish.gate([_cand(score=999.0, severity=True)], frozenset(),
+                             replenish.ReplenishConfig())
+    assert kept[0].score == replenish.BASE_SCORE + replenish.SEVERITY_BONUS
+
+
+def test_an_absurd_recurrence_is_clamped_rather_than_unbounded():
+    huge = replenish.score_for(_cand(severity=False, recurrence=10_000))
+    assert huge == (replenish.BASE_SCORE
+                    + replenish.MAX_RECURRENCE * replenish.RECURRENCE_STEP)
+    # A negative or boolean count is a malformed lens, not a negative score.
+    assert replenish.score_for(_cand(severity=False,
+                                     recurrence=-5)) == replenish.BASE_SCORE
+    assert replenish.score_for(_cand(severity=False,
+                                     recurrence=True)) == replenish.BASE_SCORE
+
+
+def test_raising_the_threshold_above_every_candidate_makes_the_round_dry():
+    cfg = replenish.ReplenishConfig(min_score=10_000, dry_rounds_to_exit=2)
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses={"l": lambda _e: [_cand()]})
+    assert res.dry and res.landed == []
+    assert [r for r in _rows() if r["outcome"] == "dry"]
 
 
 def test_history_is_recovered_from_the_ledger_with_no_sidecar():

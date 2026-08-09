@@ -30,8 +30,12 @@ def _rec(plan_id=SID):
 
 
 def _cand(fp="fp-1", title="Run the test suite"):
+    # `severity=True` so the stub clears the default threshold — the gate
+    # computes the score now (U2), and a bare candidate scores the base 10
+    # against a default minimum of 25.
     return replenish.Candidate(lens="evidence-gap", title=title,
-                               fingerprint=fp, evidence=("a real pointer",))
+                               fingerprint=fp, evidence=("a real pointer",),
+                               severity=True)
 
 
 # --- characterization: the fold before and after the new key -----------------

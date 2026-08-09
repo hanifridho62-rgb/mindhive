@@ -125,16 +125,23 @@ def test_status_reports_the_folded_state(capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["last_recorded_round"] == 1
     assert data["dry_rounds"] == 0
-    assert data["lenses"] == ["evidence-gap"]
-    assert any(f.startswith("evidence-gap:") for f in data["spent_fingerprints"])
+    assert "evidence-gap" in data["lenses"]
+    # Content-addressed since U1: a hex SHA-256, not a lens-prefixed string.
+    assert data["spent_fingerprints"]
+    assert all(len(f) == 64 and all(c in "0123456789abcdef" for c in f)
+               for f in data["spent_fingerprints"])
 
 
 def test_status_on_an_empty_ledger(capsys):
     assert main(["replenish", "status"]) == 0
     data = json.loads(capsys.readouterr().out)
+    lenses = data.pop("lenses")
     assert data == {"surface": "session", "last_recorded_round": 0,
-                    "dry_rounds": 0, "spent_fingerprints": [],
-                    "lenses": ["evidence-gap"]}
+                    "dry_rounds": 0, "spent_fingerprints": []}
+    # Asserted by membership rather than equality: the registry grows as lenses
+    # land, and a list-equality assertion here would fail on every addition
+    # without saying anything about the state this test is actually about.
+    assert "evidence-gap" in lenses and lenses == sorted(lenses)
 
 
 def test_a_crash_is_reported_on_stderr_and_exits_non_zero(monkeypatch, capsys):

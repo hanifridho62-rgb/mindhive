@@ -44,7 +44,8 @@ recorded fact, not the absence of one: the two-consecutive-empty-rounds exit
 cannot be derived from silence.
 """
 
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import dataclass, field, replace
 
 from . import events as ev_mod
 
@@ -65,6 +66,80 @@ MAX_EVIDENCE_CHARS = 300
 # event with no type filter, so the cost lands on `hive verify` for the life of
 # the store.
 DUPLICATE_REASON = "already proposed — this fingerprint is spent"
+
+# The other refusal that is not about this candidate's merit: the project already
+# holds a prevention rule for the condition, so the fix is recorded and proposing
+# it again is noise. It is a REFUSAL rather than a silent skip because the
+# dry-round exit reads the difference — "declined" and "found nothing" mean
+# opposite things and look identical from the outside.
+RULE_COVERED_REASON = ("a prevention rule already covers this signature — the "
+                       "fix is on the record, so re-proposing it is noise")
+
+
+# --- fingerprints ------------------------------------------------------------
+# One way to identify a CONDITION INSTANCE, shared by every lens. Hand-built
+# strings worked while one lens existed; six lenses each inventing a convention
+# is six chances for two of them to disagree about what "the same condition"
+# means, and the dedup set is the injector's only guard against re-proposing
+# spent work.
+#
+# The lens still chooses WHAT to hash, because only the lens knows what an
+# instance is: a failure signature for `repair`, a path plus a size bucket for
+# `debt`, the newest covered timestamp for `evidence-gap`. Hashing the whole
+# evidence list would be wrong — evidence carries incidental detail that varies
+# while the condition holds, so the fingerprint would never dedup.
+
+def fingerprint(lens, key) -> str:
+    """Stable hex SHA-256 over ``(lens, key)``.
+
+    The lens name is length-prefixed rather than merely joined, so the encoding
+    is injective: without it, ``("a", "b\\0c")`` and ``("a\\0b", "c")`` would
+    hash the same bytes and two unrelated conditions would dedup each other.
+
+    An empty lens or key raises. A lens that cannot name its condition instance
+    is a defect, and a digest over "" would quietly collapse every such
+    candidate onto one fingerprint — which reads as "already proposed" forever."""
+    lens = str(lens or "").strip()
+    key = str(key or "").strip()
+    if not lens:
+        raise ValueError("fingerprint requires a lens name")
+    if not key:
+        raise ValueError(
+            "fingerprint requires a non-empty key — the lens must name the "
+            "condition instance it found, not just the condition")
+    raw = f"{len(lens)}:{lens}{key}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+# --- scoring -----------------------------------------------------------------
+# The value gate's numbers. They live in the core, keyed off what each lens
+# OBSERVED (how often, and whether the project already treats it as blocking),
+# not off a number each lens computed for itself — six implementations of
+# "base plus five per repeat" is six places for the arithmetic to drift, and the
+# auto-tuner has to reason about one formula.
+BASE_SCORE = 10
+RECURRENCE_STEP = 5
+SEVERITY_BONUS = 20
+# A malformed or adversarial recurrence count must not produce an unbounded
+# score that outranks everything else in the round forever.
+MAX_RECURRENCE = 20
+
+
+def score_for(candidate) -> int:
+    """This candidate's score, computed from what its lens observed.
+
+    Zero when a prevention rule already covers the signature — the gate then
+    refuses it with :data:`RULE_COVERED_REASON`, so `hive replenish status` can
+    show a lens working and being correctly declined rather than showing
+    nothing."""
+    if getattr(candidate, "rule_covered", False):
+        return 0
+    rec = getattr(candidate, "recurrence", 0)
+    if isinstance(rec, bool) or not isinstance(rec, int) or rec < 0:
+        rec = 0
+    rec = min(rec, MAX_RECURRENCE)
+    severity = SEVERITY_BONUS if getattr(candidate, "severity", False) else 0
+    return BASE_SCORE + RECURRENCE_STEP * rec + severity
 
 
 def _require_str(payload, key, cap, *, what):
@@ -147,13 +222,23 @@ class Candidate:
     or signature that a reader can go and check. `fingerprint` identifies the
     CONDITION INSTANCE, not the condition — keyed on the bare lens name a
     candidate would fire once ever, and keyed on something that changes every
-    round it would never dedup."""
+    round it would never dedup.
+
+    `recurrence`, `severity` and `rule_covered` are OBSERVATIONS, not verdicts:
+    how many times the lens saw this condition, whether the project already
+    treats it as blocking, and whether a prevention rule already covers it.
+    :func:`score_for` turns them into `score`, and :func:`gate` overwrites
+    whatever a lens put there — a lens that could set its own score could
+    outrank every other lens by asserting a number."""
 
     lens: str
     title: str
     fingerprint: str
     evidence: tuple = ()
     score: float = 1.0
+    recurrence: int = 0
+    severity: bool = False
+    rule_covered: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,7 +254,11 @@ class Placement:
 @dataclass
 class ReplenishConfig:
     enabled: bool = True
-    min_score: float = 0.5
+    # The value gate's threshold, on :func:`score_for`'s scale. The default is
+    # the balanced ambition level; `from_ambition` sets the other two. It shipped
+    # as 0.5 against an implicit 1.0 score, which meant the score branch had
+    # never rejected anything — a candidate either had evidence or it did not.
+    min_score: float = 25
     # Deliberately small. A round that proposes more than a person will look at
     # is how an injector becomes noise, and phase 1 has no backpressure yet.
     max_per_round: int = 3
@@ -277,6 +366,12 @@ def refusal_reason(candidate, spent, cfg) -> str:
     if not evidence:
         return ("no evidence — a candidate must point at a real ledger row, "
                 "file, or signature")
+    # Ahead of the score check on purpose. A rule-covered candidate scores zero,
+    # so it would ALSO fail the threshold — and the generic "below the minimum"
+    # text would misreport why: the condition is real and the lens is right, the
+    # project simply already wrote the fix down.
+    if getattr(candidate, "rule_covered", False):
+        return RULE_COVERED_REASON
     if candidate.score < cfg.min_score:
         return (f"score {candidate.score} below the round's minimum "
                 f"{cfg.min_score}")
@@ -300,7 +395,11 @@ def normalise(candidate) -> Candidate:
     return Candidate(lens=str(candidate.lens)[:64],
                      title=str(candidate.title)[:MAX_TITLE_CHARS],
                      fingerprint=str(candidate.fingerprint)[:128],
-                     evidence=evidence, score=candidate.score)
+                     evidence=evidence, score=candidate.score,
+                     recurrence=getattr(candidate, "recurrence", 0),
+                     severity=bool(getattr(candidate, "severity", False)),
+                     rule_covered=bool(getattr(candidate, "rule_covered",
+                                               False)))
 
 
 def gate(candidates, spent, cfg):
@@ -316,7 +415,10 @@ def gate(candidates, spent, cfg):
     for c in candidates or []:
         if not isinstance(c, Candidate):
             continue           # a lens returning junk is a bug, not a decision
-        c = normalise(c)
+        # Normalise clamps the shapes the audit contract accepts; the score is
+        # then computed HERE rather than trusted from the lens, so no lens can
+        # promote its own candidates past the gate by asserting a number.
+        c = replace(normalise(c), score=score_for(c))
         reason = refusal_reason(c, seen, cfg)
         if reason:
             refused.append((c, reason))
@@ -501,7 +603,12 @@ def evidence_gap(evs) -> list:
     The fingerprint keys on the newest covered `code_change` timestamp, which is
     the CONDITION INSTANCE: once the suite runs the condition clears, and a later
     change mints a fresh instance so the lens may fire again. Keying on the bare
-    lens name would let it fire exactly once in the life of the project."""
+    lens name would let it fire exactly once in the life of the project.
+
+    `severity` is set because this project treats it as blocking: CLAUDE.md's
+    "any change here must land green" and SOP `change-audit` §3 both say the
+    suite passing is a precondition for calling work done, not a nicety. The
+    flag is that recorded stance, not this lens's opinion of itself."""
     newest_ts, newest_payload, count = "", None, 0
     verified_ts = _passing_verification_ts(evs)
     for ev in evs or []:
@@ -530,8 +637,9 @@ def evidence_gap(evs) -> list:
     ]
     evidence += [f"changed: {f}" for f in files[:_EVIDENCE_FILES]]
     return [Candidate(lens="evidence-gap", title=title[:MAX_TITLE_CHARS],
-                      fingerprint=f"evidence-gap:{newest_ts}",
-                      evidence=tuple(evidence))]
+                      fingerprint=fingerprint("evidence-gap", newest_ts),
+                      evidence=tuple(evidence),
+                      recurrence=count, severity=True)]
 
 
 LENSES["evidence-gap"] = evidence_gap
