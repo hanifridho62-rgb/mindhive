@@ -29,6 +29,29 @@ from .replenish import Placement
 from .sop import ID_RE
 
 
+def roadmap_step_status(evs):
+    """``(plan_id, step_index) -> status | None`` over the roadmap fold.
+
+    The auto-tuner's resolver (`replenish.outcomes`). It lives here for the same
+    reason the sinks do: `replenish.py` decides what is outstanding and must not
+    import a surface — its own architecture test asserts that. Returns None for
+    a plan or index that no longer resolves, which the tuner reads as "unknown"
+    rather than as success.
+
+    The fold runs ONCE per call, not once per lookup: `roadmap.fold` walks the
+    whole ledger, and a resolver that folded per landed row would turn a linear
+    pass into a quadratic one on a store with thousands of injections."""
+    plans = rm_mod.fold(evs or [])
+
+    def status(plan_id, index):
+        rec = plans.get(plan_id)
+        if rec is None or not (0 <= index < len(rec["steps"])):
+            return None
+        return rec["steps"][index]["status"]
+
+    return status
+
+
 def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
     """A sink that appends kept candidates to *session_id*'s roadmap plan.
 

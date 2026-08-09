@@ -774,3 +774,302 @@ def test_disabled_skips_the_round():
     res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
                               lenses={"l": lambda _e: [_cand()]})
     assert not res.ran and res.skipped == "disabled"
+
+
+# --- run-scoped bounds (U8) --------------------------------------------------
+
+def _run(run_id="run-a", cfg=None, n=1, tag="a", **kw):
+    # `tag` varies the fingerprints between rounds. Without it the second round
+    # refuses everything as a spent duplicate and the bound under test never
+    # gets to speak.
+    lenses = {"l": lambda _e, n=n: [_cand(f"fp-{run_id}-{tag}-{i}")
+                                    for i in range(n)]}
+    return replenish.run_round(events.read_all(), surface="loop",
+                               sink=_sink(), cfg=cfg, lenses=lenses,
+                               run_id=run_id, **kw)
+
+
+def test_a_run_at_its_injection_ceiling_lands_nothing_more():
+    cfg = replenish.ReplenishConfig(max_per_run=2)
+    first = _run(cfg=cfg, n=2, tag="a")
+    assert len(first.landed) == 2
+    second = _run(cfg=cfg, n=2, tag="b")
+    assert not second.ran and "max injections per run" in second.skipped
+
+
+def test_the_per_run_remainder_caps_the_round_and_records_the_cut():
+    cfg = replenish.ReplenishConfig(max_per_run=3)
+    _run(cfg=cfg, n=2, tag="a")
+    res = _run(cfg=cfg, n=2, tag="b")
+    assert len(res.landed) == 1
+    assert res.dropped == 1
+    truncated = [r for r in _rows() if r["outcome"] == "truncated"]
+    assert truncated and truncated[-1]["dropped"] == 1
+
+
+def test_a_capped_round_is_not_reported_as_dry():
+    # R15/R16: "the cap cut this" and "there was nothing" mean opposite things.
+    cfg = replenish.ReplenishConfig(max_per_run=1)
+    res = _run(cfg=cfg, n=3)
+    assert res.dropped == 2 and res.dry is False
+
+
+def test_a_round_ceiling_skips_the_round_and_names_the_bound():
+    cfg = replenish.ReplenishConfig(max_rounds=1)
+    assert _run(cfg=cfg, tag="a").ran
+    second = _run(cfg=cfg, tag="b")
+    assert not second.ran and "max injection rounds" in second.skipped
+
+
+def test_the_bounds_are_per_run():
+    cfg = replenish.ReplenishConfig(max_per_run=1, max_rounds=1)
+    _run(run_id="run-a", cfg=cfg)
+    # A different run starts with a clean count — a ceiling read off the
+    # surface's whole history would refuse the first round of every later run.
+    assert _run(run_id="run-b", cfg=cfg).ran
+
+
+def test_a_round_at_the_depth_ceiling_runs_no_lens():
+    seen = []
+
+    def lens(_evs):
+        seen.append(1)
+        return [_cand()]
+
+    res = replenish.run_round(
+        [], surface="loop", sink=_sink(),
+        cfg=replenish.ReplenishConfig(max_depth=2), lenses={"l": lens},
+        depth=3)
+    assert not res.ran and "depth" in res.skipped
+    # Mining at a depth where nothing may land would spend a full ledger pass
+    # producing candidates that are all refused.
+    assert seen == []
+
+
+def test_a_round_at_the_ceiling_itself_still_lands():
+    res = replenish.run_round(
+        [], surface="loop", sink=_sink(),
+        cfg=replenish.ReplenishConfig(max_depth=2),
+        lenses={"l": lambda _e: [_cand()]}, depth=2)
+    assert len(res.landed) == 1
+
+
+def test_the_landed_row_carries_the_run_and_the_depth():
+    replenish.run_round([], surface="loop", sink=_sink(),
+                        lenses={"l": lambda _e: [_cand()]},
+                        run_id="run-a", depth=1)
+    row = [r for r in _rows() if r["outcome"] == "landed"][0]
+    assert row["run_id"] == "run-a"
+    assert row["depth"] == 1
+
+
+def test_depth_zero_is_omitted_so_historical_rows_stay_identical():
+    replenish.run_round([], surface="loop", sink=_sink(),
+                        lenses={"l": lambda _e: [_cand()]}, run_id="run-a")
+    row = [r for r in _rows() if r["outcome"] == "landed"][0]
+    assert "depth" not in row
+
+
+def test_the_per_run_fold_ignores_rows_from_other_runs_and_junk():
+    events.append_event("work_injected", ["not", "a", "dict"])
+    events.append_event("work_injected",
+                        {"outcome": "landed", "round": 1, "surface": "loop",
+                         "lens": "l", "title": "t", "fingerprint": "fp-x",
+                         "evidence": ["e"], "run_id": "other-run"})
+    hist = replenish.history(events.read_all(), surface="loop",
+                             run_id="run-a")
+    assert hist.run_landed == 0 and hist.run_rounds == 0
+
+
+def test_a_run_id_is_rejected_when_blank():
+    with pytest.raises(ValueError, match="run_id"):
+        _check(_landed(run_id="   "))
+
+
+def test_a_negative_depth_is_rejected():
+    with pytest.raises(ValueError, match="depth"):
+        _check(_landed(depth=-1))
+
+
+def test_a_boolean_depth_is_rejected():
+    with pytest.raises(ValueError, match="depth"):
+        _check(_landed(depth=True))
+
+
+def test_run_id_and_depth_are_optional():
+    payload = _landed()
+    assert "run_id" not in payload and "depth" not in payload
+    _check(payload)
+
+
+def test_the_bounds_are_off_by_default_for_the_session_surface():
+    # A session runs one round, so a per-run ceiling there bounds nothing.
+    cfg = replenish.ReplenishConfig()
+    assert cfg.max_per_run == 0 and cfg.max_rounds == 0
+
+
+# --- auto-tuning the threshold (U7) ------------------------------------------
+# Measured, not configured: step completion is already on the record, so the
+# tuner asks the ledger rather than asking the operator.
+
+from mindhive import replenish_sinks                               # noqa: E402
+
+PLAN = "plan-tune"
+
+
+def _plan_with(statuses):
+    steps = [{"text": f"step {i}", "status": s, "new": True}
+             for i, s in enumerate(statuses)]
+    events.append_event("roadmap",
+                        {"action": "set", "plan_id": PLAN, "prompt": "ask",
+                         "title": "ask", "steps": steps},
+                        ts="2026-08-01T00:00:00Z", tags=["roadmap"])
+
+
+def _landed_row(i, ts="2026-08-02T00:00:00Z", session_id="s1", **over):
+    payload = {"outcome": "landed", "round": 1, "surface": "session",
+               "lens": "l", "title": f"step {i}", "fingerprint": f"fp-{i}",
+               "evidence": ["e"], "plan_id": PLAN, "step_index": i}
+    payload.update(over)
+    events.append_event("work_injected", payload, ts=ts,
+                        session_id=session_id, tags=["replenish", "landed"])
+
+
+def _pass(ts="2026-08-03T00:00:00Z"):
+    events.append_event("verification",
+                        {"text": "pytest", "argv": ["pytest"], "exit_code": 0,
+                         "counts": {"passed": 1}, "excerpt": "",
+                         "verified_by": "python"}, ts=ts)
+
+
+def _fail(ts="2026-08-03T00:00:00Z", session_id="s1"):
+    events.append_event("tool_failed",
+                        {"text": "boom", "signature": "x:y", "action": "z"},
+                        ts=ts, session_id=session_id, tags=["failure"])
+
+
+def _outs():
+    evs = events.read_all()
+    # The resolver is a parameter for the same reason the sink is: the core
+    # must not import a surface, and its own architecture test asserts that.
+    return replenish.outcomes(
+        evs, step_status=replenish_sinks.roadmap_step_status(evs),
+        surface="session")
+
+
+def test_a_done_step_with_a_passing_run_after_it_is_green():
+    _plan_with(["done"])
+    _landed_row(0)
+    _pass()
+    assert _outs() == ["green"]
+
+
+def test_a_done_step_with_no_passing_run_is_open_not_green():
+    _plan_with(["done"])
+    _landed_row(0)
+    assert _outs() == ["open"]
+
+
+def test_an_unfinished_step_followed_by_a_failure_in_the_same_session_is_bad():
+    _plan_with(["pending"])
+    _landed_row(0)
+    _fail()
+    assert _outs() == ["bad"]
+
+
+def test_a_failure_in_a_different_session_does_not_mark_it_bad():
+    # "Any failure anywhere after this landed" measures the day, not the work.
+    _plan_with(["pending"])
+    _landed_row(0, session_id="s1")
+    _fail(session_id="s2")
+    assert _outs() == ["open"]
+
+
+def test_a_breaker_open_run_marks_its_injections_bad():
+    _plan_with(["pending"])
+    _landed_row(0, run_id="run-x")
+    events.append_event("loop_run_end",
+                        {"run_id": "run-x", "reason": "breaker_open",
+                         "iterations": 3}, ts="2026-08-03T00:00:00Z")
+    assert _outs() == ["bad"]
+
+
+def test_a_landed_row_whose_plan_is_gone_is_open_not_green():
+    _landed_row(0)                      # no roadmap set at all
+    assert _outs() == ["open"]
+
+
+def test_a_landed_row_with_no_step_index_is_skipped_without_raising():
+    _plan_with(["done"])
+    payload = {"outcome": "landed", "round": 1, "surface": "session",
+               "lens": "l", "title": "t", "fingerprint": "fp-n",
+               "evidence": ["e"], "plan_id": PLAN}
+    events.append_event("work_injected", payload, ts="2026-08-02T00:00:00Z")
+    assert _outs() == ["open"]
+
+
+def test_the_outcome_fold_is_total_against_a_malformed_row():
+    events.append_event("work_injected", ["not", "a", "dict"])
+    _plan_with(["done"])
+    _landed_row(0)
+    _pass()
+    assert _outs() == ["green"]
+
+
+def test_three_bad_outcomes_in_a_row_raise_the_threshold():
+    new, reason = replenish.tune(25, ["bad", "bad", "bad"])
+    assert new == 35 and "raising" in reason
+
+
+def test_five_green_outcomes_in_a_row_lower_the_threshold():
+    new, reason = replenish.tune(25, ["green"] * 5)
+    assert new == 20 and "lowering" in reason
+
+
+def test_a_mixed_sequence_moves_nothing():
+    assert replenish.tune(25, ["green", "bad", "green", "bad", "green"]) \
+        == (25, "")
+
+
+def test_open_outcomes_are_filtered_from_both_rules():
+    assert replenish.tune(25, ["open", "open", "open"]) == (25, "")
+    # Filtered, not counted against: three bads separated by opens still raise.
+    new, _ = replenish.tune(25, ["bad", "open", "bad", "open", "bad"])
+    assert new == 35
+
+
+def test_the_threshold_stops_at_the_ceiling():
+    at_top = replenish.TUNE_MAX_THRESHOLD
+    assert replenish.tune(at_top, ["bad"] * 3) == (at_top, "")
+
+
+def test_the_threshold_stops_at_the_floor():
+    at_bottom = replenish.TUNE_MIN_THRESHOLD
+    assert replenish.tune(at_bottom, ["green"] * 5) == (at_bottom, "")
+
+
+def test_a_move_is_recorded_as_one_decision_event():
+    _plan_with(["pending"] * 3)
+    for i in range(3):
+        _landed_row(i, ts=f"2026-08-0{i + 2}T00:00:00Z")
+    _fail(ts="2026-08-09T00:00:00Z")
+    evs = events.read_all()
+    cfg, reason = replenish.autotune(
+        replenish.ReplenishConfig(), evs,
+        step_status=replenish_sinks.roadmap_step_status(evs),
+        surface="session")
+    assert cfg.min_score == 35 and reason
+    rows = [e for e in events.read_all() if e.type == "decision"]
+    assert len(rows) == 1
+    assert "replenish threshold" in rows[0].payload["text"]
+    assert len(rows[0].payload["text"]) <= 500        # memo hygiene cap
+
+
+def test_no_move_records_nothing():
+    evs = events.read_all()
+    cfg, reason = replenish.autotune(
+        replenish.ReplenishConfig(), evs,
+        step_status=replenish_sinks.roadmap_step_status(evs),
+        surface="session")
+    assert reason == ""
+    assert [e for e in events.read_all() if e.type == "decision"] == []

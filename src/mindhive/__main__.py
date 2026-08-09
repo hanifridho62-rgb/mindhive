@@ -618,6 +618,14 @@ def cmd_replenish_run(args) -> int | None:
     cfg, warning = _replenish_cfg(getattr(args, "ambition", None))
     if warning:
         print(warning, file=sys.stderr)
+    # R17: the threshold moves with how previously-injected work actually turned
+    # out, before this round is judged against it. `append=write` so a --dry-run
+    # previews the adjustment without recording a decision that never applied.
+    cfg, tuned = rp_mod.autotune(
+        cfg, evs, step_status=sink_mod.roadmap_step_status(evs),
+        surface="session", session_id=sid, append=write)
+    if tuned:
+        print(tuned)
     # BOTH flags: the core's governs the audit rows, the sink's governs the work
     # itself. Passing only the first would leave a real roadmap step behind on a
     # run the operator asked to be a preview.

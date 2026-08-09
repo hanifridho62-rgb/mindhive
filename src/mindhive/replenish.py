@@ -180,6 +180,23 @@ def validate_payload(payload) -> None:
     _require_positive_int(payload, "round")
     _require_str(payload, "surface", 64, what="event")
 
+    # Optional on every outcome, and absent on every row written before the
+    # run-scoped bounds existed — so both are checked only when present, and the
+    # fold defaults them the same way (no run_id = unattributed, no depth = 0).
+    run_id = payload.get("run_id")
+    if run_id is not None and (not isinstance(run_id, str)
+                               or not run_id.strip() or len(run_id) > 128):
+        raise ValueError(
+            "work_injected run_id must be non-empty text under 128 chars — it "
+            "scopes the per-run ceilings, and a blank one would pool every "
+            "run's injections into a single budget")
+    depth = payload.get("depth")
+    if depth is not None and (isinstance(depth, bool)
+                              or not isinstance(depth, int) or depth < 0):
+        raise ValueError(
+            "work_injected depth must be a non-negative integer — how far this "
+            "work is from the plan a human wrote")
+
     if outcome == "dry":
         return
 
@@ -281,6 +298,15 @@ class ReplenishConfig:
     # reset the counter except work landing, and work can only land if a round
     # runs, so two quiet sessions would switch the injector off permanently.
     dry_rounds_to_exit: int = 0
+    # Run-scoped bounds (R14). 0 disables each one independently, which is the
+    # right default for the session surface: a session runs one round, so a
+    # per-run ceiling there is a bound on nothing. The loop surface sets them.
+    max_per_run: int = 0
+    max_rounds: int = 0
+    # Injected work may inject; work injected BY injected work may not go
+    # further. Depth 0 is the plan the operator wrote, so the ceiling of 2
+    # allows two generations of machine-proposed work and stops the third.
+    max_depth: int = 2
 
     @classmethod
     def from_ambition(cls, level, **over):
@@ -346,6 +372,13 @@ class History:
     fingerprints: frozenset = frozenset()
     last_round: int = 0
     dry_rounds: int = 0
+    # Scoped to one `run_id` when `history` was given one, else 0. Separate from
+    # `last_round` because that counts the SURFACE's rounds: a loop that has run
+    # forty rounds this month is not a loop that has run forty rounds this run,
+    # and a per-run ceiling read off the surface counter would refuse the first
+    # round of every new run.
+    run_landed: int = 0
+    run_rounds: int = 0
 
 
 @dataclass
@@ -369,7 +402,7 @@ class RoundResult:
 LENSES: dict = {}
 
 
-def history(evs, surface=None) -> History:
+def history(evs, surface=None, run_id=None) -> History:
     """Fold `work_injected` rows into the state a round needs.
 
     Total, per the ledger's read contract: a row whose payload is not a dict, or
@@ -388,8 +421,14 @@ def history(evs, surface=None) -> History:
     proposed it — a loop and a session must not each mint a step for the same
     outstanding fact. "How many rounds has this surface run without finding
     anything?" is about one surface's own pacing, and mixing surfaces there
-    would let a quiet loop switch off a session's injector."""
+    would let a quiet loop switch off a session's injector.
+
+    *run_id* scopes the per-run counters and nothing else, for the same reason:
+    "how much has THIS run injected" is the question the per-run ceiling asks,
+    and answering it from the surface's whole history would refuse the first
+    round of every run after the first."""
     spent, last, dry = set(), 0, 0
+    run_landed, run_rounds_seen = 0, set()
     for ev in evs or []:
         if getattr(ev, "type", None) != "work_injected":
             continue
@@ -411,7 +450,13 @@ def history(evs, surface=None) -> History:
             dry += 1
         elif outcome == "landed":
             dry = 0            # real work landed: the streak is broken
-    return History(frozenset(spent), last, dry)
+        if run_id is not None and p.get("run_id") == run_id:
+            if isinstance(r, int) and not isinstance(r, bool):
+                run_rounds_seen.add(r)
+            if outcome == "landed":
+                run_landed += 1
+    return History(frozenset(spent), last, dry, run_landed,
+                   len(run_rounds_seen))
 
 
 def refusal_reason(candidate, spent, cfg) -> str:
@@ -533,7 +578,8 @@ def _record_lens_errors(errors, surface, project=None, session_id=None) -> None:
 
 
 def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
-              session_id=None, append=True) -> RoundResult:
+              session_id=None, append=True, run_id=None,
+              depth=0) -> RoundResult:
     """Run one replenishment round and record what it decided.
 
     *sink* is a parameter, not an import: deciding what is outstanding is
@@ -542,15 +588,39 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     A candidate the sink could not place gets NO row, so its fingerprint stays
     unspent and it can be proposed again next round. Same for candidates the cap
-    cut — a truncation is "not now", not "never"."""
+    cut — a truncation is "not now", not "never".
+
+    *run_id* scopes the per-run bounds, and *depth* is how far from the operator's
+    own plan this round already is: 0 while replenishing the work a human asked
+    for, 1 while replenishing work the injector added, and so on. The caller owns
+    that number because only the caller knows which step it is executing."""
     cfg = cfg or ReplenishConfig()
     if not cfg.enabled:
         return RoundResult(skipped="disabled")
 
-    hist = history(evs, surface=surface)
+    depth = _count(depth)
+    if depth > cfg.max_depth:
+        # Recursion bound (R14). Checked before any lens runs: at this depth
+        # nothing may land, so mining would spend a full ledger pass to produce
+        # candidates that are all refused.
+        return RoundResult(skipped=f"max injection depth {cfg.max_depth} "
+                                   f"reached (this round is at depth {depth})")
+
+    hist = history(evs, surface=surface, run_id=run_id)
     if cfg.dry_rounds_to_exit > 0 and hist.dry_rounds >= cfg.dry_rounds_to_exit:
         return RoundResult(round_no=hist.last_round,
                            skipped="dry rounds exhausted")
+    if cfg.max_rounds > 0 and hist.run_rounds >= cfg.max_rounds:
+        return RoundResult(round_no=hist.last_round,
+                           skipped=f"max injection rounds ({cfg.max_rounds}) "
+                                   "reached for this run")
+    room = None
+    if cfg.max_per_run > 0:
+        room = cfg.max_per_run - hist.run_landed
+        if room <= 0:
+            return RoundResult(round_no=hist.last_round,
+                               skipped=f"max injections per run "
+                                       f"({cfg.max_per_run}) reached")
     round_no = hist.last_round + 1
 
     registry = LENSES if lenses is None else lenses
@@ -587,9 +657,13 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     # "nothing outstanding" in the same breath.
     dry = not kept
     dropped = 0
-    if len(kept) > cfg.max_per_round:
-        dropped = len(kept) - cfg.max_per_round
-        kept = kept[:cfg.max_per_round]
+    # The per-round cap and the per-run remainder are the same kind of bound, so
+    # they are applied as one: whichever leaves less room wins, and the cut is
+    # recorded once rather than twice.
+    ceiling = cfg.max_per_round if room is None else min(cfg.max_per_round, room)
+    if len(kept) > ceiling:
+        dropped = len(kept) - ceiling
+        kept = kept[:ceiling]
 
     placements, sink_dropped = ([], 0)
     if kept:
@@ -608,6 +682,12 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                          evidence=[str(e)[:MAX_EVIDENCE_CHARS]
                                    for e in c.evidence][:MAX_EVIDENCE_ITEMS],
                          score=c.score, plan_id=pl.plan_id,
+                         run_id=run_id,
+                         # Recorded on the row rather than recomputed later: the
+                         # next round's depth is this row's depth plus one, and
+                         # a derivation that had to re-walk the plan tree would
+                         # disagree with it the moment a step was edited.
+                         depth=depth or None,
                          step_index=pl.step_index if pl.step_index >= 0 else None))
     for c, reason in refused:
         if reason == DUPLICATE_REASON:
@@ -620,16 +700,17 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
             continue
         rows.append(_row("refused", round_no, surface, lens=c.lens,
                          title=c.title or "(untitled)",
-                         fingerprint=c.fingerprint,
+                         fingerprint=c.fingerprint, run_id=run_id,
                          reason=reason[:MAX_REASON_CHARS]))
     if dropped:
         # R15: a cap that cut silently would read as "nothing more was found".
-        rows.append(_row("truncated", round_no, surface, dropped=dropped))
+        rows.append(_row("truncated", round_no, surface, dropped=dropped,
+                         run_id=run_id))
     # The dry row exists to feed the dry-round exit. Where that exit is off, it
     # is a row nobody reads, appended once per session forever — so it is only
     # written when something actually consumes it.
     if dry and cfg.dry_rounds_to_exit > 0:
-        rows.append(_row("dry", round_no, surface))
+        rows.append(_row("dry", round_no, surface, run_id=run_id))
 
     if append:
         _record(rows, project=project, session_id=session_id)
@@ -638,6 +719,173 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
 
     return RoundResult(round_no=round_no, landed=landed, refused=refused,
                        dropped=dropped, dry=dry, lens_errors=lens_errors)
+
+
+# --- auto-tuning the threshold ------------------------------------------------
+# R17: the threshold moves with the measured outcome of previously injected
+# work, in bounded steps, and every move is recorded. Measured, not configured —
+# step completion is already on the record, so this asks the ledger rather than
+# asking the operator.
+
+TUNE_UP_AFTER = 3          # consecutive bad outcomes before getting quieter
+TUNE_UP_STEP = 10
+TUNE_DOWN_AFTER = 5        # consecutive green outcomes before getting bolder
+TUNE_DOWN_STEP = 5
+# The clamp is the guard that keeps a slow ratchet from switching the injector
+# off in silence. The floor is the base score, below which the threshold rejects
+# nothing; the ceiling is a score a severe, six-times-recurring candidate can
+# still reach, so even a fully-ratcheted threshold leaves the strongest evidence
+# a way through.
+TUNE_MIN_THRESHOLD = BASE_SCORE
+TUNE_MAX_THRESHOLD = 60
+
+OUTCOME_KINDS = ("green", "bad", "open")
+
+
+def _passing_verification_after(evs, ts) -> bool:
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "verification":
+            continue
+        p = getattr(ev, "payload", None)
+        if not isinstance(p, dict):
+            continue
+        code = p.get("exit_code")
+        if isinstance(code, bool) or not isinstance(code, int) or code != 0:
+            continue
+        if (getattr(ev, "ts", "") or "") >= ts:
+            return True
+    return False
+
+
+def outcomes(evs, *, step_status, surface=None, run_id=None) -> list:
+    """How previously-injected work actually turned out, oldest first.
+
+    ``green`` — the step reached ``done`` and a passing verification followed.
+    ``bad``   — the step did not finish AND the record shows why: the run that
+                owned it tripped its breaker, or the session it landed in
+                recorded a tool failure after it landed.
+    ``open``  — anything else, including work still in progress.
+
+    `open` is a third value rather than being folded into either side, and that
+    is the load-bearing choice. Counting unfinished work as failure would ratchet
+    the threshold up through any long-running plan; counting it as success would
+    ratchet it down. Neither is a measurement.
+
+    *step_status* is a parameter for the same reason the sink is: knowing
+    whether a placement finished is surface-specific, and importing the roadmap
+    here would tie the decision layer to one surface — which the module's own
+    architecture test forbids. It is called with ``(plan_id, step_index)`` and
+    returns the placement's status, or None when it cannot be resolved."""
+    breaker_runs = set()
+    for ev in evs or []:
+        p = getattr(ev, "payload", None)
+        if getattr(ev, "type", None) == "loop_run_end" and isinstance(p, dict) \
+                and p.get("reason") == "breaker_open":
+            rid = p.get("run_id")
+            if isinstance(rid, str):
+                breaker_runs.add(rid)
+
+    out = []
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "work_injected":
+            continue
+        p = getattr(ev, "payload", None)
+        if not isinstance(p, dict) or p.get("outcome") != "landed":
+            continue
+        if surface is not None and p.get("surface") != surface:
+            continue
+        if run_id is not None and p.get("run_id") != run_id:
+            continue
+        idx = p.get("step_index")
+        status = None
+        if not isinstance(idx, bool) and isinstance(idx, int):
+            status = step_status(p.get("plan_id"), idx)
+        if status is None:
+            # A placement that no longer resolves is UNKNOWN, not success.
+            # Reading a missing plan as green is how a tuner talks itself into
+            # being bold about work nobody can find.
+            out.append("open")
+            continue
+        ts = getattr(ev, "ts", "") or ""
+        if status == "done":
+            out.append("green" if _passing_verification_after(evs, ts)
+                       else "open")
+            continue
+        if p.get("run_id") in breaker_runs \
+                or _failure_after(evs, getattr(ev, "session_id", None), ts):
+            out.append("bad")
+        else:
+            out.append("open")
+    return out
+
+
+def _failure_after(evs, session_id, ts) -> bool:
+    """A `tool_failed` in the SAME session, at or after *ts*.
+
+    Scoped to the session on purpose: "any failure anywhere in the project after
+    this landed" would mark every injection bad on a busy day, which is a
+    measurement of the day rather than of the work."""
+    if not session_id:
+        return False
+    for ev in evs or []:
+        if getattr(ev, "type", None) != "tool_failed":
+            continue
+        if getattr(ev, "session_id", None) != session_id:
+            continue
+        if (getattr(ev, "ts", "") or "") >= ts:
+            return True
+    return False
+
+
+def tune(threshold, outs):
+    """``(threshold, reason)`` — the threshold after applying R17's two rules.
+
+    `open` outcomes are FILTERED, not counted against either rule, so a plan
+    that is simply still in progress moves nothing."""
+    decided = [o for o in (outs or []) if o in ("green", "bad")]
+    if len(decided) >= TUNE_UP_AFTER and all(
+            o == "bad" for o in decided[-TUNE_UP_AFTER:]):
+        new = min(TUNE_MAX_THRESHOLD, threshold + TUNE_UP_STEP)
+        if new != threshold:
+            return new, (f"{TUNE_UP_AFTER} injected step(s) in a row ended "
+                         f"badly — raising the replenish threshold from "
+                         f"{threshold} to {new}")
+        return threshold, ""
+    if len(decided) >= TUNE_DOWN_AFTER and all(
+            o == "green" for o in decided[-TUNE_DOWN_AFTER:]):
+        new = max(TUNE_MIN_THRESHOLD, threshold - TUNE_DOWN_STEP)
+        if new != threshold:
+            return new, (f"{TUNE_DOWN_AFTER} injected step(s) in a row "
+                         f"completed and verified — lowering the replenish "
+                         f"threshold from {threshold} to {new}")
+        return threshold, ""
+    return threshold, ""
+
+
+def autotune(cfg, evs, *, step_status, surface=None, run_id=None, project=None,
+             session_id=None, append=True):
+    """Apply :func:`tune` to *cfg* and record any MOVE as a `decision` event.
+
+    Only a move is recorded. A tuner that appended a row every round would put
+    one event per session into the briefing forever to say nothing changed, and
+    `decision` is a semantic type — it rides the LEDGER, the hash chain and
+    recall."""
+    new, reason = tune(cfg.min_score,
+                       outcomes(evs, step_status=step_status, surface=surface,
+                                run_id=run_id))
+    if not reason:
+        return cfg, ""
+    if append:
+        try:
+            ev_mod.append_event("decision", {"text": reason},
+                                session_id=session_id,
+                                tags=["replenish", "autotune", "auto"],
+                                project=project)
+        except Exception:                                       # noqa: BLE001
+            # Transparency is the point of the row, but failing to write it must
+            # not cost the round the adjustment it just measured.
+            pass
+    return replace(cfg, min_score=new), reason
 
 
 # --- lenses ------------------------------------------------------------------
