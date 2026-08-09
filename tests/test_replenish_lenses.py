@@ -151,3 +151,198 @@ def test_the_fingerprint_changes_after_a_newer_code_change():
 
 def test_the_lens_is_registered():
     assert replenish.LENSES["evidence-gap"] is replenish.evidence_gap
+
+
+# --- the repair lens (U3) ----------------------------------------------------
+# Recurrence, the threshold crossing, and whether a rule exists are resolved by
+# `incidents.summaries` — the same fold `hive rules list` reads. The lens must
+# not re-derive them, or the injector gets its own opinion of "recurring".
+
+from mindhive import incidents, paths                              # noqa: E402
+
+
+def _failure(sig, session="s1", action="do the thing"):
+    events.append_event("tool_failed",
+                        {"text": f"err {sig}", "signature": sig,
+                         "action": action},
+                        session_id=session, tags=["auto", "failure"])
+
+
+def _build_incidents(threshold=2):
+    incidents.project(threshold=threshold)
+
+
+def _repair():
+    return replenish.repair(events.read_all())
+
+
+def _incident_file():
+    return next(iter((paths.project_dir(None) / "rules" / "incidents")
+                     .glob("*.md")))
+
+
+def test_a_recurring_signature_with_no_rule_becomes_a_candidate():
+    _failure("pscmd:hive", session="s1")
+    _failure("pscmd:hive", session="s2")
+    _build_incidents()
+    cands = _repair()
+    assert len(cands) == 1
+    assert cands[0].lens == "repair"
+    assert cands[0].recurrence == 2
+    assert cands[0].rule_covered is False
+    assert "pscmd:hive" in cands[0].title
+
+
+def test_a_signature_below_the_threshold_yields_nothing():
+    _failure("pscmd:once")
+    _build_incidents(threshold=5)
+    assert _repair() == []
+
+
+def test_a_signature_with_a_rule_is_reported_but_refused_by_the_gate():
+    # Not skipped silently: "declined" and "found nothing" are the one
+    # distinction the dry-round exit reads.
+    _failure("pscmd:ruled", session="s1")
+    _failure("pscmd:ruled", session="s2")
+    _build_incidents()
+    path = _incident_file()
+    path.write_text(
+        incidents._replace_section(path.read_text(encoding="utf-8"),
+                                   "Human Evaluation",
+                                   "Prevention rule: use the venv path"),
+        encoding="utf-8")
+    cands = _repair()
+    assert len(cands) == 1 and cands[0].rule_covered is True
+    kept, refused = replenish.gate(cands, frozenset(),
+                                   replenish.ReplenishConfig())
+    assert kept == []
+    assert "prevention rule" in refused[0][1]
+
+
+def test_severity_needs_more_than_one_session():
+    _failure("pscmd:solo", session="s1")
+    _failure("pscmd:solo", session="s1")
+    _build_incidents()
+    assert _repair()[0].severity is False
+
+
+def test_a_signature_across_two_sessions_is_severe():
+    _failure("pscmd:spread", session="s1")
+    _failure("pscmd:spread", session="s2")
+    _build_incidents()
+    assert _repair()[0].severity is True
+
+
+def test_two_signatures_get_two_distinct_fingerprints():
+    for sig in ("pscmd:a", "pscmd:b"):
+        _failure(sig, session="s1")
+        _failure(sig, session="s2")
+    _build_incidents()
+    cands = _repair()
+    assert len(cands) == 2
+    assert len({c.fingerprint for c in cands}) == 2
+
+
+def test_repair_on_an_empty_store_yields_nothing_and_does_not_raise():
+    assert replenish.repair([]) == []
+
+
+def test_a_malformed_incident_record_is_skipped(monkeypatch):
+    monkeypatch.setattr(
+        incidents, "summaries",
+        lambda project=None: [None, {"signature": ""},
+                              {"signature": "ok:1", "status": "active",
+                               "occurrences": 3, "sessions": 2}])
+    cands = _repair()
+    assert len(cands) == 1 and cands[0].recurrence == 3
+
+
+def test_the_repair_lens_is_registered():
+    assert replenish.LENSES["repair"] is replenish.repair
+
+
+# --- the caveat lens (U3) ----------------------------------------------------
+# `pinned` is the project's own marker for safety-critical: sync keeps pinned
+# caveats through the MEMORY.md cap and consolidate never folds them.
+
+def _caveat(text, pinned=True, ts="2026-08-02T00:00:00Z"):
+    return events.append_event("caveat", {"text": text}, ts=ts,
+                               tags=["pinned"] if pinned else ["memo"])
+
+
+_CAV = ("write_text_atomic is flaky on Windows because os.replace raises "
+        "PermissionError on the destination handle")
+
+
+def _caveats():
+    return replenish.caveat(events.read_all())
+
+
+def test_a_pinned_caveat_with_nothing_closing_it_becomes_a_candidate():
+    _caveat(_CAV)
+    cands = _caveats()
+    assert len(cands) == 1
+    assert cands[0].lens == "caveat"
+    assert cands[0].severity is True
+    assert "write_text_atomic" in cands[0].title
+
+
+def test_an_unpinned_caveat_yields_nothing():
+    _caveat(_CAV, pinned=False)
+    assert _caveats() == []
+
+
+def test_a_later_experiment_result_that_repeats_the_caveat_closes_it():
+    _caveat(_CAV)
+    events.append_event(
+        "experiment_result",
+        {"text": "fixed: write_text_atomic no longer raises PermissionError "
+                 "on the destination handle on Windows because os.replace is "
+                 "now retried"},
+        ts="2026-08-03T00:00:00Z")
+    assert _caveats() == []
+
+
+def test_an_unrelated_later_memo_does_not_close_it():
+    _caveat(_CAV)
+    events.append_event("code_change",
+                        {"text": "renamed a dashboard pill", "category": "update",
+                         "files": ["src/mindhive/dashboard_page.py"]},
+                        ts="2026-08-03T00:00:00Z")
+    assert len(_caveats()) == 1
+
+
+def test_a_reworded_repeat_raises_recurrence_instead_of_adding_a_candidate():
+    _caveat(_CAV, ts="2026-08-01T00:00:00Z")
+    _caveat(_CAV, ts="2026-08-02T00:00:00Z")
+    _caveat(_CAV, ts="2026-08-03T00:00:00Z")
+    cands = _caveats()
+    assert len(cands) == 1
+    assert cands[0].recurrence == 3
+
+
+def test_the_caveat_fingerprint_is_stable_across_re_appends():
+    _caveat(_CAV, ts="2026-08-01T00:00:00Z")
+    first = _caveats()[0].fingerprint
+    _caveat(_CAV, ts="2026-08-05T00:00:00Z")
+    assert _caveats()[0].fingerprint == first
+
+
+def test_a_blank_caveat_is_skipped():
+    _caveat("   ")
+    assert _caveats() == []
+
+
+def test_caveat_on_an_empty_ledger_yields_nothing():
+    assert replenish.caveat([]) == []
+
+
+def test_a_malformed_caveat_row_does_not_break_the_lens():
+    events.append_event("caveat", ["not", "a", "dict"], tags=["pinned"],
+                        ts="2026-08-01T00:00:00Z")
+    _caveat(_CAV, ts="2026-08-02T00:00:00Z")
+    assert len(_caveats()) == 1
+
+
+def test_the_caveat_lens_is_registered():
+    assert replenish.LENSES["caveat"] is replenish.caveat

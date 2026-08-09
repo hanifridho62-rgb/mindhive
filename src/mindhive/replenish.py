@@ -125,6 +125,14 @@ SEVERITY_BONUS = 20
 MAX_RECURRENCE = 20
 
 
+def _count(value) -> int:
+    """A non-negative int from a folded field, 0 for anything else. `bool` is an
+    int subclass, so `True` would otherwise fold in as a count of 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def score_for(candidate) -> int:
     """This candidate's score, computed from what its lens observed.
 
@@ -134,10 +142,7 @@ def score_for(candidate) -> int:
     nothing."""
     if getattr(candidate, "rule_covered", False):
         return 0
-    rec = getattr(candidate, "recurrence", 0)
-    if isinstance(rec, bool) or not isinstance(rec, int) or rec < 0:
-        rec = 0
-    rec = min(rec, MAX_RECURRENCE)
+    rec = min(_count(getattr(candidate, "recurrence", 0)), MAX_RECURRENCE)
     severity = SEVERITY_BONUS if getattr(candidate, "severity", False) else 0
     return BASE_SCORE + RECURRENCE_STEP * rec + severity
 
@@ -500,6 +505,12 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
             lens_errors.append((name, f"{type(exc).__name__}: {exc}"))
 
     kept, refused = gate(candidates, hist.fingerprints, cfg)
+    # Highest score first, so the per-round cap keeps the work the record makes
+    # the strongest case for. Without this the cap took whichever candidates the
+    # lens registry happened to yield first, which made the scoring decorative:
+    # a blocking, thrice-recurring failure could be cut for a first-sighting from
+    # a lens that ran earlier. `sort` is stable, so equal scores keep lens order.
+    kept.sort(key=lambda c: -c.score)
     # R16 asks whether anything QUALIFIED, which is decided here. A round the cap
     # trimmed or the sink could not place found real work and must not report
     # itself dry — the CLI was printing "N candidate(s) did not fit" and
@@ -643,3 +654,165 @@ def evidence_gap(evs) -> list:
 
 
 LENSES["evidence-gap"] = evidence_gap
+
+
+# --- lens: repair -------------------------------------------------------------
+
+# Incident statuses that mean the recurrence threshold was crossed. `candidate`
+# has not crossed it yet, and `expired` is already excluded by
+# `incidents.summaries`. Naming them here rather than testing `!= "candidate"`
+# keeps a future status from silently becoming a proposal.
+_REPAIR_STATUSES = ("active", "promoted", "demoted")
+
+# Distinct sessions a signature must have survived before it counts as blocking.
+# A failure that crosses a session boundary is systemic; one that fires twice
+# inside a single session is usually one person retrying one thing.
+#
+# The obvious alternative — treating the record's `flag` as the severity signal —
+# is a DEAD BRANCH, and checking that is why it is not used: `needs_review`
+# requires a human rule and `reroute_exhausted` requires an auto rule, so every
+# flagged signature is also `rule_covered`, scores zero, and is refused before
+# severity is ever read. A severity term that can never apply is worse than none,
+# because the scale silently loses a level nobody notices is missing.
+REPAIR_SEVERITY_SESSIONS = 2
+
+
+def repair(evs=None, *, project=None) -> list:
+    """A failure signature that keeps happening and has nothing written down.
+
+    The recurrence count, the threshold crossing, and whether a rule exists are
+    all already resolved by `incidents.summaries` — the same fold the dashboard's
+    Improvements view and `hive rules list` read. Re-deriving them from
+    `tool_failed` rows here would give the injector its own opinion of what
+    counts as recurring, and the two would disagree the first time the incident
+    threshold moved.
+
+    A signature that DOES have a rule still produces a candidate, marked
+    `rule_covered`. The gate refuses it and records why, so the round's audit
+    shows the lens working and being correctly declined — a silent skip would be
+    indistinguishable from the lens finding nothing, which is the one difference
+    the dry-round exit reads."""
+    from . import incidents as inc_mod
+    out = []
+    for rec in inc_mod.summaries(project) or []:
+        if not isinstance(rec, dict):
+            continue
+        signature = str(rec.get("signature") or "").strip()
+        if not signature or rec.get("status") not in _REPAIR_STATUSES:
+            continue
+        occurrences = _count(rec.get("occurrences"))
+        sessions = _count(rec.get("sessions"))
+        covered = bool(str(rec.get("active_rule") or "").strip()
+                       or str(rec.get("prevention_rule") or "").strip())
+        evidence = [f"signature {signature}",
+                    f"{occurrences} recorded occurrence(s) across "
+                    f"{sessions} session(s), status {rec.get('status')}"]
+        excerpt = str(rec.get("excerpt") or "").strip()
+        if excerpt:
+            evidence.append(f"raw signal: {excerpt}")
+        out.append(Candidate(
+            lens="repair",
+            title=f"Investigate and patch the root cause of {signature}",
+            fingerprint=fingerprint("repair", signature),
+            evidence=tuple(evidence),
+            recurrence=occurrences,
+            severity=sessions >= REPAIR_SEVERITY_SESSIONS,
+            rule_covered=covered))
+    return out
+
+
+LENSES["repair"] = repair
+
+
+# --- lens: caveat -------------------------------------------------------------
+
+# How much of a caveat's meaning a later memo must repeat before it counts as
+# closing it. Containment, not Jaccard: a `code_change` that fixes a caveat says
+# far more than the caveat did, so symmetric overlap would never fire. The bias
+# is deliberate and asymmetric — a false "still open" costs one refused
+# candidate, a false "closed" loses a safety-critical note.
+CAVEAT_CLOSE_RATIO = 0.8
+_CAVEAT_CLOSERS = ("experiment_result", "code_change")
+
+
+def _memo_text(payload) -> str:
+    """Memo text from a payload, tolerating the two shapes the ledger actually
+    holds: a dict with a ``text`` key, and a bare string from older writers
+    (``roadmap._session_prompt`` reads both the same way).
+
+    Anything else is a malformed row and contributes nothing. `str()` on it
+    would turn junk into a plausible-looking caveat — a list payload rendered as
+    ``['not', 'a', 'dict']`` and became a proposed piece of work."""
+    if isinstance(payload, dict):
+        return str(payload.get("text") or "")
+    if isinstance(payload, str):
+        return payload
+    return ""
+
+
+def _closes(caveat_tokens, closer_tokens) -> bool:
+    """True when *closer_tokens* repeats enough of *caveat_tokens* to count as
+    addressing it. Empty caveat tokens never close — a memo with nothing but
+    stopwords in it would otherwise be closed by every later event."""
+    if not caveat_tokens:
+        return False
+    return (len(caveat_tokens & closer_tokens) / len(caveat_tokens)
+            >= CAVEAT_CLOSE_RATIO)
+
+
+def caveat(evs) -> list:
+    """A pinned caveat nothing has closed.
+
+    Pinned is the project's own marker for "safety-critical": `sync` keeps pinned
+    caveats through the MEMORY.md cap rotation and `consolidate` never folds
+    them. An unpinned caveat is a note; a pinned one is a standing constraint,
+    which is why every candidate here carries `severity`.
+
+    Re-appends collapse through `dedupe.similar`, the same rule
+    `hive consolidate` uses, so a reworded repeat raises the recurrence count
+    instead of minting a second candidate. The fingerprint keys on the OLDEST
+    member's text, so a later re-append does not re-open a condition already
+    proposed."""
+    from . import dedupe as dedupe_mod
+    groups, closers = [], []
+    for ev in evs or []:
+        etype = getattr(ev, "type", None)
+        if etype in _CAVEAT_CLOSERS:
+            closers.append(dedupe_mod.normalize(_memo_text(
+                getattr(ev, "payload", None))))
+            continue
+        if etype != "caveat":
+            continue
+        if "pinned" not in (getattr(ev, "tags", None) or []):
+            continue
+        text = _memo_text(getattr(ev, "payload", None)).strip()
+        if not text:
+            continue
+        tokens = dedupe_mod.normalize(text)
+        for g in groups:
+            if dedupe_mod.similar(g["tokens"], tokens):
+                g["count"] += 1
+                break
+        else:
+            groups.append({"text": text, "tokens": tokens, "count": 1,
+                           "ts": getattr(ev, "ts", "") or ""})
+
+    out = []
+    for g in groups:
+        if any(_closes(g["tokens"], c) for c in closers):
+            continue
+        headline = g["text"].splitlines()[0].strip()
+        out.append(Candidate(
+            lens="caveat",
+            title=f"Resolve pinned architectural caveat: {headline}",
+            fingerprint=fingerprint(
+                "caveat", dedupe_mod.text_fingerprint(g["text"])),
+            evidence=(f"pinned caveat @ {g['ts']}",
+                      f"seen {g['count']} time(s), nothing recorded closing it",
+                      headline[:MAX_EVIDENCE_CHARS]),
+            recurrence=g["count"],
+            severity=True))
+    return out
+
+
+LENSES["caveat"] = caveat
