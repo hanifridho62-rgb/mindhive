@@ -160,3 +160,64 @@ def test_fix_plan_read_requires_hive_loop_dir(tmp_path):
     _seed_run("aaa", 10, goal_dir=str(stray))
     res = state.list_runs("test", now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))
     assert res["runs"][0]["planned"] == []
+
+
+# --- the injected count on the loop card -------------------------------------
+
+def test_a_run_reports_how_many_items_it_injected():
+    _seed_run("ccc", 10)
+    for i in range(3):
+        events.append_event(
+            "work_injected",
+            {"outcome": "landed", "round": 1, "surface": "loop", "lens": "l",
+             "title": f"item {i}", "fingerprint": f"fp-{i}",
+             "evidence": ["e"], "run_id": "ccc"},
+            ts="2026-07-07T10:02:00Z")
+    r = state.list_runs("test",
+                        now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))["runs"][0]
+    assert r["injected_count"] == 3
+
+
+def test_rows_for_another_run_do_not_count():
+    _seed_run("ccc", 10)
+    events.append_event(
+        "work_injected",
+        {"outcome": "landed", "round": 1, "surface": "loop", "lens": "l",
+         "title": "elsewhere", "fingerprint": "fp-x", "evidence": ["e"],
+         "run_id": "another-run"}, ts="2026-07-07T10:02:00Z")
+    r = state.list_runs("test",
+                        now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))["runs"][0]
+    assert r["injected_count"] == 0
+
+
+def test_only_landed_rows_count():
+    _seed_run("ccc", 10)
+    events.append_event(
+        "work_injected",
+        {"outcome": "refused", "round": 1, "surface": "loop", "lens": "l",
+         "title": "declined", "fingerprint": "fp-r", "reason": "no evidence",
+         "run_id": "ccc"}, ts="2026-07-07T10:02:00Z")
+    r = state.list_runs("test",
+                        now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))["runs"][0]
+    assert r["injected_count"] == 0
+
+
+def test_a_malformed_injection_row_is_skipped_and_the_fold_returns():
+    # The ledger holds rows written by every past version of the injector; a
+    # 500 on the Oversee projection is not an acceptable way to learn that.
+    _seed_run("ccc", 10)
+    events.append_event("work_injected", ["not", "a", "dict"],
+                        ts="2026-07-07T10:02:00Z")
+    events.append_event("work_injected",
+                        {"outcome": "landed", "round": 1, "surface": "loop",
+                         "run_id": None}, ts="2026-07-07T10:02:01Z")
+    r = state.list_runs("test",
+                        now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))["runs"][0]
+    assert r["injected_count"] == 0
+
+
+def test_a_run_with_no_injections_reports_zero():
+    _seed_run("ccc", 10)
+    r = state.list_runs("test",
+                        now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))["runs"][0]
+    assert r["injected_count"] == 0

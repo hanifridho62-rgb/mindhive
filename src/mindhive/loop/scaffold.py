@@ -45,6 +45,12 @@ enabled = true
 #   balanced     - score >= 25, at most 10 per round, all deterministic lenses
 #   ambitious    - score >= 15, at most 25 per round, plus the model-driven lens
 ambition = "balanced"
+# Runaway bounds for THIS run. max_rounds caps how many times the mining engine
+# may run (a loop that keeps completing, injecting one item and completing again
+# is the shape this stops); dry_rounds ends the run after that many consecutive
+# rounds that qualified nothing. 0 disables either bound.
+max_rounds = 5
+dry_rounds = 2
 """
 
 _FILES = {"PROMPT.md": _PROMPT, "fix_plan.md": _FIX_PLAN,

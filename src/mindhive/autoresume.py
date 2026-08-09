@@ -245,6 +245,23 @@ def resume_prompt(rec, attempt=1) -> str:
         f"scheduled to re-enter Claude after the usage cooldown; this is "
         f"delivery attempt {attempt}.",
         "",
+    ]
+    # What the run was doing when it stopped, when the interrupting writer
+    # recorded it. Placed before the ask because it is the situation the ask is
+    # being resumed INTO — a reader who stops after the first paragraph should
+    # still know they are picking up a loop, not starting one.
+    relay = str(rec.get("relay_context") or "").strip()
+    if relay:
+        lines += [f"**Where it stopped:** {relay}", ""]
+    if any(s.get("new") for s in rec["steps"]):
+        lines += [
+            "Steps marked `(new)` below were added by the replenishment "
+            "injector because the record proved them outstanding — they were "
+            "not in the plan this work started from. They are real work, not "
+            "filler, and each one was admitted only against recorded evidence.",
+            "",
+        ]
+    lines += [
         "## The original ask (what the user wants — verbatim)",
         rec["prompt"],
         "",

@@ -1203,3 +1203,70 @@ def test_append_false_picks_without_recording():
     assert replenish.direct_skill(["ce-plan"], session_id=TSID,
                                   append=False) == "ce-plan"
     assert [e for e in events.read_all() if e.type == "skill_directed"] == []
+
+
+# --- ranking: one lens must not take the whole round -------------------------
+# Measured against this project's real ledger: `repair` reads occurrence counts
+# in the hundreds, so even clamped its recurrence term dwarfs every other
+# lens's and seven of ten injected items came from it. The other five lenses
+# answered their questions and were cut before anyone read them.
+
+def _lens_cand(lens, fp, recurrence=0, severity=True):
+    # Scored the way `gate` scores it. `_rank` reads `Candidate.score`, which is
+    # only populated on the far side of the gate — a raw candidate carries the
+    # dataclass default, so ranking one would be ranking a constant.
+    import dataclasses
+    c = replenish.Candidate(lens=lens, title=f"{lens} {fp}", fingerprint=fp,
+                            evidence=("a real pointer",),
+                            recurrence=recurrence, severity=severity)
+    return dataclasses.replace(c, score=replenish.score_for(c))
+
+
+def test_the_highest_scoring_candidate_still_goes_first():
+    ranked = replenish._rank([
+        _lens_cand("coverage", "c1", recurrence=1),
+        _lens_cand("repair", "r1", recurrence=10),
+    ])
+    assert ranked[0].fingerprint == "r1"
+
+
+def test_every_lens_gets_its_best_find_in_before_any_lens_gets_a_second():
+    ranked = replenish._rank([
+        _lens_cand("repair", "r1", recurrence=10),
+        _lens_cand("repair", "r2", recurrence=9),
+        _lens_cand("repair", "r3", recurrence=8),
+        _lens_cand("coverage", "c1", recurrence=1),
+        _lens_cand("debt", "d1", recurrence=2),
+    ])
+    assert [c.lens for c in ranked[:3]] == ["repair", "debt", "coverage"]
+
+
+def test_a_dominating_lens_cannot_take_the_whole_round():
+    cands = [_lens_cand("repair", f"r{i}", recurrence=20) for i in range(10)]
+    cands += [_lens_cand("coverage", "c1", recurrence=0),
+              _lens_cand("audit", "a1", recurrence=1)]
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(),
+        cfg=replenish.ReplenishConfig(max_per_round=3),
+        lenses={"l": lambda _e: cands})
+    lenses = {c.lens for c, _ in res.landed}
+    assert lenses == {"repair", "coverage", "audit"}
+
+
+def test_within_a_lens_the_order_is_by_score():
+    ranked = replenish._rank([
+        _lens_cand("repair", "low", recurrence=1),
+        _lens_cand("repair", "high", recurrence=9),
+    ])
+    assert [c.fingerprint for c in ranked] == ["high", "low"]
+
+
+def test_the_ranking_is_deterministic_on_a_tie():
+    # The same ledger must produce the same round; ties break on the lens name.
+    a = replenish._rank([_lens_cand("zebra", "z1"), _lens_cand("alpha", "a1")])
+    b = replenish._rank([_lens_cand("alpha", "a1"), _lens_cand("zebra", "z1")])
+    assert [c.lens for c in a] == [c.lens for c in b] == ["alpha", "zebra"]
+
+
+def test_ranking_an_empty_list_returns_empty():
+    assert replenish._rank([]) == []

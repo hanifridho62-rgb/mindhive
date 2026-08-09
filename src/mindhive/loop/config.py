@@ -48,6 +48,15 @@ class LoopConfig:
     # the cap picks the winners).
     replenish_enabled: bool = True
     replenish_ambition: str = "balanced"
+    # How many replenishment ROUNDS one run may hold. Separate from the
+    # per-round and per-run injection caps because it bounds a different
+    # runaway: a loop that keeps completing, injecting one item, completing
+    # again. 0 disables the bound.
+    replenish_max_rounds: int = 5
+    # Consecutive rounds that qualify nothing before the run gives up. This is
+    # the surface the exit was designed for — a loop runs rounds back to back,
+    # so the counter can actually be reset by work landing.
+    replenish_dry_rounds: int = 2
 
     @property
     def cooldown_seconds(self) -> float:
@@ -99,4 +108,8 @@ def load_config(path: Path) -> LoopConfig:
         cooldown_minutes=breaker.get("cooldown_minutes", cfg.cooldown_minutes),
         replenish_enabled=replenish.get("enabled", cfg.replenish_enabled),
         replenish_ambition=replenish.get("ambition", cfg.replenish_ambition),
+        replenish_max_rounds=replenish.get("max_rounds",
+                                           cfg.replenish_max_rounds),
+        replenish_dry_rounds=replenish.get("dry_rounds",
+                                           cfg.replenish_dry_rounds),
     )

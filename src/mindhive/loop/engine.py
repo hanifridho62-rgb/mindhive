@@ -15,13 +15,47 @@ from .contract import parse_status
 from .driver import preflight
 
 
-# Run-end reasons that mean "usage ran out mid-plan": the Claude usage/rate
-# limit (api_cap) and the local budget gate (budget_cap). These get the
-# roadmap interruption marker so the next session inherits the big picture.
-USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap")
+# Run-end reasons that mean "the run stopped with work still open": the Claude
+# usage/rate limit (api_cap), the local budget gate (budget_cap), and the wall
+# clock (max_hours). These get the roadmap interruption marker so the next
+# session inherits the big picture.
+#
+# `max_hours` joined the other two when the loop learned to grow its own plan. A
+# run that ran out of clock has exactly the same unfinished plan as one that ran
+# out of money, and dropping its marker was how injected work — evidence-backed
+# work nobody else is tracking — silently disappeared at the end of a long run.
+USAGE_INTERRUPT_REASONS = ("api_cap", "budget_cap", "max_hours")
+
+# One bounded line describing what the run was doing when it stopped, carried on
+# the interruption so the resumed session inherits the situation and not just
+# the checklist.
+MAX_RELAY_CONTEXT_CHARS = 500
 
 
-def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
+def _relay_context(project, run_id, cause, iterations) -> str:
+    """One line naming what stopped the run and how much of its plan it wrote.
+
+    Folded from the injection rows rather than threaded through the loop, for
+    the reason the injector has no sidecar: the events ARE the state, and a
+    second source could disagree with them. Best-effort — a relay line that
+    cannot be built must not cost the marker it rides on."""
+    injected = 0
+    try:
+        from .. import replenish as rp_mod
+        injected = rp_mod.history(events.read_all(project), surface="loop",
+                                  run_id=run_id).run_landed
+    except Exception:                                           # noqa: BLE001
+        pass
+    note = (f"Resuming loop run {run_id}: stopped after {iterations} "
+            f"iteration(s) on {cause}.")
+    if injected:
+        note += (f" {injected} step(s) marked (new) were added by the "
+                 "replenishment injector, not by the original plan.")
+    return note[:MAX_RELAY_CONTEXT_CHARS]
+
+
+def _snapshot_interrupted_plan(project, run_id, loop_dir, cause,
+                               iterations=0):
     """Out-of-usage marker (roadmap.py): persist the initial ask, the plan,
     and how far it got, as roadmap set + interrupt events. The marker rides
     STATE.md/MEMORY.md so the next session resumes from the next step instead
@@ -46,7 +80,9 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
                        "title": prompt[:roadmap_mod.MAX_TITLE_CHARS],
                        "steps": steps}
         int_payload = {"action": "interrupt", "plan_id": run_id,
-                       "cause": cause}
+                       "cause": cause,
+                       "relay_context": _relay_context(project, run_id, cause,
+                                                       iterations)}
         roadmap_mod.validate_payload(set_payload)
         roadmap_mod.validate_payload(int_payload)
         events.append_event("roadmap", set_payload, tags=["roadmap"],
@@ -62,6 +98,74 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
                                 cwd=str(Path(loop_dir).parent))
     except Exception:
         pass
+
+
+def replenish_round(project, run_id, loop_dir, cfg, session_id=None):
+    """Mine for outstanding work before a completion exit is honoured.
+
+    Returns ``(landed, exhausted)``. ``landed`` above zero means
+    `task.required_remaining_count` has risen and `safeguards.should_exit` will
+    refuse the exit on the next pass — the forcing mechanism is the COUNT, not
+    anything said in a prompt (SOP `agentic-loops` §1). ``exhausted`` means no
+    further injection is possible in this run (the dry streak, the round
+    ceiling, the per-run ceiling or the depth bound), so the caller should stop
+    rather than iterate hoping for a different answer.
+
+    The two are distinct because a single empty round is NOT a finished run: the
+    iteration that just ran wrote events of its own, so the next round reads a
+    different ledger. That is what the dry-streak bound is for — it gives the
+    record a bounded number of chances to change instead of one.
+
+    Best-effort by design: a failed injection must degrade to "nothing landed"
+    and let the run exit normally, never crash a live loop or leave the ledger
+    half-written. Silence would be worse than the crash, though, so the failure
+    goes to `tool_failed` under the signature the failure loop already audits."""
+    try:
+        from .. import replenish as rp_mod
+        from .. import replenish_sinks as sink_mod
+        if not cfg.replenish_enabled:
+            return 0, True
+        # The ambition level's number is the RUN ceiling as well as the round
+        # ceiling: an operator who asks for "at most 10" means ten pieces of
+        # injected work, not ten per round for as many rounds as the run lasts.
+        level, warning = rp_mod.resolve_ambition(cfg.replenish_ambition)
+        if warning:
+            events.append_event("tool_failed",
+                                {"text": warning, "signature": "replenish:config",
+                                 "action": "read [replenish] from loop.toml"},
+                                session_id=session_id,
+                                tags=["replenish", "config"], project=project)
+        rcfg = rp_mod.ReplenishConfig.from_ambition(
+            level,
+            max_per_run=rp_mod.AMBITION[level]["max_per_round"],
+            max_rounds=cfg.replenish_max_rounds,
+            dry_rounds_to_exit=cfg.replenish_dry_rounds)
+        res = rp_mod.run_round(
+            events.read_all(project), surface="loop",
+            sink=sink_mod.fix_plan_sink(loop_dir, run_id),
+            # The tree the RUN is working in — the parent of `.hive-loop` — not
+            # the checkout mindhive itself was installed from. Otherwise a loop
+            # in someone else's project is handed work about mindhive's files,
+            # with evidence paths that do not exist where the work is happening.
+            lenses=rp_mod.lens_registry(root=Path(loop_dir).parent),
+            cfg=rcfg, project=project, session_id=session_id, run_id=run_id)
+        # A SKIPPED round is a bound biting, not an empty ledger. Reported as
+        # exhausted so the run stops instead of iterating against a ceiling that
+        # will refuse it every time.
+        return len(res.landed), not res.ran
+    except Exception as exc:                                    # noqa: BLE001
+        try:
+            events.append_event(
+                "tool_failed",
+                {"text": f"replenish round failed: "
+                         f"{type(exc).__name__}: {exc}"[:500],
+                 "signature": "replenish:round",
+                 "action": f"replenish the loop run {run_id}"},
+                session_id=session_id, tags=["replenish", "failure"],
+                project=project)
+        except Exception:                                       # noqa: BLE001
+            pass
+        return 0, True
 
 
 def run_loop(project, loop_dir, cfg, driver, *,
@@ -200,16 +304,37 @@ def run_loop(project, loop_dir, cfg, driver, *,
             done, exit_reason = safeguards.should_exit(
                 status, required_remaining, json_mode=not live,
                 min_heuristics=cfg.min_completion_heuristics)
+            injected = 0
             if done:
-                reason = "completed"
-                break
+                # Adaptive work injection (replenish.py). The round runs at the
+                # ONE moment the run would otherwise end, so a run that never
+                # reaches a completion exit never pays for it. Anything landed
+                # raises `required_remaining` for the next pass, which is what
+                # overturns the exit — structurally, via the gate that already
+                # exists.
+                injected, exhausted = replenish_round(
+                    project, run_id, loop_dir, cfg,
+                    session_id=result.session_id)
+                # A dry round ends the run only when nothing can change its
+                # answer: either the streak bound is off (so there is no second
+                # chance to give) or a bound has already been hit. Otherwise the
+                # run iterates once more — the last iteration's own events are
+                # exactly the evidence the next round might read.
+                if exhausted or (not injected and cfg.replenish_dry_rounds <= 0):
+                    reason = "completed"
+                    break
 
             # An iteration blocked ONLY by the heuristic corroboration gate is a
             # responsive agent that claims completion, not a stuck one — it must
             # not feed the breaker or escalate the model tier while it restates
             # the outcome per the contract.
             heuristic_blocked = (exit_reason == "insufficient_completion_heuristics")
-            cb.record(progress=progressed or heuristic_blocked,
+            # Injecting counts as progress for the breaker. The mtime tracker
+            # cannot see it — `.hive-loop` is in its ignore set — so without
+            # this the no-progress counter would climb on exactly the iterations
+            # the feature exists to create, and the breaker would kill the run
+            # for doing what it was told to do.
+            cb.record(progress=progressed or heuristic_blocked or bool(injected),
                       error_sig=error_sig, now=now_fn())
             if cb.state == "OPEN":
                 reason = "breaker_open"
@@ -217,7 +342,9 @@ def run_loop(project, loop_dir, cfg, driver, *,
 
             # measured escalation: a lightweight iteration that errored or made no
             # progress hands the next one to the tier above (saturates at heavy)
-            if routing and (error_sig or not (progressed or heuristic_blocked)):
+            if routing and (error_sig
+                            or not (progressed or heuristic_blocked
+                                    or injected)):
                 tier = router_mod.escalate(tier)
 
             # A timed-out / failed iteration leaves no usable session to resume —
@@ -248,7 +375,8 @@ def run_loop(project, loop_dir, cfg, driver, *,
     # Out-of-usage interruption: preserve the plan + progress BEFORE the run
     # closes, so even a ledger reader that stops at loop_run_end sees the mark.
     if reason in USAGE_INTERRUPT_REASONS:
-        _snapshot_interrupted_plan(project, run_id, loop_dir, reason)
+        _snapshot_interrupted_plan(project, run_id, loop_dir, reason,
+                                   iterations=iteration)
     events.append_event("loop_run_end",
                         {"run_id": run_id, "reason": reason, "iterations": iteration},
                         project=project)

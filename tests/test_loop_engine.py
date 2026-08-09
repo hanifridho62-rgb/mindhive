@@ -1,9 +1,24 @@
 # tests/test_loop_engine.py
 from pathlib import Path
 
+import pytest
+
 from mindhive import events, runlog
 from mindhive.loop import engine, config
 from mindhive.loop.driver import DriverResult, Usage
+
+
+@pytest.fixture(autouse=True)
+def no_replenish(monkeypatch):
+    """This file tests the engine's own control flow, not the injector.
+
+    Left on, every completing run here mines the REAL ledger and the real tree,
+    injects whatever it finds, and iterates again — so a driver with two canned
+    results runs out of them. That is the injector working correctly; it just
+    makes these assertions measure something else. The trigger has its own file
+    (`test_loop_replenish.py`), where it is the subject rather than a confound."""
+    monkeypatch.setattr(engine, "replenish_round",
+                        lambda *_a, **_kw: (0, True))
 
 
 def _setup(tmp_path, monkeypatch):

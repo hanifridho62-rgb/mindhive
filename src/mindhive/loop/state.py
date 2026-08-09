@@ -78,7 +78,25 @@ def list_runs(project=None, *, now_fn=time.time,
     Dismissed runs (graceful exit, breaker trip, manual delete) are excluded —
     only their count is reported. Events written before run_id stamping group
     into synthetic per-start legacy buckets, so old ledgers still render."""
-    evs = [e for e in events.read_all(project) if e.type in _LOOP_TYPES]
+    all_evs = events.read_all(project)
+    # Per-run injected count, folded in the same pass the caller already pays
+    # for. Total by construction: a payload that is not a dict, an outcome this
+    # version does not know, or a row with no run_id is skipped rather than
+    # raising — the ledger holds rows written by every past version of the
+    # injector, and a 500 on the Oversee projection is not an acceptable way to
+    # learn that one of them was shaped differently.
+    injected: dict = {}
+    for e in all_evs:
+        if e.type != "work_injected":
+            continue
+        p = e.payload if isinstance(e.payload, dict) else {}
+        if p.get("outcome") != "landed":
+            continue
+        rid = p.get("run_id")
+        if isinstance(rid, str) and rid:
+            injected[rid] = injected.get(rid, 0) + 1
+
+    evs = [e for e in all_evs if e.type in _LOOP_TYPES]
     runs, order, dismissed = {}, [], {}
     legacy = None
 
@@ -156,6 +174,11 @@ def list_runs(project=None, *, now_fn=time.time,
                      for i, s in past] + items["done"]
         r["planned"] = items["planned"]
         r["not_yet"] = items["not_yet"]
+        # The operator's view of a loop growing its own plan. Also the only
+        # place the COST of that is visible: each injected item is work the run
+        # took on that nobody asked for, and a run quietly doing twenty of them
+        # is something to see rather than to discover from the bill.
+        r["injected_count"] = injected.get(rid, 0)
         out.append(r)
     out.reverse()
     return {"runs": out, "dismissed": excluded}

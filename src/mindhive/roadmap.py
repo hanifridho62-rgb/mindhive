@@ -37,6 +37,11 @@ MAX_STEPS = 50
 MAX_STEP_CHARS = 300
 MAX_NOTE_CHARS = 500
 MAX_CAUSE_CHARS = 120
+# One bounded line on an `interrupt`: what the run was doing when it stopped,
+# so a resumed session inherits the situation and not just the checklist.
+# Capped like its neighbours — the marker rides the auto-loaded MEMORY.md, and
+# preserving context must not become a context-budget regression (invariant 4).
+MAX_RELAY_CONTEXT_CHARS = 500
 
 # Notice rendering caps: done steps collapse to a tail, pending to a head, so
 # one interrupted plan costs a bounded slice of the auto-loaded MEMORY.md.
@@ -165,6 +170,16 @@ def validate_payload(payload) -> None:
         if len(cause) > MAX_CAUSE_CHARS:
             raise ValueError(
                 f"roadmap cause exceeds {MAX_CAUSE_CHARS} chars")
+        relay = payload.get("relay_context")
+        # REJECTED rather than truncated. A silently-shortened relay line ends
+        # mid-sentence in the next session's auto-loaded context, where nobody
+        # can tell a deliberate summary from a cut-off one — and the writer,
+        # which knows the whole situation, is where the shortening belongs.
+        if relay is not None and len(str(relay)) > MAX_RELAY_CONTEXT_CHARS:
+            raise ValueError(
+                f"roadmap relay_context exceeds {MAX_RELAY_CONTEXT_CHARS} "
+                "chars — carry the headline of what the run was doing, not a "
+                "transcript")
     # resume / complete: plan_id is enough.
 
 
@@ -257,6 +272,9 @@ def fold(evs) -> dict:
             note = str(p.get("note") or "").strip()
             if note:
                 rec["interrupt_note"] = note
+            relay = str(p.get("relay_context") or "").strip()
+            if relay:
+                rec["relay_context"] = relay
         elif action == "resume":
             rec["status"] = "active"
             rec["cause"] = ""

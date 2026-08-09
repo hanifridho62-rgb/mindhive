@@ -82,7 +82,7 @@ All paths relative to `src/mindhive/`.
 | `roadmap.py`, `autoresume.py` | The ask/plan/progress registry, and post-cooldown delivery of an interrupted plan's marker back into Claude. |
 | `plugins.py`, `recommend.py`, `invoker.py`, `playbook.py` | Skill/plugin catalog (backs both `hive plugins` and `hive skills`), deterministic recommendation, the invoke channel, and the per-prompt playbook (MN-15). |
 | `replenish.py` | Adaptive work injection — the **decision** half. Six deterministic lenses (`repair`, `evidence-gap`, `debt`, `audit`, `caveat`, `coverage`) fold the ledger and the tree for work the record proves outstanding; the value gate refuses anything without evidence, scores what is left (`score_for`: base + recurrence + severity, zero when a prevention rule already covers it), dedups on a content-addressed `fingerprint(lens, key)`, and caps the round. The **ambition dial** (`AMBITION`, read from `[replenish]` in `loop.toml`) moves the threshold, the cap and the active lens set together; `autotune` then moves the threshold with the measured outcome of past injections and records each move as a `decision`. State is the `work_injected` fold, never a sidecar. Knows **nothing** about surfaces: the sink AND the step-status resolver are parameters, and `tests/test_replenish.py` asserts the module does not import one. |
-| `replenish_sinks.py` | The **landing** half, one sink per surface, plus `roadmap_step_status` — the auto-tuner's resolver, here rather than in the core for the same no-surface-imports reason. `roadmap_sink` appends steps to the plan whose `plan_id` is the session id, marked `new`; `roadmap.autoclose_session` then interrupts it and `roadmap.notice` carries it into the next session's auto-loaded STATE.md — that hop is the forcing mechanism, not prose. The loop sink (checklist items that raise `loop.task.required_remaining_count`) is a later phase. |
+| `replenish_sinks.py` | The **landing** half, one sink per surface, plus `roadmap_step_status` — the auto-tuner's resolver, here rather than in the core for the same no-surface-imports reason. `roadmap_sink` appends steps to the plan whose `plan_id` is the session id, marked `new`; `roadmap.autoclose_session` then interrupts it and `roadmap.notice` carries it into the next session's auto-loaded STATE.md — that hop is the forcing mechanism, not prose. `fix_plan_sink` is the loop's: it writes `- [ ] (new) …` **above** the `Future / Optional` heading, so `loop.task.required_remaining_count` rises and `loop.safeguards.should_exit` refuses the exit. Below the heading the item would be non-blocking and the injection would force nothing. |
 
 ### `mindnet/` — the phase spine (MindNetwork)
 
@@ -134,6 +134,18 @@ scrapes `EXIT_SIGNAL`/`STATUS` out of the reply and `safeguards.should_exit`
 additionally requires ≥`min_completion_heuristics` natural-language completion
 signals plus zero remaining required work. Prose alone cannot end a run; prose is
 one of two conditions.
+
+**A completion exit is now a QUESTION, not an answer.** At the one moment a run
+would otherwise stop, `engine.replenish_round` mines the ledger and the run's own
+tree for work the record still proves outstanding and lands survivors as
+`- [ ] (new) …` items above the `Future / Optional` heading. That raises
+`task.required_remaining_count`, and the gate above refuses the exit on the next
+pass — structural, with nothing in any prompt asking the agent to keep going. The
+bounds are the ambition level's per-round and per-run caps, `max_rounds`, a
+depth ceiling of 2, and a dry streak; a single empty round does **not** end the
+run, because the iteration that just ran wrote the events the next round reads.
+The whole thing is best-effort: a failed injection degrades to "nothing landed"
+and the run exits normally, with the failure recorded under `replenish:round`.
 
 ### Dashboard (port 54461)
 

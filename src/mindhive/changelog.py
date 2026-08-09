@@ -140,23 +140,30 @@ def clear(project=None) -> bool:
     return existed
 
 
-def _git_changed_files() -> list:
+def _git_changed_files(cwd=None) -> list:
     """Fallback file detection for manual use outside a hooked session: files
     changed on this branch vs the merge-base with master, plus uncommitted
     changes. Empty list on any git failure — the caller errors out asking for
-    explicit --files instead of guessing."""
+    explicit --files instead of guessing.
+
+    *cwd* names the checkout to ask. It defaults to the process's own directory,
+    which is right for `hive log`; a caller that knows which tree it is talking
+    about (the replenishment audit lens, running for a loop in another project)
+    passes it, because the answer is per-checkout and running git in the wrong
+    one reports another repo's changes as this one's."""
     files = []
+    run_kw = {"capture_output": True, "text": True, "timeout": 15}
+    if cwd is not None:
+        run_kw["cwd"] = str(cwd)
     try:
         base = subprocess.run(
-            ["git", "merge-base", "master", "HEAD"],
-            capture_output=True, text=True, timeout=15).stdout.strip()
+            ["git", "merge-base", "master", "HEAD"], **run_kw).stdout.strip()
         cmds = [["git", "diff", "--name-only", "HEAD"]]
         if base:
             cmds.append(["git", "diff", "--name-only", base, "HEAD"])
         seen = set()
         for cmd in cmds:
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=15).stdout
+            out = subprocess.run(cmd, **run_kw).stdout
             for line in out.splitlines():
                 line = line.strip()
                 if line and line not in seen and in_scope(line):

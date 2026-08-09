@@ -924,6 +924,13 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (chat && r.skills_total ? ' <span class="pill">'+r.skills_total
           + ' skill'+(r.skills_total===1?'':'s')+'</span>' : '')
       + (chat ? '' : ' <span class="pill">$'+(r.total_cost_usd||0).toFixed(2)+'</span>')
+      // How much of this run's plan the run wrote for itself. Shown because it
+      // is a cost as well as a feature: each injected item is work the run took
+      // on that nobody asked for, and twenty of them is something to see rather
+      // than to discover from the bill.
+      + (r.injected_count ? ' <span class="pill rmnew" title="items the '
+          + 'replenishment injector added to this run\\u2019s checklist">'
+          + r.injected_count+' injected</span>' : '')
       + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
                     + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';

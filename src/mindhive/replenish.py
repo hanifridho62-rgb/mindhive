@@ -446,10 +446,16 @@ def history(evs, surface=None, run_id=None) -> History:
         r = p.get("round")
         if isinstance(r, int) and not isinstance(r, bool) and r > last:
             last = r
-        if outcome == "dry":
-            dry += 1
-        elif outcome == "landed":
-            dry = 0            # real work landed: the streak is broken
+        # The dry STREAK is run-scoped whenever a run is named, and that is a
+        # prerequisite of enabling the dry exit at all — not a refinement. Folded
+        # over the surface's whole history, the first run that went quiet twice
+        # would switch `surface="loop"` off project-wide, forever, and the
+        # symptom would be an injector that silently stopped proposing.
+        if run_id is None or p.get("run_id") == run_id:
+            if outcome == "dry":
+                dry += 1
+            elif outcome == "landed":
+                dry = 0        # real work landed: the streak is broken
         if run_id is not None and p.get("run_id") == run_id:
             if isinstance(r, int) and not isinstance(r, bool):
                 run_rounds_seen.add(r)
@@ -539,6 +545,40 @@ def gate(candidates, spent, cfg):
         seen.add(c.fingerprint)
         kept.append(c)
     return kept, refused
+
+
+def _rank(kept) -> list:
+    """Order survivors so the round's cap keeps the best work from EVERY lens.
+
+    Two rules, and the second exists because the first alone failed on the real
+    store. Sorting by score is necessary — without it the cap took whichever
+    candidates the registry happened to yield first, which made the scoring
+    decorative: a blocking, thrice-recurring failure could be cut for a
+    first-sighting from a lens that ran earlier.
+
+    But score alone lets one lens take the whole round. Measured against this
+    project's own ledger, `repair` reads occurrence counts in the hundreds, so
+    even clamped its recurrence term dwarfs every other lens's and seven of ten
+    injected items came from it. A round that is one lens is not a round; the
+    other five answered their questions and were cut before anyone read them.
+
+    So: rank within each lens by score, then take round-robin across lenses. The
+    highest-scoring candidate overall still goes first, every lens gets its best
+    find in before any lens gets its second, and the ordering is deterministic —
+    ties break on the lens name, so the same ledger produces the same round."""
+    by_lens: dict = {}
+    for c in kept:
+        by_lens.setdefault(c.lens, []).append(c)
+    for group in by_lens.values():
+        group.sort(key=lambda c: -c.score)
+    # Lenses whose best find scores highest go first in each pass.
+    order = sorted(by_lens, key=lambda name: (-by_lens[name][0].score, name))
+    out = []
+    for i in range(max((len(g) for g in by_lens.values()), default=0)):
+        for name in order:
+            if i < len(by_lens[name]):
+                out.append(by_lens[name][i])
+    return out
 
 
 def _row(outcome, round_no, surface, **extra) -> dict:
@@ -645,12 +685,7 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
             lens_errors.append((name, f"{type(exc).__name__}: {exc}"))
 
     kept, refused = gate(candidates, hist.fingerprints, cfg)
-    # Highest score first, so the per-round cap keeps the work the record makes
-    # the strongest case for. Without this the cap took whichever candidates the
-    # lens registry happened to yield first, which made the scoring decorative:
-    # a blocking, thrice-recurring failure could be cut for a first-sighting from
-    # a lens that ran earlier. `sort` is stable, so equal scores keep lens order.
-    kept.sort(key=lambda c: -c.score)
+    kept = _rank(kept)
     # R16 asks whether anything QUALIFIED, which is decided here. A round the cap
     # trimmed or the sink could not place found real work and must not report
     # itself dry — the CLI was printing "N candidate(s) did not fit" and
@@ -1194,14 +1229,37 @@ LENSES["caveat"] = caveat
 
 
 # --- the tree the filesystem lenses read --------------------------------------
-# Derived from this module's own location, never from cwd: `debt` and `coverage`
-# run inside the SessionEnd hook, and SOP `tool-failure-prevention` §3 records
-# seven "file does not exist" failures in this ledger caused by cwd drift
-# between calls. An editable install resolves this to the checkout actually
-# being served, which is the tree the operator is working in.
-def repo_root():
+# The SURFACE's tree, not this module's. A loop run in someone else's project
+# must not be handed work mined from the mindhive checkout — it would propose
+# refactoring files the run has no business touching, and the evidence would
+# point at paths that do not exist where the work is happening.
+#
+# `paths.worktree_root()` answers the git worktree containing cwd and is total
+# (None outside a repo). The module-derived path is the fallback, not the
+# default: it is right only when the surface happens to be running in this
+# checkout, which is the session case and not the loop case.
+
+def repo_root(cwd=None):
     from pathlib import Path
-    return Path(__file__).resolve().parents[2]
+    from . import paths as paths_mod
+    return paths_mod.worktree_root(cwd) or Path(__file__).resolve().parents[2]
+
+
+def lens_registry(root=None):
+    """The standard lenses, with the filesystem ones bound to *root*.
+
+    A lens is called with the events alone, so the tree it reads cannot be a
+    round-level parameter — it has to be bound here. Callers that know which
+    tree the surface is working in (the loop engine knows: it is the parent of
+    `.hive-loop`) pass it; everyone else gets `repo_root()`."""
+    from functools import partial
+    if root is None:
+        return dict(LENSES)
+    bound = dict(LENSES)
+    for name in ("debt", "coverage", "audit"):
+        if name in bound:
+            bound[name] = partial(bound[name], root=root)
+    return bound
 
 
 # Only the two directories `review.in_scope` accepts. Walking the repo root
@@ -1401,7 +1459,7 @@ LENSES["coverage"] = coverage
 
 # --- lens: audit --------------------------------------------------------------
 
-def audit(evs=None, *, project=None, changed_fn=None) -> list:
+def audit(evs=None, *, project=None, root=None, changed_fn=None) -> list:
     """Source edited with no change-log entry covering it.
 
     Both halves come from `changelog`, deliberately: the pending marker
@@ -1430,7 +1488,13 @@ def audit(evs=None, *, project=None, changed_fn=None) -> list:
                 files.append(key)
 
     covered = cl_mod._covered_map(evs or [])
-    for f in (changed_fn or cl_mod._git_changed_files)() or []:
+    if changed_fn is None:
+        # Asked of the SURFACE's checkout. Run in the process's own directory,
+        # a loop in another project would report this repo's changes as that
+        # run's unlogged work.
+        def changed_fn():
+            return cl_mod._git_changed_files(cwd=root)
+    for f in changed_fn() or []:
         if not isinstance(f, str) or not f.strip():
             continue
         key = f.replace("\\", "/")
