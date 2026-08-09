@@ -91,10 +91,17 @@ lifecycle), `trigger_trained`, `invoke_requested`/`invoke_result`,
 `skill_used` (`{name, plugin?, ok, text, args?}` — optional `args` is the
 capped invocation ask, the recorded "why" behind Oversee's per-session skill
 trail; contract owned by `hookcapture.py`),
-`skill_directed` (`{skills: [{name, plugin?, measured?}]}` — the prompt-quality
-gate directed these skills on an underspecified prompt; `promptgate.py` writes
-it, `oversee.skill_trails` joins it to a later same-session `skill_used` for the
-honest causal "directed by prompt-gate" why), `memory_consolidated`,
+`skill_directed` (`{skills: [{name, plugin?, measured?}], source?}` — these
+skills were directed at a session; `oversee.skill_trails` joins the row to a
+later same-session `skill_used` for the honest causal why. `source` names the
+writer: **absent/empty is the prompt gate** (`promptgate.py`, the only writer
+before the field existed, so every historical row folds unchanged),
+`"replenish_injector"` is the adaptive-work-injection loop (`replenish.py`).
+`oversee.DIRECTION_SOURCES` maps each to its rendered reason, and an
+**unrecognised** source renders a bare "directed": attributing an unknown
+writer's call to the prompt gate is exactly what the honest-trail rule forbids,
+and echoing the raw value would put unvalidated ledger text into the UI),
+`memory_consolidated`,
 `prompt_enriched`/`enrich_toggled` (Oversee prompt enrichment, `enrich.py`:
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
@@ -134,8 +141,9 @@ unparseable summary records counts **absent rather than zero**, because "we
 could not tell" and "nothing passed" are different facts. Full output goes to
 `runlog`, not the ledger; the event keeps a bounded excerpt plus the artifact
 path),
-`work_injected` (`{outcome, round, surface, lens?, title?, evidence[]?,
-fingerprint?, score?, reason?, dropped?, plan_id?, step_index?}` — one row per
+`work_injected` (`{outcome, round, surface, run_id?, depth?, lens?, title?,
+evidence[]?, fingerprint?, score?, reason?, dropped?, plan_id?, step_index?}` —
+one row per
 replenishment decision, written by `replenish.py`: `outcome` ∈ landed, refused,
 truncated, dry. `landed` and `refused` are per-candidate and carry `lens`,
 `title` and `fingerprint`; `landed` additionally requires a **non-empty**
@@ -148,7 +156,16 @@ two-consecutive-empty-rounds exit cannot be derived from silence. These rows are
 the injector's **only** persistent state — spent fingerprints, the round counter
 and the dry-round count are folded back out of them, so there is no sidecar that
 can drift. The work itself is not here: a landed candidate becomes a `roadmap`
-step, which is semantic and rides the LEDGER, the chain and recall).
+step, which is semantic and rides the LEDGER, the chain and recall.
+`run_id` and `depth` are **optional on every outcome and absent on every row
+written before the run-scoped bounds existed**, so the fold defaults them the
+same way it reads a legacy row: no `run_id` is unattributed, no `depth` is 0.
+`run_id` scopes the per-run ceilings — a blank one would pool every run's
+injections into a single budget, which is why the contract rejects it rather
+than accepting it as "unset". `depth` is how far the work is from the plan a
+human wrote (0 = the operator's own plan), and it is recorded rather than
+recomputed because a derivation that re-walked the plan tree would disagree with
+the row the moment a step was edited).
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view

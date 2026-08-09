@@ -888,6 +888,63 @@ def autotune(cfg, evs, *, step_status, surface=None, run_id=None, project=None,
     return replace(cfg, min_score=new), reason
 
 
+# --- injector-directed skills -------------------------------------------------
+# R20: when the injector directs a skill, the direction is recorded BEFORE the
+# invocation and says who directed it. The event type, the consume-once pairing
+# and the trail render already exist for the prompt gate; this adds a `source`
+# field and reuses all three, because a second direction event would split the
+# fold that answers "was this suggestion ever followed".
+
+SOURCE_REPLENISH = "replenish_injector"
+
+
+def pick_skill(names, *, project=None, evs=None):
+    """The skill to direct for a candidate, or "" when none is defensible.
+
+    Two measured inputs, in order: a skill whose LAST recorded call failed is
+    dropped (`plugins.call_status`), and among what is left the one whose past
+    directions were actually followed wins (`oversee.consumed_directions`).
+    Ties break on the name so the choice is reproducible from the ledger.
+
+    Returning "" is a real outcome, not a fallback. Directing a skill with no
+    basis is exactly the fabricated trail R20 forbids — better to record no
+    direction than to record one the record does not support."""
+    from . import oversee as ov_mod
+    from . import plugins as pl_mod
+    candidates = [str(n) for n in (names or []) if str(n or "").strip()]
+    if not candidates:
+        return ""
+    status = pl_mod.call_status(project) or {}
+    viable = [n for n in candidates if status.get(n) != "fail"]
+    if not viable:
+        return ""
+    followed = ov_mod.consumed_directions(project, evs=evs) or {}
+    return sorted(viable, key=lambda n: (-int(followed.get(n, 0)), n))[0]
+
+
+def direct_skill(names, *, project=None, session_id=None, evs=None,
+                 append=True):
+    """Record one injector-sourced ``skill_directed``, or nothing.
+
+    Called BEFORE the invocation so the consume-once pairing in
+    `oversee.skill_trails` joins it to the `skill_used` that follows. Returns
+    the directed skill name, or "" when none was defensible."""
+    name = pick_skill(names, project=project, evs=evs)
+    if not name or not append:
+        return name
+    try:
+        ev_mod.append_event(
+            "skill_directed",
+            {"skills": [{"name": name}], "source": SOURCE_REPLENISH},
+            session_id=session_id, tags=["skill", "replenish", "auto"],
+            project=project)
+    except Exception:                                           # noqa: BLE001
+        # Best-effort, matching `promptgate.record_direction`: failing to record
+        # the trail must not stop the work the trail is about.
+        return ""
+    return name
+
+
 # --- lenses ------------------------------------------------------------------
 # Each lens answers ONE question about the record and returns candidates. They
 # are plain folds: no model, no subprocess, no network. A lens that needs a model

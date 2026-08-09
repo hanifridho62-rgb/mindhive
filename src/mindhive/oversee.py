@@ -124,28 +124,49 @@ def consumed_directions(project=None, evs=None) -> dict:
     return out
 
 
+# Who issued a direction. The absent/empty case is the prompt gate: it was the
+# only writer of `skill_directed` until the replenishment injector, so every
+# historical row folds exactly as it did before the field existed.
+DIRECTION_SOURCES = {
+    "": "directed by prompt-gate",
+    "replenish_injector": "directed by autonomous replenish loop",
+}
+
+
 def _skill_why(payload, directed, intended_use) -> str:
     """The recorded "why" for one ``skill_used``, honesty-ordered: the
-    invocation args (the ask) -> a same-session prompt-gate direction (causal)
-    -> the skill's intended-use one-liner (labelled as PURPOSE, not motive) ->
-    empty. Never a synthesized motive.
+    invocation args (the ask) -> a same-session direction, attributed to
+    whoever issued it (causal) -> the skill's intended-use one-liner (labelled
+    as PURPOSE, not motive) -> empty. Never a synthesized motive.
 
     A direction is CONSUMED (one ``skill_directed`` -> the next matching
     invocation): stamping every later same-session call "directed by
     prompt-gate" would over-attribute — a skill the gate suggested once but
     that was later invoked independently did not happen *because* of the gate.
     ``directed`` is the caller's live per-session dict, so the pop persists
-    across entries in the fold."""
+    across entries in the fold.
+
+    An UNRECOGNISED source renders as a bare "directed": R20 forbids attributing
+    an injector-driven call to the prompt gate, and that rule cannot be honoured
+    by defaulting every unknown writer to the gate's wording. Echoing the raw
+    value would be worse still — it puts an unvalidated string from the ledger
+    straight into the trail."""
     args_why = headline(str(payload.get("args") or ""))
     if args_why:
         return args_why
     name = str(payload.get("name") or "")
     if name in directed:
-        measured = directed.pop(name)     # consume: one direction, one invocation
-        if isinstance(measured, dict) and measured.get("calls"):
-            return (f"directed by prompt-gate "
+        entry = directed.pop(name)     # consume: one direction, one invocation
+        measured, source = entry if isinstance(entry, tuple) else (entry, "")
+        if source not in DIRECTION_SOURCES:
+            return "directed"
+        why = DIRECTION_SOURCES[source]
+        # The measured suffix belongs to the gate's own catalog scoring; a
+        # source that carries none renders the bare reason.
+        if source == "" and isinstance(measured, dict) and measured.get("calls"):
+            return (f"{why} "
                     f"(measured {measured.get('ok', 0)}/{measured['calls']})")
-        return "directed by prompt-gate"
+        return why
     use = (intended_use or {}).get(name)
     return f"purpose: {use}" if use else ""
 
@@ -181,9 +202,15 @@ def skill_trails(project=None, evs=None, intended_use=None) -> dict:
             # container type explicitly, not just the items.
             skills = p.get("skills")
             if isinstance(skills, list):
+                # The source is per EVENT, the measured score per skill, so the
+                # pair travels together — `_skill_why` needs both and reading
+                # the source off the skill dict would find nothing.
+                source = p.get("source")
+                source = source if isinstance(source, str) else ""
                 for s in skills:
                     if isinstance(s, dict) and s.get("name"):
-                        directed.setdefault(sid, {})[str(s["name"])] = s.get("measured")
+                        directed.setdefault(sid, {})[str(s["name"])] = (
+                            s.get("measured"), source)
         elif e.type == "skill_used":
             if not p.get("name"):
                 continue
