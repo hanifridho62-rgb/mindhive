@@ -7,7 +7,7 @@ and not to the counts, which are a best-effort parse recorded absent rather than
 zero when they cannot be read. A lens that judged on counts would call an
 unparsed green run a failure and re-propose work that was already done.
 """
-from mindhive import events, replenish
+from mindhive import events, replenish, replenish_lenses
 
 
 def _code_change(ts, files=("src/mindhive/x.py",)):
@@ -438,7 +438,9 @@ def test_a_missing_tree_yields_nothing(tmp_path):
 
 
 def test_the_walk_is_bounded_and_says_so(tmp_path, monkeypatch):
-    monkeypatch.setattr(replenish, "SCAN_MAX_FILES", 2)
+    # The constant lives with the walk that reads it (replenish_lenses),
+    # not with the gate — patching the re-export would not be seen.
+    monkeypatch.setattr(replenish_lenses, "SCAN_MAX_FILES", 2)
     _tree(tmp_path, {f"src/mindhive/m{i}.py": 1600 for i in range(5)})
     cands = _debt(tmp_path)
     # Bounded, and the truncation rides the evidence — a silent cut would read
