@@ -52,3 +52,42 @@ def test_min_completion_heuristics_default_and_override(tmp_path):
     p = tmp_path / "loop.toml"
     p.write_text("[loop]\nmin_completion_heuristics = 0\n", encoding="utf-8")
     assert cfg_mod.load_config(p).min_completion_heuristics == 0
+
+
+# --- the [replenish] section (U6) --------------------------------------------
+
+def test_a_toml_with_no_replenish_section_loads_the_defaults(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text("[loop]\nmax_iterations = 7\n", encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.max_iterations == 7
+    assert cfg.replenish_enabled is True
+    assert cfg.replenish_ambition == "balanced"
+
+
+def test_the_replenish_section_is_read(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nenabled = false\nambition = "ambitious"\n',
+                 encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_enabled is False
+    assert cfg.replenish_ambition == "ambitious"
+
+
+def test_a_partial_replenish_section_takes_defaults_for_the_rest(tmp_path):
+    p = tmp_path / "loop.toml"
+    p.write_text('[replenish]\nambition = "conservative"\n', encoding="utf-8")
+    cfg = config.load_config(p)
+    assert cfg.replenish_ambition == "conservative"
+    assert cfg.replenish_enabled is True
+
+
+def test_the_scaffold_template_round_trips_through_load_config(tmp_path):
+    from mindhive.loop import scaffold
+    scaffold.scaffold(tmp_path)
+    cfg = config.load_config(tmp_path / "loop.toml")
+    assert cfg.replenish_enabled is True
+    # The template must name a level the dial actually knows, or every scaffolded
+    # project starts on a silently-corrected setting.
+    from mindhive import replenish
+    assert replenish.resolve_ambition(cfg.replenish_ambition)[1] == ""

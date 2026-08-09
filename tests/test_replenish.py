@@ -688,3 +688,89 @@ def test_the_core_does_not_import_a_sink():
     leaves = {name.rsplit(".", 1)[-1] for name in imported}
     assert "roadmap" not in leaves
     assert "replenish_sinks" not in leaves
+
+
+# --- the ambition dial (U6) --------------------------------------------------
+
+def test_each_level_carries_its_documented_numbers():
+    assert replenish.AMBITION["conservative"]["min_score"] == 40
+    assert replenish.AMBITION["balanced"]["min_score"] == 25
+    assert replenish.AMBITION["ambitious"]["min_score"] == 15
+    assert replenish.AMBITION["conservative"]["max_per_round"] == 3
+    assert replenish.AMBITION["balanced"]["max_per_round"] == 10
+    assert replenish.AMBITION["ambitious"]["max_per_round"] == 25
+
+
+def test_the_defaults_are_the_balanced_level():
+    # "No dial" and "the dial at its middle" must behave identically, or an
+    # operator who never opens loop.toml runs a configuration that is documented
+    # nowhere.
+    default = replenish.ReplenishConfig()
+    balanced = replenish.ReplenishConfig.from_ambition("balanced")
+    assert default.min_score == balanced.min_score
+    assert default.max_per_round == balanced.max_per_round
+
+
+def test_conservative_runs_only_the_two_ledger_lenses():
+    cfg = replenish.ReplenishConfig.from_ambition("conservative")
+    assert set(cfg.lenses) == {"repair", "evidence-gap"}
+
+
+def test_balanced_runs_every_deterministic_lens():
+    cfg = replenish.ReplenishConfig.from_ambition("balanced")
+    assert set(cfg.lenses) == {"repair", "evidence-gap", "debt", "audit",
+                               "caveat", "coverage"}
+    # Every name it lists is actually registered — a level naming a lens that
+    # does not exist would quietly run fewer lenses than it advertises.
+    assert set(cfg.lenses) <= set(replenish.LENSES)
+
+
+def test_ambitious_admits_the_model_lens_before_it_is_registered():
+    cfg = replenish.ReplenishConfig.from_ambition("ambitious")
+    assert replenish.INNOVATION_LENS in cfg.lenses
+    assert replenish.INNOVATION_LENS not in replenish.LENSES
+    # A name with no registered lens must be absent, not fatal — otherwise the
+    # boldest level is the only one that cannot run.
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses={"repair": lambda _e: [_cand()]})
+    assert len(res.landed) == 1 and res.lens_errors == []
+
+
+def test_an_unknown_level_falls_back_to_balanced_and_says_so():
+    level, warning = replenish.resolve_ambition("agressive")
+    assert level == "balanced"
+    assert "agressive" in warning and "balanced" in warning
+
+
+def test_a_blank_level_is_unset_not_a_typo():
+    assert replenish.resolve_ambition("") == ("balanced", "")
+    assert replenish.resolve_ambition(None) == ("balanced", "")
+
+
+def test_the_level_name_is_case_insensitive():
+    assert replenish.resolve_ambition("  Ambitious ") == ("ambitious", "")
+
+
+def test_the_lens_filter_selects_by_name():
+    cfg = replenish.ReplenishConfig(lenses=("keep",))
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(), cfg=cfg,
+        lenses={"keep": lambda _e: [_cand("fp-keep")],
+                "drop": lambda _e: [_cand("fp-drop")]})
+    assert [c.fingerprint for c, _ in res.landed] == ["fp-keep"]
+
+
+def test_an_empty_lens_tuple_means_every_registered_lens():
+    cfg = replenish.ReplenishConfig(lenses=())
+    res = replenish.run_round(
+        [], surface="session", sink=_sink(), cfg=cfg,
+        lenses={"a": lambda _e: [_cand("fp-a")],
+                "b": lambda _e: [_cand("fp-b")]})
+    assert len(res.landed) == 2
+
+
+def test_disabled_skips_the_round():
+    cfg = replenish.ReplenishConfig.from_ambition("balanced", enabled=False)
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses={"l": lambda _e: [_cand()]})
+    assert not res.ran and res.skipped == "disabled"

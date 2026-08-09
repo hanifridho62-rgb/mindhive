@@ -33,6 +33,18 @@ permission_mode = "acceptEdits"
 no_progress_threshold = 3
 same_error_threshold = 5
 cooldown_minutes = 30
+
+[replenish]
+# Adaptive work injection: when this surface would otherwise stop, mine the
+# ledger for work the record still proves outstanding and land it as required
+# work. Every candidate must point at a real ledger row, file or signature.
+enabled = true
+# How bold the injector is. One dial, because the threshold, the cap and the
+# active lens set are not independent:
+#   conservative - score >= 40, at most 3 per round, repair + evidence-gap only
+#   balanced     - score >= 25, at most 10 per round, all deterministic lenses
+#   ambitious    - score >= 15, at most 25 per round, plus the model-driven lens
+ambition = "balanced"
 """
 
 _FILES = {"PROMPT.md": _PROMPT, "fix_plan.md": _FIX_PLAN,

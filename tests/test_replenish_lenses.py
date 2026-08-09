@@ -510,3 +510,93 @@ def test_tests_themselves_are_never_proposed_for_coverage(tmp_path):
 
 def test_the_coverage_lens_is_registered():
     assert replenish.LENSES["coverage"] is replenish.coverage
+
+
+# --- the audit lens (U5) -----------------------------------------------------
+# Both halves come from `changelog`: the cumulative pending marker STATE.md
+# renders as a blocking notice, and the git scan `hive log` already uses. The
+# lens and the notice must never disagree about which files are unlogged.
+
+from mindhive import changelog                                     # noqa: E402
+
+
+def _audit(changed=()):
+    return replenish.audit(events.read_all(), changed_fn=lambda: list(changed))
+
+
+def _mark_unlogged(*files):
+    p = changelog.pending_path(None)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"files": list(files),
+                             "created_at": "2026-08-02T00:00:00Z",
+                             "session_id": "s1"}), encoding="utf-8")
+
+
+def test_changed_files_with_no_entry_yield_one_candidate():
+    cands = _audit(["src/mindhive/a.py", "src/mindhive/b.py"])
+    assert len(cands) == 1
+    assert cands[0].lens == "audit"
+    assert cands[0].recurrence == 2
+    assert cands[0].severity is True
+    assert any("src/mindhive/a.py" in e for e in cands[0].evidence)
+
+
+def test_a_covering_code_change_clears_them():
+    _code_change("2026-08-02T00:00:00Z", files=["src/mindhive/a.py"])
+    assert _audit(["src/mindhive/a.py"]) == []
+
+
+def test_a_clean_tree_yields_nothing():
+    assert _audit([]) == []
+
+
+def test_git_unavailable_yields_no_candidates_and_no_error():
+    # `_git_changed_files` returns [] on any git failure. "I could not look" is
+    # not a defect worth a tool_failed row on every round of a non-git checkout.
+    assert replenish.audit(events.read_all(), changed_fn=lambda: []) == []
+
+
+def test_the_pending_marker_alone_is_enough():
+    _mark_unlogged("C:/repo/src/mindhive/workspace.py")
+    cands = _audit([])
+    assert len(cands) == 1
+    assert any("workspace.py" in e for e in cands[0].evidence)
+
+
+def test_the_fingerprint_is_stable_while_the_same_set_is_unlogged():
+    first = _audit(["src/mindhive/a.py"])[0].fingerprint
+    assert _audit(["src/mindhive/a.py"])[0].fingerprint == first
+
+
+def test_a_new_file_joining_the_set_is_a_new_condition():
+    first = _audit(["src/mindhive/a.py"])[0].fingerprint
+    second = _audit(["src/mindhive/a.py", "src/mindhive/b.py"])[0].fingerprint
+    assert first != second
+
+
+def test_the_order_git_reports_files_in_does_not_change_the_fingerprint():
+    a = _audit(["src/mindhive/a.py", "src/mindhive/b.py"])[0].fingerprint
+    b = _audit(["src/mindhive/b.py", "src/mindhive/a.py"])[0].fingerprint
+    assert a == b
+
+
+def test_the_evidence_list_is_bounded_and_says_how_many_it_hid():
+    files = [f"src/mindhive/m{i}.py" for i in range(20)]
+    ev = _audit(files)[0].evidence
+    assert any("and 14 more" in e for e in ev)
+    assert len(ev) <= replenish.MAX_EVIDENCE_ITEMS
+
+
+def test_the_marker_and_the_git_scan_are_not_double_counted():
+    _mark_unlogged("src/mindhive/a.py")
+    assert _audit(["src/mindhive/a.py"])[0].recurrence == 1
+
+
+def test_the_audit_candidate_clears_the_balanced_threshold():
+    kept, refused = replenish.gate(_audit(["src/mindhive/a.py"]), frozenset(),
+                                   replenish.ReplenishConfig())
+    assert len(kept) == 1 and refused == []
+
+
+def test_the_audit_lens_is_registered():
+    assert replenish.LENSES["audit"] is replenish.audit

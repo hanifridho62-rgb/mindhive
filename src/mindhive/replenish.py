@@ -264,9 +264,16 @@ class ReplenishConfig:
     # as 0.5 against an implicit 1.0 score, which meant the score branch had
     # never rejected anything — a candidate either had evidence or it did not.
     min_score: float = 25
-    # Deliberately small. A round that proposes more than a person will look at
-    # is how an injector becomes noise, and phase 1 has no backpressure yet.
-    max_per_round: int = 3
+    # Also the balanced level. The defaults ARE an ambition level rather than a
+    # fourth setting nobody chose: "no dial" and "the dial at its middle" must
+    # behave identically, or an operator who never opens `loop.toml` is running
+    # a configuration that appears nowhere in the documentation.
+    max_per_round: int = 10
+    # Which registered lenses may run. Empty means all of them — a caller that
+    # never touches the dial keeps the whole registry, and a name here with no
+    # registered lens is simply absent rather than an error, so `ambitious` can
+    # admit the model lens before phase 3 registers it.
+    lenses: tuple = ()
     # 0 DISABLES the dry-round exit, and that is the right setting for any
     # surface whose own lifecycle already bounds the rounds. The exit exists for
     # a loop, which runs many rounds back to back and must stop spinning. On a
@@ -274,6 +281,62 @@ class ReplenishConfig:
     # reset the counter except work landing, and work can only land if a round
     # runs, so two quiet sessions would switch the injector off permanently.
     dry_rounds_to_exit: int = 0
+
+    @classmethod
+    def from_ambition(cls, level, **over):
+        """The config for an ambition level. An unknown level falls back to
+        balanced — see :func:`resolve_ambition` for why that is not silent."""
+        name, _ = resolve_ambition(level)
+        spec = AMBITION[name]
+        kw = {"min_score": spec["min_score"],
+              "max_per_round": spec["max_per_round"],
+              "lenses": spec["lenses"]}
+        kw.update(over)
+        return cls(**kw)
+
+
+# --- the ambition dial --------------------------------------------------------
+# One setting an operator turns. It drives three numbers together because they
+# are not independent: a low threshold with a small cap just means the cap picks
+# the winners, and a high threshold with a large cap never fills it.
+
+DEFAULT_AMBITION = "balanced"
+
+# Registered by phase 3's model lens. Named here so the ambitious level admits
+# it the moment it lands, rather than needing this table edited again — and the
+# lens filter tolerates a name with no registered lens for exactly that reason.
+INNOVATION_LENS = "innovation"
+
+_DETERMINISTIC_LENSES = ("repair", "evidence-gap", "debt", "audit", "caveat",
+                         "coverage")
+
+AMBITION = {
+    "conservative": {"min_score": 40, "max_per_round": 3,
+                     "lenses": _DETERMINISTIC_LENSES[:2]},
+    "balanced": {"min_score": 25, "max_per_round": 10,
+                 "lenses": _DETERMINISTIC_LENSES},
+    "ambitious": {"min_score": 15, "max_per_round": 25,
+                  "lenses": _DETERMINISTIC_LENSES + (INNOVATION_LENS,)},
+}
+AMBITION_LEVELS = tuple(AMBITION)
+
+
+def resolve_ambition(level):
+    """``(level, warning)`` for a configured ambition string.
+
+    An unknown value falls back to balanced AND returns a warning, rather than
+    raising or silently picking a level. Both alternatives are worse in a
+    specific way: refusing to run takes the injector out entirely over a typo,
+    and a silent fallback would spend the operator's tokens on a setting they
+    never chose. Blank is not a typo — it means "unset"."""
+    name = str(level or "").strip().lower()
+    if not name:
+        return DEFAULT_AMBITION, ""
+    if name in AMBITION:
+        return name, ""
+    return DEFAULT_AMBITION, (
+        f"unknown replenish ambition {level!r} — falling back to "
+        f"{DEFAULT_AMBITION}; valid levels: " + ", ".join(AMBITION_LEVELS))
 
 
 @dataclass(frozen=True)
@@ -490,8 +553,15 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
                            skipped="dry rounds exhausted")
     round_no = hist.last_round + 1
 
+    registry = LENSES if lenses is None else lenses
+    if cfg.lenses:
+        # An ambition level selects lenses by NAME, and a name with no
+        # registered lens is simply absent. That is what lets `ambitious` list
+        # the model lens before phase 3 registers it — raising here would make
+        # the boldest level the only one that cannot run.
+        registry = {k: v for k, v in registry.items() if k in cfg.lenses}
     candidates, lens_errors = [], []
-    for name, lens in (LENSES if lenses is None else lenses).items():
+    for name, lens in registry.items():
         try:
             candidates.extend(lens(evs) or [])
         except Exception as exc:                                # noqa: BLE001
@@ -1022,3 +1092,69 @@ def coverage(evs=None, *, root=None) -> list:
 
 
 LENSES["coverage"] = coverage
+
+
+# --- lens: audit --------------------------------------------------------------
+
+def audit(evs=None, *, project=None, changed_fn=None) -> list:
+    """Source edited with no change-log entry covering it.
+
+    Both halves come from `changelog`, deliberately: the pending marker
+    SessionEnd writes (cumulative, and the thing STATE.md renders as a blocking
+    notice) and the git working-tree scan `hive log` already uses. Re-deriving
+    either here would let the injector and the blocking notice disagree about
+    which files are unlogged, and the operator would have no way to tell which
+    was right.
+
+    ONE candidate for the whole change-set. The outstanding fact is singular —
+    "this change-set has no entry" — and a candidate per file would spend the
+    round's whole cap on a busy branch.
+
+    Git being unavailable yields no candidates and NO lens error. "I could not
+    look" is not "there is nothing", but it is also not a defect worth minting a
+    `tool_failed` row for on every round of a non-git checkout; the round's own
+    dry accounting already says nothing was found."""
+    from . import changelog as cl_mod
+    marker = cl_mod.load_pending(project)
+    files, seen = [], set()
+    for f in ((marker.get("files") or []) if isinstance(marker, dict) else []):
+        if isinstance(f, str) and f.strip():
+            key = f.replace("\\", "/")
+            if key not in seen:
+                seen.add(key)
+                files.append(key)
+
+    covered = cl_mod._covered_map(evs or [])
+    for f in (changed_fn or cl_mod._git_changed_files)() or []:
+        if not isinstance(f, str) or not f.strip():
+            continue
+        key = f.replace("\\", "/")
+        if key in seen or key in covered:
+            continue
+        seen.add(key)
+        files.append(key)
+
+    if not files:
+        return []
+    files.sort()
+    plural = "" if len(files) == 1 else "s"
+    evidence = [f"{len(files)} source file{plural} changed with no covering "
+                "code_change entry"]
+    evidence += [f"unlogged: {f}" for f in files[:_EVIDENCE_FILES]]
+    if len(files) > _EVIDENCE_FILES:
+        evidence.append(f"… and {len(files) - _EVIDENCE_FILES} more")
+    return [Candidate(
+        lens="audit",
+        title=("Audit changes and record change-log entries for "
+               f"{len(files)} modified source file{plural}"),
+        # Keyed on the whole set: while the same files are unlogged this is one
+        # condition, and a file joining the set is a new one.
+        fingerprint=fingerprint("audit", "\n".join(files)),
+        evidence=tuple(evidence),
+        recurrence=len(files),
+        # CLAUDE.md makes logging mandatory and STATE.md renders the notice as
+        # blocking. The flag is that recorded stance, not this lens's opinion.
+        severity=True)]
+
+
+LENSES["audit"] = audit

@@ -41,6 +41,13 @@ class LoopConfig:
     no_progress_threshold: int = 3
     same_error_threshold: int = 5
     cooldown_minutes: int = 30
+    # [replenish] — the ambition dial (replenish.AMBITION). Only two settings
+    # are exposed: the threshold, the per-round cap and the active lens set all
+    # move together with the level, because tuning them apart produces
+    # combinations that cancel out (a low threshold with a small cap just means
+    # the cap picks the winners).
+    replenish_enabled: bool = True
+    replenish_ambition: str = "balanced"
 
     @property
     def cooldown_seconds(self) -> float:
@@ -63,6 +70,11 @@ def load_config(path: Path) -> LoopConfig:
     budget = data.get("budget", {})
     loop = data.get("loop", {})
     breaker = data.get("breaker", {})
+    # A missing section yields the dataclass defaults, so every loop.toml
+    # written before the dial existed loads unchanged.
+    replenish = data.get("replenish", {})
+    if not isinstance(replenish, dict):
+        replenish = {}
     return LoopConfig(
         context_window=model.get("context_window", cfg.context_window),
         smart_zone_ratio=model.get("smart_zone_ratio", cfg.smart_zone_ratio),
@@ -85,4 +97,6 @@ def load_config(path: Path) -> LoopConfig:
         no_progress_threshold=breaker.get("no_progress_threshold", cfg.no_progress_threshold),
         same_error_threshold=breaker.get("same_error_threshold", cfg.same_error_threshold),
         cooldown_minutes=breaker.get("cooldown_minutes", cfg.cooldown_minutes),
+        replenish_enabled=replenish.get("enabled", cfg.replenish_enabled),
+        replenish_ambition=replenish.get("ambition", cfg.replenish_ambition),
     )

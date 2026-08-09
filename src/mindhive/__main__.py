@@ -569,6 +569,29 @@ def cmd_log_pending(args) -> int | None:
 _UNATTRIBUTABLE_SESSIONS = ("unknown", "manual")
 
 
+def _replenish_cfg(override=None):
+    """``(config, warning)`` for one replenishment round.
+
+    Precedence: an explicit ``--ambition`` wins, else the project's
+    ``[replenish]`` section, else the balanced defaults. The section is read
+    from `.hive-loop/loop.toml` via `paths.worktree_root()` rather than cwd —
+    this runs inside the SessionEnd hook, where cwd is not something the caller
+    controls. A project with no `.hive-loop` simply gets the defaults, which are
+    the balanced level by construction."""
+    from pathlib import Path as _Path
+    from . import replenish as rp_mod
+    from .loop import config as loop_cfg_mod
+    level, enabled = override, True
+    if not level:
+        root = paths.worktree_root()
+        lc = loop_cfg_mod.load_config(
+            _Path(root or ".") / ".hive-loop" / "loop.toml")
+        level, enabled = lc.replenish_ambition, lc.replenish_enabled
+    name, warning = rp_mod.resolve_ambition(level)
+    return (rp_mod.ReplenishConfig.from_ambition(name, enabled=bool(enabled)),
+            warning)
+
+
 def cmd_replenish_run(args) -> int | None:
     """One replenishment round for a session. Run by session_end BEFORE
     `roadmap autoclose`, so the injected steps exist when the plan is closed and
@@ -592,6 +615,9 @@ def cmd_replenish_run(args) -> int | None:
         return None
     evs = events.read_all()
     write = not args.dry_run
+    cfg, warning = _replenish_cfg(getattr(args, "ambition", None))
+    if warning:
+        print(warning, file=sys.stderr)
     # BOTH flags: the core's governs the audit rows, the sink's governs the work
     # itself. Passing only the first would leave a real roadmap step behind on a
     # run the operator asked to be a preview.
@@ -604,7 +630,7 @@ def cmd_replenish_run(args) -> int | None:
         res = rp_mod.run_round(evs, surface="session",
                                sink=sink_mod.roadmap_sink(sid, evs=evs,
                                                           append=write),
-                               session_id=sid, append=write)
+                               cfg=cfg, session_id=sid, append=write)
     except Exception as exc:                                    # noqa: BLE001
         # The SessionEnd hook pipes stdout to Out-Null and a native non-zero
         # exit does not reach PowerShell's catch, so an unhandled traceback here
@@ -643,8 +669,19 @@ def cmd_replenish_status(args) -> int | None:
     """What the injector knows, folded from the ledger — there is no sidecar."""
     from . import replenish as rp_mod
     hist = rp_mod.history(events.read_all(), surface="session")
+    cfg, warning = _replenish_cfg(getattr(args, "ambition", None))
+    if warning:
+        print(warning, file=sys.stderr)
     print(json.dumps({
         "surface": "session",
+        # What the dial is actually set to, resolved the same way a round
+        # resolves it — an operator debugging "why did nothing land" needs the
+        # threshold and the active lens set, not just the folded history.
+        "enabled": cfg.enabled,
+        "min_score": cfg.min_score,
+        "max_per_round": cfg.max_per_round,
+        "active_lenses": sorted(set(cfg.lenses) & set(rp_mod.LENSES))
+                         if cfg.lenses else sorted(rp_mod.LENSES),
         # Named for what it is. A round that writes no rows — every candidate a
         # spent duplicate, nothing landed, no cap hit — leaves the counter where
         # it was, so this is the last round that RECORDED something, not the
@@ -3010,6 +3047,10 @@ def _build_parser() -> argparse.ArgumentParser:
     lgsub.add_parser("pending", help="print the pending unlogged-changes marker, if any").set_defaults(func=cmd_log_pending)
 
     # --- replenish (adaptive work injection) ---
+    # Imported for the ambition level names: `choices` must be the same tuple
+    # the config resolves against, or the CLI would accept a level the dial does
+    # not know (or reject one it does).
+    from . import replenish as replenish_mod
     rp = sub.add_parser("replenish",
                         help="propose work the record proves is outstanding "
                              "(run by session_end)")
@@ -3019,11 +3060,21 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="session id to replenish (default: $MINDHIVE_SESSION)")
     rpr.add_argument("--dry-run", action="store_true",
                      help="decide and print without appending anything")
+    _AMBITION_HELP = ("how bold this round is — threshold, per-round cap and "
+                      "active lenses move together (default: the project's "
+                      "[replenish] section in .hive-loop/loop.toml, else "
+                      "balanced)")
+    rpr.add_argument("--ambition", default=None,
+                     choices=list(replenish_mod.AMBITION_LEVELS),
+                     help=_AMBITION_HELP)
     rpr.set_defaults(func=cmd_replenish_run)
-    rpsub.add_parser("status",
-                     help="what the injector knows: rounds, dry streak, spent "
-                          "fingerprints, active lenses"
-                     ).set_defaults(func=cmd_replenish_status)
+    rps = rpsub.add_parser("status",
+                           help="what the injector knows: the dial, rounds, "
+                                "dry streak, spent fingerprints, lenses")
+    rps.add_argument("--ambition", default=None,
+                     choices=list(replenish_mod.AMBITION_LEVELS),
+                     help=_AMBITION_HELP)
+    rps.set_defaults(func=cmd_replenish_status)
 
     # --- sop (managed standard operating procedures) ---
     so = sub.add_parser("sop", help="standard operating procedures "

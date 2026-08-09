@@ -28,9 +28,17 @@ def ledger_only_lenses(monkeypatch):
     tree, so `debt` and `coverage` read this checkout's real files. Left in,
     every assertion here would depend on the current line count of
     `src/mindhive/__main__.py` — which is exactly what broke when those two
-    lenses landed. The CLI is what this file tests; the lenses have their own."""
+    lenses landed. The CLI is what this file tests; the lenses have their own.
+
+    The level's own lens tuple is emptied alongside the registry. An ambition
+    level names lenses by NAME, so leaving `balanced`'s list in place would
+    filter out anything a test registers of its own — including the deliberately
+    exploding probe below, whose failure would then never be reported because it
+    never ran."""
     monkeypatch.setattr(replenish, "LENSES",
                         {"evidence-gap": replenish.evidence_gap})
+    monkeypatch.setitem(replenish.AMBITION, "balanced",
+                        dict(replenish.AMBITION["balanced"], lenses=()))
 
 
 def _outstanding():
@@ -151,12 +159,23 @@ def test_status_on_an_empty_ledger(capsys):
     assert main(["replenish", "status"]) == 0
     data = json.loads(capsys.readouterr().out)
     lenses = data.pop("lenses")
+    data.pop("active_lenses")
     assert data == {"surface": "session", "last_recorded_round": 0,
-                    "dry_rounds": 0, "spent_fingerprints": []}
+                    "dry_rounds": 0, "spent_fingerprints": [],
+                    "enabled": True, "min_score": 25, "max_per_round": 10}
     # Asserted by membership rather than equality: the registry grows as lenses
     # land, and a list-equality assertion here would fail on every addition
     # without saying anything about the state this test is actually about.
     assert "evidence-gap" in lenses and lenses == sorted(lenses)
+
+
+def test_status_reports_the_dial_the_round_would_use(capsys):
+    assert main(["replenish", "status", "--ambition", "conservative"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    # An operator debugging "why did nothing land" needs the threshold and the
+    # active set, not just the folded history.
+    assert data["min_score"] == 40
+    assert data["max_per_round"] == 3
 
 
 def test_a_crash_is_reported_on_stderr_and_exits_non_zero(monkeypatch, capsys):
