@@ -303,21 +303,44 @@ def next_step(rec):
     return None
 
 
+def _plan_item(entry):
+    """``(text, new)`` from one `task.plan_items` entry.
+
+    Tolerates a bare string as well as the ``{text, is_new}`` dict, because the
+    ledger is not the only caller — a hand-built list of strings is still a
+    legitimate way to describe a plan, and the loop's parser is free to grow
+    keys this function does not read."""
+    if isinstance(entry, dict):
+        return str(entry.get("text") or "").strip(), bool(entry.get("is_new"))
+    return str(entry).strip(), False
+
+
 def steps_from_plan_items(items) -> list:
     """Build explicit-status steps from a loop fix_plan split
     (``task.plan_items``): checked work is done, the first unchecked-required
     item is where work stopped (active), the rest stay pending, and
     Future/Optional items are skipped — the engine's interruption snapshot.
     Texts are truncated to the contract cap so an oversized checklist item can
-    never invalidate (and thereby silently drop) the whole marker."""
+    never invalidate (and thereby silently drop) the whole marker.
+
+    The injected-work flag rides across. This is the hop where it used to die:
+    the snapshot rebuilds every step's text from the checklist, so a marker
+    carried as a substring would have survived and a marker carried as a flag
+    would not — which is why `task.item` parses it and this puts it back."""
     steps = []
-    for t in items.get("done") or []:
-        steps.append({"text": t[:MAX_STEP_CHARS], "status": "done"})
-    for i, t in enumerate(items.get("planned") or []):
-        steps.append({"text": t[:MAX_STEP_CHARS],
-                      "status": "active" if i == 0 else "pending"})
-    for t in items.get("not_yet") or []:
-        steps.append({"text": t[:MAX_STEP_CHARS], "status": "skipped"})
+    for entry in items.get("done") or []:
+        text, new = _plan_item(entry)
+        steps.append({"text": text[:MAX_STEP_CHARS], "status": "done",
+                      "new": new})
+    for i, entry in enumerate(items.get("planned") or []):
+        text, new = _plan_item(entry)
+        steps.append({"text": text[:MAX_STEP_CHARS],
+                      "status": "active" if i == 0 else "pending",
+                      "new": new})
+    for entry in items.get("not_yet") or []:
+        text, new = _plan_item(entry)
+        steps.append({"text": text[:MAX_STEP_CHARS], "status": "skipped",
+                      "new": new})
     return steps[:MAX_STEPS]
 
 

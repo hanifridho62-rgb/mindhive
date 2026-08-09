@@ -23,10 +23,108 @@ Phase 3's loop sink lands checklist items instead, so that
 `loop.task.required_remaining_count` rises and `loop.safeguards.should_exit`
 refuses to exit. Same core, different sink.
 """
+from pathlib import Path
+
 from . import events as ev_mod
+from . import paths as paths_mod
 from . import roadmap as rm_mod
+from .loop import task as task_mod
 from .replenish import Placement
 from .sop import ID_RE
+
+
+def _checklist_line(title: str) -> str:
+    """One `fix_plan.md` line for an injected candidate.
+
+    The title is flattened to a single line and stripped of anything that would
+    change the file's STRUCTURE rather than its content: an embedded newline
+    would split one item into two (the second of which is not a checklist item
+    at all, so it would silently stop being required), and a leading checklist
+    marker would produce `- [ ] - [ ] …`."""
+    text = " ".join(str(title or "").split())
+    while True:
+        stripped = task_mod._UNCHECKED_ITEM.match(text) \
+            or task_mod._CHECKED_ITEM.match(text)
+        if not stripped:
+            break
+        text = stripped.group(1).strip()
+    # The marker is written here rather than carried in the title, so a title
+    # that happens to start with "(new)" cannot masquerade as injected work and
+    # an injected item cannot lose its marker to a title rewrite.
+    text = task_mod._NEW_PREFIX.sub("", text, count=1).strip()
+    return f"- [ ] {task_mod.NEW_MARKER} {text}" if text else ""
+
+
+def _insert_at(lines) -> int:
+    """Index of the first Future/Optional heading, else the end.
+
+    Items after that heading are non-blocking (`task.required_remaining_count`
+    stops counting there), so landing below it would write work the exit gate
+    never sees — the injection would look successful and force nothing."""
+    for i, line in enumerate(lines):
+        if task_mod._FUTURE_HEADING.match(line):
+            return i
+    return len(lines)
+
+
+def fix_plan_sink(loop_dir, run_id="", append=True):
+    """A sink that appends kept candidates to a loop run's required checklist.
+
+    This is the loop surface's forcing mechanism, and it is entirely structural:
+    an unchecked item above the Future heading raises
+    `loop.task.required_remaining_count`, and `loop.safeguards.should_exit`
+    already refuses to exit while any remains. Nothing in the prompt asks the
+    agent to keep going (SOP `agentic-loops` §1).
+
+    Returns ``(placements, dropped)``. A missing `fix_plan.md` drops everything
+    rather than creating one: the file is the run's only source of required
+    work, and inventing it would hand the loop a plan nobody wrote.
+
+    ``append=False`` runs the identical placement math and writes nothing."""
+    path = Path(loop_dir) / "fix_plan.md"
+
+    def sink(kept):
+        kept = list(kept or [])
+        if not kept or not path.is_file():
+            return [], len(kept)
+        try:
+            body = path.read_text(encoding="utf-8")
+        except OSError:
+            return [], len(kept)
+        lines = body.splitlines()
+        at = _insert_at(lines)
+        placed, new_lines = [], []
+        # The index a placement reports is the item's position among the
+        # REQUIRED items, which is what `steps_from_plan_items` orders by — not
+        # its line number, which counts headings and blank lines too.
+        base = len(task_mod.plan_items(body)["planned"])
+        for c in kept:
+            line = _checklist_line(c.title)
+            if not line:
+                continue
+            placed.append(Placement(c.fingerprint, str(run_id or ""),
+                                    base + len(new_lines)))
+            new_lines.append(line)
+        if not new_lines:
+            return [], len(kept)
+        merged = lines[:at] + new_lines + lines[at:]
+        text = "\n".join(merged)
+        if body.endswith("\n") or not body:
+            text += "\n"
+        if append:
+            try:
+                paths_mod.write_text_atomic(path, text)
+            except OSError:
+                # Known on Windows: os.replace raises PermissionError on the
+                # DESTINATION while any process holds a handle to it (the
+                # dashboard reads this file for the Oversee card). A half-
+                # written fix_plan.md would corrupt the run's only source of
+                # required work, so report everything unplaced — the
+                # fingerprints stay unspent and the next round tries again.
+                return [], len(kept)
+        return placed, len(kept) - len(placed)
+
+    return sink
 
 
 def roadmap_step_status(evs):

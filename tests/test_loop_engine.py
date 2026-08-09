@@ -236,10 +236,10 @@ def test_api_cap_run_snapshots_an_interrupted_roadmap(tmp_path, monkeypatch):
     assert all(e.payload["plan_id"] == result["run_id"] for e in rms)
     assert rms[0].payload["prompt"] == "Build it"
     assert rms[0].payload["steps"] == [
-        {"text": "done step", "status": "done"},
-        {"text": "step one", "status": "active"},
-        {"text": "step two", "status": "pending"},
-        {"text": "someday", "status": "skipped"},
+        {"text": "done step", "status": "done", "new": False},
+        {"text": "step one", "status": "active", "new": False},
+        {"text": "step two", "status": "pending", "new": False},
+        {"text": "someday", "status": "skipped", "new": False},
     ]
     assert rms[1].payload["cause"] == "api_cap"
     types = [e.type for e in evs]

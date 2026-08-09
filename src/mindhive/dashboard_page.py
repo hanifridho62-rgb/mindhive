@@ -767,9 +767,17 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
     return ['\\u25a0', 'snone', r.status || 'ended'];
   }
-  function ovRow(glyph, cls, text, dim){
+  // An entry is either a bare string (chat cards) or {text, is_new} (loop
+  // cards, and injected chat steps). The badge is the ONLY markup emitted; the
+  // text is escaped either way, so a checklist item containing HTML cannot
+  // reach innerHTML unescaped.
+  function ovRow(glyph, cls, entry, dim){
+    const obj = (entry && typeof entry === 'object') ? entry : {text: entry};
+    const pill = obj.is_new
+      ? '<span class="pill rmnew" title="not in the original plan \\u2014 added '
+        + 'because the record proved it outstanding">new</span> ' : '';
     return '<div class="snip'+(dim?' dup':'')+'"><span class="'+cls+'">'+glyph
-      + '</span> '+esc(text)+'</div>';
+      + '</span> '+pill+esc(obj.text == null ? '' : obj.text)+'</div>';
   }
   function ovGroup(items, glyph, cls, dim){
     return (items || []).map(x => ovRow(glyph, cls, x, dim)).join('');

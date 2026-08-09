@@ -295,6 +295,17 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             p = _text(e.payload)
             if p and p not in s["files"]:
                 s["files"].append(p)
+        elif e.type == "work_injected":
+            # The replenishment injector's landed work, on the card of the
+            # session it landed in — marked, permanently. The roadmap panel
+            # already shows it as a step; this puts it in the card's own
+            # progress list too, so a reader who never opens the panel still
+            # sees that the plan grew and why it grew.
+            p = e.payload if isinstance(e.payload, dict) else {}
+            if p.get("outcome") == "landed":
+                t = headline(str(p.get("title") or ""))
+                if t:
+                    s["planned"].append({"text": t, "is_new": True})
         elif e.type == "command_run":
             s["iterations"] += 1          # activity count for the pill
 

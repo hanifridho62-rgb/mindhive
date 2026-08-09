@@ -158,12 +158,27 @@ def test_plans_order_by_created_then_id():
 
 
 def test_steps_from_plan_items_maps_statuses():
+    # Bare strings are still accepted: a hand-built plan is a legitimate caller,
+    # and they carry no provenance, so `new` is False.
     steps = roadmap.steps_from_plan_items(
         {"done": ["a"], "planned": ["b", "c"], "not_yet": ["d"]})
-    assert steps == [{"text": "a", "status": "done"},
-                     {"text": "b", "status": "active"},
-                     {"text": "c", "status": "pending"},
-                     {"text": "d", "status": "skipped"}]
+    assert steps == [{"text": "a", "status": "done", "new": False},
+                     {"text": "b", "status": "active", "new": False},
+                     {"text": "c", "status": "pending", "new": False},
+                     {"text": "d", "status": "skipped", "new": False}]
+
+
+def test_steps_from_plan_items_carries_the_injected_flag():
+    # This is the hop where the marker used to die: the snapshot rebuilds every
+    # step's text from the checklist, so a flag that stopped here would make the
+    # resumed session unable to tell injected work from the original plan.
+    steps = roadmap.steps_from_plan_items(
+        {"done": [], "not_yet": [],
+         "planned": [{"text": "a", "is_new": True},
+                     {"text": "b", "is_new": False}]})
+    assert [s["new"] for s in steps] == [True, False]
+    assert roadmap.new_prefix(steps[0]) == roadmap.NEW_MARKER
+    assert roadmap.new_prefix(steps[1]) == ""
     assert roadmap.steps_from_plan_items(
         {"done": [], "planned": [], "not_yet": []}) == []
     # oversize checklist items truncate instead of invalidating the marker

@@ -148,7 +148,12 @@ def list_runs(project=None, *, now_fn=time.time,
         items = _fix_plan_items(r["goal_dir"])
         r["doing"] = summaries[-1][1] if (running and summaries) else None
         past = summaries[:-1] if running else summaries
-        r["done"] = [f"iter {i}: {s}" for i, s in past] + items["done"]
+        # Iteration summaries are wrapped in the same shape the checklist items
+        # arrive in, so the renderer reads ONE contract for the whole group. A
+        # list mixing bare strings with dicts is how a template ends up printing
+        # "[object Object]" for half a card.
+        r["done"] = [{"text": f"iter {i}: {s}", "is_new": False}
+                     for i, s in past] + items["done"]
         r["planned"] = items["planned"]
         r["not_yet"] = items["not_yet"]
         out.append(r)

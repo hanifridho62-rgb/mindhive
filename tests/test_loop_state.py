@@ -103,10 +103,25 @@ def test_list_runs_progress_groups(tmp_path):
     r = res["runs"][0]
     assert r["title"] == "wiring now"          # latest summary supersedes PROMPT title
     assert r["doing"] == "wiring now"
-    assert "iter 1: did scaffold" in r["done"]
-    assert "scaffold" in r["done"]
-    assert r["planned"] == ["wire API"]
-    assert r["not_yet"] == ["polish"]
+    # One contract for the whole group: iteration summaries and checklist items
+    # arrive in the same {text, is_new} shape, so the renderer never has to ask
+    # which kind of entry it is holding.
+    assert {"text": "iter 1: did scaffold", "is_new": False} in r["done"]
+    assert {"text": "scaffold", "is_new": False} in r["done"]
+    assert r["planned"] == [{"text": "wire API", "is_new": False}]
+    assert r["not_yet"] == [{"text": "polish", "is_new": False}]
+
+
+def test_list_runs_marks_injected_checklist_items(tmp_path):
+    goal = tmp_path / ".hive-loop"
+    goal.mkdir()
+    (goal / "fix_plan.md").write_text(
+        "- [ ] wire API\n- [ ] (new) Bootstrap the suite\n", encoding="utf-8")
+    _seed_run("bbb", 10, goal_dir=str(goal))
+    r = state.list_runs("test",
+                        now_fn=lambda: _epoch("2026-07-07T10:03:00Z"))["runs"][0]
+    assert r["planned"] == [{"text": "wire API", "is_new": False},
+                            {"text": "Bootstrap the suite", "is_new": True}]
 
 
 def test_dismissed_live_run_resurfaces_on_new_events():

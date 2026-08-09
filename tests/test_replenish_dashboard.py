@@ -86,3 +86,58 @@ def test_the_served_page_draws_the_marker(server):
     # The pre-existing Oversee hooks must still be there — a render change that
     # took the section out with it is the failure mode worth catching.
     assert "showOversee" in body and "renderOversee" in body and "rmPanel" in body
+
+
+# --- the progress list, not just the roadmap panel ---------------------------
+# Master-prompt 4.1/4.2/4.3: the card's own done/planned/not_yet groups carry
+# the flag too, so a reader who never opens the roadmap panel still sees that
+# the plan grew.
+
+def test_a_chat_card_carries_landed_work_as_a_marked_planned_item():
+    from mindhive import oversee, replenish
+    events.append_event("user_prompt", {"text": "add the parser"},
+                        session_id=SID)
+    replenish.run_round(
+        events.read_all(), surface="session",
+        sink=replenish_sinks.roadmap_sink(SID),
+        lenses={"l": lambda _e: [Candidate(
+            lens="evidence-gap", title="Run the test suite",
+            fingerprint="fp-card", evidence=("a real pointer",),
+            severity=True)]},
+        session_id=SID)
+    cards = oversee.interactive_sessions()
+    card = next(c for c in cards if c["run_id"] == SID)
+    assert {"text": "Run the test suite", "is_new": True} in card["planned"]
+
+
+def test_a_refused_row_does_not_reach_the_card():
+    from mindhive import oversee
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    events.append_event(
+        "work_injected",
+        {"outcome": "refused", "round": 1, "surface": "session", "lens": "l",
+         "title": "not worth doing", "fingerprint": "fp-r",
+         "reason": "no evidence"}, session_id=SID, tags=["replenish"])
+    card = next(c for c in oversee.interactive_sessions()
+                if c["run_id"] == SID)
+    assert card["planned"] == []
+
+
+def test_a_malformed_work_injected_row_does_not_break_the_card():
+    from mindhive import oversee
+    events.append_event("user_prompt", {"text": "ask"}, session_id=SID)
+    events.append_event("work_injected", ["not", "a", "dict"], session_id=SID)
+    card = next(c for c in oversee.interactive_sessions()
+                if c["run_id"] == SID)
+    assert card["planned"] == []
+
+
+def test_the_row_renderer_tolerates_both_shapes_and_escapes_the_text(server):
+    base, _token = server
+    _status, body = _get(base, "/")
+    # ovRow must accept a bare string (chat cards) and {text, is_new} (loop
+    # cards). Escaping stays on the text; the badge is the only markup.
+    assert "function ovRow(" in body
+    assert "typeof entry === 'object'" in body
+    assert "obj.is_new" in body
+    assert "esc(obj.text" in body
