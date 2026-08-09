@@ -1372,6 +1372,50 @@ def _fuse(target, members) -> Candidate:
         score=combined.total)
 
 
+def _rank(kept) -> list:
+    """Order survivors so the cap keeps the best work from EVERY lens.
+
+    Score ordering came first and was necessary. Trimmed in gate order the cap
+    cut by lens registration instead: measured against the real ledger under
+    `balanced`, 22 candidates cleared the gate and `kept[:10]` kept ten `repair`
+    rows scoring 25-65 while dropping a repair scoring 1320, an evidence-gap
+    scoring 100, and every pinned caveat.
+
+    But score ALONE lets one lens take the whole round, and on this ledger it
+    does. `repair` reads occurrence counts in the hundreds, so even bounded by
+    `RECURRENCE_MAX_STEPS` its subtotal dwarfs every other lens's. Measured the
+    same way, a balanced round gave 7 of its 10 slots to `repair` and **zero to
+    `audit` and `coverage`** — five lenses answered their questions and were cut
+    before anyone read them. A round that is one lens is not a round; it is the
+    loudest fold repeated ten times.
+
+    So: rank within each lens by score, then take round-robin across lenses. The
+    highest-scoring candidate overall still goes first, and the cap still cuts
+    the least-insisted-on work WITHIN each lens — but every lens gets its best
+    find in before any lens gets its second.
+
+    Fused candidates ride as one group: `_fuse` gives every one of them
+    `lens="resonance"`, which is correct here — the round noticing agreement is
+    itself a distinct source, and it competes as one rather than crowding the
+    rotation with a bucket per target.
+
+    Deterministic: lenses are ordered by their best candidate's score, ties
+    broken on the lens name, so the same ledger produces the same round."""
+    by_lens: dict = {}
+    for candidate in kept:
+        by_lens.setdefault(candidate.lens, []).append(candidate)
+    for group in by_lens.values():
+        # Stable, so equal scores keep gate (registry) order within a lens.
+        group.sort(key=lambda c: c.score, reverse=True)
+    order = sorted(by_lens, key=lambda name: (-by_lens[name][0].score, name))
+    out = []
+    for i in range(max((len(g) for g in by_lens.values()), default=0)):
+        for name in order:
+            if i < len(by_lens[name]):
+                out.append(by_lens[name][i])
+    return out
+
+
 def gate(candidates, spent, cfg):
     """``(kept, refused)`` — refused entries carry their reason.
 
@@ -1577,13 +1621,7 @@ def run_round(evs, *, surface, sink, cfg=None, lenses=None, project=None,
     if injection_budget is not None:
         ceiling = min(ceiling, injection_budget)
     if len(kept) > ceiling:
-        # Highest score first, so a cap cuts the work the record insists on LEAST.
-        # Trimmed in gate order the cap cut by lens registration instead: measured
-        # against the real ledger under `balanced`, 22 candidates cleared the gate
-        # and `kept[:10]` kept ten `repair` rows scoring 25-65 while dropping a
-        # repair scoring 1320, an evidence-gap scoring 100, and every pinned
-        # caveat. Sorting is stable, so equal scores keep that registry order.
-        kept = sorted(kept, key=lambda c: c.score, reverse=True)
+        kept = _rank(kept)
         dropped = len(kept) - ceiling
         kept = kept[:ceiling]
 

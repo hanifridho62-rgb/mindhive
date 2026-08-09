@@ -1159,3 +1159,68 @@ def test_the_core_does_not_import_a_sink():
     leaves = {name.rsplit(".", 1)[-1] for name in imported}
     assert "roadmap" not in leaves
     assert "replenish_sinks" not in leaves
+
+
+# --- the cap must not hand the whole round to one lens ------------------------
+# Score ordering alone does exactly that on this ledger: `repair` reads
+# occurrence counts in the hundreds, so even bounded by RECURRENCE_MAX_STEPS its
+# subtotal dwarfs every other lens's. Measured under `balanced`, a round gave 7
+# of 10 slots to `repair` and zero to `audit` and `coverage`.
+
+def _ranked(lens, fp, score):
+    return _cand(fp=fp, lens=lens, score=score)
+
+
+def test_the_highest_scoring_candidate_still_goes_first():
+    ranked = replenish._rank([_ranked("coverage", "c1", 15),
+                              _ranked("repair", "r1", 1320)])
+    assert ranked[0].fingerprint == "r1"
+
+
+def test_every_lens_gets_its_best_in_before_any_lens_gets_a_second():
+    ranked = replenish._rank([
+        _ranked("repair", "r1", 1320), _ranked("repair", "r2", 900),
+        _ranked("repair", "r3", 400),
+        _ranked("coverage", "c1", 15), _ranked("audit", "a1", 35),
+    ])
+    assert [c.lens for c in ranked[:3]] == ["repair", "audit", "coverage"]
+
+
+def test_within_a_lens_the_cap_still_cuts_the_least_insisted_on_work():
+    ranked = replenish._rank([_ranked("repair", "low", 25),
+                              _ranked("repair", "high", 1320)])
+    assert [c.fingerprint for c in ranked] == ["high", "low"]
+
+
+def test_a_dominating_lens_cannot_take_the_whole_round():
+    cfg = replenish.ReplenishConfig(min_score=0, max_per_round=3)
+    lenses = {
+        "repair": lambda _c: [_ranked("repair", f"r{i}", 1000 - i)
+                              for i in range(10)],
+        "coverage": lambda _c: [_ranked("coverage", "c1", 15)],
+        "audit": lambda _c: [_ranked("audit", "a1", 35)],
+    }
+    res = replenish.run_round([], surface="session", sink=_sink(), cfg=cfg,
+                              lenses=lenses)
+    assert {c.lens for c, _pl in res.landed} == {"repair", "audit", "coverage"}
+
+
+def test_fused_candidates_ride_as_one_group():
+    # `_fuse` gives every fused candidate lens="resonance". They compete as one
+    # source rather than crowding the rotation with a bucket per target.
+    ranked = replenish._rank([
+        _ranked("resonance", "f1", 300), _ranked("resonance", "f2", 280),
+        _ranked("repair", "r1", 290),
+    ])
+    assert [c.fingerprint for c in ranked] == ["f1", "r1", "f2"]
+
+
+def test_the_ranking_is_deterministic_on_a_tie():
+    # The same ledger must produce the same round; ties break on the lens name.
+    a = replenish._rank([_ranked("zebra", "z1", 40), _ranked("alpha", "a1", 40)])
+    b = replenish._rank([_ranked("alpha", "a1", 40), _ranked("zebra", "z1", 40)])
+    assert [c.lens for c in a] == [c.lens for c in b] == ["alpha", "zebra"]
+
+
+def test_ranking_an_empty_list_returns_empty():
+    assert replenish._rank([]) == []
