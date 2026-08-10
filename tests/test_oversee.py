@@ -264,3 +264,137 @@ def test_cli_skills_trail_prints_trail(capsys, monkeypatch):
     cli.cmd_skills_trail(args)
     out = capsys.readouterr().out
     assert "ce-plan" in out and "plan the thing" in out and "sess-abc" in out
+
+
+# --- injector-directed skills and the honest trail ---------------------------
+# The trail must never attribute a call to something that did not cause it. That
+# rule is what makes the field necessary: before it, every direction rendered as
+# "directed by prompt-gate" no matter who issued it.
+
+from mindhive import replenish as _replenish                       # noqa: E402
+
+TSID = "sess-trail-01"
+
+
+def _direct(source="replenish_injector", name="ce-code-review"):
+    payload = {"skills": [{"name": name}]}
+    if source is not None:
+        payload["source"] = source
+    events.append_event("skill_directed", payload, session_id=TSID,
+                        ts="2026-08-02T00:00:00Z", tags=["skill"])
+
+
+def _used(name="ce-code-review", ts="2026-08-02T00:01:00Z", **over):
+    payload = {"name": name}
+    payload.update(over)
+    events.append_event("skill_used", payload, session_id=TSID, ts=ts,
+                        tags=["skill"])
+
+
+def _why():
+    return oversee.skill_trails(evs=events.read_all())[TSID][0]["why"]
+
+
+def test_an_injector_direction_names_the_injector():
+    _direct()
+    _used()
+    assert _why() == "directed by autonomous replenish loop"
+
+
+def test_a_row_with_no_source_still_renders_as_the_prompt_gate():
+    # Every historical row predates the field; the fold must not change for one.
+    _direct(source=None)
+    _used()
+    assert _why() == "directed by prompt-gate"
+
+
+def test_the_measured_suffix_still_rides_a_gate_direction():
+    events.append_event(
+        "skill_directed",
+        {"skills": [{"name": "ce-code-review",
+                     "measured": {"calls": 4, "ok": 3}}]},
+        session_id=TSID, ts="2026-08-02T00:00:00Z", tags=["skill"])
+    _used()
+    assert _why() == "directed by prompt-gate (measured 3/4)"
+
+
+def test_an_unknown_source_is_not_attributed_to_the_prompt_gate():
+    _direct(source="some-future-writer")
+    _used()
+    why = _why()
+    assert why == "directed"
+    assert "prompt-gate" not in why
+    assert "some-future-writer" not in why      # never echo the raw value
+
+
+def test_invocation_args_still_outrank_any_direction():
+    _direct()
+    _used(args="review the parser change")
+    assert "review the parser change" in _why()
+
+
+def test_consumed_directions_counts_an_injector_direction_the_same():
+    _direct()
+    _used()
+    assert oversee.consumed_directions(evs=events.read_all()) == {
+        "ce-code-review": 1}
+
+
+def _stats(fail=(), ok=()):
+    for n in fail:
+        events.append_event("tool_failed",
+                            {"text": "boom", "signature": f"skill:{n}",
+                             "action": "x"}, ts="2026-08-01T00:00:00Z")
+    for n in ok:
+        events.append_event("invoke_result", {"name": n, "text": "fine"},
+                            ts="2026-08-01T00:00:00Z")
+
+
+def test_a_skill_whose_last_call_failed_is_not_picked():
+    _stats(fail=["ce-code-review"], ok=["ce-plan"])
+    assert _replenish.pick_skill(["ce-code-review", "ce-plan"]) == "ce-plan"
+
+
+def test_the_more_followed_skill_wins():
+    _stats(ok=["ce-plan", "ce-work"])
+    events.append_event("skill_directed", {"skills": [{"name": "ce-work"}]},
+                        session_id=TSID, ts="2026-08-01T00:00:00Z")
+    events.append_event("skill_used", {"name": "ce-work"}, session_id=TSID,
+                        ts="2026-08-01T00:01:00Z")
+    assert _replenish.pick_skill(["ce-plan", "ce-work"]) == "ce-work"
+
+
+def test_an_exact_tie_breaks_on_the_name():
+    _stats(ok=["b-skill", "a-skill"])
+    assert _replenish.pick_skill(["b-skill", "a-skill"]) == "a-skill"
+
+
+def test_no_viable_skill_directs_nothing_and_records_nothing():
+    # A direction with no basis is a fabricated trail.
+    _stats(fail=["only-skill"])
+    assert _replenish.direct_skill(["only-skill"], session_id=TSID) == ""
+    assert [e for e in events.read_all() if e.type == "skill_directed"] == []
+
+
+def test_an_empty_name_list_directs_nothing():
+    assert _replenish.pick_skill([]) == ""
+    assert _replenish.pick_skill(["  "]) == ""
+
+
+def test_the_direction_is_recorded_before_the_invocation():
+    _stats(ok=["ce-plan"])
+    assert _replenish.direct_skill(["ce-plan"], session_id=TSID) == "ce-plan"
+    row = [e for e in events.read_all() if e.type == "skill_directed"][0]
+    assert row.payload["source"] == _replenish.SOURCE_REPLENISH
+    assert row.payload["skills"] == [{"name": "ce-plan"}]
+    # Recorded first is what lets the consume-once pairing join it to the
+    # skill_used that follows; `ts=None` stamps now, after the direction.
+    _used(name="ce-plan", ts=None)
+    assert _why() == "directed by autonomous replenish loop"
+
+
+def test_append_false_picks_without_recording():
+    _stats(ok=["ce-plan"])
+    assert _replenish.direct_skill(["ce-plan"], session_id=TSID,
+                                   append=False) == "ce-plan"
+    assert [e for e in events.read_all() if e.type == "skill_directed"] == []

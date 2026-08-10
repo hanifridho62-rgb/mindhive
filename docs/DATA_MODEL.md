@@ -91,10 +91,17 @@ lifecycle), `trigger_trained`, `invoke_requested`/`invoke_result`,
 `skill_used` (`{name, plugin?, ok, text, args?}` — optional `args` is the
 capped invocation ask, the recorded "why" behind Oversee's per-session skill
 trail; contract owned by `hookcapture.py`),
-`skill_directed` (`{skills: [{name, plugin?, measured?}]}` — the prompt-quality
-gate directed these skills on an underspecified prompt; `promptgate.py` writes
-it, `oversee.skill_trails` joins it to a later same-session `skill_used` for the
-honest causal "directed by prompt-gate" why), `memory_consolidated`,
+`skill_directed` (`{skills: [{name, plugin?, measured?}], source?}` — these
+skills were directed at a session, and `oversee.skill_trails` joins the row to a
+later same-session `skill_used` for the honest causal why. `source` names the
+writer: **absent or empty is the prompt gate** (`promptgate.py`, its only writer
+before the replenishment injector, so every historical row folds unchanged),
+`"replenish_injector"` is the injector (`replenish.direct_skill`).
+`oversee.DIRECTION_SOURCES` maps each to its rendered reason. An **unrecognised**
+source renders a bare `"directed"`: a trail must never attribute a call to
+something that did not cause it, and that cannot hold if every unknown writer
+falls back to the gate's wording — while echoing the raw value would put an
+unvalidated ledger string into the rendered trail), `memory_consolidated`,
 `prompt_enriched`/`enrich_toggled` (Oversee prompt enrichment, `enrich.py`:
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
