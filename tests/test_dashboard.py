@@ -134,6 +134,33 @@ def test_served_page_contains_log_view_hook(dashboard_server):
     assert "/api/changelog" in body
 
 
+def test_boot_does_not_clobber_a_view_the_user_already_picked(dashboard_server):
+    # loadProjects() takes seconds on a large ledger and the nav stays clickable
+    # while it runs, so boot's own showOverview() used to overwrite whatever
+    # section the user clicked in that window — silently, with no error.
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    assert "await loadProjects(); if (!viewPicked) showOverview();" in body
+    # and the unguarded form must be gone
+    assert "await loadProjects(); showOverview();" not in body
+
+
+def test_run_marks_the_view_picked_before_it_awaits(dashboard_server):
+    # The flag has to be set at click time. Setting it after the section's fetch
+    # resolves would leave the same race open, because boot can win that race.
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    start = body.index("async function run(label, fn){")
+    body_of_run = body[start:start + 300]
+    picked = body_of_run.index("viewPicked = true;")
+    busy = body_of_run.index("setBusy(true, label);")
+    assert picked < busy, "viewPicked must be set before run() does anything else"
+    # panel swaps that never reach run() count too
+    assert "function only(el){ viewPicked = true;" in body
+
+
 def test_overview_endpoint_returns_stats(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/api/overview", token)
