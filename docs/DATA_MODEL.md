@@ -187,6 +187,24 @@ every telemetry event is hashed and re-hashed in full by every `hive verify`.
 Volume is therefore a real cost of a high-frequency type (`mindnet_activity`
 being the one to watch); bound it at the emitter.
 
+**The checkpoint seals whole SECONDS, not event counts.** `read_all` orders rows
+by `(ts, segment_name, line_index)` — total and deterministic for a given set of
+files, but **not append-monotonic**: ledger timestamps are second-resolution and
+the tie-break is the segment's filename, so an event appended later with a `ts`
+equal to already-sealed rows can sort *before* them. A checkpoint whose boundary
+sat inside such a group was invalidated by the next arrival in that same second,
+which kept `hive verify` red permanently — and an alarm that is always red
+attests to nothing, because a real tamper cannot be told apart from the standing
+failure. `chain.sealable` therefore ends the stamped prefix at a second boundary.
+
+Two consequences follow, and both are intended. Events in the newest second are
+**unattested** until a later projection seals them, so `ahead` is the normal
+steady state and a tamper confined to that window is not caught until the next
+projection. A store written entirely within one second seals nothing (count 0,
+the zero digest) — the correct answer rather than a case to special-case around.
+Removing the window entirely needs an append-monotonic order (a sequence number
+or sub-second timestamps), which would re-base every chain head ever computed.
+
 ### 3.1 Merge exemptions (both lists, or it is not exempt)
 
 Registry/audit types are **exempt from merging everywhere**, and "everywhere"
