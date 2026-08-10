@@ -161,6 +161,36 @@ def test_run_marks_the_view_picked_before_it_awaits(dashboard_server):
     assert "function only(el){ viewPicked = true;" in body
 
 
+def test_both_pollers_skip_a_tick_instead_of_queueing(dashboard_server):
+    # Measured 2026-08-10 against the 31k-event store: the section endpoints cost
+    # 1.2-1.9 s of pure-Python fold and /api/mindnet/cats 0.87-0.92 s, against a
+    # 2500 ms timer. Overlapping requests do not divide that work, they queue it --
+    # four concurrent requests measured 4.99 s against 5.3 s run serially, so the GIL
+    # serialises the folds -- and a user's click lands behind the queue at 6-12 s.
+    # Each poller must skip its tick rather than stack another request on top.
+    #
+    # LIMIT, stated so nobody mistakes this for proof: this asserts the SHAPE of the
+    # served source, not behaviour. No JavaScript executes here. It catches the guard
+    # being deleted, set too late, or never released; it cannot observe two real
+    # requests overlapping. Behavioural cover is the node unit test (T11) and the
+    # Playwright suite (T12), neither of which exists yet.
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    for fn, flag in (("refreshLive", "liveInFlight"), ("pollCats", "catsInFlight")):
+        start = body.index("async function " + fn + "(){")
+        block = body[start:start + 700]
+        assert "if (" + flag + ") return;" in block, \
+            fn + " must skip while one of its own requests is in flight"
+        # raised before the first await, or two ticks both pass the check and overlap
+        raised = block.index(flag + " = true;")
+        awaited = block.index("await ")
+        assert raised < awaited, fn + " must set " + flag + " before it awaits"
+        # released in finally, or one thrown error wedges the poller permanently
+        assert "finally { " + flag + " = false; }" in block, \
+            fn + " must clear " + flag + " in a finally block"
+
+
 def test_overview_endpoint_returns_stats(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/api/overview", token)

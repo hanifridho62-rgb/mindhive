@@ -246,11 +246,23 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   // silent refresh: no busy spinner, no nav-disable, errors swallowed so a
   // transient blip never disrupts what the user is reading.
+  //
+  // The in-flight guard is load-bearing, not defensive. Measured 2026-08-10 against
+  // the 31k-event store: the section endpoints cost 1.2-1.9 s of pure-Python fold, so
+  // a 2500 ms timer overlaps its own previous request the moment anything else
+  // competes for the interpreter. Overlap does not divide that work, it queues it —
+  // four concurrent requests measured 4.99 s against 5.3 s run serially, i.e. the GIL
+  // serialises the folds — and a user's click lands at the back of the queue. Skipping
+  // a tick costs one stale interval; not skipping cost 6-12 s section loads.
+  let liveInFlight = false;
   async function refreshLive(){
     if (!liveOn || !liveFn) return;
     if (document.hidden) return;
     if (busyDot.classList.contains('busy')) return;  // don't fight a manual op
+    if (liveInFlight) return;                        // skip this tick, never queue it
+    liveInFlight = true;
     try { await liveFn(); markSynced(); } catch(_) { /* keep last good view */ }
+    finally { liveInFlight = false; }
   }
   setInterval(refreshLive, LIVE_MS);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshLive(); });
@@ -1835,14 +1847,24 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // Errors are swallowed for the same reason the swarm page keeps this call outside
   // its main try: a failing board must not take out the page, and a failing page
   // must not take out the board.
+  // In-flight guard, same reason as refreshLive — see the measurement in its comment.
+  // This timer is the worse offender of the two: it has no busy gate at all, so it
+  // fires against /api/mindnet/cats every 2500 ms whatever section is open, and that
+  // endpoint reads the whole ledger (or every namespace in HIVE MIND) on each call.
+  // Measured alone it costs 0.87-0.92 s and returns 503 bytes; under real load it took
+  // 6 s for the same 503 bytes, which is queueing, not payload.
+  let catsInFlight = false;
   async function pollCats(){
     if (!liveOn || document.hidden) return;
+    if (catsInFlight) return;   // skip this tick, never queue it
+    catsInFlight = true;
     // ONE fetch feeds both strips — see the swarm page's poll for why.
     try {
       const board = await apiGet('/api/mindnet/cats');
       paintCats(board.cats || []);
       paintSessions(board);
     } catch(_){}
+    finally { catsInFlight = false; }
   }
   setInterval(pollCats, LIVE_MS);
 
