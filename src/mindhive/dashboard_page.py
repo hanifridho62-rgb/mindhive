@@ -227,6 +227,11 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // mutate memory call refreshLive() so changes appear without a manual click.
   let liveFn = null;
   let liveOn = true;
+  // The boot sequence lands on the overview only if the user hasn't already
+  // picked a view. loadProjects() takes seconds on a large ledger and the nav
+  // stays clickable throughout (setBusy never fires for it), so a click in that
+  // window used to be overwritten by boot's own showOverview() with no error.
+  let viewPicked = false;
   const LIVE_MS = 2500;
   function pad2(n){ return (n<10?'0':'')+n; }
   function markSynced(){
@@ -258,7 +263,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     navButtons().forEach(b => b.disabled = on);
   }
   // panel switching
-  function only(el){ for (const e of [out, view, graph]) e.classList.toggle('hidden', e !== el); }
+  // Panel swaps that bypass run() (Recall, Append, the workspace iframes) still
+  // count as the user picking a view — see viewPicked.
+  function only(el){ viewPicked = true; for (const e of [out, view, graph]) e.classList.toggle('hidden', e !== el); }
   function showText(v){ only(out); out.textContent = (typeof v === 'string') ? v : JSON.stringify(v, null, 2); }
   function showHTML(html){ only(view); view.innerHTML = html; }
   function fail(e){
@@ -329,6 +336,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   // wrap any async unit of work with busy state + error handling
   async function run(label, fn){
+    // Set before the first await: the section is chosen at click time, not when
+    // its fetch returns, and boot may resolve in between.
+    viewPicked = true;
     setBusy(true, label);
     try { await fn(); } catch(e) { fail(e); } finally { setBusy(false); }
   }
@@ -1836,8 +1846,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   setInterval(pollCats, LIVE_MS);
 
-  // populate the project picker, then land on the overview
-  (async () => { await loadProjects(); showOverview(); pollCats(); })();
+  // populate the project picker, then land on the overview — unless the user
+  // already picked a view while the picker was still loading.
+  (async () => { await loadProjects(); if (!viewPicked) showOverview(); pollCats(); })();
 </script>
 </body></html>""" \
     .replace("/*__CAT_CSS__*/", cat_board.CSS) \
