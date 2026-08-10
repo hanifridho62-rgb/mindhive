@@ -25,10 +25,41 @@ def compute_chain(evs, checkpoint=None) -> dict:
     return out
 
 
+def sealable(evs) -> list:
+    """The prefix a checkpoint may attest to: every event strictly before the
+    newest timestamp on record.
+
+    `read_all` orders by ``(ts, segment_name, line_index)``. That order is total
+    and deterministic for a given set of files, but it is **not
+    append-monotonic**: ledger timestamps are second-resolution and the
+    tie-break is the segment's filename, so an event appended later with a ts
+    equal to already-sealed rows can sort BEFORE them. A checkpoint whose
+    boundary sits inside such a group is invalidated by the next arrival in that
+    same second — measured on the live store, that kept `hive verify` red
+    permanently, and an alarm that is always red attests to nothing.
+
+    Ending the prefix at a second boundary fixes that: no later event can sort
+    into a second that is already complete.
+
+    The cost is real and bounded. Events in the newest second are unattested
+    until a later projection seals them — the `ahead` window widens by at most
+    one second's worth of events. A store written entirely within one second
+    therefore seals nothing, which is the correct answer rather than a case to
+    special-case around."""
+    if not evs:
+        return []
+    newest = evs[-1].ts or ""
+    end = len(evs)
+    while end > 0 and (evs[end - 1].ts or "") == newest:
+        end -= 1
+    return evs[:end]
+
+
 def write_chain(project=None, evs=None) -> dict:
     # Accept pre-parsed events to avoid a second full read of the event log when
     # the caller (e.g. projector.project) already has them in hand.
-    c = compute_chain(events.read_all(project) if evs is None else evs)
+    rows = events.read_all(project) if evs is None else evs
+    c = compute_chain(sealable(rows))
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
     (pdir / "chain.json").write_text(events.canonical_json(c), encoding="utf-8")
