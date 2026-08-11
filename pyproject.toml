@@ -19,3 +19,20 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# `node` is deselected by DEFAULT, and that is the whole reason it exists.
+# `hive selftest` shells `[sys.executable, -m, pytest, -q, tests/]` from inside
+# the dashboard's POST handler (src/mindhive/verify.py:64), so anything this
+# suite collects by default runs inside the web server when somebody presses
+# Self-test in the browser. A JavaScript test that spawns `node` (and, later,
+# Playwright browsers) must never be in that set.
+#
+# `-m` is last-one-wins, so an explicit `pytest -m node` on the command line
+# overrides the line below rather than intersecting with it. Nothing else about
+# the default run changes: the node tests are reported as `deselected`, which is
+# a visible number, not a silent omission.
+markers = [
+    "node: JavaScript unit tests executed through the node binary. Deselected by default (see above); run with `pytest -m node`.",
+]
+addopts = "-m 'not node'"

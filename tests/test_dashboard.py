@@ -1,5 +1,6 @@
 # tests/test_dashboard.py
 import json
+import re
 import socket
 import urllib.request
 import urllib.error
@@ -7,7 +8,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard
+from mindhive import dashboard, dashboard_page
 
 # Store isolation is provided by the autouse `isolate_store` fixture in
 # tests/conftest.py — every dashboard test (and its in-process server threads)
@@ -189,6 +190,338 @@ def test_both_pollers_skip_a_tick_instead_of_queueing(dashboard_server):
         # released in finally, or one thrown error wedges the poller permanently
         assert "finally { " + flag + " = false; }" in block, \
             fn + " must clear " + flag + " in a finally block"
+
+
+# --------------------------------------------------------------------------
+# The stale-paint discard (T9): a render must never paint a section the user
+# is no longer on.
+#
+# WHAT WAS ACTUALLY WRONG, so nobody re-derives it from the tests below: the
+# live poller calls liveFn() DIRECTLY -- it does not go through run(), and it
+# does not set the busy flag. So a poll of Oversee started 2 s ago is still in
+# flight when Overview is clicked; /api/overview happens to answer first; the
+# poller's showHTML() then lands LAST and repaints Oversee under a "ready"
+# status. The user sees the section they picked appear and then get taken
+# away. Disabling the nav during a fetch never touched this path, and a
+# generation counter stamped inside run() cannot see the poller's renders at
+# all -- which is why the fix compares the render function's own identity
+# against liveFn at paint time.
+#
+# LIMIT of everything in this block, stated plainly: these assert the SHAPE of
+# the served source. No JavaScript executes here. They catch a guard being
+# deleted, placed before the await where it can catch nothing, placed after the
+# paint where it is too late, or ordered after a throw (which reaches run()'s
+# catch and paints an error over the new section instead). They cannot observe
+# two real responses interleaving. The decision itself IS executed, in
+# tests/test_paint_guard_node.py (T11, `pytest -m node`), against the exact
+# source this page ships -- the seam is asserted by
+# test_the_guard_node_executes_is_the_guard_the_page_ships below. Tier 2
+# (Playwright, T12) does not exist yet.
+# --------------------------------------------------------------------------
+
+# Every renderer registered as a liveFn. renderPlugins is asserted separately:
+# it predates this change and already carries the idiom in its positive form.
+_LIVE_RENDERERS = ["renderOverview", "renderMemory", "renderImprovements",
+                   "renderOversee", "renderLog", "renderSops", "renderState"]
+# Renderers that raise on a bad payload -- the guard has to come first.
+_THROWING_RENDERERS = ["renderImprovements", "renderOversee", "renderLog",
+                       "renderSops"]
+_PAINT_CALLS = ("showHTML(", "showText(", "paintMemory(", "paintImprovements(",
+                "paintOversee(", "paintPlugins(")
+
+
+def _js_block(page, signature):
+    """Slice one top-level function out of the served page: from its signature
+    to the first line that closes at the script's own two-space indent. Every
+    nested block in this file is indented four or more, so `\\n  }` cannot match
+    inside one (the same slice the poller test above relies on)."""
+    start = page.index(signature)
+    return page[start:page.index("\n  }", start)]
+
+
+def _first_of(block, needles):
+    hits = [block.index(n) for n in needles if n in block]
+    return min(hits) if hits else None
+
+
+@pytest.mark.parametrize("fn", _LIVE_RENDERERS)
+def test_a_live_renderer_discards_a_paint_for_a_section_the_user_left(fn, dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert status == 200
+    block = _js_block(body, "async function " + fn + "(){")
+    guard = "if (!shouldPaint(liveFn, " + fn + ")) return;"
+    assert guard in block, (
+        fn + " can paint a section the user already navigated away from; it "
+        "must re-read liveFn after its fetch and return when it no longer "
+        "matches itself")
+    where = block.index(guard)
+    assert where > block.index("await "), (
+        fn + " checks liveFn before it awaits, where nothing can have changed "
+        "yet -- the check has to happen after the response lands")
+    paint = _first_of(block, _PAINT_CALLS)
+    assert paint is not None, fn + " no longer paints anything; fix this test"
+    assert where < paint, fn + " checks liveFn only after it has already painted"
+
+
+@pytest.mark.parametrize("fn", _THROWING_RENDERERS)
+def test_a_discarded_render_does_not_raise_either(fn, dashboard_server):
+    """Returning early is only half of it. A stale render that throws lands in
+    run()'s catch, which calls fail() -- and fail() paints the error over
+    whatever section the user is now looking at. Same clobber, different route."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    block = _js_block(body, "async function " + fn + "(){")
+    assert block.index("if (!shouldPaint(liveFn, " + fn + ")) return;") < block.index("throw new Error"), (
+        fn + " raises before it checks whether its section is still selected")
+
+
+@pytest.mark.parametrize("fn,cache", [("renderMemory", "MEM_ITEMS = "),
+                                      ("renderImprovements", "IMP_ITEMS = "),
+                                      ("renderOversee", "OV_DATA = ")])
+def test_a_discarded_render_writes_no_cache(fn, cache, dashboard_server):
+    """A stale response that skips the paint but still overwrites the module
+    cache leaves the visible section rendering another section's data on its
+    next repaint -- the same bug, deferred by one tick."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    block = _js_block(body, "async function " + fn + "(){")
+    assert block.index("if (!shouldPaint(liveFn, " + fn + ")) return;") < block.index(cache), (
+        fn + " writes " + cache.strip() + " before it knows the response is "
+        "still wanted")
+
+
+def test_the_plugins_renderer_still_carries_the_same_idiom(dashboard_server):
+    """renderPlugins had this guard before T9 (in its positive form, gating a
+    paint rather than returning early). It is the reason the idiom was chosen
+    rather than invented: seven existing call sites. Those sites now call
+    shouldPaint too -- one decision, one home, one thing the node test covers."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "if (shouldPaint(liveFn, renderPlugins)) paintPlugins();" in body
+    assert body.count("shouldPaint(liveFn, renderPlugins)") >= 6
+    assert "liveFn === renderPlugins" not in body, (
+        "a raw identity comparison is back; the decision has to stay in "
+        "shouldPaint, which is the only part of it any test can execute")
+    assert "liveFn !== render" not in body, (
+        "a raw identity comparison is back outside shouldPaint")
+
+
+def test_the_guard_node_executes_is_the_guard_the_page_ships(dashboard_server):
+    """SOURCE-SHAPE assertion, and stated as one -- but it is the seam that
+    stops the tier-1 node test (tests/test_paint_guard_node.py) from proving
+    something true about a copy. That test imports PAINT_GUARD_JS and executes
+    it; this asserts the browser is served those same bytes. Without this pair,
+    the page's guard could change and node would keep testing the old text."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert dashboard_page.PAINT_GUARD_JS in body, (
+        "the served page no longer contains PAINT_GUARD_JS verbatim -- the node "
+        "test is now exercising something the browser never receives")
+    assert "/*__PAINT_GUARD__*/" not in body, "the placeholder was never substituted"
+    # One definition only: a second copy is how the two would drift.
+    assert body.count("function shouldPaint(") == 1
+    assert "function shouldPaint(currentLiveFn, renderFn){" in \
+        dashboard_page.PAINT_GUARD_JS
+    # Pure, or node cannot import it: no globals, no DOM, no fetch.
+    guard = _js_block(body, "function shouldPaint(currentLiveFn, renderFn){")
+    for forbidden in ("document", "window", "liveFn =", "await", "fetch("):
+        assert forbidden not in guard, (
+            f"shouldPaint touches {forbidden!r}; it has to stay importable "
+            "outside a browser or the tier-1 test cannot run it")
+
+
+def test_the_nav_is_never_disabled_during_a_fetch(dashboard_server):
+    """setBusy used to disable every nav button for the length of a fetch. It
+    never covered the poller (which bypasses setBusy), it made the nav feel dead
+    for the 1-2 s a section costs, and it is what made 'click A then B' feel
+    impossible. The discard guards replace it; the server-side locks make it
+    safe. Nothing may quietly reintroduce it."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    block = _js_block(body, "function setBusy(on, label){")
+    assert "disabled" not in block, (
+        "setBusy is disabling controls again: " + block)
+    assert "navButtons" not in body, "the nav-locking helper is back"
+    assert "nav button:disabled" not in body, (
+        "dead CSS for a state nav buttons no longer enter")
+
+
+def test_busy_is_announced_to_assistive_tech_instead_of_locking_the_nav(dashboard_server):
+    """The accessibility half of dropping the nav lock. `disabled` on every nav
+    button was the ONLY signal a screen reader got that the app was busy -- a
+    side effect of a lock, not a statement of state. Removing it without
+    replacing it would have been a regression for exactly the users who cannot
+    see the spinner."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert 'id="panel" aria-busy="false"' in body, (
+        "the panel does not declare an initial aria-busy state")
+    block = _js_block(body, "function setBusy(on, label){")
+    assert "aria-busy" in block, "aria-busy is never updated as work starts/ends"
+    for needle in ('id="ann"', 'role="status"', 'aria-live="polite"',
+                   'aria-atomic="true"', 'class="sr-only"'):
+        assert needle in body, f"missing live-region attribute: {needle}"
+    # display:none / hidden on a live region means it is never announced at all
+    assert ".sr-only { position:absolute" in body
+    assert "display:none" not in body[body.index(".sr-only {"):
+                                      body.index(".sr-only {") + 200]
+
+
+def test_run_announces_the_section_change_and_the_outcome(dashboard_server):
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    block = _js_block(body, "async function run(label, fn){")
+    assert "announce(label);" in block, "no announcement when a section starts loading"
+    assert block.index("announce(label);") < block.index("await fn()")
+    assert block.count("announce(") == 3, (
+        "expected three announcements: section change, success, failure -- got "
+        + str(block.count("announce(")))
+    assert "catch(e) { fail(e); announce(" in block, (
+        "a failed operation ends silently for a screen reader")
+
+
+def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_server):
+    """Two thresholds, not one. Painting a placeholder immediately makes every
+    fast section flicker; never painting one leaves the 1.2-1.9 s section loads
+    looking frozen. And a 10 s wait under a bare 'working…' chip reads as a hang."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "const SKEL_MS = 300, SLOW_MS = 10000;" in body
+    block = _js_block(body, "async function run(label, fn){")
+    assert "setTimeout(showSkeleton, SKEL_MS)" in block, "no deferred skeleton"
+    assert "SLOW_MS" in block, "nothing escalates the status text on a long wait"
+    # both timers cleared in finally, or a failed op leaves a skeleton painting
+    # itself over the error the user needs to read
+    assert "finally { clearTimeout(skel); clearTimeout(slow); setBusy(false); }" in block
+    skel = _js_block(body, "function showSkeleton(){")
+    assert "document.activeElement" in skel and "closest('#view')" in skel, (
+        "the skeleton can repaint the panel out from under a caret")
+
+
+def test_the_pages_own_animations_honour_reduced_motion(dashboard_server):
+    """`cat_board.CSS` ships the guard for the cat sprites and deliberately names
+    nothing else. Without a page-local block, a reduced-motion user would keep
+    every pulse this page declares itself and lose only the cats' bob."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    blocks = re.findall(r"@media \(prefers-reduced-motion: reduce\)\s*\{"
+                        r"(.*?)\n  \}", body, re.S)
+    assert blocks, "the dashboard page ships no reduced-motion guard at all"
+    covered = " ".join(blocks)
+    for sel in (".dot.busy", "#live .blip", ".ovspin", ".rmnode.rmactive",
+                ".skel .bar"):
+        assert sel in covered, (
+            f"{sel} keeps animating under prefers-reduced-motion")
+    assert "!important" in covered, (
+        "the rules switching each animation on are at least as specific, and a "
+        "media query adds no specificity -- without !important the guard loses")
+
+
+# Every selector in the SERVED page that switches motion on, mapped to the
+# selector of the rule that switches it back off under prefers-reduced-motion.
+# Usually the same string. `.mn-cat.active svg` is the exception, and it is the
+# reason this is a written map instead of a computed one: cat_board disables it
+# through `.mn-cat-sprite`, a class it stamps on every sprite it draws, so the
+# two are different text for the same elements. No CSS engine runs here, so that
+# pairing is asserted rather than proved -- but the CENSUS below is computed
+# from the page, which is the half that catches the regression that actually
+# happens: an animation added later, in any of the three fragments, with nothing
+# turning it off.
+_MOTION_GUARDS = {
+    # dashboard_page.py
+    "header .dot.busy": "header .dot.busy",
+    "header #live .blip": "header #live .blip",
+    ".ovspin": ".ovspin",
+    ".rmnode.rmactive": ".rmnode.rmactive",
+    ".rmfill": ".rmfill",
+    ".skel .bar": ".skel .bar",
+    # cat_board.py
+    ".mn-cat.active svg": ".mn-cat-sprite",
+    ".mn-sess.working .mn-cat-sprite": ".mn-cat-sprite",
+    ".mn-sess": ".mn-sess",
+    # taskview.py
+    ".tstat.ongoing": ".tstat.ongoing",
+}
+
+_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+_MOTION_RE = re.compile(r"(?:animation|transition)\s*:\s*([^;}]+)")
+
+
+def _css_rules(css):
+    for sel, decls in _RULE_RE.findall(css):
+        yield " ".join(sel.split()), decls
+
+
+def test_every_animation_the_page_serves_is_stopped_under_reduced_motion(dashboard_server):
+    """The census behind the checklist above. Three modules contribute CSS to
+    this one page -- dashboard_page, cat_board and taskview -- and each guards
+    its own motion, so "did anyone add a pulse and forget" is a question no
+    single file can answer. This asks the assembled page.
+
+    SOURCE-SHAPE, stated plainly: it reads the served stylesheet, it does not
+    apply it. It cannot prove a guard wins the cascade; it proves every live
+    animation has one, that the one it has is `!important` (a media query adds
+    no specificity, so without it the guard loses), and that a newly added
+    animation cannot ship without somebody deciding about it here."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert body.count("<style>") == 1, "the page grew a second stylesheet block"
+    css = re.sub(r"/\*.*?\*/", "",
+                 body[body.index("<style>"):body.index("</style>")], flags=re.S)
+
+    reduced = re.findall(r"@media \(prefers-reduced-motion: reduce\)\s*\{(.*?)\n  \}",
+                         css, re.S)
+    assert reduced, "the page ships no reduced-motion guard at all"
+    outside = css
+    for block in reduced:
+        outside = outside.replace(block, "")
+
+    live = set()
+    for sel, decls in _css_rules(outside):
+        m = _MOTION_RE.search(decls)
+        if m and not m.group(1).strip().startswith("none"):
+            live.add(sel)
+    assert live == set(_MOTION_GUARDS), (
+        "the page's motion changed and this census was not updated.\n"
+        f"  no guard decided for: {sorted(live - set(_MOTION_GUARDS))}\n"
+        f"  listed but gone from the page: {sorted(set(_MOTION_GUARDS) - live)}\n"
+        "Repeating animation is a trigger for some people, not an annoyance: a "
+        "new one needs a prefers-reduced-motion rule that stops it, in the "
+        "fragment that declares it.")
+
+    stopped = {}
+    for block in reduced:
+        for sel, decls in _css_rules(block):
+            if re.search(r"(?:animation|transition)\s*:\s*none", decls):
+                for one in sel.split(","):
+                    stopped.setdefault(" ".join(one.split()), []).append(decls)
+    for on_sel, guard_sel in sorted(_MOTION_GUARDS.items()):
+        assert guard_sel in stopped, (
+            f"{on_sel} keeps moving under prefers-reduced-motion: no rule for "
+            f"{guard_sel} inside a reduced-motion block")
+        assert "!important" in " ".join(stopped[guard_sel]), (
+            f"the guard for {on_sel} ({guard_sel}) is not !important, so the "
+            "more specific rule that turns the animation on still wins")
+
+
+def test_the_live_chip_stops_claiming_live_after_three_failed_ticks(dashboard_server):
+    """Swallowing every poll failure was right for one blip and wrong for a dead
+    server: the chip went on reading 'live' while nothing had refreshed for
+    minutes. CONSECUTIVE is the load-bearing word -- a counter that never resets
+    would flag a single recovered blip forever."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    assert "const LIVE_STALE_STRIKES = 3;" in body
+    block = _js_block(body, "function markLiveHealth(ok){")
+    assert "liveFails = ok ? 0 : liveFails + 1;" in block, (
+        "one success must reset the streak, or a recovered blip flags forever")
+    assert "liveFails >= LIVE_STALE_STRIKES" in block
+    assert "classList.toggle('stale'" in block, "the state is never made visible"
+    live = _js_block(body, "async function refreshLive(){")
+    assert "markLiveHealth(true)" in live and "markLiveHealth(false)" in live, (
+        "refreshLive records neither success nor failure")
+    assert "header #live.stale" in body, "the stale class has no styling"
 
 
 def test_overview_endpoint_returns_stats(dashboard_server):
