@@ -1031,14 +1031,54 @@ verification conditions above.
 
 ## Unresolved Decisions
 
-None. 19 DX-review + 15 eng-review + 8 cross-model + 10 design-review = 52 decisions,
-all answered.
+None. 19 DX-review + 15 eng-review + 8 cross-model + 10 design-review + 3 CEO-review = 55
+decisions, all answered.
+
+## PR-1 resequencing — CEO review, 2026-08-10
+
+Mode: HOLD SCOPE. Coverage unchanged — all 31 tasks stand, none added, none removed. Only
+the order changed, and it changed because one session produced 2 of 31 tasks while four of
+the five reported complaints have PRs that are independent and unstarted.
+
+Lane A stays serial inside itself (`dashboard.py` 1460 lines and `dashboard_page.py` 1859
+lines are the shared surface — three live slices on them would conflict three ways). Lanes
+B/C/D share no module with A or with each other and run in parallel, exactly as the
+Worktree parallelization table above already says.
+
+```
+PR-1a  T8 -> T6 -> T9 + T11 + T31     closes P1 end to end (slow AND wrong-section)
+PR-1b  T5, T2, T3, T4                 worst single endpoint + keep-alive correctness
+PR-1c  T26, T28, T10                  polish
+PR-2   T13..T16, T12                  closes P4 (three dead buttons)
+
+PR-3   T17, T18      closes P2 (roadmap card never retires)  | parallel, can start now
+PR-4   T19, T25      closes P3 (rotation advisory lies)      | parallel, can start now
+PR-5   T20..T24      closes P5 (SOP injection proof)         | parallel, can start now
+```
+
+Three decisions this review made:
+
+1. **Order inside PR-1a is `T8 -> T6 -> T9`, not `T8 -> T9 -> T6`.** T9 drops the nav
+   disable, which raises concurrent requests; T1 measured the folds as GIL-serialized
+   (4 concurrent 4.99s vs 5.3s serial). T6 removes the queue first, then nav opens. T8
+   stays first — W1c already states that order is not negotiable.
+2. **T11 moves from PR-2 into PR-1a.** The failure-modes table classifies the `liveFn ===`
+   discard as **silent** and requires tier 1 + tier 2. Tier 2 (T12) legitimately belongs to
+   PR-2, but shipping T9 with neither leaves its mandatory regression test defaulting to the
+   source-string style this plan already calls vacuous. T11 is the tier-1 node test and is
+   marker-fenced, so `hive selftest` still never spawns node from inside the POST handler
+   ([verify.py:64](../../src/mindhive/verify.py:64)).
+3. **T31 moves from PR-1c into PR-1a.** T9 removes `disabled`, today's only screen-reader
+   busy signal; T31's `aria-busy`/`aria-live` is its replacement. Split across merged PRs
+   they leave an a11y regression window; landed together they are one change.
+
+No decision from the DX, eng, design, or outside-voice reviews was reopened.
 
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (HOLD) | mode: HOLD_SCOPE, 0 critical gaps, 3 decisions |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 21 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 1 | CLEAR (FULL) | score: 4/10 → 8/10, 10 decisions |
@@ -1046,6 +1086,12 @@ all answered.
 | Outside Voice | Claude subagent | Independent plan challenge | 2 | ISSUES_FOUND | 26 findings across two passes |
 
 **CODEX:** Codex CLI is not installed on this machine; both outside-voice passes ran as Claude subagents with fresh context. The gstack mockup generator is installed but unconfigured (no OpenAI key), so the design reference board was hand-built from the real palette instead — exact rather than generated.
+
+**CROSS-MODEL:** The CEO review's central finding is one no prior pass reached: the failure-modes table marks the `liveFn ===` discard **silent** and requires tier 1 + tier 2, while both tiers were assigned to PR-2 and T9 to PR-1. Eng, design, DX, and both outside-voice passes each reviewed one dimension and none crossed the test-strategy table against the PR assignment. No prior finding was contradicted.
+
+**VERDICT:** CEO + ENG + DESIGN CLEARED — ready to implement. DX review remains ISSUES_OPEN (score 7/10, informational, never a ship gate). PR-1 resequenced into three slices with lanes B/C/D unblocked in parallel; scope held at 31 tasks.
+
+NO UNRESOLVED DECISIONS
 
 **CROSS-MODEL:** The outside voice ran twice and was right both times. Pass 1 refuted three DX-review conclusions and one fact (namespace count 80 → 56), reversing the execution order, cutting an SSE endpoint and a new subcommand, and adding a mandatory profiling step. Pass 2 refuted five engineering-review conclusions: the generation guard was over-engineered (a one-line `liveFn ===` idiom already exists seven times in the same file), HTTP/1.1's real hazards were `_body` raising before draining and a blanket-except double response rather than Content-Length, `hook_decision` already ships the advisory ceiling W3 proposed to design, `default_project()` is not on the per-request hot path, and the subcommand count seeding a parity test was wrong (39, not 38). It also found that dropping the nav disable removes the only mutual exclusion on six unlocked mutating endpoints. All 8 tensions resolved toward the outside voice. The design review then found that the plan was inventing a third status vocabulary where two already existed, and that its own enum contradicted its own diagram by omitting `failed`.
 

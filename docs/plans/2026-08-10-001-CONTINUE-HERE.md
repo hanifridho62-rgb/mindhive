@@ -15,13 +15,16 @@ that the plan does not already say.
 ## 1. Exact state of the tree
 
 ```
- M src/mindhive/dashboard_page.py      +22   T7 only
- M tests/test_dashboard.py             +30   T7's test only
-?? TODOS.md                                  8 items
-?? docs/plans/2026-08-10-001-*.md            the plan + this file
+a3d7606  docs: PR-1 plan, three review reports, and the T1 profile
+99dd244  feat(dashboard): serialise both live pollers so a slow tick is skipped, not queued
 ```
 
-**Nothing is committed.** Zero commits ahead of `efa3751`.
+**Both commits landed.** Working tree clean, 2 commits ahead of `efa3751`. §7 below is
+therefore already done — do not redo it.
+
+**This work lives ONLY in this worktree**, on `claude/mindhive-dashboard-perf-eab7dd`.
+Neither commit exists on `master` or in any other worktree. A "fresh session in this
+worktree" means literally this path — opening one elsewhere gets `efa3751` and none of it.
 
 ## 2. Done and verified
 
@@ -39,23 +42,42 @@ their first `await` and clear it in `finally`.
 
 ## 3. NOT done
 
-24 tasks remain. PR-1's remainder, in the profile-corrected order:
+24 tasks remain. **Resequenced by `/plan-ceo-review` on 2026-08-10 (HOLD SCOPE — nothing
+added, nothing removed, order only).** Full reasoning: `## PR-1 resequencing` in the plan.
 
 ```
-T8   server locks on six mutating endpoints   MUST land before T9
-T6   gate /api/mindnet/cats                   the biggest lever after T7
-T5   segment_stats memo for _project_stats    two guards mandatory
-T2   drain _body before raising
-T3   _responded flag on both blanket excepts
-T4   protocol_version HTTP/1.1 + timeout=30   ships only after T2 and T3
-T26  extract 123 hex literals to CSS tokens
-T9   liveFn === discard + drop nav disable    regression test mandatory
-T28  three skeleton shapes at 150ms
-T10  3-strike stale chip
-T31  prefers-reduced-motion + aria-live + aria-busy
+PR-1a  T8   server locks on six mutating endpoints   MUST land before T9
+       T6   gate /api/mindnet/cats                   biggest lever after T7
+       T9   liveFn === discard + drop nav disable    AFTER T6, not before
+       T11  node unit test of the discard decision   moved up from PR-2
+       T31  reduced-motion + aria-live + aria-busy   moved up from PR-1c
+       -> closes complaint P1 end to end, and yields the before/after number
+
+PR-1b  T5   segment_stats memo                       two guards mandatory
+       T2   drain _body before raising
+       T3   _responded flag on both blanket excepts
+       T4   protocol_version HTTP/1.1 + timeout=30   only after T2 and T3
+
+PR-1c  T26  extract 123 hex literals to CSS tokens
+       T28  three skeleton shapes at 150ms
+       T10  3-strike stale chip
 ```
 
-PR-2..PR-5 (T11–T25, T27, T29, T30) are separate branches. Do not start them here.
+Why T6 before T9: T9 makes the nav clickable during a fetch, which raises concurrent
+requests, and T1 measured the folds as GIL-serialized (4 concurrent 4.99s vs 5.3s serial).
+Relieve the queue first, then open the nav.
+
+Why T11 rides with T9: the plan's failure-modes table marks the `liveFn ===` discard
+**silent** and requires tier 1 + tier 2. Without T11, T9's mandatory regression test falls
+back to the source-string style the plan itself calls vacuous (trap 7 below).
+
+**Lane A is serial** — PR-1a, PR-1b, PR-1c and PR-2 all own `dashboard.py` and
+`dashboard_page.py`. Do not run them concurrently.
+
+**PR-3, PR-4, PR-5 are unblocked and can start NOW, in parallel worktrees** — they share no
+module with lane A or with each other. Each is small and each closes a whole complaint:
+PR-3 = T17,T18 (P2 roadmap card) · PR-4 = T19,T25 (P3 rotation) · PR-5 = T20..T24 (P5 SOP
+proof). PR-2 (T13-T16, T12) closes P4 but must wait for lane A.
 
 ## 4. Measured facts — do NOT re-derive these
 
@@ -142,11 +164,15 @@ records, biting the handoff itself. So:
 
 1. `hive state` and `hive briefing` — standing SOP, orient from the ledger first.
 2. Read the plan, then this file.
-3. **Commit what exists first** (see §7) so the T1 profile and T7 are not at risk.
-4. Then T8 → T6 → T5, in that order. T8 first because T9 cannot ship safely without it.
+3. ~~Commit what exists first~~ — **already done**, see §7. Do not redo it.
+4. Then PR-1a: **T8 → T6 → T9, plus T11 and T31**, in that order (see §3). T8 first because
+   T9 cannot ship safely without it; T6 before T9 because T9 raises concurrency.
+5. Consider opening PR-3, PR-4 or PR-5 in a separate worktree in parallel — each is 2-5
+   tasks, each closes a whole complaint, and none shares a module with lane A.
 
-**Do not** re-run `/plan-devex-review`, `/plan-eng-review`, or `/plan-design-review`. All three
-are logged CLEAR/complete within the 7-day window and their reports are in the plan.
+**Do not** re-run `/plan-devex-review`, `/plan-eng-review`, `/plan-design-review`, or
+`/plan-ceo-review`. All four are logged CLEAR/complete within the 7-day window and their
+reports are in the plan.
 
 **Subagents and workflows were unavailable** at the end of this session (hard session limit).
 If they are available again, the failed workflow script is at
@@ -156,9 +182,11 @@ completed, so nothing replays from cache; it starts fresh. Its two lanes have st
 ownership (`dashboard.py` vs `dashboard_page.py`) and separate new test files, which is what
 makes it safe to parallelise.
 
-## 7. The commit that should happen first
+## 7. The first commit — DONE 2026-08-10
 
-Nothing is committed. Two logical change-sets:
+Both change-sets are committed. Kept here for history; there is nothing to do in this
+section. **Verified 2026-08-10: no upstream, no remote ref, no PR — this branch has no
+copy anywhere but this disk.**
 
 ```
 1. src/mindhive/dashboard_page.py + tests/test_dashboard.py
@@ -170,7 +198,7 @@ Nothing is committed. Two logical change-sets:
    No src/ or tests/ touched -> no hive log entry required for this one.
 ```
 
-They can be one commit or two. Two reads better in history: one is behaviour, one is planning.
+Landed as two commits — `99dd244` (behaviour) and `a3d7606` (planning).
 
 ## 8. Honest gaps
 
