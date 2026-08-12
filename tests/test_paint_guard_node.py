@@ -138,12 +138,16 @@ def _case(report, name):
     assert c["ok"], f"{name}: {c['detail']}"
 
 
-# Renderers whose paint the page CAN guard. renderSessions / renderTaskCards are
-# the documented gap (the paint happens inside taskview.py, past an await this
-# module does not own) and are checked by the subset test instead, which stays
-# green when that gap is closed.
+# Every renderer the page declares — there is no longer an excused set.
+# renderSessions / renderTaskCards used to be "the documented gap", on the
+# grounds that their paint happens inside taskview.py past an await this module
+# does not own. taskview.py had already shipped that guard in the same commit,
+# so the excuse outlived the gap: the one guard living outside dashboard_page.py
+# was the only guard in the change with no discard case, no anti-vacuity case
+# and no mutant, and deleting it would have kept every test green.
 GUARDED = ["renderOverview", "renderMemory", "renderImprovements", "renderOversee",
-           "renderLog", "renderSops", "renderState", "renderPlugins"]
+           "renderLog", "renderSops", "renderState", "renderPlugins",
+           "renderSessions", "renderTaskCards"]
 
 
 def test_the_harness_saw_the_renderers_the_page_declares(report):
@@ -241,4 +245,68 @@ def test_a_wedged_poll_cannot_keep_claiming_live(report, case):
     on asserting freshness. The second case is the other half: the answer is to
     keep skipping and tell the truth, NOT to retry, because a replacement
     request every 2.5 s is exactly the pile-up the latch was added to stop."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
+    "the_cats_poll_issues_one_request_and_then_skips",
+    "the_cats_poll_resumes_once_its_request_lands",
+    "both_halves_of_the_cats_latch_are_removable",
+    "removing_the_cats_skip_lets_the_ticks_queue",
+    "removing_the_cats_release_wedges_the_poller",
+])
+def test_the_cats_poller_skips_rather_than_queues(report, case):
+    """The second poller, which had no executed cover at all.
+
+    `pollCats` carries the same latch as `refreshLive` and was asserted only by
+    substring-matching the served page, including a whitespace-exact
+    `finally { catsInFlight = false; }`. That check cannot tell a latch that
+    works from one that is merely spelled correctly — and this is the poller
+    with the cheaper endpoint, so it is the one likeliest to be waved through."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
+    "a_render_started_for_another_project_paints_nothing",
+    "the_scope_check_is_one_removable_expression",
+    "removing_the_scope_check_paints_the_other_projects_data",
+])
+def test_a_project_switch_discards_the_previous_namespaces_answer(report, case):
+    """SCOPE, which section identity cannot express.
+
+    `shouldPaint` asks which SECTION is live. A project switch changes neither
+    the section nor the renderer — `onProjChange` re-enters Overview — so a user
+    already on Overview has `liveFn === renderOverview` on both sides and an
+    answer fetched for the previous namespace compares equal. It painted another
+    project's numbers under this project's label with nothing on screen looking
+    wrong. The case asserts liveFn was identical across the switch, so a pass
+    cannot be credited to the section guard by accident."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
+    "the_refusal_check_is_removable",
+    "the_stamp_check_is_removable",
+    "the_paused_check_is_removable",
+    "a_refused_action_is_not_announced_as_ready",
+    "the_refusal_reason_still_reaches_the_panel",
+    "a_discarded_live_tick_does_not_stamp_the_page_as_updated",
+    "pausing_replaces_the_stale_message_it_can_no_longer_update",
+    "without_the_refusal_check_the_status_says_ready",
+    "without_the_liveFn_recheck_a_discarded_tick_stamps",
+    "without_the_paused_branch_the_stale_message_survives_the_pause",
+])
+def test_the_page_does_not_report_what_did_not_happen(report, case):
+    """Three ways the page said something that was not so, none of them a paint.
+
+    A server-side refusal (`{ok:false, error:…}` with HTTP 200 — how the six
+    one-at-a-time locks decline work) was rendered and then reported as a
+    completed operation. A live tick whose render was DISCARDED still moved the
+    "updated HH:MM:SS" stamp, which is the one widget a user checks to decide
+    whether what they are reading is current. And a chip that went stale and was
+    then paused kept the "not refreshing" message, which nothing could correct
+    because markLiveHealth is unreachable while paused.
+
+    Each is checked against the real page and against a copy with that one
+    check removed, which must fail."""
     _case(report, case)

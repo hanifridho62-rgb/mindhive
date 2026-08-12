@@ -182,31 +182,18 @@ names.
 
 ---
 
-## 9. A section render in flight when the project changes paints the old project's data
+## 9. ~~A section render in flight when the project changes paints the old project's data~~ — DONE
 
-**What:** Give every renderer the treatment `renderPlugins` already has: capture the scope it
-was started for, and discard on the far side of the await if that scope has moved.
+Closed 2026-08-12, not deferred. The fix is one scope check in `apiGet`
+([dashboard_page.py](src/mindhive/dashboard_page.py)): capture `PROJECT` before the fetch,
+throw a named `StaleScope` error if the picker moved before the body arrived. That is the one
+choke point every renderer and both pollers already pass through, so it did not need the
+nine-renderer change this item was written to warn about. `apiPost` is deliberately left alone
+— a mutation ran against the project named in its own body, so its result is worth showing.
 
-**Why:** `shouldPaint` compares SECTION identity
-([dashboard_page.py:49](src/mindhive/dashboard_page.py:49)), and section identity is not scope
-identity. `onProjChange` sets `PROJECT` and calls `showOverview()`, so a user already on
-Overview has `liveFn === renderOverview` on both sides of the switch — a render still in flight
-for the previous project compares equal and paints its rows under the new project's label.
-Nothing errors and nothing looks wrong; the numbers are simply the other project's, until the
-next 2.5 s poll replaces them. That is the same class of bug PR-1a fixed across sections, and
-the same class the ledger's honest-zero rule exists for: a view that states a fact it cannot
-support.
+Kept here rather than deleted because the reasoning is the useful part: `shouldPaint` compares
+SECTION identity, and section identity is not scope identity. Anything else added later that
+fetches outside `apiGet` inherits the bug again.
 
-**Pros:** closes the last reachable instance of the documented within-section gap. **Cons:**
-nine renderers, each needing the capture-and-recheck pair; a partial application is worse than
-none, because the gap then looks closed.
-
-**Context for whoever picks this up in 3 months:** the mechanism to copy is
-`renderPlugins`' `PLUG_GEN` — stamp before the fetch burst, compare after, return without
-writing caches or painting. The cheap version is one module-level `SCOPE_GEN` bumped by
-`onProjChange`, captured by `run()` and re-checked in the same place `current()` is; that gets
-all nine renderers at once IF every one of them is started through `run()`. Verify that before
-assuming it — the pollers (`refreshLive`, `pollCats`) deliberately are not.
-
-**Depends on:** nothing. Independent of the five PRs; deliberately left out of PR-1 so the
-paint-guard change stayed one idea.
+**Behavioural cover:** `a_render_started_for_another_project_paints_nothing` in the node tier-1
+suite, with a mutant half that must fail.

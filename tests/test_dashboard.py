@@ -215,18 +215,20 @@ def test_both_pollers_skip_a_tick_instead_of_queueing(dashboard_server):
     # Each poller must skip its tick rather than stack another request on top.
     #
     # LIMIT, stated so nobody mistakes this for proof: this asserts the SHAPE of the
-    # served source, not behaviour. No JavaScript executes here. It catches the guard
-    # being deleted, set too late, or never released; it cannot observe two real
-    # requests overlapping. The behavioural half now exists for the live poller --
-    # `a_stuck_poll_never_issues_a_second_request` in the node tier-1 suite parks a
-    # request and counts how many go out -- but only for that one; pollCats has no
-    # executed cover, so this shape check is still the whole story there.
+    # served source, not behaviour. No JavaScript executes here. Both pollers now
+    # have executed cover in the node tier-1 suite -- `a_stuck_poll_never_issues_a
+    # _second_request` for this one, `the_cats_poll_issues_one_request_and_then_skips`
+    # plus `..._resumes_once_its_request_lands` for the other, each with a mutant
+    # half that must fail. That suite is deselected by default (`-m 'not node'`),
+    # so this stays as the DEFAULT suite's copy of the claim, not as its proof.
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert status == 200
     for fn, flag in (("refreshLive", "liveInFlight"), ("pollCats", "catsInFlight")):
         start = body.index("async function " + fn + "(){")
-        block = body[start:start + 900]
+        # Wide enough to reach the `finally`; the assert on it is what proves the
+        # window did not cut the function in half.
+        block = body[start:start + 1800]
         # `if (flag) return;` or a braced body that returns -- the live poller's
         # took a body when it grew the stuck-poll report. What must hold is that
         # the latch is read and the tick ends, not which of the two shapes it is.
@@ -447,6 +449,55 @@ def test_run_announces_the_section_change_and_the_outcome(dashboard_server):
         "run IS the current one, and guarding it would silence every section "
         "change instead of only the stale ones")
 
+    # The live region must not sit inside the subtree setBusy marks busy, or the
+    # "which section is coming up" announcement -- the thing that REPLACED the
+    # nav-disable busy signal -- is suppressed for the whole load and only the
+    # "-- ready" survives.
+    panel = body.index('id="panel" aria-busy="false"')
+    assert body.index('id="ann"') < panel, (
+        "the polite live region is a descendant of the aria-busy container, so "
+        "assistive tech is entitled to skip everything announced during a load")
+
+
+def test_a_failed_operation_does_not_end_with_the_status_reading_ready(
+        dashboard_server):
+    """`setBusy(false)` writes "ready" -- a RESTING state, not a verdict -- and
+    it ran in run()'s `finally`, after the catch. So every failure ended with the
+    live region saying "failed", the error sitting in the panel, and the status
+    chip a sighted user actually looks at saying the operation was fine.
+
+    Executed cover: `a_refused_action_is_not_announced_as_ready` in the node
+    tier-1 suite drives a real 200-with-ok:false through doAction and reads the
+    status element."""
+    base, token = dashboard_server
+    body = _get(base, "/")[1]
+    block = _js_block(body, "async function run(label, fn")
+    assert "failed = true;" in block, "run() does not record that it failed"
+    tail = block[block.index("finally {"):]
+    assert "if (failed)" in tail and "setBusy(false)" in tail, (
+        "the outcome is not applied after setBusy resets the status line")
+    assert tail.index("setBusy(false)") < tail.index("if (failed)"), (
+        "the failure text is written before setBusy overwrites it with 'ready'")
+
+
+def test_pausing_the_live_chip_outranks_a_stale_health_message(dashboard_server):
+    """Both rules are one id plus one class, so the later one wins a tie -- and
+    the later one was `.stale`. A chip that went stale and was then paused
+    rendered amber "not refreshing" under the word "paused", and could not
+    correct itself: markLiveHealth is unreachable while paused.
+
+    SOURCE-SHAPE, stated plainly: no CSS cascade runs here. The title half is
+    executed in the node suite (`pausing_replaces_the_stale_message_it_can_no
+    _longer_update`); the colour half is a selector this test can only read."""
+    base, token = dashboard_server
+    body = _get(base, "/")[1]
+    assert "header #live.stale:not(.paused)" in body, (
+        "the stale colour is not scoped away from the paused state")
+    assert "function liveTitle()" in body, (
+        "the chip's title is computed in more than one place again")
+    block = _js_block(body, "function liveTitle(){")
+    assert "if (!liveOn)" in block, "liveTitle does not consider the paused state"
+
 
 def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_server):
     """Two thresholds, not one. Painting a placeholder immediately makes every
@@ -471,9 +522,13 @@ def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_se
         "rewrites the status text of the section that replaced it")
     # both timers cleared in finally, or a failed op leaves a skeleton painting
     # itself over the error the user needs to read; busy is released only by the
-    # run that still owns the panel
-    assert ("finally { clearTimeout(skel); clearTimeout(slow); "
-            "if (current()) setBusy(false); }") in block
+    # run that still owns the panel. Asserted as facts about the finally block
+    # rather than as one whitespace-exact line: that line has now been reflowed
+    # twice by changes that altered nothing it was protecting.
+    tail = block[block.index("finally {"):]
+    for needle in ("clearTimeout(skel);", "clearTimeout(slow);",
+                   "if (current())", "setBusy(false)"):
+        assert needle in tail, f"run()'s finally no longer does: {needle}"
     skel = _js_block(body, "function showSkeleton(){")
     assert "document.activeElement" in skel and "closest('#view')" in skel, (
         "the skeleton can repaint the panel out from under a caret")
@@ -529,6 +584,47 @@ def test_every_page_module_guards_the_animations_it_declares():
         + "\n  ".join(offenders) +
         "\nRepeating animation is a trigger for some people, not an annoyance, "
         "and an iframe page inherits nothing from the host page's guard.")
+
+
+def test_no_stylesheet_closes_a_comment_twice():
+    """A stray `*/` deletes the rule that follows it, in silence.
+
+    Found by T12, against this very PR's own fix. The `#live.stale` comment ran
+    nine lines and closed on line three; CSS error recovery then read everything
+    from the reopened prose to the NEXT `{...}` as one invalid selector and
+    dropped that whole rule -- so `header #live.stale:not(.paused)` was never in
+    the stylesheet at all, and a stale chip rendered plain green. Every
+    source-shape assertion in this file passed the entire time, because the text
+    was exactly right; it just was not CSS any more.
+
+    Scoped to `<style>` regions and `*_CSS` constants rather than whole files:
+    `plugins.py` globs `*/SKILL.md` and `enforce.py` documents `**/*.py`, and a
+    file-wide sweep reports those as unbalanced closers. Only the text a browser
+    parses as CSS is in question here."""
+    import pathlib
+    from mindhive import dashboard_page as _dp
+
+    def stray_closers(css):
+        return re.findall(r"\*/", re.sub(r"/\*.*?\*/", "", css, flags=re.S))
+
+    # The canary: this detector is worth nothing if it cannot see the defect it
+    # was written for, and the defect is invisible to every other check here.
+    assert stray_closers("/* opened\n   closed */\n   still prose */\na { color:red }")
+    assert not stray_closers("/* opened\n   still prose */\na { color:red }")
+
+    pkg = pathlib.Path(_dp.__file__).parent
+    offenders = []
+    for path in sorted(pkg.rglob("*.py")):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        blocks = re.findall(r"<style>(.*?)</style>", src, re.S)
+        blocks += re.findall(r"^[A-Z_]*CSS\s*=\s*\"\"\"(.*?)\"\"\"", src,
+                             re.S | re.M)
+        for css in blocks:
+            for _ in stray_closers(css):
+                offenders.append(path.name)
+    assert not offenders, (
+        "a stylesheet closes a comment it never reopened, which silently deletes "
+        "the rule after it: " + ", ".join(sorted(set(offenders))))
 
 
 def test_the_pages_own_animations_honour_reduced_motion(dashboard_server):

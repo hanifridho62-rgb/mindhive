@@ -47,15 +47,13 @@ PAINT_GUARD_JS = """\
   // equal and both paint. Within-section ordering is a different problem with
   // its own fix (PLUG_GEN). This one is cross-section only.
   //
-  // The reachable instance of that gap, named rather than left abstract: SCOPE.
-  // `onProjChange` switches PROJECT and calls showOverview(), so a user already
-  // on Overview when they change the project has liveFn === renderOverview on
-  // both sides of the switch — and a render still in flight for the OLD project
-  // compares equal and paints its rows under the NEW project's label. Section
-  // identity is not scope identity, and this function only knows the first.
-  // Closing it means every renderer capturing PROJECT before its await and
-  // re-checking after, the way renderPlugins does with PLUG_GEN; that is a
-  // change to nine renderers and is tracked in TODOS.md, not smuggled in here.
+  // SCOPE is not this function's job either, and that was the reachable
+  // instance of the gap above: `onProjChange` switches PROJECT and calls
+  // showOverview(), so a user already on Overview has liveFn === renderOverview
+  // on both sides of the switch and the old project's rows compared equal.
+  // Closed elsewhere, at `apiGet` — one choke point every renderer and both
+  // pollers already pass through — rather than by teaching this comparison
+  // about globals it is deliberately pure of.
   function shouldPaint(currentLiveFn, renderFn){
     return currentLiveFn === renderFn;
   }"""
@@ -82,8 +80,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   header #live.paused { color:#6b7488; }
   /* Three consecutive failed live ticks (7.5 s): the chip stops claiming to be
      live. Colour + title only — toggleLive() rewrites this element's innerHTML,
-     so any text state written here would vanish on the next pause/resume. */
-  header #live.stale { color:#e0b341; }
+     so any text state written here would vanish on the next pause/resume.
+     `:not(.paused)` because both rules are one id + one class, so the later one
+     wins a tie — and the later one was `.stale`. A chip that went stale and was
+     then paused rendered amber "not refreshing" under the word "paused", and
+     could not clear itself: markLiveHealth is unreachable while paused
+     (refreshLive returns at `!liveOn`). Paused is a state the user CHOSE; it
+     outranks a health signal about a poll that is no longer running. */
+  header #live.stale:not(.paused) { color:#e0b341; }
   header #live .blip { animation: pulse 1.6s infinite; }
   header #synced { font-size:11px; color:#6b7488; min-width:118px; text-align:right; }
   header #projwrap { font-size:12px; color:#9aa3b8; display:flex; align-items:center; gap:6px; }
@@ -352,6 +356,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     liveOn = !liveOn;
     liveEl.classList.toggle('paused', !liveOn);
     liveEl.innerHTML = (liveOn ? '<span class="blip">&#9679;</span> live' : '&#9679; paused');
+    // The tooltip follows the same precedence as the colour: paused is what the
+    // user asked for, so it replaces a health message about a poll that is no
+    // longer running. The strike count is deliberately NOT reset — a server
+    // that was dead before the pause is probably dead after it, and resuming
+    // runs a tick immediately, which is what re-establishes the truth.
+    liveEl.title = liveTitle();
     if (liveOn) refreshLive();
   }
   // silent refresh: no busy spinner, no status text, errors swallowed so a
@@ -388,13 +398,18 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // the last good render stays on screen, only the chip stops lying about it.
   const LIVE_STALE_STRIKES = 3;
   let liveFails = 0;
-  function markLiveHealth(ok){
-    liveFails = ok ? 0 : liveFails + 1;
-    const stale = liveFails >= LIVE_STALE_STRIKES;
-    liveEl.classList.toggle('stale', stale);
-    liveEl.title = stale
+  // One place decides what the chip claims, because two places disagreed: the
+  // health message outlived the pause that made it untrue.
+  function liveTitle(){
+    if (!liveOn) return 'Paused \\u2014 click to resume';
+    return liveFails >= LIVE_STALE_STRIKES
       ? 'Not refreshing \\u2014 '+liveFails+' updates failed in a row. Click to pause/resume.'
       : 'Real-time updates \\u2014 click to pause/resume';
+  }
+  function markLiveHealth(ok){
+    liveFails = ok ? 0 : liveFails + 1;
+    liveEl.classList.toggle('stale', liveFails >= LIVE_STALE_STRIKES);
+    liveEl.title = liveTitle();
   }
   async function refreshLive(){
     if (!liveOn || !liveFn) return;
@@ -406,8 +421,23 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     }
     liveInFlight = true;
     liveSince = Date.now();
-    try { await liveFn(); markSynced(); markLiveHealth(true); }
-    catch(_) { markLiveHealth(false); /* keep last good view */ }
+    // Capture the section this tick is FOR. A discarded render returns
+    // `undefined` exactly like a successful one — shouldPaint just returns
+    // early — so without this the poller stamped "updated HH:MM:SS" and reset
+    // the failure count for a paint that never happened. That is the same lie
+    // the stale chip exists to stop, arriving through the other door: the one
+    // widget a user checks to decide whether the view in front of them is
+    // current. Re-reading `liveFn` after the await IS the discard test, and it
+    // is the same comparison every renderer makes at its own paint site.
+    const fn = liveFn;
+    try {
+      await fn();
+      if (liveFn === fn) { markSynced(); markLiveHealth(true); }
+    }
+    // A scope change is not an outage. The tick was discarded because the user
+    // moved the picker, and counting it as a failed update would walk the chip
+    // toward "not refreshing" for something the user did on purpose.
+    catch(e) { if (!e || e.name !== 'StaleScope') markLiveHealth(false); }
     finally { liveInFlight = false; }
   }
   setInterval(refreshLive, LIVE_MS);
@@ -465,10 +495,29 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function withProj(path){
     return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
   }
+  // SCOPE identity, the half `shouldPaint` cannot answer. It compares which
+  // SECTION is live; a project switch changes neither the section nor the
+  // renderer, so a response fetched for project A used to paint its rows under
+  // project B's label with nothing wrong on screen to show for it — the numbers
+  // were simply another namespace's until the next poll replaced them.
+  //
+  // Enforced HERE, at the one place every renderer and both pollers already go
+  // through, rather than in nine renderers that would each have to remember.
+  // `apiPost` is deliberately NOT guarded: a mutation really did run against
+  // the project it named in its own body, so its result is worth showing.
+  function StaleScope(scope){
+    const e = new Error('a response for project ' + JSON.stringify(scope)
+                        + ' arrived after the picker had already moved');
+    e.name = 'StaleScope';
+    return e;
+  }
   async function apiGet(path){
+    const scope = PROJECT;              // the namespace this question was asked of
     const r = await fetch(u(withProj(path)), { headers: { 'X-Hive-Token': TOKEN } });
     const ct = r.headers.get('content-type') || '';
-    return ct.includes('json') ? r.json() : r.text();
+    const data = ct.includes('json') ? await r.json() : await r.text();
+    if (PROJECT !== scope) throw StaleScope(scope);
+    return data;
   }
   async function apiPost(path, body){
     const b = Object.assign({}, body || {});
@@ -567,15 +616,28 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     }, SLOW_MS);
     // `current` is passed to fn so the anonymous run()-scoped bodies can guard
     // their own paint. Renderers that take no argument ignore it, unchanged.
+    let failed = false;
     try { await fn(current); if (current()) announce((label || 'operation') + ' \\u2014 ready'); }
     catch(e) {
       // A stale failure is swallowed on purpose, the same way refreshLive
       // swallows a transient blip: painting it would put an error over the
       // section the user is now reading, which is the clobber this guard exists
       // to stop. The live run still surfaces its own errors.
+      failed = true;
       if (current()) { fail(e); announce((label || 'operation') + ' \\u2014 failed'); }
     }
-    finally { clearTimeout(skel); clearTimeout(slow); if (current()) setBusy(false); }
+    finally {
+      clearTimeout(skel); clearTimeout(slow);
+      if (current()) {
+        setBusy(false);
+        // "ready" is setBusy's RESTING state, not a verdict, and it was
+        // overwriting the outcome: every failed operation ended with the status
+        // chip reading "ready" while the live region said "failed" and the error
+        // sat in the panel below. Two surfaces, two different stories, and the
+        // one a sighted user actually looks at was the wrong one.
+        if (failed) statusEl.textContent = (label || 'operation') + ' \\u2014 failed';
+      }
+    }
   }
 
   async function renderOverview(){
@@ -996,13 +1058,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
 
   // --- Sessions: rendered by the notification-center fragment (taskview.py).
-  // KNOWN GAP, stated rather than papered over: this is the one section whose
-  // paint this module cannot guard. renderTaskCards awaits /api/sessions and
-  // then calls paintTaskCards() on the far side of that await, inside
-  // taskview.py — so a Sessions poll that resolves after the user has moved on
-  // still paints. Closing it needs the same shouldPaint(liveFn, renderSessions)
-  // at paintTaskCards, in that module. A guard here would run before the await
-  // and catch nothing, which would read as protection while providing none.
+  // This is the one section whose paint does not happen in this module, and
+  // therefore the one whose guard does not either: renderTaskCards awaits
+  // /api/sessions and calls paintTaskCards() on the far side of that await,
+  // inside taskview.py. The guard lives there, at both the paint and the cache
+  // write, and it compares against renderSessions — the section the user picked
+  // — because renderTaskCards is not somewhere you can navigate to. A guard
+  // placed HERE would run before the await and catch nothing, which would read
+  // as protection while providing none.
   async function renderSessions(){ return renderTaskCards(); }
   function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions, true); }
   function openSession(sid){ SESSION = sid; showMemory(); }
@@ -2097,11 +2160,26 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   function doExport(){ window.location = u('/api/export'); }
 
+  // A server-side refusal is `{ok:false, error:"…"}` with HTTP 200 — the six
+  // one-at-a-time locks answer that way on purpose, so the page can render it.
+  // Rendering it was ALL that happened: neither caller inspected `ok`, so run()
+  // finished normally and both the status line and the live region announced
+  // "ready" for an operation the server had declined to start. With the nav
+  // lock gone, a second click is easy to make and this was its only feedback.
+  //
+  // Keyed on `error` rather than on `ok` alone, because ok:false is also a
+  // legitimate RESULT here: `/api/verify` reports a broken hash chain that way,
+  // carrying `reason`, and that operation really did run.
+  function refusal(r){
+    return r && r.ok === false && typeof r.error === 'string' ? r.error : null;
+  }
   function doAction(path, label, method){
     controls.innerHTML=''; liveFn = null;
     run(label+'…', async (current) => {
       const r = method === 'GET' ? await apiGet(path) : await apiPost(path, {});
       if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
+      const why = refusal(r);
+      if (why) throw new Error(why);   // reaches run()'s catch -> "failed", announced
     });
   }
   function confirmAction(path, label){
@@ -2112,6 +2190,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     run(label+' running…', async (current) => {
       const r = await apiPost(path, body);
       if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
+      const why = refusal(r);
+      if (why) throw new Error(why);
     });
   }
 

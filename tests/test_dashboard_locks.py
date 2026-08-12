@@ -35,7 +35,8 @@ from mindhive import dashboard, events
 # test starts and ends from a known state.
 _ALL_LOCKS = (dashboard._HARVEST_LOCK, dashboard._PROJECT_LOCK,
               dashboard._SYNC_LOCK, dashboard._EMBED_LOCK,
-              dashboard._PLUGINS_LOCK, dashboard._SELFTEST_LOCK)
+              dashboard._PLUGINS_LOCK, dashboard._SELFTEST_LOCK,
+              dashboard._VERIFY_LOCK)
 
 
 @pytest.fixture(autouse=True)
@@ -493,3 +494,95 @@ def test_a_cache_hit_still_ages_the_wall_clock_fields(dashboard_server,
     assert aged["cats"][0]["age_secs"] >= 200
     assert aged["sessions"][0]["display"] == "resting", \
         "a cached fold froze `online`"
+
+
+# --- the one GET that belongs with the POSTs -------------------------------
+
+def test_a_second_chain_verification_is_refused_while_the_first_runs(
+        dashboard_server, monkeypatch):
+    """`/api/verify` reads every event and recomputes the hash chain — as
+    expensive as most of the POSTs above — and it is a GET, so the decorator
+    that guards them did not fit it and the nav disable was its only protection.
+    T9 removed that. One double-click then started two full chain recomputations
+    over the same ledger.
+
+    The decorator now takes `*a` rather than `(proj, body)` for exactly this: a
+    read-only endpoint still deserves the guard when the READ is the expensive
+    part."""
+    base, token = dashboard_server
+    fake, entered, release, calls = _blocking({"ok": True})
+    monkeypatch.setattr(importlib.import_module("mindhive.chain"), "verify", fake)
+
+    out: list = []
+    first = threading.Thread(
+        target=lambda: out.append(_get(base, "/api/verify?project=test", token)))
+    first.start()
+    assert entered.wait(10), "/api/verify never reached chain.verify"
+
+    status, obj = _get(base, "/api/verify?project=test", token)
+    assert status == 200, f"the refusal came back as {status}, not 200"
+    assert obj["ok"] is False and "already running" in obj["error"]
+
+    release.set()
+    first.join(20)
+    assert out and out[0][0] == 200 and out[0][1]["ok"] is True
+    assert calls == [1], \
+        f"chain.verify ran {len(calls)} times — the refusal answered but did not stop it"
+
+
+def _get_any(base, path, token):
+    """`_get` lets urllib raise on a 500; do_GET's unexpected-fault path IS part
+    of the contract here, so this one decodes it instead."""
+    sep = "&" if "?" in path else "?"
+    try:
+        with urllib.request.urlopen(f"{base}{path}{sep}token={token}",
+                                    timeout=20) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def test_the_verify_lock_is_released_when_the_read_raises(dashboard_server,
+                                                          monkeypatch):
+    base, token = dashboard_server
+    chain_mod = importlib.import_module("mindhive.chain")
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("ledger exploded")
+    monkeypatch.setattr(chain_mod, "verify", boom)
+    status, obj = _get_any(base, "/api/verify?project=test", token)
+    assert status == 500 and obj["ok"] is False
+
+    monkeypatch.setattr(chain_mod, "verify", lambda *_a, **_kw: {"ok": True})
+    status, obj = _get(base, "/api/verify?project=test", token)
+    assert status == 200 and obj["ok"] is True, \
+        "/api/verify stayed locked after the read raised"
+
+
+# --- the memos are bounded --------------------------------------------------
+
+def test_both_memos_evict_instead_of_growing_with_the_namespace_count():
+    """Process-global, server-lifetime, one entry per project ever polled — each
+    holding a full telemetry fold and every session record for that project.
+    `hive projects` reports 56 stores on this machine, and the picker plus HIVE
+    MIND make visiting many of them a normal afternoon.
+
+    LRU rather than a plain cap because the access pattern is extreme: one
+    namespace is hot and the rest go cold the moment the picker moves. The
+    re-read below is what proves it is an LRU and not a FIFO — a hot key read
+    on every pass must survive an eviction sweep that is longer than the bound.
+    """
+    for memo in (dashboard._CATS_MEMO, dashboard._SESSIONS_MEMO):
+        memo.clear()
+        dashboard._memo_put(memo, "hot", "kept")
+        for i in range(dashboard._MEMO_MAX * 3):
+            dashboard._memo_put(memo, f"cold-{i}", i)
+            assert dashboard._memo_get(memo, "hot") == "kept", (
+                f"the hot key was evicted after {i + 1} cold inserts — this is a "
+                f"FIFO, not an LRU, and the entry every poll touches is the one "
+                f"it drops")
+        assert len(memo) <= dashboard._MEMO_MAX, (
+            f"{len(memo)} entries retained against a bound of {dashboard._MEMO_MAX}")
+        assert dashboard._memo_get(memo, "cold-0") is None, \
+            "the oldest cold entry survived a full sweep, so nothing is evicting"
+        memo.clear()

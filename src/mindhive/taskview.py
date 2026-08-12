@@ -356,7 +356,14 @@ CARDS_JS = """
     paintTaskCards();
   }
   async function renderTaskCards(){
-    TASK_SESSIONS = await apiGet('/api/sessions');
+    const rows = await apiGet('/api/sessions');
+    // The cache write is INSIDE the guard, not before it. paintTaskCards
+    // already refuses to paint for a section the user left, but the assignment
+    // ran first — so a discarded poll still replaced TASK_SESSIONS, and every
+    // later repaint that does not refetch (toggleTaskCard, toggleTaskRow) drew
+    // from it. Discarding a render means writing nothing, caches included.
+    if (!shouldPaint(liveFn, renderSessions)) return;
+    TASK_SESSIONS = rows;
     for (const s of TASK_SESSIONS){
       const key = taskKey(s);
       if (TASK_OPEN.has(key) && (s.status === 'ongoing' || !TASK_ITEMS[key]))

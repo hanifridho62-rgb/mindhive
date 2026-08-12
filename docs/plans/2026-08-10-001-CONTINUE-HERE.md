@@ -17,6 +17,7 @@ that the plan does not already say.
 Updated 2026-08-12, at the end of the follow-on session that landed PR-1a.
 
 ```
+2ce7a0b  fix(dashboard): close the P2 findings against PR-1a
 8f1a150  fix(dashboard): close the seven P1 findings against PR-1a
 d37cb08  docs: PR-1 resequencing and the updated fresh-session brief
 1f4b55d  feat(dashboard): PR-1a - server locks, cats gate, stale-paint discard, a11y signals
@@ -24,9 +25,9 @@ a3d7606  docs: PR-1 plan, three review reports, and the T1 profile
 99dd244  feat(dashboard): serialise both live pollers so a slow tick is skipped, not queued
 ```
 
-**Five commits landed**, ahead of `efa3751`, plus one more closing the P2 review findings (CI
-node job, the run()-scoped generation, the stuck-poll report, three reduced-motion guards, the
-renderPlugins cache discard). §7 below is history — do not redo it.
+**Six commits landed** ahead of `efa3751`, plus one more closing the P3 set. The adversarial
+review's 40 credible findings (P1 7 · P2 22 · P3 11) are now all dispositioned: fixed, or
+closed with the reason written down. §7 below is history — do not redo it.
 
 **This work lives ONLY in this worktree**, on `claude/mindhive-dashboard-perf-eab7dd`.
 Neither commit exists on `master` or in any other worktree. A "fresh session in this
@@ -60,7 +61,24 @@ reduced-motion, `aria-busy` and a polite live region.
   report so a wedged fetch stops the chip claiming "live", reduced-motion guards for the three
   iframe pages, and `renderPlugins` discarding its seven module caches — not just its paint —
   once the user has left.
-- Node tier-1 is **49 cases** and every one of them has a mutant half that must fail.
+- Then the P3 set, which turned out to contain three real honesty defects rather than the
+  polish the severity implied: a refused action (HTTP 200 + `ok:false`, how the new locks
+  decline work) was announced as completed; a live tick whose render was DISCARDED still moved
+  the "updated HH:MM:SS" stamp; and a chip that went stale and was then paused kept a "not
+  refreshing" message nothing could correct. Also in that pass: `/api/verify` — a heavy GET
+  whose only protection was the nav disable T9 removed — got the same one-at-a-time lock; both
+  process-global memos became bounded LRUs; `renderSessions`/`renderTaskCards` lost their
+  test exemption and gained full discard + anti-vacuity + mutant cases; and the scope gap
+  below closed.
+- **Scope, closed.** `shouldPaint` compares which SECTION is live, and a project switch changes
+  neither the section nor the renderer — so an answer fetched for the previous namespace used
+  to paint under the new one's label. Now `apiGet` captures `PROJECT` before its fetch and
+  throws a named `StaleScope` if the picker moved: one choke point every renderer and both
+  pollers already pass through, instead of the nine-renderer change TODOS item 9 warned about.
+  `apiPost` is deliberately untouched — a mutation ran against the project in its own body.
+- Node tier-1 is **74 cases**, driven through the real `show*()` nav functions rather than by
+  assigning `liveFn` (which had stubbed out the precondition the design rests on), and every
+  case has a mutant half that must fail.
 
 ## 3. NOT done
 
@@ -127,7 +145,9 @@ T6 and T7 are the latency levers because they remove the queue everything else w
    (`dashboard_page.py:251` and the same check in `pollCats`), so **neither poller runs in the
    pane**. It looks exactly like a wedged poller when nothing is wrong. Override with
    `Object.defineProperty(document, 'hidden', {configurable:true, get:()=>false})` and `delete
-   document.hidden` to restore. **T12 (Playwright) must handle this or it will test nothing.**
+   document.hidden` to restore. T12 handles it by ASSERTING the premise:
+   `test_the_page_is_visible_to_its_own_pollers` fails loudly rather than letting the rest of
+   the suite pass over a page whose live refresh never ran.
 
 3. **`hive log` over-claims files** when `MINDHIVE_SESSION` is unset — it falls back to a stale
    touched-files marker. Always pass `--files` explicitly.
@@ -218,14 +238,24 @@ Landed as two commits — `99dd244` (behaviour) and `a3d7606` (planning).
   with `?project=` pinned on a quiet server, which is what makes master and branch comparable —
   it is NOT "the dashboard is 85× faster". The aggregate under real browser-pane load was
   inconclusive and is deliberately not quoted as a win anywhere.
-- **T12 (Playwright) still does not exist.** T11 does, and it executes the decision rather than
-  matching its source text — but it drives a hand-rolled DOM stub in `node:vm`, not a browser.
-  Everything about real layout, real timers and real fetch remains unproven by CI.
-- **`pollCats` has no executed cover.** Its in-flight latch is asserted by source shape only;
-  the behavioural cases in the node suite cover `refreshLive`.
-- **Within-section staleness is still open**, and there is one reachable instance: changing the
-  project while already on Overview can paint the previous project's rows. Written up as
-  TODOS.md item 9 and named in `PAINT_GUARD_JS`'s own comment rather than left implicit.
+- **T12 (Playwright) now exists** — `tests/test_dashboard_browser.py`, marker `browser`,
+  deselected by default for the same `hive selftest` reason as `node`, with its own CI job.
+  Six probes, each paired with a mutant page that must make it fail. It paid for itself on the
+  first run: `header #live.stale:not(.paused)` was **absent from the parsed stylesheet
+  entirely** — the comment above it closed six lines early, so CSS error recovery swallowed the
+  reopened prose AND the rule after it, and a stale chip rendered plain green. Every
+  source-shape assertion about that rule passed the whole time. Fixed, plus
+  `test_no_stylesheet_closes_a_comment_twice` so the defect class cannot come back silently.
+  What T12 still does NOT cover: it drives Chromium only, and it asserts the CASCADE for the
+  live chip rather than driving three failed 2.5 s ticks to reach the state for real.
+- **Within-section ordering (two loads of ONE section) is still open.** The scope instance is
+  closed; what remains is two in-flight renders of the same section, which both compare equal
+  to `liveFn` and both paint. `PAINT_GUARD_JS` says so in its own comment. RUN_GEN covers
+  everything run() does around such a render (skeleton, status, announce, error panel) — the
+  paint itself is the gap.
+- **`_HARVEST_LOCK` and the background auto-harvest are not mutually exclusive in-process**,
+  and deliberately so: `harvest.catch_up` already takes a cross-process file lock, and its skip
+  surfaces as `locked: true` in the response body. Checked, not assumed.
 - **The design review's mockups were hand-built**, not generated — the gstack designer is
   installed but has no OpenAI key. The reference board is at
   `~/.gstack/projects/hanifridho62-rgb-Lintester-project/designs/status-vocabulary-20260810/board.html`.

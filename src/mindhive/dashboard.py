@@ -1,6 +1,7 @@
 # src/mindhive/dashboard.py
 from __future__ import annotations
 
+import collections
 import functools
 import gzip
 import json
@@ -76,6 +77,10 @@ _SELFTEST_LOCK = threading.Lock()
 # racing over one plugin cache through two different doors, which is exactly the
 # guarantee this is supposed to make.
 _PLUGINS_LOCK = threading.Lock()
+# The one GET that belongs in this list. `/api/verify` reads every event and
+# recomputes the chain; T9 removed the nav disable that was its only guard, and
+# the button is one click away from being clicked twice.
+_VERIFY_LOCK = threading.Lock()
 
 # Reflect batch size per request. Each incident is one `claude` CLI call (up
 # to 120s), so an unbounded batch could outlive the browser's fetch timeout.
@@ -83,7 +88,7 @@ REFLECT_BATCH_LIMIT = 3
 
 
 def _one_at_a_time(lock, busy):
-    """Refuse a second concurrent call to a POST handler instead of running it.
+    """Refuse a second concurrent call to a handler instead of running it.
 
     Written once as a decorator rather than six copies of the same
     acquire/try/finally: the boilerplate is identical every time and the two
@@ -99,14 +104,20 @@ def _one_at_a_time(lock, busy):
     `blocking=False` so the loser is answered immediately rather than parked on
     a worker thread waiting for a pytest run to finish; the `finally` so a
     handler that raises releases the endpoint instead of wedging it for the life
-    of the process."""
+    of the process.
+
+    `*a` rather than `(proj, body)`: GET handlers take `(proj, am, qs)`, and one
+    of them needs this. `/api/verify` re-reads the whole ledger and recomputes
+    the hash chain — as expensive as most of the POSTs guarded here — and its
+    only protection was the nav disable that T9 removed. A read-only endpoint
+    still deserves the guard when the read is the expensive part."""
     def decorate(fn):
         @functools.wraps(fn)
-        def guarded(self, proj, body):
+        def guarded(self, *a):
             if not lock.acquire(blocking=False):
                 return self._json({"ok": False, "error": busy}, 200)
             try:
-                return fn(self, proj, body)
+                return fn(self, *a)
             finally:
                 lock.release()
         return guarded
@@ -324,14 +335,41 @@ def _safe_chain_ok(name: str, evs=None) -> bool:
         return False
 
 
+# Both memos below are process-global and live for the life of the server, so
+# they are bounded rather than left to grow with the number of namespaces ever
+# polled. `hive projects` reports 56 stores on this machine, and HIVE MIND mode
+# plus a project picker makes visiting many of them a normal afternoon; each
+# entry holds a full telemetry fold and every session record for that project.
+#
+# An LRU rather than a size-only cap because the access pattern is extreme: one
+# namespace is hot (the picker's current selection) and the rest are cold the
+# moment it changes. Eviction costs a single recompute of the endpoint the gate
+# was added to make cheap — the same price a first visit pays.
+_MEMO_MAX = 8
+
+
+def _memo_put(memo: "collections.OrderedDict", key, value) -> None:
+    memo[key] = value
+    memo.move_to_end(key)
+    while len(memo) > _MEMO_MAX:
+        memo.popitem(last=False)
+
+
+def _memo_get(memo: "collections.OrderedDict", key):
+    if key not in memo:
+        return None
+    memo.move_to_end(key)      # a read counts as use, or the hot key ages out
+    return memo[key]
+
+
 # One memo of the session fold, shared by every poll of /api/mindnet/cats.
 # {(project, all_mode): (fingerprint, records)}
-_SESSIONS_MEMO: dict = {}
+_SESSIONS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
 
 # The outer gate for the same endpoint, keyed on the stat-only ledger
 # fingerprint so an unchanged ledger is never even READ.
 # {project: (segment_stats, telemetry fold, session records)}
-_CATS_MEMO: dict = {}
+_CATS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
 
 
 def _with_online(records, stamp):
@@ -386,11 +424,11 @@ def _sessions_cached(proj, am, evs, stamp):
     from . import oversee as oversee_mod
     key = (proj, bool(am))
     fingerprint = (len(evs), evs[-1].ts if evs else "")
-    cached = _SESSIONS_MEMO.get(key)
+    cached = _memo_get(_SESSIONS_MEMO, key)
     if cached is None or cached[0] != fingerprint:
         records = oversee_mod.interactive_sessions(
             project=proj, evs=evs, now_fn=lambda: stamp)
-        _SESSIONS_MEMO[key] = (fingerprint, records)
+        _memo_put(_SESSIONS_MEMO, key, (fingerprint, records))
     else:
         records = cached[1]
     return _with_online(records, stamp)
@@ -475,6 +513,7 @@ def make_handler(token: str):
             bpath = build_briefing(proj)
             return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
 
+        @_one_at_a_time(_VERIFY_LOCK, "a chain verification is already running")
         def _get_verify(self, proj, am, qs):
             if am:
                 per = {n: _safe_chain_ok(n) for n in _all_projects()}
@@ -809,7 +848,7 @@ def make_handler(token: str):
                 "MINDHIVE_EVENT_BACKEND", "file").strip().lower() == "file"
             fp = (None if (am or not file_backend)
                   else sidecar_mod.segment_stats(proj))
-            memo = _CATS_MEMO.get(proj) if fp else None
+            memo = _memo_get(_CATS_MEMO, proj) if fp else None
             if memo is not None and memo[0] == fp:
                 tel_state, records, have_sessions = memo[1], memo[2], True
             else:
@@ -836,7 +875,7 @@ def make_handler(token: str):
                 # next moved; re-attempting costs exactly what this endpoint cost
                 # before the gate existed, which is the honest price of a fault.
                 if fp and have_sessions:
-                    _CATS_MEMO[proj] = (fp, tel_state, records)
+                    _memo_put(_CATS_MEMO, proj, (fp, tel_state, records))
             # Both boards render from THIS call's clock, whatever the gate did.
             # `_with_online` runs unconditionally — on a miss it is a redundant
             # (idempotent) second pass over a few dozen rows, which is the price

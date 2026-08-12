@@ -116,13 +116,14 @@ const CACHES = {
   renderSessions: 'TASK_SESSIONS',
 };
 
-// Sessions is the one section whose paint the page cannot guard: renderSessions
-// delegates to renderTaskCards in taskview.py, which awaits /api/sessions and
-// paints on the far side of that await, in a module the page does not own. The
-// page says so in a comment rather than pretending otherwise. This list is a
-// CEILING, not a pin — closing the gap in taskview.py makes the set of
-// clobbering renderers smaller, which still satisfies the subset check below.
-const ALLOWED_UNGUARDED = new Set(['renderSessions', 'renderTaskCards']);
+// Renderers excused from the per-renderer discard cases. It is EMPTY, and that
+// is the point: it used to excuse renderSessions and renderTaskCards on the
+// grounds that the paint happens inside taskview.py, past an await this module
+// does not own. taskview.py had already shipped that guard in the same commit —
+// so the one guard living outside dashboard_page.py was the only guard in the
+// change with no discard case, no anti-vacuity case and no mutant, and deleting
+// it would have kept every test green. A ceiling nobody rechecks is a hole.
+const ALLOWED_UNGUARDED = new Set([]);
 
 // A renderer's guard compares against the identity of the SECTION it belongs
 // to, which for almost every renderer is itself. renderTaskCards is the one
@@ -138,6 +139,25 @@ const ALLOWED_UNGUARDED = new Set(['renderSessions', 'renderTaskCards']);
 // enumerated only the 40 case names it knew, printed "40 passed".
 const OWNING_SECTION = { renderTaskCards: 'renderSessions' };
 const sectionOf = (name) => OWNING_SECTION[name] || name;
+
+// The function the nav button calls, per section. The race USED to set
+// `liveFn = renderX` itself, which stubbed out the precondition the whole
+// design rests on — "showOverview()/showOversee()/… each assign it
+// SYNCHRONOUSLY before starting their fetch" — and turned the harness's own
+// `ownedPanelAtStart` claim into a tautology it constructed. Entering through
+// the real function makes that claim a measurement: nothing is awaited between
+// the call and the read.
+const SHOW_OF = {
+  renderOverview: 'showOverview',
+  renderMemory: 'showMemory',
+  renderImprovements: 'showImprovements',
+  renderOversee: 'showOversee',
+  renderLog: 'showLog',
+  renderSops: 'showSops',
+  renderState: 'showState',
+  renderPlugins: 'showSkillPanel',
+  renderSessions: 'showSessions',
+};
 
 // ---------------------------------------------------------------------------
 // the DOM stub
@@ -299,6 +319,15 @@ function newWorld(scriptSrc) {
         rec.resolve(respond(Object.hasOwn(PAYLOADS, rec.path) ? PAYLOADS[rec.path] : DEFAULT_PAYLOAD));
       }
     },
+    /** Answer with a body the fixture table does not carry — a server-side
+     *  refusal is a 200 with `ok:false`, which no path-keyed payload models. */
+    answerWith: (recs, payload) => {
+      for (const rec of recs) {
+        if (rec.done) continue;
+        rec.done = true;
+        rec.resolve(respond(payload));
+      }
+    },
     /** The other way a request can end. run()'s catch is a paint site too. */
     reject: (recs, msg) => {
       for (const rec of recs) {
@@ -323,7 +352,7 @@ function newWorld(scriptSrc) {
     /** Drain the microtask queue. setImmediate is a host macrotask, so every
      *  promise continuation the page queued has run by the time it fires. */
     settle: async () => {
-      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+      for (let i = 0; i < 12; i++) await new Promise((r) => setImmediate(r));
     },
   };
   return world;
@@ -375,14 +404,29 @@ async function race(scriptSrc, victim, { switchAway = true, via = 'run' } = {}) 
   const w = newWorld(scriptSrc);
   await w.settle();                                  // let boot issue /api/projects
   const winner = victim === 'renderState' ? 'renderOverview' : 'renderState';
-
-  // 1. the user is on `victim`; its load starts and its fetch goes out
-  const mark = w.pending.length;
   const victimSection = sectionOf(victim);
-  w.eval('liveFn = ' + victimSection + ';');
-  const victimRun = via === 'poll'
-    ? w.eval('refreshLive()')
-    : w.eval("run('loading " + victim + "', " + victim + ')');
+  const enter = SHOW_OF[victimSection];
+  if (!enter) return { error: 'no nav entry point mapped for ' + victimSection };
+
+  // 1. the user picks `victim`, through the same function its nav button calls
+  let mark = w.pending.length;
+  w.eval(enter + '()');
+  // The ordering claim, MEASURED: nothing has been awaited between the call
+  // above and this read, so if liveFn already points at the section, the
+  // assignment really is synchronous and really does precede the fetch. That is
+  // the property the whole mechanism rests on — a guard re-read after an await
+  // is only meaningful because the assignment landed before one.
+  const ownedPanelAtStart = w.eval('liveFn') === w.eval(victimSection);
+
+  if (via === 'poll') {
+    // Let the section finish, THEN let the poller start the in-flight load —
+    // the path the user actually hit, and the one run()'s counter cannot see.
+    await w.settle();
+    w.answer(w.since(mark));
+    await w.settle();
+    mark = w.pending.length;
+    w.eval('refreshLive()');
+  }
   await w.settle();
   const victimFetches = w.since(mark);
   if (!victimFetches.length) {
@@ -390,23 +434,15 @@ async function race(scriptSrc, victim, { switchAway = true, via = 'run' } = {}) 
                     ' this scenario cannot say anything about it' };
   }
 
-  // The ordering claim, measured instead of argued: at the instant this fetch
-  // went out, liveFn WAS the victim — so a guard evaluated here, before the
-  // await, would have let the render through. Everything the discard case
-  // proves rests on this being true first.
-  const ownedPanelAtStart = w.eval('liveFn') === w.eval(victimSection);
-
   const cacheVar = CACHES[victim];
   const cacheBefore = cacheVar ? w.eval('JSON.stringify(' + cacheVar + ')') : null;
 
-  // 2. mid-flight, the user picks another section
+  // 2. mid-flight, the user picks another section — again through its button
   if (switchAway) {
     const mark2 = w.pending.length;
-    w.eval('liveFn = ' + winner + ';');
-    const winnerRun = w.eval("run('loading " + winner + "', " + winner + ')');
+    w.eval(SHOW_OF[winner] + '()');
     await w.settle();
     w.answer(w.since(mark2));                        // the new section answers first
-    await winnerRun;
     await w.settle();
     if (w.eval('liveFn') === w.eval(victimSection)) {
       return { error: 'the switch did not take: liveFn still points at ' + victimSection };
@@ -416,7 +452,6 @@ async function race(scriptSrc, victim, { switchAway = true, via = 'run' } = {}) 
   // 3. the older response lands last
   const mark3 = w.panelWrites.length;
   w.answer(victimFetches);
-  await victimRun;
   await w.settle();
 
   const late = w.panelWrites.slice(mark3);
@@ -532,7 +567,11 @@ function describeClobber(name, r) {
 async function mutantCases(renderers) {
   for (const name of renderers) {
     if (ALLOWED_UNGUARDED.has(name)) continue;
-    const { src, sites } = removeGuard(PAGE_JS, name);
+    // Mutate the guard of the SECTION this renderer belongs to: renderTaskCards
+    // is guarded by `shouldPaint(liveFn, renderSessions)`, because Sessions is
+    // what the user picked. Searching for its own name would find nothing and
+    // report a missing guard that is right there.
+    const { src, sites } = removeGuard(PAGE_JS, sectionOf(name));
     if (!sites) {
       // Reported under the case name the test reads, not a separate one: a
       // missing case surfaces as "the harness ran no such case", which says
@@ -752,6 +791,302 @@ async function stuckPollCases() {
            : 'check removed → six skipped ticks and the chip still says live'));
 }
 
+// --- tier 6: the OTHER poller, which had no executed cover at all ------------
+//
+// `pollCats` carries the same in-flight latch as `refreshLive` and was asserted
+// only by substring-matching the served page — including a whitespace-exact
+// `finally { catsInFlight = false; }`. That check cannot tell a latch that
+// works from one that is merely spelled correctly, and this is the poller with
+// the shorter fold and therefore the one most likely to be judged unimportant.
+
+async function catsPollTicks(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  const mark = w.pending.length;
+  const out = (n) => w.pending.length - mark;
+
+  w.eval('pollCats()');
+  await w.settle();
+  const first = out();
+
+  w.eval('pollCats()');            // two more ticks while the first is parked
+  w.eval('pollCats()');
+  await w.settle();
+  const afterSkips = out();
+
+  w.answer(w.since(mark));         // the request finally lands...
+  await w.settle();
+  w.eval('pollCats()');            // ...and the next tick must go out
+  await w.settle();
+  return { first, afterSkips, afterRelease: out() };
+}
+
+function withoutCatsLatch(src) {
+  const from = 'if (catsInFlight) return;';
+  const out = src.replace(from, '');
+  return { src: out, changed: out !== src };
+}
+
+function withoutCatsRelease(src) {
+  const from = 'finally { catsInFlight = false; }';
+  const out = src.replace(from, 'finally { }');
+  return { src: out, changed: out !== src };
+}
+
+async function catsPollCases() {
+  const r = await catsPollTicks(PAGE_JS);
+  record('the_cats_poll_issues_one_request_and_then_skips',
+         r.first === 1 && r.afterSkips === 1,
+         r.first !== 1
+           ? `the first tick issued ${r.first} request(s), so the rest of this ` +
+             'case is not measuring what it claims'
+           : r.afterSkips === 1
+             ? 'two further ticks fired while the first was in flight and neither queued'
+             : `${r.afterSkips - 1} extra requests went out while one was in flight`);
+  record('the_cats_poll_resumes_once_its_request_lands',
+         r.afterRelease === 2,
+         r.afterRelease === 2
+           ? 'the latch released and the next tick issued its own request'
+           : `${r.afterRelease - 1} request(s) after the answer arrived — the latch ` +
+             'was never released, so this poller is wedged for the life of the page');
+
+  const a = withoutCatsLatch(PAGE_JS);
+  const b = withoutCatsRelease(PAGE_JS);
+  record('both_halves_of_the_cats_latch_are_removable', a.changed && b.changed,
+         a.changed && b.changed
+           ? 'the skip and the release are both present and can be neutralised'
+           : `not found: ${[!a.changed && 'the skip', !b.changed && 'the release']
+                .filter(Boolean).join(' and ')} — the cases above cannot be made ` +
+             'to fail, so treat them as unproven');
+  if (a.changed) {
+    const ra = await catsPollTicks(a.src);
+    record('removing_the_cats_skip_lets_the_ticks_queue', ra.afterSkips > 1,
+           ra.afterSkips > 1
+             ? `skip removed → ${ra.afterSkips} concurrent requests`
+             : 'skip removed and nothing changed — the case does not discriminate');
+  }
+  if (b.changed) {
+    const rb = await catsPollTicks(b.src);
+    record('removing_the_cats_release_wedges_the_poller', rb.afterRelease === 1,
+           rb.afterRelease === 1
+             ? 'release removed → no tick ever goes out again'
+             : 'release removed and the poller kept going — the case does not discriminate');
+  }
+}
+
+// --- tier 7: scope, which section identity cannot express --------------------
+//
+// `shouldPaint` compares WHICH SECTION is live. Changing the project changes
+// neither the section nor the renderer: `onProjChange` re-enters Overview, so a
+// user already on Overview has liveFn === renderOverview on both sides of the
+// switch and an answer fetched for the previous namespace compares equal. It
+// paints numbers from another project under this project's label, with nothing
+// on screen that looks wrong. Driven through `onProjChange` rather than by
+// assigning PROJECT, so it is the real path and not a constructed one.
+
+async function projectSwitchDiscardsTheOldAnswer(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  w.eval("PROJECT = 'alpha';");
+  const mark = w.pending.length;
+  w.eval('showOverview()');
+  await w.settle();
+  const old = w.since(mark);
+  if (!old.length) return { error: 'showOverview issued no request' };
+  const sameSectionBefore = w.eval('liveFn') === w.eval('renderOverview');
+
+  const mark2 = w.pending.length;
+  w.eval("document.getElementById('proj').value = 'beta';");
+  w.eval('onProjChange()');
+  await w.settle();
+  if (!w.since(mark2).length) {
+    return { error: 'onProjChange issued no request, so no newer answer exists' };
+  }
+  w.answer(w.since(mark2));
+  await w.settle();
+  const sameSectionAfter = w.eval('liveFn') === w.eval('renderOverview');
+
+  const before = w.panelWrites.length;
+  w.answer(old);                   // project alpha's overview lands last
+  await w.settle();
+  return { late: w.panelWrites.slice(before), scope: w.eval('PROJECT'),
+           sameSection: sameSectionBefore && sameSectionAfter };
+}
+
+function withoutTheScopeCheck(src) {
+  const from = 'if (PROJECT !== scope) throw StaleScope(scope);';
+  const out = src.replace(from, '');
+  return { src: out, changed: out !== src };
+}
+
+async function scopeCases() {
+  const r = await projectSwitchDiscardsTheOldAnswer(PAGE_JS);
+  record('a_render_started_for_another_project_paints_nothing',
+         !r.error && r.scope === 'beta' && r.sameSection && r.late.length === 0,
+         r.error || (r.scope !== 'beta'
+           ? `the picker did not move (PROJECT is ${JSON.stringify(r.scope)}), so ` +
+             'no scope change happened and nothing was tested'
+           : !r.sameSection
+             ? 'liveFn changed across the project switch, so shouldPaint could have ' +
+               'caught this on its own and the case proves nothing about scope'
+             : r.late.length
+               ? "project alpha's answer painted " + JSON.stringify(r.late[0]) +
+                 " under project beta's label"
+               : "the previous project's answer was discarded, and liveFn was " +
+                 'identical on both sides of the switch — only the scope check ' +
+                 'could have made that decision'));
+
+  const m = withoutTheScopeCheck(PAGE_JS);
+  record('the_scope_check_is_one_removable_expression', m.changed,
+         m.changed ? 'found the scope comparison in apiGet'
+                   : 'no scope comparison found in apiGet — the case above cannot ' +
+                     'be made to fail, so treat it as unproven');
+  if (!m.changed) return;
+  const rm = await projectSwitchDiscardsTheOldAnswer(m.src);
+  record('removing_the_scope_check_paints_the_other_projects_data',
+         !rm.error && rm.late.length > 0,
+         rm.error || (rm.late.length
+           ? 'check removed → the previous project\'s rows land on the new project'
+           : 'check removed and NOTHING changed — the case above does not ' +
+             'discriminate, so treat its pass as unproven'));
+}
+
+// --- tier 8: honesty of the surrounding report ------------------------------
+//
+// Three separate ways the page told the user something that was not so. None of
+// them is a paint, so none is reachable through the race scenario, and all
+// three are exactly the class of defect this whole change exists to remove.
+
+/** A refused action must not be announced as a completed one. */
+async function refusedActionReportsFailure(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  const mark = w.pending.length;
+  w.eval("doAction('/api/harvest','Catch up')");
+  await w.settle();
+  const reqs = w.since(mark);
+  if (!reqs.length) return { error: 'doAction issued no request' };
+  w.answerWith(reqs, { ok: false, error: 'a harvest is already running' });
+  await w.settle();
+  return {
+    status: w.getElementById('status')._textContent,
+    announced: w.getElementById('ann')._textContent,
+    body: w.getElementById('out')._textContent || w.getElementById('out')._innerHTML,
+  };
+}
+
+/** A tick whose render was discarded must not stamp the page as updated. */
+async function discardedTickDoesNotStamp(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  let mark = w.pending.length;
+  w.eval('showOversee()');
+  await w.settle();
+  w.answer(w.since(mark));
+  await w.settle();
+
+  mark = w.pending.length;
+  w.eval('refreshLive()');                    // a poll of Oversee goes out
+  await w.settle();
+  const poll = w.since(mark);
+  if (!poll.length) return { error: 'refreshLive issued no request' };
+  const stampedBefore = w.getElementById('synced')._textContent;
+
+  const mark2 = w.pending.length;
+  w.eval('showState()');                      // the user leaves mid-flight
+  await w.settle();
+  w.answer(w.since(mark2));
+  await w.settle();
+  w.answer(poll);                             // the discarded answer lands last
+  await w.settle();
+  return { stampedBefore, stampedAfter: w.getElementById('synced')._textContent };
+}
+
+/** Pausing outranks a health message about a poll that is no longer running. */
+async function pausedChipDropsTheStaleMessage(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  w.eval('liveFails = 3; markLiveHealth(false);');
+  const staleTitle = w.eval('liveEl.title');
+  const staleClass = w.eval("liveEl.classList.contains('stale')");
+  w.eval('toggleLive();');                    // the user pauses
+  return { staleTitle, staleClass, pausedTitle: w.eval('liveEl.title'),
+           pausedClass: w.eval("liveEl.classList.contains('paused')") };
+}
+
+// One mutation each, and each is the whole mechanism: with `refusal` blind both
+// callers stop noticing, with the liveFn re-read gone every tick stamps, with
+// the paused branch gone the health message outlives the pause.
+const HONESTY_MUTANTS = {
+  refusal: (s) => s.replace(
+    "return r && r.ok === false && typeof r.error === 'string' ? r.error : null;",
+    'return null;'),
+  stamp: (s) => s.replace(
+    'if (liveFn === fn) { markSynced(); markLiveHealth(true); }',
+    'markSynced(); markLiveHealth(true);'),
+  paused: (s) => s.replace(/if \(!liveOn\) return '[^']*';/, ''),
+};
+
+async function honestyCases() {
+  for (const [name, mutate] of Object.entries(HONESTY_MUTANTS)) {
+    record(`the_${name}_check_is_removable`, mutate(PAGE_JS) !== PAGE_JS,
+           mutate(PAGE_JS) !== PAGE_JS
+             ? 'found and neutralisable'
+             : `the ${name} check is no longer in the shape this file can remove, ` +
+               'so its case below cannot be made to fail and is unproven');
+  }
+
+  const a = await refusedActionReportsFailure(PAGE_JS);
+  record('a_refused_action_is_not_announced_as_ready',
+         !a.error && /failed/i.test(a.status || '') && /failed/i.test(a.announced || ''),
+         a.error || `status=${JSON.stringify(a.status)} announced=` +
+           `${JSON.stringify(a.announced)} — a 200 with ok:false is how the server ` +
+           'declines to start work; neither caller inspected it, so the status ' +
+           'line and the live region both said the operation was done');
+  record('the_refusal_reason_still_reaches_the_panel',
+         !a.error && String(a.body).includes('already running'),
+         a.error || 'the panel shows ' + JSON.stringify(String(a.body).slice(0, 120)) +
+           " — reporting failure must not cost the user the server's reason");
+
+  const d = await discardedTickDoesNotStamp(PAGE_JS);
+  record('a_discarded_live_tick_does_not_stamp_the_page_as_updated',
+         !d.error && d.stampedAfter === d.stampedBefore,
+         d.error || (d.stampedAfter === d.stampedBefore
+           ? 'the tick was discarded and "updated HH:MM:SS" did not move'
+           : `the stamp moved to ${JSON.stringify(d.stampedAfter)} for a render that ` +
+             'never painted — that stamp is the one widget a user checks to decide ' +
+             'whether what they are looking at is current'));
+
+  const p = await pausedChipDropsTheStaleMessage(PAGE_JS);
+  record('pausing_replaces_the_stale_message_it_can_no_longer_update',
+         /not refreshing/i.test(p.staleTitle || '') && p.staleClass &&
+         /paused/i.test(p.pausedTitle || '') && !/not refreshing/i.test(p.pausedTitle || ''),
+         !p.staleClass
+           ? 'the chip never went stale, so the pause case starts from the wrong state'
+           : /not refreshing/i.test(p.pausedTitle || '')
+             ? 'the paused chip still reads ' + JSON.stringify(p.pausedTitle) +
+               ' — markLiveHealth is unreachable while paused, so nothing would ' +
+               'ever correct it'
+             : 'stale before, ' + JSON.stringify(p.pausedTitle) + ' after pausing');
+
+  // the canaries: each pass above must be makeable to fail
+  const am = await refusedActionReportsFailure(HONESTY_MUTANTS.refusal(PAGE_JS));
+  record('without_the_refusal_check_the_status_says_ready',
+         !am.error && !/failed/i.test(am.status || ''),
+         am.error || 'the refusal check was removed and the status still read ' +
+           JSON.stringify(am.status) + ' — the case above does not discriminate');
+  const dm = await discardedTickDoesNotStamp(HONESTY_MUTANTS.stamp(PAGE_JS));
+  record('without_the_liveFn_recheck_a_discarded_tick_stamps',
+         !dm.error && dm.stampedAfter !== dm.stampedBefore,
+         dm.error || 'the re-read was removed and the stamp still did not move — ' +
+           'the case above does not discriminate');
+  const pm = await pausedChipDropsTheStaleMessage(HONESTY_MUTANTS.paused(PAGE_JS));
+  record('without_the_paused_branch_the_stale_message_survives_the_pause',
+         /not refreshing/i.test(pm.pausedTitle || ''),
+         'the paused branch was removed and the chip still read ' +
+           JSON.stringify(pm.pausedTitle) + ' — the case above does not discriminate');
+}
+
 // --- the census: neither list may drift out from under the other ------------
 function censusCases(renderers) {
   // If the regex stops matching the emitted page, every case below it becomes
@@ -782,6 +1117,9 @@ async function main() {
   await mutantCases(renderers);
   await runGenerationCases();
   await stuckPollCases();
+  await catsPollCases();
+  await scopeCases();
+  await honestyCases();
 
   const ok = cases.every((c) => c.ok);
   process.stdout.write(JSON.stringify({ ok, renderers, cases }, null, 1));
