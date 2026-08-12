@@ -72,6 +72,21 @@ DELAY_FETCH = """
 """
 
 
+class _QuietServer(ThreadingHTTPServer):
+    """Closing a browser context aborts whatever it still had in flight, and the
+    cats probe deliberately leaves a 4 s response outstanding when it does. The
+    stock handler prints a full traceback for each one, which would leave a
+    PASSING CI job strewn with tracebacks — the fastest way to teach a reader
+    that tracebacks in this job are normal. Only the aborted-peer errors are
+    swallowed; anything else still prints."""
+
+    def handle_error(self, request, client_address):
+        import sys
+        if not isinstance(sys.exc_info()[1], (ConnectionAbortedError,
+                                              ConnectionResetError, BrokenPipeError)):
+            super().handle_error(request, client_address)
+
+
 @contextlib.contextmanager
 def serving(mutation=None):
     """Serve the real dashboard, optionally with one guard cut out of the page.
@@ -92,7 +107,7 @@ def serving(mutation=None):
             return _real(*a, **k).replace(old, new)
 
     with mock.patch.object(dashboard, "render_page", render):
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(TOKEN))
+        srv = _QuietServer(("127.0.0.1", 0), dashboard.make_handler(TOKEN))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             yield f"http://127.0.0.1:{srv.server_address[1]}"
@@ -259,6 +274,65 @@ def probe_loading_ladder(browser, url):
         assert page.inner_text("#status").strip() == "ready"
 
 
+# Counts the cats poll the way the SERVER would see it — how many of its
+# requests are outstanding at once — and holds each response past the poll
+# interval so a tick necessarily lands on an unfinished one. `max` is the whole
+# measurement: the latch's claim is that a slow tick is SKIPPED, and a skipped
+# tick is exactly one that never becomes a second concurrent request.
+COUNT_CATS = """
+  (() => {
+    const real = window.fetch;
+    const s = window.__cats = { inflight: 0, max: 0, done: 0 };
+    window.fetch = function(...a){
+      const url = String((a[0] && a[0].url) || a[0] || '');
+      if (!url.includes('/api/mindnet/cats')) return real.apply(this, a);
+      s.inflight++;
+      if (s.inflight > s.max) s.max = s.inflight;
+      const settle = () => { s.inflight--; s.done++; };
+      return new Promise(r => setTimeout(() => r(real.apply(this, a)), __MS__))
+        .then(res => { settle(); return res; },
+              err => { settle(); throw err; });
+    };
+  })();
+"""
+CATS_DELAY_MS = 4000            # LIVE_MS is 2500, so a tick always lands mid-flight
+CATS_WATCH_MS = 7000            # three ticks' worth of chances to queue one
+
+
+def probe_cats_poll_skips_rather_than_queues(browser, url):
+    """The finding this whole PR started from, measured instead of read.
+
+    `pollCats` is on a 2.5 s interval against an endpoint that cost 0.87-0.92 s
+    idle and far more under load; before the latch, a tick that landed on an
+    unfinished request simply started another, and the folds are pure Python so
+    the GIL serialises them into a queue every click then waits behind. Until
+    now the latch was covered only by asserting `if (catsInFlight) return;`
+    appears in the source — which is true of a latch that is never reached, or
+    one whose flag is cleared in the wrong place.
+
+    Here the response is held for 4 s against a 2.5 s interval, so at least one
+    tick is GUARANTEED to arrive while a request is outstanding, and the only
+    thing asserted is what the server would see: never two at once.
+
+    (`refreshLive`'s own latch is the node tier's job — tier 5 drives it under a
+    fake clock, which can fire a timer in zero wall time. This one is here
+    because the poll is registered by `setInterval` at load and driving it needs
+    a real clock.)"""
+    with opened(browser, url) as page:
+        page.add_init_script(COUNT_CATS.replace("__MS__", str(CATS_DELAY_MS)))
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_timeout(CATS_WATCH_MS)
+        s = page.evaluate("window.__cats")
+
+    assert s["done"] + s["inflight"] >= 1, (
+        f"the cats poll never fired at all in {CATS_WATCH_MS} ms, so `max` is 0 "
+        f"for the one reason that proves nothing: {s}")
+    assert s["max"] == 1, (
+        f"{s['max']} cats requests were outstanding at once — a tick that landed "
+        f"on an unfinished poll queued another instead of skipping, which is the "
+        f"amplification this PR exists to remove: {s}")
+
+
 def probe_nav_clickable(browser, url):
     """T9 took the nav disable out — being unable to leave a section while it
     loads is what made a 1-2 s fetch feel like a hang. `aria-busy` says the same
@@ -319,6 +393,10 @@ def test_a_slow_section_paints_a_skeleton_and_then_replaces_it(browser, url):
     probe_loading_ladder(browser, url)
 
 
+def test_the_cats_poll_skips_a_slow_tick_instead_of_queueing_it(browser, url):
+    probe_cats_poll_skips_rather_than_queues(browser, url)
+
+
 def test_the_nav_stays_clickable_while_a_section_loads(browser, url):
     probe_nav_clickable(browser, url)
 
@@ -352,6 +430,10 @@ MUTANTS = [
      ("    header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,\n"
       "    .skel .bar { animation:none !important; }",
       "    .rmfill { animation:none !important; }")),
+
+    ("pollCats loses its latch and queues a tick onto a slow one",
+     probe_cats_poll_skips_rather_than_queues,
+     ("    if (catsInFlight) return;   // skip this tick, never queue it\n", "")),
 
     ("SKEL_MS goes to 0 — every section load flickers a placeholder",
      probe_loading_ladder,

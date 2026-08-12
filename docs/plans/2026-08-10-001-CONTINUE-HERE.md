@@ -45,6 +45,11 @@ their first `await` and clear it in `finally`.
   `efa3751` and passes here, so it discriminates.
 - Behavioural proof taken by hand in a real browser: `flag_while_in_flight=true`,
   `first_tick_ms=715`, `second_tick_ms=0`, `flag_after_settle=false`.
+- That hand proof is now automated for `pollCats` by T12
+  (`probe_cats_poll_skips_rather_than_queues`): the cats response is held 4 s against the
+  2.5 s interval, so a tick is guaranteed to land mid-flight, and the assertion is what the
+  SERVER sees — never two outstanding at once. Mutant-checked, and confirmed against master's
+  own pre-latch page, which reports `max=2`.
 - Change-logged: `hive log update` with explicit `--files` (2 files, no over-claim).
 
 **PR-1a — T8, T6, T9, T11, T31.** Server locks on six mutating endpoints plus the HIVE MIND
@@ -240,7 +245,7 @@ Landed as two commits — `99dd244` (behaviour) and `a3d7606` (planning).
   inconclusive and is deliberately not quoted as a win anywhere.
 - **T12 (Playwright) now exists** — `tests/test_dashboard_browser.py`, marker `browser`,
   deselected by default for the same `hive selftest` reason as `node`, with its own CI job.
-  Six probes, each paired with a mutant page that must make it fail. It paid for itself on the
+  Seven probes, each paired with a mutant page that must make it fail. It paid for itself on the
   first run: `header #live.stale:not(.paused)` was **absent from the parsed stylesheet
   entirely** — the comment above it closed six lines early, so CSS error recovery swallowed the
   reopened prose AND the rule after it, and a stale chip rendered plain green. Every
