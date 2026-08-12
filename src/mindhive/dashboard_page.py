@@ -16,6 +16,48 @@ import json
 
 from . import cat_board
 
+# The stale-paint discard decision, held as one named constant instead of being
+# typed straight into the page string below. Two consumers need the SAME bytes:
+# the browser, which gets it inlined at `/*__PAINT_GUARD__*/`, and the tier-1
+# node unit test (`tests/node/paint_guard.test.mjs`, run by
+# `tests/test_paint_guard_node.py` under `pytest -m node`), which imports it and
+# executes it. A test that retyped the comparison would keep passing after the
+# page's own copy changed — the exact vacuous fixture this repo's ledger warns
+# about. `tests/test_dashboard.py` asserts the seam itself, in the DEFAULT suite,
+# so "the page still ships this text" is never taken on trust either.
+#
+# Pure by necessity, not by taste: it reads no globals, touches no DOM and does
+# no I/O, which is the only reason node can import it outside a browser at all.
+# `currentLiveFn` is a parameter rather than a closed-over `liveFn` for the same
+# reason.
+PAINT_GUARD_JS = """\
+  // shouldPaint answers one question, asked at paint time by every renderer
+  // that registers itself as a liveFn: is the render about to write to the
+  // panel still the render the user is waiting for?
+  //
+  // Identity, not equality, and deliberately so. `liveFn` IS the record of
+  // which section the user picked, because showOverview()/showOversee()/… each
+  // assign it SYNCHRONOUSLY before starting their fetch. A render that started
+  // earlier therefore compares unequal from the instant another section is
+  // clicked — no generation counter, no token threaded through showHTML(),
+  // which takes a string and cannot know who sent it.
+  //
+  // What it does NOT do, said out loud so nothing is expected of it that it
+  // does not give: two in-flight renders of the SAME section both compare
+  // equal and both paint. Within-section ordering is a different problem with
+  // its own fix (PLUG_GEN). This one is cross-section only.
+  //
+  // SCOPE is not this function's job either, and that was the reachable
+  // instance of the gap above: `onProjChange` switches PROJECT and calls
+  // showOverview(), so a user already on Overview has liveFn === renderOverview
+  // on both sides of the switch and the old project's rows compared equal.
+  // Closed elsewhere, at `apiGet` — one choke point every renderer and both
+  // pollers already pass through — rather than by teaching this comparison
+  // about globals it is deliberately pure of.
+  function shouldPaint(currentLiveFn, renderFn){
+    return currentLiveFn === renderFn;
+  }"""
+
 
 def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     return """<!doctype html>
@@ -36,6 +78,16 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   header #live { font-size:12px; cursor:pointer; user-select:none; margin-left:auto;
     color:#46c46a; }
   header #live.paused { color:#6b7488; }
+  /* Three consecutive failed live ticks (7.5 s): the chip stops claiming to be
+     live. Colour + title only — toggleLive() rewrites this element's innerHTML,
+     so any text state written here would vanish on the next pause/resume.
+     `:not(.paused)` because both rules are one id + one class, so the later one
+     wins a tie — and the later one was `.stale`. A chip that went stale and was
+     then paused rendered amber "not refreshing" under the word "paused", and
+     could not clear itself: markLiveHealth is unreachable while paused
+     (refreshLive returns at `!liveOn`). Paused is a state the user CHOSE; it
+     outranks a health signal about a poll that is no longer running. */
+  header #live.stale:not(.paused) { color:#e0b341; }
   header #live .blip { animation: pulse 1.6s infinite; }
   header #synced { font-size:11px; color:#6b7488; min-width:118px; text-align:right; }
   header #projwrap { font-size:12px; color:#9aa3b8; display:flex; align-items:center; gap:6px; }
@@ -47,8 +99,11 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     margin:14px 6px 4px; }
   nav button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
     background:#1d2230; color:#e6e8ef; border:1px solid #2a2f3d; border-radius:6px; cursor:pointer; }
-  nav button:hover:not(:disabled) { background:#262d3d; }
-  nav button:disabled { opacity:.45; cursor:wait; }
+  /* No `:disabled` rule, and no `:not(:disabled)` qualifier on the hover: nav
+     buttons are never disabled any more. setBusy used to grey the entire nav out
+     for the duration of a fetch — which is what made switching section mid-load
+     impossible, and what made the nav feel dead for the 1-2 s a section costs. */
+  nav button:hover { background:#262d3d; }
   section.panel { padding:18px 22px; }
   pre#out { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px;
     padding:14px; min-height:120px; max-height:62vh; overflow:auto; }
@@ -58,6 +113,20 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   .row { margin:8px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .hidden { display:none; }
   .err { color:#ff8a8a; }
+  /* Loading skeleton. Bars rather than a spinner: the shape says content is
+     coming and roughly what shape it has; a spinner only says something is
+     happening, which the busy dot already says. Never painted before SKEL_MS —
+     under that the eye reads a placeholder as a flicker, not as progress. */
+  .skel .bar { height:14px; margin:10px 0; border-radius:6px;
+    background:linear-gradient(90deg,#161a25 25%,#20263a 37%,#161a25 63%);
+    background-size:400% 100%; animation: shimmer 1.4s ease infinite; }
+  .skel .bar.w60 { width:60%; }
+  .skel .bar.w40 { width:40%; }
+  @keyframes shimmer { 0%{background-position:100% 0} 100%{background-position:0 0} }
+  /* The screen-reader channel. Off-screen, never display:none or hidden — a
+     live region that is not rendered at all is not announced at all. */
+  .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
   .card { background:#0c0e14; border:1px solid #2a2f3d; border-radius:10px; padding:14px 16px; }
   .card .big { font-size:26px; font-weight:600; }
@@ -153,6 +222,16 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
      fixed seven — never get squeezed out by an unbounded session list. */
   #mn-sessions { display:flex; align-items:center; gap:5px; flex:0 1 auto;
     overflow-x:auto; max-width:34%; margin-left:8px; }
+  /* This page's OWN motion, guarded separately from the one that arrives with
+     `cat_board.CSS`: that sheet deliberately names only the shared sprite, so a
+     reduced-motion user who got only the cat guard would keep every pulse this
+     page declares itself. Each of these animations is switched on by a rule at
+     least as specific, and a media query adds no specificity — hence !important. */
+  @media (prefers-reduced-motion: reduce) {
+    header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,
+    .skel .bar { animation:none !important; }
+    .rmfill { transition:none !important; }
+  }
 /*__CAT_CSS__*/
   /*__TASKS_CSS__*/
 </style></head>
@@ -168,7 +247,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   <!--__CAT_HTML__-->
 </header>
 <main>
-  <nav>
+  <nav aria-label="sections">
     <button onclick="showOverview()">Overview</button>
     <div class="group">Work</div>
     <button onclick="showOversee()">Oversee</button>
@@ -202,7 +281,23 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
     <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
   </nav>
-  <section class="panel">
+  <!-- The screen-reader channel. Until the nav stopped being disabled during a
+       fetch, `disabled` on every nav button WAS the only signal assistive tech
+       got that the app was busy — a side effect of a lock, not a statement. It
+       is now said properly: aria-busy on the panel while it loads, and this
+       polite region for the two facts a sighted user reads off the screen —
+       which section is coming up, and how the operation ended.
+
+       OUTSIDE the panel, deliberately. It shipped inside it, and inside is
+       where it is silent: `aria-busy="true"` tells assistive tech to defer
+       updates within that subtree, and run() raises aria-busy before the
+       opening announce() and lowers it only in its finally — after the "ready"
+       announcement. Every announcement this channel makes was made while its
+       own container was marked busy, so the whole channel could be coalesced
+       away. A live region has to sit outside the thing whose busyness it
+       reports. -->
+  <div id="ann" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+  <section class="panel" id="panel" aria-busy="false">
     <div id="controls"></div>
     <div id="view"></div>
     <pre id="out" class="hidden"></pre>
@@ -217,15 +312,34 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   const controls = document.getElementById('controls');
   const busyDot = document.getElementById('busy');
   const statusEl = document.getElementById('status');
-  const navButtons = () => Array.from(document.querySelectorAll('nav button'));
+  const panelEl = document.getElementById('panel');
+  const announcer = document.getElementById('ann');
   const liveEl = document.getElementById('live');
   const syncedEl = document.getElementById('synced');
+  // Every animation on this page is dropped in CSS under prefers-reduced-motion;
+  // a scripted smooth scroll is the one piece of motion a stylesheet can't reach.
+  const REDUCE_MOTION = !!(window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
   // --- real-time engine ---
   // liveFn is the silent re-renderer for the current view (null = view isn't
   // auto-refreshable). A timer re-runs it on an interval, and actions that
   // mutate memory call refreshLive() so changes appear without a manual click.
+  //
+  // It is ALSO the answer to "which section does the user want right now", and
+  // that second job is what stops a section nobody picked from painting itself.
+  // Every renderer below re-reads liveFn after its await and returns — no cache
+  // write, no paint, no throw — when it no longer matches itself. Reported as:
+  // "I click Improvements, it moves there briefly, then goes back to Oversee."
+  // The path is refreshLive(), which calls liveFn() DIRECTLY and never goes
+  // through run(): a poll of Oversee started 2 s ago is still in flight when
+  // Overview is clicked, /api/overview happens to answer first, and the poller's
+  // showHTML() then lands last — painting Oversee under a "ready" status, with
+  // no error anywhere. A generation counter stamped inside run() cannot see
+  // those poller renders at all; function identity can, because assigning
+  // liveFn IS how a section gets picked.
   let liveFn = null;
+/*__PAINT_GUARD__*/
   let liveOn = true;
   // The boot sequence lands on the overview only if the user hasn't already
   // picked a view. loadProjects() takes seconds on a large ledger and the nav
@@ -242,26 +356,109 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     liveOn = !liveOn;
     liveEl.classList.toggle('paused', !liveOn);
     liveEl.innerHTML = (liveOn ? '<span class="blip">&#9679;</span> live' : '&#9679; paused');
+    // The tooltip follows the same precedence as the colour: paused is what the
+    // user asked for, so it replaces a health message about a poll that is no
+    // longer running. The strike count is deliberately NOT reset — a server
+    // that was dead before the pause is probably dead after it, and resuming
+    // runs a tick immediately, which is what re-establishes the truth.
+    liveEl.title = liveTitle();
     if (liveOn) refreshLive();
   }
-  // silent refresh: no busy spinner, no nav-disable, errors swallowed so a
-  // transient blip never disrupts what the user is reading.
+  // silent refresh: no busy spinner, no status text, errors swallowed so a
+  // transient blip never disrupts what the user is reading — but counted, so a
+  // sustained outage stops passing for health (see markLiveHealth).
+  //
+  // The in-flight guard is load-bearing, not defensive. Measured 2026-08-10 against
+  // the 31k-event store: the section endpoints cost 1.2-1.9 s of pure-Python fold, so
+  // a 2500 ms timer overlaps its own previous request the moment anything else
+  // competes for the interpreter. Overlap does not divide that work, it queues it —
+  // four concurrent requests measured 4.99 s against 5.3 s run serially, i.e. the GIL
+  // serialises the folds — and a user's click lands at the back of the queue. Skipping
+  // a tick costs one stale interval; not skipping cost 6-12 s section loads.
+  let liveInFlight = false;
+  // The one case `finally` cannot cover: a fetch that never settles. `fetch`
+  // has no default timeout, so a wedged server thread — the exact failure the
+  // server-side locks in this change are about — leaves the latch held forever,
+  // every later tick returns at the line below, and the chip goes on saying
+  // "live" while nothing has refreshed for minutes. So record WHEN the latch
+  // was taken and let a tick that finds it held too long report the failure
+  // through the same strike counter a rejected fetch uses.
+  //
+  // It deliberately does NOT clear the latch or abort the request. Against a
+  // server that is merely slow, either would replace one stuck request with a
+  // fresh one every 2.5 s — piling work onto the queue is what the latch exists
+  // to prevent. Skipping stays the behaviour; only the lie stops.
+  let liveSince = 0;
+  const LIVE_STUCK_MS = LIVE_MS * 2;
+  // Swallowing every failure was right for ONE blip and wrong for a dead server:
+  // the chip went on claiming "live" while nothing had refreshed for minutes.
+  // So count CONSECUTIVE failures — three in a row (7.5 s) is past any transient
+  // — and let a single success reset the count, so a flaky endpoint that
+  // recovers never shows the state at all. The view itself is still left alone:
+  // the last good render stays on screen, only the chip stops lying about it.
+  const LIVE_STALE_STRIKES = 3;
+  let liveFails = 0;
+  // One place decides what the chip claims, because two places disagreed: the
+  // health message outlived the pause that made it untrue.
+  function liveTitle(){
+    if (!liveOn) return 'Paused \\u2014 click to resume';
+    return liveFails >= LIVE_STALE_STRIKES
+      ? 'Not refreshing \\u2014 '+liveFails+' updates failed in a row. Click to pause/resume.'
+      : 'Real-time updates \\u2014 click to pause/resume';
+  }
+  function markLiveHealth(ok){
+    liveFails = ok ? 0 : liveFails + 1;
+    liveEl.classList.toggle('stale', liveFails >= LIVE_STALE_STRIKES);
+    liveEl.title = liveTitle();
+  }
   async function refreshLive(){
     if (!liveOn || !liveFn) return;
     if (document.hidden) return;
     if (busyDot.classList.contains('busy')) return;  // don't fight a manual op
-    try { await liveFn(); markSynced(); } catch(_) { /* keep last good view */ }
+    if (liveInFlight) {                              // skip this tick, never queue it
+      if (Date.now() - liveSince > LIVE_STUCK_MS) markLiveHealth(false);
+      return;
+    }
+    liveInFlight = true;
+    liveSince = Date.now();
+    // Capture the section this tick is FOR. A discarded render returns
+    // `undefined` exactly like a successful one — shouldPaint just returns
+    // early — so without this the poller stamped "updated HH:MM:SS" and reset
+    // the failure count for a paint that never happened. That is the same lie
+    // the stale chip exists to stop, arriving through the other door: the one
+    // widget a user checks to decide whether the view in front of them is
+    // current. Re-reading `liveFn` after the await IS the discard test, and it
+    // is the same comparison every renderer makes at its own paint site.
+    const fn = liveFn;
+    try {
+      await fn();
+      if (liveFn === fn) { markSynced(); markLiveHealth(true); }
+    }
+    // A scope change is not an outage. The tick was discarded because the user
+    // moved the picker, and counting it as a failed update would walk the chip
+    // toward "not refreshing" for something the user did on purpose.
+    catch(e) { if (!e || e.name !== 'StaleScope') markLiveHealth(false); }
+    finally { liveInFlight = false; }
   }
   setInterval(refreshLive, LIVE_MS);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshLive(); });
 
   function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
   function u(path){ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }
+  // Busy state WITHOUT locking the nav. Disabling every nav button was the old
+  // way to stop a second section landing mid-fetch — but it never covered the
+  // poller (refreshLive bypasses setBusy entirely), it made the nav feel dead
+  // for the 1-2 s a section costs, and it was the app's only busy signal for a
+  // screen reader. The paint-time discard guards make the lock unnecessary;
+  // aria-busy states the same fact without taking the controls away.
   function setBusy(on, label){
     busyDot.className = 'dot' + (on ? ' busy' : '');
     statusEl.textContent = on ? (label || 'working…') : 'ready';
-    navButtons().forEach(b => b.disabled = on);
+    if (panelEl) panelEl.setAttribute('aria-busy', on ? 'true' : 'false');
   }
+  // The polite live region: the two facts a sighted user reads off the panel and
+  // the status chip — which section is coming up, and how the operation ended.
+  function announce(msg){ if (announcer) announcer.textContent = msg; }
   // panel switching
   // Panel swaps that bypass run() (Recall, Append, the workspace iframes) still
   // count as the user picking a view — see viewPicked.
@@ -298,10 +495,29 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function withProj(path){
     return PROJECT ? path + (path.includes('?')?'&':'?') + 'project=' + encodeURIComponent(PROJECT) : path;
   }
+  // SCOPE identity, the half `shouldPaint` cannot answer. It compares which
+  // SECTION is live; a project switch changes neither the section nor the
+  // renderer, so a response fetched for project A used to paint its rows under
+  // project B's label with nothing wrong on screen to show for it — the numbers
+  // were simply another namespace's until the next poll replaced them.
+  //
+  // Enforced HERE, at the one place every renderer and both pollers already go
+  // through, rather than in nine renderers that would each have to remember.
+  // `apiPost` is deliberately NOT guarded: a mutation really did run against
+  // the project it named in its own body, so its result is worth showing.
+  function StaleScope(scope){
+    const e = new Error('a response for project ' + JSON.stringify(scope)
+                        + ' arrived after the picker had already moved');
+    e.name = 'StaleScope';
+    return e;
+  }
   async function apiGet(path){
+    const scope = PROJECT;              // the namespace this question was asked of
     const r = await fetch(u(withProj(path)), { headers: { 'X-Hive-Token': TOKEN } });
     const ct = r.headers.get('content-type') || '';
-    return ct.includes('json') ? r.json() : r.text();
+    const data = ct.includes('json') ? await r.json() : await r.text();
+    if (PROJECT !== scope) throw StaleScope(scope);
+    return data;
   }
   async function apiPost(path, body){
     const b = Object.assign({}, body || {});
@@ -334,17 +550,99 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     SESSION = null;
     showOverview();
   }
+  // Loading feedback, two staged thresholds rather than one. Below SKEL_MS a
+  // placeholder reads as a flicker instead of as progress, so a fast section
+  // paints nothing extra; past SLOW_MS a bare "working…" chip stops informing
+  // and starts looking like a hang, so the status line says how long it's been.
+  // Measured 2026-08-10: the section endpoints cost 1.2-1.9 s against the 31k
+  // store, which is exactly the band where a skeleton earns its place.
+  const SKEL_MS = 300, SLOW_MS = 10000;
+  function showSkeleton(){
+    // Same rule renderOversee already applies to the enrichment panel: never
+    // repaint the view out from under a caret. A skeleton that eats what
+    // somebody is typing is worse than no skeleton.
+    const ae = document.activeElement;
+    if (ae && ae.closest && ae.closest('#view')) return;
+    showHTML('<div class="skel" aria-hidden="true"><div class="bar w60"></div>'
+      + '<div class="bar"></div><div class="bar"></div>'
+      + '<div class="bar w40"></div></div>');
+  }
   // wrap any async unit of work with busy state + error handling
-  async function run(label, fn){
+  // Every run() gets a generation. `shouldPaint` covers renderers that register
+  // a liveFn; it structurally CANNOT cover the run()-scoped paths that set
+  // `liveFn = null` — Briefing, Recall, Graph, doAction, confirmAction — because
+  // shouldPaint(null, anonymousFn) is false for all of them, so an identity
+  // check there would discard every paint rather than only the stale ones.
+  //
+  // Corrections 6 in the plan rejected a generation guard for POLLER renders,
+  // and that still holds: refreshLive calls liveFn() directly and never enters
+  // run(), so a counter here would tag nothing for it. It says nothing about
+  // run()-scoped work, which this counter is exactly the right shape for.
+  //
+  // It also covers three wrapper effects that shouldPaint never touched: a
+  // stale run's completion ANNOUNCEMENT (the #ann live region is not the panel,
+  // so a screen-reader user heard "loading oversee — ready" after they had
+  // already moved to Overview), a stale run clearing busy while a newer one is
+  // still loading, and stale skeleton/slow-status timers repainting over the
+  // section that replaced them.
+  // `isSection` gates the skeleton, and only the skeleton. It shipped firing for
+  // EVERY run() caller, which is wrong in a way that only shows up on the paths
+  // nobody demos: dismissing an improvement, reflecting, resolving, enriching a
+  // prompt, deleting a session, appending a memory, and both Action buttons all
+  // go through run() from inside an already-painted view. A placeholder there
+  // wipes the thing the user was reading to announce work that does not replace
+  // it. Section loads are the only runs whose whole job is to replace the panel.
+  //
+  // Per-section skeleton SHAPES (D3: card grid / list rows / monospace block,
+  // with Graph and the workspaces exempt) and the 150 ms threshold (D6) are T28,
+  // which the resequencing put in PR-1c. This is the flag they will hang off;
+  // deliberately not doing their work here, since landing T28 early in the wrong
+  // shape is what produced this finding in the first place.
+  let RUN_GEN = 0;
+  async function run(label, fn, isSection){
     // Set before the first await: the section is chosen at click time, not when
     // its fetch returns, and boot may resolve in between.
     viewPicked = true;
+    const gen = ++RUN_GEN;
+    const current = () => gen === RUN_GEN;
     setBusy(true, label);
-    try { await fn(); } catch(e) { fail(e); } finally { setBusy(false); }
+    announce(label);
+    const skel = isSection
+      ? setTimeout(() => { if (current()) showSkeleton(); }, SKEL_MS)
+      : null;
+    const slow = setTimeout(() => {
+      if (current())
+        statusEl.textContent = (label || 'working') + ' \\u2014 still loading\\u2026';
+    }, SLOW_MS);
+    // `current` is passed to fn so the anonymous run()-scoped bodies can guard
+    // their own paint. Renderers that take no argument ignore it, unchanged.
+    let failed = false;
+    try { await fn(current); if (current()) announce((label || 'operation') + ' \\u2014 ready'); }
+    catch(e) {
+      // A stale failure is swallowed on purpose, the same way refreshLive
+      // swallows a transient blip: painting it would put an error over the
+      // section the user is now reading, which is the clobber this guard exists
+      // to stop. The live run still surfaces its own errors.
+      failed = true;
+      if (current()) { fail(e); announce((label || 'operation') + ' \\u2014 failed'); }
+    }
+    finally {
+      clearTimeout(skel); clearTimeout(slow);
+      if (current()) {
+        setBusy(false);
+        // "ready" is setBusy's RESTING state, not a verdict, and it was
+        // overwriting the outcome: every failed operation ended with the status
+        // chip reading "ready" while the live region said "failed" and the error
+        // sat in the panel below. Two surfaces, two different stories, and the
+        // one a sighted user actually looks at was the wrong one.
+        if (failed) statusEl.textContent = (label || 'operation') + ' \\u2014 failed';
+      }
+    }
   }
 
   async function renderOverview(){
     const o = await apiGet('/api/overview');
+    if (!shouldPaint(liveFn, renderOverview)) return;  // newer section owns the panel
     const chip = o.chain_ok
       ? '<span class="big ok">OK</span>' : '<span class="big bad">CHECK</span>';
     const types = Object.entries(o.by_type || {}).sort((a,b)=>b[1]-a[1])
@@ -371,7 +669,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   let MEM_SORT = 'new';            // 'new' = newest first, 'old' = oldest first
   async function renderMemory(){
     const path = '/api/memory' + (SESSION ? '?session='+encodeURIComponent(SESSION) : '');
-    MEM_ITEMS = await apiGet(path);
+    const items = await apiGet(path);
+    if (!shouldPaint(liveFn, renderMemory)) return;    // newer section owns the panel
+    MEM_ITEMS = items;
     paintMemory();
   }
   function paintMemory(){
@@ -416,7 +716,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         + 'value="'+escAttr(MEM_QUERY)+'" oninput="onMemSearch(this.value)">'
       + '<button id="memsort" onclick="toggleMemSort()">'
         + (MEM_SORT==='new' ? 'newest first' : 'oldest first')+'</button></div>';
-    liveFn = renderMemory; run('loading memory', renderMemory);
+    liveFn = renderMemory; run('loading memory', renderMemory, true);
   }
   function clearSession(){ SESSION = null; showMemory(); }
 
@@ -549,6 +849,10 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   async function renderImprovements(){
     const res = await apiGet('/api/improvements');
+    // Discard BEFORE the error check, not after: a stale render that throws
+    // would reach run()'s catch and paint its error over the section the user
+    // is now looking at — the same clobber by another route.
+    if (!shouldPaint(liveFn, renderImprovements)) return;  // newer section owns the panel
     // Surface a server error instead of rendering it as an empty "no lessons"
     // state; run() shows it, and the live tick keeps the last good view.
     if (!res || res.ok === false) throw new Error((res && res.error) || 'improvements fetch failed');
@@ -750,12 +1054,20 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<button onclick="runResolve()" title="reroute red rules whose nudge '
       + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
-    liveFn = renderImprovements; run('loading improvements', renderImprovements);
+    liveFn = renderImprovements; run('loading improvements', renderImprovements, true);
   }
 
   // --- Sessions: rendered by the notification-center fragment (taskview.py).
+  // This is the one section whose paint does not happen in this module, and
+  // therefore the one whose guard does not either: renderTaskCards awaits
+  // /api/sessions and calls paintTaskCards() on the far side of that await,
+  // inside taskview.py. The guard lives there, at both the paint and the cache
+  // write, and it compares against renderSessions — the section the user picked
+  // — because renderTaskCards is not somewhere you can navigate to. A guard
+  // placed HERE would run before the await and catch nothing, which would read
+  // as protection while providing none.
   async function renderSessions(){ return renderTaskCards(); }
-  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions); }
+  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions, true); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
   // --- Oversee: live Claude work — loop runs AND interactive sessions ---
@@ -1132,6 +1444,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (ae && ae.closest && ae.closest('#enpanel')) return;
     const [res, es] = await Promise.all([apiGet('/api/oversee'),
                                          apiGet('/api/enrich/settings')]);
+    // The clobber the user reported was this exact render landing late. Discard
+    // before the throw too — see renderImprovements for why.
+    if (!shouldPaint(liveFn, renderOversee)) return;   // newer section owns the panel
     if (!res || res.ok === false) throw new Error((res && res.error) || 'oversee fetch failed');
     OV_DATA = res;
     EN_SET = (es && typeof es.enabled === 'boolean') ? es : {enabled: true};
@@ -1148,8 +1463,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       await renderOversee();
     });
   }
-  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee); }
-  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview); }
+  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee, true); }
+  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview, true); }
 
   // --- mandatory code change-log (Log view) ---
   function logBadge(cat){
@@ -1160,6 +1475,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   async function renderLog(){
     const res = await apiGet('/api/changelog');
+    if (!shouldPaint(liveFn, renderLog)) return;       // newer section owns the panel
     if (!res || !Array.isArray(res.entries)) throw new Error((res && res.error) || 'changelog fetch failed');
     const pend = res.pending && res.pending.files && res.pending.files.length
       ? '<div class="row"><span class="pill" style="color:#e0a030;border-color:#a67a20">'
@@ -1183,7 +1499,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
       + '</ul>');
   }
-  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog); }
+  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog, true); }
 
   function sopBadge(action){
     const colors = {add:'#6aa84f', update:'#4a90d9', 'delete':'#d94a4a'};
@@ -1192,6 +1508,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   async function renderSops(){
     const res = await apiGet('/api/sops');
+    if (!shouldPaint(liveFn, renderSops)) return;      // newer section owns the panel
     if (!res || !Array.isArray(res.active)) throw new Error((res && res.error) || 'sop fetch failed');
     const showProj = (PROJECT === '*');
     if (!res.active.length && !res.history.length){
@@ -1218,11 +1535,24 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (res.history.length===1?'':'s')+')</h2>'
       + '<ul class="hits">'+hist+'</ul>');
   }
-  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops); }
+  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops, true); }
 
-  async function renderState(){ showText(await apiGet('/api/state')); }
-  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
-  function showBriefing(){ controls.innerHTML=''; liveFn = null; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
+  async function renderState(){
+    const s = await apiGet('/api/state');
+    if (!shouldPaint(liveFn, renderState)) return;     // newer section owns the panel
+    showText(s);
+  }
+  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState, true); }
+  function showBriefing(){
+    controls.innerHTML=''; liveFn = null;
+    // liveFn is null here, so shouldPaint cannot guard this one — run()'s
+    // generation does. Without it, /api/briefing (1.2-1.9s on the 31k store)
+    // resolving after the user clicked another section painted Briefing over it.
+    run('loading briefing', async (current) => {
+      const t = await apiGet('/api/briefing');
+      if (current()) showText(t);
+    }, true);
+  }
 
   function showRecall(){
     liveFn = null;
@@ -1230,6 +1560,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<label><input type="checkbox" id="sem"> semantic</label>'
       + '<button onclick="runRecall()">Search</button></div>';
     showText('Enter a query and search.');
+    // Panel swaps that never reach run() still have to announce themselves —
+    // run() is where the other sections get their announcement.
+    announce('recall \\u2014 ready');
     const q = document.getElementById('q');
     q.focus();
     q.addEventListener('keydown', e => { if (e.key === 'Enter') runRecall(); });
@@ -1237,13 +1570,16 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function runRecall(){
     const q = document.getElementById('q').value;
     const sem = document.getElementById('sem').checked ? '1' : '0';
-    run('searching', async () => {
+    run('searching', async (current) => {
       const hits = await apiGet('/api/recall?q='+encodeURIComponent(q)+'&semantic='+sem);
+      // Recall sets liveFn = null, and a second search while the first is in
+      // flight is the common case here, not an edge one.
+      if (!current()) return;
       if (!hits.length) { showText('No matches for "'+q+'".'); return; }
       showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
         + hits.map(h => '<li><div class="file">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
         + '</ul>');
-    });
+    }, true);
   }
 
   // Graph is a one-shot heavy render (not live-refreshed): fetch once and hand
@@ -1255,9 +1591,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     let semantic = false;
     controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
       + '<input type="checkbox" id="gsem"> semantic links</label>';
-    const load = () => run('building graph', async () => {
+    const load = () => run('building graph', async (current) => {
       const html = await apiGet('/api/graph' + (semantic ? '?semantic=1' : ''));
-      only(graph); graph.srcdoc = html;
+      // liveFn is null for Graph, so run()'s generation is the only guard. It
+      // also covers re-entry: toggling the semantic checkbox calls load() again,
+      // and the slower of the two answers must not win.
+      if (current()) { only(graph); graph.srcdoc = html; }
     });
     const cb = document.getElementById('gsem');
     if (cb) cb.addEventListener('change', () => { semantic = cb.checked; load(); });
@@ -1273,6 +1612,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     graph.removeAttribute('srcdoc');
     graph.src = u(withProj(view === 'research' ? '/api/research/page'
                                                : '/api/workspace/'+view));
+    announce(view + ' workspace \\u2014 loading');
   }
 
   // Self-Reliant (an iframe) can ask the parent to open the Memory view filtered
@@ -1297,6 +1637,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<div class="row"><input id="etags" placeholder="tags,comma,separated">'
       + '<button onclick="runAppend()">Append</button></div>';
     showText('Fill the form and append a memory event.');
+    announce('append memory \\u2014 ready');
   }
   function runAppend(){
     const body = { type: document.getElementById('etype').value,
@@ -1471,13 +1812,22 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     ].concat(expanded.map(n =>
       apiGet('/api/skills/history?name='+encodeURIComponent(n)+'&limit=25').catch(() => null))));
     if (gen !== PLUG_GEN) return;   // a newer cycle owns the caches now
+    // The cross-section discard sits ABOVE the cache writes, not just around
+    // the paint. It used to guard only paintPlugins(), so a cycle that resolved
+    // after the user had left still overwrote seven module caches with the
+    // answers to questions they had stopped asking — and every later repaint
+    // that does NOT refetch (a filter toggle, an expand, invokeSkill's own
+    // repaint) rendered from them. The node harness could not see it: its
+    // inventory fixture deserialised to exactly PLUG_INV's initial value, so
+    // the write left no trace to detect.
+    if (!shouldPaint(liveFn, renderPlugins)) return;
     PLUG_INV = (res[0] && res[0].inventory) || {plugins: [], local_skills: [], counts: {}};
     if (res[1]) { PLUG_STATUS = res[1].status || {}; PLUG_COUNTS = res[1].counts || {}; }
     if (res[2] && res[2].stats) PLUG_STATS = res[2].stats;
     if (res[3] && res[3].recommendations) PLUG_REC = res[3];
     if (res[4] && res[4].auto) indexSkillRules(res[4].auto);
     expanded.forEach((n, i) => { if (res[5+i]) PLUG_HIST[n] = res[5+i]; });
-    if (liveFn === renderPlugins) paintPlugins();
+    paintPlugins();
   }
   function fmtRate(r){ return r == null ? '\\u2014' : Math.round(r*100)+'%'; }
   function skMetrics(st){
@@ -1702,12 +2052,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         + (plugin ? '&plugin='+encodeURIComponent(plugin) : '');
       apiGet(q).then(d => {
         PLUG_DETAILS[name] = (d && d.ok !== false) ? d : {missing: true};
-        if (liveFn === renderPlugins) paintPlugins();
+        if (shouldPaint(liveFn, renderPlugins)) paintPlugins();
       }).catch(() => {});
     }
     if (!PLUG_HIST[name]){
       apiGet('/api/skills/history?name='+encodeURIComponent(name)+'&limit=25')
-        .then(h => { PLUG_HIST[name] = h || []; if (liveFn === renderPlugins) paintPlugins(); })
+        .then(h => { PLUG_HIST[name] = h || []; if (shouldPaint(liveFn, renderPlugins)) paintPlugins(); })
         .catch(() => {});
     }
     paintPlugins();
@@ -1728,7 +2078,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       paintPlugins();
       el = Array.from(view.querySelectorAll('.skrow')).find(li => li.dataset.name === name);
     }
-    if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
+    if (el) el.scrollIntoView({behavior: REDUCE_MOTION ? 'auto' : 'smooth',
+                               block: 'center'});
   }
   function syncPlugControls(){
     const q = document.getElementById('plugq'); if (q) q.value = PLUG_QUERY;
@@ -1746,7 +2097,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (PLUG_CALLING.has(name)) return;
     if (!confirm('Call the "'+name+'" skill now? This runs a headless Claude and can take a while.')) return;
     PLUG_CALLING.add(name);
-    if (liveFn === renderPlugins) paintPlugins();
+    if (shouldPaint(liveFn, renderPlugins)) paintPlugins();
     let res;
     try { res = await apiPost('/api/skills/invoke', {name: name, plugin: plugin || null}); }
     catch(e){ res = {ok: false, excerpt: String((e && e.message) || e)}; }
@@ -1762,7 +2113,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       if (r[0] && r[0].stats) PLUG_STATS = r[0].stats;
       if (r[1]) PLUG_HIST[name] = r[1];
     } catch(_){}
-    if (liveFn === renderPlugins) paintPlugins();
+    if (shouldPaint(liveFn, renderPlugins)) paintPlugins();
   }
   // Learn from a failed call on demand: reflect the skill:<name> incident into
   // a prevention rule immediately (bypassing the recurrence gate). Spawns the
@@ -1772,7 +2123,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (PLUG_REFLECTING.has(name)) return;
     if (!confirm('Reflect the "'+name+'" failure into a prevention rule now? Runs the claude CLI once.')) return;
     PLUG_REFLECTING.add(name);
-    if (liveFn === renderPlugins) paintPlugins();
+    if (shouldPaint(liveFn, renderPlugins)) paintPlugins();
     let res;
     try { res = await apiPost('/api/rules/reflect_one', {signature: 'skill:'+name}); }
     catch(e){ res = {ok: false, error: String((e && e.message) || e)}; }
@@ -1783,7 +2134,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       const imp = await apiGet('/api/improvements');
       if (imp && imp.auto) indexSkillRules(imp.auto);
     } catch(_){}
-    if (liveFn === renderPlugins) paintPlugins();
+    if (shouldPaint(liveFn, renderPlugins)) paintPlugins();
   }
   function onPlugSearch(v){ PLUG_QUERY = v; paintPlugins(); }
   function onPlugStatus(v){ PLUG_STATUSF = v; paintPlugins(); }
@@ -1805,20 +2156,43 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<button id="plugdir" onclick="togglePlugDir()">'+plugDirLabel()+'</button>'
       + '</div>';
     liveFn = renderPlugins;
-    run('loading skill & plugin', renderPlugins);
+    run('loading skill & plugin', renderPlugins, true);
   }
   function doExport(){ window.location = u('/api/export'); }
 
+  // A server-side refusal is `{ok:false, error:"…"}` with HTTP 200 — the six
+  // one-at-a-time locks answer that way on purpose, so the page can render it.
+  // Rendering it was ALL that happened: neither caller inspected `ok`, so run()
+  // finished normally and both the status line and the live region announced
+  // "ready" for an operation the server had declined to start. With the nav
+  // lock gone, a second click is easy to make and this was its only feedback.
+  //
+  // Keyed on `error` rather than on `ok` alone, because ok:false is also a
+  // legitimate RESULT here: `/api/verify` reports a broken hash chain that way,
+  // carrying `reason`, and that operation really did run.
+  function refusal(r){
+    return r && r.ok === false && typeof r.error === 'string' ? r.error : null;
+  }
   function doAction(path, label, method){
     controls.innerHTML=''; liveFn = null;
-    run(label+'…', async () => showText(method === 'GET' ? await apiGet(path) : await apiPost(path, {})));
+    run(label+'…', async (current) => {
+      const r = method === 'GET' ? await apiGet(path) : await apiPost(path, {});
+      if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
+      const why = refusal(r);
+      if (why) throw new Error(why);   // reaches run()'s catch -> "failed", announced
+    });
   }
   function confirmAction(path, label){
     if(!confirm(label + ' — this can take a while. Continue?')) return;
     let body = {};
     if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
     controls.innerHTML=''; liveFn = null;
-    run(label+' running…', async () => showText(await apiPost(path, body)));
+    run(label+' running…', async (current) => {
+      const r = await apiPost(path, body);
+      if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
+      const why = refusal(r);
+      if (why) throw new Error(why);
+    });
   }
 
   //__TASKS_JS__
@@ -1835,14 +2209,24 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // Errors are swallowed for the same reason the swarm page keeps this call outside
   // its main try: a failing board must not take out the page, and a failing page
   // must not take out the board.
+  // In-flight guard, same reason as refreshLive — see the measurement in its comment.
+  // This timer is the worse offender of the two: it has no busy gate at all, so it
+  // fires against /api/mindnet/cats every 2500 ms whatever section is open, and that
+  // endpoint reads the whole ledger (or every namespace in HIVE MIND) on each call.
+  // Measured alone it costs 0.87-0.92 s and returns 503 bytes; under real load it took
+  // 6 s for the same 503 bytes, which is queueing, not payload.
+  let catsInFlight = false;
   async function pollCats(){
     if (!liveOn || document.hidden) return;
+    if (catsInFlight) return;   // skip this tick, never queue it
+    catsInFlight = true;
     // ONE fetch feeds both strips — see the swarm page's poll for why.
     try {
       const board = await apiGet('/api/mindnet/cats');
       paintCats(board.cats || []);
       paintSessions(board);
     } catch(_){}
+    finally { catsInFlight = false; }
   }
   setInterval(pollCats, LIVE_MS);
 
@@ -1851,6 +2235,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   (async () => { await loadProjects(); if (!viewPicked) showOverview(); pollCats(); })();
 </script>
 </body></html>""" \
+    .replace("/*__PAINT_GUARD__*/", PAINT_GUARD_JS) \
     .replace("/*__CAT_CSS__*/", cat_board.CSS) \
     .replace("<!--__CAT_HTML__-->", cat_board.HTML) \
     .replace("/*__CAT_JS__*/", cat_board.script()) \

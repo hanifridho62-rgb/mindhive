@@ -1,5 +1,7 @@
 # src/mindhive/projector.py
 import hashlib
+import os
+import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import roadmap
 # Both reach only `sop` -> `events`, so a module-level import here introduces no
@@ -200,7 +202,53 @@ def build_index(entries) -> dict:
     return idx
 
 
+_PROJECT_LOCKS: dict = {}
+_PROJECT_LOCKS_GUARD = threading.Lock()
+
+
+def _project_lock(key: str):
+    """One re-entrant lock per project directory, created on first use."""
+    with _PROJECT_LOCKS_GUARD:
+        return _PROJECT_LOCKS.setdefault(key, threading.RLock())
+
+
 def project(project=None, evs=None, suggestions=None) -> dict:
+    """Rebuild a project's derived files, one writer at a time per project.
+
+    The lock lives HERE rather than at the call sites because there are nine of
+    them and they do not agree: `dashboard._post_project` held `_PROJECT_LOCK`,
+    `_post_sync` held `_SYNC_LOCK`, `_post_harvest` held `_HARVEST_LOCK`,
+    `_post_append` and the background `_auto_harvest_loop` held nothing, and
+    `autosync`, `consolidate` and two CLI paths are not handlers at all. Four
+    different locks over one critical section exclude nothing; the resource has
+    to own its own lock.
+
+    What two concurrent rebuilds actually did:
+      * both wrote the SAME `STATE.md.tmp` (a fixed per-project path), so the
+        file that got `.replace`d into STATE.md could hold interleaved halves of
+        two different renders;
+      * worse, both ran the LEDGER prune below. `keep` is computed from the
+        caller's `evs`, and `sync` passes a pre-read list — so a rebuild holding
+        slightly older events would `unlink()` entry files a fresher concurrent
+        rebuild had just written. That is data loss, not a torn temp file.
+
+    Reachable from a single tab only after PR-1a removed the nav disable, which
+    had been the sole thing stopping two of these buttons being clicked at once.
+    The race itself is older than that: the auto-harvest thread has always run
+    unlocked alongside them.
+
+    NOT fixed here, and deliberately not claimed: this is a threading lock, so
+    it covers one process. `hive sync` in a terminal racing the dashboard is a
+    second process and still races. The unique temp name below removes the torn
+    STATE.md half of that; the LEDGER prune half needs a file lock and is out of
+    scope for PR-1a.
+    """
+    pdir = paths.project_dir(project)
+    with _project_lock(str(pdir)):
+        return _project(project=project, evs=evs, suggestions=suggestions)
+
+
+def _project(project=None, evs=None, suggestions=None) -> dict:
     # Accept pre-read events (and a pre-computed suggested-skills block) so a
     # caller (e.g. sync) that already has them need not recompute either.
     if evs is None:
@@ -208,10 +256,26 @@ def project(project=None, evs=None, suggestions=None) -> dict:
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
 
-    tmp = pdir / "STATE.md.tmp"
-    tmp.write_text(compose_state(evs, project, suggestions=suggestions),
-                   encoding="utf-8")
-    tmp.replace(pdir / "STATE.md")
+    # Unique per writer, not the fixed "STATE.md.tmp" this used to be: the lock
+    # above serialises threads in THIS process, but `hive sync` in a terminal is
+    # another process and shares the directory. Two of them writing one fixed
+    # temp path interleave their bytes and then both `.replace()` it, so the
+    # atomic rename lands a file that is atomically corrupt. A unique name makes
+    # each render internally consistent no matter who else is writing; the
+    # rename stays atomic, so the loser simply loses cleanly.
+    tmp = pdir / f"STATE.md.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        tmp.write_text(compose_state(evs, project, suggestions=suggestions),
+                       encoding="utf-8")
+        tmp.replace(pdir / "STATE.md")
+    finally:
+        # A crash between write and replace would otherwise leave a uniquely
+        # named orphan behind forever, which the fixed name never could.
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # The mandatory-SOP sidecar is derived state like everything else written
     # here, and this is the one place that already holds `evs` — so a full

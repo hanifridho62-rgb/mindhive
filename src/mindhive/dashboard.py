@@ -1,6 +1,8 @@
 # src/mindhive/dashboard.py
 from __future__ import annotations
 
+import collections
+import functools
 import gzip
 import json
 import os
@@ -45,9 +47,81 @@ _REFLECT_LOCK = threading.Lock()
 # concurrent clicks would fork a fleet of agents. One at a time, like reflect.
 _INVOKE_LOCK = threading.Lock()
 
+# The remaining mutating endpoints, one lock EACH. Until now their only mutual
+# exclusion was the page disabling its own nav while a request was in flight —
+# a client-side guard, so two tabs, a double click, or one curl started two full
+# runs over the same repo. Selftest is the worst case (two concurrent pytest
+# runs over the same tree), but a doubled harvest, sync or embed all put two
+# writers over the same files.
+#
+# Projection is the one that is NO LONGER on that list: `projector.project()`
+# now takes its own per-project lock, because nine call sites reach it and only
+# some are handlers this decorator can wrap. `_PROJECT_LOCK` still earns its
+# place — it refuses the SECOND CLICK at the door with a message, instead of
+# queueing it to rebuild everything again a moment later — but it is no longer
+# what makes concurrent rebuilds safe. Deleting it would cost a UX affordance,
+# not a guarantee.
+#
+# Per operation rather than one shared lock: a harvest and a sync are unrelated
+# jobs touching different files, and making them wait on each other would turn
+# two legitimate clicks into a stall. Each lock is only ever about its OWN
+# duplicate.
+_HARVEST_LOCK = threading.Lock()
+_PROJECT_LOCK = threading.Lock()
+_SYNC_LOCK = threading.Lock()
+_EMBED_LOCK = threading.Lock()
+_SELFTEST_LOCK = threading.Lock()
+# ONE lock across BOTH plugin routes, deliberately. `/api/plugins/autoscan`
+# reaches `plugins.ensure_fresh`, which runs the same machine-wide scan
+# `/api/plugins/scan` runs directly — a lock per route would leave two scans
+# racing over one plugin cache through two different doors, which is exactly the
+# guarantee this is supposed to make.
+_PLUGINS_LOCK = threading.Lock()
+# The one GET that belongs in this list. `/api/verify` reads every event and
+# recomputes the chain; T9 removed the nav disable that was its only guard, and
+# the button is one click away from being clicked twice.
+_VERIFY_LOCK = threading.Lock()
+
 # Reflect batch size per request. Each incident is one `claude` CLI call (up
 # to 120s), so an unbounded batch could outlive the browser's fetch timeout.
 REFLECT_BATCH_LIMIT = 3
+
+
+def _one_at_a_time(lock, busy):
+    """Refuse a second concurrent call to a handler instead of running it.
+
+    Written once as a decorator rather than six copies of the same
+    acquire/try/finally: the boilerplate is identical every time and the two
+    things that are easy to get wrong — `blocking=False`, and releasing from a
+    `finally` — are exactly the parts a copy would drift on.
+
+    The refusal is ``ok:False`` with HTTP **200**, not 409. This file's
+    convention is that an expected domain rejection is a 200 body the page can
+    render (see `_post_embed`'s LIVE_LOCK and `_post_append`'s validation), and
+    only an unexpected server fault becomes a 500 in `do_POST`. "Something else
+    is already running" is the former.
+
+    `blocking=False` so the loser is answered immediately rather than parked on
+    a worker thread waiting for a pytest run to finish; the `finally` so a
+    handler that raises releases the endpoint instead of wedging it for the life
+    of the process.
+
+    `*a` rather than `(proj, body)`: GET handlers take `(proj, am, qs)`, and one
+    of them needs this. `/api/verify` re-reads the whole ledger and recomputes
+    the hash chain — as expensive as most of the POSTs guarded here — and its
+    only protection was the nav disable that T9 removed. A read-only endpoint
+    still deserves the guard when the read is the expensive part."""
+    def decorate(fn):
+        @functools.wraps(fn)
+        def guarded(self, *a):
+            if not lock.acquire(blocking=False):
+                return self._json({"ok": False, "error": busy}, 200)
+            try:
+                return fn(self, *a)
+            finally:
+                lock.release()
+        return guarded
+    return decorate
 
 
 def _token_path():
@@ -261,9 +335,66 @@ def _safe_chain_ok(name: str, evs=None) -> bool:
         return False
 
 
+# Both memos below are process-global and live for the life of the server, so
+# they are bounded rather than left to grow with the number of namespaces ever
+# polled. `hive projects` reports 56 stores on this machine, and HIVE MIND mode
+# plus a project picker makes visiting many of them a normal afternoon; each
+# entry holds a full telemetry fold and every session record for that project.
+#
+# An LRU rather than a size-only cap because the access pattern is extreme: one
+# namespace is hot (the picker's current selection) and the rest are cold the
+# moment it changes. Eviction costs a single recompute of the endpoint the gate
+# was added to make cheap — the same price a first visit pays.
+_MEMO_MAX = 8
+
+
+def _memo_put(memo: "collections.OrderedDict", key, value) -> None:
+    memo[key] = value
+    memo.move_to_end(key)
+    while len(memo) > _MEMO_MAX:
+        memo.popitem(last=False)
+
+
+def _memo_get(memo: "collections.OrderedDict", key):
+    if key not in memo:
+        return None
+    memo.move_to_end(key)      # a read counts as use, or the hot key ages out
+    return memo[key]
+
+
 # One memo of the session fold, shared by every poll of /api/mindnet/cats.
 # {(project, all_mode): (fingerprint, records)}
-_SESSIONS_MEMO: dict = {}
+_SESSIONS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+
+# The outer gate for the same endpoint, keyed on the stat-only ledger
+# fingerprint so an unchanged ledger is never even READ.
+# {project: (segment_stats, telemetry fold, session records)}
+_CATS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+
+
+def _with_online(records, stamp):
+    """*records* with `online` re-derived at *stamp*.
+
+    THE field that must never be memoized: `online` is a function of the wall
+    clock, not of the events, so a cached copy would freeze a session as working
+    (or as gone) until the ledger next moved. Every layer of caching over this
+    endpoint therefore stores the FOLD and calls this on the way out.
+
+    Idempotent by construction — `dict(r, online=…)` replaces the key rather
+    than reading it — so re-deriving over already-derived rows is correct, which
+    is what lets `_CATS_MEMO` hold rows that already went through here once.
+
+    The rule itself is oversee's own final line applied to oversee's own
+    constant, not a second implementation of liveness."""
+    from . import oversee as oversee_mod
+    from .loop.state import _ts_epoch
+    out = []
+    for r in records:
+        last = _ts_epoch(r.get("last_event_ts"))
+        out.append(dict(r, online=(last is not None
+                                   and (stamp - last)
+                                   < oversee_mod.ONLINE_WINDOW_SECONDS)))
+    return out
 
 
 def _sessions_cached(proj, am, evs, stamp):
@@ -282,27 +413,25 @@ def _sessions_cached(proj, am, evs, stamp):
     appended means the fold cannot have changed.
 
     `online` is the one field that must NOT be memoized — it is a function of the
-    wall clock, not of the events — so it is re-derived here from each record's
-    own `last_event_ts` against `ONLINE_WINDOW_SECONDS`. That is oversee's own
-    final line, applied to oversee's own constant; the FOLD is what is cached."""
+    wall clock, not of the events — so `_with_online` re-derives it per call; the
+    FOLD is what is cached.
+
+    This is the INNER gate. `_CATS_MEMO` sits in front of it and answers the
+    common case without reading the ledger at all; this one still earns its keep
+    on the paths that gate cannot serve — HIVE MIND (which bypasses it), and a
+    miss whose segment stats moved without the event count or newest ts
+    changing."""
     from . import oversee as oversee_mod
-    from .loop.state import _ts_epoch
     key = (proj, bool(am))
     fingerprint = (len(evs), evs[-1].ts if evs else "")
-    cached = _SESSIONS_MEMO.get(key)
+    cached = _memo_get(_SESSIONS_MEMO, key)
     if cached is None or cached[0] != fingerprint:
         records = oversee_mod.interactive_sessions(
             project=proj, evs=evs, now_fn=lambda: stamp)
-        _SESSIONS_MEMO[key] = (fingerprint, records)
+        _memo_put(_SESSIONS_MEMO, key, (fingerprint, records))
     else:
         records = cached[1]
-    out = []
-    for r in records:
-        last = _ts_epoch(r.get("last_event_ts"))
-        out.append(dict(r, online=(last is not None
-                                   and (stamp - last)
-                                   < oversee_mod.ONLINE_WINDOW_SECONDS)))
-    return out
+    return _with_online(records, stamp)
 
 
 def make_handler(token: str):
@@ -384,6 +513,7 @@ def make_handler(token: str):
             bpath = build_briefing(proj)
             return self._send(200, bpath.read_text(encoding="utf-8"), "text/plain; charset=utf-8")
 
+        @_one_at_a_time(_VERIFY_LOCK, "a chain verification is already running")
         def _get_verify(self, proj, am, qs):
             if am:
                 per = {n: _safe_chain_ok(n) for n in _all_projects()}
@@ -659,11 +789,10 @@ def make_handler(token: str):
             from datetime import datetime, timezone
 
             from . import oversee as oversee_mod
+            from .mindnet import sidecar as sidecar_mod
             from .mindnet import telemetry as tel_mod
             from .mindnet import ui_cats as cats_mod
             from .mindnet import ui_sessions as sess_mod
-            evs = [e for _, e in all_event_pairs()] if am else \
-                events.read_all(proj)
             # ONE clock for both boards. The faculty side ages rows from an ISO
             # string and `oversee` decides liveness from an epoch float; reading
             # the clock twice would let a session straddle the two and render as
@@ -671,22 +800,89 @@ def make_handler(token: str):
             stamp = time.time()
             now = datetime.fromtimestamp(stamp, timezone.utc) \
                 .strftime("%Y-%m-%dT%H:%M:%SZ")
-            cats = cats_mod.board(tel_mod.fold(evs), now)
-            # ONE ledger read for both, too. The two folds ask different
-            # questions of the SAME events, and `interactive_sessions` takes
-            # `evs` for exactly this reason — re-reading would double the cost of
-            # a poll that fires every 1.2 s against a store measured in tens of
-            # thousands of events.
-            # The session half is isolated. `oversee.interactive_sessions` is not
-            # documented as total, it folds every event twice internally, and it
-            # is NEW here — letting it raise would 500 the whole endpoint and take
-            # the faculty strip, which was reliable before this, down with it. The
-            # page's own rule is that a failing board must not take out the page;
-            # the server owes it the same.
+            # THE gate. Measured on the real store this endpoint returned 503
+            # bytes in 6.0 s under load — all of it `read_all` plus the two
+            # folds, on a route every open page polls every 2.5 s. An unchanged
+            # ledger cannot change either fold, so a hit reads nothing and folds
+            # nothing.
+            #
+            # `segment_stats` is the same stat-only fingerprint the phase sidecar
+            # already answers staleness with: `os.scandir`'s cached stat data,
+            # microseconds, never opens or parses a byte.
+            #
+            # THREE properties are load-bearing, and the cache is worse than no
+            # cache without any one of them:
+            #   * An EMPTY fingerprint is an unconditional MISS. `segment_stats`
+            #     answers {} both for "no events directory" and for ANY OSError,
+            #     so letting {} == {} count as a hit would let one transient
+            #     directory error freeze this board for the life of the process —
+            #     silently, which is the one failure mode a cache must not have.
+            #     `if fp` covers both sides: nothing empty is ever stored, so
+            #     nothing empty can ever match.
+            #   * HIVE MIND (am) bypasses the gate outright. It reads EVERY
+            #     namespace through `all_event_pairs`, and `segment_stats` is
+            #     per-project — a single-project stamp would miss an append in
+            #     any other namespace, and would miss a whole new namespace
+            #     appearing. Stamping every namespace is possible but is a
+            #     scandir each plus a re-listing to notice new ones; bypassing is
+            #     unconditionally correct, and this is the rarer path.
+            #   * A NON-FILE EVENT BACKEND bypasses it too. `events.read_all`
+            #     short-circuits to Postgres when MINDHIVE_EVENT_BACKEND is `pg`
+            #     (events.py:314, :356), while `segment_stats` keeps stat'ing the
+            #     local .jsonl segments — which, on the documented
+            #     file -> dual -> pg migration path, are still on disk and never
+            #     change again. The fingerprint would be non-empty, stable
+            #     forever, and every subsequent poll a hit: the board frozen at
+            #     the first response for the life of the process, with nothing
+            #     anywhere reporting it. This guard was specified with the {}
+            #     one and did not ship; the comment above it said "two properties
+            #     are load-bearing" and named a different second, so the gap read
+            #     as completeness. That is the failure mode this whole plan
+            #     exists to remove, so it is spelled out rather than fixed
+            #     quietly.
+            #
+            # What is memoized is the two FOLDS, never the response: `now` and
+            # `online` are functions of the wall clock and are re-derived below
+            # on every call, hit or miss (see `_with_online`).
+            file_backend = os.environ.get(
+                "MINDHIVE_EVENT_BACKEND", "file").strip().lower() == "file"
+            fp = (None if (am or not file_backend)
+                  else sidecar_mod.segment_stats(proj))
+            memo = _memo_get(_CATS_MEMO, proj) if fp else None
+            if memo is not None and memo[0] == fp:
+                tel_state, records, have_sessions = memo[1], memo[2], True
+            else:
+                # ONE ledger read for both folds. They ask different questions of
+                # the SAME events, and `interactive_sessions` takes `evs` for
+                # exactly this reason — re-reading would double the cost of the
+                # miss against a store measured in tens of thousands of events.
+                evs = [e for _, e in all_event_pairs()] if am else \
+                    events.read_all(proj)
+                tel_state = tel_mod.fold(evs)
+                # The session half is isolated. `oversee.interactive_sessions` is
+                # not documented as total and it folds every event twice
+                # internally — letting it raise would 500 the whole endpoint and
+                # take the faculty strip, which was reliable before this, down
+                # with it. The page's own rule is that a failing board must not
+                # take out the page; the server owes it the same.
+                try:
+                    records = _sessions_cached(proj, am, evs, stamp)
+                    have_sessions = True
+                except Exception:               # noqa: BLE001
+                    records, have_sessions = [], False
+                # Only a fold that SUCCEEDED is memoized. Storing the degraded
+                # answer would pin "cannot know" behind the gate until the ledger
+                # next moved; re-attempting costs exactly what this endpoint cost
+                # before the gate existed, which is the honest price of a fault.
+                if fp and have_sessions:
+                    _memo_put(_CATS_MEMO, proj, (fp, tel_state, records))
+            # Both boards render from THIS call's clock, whatever the gate did.
+            # `_with_online` runs unconditionally — on a miss it is a redundant
+            # (idempotent) second pass over a few dozen rows, which is the price
+            # of there being exactly one place that can freeze `online`.
+            cats = cats_mod.board(tel_state, now)
             try:
-                sessions = sess_mod.board(
-                    _sessions_cached(proj, am, evs, stamp), now)
-                have_sessions = True
+                sessions = sess_mod.board(_with_online(records, stamp), now)
             except Exception:                       # noqa: BLE001
                 sessions = {"cats": (), "total": 0, "hidden": 0}
                 have_sessions = False
@@ -865,6 +1061,7 @@ def make_handler(token: str):
         # Each takes (proj, body) and sends its own response, wired via
         # _POST_ROUTES. The HIVE MIND read-only guard and the mutating-action
         # target check live in do_POST, before dispatch.
+        @_one_at_a_time(_HARVEST_LOCK, "a harvest is already running")
         def _post_harvest(self, proj, body):
             # self-healing backfill: capture any session the hooks missed
             res = run_catch_up()
@@ -896,14 +1093,17 @@ def make_handler(token: str):
             projector.project(proj)
             return self._json({"ok": True, "type": ev.type, "ts": ev.ts, "project": proj})
 
+        @_one_at_a_time(_PROJECT_LOCK, "a projection rebuild is already running")
         def _post_project(self, proj, body):
             return self._json({"ok": True, "result": projector.project(proj)})
 
+        @_one_at_a_time(_SYNC_LOCK, "a sync is already running")
         def _post_sync(self, proj, body):
             folder = _folder_for_project(proj)
             path = sync_mod.sync(folder, project=proj)
             return self._json({"ok": True, "path": str(path), "folder": folder})
 
+        @_one_at_a_time(_EMBED_LOCK, "an embedding pass is already running")
         def _post_embed(self, proj, body):
             force = bool(body.get("force", False))
             try:
@@ -915,6 +1115,7 @@ def make_handler(token: str):
             from . import vectors
             return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
 
+        @_one_at_a_time(_PLUGINS_LOCK, "a plugin scan is already running")
         def _post_plugins_scan(self, proj, body):
             # Plugins/skills are installed machine-wide, so a scan is global. In
             # HIVE MIND (all-projects) mode there's no concrete namespace to store
@@ -940,6 +1141,10 @@ def make_handler(token: str):
             return self._json({"ok": res["ok"], "name": name, "plugin": plugin,
                                "exit": res["exit"], "excerpt": res["excerpt"]})
 
+        # Shares _PLUGINS_LOCK with /api/plugins/scan on purpose: `ensure_fresh`
+        # runs that same scan when the catalog is stale, so a lock per route
+        # would leave two scans reachable over one cache through two doors.
+        @_one_at_a_time(_PLUGINS_LOCK, "a plugin scan is already running")
         def _post_plugins_autoscan(self, proj, body):
             if is_all(proj):                       # global scan; see _post_plugins_scan
                 proj = default_project()
@@ -1130,6 +1335,7 @@ def make_handler(token: str):
                 enrich_mod.record(text, res, project=proj)
             return self._json({"ok": True, "result": res})
 
+        @_one_at_a_time(_SELFTEST_LOCK, "a self test is already running")
         def _post_selftest(self, proj, body):
             from . import selftest as selftest_mod
             code = selftest_mod.run()
@@ -1150,7 +1356,20 @@ def make_handler(token: str):
                 proj = body.get("project") or default_project()
                 if is_all(proj):
                     if route == "/api/project":
-                        res = {n: projector.project(n) for n in _all_projects()}
+                        # Takes the SAME lock as _post_project. This branch
+                        # answers and returns before _POST_ROUTES dispatch, so
+                        # it never passes through the decorated handler —
+                        # HIVE MIND was the one remaining door into
+                        # projector.project() that T8's decorator could not see,
+                        # and it is the widest one (every namespace, not one).
+                        if not _PROJECT_LOCK.acquire(blocking=False):
+                            return self._json({"ok": False, "error":
+                                "a projection rebuild is already running"}, 200)
+                        try:
+                            res = {n: projector.project(n)
+                                   for n in _all_projects()}
+                        finally:
+                            _PROJECT_LOCK.release()
                         return self._json({"ok": True, "result": res})
                     # selftest + harvest + plugin scans + auth verification are
                     # global (machine-wide, not tied to one project); every other

@@ -82,6 +82,14 @@ _PAGE = """<!doctype html>
   .dot.running { background:#e0b341; animation:pulse 1s infinite; }
   .dot.done { background:#46c46a; } .dot.error { background:#ff6b6b; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  /* D8: the sheet that turns an animation ON owns switching it off, so a
+     second consumer of this CSS inherits the guard instead of quietly
+     losing it. Repeating motion is a trigger for some people, not a
+     preference. This page is served into the dashboard's own iframe, so
+     the host page's guard does not reach it. */
+  @media (prefers-reduced-motion: reduce) {
+    .dot.running { animation:none !important; }
+  }
   .pout { flex:1; overflow-y:auto; padding:8px 10px; margin:0; white-space:pre-wrap;
     word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
   .recipe { display:flex; flex-wrap:wrap; gap:4px; padding:4px 6px;

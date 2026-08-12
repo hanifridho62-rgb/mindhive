@@ -222,6 +222,15 @@ CARDS_CSS = """
   .tstat { font-size:11px; border-radius:999px; padding:1px 8px;
     border:1px solid #2a2f3d; white-space:nowrap; }
   .tstat.ongoing { color:#e0b341; animation: pulse 1.6s infinite; }
+  /* This fragment's own motion, guarded here rather than in the host page —
+     same rule cat_board follows: the sheet that turns an animation ON owns
+     switching it off, so a second consumer of CARDS_CSS inherits the guard
+     instead of quietly losing it. `!important` because `.tstat.ongoing` is as
+     specific as this rule and a media query adds no specificity of its own.
+     The `pulse` keyframes come from the host page; only the rule is ours. */
+  @media (prefers-reduced-motion: reduce) {
+    .tstat.ongoing { animation:none !important; }
+  }
   .tstat.done { color:#46c46a; }
   .tsid { font-size:12px; color:#7fb2ff; word-break:break-all; }
   .tchip { font-size:12px; color:#e6e8ef; }
@@ -347,7 +356,14 @@ CARDS_JS = """
     paintTaskCards();
   }
   async function renderTaskCards(){
-    TASK_SESSIONS = await apiGet('/api/sessions');
+    const rows = await apiGet('/api/sessions');
+    // The cache write is INSIDE the guard, not before it. paintTaskCards
+    // already refuses to paint for a section the user left, but the assignment
+    // ran first — so a discarded poll still replaced TASK_SESSIONS, and every
+    // later repaint that does not refetch (toggleTaskCard, toggleTaskRow) drew
+    // from it. Discarding a render means writing nothing, caches included.
+    if (!shouldPaint(liveFn, renderSessions)) return;
+    TASK_SESSIONS = rows;
     for (const s of TASK_SESSIONS){
       const key = taskKey(s);
       if (TASK_OPEN.has(key) && (s.status === 'ongoing' || !TASK_ITEMS[key]))
@@ -394,6 +410,21 @@ CARDS_JS = """
       + '</div>' + body + '</div>';
   }
   function paintTaskCards(){
+    // Cross-section discard, applied HERE because this is the paint site.
+    // renderTaskCards awaits /api/sessions and calls us on the FAR SIDE of that
+    // await, so the same guard placed in renderSessions (dashboard_page.py)
+    // would run before the await and catch nothing — it would read as
+    // protection while providing none. Measured before this line existed:
+    // renderSessions and renderTaskCards were the only renderers still able to
+    // paint over a section the user had already left.
+    // The three callers are all post-await (renderTaskCards, toggleTaskCard,
+    // toggleTaskRow), so one check here covers every path into showHTML.
+    // This couples the fragment to its host on purpose: CARDS_JS is inlined by
+    // exactly one page (dashboard.py -> render_page(tasks_js=...)), which is
+    // where liveFn, shouldPaint and renderSessions live. A future second
+    // consumer without them gets a loud ReferenceError here rather than a
+    // silently unguarded paint.
+    if (!shouldPaint(liveFn, renderSessions)) return;
     if (!TASK_SESSIONS.length){ showText('No sessions yet.'); return; }
     showHTML('<h2 class="h">'+TASK_SESSIONS.length+' task'
       +(TASK_SESSIONS.length>1?'s':'')+'</h2>'

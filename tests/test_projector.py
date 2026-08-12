@@ -219,3 +219,77 @@ def test_recommend_failure_skips_block_state_still_builds(monkeypatch):
     state = _state()
     assert "SUGGESTED SKILLS" not in state
     assert "d1" in state                   # state body intact
+
+
+def test_two_rebuilds_of_one_project_never_overlap():
+    """The critical section is `projector.project` itself, not its call sites.
+
+    Nine call sites reach it -- four dashboard handlers, the background
+    auto-harvest thread, autosync, consolidate and two CLI paths -- and before
+    this lock they disagreed about which mutex to hold: `_PROJECT_LOCK`,
+    `_SYNC_LOCK`, `_HARVEST_LOCK`, or none at all. Four different locks over one
+    critical section exclude nothing.
+
+    Two concurrent rebuilds of the same project used to write the same fixed
+    `STATE.md.tmp` and then both `.replace()` it, and -- worse -- both ran the
+    LEDGER prune, where `keep` is derived from the caller's `evs`. `sync` passes
+    a pre-read list, so an older rebuild could `unlink()` entry files a fresher
+    one had just written. That is data loss, not a torn temp file.
+
+    Measured here by counting how many threads are inside compose_state at once.
+    Without the lock this reaches the thread count; with it, exactly one.
+    """
+    import threading
+    import time
+    from mindhive import projector as pj
+
+    events.append_event("decision", {"text": "concurrency probe"}, session_id="s")
+
+    inside, peak, lock = [], [0], threading.Lock()
+    real = pj.compose_state
+
+    def slow_compose(*a, **k):
+        with lock:
+            inside.append(1)
+            peak[0] = max(peak[0], len(inside))
+        time.sleep(0.05)          # hold the section open long enough to collide
+        try:
+            return real(*a, **k)
+        finally:
+            with lock:
+                inside.pop()
+
+    pj.compose_state = slow_compose
+    try:
+        threads = [threading.Thread(target=pj.project) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads), "a rebuild deadlocked"
+    finally:
+        pj.compose_state = real
+
+    assert peak[0] == 1, (
+        f"{peak[0]} rebuilds were inside compose_state at once -- they share one "
+        f"project directory, so they interleave STATE.md and race the LEDGER prune")
+
+
+def test_the_state_temp_file_is_unique_per_writer():
+    """The lock covers one process; `hive sync` in a terminal is another.
+
+    A fixed `STATE.md.tmp` lets two processes interleave their bytes into one
+    file that is then atomically renamed -- an atomically corrupt STATE.md. A
+    unique name makes each render internally consistent regardless of who else
+    is writing, and the loser of the rename simply loses cleanly.
+    """
+    body = open(projector.__file__, encoding="utf-8").read()
+    fixed = 'pdir / "STATE.md.tmp"'
+    assert fixed not in body, (
+        "the temp path is fixed again, so two processes share one scratch file")
+    assert "os.getpid()" in body and "threading.get_ident()" in body, (
+        "the temp name is not unique per process and thread")
+    # and no orphan is left behind by a normal rebuild
+    projector.project()
+    leftovers = list(paths.project_dir().glob("STATE.md*.tmp"))
+    assert not leftovers, f"rebuild left temp files behind: {leftovers}"
