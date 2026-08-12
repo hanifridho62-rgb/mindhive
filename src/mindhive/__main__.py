@@ -961,6 +961,22 @@ def _roadmap_steps(args) -> list:
     return steps
 
 
+def _roadmap_work_link(args) -> dict:
+    """The `--branch/--pr/--commit` trio as `roadmap.record` keywords.
+
+    An omitted flag stays absent rather than becoming an empty value, because
+    the fold carries the recorded link forward across events: attaching a PR
+    number next week must not erase the branch recorded today."""
+    link = {}
+    if getattr(args, "branch", None):
+        link["work_branch"] = args.branch
+    if getattr(args, "pr", None):
+        link["work_pr"] = args.pr
+    if getattr(args, "commit", None):
+        link["work_commits"] = list(args.commit)
+    return link
+
+
 def _cmd_roadmap_write(args, action) -> int | None:
     from . import roadmap as roadmap_mod
     sid = args.session or os.environ.get("MINDHIVE_SESSION")
@@ -974,6 +990,9 @@ def _cmd_roadmap_write(args, action) -> int | None:
                           note=args.note)
         elif action == "interrupt":
             kwargs.update(cause=args.cause, note=args.note)
+        elif action == "archive":
+            kwargs.update(reason=args.reason)
+        kwargs.update(_roadmap_work_link(args))
         ev = roadmap_mod.record(action, args.plan_id, session_id=sid,
                                 **kwargs)
     except (ValueError, OSError) as e:
@@ -1046,6 +1065,90 @@ def cmd_roadmap_complete(args) -> int | None:
     return None
 
 
+def cmd_roadmap_archive(args) -> int | None:
+    """Retire a plan whose last step nothing can verify, on a stated reason.
+    The honest third exit, next to `complete` (it finished) and leaving it open
+    (it has not)."""
+    rc = _cmd_roadmap_write(args, "archive")
+    if rc:
+        return rc
+    _cancel_pending_autoresume(args)
+    return None
+
+
+def cmd_roadmap_link(args) -> int | None:
+    """Point a plan at the code it produced, without touching its status."""
+    return _cmd_roadmap_write(args, "link")
+
+
+def _print_merge_answer(plan_id, answer, link_text) -> None:
+    """One merge answer, said plainly. `unknown` prints the reason it is
+    unknown, because "we could not check" and "it has not landed" are different
+    facts and a reader who cannot tell them apart has learned nothing."""
+    from . import repo as repo_mod
+    marks = {repo_mod.MERGED: "merged", repo_mod.CLOSED: "closed unmerged",
+             repo_mod.OPEN: "not landed yet", repo_mod.UNKNOWN: "unknown"}
+    head = f"{plan_id}: {marks.get(answer['state'], answer['state'])}"
+    if link_text:
+        head += f"  [{link_text}]"
+    print(head)
+    if answer["evidence"]:
+        print(f"  evidence: {answer['evidence']}")
+    if answer["state"] == repo_mod.UNKNOWN:
+        print(f"  reason: {answer['reason']}")
+        if answer["detail"]:
+            print(f"  detail: {answer['detail']}")
+
+
+def cmd_roadmap_merge_state(args) -> int | None:
+    """Probe one plan's work link against git and `gh`. Read-only: it never
+    retires anything, so it is safe to run on a card you are only asking about."""
+    from . import repo as repo_mod, roadmap as roadmap_mod
+    evs = events.read_all(getattr(args, "project", None))
+    rec = roadmap_mod.get(evs, args.plan_id)
+    if rec is None:
+        print(f"error: no roadmap '{args.plan_id}' in the ledger",
+              file=sys.stderr)
+        return 2
+    answer = repo_mod.merge_state(**roadmap_mod.work_link(rec))
+    if args.json:
+        print(json.dumps(dict(answer, plan_id=rec["plan_id"]), indent=2,
+                         ensure_ascii=False))
+        return None
+    _print_merge_answer(rec["plan_id"], answer,
+                        roadmap_mod.describe_work_link(rec))
+    return None
+
+
+def cmd_roadmap_retire(args) -> int | None:
+    """Retire every live plan whose work link proves the work is finished.
+
+    Prints what was examined, not only what changed: a run that retires nothing
+    because every PR is still open has to be distinguishable from one that
+    retired nothing because `gh` is missing."""
+    from . import roadmap as roadmap_mod
+    proj = getattr(args, "project", None)
+    outcomes = roadmap_mod.retire_landed(
+        project=proj, session_id=args.session or os.environ.get(
+            "MINDHIVE_SESSION"))
+    if args.json:
+        print(json.dumps(outcomes, indent=2, ensure_ascii=False))
+        return None
+    if not outcomes:
+        print("(no live roadmaps to examine — hive roadmap list --all)")
+        return None
+    retired = [o for o in outcomes if o["action"]]
+    for outcome in outcomes:
+        _print_merge_answer(outcome["plan_id"], outcome,
+                            f"-> {outcome['action']}" if outcome["action"]
+                            else "")
+    print(f"\n{len(retired)} of {len(outcomes)} roadmap(s) retired on evidence")
+    if not retired:
+        print("nothing retired: no examined plan's work link proved the work "
+              "landed (see each reason above)")
+    return None
+
+
 def cmd_roadmap_autoclose(args) -> int | None:
     """Close the session's auto-synced roadmap (run by the SessionEnd hook).
     Silent no-op when the session has no auto-owned open plan — the hook must
@@ -1071,7 +1174,10 @@ def cmd_roadmap_list(args) -> int | None:
         print('(no roadmaps — declare one: hive roadmap set <id> '
               '--prompt "…" --step "…")')
         return None
-    marks = {"active": ">", "interrupted": "!", "completed": "x"}
+    # `-` for archived mirrors the `[-]` a skipped step already prints: retired
+    # without having been finished.
+    marks = {"active": ">", "interrupted": "!", "completed": "x",
+             "archived": "-"}
     for i, r in enumerate(recs, 1):
         p = r["progress"]
         print(f"  {i}. {marks.get(r['status'], '?')} "
@@ -1105,6 +1211,16 @@ def cmd_roadmap_show(args) -> int | None:
     print(f"asked: {rec['prompt']}")
     if rec["status"] == "interrupted":
         print(f"interrupted {rec['interrupted_at']} (cause: {rec['cause']})")
+    if rec["status"] == roadmap_mod.ARCHIVED:
+        print(f"archived {rec.get('archived_at', '')} "
+              f"(reason: {rec.get('archive_reason', '')})")
+    link = roadmap_mod.describe_work_link(rec)
+    # Printed offline on purpose: `show` reads the ledger and nothing else, so
+    # it stays instant and works with no network. `hive roadmap merge-state`
+    # is the command that actually asks git and `gh`.
+    print(f"work: {link}" if link
+          else "work: (no link — hive roadmap link "
+               f"{rec['plan_id']} --pr … --branch …)")
     print(f"progress: {p['done']}/{p['total']} steps done\n")
     glyphs = {"done": "[x]", "active": "[>]", "pending": "[ ]",
               "skipped": "[-]"}
@@ -3179,6 +3295,22 @@ def _build_parser() -> argparse.ArgumentParser:
                         "per-step progress (interrupted plans surface in "
                         "STATE.md and Oversee)")
     rmsub = rm.add_subparsers(dest="roadmap_cmd", required=True)
+
+    def _add_work_link_flags(parser) -> None:
+        """The durable work link, on every subcommand that can learn one.
+
+        Four subcommands take the same trio, and hand-copying three
+        `add_argument` calls four times is exactly how flag names and help text
+        drift apart. All three are optional and independent because they become
+        knowable at different moments — the branch when work starts, the commits
+        as it lands, the PR number only once one is opened."""
+        parser.add_argument("--branch", default=None,
+                            help="branch this plan's work lives on")
+        parser.add_argument("--pr", type=int, default=None,
+                            help="pull-request number for this plan's work")
+        parser.add_argument("--commit", action="append", default=None,
+                            help="commit sha the work landed as (repeatable)")
+
     rms = rmsub.add_parser("set", help="declare (or replace) a plan")
     rms.add_argument("plan_id", help="stable kebab-case id, e.g. a run id")
     rms.add_argument("--prompt", required=True,
@@ -3189,6 +3321,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rms.add_argument("--file", default=None,
                      help="read steps from a file, one per line")
     rms.add_argument("--session", default=None)
+    _add_work_link_flags(rms)
     rms.set_defaults(func=cmd_roadmap_set)
     rmp = rmsub.add_parser("step", help="update one step's status")
     rmp.add_argument("plan_id")
@@ -3218,7 +3351,42 @@ def _build_parser() -> argparse.ArgumentParser:
     rmc = rmsub.add_parser("complete", help="mark the plan finished")
     rmc.add_argument("plan_id")
     rmc.add_argument("--session", default=None)
+    _add_work_link_flags(rmc)
     rmc.set_defaults(func=cmd_roadmap_complete)
+    rmar = rmsub.add_parser(
+        "archive", help="retire a plan whose last step nothing can verify, on "
+                        "a stated reason — the honest exit between 'finished' "
+                        "and 'still open'")
+    rmar.add_argument("plan_id")
+    rmar.add_argument("--reason", required=True,
+                      help="what settled the unverifiable step, e.g. "
+                           "'PR #103 merged' or 'superseded by the jobs plan'")
+    rmar.add_argument("--session", default=None)
+    _add_work_link_flags(rmar)
+    rmar.set_defaults(func=cmd_roadmap_archive)
+    rmk = rmsub.add_parser(
+        "link", help="point a plan at the code it produced (branch, PR, "
+                     "commits) without changing its status")
+    rmk.add_argument("plan_id")
+    rmk.add_argument("--session", default=None)
+    _add_work_link_flags(rmk)
+    rmk.set_defaults(func=cmd_roadmap_link)
+    rmm = rmsub.add_parser(
+        "merge-state", help="ask git and `gh` whether this plan's work landed. "
+                            "Read-only, and answers 'unknown' with a reason "
+                            "rather than guessing")
+    rmm.add_argument("plan_id")
+    rmm.add_argument("--project", default=None)
+    rmm.add_argument("--json", action="store_true")
+    rmm.set_defaults(func=cmd_roadmap_merge_state)
+    rmt = rmsub.add_parser(
+        "retire", help="retire every live plan whose work link PROVES the work "
+                       "is finished (merged -> complete, closed unmerged -> "
+                       "archive); reports every plan it examined")
+    rmt.add_argument("--project", default=None)
+    rmt.add_argument("--json", action="store_true")
+    rmt.add_argument("--session", default=None)
+    rmt.set_defaults(func=cmd_roadmap_retire)
     rma = rmsub.add_parser("autoclose", help="close a session's auto-synced "
                            "roadmap (run by the SessionEnd hook): complete "
                            "when all steps are done/skipped, else interrupt")
@@ -3229,7 +3397,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rml.add_argument("--project", default=None)
     rml.add_argument("--json", action="store_true")
     rml.add_argument("--all", action="store_true",
-                     help="include completed roadmaps")
+                     help="include retired roadmaps (completed and archived)")
     rml.set_defaults(func=cmd_roadmap_list)
     rmw = rmsub.add_parser("show", help="print one roadmap in full, "
                            "with history")

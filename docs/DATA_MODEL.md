@@ -79,7 +79,7 @@ LEDGER, the hash chain, the Memory view, and keyword recall:
 | `code_change` | `{text, category, files[]}` | mandatory change-log (`changelog.py`); category ∈ update, minor_change, deletion, reduction, major_change, replacement |
 | `learning` | `{text, …}` | Self-Reliant PRD report |
 | `sop` | `{action, sop_id, title?, text?}` | SOP lifecycle (`sop.py`); action ∈ add, update, delete; current registry = deterministic fold, delivered via the STATE.md SOP block |
-| `roadmap` | `{action, plan_id, title?, prompt?, steps[]?, index?, status?, cause?, note?}` | Flat plan registry (`roadmap.py`); action ∈ set, step, interrupt, resume, complete; `set` replaces the step list wholesale (≤ `MAX_STEPS` 50, no `parent_id`); `interrupt` projects the STATE.md out-of-usage marker |
+| `roadmap` | `{action, plan_id, title?, prompt?, steps[]?, index?, status?, cause?, note?, reason?, work_branch?, work_pr?, work_commits[]?}` | Flat plan registry (`roadmap.py`); action ∈ set, step, interrupt, resume, complete, archive, link; `set` replaces the step list wholesale (≤ `MAX_STEPS` 50, no `parent_id`); `interrupt` projects the STATE.md out-of-usage marker; `archive` retires a plan whose last step nothing can verify and **requires `reason`**; `link` records the work link and touches nothing else. The three `work_*` keys may ride ANY action and MERGE into the record (an absent key keeps what is on file — `sync_from_todos` re-`set`s without one), so a plan stays pointed at its code across a re-plan. `roadmap.py` owns the contract; `repo.py` owns the probe that reads it |
 | `mindnet_task` | `{action, task_id, title?, parent_id?, description?, status?, on?, ref?, dependencies[]?, language_context[]?, validation_script?, faculty?, triviality_bypass?}` | MN-2 hierarchical task graph (`mindnet/tasks.py`); action ∈ declare, status, depend, reparent, evidence. **No `phase` action** — the phase axis has exactly one writer (see `mindnet_phase`). `triviality_bypass` is honoured on the FIRST declare only. The fold *refuses* cycle-closing / over-deep / settled-work edges and records the refusal in the record's `violations` rather than entering the bad state |
 | `mindnet_phase` | `{action, task_id, phase?, epoch?, evidence?{kind, ref?, result?, detail?}, detail?, verified_by}` | MN-1 phase spine (`mindnet/phases.py` contract, `mindnet/controller.py` fold); action ∈ declare, enter, satisfy, fall_back; phase ∈ brainstorm, plan, prd, execution, audit-bug, audit-code, audit-system, pr-green; evidence kind ∈ file, event, command, human; `verified_by` ∈ python, agent, human. **Two validators, deliberately:** `validate_payload` (the raw-append surface) REFUSES a payload carrying `verified_by`, and `validate_stored` (the writer, called just before `append_event`) REQUIRES it |
 
@@ -264,6 +264,9 @@ Key joins an AI reader should know:
   audit row to its work: the row explains WHY a step exists, the step IS the
   work. The key is optional on the row because a future sink need not land in a
   roadmap at all (the loop's checklist sink has no `plan_id`).
+- `work_branch` / `work_pr` / `work_commits[]` are the roadmap's join *outward*,
+  to git and GitHub — the plan's only checkable link to the code it produced.
+  All three are optional and independent (§4.15).
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
 - `task_id` is MindNetwork's join key and threads **three** streams:
@@ -1373,6 +1376,58 @@ also never emits `decision`, honours `stop_hook_active`, ignores subagent stops
 (`agent_id` present — a subagent's usage is the subagent's context), and returns
 silence on any exception. Fail-open is the contract: the failure mode of a
 measuring hook must be "we did not measure", never "your work stopped".
+
+### 4.15 The work link, and retiring a card on evidence
+
+A roadmap card used to have no way out except "every step done". So a plan whose
+last step was *"merge the PR"* or *"watch it run for a week"* stayed in Oversee
+forever: nothing in the store could see the outside world, and ticking the step
+anyway would have put a claim in the audit trail that no code had checked. Two
+additions close that, and they are deliberately separate.
+
+**The link (`roadmap.py`).** Three optional, independent keys — `work_branch`,
+`work_pr`, `work_commits[]` — may ride **any** action, and the fold MERGES them
+into the plan record. Independent because they become knowable at different
+moments (branch when work starts, commits as it lands, the PR only once one is
+opened); merged rather than replaced because `sync_from_todos` appends a fresh
+`set` on every material TodoWrite change and never supplies a link — without
+carry-forward, one more todo edit would silently drop the PR number, the same
+erasure the `new` step flag already had to be protected from. A record written
+before these keys existed simply has none of them: `roadmap.work_link` answers
+`{branch: "", pr: 0, commits: []}` and the fold stays total.
+
+**The probe (`repo.py`).** `repo.merge_state(**roadmap.work_link(rec))` returns
+`{state, reason, detail, evidence}` and never raises. `state` ∈ `merged`,
+`closed` (PR closed without merging), `open`, `unknown`. **`merged` is returned
+only on proof** — a merged PR record, or a commit git confirms is an ancestor of
+the integration ref (`origin/HEAD`, falling back to `origin/master` /
+`origin/main`). Where it cannot tell, it says which of four things stopped it:
+
+| reason | meaning |
+| --- | --- |
+| `no_work_link` | the plan records no branch, PR, or commit |
+| `no_github_remote` | not a git checkout, or no github.com remote |
+| `no_gh_cli` | `gh` is not on PATH, so a PR could not be read |
+| `probe_failed` | git or `gh` ran and failed (offline, rate limit, auth, bad sha) |
+
+Probes run PR → commits → branch and the first definite answer wins, which is
+what makes the module degrade instead of fail: with no `gh`, recorded commits
+still answer. Two boundaries are load-bearing. `git merge-base --is-ancestor`
+exits 1 for "not an ancestor" and 128 for "no such object" — reading both as
+"not merged" would turn a typo'd sha into a claim about the code. And the branch
+probe is **prove-only**: a squash merge deletes the branch and rewrites its
+commits, so "not an ancestor" is not evidence of anything, and without `gh` the
+answer is `unknown`/`no_gh_cli` rather than `open`.
+
+**The exit.** `archive` retires a plan and **requires a `reason`** (status
+`archived`, hidden from `plans()` alongside `completed`). It is append-only, on
+the `loop_run_dismissed` tombstone precedent: the retirement carries its own
+justification and never edits the history that pinned the card open. The plan's
+real progress stays on the record, so `archived` never reads as "finished".
+`hive roadmap retire` is the automatic path — it completes what the probe proves
+merged, archives what it proves closed, and **reports every plan it examined**,
+including the untouched ones with their reasons, so "nothing was provably
+landed" cannot be mistaken for "the sweep worked".
 
 ## 5. Invariants — do not break these
 
