@@ -76,10 +76,18 @@ const PAYLOADS = {
 };
 const DEFAULT_PAYLOAD = { ok: true };
 
-// The panel is these two elements. A render "painted" exactly when one of them
-// was written — which is also how run()'s catch shows an error (fail() writes
-// #out), so "discarded without throwing" needs no separate probe.
-const PANEL_IDS = new Set(['view', 'out']);
+// What the user perceives as "the section", which is not only what they can
+// see. A render "painted" exactly when one of these was written — #out covers
+// run()'s catch path too, since fail() writes there, so "discarded without
+// throwing" needs no separate probe.
+//
+// #ann and #status were NOT in this set when the guard first shipped, and that
+// omission made 16 `discards_late_paint:*` cases certify "wrote nothing" while
+// run() announced the STALE section's completion into the live region with no
+// guard at all. A screen-reader user got exactly the clobber the visual guard
+// exists to prevent, and the harness reported it as clean. A panel probe that
+// only watches the pixels measures half the interface.
+const PANEL_IDS = new Set(['view', 'out', 'ann', 'status']);
 
 // The module-level cache each renderer writes on the far side of its await. A
 // stale response that skips the paint but still writes here reintroduces the
@@ -100,6 +108,21 @@ const CACHES = {
 // CEILING, not a pin — closing the gap in taskview.py makes the set of
 // clobbering renderers smaller, which still satisfies the subset check below.
 const ALLOWED_UNGUARDED = new Set(['renderSessions', 'renderTaskCards']);
+
+// A renderer's guard compares against the identity of the SECTION it belongs
+// to, which for almost every renderer is itself. renderTaskCards is the one
+// exception: it is the paint half of renderSessions, and taskview.py guards it
+// with `shouldPaint(liveFn, renderSessions)` deliberately, because the section
+// the user picked is Sessions — renderTaskCards is never something you can
+// navigate to. Discovery here is by name pattern (`async function render\w+`),
+// so it gets picked up as if it were its own section; driving it that way sets
+// liveFn to a value no guard on the page ever compares against, every scenario
+// discards, and the anti-vacuity control below reports "nothing painted".
+// That was a modelling artifact in this harness, not a defect in the page —
+// but it was reported as 41 cases with ok:false while the python driver, which
+// enumerated only the 40 case names it knew, printed "40 passed".
+const OWNING_SECTION = { renderTaskCards: 'renderSessions' };
+const sectionOf = (name) => OWNING_SECTION[name] || name;
 
 // ---------------------------------------------------------------------------
 // the DOM stub
@@ -311,7 +334,8 @@ async function race(scriptSrc, victim, { switchAway = true, via = 'run' } = {}) 
 
   // 1. the user is on `victim`; its load starts and its fetch goes out
   const mark = w.pending.length;
-  w.eval('liveFn = ' + victim + ';');
+  const victimSection = sectionOf(victim);
+  w.eval('liveFn = ' + victimSection + ';');
   const victimRun = via === 'poll'
     ? w.eval('refreshLive()')
     : w.eval("run('loading " + victim + "', " + victim + ')');
@@ -326,7 +350,7 @@ async function race(scriptSrc, victim, { switchAway = true, via = 'run' } = {}) 
   // went out, liveFn WAS the victim — so a guard evaluated here, before the
   // await, would have let the render through. Everything the discard case
   // proves rests on this being true first.
-  const ownedPanelAtStart = w.eval('liveFn') === w.eval(victim);
+  const ownedPanelAtStart = w.eval('liveFn') === w.eval(victimSection);
 
   const cacheVar = CACHES[victim];
   const cacheBefore = cacheVar ? w.eval('JSON.stringify(' + cacheVar + ')') : null;
@@ -340,8 +364,8 @@ async function race(scriptSrc, victim, { switchAway = true, via = 'run' } = {}) 
     w.answer(w.since(mark2));                        // the new section answers first
     await winnerRun;
     await w.settle();
-    if (w.eval('liveFn') === w.eval(victim)) {
-      return { error: 'the switch did not take: liveFn still points at ' + victim };
+    if (w.eval('liveFn') === w.eval(victimSection)) {
+      return { error: 'the switch did not take: liveFn still points at ' + victimSection };
     }
   }
 

@@ -82,8 +82,6 @@ def report(tmp_path_factory):
         timeout=NODE_TIMEOUT_S,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    # Exit code 1 means cases failed and the report is still the evidence; only
-    # a missing/unparseable report is a harness failure worth raising here.
     try:
         data = json.loads(proc.stdout)
     except ValueError:                              # pragma: no cover
@@ -91,6 +89,25 @@ def report(tmp_path_factory):
                     f"--- stdout ---\n{proc.stdout[:4000]}\n"
                     f"--- stderr ---\n{proc.stderr[:4000]}")
     assert not data.get("harness_error"), data.get("harness_error")
+
+    # The harness's own verdict is the verdict. An earlier version of this
+    # fixture read the report and threw the exit code away, on the reasoning
+    # that "exit 1 means cases failed and the report is still the evidence" —
+    # which is true of the report and false of the run. The tests below name
+    # the cases they care about, so any case NOT named by one of them failed
+    # into silence: `pytest -m node` reported 40 passed while this same harness
+    # exited 1 on `paints_when_the_user_stayed:renderTaskCards`. A test suite
+    # that cannot go red is not a test suite, and this one exists precisely to
+    # stop a vacuous fixture reaching the dashboard.
+    failed = [c for c in data["cases"] if not c.get("ok")]
+    assert not failed, (
+        "the node harness reported %d failing case(s) (exit %s):\n%s"
+        % (len(failed), proc.returncode,
+           "\n".join("  %s :: %s" % (c["name"], c.get("detail", "")) for c in failed)))
+    assert proc.returncode == 0, (
+        f"the harness exited {proc.returncode} with no failing case — the report "
+        f"and the exit code disagree, which means the harness itself is broken")
+
     # Cases by name, plus the harness's own discovery under a `_`-prefixed key
     # so it can never collide with a case name.
     return {c["name"]: c for c in data["cases"]} | {"_renderers": data["renderers"]}

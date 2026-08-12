@@ -482,19 +482,48 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<div class="bar w40"></div></div>');
   }
   // wrap any async unit of work with busy state + error handling
+  // Every run() gets a generation. `shouldPaint` covers renderers that register
+  // a liveFn; it structurally CANNOT cover the run()-scoped paths that set
+  // `liveFn = null` — Briefing, Recall, Graph, doAction, confirmAction — because
+  // shouldPaint(null, anonymousFn) is false for all of them, so an identity
+  // check there would discard every paint rather than only the stale ones.
+  //
+  // Corrections 6 in the plan rejected a generation guard for POLLER renders,
+  // and that still holds: refreshLive calls liveFn() directly and never enters
+  // run(), so a counter here would tag nothing for it. It says nothing about
+  // run()-scoped work, which this counter is exactly the right shape for.
+  //
+  // It also covers three wrapper effects that shouldPaint never touched: a
+  // stale run's completion ANNOUNCEMENT (the #ann live region is not the panel,
+  // so a screen-reader user heard "loading oversee — ready" after they had
+  // already moved to Overview), a stale run clearing busy while a newer one is
+  // still loading, and stale skeleton/slow-status timers repainting over the
+  // section that replaced them.
+  let RUN_GEN = 0;
   async function run(label, fn){
     // Set before the first await: the section is chosen at click time, not when
     // its fetch returns, and boot may resolve in between.
     viewPicked = true;
+    const gen = ++RUN_GEN;
+    const current = () => gen === RUN_GEN;
     setBusy(true, label);
     announce(label);
-    const skel = setTimeout(showSkeleton, SKEL_MS);
+    const skel = setTimeout(() => { if (current()) showSkeleton(); }, SKEL_MS);
     const slow = setTimeout(() => {
-      statusEl.textContent = (label || 'working') + ' \\u2014 still loading\\u2026';
+      if (current())
+        statusEl.textContent = (label || 'working') + ' \\u2014 still loading\\u2026';
     }, SLOW_MS);
-    try { await fn(); announce((label || 'operation') + ' \\u2014 ready'); }
-    catch(e) { fail(e); announce((label || 'operation') + ' \\u2014 failed'); }
-    finally { clearTimeout(skel); clearTimeout(slow); setBusy(false); }
+    // `current` is passed to fn so the anonymous run()-scoped bodies can guard
+    // their own paint. Renderers that take no argument ignore it, unchanged.
+    try { await fn(current); if (current()) announce((label || 'operation') + ' \\u2014 ready'); }
+    catch(e) {
+      // A stale failure is swallowed on purpose, the same way refreshLive
+      // swallows a transient blip: painting it would put an error over the
+      // section the user is now reading, which is the clobber this guard exists
+      // to stop. The live run still surfaces its own errors.
+      if (current()) { fail(e); announce((label || 'operation') + ' \\u2014 failed'); }
+    }
+    finally { clearTimeout(skel); clearTimeout(slow); if (current()) setBusy(false); }
   }
 
   async function renderOverview(){
@@ -1399,7 +1428,16 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     showText(s);
   }
   function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState); }
-  function showBriefing(){ controls.innerHTML=''; liveFn = null; run('loading briefing', async () => showText(await apiGet('/api/briefing'))); }
+  function showBriefing(){
+    controls.innerHTML=''; liveFn = null;
+    // liveFn is null here, so shouldPaint cannot guard this one — run()'s
+    // generation does. Without it, /api/briefing (1.2-1.9s on the 31k store)
+    // resolving after the user clicked another section painted Briefing over it.
+    run('loading briefing', async (current) => {
+      const t = await apiGet('/api/briefing');
+      if (current()) showText(t);
+    });
+  }
 
   function showRecall(){
     liveFn = null;
@@ -1417,8 +1455,11 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function runRecall(){
     const q = document.getElementById('q').value;
     const sem = document.getElementById('sem').checked ? '1' : '0';
-    run('searching', async () => {
+    run('searching', async (current) => {
       const hits = await apiGet('/api/recall?q='+encodeURIComponent(q)+'&semantic='+sem);
+      // Recall sets liveFn = null, and a second search while the first is in
+      // flight is the common case here, not an edge one.
+      if (!current()) return;
       if (!hits.length) { showText('No matches for "'+q+'".'); return; }
       showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
         + hits.map(h => '<li><div class="file">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
@@ -1435,9 +1476,12 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     let semantic = false;
     controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
       + '<input type="checkbox" id="gsem"> semantic links</label>';
-    const load = () => run('building graph', async () => {
+    const load = () => run('building graph', async (current) => {
       const html = await apiGet('/api/graph' + (semantic ? '?semantic=1' : ''));
-      only(graph); graph.srcdoc = html;
+      // liveFn is null for Graph, so run()'s generation is the only guard. It
+      // also covers re-entry: toggling the semantic checkbox calls load() again,
+      // and the slower of the two answers must not win.
+      if (current()) { only(graph); graph.srcdoc = html; }
     });
     const cb = document.getElementById('gsem');
     if (cb) cb.addEventListener('change', () => { semantic = cb.checked; load(); });
@@ -1994,14 +2038,20 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
 
   function doAction(path, label, method){
     controls.innerHTML=''; liveFn = null;
-    run(label+'…', async () => showText(method === 'GET' ? await apiGet(path) : await apiPost(path, {})));
+    run(label+'…', async (current) => {
+      const r = method === 'GET' ? await apiGet(path) : await apiPost(path, {});
+      if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
+    });
   }
   function confirmAction(path, label){
     if(!confirm(label + ' — this can take a while. Continue?')) return;
     let body = {};
     if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
     controls.innerHTML=''; liveFn = null;
-    run(label+' running…', async () => showText(await apiPost(path, body)));
+    run(label+' running…', async (current) => {
+      const r = await apiPost(path, body);
+      if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
+    });
   }
 
   //__TASKS_JS__

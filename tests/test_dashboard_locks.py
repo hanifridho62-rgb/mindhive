@@ -407,6 +407,40 @@ def test_an_empty_fingerprint_never_matches_and_never_freezes_the_board(
         assert {c["faculty"] for c in body["cats"]} == {"sop"}
 
 
+def test_a_non_file_event_backend_bypasses_the_gate(
+        dashboard_server, counters, monkeypatch):
+    """The second mandated guard, which did not ship the first time.
+
+    `events.read_all` short-circuits to Postgres when MINDHIVE_EVENT_BACKEND is
+    `pg` (events.py:314, :356), while `segment_stats` keeps stat'ing the local
+    .jsonl segments. On the documented file -> dual -> pg migration path those
+    segments are still on disk and never change again, so the fingerprint would
+    be non-empty and stable forever, every poll after the first a hit, and the
+    board frozen at its first response for the life of the process — silently.
+
+    `_maybe_read_from_pg` is stubbed to None so `read_all` still answers from
+    the file segments: the only variable under test is the gate's decision, not
+    whether a Postgres server happens to be reachable from this machine.
+    """
+    base, token = dashboard_server
+    _seed()
+    status, warm = _get(base, CATS, token)          # miss: warms the memo
+    assert status == 200
+
+    ev_mod = importlib.import_module("mindhive.events")
+    monkeypatch.setattr(ev_mod, "_maybe_read_from_pg", lambda project=None: None)
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "pg")
+
+    counters.reset()
+    status, again = _get(base, CATS, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, (
+        "a non-file backend served the memo instead of reading: segment_stats "
+        "fingerprints local segments that pg never writes, so the gate can "
+        "never invalidate and the board freezes for the life of the process")
+    assert set(again) == set(warm), "the bypass changed the payload shape"
+
+
 def test_hive_mind_bypasses_the_gate(dashboard_server, counters):
     # All-projects mode reads EVERY namespace via all_event_pairs, but
     # segment_stats is per-project — a single-project stamp would miss an append

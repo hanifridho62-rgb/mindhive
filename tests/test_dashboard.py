@@ -373,12 +373,29 @@ def test_run_announces_the_section_change_and_the_outcome(dashboard_server):
     status, body = _get(base, "/")
     block = _js_block(body, "async function run(label, fn){")
     assert "announce(label);" in block, "no announcement when a section starts loading"
-    assert block.index("announce(label);") < block.index("await fn()")
+    # `await fn(` rather than `await fn()`: run() now hands the body its own
+    # generation check, so the call carries an argument.
+    assert block.index("announce(label);") < block.index("await fn(")
     assert block.count("announce(") == 3, (
         "expected three announcements: section change, success, failure -- got "
         + str(block.count("announce(")))
-    assert "catch(e) { fail(e); announce(" in block, (
+    assert "fail(e); announce(" in block, (
         "a failed operation ends silently for a screen reader")
+
+    # The two OUTCOME announcements must be generation-guarded; the opening one
+    # must not be. #ann is not the panel, so shouldPaint never covered it: a
+    # stale run announced "loading oversee - ready" into the live region after
+    # the user had already moved to Overview, and the node harness certified
+    # those runs as clean because its panel probe watched only #view and #out.
+    # Measured against the pre-guard page with the probe widened: 9 failures.
+    after_await = block[block.index("await fn("):]
+    assert after_await.count("if (current())") >= 2, (
+        "the ready/failed announcements are not guarded by run()'s generation, "
+        "so a stale section still speaks over the one the user picked")
+    assert "if (current()) announce(label);" not in block, (
+        "the OPENING announcement must fire unguarded -- at that instant this "
+        "run IS the current one, and guarding it would silence every section "
+        "change instead of only the stale ones")
 
 
 def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_server):
@@ -389,11 +406,24 @@ def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_se
     status, body = _get(base, "/")
     assert "const SKEL_MS = 300, SLOW_MS = 10000;" in body
     block = _js_block(body, "async function run(label, fn){")
-    assert "setTimeout(showSkeleton, SKEL_MS)" in block, "no deferred skeleton"
+    assert "showSkeleton()" in block and "SKEL_MS)" in block, "no deferred skeleton"
     assert "SLOW_MS" in block, "nothing escalates the status text on a long wait"
+    # Both timers belong to the run that armed them, and both now check the
+    # generation before firing: a stale run's skeleton would otherwise repaint
+    # over the section that replaced it, and its slow-status timer would clobber
+    # the live run's status text 10 s in.
+    skel_call = block[block.index("SKEL_MS)") - 120:block.index("SKEL_MS)")]
+    assert "if (current())" in skel_call, (
+        "the deferred skeleton is not generation-guarded")
+    slow_call = block[block.index("const slow = setTimeout("):block.index("SLOW_MS);")]
+    assert "if (current())" in slow_call, (
+        "the slow-status timer is not generation-guarded, so a stale run "
+        "rewrites the status text of the section that replaced it")
     # both timers cleared in finally, or a failed op leaves a skeleton painting
-    # itself over the error the user needs to read
-    assert "finally { clearTimeout(skel); clearTimeout(slow); setBusy(false); }" in block
+    # itself over the error the user needs to read; busy is released only by the
+    # run that still owns the panel
+    assert ("finally { clearTimeout(skel); clearTimeout(slow); "
+            "if (current()) setBusy(false); }") in block
     skel = _js_block(body, "function showSkeleton(){")
     assert "document.activeElement" in skel and "closest('#view')" in skel, (
         "the skeleton can repaint the panel out from under a caret")

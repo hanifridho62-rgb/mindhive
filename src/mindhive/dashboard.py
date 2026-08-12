@@ -763,8 +763,8 @@ def make_handler(token: str):
             # already answers staleness with: `os.scandir`'s cached stat data,
             # microseconds, never opens or parses a byte.
             #
-            # Two properties are load-bearing, and the cache is worse than no
-            # cache without either:
+            # THREE properties are load-bearing, and the cache is worse than no
+            # cache without any one of them:
             #   * An EMPTY fingerprint is an unconditional MISS. `segment_stats`
             #     answers {} both for "no events directory" and for ANY OSError,
             #     so letting {} == {} count as a hit would let one transient
@@ -779,11 +779,28 @@ def make_handler(token: str):
             #     appearing. Stamping every namespace is possible but is a
             #     scandir each plus a re-listing to notice new ones; bypassing is
             #     unconditionally correct, and this is the rarer path.
+            #   * A NON-FILE EVENT BACKEND bypasses it too. `events.read_all`
+            #     short-circuits to Postgres when MINDHIVE_EVENT_BACKEND is `pg`
+            #     (events.py:314, :356), while `segment_stats` keeps stat'ing the
+            #     local .jsonl segments — which, on the documented
+            #     file -> dual -> pg migration path, are still on disk and never
+            #     change again. The fingerprint would be non-empty, stable
+            #     forever, and every subsequent poll a hit: the board frozen at
+            #     the first response for the life of the process, with nothing
+            #     anywhere reporting it. This guard was specified with the {}
+            #     one and did not ship; the comment above it said "two properties
+            #     are load-bearing" and named a different second, so the gap read
+            #     as completeness. That is the failure mode this whole plan
+            #     exists to remove, so it is spelled out rather than fixed
+            #     quietly.
             #
             # What is memoized is the two FOLDS, never the response: `now` and
             # `online` are functions of the wall clock and are re-derived below
             # on every call, hit or miss (see `_with_online`).
-            fp = None if am else sidecar_mod.segment_stats(proj)
+            file_backend = os.environ.get(
+                "MINDHIVE_EVENT_BACKEND", "file").strip().lower() == "file"
+            fp = (None if (am or not file_backend)
+                  else sidecar_mod.segment_stats(proj))
             memo = _CATS_MEMO.get(proj) if fp else None
             if memo is not None and memo[0] == fp:
                 tel_state, records, have_sessions = memo[1], memo[2], True
