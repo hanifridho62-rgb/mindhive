@@ -147,14 +147,58 @@ def test_boot_does_not_clobber_a_view_the_user_already_picked(dashboard_server):
     assert "await loadProjects(); showOverview();" not in body
 
 
+def test_only_section_loads_arm_a_skeleton(dashboard_server):
+    """A placeholder belongs to a run whose job is to replace the panel.
+
+    run() is also how the dashboard does in-panel work -- dismissing an
+    improvement, reflecting, resolving, enriching a prompt, deleting a session,
+    appending a memory -- and how both Action buttons run. Those start from an
+    already-painted view and do not replace it, so a skeleton there wipes what
+    the user was reading in order to announce work that leaves it in place. It
+    shipped firing for every caller of run(); it is now opt-in.
+    """
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    block = _js_block(body, "async function run(label, fn")
+    assert "isSection" in block, "the skeleton is not gated on the caller's intent"
+    skel_line = block[block.index("const skel"):block.index("const skel") + 140]
+    assert "isSection" in skel_line, "the skeleton timer is armed regardless of caller"
+
+    for call in ("run('loading overview', renderOverview, true)",
+                 "run('loading memory', renderMemory, true)",
+                 "run('loading oversee', renderOversee, true)",
+                 "run('loading state', renderState, true)",
+                 "run('loading change log', renderLog, true)",
+                 "run('loading SOPs', renderSops, true)",
+                 "run('loading sessions', renderSessions, true)",
+                 "run('loading improvements', renderImprovements, true)",
+                 "run('loading skill & plugin', renderPlugins, true)"):
+        assert call in body, f"section load lost its skeleton: {call}"
+
+    # The two Action helpers share this exact paint line; neither may opt in.
+    assert body.count("if (current()) showText(r);") == 2, (
+        "doAction/confirmAction changed shape -- re-check the assertion below")
+    for i in _all_indexes(body, "if (current()) showText(r);"):
+        assert ", true)" not in body[i:i + 120], (
+            "an Action button arms a skeleton over the view it started from")
+
+
+def _all_indexes(hay, needle):
+    i, out = hay.find(needle), []
+    while i != -1:
+        out.append(i)
+        i = hay.find(needle, i + 1)
+    return out
+
+
 def test_run_marks_the_view_picked_before_it_awaits(dashboard_server):
     # The flag has to be set at click time. Setting it after the section's fetch
     # resolves would leave the same race open, because boot can win that race.
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert status == 200
-    start = body.index("async function run(label, fn){")
-    body_of_run = body[start:start + 300]
+    start = body.index("async function run(label, fn")   # prefix: the signature grows
+    body_of_run = body[start:start + 400]
     picked = body_of_run.index("viewPicked = true;")
     busy = body_of_run.index("setBusy(true, label);")
     assert picked < busy, "viewPicked must be set before run() does anything else"
@@ -173,15 +217,21 @@ def test_both_pollers_skip_a_tick_instead_of_queueing(dashboard_server):
     # LIMIT, stated so nobody mistakes this for proof: this asserts the SHAPE of the
     # served source, not behaviour. No JavaScript executes here. It catches the guard
     # being deleted, set too late, or never released; it cannot observe two real
-    # requests overlapping. Behavioural cover is the node unit test (T11) and the
-    # Playwright suite (T12), neither of which exists yet.
+    # requests overlapping. The behavioural half now exists for the live poller --
+    # `a_stuck_poll_never_issues_a_second_request` in the node tier-1 suite parks a
+    # request and counts how many go out -- but only for that one; pollCats has no
+    # executed cover, so this shape check is still the whole story there.
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert status == 200
     for fn, flag in (("refreshLive", "liveInFlight"), ("pollCats", "catsInFlight")):
         start = body.index("async function " + fn + "(){")
-        block = body[start:start + 700]
-        assert "if (" + flag + ") return;" in block, \
+        block = body[start:start + 900]
+        # `if (flag) return;` or a braced body that returns -- the live poller's
+        # took a body when it grew the stuck-poll report. What must hold is that
+        # the latch is read and the tick ends, not which of the two shapes it is.
+        guard = block.index("if (" + flag + ")")
+        assert "return;" in block[guard:guard + 200], \
             fn + " must skip while one of its own requests is in flight"
         # raised before the first await, or two ticks both pass the check and overlap
         raised = block.index(flag + " = true;")
@@ -371,7 +421,7 @@ def test_busy_is_announced_to_assistive_tech_instead_of_locking_the_nav(dashboar
 def test_run_announces_the_section_change_and_the_outcome(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")
-    block = _js_block(body, "async function run(label, fn){")
+    block = _js_block(body, "async function run(label, fn")   # prefix: the signature grows
     assert "announce(label);" in block, "no announcement when a section starts loading"
     # `await fn(` rather than `await fn()`: run() now hands the body its own
     # generation check, so the call carries an argument.
@@ -405,7 +455,7 @@ def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_se
     base, token = dashboard_server
     status, body = _get(base, "/")
     assert "const SKEL_MS = 300, SLOW_MS = 10000;" in body
-    block = _js_block(body, "async function run(label, fn){")
+    block = _js_block(body, "async function run(label, fn")   # prefix: the signature grows
     assert "showSkeleton()" in block and "SKEL_MS)" in block, "no deferred skeleton"
     assert "SLOW_MS" in block, "nothing escalates the status text on a long wait"
     # Both timers belong to the run that armed them, and both now check the
@@ -427,6 +477,58 @@ def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_se
     skel = _js_block(body, "function showSkeleton(){")
     assert "document.activeElement" in skel and "closest('#view')" in skel, (
         "the skeleton can repaint the panel out from under a caret")
+
+
+def test_every_page_module_guards_the_animations_it_declares():
+    """D8 for the pages the census above cannot see.
+
+    The census asserts per-selector coverage for `/`. It cannot cover
+    `research_page`, `workspace_page` or `swarm_page`: those render into the
+    dashboard's own iframes, so the host page's reduced-motion block never
+    reaches them, and they are not in the served `/` stylesheet at all.
+    `research_page` and `workspace_page` each shipped a pulsing status dot with
+    no guard of their own -- not a partial gap, a total one.
+
+    WEAKER THAN THE CENSUS, deliberately, and here is the limit: this asserts
+    only that a module declaring motion also declares a reduced-motion block
+    that stops something. It does NOT prove every selector in that module is
+    covered, because two things make that undecidable from source text:
+
+      * guards cross module boundaries -- `swarm_page`'s `.chip.running
+        .mn-cat-sprite` is stopped by `cat_board.CSS`, which swarm_page injects
+        at `/*__CAT_CSS__*/`, not by anything in swarm_page's own sheet; and
+      * a guard can name a class the animating selector reaches through the DOM
+        rather than through text -- `.mn-cat.active svg` IS `.mn-cat-sprite`,
+        which is exactly why `_MOTION_GUARDS` above is a written map.
+
+    A per-selector version of this sweep reported both of those as violations,
+    and "fixing" the swarm one added a line already guarded with `!important`
+    from cat_board. A check that manufactures work is worse than a narrow one
+    that does not, so this stays narrow and the census stays the strict half.
+    """
+    import pathlib
+    from mindhive import dashboard_page as _dp
+
+    pkg = pathlib.Path(_dp.__file__).parent
+    offenders = []
+    for path in sorted(pkg.rglob("*.py")):
+        # comments first: these files argue about their motion choices at
+        # length, and prose containing `animation:` reads as a declaration.
+        src = re.sub(r"/\*.*?\*/", " ",
+                     path.read_text(encoding="utf-8", errors="replace"), flags=re.S)
+        on = set(re.findall(r"animation:\s*([\w-]+)", src)) - {"none"}
+        if not on:
+            continue
+        guards = re.findall(
+            r"@media \(prefers-reduced-motion: reduce\)\s*\{(.*?)\n\s*\}", src, re.S)
+        if not any("animation:" in g and "none" in g for g in guards):
+            offenders.append(f"{path.name}: turns on {sorted(on)} and never "
+                             f"stops it under prefers-reduced-motion")
+    assert not offenders, (
+        "a page module ships motion with no reduced-motion guard at all:\n  "
+        + "\n  ".join(offenders) +
+        "\nRepeating animation is a trigger for some people, not an annoyance, "
+        "and an iframe page inherits nothing from the host page's guard.")
 
 
 def test_the_pages_own_animations_honour_reduced_motion(dashboard_server):

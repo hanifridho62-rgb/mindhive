@@ -50,8 +50,16 @@ _INVOKE_LOCK = threading.Lock()
 # exclusion was the page disabling its own nav while a request was in flight —
 # a client-side guard, so two tabs, a double click, or one curl started two full
 # runs over the same repo. Selftest is the worst case (two concurrent pytest
-# runs over the same tree), but a doubled harvest, projection, sync or embed all
-# race two writers over the same projection files.
+# runs over the same tree), but a doubled harvest, sync or embed all put two
+# writers over the same files.
+#
+# Projection is the one that is NO LONGER on that list: `projector.project()`
+# now takes its own per-project lock, because nine call sites reach it and only
+# some are handlers this decorator can wrap. `_PROJECT_LOCK` still earns its
+# place — it refuses the SECOND CLICK at the door with a message, instead of
+# queueing it to rebuild everything again a moment later — but it is no longer
+# what makes concurrent rebuilds safe. Deleting it would cost a UX affordance,
+# not a guarantee.
 #
 # Per operation rather than one shared lock: a harvest and a sync are unrelated
 # jobs touching different files, and making them wait on each other would turn

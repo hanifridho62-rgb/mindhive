@@ -38,3 +38,45 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  # The node tier-1 suite runs in its own job, not in the matrix above.
+  #
+  # It has to be a separate invocation because `addopts = -m 'not node'` in
+  # pyproject.toml deselects it by default, and that default is load-bearing:
+  # `hive selftest` shells `pytest -q tests/` from inside the dashboard's own
+  # POST handler (verify.py), so an unfenced node suite would spawn node from
+  # inside the web server. Deselected-by-default plus one explicit job is the
+  # only shape that satisfies both.
+  #
+  # One job rather than four: these cases are pure JavaScript executed through
+  # node:vm and have no OS or Python dimension, so running them on every matrix
+  # leg would buy nothing. Without this job the 40 cases never execute in CI at
+  # all — which is exactly what the CEO resequencing pulled T11 forward to
+  # prevent, since T9's mandatory regression test would otherwise fall back to
+  # the source-string style this project calls vacuous.
+  node-tests:
+    name: node tier-1 (paint guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+
+      # `-m node` overrides the deselect in pyproject.toml (-m is last-one-wins).
+      # `--no-header -rA` so a failure names the case rather than only counting it.
+      - name: Run node tier-1 tests
+        run: python -m pytest -m node -q

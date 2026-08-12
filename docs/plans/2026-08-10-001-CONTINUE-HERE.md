@@ -14,13 +14,19 @@ that the plan does not already say.
 
 ## 1. Exact state of the tree
 
+Updated 2026-08-12, at the end of the follow-on session that landed PR-1a.
+
 ```
+8f1a150  fix(dashboard): close the seven P1 findings against PR-1a
+d37cb08  docs: PR-1 resequencing and the updated fresh-session brief
+1f4b55d  feat(dashboard): PR-1a - server locks, cats gate, stale-paint discard, a11y signals
 a3d7606  docs: PR-1 plan, three review reports, and the T1 profile
 99dd244  feat(dashboard): serialise both live pollers so a slow tick is skipped, not queued
 ```
 
-**Both commits landed.** Working tree clean, 2 commits ahead of `efa3751`. §7 below is
-therefore already done — do not redo it.
+**Five commits landed**, ahead of `efa3751`, plus one more closing the P2 review findings (CI
+node job, the run()-scoped generation, the stuck-poll report, three reduced-motion guards, the
+renderPlugins cache discard). §7 below is history — do not redo it.
 
 **This work lives ONLY in this worktree**, on `claude/mindhive-dashboard-perf-eab7dd`.
 Neither commit exists on `master` or in any other worktree. A "fresh session in this
@@ -40,18 +46,29 @@ their first `await` and clear it in `finally`.
   `first_tick_ms=715`, `second_tick_ms=0`, `flag_after_settle=false`.
 - Change-logged: `hive log update` with explicit `--files` (2 files, no over-claim).
 
+**PR-1a — T8, T6, T9, T11, T31.** Server locks on six mutating endpoints plus the HIVE MIND
+door; the stat-only gate in front of `/api/mindnet/cats`; `shouldPaint(liveFn, renderFn)` on
+nine renderers with the nav lock removed; the node tier-1 harness that EXECUTES the decision;
+reduced-motion, `aria-busy` and a polite live region.
+
+- The before/after, measured in isolation rather than under pane load, `?project=` pinned so
+  both sides fold the same store: `/api/mindnet/cats` **~0.29 s → ~3.5 ms** (master
+  0.431/0.314/0.279/0.284/0.295/0.303 · branch 0.437 cold, then
+  0.0038/0.0035/0.0034/0.0033/0.0189). `/api/projects` unchanged on both as a negative control.
+- A follow-on pass closed seven P1 review findings (`8f1a150`) and then the P2 set: a CI job
+  that actually runs the node suite, the run()-scoped generation (`RUN_GEN`), a stuck-poll
+  report so a wedged fetch stops the chip claiming "live", reduced-motion guards for the three
+  iframe pages, and `renderPlugins` discarding its seven module caches — not just its paint —
+  once the user has left.
+- Node tier-1 is **49 cases** and every one of them has a mutant half that must fail.
+
 ## 3. NOT done
 
-24 tasks remain. **Resequenced by `/plan-ceo-review` on 2026-08-10 (HOLD SCOPE — nothing
+19 tasks remain. **Resequenced by `/plan-ceo-review` on 2026-08-10 (HOLD SCOPE — nothing
 added, nothing removed, order only).** Full reasoning: `## PR-1 resequencing` in the plan.
 
 ```
-PR-1a  T8   server locks on six mutating endpoints   MUST land before T9
-       T6   gate /api/mindnet/cats                   biggest lever after T7
-       T9   liveFn === discard + drop nav disable    AFTER T6, not before
-       T11  node unit test of the discard decision   moved up from PR-2
-       T31  reduced-motion + aria-live + aria-busy   moved up from PR-1c
-       -> closes complaint P1 end to end, and yields the before/after number
+PR-1a  DONE — T8, T6, T9, T11, T31 (see §2)
 
 PR-1b  T5   segment_stats memo                       two guards mandatory
        T2   drain _body before raising
@@ -62,14 +79,6 @@ PR-1c  T26  extract 123 hex literals to CSS tokens
        T28  three skeleton shapes at 150ms
        T10  3-strike stale chip
 ```
-
-Why T6 before T9: T9 makes the nav clickable during a fetch, which raises concurrent
-requests, and T1 measured the folds as GIL-serialized (4 concurrent 4.99s vs 5.3s serial).
-Relieve the queue first, then open the nav.
-
-Why T11 rides with T9: the plan's failure-modes table marks the `liveFn ===` discard
-**silent** and requires tier 1 + tier 2. Without T11, T9's mandatory regression test falls
-back to the source-string style the plan itself calls vacuous (trap 7 below).
 
 **Lane A is serial** — PR-1a, PR-1b, PR-1c and PR-2 all own `dashboard.py` and
 `dashboard_page.py`. Do not run them concurrently.
@@ -165,10 +174,13 @@ records, biting the handoff itself. So:
 1. `hive state` and `hive briefing` — standing SOP, orient from the ledger first.
 2. Read the plan, then this file.
 3. ~~Commit what exists first~~ — **already done**, see §7. Do not redo it.
-4. Then PR-1a: **T8 → T6 → T9, plus T11 and T31**, in that order (see §3). T8 first because
-   T9 cannot ship safely without it; T6 before T9 because T9 raises concurrency.
+4. ~~Then PR-1a~~ — **already done**, see §2. Next in lane A is **PR-1b: T5 → T2 → T3 → T4**,
+   in that order. T4 (HTTP/1.1 + timeout) only after T2 and T3, because keep-alive turns a
+   half-written response into a desynchronised connection rather than a closed one.
 5. Consider opening PR-3, PR-4 or PR-5 in a separate worktree in parallel — each is 2-5
    tasks, each closes a whole complaint, and none shares a module with lane A.
+6. Nothing here has been pushed. `git push` and `gh pr list --head <branch>` both say so —
+   the branch exists on this disk only, and that is deliberate, not an oversight.
 
 **Do not** re-run `/plan-devex-review`, `/plan-eng-review`, `/plan-design-review`, or
 `/plan-ceo-review`. All four are logged CLEAR/complete within the 7-day window and their
@@ -202,12 +214,18 @@ Landed as two commits — `99dd244` (behaviour) and `a3d7606` (planning).
 
 ## 8. Honest gaps
 
-- **No end-to-end latency number yet.** T7 alone only reduces request count when a response
-  exceeds the 2500ms interval, which does not happen on an idle preview server. The before/after
-  belongs after T6 lands, measured under the conditions in the plan's
-  `### Verification conditions for the "after" measurement`.
-- **T7's behavioural proof was taken by hand, not by CI.** T11 (node unit test) and T12
-  (Playwright) are what make it repeatable. Neither exists.
+- **The latency number is for `/api/mindnet/cats` in isolation, not for a page load.** Measured
+  with `?project=` pinned on a quiet server, which is what makes master and branch comparable —
+  it is NOT "the dashboard is 85× faster". The aggregate under real browser-pane load was
+  inconclusive and is deliberately not quoted as a win anywhere.
+- **T12 (Playwright) still does not exist.** T11 does, and it executes the decision rather than
+  matching its source text — but it drives a hand-rolled DOM stub in `node:vm`, not a browser.
+  Everything about real layout, real timers and real fetch remains unproven by CI.
+- **`pollCats` has no executed cover.** Its in-flight latch is asserted by source shape only;
+  the behavioural cases in the node suite cover `refreshLive`.
+- **Within-section staleness is still open**, and there is one reachable instance: changing the
+  project while already on Overview can paint the previous project's rows. Written up as
+  TODOS.md item 9 and named in `PAINT_GUARD_JS`'s own comment rather than left implicit.
 - **The design review's mockups were hand-built**, not generated — the gstack designer is
   installed but has no OpenAI key. The reference board is at
   `~/.gstack/projects/hanifridho62-rgb-Lintester-project/designs/status-vocabulary-20260810/board.html`.

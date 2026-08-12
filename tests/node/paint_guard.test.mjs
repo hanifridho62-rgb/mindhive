@@ -62,13 +62,28 @@ const PAYLOADS = {
     text: 'memory-fixture', tags: [],
   }],
   '/api/improvements': { ok: true, auto: [], manual: [] },
-  '/api/sessions': [],
+  // Deliberately NOT the empty list. An empty payload deserialises to exactly
+  // the value `TASK_SESSIONS` already holds, so the cache probe could not tell
+  // a stale write from no write at all — and `paintTaskCards` takes its "No
+  // sessions yet." branch, which exercises none of the card path. One row fixes
+  // both. `status: 'completed'` keeps `renderTaskCards` off the per-card
+  // `/api/task` fetches, which only fire for OPEN or ongoing cards.
+  '/api/sessions': [{
+    project: 'sessions-fixture', session_id: 's-late', status: 'completed',
+    origin: 'manual', activity: { files: 1 },
+    first_ts: '2026-01-01T00:00:00Z', last_ts: '2026-01-01T00:01:00Z',
+  }],
   '/api/oversee': { ok: true, runs: [], sessions: [] },
   '/api/enrich/settings': { enabled: true },
   '/api/changelog': { ok: true, entries: [], categories: ['update'], pending: { files: [] } },
   '/api/sops': { ok: true, active: [], history: [] },
   '/api/state': 'state-fixture',
-  '/api/plugins/inventory': { ok: true, inventory: { plugins: [], local_skills: [], counts: {} } },
+  // Same reason as `/api/sessions`: the empty inventory IS `PLUG_INV`'s initial
+  // value, so a stale cache write was invisible to the probe.
+  '/api/plugins/inventory': { ok: true, inventory: {
+    plugins: [{ name: 'plugins-fixture', version: '0.0.0', marketplace: 'fixture',
+                present: true, skills: [{ name: 'fixture-skill', trigger: 'never' }] }],
+    local_skills: [], counts: { skills_total: 1 } } },
   '/api/skills/status': { ok: true, status: {}, counts: {} },
   '/api/skills/stats': { ok: true, stats: {} },
   '/api/skills/recommend': { ok: true, recommendations: [] },
@@ -182,6 +197,10 @@ function newWorld(scriptSrc) {
   const pending = [];          // every fetch issued and not yet answered
   const timers = new Map();    // recorded, never fired — see below
   let timerId = 0;
+  // A clock the scenario moves by hand. Timers here never elapse on their own,
+  // so anything the page decides from wall-clock deltas (the stuck-poll check)
+  // would otherwise be untestable without sleeping.
+  let clock = 1767225600000;   // 2026-01-01T00:00:00Z, fixed so runs compare
 
   const getElementById = (id) => {
     if (!elements.has(id)) {
@@ -234,6 +253,10 @@ function newWorld(scriptSrc) {
       error: (...a) => process.stderr.write('[page] ' + a.join(' ') + '\n'),
     },
     document: documentStub,
+    Date: class extends Date {
+      constructor(...a) { if (a.length) super(...a); else super(clock); }
+      static now() { return clock; }
+    },
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     navigator: { clipboard: { writeText: async () => {} } },
     fetch: fetchStub,
@@ -275,6 +298,27 @@ function newWorld(scriptSrc) {
         rec.done = true;
         rec.resolve(respond(Object.hasOwn(PAYLOADS, rec.path) ? PAYLOADS[rec.path] : DEFAULT_PAYLOAD));
       }
+    },
+    /** The other way a request can end. run()'s catch is a paint site too. */
+    reject: (recs, msg) => {
+      for (const rec of recs) {
+        if (rec.done) continue;
+        rec.done = true;
+        rec.reject(new Error(msg || 'the request died'));
+      }
+    },
+    /** Fire every one-shot timer currently armed and forget it.
+     *
+     *  The default of never firing is right for the race cases (see the stub
+     *  comment) but it is not free: it makes run()'s skeleton unreachable, and
+     *  the skeleton is a paint. Repeating timers are deliberately left alone —
+     *  the two 2.5 s pollers would issue requests no scenario here answers. */
+    /** Move the page's wall clock forward without waiting for it. */
+    advance: (ms) => { clock += ms; },
+    fireTimers: () => {
+      const once = [...timers.entries()].filter(([, t]) => !t.repeating);
+      for (const [id, t] of once) { timers.delete(id); t.fn(); }
+      return once.length;
     },
     /** Drain the microtask queue. setImmediate is a host macrotask, so every
      *  promise continuation the page queued has run by the time it fires. */
@@ -446,9 +490,24 @@ async function raceCases(renderers) {
 
     // Anti-vacuity: the same scenario with no switch MUST paint. Without this,
     // a renderer that returned unconditionally would score a clean pass above.
+    //
+    // The cache half of that same argument, and it is not hypothetical: the
+    // `/api/plugins/inventory` fixture used to deserialise to exactly the value
+    // `PLUG_INV` already held, so `cacheBefore !== cacheAfter` was false whether
+    // or not the stale render wrote it. The probe read as coverage and measured
+    // nothing. Requiring the KEPT run to move the cache proves the fixture can
+    // tell the two apart at all — for every cached renderer, including ones
+    // added after this was written.
     const kept = await race(PAGE_JS, name, { switchAway: false });
-    record(`paints_when_the_user_stayed:${name}`, !kept.error && kept.painted,
-           kept.error || (kept.painted ? 'painted as expected'
+    const probeBlind = CACHES[name] && !kept.error && !kept.cacheWritten;
+    record(`paints_when_the_user_stayed:${name}`,
+           !kept.error && kept.painted && !probeBlind,
+           kept.error || (probeBlind
+             ? `the ${CACHES[name]} probe cannot see a write: this renderer painted ` +
+               'with the user still on it and the cache did not change, so the ' +
+               'fixture must already equal the initial value. Every cache claim ' +
+               `for ${name} above is unproven until the fixture differs.`
+             : kept.painted ? 'painted as expected, and moved its cache'
              : 'nothing painted even though the user never left — the scenario ' +
                'proves nothing about the discard case'));
   }
@@ -497,6 +556,202 @@ async function mutantCases(renderers) {
   }
 }
 
+// --- tier 4: the run()-scoped generation, invisible to the race above --------
+//
+// `shouldPaint` answers one question: is this render's SECTION still the live
+// one. Everything run() does AROUND the render is outside that question —
+// the skeleton it arms, the "still loading" status, the closing announce, and
+// fail()'s error panel — and two loads of the SAME section make shouldPaint
+// answer yes for both, so it cannot help there at all. That is what RUN_GEN is
+// for, and none of it is reachable through the race scenario: the skeleton half
+// needs a timer to elapse, and the same-section half needs two loads of one
+// section, which race() never performs.
+
+/** A superseded run's timers fire late. They must write nothing. */
+async function supersededTimers(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  const mark = w.pending.length;
+  w.eval('liveFn = renderState;');
+  const stale = w.eval("run('loading state', renderState, true)");
+  await w.settle();
+  if (!w.since(mark).length) return { error: 'renderState issued no request' };
+
+  const mark2 = w.pending.length;
+  w.eval('liveFn = renderOverview;');
+  const fresh = w.eval("run('loading overview', renderOverview, true)");
+  await w.settle();
+  w.answer(w.since(mark2));
+  await fresh;
+  await w.settle();
+
+  // Only the stale run's one-shots are still armed: the winner cleared its own
+  // in run()'s finally, and boot's /api//projects fetch is never answered.
+  const before = w.panelWrites.length;
+  const fired = w.fireTimers();
+  await w.settle();
+  return { fired, late: w.panelWrites.slice(before) };
+}
+
+/** The same section loaded twice; the older load then FAILS. */
+async function staleSameSectionError(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  w.eval('liveFn = renderState;');
+  const mark = w.pending.length;
+  const first = w.eval("run('loading state', renderState, true)");
+  await w.settle();
+  const firstFetches = w.since(mark);
+  if (!firstFetches.length) return { error: 'renderState issued no request' };
+
+  const mark2 = w.pending.length;
+  const second = w.eval("run('loading state', renderState, true)");
+  await w.settle();
+  if (!w.since(mark2).length) {
+    return { error: 'the second load of the same section issued no request, so ' +
+                    'there are not two runs in flight and nothing is being tested' };
+  }
+  w.answer(w.since(mark2));
+  await second;
+  await w.settle();
+
+  const before = w.panelWrites.length;
+  w.reject(firstFetches, 'the older request died');
+  await first;
+  await w.settle();
+  return { late: w.panelWrites.slice(before) };
+}
+
+// The single point RUN_GEN is read through. Neutralising it is the page as it
+// was before the counter existed, which is what the mutant halves below require
+// each pass above to be makeable back into.
+function withoutRunGeneration(src) {
+  const from = 'const current = () => gen === RUN_GEN;';
+  const out = src.replace(from, 'const current = () => true;');
+  return { src: out, changed: out !== src };
+}
+
+async function runGenerationCases() {
+  const mutant = withoutRunGeneration(PAGE_JS);
+  record('the_run_generation_is_read_through_one_expression', mutant.changed,
+         mutant.changed
+           ? 'found `current()` and can neutralise it'
+           : 'run() no longer defines `current` as a comparison against RUN_GEN, ' +
+             'so the two mutant cases below cannot be constructed and the two ' +
+             'real ones are unproven');
+
+  const t = await supersededTimers(PAGE_JS);
+  record('a_superseded_runs_timers_paint_nothing',
+         !t.error && t.fired > 0 && t.late.length === 0,
+         t.error || (t.fired === 0
+           ? 'no one-shot timer was armed, so nothing was tested — run() no ' +
+             'longer stages its loading feedback through setTimeout'
+           : t.late.length
+             ? "the superseded run's timers wrote " + JSON.stringify(t.late[0]) +
+               ' over the section the user actually picked'
+             : t.fired + ' late timer(s) fired and wrote nothing'));
+
+  const e = await staleSameSectionError(PAGE_JS);
+  record('an_older_load_of_the_same_section_cannot_paint_its_error',
+         !e.error && e.late.length === 0,
+         e.error || (e.late.length
+           ? 'the older load failed and painted ' + JSON.stringify(e.late[0]) +
+             ' over the result the newer load had already delivered. shouldPaint ' +
+             'cannot catch this: both loads ARE the live section.'
+           : 'the older failure was discarded'));
+
+  if (!mutant.changed) return;
+  const tm = await supersededTimers(mutant.src);
+  record('removing_the_run_generation_lets_the_stale_timers_paint',
+         !tm.error && tm.late.length > 0,
+         tm.error || (tm.late.length
+           ? 'without the generation check the skeleton lands on the new section'
+           : 'the generation check was removed and NOTHING changed — the case ' +
+             'above does not discriminate, so treat its pass as unproven'));
+  const em = await staleSameSectionError(mutant.src);
+  record('removing_the_run_generation_lets_the_stale_error_paint',
+         !em.error && em.late.length > 0,
+         em.error || (em.late.length
+           ? 'without the generation check the dead request paints its error'
+           : 'the generation check was removed and NOTHING changed — the case ' +
+             'above does not discriminate, so treat its pass as unproven'));
+}
+
+// --- tier 5: the poller's in-flight latch, when the request never settles ----
+//
+// `liveInFlight` is released in a `finally`, so every way a fetch can END is
+// covered. A fetch that never ends is not one of them: `fetch` has no default
+// timeout, so a wedged server holds the latch forever, every tick returns
+// early, and the "live" chip keeps asserting freshness over a view that stopped
+// updating. The harness parks requests by construction, which makes that state
+// exact rather than a timing window.
+
+async function stuckPollGoesStale(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();
+  const isStale = () => w.eval("liveEl.classList.contains('stale')");
+  w.eval('liveFn = renderState;');
+  const mark = w.pending.length;
+  w.eval('refreshLive()');
+  await w.settle();
+  const issued = w.pending.length - mark;
+  if (!issued) return { error: 'refreshLive() issued no request' };
+  const staleImmediately = isStale();
+
+  let ticks = 0;
+  while (ticks < 6 && !isStale()) {
+    w.advance(6000);            // well past LIVE_STUCK_MS, latch still held
+    w.eval('refreshLive()');
+    await w.settle();
+    ticks++;
+  }
+  return { stale: isStale(), staleImmediately, ticks,
+           issued: w.pending.length - mark };
+}
+
+function withoutTheStuckCheck(src) {
+  const from = 'if (Date.now() - liveSince > LIVE_STUCK_MS) markLiveHealth(false);';
+  const out = src.replace(from, '');
+  return { src: out, changed: out !== src };
+}
+
+async function stuckPollCases() {
+  const r = await stuckPollGoesStale(PAGE_JS);
+  record('a_poll_that_never_returns_stops_the_chip_claiming_live',
+         !r.error && r.stale && !r.staleImmediately,
+         r.error || (r.staleImmediately
+           ? 'the chip was already stale before any tick was missed, so this ' +
+             'says nothing about the stuck poll'
+           : r.stale
+             ? `the chip went stale after ${r.ticks} skipped tick(s)`
+             : 'six skipped ticks with the request still in flight and the chip ' +
+               'still claims the view is live'));
+
+  // The other half, and the reason this is not simply a timeout: a stuck poll
+  // must not spawn a replacement every tick. Piling requests onto a server that
+  // is merely slow is the failure the latch exists to prevent.
+  record('a_stuck_poll_never_issues_a_second_request',
+         !r.error && r.issued === 1,
+         r.error || (r.issued === 1
+           ? 'six ticks were skipped and the one stuck request was never joined'
+           : `${r.issued} requests went out while one was already in flight — ` +
+             'the latch is retrying instead of skipping'));
+
+  const m = withoutTheStuckCheck(PAGE_JS);
+  record('removing_the_stuck_check_lets_the_chip_go_on_lying', m.changed,
+         m.changed ? 'the check is present and removable'
+                   : 'no stuck-poll check found in refreshLive() — the case ' +
+                     'above cannot be made to fail, so treat it as unproven');
+  if (!m.changed) return;
+  const rm = await stuckPollGoesStale(m.src);
+  record('the_chip_stays_green_without_the_stuck_check',
+         !rm.error && !rm.stale,
+         rm.error || (rm.stale
+           ? 'the chip went stale with the check removed, so something else is ' +
+             'producing that signal and the case above does not isolate it'
+           : 'check removed → six skipped ticks and the chip still says live'));
+}
+
 // --- the census: neither list may drift out from under the other ------------
 function censusCases(renderers) {
   // If the regex stops matching the emitted page, every case below it becomes
@@ -525,6 +780,8 @@ async function main() {
   guardCases();
   await raceCases(renderers);
   await mutantCases(renderers);
+  await runGenerationCases();
+  await stuckPollCases();
 
   const ok = cases.every((c) => c.ok);
   process.stdout.write(JSON.stringify({ ok, renderers, cases }, null, 1));

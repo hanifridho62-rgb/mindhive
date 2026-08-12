@@ -202,3 +202,43 @@ def test_no_renderer_outside_the_documented_gap_can_clobber(report):
     own renderers, so one added later without the guard fails here without
     anybody remembering to add it to a list."""
     _case(report, "no_renderer_outside_the_documented_gap_can_clobber")
+
+
+@pytest.mark.parametrize("case", [
+    "the_run_generation_is_read_through_one_expression",
+    "a_superseded_runs_timers_paint_nothing",
+    "an_older_load_of_the_same_section_cannot_paint_its_error",
+    "removing_the_run_generation_lets_the_stale_timers_paint",
+    "removing_the_run_generation_lets_the_stale_error_paint",
+])
+def test_the_run_scoped_generation(report, case):
+    """The half `shouldPaint` cannot answer for.
+
+    Two loads of the SAME section both compare equal to liveFn, so the paint
+    guard passes for both — and everything run() does around the render (the
+    skeleton timer, the "still loading" status, the closing announce, fail()'s
+    error panel) is outside the section question entirely. RUN_GEN covers that,
+    and neither of its two paint sites is reachable through the race scenario:
+    one needs a timer to elapse, the other needs two loads of one section.
+
+    Named here, not left to the fixture's blanket "no case failed": that assert
+    catches a case that RAN and failed, and says nothing about one the harness
+    silently stopped running."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
+    "a_poll_that_never_returns_stops_the_chip_claiming_live",
+    "a_stuck_poll_never_issues_a_second_request",
+    "removing_the_stuck_check_lets_the_chip_go_on_lying",
+    "the_chip_stays_green_without_the_stuck_check",
+])
+def test_a_wedged_poll_cannot_keep_claiming_live(report, case):
+    """`liveInFlight` is released in a `finally`, which covers every way a fetch
+    can END. A fetch that never ends is not one of them, and `fetch` has no
+    default timeout — so a wedged server thread (the failure the server-side
+    locks in this change exist for) held the latch forever while the chip went
+    on asserting freshness. The second case is the other half: the answer is to
+    keep skipping and tell the truth, NOT to retry, because a replacement
+    request every 2.5 s is exactly the pile-up the latch was added to stop."""
+    _case(report, case)
