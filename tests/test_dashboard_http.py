@@ -1,0 +1,409 @@
+# tests/test_dashboard_http.py
+"""The connection layer: keep-alive (T4) and the two obligations it creates.
+
+The dashboard issues dozens of small JSON requests per poll cycle, and two
+pollers run on timers, so HTTP/1.0 spent a TCP handshake per request. HTTP/1.1
+removes that — and in exchange makes the connection STATEFUL: responses are now
+framed one after another on the same socket, so anything that leaves unread bytes
+behind (T2) or writes twice for one request (T3) no longer produces an error. It
+produces answers attached to the wrong questions, which is worse than an error
+because nothing reports it.
+
+Every test here therefore speaks raw HTTP over a raw socket and asserts what came
+back BYTE for byte on ONE connection. `urllib` cannot express any of these cases:
+it opens a fresh connection per request, hides the status line, and would parse a
+desynchronised stream into plausible-looking objects — exactly the failure these
+tests exist to catch.
+
+Store isolation comes from the autouse `isolate_store` fixture in
+tests/conftest.py, like every other dashboard test.
+"""
+import collections
+import json
+import socket
+import threading
+from http.server import ThreadingHTTPServer
+
+import pytest
+
+from mindhive import dashboard, events
+
+TOKEN = "test-token-123"
+
+
+def _module_memos():
+    """Every module-level memo, whatever they happen to be.
+
+    The caches are module-level and so outlive a test, and `/api/projects` — the
+    route these tests poll — reads through one of them. Enumerated rather than
+    listed by name because this file's subject is the CONNECTION layer: it should
+    not have to be edited when a cache is added, and naming one that does not
+    exist would turn a behavioural failure into a setup error."""
+    return [value for name, value in vars(dashboard).items()
+            if name.endswith("_MEMO")
+            and isinstance(value, collections.OrderedDict)]
+
+
+@pytest.fixture(autouse=True)
+def clean_module_state():
+    for memo in _module_memos():
+        memo.clear()
+    yield
+    for memo in _module_memos():
+        memo.clear()
+
+
+@pytest.fixture
+def server():
+    """A threaded dashboard on an ephemeral port, yielding the pieces these
+    tests need to reach: address, token, and the handler CLASS.
+
+    The class matters because `make_handler` mints a fresh one per call, so its
+    route table and its byte limits can be adjusted for one test without leaking
+    into the next — and because the limits under test are class attributes."""
+    handler = dashboard.make_handler(TOKEN)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield httpd.server_address, TOKEN, handler
+    finally:
+        httpd.shutdown()
+
+
+def _connect(address, timeout=10.0):
+    sock = socket.create_connection(address, timeout=timeout)
+    sock.settimeout(timeout)
+    return sock
+
+
+def _request_bytes(method, path, body=b"", content_length=None):
+    """One raw request. `content_length` is separate from `len(body)` on purpose:
+    claiming a length and then sending less (or nothing) is precisely how a
+    client hangs up mid-body, and that case has its own branch in `_drain`."""
+    declared = len(body) if content_length is None else content_length
+    head = (f"{method} {path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {declared}\r\n"
+            f"\r\n")
+    return head.encode("ascii") + body
+
+
+def _read_response(sock):
+    """One response: (status line, headers dict, body). Framing is read the way a
+    keep-alive client reads it — headers, then exactly Content-Length bytes — so a
+    server that lies about the length shows up here as a hang or a short body
+    rather than being silently tolerated.
+
+    Returns None when the peer closed before a complete header block, which is a
+    legitimate answer for the tests that assert a connection was dropped."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return None
+        buf += chunk
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(b":")
+        headers[name.strip().lower().decode("latin-1")] = value.strip().decode("latin-1")
+    length = int(headers.get("content-length", len(rest)))
+    while len(rest) < length:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        rest += chunk
+    return lines[0], headers, rest[:length]
+
+
+def _read_until_closed(sock):
+    """(everything the server sent, whether it closed). The T3 assertion is about
+    how many responses were FRAMED on the wire, so it has to see the whole stream
+    rather than a parsed object — and the T2 assertions turn on whether the server
+    hung up or is still waiting, which is the difference the flag carries.
+
+    A reset counts as closed. On Windows, closing a socket that still has unread
+    bytes inbound aborts it (WinError 10053) instead of delivering a clean FIN,
+    and any bytes already sent may be discarded with it — so a test that demands a
+    graceful EOF here would be asserting a platform detail, not our behaviour."""
+    out = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except (socket.timeout, TimeoutError):
+            return out, False
+        except (ConnectionAbortedError, ConnectionResetError):
+            return out, True
+        if not chunk:
+            return out, True
+        out += chunk
+
+
+def _seed():
+    events.append_event("user_prompt", {"text": "do the thing"},
+                        session_id="sess-1", project="test")
+
+
+PROJECTS = f"/api/projects?project=test&token={TOKEN}"
+
+
+# --- T4: HTTP/1.1, and one connection serving many requests -----------------
+
+def test_the_server_speaks_http_1_1(server):
+    address, _token, _handler = server
+    _seed()
+    sock = _connect(address)
+    try:
+        sock.sendall(_request_bytes("GET", PROJECTS))
+        status, headers, body = _read_response(sock)
+        assert status.startswith(b"HTTP/1.1 200"), status
+        # An exact Content-Length is the PREREQUISITE for keep-alive, not a
+        # nicety: without it the client cannot tell where this body ends and the
+        # next response begins.
+        assert "content-length" in headers
+        assert len(body) == int(headers["content-length"])
+        assert json.loads(body.decode("utf-8"))["projects"]
+    finally:
+        sock.close()
+
+
+def test_one_connection_answers_two_requests_in_order(server):
+    """The point of the change. Under HTTP/1.0 the second request on this socket
+    reads EOF, because the server closed after the first response."""
+    address, _token, _handler = server
+    _seed()
+    sock = _connect(address)
+    try:
+        for expected in (1, 2):
+            sock.sendall(_request_bytes("GET", PROJECTS))
+            answer = _read_response(sock)
+            assert answer is not None, \
+                f"the connection was closed before request {expected} was answered"
+            status, _headers, body = answer
+            assert status.startswith(b"HTTP/1.1 200")
+            assert json.loads(body.decode("utf-8"))["current"] == "test"
+    finally:
+        sock.close()
+
+
+def test_an_idle_connection_is_released_instead_of_pinning_a_thread(server):
+    """DISCRIMINATING. The cost keep-alive adds: the base class's `timeout` is
+    None, so `rfile.readline()` on a connection a browser is holding open blocks
+    FOREVER and that worker thread never returns to the pool. Two dashboard tabs
+    left open would each hold one for the life of the tab.
+
+    Both halves are needed, and the first is the one that fails against a server
+    that never set a timeout: assigning the attribute here would make the
+    STDLIB's plumbing honour it whatever we ship, so the shipped value has to be
+    asserted before it is lowered. Lowering it then proves the plumbing works
+    end-to-end without the test waiting out the real 30 seconds."""
+    address, _token, handler = server
+    assert isinstance(handler.timeout, (int, float)) and handler.timeout > 0, (
+        f"the handler ships timeout={handler.timeout!r}, so an idle keep-alive "
+        f"connection blocks its worker thread forever")
+
+    handler.timeout = 0.3
+    sock = _connect(address, timeout=5.0)
+    try:
+        assert sock.recv(4096) == b"", \
+            "an idle connection was still open past the handler's timeout"
+    finally:
+        sock.close()
+
+
+def test_a_connection_is_not_dropped_while_the_timeout_has_not_passed(server):
+    """CANARY for the test above, which passes trivially against a server that
+    hangs up on everyone. Same idle socket, a timeout longer than the wait: it
+    must still be open."""
+    address, _token, handler = server
+    handler.timeout = 30
+    sock = _connect(address, timeout=1.0)
+    try:
+        with pytest.raises((socket.timeout, TimeoutError)):
+            sock.recv(4096)
+    finally:
+        sock.close()
+
+
+# --- T2: a body we refuse to read is a connection we stop reusing -----------
+
+def test_a_refused_body_never_becomes_the_next_request(server):
+    """DISCRIMINATING, and the reason refusal now closes.
+
+    The refused megabyte is still sitting in the socket. Keeping the connection
+    would have the server's next `readline()` read the middle of that junk as a
+    request line, so the refusal stops being a refusal of ONE request: every
+    request after it is answered off by one, or answered with a parse error for a
+    call the client never made.
+
+    The valid GET is queued BEHIND the refusal before anything is read, which is
+    both what a real client does and the only ordering in which the junk is still
+    buffered when the next request line would be parsed. Its correct fate is to
+    be answered NOT AT ALL — the connection ends, and the client reconnects,
+    which keep-alive already assumes can happen. What must never appear is a
+    second framed response.
+
+    The valid request FIRST is what makes this fail against a pre-keep-alive
+    server: there, the connection is already gone before the refusal is sent, so
+    there is no desync to have."""
+    address, _token, handler = server
+    _seed()
+    sock = _connect(address, timeout=20.0)
+    try:
+        sock.sendall(_request_bytes("GET", PROJECTS))
+        first = _read_response(sock)
+        assert first is not None and first[0].startswith(b"HTTP/1.1 200"), \
+            "the connection is not reusable at all, so T2 cannot be under test"
+
+        sock.sendall(_request_bytes("POST", f"/api/append?token={TOKEN}",
+                                    body=b"x" * (handler.MAX_BODY_BYTES + 1)))
+        sock.sendall(_request_bytes("GET", PROJECTS))
+        stream, closed = _read_until_closed(sock)
+
+        assert closed, "a connection with an unread body on it was kept for reuse"
+        assert stream.count(b"HTTP/1.1 ") <= 1, (
+            f"{stream.count(b'HTTP/1.1 ')} responses after the refusal — the "
+            f"junk body was read as a request line: {stream[:300]!r}")
+        if stream:
+            assert b"request body too large" in stream, stream[:300]
+            assert b'"projects"' not in stream, \
+                "the GET behind the refusal was answered from a desynced stream"
+    finally:
+        sock.close()
+
+
+def test_a_declared_length_the_client_never_sends_does_not_pin_a_thread(server):
+    """REGRESSION GUARD (passes against the baseline too, and says so).
+
+    The first cut of T2 drained the refused body to keep the connection framed.
+    That is an untrusted read: this request declares more than 4 MiB and sends 32
+    bytes, so the drain waits for bytes that never arrive and holds a worker
+    thread until the handler timeout — the exact cost MAX_BODY_BYTES exists to
+    refuse, reintroduced by the fix for a different problem. No byte cap closes
+    it, because the bytes never come.
+
+    A server that refuses without reading answers and hangs up at once, which is
+    what `closed` records here; the drained version shows up as a client timeout
+    with the connection still open."""
+    address, _token, handler = server
+    sock = _connect(address, timeout=5.0)
+    try:
+        sock.sendall(_request_bytes(
+            "POST", f"/api/append?token={TOKEN}", body=b"x" * 32,
+            content_length=handler.MAX_BODY_BYTES * 4))
+        _stream, closed = _read_until_closed(sock)
+        assert closed, (
+            "the server is still waiting for a body it had already decided to "
+            "refuse — one local process can hold a worker thread on demand")
+    finally:
+        sock.close()
+
+
+def test_an_unparseable_content_length_is_refused_by_name(server):
+    """A length we cannot parse is a body whose END we cannot find, so the
+    connection cannot be kept framed either. DISCRIMINATING on the message:
+    `int("banana")` used to escape `_body` as a bare ValueError, so the client was
+    told `invalid literal for int() with base 10: 'banana'` — our own internals
+    quoted back as if they were the caller's problem."""
+    address, _token, _handler = server
+    sock = _connect(address, timeout=10.0)
+    try:
+        sock.sendall(b"POST /api/append?token=" + TOKEN.encode() +
+                     b" HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     b"Content-Length: banana\r\n\r\n")
+        stream, closed = _read_until_closed(sock)
+        assert closed, "a connection whose framing is unrecoverable stayed open"
+        assert stream.count(b"HTTP/1.1 ") == 1, stream[:200]
+        assert b"invalid Content-Length" in stream, stream[:300]
+    finally:
+        sock.close()
+
+
+# --- T3: exactly one response per request -----------------------------------
+
+def _writes_then_raises(handler, proj, am, qs):
+    handler._json({"ok": True, "written": "the real answer"})
+    raise RuntimeError("boom AFTER the headers went out")
+
+
+def _raises_before_writing(handler, proj, am, qs):
+    raise RuntimeError("boom BEFORE anything was written")
+
+
+def test_a_route_that_raises_after_writing_frames_only_one_response(server):
+    """DISCRIMINATING. A second full response for one request is not a harmless
+    duplicate under keep-alive: it is FRAMED as the answer to the NEXT request,
+    so from there on the client reads our error JSON as the body of something it
+    asked for later. `_fail` therefore checks whether bytes are already on the
+    wire and, if so, stops talking and lets the connection close.
+
+    The route is injected rather than found: this is a property of the error path
+    itself, and pinning it to whichever handler happens to write-then-fail today
+    would test that handler, not the rule."""
+    address, _token, handler = server
+    handler._GET_ROUTES["/api/test_boom_late"] = _writes_then_raises
+    sock = _connect(address, timeout=10.0)
+    try:
+        sock.sendall(_request_bytes("GET", f"/api/test_boom_late?token={TOKEN}"))
+        stream, closed = _read_until_closed(sock)
+        assert closed, \
+            "a half-written response left the connection open and mis-framed"
+        assert stream.count(b"HTTP/1.1 ") == 1, (
+            f"{stream.count(b'HTTP/1.1 ')} responses framed for one request; the "
+            f"second would be read as the answer to the next one: {stream[:300]!r}")
+        assert b'"written": "the real answer"' in stream
+        assert b"boom AFTER" not in stream, \
+            "the error was appended behind a response that had already shipped"
+    finally:
+        sock.close()
+
+
+def test_a_route_that_raises_before_writing_still_reports_500(server):
+    """CANARY for the test above: a `_fail` that always went silent would satisfy
+    "exactly one response" by never answering at all. A fault with nothing yet on
+    the wire must still produce the 500 that tells monitoring a server fault
+    happened — and, having framed exactly one complete response, must leave the
+    connection usable."""
+    address, _token, handler = server
+    _seed()
+    handler._GET_ROUTES["/api/test_boom_early"] = _raises_before_writing
+    sock = _connect(address, timeout=10.0)
+    try:
+        sock.sendall(_request_bytes("GET", f"/api/test_boom_early?token={TOKEN}"))
+        status, _headers, body = _read_response(sock)
+        assert status.startswith(b"HTTP/1.1 500"), status
+        assert json.loads(body.decode("utf-8")) == {
+            "ok": False, "error": "boom BEFORE anything was written"}
+
+        sock.sendall(_request_bytes("GET", PROJECTS))
+        answer = _read_response(sock)
+        assert answer is not None, \
+            "a clean 500 dropped the connection, so keep-alive buys nothing here"
+        assert answer[0].startswith(b"HTTP/1.1 200")
+    finally:
+        sock.close()
+
+
+def test_the_responded_flag_is_per_request_not_per_connection(server):
+    """The flag lives in `handle_one_request`, not `__init__`, because keep-alive
+    reuses ONE handler instance for every request on the connection. Setting it
+    once per connection would make it mean "this connection has ever answered" —
+    and would silence every error response after the first, on a socket a browser
+    holds open for the life of the tab."""
+    address, _token, handler = server
+    handler._GET_ROUTES["/api/test_boom_early"] = _raises_before_writing
+    sock = _connect(address, timeout=10.0)
+    try:
+        for attempt in (1, 2, 3):
+            sock.sendall(_request_bytes(
+                "GET", f"/api/test_boom_early?token={TOKEN}"))
+            answer = _read_response(sock)
+            assert answer is not None, \
+                f"the connection was dropped before fault {attempt} was reported"
+            assert answer[0].startswith(b"HTTP/1.1 500"), (
+                f"fault {attempt} on this connection was not reported: "
+                f"{answer[0]!r} — the flag is per-connection, not per-request")
+    finally:
+        sock.close()

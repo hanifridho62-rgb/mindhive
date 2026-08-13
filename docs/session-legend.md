@@ -162,7 +162,7 @@ remove an entry would silently re-propose finished work.
 
 | Module | Owns |
 |---|---|
-| `dashboard.py` | HTTP routes + server. |
+| `dashboard.py` | HTTP routes + server. The connection is **keep-alive** (`protocol_version = "HTTP/1.1"`, `timeout = 30`), which makes three things load-bearing rather than optional: every response carries an exact Content-Length; a request whose body is refused closes the connection instead of reusing it (`_body`); and a route that raises *after* writing must not frame a second response (`_fail`, `_responded`). Reads are cached per namespace behind a **stat-only** ledger fingerprint — `_ledger_fingerprint` (`mindnet.sidecar.segment_stats`, no read, `None` when it cannot be trusted) plus `_fingerprinted`; `_CATS_MEMO`, `_SESSIONS_MEMO`, `_STATS_MEMO` are LRU-bounded at `_MEMO_MAX`. |
 | `dashboard_page.py` | The shell UI and its sections. Section render/show pairs: `Overview`, `State`, `Memory`, `Log`, `Sops`, `Improvements`, `Oversee`, `Sessions`. The **Skill & Plugin** section breaks the pattern — `renderPlugins`/`paintPlugins`, entered via `showSkillPanel()` (there is no `showPlugins`). Plus `showBriefing`/`showRecall`/`showGraph`/`showAppend`/`showWorkspace`. |
 | `workspace.py` + `workspace_page.py` | MindParallel — the fleet of headless `claude` subprocess agents. |
 | `swarm_page.py` | MindSwarm — the mission view. |

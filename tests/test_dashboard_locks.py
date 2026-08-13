@@ -17,6 +17,7 @@ lock-shaped comment.
 Store isolation comes from the autouse `isolate_store` fixture in
 tests/conftest.py, like every other dashboard test.
 """
+import collections
 import importlib
 import json
 import threading
@@ -39,13 +40,23 @@ _ALL_LOCKS = (dashboard._HARVEST_LOCK, dashboard._PROJECT_LOCK,
               dashboard._VERIFY_LOCK)
 
 
+def _clear_memos():
+    """Empty every module-level memo, enumerated rather than listed by name.
+
+    Naming them here couples this whole file's SETUP to the current cache
+    inventory: a memo that does not exist in the version under test turns every
+    behavioural failure in the file into an AttributeError at setup, which is the
+    one thing a test run must not do — it hides the result it was run to get."""
+    for name, value in vars(dashboard).items():
+        if name.endswith("_MEMO") and isinstance(value, collections.OrderedDict):
+            value.clear()
+
+
 @pytest.fixture(autouse=True)
 def clean_module_state():
-    dashboard._CATS_MEMO.clear()
-    dashboard._SESSIONS_MEMO.clear()
+    _clear_memos()
     yield
-    dashboard._CATS_MEMO.clear()
-    dashboard._SESSIONS_MEMO.clear()
+    _clear_memos()
     for lock in _ALL_LOCKS:
         if lock.locked():           # a failed test must not wedge the next one
             lock.release()
@@ -586,3 +597,158 @@ def test_both_memos_evict_instead_of_growing_with_the_namespace_count():
         assert dashboard._memo_get(memo, "cold-0") is None, \
             "the oldest cold entry survived a full sweep, so nothing is evicting"
         memo.clear()
+
+
+# --- T5: the project picker stops re-reading every ledger on disk ------------
+#
+# `default_project()` is a loop over `_project_stats`, so ONE dashboard launch
+# read every namespace's full log — 56 of them on this machine — and `/api/
+# projects` did it again on every poll of the picker.
+#
+# `_SESSIONS_MEMO` is the wrong precedent and the reason `_fingerprinted` exists
+# separately: it stamps `(len(evs), evs[-1].ts)`, which needs `evs`, so by the
+# time it can answer, the read it was meant to avoid has already happened — it
+# memoizes the FOLD. `segment_stats` is `os.scandir` over size and mtime: it
+# answers "may I skip the read?" without a read.
+#
+# The two guards are the whole test surface, and the naive "read_all is not
+# called twice" test passes in BOTH broken states, so on its own it proves
+# nothing: `{} == {}` scores a hit, and a pg backend leaves the local segments
+# frozen. Each guard therefore gets a test whose failure mode is the specific
+# thing that goes wrong — a cache that can never invalidate again.
+
+PROJECTS = "/api/projects?project=test"
+
+
+def _seed_other(session_id="sess-other"):
+    """A second namespace, so "one project was re-read" is distinguishable from
+    "everything was re-read" — per-project invalidation is the whole claim."""
+    events.append_event("user_prompt", {"text": "elsewhere"},
+                        session_id=session_id, project="other")
+
+
+def _stats_for(body, name):
+    for row in body["projects"]:
+        if row["name"] == name:
+            return row
+    raise AssertionError(f"{name} missing from the picker: {body['projects']}")
+
+
+def test_an_unchanged_picker_reads_no_ledger_at_all(dashboard_server, counters):
+    base, token = dashboard_server
+    _seed()
+    _seed_other()
+    status, warm = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls >= 2, \
+        "the first poll must actually read both namespaces"
+
+    counters.reset()
+    status, again = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls == 0, \
+        f"an unchanged store was read {counters.reads.calls}x anyway"
+    # Cheap AND identical: a memo that served a different picker would be a
+    # regression dressed as a speedup.
+    assert again["projects"] == warm["projects"]
+    assert again["hivemind"] == warm["hivemind"]
+    assert again["default"] == warm["default"]
+
+
+def test_an_append_re_reads_that_project_and_only_that_project(
+        dashboard_server, counters):
+    """The invalidation that matters comes from OUTSIDE this process — the CLI, a
+    hook, `hive loop`. A real event goes into the real segment file, so the stat
+    the memo depends on moves exactly the way it does in production."""
+    base, token = dashboard_server
+    _seed()
+    _seed_other()
+    _status, warm = _get(base, PROJECTS, token)
+    before = _stats_for(warm, "test")["events"]
+
+    events.append_event("decision", {"text": "an append from outside"},
+                        session_id="sess-1", project="test")
+    counters.reset()
+    status, after = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls == 1, (
+        f"{counters.reads.calls} ledgers re-read for an append to one of them — "
+        f"the fingerprint is not per-project")
+    assert _stats_for(after, "test")["events"] == before + 1, \
+        "the appended event never reached the picker"
+    assert _stats_for(after, "other") == _stats_for(warm, "other")
+
+
+def test_an_empty_fingerprint_never_matches_and_never_freezes_the_picker(
+        dashboard_server, counters, monkeypatch):
+    """DISCRIMINATING. `segment_stats` answers `{}` for ANY OSError as well as
+    for "no events directory". Fail-safe for the sidecar, INVERTED as a cache
+    key: `{} == {}` scores a hit, so one transient directory error would pin this
+    picker's counts for the life of the process — silently, which is the one
+    failure mode a cache must not have."""
+    base, token = dashboard_server
+    _seed()
+    _get(base, PROJECTS, token)                  # warm with a real fingerprint
+    sidecar = importlib.import_module("mindhive.mindnet.sidecar")
+    monkeypatch.setattr(sidecar, "segment_stats", lambda *_a, **_kw: {})
+
+    for attempt in (1, 2):
+        counters.reset()
+        status, body = _get(base, PROJECTS, token)
+        assert status == 200
+        assert counters.reads.calls >= 1, \
+            f"poll {attempt} served an empty fingerprint from the memo"
+        assert _stats_for(body, "test")["events"] == 2
+    # The warm entry from before the fault is still there and is harmless — while
+    # the fingerprint is untrusted, `_fingerprinted` returns before it consults
+    # the memo at all. What must NOT have happened is `{}` being written as a
+    # stamp: that is the value a later poll could match against.
+    stored, _stats = dashboard._STATS_MEMO["test"]
+    assert stored, "an empty fingerprint was stored as a key a later poll can hit"
+
+
+def test_a_non_file_event_backend_bypasses_the_stats_memo(
+        dashboard_server, counters, monkeypatch):
+    """DISCRIMINATING, and the same gap that shipped the first time on the cats
+    gate. `events.read_all` short-circuits to Postgres when the backend is `pg`,
+    while `segment_stats` keeps stat'ing the local `.jsonl` segments — which, on
+    the documented file → dual → pg path, are still on disk and never change
+    again. Non-empty fingerprint, stable forever, every poll a hit, the picker
+    frozen at its first response.
+
+    `_maybe_read_from_pg` is stubbed to None so `read_all` still answers from the
+    file segments: the variable under test is the memo's decision, not whether a
+    Postgres server happens to be reachable from this machine."""
+    base, token = dashboard_server
+    _seed()
+    _status, warm = _get(base, PROJECTS, token)
+
+    ev_mod = importlib.import_module("mindhive.events")
+    monkeypatch.setattr(ev_mod, "_maybe_read_from_pg", lambda project=None: None)
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "pg")
+
+    counters.reset()
+    status, again = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, (
+        "a non-file backend served the memo instead of reading: segment_stats "
+        "fingerprints local segments that pg never writes, so the memo can "
+        "never invalidate and the picker freezes for the life of the process")
+    assert again["projects"] == warm["projects"], \
+        "the bypass changed the picker's contents"
+
+
+def test_the_fingerprint_is_a_real_stamp_when_it_can_be_trusted():
+    """CANARY for both guards above. They assert an ABSENCE of caching, which a
+    `_ledger_fingerprint` that returned None unconditionally would also produce —
+    and that version would be a cache that never caches, passing every test
+    above while restoring the original 56-read launch."""
+    _seed()
+    trusted = dashboard._ledger_fingerprint("test")
+    assert trusted, "a file-backend namespace produced no fingerprint at all"
+    assert trusted == dashboard._ledger_fingerprint("test"), \
+        "two stats of one unchanged ledger disagreed, so nothing can ever hit"
+    events.append_event("decision", {"text": "moves the stamp"},
+                        session_id="sess-1", project="test")
+    assert dashboard._ledger_fingerprint("test") != trusted, \
+        "an appended event did not move the stamp"

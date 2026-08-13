@@ -183,6 +183,17 @@ def _all_projects() -> list:
 
 
 def _project_stats(name: str) -> dict:
+    """Per-project counts for the picker, folded at most once per ledger change.
+
+    Cached because `default_project()` is a loop over this: at launch it runs for
+    every namespace on disk, so one dashboard start read every ledger on the
+    machine. The fingerprint is stat-only and both of its lying states are
+    handled in `_ledger_fingerprint` — on either one this is exactly the
+    uncached function it was before."""
+    return _fingerprinted(_STATS_MEMO, name, lambda: _project_stats_uncached(name))
+
+
+def _project_stats_uncached(name: str) -> dict:
     evs = events.read_all(name)
     sessions, mem, auto = set(), 0, 0
     for ev in evs:
@@ -362,6 +373,70 @@ def _memo_get(memo: "collections.OrderedDict", key):
     return memo[key]
 
 
+def _ledger_fingerprint(proj) -> dict | None:
+    """The stat-only fingerprint of *proj*'s ledger, or **None when no
+    fingerprint can be trusted**.
+
+    `sidecar.segment_stats` is `os.scandir` over `[size, mtime_ns]` — microseconds,
+    and it never opens or parses a byte. That makes it the right primitive for
+    "may I skip the read?", and it lies in exactly two states. Both are answered
+    here, once, because they are two ways of asking the same question and a
+    caller that remembers one and forgets the other builds a cache that is worse
+    than no cache:
+
+    * **`{}` is never-equal.** `segment_stats` answers `{}` both for "no events
+      directory" and for ANY `OSError`. That is the fail-safe direction for the
+      sidecar (`{} != a real stamp` reads as stale) and it INVERTS as a cache
+      key: `{} == {}` would score a hit, so one transient directory error would
+      freeze the cached answer for the life of the process — silently, which is
+      the one failure mode a cache must not have.
+    * **A non-file backend has no fingerprint at all.** `events.read_all`
+      short-circuits to Postgres when `MINDHIVE_EVENT_BACKEND` is `pg` or `dual`,
+      while `segment_stats` keeps stat'ing the local `.jsonl` segments — which,
+      on the documented file → dual → pg migration path, are still on disk and
+      never change again. The fingerprint would be non-empty and stable forever:
+      every poll a hit, the view frozen at the first response, nothing reporting
+      it.
+
+    Returning None for both, rather than a falsy-but-comparable value, is what
+    makes the guards impossible to half-apply: there is no value here that a `==`
+    can match, so an untrusted fingerprint cannot become a hit by accident."""
+    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").strip().lower() != "file":
+        return None
+    from .mindnet import sidecar as sidecar_mod
+    stats = sidecar_mod.segment_stats(proj)
+    return stats or None
+
+
+def _fingerprinted(memo: "collections.OrderedDict", proj, compute):
+    """*compute*'s result for *proj*, recomputed only when the ledger moved.
+
+    The whole point is to skip the READ. `_SESSIONS_MEMO` is the wrong precedent
+    for this and is kept deliberately distinct: it fingerprints
+    `(len(evs), evs[-1].ts)`, which needs `evs`, so by the time it can answer,
+    the read it was meant to avoid has already happened — it memoizes the fold.
+
+    An untrusted fingerprint (see `_ledger_fingerprint`) computes and stores
+    NOTHING: no entry to go stale, and no chance of a later hit against a stamp
+    that cannot move."""
+    fingerprint = _ledger_fingerprint(proj)
+    if fingerprint is None:
+        return compute()
+    cached = _memo_get(memo, proj)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    value = compute()
+    _memo_put(memo, proj, (fingerprint, value))
+    return value
+
+
+# Per-project counts for the picker. `default_project()` computes these for
+# EVERY namespace on disk — 56 on this machine — at launch and on every project
+# list, and each one was a full `read_all`.
+# {project: (fingerprint, stats dict)}
+_STATS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+
+
 # One memo of the session fold, shared by every poll of /api/mindnet/cats.
 # {(project, all_mode): (fingerprint, records)}
 _SESSIONS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
@@ -436,8 +511,67 @@ def _sessions_cached(proj, am, evs, stamp):
 
 def make_handler(token: str):
     class DashboardHandler(BaseHTTPRequestHandler):
+        # HTTP/1.1, so the browser reuses one connection for the whole page
+        # instead of a TCP handshake per request — this panel issues dozens of
+        # small JSON requests per poll cycle and two pollers run on timers.
+        #
+        # Keep-alive brings two obligations, and BOTH are prerequisites rather
+        # than nice-to-haves; this line is deliberately the LAST of the three to
+        # ship. (1) Every response must carry an exact Content-Length, or the
+        # client cannot find where one body ends and the next begins — both
+        # response paths here set it, and `send_error` sets its own. (2) A
+        # connection may only be REUSED when the last request was read to its end
+        # and answered exactly once; see `_body` and `_fail`. Without those,
+        # keep-alive does not produce an error — it produces answers attached to
+        # the wrong questions.
+        protocol_version = "HTTP/1.1"
+
+        # And keep-alive costs a thread per idle connection: the base class's
+        # `timeout` is None, so `rfile.readline()` on a connection the browser is
+        # holding open blocks forever and the worker never returns to the pool. A
+        # timeout turns "pinned until the tab closes" into "released after 30s of
+        # silence"; the client just reconnects, which is what keep-alive already
+        # assumes can happen.
+        timeout = 30
+
+        # Whether bytes of a response for the request in flight are already on
+        # the wire. Class-level default so it reads correctly even if a failure
+        # happens before `handle_one_request` runs.
+        _responded = False
+
         def log_message(self, *args):  # keep the console quiet
             pass
+
+        def handle_one_request(self):
+            # Keep-alive reuses ONE handler instance for every request on the
+            # connection, so this is per-REQUEST state and has to be reset here.
+            # Setting it in __init__ would make the flag mean "this connection
+            # has ever answered", which would silence every error response after
+            # the first.
+            self._responded = False
+            return BaseHTTPRequestHandler.handle_one_request(self)
+
+        def send_response(self, *args, **kwargs):
+            # The one place every response passes through — this class's two
+            # writers and the base class's `send_error` alike — so it is the only
+            # place that can reliably know a reply has started.
+            self._responded = True
+            return BaseHTTPRequestHandler.send_response(self, *args, **kwargs)
+
+        def _fail(self, exc):
+            """The single error exit for a route that raised.
+
+            A second full response for one request is not a duplicate: under
+            keep-alive it is FRAMED as the next response, so every later
+            request/response pair on that connection is answered off by one. Once
+            headers are out, the honest move is to stop talking and let the
+            connection close — the client sees one truncated response and
+            reconnects, instead of parsing our error JSON as the body of
+            something it asked for later."""
+            if self._responded:
+                self.close_connection = True
+                return None
+            return self._json({"ok": False, "error": str(exc)}, 500)
 
         # --- helpers ---
         def _check_token(self) -> bool:
@@ -475,8 +609,44 @@ def make_handler(token: str):
         MAX_BODY_BYTES = 1 << 20  # 1 MiB
 
         def _body(self) -> dict:
-            length = int(self.headers.get("Content-Length") or 0)
+            """The request body as JSON, or ValueError with the connection marked
+            for closing.
+
+            **A body we refuse to read is a connection we stop reusing**, and
+            that is the whole of the rule — one answer for all three refusals
+            below.
+
+            Keep-alive is what makes this load-bearing. The refused bytes are
+            still sitting in the socket, so the server's next `readline()` would
+            read the middle of that body as a request line: the refusal would
+            stop being a refusal of ONE request and desynchronise every request
+            after it on the connection, answering calls the client never made.
+            Reading the refused body would also restore the framing, and the
+            first cut of this did exactly that — but it is an UNTRUSTED read. A
+            caller that declares a megabyte and then sends nothing holds a worker
+            thread until the handler timeout, which is precisely the cost
+            MAX_BODY_BYTES exists to refuse; no byte cap fixes it, because the
+            bytes never arrive. Closing needs no cap, no chunk loop, and no trust
+            in the caller.
+
+            What closing costs: with unread bytes still inbound, Windows aborts
+            the connection (WinError 10053) instead of delivering our 500, so an
+            oversized caller may see a reset rather than the reason. These bodies
+            are tiny JSON control messages by construction — the callers that
+            reach these branches are broken or probing, a reset answers both, and
+            the alternative is a thread any local process can pin on demand.
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                # A length we cannot parse is a body whose END we cannot find.
+                self.close_connection = True
+                raise ValueError("invalid Content-Length")
+            if length < 0:
+                self.close_connection = True
+                raise ValueError("invalid Content-Length")
             if length > self.MAX_BODY_BYTES:
+                self.close_connection = True
                 raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
@@ -789,7 +959,6 @@ def make_handler(token: str):
             from datetime import datetime, timezone
 
             from . import oversee as oversee_mod
-            from .mindnet import sidecar as sidecar_mod
             from .mindnet import telemetry as tel_mod
             from .mindnet import ui_cats as cats_mod
             from .mindnet import ui_sessions as sess_mod
@@ -812,13 +981,11 @@ def make_handler(token: str):
             #
             # THREE properties are load-bearing, and the cache is worse than no
             # cache without any one of them:
-            #   * An EMPTY fingerprint is an unconditional MISS. `segment_stats`
-            #     answers {} both for "no events directory" and for ANY OSError,
-            #     so letting {} == {} count as a hit would let one transient
-            #     directory error freeze this board for the life of the process —
-            #     silently, which is the one failure mode a cache must not have.
-            #     `if fp` covers both sides: nothing empty is ever stored, so
-            #     nothing empty can ever match.
+            #   * An EMPTY fingerprint is an unconditional MISS, and so is a
+            #     NON-FILE BACKEND. Both now live in `_ledger_fingerprint`, which
+            #     returns None for either — one place, so the pair cannot be
+            #     half-applied by the next caller that wants this gate. Their
+            #     reasoning is there; the gap that shipped is recorded below.
             #   * HIVE MIND (am) bypasses the gate outright. It reads EVERY
             #     namespace through `all_event_pairs`, and `segment_stats` is
             #     per-project — a single-project stamp would miss an append in
@@ -826,28 +993,18 @@ def make_handler(token: str):
             #     appearing. Stamping every namespace is possible but is a
             #     scandir each plus a re-listing to notice new ones; bypassing is
             #     unconditionally correct, and this is the rarer path.
-            #   * A NON-FILE EVENT BACKEND bypasses it too. `events.read_all`
-            #     short-circuits to Postgres when MINDHIVE_EVENT_BACKEND is `pg`
-            #     (events.py:314, :356), while `segment_stats` keeps stat'ing the
-            #     local .jsonl segments — which, on the documented
-            #     file -> dual -> pg migration path, are still on disk and never
-            #     change again. The fingerprint would be non-empty, stable
-            #     forever, and every subsequent poll a hit: the board frozen at
-            #     the first response for the life of the process, with nothing
-            #     anywhere reporting it. This guard was specified with the {}
-            #     one and did not ship; the comment above it said "two properties
-            #     are load-bearing" and named a different second, so the gap read
-            #     as completeness. That is the failure mode this whole plan
-            #     exists to remove, so it is spelled out rather than fixed
-            #     quietly.
+            #
+            # The non-file-backend guard was specified alongside the {} one and
+            # did not ship: the comment here said "two properties are
+            # load-bearing" and named a different second, so the gap read as
+            # completeness. That is the failure mode this whole plan exists to
+            # remove, so it is named rather than fixed quietly — and both guards
+            # now sit behind one helper so the next gate inherits them.
             #
             # What is memoized is the two FOLDS, never the response: `now` and
             # `online` are functions of the wall clock and are re-derived below
             # on every call, hit or miss (see `_with_online`).
-            file_backend = os.environ.get(
-                "MINDHIVE_EVENT_BACKEND", "file").strip().lower() == "file"
-            fp = (None if (am or not file_backend)
-                  else sidecar_mod.segment_stats(proj))
+            fp = None if am else _ledger_fingerprint(proj)
             memo = _memo_get(_CATS_MEMO, proj) if fp else None
             if memo is not None and memo[0] == fp:
                 tel_state, records, have_sessions = memo[1], memo[2], True
@@ -1055,7 +1212,10 @@ def make_handler(token: str):
                 # Unexpected failure -> 500 so monitoring and clients can tell a
                 # server fault apart from a normal empty/negative result. Expected
                 # domain rejections return their own ok:False, 200 inside handlers.
-                return self._json({"ok": False, "error": str(e)}, 500)
+                # Via `_fail`, because a route that raised AFTER writing (a
+                # streaming export, a handler that sends then post-processes) must
+                # not have a second response framed behind its first.
+                return self._fail(e)
 
         # --- POST route handlers ------------------------------------------
         # Each takes (proj, body) and sends its own response, wired via
@@ -1349,7 +1509,7 @@ def make_handler(token: str):
             try:
                 body = self._body()
             except Exception as e:
-                return self._json({"ok": False, "error": str(e)}, 500)
+                return self._fail(e)
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
@@ -1390,7 +1550,7 @@ def make_handler(token: str):
                 # Unexpected failure -> 500 (see do_GET). The HIVE MIND read-only
                 # guard and the "type is required" check return ok:False, 200
                 # explicitly as expected domain rejections.
-                return self._json({"ok": False, "error": str(e)}, 500)
+                return self._fail(e)
 
         # --- route tables (path -> handler) -------------------------------
         # Defined after the handlers so the names resolve; dispatched once by
