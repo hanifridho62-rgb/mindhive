@@ -3035,7 +3035,8 @@ def _build_parser() -> argparse.ArgumentParser:
     se_install = se_sub.add_parser(
         "install-hook", help="register the Stop hook in a settings.json "
                              "(idempotent; the hook stays inert until "
-                             "MINDHIVE_ROTATION is set)")
+                             "MINDHIVE_ROTATION is set, and the shim is "
+                             "PowerShell, so rotation only fires on Windows)")
     se_install.add_argument("settings", help="path to the settings.json to edit")
     se_install.add_argument("--command", default=None,
                             help="the hook command to register (default: this "

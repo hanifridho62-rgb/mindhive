@@ -53,6 +53,25 @@ def enabled(monkeypatch):
     monkeypatch.setenv("MINDHIVE_ROTATION", "1")
 
 
+@pytest.fixture
+def unsupervised(monkeypatch):
+    """Rotation on, nobody waiting — a user who switched the feature on by hand.
+
+    Explicit rather than assumed: the marker is inherited, so a test suite run
+    from inside `hive session run` would otherwise get the supervised advice and
+    every assertion below would silently invert."""
+    monkeypatch.delenv(hook.SUPERVISED_ENV, raising=False)
+
+
+@pytest.fixture
+def supervised(monkeypatch):
+    monkeypatch.setenv(hook.SUPERVISED_ENV, "1")
+
+
+def _advice(decision) -> str:
+    return decision["hookSpecificOutput"]["additionalContext"]
+
+
 # --- the firing path -------------------------------------------------------
 
 def test_over_threshold_fires_and_writes_the_artifact(tmp_path, enabled, monkeypatch):
@@ -125,6 +144,91 @@ def test_unknown_occupancy_is_silent(tmp_path, enabled, monkeypatch):
     raw = _payload(tmp_path / "does-not-exist.jsonl")
     assert hook.hook_decision(raw) is None
     assert artifact.read() is None
+
+
+# --- what the advice is allowed to claim -----------------------------------
+#
+# The advice is the only part of this feature a human or an agent ever reads, so
+# each sentence in it is a promise the feature has to keep. "A successor session
+# is queued" used to be unconditional, and it is false in every session that
+# merely has rotation switched on: the artifact is written and the process that
+# would read it does not exist.
+
+def test_supervised_advice_names_who_is_waiting(tmp_path, enabled, supervised,
+                                               monkeypatch):
+    monkeypatch.setenv("MINDHIVE_ROTATION_CAP", "1000")
+    advice = _advice(hook.hook_decision(_payload(_transcript(tmp_path))))
+    assert "hive session run" in advice
+    assert "waiting on this session" in advice
+    assert "successor" in advice
+
+
+def test_unsupervised_advice_does_not_promise_a_successor(tmp_path, enabled,
+                                                          unsupervised,
+                                                          monkeypatch):
+    """DISCRIMINATING. Same crossing, same artifact, no supervisor — so the one
+    thing the message must not do is describe what a supervisor would do next."""
+    monkeypatch.setenv("MINDHIVE_ROTATION_CAP", "1000")
+    advice = _advice(hook.hook_decision(_payload(_transcript(tmp_path))))
+    assert "Nothing is queued" in advice
+    assert "no successor starts" in advice
+    assert "A successor session is queued" not in advice
+
+
+def test_unsupervised_advice_names_the_file_it_actually_wrote(tmp_path, enabled,
+                                                              unsupervised,
+                                                              monkeypatch):
+    """The honest remainder has to be checkable: the path in the message is the
+    path that was written, so the reader can go and look rather than take
+    "recorded" on trust. Rotation is still RECORDED unsupervised — only the
+    claim about a successor changes."""
+    monkeypatch.setenv("MINDHIVE_ROTATION_CAP", "1000")
+    advice = _advice(hook.hook_decision(_payload(_transcript(tmp_path))))
+    assert str(artifact.path()) in advice
+    assert artifact.read() is not None
+    assert "hive session run" in advice          # the command that would queue one
+
+
+def test_the_supervised_marker_alone_does_not_switch_the_hook_on(tmp_path,
+                                                                 monkeypatch):
+    """Opt-in is the property that makes a global Stop hook safe, and adding a
+    second variable is exactly how one would leak away. The marker chooses WORDS;
+    `MINDHIVE_ROTATION` alone decides whether there are any."""
+    monkeypatch.delenv("MINDHIVE_ROTATION", raising=False)
+    monkeypatch.setenv(hook.SUPERVISED_ENV, "1")
+    monkeypatch.setenv("MINDHIVE_ROTATION_CAP", "1000")
+    assert hook.hook_decision(_payload(_transcript(tmp_path))) is None
+    assert artifact.read() is None
+
+
+def test_canary_the_same_payload_fires_once_rotation_is_also_on(tmp_path,
+                                                                monkeypatch):
+    """CANARY for the test above."""
+    monkeypatch.setenv("MINDHIVE_ROTATION", "1")
+    monkeypatch.setenv(hook.SUPERVISED_ENV, "1")
+    monkeypatch.setenv("MINDHIVE_ROTATION_CAP", "1000")
+    assert hook.hook_decision(_payload(_transcript(tmp_path))) is not None
+
+
+@pytest.mark.parametrize("marker", ["1", ""])
+def test_neither_advice_mode_emits_a_block_decision(tmp_path, enabled,
+                                                    monkeypatch, marker):
+    """The inverted-mechanism guard, now that there are two messages. A branch
+    is exactly where the forbidden decision would get reintroduced on one side
+    only."""
+    monkeypatch.setenv(hook.SUPERVISED_ENV, marker)
+    monkeypatch.setenv("MINDHIVE_ROTATION_CAP", "1000")
+    decision = hook.hook_decision(_payload(_transcript(tmp_path)))
+    assert "decision" not in decision
+    assert "block" not in json.dumps(decision).lower()
+
+
+@pytest.mark.parametrize("value,is_supervised", [
+    ("1", True), ("true", True), ("on", True), ("yes", True),
+    ("0", False), ("off", False), ("", False),
+])
+def test_supervised_reads_the_same_spellings_as_enabled(value, is_supervised):
+    assert hook.supervised({hook.SUPERVISED_ENV: value}) is is_supervised
 
 
 # --- totality --------------------------------------------------------------

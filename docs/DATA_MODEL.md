@@ -1377,6 +1377,26 @@ also never emits `decision`, honours `stop_hook_active`, ignores subagent stops
 silence on any exception. Fail-open is the contract: the failure mode of a
 measuring hook must be "we did not measure", never "your work stopped".
 
+**A second variable, `MINDHIVE_ROTATION_SUPERVISED`, decides only what the hook
+SAYS.** `MINDHIVE_ROTATION` is set both by `hive session run` and by a human
+switching the feature on, so it cannot answer whether anything is waiting to read
+the artifact — and the advice used to promise a queued successor to every session
+that crossed the boundary, which is false in the second case: the file is written
+and nothing ever reads it. `supervisor._child_env` is the only place the marker
+is set, because it is the only place "a supervisor is waiting on you" is a fact.
+Supervised, the advice names the supervisor and what it will do. Unsupervised, it
+says plainly that nothing is queued, names the artifact path it wrote, and names
+`hive session run` as the command that would queue one. The marker enables
+nothing: with `MINDHIVE_ROTATION` unset the hook is silent whatever the marker
+says (`tests/test_rotation_hook.py`).
+
+**Rotation is Windows-only today.** Every shim in `hooks/` is PowerShell — nine
+`.ps1` files, no POSIX equivalent — so `hive session install-hook` on
+macOS/Linux writes a perfectly valid settings.json entry for a command that
+cannot run, and the session then never rotates with nothing said. `install`
+returns a `platform_warning` on any successful result from a non-`nt`
+`os.name`, so the limit is reported rather than discovered as an absence.
+
 ### 4.15 The work link, and retiring a card on evidence
 
 A roadmap card used to have no way out except "every step done". So a plan whose

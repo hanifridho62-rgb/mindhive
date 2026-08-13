@@ -87,6 +87,15 @@ Two properties keep that safe. Do not weaken either:
   and switching it on are separate steps on purpose. Never make it
   active-by-default "for convenience".
 
+`MINDHIVE_ROTATION_SUPERVISED` is **not** a second enable switch and must never
+become one. `supervisor._child_env` is the only place it is set, and all it does
+is choose which advice text the hook emits: supervised, a successor really is
+waiting, so the message may say so; unsupervised — rotation switched on by hand,
+nothing reading the artifact — the message says plainly that nothing is queued
+and names `hive session run`. With `MINDHIVE_ROTATION` unset the hook stays
+silent whatever the marker says. Do not make the hook's advice claim anything
+that depends on who launched the session without checking that marker.
+
 **Never emit `{"decision": "block"}` from this hook.** For a Stop hook, `block`
 means *do not stop — keep working*. It would pin a full session open instead of
 rotating it, which is the exact opposite of the intent. Rotation is signalled by

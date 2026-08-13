@@ -7,6 +7,7 @@ rotation; corrupting this costs Claude Code. Every test here is about the second
 risk, not the first.
 """
 import json
+import os
 
 from mindhive.rotation import install
 
@@ -169,6 +170,47 @@ def test_default_command_points_at_the_repo_shim():
     cmd = install.default_command()
     assert cmd.startswith("powershell -NoProfile -File ")
     assert cmd.endswith("hooks/stop.ps1")
+
+
+# --- the platform the shim cannot run on -----------------------------------
+#
+# Every shim in hooks/ is PowerShell — nine .ps1 files, no POSIX equivalent — so
+# on macOS or Linux this registration succeeds and the hook can then never fire.
+# `os_name` is injected in both directions so BOTH answers are reachable from
+# either CI runner; a caveat only one runner can test is a caveat nobody tests.
+
+def test_a_posix_install_says_the_shim_cannot_run_there(tmp_path):
+    """DISCRIMINATING: the JSON edit works everywhere, which is exactly why the
+    failure is silent. Rotation would simply never happen, with nothing said."""
+    p = _write(tmp_path, REAL_SHAPE)
+    result = install.install(p, CMD, os_name="posix")
+    assert result["ok"] and result["reason"] == "installed"
+    warning = result["platform_warning"]
+    assert "PowerShell" in warning and "Windows-only" in warning
+    assert "posix" in warning                   # names the platform it found
+
+
+def test_a_windows_install_carries_no_platform_warning(tmp_path):
+    """CANARY for the test above: the key is absent when the shim can actually
+    run, so the warning is a finding rather than boilerplate on every result."""
+    p = _write(tmp_path, REAL_SHAPE)
+    result = install.install(p, CMD, os_name="nt")
+    assert result["ok"] and "platform_warning" not in result
+
+
+def test_a_refusal_is_not_diluted_by_the_platform_warning(tmp_path):
+    """A malformed settings.json is the whole answer. Appending a second caveat
+    to it buries the one the user has to act on."""
+    p = _write(tmp_path, "{broken", name="bad.json")
+    result = install.install(p, CMD, os_name="posix")
+    assert result["reason"] == "malformed"
+    assert "platform_warning" not in result
+
+
+def test_platform_warning_defaults_to_this_machine():
+    """Unqualified, it answers for the interpreter that is running — which is
+    what the CLI path relies on, since it passes no os_name."""
+    assert install.platform_warning() == install.platform_warning(os.name)
 
 
 # --- CLI wiring ------------------------------------------------------------

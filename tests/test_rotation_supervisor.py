@@ -254,6 +254,27 @@ def test_child_env_enables_rotation():
     assert supervisor._child_env({})["MINDHIVE_ROTATION"] == "1"
 
 
+def test_child_env_marks_the_child_as_supervised():
+    """The hook's advice branches on this, and this function is the only place
+    it may be set: it asserts "a supervisor is waiting on you", which is a fact
+    here and an assumption anywhere else. Without it the hook cannot tell a
+    supervised child from a session that merely has rotation switched on, and it
+    promised a queued successor to both."""
+    from mindhive.rotation import hook
+
+    env = supervisor._child_env({})
+    assert env[hook.SUPERVISED_ENV] == "1"
+    assert hook.supervised(env) is True
+
+
+def test_an_unsupervised_environment_is_not_marked():
+    """CANARY for the test above: the marker is not something every environment
+    happens to carry, so the assertion is about what `_child_env` did."""
+    from mindhive.rotation import hook
+
+    assert hook.supervised({"MINDHIVE_ROTATION": "1"}) is False
+
+
 def test_child_env_strips_an_inherited_headless_flag():
     """Every hooks/*.ps1 exits immediately on MINDHIVE_HEADLESS=1, stop.ps1
     included. The flag is inherited, so running the supervisor from inside a

@@ -110,13 +110,16 @@ Units are MN-numbered; the number in each docstring is the address.
 ### `rotation/` — smart-zone session rotation
 
 Interactive sessions only, and **opt-in**: inert unless `MINDHIVE_ROTATION` is
-set, which only `hive session run` does for its children.
+set, which only `hive session run` does for its children. **Windows-only today** —
+every shim in `hooks/` is PowerShell (nine `.ps1`, no POSIX equivalent), so
+`install` reports a `platform_warning` elsewhere rather than letting rotation
+silently never fire.
 
 | Module | Owns |
 |---|---|
 | `occupancy.py` | True context occupancy read from the Claude Code transcript (tail-read — these reach 20MB+). |
 | `window.py` | Model id → context window → rotation threshold. |
-| `hook.py` | The Stop-hook decision. **Never emits `{"decision":"block"}`** — for a Stop hook that means *keep working*, the exact opposite of rotating. |
+| `hook.py` | The Stop-hook decision. **Never emits `{"decision":"block"}`** — for a Stop hook that means *keep working*, the exact opposite of rotating. Two advice texts, chosen by `MINDHIVE_ROTATION_SUPERVISED` (set only by `supervisor._child_env`): a successor is promised only when one is actually waiting. |
 | `artifact.py` | `ROTATION_PENDING` at `project_dir()/ROTATION_PENDING` — the only channel between hook and supervisor. |
 | `supervisor.py` | `hive session run` — the outer loop around an interactive session. Nothing inside an interactive session can clear its own context, so the loop lives outside it. |
 | `install.py` | Idempotent registration of the Stop hook in a `settings.json` (`hive session install-hook`). |

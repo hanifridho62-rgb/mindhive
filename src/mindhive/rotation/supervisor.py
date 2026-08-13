@@ -22,13 +22,19 @@ supervisor sets it only in the environment of the children it spawns. So a bare
 `claude` session is untouched by all of this, and rotation is a property of
 running under the supervisor rather than of having installed the hook. That is
 what makes registering it safe.
+
+`_child_env` sets a second marker (`hook.SUPERVISED_ENV`) for the same reason
+inverted: a session may have rotation switched on with no supervisor waiting on
+it, and the hook's advice used to promise a successor to that session anyway.
+This module is the only place the marker is set, because this module is the only
+place where "someone is waiting on you" is a fact rather than an assumption.
 """
 import os
 import subprocess
 from dataclasses import dataclass
 from time import monotonic
 
-from . import artifact
+from . import artifact, hook
 
 # Rotations allowed inside SPIN_WINDOW_S before the loop is judged to be
 # spiralling. A healthy long session rotates on the order of hours; three inside
@@ -112,6 +118,12 @@ def _child_env(env=None):
     merged = dict(os.environ if env is None else env)
     merged.pop("MINDHIVE_HEADLESS", None)
     merged["MINDHIVE_ROTATION"] = "1"
+    # The second marker is what lets the hook's advice tell the truth. This
+    # function is the ONLY place it is ever set: it means "a supervisor is
+    # waiting on you", and this is the only code from which that is a fact. The
+    # line above cannot carry it, because a user who switches rotation on by
+    # hand sets that variable too and no one is waiting on them.
+    merged[hook.SUPERVISED_ENV] = "1"
     return merged
 
 
