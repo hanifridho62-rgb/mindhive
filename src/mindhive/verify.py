@@ -129,7 +129,7 @@ def validate_stored(payload) -> None:
             f"{VERIFIED_BY!r} — nothing else may record a mechanical run")
 
 
-def _stream(argv, echo: bool):
+def _stream(argv, echo: bool, emit=None):
     """Run *argv* and return ``(exit_code, output, error)``.
 
     Line-streamed rather than captured wholesale so a four-minute suite still
@@ -164,6 +164,16 @@ def _stream(argv, echo: bool):
                 if kept < runlog.MAX_ARTIFACT_BYTES:
                     chunks.append(line)
                     kept += len(line)
+                if emit is not None:
+                    # A second reader, line by line for the same reason `echo`
+                    # flushes: the dashboard's job pane is polled while the run is
+                    # still going. Its failure must not take the run down — the
+                    # exit code is the point, and a broken sink is not a reason to
+                    # lose it.
+                    try:
+                        emit(line)
+                    except Exception:           # noqa: BLE001 — see comment
+                        emit = None
                 if echo:
                     sys.stdout.write(line)
                     # Explicit, because "streams as it goes" is otherwise only
@@ -178,7 +188,8 @@ def _stream(argv, echo: bool):
     return code, "".join(chunks), ""
 
 
-def run_and_record(argv=None, project=None, root=None, echo: bool = True) -> dict:
+def run_and_record(argv=None, project=None, root=None, echo: bool = True,
+                   emit=None) -> dict:
     """Run a test command, record the result, return
     ``{exit_code, counts, error, artifact, excerpt}``.
 
@@ -186,7 +197,7 @@ def run_and_record(argv=None, project=None, root=None, echo: bool = True) -> dic
     artifact. Never raises for a failing or missing command — a failure is a
     result to record, not an exception to hide."""
     cmd = list(argv) if argv else default_argv(root)
-    code, output, error = _stream(cmd, echo)
+    code, output, error = _stream(cmd, echo, emit)
     counts = parse_summary(output)
     excerpt = output.strip()[:runlog.EXCERPT_CHARS]
 

@@ -177,7 +177,34 @@ two-consecutive-empty-rounds exit cannot be derived from silence. These rows are
 the injector's **only** persistent state — spent fingerprints, the round counter
 and the dry-round count are folded back out of them, so there is no sidecar that
 can drift. The work itself is not here: a landed candidate becomes a `roadmap`
-step, which is semantic and rides the LEDGER, the chain and recall).
+step, which is semantic and rides the LEDGER, the chain and recall),
+`job_started` / `job_finished` / `job_abandoned` (`{job_id, kind}` on all three,
+plus `pid` on started, `{outcome, summary, seconds}` on finished and `reason` on
+abandoned — one row per lifecycle edge of a long dashboard operation, written by
+`jobs.py`. Six operations (harvest, embed, plugin scan, reflect, resolve,
+selftest) return **202 Accepted** with a job id and are polled, so these rows are
+what makes the answer to "what happened to that click?" outlive the process that
+ran it. `outcome` is drawn from `outcomes.OUTCOMES`, and the distinction it
+carries is the reason the events exist: `did_work` and `nothing_to_do` are both
+successes and only one of them changed anything.
+**Three types rather than one `job` with an action field**, unlike `roadmap` or
+`autoresume`, because the boot seal's entire job is to pair a start against a
+close, and "what never finished" should be answerable by asking for exactly that.
+The payload contract is nonetheless SHARED across all three
+(`jobs.validate_payload`) since the raw-append surfaces see only a payload, and
+what the fold depends on is the two fields it pairs on. **Two validators, exactly
+as `verification` has:** `validate_stored` (the writer) additionally requires what
+each type must carry — a `job_finished` with no outcome is the row that would make
+a finished job read as running forever — and it REFUSES `outcome: abandoned`,
+because a run cannot witness its own death.
+`job_abandoned` is written **only** by `jobs.seal_orphans` at dashboard boot, and
+it rests on a single-writer assumption spelled out in `jobs.py`'s module
+docstring: "started, never finished, and not by this pid" is abandoned, which is
+right for a restart and wrong for two dashboards sharing one namespace. The seal
+is scoped to the selected namespace for the same reason — sealing every store on
+the machine would extend that claim to namespaces the process has no business
+speaking for. Job output is capped in memory and read by byte offset
+(`jobs.OutputRing`), never carried whole in these rows)
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view

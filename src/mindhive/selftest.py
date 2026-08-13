@@ -10,12 +10,25 @@ and no second way to run the suite that quietly records nothing.
 
 Output still streams line by line, so a four-minute run is not four minutes of
 silence; `verify._stream` echoes while it buffers.
+
+`emit` is the second reader of that stream. The CLI's reader is a terminal, so
+`echo` writes to stdout; the dashboard's reader is a browser polling a job, and
+the server's stdout is not where that person is looking. Both are line-by-line
+for the same reason — the alternative is a pane that stays empty for four minutes
+and then fills all at once.
 """
 from pathlib import Path
 
 from . import verify
 
 
-def run() -> int:
+def run(emit=None, echo: bool = True) -> dict:
+    """Run the suite, record the run, and return verify's full result.
+
+    Returns the whole dict rather than just the exit code: the caller that reports
+    to a human wants the parsed counts too, and "1 failed" is the part of "exit 1"
+    that is actually useful. `cmd_selftest` takes `exit_code` back out of it for
+    the process status.
+    """
     root = Path(__file__).resolve().parents[2]
-    return verify.run_and_record(verify.default_argv(root))["exit_code"]
+    return verify.run_and_record(verify.default_argv(root), emit=emit, echo=echo)

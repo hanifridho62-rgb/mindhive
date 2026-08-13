@@ -13,12 +13,14 @@ in research.py; only the staged recipe persists in localStorage.
 """
 import json
 
+from . import theme
+
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Self-Reliant</title>
 <style>
-  :root { color-scheme: dark; }
+/*__STATUS__*/
   * { box-sizing: border-box; }
   body { margin:0; font:13px/1.45 system-ui, sans-serif; background:#0e1116; color:#e6edf3;
     height:100vh; display:flex; flex-direction:column; overflow:hidden; }
@@ -30,7 +32,7 @@ _PAGE = """<!doctype html>
     padding:4px 10px; cursor:pointer; font:inherit; }
   button:hover { background:#30363d; }
   button.go { border-color:#2ea043; color:#7ee2a8; }
-  button.warn:hover { color:#ff8a8a; }
+  button.warn:hover { color:var(--bad); }
   input, select, textarea { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
   input:focus, select:focus, textarea:focus { outline:none; border-color:#58a6ff; }
@@ -49,7 +51,7 @@ _PAGE = """<!doctype html>
   .prof button { padding:0 6px; font-size:10px; }
   .prof button.primary { border-color:#2ea043; color:#7ee2a8; }
   .adot { width:8px; height:8px; border-radius:50%; background:#3a4054; flex:0 0 auto; }
-  .adot.ok { background:#46c46a; } .adot.expired { background:#e0b341; }
+  .adot.ok { background:var(--ok); } .adot.expired { background:var(--warn); }
   .adot.none { background:#ff6b6b; } .adot.unknown, .adot.error { background:#8b949e; }
   .prof-id { font-size:10px; color:#8b949e; margin:0 0 4px 14px; overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; }
@@ -70,20 +72,28 @@ _PAGE = """<!doctype html>
   .rchip { display:inline-flex; align-items:center; gap:5px; color:#9ecbff;
     background:#12182a; border:1px solid #2a3550; border-radius:999px;
     padding:1px 8px; font-size:11px; }
-  .rchip b { cursor:pointer; color:#ff8a8a; font-weight:400; }
+  .rchip b { cursor:pointer; color:var(--bad); font-weight:400; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px; }
   .row input[type=number] { width:90px; }
   #goal { width:100%; min-height:44px; resize:vertical; }
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#3a4054; }
-  .dot.running { background:#e0b341; animation:pulse 1s infinite; }
-  .dot.ended { background:#46c46a; } .dot.stopped { background:#ff6b6b; }
+  .dot.running { background:var(--warn); animation:pulse 1s infinite; }
+  .dot.ended { background:var(--ok); } .dot.stopped { background:#ff6b6b; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  /* D8: the sheet that turns an animation ON owns switching it off, so a
+     second consumer of this CSS inherits the guard instead of quietly
+     losing it. Repeating motion is a trigger for some people, not a
+     preference. This page is served into the dashboard's own iframe, so
+     the host page's guard does not reach it. */
+  @media (prefers-reduced-motion: reduce) {
+    .dot.running { animation:none !important; }
+  }
   table { width:100%; border-collapse:collapse; font-size:12px; }
   th, td { text-align:left; padding:4px 8px; border-bottom:1px solid #21262d; }
   th { color:#8b949e; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
   tr.best td { color:#7ee2a8; }
-  td.st-ok { color:#46c46a; } td.st-oom { color:#e0b341; }
-  td.st-crash, td.st-timeout, td.st-aborted { color:#ff8a8a; }
+  td.st-ok { color:var(--ok); } td.st-oom { color:var(--warn); }
+  td.st-crash, td.st-timeout, td.st-aborted { color:var(--bad); }
   #log { flex:1 1 auto; min-height:120px; overflow-y:auto; margin:0; white-space:pre-wrap;
     word-break:break-word; font:12px/1.5 ui-monospace, Consolas, monospace; color:#c9d1d9; }
   #prds { display:flex; flex-direction:column; gap:6px; margin-top:6px; }
@@ -529,6 +539,15 @@ _PAGE = """<!doctype html>
   (async function loop(){ await poll(); setTimeout(loop, 1000); })();
 </script>
 </body></html>"""
+
+
+# The three status colours are decided in `theme`, not here: this document has its
+# own palette, but "done is green, working is amber, failed is red" is the same
+# decision in every one of them, and a value repeated across four documents is a
+# value that drifts. Substituted at IMPORT rather than per request — a marker that
+# is already gone cannot be placed by anything a request carries, which is the
+# ordering the token substitution below has to reason about explicitly.
+_PAGE = _PAGE.replace("/*__STATUS__*/", theme.STATUS_CSS)
 
 
 def render_research(token: str) -> str:

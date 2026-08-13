@@ -269,6 +269,23 @@ namespaces). Disable with `MINDHIVE_AUTOHARVEST=0`; tune cadence with
 `MINDHIVE_AUTOHARVEST_SECS` (default 180). Trigger it by hand with the **Catch
 up** button, the `POST /api/harvest` endpoint, or `hive harvest --catch-up`.
 
+**The six long operations are jobs, not requests.** Catch up, Embed, Plugins
+scan, Reflect, Resolve red and Self-test answer **`202 Accepted`** with
+`{"ok": true, "job": {"id": …, "state": "running"}}` and do the work on their own
+thread; poll `GET /api/job?id=<id>&offset=<bytes>` for state and for output since
+`offset`. They used to hold one fetch open for the whole run, so anything longer
+than the browser's timeout was reported as a failure while it was still going and
+still about to succeed. A second click while one runs is still refused the same
+way as before — `{"ok": false, "error": "… already running"}` with a 200.
+
+A finished job names **what it did**, not just that it ran: `did_work`,
+`nothing_to_do`, `degraded`, or `failed`. "Nothing to do" is a success — a
+harvest that found no missed sessions is working correctly, and it used to be
+indistinguishable from one that ingested forty. Each run leaves `job_started` and
+`job_finished` rows in the ledger; a job whose process died is closed out as
+`job_abandoned` by the next dashboard start-up, so an orphan no longer reads as
+still-running forever.
+
 **The URL is stable across launches.** It binds a fixed port (**54461**) and a
 token persisted to `~/.mindhive/dashboard.token`, so every launch (CLI or
 `MindHive.exe`) serves the same `http://127.0.0.1:54461/?token=…` — bookmark it
