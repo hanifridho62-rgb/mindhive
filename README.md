@@ -286,6 +286,26 @@ indistinguishable from one that ingested forty. Each run leaves `job_started` an
 `job_abandoned` by the next dashboard start-up, so an orphan no longer reads as
 still-running forever.
 
+That vocabulary is not the dashboard's alone. **Five surfaces in MIND HIVE report
+progress to a human, and all five now answer in the same words** — the rule being
+that every path which can produce zero work, a degraded result, or an abandoned
+job has to say *which* of the three it is, and *why*:
+
+| Surface | The loop it closes |
+|---|---|
+| `dashboard-jobs` | a long click reports what it did, not just that it started |
+| `roadmap-retirement` | a plan card retires because something checkable said so, or names which of four things stopped it |
+| `rotation-advice` | the end-of-turn advisory claims a queued successor only when one is really queued |
+| `sop-injection` | a prompt is told when a mandatory procedure arrived as a pointer instead of its body |
+| `memory-budget` | the always-on digest reports the sections that fall past the loader's cut instead of losing them quietly |
+
+Each surface registers itself in `outcomes.py` and carries its own read-only
+probe, which the suite runs on every pass. The point of the registry is what it
+makes impossible to do quietly: a surface can no longer report "fine" for a run
+that did nothing, and `nothing_to_do` — rotation switched off, no live plan, no
+mandatory SOP, no digest written yet — is a **success with a reason attached**,
+not an absence of news.
+
 **The URL is stable across launches.** It binds a fixed port (**54461**) and a
 token persisted to `~/.mindhive/dashboard.token`, so every launch (CLI or
 `MindHive.exe`) serves the same `http://127.0.0.1:54461/?token=…` — bookmark it

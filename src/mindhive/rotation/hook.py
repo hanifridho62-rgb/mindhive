@@ -34,6 +34,7 @@ import json
 import os
 
 from . import artifact, occupancy, window
+from .. import outcomes
 from ..loop.config import LoopConfig
 
 _TRUTHY = {"1", "true", "on", "yes"}
@@ -158,3 +159,54 @@ def hook_decision(raw: str, *, project: str | None = None, env=None) -> dict | N
         }}
     except Exception:                                       # noqa: BLE001
         return None
+
+
+# --- the outcomes-registry probe ----------------------------------------------
+# Two module-level lines in the file that runs at the end of every turn in every
+# session on this machine, so both are deliberately inert: `outcomes` imports
+# nothing but `collections`, and `register` is called with literals and a
+# function defined above it. Neither touches the environment, the transcript, or
+# the artifact. `test_the_probe_registers_on_import` is what keeps that true.
+
+def _probe(project=None) -> outcomes.Report:
+    """Report on the advisory's own feedback loop: when this hook speaks, is what
+    it says true of the session it is speaking to?
+
+    Silence is the honest zero here and is reported as one. The hook says nothing
+    unless `MINDHIVE_ROTATION` is set, and that is opt-in by design (CLAUDE.md) —
+    "off" and "broken" are different facts, and a probe that reported them alike
+    would be the thing this registry exists to prevent.
+
+    The one genuinely degraded state it can see is the two advice texts having
+    become the same text, which is exactly the defect the supervised marker was
+    added to fix: one message for both modes means one of the two sessions is
+    being told something false. Cheap and read-only — it reads two env vars and
+    compares two constants, and never calls `hook_decision`.
+    """
+    if _ADVICE_SUPERVISED == _ADVICE_UNSUPERVISED:
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            "supervised and unsupervised advice are the same text — one of the "
+            "two modes is being told something untrue about a successor")
+    if not enabled():
+        return outcomes.Report(
+            outcomes.NOTHING_TO_DO,
+            "rotation is off, so the hook returns None and says nothing — "
+            "registration and activation are separate on purpose; "
+            "`hive session run` is what switches it on")
+    if supervised():
+        return outcomes.Report(
+            outcomes.DID_WORK,
+            "rotation on under a supervisor — a crossing names the successor "
+            "`hive session run` will start, which is true here")
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        "rotation on with no supervisor — a crossing says plainly that nothing "
+        "is queued, names the artifact it wrote, and names the command that "
+        "would queue one")
+
+
+outcomes.register("rotation-advice",
+                  "the end-of-turn advisory claims a queued successor only when "
+                  "one is really queued",
+                  _probe)

@@ -17,6 +17,7 @@ import json
 
 import pytest
 
+from mindhive import outcomes
 from mindhive.rotation import artifact, hook
 
 
@@ -317,3 +318,66 @@ class _FakeStdin:
 
     def read(self):
         return self._text
+
+
+# --- the outcomes-registry probe -----------------------------------------------
+
+def test_probe_reports_silence_as_the_honest_zero(monkeypatch):
+    """Rotation off is a success, not a fault. CLAUDE.md keeps registration and
+    activation separate on purpose, so a probe that called the silent hook
+    degraded would be reporting the design as a defect."""
+    monkeypatch.delenv("MINDHIVE_ROTATION", raising=False)
+    report = hook._probe()
+    assert report.outcome == outcomes.NOTHING_TO_DO
+    assert report.worked
+    assert "hive session run" in report.summary
+
+
+def test_probe_distinguishes_supervised_from_unsupervised(monkeypatch):
+    """The two modes must not report identically — that conflation is the whole
+    reason the supervised marker exists."""
+    monkeypatch.setenv("MINDHIVE_ROTATION", "1")
+    monkeypatch.setenv(hook.SUPERVISED_ENV, "1")
+    supervised = hook._probe()
+    monkeypatch.delenv(hook.SUPERVISED_ENV)
+    unsupervised = hook._probe()
+    assert supervised.outcome == outcomes.DID_WORK
+    assert unsupervised.outcome == outcomes.DID_WORK
+    assert supervised.summary != unsupervised.summary
+    assert "under a supervisor" in supervised.summary
+    assert "nothing is queued" in unsupervised.summary
+
+
+def test_probe_is_degraded_when_the_two_advices_collapse_into_one(monkeypatch):
+    """The regression this surface is here to catch: one text for both modes means
+    one of the two sessions is told something untrue. Checked ahead of the enabled
+    gate, because a collapsed advisory is broken whether or not it is switched on
+    in the process running the probe."""
+    monkeypatch.delenv("MINDHIVE_ROTATION", raising=False)
+    monkeypatch.setattr(hook, "_ADVICE_UNSUPERVISED", hook._ADVICE_SUPERVISED)
+    report = hook._probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert not report.worked
+    assert "same text" in report.summary
+
+
+def test_the_probe_registers_on_import():
+    """Two module-level lines run in every session on this machine. If the
+    registration ever stops happening, this says so rather than the hook quietly
+    dropping out of the registry."""
+    surface = outcomes.get("rotation-advice")
+    assert surface is not None
+    assert surface.probe is hook._probe
+
+
+def test_the_probe_never_reads_the_transcript_or_writes_an_artifact(tmp_path,
+                                                                   monkeypatch):
+    """A probe runs on every suite run. This one must not touch the two things the
+    hook itself touches, or the registry would be writing rotation state as a side
+    effect of being measured."""
+    monkeypatch.setenv("MINDHIVE_ROTATION", "1")
+    monkeypatch.setattr(hook.occupancy, "read_occupancy",
+                        lambda *a, **k: pytest.fail("probe read the transcript"))
+    monkeypatch.setattr(hook.artifact, "write",
+                        lambda *a, **k: pytest.fail("probe wrote an artifact"))
+    assert hook._probe().outcome in outcomes.SELF_REPORTABLE

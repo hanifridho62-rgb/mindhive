@@ -53,7 +53,7 @@ import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from . import paths
+from . import outcomes, paths
 
 # Average characters per token for English prose and markdown. Real tokenizers
 # land near this for ordinary text; dense punctuation or CJK diverge. Used only
@@ -685,3 +685,67 @@ def to_json(report: dict, found: list[Finding]) -> str:
     payload = dict(report)
     payload["findings"] = [asdict(f) for f in found]
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+# --- the outcomes-registry probe ----------------------------------------------
+
+def _probe(project=None, path=None) -> outcomes.Report:
+    """Report on the always-on digest's own feedback loop: does everything `sync`
+    wrote actually reach a session?
+
+    Three states this has to keep apart, because the file arriving at all made
+    every one of them look like success:
+
+    - No file yet is NOTHING_TO_DO. Nothing is delivered, so nothing is lost — an
+      unwritten digest is not a truncated one.
+    - A file present but unreadable is DEGRADED, never "fine". `memory_pressure`
+      reports `readable: False` for absent AND unreadable, so the existence check
+      here is what separates the two.
+    - Over the loader's budget is DEGRADED and names the sections that fall past
+      the cut, because those are the ones no session ever sees.
+
+    The folder comes from `_memory_folder`, not from `Path.cwd()`, for the reason
+    that function documents: from inside a linked worktree the cwd encoding misses
+    the real file, and this probe would then answer "no MEMORY.md yet" about a
+    digest that is in fact being truncated — the exact failure it exists to catch.
+    Measured live: cwd gave `nothing_to_do`, the main repo gave the truncation.
+
+    Cheap: one `git rev-parse`, one `stat`, and one read of a file whose whole
+    purpose is to be small.
+
+    `path` overrides the resolution so a test can point at a file it wrote, the
+    way `memory_pressure` already takes its path from the caller.
+    """
+    if path is None:
+        from . import sync as sync_mod      # lazy: sync pulls in the projections,
+        path = sync_mod.native_memory_path(_memory_folder())   # nothing else here
+
+    pressure = memory_pressure(path, project=project)
+    if not pressure["readable"]:
+        if not Path(path).exists():
+            return outcomes.Report(
+                outcomes.NOTHING_TO_DO,
+                f"no MEMORY.md for this folder yet ({path}) — `hive sync` writes "
+                f"it; nothing is delivered, so nothing is being lost", pressure)
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"MEMORY.md at {path} exists but could not be read — the pressure is "
+            f"unmeasured, which is not the same as fine", pressure)
+    if pressure["over"]:
+        lost = ", ".join(pressure["dropped"]) or "the tail of the file"
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"MEMORY.md is {pressure['lines']} lines against a "
+            f"{pressure['budget']}-line loader budget (over by "
+            f"{pressure['over']}) — these never reach a session: {lost}",
+            pressure)
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"MEMORY.md is {pressure['lines']} of {pressure['budget']} loader lines "
+        f"— every section reaches a session", pressure)
+
+
+outcomes.register("memory-budget",
+                  "the always-on digest reports the sections that fall past the "
+                  "loader's cut instead of losing them quietly",
+                  _probe)

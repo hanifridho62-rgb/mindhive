@@ -7,10 +7,13 @@ report the same thing.
 import pytest
 
 from mindhive import outcomes
-# Imported for its import side effect: registering the "dashboard-jobs" surface,
-# so `test_every_registered_probe_*` below is parametrized over a real entry
-# rather than silently over an empty list.
-from mindhive import jobs                                    # noqa: F401
+# Imported for their import side effect: registering the five surfaces, so
+# `test_every_registered_probe_*` below is parametrized over real entries rather
+# than silently over an empty list. Import, not a fixture — registration happens
+# at module import and the parametrize list is built at collection time, so a
+# fixture would run too late to be seen.
+from mindhive import context, jobs, roadmap, sopgate         # noqa: F401
+from mindhive.rotation import hook                           # noqa: F401
 
 
 @pytest.fixture
@@ -146,3 +149,44 @@ def test_the_registry_is_not_silently_empty():
     """The parametrized tests above are vacuous if nothing is registered, and an
     empty registry is indistinguishable from a passing run."""
     assert outcomes.registered(), "no surface registered — the tests above are vacuous"
+
+
+# --- the closing assertion: all five surfaces are here ------------------------
+# Deliberately the LAST thing to be written, not the first. The plan's five PRs
+# run as independent lanes, so a test that counted to five before five existed
+# would have been red for weeks while telling nobody anything new. It is written
+# now because the fifth surface has landed.
+
+EXPECTED_SURFACES = {
+    # name                  the loop it closes, in one clause
+    "dashboard-jobs":      "a long click reports what it did",
+    "roadmap-retirement":  "a card retires on evidence, or says what stopped it",
+    "rotation-advice":     "the advisory claims a successor only when one exists",
+    "sop-injection":       "a prompt is told when a procedure became a pointer",
+    "memory-budget":       "the digest reports what falls past the loader's cut",
+}
+
+
+def test_all_five_honest_zero_surfaces_are_registered():
+    """The invariant the plan set out to enforce: every path that can produce zero
+    work, a degraded result, or an abandoned job reports WHICH and WHY. Five
+    surfaces was the scope; this is the test that says so out loud, and it names
+    the missing one rather than comparing counts."""
+    missing = set(EXPECTED_SURFACES) - {s.name for s in outcomes.registered()}
+    assert not missing, f"honest-zero surfaces not registered: {sorted(missing)}"
+
+
+def test_no_surface_registered_beyond_the_five_without_being_named_here():
+    """The other direction, and the reason this is not a count: a sixth surface is
+    welcome, but it arrives with its line in EXPECTED_SURFACES saying which loop it
+    closes — otherwise the registry grows entries nobody can explain."""
+    unexpected = {s.name for s in outcomes.registered()} - set(EXPECTED_SURFACES)
+    assert not unexpected, f"unnamed surfaces in the registry: {sorted(unexpected)}"
+
+
+def test_every_surface_says_which_loop_it_closes():
+    """`what` is what a person reads in a report listing all five. An empty or
+    duplicated one means two surfaces are indistinguishable in that list."""
+    whats = [s.what for s in outcomes.registered()]
+    assert all(w.strip() for w in whats)
+    assert len(set(whats)) == len(whats), "two surfaces describe the same loop"

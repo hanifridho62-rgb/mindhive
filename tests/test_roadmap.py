@@ -3,7 +3,8 @@
 guards, the interrupted-plan STATE/LEDGER delivery, and the `hive roadmap`
 CLI."""
 import pytest
-from mindhive import __main__ as cli_mod, events, paths, projector, roadmap
+from mindhive import (__main__ as cli_mod, events, outcomes, paths, projector,
+                      roadmap)
 
 PROMPT = "Add an interactive roadmap to the Oversee section"
 STEPS = ["design the data model", "build the fold", "render the panel"]
@@ -826,3 +827,63 @@ def test_cli_retire_completes_on_proof(capsys, monkeypatch):
 def test_cli_retire_on_an_empty_store_says_there_was_nothing_to_examine(capsys):
     assert cli_mod.main(["roadmap", "retire"]) == 0
     assert "no live roadmaps to examine" in capsys.readouterr().out
+
+
+# --- the outcomes-registry probe -----------------------------------------------
+# `roadmap._probe` is the module's registry probe; the bare `_probe` in this file
+# is the fake merge_state factory above. Always qualified here for that reason.
+
+def test_probe_on_an_empty_store_reports_nothing_waiting():
+    """The honest zero. No plans is a success, and must not read like a store the
+    probe failed to open."""
+    report = roadmap._probe()
+    assert report.outcome == outcomes.NOTHING_TO_DO
+    assert report.worked
+    assert "no live roadmap plan" in report.summary
+
+
+def test_probe_is_degraded_when_no_live_plan_carries_a_work_link():
+    """The state that makes retirement unreachable: `merge_state` on a plan with
+    no branch, PR or commit can only ever answer unknown/no_work_link, so the
+    sweep will never retire this card however often it runs."""
+    _set()
+    report = roadmap._probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert not report.worked
+    assert "no_work_link" in report.summary
+
+
+def test_probe_names_the_unlinked_share_when_only_some_are_linked():
+    """A partially linked store is still degraded, and the count is the actionable
+    part — "some plans are fine" does not tell anyone which to fix."""
+    _set(plan_id="linked-plan")
+    _ev("link", plan_id="linked-plan", work_pr=103)
+    _set(plan_id="unlinked-plan")
+    report = roadmap._probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert "1 of 2" in report.summary
+
+
+def test_probe_reports_did_work_when_every_live_plan_is_checkable():
+    _set(plan_id="linked-plan")
+    _ev("link", plan_id="linked-plan", work_branch="claude/perf")
+    report = roadmap._probe()
+    assert report.outcome == outcomes.DID_WORK
+    assert "1 live plan(s)" in report.summary
+
+
+def test_probe_ignores_plans_that_already_left():
+    """A retired plan with no work link is not a broken loop — it is a closed one.
+    Counting it would make every finished plan degrade the report forever."""
+    _set(plan_id="done-plan")
+    _ev("complete", plan_id="done-plan")
+    _set(plan_id="gone-plan")
+    _ev("archive", plan_id="gone-plan", reason="superseded by the new plan")
+    report = roadmap._probe()
+    assert report.outcome == outcomes.NOTHING_TO_DO
+
+
+def test_probe_is_registered_under_its_surface_name():
+    surface = outcomes.get("roadmap-retirement")
+    assert surface is not None
+    assert surface.probe is roadmap._probe

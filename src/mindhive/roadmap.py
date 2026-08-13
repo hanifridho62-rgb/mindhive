@@ -23,7 +23,7 @@ Two projections consume it:
 Like the change-log and SOPs, roadmap events are registry/audit content:
 consolidation never absorbs them and display-time dedupe never collapses them.
 """
-from . import events as ev_mod
+from . import events as ev_mod, outcomes
 from .sop import ID_RE
 
 ACTIONS = ("set", "step", "interrupt", "resume", "complete", "archive", "link")
@@ -944,3 +944,49 @@ def ledger_body(payload) -> str:
     if note:
         parts.append(note)
     return "\n\n".join(parts)
+
+
+# --- the outcomes-registry probe ----------------------------------------------
+
+def _probe(project=None) -> outcomes.Report:
+    """Report on retirement's own feedback loop: can a live card still be shown
+    the door by something checkable?
+
+    The answer is decided before any git or `gh` call, by whether the plans
+    carry a work link at all. `merge_state` on a plan with no branch, PR or
+    commit can only ever return `unknown/no_work_link` — so an unlinked card is
+    one that no sweep will ever retire, however many times the sweep runs. That
+    is the state worth reporting, and it is readable from the store alone.
+
+    Reads the ledger, which `jobs._probe` deliberately does not, because here the
+    surface's state IS ledger state — there is nowhere else to look. It stays
+    read-only: no probing of the outside world, no events written.
+    """
+    live = plans(evs=ev_mod.read_all(project))
+    if not live:
+        return outcomes.Report(
+            outcomes.NOTHING_TO_DO,
+            "no live roadmap plan — nothing is waiting on a verdict")
+    linked = [rec for rec in live if has_work_link(rec)]
+    if not linked:
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"{len(live)} live plan(s), none carrying a work link — merge "
+            f"detection can only answer unknown/no_work_link, so no card here "
+            f"can retire on evidence")
+    if len(linked) < len(live):
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"{len(linked)} of {len(live)} live plans carry a work link; the "
+            f"other {len(live) - len(linked)} can only ever answer "
+            f"unknown/no_work_link")
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"{len(live)} live plan(s), every one carrying a work link a sweep can "
+        f"reach a verdict on")
+
+
+outcomes.register("roadmap-retirement",
+                  "a plan card retires because something checkable said so, or "
+                  "says which of four things stopped it",
+                  _probe)

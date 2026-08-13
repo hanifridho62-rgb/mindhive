@@ -9,7 +9,7 @@ arguments for the same reason — nothing in this file may touch the real
 import json
 from pathlib import Path
 
-from mindhive import context, paths
+from mindhive import context, outcomes, paths
 
 
 # --------------------------------------------------------------------------
@@ -696,3 +696,65 @@ def test_the_findings_pipeline_stays_inside_its_latency_budget(tmp_path):
     context.findings(segs, project="test")
     elapsed = time.perf_counter() - start
     assert elapsed < 5.0, f"findings over 40 artifacts took {elapsed:.2f}s"
+
+
+# --------------------------------------------------------------------------
+# the outcomes-registry probe
+# --------------------------------------------------------------------------
+# `memory_pressure` already reports the numbers; these are about the three
+# states it deliberately does NOT distinguish on its own — absent, unreadable,
+# and over — arriving as three different outcomes instead of one "readable:
+# False" a caller can forget to look at.
+
+def test_probe_reports_an_unwritten_digest_as_the_honest_zero(tmp_path):
+    """Nothing delivered means nothing lost. An unwritten digest is not a
+    truncated one, and reporting it as degraded would cry wolf on every fresh
+    checkout."""
+    report = context._probe(path=tmp_path / "never-synced.md")
+    assert report.outcome == outcomes.NOTHING_TO_DO
+    assert report.worked
+    assert "hive sync" in report.summary
+
+
+def test_probe_reports_a_present_but_unreadable_digest_as_degraded(tmp_path):
+    """DISCRIMINATING against the test above: `memory_pressure` answers
+    `readable: False` for both, so the existence check is what separates "not
+    written yet" from "written and we cannot read it"."""
+    unreadable = tmp_path / "MEMORY.md"
+    unreadable.mkdir()          # a directory reads as present and unreadable
+    report = context._probe(path=unreadable)
+    assert report.outcome == outcomes.DEGRADED
+    assert not report.worked
+    assert "not the same as fine" in report.summary
+
+
+def test_probe_names_the_sections_that_never_reach_a_session(tmp_path):
+    context.save_budget(30000, project="test", memory_lines=200)
+    report = context._probe(project="test", path=_memory(tmp_path, 260))
+    assert report.outcome == outcomes.DEGRADED
+    assert "over by 60" in report.summary
+    assert "Key decisions" in report.summary
+
+
+def test_probe_reports_a_digest_that_fits_as_did_work(tmp_path):
+    """CANARY for the test above: the same probe on a short digest must not
+    report loss, or the degraded branch is a constant."""
+    context.save_budget(30000, project="test", memory_lines=200)
+    report = context._probe(project="test", path=_memory(tmp_path, 20))
+    assert report.outcome == outcomes.DID_WORK
+    assert report.worked
+    assert "every section reaches a session" in report.summary
+
+
+def test_probe_is_registered_and_defaults_to_the_main_repo_digest(monkeypatch):
+    """The default path must come from `_memory_folder`, not the cwd: run from a
+    linked worktree, a cwd-keyed lookup misses the real file and reports "no
+    MEMORY.md yet" about a digest that is in fact being truncated."""
+    surface = outcomes.get("memory-budget")
+    assert surface is not None
+    assert surface.probe is context._probe
+    seen = []
+    monkeypatch.setattr(context, "_memory_folder",
+                        lambda *a, **k: seen.append(1) or "C:/Users/x/repo")
+    context._probe()
+    assert seen, "the probe resolved its path without _memory_folder"

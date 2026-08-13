@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from mindhive import events, paths, sop, sopgate
+from mindhive import events, outcomes, paths, sop, sopgate
 from mindhive import __main__ as cli
 
 
@@ -447,3 +447,55 @@ class _Stdin:
 
     def read(self):
         return self._text
+
+
+# --- the outcomes-registry probe -----------------------------------------------
+# Driven through the sidecar the hook path reads, not by stubbing `probe`: the
+# guarantee worth testing is that the wording and the fit rule agree, and a
+# stubbed input would pass even when they disagree.
+
+def test_surface_probe_reports_verbatim_delivery_as_did_work():
+    _add()
+    report = sopgate._surface_probe()
+    assert report.outcome == outcomes.DID_WORK
+    assert report.worked
+    assert "rides in full" in report.summary
+    assert report.result["verdict"] == "verbatim"
+
+
+def test_surface_probe_reports_the_pointers_only_state_as_degraded():
+    """The live state of this repo, in the shared vocabulary: the block still
+    arrives, so the only thing that ever said otherwise was this report."""
+    _add("huge", "Huge procedure", "B" * (sopgate.PROMPT_BUDGET + 500))
+    report = sopgate._surface_probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert not report.worked
+    assert str(sopgate.PROMPT_BUDGET) in report.summary
+    assert "instead of the procedure" in report.summary
+
+
+def test_surface_probe_reports_a_partial_fit_as_degraded():
+    _add("fits", "Fits", "A" * (sopgate.PROMPT_BUDGET - 10))
+    _add("does-not", "Does not", "B" * 500)
+    report = sopgate._surface_probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert "1 of 2" in report.summary
+    assert "degraded to" in report.summary
+
+
+def test_surface_probe_reports_an_empty_sidecar_as_the_honest_zero():
+    """Nothing injected AND nothing promised. Distinct from a promised body that
+    arrived as a pointer, which is the distinction the whole registry is for."""
+    report = sopgate._surface_probe()
+    assert report.outcome == outcomes.NOTHING_TO_DO
+    assert report.worked
+    assert "nothing was promised" in report.summary
+
+
+def test_surface_probe_is_registered_and_carries_the_measurement():
+    surface = outcomes.get("sop-injection")
+    assert surface is not None
+    assert surface.probe is sopgate._surface_probe
+    _add()
+    assert outcomes.run_probe("sop-injection").result["budget"] == \
+        sopgate.PROMPT_BUDGET

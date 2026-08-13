@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import json
 
-from . import sop
+from . import outcomes, sop
 from .promptgate import PROMPT_SCAN_CAP
 
 # Marker so an injected SOP block is greppable in a transcript and tellable
@@ -299,3 +299,51 @@ def extend_hook_context(context, raw, project=None) -> dict:
             hso, hookEventName="UserPromptSubmit", additionalContext=merged))
     except Exception:                                       # noqa: BLE001
         return context
+
+
+# --- the outcomes-registry probe ----------------------------------------------
+
+def _surface_probe(project=None) -> outcomes.Report:
+    """Report on the injection's own feedback loop, in the one vocabulary the
+    other four surfaces use.
+
+    Named apart from `probe` above because that one is this module's measurement
+    and this one is the registry's adapter over it: the numbers are computed once,
+    in `probe`, and translating them into an outcome is all that happens here. Two
+    functions computing the same fit would be the defect `probe` was written to
+    end.
+
+    `silent` is the honest zero — no mandatory SOP means nothing is injected AND
+    nothing was promised, which is a different fact from a body that was promised
+    verbatim and arrived as a pointer.
+    """
+    measured = probe(project=project)
+    verdict = measured["verdict"]
+    budget, mandatory = measured["budget"], measured["mandatory"]
+    if verdict == "silent":
+        return outcomes.Report(
+            outcomes.NOTHING_TO_DO,
+            "no mandatory SOP in the global sidecar — nothing is injected, and "
+            "nothing was promised", measured)
+    if verdict == "pointers_only":
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"no body fits the {budget}-char prompt budget — every prompt gets "
+            f"{mandatory} title(s) and `hive sop show` instead of the procedure "
+            f"(largest is {measured['largest_chars']} chars)", measured)
+    if verdict == "partial":
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"{measured['bodies']} of {mandatory} mandatory bodies fit the "
+            f"{budget}-char budget; the other {measured['pointers']} degraded to "
+            f"pointers", measured)
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"every mandatory body rides in full — {mandatory} SOP(s), "
+        f"{measured['body_chars']} of {budget} chars spent", measured)
+
+
+outcomes.register("sop-injection",
+                  "a prompt is told when a mandatory procedure arrived as a "
+                  "pointer instead of its body",
+                  _surface_probe)
