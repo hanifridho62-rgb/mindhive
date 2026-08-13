@@ -25,6 +25,7 @@ from . import plugins as plugins_mod
 from . import invoker as invoker_mod
 from . import export as export_mod
 from . import events, projector
+from . import jobs, outcomes
 from . import dedupe
 from . import taskview
 from . import sync as sync_mod
@@ -66,6 +67,20 @@ _INVOKE_LOCK = threading.Lock()
 # jobs touching different files, and making them wait on each other would turn
 # two legitimate clicks into a stall. Each lock is only ever about its OWN
 # duplicate.
+#
+# WHO HOLDS THEM CHANGED IN T13, AND FOR HOW LONG. The six long operations now
+# run as jobs (see `jobs.py` and the `register_kind` calls below), so their lock
+# is taken by the JOB for as long as the work runs, not by the handler for as
+# long as the response takes — `_one_at_a_time` would have released it the
+# instant the 202 was written, before the work began. `_SYNC_LOCK`,
+# `_PROJECT_LOCK` and `_VERIFY_LOCK` are still the decorator's, because those
+# three still do their work inside the request.
+#
+# The locks did NOT become redundant with "one job per kind at a time". Each one
+# also guards doors this module cannot see: `/api/plugins/autoscan` reaches the
+# same machine-wide scan `/api/plugins/scan` runs, and the CLI reaches most of
+# this work directly. Dropping them would have quietly narrowed the guarantee
+# from "this work runs once" to "this endpoint starts it once".
 _HARVEST_LOCK = threading.Lock()
 _PROJECT_LOCK = threading.Lock()
 _SYNC_LOCK = threading.Lock()
@@ -183,6 +198,17 @@ def _all_projects() -> list:
 
 
 def _project_stats(name: str) -> dict:
+    """Per-project counts for the picker, folded at most once per ledger change.
+
+    Cached because `default_project()` is a loop over this: at launch it runs for
+    every namespace on disk, so one dashboard start read every ledger on the
+    machine. The fingerprint is stat-only and both of its lying states are
+    handled in `_ledger_fingerprint` — on either one this is exactly the
+    uncached function it was before."""
+    return _fingerprinted(_STATS_MEMO, name, lambda: _project_stats_uncached(name))
+
+
+def _project_stats_uncached(name: str) -> dict:
     evs = events.read_all(name)
     sessions, mem, auto = set(), 0, 0
     for ev in evs:
@@ -362,6 +388,70 @@ def _memo_get(memo: "collections.OrderedDict", key):
     return memo[key]
 
 
+def _ledger_fingerprint(proj) -> dict | None:
+    """The stat-only fingerprint of *proj*'s ledger, or **None when no
+    fingerprint can be trusted**.
+
+    `sidecar.segment_stats` is `os.scandir` over `[size, mtime_ns]` — microseconds,
+    and it never opens or parses a byte. That makes it the right primitive for
+    "may I skip the read?", and it lies in exactly two states. Both are answered
+    here, once, because they are two ways of asking the same question and a
+    caller that remembers one and forgets the other builds a cache that is worse
+    than no cache:
+
+    * **`{}` is never-equal.** `segment_stats` answers `{}` both for "no events
+      directory" and for ANY `OSError`. That is the fail-safe direction for the
+      sidecar (`{} != a real stamp` reads as stale) and it INVERTS as a cache
+      key: `{} == {}` would score a hit, so one transient directory error would
+      freeze the cached answer for the life of the process — silently, which is
+      the one failure mode a cache must not have.
+    * **A non-file backend has no fingerprint at all.** `events.read_all`
+      short-circuits to Postgres when `MINDHIVE_EVENT_BACKEND` is `pg` or `dual`,
+      while `segment_stats` keeps stat'ing the local `.jsonl` segments — which,
+      on the documented file → dual → pg migration path, are still on disk and
+      never change again. The fingerprint would be non-empty and stable forever:
+      every poll a hit, the view frozen at the first response, nothing reporting
+      it.
+
+    Returning None for both, rather than a falsy-but-comparable value, is what
+    makes the guards impossible to half-apply: there is no value here that a `==`
+    can match, so an untrusted fingerprint cannot become a hit by accident."""
+    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").strip().lower() != "file":
+        return None
+    from .mindnet import sidecar as sidecar_mod
+    stats = sidecar_mod.segment_stats(proj)
+    return stats or None
+
+
+def _fingerprinted(memo: "collections.OrderedDict", proj, compute):
+    """*compute*'s result for *proj*, recomputed only when the ledger moved.
+
+    The whole point is to skip the READ. `_SESSIONS_MEMO` is the wrong precedent
+    for this and is kept deliberately distinct: it fingerprints
+    `(len(evs), evs[-1].ts)`, which needs `evs`, so by the time it can answer,
+    the read it was meant to avoid has already happened — it memoizes the fold.
+
+    An untrusted fingerprint (see `_ledger_fingerprint`) computes and stores
+    NOTHING: no entry to go stale, and no chance of a later hit against a stamp
+    that cannot move."""
+    fingerprint = _ledger_fingerprint(proj)
+    if fingerprint is None:
+        return compute()
+    cached = _memo_get(memo, proj)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    value = compute()
+    _memo_put(memo, proj, (fingerprint, value))
+    return value
+
+
+# Per-project counts for the picker. `default_project()` computes these for
+# EVERY namespace on disk — 56 on this machine — at launch and on every project
+# list, and each one was a full `read_all`.
+# {project: (fingerprint, stats dict)}
+_STATS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+
+
 # One memo of the session fold, shared by every poll of /api/mindnet/cats.
 # {(project, all_mode): (fingerprint, records)}
 _SESSIONS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
@@ -436,8 +526,67 @@ def _sessions_cached(proj, am, evs, stamp):
 
 def make_handler(token: str):
     class DashboardHandler(BaseHTTPRequestHandler):
+        # HTTP/1.1, so the browser reuses one connection for the whole page
+        # instead of a TCP handshake per request — this panel issues dozens of
+        # small JSON requests per poll cycle and two pollers run on timers.
+        #
+        # Keep-alive brings two obligations, and BOTH are prerequisites rather
+        # than nice-to-haves; this line is deliberately the LAST of the three to
+        # ship. (1) Every response must carry an exact Content-Length, or the
+        # client cannot find where one body ends and the next begins — both
+        # response paths here set it, and `send_error` sets its own. (2) A
+        # connection may only be REUSED when the last request was read to its end
+        # and answered exactly once; see `_body` and `_fail`. Without those,
+        # keep-alive does not produce an error — it produces answers attached to
+        # the wrong questions.
+        protocol_version = "HTTP/1.1"
+
+        # And keep-alive costs a thread per idle connection: the base class's
+        # `timeout` is None, so `rfile.readline()` on a connection the browser is
+        # holding open blocks forever and the worker never returns to the pool. A
+        # timeout turns "pinned until the tab closes" into "released after 30s of
+        # silence"; the client just reconnects, which is what keep-alive already
+        # assumes can happen.
+        timeout = 30
+
+        # Whether bytes of a response for the request in flight are already on
+        # the wire. Class-level default so it reads correctly even if a failure
+        # happens before `handle_one_request` runs.
+        _responded = False
+
         def log_message(self, *args):  # keep the console quiet
             pass
+
+        def handle_one_request(self):
+            # Keep-alive reuses ONE handler instance for every request on the
+            # connection, so this is per-REQUEST state and has to be reset here.
+            # Setting it in __init__ would make the flag mean "this connection
+            # has ever answered", which would silence every error response after
+            # the first.
+            self._responded = False
+            return BaseHTTPRequestHandler.handle_one_request(self)
+
+        def send_response(self, *args, **kwargs):
+            # The one place every response passes through — this class's two
+            # writers and the base class's `send_error` alike — so it is the only
+            # place that can reliably know a reply has started.
+            self._responded = True
+            return BaseHTTPRequestHandler.send_response(self, *args, **kwargs)
+
+        def _fail(self, exc):
+            """The single error exit for a route that raised.
+
+            A second full response for one request is not a duplicate: under
+            keep-alive it is FRAMED as the next response, so every later
+            request/response pair on that connection is answered off by one. Once
+            headers are out, the honest move is to stop talking and let the
+            connection close — the client sees one truncated response and
+            reconnects, instead of parsing our error JSON as the body of
+            something it asked for later."""
+            if self._responded:
+                self.close_connection = True
+                return None
+            return self._json({"ok": False, "error": str(exc)}, 500)
 
         # --- helpers ---
         def _check_token(self) -> bool:
@@ -475,8 +624,44 @@ def make_handler(token: str):
         MAX_BODY_BYTES = 1 << 20  # 1 MiB
 
         def _body(self) -> dict:
-            length = int(self.headers.get("Content-Length") or 0)
+            """The request body as JSON, or ValueError with the connection marked
+            for closing.
+
+            **A body we refuse to read is a connection we stop reusing**, and
+            that is the whole of the rule — one answer for all three refusals
+            below.
+
+            Keep-alive is what makes this load-bearing. The refused bytes are
+            still sitting in the socket, so the server's next `readline()` would
+            read the middle of that body as a request line: the refusal would
+            stop being a refusal of ONE request and desynchronise every request
+            after it on the connection, answering calls the client never made.
+            Reading the refused body would also restore the framing, and the
+            first cut of this did exactly that — but it is an UNTRUSTED read. A
+            caller that declares a megabyte and then sends nothing holds a worker
+            thread until the handler timeout, which is precisely the cost
+            MAX_BODY_BYTES exists to refuse; no byte cap fixes it, because the
+            bytes never arrive. Closing needs no cap, no chunk loop, and no trust
+            in the caller.
+
+            What closing costs: with unread bytes still inbound, Windows aborts
+            the connection (WinError 10053) instead of delivering our 500, so an
+            oversized caller may see a reset rather than the reason. These bodies
+            are tiny JSON control messages by construction — the callers that
+            reach these branches are broken or probing, a reset answers both, and
+            the alternative is a thread any local process can pin on demand.
+            """
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                # A length we cannot parse is a body whose END we cannot find.
+                self.close_connection = True
+                raise ValueError("invalid Content-Length")
+            if length < 0:
+                self.close_connection = True
+                raise ValueError("invalid Content-Length")
             if length > self.MAX_BODY_BYTES:
+                self.close_connection = True
                 raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
@@ -789,7 +974,6 @@ def make_handler(token: str):
             from datetime import datetime, timezone
 
             from . import oversee as oversee_mod
-            from .mindnet import sidecar as sidecar_mod
             from .mindnet import telemetry as tel_mod
             from .mindnet import ui_cats as cats_mod
             from .mindnet import ui_sessions as sess_mod
@@ -812,13 +996,11 @@ def make_handler(token: str):
             #
             # THREE properties are load-bearing, and the cache is worse than no
             # cache without any one of them:
-            #   * An EMPTY fingerprint is an unconditional MISS. `segment_stats`
-            #     answers {} both for "no events directory" and for ANY OSError,
-            #     so letting {} == {} count as a hit would let one transient
-            #     directory error freeze this board for the life of the process —
-            #     silently, which is the one failure mode a cache must not have.
-            #     `if fp` covers both sides: nothing empty is ever stored, so
-            #     nothing empty can ever match.
+            #   * An EMPTY fingerprint is an unconditional MISS, and so is a
+            #     NON-FILE BACKEND. Both now live in `_ledger_fingerprint`, which
+            #     returns None for either — one place, so the pair cannot be
+            #     half-applied by the next caller that wants this gate. Their
+            #     reasoning is there; the gap that shipped is recorded below.
             #   * HIVE MIND (am) bypasses the gate outright. It reads EVERY
             #     namespace through `all_event_pairs`, and `segment_stats` is
             #     per-project — a single-project stamp would miss an append in
@@ -826,28 +1008,18 @@ def make_handler(token: str):
             #     appearing. Stamping every namespace is possible but is a
             #     scandir each plus a re-listing to notice new ones; bypassing is
             #     unconditionally correct, and this is the rarer path.
-            #   * A NON-FILE EVENT BACKEND bypasses it too. `events.read_all`
-            #     short-circuits to Postgres when MINDHIVE_EVENT_BACKEND is `pg`
-            #     (events.py:314, :356), while `segment_stats` keeps stat'ing the
-            #     local .jsonl segments — which, on the documented
-            #     file -> dual -> pg migration path, are still on disk and never
-            #     change again. The fingerprint would be non-empty, stable
-            #     forever, and every subsequent poll a hit: the board frozen at
-            #     the first response for the life of the process, with nothing
-            #     anywhere reporting it. This guard was specified with the {}
-            #     one and did not ship; the comment above it said "two properties
-            #     are load-bearing" and named a different second, so the gap read
-            #     as completeness. That is the failure mode this whole plan
-            #     exists to remove, so it is spelled out rather than fixed
-            #     quietly.
+            #
+            # The non-file-backend guard was specified alongside the {} one and
+            # did not ship: the comment here said "two properties are
+            # load-bearing" and named a different second, so the gap read as
+            # completeness. That is the failure mode this whole plan exists to
+            # remove, so it is named rather than fixed quietly — and both guards
+            # now sit behind one helper so the next gate inherits them.
             #
             # What is memoized is the two FOLDS, never the response: `now` and
             # `online` are functions of the wall clock and are re-derived below
             # on every call, hit or miss (see `_with_online`).
-            file_backend = os.environ.get(
-                "MINDHIVE_EVENT_BACKEND", "file").strip().lower() == "file"
-            fp = (None if (am or not file_backend)
-                  else sidecar_mod.segment_stats(proj))
+            fp = None if am else _ledger_fingerprint(proj)
             memo = _memo_get(_CATS_MEMO, proj) if fp else None
             if memo is not None and memo[0] == fp:
                 tel_state, records, have_sessions = memo[1], memo[2], True
@@ -1055,17 +1227,38 @@ def make_handler(token: str):
                 # Unexpected failure -> 500 so monitoring and clients can tell a
                 # server fault apart from a normal empty/negative result. Expected
                 # domain rejections return their own ok:False, 200 inside handlers.
-                return self._json({"ok": False, "error": str(e)}, 500)
+                # Via `_fail`, because a route that raised AFTER writing (a
+                # streaming export, a handler that sends then post-processes) must
+                # not have a second response framed behind its first.
+                return self._fail(e)
 
         # --- POST route handlers ------------------------------------------
         # Each takes (proj, body) and sends its own response, wired via
         # _POST_ROUTES. The HIVE MIND read-only guard and the mutating-action
         # target check live in do_POST, before dispatch.
-        @_one_at_a_time(_HARVEST_LOCK, "a harvest is already running")
+        def _start(self, kind, proj, body, busy):
+            """Accept a long operation and hand back a job to poll.
+
+            **202, not 200.** The work has not been done when this returns, and a
+            200 would be a claim that it had. The refusal below stays ``ok:False``
+            with a 200 — this file's convention for an expected domain rejection
+            (see `_one_at_a_time`), and unchanged from when these ran inline, so
+            "already running" reads the same to the page either way.
+
+            No `_one_at_a_time` decorator on the routes that come through here:
+            the JOB holds the operation's lock for as long as the work runs. A
+            decorator would hold it only for the length of this response and
+            release it before the work began.
+            """
+            job = jobs.start(kind, proj, body)
+            if job is None:
+                return self._json({"ok": False, "error": busy}, 200)
+            return self._json({"ok": True, "job": job.snapshot(0)}, 202)
+
         def _post_harvest(self, proj, body):
             # self-healing backfill: capture any session the hooks missed
-            res = run_catch_up()
-            return self._json({"ok": True, "result": res})
+            return self._start("harvest", proj, body,
+                               "a harvest is already running")
 
         def _post_append(self, proj, body):
             etype = body.get("type")
@@ -1103,28 +1296,24 @@ def make_handler(token: str):
             path = sync_mod.sync(folder, project=proj)
             return self._json({"ok": True, "path": str(path), "folder": folder})
 
-        @_one_at_a_time(_EMBED_LOCK, "an embedding pass is already running")
         def _post_embed(self, proj, body):
-            force = bool(body.get("force", False))
+            # The guard stays SYNCHRONOUS: it is instant, and answering an active
+            # LIVE_LOCK with a job id the caller must poll to discover it was
+            # refused would be a worse contract than saying so now.
             try:
-                guard.ensure_safe(force=force)  # raises when LIVE_LOCK active and not force
+                guard.ensure_safe(force=bool(body.get("force", False)))
             except RuntimeError as e:
                 # LIVE_LOCK is an expected, safe-to-report rejection — not a
                 # server fault — so keep it ok:False, 200.
                 return self._json({"ok": False, "error": str(e)}, 200)
-            from . import vectors
-            return self._json({"ok": True, "result": vectors.embed(proj, force=force)})
+            return self._start("embed", proj, body,
+                               "an embedding pass is already running")
 
-        @_one_at_a_time(_PLUGINS_LOCK, "a plugin scan is already running")
         def _post_plugins_scan(self, proj, body):
-            # Plugins/skills are installed machine-wide, so a scan is global. In
-            # HIVE MIND (all-projects) mode there's no concrete namespace to store
-            # the catalog under — fall back to the default project so the snapshot
-            # stays retrievable by the recommend route.
-            if is_all(proj):
-                proj = default_project()
-            result = plugins_mod.scan_and_store(top_n=int(body.get("top", 5)), project=proj)
-            return self._json({"ok": True, "result": result})
+            # The all-projects fallback lives in the job body, which is the one
+            # place that knows where the catalog is written.
+            return self._start("plugins_scan", proj, body,
+                               "a plugin scan is already running")
 
         def _post_skills_invoke(self, proj, body):
             name = (body.get("name") or "").strip()
@@ -1157,77 +1346,26 @@ def make_handler(token: str):
             return self._json({"ok": True, "scanned": res["scanned"],
                                "age_hours": res["age_hours"], "result": res["payload"]})
 
-        def _post_rules_reflect(self, proj, body):
-            # Reflect a bounded batch of active, not-yet-reflected incidents
-            # into structured lessons. Candidates (below the recurrence
-            # threshold) wait until they recur; already-reflected records are
-            # skipped (the CLI's `hive rules reflect` re-reflects everything —
-            # this endpoint deliberately does not).
-            import shutil
-            from . import incidents, reflect as reflect_mod
-            # Clamp to [0, REFLECT_BATCH_LIMIT]: a direct API caller must not be
-            # able to request an unbounded batch of 120s-per-incident claude
-            # calls while holding _REFLECT_LOCK. Non-numeric is a domain error.
+        def _bad_limit(self, body):
+            """The `limit` check both reflection routes share, kept synchronous:
+            a non-numeric limit is a caller mistake to report now, not a job to
+            start and then fail. Returns the rejection response, or None."""
             try:
-                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
+                int(body.get("limit", REFLECT_BATCH_LIMIT))
             except (TypeError, ValueError):
                 return self._json({"ok": False,
                                    "error": "limit must be an integer"}, 200)
-            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
-            if not _REFLECT_LOCK.acquire(blocking=False):
-                return self._json({"ok": False,
-                                   "error": "reflection already running"}, 200)
-            try:
-                # self-heal a stale or missing incident projection first
-                incidents.audit(project=proj)
-                incidents.project(project=proj)
-                eligible = [
-                    s["signature"] for s in incidents.summaries(proj)
-                    if s["status"] == "active" and s["rule_source"] == "none"
-                ]
-                reflected = failed = 0
-                for signature in eligible[:limit]:
-                    if reflect_mod.reflect_incident(signature, project=proj).get("reflected"):
-                        reflected += 1
-                    else:
-                        failed += 1
-                if failed and not reflected and not shutil.which("claude"):
-                    return self._json({"ok": False, "error":
-                        "claude CLI unavailable — reflection needs it on PATH"}, 200)
-                # pending = eligible not yet turned into a lesson: exclude the
-                # ones that failed this round (they were attempted, not skipped).
-                return self._json({"ok": True, "reflected": reflected,
-                                   "failed": failed,
-                                   "pending": max(0, len(eligible) - reflected - failed)})
-            finally:
-                _REFLECT_LOCK.release()
+            return None
+
+        def _post_rules_reflect(self, proj, body):
+            return (self._bad_limit(body)
+                    or self._start("rules_reflect", proj, body,
+                                   "reflection already running"))
 
         def _post_rules_resolve(self, proj, body):
-            # Active resolution over the red (unresolved) set: reflect
-            # incidents with no rule yet, reroute leaking auto rules to the
-            # best distinct alternative route (human rules are never touched).
-            # Same clamp + lock discipline as the Reflect endpoint — each red
-            # incident can cost a 120s claude call.
-            import shutil
-            from . import resolve as resolve_mod
-            try:
-                limit = int(body.get("limit", REFLECT_BATCH_LIMIT))
-            except (TypeError, ValueError):
-                return self._json({"ok": False,
-                                   "error": "limit must be an integer"}, 200)
-            limit = max(0, min(limit, REFLECT_BATCH_LIMIT))
-            if not _REFLECT_LOCK.acquire(blocking=False):
-                return self._json({"ok": False,
-                                   "error": "resolution already running"}, 200)
-            try:
-                res = resolve_mod.resolve_batch(project=proj, limit=limit)
-                done = res.get("rerouted", 0) + res.get("reflected", 0)
-                if res.get("failed") and not done and not shutil.which("claude"):
-                    return self._json({"ok": False, "error":
-                        "claude CLI unavailable — resolution needs it on PATH"}, 200)
-                return self._json(dict(res, ok=True))
-            finally:
-                _REFLECT_LOCK.release()
+            return (self._bad_limit(body)
+                    or self._start("rules_resolve", proj, body,
+                                   "resolution already running"))
 
         def _post_rules_reflect_one(self, proj, body):
             # Reflect ONE named failure signature on demand — the "reflect this
@@ -1335,11 +1473,27 @@ def make_handler(token: str):
                 enrich_mod.record(text, res, project=proj)
             return self._json({"ok": True, "result": res})
 
-        @_one_at_a_time(_SELFTEST_LOCK, "a self test is already running")
         def _post_selftest(self, proj, body):
-            from . import selftest as selftest_mod
-            code = selftest_mod.run()
-            return self._json({"ok": code == 0, "exit_code": code})
+            return self._start("selftest", proj, body,
+                               "a self test is already running")
+
+        def _get_job(self, proj, am, qs):
+            """Poll one job. `offset` is how many output bytes the caller already
+            has, so a 2.5s poll carries only what is new — the whole buffer used
+            to be re-sent every tick (T16).
+
+            An unknown id is ``ok:False`` with a 200, not a 404: the honest reason
+            is almost always that the server restarted, and the page needs to say
+            that rather than render a transport error.
+            """
+            job_id = (qs.get("id") or [""])[0]
+            job = jobs.get(job_id)
+            if job is None:
+                return self._json({"ok": False, "error":
+                    "no such job — the dashboard may have restarted since it "
+                    "started"}, 200)
+            offset = (qs.get("offset") or ["0"])[0]
+            return self._json({"ok": True, "job": job.snapshot(offset)})
 
         def do_POST(self):
             route = urlparse(self.path).path
@@ -1349,7 +1503,7 @@ def make_handler(token: str):
             try:
                 body = self._body()
             except Exception as e:
-                return self._json({"ok": False, "error": str(e)}, 500)
+                return self._fail(e)
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
@@ -1390,7 +1544,7 @@ def make_handler(token: str):
                 # Unexpected failure -> 500 (see do_GET). The HIVE MIND read-only
                 # guard and the "type is required" check return ok:False, 200
                 # explicitly as expected domain rejections.
-                return self._json({"ok": False, "error": str(e)}, 500)
+                return self._fail(e)
 
         # --- route tables (path -> handler) -------------------------------
         # Defined after the handlers so the names resolve; dispatched once by
@@ -1422,6 +1576,7 @@ def make_handler(token: str):
             "/api/skills/recommend": _get_skills_recommend,
             "/api/enrich/settings": _get_enrich_settings,
             "/api/export": _get_export,
+            "/api/job": _get_job,
         }
         for _p in ("parallel", "swarm", "agents", "output", "profiles",
                    "auth", "board"):
@@ -1474,6 +1629,199 @@ def run_catch_up() -> dict:
         except Exception:
             pass
     return res
+
+
+# --- the six long operations, as jobs (T13) ----------------------------------
+# Each body answers ONE question the endpoint could not: what did the run
+# actually do? `ok: True` said only that the code reached the end, so a harvest
+# that found nothing and a harvest that ingested forty sessions reported
+# identically — and that ambiguity was the whole complaint. Every body below has
+# to choose between DID_WORK and NOTHING_TO_DO, which is the one place the
+# distinction can be made honestly, because it is the only place that has the
+# counts.
+#
+# Module level, not inside `make_handler`: registration happens once at import,
+# and a runner that closed over a handler instance could not be tested without
+# an HTTP server. The endpoints reach them by kind NAME, so nothing here needs to
+# be defined before the handler class.
+#
+# Validation and refusals stay SYNCHRONOUS at the endpoint (a bad `limit`, an
+# active LIVE_LOCK): they are instant, and answering them with a job id the
+# caller then has to poll to learn it was rejected would be a worse contract.
+
+def _job_harvest(project, request, emit) -> outcomes.Report:
+    res = run_catch_up()
+    if res.get("locked"):
+        # Another harvester — the background loop, or the CLI — holds the file
+        # lock. Not NOTHING_TO_DO: there may well have been work, and this run
+        # simply did not get to look.
+        return outcomes.Report(outcomes.DEGRADED,
+                               "another harvest was already running — nothing "
+                               "was captured by this one", res)
+    new = int(res.get("total_new") or 0)
+    touched = len(res.get("projects") or {})
+    skipped = res.get("skipped_unknown") or []
+    tail = (f"; skipped {len(skipped)} untracked namespace(s)" if skipped else "")
+    if not new:
+        return outcomes.Report(outcomes.NOTHING_TO_DO,
+                               f"no sessions the hooks missed{tail}", res)
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"harvested {new} session(s) into {touched} project(s){tail}", res)
+
+
+def _job_embed(project, request, emit) -> outcomes.Report:
+    from . import vectors
+    force = bool(request.get("force", False))
+    try:
+        res = vectors.embed(project, force=force)
+    except RuntimeError as e:
+        # The semantic layer is optional by invariant (DATA_MODEL §5), so absent
+        # extras are a DEGRADED store rather than a broken dashboard — reporting
+        # that as FAILED would send someone hunting a bug in a dependency they
+        # chose not to install.
+        #
+        # Narrowed to the chained ImportError rather than every RuntimeError, and
+        # that distinction is load-bearing: `vectors._require_deps` is the ONLY
+        # path that raises from an ImportError, so anything else reaching here is
+        # a real fault and must stay FAILED. A blanket `except RuntimeError` had
+        # exactly the flattening this module exists to stop — it labelled a
+        # genuine crash as "optional dependency missing".
+        if isinstance(e.__cause__, ImportError):
+            return outcomes.Report(outcomes.DEGRADED, str(e))
+        raise
+    embedded = int(res.get("embedded") or 0)
+    if not embedded:
+        return outcomes.Report(outcomes.NOTHING_TO_DO,
+                               "no LEDGER entries to embed yet", res)
+    return outcomes.Report(outcomes.DID_WORK,
+                           f"embedded {embedded} LEDGER entr(ies)", res)
+
+
+def _job_plugins_scan(project, request, emit) -> outcomes.Report:
+    # Plugins/skills are installed machine-wide, so a scan is global. In HIVE
+    # MIND mode there is no concrete namespace to store the catalog under — fall
+    # back to the default project so the recommend route can still find it.
+    target = default_project() if is_all(project) else project
+    res = plugins_mod.scan_and_store(top_n=int(request.get("top", 5)),
+                                     project=target)
+    counts = res.get("counts") or {}
+    total = int(counts.get("plugins_total") or 0)
+    skills = int(counts.get("skills_total") or 0)
+    if not total and not skills:
+        return outcomes.Report(outcomes.NOTHING_TO_DO,
+                               "no plugins or skills found in the cache", res)
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"catalogued {total} plugin(s) and {skills} skill(s)", res)
+
+
+def _reflect_limit(request) -> int:
+    """Clamp to [0, REFLECT_BATCH_LIMIT]. A direct API caller must not be able to
+    request an unbounded batch of 120s-per-incident claude calls."""
+    return max(0, min(int(request.get("limit", REFLECT_BATCH_LIMIT)),
+                      REFLECT_BATCH_LIMIT))
+
+
+def _job_rules_reflect(project, request, emit) -> outcomes.Report:
+    # Reflect a bounded batch of active, not-yet-reflected incidents into
+    # structured lessons. Candidates below the recurrence threshold wait until
+    # they recur; already-reflected records are skipped (the CLI's `hive rules
+    # reflect` re-reflects everything — this deliberately does not).
+    import shutil
+    from . import incidents, reflect as reflect_mod
+    limit = _reflect_limit(request)
+    incidents.audit(project=project)       # self-heal a stale projection first
+    incidents.project(project=project)
+    eligible = [s["signature"] for s in incidents.summaries(project)
+                if s["status"] == "active" and s["rule_source"] == "none"]
+    if not eligible:
+        return outcomes.Report(outcomes.NOTHING_TO_DO,
+                               "no active failure without a lesson already",
+                               {"reflected": 0, "failed": 0, "pending": 0})
+    reflected = failed = 0
+    for signature in eligible[:limit]:
+        emit(f"reflecting {signature}\n")
+        if reflect_mod.reflect_incident(signature, project=project).get("reflected"):
+            reflected += 1
+        else:
+            failed += 1
+    # pending = eligible not yet turned into a lesson, excluding the ones tried
+    # this round: they were attempted, not skipped.
+    res = {"reflected": reflected, "failed": failed,
+           "pending": max(0, len(eligible) - reflected - failed)}
+    if failed and not reflected and not shutil.which("claude"):
+        return outcomes.Report(
+            outcomes.FAILED,
+            "claude CLI unavailable — reflection needs it on PATH", res)
+    if failed:
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"reflected {reflected}, {failed} failed, {res['pending']} pending",
+            res)
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"reflected {reflected} lesson(s), {res['pending']} pending", res)
+
+
+def _job_rules_resolve(project, request, emit) -> outcomes.Report:
+    # Active resolution over the red (unresolved) set: reflect incidents with no
+    # rule yet, reroute leaking auto rules to the best distinct alternative
+    # (human rules are never touched). Same clamp as Reflect — each red incident
+    # can cost a 120s claude call.
+    import shutil
+    from . import resolve as resolve_mod
+    res = resolve_mod.resolve_batch(project=project, limit=_reflect_limit(request))
+    rerouted = int(res.get("rerouted") or 0)
+    reflected = int(res.get("reflected") or 0)
+    failed = int(res.get("failed") or 0)
+    done = rerouted + reflected
+    if failed and not done and not shutil.which("claude"):
+        return outcomes.Report(
+            outcomes.FAILED,
+            "claude CLI unavailable — resolution needs it on PATH", res)
+    if failed:
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"rerouted {rerouted}, reflected {reflected}, {failed} failed", res)
+    if not done:
+        return outcomes.Report(outcomes.NOTHING_TO_DO,
+                               "nothing red left to resolve", res)
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"rerouted {rerouted}, reflected {reflected}", res)
+
+
+def _job_selftest(project, request, emit) -> outcomes.Report:
+    from . import selftest as selftest_mod
+    # echo=False: the server's stdout is the terminal the dashboard was launched
+    # from, and the person who wants this output is looking at the browser. `emit`
+    # is what puts it there, line by line, so a four-minute suite is not four
+    # minutes of an empty pane.
+    res = selftest_mod.run(emit=emit, echo=False)
+    code = res["exit_code"]
+    counts = res.get("counts") or {}
+    tally = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no counts parsed"
+    if code == 0:
+        return outcomes.Report(outcomes.DID_WORK, f"suite green — {tally}", res)
+    return outcomes.Report(outcomes.FAILED,
+                           f"suite exited {code} — {tally}", res)
+
+
+# Opt-in, one line each. The lock is the pre-existing per-operation lock: the
+# same work is reachable from the CLI and, for plugins, from a sibling endpoint,
+# so "one job per kind" alone would have quietly dropped that guarantee.
+jobs.register_kind("harvest", "Catching up on missed sessions",
+                   _job_harvest, _HARVEST_LOCK)
+jobs.register_kind("embed", "Embedding the ledger", _job_embed, _EMBED_LOCK)
+jobs.register_kind("plugins_scan", "Scanning plugins and skills",
+                   _job_plugins_scan, _PLUGINS_LOCK)
+jobs.register_kind("rules_reflect", "Reflecting failures into lessons",
+                   _job_rules_reflect, _REFLECT_LOCK)
+jobs.register_kind("rules_resolve", "Resolving red lessons",
+                   _job_rules_resolve, _REFLECT_LOCK)
+jobs.register_kind("selftest", "Running the test suite",
+                   _job_selftest, _SELFTEST_LOCK)
 
 
 def _transcripts_fingerprint(root=None) -> float:
@@ -1668,6 +2016,22 @@ def serve(port: int | None = None, open_browser: bool = True,
     print("Close this window or press Ctrl+C to stop.", flush=True)
     if open_browser:
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    # The boot seal (T14). Jobs run on daemon threads, so anything still running
+    # when this process ended died with it and left a `job_started` row with no
+    # close — which, unsealed, reads as still-running forever. Close them now,
+    # while nothing of this process's own is in flight yet.
+    #
+    # Best-effort: an unreadable ledger must not stop the dashboard from serving,
+    # and this runs BEFORE serve_forever precisely so the seal cannot race a job
+    # the user starts. Read `jobs`' module docstring for the single-writer
+    # assumption; the scope is one namespace for the same reason.
+    try:
+        sealed = jobs.seal_orphans(default_project())
+        if sealed:
+            print(f"sealed {sealed} job(s) abandoned by a previous run",
+                  flush=True)
+    except Exception as e:                      # noqa: BLE001 — see comment
+        print(f"job seal skipped: {type(e).__name__}: {e}", flush=True)
     stop_event = threading.Event()
     threading.Thread(target=_auto_harvest_loop, args=(stop_event,), daemon=True).start()
     try:

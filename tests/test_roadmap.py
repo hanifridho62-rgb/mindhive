@@ -3,7 +3,8 @@
 guards, the interrupted-plan STATE/LEDGER delivery, and the `hive roadmap`
 CLI."""
 import pytest
-from mindhive import __main__ as cli_mod, events, paths, projector, roadmap
+from mindhive import (__main__ as cli_mod, events, outcomes, paths, projector,
+                      roadmap)
 
 PROMPT = "Add an interactive roadmap to the Oversee section"
 STEPS = ["design the data model", "build the fold", "render the panel"]
@@ -136,6 +137,11 @@ def test_reset_revives_with_created_and_version_continuity():
 
 
 def test_fold_is_total_on_junk_history():
+    """Every historical record predates every field added since, so the fold
+    has to read a valid-but-old event as ordinary rather than degraded. The
+    work-link keys join `new` and the relay fields in that guarantee: absent is
+    the normal case, and asking a linkless plan for its link answers empty
+    instead of raising."""
     _ev("step", plan_id="ghost", index=0, status="done")
     _ev("interrupt", plan_id="ghost2", cause="usage_limit")
     _set(ts="2026-07-17T10:00:00Z")
@@ -143,10 +149,20 @@ def test_fold_is_total_on_junk_history():
     events.append_event("roadmap", {"action": "set", "plan_id": "half"},
                         session_id="s1")                  # no prompt/steps
     events.append_event("roadmap", "free text", session_id="s1")
+    # A valid-but-old `archive`, from before the reason was required, and a
+    # `link` carrying nothing: both must fold away without touching the plan.
+    _ev("archive", ts="2026-07-17T10:02:00Z")
+    _ev("link", ts="2026-07-17T10:03:00Z")
     evs = events.read_all()
     rec = roadmap.get(evs, "oversee-roadmap")
     assert rec["progress"] == {"done": 0, "total": 3}     # bad step skipped
+    assert rec["status"] == "active"                     # reasonless archive
     assert set(roadmap.fold(evs)) == {"oversee-roadmap"}
+    assert not any(key in rec for key in roadmap.WORK_KEYS)
+    assert roadmap.work_link(rec) == {"branch": "", "pr": 0, "commits": []}
+    assert roadmap.has_work_link(rec) is False
+    assert roadmap.describe_work_link(rec) == ""
+    assert roadmap.work_link(None) == {"branch": "", "pr": 0, "commits": []}
 
 
 def test_plans_order_by_created_then_id():
@@ -512,3 +528,362 @@ def test_cli_roadmap_autoclose(capsys, monkeypatch):
     roadmap.sync_from_todos(SID, TODOS)
     assert cli_mod.main(["roadmap", "autoclose", "--session", SID]) == 0
     assert "interrupt" in capsys.readouterr().out
+
+
+# --- the work link: how a plan points at the code it produced -------------------
+# Before it, `roadmap.fold` had no branch, PR, or commit field, so nothing
+# checkable connected a plan to its work — and a card whose last step was
+# "merge the PR" sat in Oversee forever, because retiring it would have meant
+# asserting something no code could see.
+
+SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize("payload", [
+    {"action": "link", "plan_id": "x-1"},                       # links nothing
+    {"action": "set", "plan_id": "x-1", "prompt": PROMPT, "steps": STEPS,
+     "work_branch": "   "},
+    {"action": "set", "plan_id": "x-1", "prompt": PROMPT, "steps": STEPS,
+     "work_branch": "b" * 251},
+    {"action": "link", "plan_id": "x-1", "work_pr": 0},
+    {"action": "link", "plan_id": "x-1", "work_pr": -3},
+    {"action": "link", "plan_id": "x-1", "work_pr": True},       # bool is an int
+    {"action": "link", "plan_id": "x-1", "work_pr": "103"},
+    {"action": "link", "plan_id": "x-1", "work_commits": SHA},   # not a list
+    {"action": "link", "plan_id": "x-1", "work_commits": [""]},
+    {"action": "link", "plan_id": "x-1", "work_commits": ["x" * 41]},
+    {"action": "link", "plan_id": "x-1", "work_commits": [SHA] * 21},
+    {"action": "archive", "plan_id": "x-1"},                     # no reason
+    {"action": "archive", "plan_id": "x-1", "reason": "  "},
+    {"action": "archive", "plan_id": "x-1", "reason": "r" * 301},
+])
+def test_validate_payload_rejects_malformed_links_and_archives(payload):
+    with pytest.raises(ValueError):
+        roadmap.validate_payload(payload)
+
+
+def test_link_records_the_work_without_touching_the_plan():
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_pr=103, work_branch="claude/perf",
+        work_commits=[SHA], ts="2026-07-17T10:05:00Z")
+    rec = roadmap.get(events.read_all(), "oversee-roadmap")
+    assert roadmap.work_link(rec) == {"branch": "claude/perf", "pr": 103,
+                                      "commits": [SHA]}
+    assert roadmap.has_work_link(rec) is True
+    assert rec["status"] == "active"                      # status untouched
+    assert [s["status"] for s in rec["steps"]] == \
+        ["active", "pending", "pending"]                  # steps untouched
+    assert "PR #103" in roadmap.describe_work_link(rec)
+    assert "claude/perf" in roadmap.describe_work_link(rec)
+
+
+def test_the_three_link_fields_accumulate_one_at_a_time():
+    """They become knowable at different moments — branch when work starts, PR
+    once one is opened — so a later `link` must merge rather than replace."""
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_branch="claude/perf", ts="2026-07-17T10:01:00Z")
+    _ev("link", work_pr=103, ts="2026-07-17T10:02:00Z")
+    rec = roadmap.get(events.read_all(), "oversee-roadmap")
+    assert roadmap.work_link(rec)["branch"] == "claude/perf"
+    assert roadmap.work_link(rec)["pr"] == 103
+
+
+def test_a_replan_keeps_the_work_link():
+    """`set` replaces the STEPS wholesale and says nothing about where the code
+    went. `sync_from_todos` re-`set`s on every material TodoWrite change and
+    never supplies a link, so without carry-forward one more todo edit would
+    silently drop the PR number — the erasure the `new` flag already had to be
+    protected from."""
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_pr=103, ts="2026-07-17T10:01:00Z")
+    _set(steps=["a whole new plan"], ts="2026-07-17T11:00:00Z")
+    rec = roadmap.get(events.read_all(), "oversee-roadmap")
+    assert roadmap.work_link(rec)["pr"] == 103
+    assert [s["text"] for s in rec["steps"]] == ["a whole new plan"]
+
+
+def test_a_replan_may_repoint_the_link():
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_pr=103, ts="2026-07-17T10:01:00Z")
+    _set(steps=["moved"], work_pr=104, ts="2026-07-17T11:00:00Z")
+    assert roadmap.get(events.read_all(), "oversee-roadmap")["work_pr"] == 104
+
+
+def test_the_link_survives_interrupt_and_resume():
+    """`resume` drops the relay because a consumed baton would mislead a later
+    reader. The work link is the opposite: it is durable provenance, and the
+    plan still points at the same code after it is picked back up."""
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_pr=103, ts="2026-07-17T10:01:00Z")
+    _ev("interrupt", cause="usage_limit", relay_context="ctx",
+        ts="2026-07-17T11:00:00Z")
+    _ev("resume", ts="2026-07-17T12:00:00Z")
+    rec = roadmap.get(events.read_all(), "oversee-roadmap")
+    assert roadmap.work_link(rec)["pr"] == 103
+    assert "relay_context" not in rec
+
+
+def test_the_ledger_body_carries_the_link_so_recall_finds_it_by_pr():
+    body = roadmap.ledger_body({"action": "link", "plan_id": "x-1",
+                                "work_pr": 103, "work_branch": "claude/perf"})
+    assert "PR #103" in body and "claude/perf" in body
+
+
+# --- archive: the honest exit for a step nothing can check ----------------------
+
+def test_archive_retires_the_plan_and_keeps_the_reason():
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("archive", reason="PR #103 merged; the manual step is settled",
+        ts="2026-07-17T11:00:00Z")
+    evs = events.read_all()
+    rec = roadmap.get(evs, "oversee-roadmap")
+    assert rec["status"] == roadmap.ARCHIVED
+    assert rec["archive_reason"] == "PR #103 merged; the manual step is settled"
+    assert rec["archived_at"] == "2026-07-17T11:00:00Z"
+    # Retired, but NOT claimed as finished: the progress it really reached
+    # stays on the record, and it leaves the live views like a completed plan.
+    assert rec["progress"] == {"done": 0, "total": 3}
+    assert roadmap.plans(evs) == []
+    assert roadmap.plans(evs, include_completed=True) != []
+    assert roadmap.notice(evs) == ""                     # no longer a marker
+
+
+def test_archive_is_reversible_by_replanning():
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("archive", reason="superseded", ts="2026-07-17T11:00:00Z")
+    _set(steps=["back on"], ts="2026-07-17T12:00:00Z")
+    assert roadmap.get(events.read_all(),
+                       "oversee-roadmap")["status"] == "active"
+
+
+def test_record_guards_the_archive_transitions():
+    roadmap.record("set", "auth-refactor", prompt=PROMPT, steps=list(STEPS))
+    with pytest.raises(ValueError, match="requires a reason"):
+        roadmap.record("archive", "auth-refactor")
+    roadmap.record("archive", "auth-refactor", reason="the human said so")
+    with pytest.raises(ValueError, match="already archived"):
+        roadmap.record("archive", "auth-refactor", reason="again")
+    with pytest.raises(ValueError, match="revive"):
+        roadmap.record("step", "auth-refactor", index=0, status="done")
+    # `link` is the one action a retired plan still accepts: a PR number is
+    # routinely learned after the plan has left every view.
+    roadmap.record("link", "auth-refactor", work_pr=103)
+    assert roadmap.get(events.read_all(), "auth-refactor")["work_pr"] == 103
+
+
+def test_archiving_a_finished_plan_is_refused():
+    roadmap.record("set", "auth-refactor", prompt=PROMPT, steps=list(STEPS))
+    roadmap.record("complete", "auth-refactor")
+    with pytest.raises(ValueError, match="already completed"):
+        roadmap.record("archive", "auth-refactor", reason="tidy up")
+
+
+# --- retirement on evidence ----------------------------------------------------
+
+def _probe(state, reason="", evidence="e", detail="d"):
+    """A stand-in for `repo.merge_state`: the retirement logic is what is under
+    test here, and `tests/test_repo.py` owns the probe's own honesty."""
+    def probe(root=None, branch="", pr=0, commits=()):
+        return {"state": state, "reason": reason, "evidence": evidence,
+                "detail": detail}
+    return probe
+
+
+def test_retire_completes_a_plan_whose_pr_is_merged():
+    from mindhive import repo
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_pr=103, ts="2026-07-17T10:01:00Z")
+    outcomes = roadmap.retire_landed(
+        probe=_probe(repo.MERGED, evidence="PR #103 is merged"))
+    assert [(o["plan_id"], o["action"]) for o in outcomes] == \
+        [("oversee-roadmap", "complete")]
+    rec = roadmap.get(events.read_all(), "oversee-roadmap")
+    assert rec["status"] == "completed"
+
+
+def test_retire_archives_a_plan_whose_pr_was_closed_unmerged():
+    from mindhive import repo
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("link", work_pr=103, ts="2026-07-17T10:01:00Z")
+    outcomes = roadmap.retire_landed(
+        probe=_probe(repo.CLOSED, evidence="PR #103 was closed"))
+    assert outcomes[0]["action"] == "archive"
+    rec = roadmap.get(events.read_all(), "oversee-roadmap")
+    assert rec["status"] == roadmap.ARCHIVED
+    assert "closed" in rec["archive_reason"]
+
+
+@pytest.mark.parametrize("state,reason", [
+    ("open", ""), ("unknown", "no_gh_cli"), ("unknown", "no_work_link")])
+def test_retire_leaves_everything_it_cannot_prove(state, reason):
+    """The invariant that makes the sweep safe to run on a whole store: only
+    proof retires a card. Everything else is REPORTED, not acted on."""
+    _set(ts="2026-07-17T10:00:00Z")
+    outcomes = roadmap.retire_landed(probe=_probe(state, reason))
+    assert outcomes[0]["action"] == ""
+    assert outcomes[0]["reason"] == reason
+    assert roadmap.get(events.read_all(),
+                       "oversee-roadmap")["status"] == "active"
+
+
+def test_retire_reports_every_plan_it_examined():
+    """A sweep that retired nothing because every PR is open must be
+    distinguishable from one that retired nothing because `gh` is missing — and
+    the only way to tell them apart is to report what was looked at."""
+    from mindhive import repo
+    _set(plan_id="a-plan", ts="2026-07-17T10:00:00Z")
+    _set(plan_id="b-plan", ts="2026-07-17T10:01:00Z")
+    outcomes = roadmap.retire_landed(
+        probe=_probe(repo.UNKNOWN, reason="no_gh_cli", evidence=""))
+    assert [o["plan_id"] for o in outcomes] == ["a-plan", "b-plan"]
+    assert all(o["reason"] == "no_gh_cli" for o in outcomes)
+
+
+def test_retire_skips_plans_that_already_retired():
+    from mindhive import repo
+    _set(ts="2026-07-17T10:00:00Z")
+    _ev("complete", ts="2026-07-17T11:00:00Z")
+    assert roadmap.retire_landed(probe=_probe(repo.MERGED)) == []
+
+
+# --- the CLI surfaces ----------------------------------------------------------
+
+def test_cli_link_and_show_render_the_work_link(capsys):
+    cli_mod.main(["roadmap", "set", "auth-refactor", "--prompt", PROMPT,
+                  "--step", STEPS[0], "--branch", "claude/perf"])
+    assert cli_mod.main(["roadmap", "link", "auth-refactor", "--pr", "103",
+                         "--commit", SHA]) == 0
+    assert cli_mod.main(["roadmap", "show", "auth-refactor"]) == 0
+    out = capsys.readouterr().out
+    assert "work: PR #103 · branch claude/perf · 0123456789ab" in out
+
+
+def test_cli_show_names_the_command_that_adds_a_missing_link(capsys):
+    cli_mod.main(["roadmap", "set", "auth-refactor", "--prompt", PROMPT,
+                  "--step", STEPS[0]])
+    cli_mod.main(["roadmap", "show", "auth-refactor"])
+    assert "hive roadmap link auth-refactor" in capsys.readouterr().out
+
+
+def test_cli_archive_requires_a_reason_and_marks_the_card(capsys):
+    cli_mod.main(["roadmap", "set", "auth-refactor", "--prompt", PROMPT,
+                  "--step", STEPS[0]])
+    with pytest.raises(SystemExit):                       # argparse: required
+        cli_mod.main(["roadmap", "archive", "auth-refactor"])
+    assert cli_mod.main(["roadmap", "archive", "auth-refactor",
+                         "--reason", "PR #103 merged"]) == 0
+    cli_mod.main(["roadmap", "list"])
+    assert "no roadmaps" in capsys.readouterr().out       # left the live view
+    cli_mod.main(["roadmap", "list", "--all"])
+    assert "(archived)" in capsys.readouterr().out
+
+
+def test_cli_merge_state_prints_the_reason_it_could_not_tell(capsys, monkeypatch):
+    from mindhive import repo
+    cli_mod.main(["roadmap", "set", "auth-refactor", "--prompt", PROMPT,
+                  "--step", STEPS[0]])
+    monkeypatch.setattr(repo, "merge_state", _probe(
+        repo.UNKNOWN, reason="no_gh_cli", evidence="", detail="gh is not on PATH"))
+    assert cli_mod.main(["roadmap", "merge-state", "auth-refactor"]) == 0
+    out = capsys.readouterr().out
+    assert "unknown" in out
+    assert "reason: no_gh_cli" in out
+    assert "detail: gh is not on PATH" in out
+
+
+def test_cli_merge_state_on_a_missing_plan_exits_2(capsys):
+    assert cli_mod.main(["roadmap", "merge-state", "nope"]) == 2
+    assert "no roadmap 'nope'" in capsys.readouterr().err
+
+
+def test_cli_retire_says_so_when_it_retires_nothing(capsys, monkeypatch):
+    """The zero-honest case: "nothing was provably landed" must not read like
+    "the sweep worked and your cards are gone"."""
+    from mindhive import repo
+    cli_mod.main(["roadmap", "set", "auth-refactor", "--prompt", PROMPT,
+                  "--step", STEPS[0]])
+    monkeypatch.setattr(repo, "merge_state",
+                        _probe(repo.OPEN, evidence="PR #103 is still open"))
+    assert cli_mod.main(["roadmap", "retire"]) == 0
+    out = capsys.readouterr().out
+    assert "0 of 1 roadmap(s) retired on evidence" in out
+    assert "nothing retired" in out
+    assert "not landed yet" in out
+
+
+def test_cli_retire_completes_on_proof(capsys, monkeypatch):
+    from mindhive import repo
+    cli_mod.main(["roadmap", "set", "auth-refactor", "--prompt", PROMPT,
+                  "--step", STEPS[0]])
+    monkeypatch.setattr(repo, "merge_state",
+                        _probe(repo.MERGED, evidence="PR #103 is merged"))
+    assert cli_mod.main(["roadmap", "retire"]) == 0
+    out = capsys.readouterr().out
+    assert "1 of 1 roadmap(s) retired on evidence" in out
+    assert roadmap.get(events.read_all(),
+                       "auth-refactor")["status"] == "completed"
+
+
+def test_cli_retire_on_an_empty_store_says_there_was_nothing_to_examine(capsys):
+    assert cli_mod.main(["roadmap", "retire"]) == 0
+    assert "no live roadmaps to examine" in capsys.readouterr().out
+
+
+# --- the outcomes-registry probe -----------------------------------------------
+# `roadmap._probe` is the module's registry probe; the bare `_probe` in this file
+# is the fake merge_state factory above. Always qualified here for that reason.
+
+def test_probe_on_an_empty_store_reports_nothing_waiting():
+    """The honest zero. No plans is a success, and must not read like a store the
+    probe failed to open."""
+    report = roadmap._probe()
+    assert report.outcome == outcomes.NOTHING_TO_DO
+    assert report.worked
+    assert "no live roadmap plan" in report.summary
+
+
+def test_probe_is_degraded_when_no_live_plan_carries_a_work_link():
+    """The state that makes retirement unreachable: `merge_state` on a plan with
+    no branch, PR or commit can only ever answer unknown/no_work_link, so the
+    sweep will never retire this card however often it runs."""
+    _set()
+    report = roadmap._probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert not report.worked
+    assert "no_work_link" in report.summary
+
+
+def test_probe_names_the_unlinked_share_when_only_some_are_linked():
+    """A partially linked store is still degraded, and the count is the actionable
+    part — "some plans are fine" does not tell anyone which to fix."""
+    _set(plan_id="linked-plan")
+    _ev("link", plan_id="linked-plan", work_pr=103)
+    _set(plan_id="unlinked-plan")
+    report = roadmap._probe()
+    assert report.outcome == outcomes.DEGRADED
+    assert "1 of 2" in report.summary
+
+
+def test_probe_reports_did_work_when_every_live_plan_is_checkable():
+    _set(plan_id="linked-plan")
+    _ev("link", plan_id="linked-plan", work_branch="claude/perf")
+    report = roadmap._probe()
+    assert report.outcome == outcomes.DID_WORK
+    assert "1 live plan(s)" in report.summary
+
+
+def test_probe_ignores_plans_that_already_left():
+    """A retired plan with no work link is not a broken loop — it is a closed one.
+    Counting it would make every finished plan degrade the report forever."""
+    _set(plan_id="done-plan")
+    _ev("complete", plan_id="done-plan")
+    _set(plan_id="gone-plan")
+    _ev("archive", plan_id="gone-plan", reason="superseded by the new plan")
+    report = roadmap._probe()
+    assert report.outcome == outcomes.NOTHING_TO_DO
+
+
+def test_probe_is_registered_under_its_surface_name():
+    surface = outcomes.get("roadmap-retirement")
+    assert surface is not None
+    assert surface.probe is roadmap._probe

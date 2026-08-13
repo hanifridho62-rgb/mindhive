@@ -5,6 +5,23 @@
 Deterministic, event-sourced memory for long-running Claude sessions.
 Append events; deterministic projections rebuild everything. Nothing is hand-edited.
 
+## Quick start
+
+    pip install -e .
+    hive state                       # what the record says right now
+    hive append decision "chose X over Y because Z"
+    hive sync                        # refresh the MEMORY.md a session auto-loads
+    hive context --check             # is the auto-loaded surface still honest?
+
+Four commands are worth knowing before the rest: `hive state` (the live
+projection), `hive append` (the only way anything gets in), `hive sync` (rebuild
+what the next session reads), and `hive context --check` (what that costs, and
+whether all of it actually arrives). Everything else in this file is a
+specialisation of those four.
+
+On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
+**PowerShell 5.1 note** below.
+
 ## Commands
 - `hive append <type> <payload> [--json] [--stdin] [--tags a,b]` — add an event
 - `hive project` — rebuild STATE.md + LEDGER/ + index.json + chain.json
@@ -36,7 +53,11 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - `hive roadmap step <id> <index> --status done|active|pending|skipped [--note "…"]` — update one step; marking the active step done auto-advances the pointer to the next pending step
 - `hive roadmap interrupt <id> --cause usage_limit` — the **out-of-usage marker**: flags the plan interrupted so STATE.md (and the auto-loaded MEMORY.md) carries the creation context — the ask, steps done, and the next step — until it is resumed. `hive loop` records this automatically when a run ends on `api_cap` (Claude usage limit) or `budget_cap`
 - `hive roadmap resume <id>` / `hive roadmap complete <id>` — pick an interrupted plan back up / mark it finished (append-only, like everything else)
-- `hive roadmap list [--all]` / `hive roadmap show <id>` — list plans (completed hidden unless `--all`) / print one plan with step statuses and history
+- `hive roadmap link <id> [--pr N] [--branch <name>] [--commit <sha>]` — the **durable work link**: point a plan at the code it produced, without changing its status. `set`, `complete` and `archive` accept the same three flags; all three are optional and independent (the branch is known when work starts, the PR only once one is opened), and they merge into the record, so a re-plan never drops the PR number
+- `hive roadmap merge-state <id>` — ask git and `gh` whether that work landed. Read-only, and **honest about not knowing**: `merged` only on proof (a merged PR, or a commit git confirms is an ancestor of the integration ref), otherwise `open`, `closed`, or `unknown` with the reason — `no_work_link`, `no_github_remote`, `no_gh_cli`, or `probe_failed`. It never reports `merged` because a probe failed to run
+- `hive roadmap archive <id> --reason "<what settled it>"` — retire a plan whose last step nothing can verify ("merge the PR", "watch it for a week"). The honest third exit between *finished* and *still open*: the plan leaves the live views, the reason is recorded append-only, and the progress it actually reached stays on the record, so `archived` never reads as "done"
+- `hive roadmap retire` — retire every live plan whose work link **proves** the work is finished: merged → `complete`, closed unmerged → `archive`. Reports every plan it examined, untouched ones included with their reasons, so "nothing was provably landed" cannot be mistaken for a successful sweep
+- `hive roadmap list [--all]` / `hive roadmap show <id>` — list plans (retired ones — completed and archived — hidden unless `--all`) / print one plan with step statuses, its work link, and history
 - **Session auto-sync** — interactive sessions declare and update their roadmap automatically: the PostToolUse hook mirrors each TodoWrite into a `roadmap set` for the session's id (statuses mapped completed→done, in_progress→active), and `hive roadmap autoclose --session <id>` (run by the SessionEnd hook) completes a finished plan or interrupts an unfinished one so its context rides STATE.md into the next session. Auto-synced plans carry the `auto` tag; human-declared plans are never touched
 - `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
@@ -51,6 +72,59 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - **`/circle`** — the loop **primitive** (not the pipeline): type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous `hive loop` and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. The `/mindhive-orchestrator` pipeline may drive this loop as one of its execution engines. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
 - **`hive clusters build` / `hive clusters plan --lanes N`** — the parallel-orchestration layer the pipeline stands on at execution: clusters the repo by module, classifies each file's complexity, and packs whole clusters into `N` **file-ownership-safe lanes** (no file in two lanes) so parallel sub-agents never collide. Deterministic and dependency-free; the cluster DB is an overwrite-in-place `cluster_db.json` sidecar.
 - **`/engineering-loop`** — a **subordinate execution engine** (not a competing pipeline): fuses `/circle`'s bounded headless loop with the compound-engineering `lfg` pipeline into a memory-driven **plan → work → review → fix → verify → learn** loop. MindHive memory sits between every stage (recall before, append after), it drives the chosen skills through the invoke channel with green/red status, and any skill failure feeds the improvement loop as a `skill:<name>` prevention rule. The `/mindhive-orchestrator` pipeline may drive it at its execution stage. Shipped in the same plugin (`skills/engineering-loop/`).
+
+### The always-on surface: what auto-loads, and whether it arrives
+
+Four of these exist because the auto-loaded surface can degrade **silently** —
+the block still arrives, so nothing looks broken, and part of what it promised is
+missing. `tests/test_docs_parity.py` enumerates the shipped commands off the live
+parser and fails when one of them is absent from this file, so this list cannot
+quietly fall behind the CLI again.
+
+- `hive sync [--folder P] [--no-briefing]` — write the native `MEMORY.md` digest the desktop app auto-loads. It now **warns when the file it just wrote is past the loader's line budget**, naming the sections the loader will not reach — the digest's caps bound item counts, and no item count bounds lines, so the tail (lessons, decisions) is what silently stops arriving
+- `hive context [--check] [--top N] [--origin hive|claude] [--json]` — measure everything that auto-loads into every session, ranked by estimated token cost, with trim suggestions. `--check` is the gate: exit 1 when over the token budget **or** when `MEMORY.md` is past its line budget (that one is loss, not cost, and is reported even with no token budget configured)
+- `hive context --set-budget N [--set-memory-lines N]` — persist this namespace's token budget and, optionally, its MEMORY.md line budget (default: the native loader's own limit). One sidecar holds both; setting one never discards the other
+- `hive sop add|update|delete|list|show <id>` — the event-sourced SOP registry. A **mandatory** SOP is re-asserted on every human prompt, verbatim
+- `hive sop injection [--json]` — what that per-prompt injection **actually delivers right now**: every mandatory body verbatim, or degraded to `hive sop show <id>` pointers because it outgrew the per-prompt budget. Read-only, and not a gate
+- `hive sop preflight [--json]` — pre-execution report: is this session new or a continuation (with the ledger evidence), which SOPs are mandatory, what the improvements record already warns about
+- `hive briefing` — build and print `BRIEFING.md` (the full context; `MEMORY.md` is the compact digest of it)
+- `hive directives` — print the session operating directives
+- `hive repo stale [--max-age-hours H] [--json]` — how far this checkout has drifted from its integration ref. **Never fetches**: it compares against the ref as this checkout last saw it and reports the age of that snapshot alongside the count, because "0 behind" and "0 behind, last fetched in July" are different facts. `unknown` carries its reason (`no_checkout`, `no_integration_ref`, `probe_failed`)
+- `hive premise check [--file F]` — check a prompt or handoff document's factual claims against the record: asserted file paths, roadmap ids, and test counts that contradict what is on disk, plus the claims it could not check
+
+### Namespaces, hygiene & automation
+
+- `hive projects` — list namespaces (registered vs unregistered)
+- `hive gc [--prune <name>|--prune --orphans|--prune --graph-blobs] [--force]` — store hygiene: report per-namespace sizes, prune junk. Opt-in and guarded — it refuses a bulk prune when the registry is unreadable, rather than treating every namespace as an orphan
+- `hive autosync [--max-age-hours H]` — automated `sync` for registered projects (run from hooks; a near-instant no-op when nothing is stale)
+- `hive autoresume` — after a usage cooldown, deliver an interrupted plan's marker (the ask, the progress, the next step) into the new session
+- `hive replenish [explain]` — propose the work the record proves is outstanding (run by `session_end`); `explain` shows the per-lens scoring behind each proposal
+- `hive failures list` — recorded tool failures and incidents, the raw material `hive rules` mints prevention rules from
+- `hive triggers` — prompt-quality trigger rules (the UserPromptSubmit gate)
+- `hive enrich` — prompt enrichment for Oversee: the default-on toggle and a deterministic preview of the enriched prompt
+- `hive packs check [--manifest P]` — stack content-pack quality gates (read-only)
+- `hive mindnet` — the MindNetwork task graph and phase spine: declare tasks, walk the six-phase pipeline, record the evidence each phase requires
+- `hive session run` — supervise an interactive Claude Code session and rotate it when context fills; see **Smart-zone session rotation** below
+- `hive session install-hook <settings.json> [--command C] [--dry-run]` — register the Stop hook that measures occupancy. Idempotent, refuses an unparseable settings file rather than repairing it, and backs up before writing
+
+### Smart-zone session rotation (interactive sessions)
+
+`hive session run` wraps an interactive session: when the Stop hook measures
+context past the smart-zone boundary it writes a `ROTATION_PENDING` artifact, and
+the supervisor starts a successor seeded from the ledger once the child exits. A
+Stop hook cannot end a session, which is why the signal is a file.
+
+Two properties are deliberate, not incidental. The hook is **inert until
+switched on** (`MINDHIVE_ROTATION`, which only `hive session run` sets, for its
+own children), so registering it changes nothing on its own. And its advice tells
+the truth about what happens next: it promises a queued successor only when a
+supervisor is actually waiting, and otherwise says plainly that nothing is queued
+and names the command that would queue one.
+
+**Rotation is Windows-only today** — every hook shim in `hooks/` is PowerShell
+(nine `.ps1`, no POSIX equivalent), so `hive session install-hook` on macOS or
+Linux registers a valid entry for a command that cannot run. It reports that as a
+`platform_warning` rather than leaving you to discover it as an absence.
 
 ## Install the `/circle` plugin (global)
 This repo is a self-contained Claude Code plugin marketplace. To get `/circle` in **every** project:
@@ -194,6 +268,43 @@ double-counting) and only touches projects you already track (no surprise
 namespaces). Disable with `MINDHIVE_AUTOHARVEST=0`; tune cadence with
 `MINDHIVE_AUTOHARVEST_SECS` (default 180). Trigger it by hand with the **Catch
 up** button, the `POST /api/harvest` endpoint, or `hive harvest --catch-up`.
+
+**The six long operations are jobs, not requests.** Catch up, Embed, Plugins
+scan, Reflect, Resolve red and Self-test answer **`202 Accepted`** with
+`{"ok": true, "job": {"id": …, "state": "running"}}` and do the work on their own
+thread; poll `GET /api/job?id=<id>&offset=<bytes>` for state and for output since
+`offset`. They used to hold one fetch open for the whole run, so anything longer
+than the browser's timeout was reported as a failure while it was still going and
+still about to succeed. A second click while one runs is still refused the same
+way as before — `{"ok": false, "error": "… already running"}` with a 200.
+
+A finished job names **what it did**, not just that it ran: `did_work`,
+`nothing_to_do`, `degraded`, or `failed`. "Nothing to do" is a success — a
+harvest that found no missed sessions is working correctly, and it used to be
+indistinguishable from one that ingested forty. Each run leaves `job_started` and
+`job_finished` rows in the ledger; a job whose process died is closed out as
+`job_abandoned` by the next dashboard start-up, so an orphan no longer reads as
+still-running forever.
+
+That vocabulary is not the dashboard's alone. **Five surfaces in MIND HIVE report
+progress to a human, and all five now answer in the same words** — the rule being
+that every path which can produce zero work, a degraded result, or an abandoned
+job has to say *which* of the three it is, and *why*:
+
+| Surface | The loop it closes |
+|---|---|
+| `dashboard-jobs` | a long click reports what it did, not just that it started |
+| `roadmap-retirement` | a plan card retires because something checkable said so, or names which of four things stopped it |
+| `rotation-advice` | the end-of-turn advisory claims a queued successor only when one is really queued |
+| `sop-injection` | a prompt is told when a mandatory procedure arrived as a pointer instead of its body |
+| `memory-budget` | the always-on digest reports the sections that fall past the loader's cut instead of losing them quietly |
+
+Each surface registers itself in `outcomes.py` and carries its own read-only
+probe, which the suite runs on every pass. The point of the registry is what it
+makes impossible to do quietly: a surface can no longer report "fine" for a run
+that did nothing, and `nothing_to_do` — rotation switched off, no live plan, no
+mandatory SOP, no digest written yet — is a **success with a reason attached**,
+not an absence of news.
 
 **The URL is stable across launches.** It binds a fixed port (**54461**) and a
 token persisted to `~/.mindhive/dashboard.token`, so every launch (CLI or

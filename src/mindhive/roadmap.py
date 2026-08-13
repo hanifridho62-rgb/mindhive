@@ -23,11 +23,22 @@ Two projections consume it:
 Like the change-log and SOPs, roadmap events are registry/audit content:
 consolidation never absorbs them and display-time dedupe never collapses them.
 """
-from . import events as ev_mod
+from . import events as ev_mod, outcomes
 from .sop import ID_RE
 
-ACTIONS = ("set", "step", "interrupt", "resume", "complete")
+ACTIONS = ("set", "step", "interrupt", "resume", "complete", "archive", "link")
 STATUSES = ("pending", "active", "done", "skipped")
+
+# `archive` is the honest exit for a plan whose last step no one can check.
+# Before it, a plan had exactly two ways out: every step done (`complete`), or
+# nothing — so a plan ending in "merge the PR" or "watch it run for a week" sat
+# in Oversee forever, because the fold had no way to say "we stopped tracking
+# this, and here is why". Marking such a step done instead would have been a
+# lie, and the ledger is the audit trail. So `archive` retires the plan and
+# REQUIRES a reason, following the `loop_run_dismissed` tombstone precedent:
+# the retirement is an append-only event carrying its own justification, never
+# an edit to the history that pinned it open.
+ARCHIVED = "archived"
 
 # Size caps bound every event (and therefore the STATE.md notice): the marker
 # must preserve context, not become a context-budget regression (invariant 4).
@@ -37,6 +48,19 @@ MAX_STEPS = 50
 MAX_STEP_CHARS = 300
 MAX_NOTE_CHARS = 500
 MAX_CAUSE_CHARS = 120
+MAX_REASON_CHARS = 300
+
+# The work link: how a plan points at the code it produced.
+#
+# `roadmap.fold` carried no branch, PR, or commit field, so nothing checkable
+# connected a plan to its work — which is the whole reason a finished card could
+# not retire itself. These three caps bound the link the same way every
+# neighbouring field is bounded, and they are REJECTED rather than truncated: a
+# silently shortened commit sha would probe as an unknown object and report
+# `probe_failed` forever, a failure whose cause would be invisible.
+MAX_WORK_BRANCH_CHARS = 250
+MAX_WORK_COMMITS = 20
+MAX_WORK_COMMIT_CHARS = 40      # a full sha; abbreviations are shorter
 
 # Notice rendering caps: done steps collapse to a tail, pending to a head, so
 # one interrupted plan costs a bounded slice of the auto-loaded MEMORY.md.
@@ -56,6 +80,114 @@ def new_prefix(step) -> str:
     """``NEW_MARKER`` when *step* was added by the replenishment injector, else
     "". Every text renderer of a roadmap step goes through this."""
     return NEW_MARKER if (step or {}).get("new") else ""
+
+
+# --- the work link ------------------------------------------------------------
+# Three flat keys rather than one nested object, matching the relay fields below:
+# a flat payload folds forward through every historical event unchanged, and each
+# key is independently optional because the three become knowable at different
+# moments — the branch when work starts, the commits as it lands, the PR number
+# only once one is opened.
+WORK_KEYS = ("work_branch", "work_pr", "work_commits")
+
+
+def work_link(rec) -> dict:
+    """The recorded pointer to the code this plan produced, shaped as the
+    keyword arguments ``repo.merge_state`` takes. One reader for the three keys,
+    so no caller has to know which of them a given plan happens to carry."""
+    rec = rec or {}
+    return {"branch": rec.get("work_branch") or "",
+            "pr": rec.get("work_pr") or 0,
+            "commits": list(rec.get("work_commits") or ())}
+
+
+def has_work_link(rec) -> bool:
+    """True when *rec* points at anything checkable."""
+    link = work_link(rec)
+    return bool(link["branch"] or link["pr"] or link["commits"])
+
+
+def describe_work_link(rec) -> str:
+    """One-line human rendering of the link, or "" when there is none. Every
+    surface that shows a work link goes through this — the CLI, the LEDGER body
+    that keyword recall searches, and the retirement note — so a plan is
+    findable by its branch or PR number from any of them (the ``new_prefix``
+    precedent: one renderer, not three literals that drift)."""
+    link = work_link(rec)
+    parts = []
+    if link["pr"]:
+        parts.append(f"PR #{link['pr']}")
+    if link["branch"]:
+        parts.append(f"branch {link['branch']}")
+    if link["commits"]:
+        parts.append(", ".join(c[:12] for c in link["commits"]))
+    return " · ".join(parts)
+
+
+def _validate_work_link(payload) -> None:
+    """Check the optional work-link fields, which ANY action may carry.
+
+    Rejected rather than coerced, on the same reasoning as the relay below: a
+    work link exists to be probed against git, and a malformed one probes as
+    ``probe_failed`` — a permanent unknown whose cause is invisible from the
+    card it silences. Better to refuse the write while the caller still holds
+    the value."""
+    branch = payload.get("work_branch")
+    if branch is not None:
+        if not isinstance(branch, str) or not branch.strip():
+            raise ValueError("roadmap work_branch must be non-empty text")
+        if len(branch) > MAX_WORK_BRANCH_CHARS:
+            raise ValueError(
+                f"roadmap work_branch exceeds {MAX_WORK_BRANCH_CHARS} chars")
+
+    pr = payload.get("work_pr")
+    if pr is not None:
+        # bool is an int in Python, and a `work_pr` of True folding to PR #1
+        # would probe a real, unrelated pull request.
+        if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+            raise ValueError("roadmap work_pr must be a positive integer "
+                             "pull-request number")
+
+    commits = payload.get("work_commits")
+    if commits is not None:
+        if not isinstance(commits, list):
+            raise ValueError("roadmap work_commits must be a list of commit "
+                             "shas")
+        if len(commits) > MAX_WORK_COMMITS:
+            raise ValueError(
+                f"roadmap work_commits exceeds {MAX_WORK_COMMITS} entries — "
+                "record the merge commit, not every commit")
+        for sha in commits:
+            if not isinstance(sha, str) or not sha.strip():
+                raise ValueError("roadmap work_commits entries must be "
+                                 "non-empty commit shas")
+            if len(sha.strip()) > MAX_WORK_COMMIT_CHARS:
+                raise ValueError(
+                    f"roadmap work_commits entry exceeds "
+                    f"{MAX_WORK_COMMIT_CHARS} chars — that is not a commit sha")
+
+
+def _fold_work_link(rec, payload) -> None:
+    """Merge whatever work-link fields *payload* carries into *rec*, in place.
+
+    An absent key leaves the recorded link alone, so the three can be attached
+    one at a time as they become knowable, and a ``set`` that says nothing about
+    the link keeps it. That carry-forward is deliberate rather than lazy:
+    ``sync_from_todos`` appends a fresh ``set`` on every material TodoWrite
+    change and never supplies a link, so without it one more todo edit would
+    silently drop the PR number off an auto-synced plan — the same erasure the
+    ``new`` flag already had to be protected from."""
+    branch = str(payload.get("work_branch") or "").strip()
+    if branch:
+        rec["work_branch"] = branch
+    pr = payload.get("work_pr")
+    if isinstance(pr, int) and not isinstance(pr, bool) and pr > 0:
+        rec["work_pr"] = pr
+    commits = payload.get("work_commits")
+    if isinstance(commits, list):
+        clean = [str(c).strip() for c in commits if str(c).strip()]
+        if clean:
+            rec["work_commits"] = clean[:MAX_WORK_COMMITS]
 
 
 def _norm_steps(raw):
@@ -108,6 +240,7 @@ def validate_payload(payload) -> None:
     note = payload.get("note")
     if note is not None and len(str(note)) > MAX_NOTE_CHARS:
         raise ValueError(f"roadmap note exceeds {MAX_NOTE_CHARS} chars")
+    _validate_work_link(payload)
     if action == "set":
         prompt = str(payload.get("prompt") or "").strip()
         if not prompt:
@@ -166,6 +299,24 @@ def validate_payload(payload) -> None:
             raise ValueError(
                 f"roadmap cause exceeds {MAX_CAUSE_CHARS} chars")
         _validate_relay(payload)
+    elif action == "archive":
+        # The reason is REQUIRED, and that is the whole point of the action. An
+        # archive without one would retire the card and destroy the only thing
+        # that made retiring it honest — why a human decided the unverifiable
+        # step was settled.
+        reason = str(payload.get("reason") or "").strip()
+        if not reason:
+            raise ValueError(
+                "roadmap archive requires a reason — what settled the step "
+                "nothing can verify, e.g. 'PR #103 merged' or 'superseded by "
+                "the async-jobs plan'")
+        if len(reason) > MAX_REASON_CHARS:
+            raise ValueError(f"roadmap reason exceeds {MAX_REASON_CHARS} chars")
+    elif action == "link":
+        if not any(payload.get(k) is not None for k in WORK_KEYS):
+            raise ValueError(
+                "roadmap link requires at least one of work_branch, work_pr, "
+                "work_commits — it exists to point the plan at its code")
     # resume / complete: plan_id is enough.
 
 
@@ -241,7 +392,12 @@ def fold(evs) -> dict:
     it never raises on historical data: a step on an unknown plan or an
     out-of-range index is skipped, unknown actions are skipped, and lifecycle
     actions on unknown plans are no-ops. ``set`` upserts (a re-plan replaces
-    the steps wholesale); re-``set`` after complete revives the plan."""
+    the steps wholesale); re-``set`` after complete or archive revives the plan.
+
+    Every record predates the work link, and every record predates the relay
+    before that, so the fold reads both defensively: the ``work_*`` keys appear
+    on a record only when some event actually supplied them, and their absence
+    is the ordinary case rather than a degraded one."""
     plans: dict = {}
     for ev in evs:
         if ev.type != "roadmap" or not isinstance(ev.payload, dict):
@@ -261,7 +417,7 @@ def fold(evs) -> dict:
             prompt = str(p.get("prompt") or "").strip()
             if not prompt:
                 continue
-            plans[plan_id] = {
+            fresh = {
                 "plan_id": plan_id,
                 "prompt": prompt,
                 "title": str(p.get("title") or "").strip(),
@@ -276,6 +432,15 @@ def fold(evs) -> dict:
                 "tags": list(ev.tags or []),
                 "progress": _progress(steps),
             }
+            # The work link survives a re-plan. A `set` replaces the STEPS
+            # wholesale — it says nothing about where the code went, and the
+            # auto-sync writer that re-`set`s on every TodoWrite change never
+            # supplies one.
+            for key in WORK_KEYS:
+                if rec and key in rec:
+                    fresh[key] = rec[key]
+            _fold_work_link(fresh, p)
+            plans[plan_id] = fresh
             continue
         if rec is None:
             continue  # lifecycle action on an unknown plan: nothing to do
@@ -326,6 +491,19 @@ def fold(evs) -> dict:
                 rec.pop(key, None)
         elif action == "complete":
             rec["status"] = "completed"
+        elif action == "archive":
+            reason = str(p.get("reason") or "").strip()
+            if not reason:
+                continue        # an archive with no reason is not an archive
+            rec["status"] = ARCHIVED
+            rec["archive_reason"] = reason
+            rec["archived_at"] = ev.ts
+        elif action == "link":
+            # `link` records where the work went and touches nothing else, so a
+            # plan can be pointed at its branch or PR without disturbing its
+            # status, its steps, or the interruption marker it may be carrying.
+            pass
+        _fold_work_link(rec, p)
         rec["updated"] = ev.ts
         rec["version"] += 1
         rec["session_id"] = ev.session_id
@@ -335,11 +513,18 @@ def fold(evs) -> dict:
     return plans
 
 
+RETIRED_STATUSES = ("completed", ARCHIVED)
+
+
 def plans(evs, include_completed=False) -> list:
-    """Plan records in stable delivery order: (created, plan_id). Completed
-    plans are hidden by default — they earned their exit from every view."""
+    """Plan records in stable delivery order: (created, plan_id). Retired plans
+    — completed AND archived — are hidden by default; both earned their exit
+    from every view, one by finishing and one by saying why it stopped.
+
+    The flag keeps its original name because it is the argument every caller
+    already passes; what changed is that "completed" was never the only way out."""
     out = [r for r in fold(evs).values()
-           if include_completed or r["status"] != "completed"]
+           if include_completed or r["status"] not in RETIRED_STATUSES]
     return sorted(out, key=lambda r: (r["created"], r["plan_id"]))
 
 
@@ -351,6 +536,46 @@ def get(evs, plan_id):
 def interrupted(evs) -> list:
     """Interrupted plans in delivery order — the out-of-usage markers."""
     return [r for r in plans(evs) if r["status"] == "interrupted"]
+
+
+# --- retirement, on evidence ---------------------------------------------------
+
+def retire_landed(project=None, evs=None, probe=None, root=None,
+                  session_id=None) -> list:
+    """Retire every live plan whose work link PROVES the work is finished, and
+    report on the ones it could not.
+
+    This is the payoff of the work link: the card that would otherwise sit in
+    Oversee forever, waiting on a step no automation can tick, retires because
+    something checkable said so. A merged PR completes the plan; a PR closed
+    without merging archives it with that as the reason. Anything else is left
+    exactly where it was.
+
+    Returns one outcome per live plan — including the untouched ones, each
+    carrying the state and, when unknown, the reason. A sweep that retires
+    nothing must not look like a sweep that failed, and the only way to tell
+    them apart is to report what was examined."""
+    from . import repo as repo_mod          # lazy: the registry has no need of
+    probe = probe or repo_mod.merge_state   # git plumbing until a sweep runs
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    outcomes = []
+    for rec in plans(evs):
+        answer = probe(root=root, **work_link(rec))
+        outcome = {"plan_id": rec["plan_id"], "action": "",
+                   "state": answer["state"], "reason": answer["reason"],
+                   "detail": answer["detail"], "evidence": answer["evidence"]}
+        if answer["state"] == repo_mod.MERGED:
+            outcome["action"] = "complete"
+            record("complete", rec["plan_id"], note=answer["evidence"],
+                   session_id=session_id, project=project, evs=evs)
+        elif answer["state"] == repo_mod.CLOSED:
+            outcome["action"] = "archive"
+            record("archive", rec["plan_id"],
+                   reason=f"work abandoned — {answer['evidence']}",
+                   session_id=session_id, project=project, evs=evs)
+        outcomes.append(outcome)
+    return outcomes
 
 
 def next_step(rec):
@@ -530,7 +755,8 @@ def autoclose_session(session_id, project=None, evs=None, ts=None):
 
 
 def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
-           status=None, note=None, cause=None, tags=None, session_id=None,
+           status=None, note=None, cause=None, reason=None, work_branch=None,
+           work_pr=None, work_commits=None, tags=None, session_id=None,
            project=None, evs=None):
     """Append one roadmap event after registry-aware guards: lifecycle
     actions on a missing plan (or in the wrong state) are almost always typos
@@ -552,6 +778,15 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
         payload["note"] = note.strip()
     if cause is not None:
         payload["cause"] = cause.strip()
+    if reason is not None:
+        payload["reason"] = reason.strip()
+    if work_branch is not None:
+        payload["work_branch"] = work_branch.strip()
+    if work_pr is not None:
+        payload["work_pr"] = work_pr
+    if work_commits is not None:
+        payload["work_commits"] = [str(c).strip() for c in work_commits
+                                   if str(c).strip()]
     validate_payload(payload)
     if evs is None:
         evs = ev_mod.read_all(project)
@@ -564,10 +799,15 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
                 f"no roadmap '{plan_id}' — declare it first with: "
                 f"hive roadmap set {plan_id} --prompt … --step … "
                 f"(known ids: {known})")
-        if rec["status"] == "completed" and action != "complete":
+        # A retired plan (completed or archived) accepts only the two actions
+        # that name its own state — so each still reaches its precise "already …"
+        # error below — plus `link`, because a PR number is routinely learned
+        # after the plan has left every view.
+        if rec["status"] in RETIRED_STATUSES \
+                and action not in ("complete", "archive", "link"):
             raise ValueError(
-                f"roadmap '{plan_id}' is completed — revive it with a new: "
-                f"hive roadmap set {plan_id} …")
+                f"roadmap '{plan_id}' is {rec['status']} — revive it with a "
+                f"new: hive roadmap set {plan_id} …")
         if action == "step" and not (
                 isinstance(index, int) and 0 <= index < len(rec["steps"])):
             raise ValueError(
@@ -583,6 +823,14 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
                 f"roadmap '{plan_id}' is not interrupted — nothing to resume")
         if action == "complete" and rec["status"] == "completed":
             raise ValueError(f"roadmap '{plan_id}' is already completed")
+        if action == "archive" and rec["status"] == ARCHIVED:
+            raise ValueError(
+                f"roadmap '{plan_id}' is already archived "
+                f"(reason: {rec.get('archive_reason', '')})")
+        if action == "archive" and rec["status"] == "completed":
+            raise ValueError(
+                f"roadmap '{plan_id}' is already completed — it finished, so "
+                f"there is no unverifiable step left to archive")
     return ev_mod.append_event(
         "roadmap", payload, session_id=session_id,
         tags=["roadmap"] + [t for t in (tags or []) if t != "roadmap"],
@@ -686,7 +934,59 @@ def ledger_body(payload) -> str:
     cause = str(payload.get("cause") or "").strip()
     if cause:
         parts.append(f"cause: {cause}")
+    link = describe_work_link(payload)
+    if link:
+        parts.append(f"work: {link}")
+    reason = str(payload.get("reason") or "").strip()
+    if reason:
+        parts.append(f"reason: {reason}")
     note = str(payload.get("note") or "").strip()
     if note:
         parts.append(note)
     return "\n\n".join(parts)
+
+
+# --- the outcomes-registry probe ----------------------------------------------
+
+def _probe(project=None) -> outcomes.Report:
+    """Report on retirement's own feedback loop: can a live card still be shown
+    the door by something checkable?
+
+    The answer is decided before any git or `gh` call, by whether the plans
+    carry a work link at all. `merge_state` on a plan with no branch, PR or
+    commit can only ever return `unknown/no_work_link` — so an unlinked card is
+    one that no sweep will ever retire, however many times the sweep runs. That
+    is the state worth reporting, and it is readable from the store alone.
+
+    Reads the ledger, which `jobs._probe` deliberately does not, because here the
+    surface's state IS ledger state — there is nowhere else to look. It stays
+    read-only: no probing of the outside world, no events written.
+    """
+    live = plans(evs=ev_mod.read_all(project))
+    if not live:
+        return outcomes.Report(
+            outcomes.NOTHING_TO_DO,
+            "no live roadmap plan — nothing is waiting on a verdict")
+    linked = [rec for rec in live if has_work_link(rec)]
+    if not linked:
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"{len(live)} live plan(s), none carrying a work link — merge "
+            f"detection can only answer unknown/no_work_link, so no card here "
+            f"can retire on evidence")
+    if len(linked) < len(live):
+        return outcomes.Report(
+            outcomes.DEGRADED,
+            f"{len(linked)} of {len(live)} live plans carry a work link; the "
+            f"other {len(live) - len(linked)} can only ever answer "
+            f"unknown/no_work_link")
+    return outcomes.Report(
+        outcomes.DID_WORK,
+        f"{len(live)} live plan(s), every one carrying a work link a sweep can "
+        f"reach a verdict on")
+
+
+outcomes.register("roadmap-retirement",
+                  "a plan card retires because something checkable said so, or "
+                  "says which of four things stopped it",
+                  _probe)

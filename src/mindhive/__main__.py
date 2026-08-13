@@ -301,10 +301,24 @@ def cmd_context(args) -> int | None:
     project = getattr(args, "project", None)
     origin = getattr(args, "origin", "all")
 
-    if getattr(args, "set_budget", None) is not None:
-        data = context_mod.save_budget(args.set_budget, project=project)
-        print(f"context budget set to {data['budget']:,} est. tokens "
-              f"(stored in {context_mod.BUDGET_FILE})")
+    set_memory_lines = getattr(args, "set_memory_lines", None)
+    if getattr(args, "set_budget", None) is not None or set_memory_lines is not None:
+        # One sidecar, one write. `--set-memory-lines` alone must not drop the
+        # token budget already stored there, so the current value is read back
+        # and rewritten when only the line budget is being changed.
+        budget_value = getattr(args, "set_budget", None)
+        if budget_value is None:
+            budget_value = context_mod.load_budget(project)
+        if budget_value is None:
+            print("error: --set-memory-lines needs a token budget too — pass "
+                  "--set-budget N (the sidecar holds both)", file=sys.stderr)
+            return 2
+        data = context_mod.save_budget(budget_value, project=project,
+                                       memory_lines=set_memory_lines)
+        print(f"context budget set to {data['budget']:,} est. tokens"
+              + (f", MEMORY.md line budget {data['memory_lines']}"
+                 if "memory_lines" in data else "")
+              + f" (stored in {context_mod.BUDGET_FILE})")
         return None
 
     segments = []
@@ -318,7 +332,7 @@ def cmd_context(args) -> int | None:
         budget = context_mod.load_budget(project)
 
     report = context_mod.analyze(segments, budget=budget)
-    found = context_mod.findings(segments)
+    found = context_mod.findings(segments, project=project)
 
     if getattr(args, "json", False):
         print(context_mod.to_json(report, found))
@@ -326,7 +340,18 @@ def cmd_context(args) -> int | None:
         print(context_mod.render_text(report, found, top=getattr(args, "top", None)))
 
     if getattr(args, "check", False):
+        # Two independent failures, checked in this order because they are not
+        # the same kind of problem. The token budget is about COST — context
+        # spent. A truncated MEMORY.md is about LOSS — context paid for and never
+        # delivered, which is the worse of the two and needs no configured
+        # budget to be a fact, so it is reported even when the token check
+        # cannot run for want of one.
+        truncated = [f for f in found if f.rule == "memory_truncated"]
+        for f in truncated:
+            print(f"TRUNCATED: {f.message}", file=sys.stderr)
         if budget is None:
+            if truncated:
+                return 1
             print("error: --check needs a budget — set one with "
                   "`hive context --set-budget N` (or pass --budget N)",
                   file=sys.stderr)
@@ -335,6 +360,8 @@ def cmd_context(args) -> int | None:
         if over > 0:
             print(f"OVER BUDGET by ~{over:,} est. tokens — trim before adding "
                   f"anything new (see suggestions above)", file=sys.stderr)
+            return 1
+        if truncated:
             return 1
     return None
 
@@ -456,7 +483,9 @@ def cmd_embed(args) -> int | None:
 
 
 def cmd_selftest(args) -> int | None:
-    return selftest_mod.run()
+    # The exit code IS the command's contract; `run` returns the whole result
+    # because the dashboard's job reports the counts too.
+    return selftest_mod.run()["exit_code"]
 
 
 def cmd_premise_check(args) -> int | None:
@@ -948,6 +977,57 @@ def cmd_sop_preflight(args) -> int | None:
     return None
 
 
+def _repo_default_max_age() -> float:
+    """The staleness default, read from the module that owns it rather than
+    duplicated as an argparse literal — the same reason
+    `rotation_supervisor_defaults` exists."""
+    from . import repo
+    return repo.DEFAULT_MAX_AGE_HOURS
+
+
+def cmd_repo_stale(args) -> int | None:
+    """How stale is this checkout? Read-only and never fetches — see
+    `repo.staleness`. A report, not a gate: it exits zero even when behind,
+    because being behind is a normal state mid-branch and a diagnostic that
+    fails would be pruned from whatever ran it."""
+    from . import repo
+    max_age = getattr(args, "max_age_hours", None)
+    result = repo.staleness(max_age_hours=max_age if max_age is not None
+                            else repo.DEFAULT_MAX_AGE_HOURS)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return None
+    age = result["fetch_age_hours"]
+    age_text = ("never fetched (or unreadable)" if age is None
+                else f"last fetched {age:.1f}h ago")
+    if result["state"] == "unknown":
+        print(f"checkout staleness: unknown ({result['reason']}) — "
+              f"{result['detail']}")
+    else:
+        print(f"checkout staleness: {result['state']} — {result['behind']} behind "
+              f"/ {result['ahead']} ahead of {result['ref']}")
+    print(f"  {age_text}"
+          + ("  [the comparison is older than the freshness window, so the "
+             "counts above may already be wrong — `git fetch` to refresh]"
+             if result["fetch_stale"] else ""))
+    return None
+
+
+def cmd_sop_injection(args) -> int | None:
+    """Report what the per-prompt SOP injection is currently delivering.
+
+    Read-only, and deliberately not a gate: `hive context --check` is where the
+    always-on surface gets an exit code. Exiting non-zero here would make a
+    diagnostic fail in every script that ran it."""
+    from . import sopgate
+    result = sopgate.probe(project=getattr(args, "project", None))
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return None
+    print(sopgate.render_probe(result))
+    return None
+
+
 def _roadmap_steps(args) -> list:
     """Resolve `roadmap set` steps from repeatable --step flags plus an
     optional --file (one step per line) — multi-line plans are painful to
@@ -959,6 +1039,22 @@ def _roadmap_steps(args) -> list:
                   for ln in Path(args.file).read_text(encoding="utf-8").splitlines()
                   if ln.strip()]
     return steps
+
+
+def _roadmap_work_link(args) -> dict:
+    """The `--branch/--pr/--commit` trio as `roadmap.record` keywords.
+
+    An omitted flag stays absent rather than becoming an empty value, because
+    the fold carries the recorded link forward across events: attaching a PR
+    number next week must not erase the branch recorded today."""
+    link = {}
+    if getattr(args, "branch", None):
+        link["work_branch"] = args.branch
+    if getattr(args, "pr", None):
+        link["work_pr"] = args.pr
+    if getattr(args, "commit", None):
+        link["work_commits"] = list(args.commit)
+    return link
 
 
 def _cmd_roadmap_write(args, action) -> int | None:
@@ -974,6 +1070,9 @@ def _cmd_roadmap_write(args, action) -> int | None:
                           note=args.note)
         elif action == "interrupt":
             kwargs.update(cause=args.cause, note=args.note)
+        elif action == "archive":
+            kwargs.update(reason=args.reason)
+        kwargs.update(_roadmap_work_link(args))
         ev = roadmap_mod.record(action, args.plan_id, session_id=sid,
                                 **kwargs)
     except (ValueError, OSError) as e:
@@ -1046,6 +1145,90 @@ def cmd_roadmap_complete(args) -> int | None:
     return None
 
 
+def cmd_roadmap_archive(args) -> int | None:
+    """Retire a plan whose last step nothing can verify, on a stated reason.
+    The honest third exit, next to `complete` (it finished) and leaving it open
+    (it has not)."""
+    rc = _cmd_roadmap_write(args, "archive")
+    if rc:
+        return rc
+    _cancel_pending_autoresume(args)
+    return None
+
+
+def cmd_roadmap_link(args) -> int | None:
+    """Point a plan at the code it produced, without touching its status."""
+    return _cmd_roadmap_write(args, "link")
+
+
+def _print_merge_answer(plan_id, answer, link_text) -> None:
+    """One merge answer, said plainly. `unknown` prints the reason it is
+    unknown, because "we could not check" and "it has not landed" are different
+    facts and a reader who cannot tell them apart has learned nothing."""
+    from . import repo as repo_mod
+    marks = {repo_mod.MERGED: "merged", repo_mod.CLOSED: "closed unmerged",
+             repo_mod.OPEN: "not landed yet", repo_mod.UNKNOWN: "unknown"}
+    head = f"{plan_id}: {marks.get(answer['state'], answer['state'])}"
+    if link_text:
+        head += f"  [{link_text}]"
+    print(head)
+    if answer["evidence"]:
+        print(f"  evidence: {answer['evidence']}")
+    if answer["state"] == repo_mod.UNKNOWN:
+        print(f"  reason: {answer['reason']}")
+        if answer["detail"]:
+            print(f"  detail: {answer['detail']}")
+
+
+def cmd_roadmap_merge_state(args) -> int | None:
+    """Probe one plan's work link against git and `gh`. Read-only: it never
+    retires anything, so it is safe to run on a card you are only asking about."""
+    from . import repo as repo_mod, roadmap as roadmap_mod
+    evs = events.read_all(getattr(args, "project", None))
+    rec = roadmap_mod.get(evs, args.plan_id)
+    if rec is None:
+        print(f"error: no roadmap '{args.plan_id}' in the ledger",
+              file=sys.stderr)
+        return 2
+    answer = repo_mod.merge_state(**roadmap_mod.work_link(rec))
+    if args.json:
+        print(json.dumps(dict(answer, plan_id=rec["plan_id"]), indent=2,
+                         ensure_ascii=False))
+        return None
+    _print_merge_answer(rec["plan_id"], answer,
+                        roadmap_mod.describe_work_link(rec))
+    return None
+
+
+def cmd_roadmap_retire(args) -> int | None:
+    """Retire every live plan whose work link proves the work is finished.
+
+    Prints what was examined, not only what changed: a run that retires nothing
+    because every PR is still open has to be distinguishable from one that
+    retired nothing because `gh` is missing."""
+    from . import roadmap as roadmap_mod
+    proj = getattr(args, "project", None)
+    outcomes = roadmap_mod.retire_landed(
+        project=proj, session_id=args.session or os.environ.get(
+            "MINDHIVE_SESSION"))
+    if args.json:
+        print(json.dumps(outcomes, indent=2, ensure_ascii=False))
+        return None
+    if not outcomes:
+        print("(no live roadmaps to examine — hive roadmap list --all)")
+        return None
+    retired = [o for o in outcomes if o["action"]]
+    for outcome in outcomes:
+        _print_merge_answer(outcome["plan_id"], outcome,
+                            f"-> {outcome['action']}" if outcome["action"]
+                            else "")
+    print(f"\n{len(retired)} of {len(outcomes)} roadmap(s) retired on evidence")
+    if not retired:
+        print("nothing retired: no examined plan's work link proved the work "
+              "landed (see each reason above)")
+    return None
+
+
 def cmd_roadmap_autoclose(args) -> int | None:
     """Close the session's auto-synced roadmap (run by the SessionEnd hook).
     Silent no-op when the session has no auto-owned open plan — the hook must
@@ -1071,7 +1254,10 @@ def cmd_roadmap_list(args) -> int | None:
         print('(no roadmaps — declare one: hive roadmap set <id> '
               '--prompt "…" --step "…")')
         return None
-    marks = {"active": ">", "interrupted": "!", "completed": "x"}
+    # `-` for archived mirrors the `[-]` a skipped step already prints: retired
+    # without having been finished.
+    marks = {"active": ">", "interrupted": "!", "completed": "x",
+             "archived": "-"}
     for i, r in enumerate(recs, 1):
         p = r["progress"]
         print(f"  {i}. {marks.get(r['status'], '?')} "
@@ -1105,6 +1291,16 @@ def cmd_roadmap_show(args) -> int | None:
     print(f"asked: {rec['prompt']}")
     if rec["status"] == "interrupted":
         print(f"interrupted {rec['interrupted_at']} (cause: {rec['cause']})")
+    if rec["status"] == roadmap_mod.ARCHIVED:
+        print(f"archived {rec.get('archived_at', '')} "
+              f"(reason: {rec.get('archive_reason', '')})")
+    link = roadmap_mod.describe_work_link(rec)
+    # Printed offline on purpose: `show` reads the ledger and nothing else, so
+    # it stays instant and works with no network. `hive roadmap merge-state`
+    # is the command that actually asks git and `gh`.
+    print(f"work: {link}" if link
+          else "work: (no link — hive roadmap link "
+               f"{rec['plan_id']} --pr … --branch …)")
     print(f"progress: {p['done']}/{p['total']} steps done\n")
     glyphs = {"done": "[x]", "active": "[>]", "pending": "[ ]",
               "skipped": "[-]"}
@@ -2472,6 +2668,19 @@ def cmd_sync(args) -> int | None:
     folder = args.folder or os.getcwd()
     native_path = sync_mod.sync(folder, include_briefing=not args.no_briefing)
     print(str(native_path))
+    # Say it here, where the file was just written. The digest's caps bound item
+    # counts, not lines, so this is the moment the file can cross the loader's
+    # limit — and the loader's own warning appears in the NEXT session, to the
+    # agent rather than to the person who ran sync.
+    from . import context as context_mod
+    pressure = context_mod.memory_pressure(native_path)
+    if pressure["readable"] and pressure["over"]:
+        lost = (", ".join(pressure["dropped"]) if pressure["dropped"]
+                else "the tail of the file")
+        print(f"warning: MEMORY.md is {pressure['lines']} lines against a "
+              f"{pressure['budget']}-line loader budget (over by "
+              f"{pressure['over']}); the loader will not reach: {lost}. "
+              f"See `hive context --check`.", file=sys.stderr)
     return None
 
 
@@ -2919,7 +3128,8 @@ def _build_parser() -> argparse.ArgumentParser:
     se_install = se_sub.add_parser(
         "install-hook", help="register the Stop hook in a settings.json "
                              "(idempotent; the hook stays inert until "
-                             "MINDHIVE_ROTATION is set)")
+                             "MINDHIVE_ROTATION is set, and the shim is "
+                             "PowerShell, so rotation only fires on Windows)")
     se_install.add_argument("settings", help="path to the settings.json to edit")
     se_install.add_argument("--command", default=None,
                             help="the hook command to register (default: this "
@@ -2948,13 +3158,36 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(overrides the persisted one)")
     cx.add_argument("--set-budget", type=int, default=None, dest="set_budget",
                     help="persist the namespace's token budget and exit")
+    cx.add_argument("--set-memory-lines", type=int, default=None,
+                    dest="set_memory_lines",
+                    help="persist this namespace's MEMORY.md line budget "
+                         "(default: the native loader's own limit). Raising it "
+                         "is a decision that the loader will read only part of "
+                         "the file")
     cx.add_argument("--check", action="store_true",
-                    help="exit 1 when the measured total exceeds the budget")
+                    help="exit 1 when the measured total exceeds the budget, or "
+                         "when MEMORY.md is past its line budget (the loader "
+                         "then drops the digest's tail sections)")
     cx.add_argument("--top", type=int, default=None,
                     help="show only the N heaviest contributors")
     cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",
                     help="limit the report to one origin (default: all)")
     cx.set_defaults(func=cmd_context)
+
+    # --- repo (what git can prove about this checkout) ---
+    rp = sub.add_parser("repo", help="what git can prove about this checkout "
+                                     "(read-only, never fetches)")
+    rpsub = rp.add_subparsers(dest="repo_cmd", required=True)
+    rps = rpsub.add_parser("stale", help="how far this checkout has drifted from "
+                                         "its integration ref, and how old the "
+                                         "comparison is")
+    rps.add_argument("--max-age-hours", type=float,
+                     default=None, dest="max_age_hours",
+                     help="how old the last fetch may be before the comparison "
+                          "is flagged as untrustworthy (default: "
+                          f"{_repo_default_max_age():g})")
+    rps.add_argument("--json", action="store_true")
+    rps.set_defaults(func=cmd_repo_stale)
 
     # --- packs (stack content pack quality gates) ---
     pk = sub.add_parser("packs",
@@ -3172,6 +3405,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sop_pf.add_argument("--project", default=None)
     sop_pf.add_argument("--json", action="store_true")
     sop_pf.set_defaults(func=cmd_sop_preflight)
+    sop_inj = sosub.add_parser(
+        "injection",
+        help="what the per-prompt mandatory-SOP injection actually delivers "
+             "right now — bodies verbatim, or degraded to pointers")
+    sop_inj.add_argument("--project", default=None)
+    sop_inj.add_argument("--json", action="store_true")
+    sop_inj.set_defaults(func=cmd_sop_injection)
 
     # --- roadmap (event-sourced plan registry + interruption markers) ---
     from .roadmap import STATUSES as _RM_STATUSES
@@ -3179,6 +3419,22 @@ def _build_parser() -> argparse.ArgumentParser:
                         "per-step progress (interrupted plans surface in "
                         "STATE.md and Oversee)")
     rmsub = rm.add_subparsers(dest="roadmap_cmd", required=True)
+
+    def _add_work_link_flags(parser) -> None:
+        """The durable work link, on every subcommand that can learn one.
+
+        Four subcommands take the same trio, and hand-copying three
+        `add_argument` calls four times is exactly how flag names and help text
+        drift apart. All three are optional and independent because they become
+        knowable at different moments — the branch when work starts, the commits
+        as it lands, the PR number only once one is opened."""
+        parser.add_argument("--branch", default=None,
+                            help="branch this plan's work lives on")
+        parser.add_argument("--pr", type=int, default=None,
+                            help="pull-request number for this plan's work")
+        parser.add_argument("--commit", action="append", default=None,
+                            help="commit sha the work landed as (repeatable)")
+
     rms = rmsub.add_parser("set", help="declare (or replace) a plan")
     rms.add_argument("plan_id", help="stable kebab-case id, e.g. a run id")
     rms.add_argument("--prompt", required=True,
@@ -3189,6 +3445,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rms.add_argument("--file", default=None,
                      help="read steps from a file, one per line")
     rms.add_argument("--session", default=None)
+    _add_work_link_flags(rms)
     rms.set_defaults(func=cmd_roadmap_set)
     rmp = rmsub.add_parser("step", help="update one step's status")
     rmp.add_argument("plan_id")
@@ -3218,7 +3475,42 @@ def _build_parser() -> argparse.ArgumentParser:
     rmc = rmsub.add_parser("complete", help="mark the plan finished")
     rmc.add_argument("plan_id")
     rmc.add_argument("--session", default=None)
+    _add_work_link_flags(rmc)
     rmc.set_defaults(func=cmd_roadmap_complete)
+    rmar = rmsub.add_parser(
+        "archive", help="retire a plan whose last step nothing can verify, on "
+                        "a stated reason — the honest exit between 'finished' "
+                        "and 'still open'")
+    rmar.add_argument("plan_id")
+    rmar.add_argument("--reason", required=True,
+                      help="what settled the unverifiable step, e.g. "
+                           "'PR #103 merged' or 'superseded by the jobs plan'")
+    rmar.add_argument("--session", default=None)
+    _add_work_link_flags(rmar)
+    rmar.set_defaults(func=cmd_roadmap_archive)
+    rmk = rmsub.add_parser(
+        "link", help="point a plan at the code it produced (branch, PR, "
+                     "commits) without changing its status")
+    rmk.add_argument("plan_id")
+    rmk.add_argument("--session", default=None)
+    _add_work_link_flags(rmk)
+    rmk.set_defaults(func=cmd_roadmap_link)
+    rmm = rmsub.add_parser(
+        "merge-state", help="ask git and `gh` whether this plan's work landed. "
+                            "Read-only, and answers 'unknown' with a reason "
+                            "rather than guessing")
+    rmm.add_argument("plan_id")
+    rmm.add_argument("--project", default=None)
+    rmm.add_argument("--json", action="store_true")
+    rmm.set_defaults(func=cmd_roadmap_merge_state)
+    rmt = rmsub.add_parser(
+        "retire", help="retire every live plan whose work link PROVES the work "
+                       "is finished (merged -> complete, closed unmerged -> "
+                       "archive); reports every plan it examined")
+    rmt.add_argument("--project", default=None)
+    rmt.add_argument("--json", action="store_true")
+    rmt.add_argument("--session", default=None)
+    rmt.set_defaults(func=cmd_roadmap_retire)
     rma = rmsub.add_parser("autoclose", help="close a session's auto-synced "
                            "roadmap (run by the SessionEnd hook): complete "
                            "when all steps are done/skipped, else interrupt")
@@ -3229,7 +3521,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rml.add_argument("--project", default=None)
     rml.add_argument("--json", action="store_true")
     rml.add_argument("--all", action="store_true",
-                     help="include completed roadmaps")
+                     help="include retired roadmaps (completed and archived)")
     rml.set_defaults(func=cmd_roadmap_list)
     rmw = rmsub.add_parser("show", help="print one roadmap in full, "
                            "with history")

@@ -79,7 +79,7 @@ LEDGER, the hash chain, the Memory view, and keyword recall:
 | `code_change` | `{text, category, files[]}` | mandatory change-log (`changelog.py`); category ∈ update, minor_change, deletion, reduction, major_change, replacement |
 | `learning` | `{text, …}` | Self-Reliant PRD report |
 | `sop` | `{action, sop_id, title?, text?}` | SOP lifecycle (`sop.py`); action ∈ add, update, delete; current registry = deterministic fold, delivered via the STATE.md SOP block |
-| `roadmap` | `{action, plan_id, title?, prompt?, steps[]?, index?, status?, cause?, note?}` | Flat plan registry (`roadmap.py`); action ∈ set, step, interrupt, resume, complete; `set` replaces the step list wholesale (≤ `MAX_STEPS` 50, no `parent_id`); `interrupt` projects the STATE.md out-of-usage marker |
+| `roadmap` | `{action, plan_id, title?, prompt?, steps[]?, index?, status?, cause?, note?, reason?, work_branch?, work_pr?, work_commits[]?}` | Flat plan registry (`roadmap.py`); action ∈ set, step, interrupt, resume, complete, archive, link; `set` replaces the step list wholesale (≤ `MAX_STEPS` 50, no `parent_id`); `interrupt` projects the STATE.md out-of-usage marker; `archive` retires a plan whose last step nothing can verify and **requires `reason`**; `link` records the work link and touches nothing else. The three `work_*` keys may ride ANY action and MERGE into the record (an absent key keeps what is on file — `sync_from_todos` re-`set`s without one), so a plan stays pointed at its code across a re-plan. `roadmap.py` owns the contract; `repo.py` owns the probe that reads it |
 | `mindnet_task` | `{action, task_id, title?, parent_id?, description?, status?, on?, ref?, dependencies[]?, language_context[]?, validation_script?, faculty?, triviality_bypass?}` | MN-2 hierarchical task graph (`mindnet/tasks.py`); action ∈ declare, status, depend, reparent, evidence. **No `phase` action** — the phase axis has exactly one writer (see `mindnet_phase`). `triviality_bypass` is honoured on the FIRST declare only. The fold *refuses* cycle-closing / over-deep / settled-work edges and records the refusal in the record's `violations` rather than entering the bad state |
 | `mindnet_phase` | `{action, task_id, phase?, epoch?, evidence?{kind, ref?, result?, detail?}, detail?, verified_by}` | MN-1 phase spine (`mindnet/phases.py` contract, `mindnet/controller.py` fold); action ∈ declare, enter, satisfy, fall_back; phase ∈ brainstorm, plan, prd, execution, audit-bug, audit-code, audit-system, pr-green; evidence kind ∈ file, event, command, human; `verified_by` ∈ python, agent, human. **Two validators, deliberately:** `validate_payload` (the raw-append surface) REFUSES a payload carrying `verified_by`, and `validate_stored` (the writer, called just before `append_event`) REQUIRES it |
 
@@ -177,7 +177,34 @@ two-consecutive-empty-rounds exit cannot be derived from silence. These rows are
 the injector's **only** persistent state — spent fingerprints, the round counter
 and the dry-round count are folded back out of them, so there is no sidecar that
 can drift. The work itself is not here: a landed candidate becomes a `roadmap`
-step, which is semantic and rides the LEDGER, the chain and recall).
+step, which is semantic and rides the LEDGER, the chain and recall),
+`job_started` / `job_finished` / `job_abandoned` (`{job_id, kind}` on all three,
+plus `pid` on started, `{outcome, summary, seconds}` on finished and `reason` on
+abandoned — one row per lifecycle edge of a long dashboard operation, written by
+`jobs.py`. Six operations (harvest, embed, plugin scan, reflect, resolve,
+selftest) return **202 Accepted** with a job id and are polled, so these rows are
+what makes the answer to "what happened to that click?" outlive the process that
+ran it. `outcome` is drawn from `outcomes.OUTCOMES`, and the distinction it
+carries is the reason the events exist: `did_work` and `nothing_to_do` are both
+successes and only one of them changed anything.
+**Three types rather than one `job` with an action field**, unlike `roadmap` or
+`autoresume`, because the boot seal's entire job is to pair a start against a
+close, and "what never finished" should be answerable by asking for exactly that.
+The payload contract is nonetheless SHARED across all three
+(`jobs.validate_payload`) since the raw-append surfaces see only a payload, and
+what the fold depends on is the two fields it pairs on. **Two validators, exactly
+as `verification` has:** `validate_stored` (the writer) additionally requires what
+each type must carry — a `job_finished` with no outcome is the row that would make
+a finished job read as running forever — and it REFUSES `outcome: abandoned`,
+because a run cannot witness its own death.
+`job_abandoned` is written **only** by `jobs.seal_orphans` at dashboard boot, and
+it rests on a single-writer assumption spelled out in `jobs.py`'s module
+docstring: "started, never finished, and not by this pid" is abandoned, which is
+right for a restart and wrong for two dashboards sharing one namespace. The seal
+is scoped to the selected namespace for the same reason — sealing every store on
+the machine would extend that claim to namespaces the process has no business
+speaking for. Job output is capped in memory and read by byte offset
+(`jobs.OutputRing`), never carried whole in these rows)
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
@@ -264,6 +291,9 @@ Key joins an AI reader should know:
   audit row to its work: the row explains WHY a step exists, the step IS the
   work. The key is optional on the row because a future sink need not land in a
   roadmap at all (the loop's checklist sink has no `plan_id`).
+- `work_branch` / `work_pr` / `work_commits[]` are the roadmap's join *outward*,
+  to git and GitHub — the plan's only checkable link to the code it produced.
+  All three are optional and independent (§4.15).
 - `memory_consolidated.absorbed[]` holds `(ts, type, fingerprint)` keys of
   memos hidden (not deleted) from briefings by the dreaming pass.
 - `task_id` is MindNetwork's join key and threads **three** streams:
@@ -1324,6 +1354,58 @@ so a report of three contradictions can never read as a completed audit.
 any contradiction, and exits zero on `UNKNOWN` — "could not check" is not a
 finding, and failing on it would train the operator to suppress the command.
 
+### 4.16 The always-on surface: two budgets, and what happens past them
+
+Not event types — two operator-config sidecars and the degradation rule each one
+governs. Recorded here because both decide what a session actually receives, and
+both used to degrade with nothing said.
+
+**`context_budget.json`** — `paths.project_dir()/context_budget.json`:
+
+```json
+{"budget": 51000, "memory_lines": 200, "set_at": "2026-08-13T00:00:00Z"}
+```
+
+Config, not a projection: it is not rebuildable from the ledger, exactly like
+`rules/enforce.json`. `budget` is the namespace's estimated-token ceiling for the
+auto-loaded surface; `memory_lines` is the line budget for the native `MEMORY.md`.
+Writes **merge**: setting the token budget never discards a line budget set
+earlier. A missing, corrupt or non-positive value reads as unset (token budget) or
+as `context.MEMORY_LINE_BUDGET` (line budget) — a bad value must not silence a
+real measurement.
+
+Those two numbers bound different failures, which is why they are separate:
+
+| | Bounds | Past it |
+|---|---|---|
+| `budget` | **cost** — tokens spent before work starts | reported; `hive context --check` exits 1 |
+| `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set |
+
+The loss case is the subtler one. `sync` caps ITEM COUNTS (`LESSONS_CAP`,
+`DECISIONS_CAP`) and no item count bounds lines, so the digest grew past the
+loader's limit and lost the two sections written last — the lessons and decisions
+the caps existed to protect. `context.memory_pressure` names which sections fall
+past the cut, `hive sync` warns the moment it writes such a file, and the
+`memory_truncated` finding is **high** severity because every other finding
+suggests trimming while this one reports something already gone.
+
+**The per-prompt SOP budget** (`sopgate.PROMPT_BUDGET`, a constant rather than a
+sidecar — raising it is a code decision to spend more on every prompt, not a knob).
+Past it a body degrades to a `hive sop show <id>` **pointer, never a truncation**:
+half a procedure reads like a whole one. `sopgate.plan` is the single place that
+decision is made, and `hive sop injection` reports it — `verbatim`, `partial`,
+`pointers_only`, or `silent`. `pointers_only` is the state that matters: the block
+still arrives, so nothing looks broken, and the procedure it claims to re-assert
+is not in it. Measured on this repo at the time of writing: one mandatory SOP of
+3,414 chars against a 3,000-char budget, i.e. `pointers_only` on every prompt.
+
+**Checkout staleness** (`repo.staleness`, `hive repo stale`) is the same honesty
+rule applied to git: the count of commits behind is reported **with** the age of
+the fetch it was measured against, because "0 behind" against a remote last read
+in July is not up to date. It never fetches — a probe that reached the network
+could not run on the prompt path, in a hook, or offline — and `unknown` carries
+its reason (`no_checkout`, `no_integration_ref`, `probe_failed`).
+
 ### 4.x Smart-zone session rotation (`mindhive.rotation`)
 
 Not an event type — a sidecar file plus a measurement rule. Recorded here because
@@ -1373,6 +1455,78 @@ also never emits `decision`, honours `stop_hook_active`, ignores subagent stops
 (`agent_id` present — a subagent's usage is the subagent's context), and returns
 silence on any exception. Fail-open is the contract: the failure mode of a
 measuring hook must be "we did not measure", never "your work stopped".
+
+**A second variable, `MINDHIVE_ROTATION_SUPERVISED`, decides only what the hook
+SAYS.** `MINDHIVE_ROTATION` is set both by `hive session run` and by a human
+switching the feature on, so it cannot answer whether anything is waiting to read
+the artifact — and the advice used to promise a queued successor to every session
+that crossed the boundary, which is false in the second case: the file is written
+and nothing ever reads it. `supervisor._child_env` is the only place the marker
+is set, because it is the only place "a supervisor is waiting on you" is a fact.
+Supervised, the advice names the supervisor and what it will do. Unsupervised, it
+says plainly that nothing is queued, names the artifact path it wrote, and names
+`hive session run` as the command that would queue one. The marker enables
+nothing: with `MINDHIVE_ROTATION` unset the hook is silent whatever the marker
+says (`tests/test_rotation_hook.py`).
+
+**Rotation is Windows-only today.** Every shim in `hooks/` is PowerShell — nine
+`.ps1` files, no POSIX equivalent — so `hive session install-hook` on
+macOS/Linux writes a perfectly valid settings.json entry for a command that
+cannot run, and the session then never rotates with nothing said. `install`
+returns a `platform_warning` on any successful result from a non-`nt`
+`os.name`, so the limit is reported rather than discovered as an absence.
+
+### 4.15 The work link, and retiring a card on evidence
+
+A roadmap card used to have no way out except "every step done". So a plan whose
+last step was *"merge the PR"* or *"watch it run for a week"* stayed in Oversee
+forever: nothing in the store could see the outside world, and ticking the step
+anyway would have put a claim in the audit trail that no code had checked. Two
+additions close that, and they are deliberately separate.
+
+**The link (`roadmap.py`).** Three optional, independent keys — `work_branch`,
+`work_pr`, `work_commits[]` — may ride **any** action, and the fold MERGES them
+into the plan record. Independent because they become knowable at different
+moments (branch when work starts, commits as it lands, the PR only once one is
+opened); merged rather than replaced because `sync_from_todos` appends a fresh
+`set` on every material TodoWrite change and never supplies a link — without
+carry-forward, one more todo edit would silently drop the PR number, the same
+erasure the `new` step flag already had to be protected from. A record written
+before these keys existed simply has none of them: `roadmap.work_link` answers
+`{branch: "", pr: 0, commits: []}` and the fold stays total.
+
+**The probe (`repo.py`).** `repo.merge_state(**roadmap.work_link(rec))` returns
+`{state, reason, detail, evidence}` and never raises. `state` ∈ `merged`,
+`closed` (PR closed without merging), `open`, `unknown`. **`merged` is returned
+only on proof** — a merged PR record, or a commit git confirms is an ancestor of
+the integration ref (`origin/HEAD`, falling back to `origin/master` /
+`origin/main`). Where it cannot tell, it says which of four things stopped it:
+
+| reason | meaning |
+| --- | --- |
+| `no_work_link` | the plan records no branch, PR, or commit |
+| `no_github_remote` | not a git checkout, or no github.com remote |
+| `no_gh_cli` | `gh` is not on PATH, so a PR could not be read |
+| `probe_failed` | git or `gh` ran and failed (offline, rate limit, auth, bad sha) |
+
+Probes run PR → commits → branch and the first definite answer wins, which is
+what makes the module degrade instead of fail: with no `gh`, recorded commits
+still answer. Two boundaries are load-bearing. `git merge-base --is-ancestor`
+exits 1 for "not an ancestor" and 128 for "no such object" — reading both as
+"not merged" would turn a typo'd sha into a claim about the code. And the branch
+probe is **prove-only**: a squash merge deletes the branch and rewrites its
+commits, so "not an ancestor" is not evidence of anything, and without `gh` the
+answer is `unknown`/`no_gh_cli` rather than `open`.
+
+**The exit.** `archive` retires a plan and **requires a `reason`** (status
+`archived`, hidden from `plans()` alongside `completed`). It is append-only, on
+the `loop_run_dismissed` tombstone precedent: the retirement carries its own
+justification and never edits the history that pinned the card open. The plan's
+real progress stays on the record, so `archived` never reads as "finished".
+`hive roadmap retire` is the automatic path — it completes what the probe proves
+merged, archives what it proves closed, and **reports every plan it examined**,
+including the untouched ones with their reasons, so "nothing was provably
+landed" cannot be mistaken for "the sweep worked".
 
 ## 5. Invariants — do not break these
 

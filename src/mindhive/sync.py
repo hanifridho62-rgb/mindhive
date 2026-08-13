@@ -7,6 +7,16 @@ from .briefing import (briefing as build_briefing_file, headline,
 # Caps for the compact MEMORY.md digest (KTD8): the file auto-loads into every
 # session, so each list section is bounded. Full history stays on disk
 # (BRIEFING.md, LEDGER, the event log) for on-demand reads.
+#
+# Both bound an ITEM COUNT, and no item count bounds LINES — ten lessons can be
+# ten lines or two hundred. The native loader reads only the first
+# `context.MEMORY_LINE_BUDGET` lines and then says so, which is how this digest
+# quietly lost its own tail: the two sections written last are the ones these
+# caps exist to protect. `hive sync` measures the file it just wrote
+# (`context.memory_pressure`) and warns; `hive context --check` gates on it.
+# Trimming here is deliberately NOT automatic — dropping a lesson to fit a line
+# budget is a decision, and this module's job is to write the digest, not to
+# choose what the operator loses.
 LESSONS_CAP = 10
 DECISIONS_CAP = 5
 

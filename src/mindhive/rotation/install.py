@@ -16,12 +16,42 @@ Registration does NOT activate the hook. The hook is inert unless
 `MINDHIVE_ROTATION` is set, and `hive session run` sets that only for the
 children it spawns. So installing this is safe: it changes what a supervised
 session does, and leaves every other session on the machine exactly as it was.
+
+**Rotation is Windows-only, and this is where that becomes visible.** The
+command registered here runs `hooks/stop.ps1` through `powershell`, and every
+shim in `hooks/` is PowerShell — nine `.ps1` files and no POSIX equivalent. On
+macOS or Linux the registration itself succeeds (it is a JSON edit, and JSON does
+not care), and then the hook can never fire, so the session never rotates and
+nothing ever says why. `install` reports that as `platform_warning` rather than
+leaving the user to discover it as an absence. It warns rather than refuses:
+editing a settings.json that will be read on another machine is legitimate, and
+the honest answer to "this may not do what you want" is to say so.
 """
 import json
+import os
 import shutil
 from pathlib import Path
 
 STAGE = "Stop"
+
+# `os.name` of the only platform whose shims exist. Compared against, never
+# assumed: the check has to be readable on the machine that fails it.
+SHIM_OS = "nt"
+
+_PLATFORM_WARNING = (
+    "registered, but rotation cannot fire on this platform: every hook shim in "
+    "hooks/ is PowerShell (.ps1) and this is os.name={os_name!r}, not "
+    f"{SHIM_OS!r}. The Stop hook will be invoked and do nothing. Rotation is "
+    "Windows-only until a POSIX shim exists."
+)
+
+
+def platform_warning(os_name: str | None = None) -> str:
+    """The caveat for this platform, or "" when the shims can actually run."""
+    os_name = os.name if os_name is None else os_name
+    if os_name == SHIM_OS:
+        return ""
+    return _PLATFORM_WARNING.format(os_name=os_name)
 
 
 def default_command(python: str | None = None, repo: str | None = None) -> str:
@@ -46,12 +76,28 @@ def _backup(path: Path) -> Path | None:
 
 
 def install(settings_path, command: str | None = None,
-            *, dry_run: bool = False) -> dict:
+            *, dry_run: bool = False, os_name: str | None = None) -> dict:
     """Add the Stop hook to *settings_path* unless it is already there.
 
     Returns `{"ok": bool, "reason": str, ...}` where `reason` is a stable id:
     `installed`, `already_registered`, `malformed`, `missing`, or `bad_hooks`.
+    A successful result on a platform without shims also carries
+    `platform_warning` — see the module docstring.
+
+    `os_name` is injected so the non-Windows answer is testable ON Windows, and
+    the Windows answer testable on the Linux CI runner. A platform caveat that
+    only one of the two runners can reach is a caveat nobody checks.
     """
+    result = _install(settings_path, command, dry_run=dry_run)
+    warning = platform_warning(os_name)
+    if warning and result.get("ok"):
+        # Failure results are left alone: a malformed settings.json is the whole
+        # answer, and a second sentence about platforms buries it.
+        return dict(result, platform_warning=warning)
+    return result
+
+
+def _install(settings_path, command: str | None, *, dry_run: bool) -> dict:
     path = Path(settings_path)
     command = command or default_command()
 

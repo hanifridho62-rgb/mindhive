@@ -215,13 +215,13 @@ def detail(session_id, root=None) -> dict:
 # --- page fragments (injected into dashboard_page by dashboard.py) ----------
 
 CARDS_CSS = """
-  .tcard { background:#0c0e14; border:1px solid #2a2f3d; border-radius:10px;
+  .tcard { background:var(--sunken); border:1px solid var(--line); border-radius:10px;
     padding:10px 14px; margin:10px 0; }
   .tcard .thead { display:flex; gap:10px; align-items:center; cursor:pointer;
     flex-wrap:wrap; }
   .tstat { font-size:11px; border-radius:999px; padding:1px 8px;
-    border:1px solid #2a2f3d; white-space:nowrap; }
-  .tstat.ongoing { color:#e0b341; animation: pulse 1.6s infinite; }
+    border:1px solid var(--line); white-space:nowrap; }
+  .tstat.ongoing { color:var(--warn); animation: pulse 1.6s infinite; }
   /* This fragment's own motion, guarded here rather than in the host page —
      same rule cat_board follows: the sheet that turns an animation ON owns
      switching it off, so a second consumer of CARDS_CSS inherits the guard
@@ -231,23 +231,23 @@ CARDS_CSS = """
   @media (prefers-reduced-motion: reduce) {
     .tstat.ongoing { animation:none !important; }
   }
-  .tstat.done { color:#46c46a; }
-  .tsid { font-size:12px; color:#7fb2ff; word-break:break-all; }
-  .tchip { font-size:12px; color:#e6e8ef; }
-  .tspan { font-size:11px; color:#6b7488; margin-left:auto; }
+  .tstat.done { color:var(--ok); }
+  .tsid { font-size:12px; color:var(--link); word-break:break-all; }
+  .tchip { font-size:12px; color:var(--text); }
+  .tspan { font-size:11px; color:var(--dim); margin-left:auto; }
   .trows { list-style:none; padding:0; margin:8px 0 0; }
-  .trow { border-top:1px solid #1d2230; padding:5px 2px; }
+  .trow { border-top:1px solid var(--raised); padding:5px 2px; }
   .tlab { cursor:pointer; }
-  .tpath { color:#7fb2ff; } .tplus { color:#46c46a; } .tminus { color:#ff8a8a; }
-  .tbad { color:#ff8a8a; } .tnote { color:#e0b341; }
+  .tpath { color:var(--link); } .tplus { color:var(--ok); } .tminus { color:var(--bad); }
+  .tbad { color:var(--bad); } .tnote { color:var(--warn); }
   .tbody { margin:6px 0 4px 16px; }
-  .tdiff { background:#0a0c11; border:1px solid #1d2230; border-radius:6px;
+  .tdiff { background:#0a0c11; border:1px solid var(--raised); border-radius:6px;
     padding:8px 10px; max-height:40vh; overflow:auto; white-space:pre-wrap;
     font-size:12px; }
-  .dplus { color:#46c46a; } .dminus { color:#ff8a8a; } .dctx { color:#9aa3b8; }
-  .tdet td { padding:1px 10px 1px 0; color:#9aa3b8; }
-  .tdet td+td { color:#e6e8ef; }
-  .tmem { color:#9ecbff; font-size:12px; }
+  .dplus { color:var(--ok); } .dminus { color:var(--bad); } .dctx { color:var(--muted); }
+  .tdet td { padding:1px 10px 1px 0; color:var(--muted); }
+  .tdet td+td { color:var(--text); }
+  .tmem { color:var(--link-bright); font-size:12px; }
 """
 
 

@@ -147,6 +147,27 @@ DETERMINISTIC_TYPES = {
     # the audit trail explaining why that step exists. Registry/audit content:
     # consolidation never absorbs it.
     "work_injected",
+    # The dashboard's long operations, one row per lifecycle edge (see jobs.py).
+    # A click that starts a pytest run or an embedding pass returns 202 and a job
+    # id; these rows are what makes the answer to "what happened to it?" survive
+    # the process that ran it.
+    #
+    # THREE types rather than one `job` with an action field, unlike `roadmap` or
+    # `autoresume`: the boot seal's whole job is to pair a start against a close,
+    # and a reader grepping the ledger for what never finished should be able to
+    # ask for exactly that. The payload contract is shared across all three
+    # (jobs.validate_payload) precisely because the fold pairs them by `job_id`.
+    #
+    # `job_abandoned` is written ONLY by `jobs.seal_orphans` at boot — nothing
+    # records its own death. It rests on a single-writer assumption that is
+    # written down in jobs.py's module docstring; read it before making the seal
+    # broader than one namespace.
+    #
+    # Deterministic, for the same reason as `verification` and `work_injected`:
+    # machine-generated audit telemetry carrying no human intent, and semantic
+    # membership would put a LEDGER markdown file, a Memory-view row and a
+    # recall-corpus entry on disk per button press.
+    "job_started", "job_finished", "job_abandoned",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
@@ -206,6 +227,17 @@ _PAYLOAD_CONTRACTS = {
     # and the dry-round counter, and the damage would only show up as work that
     # stopped being proposed.
     "work_injected": (".replenish", "hive replenish run --session <id>"),
+    # All three job types share ONE contract, because this surface sees only the
+    # payload and the three rows are paired by the two fields it enforces
+    # (`job_id`, `kind`). The per-type requirement — a `job_finished` MUST carry
+    # an outcome, or a finished job reads as running forever — is the writer's
+    # half, `jobs.validate_stored`, the same two-validator split `verification`
+    # and `mindnet_phase` use above. The hint names no command because there is
+    # none: these rows are written by the dashboard as it runs the work, and a
+    # hand-appended one is almost certainly a mistake.
+    "job_started": (".jobs", "the dashboard writes these as it runs a job"),
+    "job_finished": (".jobs", "the dashboard writes these as it runs a job"),
+    "job_abandoned": (".jobs", "written only by the boot seal, jobs.seal_orphans"),
 }
 
 

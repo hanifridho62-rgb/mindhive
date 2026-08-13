@@ -17,6 +17,7 @@ lock-shaped comment.
 Store isolation comes from the autouse `isolate_store` fixture in
 tests/conftest.py, like every other dashboard test.
 """
+import collections
 import importlib
 import json
 import threading
@@ -27,7 +28,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard, events
+from mindhive import dashboard, events, jobs
 
 # The locks and both memos are MODULE level on purpose — they have to hold
 # across every handler class `make_handler` mints, and across every thread the
@@ -39,13 +40,28 @@ _ALL_LOCKS = (dashboard._HARVEST_LOCK, dashboard._PROJECT_LOCK,
               dashboard._VERIFY_LOCK)
 
 
+def _clear_memos():
+    """Empty every module-level memo, enumerated rather than listed by name.
+
+    Naming them here couples this whole file's SETUP to the current cache
+    inventory: a memo that does not exist in the version under test turns every
+    behavioural failure in the file into an AttributeError at setup, which is the
+    one thing a test run must not do — it hides the result it was run to get."""
+    for name, value in vars(dashboard).items():
+        if name.endswith("_MEMO") and isinstance(value, collections.OrderedDict):
+            value.clear()
+
+
 @pytest.fixture(autouse=True)
 def clean_module_state():
-    dashboard._CATS_MEMO.clear()
-    dashboard._SESSIONS_MEMO.clear()
+    _clear_memos()
     yield
-    dashboard._CATS_MEMO.clear()
-    dashboard._SESSIONS_MEMO.clear()
+    _clear_memos()
+    # A job outlives the request that started it, so a test that leaves one
+    # running would hold its kind's slot and get the NEXT test's first click
+    # refused — which reads as a concurrency bug in whichever test ran second.
+    jobs._RUNNING.clear()
+    jobs._JOBS.clear()
     for lock in _ALL_LOCKS:
         if lock.locked():           # a failed test must not wedge the next one
             lock.release()
@@ -92,17 +108,82 @@ def _get(base, path, token):
 # "the work ran exactly once" is a claim about the expensive thing, not about
 # the HTTP round trip.
 LOCKED = [
-    ("/api/harvest", "mindhive.dashboard", "run_catch_up",
-     {"projects": {}, "total_new": 0}),
     ("/api/project", "mindhive.projector", "project", {"wrote": []}),
     ("/api/sync", "mindhive.sync", "sync", "MEMORY.md"),
-    ("/api/embed", "mindhive.vectors", "embed", {"embedded": 0}),
-    ("/api/plugins/scan", "mindhive.plugins", "scan_and_store", {"top": []}),
     ("/api/plugins/autoscan", "mindhive.plugins", "ensure_fresh",
      {"scanned": True, "age_hours": 0.0, "payload": {}}),
-    ("/api/selftest", "mindhive.selftest", "run", 0),
 ]
 LOCKED_IDS = [row[0] for row in LOCKED]
+
+# --- T13: the six long operations, now 202-accepted jobs --------------------
+# These used to be in LOCKED above, and the lock still exists and is still per
+# operation — it is just held by the JOB for as long as the work runs, instead of
+# by the handler for as long as the response takes. Two things therefore changed
+# shape and are re-asserted below rather than dropped: the accepted response is
+# 202, and a run that raises can no longer surface as a 500, because by then the
+# response is long gone. It surfaces as a job whose outcome is `failed`.
+#
+# `work` is the ONE call each operation's cost actually lives in, so "the work ran
+# exactly once" stays a claim about the expensive thing. `reach` is what has to be
+# stubbed for that call to be reached at all, and `empty` is what the operation
+# reports when there is genuinely nothing to do — the case T13 requires be
+# exercised, and the one an `ok: True` could never distinguish from real work.
+Op = collections.namedtuple("Op", "route work result reach empty")
+
+NOTHING = "nothing_to_do"
+
+JOBS = [
+    Op("/api/harvest", ("mindhive.dashboard", "run_catch_up"),
+       {"projects": {"test": {"new": 2}}, "total_new": 2},
+       {}, ({"projects": {}, "total_new": 0}, NOTHING)),
+    Op("/api/embed", ("mindhive.vectors", "embed"), {"embedded": 3},
+       {}, ({"embedded": 0}, NOTHING)),
+    Op("/api/plugins/scan", ("mindhive.plugins", "scan_and_store"),
+       {"counts": {"plugins_total": 4, "skills_total": 9}},
+       {}, ({"counts": {"plugins_total": 0, "skills_total": 0}}, NOTHING)),
+    Op("/api/selftest", ("mindhive.selftest", "run"),
+       {"exit_code": 0, "counts": {"passed": 4602}},
+       {}, ({"exit_code": 0, "counts": {}}, "did_work")),
+    # Reflection only reaches its expensive call when an eligible incident
+    # exists, so the empty case is the DEFAULT here and `reach` is what makes the
+    # work happen at all.
+    Op("/api/rules/reflect", ("mindhive.reflect", "reflect_incident"),
+       {"reflected": True},
+       {("mindhive.incidents", "summaries"): lambda *a, **k: [
+           {"signature": "sig-1", "status": "active", "rule_source": "none"}]},
+       (None, NOTHING)),
+    Op("/api/rules/resolve", ("mindhive.resolve", "resolve_batch"),
+       {"rerouted": 1, "reflected": 0, "failed": 0},
+       {}, ({"rerouted": 0, "reflected": 0, "failed": 0}, NOTHING)),
+]
+JOB_IDS = [op.route for op in JOBS]
+
+
+def _stub_incident_projection(monkeypatch):
+    """The reflect job self-heals the incident projection before it looks. Neither
+    call is the work under test, and both touch the store."""
+    incidents = importlib.import_module("mindhive.incidents")
+    monkeypatch.setattr(incidents, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(incidents, "project", lambda *a, **k: None)
+    monkeypatch.setattr(incidents, "summaries", lambda *a, **k: [])
+
+
+def _apply(monkeypatch, patches):
+    for (mod, attr), value in patches.items():
+        monkeypatch.setattr(importlib.import_module(mod), attr, value)
+
+
+def _await_job(base, token, job_id, timeout=20):
+    """Poll a job to completion the way the page does, and return its final
+    snapshot."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, obj = _get(base, f"/api/job?id={job_id}", token)
+        assert status == 200 and obj["ok"] is True, obj
+        if obj["job"]["state"] == "finished":
+            return obj["job"]
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} never finished")
 
 
 def _blocking(result):
@@ -171,6 +252,193 @@ def test_the_lock_is_released_when_the_handler_raises(
     status, obj = _post(base, route, {"project": "test"}, token)
     assert status == 200 and obj["ok"] is True, \
         f"{route} stayed locked after the handler raised"
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_a_long_operation_is_accepted_not_completed(dashboard_server,
+                                                    monkeypatch, op):
+    """202, and a job id to poll. A 200 would claim the work was done, which is
+    the lie that made the browser give up on runs that were still going."""
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    _apply(monkeypatch, op.reach)
+    mod, attr = op.work
+    monkeypatch.setattr(importlib.import_module(mod), attr,
+                        lambda *_a, **_kw: op.result)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202, f"{op.route} answered {status}, not 202 Accepted"
+    assert obj["ok"] is True and obj["job"]["id"]
+    assert obj["job"]["state"] == "running"
+    assert "outcome" not in obj["job"], "an accepted job cannot know its outcome"
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] in ("did_work", "degraded"), final
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_a_second_click_is_refused_while_the_job_still_holds_the_lock(
+        dashboard_server, monkeypatch, op):
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    _apply(monkeypatch, op.reach)
+    mod, attr = op.work
+    fake, entered, release, calls = _blocking(op.result)
+    monkeypatch.setattr(importlib.import_module(mod), attr, fake)
+
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202 and obj["ok"] is True
+    assert entered.wait(10), f"{op.route} never reached its work"
+
+    status, refused = _post(base, op.route, {"project": "test"}, token)
+    # An expected domain rejection: ok:False with HTTP 200, never 409 and never
+    # 500 — unchanged from when these ran inline, so the page reads it the same.
+    assert status == 200, f"{op.route} refused with {status}, not 200"
+    assert refused["ok"] is False
+    assert "already running" in refused["error"], refused
+
+    release.set()
+    _await_job(base, token, obj["job"]["id"])
+    # THE guarantee: the refusal did not merely answer differently, it stopped
+    # the second run from happening at all.
+    assert calls == [1], f"{op.route} ran the work {len(calls)} times, expected 1"
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_work_that_raises_is_reported_as_a_failed_job_and_frees_the_lock(
+        dashboard_server, monkeypatch, op):
+    """The 500 that used to carry this news cannot: the response is long gone by
+    the time the work runs. So the failure has to arrive as an OUTCOME — and a
+    lock released anywhere but a `finally` would wedge the operation for the life
+    of the process the first time anything threw."""
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    _apply(monkeypatch, op.reach)
+    mod, attr = op.work
+    module = importlib.import_module(mod)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("work exploded")
+    monkeypatch.setattr(module, attr, boom)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202 and obj["ok"] is True
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] == "failed", final
+    assert final["worked"] is False
+    assert "work exploded" in final["summary"], final
+
+    # The operation still answers, which is what proves the lock came back.
+    monkeypatch.setattr(module, attr, lambda *_a, **_kw: op.result)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202, f"{op.route} stayed locked after the work raised"
+    _await_job(base, token, obj["job"]["id"])
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_an_operation_with_nothing_to_do_says_so(dashboard_server, monkeypatch,
+                                                 op):
+    """The empty-work case T13 requires be exercised. `ok: True` could not tell
+    "harvested 40 sessions" from "there was nothing to harvest"; these two facts
+    now have different names."""
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    empty_result, expected = op.empty
+    if empty_result is not None:
+        mod, attr = op.work
+        monkeypatch.setattr(importlib.import_module(mod), attr,
+                            lambda *_a, **_kw: empty_result)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] == expected, final
+    assert final["worked"] is True, "an honest 'nothing to do' is still a success"
+    assert final["summary"].strip(), "an outcome with no reason is a dead end"
+
+
+def test_absent_semantic_extras_are_degraded_not_failed(dashboard_server,
+                                                        monkeypatch):
+    """The semantic layer is optional by invariant (DATA_MODEL §5), so missing
+    extras are a degraded store, not a broken dashboard.
+
+    Its sibling above — the same route raising a plain RuntimeError and having to
+    report `failed` — is what stops this from being satisfied by a blanket
+    `except RuntimeError`, which would call every crash a missing dependency.
+    """
+    base, token = dashboard_server
+
+    def missing_extras(*_a, **_kw):
+        try:
+            raise ImportError("No module named 'chromadb'")
+        except ImportError as e:
+            raise RuntimeError(
+                "semantic layer needs extras: pip install -e .[vectors]") from e
+
+    monkeypatch.setattr(importlib.import_module("mindhive.vectors"), "embed",
+                        missing_extras)
+    status, obj = _post(base, "/api/embed", {"project": "test"}, token)
+    assert status == 202
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] == "degraded", final
+    assert "extras" in final["summary"]
+    assert final["worked"] is False
+
+
+def test_a_job_id_the_server_has_never_heard_of_is_not_a_transport_error(
+        dashboard_server):
+    """After a restart the page still holds an id from the previous process. The
+    honest answer names that, and it is a 200 the page can render."""
+    base, token = dashboard_server
+    status, obj = _get(base, "/api/job?id=deadbeefdeadbeef", token)
+    assert status == 200
+    assert obj["ok"] is False
+    assert "restarted" in obj["error"]
+
+
+def test_polling_carries_only_output_that_is_new(dashboard_server, monkeypatch):
+    """The whole buffer used to be re-sent on every 2.5s tick (T16). The offset
+    the previous poll handed back is what makes the next one incremental."""
+    base, token = dashboard_server
+    release = threading.Event()
+
+    def chatty(*_a, **_kw):
+        chatty.emit("first line\n")
+        release.wait(timeout=20)
+        chatty.emit("second line\n")
+        return {"exit_code": 0, "counts": {}}
+
+    # `selftest.run` receives the job's sink as `emit`; capture it so the fake can
+    # write through the same channel the real one does.
+    real = importlib.import_module("mindhive.selftest")
+    monkeypatch.setattr(real, "run",
+                        lambda emit=None, echo=True: (
+                            setattr(chatty, "emit", emit), chatty())[1])
+
+    status, obj = _post(base, "/api/selftest", {"project": "test"}, token)
+    assert status == 202
+    job_id = obj["job"]["id"]
+
+    first = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        _, body = _get(base, f"/api/job?id={job_id}&offset=0", token)
+        if "first line" in body["job"]["output"]:
+            first = body["job"]
+            break
+        time.sleep(0.05)
+    assert first, "the first line never reached the pane"
+    release.set()
+
+    later = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        _, body = _get(
+            base, f"/api/job?id={job_id}&offset={first['offset']}", token)
+        if "second line" in body["job"]["output"]:
+            later = body["job"]
+            break
+        time.sleep(0.05)
+    assert later, "the second line never arrived"
+    assert "first line" not in later["output"], \
+        "the poll re-sent output the caller already had"
+    _await_job(base, token, job_id)
 
 
 @pytest.mark.parametrize("held,blocked", [
@@ -586,3 +854,158 @@ def test_both_memos_evict_instead_of_growing_with_the_namespace_count():
         assert dashboard._memo_get(memo, "cold-0") is None, \
             "the oldest cold entry survived a full sweep, so nothing is evicting"
         memo.clear()
+
+
+# --- T5: the project picker stops re-reading every ledger on disk ------------
+#
+# `default_project()` is a loop over `_project_stats`, so ONE dashboard launch
+# read every namespace's full log — 56 of them on this machine — and `/api/
+# projects` did it again on every poll of the picker.
+#
+# `_SESSIONS_MEMO` is the wrong precedent and the reason `_fingerprinted` exists
+# separately: it stamps `(len(evs), evs[-1].ts)`, which needs `evs`, so by the
+# time it can answer, the read it was meant to avoid has already happened — it
+# memoizes the FOLD. `segment_stats` is `os.scandir` over size and mtime: it
+# answers "may I skip the read?" without a read.
+#
+# The two guards are the whole test surface, and the naive "read_all is not
+# called twice" test passes in BOTH broken states, so on its own it proves
+# nothing: `{} == {}` scores a hit, and a pg backend leaves the local segments
+# frozen. Each guard therefore gets a test whose failure mode is the specific
+# thing that goes wrong — a cache that can never invalidate again.
+
+PROJECTS = "/api/projects?project=test"
+
+
+def _seed_other(session_id="sess-other"):
+    """A second namespace, so "one project was re-read" is distinguishable from
+    "everything was re-read" — per-project invalidation is the whole claim."""
+    events.append_event("user_prompt", {"text": "elsewhere"},
+                        session_id=session_id, project="other")
+
+
+def _stats_for(body, name):
+    for row in body["projects"]:
+        if row["name"] == name:
+            return row
+    raise AssertionError(f"{name} missing from the picker: {body['projects']}")
+
+
+def test_an_unchanged_picker_reads_no_ledger_at_all(dashboard_server, counters):
+    base, token = dashboard_server
+    _seed()
+    _seed_other()
+    status, warm = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls >= 2, \
+        "the first poll must actually read both namespaces"
+
+    counters.reset()
+    status, again = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls == 0, \
+        f"an unchanged store was read {counters.reads.calls}x anyway"
+    # Cheap AND identical: a memo that served a different picker would be a
+    # regression dressed as a speedup.
+    assert again["projects"] == warm["projects"]
+    assert again["hivemind"] == warm["hivemind"]
+    assert again["default"] == warm["default"]
+
+
+def test_an_append_re_reads_that_project_and_only_that_project(
+        dashboard_server, counters):
+    """The invalidation that matters comes from OUTSIDE this process — the CLI, a
+    hook, `hive loop`. A real event goes into the real segment file, so the stat
+    the memo depends on moves exactly the way it does in production."""
+    base, token = dashboard_server
+    _seed()
+    _seed_other()
+    _status, warm = _get(base, PROJECTS, token)
+    before = _stats_for(warm, "test")["events"]
+
+    events.append_event("decision", {"text": "an append from outside"},
+                        session_id="sess-1", project="test")
+    counters.reset()
+    status, after = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls == 1, (
+        f"{counters.reads.calls} ledgers re-read for an append to one of them — "
+        f"the fingerprint is not per-project")
+    assert _stats_for(after, "test")["events"] == before + 1, \
+        "the appended event never reached the picker"
+    assert _stats_for(after, "other") == _stats_for(warm, "other")
+
+
+def test_an_empty_fingerprint_never_matches_and_never_freezes_the_picker(
+        dashboard_server, counters, monkeypatch):
+    """DISCRIMINATING. `segment_stats` answers `{}` for ANY OSError as well as
+    for "no events directory". Fail-safe for the sidecar, INVERTED as a cache
+    key: `{} == {}` scores a hit, so one transient directory error would pin this
+    picker's counts for the life of the process — silently, which is the one
+    failure mode a cache must not have."""
+    base, token = dashboard_server
+    _seed()
+    _get(base, PROJECTS, token)                  # warm with a real fingerprint
+    sidecar = importlib.import_module("mindhive.mindnet.sidecar")
+    monkeypatch.setattr(sidecar, "segment_stats", lambda *_a, **_kw: {})
+
+    for attempt in (1, 2):
+        counters.reset()
+        status, body = _get(base, PROJECTS, token)
+        assert status == 200
+        assert counters.reads.calls >= 1, \
+            f"poll {attempt} served an empty fingerprint from the memo"
+        assert _stats_for(body, "test")["events"] == 2
+    # The warm entry from before the fault is still there and is harmless — while
+    # the fingerprint is untrusted, `_fingerprinted` returns before it consults
+    # the memo at all. What must NOT have happened is `{}` being written as a
+    # stamp: that is the value a later poll could match against.
+    stored, _stats = dashboard._STATS_MEMO["test"]
+    assert stored, "an empty fingerprint was stored as a key a later poll can hit"
+
+
+def test_a_non_file_event_backend_bypasses_the_stats_memo(
+        dashboard_server, counters, monkeypatch):
+    """DISCRIMINATING, and the same gap that shipped the first time on the cats
+    gate. `events.read_all` short-circuits to Postgres when the backend is `pg`,
+    while `segment_stats` keeps stat'ing the local `.jsonl` segments — which, on
+    the documented file → dual → pg path, are still on disk and never change
+    again. Non-empty fingerprint, stable forever, every poll a hit, the picker
+    frozen at its first response.
+
+    `_maybe_read_from_pg` is stubbed to None so `read_all` still answers from the
+    file segments: the variable under test is the memo's decision, not whether a
+    Postgres server happens to be reachable from this machine."""
+    base, token = dashboard_server
+    _seed()
+    _status, warm = _get(base, PROJECTS, token)
+
+    ev_mod = importlib.import_module("mindhive.events")
+    monkeypatch.setattr(ev_mod, "_maybe_read_from_pg", lambda project=None: None)
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "pg")
+
+    counters.reset()
+    status, again = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, (
+        "a non-file backend served the memo instead of reading: segment_stats "
+        "fingerprints local segments that pg never writes, so the memo can "
+        "never invalidate and the picker freezes for the life of the process")
+    assert again["projects"] == warm["projects"], \
+        "the bypass changed the picker's contents"
+
+
+def test_the_fingerprint_is_a_real_stamp_when_it_can_be_trusted():
+    """CANARY for both guards above. They assert an ABSENCE of caching, which a
+    `_ledger_fingerprint` that returned None unconditionally would also produce —
+    and that version would be a cache that never caches, passing every test
+    above while restoring the original 56-read launch."""
+    _seed()
+    trusted = dashboard._ledger_fingerprint("test")
+    assert trusted, "a file-backend namespace produced no fingerprint at all"
+    assert trusted == dashboard._ledger_fingerprint("test"), \
+        "two stats of one unchanged ledger disagreed, so nothing can ever hit"
+    events.append_event("decision", {"text": "moves the stamp"},
+                        session_id="sess-1", project="test")
+    assert dashboard._ledger_fingerprint("test") != trusted, \
+        "an appended event did not move the stamp"
