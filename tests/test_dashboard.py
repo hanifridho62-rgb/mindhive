@@ -2,6 +2,7 @@
 import json
 import re
 import socket
+import time
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
@@ -179,13 +180,19 @@ def test_only_section_loads_arm_a_skeleton(dashboard_server):
                  "run('loading skill & plugin', renderPlugins, 'rows')"):
         assert call in body, f"section load lost its skeleton: {call}"
 
-    # The two Action helpers share this exact paint line; neither may opt in.
-    assert body.count("if (current()) showText(r);") == 2, (
-        "doAction/confirmAction changed shape -- re-check the assertion below")
-    for i in _all_indexes(body, "if (current()) showText(r);"):
-        tail = body[i:i + 120]
-        assert not any(f", '{s}')" in tail for s in ("cards", "rows", "block")), (
-            "an Action button arms a skeleton over the view it started from")
+    # An Action button paints into whatever the user was already reading, so none
+    # of the action helpers may arm a SECTION skeleton — that would flash a
+    # heading-and-tiles placeholder over the view it was started from.
+    #
+    # Two helpers, not one, since the long operations became jobs (T13):
+    # `doAction` still runs the short ones inline, `runJob` follows a 202.
+    for helper, paint in (("function doAction", "if (current()) showText(r);"),
+                          ("function runJob", "if (current()) showText(text);")):
+        chunk = body[body.index(helper):body.index(helper) + 800]
+        assert paint in chunk, (
+            f"{helper} changed shape -- re-check the assertion below")
+        assert not any(f", '{s}')" in chunk for s in ("cards", "rows", "block")), (
+            f"{helper} arms a skeleton over the view it started from")
 
 
 def _all_indexes(hay, needle):
@@ -809,6 +816,29 @@ def _post(base, path, payload, token):
         return r.status, json.loads(r.read().decode("utf-8"))
 
 
+def _run_job(base, path, payload, token, timeout=25):
+    """POST one of the six long operations, follow its job, return the finished
+    snapshot.
+
+    Those six answer **202 with a job id** (T13) instead of doing the work inside
+    the request, so the counts these tests assert on arrive in the job's own
+    `result`. `outcome` is the fact the old `ok: True` could not carry: whether
+    anything actually happened.
+    """
+    status, obj = _post(base, path, payload, token)
+    assert status == 202, f"{path} answered {status}, not 202: {obj}"
+    job_id = obj["job"]["id"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, body = _get(base, f"/api/job?id={job_id}", token)
+        assert status == 200
+        job = json.loads(body)["job"]
+        if job["state"] == "finished":
+            return job
+        time.sleep(0.02)
+    raise AssertionError(f"the job for {path} never finished")
+
+
 def test_plugins_autoscan_is_stale_gated(dashboard_server):
     base, token = dashboard_server
     # empty store -> first autoscan must actually scan
@@ -1360,9 +1390,12 @@ def test_harvest_endpoint_runs_catch_up(dashboard_server, monkeypatch):
     import mindhive.harvest as h
     monkeypatch.setattr(h, "catch_up", lambda skip_captured=True: {"projects": {}, "total_new": 0})
     base, token = dashboard_server
-    status, obj = _post(base, "/api/harvest", {}, token)
-    assert obj["ok"] is True
-    assert obj["result"]["total_new"] == 0
+    job = _run_job(base, "/api/harvest", {}, token)
+    # An empty catch-up is a SUCCESS that changed nothing, and saying so is the
+    # point of the outcome: `ok: True` read the same either way.
+    assert job["outcome"] == "nothing_to_do", job
+    assert job["worked"] is True
+    assert job["result"]["total_new"] == 0
 
 
 def test_harvest_endpoint_allowed_under_hivemind(dashboard_server, monkeypatch):
@@ -1722,9 +1755,9 @@ def test_reflect_happy_path(dashboard_server, monkeypatch):
     _seed_incident("test", sig="sig:one")
     monkeypatch.setattr(refl_mod, "reflect_incident",
                         lambda sig, project=None: {"reflected": True})
-    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
-    assert status == 200
-    assert obj == {"ok": True, "reflected": 1, "failed": 0, "pending": 0}
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert job["outcome"] == "did_work", job
+    assert job["result"] == {"reflected": 1, "failed": 0, "pending": 0}
 
 
 def test_reflect_skips_already_reflected(dashboard_server, monkeypatch):
@@ -1734,8 +1767,9 @@ def test_reflect_skips_already_reflected(dashboard_server, monkeypatch):
     calls = []
     monkeypatch.setattr(refl_mod, "reflect_incident",
                         lambda sig, project=None: calls.append(sig) or {"reflected": True})
-    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
-    assert obj["ok"] is True and obj["reflected"] == 0 and obj["pending"] == 0
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert job["outcome"] == "nothing_to_do", job
+    assert job["result"]["reflected"] == 0 and job["result"]["pending"] == 0
     assert calls == []
 
 
@@ -1746,10 +1780,10 @@ def test_reflect_batch_cap_reports_pending(dashboard_server, monkeypatch):
     calls = []
     monkeypatch.setattr(refl_mod, "reflect_incident",
                         lambda sig, project=None: calls.append(sig) or {"reflected": True})
-    status, obj = _post(base, "/api/rules/reflect",
-                        {"project": "test", "limit": 3}, token)
+    job = _run_job(base, "/api/rules/reflect",
+                   {"project": "test", "limit": 3}, token)
     assert len(calls) == 3
-    assert obj["reflected"] == 3 and obj["pending"] == 2
+    assert job["result"]["reflected"] == 3 and job["result"]["pending"] == 2
 
 
 def test_reflect_excludes_candidates(dashboard_server, monkeypatch):
@@ -1758,8 +1792,9 @@ def test_reflect_excludes_candidates(dashboard_server, monkeypatch):
     calls = []
     monkeypatch.setattr(refl_mod, "reflect_incident",
                         lambda sig, project=None: calls.append(sig) or {"reflected": True})
-    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
-    assert obj == {"ok": True, "reflected": 0, "failed": 0, "pending": 0}
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert job["outcome"] == "nothing_to_do", job
+    assert job["result"] == {"reflected": 0, "failed": 0, "pending": 0}
     assert calls == []
 
 
@@ -1774,7 +1809,10 @@ def test_reflect_rejects_concurrent_run(dashboard_server):
         dash_mod._REFLECT_LOCK.release()
 
 
-def test_reflect_all_failed_missing_cli_is_domain_rejection(dashboard_server, monkeypatch):
+def test_reflect_all_failed_missing_cli_is_a_failed_job(dashboard_server,
+                                                       monkeypatch):
+    """Was a 200 ok:False before the work moved off the request thread. The
+    reason has to survive that move: it is now the job's outcome and summary."""
     base, token = dashboard_server
     _seed_incident("test", sig="sig:nocli")
     monkeypatch.setattr(refl_mod, "reflect_incident",
@@ -1782,15 +1820,17 @@ def test_reflect_all_failed_missing_cli_is_domain_rejection(dashboard_server, mo
                                                    "reason": "empty verdict"})
     import shutil
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
-    assert status == 200
-    assert obj["ok"] is False and "claude CLI unavailable" in obj["error"]
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert job["outcome"] == "failed", job
+    assert job["worked"] is False
+    assert "claude CLI unavailable" in job["summary"]
 
 
 def test_reflect_noop_on_empty_store(dashboard_server):
     base, token = dashboard_server
-    status, obj = _post(base, "/api/rules/reflect", {"project": "bare"}, token)
-    assert obj == {"ok": True, "reflected": 0, "failed": 0, "pending": 0}
+    job = _run_job(base, "/api/rules/reflect", {"project": "bare"}, token)
+    assert job["outcome"] == "nothing_to_do", job
+    assert job["result"] == {"reflected": 0, "failed": 0, "pending": 0}
 
 
 def test_reflect_rejected_for_hivemind(dashboard_server):
@@ -1832,9 +1872,9 @@ def test_resolve_reroutes_leaking_rule(dashboard_server, monkeypatch):
     _seed_leaking_incident("test")
     monkeypatch.setattr(refl_mod, "_claude_runner",
                         lambda prompt, timeout_s=120: _ROUTES_JSON)
-    status, obj = _post(base, "/api/rules/resolve", {"project": "test"}, token)
-    assert status == 200
-    assert obj["ok"] is True and obj["rerouted"] == 1 and obj["pending"] == 0
+    job = _run_job(base, "/api/rules/resolve", {"project": "test"}, token)
+    assert job["outcome"] == "did_work", job
+    assert job["result"]["rerouted"] == 1 and job["result"]["pending"] == 0
     rec = [r for r in inc_mod.summaries(project="test")
            if r["signature"] == "raw:leaky"][0]
     assert rec["active_rule"] == "take the alternative route"
@@ -1856,8 +1896,9 @@ def test_resolve_rejects_concurrent_run(dashboard_server):
 
 def test_resolve_noop_on_empty_store(dashboard_server):
     base, token = dashboard_server
-    status, obj = _post(base, "/api/rules/resolve", {"project": "bare"}, token)
-    assert obj["ok"] is True and obj["rerouted"] == 0 and obj["red"] == 0
+    job = _run_job(base, "/api/rules/resolve", {"project": "bare"}, token)
+    assert job["outcome"] == "nothing_to_do", job
+    assert job["result"]["rerouted"] == 0 and job["result"]["red"] == 0
 
 
 def test_improvements_payload_carries_reroute_fields(dashboard_server, monkeypatch):
@@ -1944,7 +1985,12 @@ def test_page_has_reflect_failure_hook(dashboard_server):
         assert needle in body, f"missing reflect-failure hook: {needle}"
 
 
-def test_reflect_unexpected_error_returns_500(dashboard_server, monkeypatch):
+def test_reflect_unexpected_error_becomes_a_failed_job(dashboard_server,
+                                                      monkeypatch):
+    """This used to be a 500. It cannot be one now — the response is long gone by
+    the time the work runs — so the news arrives as a failed outcome instead.
+    What must NOT change is that the reason survives: an unexpected fault that
+    reported nothing is how a wedged operation stays invisible."""
     base, token = dashboard_server
     _seed_incident("test", sig="sig:boom")
 
@@ -1952,17 +1998,9 @@ def test_reflect_unexpected_error_returns_500(dashboard_server, monkeypatch):
         raise RuntimeError("reflector exploded")
 
     monkeypatch.setattr(refl_mod, "reflect_incident", boom)
-    url = f"{base}/api/rules/reflect?token={token}"
-    data = json.dumps({"project": "test"}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=10)
-        assert False, "expected 500"
-    except urllib.error.HTTPError as e:
-        assert e.code == 500
-        obj = json.loads(e.read().decode("utf-8"))
-        assert obj["ok"] is False and "exploded" in obj["error"]
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert job["outcome"] == "failed", job
+    assert "exploded" in job["summary"]
 
 
 # --------------------------------------------------------------------------
@@ -2206,10 +2244,10 @@ def test_reflect_clamps_oversized_limit(dashboard_server, monkeypatch):
     calls = []
     monkeypatch.setattr(refl_mod, "reflect_incident",
                         lambda sig, project=None: calls.append(sig) or {"reflected": True})
-    status, obj = _post(base, "/api/rules/reflect",
-                        {"project": "test", "limit": 100}, token)
+    job = _run_job(base, "/api/rules/reflect",
+                   {"project": "test", "limit": 100}, token)
     assert len(calls) == 3                       # clamped to REFLECT_BATCH_LIMIT
-    assert obj["reflected"] == 3 and obj["pending"] == 2
+    assert job["result"]["reflected"] == 3 and job["result"]["pending"] == 2
 
 
 def test_reflect_rejects_non_numeric_limit(dashboard_server):
@@ -2232,9 +2270,12 @@ def test_reflect_pending_excludes_failed(dashboard_server, monkeypatch):
         return {"reflected": len(seen) == 1}     # first ok, rest fail
 
     monkeypatch.setattr(refl_mod, "reflect_incident", one_ok_rest_fail)
-    status, obj = _post(base, "/api/rules/reflect", {"project": "test"}, token)
-    assert obj["reflected"] == 1 and obj["failed"] == 2
-    assert obj["pending"] == 0                    # attempted-but-failed is not pending
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    # Some worked and some did not: DEGRADED is the honest name for that, and it
+    # is neither of the two answers the old body could give.
+    assert job["outcome"] == "degraded", job
+    assert job["result"]["reflected"] == 1 and job["result"]["failed"] == 2
+    assert job["result"]["pending"] == 0          # attempted-but-failed is not pending
 
 
 # --------------------------------------------------------------------------

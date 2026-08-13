@@ -28,7 +28,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard, events
+from mindhive import dashboard, events, jobs
 
 # The locks and both memos are MODULE level on purpose — they have to hold
 # across every handler class `make_handler` mints, and across every thread the
@@ -57,6 +57,11 @@ def clean_module_state():
     _clear_memos()
     yield
     _clear_memos()
+    # A job outlives the request that started it, so a test that leaves one
+    # running would hold its kind's slot and get the NEXT test's first click
+    # refused — which reads as a concurrency bug in whichever test ran second.
+    jobs._RUNNING.clear()
+    jobs._JOBS.clear()
     for lock in _ALL_LOCKS:
         if lock.locked():           # a failed test must not wedge the next one
             lock.release()
@@ -103,17 +108,82 @@ def _get(base, path, token):
 # "the work ran exactly once" is a claim about the expensive thing, not about
 # the HTTP round trip.
 LOCKED = [
-    ("/api/harvest", "mindhive.dashboard", "run_catch_up",
-     {"projects": {}, "total_new": 0}),
     ("/api/project", "mindhive.projector", "project", {"wrote": []}),
     ("/api/sync", "mindhive.sync", "sync", "MEMORY.md"),
-    ("/api/embed", "mindhive.vectors", "embed", {"embedded": 0}),
-    ("/api/plugins/scan", "mindhive.plugins", "scan_and_store", {"top": []}),
     ("/api/plugins/autoscan", "mindhive.plugins", "ensure_fresh",
      {"scanned": True, "age_hours": 0.0, "payload": {}}),
-    ("/api/selftest", "mindhive.selftest", "run", 0),
 ]
 LOCKED_IDS = [row[0] for row in LOCKED]
+
+# --- T13: the six long operations, now 202-accepted jobs --------------------
+# These used to be in LOCKED above, and the lock still exists and is still per
+# operation — it is just held by the JOB for as long as the work runs, instead of
+# by the handler for as long as the response takes. Two things therefore changed
+# shape and are re-asserted below rather than dropped: the accepted response is
+# 202, and a run that raises can no longer surface as a 500, because by then the
+# response is long gone. It surfaces as a job whose outcome is `failed`.
+#
+# `work` is the ONE call each operation's cost actually lives in, so "the work ran
+# exactly once" stays a claim about the expensive thing. `reach` is what has to be
+# stubbed for that call to be reached at all, and `empty` is what the operation
+# reports when there is genuinely nothing to do — the case T13 requires be
+# exercised, and the one an `ok: True` could never distinguish from real work.
+Op = collections.namedtuple("Op", "route work result reach empty")
+
+NOTHING = "nothing_to_do"
+
+JOBS = [
+    Op("/api/harvest", ("mindhive.dashboard", "run_catch_up"),
+       {"projects": {"test": {"new": 2}}, "total_new": 2},
+       {}, ({"projects": {}, "total_new": 0}, NOTHING)),
+    Op("/api/embed", ("mindhive.vectors", "embed"), {"embedded": 3},
+       {}, ({"embedded": 0}, NOTHING)),
+    Op("/api/plugins/scan", ("mindhive.plugins", "scan_and_store"),
+       {"counts": {"plugins_total": 4, "skills_total": 9}},
+       {}, ({"counts": {"plugins_total": 0, "skills_total": 0}}, NOTHING)),
+    Op("/api/selftest", ("mindhive.selftest", "run"),
+       {"exit_code": 0, "counts": {"passed": 4602}},
+       {}, ({"exit_code": 0, "counts": {}}, "did_work")),
+    # Reflection only reaches its expensive call when an eligible incident
+    # exists, so the empty case is the DEFAULT here and `reach` is what makes the
+    # work happen at all.
+    Op("/api/rules/reflect", ("mindhive.reflect", "reflect_incident"),
+       {"reflected": True},
+       {("mindhive.incidents", "summaries"): lambda *a, **k: [
+           {"signature": "sig-1", "status": "active", "rule_source": "none"}]},
+       (None, NOTHING)),
+    Op("/api/rules/resolve", ("mindhive.resolve", "resolve_batch"),
+       {"rerouted": 1, "reflected": 0, "failed": 0},
+       {}, ({"rerouted": 0, "reflected": 0, "failed": 0}, NOTHING)),
+]
+JOB_IDS = [op.route for op in JOBS]
+
+
+def _stub_incident_projection(monkeypatch):
+    """The reflect job self-heals the incident projection before it looks. Neither
+    call is the work under test, and both touch the store."""
+    incidents = importlib.import_module("mindhive.incidents")
+    monkeypatch.setattr(incidents, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(incidents, "project", lambda *a, **k: None)
+    monkeypatch.setattr(incidents, "summaries", lambda *a, **k: [])
+
+
+def _apply(monkeypatch, patches):
+    for (mod, attr), value in patches.items():
+        monkeypatch.setattr(importlib.import_module(mod), attr, value)
+
+
+def _await_job(base, token, job_id, timeout=20):
+    """Poll a job to completion the way the page does, and return its final
+    snapshot."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, obj = _get(base, f"/api/job?id={job_id}", token)
+        assert status == 200 and obj["ok"] is True, obj
+        if obj["job"]["state"] == "finished":
+            return obj["job"]
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} never finished")
 
 
 def _blocking(result):
@@ -182,6 +252,193 @@ def test_the_lock_is_released_when_the_handler_raises(
     status, obj = _post(base, route, {"project": "test"}, token)
     assert status == 200 and obj["ok"] is True, \
         f"{route} stayed locked after the handler raised"
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_a_long_operation_is_accepted_not_completed(dashboard_server,
+                                                    monkeypatch, op):
+    """202, and a job id to poll. A 200 would claim the work was done, which is
+    the lie that made the browser give up on runs that were still going."""
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    _apply(monkeypatch, op.reach)
+    mod, attr = op.work
+    monkeypatch.setattr(importlib.import_module(mod), attr,
+                        lambda *_a, **_kw: op.result)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202, f"{op.route} answered {status}, not 202 Accepted"
+    assert obj["ok"] is True and obj["job"]["id"]
+    assert obj["job"]["state"] == "running"
+    assert "outcome" not in obj["job"], "an accepted job cannot know its outcome"
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] in ("did_work", "degraded"), final
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_a_second_click_is_refused_while_the_job_still_holds_the_lock(
+        dashboard_server, monkeypatch, op):
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    _apply(monkeypatch, op.reach)
+    mod, attr = op.work
+    fake, entered, release, calls = _blocking(op.result)
+    monkeypatch.setattr(importlib.import_module(mod), attr, fake)
+
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202 and obj["ok"] is True
+    assert entered.wait(10), f"{op.route} never reached its work"
+
+    status, refused = _post(base, op.route, {"project": "test"}, token)
+    # An expected domain rejection: ok:False with HTTP 200, never 409 and never
+    # 500 — unchanged from when these ran inline, so the page reads it the same.
+    assert status == 200, f"{op.route} refused with {status}, not 200"
+    assert refused["ok"] is False
+    assert "already running" in refused["error"], refused
+
+    release.set()
+    _await_job(base, token, obj["job"]["id"])
+    # THE guarantee: the refusal did not merely answer differently, it stopped
+    # the second run from happening at all.
+    assert calls == [1], f"{op.route} ran the work {len(calls)} times, expected 1"
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_work_that_raises_is_reported_as_a_failed_job_and_frees_the_lock(
+        dashboard_server, monkeypatch, op):
+    """The 500 that used to carry this news cannot: the response is long gone by
+    the time the work runs. So the failure has to arrive as an OUTCOME — and a
+    lock released anywhere but a `finally` would wedge the operation for the life
+    of the process the first time anything threw."""
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    _apply(monkeypatch, op.reach)
+    mod, attr = op.work
+    module = importlib.import_module(mod)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("work exploded")
+    monkeypatch.setattr(module, attr, boom)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202 and obj["ok"] is True
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] == "failed", final
+    assert final["worked"] is False
+    assert "work exploded" in final["summary"], final
+
+    # The operation still answers, which is what proves the lock came back.
+    monkeypatch.setattr(module, attr, lambda *_a, **_kw: op.result)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202, f"{op.route} stayed locked after the work raised"
+    _await_job(base, token, obj["job"]["id"])
+
+
+@pytest.mark.parametrize("op", JOBS, ids=JOB_IDS)
+def test_an_operation_with_nothing_to_do_says_so(dashboard_server, monkeypatch,
+                                                 op):
+    """The empty-work case T13 requires be exercised. `ok: True` could not tell
+    "harvested 40 sessions" from "there was nothing to harvest"; these two facts
+    now have different names."""
+    base, token = dashboard_server
+    _stub_incident_projection(monkeypatch)
+    empty_result, expected = op.empty
+    if empty_result is not None:
+        mod, attr = op.work
+        monkeypatch.setattr(importlib.import_module(mod), attr,
+                            lambda *_a, **_kw: empty_result)
+    status, obj = _post(base, op.route, {"project": "test"}, token)
+    assert status == 202
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] == expected, final
+    assert final["worked"] is True, "an honest 'nothing to do' is still a success"
+    assert final["summary"].strip(), "an outcome with no reason is a dead end"
+
+
+def test_absent_semantic_extras_are_degraded_not_failed(dashboard_server,
+                                                        monkeypatch):
+    """The semantic layer is optional by invariant (DATA_MODEL §5), so missing
+    extras are a degraded store, not a broken dashboard.
+
+    Its sibling above — the same route raising a plain RuntimeError and having to
+    report `failed` — is what stops this from being satisfied by a blanket
+    `except RuntimeError`, which would call every crash a missing dependency.
+    """
+    base, token = dashboard_server
+
+    def missing_extras(*_a, **_kw):
+        try:
+            raise ImportError("No module named 'chromadb'")
+        except ImportError as e:
+            raise RuntimeError(
+                "semantic layer needs extras: pip install -e .[vectors]") from e
+
+    monkeypatch.setattr(importlib.import_module("mindhive.vectors"), "embed",
+                        missing_extras)
+    status, obj = _post(base, "/api/embed", {"project": "test"}, token)
+    assert status == 202
+    final = _await_job(base, token, obj["job"]["id"])
+    assert final["outcome"] == "degraded", final
+    assert "extras" in final["summary"]
+    assert final["worked"] is False
+
+
+def test_a_job_id_the_server_has_never_heard_of_is_not_a_transport_error(
+        dashboard_server):
+    """After a restart the page still holds an id from the previous process. The
+    honest answer names that, and it is a 200 the page can render."""
+    base, token = dashboard_server
+    status, obj = _get(base, "/api/job?id=deadbeefdeadbeef", token)
+    assert status == 200
+    assert obj["ok"] is False
+    assert "restarted" in obj["error"]
+
+
+def test_polling_carries_only_output_that_is_new(dashboard_server, monkeypatch):
+    """The whole buffer used to be re-sent on every 2.5s tick (T16). The offset
+    the previous poll handed back is what makes the next one incremental."""
+    base, token = dashboard_server
+    release = threading.Event()
+
+    def chatty(*_a, **_kw):
+        chatty.emit("first line\n")
+        release.wait(timeout=20)
+        chatty.emit("second line\n")
+        return {"exit_code": 0, "counts": {}}
+
+    # `selftest.run` receives the job's sink as `emit`; capture it so the fake can
+    # write through the same channel the real one does.
+    real = importlib.import_module("mindhive.selftest")
+    monkeypatch.setattr(real, "run",
+                        lambda emit=None, echo=True: (
+                            setattr(chatty, "emit", emit), chatty())[1])
+
+    status, obj = _post(base, "/api/selftest", {"project": "test"}, token)
+    assert status == 202
+    job_id = obj["job"]["id"]
+
+    first = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        _, body = _get(base, f"/api/job?id={job_id}&offset=0", token)
+        if "first line" in body["job"]["output"]:
+            first = body["job"]
+            break
+        time.sleep(0.05)
+    assert first, "the first line never reached the pane"
+    release.set()
+
+    later = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        _, body = _get(
+            base, f"/api/job?id={job_id}&offset={first['offset']}", token)
+        if "second line" in body["job"]["output"]:
+            later = body["job"]
+            break
+        time.sleep(0.05)
+    assert later, "the second line never arrived"
+    assert "first line" not in later["output"], \
+        "the poll re-sent output the caller already had"
+    _await_job(base, token, job_id)
 
 
 @pytest.mark.parametrize("held,blocked", [

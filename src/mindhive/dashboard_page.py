@@ -297,14 +297,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <button onclick="doExport()">Export handoff.md</button>
     <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
     <button onclick="doAction('/api/sync','Sync')">Sync</button>
-    <button onclick="doAction('/api/harvest','Catch up (harvest missed sessions)')">Catch up</button>
+    <button onclick="runJob('/api/harvest','Catching up')">Catch up</button>
     <button onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
     <div class="group">Heavy</div>
-    <button onclick="confirmAction('/api/embed','Embed')">Embed</button>
-    <button onclick="confirmAction('/api/plugins/scan','Plugins scan')">Plugins scan</button>
+    <button onclick="runEmbed()">Embed</button>
+    <button onclick="confirmJob('/api/plugins/scan','Plugins scan')">Plugins scan</button>
     <button onclick="runReflect()">Reflect (learn from failures)</button>
     <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
-    <button onclick="confirmAction('/api/selftest','Self-test')">Self-test</button>
+    <button onclick="confirmJob('/api/selftest','Self-test')">Self-test</button>
   </nav>
   <!-- The screen-reader channel. Until the nav stopped being disabled during a
        fetch, `disabled` on every nav button WAS the only signal assistive tech
@@ -493,6 +493,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   function fail(e){
     only(out);
     const msg = (e && e.message) || String(e);
+    if (e && e.pane) {
+      // A job that RAN and reported a bad outcome is not a transport error, and
+      // for a failed suite its output is the most useful thing on the screen. The
+      // reason goes on top; the output stays. Without this the one error path
+      // would replace four minutes of pytest with a single line.
+      out.innerHTML = '<span class="err">'+ esc(msg) +'</span>\\n\\n' + esc(e.pane);
+      return;
+    }
     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
       out.innerHTML = '<span class="err">Can\\'t reach the MIND HIVE server.</span>\\n\\n'
         + 'The server has stopped, or this tab is from an earlier run. Re-open '
@@ -625,7 +633,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // wrap any async unit of work with busy state + error handling
   // Every run() gets a generation. `shouldPaint` covers renderers that register
   // a liveFn; it structurally CANNOT cover the run()-scoped paths that set
-  // `liveFn = null` — Briefing, Recall, Graph, doAction, confirmAction — because
+  // `liveFn = null` — Briefing, Recall, Graph, doAction, runJob — because
   // shouldPaint(null, anonymousFn) is false for all of them, so an identity
   // check there would discard every paint rather than only the stale ones.
   //
@@ -1057,20 +1065,20 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       el.onclick = (ev) => { ev.stopPropagation(); copyPrompt(el); });
   }
   // Reflect keeps the Heavy confirm (token spend) but lands back on the
-  // Improvements view with an inline result banner instead of confirmAction's
-  // full-panel JSON dump.
+  // Improvements view with an inline result banner instead of `runJob`'s
+  // full-panel output pane.
   async function runReflect(){
     if(!confirm('Reflect (learn from failures) \\u2014 runs the claude CLI once '
       + 'per recurring incident (a few per click). Continue?')) return;
     // POST and repaint inside ONE run() so the live timer can't fire in a
     // busy=false gap between the reflect call and the follow-up render.
     liveFn = renderImprovements;
-    await run('reflecting\\u2026', async () => {
-      const res = await apiPost('/api/rules/reflect', {});
-      IMP_BANNER = res.ok
-        ? ('Reflect: '+res.reflected+' reflected \\u00b7 '+res.failed
-           +' failed \\u00b7 '+res.pending+' pending')
-        : (res.error || 'reflection failed');
+    await run('reflecting\\u2026', async (current) => {
+      // The job's own summary IS the banner. It already reads "reflected 2, 1
+      // failed, 3 pending" — or, when there was nothing eligible, says that
+      // instead of showing three zeroes the user has to interpret.
+      const job = await awaitJob('/api/rules/reflect', {}, current, null);
+      IMP_BANNER = 'Reflect: ' + job.summary;
       await renderImprovements();
     });
   }
@@ -1082,13 +1090,9 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + 'missing ones) \\u2014 runs the claude CLI once per red lesson '
       + '(a few per click). Continue?')) return;
     liveFn = renderImprovements;
-    await run('resolving\\u2026', async () => {
-      const res = await apiPost('/api/rules/resolve', {});
-      IMP_BANNER = res.ok
-        ? ('Resolve: '+(res.rerouted||0)+' rerouted \\u00b7 '+(res.reflected||0)
-           +' reflected \\u00b7 '+(res.failed||0)+' failed \\u00b7 '
-           +(res.pending||0)+' still red')
-        : (res.error || 'resolution failed');
+    await run('resolving\\u2026', async (current) => {
+      const job = await awaitJob('/api/rules/resolve', {}, current, null);
+      IMP_BANNER = 'Resolve: ' + job.summary;
       await renderImprovements();
     });
   }
@@ -2238,17 +2242,108 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       if (why) throw new Error(why);   // reaches run()'s catch -> "failed", announced
     });
   }
-  function confirmAction(path, label){
-    if(!confirm(label + ' — this can take a while. Continue?')) return;
-    let body = {};
-    if(path === '/api/embed' && confirm('Force past LIVE_LOCK? (only if the box is idle)')) body = { force: true };
+  // --- the six long operations: 202 accepted, then polled (T13) -------------
+  //
+  // These six used to hold one fetch open for the whole run — a pytest run, an
+  // embedding pass, a claude call per incident. Past the fetch timeout the page
+  // gave up on work that was still running and would still finish, and reported
+  // a success as a failure. Now the POST returns a job id and this follows it.
+  //
+  // Polling, not SSE: the page already has a 2.5s poll loop and its own
+  // discard-stale-paint idiom, so a second transport with its own reconnect
+  // semantics would be a new failure mode bought for the same result.
+  const JOB_POLL_MS = 900;
+  const JOB_TAIL_LINES = 400;      // what the pane keeps; the server caps the rest
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  // Polls ONE job by id. Deliberately not `apiGet`: that guards against a
+  // project switch landing a stale paint, and a job id is not ambiguous about
+  // which namespace it belongs to — it was started for exactly one. Switching the
+  // picker while a four-minute suite runs must not turn it into an error.
+  async function apiJob(id, offset){
+    const r = await fetch(u('/api/job?id=' + encodeURIComponent(id)
+        + '&offset=' + encodeURIComponent(offset)),
+      { headers: { 'X-Hive-Token': TOKEN } });
+    return r.json();
+  }
+
+  // What the pane says. The outcome is named, not implied: "nothing to do" and
+  // "did work" are both successes and the user is entitled to know which one
+  // happened.
+  function jobText(job, output, dropped){
+    const head = (job.state === 'finished')
+      ? (job.summary || job.outcome || 'done')
+        + '\\n' + (job.outcome || '') + ' \\u00b7 ' + (job.seconds || 0) + 's'
+      : (job.label || 'working') + '\\u2026 ' + (job.seconds || 0) + 's';
+    const lines = String(output || '').split('\\n');
+    const tail = lines.length > JOB_TAIL_LINES
+      ? lines.slice(-JOB_TAIL_LINES).join('\\n') : String(output || '');
+    // Truncation the reader cannot see is output it will misread.
+    const gap = dropped
+      ? '[' + dropped + ' earlier bytes dropped \\u2014 the buffer is capped]\\n\\n'
+      : '';
+    return head + '\\n\\n' + gap + tail;
+  }
+
+  // Start the work and follow it to its end. Returns the finished job; throws
+  // when the server refused to start it at all.
+  async function awaitJob(path, body, current, paint){
+    const started = await apiPost(path, body || {});
+    const why = refusal(started);
+    if (why) throw new Error(why);   // reaches run()'s catch -> "failed", announced
+    let job = started.job;
+    if (!job || !job.id)
+      throw new Error('the server accepted the work but named no job to follow');
+    let output = job.output || '', offset = job.offset || 0, dropped = job.dropped || 0;
+    while (job.state !== 'finished') {
+      if (paint && current()) paint(job, output, dropped);
+      await sleep(JOB_POLL_MS);
+      const r = await apiJob(job.id, offset);
+      const gone = refusal(r);
+      if (gone) throw new Error(gone);
+      job = r.job;
+      // Only what is new: the offset the last poll handed back is what keeps a
+      // 2.5s tick from re-sending the whole buffer (T16).
+      output += (job.output || '');
+      offset = job.offset;
+      dropped += (job.dropped || 0);
+    }
+    job.fullOutput = output;
+    job.droppedBytes = dropped;
+    return job;
+  }
+
+  function runJob(path, label, body){
     controls.innerHTML=''; liveFn = null;
-    run(label+' running…', async (current) => {
-      const r = await apiPost(path, body);
-      if (current()) showText(r);      // liveFn is null here; run()'s generation guards it
-      const why = refusal(r);
-      if (why) throw new Error(why);
+    run(label, async (current) => {
+      const job = await awaitJob(path, body, current,
+        (j, out, dropped) => showText(jobText(j, out, dropped)));
+      const text = jobText(job, job.fullOutput, job.droppedBytes);
+      if (current()) showText(text);
+      if (job.outcome === 'failed') {
+        // Carries the pane so `fail` can keep the output while stating the
+        // reason — a failed suite's own output is the point.
+        const e = new Error(job.summary || 'the job failed');
+        e.pane = text;
+        throw e;
+      }
     });
+  }
+
+  // The Heavy confirm (these cost tokens or minutes) plus the 202 handoff.
+  function confirmJob(path, label, body){
+    if(!confirm(label + ' \\u2014 this can take a while. Continue?')) return;
+    runJob(path, label, body);
+  }
+
+  // Embed asks a second question the generic confirm cannot: whether to force
+  // past LIVE_LOCK. That answer is refused SYNCHRONOUSLY by the server, so it
+  // arrives as an ordinary ok:false rather than as a job outcome.
+  function runEmbed(){
+    if(!confirm('Embed \\u2014 this can take a while. Continue?')) return;
+    const body = confirm('Force past LIVE_LOCK? (only if the box is idle)')
+      ? { force: true } : {};
+    runJob('/api/embed', 'Embedding', body);
   }
 
   //__TASKS_JS__

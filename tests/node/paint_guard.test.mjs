@@ -962,11 +962,15 @@ async function refusedActionReportsFailure(scriptSrc) {
   const w = newWorld(scriptSrc);
   await w.settle();
   const mark = w.pending.length;
-  w.eval("doAction('/api/harvest','Catch up')");
+  // Sync rather than Catch up: harvest became a 202-accepted job (T13), and this
+  // case is about `doAction`'s own inline path. The job path's refusal is driven
+  // over real HTTP in tests/test_dashboard_locks.py, where the server — not a
+  // stubbed response — is what declines to start the work.
+  w.eval("doAction('/api/sync','Sync')");
   await w.settle();
   const reqs = w.since(mark);
   if (!reqs.length) return { error: 'doAction issued no request' };
-  w.answerWith(reqs, { ok: false, error: 'a harvest is already running' });
+  w.answerWith(reqs, { ok: false, error: 'a sync is already running' });
   await w.settle();
   return {
     status: w.getElementById('status')._textContent,

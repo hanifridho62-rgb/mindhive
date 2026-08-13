@@ -456,7 +456,9 @@ def cmd_embed(args) -> int | None:
 
 
 def cmd_selftest(args) -> int | None:
-    return selftest_mod.run()
+    # The exit code IS the command's contract; `run` returns the whole result
+    # because the dashboard's job reports the counts too.
+    return selftest_mod.run()["exit_code"]
 
 
 def cmd_premise_check(args) -> int | None:
