@@ -5,6 +5,23 @@
 Deterministic, event-sourced memory for long-running Claude sessions.
 Append events; deterministic projections rebuild everything. Nothing is hand-edited.
 
+## Quick start
+
+    pip install -e .
+    hive state                       # what the record says right now
+    hive append decision "chose X over Y because Z"
+    hive sync                        # refresh the MEMORY.md a session auto-loads
+    hive context --check             # is the auto-loaded surface still honest?
+
+Four commands are worth knowing before the rest: `hive state` (the live
+projection), `hive append` (the only way anything gets in), `hive sync` (rebuild
+what the next session reads), and `hive context --check` (what that costs, and
+whether all of it actually arrives). Everything else in this file is a
+specialisation of those four.
+
+On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
+**PowerShell 5.1 note** below.
+
 ## Commands
 - `hive append <type> <payload> [--json] [--stdin] [--tags a,b]` — add an event
 - `hive project` — rebuild STATE.md + LEDGER/ + index.json + chain.json
@@ -55,6 +72,59 @@ Append events; deterministic projections rebuild everything. Nothing is hand-edi
 - **`/circle`** — the loop **primitive** (not the pipeline): type `/circle` and Claude preflights the `claude` CLI, scaffolds/confirms `.hive-loop/`, dry-runs, then drives the autonomous `hive loop` and reports the result. Headless agent runs with `permission_mode = "acceptEdits"` by default. The `/mindhive-orchestrator` pipeline may drive this loop as one of its execution engines. Shipped as a **Claude Code plugin** (`commands/circle.md` slash command + `skills/circle/` skill, declared in `.claude-plugin/`) so it works in any project once installed — see below.
 - **`hive clusters build` / `hive clusters plan --lanes N`** — the parallel-orchestration layer the pipeline stands on at execution: clusters the repo by module, classifies each file's complexity, and packs whole clusters into `N` **file-ownership-safe lanes** (no file in two lanes) so parallel sub-agents never collide. Deterministic and dependency-free; the cluster DB is an overwrite-in-place `cluster_db.json` sidecar.
 - **`/engineering-loop`** — a **subordinate execution engine** (not a competing pipeline): fuses `/circle`'s bounded headless loop with the compound-engineering `lfg` pipeline into a memory-driven **plan → work → review → fix → verify → learn** loop. MindHive memory sits between every stage (recall before, append after), it drives the chosen skills through the invoke channel with green/red status, and any skill failure feeds the improvement loop as a `skill:<name>` prevention rule. The `/mindhive-orchestrator` pipeline may drive it at its execution stage. Shipped in the same plugin (`skills/engineering-loop/`).
+
+### The always-on surface: what auto-loads, and whether it arrives
+
+Four of these exist because the auto-loaded surface can degrade **silently** —
+the block still arrives, so nothing looks broken, and part of what it promised is
+missing. `tests/test_docs_parity.py` enumerates the shipped commands off the live
+parser and fails when one of them is absent from this file, so this list cannot
+quietly fall behind the CLI again.
+
+- `hive sync [--folder P] [--no-briefing]` — write the native `MEMORY.md` digest the desktop app auto-loads. It now **warns when the file it just wrote is past the loader's line budget**, naming the sections the loader will not reach — the digest's caps bound item counts, and no item count bounds lines, so the tail (lessons, decisions) is what silently stops arriving
+- `hive context [--check] [--top N] [--origin hive|claude] [--json]` — measure everything that auto-loads into every session, ranked by estimated token cost, with trim suggestions. `--check` is the gate: exit 1 when over the token budget **or** when `MEMORY.md` is past its line budget (that one is loss, not cost, and is reported even with no token budget configured)
+- `hive context --set-budget N [--set-memory-lines N]` — persist this namespace's token budget and, optionally, its MEMORY.md line budget (default: the native loader's own limit). One sidecar holds both; setting one never discards the other
+- `hive sop add|update|delete|list|show <id>` — the event-sourced SOP registry. A **mandatory** SOP is re-asserted on every human prompt, verbatim
+- `hive sop injection [--json]` — what that per-prompt injection **actually delivers right now**: every mandatory body verbatim, or degraded to `hive sop show <id>` pointers because it outgrew the per-prompt budget. Read-only, and not a gate
+- `hive sop preflight [--json]` — pre-execution report: is this session new or a continuation (with the ledger evidence), which SOPs are mandatory, what the improvements record already warns about
+- `hive briefing` — build and print `BRIEFING.md` (the full context; `MEMORY.md` is the compact digest of it)
+- `hive directives` — print the session operating directives
+- `hive repo stale [--max-age-hours H] [--json]` — how far this checkout has drifted from its integration ref. **Never fetches**: it compares against the ref as this checkout last saw it and reports the age of that snapshot alongside the count, because "0 behind" and "0 behind, last fetched in July" are different facts. `unknown` carries its reason (`no_checkout`, `no_integration_ref`, `probe_failed`)
+- `hive premise check [--file F]` — check a prompt or handoff document's factual claims against the record: asserted file paths, roadmap ids, and test counts that contradict what is on disk, plus the claims it could not check
+
+### Namespaces, hygiene & automation
+
+- `hive projects` — list namespaces (registered vs unregistered)
+- `hive gc [--prune <name>|--prune --orphans|--prune --graph-blobs] [--force]` — store hygiene: report per-namespace sizes, prune junk. Opt-in and guarded — it refuses a bulk prune when the registry is unreadable, rather than treating every namespace as an orphan
+- `hive autosync [--max-age-hours H]` — automated `sync` for registered projects (run from hooks; a near-instant no-op when nothing is stale)
+- `hive autoresume` — after a usage cooldown, deliver an interrupted plan's marker (the ask, the progress, the next step) into the new session
+- `hive replenish [explain]` — propose the work the record proves is outstanding (run by `session_end`); `explain` shows the per-lens scoring behind each proposal
+- `hive failures list` — recorded tool failures and incidents, the raw material `hive rules` mints prevention rules from
+- `hive triggers` — prompt-quality trigger rules (the UserPromptSubmit gate)
+- `hive enrich` — prompt enrichment for Oversee: the default-on toggle and a deterministic preview of the enriched prompt
+- `hive packs check [--manifest P]` — stack content-pack quality gates (read-only)
+- `hive mindnet` — the MindNetwork task graph and phase spine: declare tasks, walk the six-phase pipeline, record the evidence each phase requires
+- `hive session run` — supervise an interactive Claude Code session and rotate it when context fills; see **Smart-zone session rotation** below
+- `hive session install-hook <settings.json> [--command C] [--dry-run]` — register the Stop hook that measures occupancy. Idempotent, refuses an unparseable settings file rather than repairing it, and backs up before writing
+
+### Smart-zone session rotation (interactive sessions)
+
+`hive session run` wraps an interactive session: when the Stop hook measures
+context past the smart-zone boundary it writes a `ROTATION_PENDING` artifact, and
+the supervisor starts a successor seeded from the ledger once the child exits. A
+Stop hook cannot end a session, which is why the signal is a file.
+
+Two properties are deliberate, not incidental. The hook is **inert until
+switched on** (`MINDHIVE_ROTATION`, which only `hive session run` sets, for its
+own children), so registering it changes nothing on its own. And its advice tells
+the truth about what happens next: it promises a queued successor only when a
+supervisor is actually waiting, and otherwise says plainly that nothing is queued
+and names the command that would queue one.
+
+**Rotation is Windows-only today** — every hook shim in `hooks/` is PowerShell
+(nine `.ps1`, no POSIX equivalent), so `hive session install-hook` on macOS or
+Linux registers a valid entry for a command that cannot run. It reports that as a
+`platform_warning` rather than leaving you to discover it as an absence.
 
 ## Install the `/circle` plugin (global)
 This repo is a self-contained Claude Code plugin marketplace. To get `/circle` in **every** project:

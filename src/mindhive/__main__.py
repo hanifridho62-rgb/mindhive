@@ -301,10 +301,24 @@ def cmd_context(args) -> int | None:
     project = getattr(args, "project", None)
     origin = getattr(args, "origin", "all")
 
-    if getattr(args, "set_budget", None) is not None:
-        data = context_mod.save_budget(args.set_budget, project=project)
-        print(f"context budget set to {data['budget']:,} est. tokens "
-              f"(stored in {context_mod.BUDGET_FILE})")
+    set_memory_lines = getattr(args, "set_memory_lines", None)
+    if getattr(args, "set_budget", None) is not None or set_memory_lines is not None:
+        # One sidecar, one write. `--set-memory-lines` alone must not drop the
+        # token budget already stored there, so the current value is read back
+        # and rewritten when only the line budget is being changed.
+        budget_value = getattr(args, "set_budget", None)
+        if budget_value is None:
+            budget_value = context_mod.load_budget(project)
+        if budget_value is None:
+            print("error: --set-memory-lines needs a token budget too — pass "
+                  "--set-budget N (the sidecar holds both)", file=sys.stderr)
+            return 2
+        data = context_mod.save_budget(budget_value, project=project,
+                                       memory_lines=set_memory_lines)
+        print(f"context budget set to {data['budget']:,} est. tokens"
+              + (f", MEMORY.md line budget {data['memory_lines']}"
+                 if "memory_lines" in data else "")
+              + f" (stored in {context_mod.BUDGET_FILE})")
         return None
 
     segments = []
@@ -318,7 +332,7 @@ def cmd_context(args) -> int | None:
         budget = context_mod.load_budget(project)
 
     report = context_mod.analyze(segments, budget=budget)
-    found = context_mod.findings(segments)
+    found = context_mod.findings(segments, project=project)
 
     if getattr(args, "json", False):
         print(context_mod.to_json(report, found))
@@ -326,7 +340,18 @@ def cmd_context(args) -> int | None:
         print(context_mod.render_text(report, found, top=getattr(args, "top", None)))
 
     if getattr(args, "check", False):
+        # Two independent failures, checked in this order because they are not
+        # the same kind of problem. The token budget is about COST — context
+        # spent. A truncated MEMORY.md is about LOSS — context paid for and never
+        # delivered, which is the worse of the two and needs no configured
+        # budget to be a fact, so it is reported even when the token check
+        # cannot run for want of one.
+        truncated = [f for f in found if f.rule == "memory_truncated"]
+        for f in truncated:
+            print(f"TRUNCATED: {f.message}", file=sys.stderr)
         if budget is None:
+            if truncated:
+                return 1
             print("error: --check needs a budget — set one with "
                   "`hive context --set-budget N` (or pass --budget N)",
                   file=sys.stderr)
@@ -335,6 +360,8 @@ def cmd_context(args) -> int | None:
         if over > 0:
             print(f"OVER BUDGET by ~{over:,} est. tokens — trim before adding "
                   f"anything new (see suggestions above)", file=sys.stderr)
+            return 1
+        if truncated:
             return 1
     return None
 
@@ -945,6 +972,57 @@ def cmd_sop_preflight(args) -> int | None:
     print(f"\nCatalog: {cat['skills']} skill(s), {cat['plugins']} plugin(s)"
           + (f" — {cat['error']}" if cat.get("error") else "")
           + "  (hive skills list / hive plugins list)")
+    return None
+
+
+def _repo_default_max_age() -> float:
+    """The staleness default, read from the module that owns it rather than
+    duplicated as an argparse literal — the same reason
+    `rotation_supervisor_defaults` exists."""
+    from . import repo
+    return repo.DEFAULT_MAX_AGE_HOURS
+
+
+def cmd_repo_stale(args) -> int | None:
+    """How stale is this checkout? Read-only and never fetches — see
+    `repo.staleness`. A report, not a gate: it exits zero even when behind,
+    because being behind is a normal state mid-branch and a diagnostic that
+    fails would be pruned from whatever ran it."""
+    from . import repo
+    max_age = getattr(args, "max_age_hours", None)
+    result = repo.staleness(max_age_hours=max_age if max_age is not None
+                            else repo.DEFAULT_MAX_AGE_HOURS)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return None
+    age = result["fetch_age_hours"]
+    age_text = ("never fetched (or unreadable)" if age is None
+                else f"last fetched {age:.1f}h ago")
+    if result["state"] == "unknown":
+        print(f"checkout staleness: unknown ({result['reason']}) — "
+              f"{result['detail']}")
+    else:
+        print(f"checkout staleness: {result['state']} — {result['behind']} behind "
+              f"/ {result['ahead']} ahead of {result['ref']}")
+    print(f"  {age_text}"
+          + ("  [the comparison is older than the freshness window, so the "
+             "counts above may already be wrong — `git fetch` to refresh]"
+             if result["fetch_stale"] else ""))
+    return None
+
+
+def cmd_sop_injection(args) -> int | None:
+    """Report what the per-prompt SOP injection is currently delivering.
+
+    Read-only, and deliberately not a gate: `hive context --check` is where the
+    always-on surface gets an exit code. Exiting non-zero here would make a
+    diagnostic fail in every script that ran it."""
+    from . import sopgate
+    result = sopgate.probe(project=getattr(args, "project", None))
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return None
+    print(sopgate.render_probe(result))
     return None
 
 
@@ -2588,6 +2666,19 @@ def cmd_sync(args) -> int | None:
     folder = args.folder or os.getcwd()
     native_path = sync_mod.sync(folder, include_briefing=not args.no_briefing)
     print(str(native_path))
+    # Say it here, where the file was just written. The digest's caps bound item
+    # counts, not lines, so this is the moment the file can cross the loader's
+    # limit — and the loader's own warning appears in the NEXT session, to the
+    # agent rather than to the person who ran sync.
+    from . import context as context_mod
+    pressure = context_mod.memory_pressure(native_path)
+    if pressure["readable"] and pressure["over"]:
+        lost = (", ".join(pressure["dropped"]) if pressure["dropped"]
+                else "the tail of the file")
+        print(f"warning: MEMORY.md is {pressure['lines']} lines against a "
+              f"{pressure['budget']}-line loader budget (over by "
+              f"{pressure['over']}); the loader will not reach: {lost}. "
+              f"See `hive context --check`.", file=sys.stderr)
     return None
 
 
@@ -3065,13 +3156,36 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(overrides the persisted one)")
     cx.add_argument("--set-budget", type=int, default=None, dest="set_budget",
                     help="persist the namespace's token budget and exit")
+    cx.add_argument("--set-memory-lines", type=int, default=None,
+                    dest="set_memory_lines",
+                    help="persist this namespace's MEMORY.md line budget "
+                         "(default: the native loader's own limit). Raising it "
+                         "is a decision that the loader will read only part of "
+                         "the file")
     cx.add_argument("--check", action="store_true",
-                    help="exit 1 when the measured total exceeds the budget")
+                    help="exit 1 when the measured total exceeds the budget, or "
+                         "when MEMORY.md is past its line budget (the loader "
+                         "then drops the digest's tail sections)")
     cx.add_argument("--top", type=int, default=None,
                     help="show only the N heaviest contributors")
     cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",
                     help="limit the report to one origin (default: all)")
     cx.set_defaults(func=cmd_context)
+
+    # --- repo (what git can prove about this checkout) ---
+    rp = sub.add_parser("repo", help="what git can prove about this checkout "
+                                     "(read-only, never fetches)")
+    rpsub = rp.add_subparsers(dest="repo_cmd", required=True)
+    rps = rpsub.add_parser("stale", help="how far this checkout has drifted from "
+                                         "its integration ref, and how old the "
+                                         "comparison is")
+    rps.add_argument("--max-age-hours", type=float,
+                     default=None, dest="max_age_hours",
+                     help="how old the last fetch may be before the comparison "
+                          "is flagged as untrustworthy (default: "
+                          f"{_repo_default_max_age():g})")
+    rps.add_argument("--json", action="store_true")
+    rps.set_defaults(func=cmd_repo_stale)
 
     # --- packs (stack content pack quality gates) ---
     pk = sub.add_parser("packs",
@@ -3289,6 +3403,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sop_pf.add_argument("--project", default=None)
     sop_pf.add_argument("--json", action="store_true")
     sop_pf.set_defaults(func=cmd_sop_preflight)
+    sop_inj = sosub.add_parser(
+        "injection",
+        help="what the per-prompt mandatory-SOP injection actually delivers "
+             "right now — bodies verbatim, or degraded to pointers")
+    sop_inj.add_argument("--project", default=None)
+    sop_inj.add_argument("--json", action="store_true")
+    sop_inj.set_defaults(func=cmd_sop_injection)
 
     # --- roadmap (event-sourced plan registry + interruption markers) ---
     from .roadmap import STATUSES as _RM_STATUSES

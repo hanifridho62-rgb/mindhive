@@ -514,9 +514,14 @@ def test_cli_set_budget_persists(capsys):
     assert context.load_budget(None) == 31000
 
 
-def test_cli_check_exit_codes():
+def test_cli_check_exit_codes(tmp_path, monkeypatch):
     from mindhive import __main__ as cli_mod
-    # A hive-origin artifact with known weight in the isolated namespace.
+    # A hive-origin artifact with known weight in the isolated namespace. The
+    # native MEMORY.md is pointed away from this machine's real one: the
+    # `--check` gate now also judges that file's LINE count, so leaving it
+    # resolved would make this test's exit code depend on the developer's own
+    # digest — passing on a fresh CI runner and failing on a working machine.
+    _point_memory_at(monkeypatch, tmp_path / "no-memory-here.md")
     _write(paths.project_dir("test") / "STATE.md", "x" * 4000)   # ~1000 tokens
     context.save_budget(10, project="test")
     assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 1
@@ -524,6 +529,170 @@ def test_cli_check_exit_codes():
     assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
 
 
-def test_cli_check_without_budget_is_an_error(capsys):
+def test_cli_check_without_budget_is_an_error(tmp_path, monkeypatch, capsys):
     from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, tmp_path / "no-memory-here.md")
     assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 2
+
+
+# --------------------------------------------------------------------------
+# the MEMORY.md line budget: context paid for and never delivered
+# --------------------------------------------------------------------------
+#
+# Every other rule in this module is about COST — tokens spent. This one is
+# about LOSS: the native loader reads only the first N lines of MEMORY.md, so a
+# digest past that limit is charged in full and delivered in part, and the part
+# that vanishes is the tail — where `sync` writes the lessons and the decisions.
+# The caps in `sync` bound item COUNTS, and no item count bounds lines.
+
+def _memory(tmp_path, lines: int, tail_section="Key decisions") -> Path:
+    body = [f"line {i}" for i in range(lines - 2)]
+    return _write(tmp_path / "MEMORY.md",
+                  "\n".join(body + [f"## {tail_section}", "- something"]))
+
+
+def test_memory_pressure_reports_the_overflow_and_what_is_lost(tmp_path):
+    path = _memory(tmp_path, 260)
+    pressure = context.memory_pressure(path, budget=200)
+    assert pressure["lines"] == 260
+    assert pressure["over"] == 60
+    assert pressure["dropped"] == ["Key decisions"]
+    assert pressure["readable"] is True
+
+
+def test_memory_pressure_is_silent_when_the_file_fits(tmp_path):
+    """CANARY for the test above: a short digest names nothing as dropped, so
+    the finding is a measurement rather than a constant."""
+    pressure = context.memory_pressure(_memory(tmp_path, 20), budget=200)
+    assert pressure["over"] == 0 and pressure["dropped"] == []
+
+
+def test_memory_pressure_distinguishes_unreadable_from_fine(tmp_path):
+    """DISCRIMINATING: both answer "over: 0", and only one of them means the
+    file is OK. `readable` is the field that tells them apart."""
+    pressure = context.memory_pressure(tmp_path / "nope.md", budget=200)
+    assert pressure["readable"] is False and pressure["over"] == 0
+
+
+def test_memory_line_budget_is_configurable_per_namespace():
+    assert context.load_memory_line_budget("test") == context.MEMORY_LINE_BUDGET
+    context.save_budget(30000, project="test", memory_lines=400)
+    assert context.load_memory_line_budget("test") == 400
+
+
+def test_setting_the_token_budget_does_not_wipe_the_line_budget():
+    """The sidecar holds both, and the two are set at different moments."""
+    context.save_budget(30000, project="test", memory_lines=400)
+    context.save_budget(31000, project="test")
+    assert context.load_memory_line_budget("test") == 400
+    assert context.load_budget("test") == 31000
+
+
+def test_corrupt_line_budget_falls_back_to_the_default():
+    _write(paths.project_dir("test") / context.BUDGET_FILE,
+           '{"budget": 100, "memory_lines": "banana"}')
+    assert context.load_memory_line_budget("test") == context.MEMORY_LINE_BUDGET
+
+
+def test_findings_flag_a_truncated_memory_digest(tmp_path):
+    path = _memory(tmp_path, 300)
+    seg = context.Segment(name="MEMORY.md", origin="hive", path=str(path),
+                          nbytes=path.stat().st_size, tokens=100,
+                          kind="artifact")
+    found = context.findings([seg], project="test")
+    truncated = [f for f in found if f.rule == "memory_truncated"]
+    assert len(truncated) == 1
+    assert truncated[0].severity == "high"
+    assert "Key decisions" in truncated[0].message
+
+
+def test_a_short_digest_produces_no_truncation_finding(tmp_path):
+    """CANARY for the test above."""
+    path = _memory(tmp_path, 30)
+    seg = context.Segment(name="MEMORY.md", origin="hive", path=str(path),
+                          nbytes=path.stat().st_size, tokens=100,
+                          kind="artifact")
+    assert not [f for f in context.findings([seg], project="test")
+                if f.rule == "memory_truncated"]
+
+
+def _point_memory_at(monkeypatch, path):
+    from mindhive import sync as sync_mod
+    monkeypatch.setattr(sync_mod, "native_memory_path",
+                        lambda folder, home=None: Path(path))
+
+
+def test_cli_check_fails_on_a_truncated_digest(tmp_path, monkeypatch, capsys):
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _memory(tmp_path, 300))
+    context.save_budget(1_000_000, project="test")      # token budget is fine
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 1
+    assert "TRUNCATED" in capsys.readouterr().err
+
+
+def test_cli_check_passes_when_the_digest_fits(tmp_path, monkeypatch, capsys):
+    """CANARY for the test above: same command, same budget, shorter file."""
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _memory(tmp_path, 30))
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    assert "TRUNCATED" not in capsys.readouterr().err
+
+
+def test_truncation_is_reported_even_with_no_token_budget(tmp_path, monkeypatch,
+                                                          capsys):
+    """A missing token budget is a configuration gap; a truncated digest is a
+    fact. The fact does not wait for the configuration."""
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _memory(tmp_path, 300))
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 1
+    assert "TRUNCATED" in capsys.readouterr().err
+
+
+def test_cli_set_memory_lines_needs_a_token_budget(capsys):
+    """One sidecar holds both, so there is no half-configured state to write."""
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["context", "--set-memory-lines", "300"]) == 2
+    assert cli_mod.main(["context", "--set-budget", "40000",
+                         "--set-memory-lines", "300"]) == 0
+    assert context.load_memory_line_budget(None) == 300
+
+
+def test_sync_warns_when_the_digest_it_just_wrote_is_truncated(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """The loader's own warning arrives in the NEXT session, to the agent. This
+    one arrives now, to whoever ran sync."""
+    from mindhive import __main__ as cli_mod
+    from mindhive import sync as sync_mod
+    written = _memory(tmp_path, 300)
+    monkeypatch.setattr(sync_mod, "sync",
+                        lambda folder, **kw: written)
+    assert cli_mod.main(["sync"]) == 0
+    err = capsys.readouterr().err
+    assert "MEMORY.md is 300 lines" in err and "Key decisions" in err
+
+
+# --------------------------------------------------------------------------
+# latency budget
+# --------------------------------------------------------------------------
+
+def test_the_findings_pipeline_stays_inside_its_latency_budget(tmp_path):
+    """`hive context --check` is meant to be cheap enough to run in an adoption
+    flow or a pre-commit script, and the rules that read file CONTENT (duplicate
+    lines, dead paths, truncation) are the ones that can quietly make it
+    expensive. The bound is deliberately loose — this is a regression guard
+    against an accidental O(n²) rule or a per-rule re-read, not a benchmark, and
+    a tight number on a shared CI runner would fail for reasons unrelated to the
+    code."""
+    import time
+    segs = []
+    for i in range(40):
+        p = _write(tmp_path / f"a{i}.md", ("a line of prose here\n" * 200))
+        segs.append(context.Segment(name=f"a{i}.md", origin="hive", path=str(p),
+                                    nbytes=p.stat().st_size, tokens=1000,
+                                    kind="artifact"))
+    start = time.perf_counter()
+    context.findings(segs, project="test")
+    elapsed = time.perf_counter() - start
+    assert elapsed < 5.0, f"findings over 40 artifacts took {elapsed:.2f}s"

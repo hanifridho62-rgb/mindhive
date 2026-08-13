@@ -104,15 +104,20 @@ def _safe_title(value) -> str:
     return " ".join(str(value or "").split())[:120]
 
 
-def render(rows) -> str:
-    """The injected block for *rows* (sidecar records), or "" when there is
-    nothing to say. Pure and deterministic: same rows in, same bytes out.
+def plan(rows) -> list[dict]:
+    """Per-SOP delivery decision for one prompt — the ONE place the budget is
+    spent. Junk rows and rows missing an id or a body are dropped here, so
+    everything downstream sees only deliverable records.
 
-    Bodies ride verbatim while the running total fits `PROMPT_BUDGET`; the rest
-    become `hive sop show <id>` pointers. Order is the sidecar's, which is
-    `sop.mandatory`'s `(created, sop_id)` — so promoting a new SOP never
-    reshuffles the ones already in force."""
-    lines, spent, any_body = [], 0, False
+    Extracted from `render` rather than re-derived by `probe`, and that is the
+    whole point of it existing: a probe carrying its own copy of the fit rule can
+    report "the procedure is injected verbatim" while the hook path ships
+    pointers — which is precisely the failure a probe exists to catch. `render`
+    renders this list and `probe` counts it, so the two cannot disagree.
+
+    Each record: `sop_id`, `title`, `chars`, `delivered` ("body" | "pointer"),
+    and `text` (the body itself, for `render`; `probe` drops it)."""
+    out, spent = [], 0
     for r in rows or []:
         if not isinstance(r, dict):
             continue                    # a junk row must not sink the block
@@ -121,17 +126,34 @@ def render(rows) -> str:
         text = str(r.get("text") or "").strip()
         if not sop_id or not text:
             continue
-        lines.append(f"— {title} `[{sop_id}]`")
-        if spent + len(text) <= PROMPT_BUDGET:
-            lines.append(text)
+        fits = spent + len(text) <= PROMPT_BUDGET
+        if fits:
             spent += len(text)
-            any_body = True
+        out.append({"sop_id": sop_id, "title": title, "chars": len(text),
+                    "delivered": "body" if fits else "pointer", "text": text})
+    return out
+
+
+def render(rows) -> str:
+    """The injected block for *rows* (sidecar records), or "" when there is
+    nothing to say. Pure and deterministic: same rows in, same bytes out.
+
+    Bodies ride verbatim while the running total fits `PROMPT_BUDGET`; the rest
+    become `hive sop show <id>` pointers. Order is the sidecar's, which is
+    `sop.mandatory`'s `(created, sop_id)` — so promoting a new SOP never
+    reshuffles the ones already in force."""
+    delivered = plan(rows)
+    lines = []
+    for row in delivered:
+        lines.append(f"— {row['title']} `[{row['sop_id']}]`")
+        if row["delivered"] == "body":
+            lines.append(row["text"])
         else:
             lines.append(f"  (body over the per-prompt budget — read it now: "
-                         f"`hive sop show {sop_id}`)")
+                         f"`hive sop show {row['sop_id']}`)")
     if not lines:
         return ""
-    if not any_body:
+    if not any(row["delivered"] == "body" for row in delivered):
         # Every body was over budget. The pointers still carry the obligation,
         # so the block is worth sending — but say plainly that the text is not
         # here, rather than letting a list of titles read as the procedure.
@@ -159,6 +181,93 @@ def block_for(text, project=None) -> str:
         return render(data.get("sops") if isinstance(data, dict) else None)
     except Exception:                                       # noqa: BLE001
         return ""
+
+
+# What the injection is currently delivering, worst first. `pointers_only` is
+# the state that matters: the block still arrives, so nothing looks broken, and
+# the procedure it claims to re-assert is not in it.
+VERDICTS = ("silent", "pointers_only", "partial", "verbatim")
+
+
+def probe(rows=None, project=None) -> dict:
+    """Measure what the per-prompt injection ACTUALLY delivers right now.
+
+    The tier's promise is that every mandatory procedure rides verbatim on every
+    human prompt. Whether it does is a fact about two numbers — the bodies'
+    length and `PROMPT_BUDGET` — and until this existed, nothing reported it: a
+    body that outgrew the budget degraded to a pointer silently, per prompt,
+    forever, and the block still arrived so nothing looked wrong. That is the
+    live state of this repo (one 3.4k-char mandatory SOP against a 3k budget).
+
+    Reads the same global sidecar the hook path reads, and counts the same `plan`
+    the hook path renders. Never raises: a probe that can fail is one more thing
+    to check."""
+    if rows is None:
+        try:
+            data = sop.read_global_sidecar()
+            rows = data.get("sops") if isinstance(data, dict) else None
+        except Exception:                                   # noqa: BLE001
+            rows = None
+    try:
+        delivered = plan(rows)
+        block = render(rows)
+    except Exception:                                       # noqa: BLE001
+        delivered, block = [], ""
+    bodies = [r for r in delivered if r["delivered"] == "body"]
+    pointers = [r for r in delivered if r["delivered"] == "pointer"]
+    if not delivered:
+        verdict = "silent"
+    elif not bodies:
+        verdict = "pointers_only"
+    elif pointers:
+        verdict = "partial"
+    else:
+        verdict = "verbatim"
+    return {
+        "budget": PROMPT_BUDGET,
+        "verdict": verdict,
+        "mandatory": len(delivered),
+        "bodies": len(bodies),
+        "pointers": len(pointers),
+        "body_chars": sum(r["chars"] for r in bodies),
+        "largest_chars": max((r["chars"] for r in delivered), default=0),
+        "block_chars": len(block),
+        # Bodies are deliberately NOT carried out of here: this is a size report,
+        # and a report that embeds the text it measures cannot be printed.
+        "sops": [{k: r[k] for k in ("sop_id", "title", "chars", "delivered")}
+                 for r in delivered],
+    }
+
+
+_PROBE_VERDICTS = {
+    "silent": "nothing is injected — no mandatory SOP in the global sidecar",
+    "pointers_only": "NO body fits — every prompt gets titles and a pointer",
+    "partial": "some bodies fit, the rest degraded to pointers",
+    "verbatim": "every mandatory body rides in full",
+}
+
+
+def render_probe(result: dict) -> str:
+    """Human-readable probe report. Says what a session RECEIVES, not what the
+    tier intends to send — the gap between those two is the whole finding."""
+    result = result or {}
+    verdict = str(result.get("verdict") or "silent")
+    lines = [f"Per-prompt SOP injection: {verdict} — "
+             f"{_PROBE_VERDICTS.get(verdict, 'unknown state')}"]
+    for row in result.get("sops") or []:
+        mark = "body" if row.get("delivered") == "body" else "POINTER"
+        lines.append(f"  {mark:<7} {row.get('chars', 0):>6,} chars  "
+                     f"{row.get('sop_id')}  ({row.get('title')})")
+    lines.append(f"  bodies {result.get('bodies', 0)}/{result.get('mandatory', 0)} · "
+                 f"body chars {result.get('body_chars', 0):,}/"
+                 f"{result.get('budget', 0):,} · "
+                 f"largest {result.get('largest_chars', 0):,} · "
+                 f"injected block {result.get('block_chars', 0):,} chars")
+    if verdict in ("pointers_only", "partial"):
+        lines.append("  Raising PROMPT_BUDGET is a deliberate decision to spend "
+                     "more on every prompt; shortening the body is the other "
+                     "lever. A pointer is honest, but it is not the procedure.")
+    return "\n".join(lines)
 
 
 def extend_hook_context(context, raw, project=None) -> dict:

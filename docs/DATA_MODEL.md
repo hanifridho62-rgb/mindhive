@@ -1327,6 +1327,58 @@ so a report of three contradictions can never read as a completed audit.
 any contradiction, and exits zero on `UNKNOWN` — "could not check" is not a
 finding, and failing on it would train the operator to suppress the command.
 
+### 4.16 The always-on surface: two budgets, and what happens past them
+
+Not event types — two operator-config sidecars and the degradation rule each one
+governs. Recorded here because both decide what a session actually receives, and
+both used to degrade with nothing said.
+
+**`context_budget.json`** — `paths.project_dir()/context_budget.json`:
+
+```json
+{"budget": 51000, "memory_lines": 200, "set_at": "2026-08-13T00:00:00Z"}
+```
+
+Config, not a projection: it is not rebuildable from the ledger, exactly like
+`rules/enforce.json`. `budget` is the namespace's estimated-token ceiling for the
+auto-loaded surface; `memory_lines` is the line budget for the native `MEMORY.md`.
+Writes **merge**: setting the token budget never discards a line budget set
+earlier. A missing, corrupt or non-positive value reads as unset (token budget) or
+as `context.MEMORY_LINE_BUDGET` (line budget) — a bad value must not silence a
+real measurement.
+
+Those two numbers bound different failures, which is why they are separate:
+
+| | Bounds | Past it |
+|---|---|---|
+| `budget` | **cost** — tokens spent before work starts | reported; `hive context --check` exits 1 |
+| `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set |
+
+The loss case is the subtler one. `sync` caps ITEM COUNTS (`LESSONS_CAP`,
+`DECISIONS_CAP`) and no item count bounds lines, so the digest grew past the
+loader's limit and lost the two sections written last — the lessons and decisions
+the caps existed to protect. `context.memory_pressure` names which sections fall
+past the cut, `hive sync` warns the moment it writes such a file, and the
+`memory_truncated` finding is **high** severity because every other finding
+suggests trimming while this one reports something already gone.
+
+**The per-prompt SOP budget** (`sopgate.PROMPT_BUDGET`, a constant rather than a
+sidecar — raising it is a code decision to spend more on every prompt, not a knob).
+Past it a body degrades to a `hive sop show <id>` **pointer, never a truncation**:
+half a procedure reads like a whole one. `sopgate.plan` is the single place that
+decision is made, and `hive sop injection` reports it — `verbatim`, `partial`,
+`pointers_only`, or `silent`. `pointers_only` is the state that matters: the block
+still arrives, so nothing looks broken, and the procedure it claims to re-assert
+is not in it. Measured on this repo at the time of writing: one mandatory SOP of
+3,414 chars against a 3,000-char budget, i.e. `pointers_only` on every prompt.
+
+**Checkout staleness** (`repo.staleness`, `hive repo stale`) is the same honesty
+rule applied to git: the count of commits behind is reported **with** the age of
+the fetch it was measured against, because "0 behind" against a remote last read
+in July is not up to date. It never fetches — a probe that reached the network
+could not run on the prompt path, in a hook, or offline — and `unknown` carries
+its reason (`no_checkout`, `no_integration_ref`, `probe_failed`).
+
 ### 4.x Smart-zone session rotation (`mindhive.rotation`)
 
 Not an event type — a sidecar file plus a measurement rule. Recorded here because

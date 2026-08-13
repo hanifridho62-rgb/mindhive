@@ -117,6 +117,25 @@ class Finding:
 # exactly like rules/enforce.json.
 BUDGET_FILE = "context_budget.json"
 
+# Lines of MEMORY.md the native loader will actually read. Past this it loads
+# PART of the file and says so — "WARNING: MEMORY.md is 207 lines (limit: 200)"
+# — which means the sections at the END of the digest silently stop arriving.
+# `sync` writes that file with caps on ITEM COUNTS only (LESSONS_CAP,
+# DECISIONS_CAP), and no item count bounds lines, so the digest grew past the
+# limit and lost its own tail: the lessons and decisions the caps were protecting
+# are the last two sections written.
+#
+# 200 is an external constant — the loader's, not ours — so it is named here
+# once and overridable per namespace (`memory_lines` in BUDGET_FILE) rather than
+# hardcoded at each surface that judges the file. Two surfaces judge it: `hive
+# sync`, right after writing it, and `hive context --check`, which gates on it.
+MEMORY_LINE_BUDGET = 200
+
+# Sections of the digest, in the order `sync` writes them. Used to name WHICH
+# sections fall past the loader's cut — "over by 7 lines" is a number, "Key
+# decisions never arrives" is the consequence.
+_MEMORY_SECTION_RE = re.compile(r"^##+\s+(.+?)\s*$", re.MULTILINE)
+
 
 def load_budget(project=None) -> int | None:
     """The persisted token budget for this namespace, or None when unset.
@@ -132,14 +151,72 @@ def load_budget(project=None) -> int | None:
         return None
 
 
-def save_budget(budget: int, project=None) -> dict:
-    """Persist the namespace's token budget. Returns the stored record."""
+def save_budget(budget: int, project=None, memory_lines: int | None = None) -> dict:
+    """Persist the namespace's token budget. Returns the stored record.
+
+    A `memory_lines` override is written only when given: absent, the file keeps
+    exactly the shape it has always had, so an older sidecar and a newer one both
+    read correctly and the default stays a constant in code rather than a value
+    silently baked into every namespace that ever ran this."""
     import time
     data = {"budget": int(budget),
             "set_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"}
+    if memory_lines is None:
+        # Merge, never replace: setting the token budget must not silently
+        # discard a line budget the operator set earlier. `load_` cannot answer
+        # "was it stored?" — it returns the default for absent and for corrupt
+        # alike — so the raw file is what decides whether to carry one forward.
+        try:
+            prior = json.loads((paths.project_dir(project) / BUDGET_FILE)
+                               .read_text(encoding="utf-8"))
+            stored = prior.get("memory_lines") if isinstance(prior, dict) else None
+            if not isinstance(stored, bool) and isinstance(stored, (int, float)) \
+                    and stored > 0:
+                data["memory_lines"] = int(stored)
+        except Exception:
+            pass
+    else:
+        data["memory_lines"] = int(memory_lines)
     paths.write_text_atomic(paths.project_dir(project) / BUDGET_FILE,
                             json.dumps(data, indent=2, sort_keys=True))
     return data
+
+
+def load_memory_line_budget(project=None) -> int:
+    """This namespace's MEMORY.md line budget — the sidecar's `memory_lines`, or
+    `MEMORY_LINE_BUDGET`. Total: a corrupt or nonsensical value reads as the
+    default, because the wrong answer here is silence about a truncated file."""
+    try:
+        path = paths.project_dir(project) / BUDGET_FILE
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        lines = obj.get("memory_lines") if isinstance(obj, dict) else None
+        if isinstance(lines, bool) or not isinstance(lines, (int, float)):
+            return MEMORY_LINE_BUDGET
+        return int(lines) if lines > 0 else MEMORY_LINE_BUDGET
+    except Exception:
+        return MEMORY_LINE_BUDGET
+
+
+def memory_pressure(path, budget: int | None = None, project=None) -> dict:
+    """Does the native MEMORY.md fit the loader, and what is lost if not?
+
+    Returns ``{lines, budget, over, dropped, readable}``. ``dropped`` names the
+    digest sections that begin past the loader's cut — the sections a session
+    therefore never sees. Never raises: an unreadable or absent file reports
+    ``readable: False`` and zero pressure, because "we could not measure" must
+    not read as "it is fine"... which is why `over` is 0 there and `readable`
+    is the field a caller has to look at."""
+    budget = int(budget if budget is not None else load_memory_line_budget(project))
+    text = _read_text(Path(path)) if path else None
+    if text is None:
+        return {"lines": 0, "budget": budget, "over": 0, "dropped": [],
+                "readable": False, "path": str(path or "")}
+    lines = text.splitlines()
+    dropped = [m.group(1) for m in _MEMORY_SECTION_RE.finditer(text)
+               if text[:m.start()].count("\n") >= budget]
+    return {"lines": len(lines), "budget": budget,
+            "over": max(0, len(lines) - budget), "dropped": dropped,
+            "readable": True, "path": str(path)}
 
 
 def estimate_tokens(text: str) -> int:
@@ -481,6 +558,34 @@ def _finding_dead_paths(segments, texts: dict[str, str]) -> list[Finding]:
     return out
 
 
+def _finding_memory_truncated(segments, project=None) -> list[Finding]:
+    """MEMORY.md past the native loader's line budget.
+
+    Distinct from `oversized_artifact`, which is about COST — this one is about
+    LOSS. An oversized artifact is paid for and delivered; a truncated one is
+    paid for and half-delivered, and the half that vanishes is the tail, where
+    `sync` writes the lessons and decisions. High severity for that reason: the
+    other findings suggest trimming, this one reports something already gone."""
+    out = []
+    for s in segments:
+        if s.name != "MEMORY.md" or not s.path:
+            continue
+        pressure = memory_pressure(s.path, project=project)
+        if not pressure["readable"] or not pressure["over"]:
+            continue
+        lost = (", ".join(pressure["dropped"]) if pressure["dropped"]
+                else "the tail of the file")
+        out.append(Finding(
+            rule="memory_truncated", severity="high", subject=s.name,
+            message=(f"MEMORY.md is {pressure['lines']} lines against a "
+                     f"{pressure['budget']}-line loader budget (over by "
+                     f"{pressure['over']}). The loader reads part of the file, so "
+                     f"these never reach a session: {lost}. Trim the digest or "
+                     f"raise `memory_lines` in {BUDGET_FILE} deliberately."),
+        ))
+    return out
+
+
 def _finding_outlier_skills(segments) -> list[Finding]:
     skills = [s for s in segments if s.kind == "skill"]
     if len(skills) < 4:
@@ -497,7 +602,7 @@ def _finding_outlier_skills(segments) -> list[Finding]:
     ]
 
 
-def findings(segments: list[Segment]) -> list[Finding]:
+def findings(segments: list[Segment], project=None) -> list[Finding]:
     """Rule-based trim suggestions over measured segments.
 
     Each rule is independent and returns zero or more findings, so a rule that
@@ -520,6 +625,7 @@ def findings(segments: list[Segment]) -> list[Finding]:
     out: list[Finding] = []
     out += _finding_dominant(segs, total)
     out += _finding_oversized(segs)
+    out += _finding_memory_truncated(segs, project)
     out += _finding_duplicate_lines(segs, texts)
     out += _finding_dead_paths(segs, texts)
     out += _finding_outlier_skills(segs)

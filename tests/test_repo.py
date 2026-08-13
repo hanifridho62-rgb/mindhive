@@ -268,3 +268,121 @@ def test_merge_state_tolerates_junk_inputs_without_raising():
     answer = repo.merge_state(commits=[None, "  ", ""], branch="   ", root=ROOT,
                               runner=_runner({}))
     assert answer["reason"] == repo.NO_WORK_LINK
+
+
+# --- staleness: how far this checkout has drifted -----------------------------
+#
+# Same seam, same bargain. The pairing under test throughout: a commit count is
+# only as good as the snapshot it was measured against, so the count NEVER ships
+# without the age of that snapshot.
+
+NOW = 1_700_000_000.0
+REF_OK = {"rev-parse --verify --quiet origin/HEAD": (0, "sha\n", "")}
+
+
+def _stale_runner(behind=0, ahead=0, git_dir=None, extra=None):
+    responses = dict(REF_OK)
+    responses["rev-list --left-right --count"] = (0, f"{ahead}\t{behind}\n", "")
+    responses["rev-parse --git-common-dir"] = ((0, str(git_dir), "") if git_dir
+                                              else (128, "", "no git dir"))
+    responses.update(extra or {})
+    return _runner(responses)
+
+
+def test_a_checkout_behind_its_ref_says_so_with_both_counts():
+    answer = repo.staleness(root=ROOT, runner=_stale_runner(behind=64, ahead=3),
+                            now=NOW)
+    assert answer["state"] == repo.BEHIND
+    assert (answer["behind"], answer["ahead"]) == (64, 3)
+    assert answer["ref"] == "origin/HEAD"
+
+
+def test_a_current_checkout_is_current_even_when_ahead():
+    """Ahead is normal mid-branch; only BEHIND means the base moved on."""
+    answer = repo.staleness(root=ROOT, runner=_stale_runner(behind=0, ahead=9),
+                            now=NOW)
+    assert answer["state"] == repo.CURRENT and answer["behind"] == 0
+
+
+def test_an_unreadable_fetch_age_counts_as_stale_not_as_fresh():
+    """DISCRIMINATING: "0 behind" against a snapshot of unknown age is the
+    misleading answer this pairing exists to prevent. An unknown age is not
+    evidence of a recent one."""
+    answer = repo.staleness(root=ROOT, runner=_stale_runner(), now=NOW)
+    assert answer["fetch_age_hours"] is None
+    assert answer["fetch_stale"] is True
+
+
+def test_a_recent_fetch_is_not_stale(tmp_path):
+    marker = tmp_path / "FETCH_HEAD"
+    marker.write_text("x", encoding="utf-8")
+    import os
+    os.utime(marker, (NOW - 3600, NOW - 3600))          # one hour old
+    answer = repo.staleness(root=ROOT, now=NOW,
+                            runner=_stale_runner(git_dir=tmp_path))
+    assert 0.9 < answer["fetch_age_hours"] < 1.1
+    assert answer["fetch_stale"] is False
+
+
+def test_the_freshness_window_is_the_caller_s_to_set(tmp_path):
+    marker = tmp_path / "FETCH_HEAD"
+    marker.write_text("x", encoding="utf-8")
+    import os
+    os.utime(marker, (NOW - 7200, NOW - 7200))          # two hours old
+    runner = _stale_runner(git_dir=tmp_path)
+    assert repo.staleness(root=ROOT, runner=runner, now=NOW,
+                          max_age_hours=1.0)["fetch_stale"] is True
+    assert repo.staleness(root=ROOT, runner=runner, now=NOW,
+                          max_age_hours=8.0)["fetch_stale"] is False
+
+
+def test_no_integration_ref_is_unknown_with_its_own_reason():
+    """The live state of this repo's `master`: no upstream to compare against.
+    Reporting "current" there would be an invention."""
+    answer = repo.staleness(root=ROOT, runner=_runner({}), now=NOW)
+    assert (answer["state"], answer["reason"]) == (repo.UNKNOWN,
+                                                  repo.NO_INTEGRATION_REF)
+    assert "origin/HEAD" in answer["detail"]            # says what it tried
+
+
+def test_outside_a_checkout_is_unknown_not_current(monkeypatch):
+    monkeypatch.setattr(repo, "worktree_root", lambda: None)
+    answer = repo.staleness(runner=_runner({}), now=NOW)
+    assert (answer["state"], answer["reason"]) == (repo.UNKNOWN,
+                                                  repo.NO_CHECKOUT)
+
+
+def test_a_failed_rev_list_is_unknown_not_zero():
+    answer = repo.staleness(root=ROOT, now=NOW, runner=_runner(dict(
+        REF_OK, **{"rev-list": (128, "", "fatal: bad revision")})))
+    assert (answer["state"], answer["reason"]) == (repo.UNKNOWN,
+                                                  repo.PROBE_FAILED)
+    assert "bad revision" in answer["detail"]
+
+
+def test_unparseable_counts_are_unknown_not_guessed():
+    answer = repo.staleness(root=ROOT, now=NOW, runner=_runner(dict(
+        REF_OK, **{"rev-list": (0, "banana\n", "")})))
+    assert (answer["state"], answer["reason"]) == (repo.UNKNOWN,
+                                                  repo.PROBE_FAILED)
+
+
+def test_staleness_never_fetches():
+    """A probe that reached the network could not run on the prompt path, in a
+    hook, or on a plane — and this one is meant to run in all three."""
+    log = []
+    repo.staleness(root=ROOT, now=NOW,
+                   runner=_runner(dict(REF_OK, **{
+                       "rev-list": (0, "0\t0\n", ""),
+                       "rev-parse --git-common-dir": (128, "", "")}), log=log))
+    assert log, "the probe ran no git commands at all"
+    assert not any("fetch" in cmd or "pull" in cmd or "ls-remote" in cmd
+                   for cmd in log), log
+
+
+def test_cli_repo_stale_reports_and_does_not_gate(capsys):
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["repo", "stale"]) == 0
+    out = capsys.readouterr().out
+    assert "checkout staleness:" in out
+    assert "fetched" in out or "never fetched" in out

@@ -295,3 +295,123 @@ def merge_state(*, branch="", pr=0, commits=(), root=None, runner=None,
             return answer
         unknowns.append(answer)
     return max(unknowns, key=lambda a: _REASON_RANK.get(a["reason"], 0))
+
+
+# --- how stale is this checkout? ---------------------------------------------
+# Same bargain as `merge_state`, different question. This one exists because a
+# checkout drifts silently: nothing in a working tree announces that the ref it
+# branched from moved on 64 commits ago, and the answer is invisible precisely
+# when it matters — the moment before you build on a stale base.
+
+CURRENT = "current"
+BEHIND = "behind"
+STALENESS_STATES = (CURRENT, BEHIND, UNKNOWN)
+
+NO_CHECKOUT = "no_checkout"
+NO_INTEGRATION_REF = "no_integration_ref"
+STALENESS_REASONS = (NO_CHECKOUT, NO_INTEGRATION_REF, PROBE_FAILED)
+
+# How old a fetch may be before the comparison is worth distrusting. A day: long
+# enough that ordinary work does not trip it, short enough that "0 behind"
+# stops meaning "up to date" before it becomes a lie. Callers override it — the
+# `--max-age-hours` idiom this repo already uses for staleness gates.
+DEFAULT_MAX_AGE_HOURS = 24.0
+
+_FETCH_MARKER = "FETCH_HEAD"
+
+
+def _fetch_age_hours(runner, root, timeout_s, now) -> float | None:
+    """Hours since this checkout last heard from its remote, or None when that
+    cannot be established. Read from `FETCH_HEAD`'s mtime, which git rewrites on
+    every fetch — the cheapest honest proxy available without a network call.
+
+    `--git-common-dir`, NOT `--absolute-git-dir`: inside a linked worktree the
+    latter points at `.git/worktrees/<name>`, which has no FETCH_HEAD, so every
+    probe run from a worktree reported "never fetched" — a false staleness alarm
+    in exactly the place this repo does most of its work. The common dir is the
+    main repo's `.git`, which is where fetches actually land, and in an ordinary
+    checkout the two are the same path anyway."""
+    import os
+    rc, out, _ = runner(["git", "rev-parse", "--git-common-dir"], root,
+                        timeout_s)
+    if rc != 0 or not out.strip():
+        return None
+    git_dir = out.strip()
+    if not os.path.isabs(git_dir):      # git answers ".git" in a plain checkout
+        git_dir = os.path.join(root, git_dir)
+    try:
+        stamp = os.path.getmtime(os.path.join(git_dir, _FETCH_MARKER))
+    except OSError:
+        return None                     # never fetched, or the file is gone
+    return max(0.0, (now - stamp) / 3600.0)
+
+
+def staleness(*, root=None, runner=None, timeout_s=PROBE_TIMEOUT_SECONDS,
+              max_age_hours: float = DEFAULT_MAX_AGE_HOURS, now=None) -> dict:
+    """How far this checkout has drifted from its integration ref.
+
+    Returns ``{state, reason, detail, behind, ahead, ref, fetch_age_hours,
+    fetch_stale}`` and never raises.
+
+    **It never fetches.** A probe that reached the network could not run
+    anywhere a probe belongs: not on the prompt path, not in a hook, not on a
+    plane. So it compares against the ref as this checkout last saw it, and
+    reports the age of that snapshot alongside the count — because "0 commits
+    behind" and "0 commits behind, last fetched in July" are different facts and
+    only one of them means up to date. That pairing is the whole design: the
+    count without the age is the misleading half.
+
+    ``unknown`` carries its reason, like every other answer in this module:
+    ``no_checkout`` (not a git worktree), ``no_integration_ref`` (nothing to
+    compare against — a checkout whose branch has no upstream, which is the live
+    state of this repo's ``master``), or ``probe_failed``."""
+    runner = runner or _default_runner
+    if now is None:
+        import time
+        now = time.time()
+    if root is None:
+        root = worktree_root()
+    if root is None:
+        return _stale_answer(UNKNOWN, reason=NO_CHECKOUT,
+                             detail="not inside a git checkout")
+    root = str(root)
+
+    ref = _integration_ref(runner, root, timeout_s)
+    age = _fetch_age_hours(runner, root, timeout_s, now)
+    if not ref:
+        return _stale_answer(UNKNOWN, reason=NO_INTEGRATION_REF,
+                             detail="no integration ref resolved (tried "
+                                    + ", ".join(_INTEGRATION_REFS) + ")",
+                             fetch_age_hours=age,
+                             max_age_hours=max_age_hours)
+    rc, out, err = runner(["git", "rev-list", "--left-right", "--count",
+                           f"HEAD...{ref}"], root, timeout_s)
+    if rc != 0:
+        return _stale_answer(UNKNOWN, reason=PROBE_FAILED, ref=ref,
+                             detail=_first_line(err)
+                             or f"git rev-list exited {rc}",
+                             fetch_age_hours=age, max_age_hours=max_age_hours)
+    parts = str(out or "").split()
+    try:
+        ahead, behind = int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return _stale_answer(UNKNOWN, reason=PROBE_FAILED, ref=ref,
+                             detail=f"unreadable rev-list output: {out!r}",
+                             fetch_age_hours=age, max_age_hours=max_age_hours)
+    return _stale_answer(BEHIND if behind else CURRENT, ref=ref, ahead=ahead,
+                         behind=behind, fetch_age_hours=age,
+                         max_age_hours=max_age_hours,
+                         detail=f"{behind} behind / {ahead} ahead of {ref}")
+
+
+def _stale_answer(state, *, reason="", detail="", ref="", ahead=0, behind=0,
+                  fetch_age_hours=None, max_age_hours=DEFAULT_MAX_AGE_HOURS) -> dict:
+    """One staleness answer. ``fetch_stale`` is True when the snapshot this
+    comparison used is older than *max_age_hours* — and also when its age could
+    not be read at all, because an unknown age is not evidence of a fresh one."""
+    return {"state": state, "reason": reason,
+            "detail": str(detail)[:MAX_DETAIL_CHARS], "ref": ref,
+            "ahead": ahead, "behind": behind,
+            "fetch_age_hours": fetch_age_hours,
+            "fetch_stale": (fetch_age_hours is None
+                            or fetch_age_hours > max_age_hours)}

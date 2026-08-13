@@ -98,6 +98,130 @@ def test_injected_bodies_stay_within_budget():
     assert block.count("X" * 700) * 700 <= sopgate.PROMPT_BUDGET
 
 
+# --- the probe: what the injection is ACTUALLY delivering -----------------------
+#
+# The tier promises every mandatory body verbatim on every human prompt. Whether
+# it keeps that promise is a fact about two numbers, and it degraded silently:
+# the block still arrives, so nothing looks broken, and the procedure it claims
+# to re-assert is not in it. These tests are about the report, and about the one
+# structural guarantee that makes the report trustworthy — it counts the same
+# `plan` the hook path renders, so it cannot say "verbatim" while shipping
+# pointers.
+
+def test_probe_reports_verbatim_when_the_body_fits():
+    _add()
+    result = sopgate.probe()
+    assert result["verdict"] == "verbatim"
+    assert (result["mandatory"], result["bodies"], result["pointers"]) == (1, 1, 0)
+    assert result["body_chars"] == len(BODY)
+    assert result["budget"] == sopgate.PROMPT_BUDGET
+    assert result["sops"][0]["sop_id"] == "execution-discipline"
+
+
+def test_probe_catches_the_state_where_no_body_fits():
+    """DISCRIMINATING, and this is the live state of this repo: one mandatory SOP
+    whose body outgrew the budget. Every prompt gets titles and a pointer, and
+    before this probe nothing anywhere said so."""
+    _add("huge", "Huge procedure", "B" * (sopgate.PROMPT_BUDGET + 500))
+    result = sopgate.probe()
+    assert result["verdict"] == "pointers_only"
+    assert result["bodies"] == 0 and result["pointers"] == 1
+    assert result["body_chars"] == 0
+    assert result["largest_chars"] == sopgate.PROMPT_BUDGET + 500
+    # The block still arrives — which is exactly why the failure was invisible.
+    assert result["block_chars"] > 0
+    assert "NO body fits" in sopgate.render_probe(result)
+
+
+def test_probe_reports_partial_when_one_of_two_fits():
+    _add("first", "First", "A" * (sopgate.PROMPT_BUDGET - 100),
+         ts="2026-07-01T10:00:00Z")
+    _add("second", "Second", "C" * 400, ts="2026-07-02T10:00:00Z")
+    result = sopgate.probe()
+    assert result["verdict"] == "partial"
+    assert (result["bodies"], result["pointers"]) == (1, 1)
+    assert [r["delivered"] for r in result["sops"]] == ["body", "pointer"]
+
+
+def test_probe_is_silent_rather_than_wrong_with_no_mandatory_sop():
+    _add(mandatory=False)
+    result = sopgate.probe()
+    assert result["verdict"] == "silent"
+    assert result["mandatory"] == 0 and result["block_chars"] == 0
+
+
+def test_probe_agrees_with_the_block_it_measures():
+    """The reason `plan` exists. A probe with its own copy of the fit rule can
+    report a body as delivered while the hook path ships a pointer; asserting
+    against the REAL injected text is what closes that gap."""
+    _add("fits", "Fits", "A" * 500, ts="2026-07-01T10:00:00Z")
+    _add("nope", "Nope", "C" * sopgate.PROMPT_BUDGET, ts="2026-07-02T10:00:00Z")
+    result = sopgate.probe()
+    block = sopgate.block_for("fix the parser")
+    for row in result["sops"]:
+        pointer = f"hive sop show {row['sop_id']}" in block
+        assert pointer is (row["delivered"] == "pointer"), row["sop_id"]
+
+
+def test_probe_never_raises_on_a_broken_sidecar(monkeypatch):
+    """A diagnostic that can fail is one more thing to diagnose."""
+    monkeypatch.setattr(sop, "read_global_sidecar",
+                        lambda: (_ for _ in ()).throw(OSError("boom")))
+    assert sopgate.probe()["verdict"] == "silent"
+
+
+def test_probe_carries_sizes_not_bodies():
+    """The report is printed and JSON-dumped, so embedding the text it measures
+    would make it unprintable at exactly the size worth reporting."""
+    _add()
+    dumped = json.dumps(sopgate.probe())
+    assert BODY not in dumped
+    assert str(len(BODY)) in dumped
+
+
+def test_cli_sop_injection_prints_the_verdict(capsys):
+    _add("huge", "Huge procedure", "B" * (sopgate.PROMPT_BUDGET + 500))
+    assert cli.main(["sop", "injection"]) == 0
+    out = capsys.readouterr().out
+    assert "pointers_only" in out and "POINTER" in out
+
+
+def test_cli_sop_injection_json_is_machine_readable(capsys):
+    _add()
+    assert cli.main(["sop", "injection", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "verbatim"
+    assert payload["budget"] == sopgate.PROMPT_BUDGET
+
+
+def test_cli_sop_injection_is_a_report_not_a_gate(capsys):
+    """It exits zero even in the worst state. `hive context --check` is the gate;
+    a diagnostic that fails would break every script that ran it."""
+    _add("huge", "Huge procedure", "B" * (sopgate.PROMPT_BUDGET + 500))
+    assert cli.main(["sop", "injection"]) == 0
+    capsys.readouterr()
+
+
+def test_the_prompt_path_stays_inside_its_latency_budget():
+    """This runs on EVERY human-typed prompt, so its cost is paid before the
+    user sees anything. The sidecar read is the whole point of the design (a
+    ledger fold measured 0.36s on the live store); this bound is the regression
+    guard that a future change has not quietly put a fold, a network call, or a
+    per-prompt rebuild back on the path. Loose on purpose — a shared CI runner
+    is not a benchmark rig, and 40x headroom over the real cost still catches a
+    ledger read."""
+    import time
+    for i in range(4):
+        _add(f"sop-{i}", f"Title {i}", "X" * 700,
+             ts=f"2026-07-0{i + 1}T10:00:00Z")
+    sopgate.block_for("warm the caches")            # exclude first-import cost
+    start = time.perf_counter()
+    for _ in range(10):
+        sopgate.block_for("add a retry to src/mindhive/guard.py")
+    elapsed = (time.perf_counter() - start) / 10
+    assert elapsed < 0.25, f"per-prompt SOP injection cost {elapsed * 1000:.0f}ms"
+
+
 # --- who gets the block --------------------------------------------------------
 
 @pytest.mark.parametrize("prompt", [
