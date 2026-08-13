@@ -249,22 +249,39 @@ def probe_reduced_motion(browser, url):
 
 
 def probe_loading_ladder(browser, url):
-    """The staged loading feedback against a real clock: nothing under SKEL_MS
-    (300 ms), a skeleton past it, and the skeleton gone once the answer lands.
-    The node harness records timers and never fires them, on purpose — so this
-    threshold has been asserted as source shape and never once observed."""
+    """The staged loading feedback against a real clock: nothing under SKEL_MS, a
+    skeleton past it, and the skeleton gone once the answer lands. The node
+    harness records timers and never fires them, on purpose — so this threshold
+    has been asserted as source shape and never once observed.
+
+    The quiet band is read from the PAGE's own `SKEL_MS` rather than written here
+    as a number. A hardcoded band silently stopped testing anything the moment the
+    threshold moved (300 → 150): the probe was still waiting the old half-band,
+    which had become the whole one.
+    """
     with opened(browser, url, delay_path="/api/changelog", delay_ms=1500) as page:
         # Boot loads Overview, which is NOT delayed. Let it finish, so nothing
         # below is reading a placeholder left over from start-up.
         settled(page)
         assert page.query_selector(".skel") is None
 
+        # `const` at the top level of a classic script lives in the global
+        # LEXICAL scope, not on `window` — an evaluate in the same realm sees it.
+        skel_ms = page.evaluate("SKEL_MS")
+        assert isinstance(skel_ms, (int, float)), (
+            f"the page's SKEL_MS is not readable ({skel_ms!r}), so the band below "
+            f"would be a guess")
+        # Half the shipped band, floored so the SKEL_MS=0 mutant still gets a real
+        # window in which its immediate placeholder can appear and be caught.
+        band = max(40, int(skel_ms) // 2)
+
         page.click("nav button:text-is('Log')")
-        page.wait_for_timeout(150)              # inside the ladder's quiet band
+        page.wait_for_timeout(band)             # inside the ladder's quiet band
         early = page.query_selector(".skel")
         assert early is None, (
-            "a placeholder painted within 150 ms — below SKEL_MS the eye reads a "
-            "section load as a flicker rather than as progress")
+            f"a placeholder painted within {band} ms — below SKEL_MS "
+            f"({skel_ms} ms) the eye reads a section load as a flicker rather "
+            f"than as progress")
 
         page.wait_for_selector(".skel", timeout=5000)
         assert page.get_attribute("#panel", "aria-busy") == "true"
@@ -420,15 +437,19 @@ MUTANTS = [
       '    <div id="ann" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>\n'
       '    <div id="controls"></div>')),
 
+    # The colour is a token, not a literal: the palette moved into `theme.py`, so
+    # the mutation has to keep whatever the shipped rule declares and remove only
+    # the `:not(.paused)` this row is about.
     ("the stale rule loses its :not(.paused) and wins the tie again",
      probe_live_colour,
-     ("header #live.stale:not(.paused) { color:#e0b341; }",
-      "header #live.stale { color:#e0b341; }")),
+     ("header #live.stale:not(.paused) { color:var(--warn); }",
+      "header #live.stale { color:var(--warn); }")),
 
     ("this page's own reduced-motion guard is dropped (the cat sheet's stays)",
      probe_reduced_motion,
      ("    header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,\n"
-      "    .skel .bar { animation:none !important; }",
+      "    .skel .bar, .skel .tile, .skel .line, .skel .pane"
+      " { animation:none !important; }",
       "    .rmfill { animation:none !important; }")),
 
     ("pollCats loses its latch and queues a tick onto a slow one",
@@ -437,7 +458,7 @@ MUTANTS = [
 
     ("SKEL_MS goes to 0 — every section load flickers a placeholder",
      probe_loading_ladder,
-     ("const SKEL_MS = 300, SLOW_MS = 10000;", "const SKEL_MS = 0, SLOW_MS = 10000;")),
+     ("const SKEL_MS = 150, SLOW_MS = 10000;", "const SKEL_MS = 0, SLOW_MS = 10000;")),
 
     ("setBusy disables the whole nav again, the way it did before T9",
      probe_nav_clickable,
