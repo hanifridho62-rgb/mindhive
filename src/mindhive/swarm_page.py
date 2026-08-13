@@ -12,14 +12,14 @@ Pure presentation: token in, HTML string out; all state is server-side.
 """
 import json
 
-from . import cat_board
+from . import cat_board, theme
 
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MindSwarm</title>
 <style>
-  :root { color-scheme: dark; }
+/*__STATUS__*/
   * { box-sizing: border-box; }
   body { margin:0; font:13px/1.45 system-ui, sans-serif; color:#e6edf3; height:100vh;
     display:flex; flex-direction:column; overflow:hidden; background:#0e1116; }
@@ -35,7 +35,7 @@ _PAGE = """<!doctype html>
   button { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px;
     padding:4px 10px; cursor:pointer; font:inherit; }
   button:hover { background:#30363d; }
-  button.stop { color:#ff8a8a; border-color:#5a2e2e; }
+  button.stop { color:var(--bad); border-color:#5a2e2e; }
   input, select { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
   input:focus, select:focus { outline:none; border-color:#58a6ff; }
@@ -53,8 +53,8 @@ _PAGE = """<!doctype html>
   .chip:hover { filter:brightness(1.3); }
   .chip.sel { box-shadow:0 0 0 2px #fff5; }
   .chip .dot { width:7px; height:7px; border-radius:50%; background:#3a4054; }
-  .chip .dot.running { background:#e0b341; animation:pulse 1s infinite; }
-  .chip .dot.done { background:#46c46a; } .chip .dot.error { background:#ff6b6b; }
+  .chip .dot.running { background:var(--warn); animation:pulse 1s infinite; }
+  .chip .dot.done { background:var(--ok); } .chip .dot.error { background:#ff6b6b; }
   /* The node cat bobs while its agent is actually running — the same motion the
      faculty strip uses, from the SAME keyframes. `mn-bob` arrives below with
      `cat_board.CSS`; declaring a second copy here is precisely the drift
@@ -421,6 +421,15 @@ _PAGE = """<!doctype html>
   (async function loop(){ await poll(); setTimeout(loop, 1200); })();
 </script>
 </body></html>"""
+
+
+# The three status colours are decided in `theme`, not here: this document has its
+# own palette, but "done is green, working is amber, failed is red" is the same
+# decision in every one of them, and a value repeated across four documents is a
+# value that drifts. Substituted at IMPORT rather than per request — a marker that
+# is already gone cannot be placed by anything a request carries, which is the
+# ordering the token substitution below has to reason about explicitly.
+_PAGE = _PAGE.replace("/*__STATUS__*/", theme.STATUS_CSS)
 
 
 def render_swarm(token: str) -> str:

@@ -24,12 +24,14 @@ browser's own (localStorage).
 """
 import json
 
+from . import theme
+
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MindParallel</title>
 <style>
-  :root { color-scheme: dark; }
+/*__STATUS__*/
   * { box-sizing: border-box; }
   body { margin:0; font:13px/1.45 system-ui, sans-serif; background:#0e1116; color:#e6edf3;
     height:100vh; display:flex; flex-direction:column; overflow:hidden; }
@@ -40,7 +42,7 @@ _PAGE = """<!doctype html>
   button { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px;
     padding:4px 10px; cursor:pointer; font:inherit; }
   button:hover { background:#30363d; }
-  button.warn:hover { color:#ff8a8a; }
+  button.warn:hover { color:var(--bad); }
   input, select, textarea { background:#0e1116; color:#e6edf3; border:1px solid #30363d;
     border-radius:6px; padding:4px 8px; font:inherit; }
   input:focus, select:focus, textarea:focus { outline:none; border-color:#58a6ff; }
@@ -57,7 +59,7 @@ _PAGE = """<!doctype html>
   .prof .name { flex:1; overflow:hidden; text-overflow:ellipsis; }
   .prof button { padding:0 5px; font-size:10px; }
   .adot { width:8px; height:8px; border-radius:50%; background:#3a4054; flex:0 0 auto; }
-  .adot.ok { background:#46c46a; } .adot.expired { background:#e0b341; }
+  .adot.ok { background:var(--ok); } .adot.expired { background:var(--warn); }
   .adot.none { background:#ff6b6b; } .adot.unknown { background:#8b949e; }
   .pin select { max-width:110px; font-size:11px; }
   #grid { flex:1 1 auto; display:flex; min-width:0; padding:6px; gap:0; }
@@ -79,8 +81,8 @@ _PAGE = """<!doctype html>
   .phead .sp { flex:1; }
   .phead button { padding:0 6px; font-size:11px; border-radius:4px; }
   .dot { width:8px; height:8px; border-radius:50%; background:#3a4054; flex:0 0 auto; }
-  .dot.running { background:#e0b341; animation:pulse 1s infinite; }
-  .dot.done { background:#46c46a; } .dot.error { background:#ff6b6b; }
+  .dot.running { background:var(--warn); animation:pulse 1s infinite; }
+  .dot.done { background:var(--ok); } .dot.error { background:#ff6b6b; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   /* D8: the sheet that turns an animation ON owns switching it off, so a
      second consumer of this CSS inherits the guard instead of quietly
@@ -98,7 +100,7 @@ _PAGE = """<!doctype html>
   .rchip { display:inline-flex; align-items:center; gap:5px; color:#9ecbff;
     background:#12182a; border:1px solid #2a3550; border-radius:999px;
     padding:1px 8px; font-size:11px; }
-  .rchip b { cursor:pointer; color:#ff8a8a; font-weight:400; }
+  .rchip b { cursor:pointer; color:var(--bad); font-weight:400; }
   .pin { display:flex; gap:6px; padding:6px; border-top:1px solid #30363d; flex:0 0 auto; }
   .pin input { flex:1; min-width:0; }
   .spawn { margin:auto; text-align:center; color:#8b949e; }
@@ -119,7 +121,7 @@ _PAGE = """<!doctype html>
   #toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
     background:#21262d; border:1px solid #3d6; border-radius:8px; padding:6px 14px;
     display:none; z-index:9; }
-  .err { color:#ff8a8a; }
+  .err { color:var(--bad); }
 </style></head>
 <body>
 <header>
@@ -761,6 +763,15 @@ _PAGE = """<!doctype html>
   (async function loop(){ await poll(); POLLED = true; setTimeout(loop, 1000); })();
 </script>
 </body></html>"""
+
+
+# The three status colours are decided in `theme`, not here: this document has its
+# own palette, but "done is green, working is amber, failed is red" is the same
+# decision in every one of them, and a value repeated across four documents is a
+# value that drifts. Substituted at IMPORT rather than per request — a marker that
+# is already gone cannot be placed by anything a request carries, which is the
+# ordering the token substitution below has to reason about explicitly.
+_PAGE = _PAGE.replace("/*__STATUS__*/", theme.STATUS_CSS)
 
 
 def render_parallel(token: str) -> str:

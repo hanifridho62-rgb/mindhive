@@ -160,26 +160,31 @@ def test_only_section_loads_arm_a_skeleton(dashboard_server):
     base, token = dashboard_server
     status, body = _get(base, "/")
     block = _js_block(body, "async function run(label, fn")
-    assert "isSection" in block, "the skeleton is not gated on the caller's intent"
+    # The opt-in carries the section's SHAPE rather than a boolean (T28), so each
+    # call site states what will be there and not merely that something will;
+    # tests/test_dashboard_theme.py checks those names against the shapes that
+    # exist. This test still owns the other half: WHICH runs may arm one at all.
+    assert "shape" in block, "the skeleton is not gated on the caller's intent"
     skel_line = block[block.index("const skel"):block.index("const skel") + 140]
-    assert "isSection" in skel_line, "the skeleton timer is armed regardless of caller"
+    assert "shape" in skel_line, "the skeleton timer is armed regardless of caller"
 
-    for call in ("run('loading overview', renderOverview, true)",
-                 "run('loading memory', renderMemory, true)",
-                 "run('loading oversee', renderOversee, true)",
-                 "run('loading state', renderState, true)",
-                 "run('loading change log', renderLog, true)",
-                 "run('loading SOPs', renderSops, true)",
-                 "run('loading sessions', renderSessions, true)",
-                 "run('loading improvements', renderImprovements, true)",
-                 "run('loading skill & plugin', renderPlugins, true)"):
+    for call in ("run('loading overview', renderOverview, 'cards')",
+                 "run('loading memory', renderMemory, 'rows')",
+                 "run('loading oversee', renderOversee, 'rows')",
+                 "run('loading state', renderState, 'block')",
+                 "run('loading change log', renderLog, 'rows')",
+                 "run('loading SOPs', renderSops, 'rows')",
+                 "run('loading sessions', renderSessions, 'rows')",
+                 "run('loading improvements', renderImprovements, 'rows')",
+                 "run('loading skill & plugin', renderPlugins, 'rows')"):
         assert call in body, f"section load lost its skeleton: {call}"
 
     # The two Action helpers share this exact paint line; neither may opt in.
     assert body.count("if (current()) showText(r);") == 2, (
         "doAction/confirmAction changed shape -- re-check the assertion below")
     for i in _all_indexes(body, "if (current()) showText(r);"):
-        assert ", true)" not in body[i:i + 120], (
+        tail = body[i:i + 120]
+        assert not any(f", '{s}')" in tail for s in ("cards", "rows", "block")), (
             "an Action button arms a skeleton over the view it started from")
 
 
@@ -505,9 +510,10 @@ def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_se
     looking frozen. And a 10 s wait under a bare 'working…' chip reads as a hang."""
     base, token = dashboard_server
     status, body = _get(base, "/")
-    assert "const SKEL_MS = 300, SLOW_MS = 10000;" in body
+    assert "const SKEL_MS = 150, SLOW_MS = 10000;" in body
     block = _js_block(body, "async function run(label, fn")   # prefix: the signature grows
-    assert "showSkeleton()" in block and "SKEL_MS)" in block, "no deferred skeleton"
+    assert "showSkeleton(shape)" in block and "SKEL_MS)" in block, \
+        "no deferred skeleton"
     assert "SLOW_MS" in block, "nothing escalates the status text on a long wait"
     # Both timers belong to the run that armed them, and both now check the
     # generation before firing: a stale run's skeleton would otherwise repaint
@@ -529,7 +535,7 @@ def test_loading_feedback_is_staged_so_a_fast_section_never_flashes(dashboard_se
     for needle in ("clearTimeout(skel);", "clearTimeout(slow);",
                    "if (current())", "setBusy(false)"):
         assert needle in tail, f"run()'s finally no longer does: {needle}"
-    skel = _js_block(body, "function showSkeleton(){")
+    skel = _js_block(body, "function showSkeleton(shape){")
     assert "document.activeElement" in skel and "closest('#view')" in skel, (
         "the skeleton can repaint the panel out from under a caret")
 
@@ -663,7 +669,13 @@ _MOTION_GUARDS = {
     ".ovspin": ".ovspin",
     ".rmnode.rmactive": ".rmnode.rmactive",
     ".rmfill": ".rmfill",
+    # The four skeleton pieces (T28: a text line, a card, a list row, a monospace
+    # block) share one shimmer rule, and each needs naming in the guard: a media
+    # query adds no specificity, so there is no shorthand that reaches them.
     ".skel .bar": ".skel .bar",
+    ".skel .tile": ".skel .tile",
+    ".skel .line": ".skel .line",
+    ".skel .pane": ".skel .pane",
     # cat_board.py
     ".mn-cat.active svg": ".mn-cat-sprite",
     ".mn-sess.working .mn-cat-sprite": ".mn-cat-sprite",
@@ -705,11 +717,17 @@ def test_every_animation_the_page_serves_is_stopped_under_reduced_motion(dashboa
     for block in reduced:
         outside = outside.replace(block, "")
 
+    # One selector per entry, on BOTH sides. A rule may switch motion on for
+    # several selectors at once (the four skeleton pieces share one shimmer), and
+    # the guard side has always split on commas — so counting the whole list as one
+    # census entry would let three of the four go unguarded while the pair still
+    # matched.
     live = set()
     for sel, decls in _css_rules(outside):
         m = _MOTION_RE.search(decls)
         if m and not m.group(1).strip().startswith("none"):
-            live.add(sel)
+            for one in sel.split(","):
+                live.add(" ".join(one.split()))
     assert live == set(_MOTION_GUARDS), (
         "the page's motion changed and this census was not updated.\n"
         f"  no guard decided for: {sorted(live - set(_MOTION_GUARDS))}\n"

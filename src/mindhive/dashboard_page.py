@@ -1,20 +1,27 @@
 # src/mindhive/dashboard_page.py
 """Presentation layer for the MIND HIVE dashboard.
 
-The single-page HTML/CSS/JS control panel, isolated from ``dashboard.py`` so
-the HTTP handler and data logic aren't buried under ~380 lines of embedded
-markup (and ``dashboard.py`` stays under the project's 1000-line file cap).
-Pure presentation: takes a session token, returns a self-contained HTML
-document string.
+The single-page HTML/CSS/JS control panel, isolated from ``dashboard.py`` so the
+HTTP handler and data logic aren't buried under the embedded markup. Pure
+presentation: takes a session token, returns a self-contained HTML document
+string.
 
-One sibling dependency, deliberately: ``cat_board`` supplies the MindNetwork
-faculty board that this page and the swarm page both render. The alternative was a
-second copy of the palettes, sprites and labels in each page — two homes for one
-legend, drifting invisibly. ``cat_board`` is itself pure presentation, so this stays
-a presentation-only module."""
+This split was originally made to keep ``dashboard.py`` under the project's
+1000-line file cap, and that is no longer true of either file — ``dashboard.py``
+is past 1800 lines and this one past 2200. The separation still earns its place
+on the original grounds (routes and data logic on one side, markup on the other),
+but the cap is a debt both files carry, not a claim this docstring gets to make.
+
+Two sibling dependencies, deliberately. ``cat_board`` supplies the MindNetwork
+faculty board that this page and the swarm page both render; the alternative was a
+second copy of the sprites and labels in each page — two homes for one legend,
+drifting invisibly. ``theme`` supplies the colour palette this document's CSS is
+written against: the same argument, for the 152 hex literals that used to be
+repeats of a value chosen somewhere else. Both are themselves pure presentation,
+so this stays a presentation-only module."""
 import json
 
-from . import cat_board
+from . import cat_board, theme
 
 # The stale-paint discard decision, held as one named constant instead of being
 # typed straight into the page string below. Two consumers need the SAME bytes:
@@ -65,19 +72,19 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MIND HIVE</title>
 <style>
-  :root { color-scheme: dark; }
+/*__PALETTE__*/
   * { box-sizing: border-box; }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background:#11131a; color:#e6e8ef; }
-  header { padding: 12px 20px; background:#171a23; border-bottom:1px solid #2a2f3d;
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background:var(--bg); color:var(--text); }
+  header { padding: 12px 20px; background:var(--surface); border-bottom:1px solid var(--line);
     display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:5; }
   header h1 { margin:0; font-size:17px; letter-spacing:.5px; }
-  header .dot { width:9px; height:9px; border-radius:50%; background:#3a4054; }
-  header .dot.busy { background:#e0b341; animation: pulse 1s infinite; }
-  header .dot.ok { background:#46c46a; }
-  header #status { font-size:12px; color:#9aa3b8; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:var(--dot-idle); }
+  header .dot.busy { background:var(--warn); animation: pulse 1s infinite; }
+  header .dot.ok { background:var(--ok); }
+  header #status { font-size:12px; color:var(--muted); }
   header #live { font-size:12px; cursor:pointer; user-select:none; margin-left:auto;
-    color:#46c46a; }
-  header #live.paused { color:#6b7488; }
+    color:var(--ok); }
+  header #live.paused { color:var(--dim); }
   /* Three consecutive failed live ticks (7.5 s): the chip stops claiming to be
      live. Colour + title only — toggleLive() rewrites this element's innerHTML,
      so any text state written here would vanish on the next pause/resume.
@@ -87,128 +94,146 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
      could not clear itself: markLiveHealth is unreachable while paused
      (refreshLive returns at `!liveOn`). Paused is a state the user CHOSE; it
      outranks a health signal about a poll that is no longer running. */
-  header #live.stale:not(.paused) { color:#e0b341; }
+  header #live.stale:not(.paused) { color:var(--warn); }
   header #live .blip { animation: pulse 1.6s infinite; }
-  header #synced { font-size:11px; color:#6b7488; min-width:118px; text-align:right; }
-  header #projwrap { font-size:12px; color:#9aa3b8; display:flex; align-items:center; gap:6px; }
+  header #synced { font-size:11px; color:var(--dim); min-width:118px; text-align:right; }
+  header #projwrap { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; }
   header #projwrap select { padding:3px 6px; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   main { display:grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 50px); }
-  nav { background:#141722; border-right:1px solid #2a2f3d; padding:12px; }
-  nav .group { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:#6b7488;
+  nav { background:var(--rail); border-right:1px solid var(--line); padding:12px; }
+  nav .group { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
     margin:14px 6px 4px; }
   nav button { display:block; width:100%; text-align:left; margin:4px 0; padding:8px 10px;
-    background:#1d2230; color:#e6e8ef; border:1px solid #2a2f3d; border-radius:6px; cursor:pointer; }
+    background:var(--raised); color:var(--text); border:1px solid var(--line); border-radius:6px; cursor:pointer; }
   /* No `:disabled` rule, and no `:not(:disabled)` qualifier on the hover: nav
      buttons are never disabled any more. setBusy used to grey the entire nav out
      for the duration of a fetch — which is what made switching section mid-load
      impossible, and what made the nav feel dead for the 1-2 s a section costs. */
-  nav button:hover { background:#262d3d; }
+  nav button:hover { background:var(--hover); }
   section.panel { padding:18px 22px; }
-  pre#out { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px;
+  pre#out { white-space:pre-wrap; background:var(--sunken); border:1px solid var(--line); border-radius:8px;
     padding:14px; min-height:120px; max-height:62vh; overflow:auto; }
-  iframe#graph { width:100%; height:72vh; border:1px solid #2a2f3d; border-radius:8px; background:#fff; }
-  input, select, textarea { background:#0c0e14; color:#e6e8ef; border:1px solid #2a2f3d;
+  iframe#graph { width:100%; height:72vh; border:1px solid var(--line); border-radius:8px; background:var(--paper); }
+  input, select, textarea { background:var(--sunken); color:var(--text); border:1px solid var(--line);
     border-radius:6px; padding:6px 8px; font:inherit; }
   .row { margin:8px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .hidden { display:none; }
-  .err { color:#ff8a8a; }
-  /* Loading skeleton. Bars rather than a spinner: the shape says content is
-     coming and roughly what shape it has; a spinner only says something is
+  .err { color:var(--bad); }
+  /* Loading skeleton. Placeholders rather than a spinner: the shape says content
+     is coming and roughly what shape it has; a spinner only says something is
      happening, which the busy dot already says. Never painted before SKEL_MS —
-     under that the eye reads a placeholder as a flicker, not as progress. */
-  .skel .bar { height:14px; margin:10px 0; border-radius:6px;
-    background:linear-gradient(90deg,#161a25 25%,#20263a 37%,#161a25 63%);
+     under that the eye reads a placeholder as a flicker, not as progress.
+
+     FOUR pieces, one per thing a section actually paints: a text line (`bar`), a
+     stat card (`tile`), a list row (`line`), and one monospace block (`pane`).
+     The sizes were MEASURED in a browser against the real panels rather than
+     inferred from the markup, and the measurements say two different things.
+
+     `tile` matches: six of them reproduce Overview's grid exactly (200px wide at
+     this width, against a real card of 89-95px depending on whether the label
+     wraps — 95 here, the taller end, so the panel never GROWS when content
+     lands). `line` does not, and cannot: a real `ul.hits > li` is 115-447px in
+     the Log, Improvements and Sops panels, while a Sessions `.tcard` is 42. No
+     fixed height avoids a reflow across that range, so this one is not trying
+     to — its job is to say "a list is coming", and it is deliberately shorter
+     than the content rather than a screenful of shimmer. */
+  .skel .bar, .skel .tile, .skel .line, .skel .pane {
+    background:linear-gradient(90deg,var(--shimmer-base) 25%,var(--shimmer-sheen) 37%,var(--shimmer-base) 63%);
     background-size:400% 100%; animation: shimmer 1.4s ease infinite; }
+  .skel .bar { height:14px; margin:10px 0; border-radius:6px; }
   .skel .bar.w60 { width:60%; }
   .skel .bar.w40 { width:40%; }
+  .skel .tile { height:95px; border-radius:10px; }
+  .skel .line { height:64px; margin:8px 0; border-radius:8px; }
+  .skel .pane { min-height:120px; height:34vh; border-radius:8px; }
   @keyframes shimmer { 0%{background-position:100% 0} 100%{background-position:0 0} }
   /* The screen-reader channel. Off-screen, never display:none or hidden — a
      live region that is not rendered at all is not announced at all. */
   .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px;
     overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
-  .card { background:#0c0e14; border:1px solid #2a2f3d; border-radius:10px; padding:14px 16px; }
+  .card { background:var(--sunken); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
   .card .big { font-size:26px; font-weight:600; }
-  .card .lbl { font-size:12px; color:#9aa3b8; margin-top:2px; }
-  .card .big.ok { color:#46c46a; } .card .big.bad { color:#ff8a8a; }
+  .card .lbl { font-size:12px; color:var(--muted); margin-top:2px; }
+  .card .big.ok { color:var(--ok); } .card .big.bad { color:var(--bad); }
   .types { margin-top:14px; display:flex; flex-wrap:wrap; gap:8px; }
-  .pill { background:#1d2230; border:1px solid #2a2f3d; border-radius:999px; padding:3px 10px; font-size:12px; }
-  .pill b { color:#fff; }
-  .pill.est { color:#e0b341; border-color:#5a4a1f; }
-  .pill.triclaude { color:#7fb4ff; border-color:#2c4a75; font-weight:700; }
-  .pill.tridism { color:#8a93a6; }
+  .pill { background:var(--raised); border:1px solid var(--line); border-radius:999px; padding:3px 10px; font-size:12px; }
+  .pill b { color:var(--text-strong); }
+  .pill.est { color:var(--warn); border-color:#5a4a1f; }
+  .pill.triclaude { color:var(--link); border-color:#2c4a75; font-weight:700; }
+  .pill.tridism { color:var(--faint); }
   .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
   .hits { list-style:none; padding:0; margin:0; }
-  .hits li { background:#0c0e14; border:1px solid #2a2f3d; border-radius:8px; padding:10px 12px; margin:8px 0; }
-  .hits .file { font-size:12px; color:#7fb2ff; word-break:break-all; }
+  .hits li { background:var(--sunken); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:8px 0; }
+  .hits .file { font-size:12px; color:var(--link); word-break:break-all; }
   .hits .snip { white-space:pre-wrap; margin-top:4px; }
-  .hits .dup { color:#8a93a6; }
+  .hits .dup { color:var(--faint); }
   .snip.one { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .skchip { display:inline-block; cursor:pointer; color:#9ecbff; background:#12182a;
+  .skchip { display:inline-block; cursor:pointer; color:var(--link-bright); background:#12182a;
     border:1px solid #2a3550; border-radius:6px; padding:1px 7px; margin:2px 3px 0 0; }
-  .skchip:hover { background:#1b2540; border-color:#3d6; color:#dfeaff; }
+  .skchip:hover { background:var(--hover-tint); border-color:var(--accent-edge); color:#dfeaff; }
   .statusDot { font-size:11px; margin-right:5px; vertical-align:middle; }
-  .statusDot.sok { color:#3fb950; }
-  .statusDot.sbad { color:#f85149; }
-  .statusDot.snone { color:#3a4150; }
+  .statusDot.sok { color:var(--ok-strong); }
+  .statusDot.sbad { color:var(--bad-strong); }
+  .statusDot.snone { color:var(--dot-idle); }
   .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
-  .legitem:hover { background:#1b2540; }
-  .legitem.on { background:#233; outline:1px solid #3d6; }
-  .callcount { font-size:11px; color:#9aa3b8; margin-left:3px; }
-  .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid #2a5;
+  .legitem:hover { background:var(--hover-tint); }
+  .legitem.on { background:#233; outline:1px solid var(--accent-edge); }
+  .callcount { font-size:11px; color:var(--muted); margin-left:3px; }
+  .callbtn { margin-left:8px; cursor:pointer; background:#12281a; border:1px solid var(--ok-edge);
     color:#9f9; border-radius:6px; font-size:11px; padding:0 7px; }
   .callbtn:hover { background:#1b3a26; color:#dfffe6; }
   .skmeta { margin:10px 0; }
-  .skmeta b { color:#7fb2ff; }
-  .skbody { white-space:pre-wrap; background:#0c0e14; border:1px solid #2a2f3d;
+  .skmeta b { color:var(--link); }
+  .skbody { white-space:pre-wrap; background:var(--sunken); border:1px solid var(--line);
     border-radius:8px; padding:10px 12px; margin-top:4px; max-height:52vh; overflow:auto; }
   h2.h { margin:2px 0 12px; font-size:16px; }
   .glyph { font-weight:700; margin-right:6px; }
-  .glyph.res { color:#46c46a; } .glyph.unres { color:#ff8a8a; }
-  .glyph.watch { color:#e0b341; } .glyph.dis { color:#8a93a6; }
-  .legend { font-size:12px; color:#9aa3b8; margin:2px 0 10px; }
-  .ovdone { color:#46c46a; font-weight:600; }
-  .ovpend { color:#8a93a6; }
-  .ovspin { color:#e0b341; display:inline-block; animation: pulse 1.6s infinite; }
+  .glyph.res { color:var(--ok); } .glyph.unres { color:var(--bad); }
+  .glyph.watch { color:var(--warn); } .glyph.dis { color:var(--faint); }
+  .legend { font-size:12px; color:var(--muted); margin:2px 0 10px; }
+  .ovdone { color:var(--ok); font-weight:600; }
+  .ovpend { color:var(--faint); }
+  .ovspin { color:var(--warn); display:inline-block; animation: pulse 1.6s infinite; }
   /* Interactive roadmap panel (Oversee): ask + progress bar + stepper */
-  .rmwrap { margin:8px 0 4px; padding:8px 10px; background:#141824;
-    border:1px solid #2a2f3d; border-radius:8px; }
+  .rmwrap { margin:8px 0 4px; padding:8px 10px; background:var(--inset);
+    border:1px solid var(--line); border-radius:8px; }
   .rmask { margin-bottom:6px; }
-  .rmint { color:#e0b341; font-size:12px; margin:2px 0 6px; }
-  .rmbar { height:6px; background:#1d2230; border-radius:999px; overflow:hidden; }
-  .rmfill { height:100%; background:#46c46a; border-radius:999px;
+  .rmint { color:var(--warn); font-size:12px; margin:2px 0 6px; }
+  .rmbar { height:6px; background:var(--raised); border-radius:999px; overflow:hidden; }
+  .rmfill { height:100%; background:var(--ok); border-radius:999px;
     transition:width .4s; }
   .rmstep { position:relative; padding:3px 0 3px 22px; cursor:pointer; }
   .rmstep::before { content:''; position:absolute; left:7px; top:0; bottom:0;
-    width:2px; background:#2a2f3d; }
+    width:2px; background:var(--line); }
   .rmstep.rmfirst::before { top:50%; }
   .rmstep.rmlast::before { bottom:50%; }
   .rmnode { position:absolute; left:0; width:16px; text-align:center;
-    background:#141824; }
-  .rmnode.rmdone { color:#46c46a; }
-  .rmnode.rmactive { color:#e0b341; animation: pulse 1.6s infinite; }
-  .rmnode.rmpend { color:#8a93a6; }
-  .rmnode.rmskip { color:#555c6e; }
-  .rmdetail { color:#9aa3b8; font-size:11px; margin:2px 0; }
+    background:var(--inset); }
+  .rmnode.rmdone { color:var(--ok); }
+  .rmnode.rmactive { color:var(--warn); animation: pulse 1.6s infinite; }
+  .rmnode.rmpend { color:var(--faint); }
+  .rmnode.rmskip { color:var(--dimmest); }
+  .rmdetail { color:var(--muted); font-size:11px; margin:2px 0; }
   /* Prompt enrichment panel (Oversee): toggle + questions + composed prompt */
-  .enwrap { margin:0 0 12px; padding:10px 12px; background:#0c0e14;
-    border:1px solid #2a2f3d; border-radius:8px; }
-  .enwrap textarea { width:100%; box-sizing:border-box; background:#141824;
-    color:#dfe6f3; border:1px solid #2a2f3d; border-radius:6px;
+  .enwrap { margin:0 0 12px; padding:10px 12px; background:var(--sunken);
+    border:1px solid var(--line); border-radius:8px; }
+  .enwrap textarea { width:100%; box-sizing:border-box; background:var(--inset);
+    color:var(--field-text); border:1px solid var(--line); border-radius:6px;
     padding:6px 8px; font:inherit; margin-top:6px; }
   .ensec { margin:8px 0 2px; }
   .enq { margin:6px 0; }
-  .enq input { width:70%; background:#141824; color:#dfe6f3;
-    border:1px solid #2a2f3d; border-radius:6px; padding:2px 8px;
+  .enq input { width:70%; background:var(--inset); color:var(--field-text);
+    border:1px solid var(--line); border-radius:6px; padding:2px 8px;
     font:inherit; margin-top:2px; }
-  .enok { color:#46c46a; font-weight:700; }
-  .enbad { color:#ff8a8a; font-weight:700; }
-  .enout { background:#141824; border:1px solid #2a2f3d; border-radius:8px;
+  .enok { color:var(--ok); font-weight:700; }
+  .enbad { color:var(--bad); font-weight:700; }
+  .enout { background:var(--inset); border:1px solid var(--line); border-radius:8px;
     padding:8px 10px; white-space:pre-wrap; max-height:40vh; overflow:auto; }
-  button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:#1d2230;
-    color:#9aa3b8; border:1px solid #2a2f3d; border-radius:999px; cursor:pointer; }
-  button.mini:hover { color:#ff8a8a; }
+  button.mini { font-size:11px; padding:1px 8px; margin-left:8px; background:var(--raised);
+    color:var(--muted); border:1px solid var(--line); border-radius:999px; cursor:pointer; }
+  button.mini:hover { color:var(--bad); }
   /* MN-13: the faculty cat board, inline in the header. Every cat and panel rule
      comes from `cat_board.CSS`; this is only the container's own box, which differs
      from the swarm page's full-width strip. `margin-left:auto` pushes it to the
@@ -229,7 +254,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
      least as specific, and a media query adds no specificity — hence !important. */
   @media (prefers-reduced-motion: reduce) {
     header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,
-    .skel .bar { animation:none !important; }
+    .skel .bar, .skel .tile, .skel .line, .skel .pane { animation:none !important; }
     .rmfill { transition:none !important; }
   }
 /*__CAT_CSS__*/
@@ -555,17 +580,47 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // paints nothing extra; past SLOW_MS a bare "working…" chip stops informing
   // and starts looking like a hang, so the status line says how long it's been.
   // Measured 2026-08-10: the section endpoints cost 1.2-1.9 s against the 31k
-  // store, which is exactly the band where a skeleton earns its place.
-  const SKEL_MS = 300, SLOW_MS = 10000;
-  function showSkeleton(){
+  // store, which is exactly the band where a skeleton earns its place. 150 ms
+  // because that band is 8-12x further out — the threshold's whole job is to
+  // suppress the flicker on a paint that was already effectively instant (a memo
+  // hit, an empty namespace), and 300 ms was also swallowing the first sixth of
+  // every real load, which is the part where the user is still deciding whether
+  // the click registered.
+  const SKEL_MS = 150, SLOW_MS = 10000;
+  // One shape per thing a section paints, named by the section's own layout so a
+  // call site reads as a claim about what is coming. Each was checked against the
+  // real panel in a browser, which is how `sessions` ended up on `rows`: its cards
+  // are called `.tcard` and read like cards in the source, but they render as
+  // stacked full-width rows 42px tall, not as a grid.
+  //   cards  Overview only: a heading, then the `.cards` grid. Six tiles because
+  //          that grid is auto-fit and Overview paints six stat cards, so any
+  //          other count produces a different column layout than the one arriving.
+  //   rows   every `ul.hits` list, plus Sessions: a heading, then stacked rows.
+  //   block  State and Briefing, which paint into `pre#out` — one filled box, and
+  //          no heading line, because their title is text inside the block.
+  // Graph and the workspace iframes take no shape at all: their panel is an
+  // iframe, and a placeholder in our document would sit behind a frame that
+  // arrives with its own background.
+  const SKEL_SHAPES = {
+    cards: '<div class="bar w40"></div><div class="cards">'
+           + '<div class="tile"></div>'.repeat(6) + '</div>',
+    rows: '<div class="bar w40"></div>' + '<div class="line"></div>'.repeat(4),
+    block: '<div class="pane"></div>',
+  };
+  function showSkeleton(shape){
+    // An unknown name paints nothing rather than throwing: the skeleton is
+    // feedback about work, and feedback must never be the thing that breaks the
+    // work. `test_dashboard_theme.py` checks every call site's name statically,
+    // which is where a typo is supposed to be caught — here it would only ever
+    // be caught by a user watching a section not paint.
+    const markup = SKEL_SHAPES[shape];
+    if (!markup) return;
     // Same rule renderOversee already applies to the enrichment panel: never
     // repaint the view out from under a caret. A skeleton that eats what
     // somebody is typing is worse than no skeleton.
     const ae = document.activeElement;
     if (ae && ae.closest && ae.closest('#view')) return;
-    showHTML('<div class="skel" aria-hidden="true"><div class="bar w60"></div>'
-      + '<div class="bar"></div><div class="bar"></div>'
-      + '<div class="bar w40"></div></div>');
+    showHTML('<div class="skel" aria-hidden="true">' + markup + '</div>');
   }
   // wrap any async unit of work with busy state + error handling
   // Every run() gets a generation. `shouldPaint` covers renderers that register
@@ -585,7 +640,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // already moved to Overview), a stale run clearing busy while a newer one is
   // still loading, and stale skeleton/slow-status timers repainting over the
   // section that replaced them.
-  // `isSection` gates the skeleton, and only the skeleton. It shipped firing for
+  // `shape` gates the skeleton, and only the skeleton. It shipped firing for
   // EVERY run() caller, which is wrong in a way that only shows up on the paths
   // nobody demos: dismissing an improvement, reflecting, resolving, enriching a
   // prompt, deleting a session, appending a memory, and both Action buttons all
@@ -593,13 +648,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // wipes the thing the user was reading to announce work that does not replace
   // it. Section loads are the only runs whose whole job is to replace the panel.
   //
-  // Per-section skeleton SHAPES (D3: card grid / list rows / monospace block,
-  // with Graph and the workspaces exempt) and the 150 ms threshold (D6) are T28,
-  // which the resequencing put in PR-1c. This is the flag they will hang off;
-  // deliberately not doing their work here, since landing T28 early in the wrong
-  // shape is what produced this finding in the first place.
+  // It carries the section's SHAPE rather than a boolean because the two facts a
+  // caller has to state — "this run replaces the panel" and "this is what will be
+  // there" — are one decision, and splitting them into a flag plus a lookup table
+  // keyed by label is how the table and the sections drift apart. Omitted means
+  // no skeleton, which is the correct default for everything that is not a
+  // section load.
   let RUN_GEN = 0;
-  async function run(label, fn, isSection){
+  async function run(label, fn, shape){
     // Set before the first await: the section is chosen at click time, not when
     // its fetch returns, and boot may resolve in between.
     viewPicked = true;
@@ -607,8 +663,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     const current = () => gen === RUN_GEN;
     setBusy(true, label);
     announce(label);
-    const skel = isSection
-      ? setTimeout(() => { if (current()) showSkeleton(); }, SKEL_MS)
+    const skel = shape
+      ? setTimeout(() => { if (current()) showSkeleton(shape); }, SKEL_MS)
       : null;
     const slow = setTimeout(() => {
       if (current())
@@ -716,7 +772,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         + 'value="'+escAttr(MEM_QUERY)+'" oninput="onMemSearch(this.value)">'
       + '<button id="memsort" onclick="toggleMemSort()">'
         + (MEM_SORT==='new' ? 'newest first' : 'oldest first')+'</button></div>';
-    liveFn = renderMemory; run('loading memory', renderMemory, true);
+    liveFn = renderMemory; run('loading memory', renderMemory, 'rows');
   }
   function clearSession(){ SESSION = null; showMemory(); }
 
@@ -1054,7 +1110,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<button onclick="runResolve()" title="reroute red rules whose nudge '
       + 'failed; reflect the rule-less ones">resolve red</button>'
       + '</div>';
-    liveFn = renderImprovements; run('loading improvements', renderImprovements, true);
+    liveFn = renderImprovements; run('loading improvements', renderImprovements, 'rows');
   }
 
   // --- Sessions: rendered by the notification-center fragment (taskview.py).
@@ -1067,7 +1123,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   // placed HERE would run before the await and catch nothing, which would read
   // as protection while providing none.
   async function renderSessions(){ return renderTaskCards(); }
-  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions, true); }
+  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions, 'rows'); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
   // --- Oversee: live Claude work — loop runs AND interactive sessions ---
@@ -1250,7 +1306,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (r.injected_count ? ' <span class="pill rmnew" title="work the injector '
           + 'added to this run\\u2019s plan from the record">'+r.injected_count
           + ' injected</span>' : '')
-      + (r.online ? ' <span class="pill" style="color:#46c46a;border-color:#2a5">'
+      + (r.online ? ' <span class="pill" style="color:var(--ok);border-color:var(--ok-edge)">'
                     + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';
     if (open){
@@ -1383,7 +1439,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     if (!OV_DATA) return;
     // Online/offline strip: shown ONLY while Claude is working on a session.
     const online = OV_DATA.any_online
-      ? '<div class="row"><span class="pill" style="color:#46c46a;border-color:#2a5">'
+      ? '<div class="row"><span class="pill" style="color:var(--ok);border-color:var(--ok-edge)">'
         + '<span class="blip">\\u25cf</span> online \\u2014 Claude is working</span></div>'
       : '';
     const showProj = (PROJECT === '*');
@@ -1463,14 +1519,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       await renderOversee();
     });
   }
-  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee, true); }
-  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview, true); }
+  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee, 'rows'); }
+  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview, 'cards'); }
 
   // --- mandatory code change-log (Log view) ---
   function logBadge(cat){
-    const colors = {update:'#4a90d9', minor_change:'#6aa84f', deletion:'#d94a4a',
-                    reduction:'#d9a44a', major_change:'#b04ad9', replacement:'#4ad9c8'};
-    const c = colors[cat] || '#888';
+    const colors = {update:'var(--cat-update)', minor_change:'var(--cat-minor)', deletion:'var(--cat-deletion)',
+                    reduction:'var(--cat-reduction)', major_change:'var(--cat-major)', replacement:'var(--cat-replacement)'};
+    const c = colors[cat] || 'var(--cat-other)';
     return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(cat||'?')+'</span>';
   }
   async function renderLog(){
@@ -1499,11 +1555,11 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
         + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
       + '</ul>');
   }
-  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog, true); }
+  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog, 'rows'); }
 
   function sopBadge(action){
-    const colors = {add:'#6aa84f', update:'#4a90d9', 'delete':'#d94a4a'};
-    const c = colors[action] || '#888';
+    const colors = {add:'var(--cat-minor)', update:'var(--cat-update)', 'delete':'var(--cat-deletion)'};
+    const c = colors[action] || 'var(--cat-other)';
     return '<span class="pill" style="color:'+c+';border-color:'+c+'">'+esc(action||'?')+'</span>';
   }
   async function renderSops(){
@@ -1535,14 +1591,14 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + (res.history.length===1?'':'s')+')</h2>'
       + '<ul class="hits">'+hist+'</ul>');
   }
-  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops, true); }
+  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops, 'rows'); }
 
   async function renderState(){
     const s = await apiGet('/api/state');
     if (!shouldPaint(liveFn, renderState)) return;     // newer section owns the panel
     showText(s);
   }
-  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState, true); }
+  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState, 'block'); }
   function showBriefing(){
     controls.innerHTML=''; liveFn = null;
     // liveFn is null here, so shouldPaint cannot guard this one — run()'s
@@ -1551,7 +1607,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     run('loading briefing', async (current) => {
       const t = await apiGet('/api/briefing');
       if (current()) showText(t);
-    }, true);
+    }, 'block');
   }
 
   function showRecall(){
@@ -1579,7 +1635,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
         + hits.map(h => '<li><div class="file">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
         + '</ul>');
-    }, true);
+    }, 'rows');
   }
 
   // Graph is a one-shot heavy render (not live-refreshed): fetch once and hand
@@ -1896,7 +1952,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   }
   function modePill(mode){
     if (mode === 'auto')
-      return ' <span class="pill" style="color:#46c46a;border-color:#2a5" '
+      return ' <span class="pill" style="color:var(--ok);border-color:var(--ok-edge)" '
         + 'title="proven track record \\u2014 may be applied automatically">auto</span>';
     return ' <span class="pill est" title="unproven \\u2014 suggested only, '
       + 'needs your approval before it runs">suggest</span>';
@@ -2156,7 +2212,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
       + '<button id="plugdir" onclick="togglePlugDir()">'+plugDirLabel()+'</button>'
       + '</div>';
     liveFn = renderPlugins;
-    run('loading skill & plugin', renderPlugins, true);
+    run('loading skill & plugin', renderPlugins, 'rows');
   }
   function doExport(){ window.location = u('/api/export'); }
 
@@ -2235,6 +2291,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
   (async () => { await loadProjects(); if (!viewPicked) showOverview(); pollCats(); })();
 </script>
 </body></html>""" \
+    .replace("/*__PALETTE__*/", theme.PALETTE_CSS) \
     .replace("/*__PAINT_GUARD__*/", PAINT_GUARD_JS) \
     .replace("/*__CAT_CSS__*/", cat_board.CSS) \
     .replace("<!--__CAT_HTML__-->", cat_board.HTML) \
