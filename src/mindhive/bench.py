@@ -427,7 +427,18 @@ def register(subparsers) -> None:
     A new top-level group rather than `hive dashboard bench`: `dashboard` is a
     leaf parser taking only `--port` and `--no-browser`, and
     `python -m mindhive dashboard` has to keep working as a bare invocation —
-    that is the mechanism the project instructions protect."""
+    that is the mechanism the project instructions protect.
+
+    **This is the only command in the tree that registers itself.** Every other
+    group — including the multi-subcommand ones — builds its parser inline in
+    `__main__.py`, which is how that file reached 4115 lines. The deviation is
+    deliberate and it is named here rather than left for the next reader to
+    notice: `__main__.py` gets two lines (an import and this call) instead of
+    forty, and the flags stay beside the code that reads them, so a new flag
+    cannot be added to one and forgotten in the other. Following the local
+    convention would have been the more consistent choice and the worse one; if
+    a second module ever registers this way, this comment stops being a
+    deviation and the pattern should be written down as the convention."""
     bn = subparsers.add_parser(
         "bench", help="time the dashboard's own endpoints (read-only; writes "
                       "no events)")
