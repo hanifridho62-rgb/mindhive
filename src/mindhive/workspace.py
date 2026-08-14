@@ -540,7 +540,7 @@ class Manager:
         # Resolved lazily in `_emit_faculty` rather than defaulted here: a
         # dashboard for a project that never touched the phase spine must not pay
         # for importing the mindnet package, which is the same rule
-        # `dashboard._get_mindnet_cats` keeps.
+        # `dashboard_get._get_mindnet_cats` keeps.
         self._emit_activity = emit_activity
         self._lock = threading.Lock()
         self.agents: dict = {}

@@ -86,8 +86,11 @@ def _live_repair(tmp_path, monkeypatch):
 
 
 def _live_tech_debt(tmp_path, monkeypatch):
-    # 1848 lines: `dashboard_page.py`'s real size in this checkout, not a number
-    # chosen to pass.
+    # 1848 lines: what `dashboard_page.py` measured when this fixture was
+    # written, not a number chosen to pass. The real file is 209 lines now — it
+    # was split — and the figure stays because what this exercises is the lens
+    # firing on a module well past the threshold, which needs a module well past
+    # the threshold to exist. `workspace.py` (1462) is the nearest real one.
     return _ctx(**_trees(tmp_path, modules=[("dashboard_page.py", 1848)]))
 
 

@@ -265,8 +265,8 @@ def start(kind_name, project, request=None) -> "Job | None":
     already running.
 
     None rather than an exception: "something is already running" is an expected
-    domain answer the page renders, exactly as `dashboard._one_at_a_time` returns
-    ``ok:False`` with a 200 rather than raising.
+    domain answer the page renders, exactly as `dashboard_locks._one_at_a_time`
+    returns ``ok:False`` with a 200 rather than raising.
     """
     kind = get_kind(kind_name)
     if kind is None:

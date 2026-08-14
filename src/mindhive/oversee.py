@@ -259,7 +259,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 # provenance: Self-Reliant runs log into research-<id> streams;
                 # the label rides the card so Oversee shows whose work this is
                 # (filled by the per-event pass below — same idiom as
-                # dashboard._get_sessions)
+                # dashboard_get._get_sessions)
                 "origin": None,
             }
             order.append(sid)

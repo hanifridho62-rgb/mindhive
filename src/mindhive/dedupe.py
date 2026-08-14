@@ -48,7 +48,7 @@ DEFAULT_THRESHOLD = 0.85
 # `state_set` is here for a third reason: it is "last one wins" state, carries
 # no `text` at all, and is excluded from the LEDGER entirely — collapsing two of
 # them is not wrong so much as meaningless. It reaches this function only
-# through the dashboard's Memory view (`dashboard._get_memory` filters on
+# through the dashboard's Memory view (`dashboard_get._get_memory` filters on
 # `events.MEMORY_VIEW_TYPES`, which includes it), where its empty text already
 # never matched anything. Listing it explicitly costs nothing and closes the
 # last gap in the two-list agreement.
