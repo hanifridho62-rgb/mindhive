@@ -216,7 +216,7 @@ def project(project=None, evs=None, suggestions=None) -> dict:
     """Rebuild a project's derived files, one writer at a time per project.
 
     The lock lives HERE rather than at the call sites because there are nine of
-    them and they do not agree: `dashboard._post_project` held `_PROJECT_LOCK`,
+    them and they do not agree: `dashboard_post._post_project` held `_PROJECT_LOCK`,
     `_post_sync` held `_SYNC_LOCK`, `_post_harvest` held `_HARVEST_LOCK`,
     `_post_append` and the background `_auto_harvest_loop` held nothing, and
     `autosync`, `consolidate` and two CLI paths are not handlers at all. Four

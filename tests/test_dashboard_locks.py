@@ -28,7 +28,13 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard, events, jobs
+from mindhive import dashboard, dashboard_get, dashboard_jobs, events, jobs
+
+# Patch targets are the module that OWNS the name, not the one that re-exports
+# it. `dashboard` still exposes the locks and memos (same objects), but the code
+# under test reads `run_catch_up` and `time` from the modules imported above, and
+# patching a re-export would silently miss — the call would run the real thing
+# while the assertion below still passed.
 
 # The locks and both memos are MODULE level on purpose — they have to hold
 # across every handler class `make_handler` mints, and across every thread the
@@ -133,7 +139,7 @@ Op = collections.namedtuple("Op", "route work result reach empty")
 NOTHING = "nothing_to_do"
 
 JOBS = [
-    Op("/api/harvest", ("mindhive.dashboard", "run_catch_up"),
+    Op("/api/harvest", ("mindhive.dashboard_jobs", "run_catch_up"),
        {"projects": {"test": {"new": 2}}, "total_new": 2},
        {}, ({"projects": {}, "total_new": 0}, NOTHING)),
     Op("/api/embed", ("mindhive.vectors", "embed"), {"embedded": 3},
@@ -258,18 +264,40 @@ def test_the_lock_is_released_when_the_handler_raises(
 def test_a_long_operation_is_accepted_not_completed(dashboard_server,
                                                     monkeypatch, op):
     """202, and a job id to poll. A 200 would claim the work was done, which is
-    the lie that made the browser give up on runs that were still going."""
+    the lie that made the browser give up on runs that were still going.
+
+    The stub BLOCKS rather than returning instantly, and that is load-bearing
+    rather than incidental. `_start` reads `job.snapshot(0)` after `jobs.start`
+    has already spawned the job's daemon thread, so with instant work the state
+    in the accepted response is a race: usually `running`, but `finished` the
+    moment the runner schedules that thread first. It lost that race on CI
+    (ubuntu/py3.11) while every other leg passed. Parking the work until this
+    test releases it makes "the response went out before the work was done" a
+    fact about the code instead of a fact about the scheduler.
+
+    This is also why the POST below is expected to return at once while the work
+    is still parked: the request thread hands off and answers, which is the whole
+    claim. A regression to inline work would show up here as a hang until the
+    socket timeout — same trade the blocking tests further down already take."""
     base, token = dashboard_server
     _stub_incident_projection(monkeypatch)
     _apply(monkeypatch, op.reach)
     mod, attr = op.work
-    monkeypatch.setattr(importlib.import_module(mod), attr,
-                        lambda *_a, **_kw: op.result)
-    status, obj = _post(base, op.route, {"project": "test"}, token)
-    assert status == 202, f"{op.route} answered {status}, not 202 Accepted"
-    assert obj["ok"] is True and obj["job"]["id"]
-    assert obj["job"]["state"] == "running"
-    assert "outcome" not in obj["job"], "an accepted job cannot know its outcome"
+    fake, _entered, release, _calls = _blocking(op.result)
+    monkeypatch.setattr(importlib.import_module(mod), attr, fake)
+    try:
+        status, obj = _post(base, op.route, {"project": "test"}, token)
+        assert status == 202, f"{op.route} answered {status}, not 202 Accepted"
+        assert obj["ok"] is True and obj["job"]["id"]
+        assert obj["job"]["state"] == "running"
+        assert "outcome" not in obj["job"], \
+            "an accepted job cannot know its outcome"
+    finally:
+        # In a `finally` so a failed assertion above does not leave the job
+        # parked for 20s holding its kind's lock — the next test's first click
+        # would then be refused, and read as a concurrency bug in whichever
+        # test happened to run second.
+        release.set()
     final = _await_job(base, token, obj["job"]["id"])
     assert final["outcome"] in ("did_work", "degraded"), final
 
@@ -482,7 +510,7 @@ def test_unrelated_operations_do_not_block_each_other(dashboard_server,
     # clicks into a stall for no safety gained.
     base, token = dashboard_server
     fake, entered, release, _calls = _blocking({"projects": {}})
-    monkeypatch.setattr(dashboard, "run_catch_up", fake)
+    monkeypatch.setattr(dashboard_jobs, "run_catch_up", fake)
     monkeypatch.setattr(importlib.import_module("mindhive.sync"), "sync",
                         lambda *_a, **_kw: "MEMORY.md")
 
@@ -725,8 +753,9 @@ def test_hive_mind_bypasses_the_gate(dashboard_server, counters):
 
 class _FakeTime:
     """The real `time` module with a movable `time()`. Substituted for
-    dashboard's module-level `time` so a cache HIT can be observed across a
-    clock change without the test sleeping."""
+    `dashboard_get`'s module-level `time` — the module that stamps the response —
+    so a cache HIT can be observed across a clock change without the test
+    sleeping."""
 
     def __init__(self, start):
         self.now = start
@@ -747,7 +776,7 @@ def test_a_cache_hit_still_ages_the_wall_clock_fields(dashboard_server,
     base, token = dashboard_server
     _seed()
     clock = _FakeTime(time.time())
-    monkeypatch.setattr(dashboard, "time", clock)
+    monkeypatch.setattr(dashboard_get, "time", clock)
 
     _status, warm = _get(base, CATS, token)
     assert [c["display"] for c in warm["cats"]] == ["active"]

@@ -71,8 +71,8 @@ def test_the_documents_this_file_guards_actually_exist():
 # Scoped to types that can ACTUALLY reach `dedupe.collapse`, which is the only
 # honest scope for an agreement assertion: exempting a type from a function it
 # never reaches proves nothing. Two callers collapse, and the wider one decides
-# the scope — `dashboard._get_memory` filters on `events.MEMORY_VIEW_TYPES` and
-# feeds every surviving row straight into `collapse`, so every SEMANTIC type
+# the scope — `dashboard_get._get_memory` filters on `events.MEMORY_VIEW_TYPES`
+# and feeds every surviving row straight into `collapse`, so every SEMANTIC type
 # reaches it, `state_set` included (`briefing._collapsed_entries` passes a
 # strict subset).
 
