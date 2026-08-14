@@ -156,9 +156,10 @@ def tracking(*, root=None, runner=None, timeout_s=PROBE_TIMEOUT_SECONDS) -> dict
     upstream_missing}``. Never raises, never fetches.
 
     Split out of `staleness` because it answers on its own and costs two git
-    calls (~85ms here) against that one's five (~250ms) — cheap enough to run
-    once per session on the orient path, where a checkout that cannot pull is
-    worth saying out loud. Nothing else reports it: `git status` is silent about
+    calls against that one's five — measured 2026-08-14 on this repo, min of 5:
+    133 ms here against 249 ms for the full probe (an earlier note said ~85ms,
+    which no longer holds). Cheap enough to run once per session on the orient
+    path, where a checkout that cannot pull is worth saying out loud. Nothing else reports it: `git status` is silent about
     a missing upstream, and the drift counts are measured against a ref that
     resolves whether or not this branch tracks anything."""
     runner = runner or _default_runner

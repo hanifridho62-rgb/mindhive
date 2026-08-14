@@ -1399,6 +1399,38 @@ still arrives, so nothing looks broken, and the procedure it claims to re-assert
 is not in it. Measured on this repo at the time of writing: one mandatory SOP of
 3,414 chars against a 3,000-char budget, i.e. `pointers_only` on every prompt.
 
+That verdict is **also pushed onto the projections**, because `hive sop injection`
+has to be typed and a degradation only a deliberate check can find is one nobody
+finds. `sopgate.notice` renders a block for `pointers_only`, `partial` and
+`silent`, and **the empty string for `verbatim`** — a notice present in every
+healthy digest is a notice every reader learns to skip. It enters at
+`projector.compose_state`, which is `build_state`'s only caller and feeds *both*
+the STATE.md rebuild and the digest `sync` embeds in `MEMORY.md`; the latter is the
+file a session loads without being asked, and is the reason the notice is composed
+there rather than in `cmd_state`, which does not build STATE.md at all — it prints
+the file (`__main__.py:282-284`).
+
+Three properties of that block are stated inside it rather than left to a reader:
+
+* **The verdict is GLOBAL.** `sopgate.probe` ignores its `project` argument and
+  reads the cross-namespace `mandatory_sops.json` on purpose (the hook is
+  registered machine-wide, so per-project data would make its reach a fiction),
+  while STATE.md is per-namespace. A global verdict printed inside a per-namespace
+  file without saying so invites exactly the wrong reading.
+* **It is as of the last rebuild**, not as of read time — the same property the
+  review, change-log and roadmap notices already have.
+* **One vocabulary.** `sopgate.verdict_sentence` is shared by the notice and by the
+  `sop-injection` outcomes surface, so the two cannot describe one measurement in
+  two ways. `probe` already refuses a second *computation* of the fit rule; this
+  refuses a second *phrasing* of the result.
+
+Ordering note: `projector._project` refreshes the mandatory-SOP sidecar **before**
+composing STATE.md, not after. With the write after, STATE.md carried the verdict
+as of the previous rebuild while the `MEMORY.md` digest composed moments later in
+the same `hive sync` carried the current one — two files disagreeing about one
+measurement. The probe itself costs one small JSON read (measured 0.1 ms, worst of
+5 reads 10.1 ms on the live store), and is paid at rebuild, never on the prompt path.
+
 **Checkout staleness** (`repo.staleness`, `hive repo stale`) is the same honesty
 rule applied to git: the count of commits behind is reported **with** the age of
 the fetch it was measured against, because "0 behind" against a remote last read
@@ -1420,7 +1452,8 @@ could not ask" is not evidence that `git pull` works, the same reasoning that
 makes an unreadable fetch age count as stale.
 
 That answer is also **pushed rather than waited for**. `repo.tracking` is the
-two-call subset of the probe (~85ms, against ~250ms for the full one), cheap
+two-call subset of the probe (measured 2026-08-14, min of 5: **133 ms**, against
+**249 ms** for the full `staleness` — the earlier note said ~85ms), cheap
 enough that `hive state` — the one command the session-start hook runs — asks
 every session and warns on stderr when the branch tracks nothing. It prints
 nothing when the branch tracks something, nothing outside a checkout, nothing
@@ -1548,6 +1581,37 @@ real progress stays on the record, so `archived` never reads as "finished".
 merged, archives what it proves closed, and **reports every plan it examined**,
 including the untouched ones with their reasons, so "nothing was provably
 landed" cannot be mistaken for "the sweep worked".
+
+### 4.17 Why the dashboard may run pytest, and what would revoke that
+
+The **Self-test** button starts the repo's own test suite from the local web
+server. The justification is recorded here and in `_job_selftest`'s docstring
+because the alarming reading of that sentence is the correct instinct, and the
+answer to it is a set of conditions that a later change could quietly remove.
+
+**The true shape.** Not pytest in-process. `verify.default_argv`
+(`src/mindhive/verify.py:69`) builds `[sys.executable, "-m", "pytest", "-q",
+<tests>]`; `verify.stream` spawns it with `subprocess.Popen` (`verify.py:141`)
+from a jobs worker thread, **argv list only** — `shell=True` appears nowhere in
+that module and a test pins its absence. stdout is streamed line by line into the
+job artifact, and a process that dies mid-run is sealed `job_abandoned` at the
+next boot rather than left reading as "running".
+
+**The three holds, at their real strength:**
+
+| Hold | Where | What it is, honestly |
+|---|---|---|
+| Token | `make_handler(token)` `dashboard.py:527`, `_check_token` `:592-598` | **Server-wide**, not per route — one value closed over by the handler, compared constant-time. Normally delivered in the **URL query string** (`stable_url` `:1888-1894`). A URL-borne bearer token is weaker than "per-route auth" implies: it reaches shell history, browser state, and any log that records a request line. |
+| Single-flight | `_SELFTEST_LOCK` `:88`, passed at `:1832-1833` | A second click during a run is refused, not queued. Prevents two pytest processes over one working tree writing the same caches and each invalidating the other's result. |
+| Local-only | `ThreadingHTTPServer(("127.0.0.1", port), …)` `:2014` | Nothing off this machine can reach the route. |
+
+**The cost, unhidden:** a browser click starts a multi-minute CPU-heavy
+subprocess on the machine already serving the dashboard.
+
+**Revocation.** Remove any ONE hold and the justification is void, not merely
+weaker — bind `0.0.0.0` and local-only is gone; drop the lock and concurrent runs
+corrupt each other's tree; make the token optional and an unauthenticated request
+starts a process.
 
 ## 5. Invariants — do not break these
 

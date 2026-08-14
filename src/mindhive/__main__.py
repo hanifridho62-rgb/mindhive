@@ -176,8 +176,16 @@ def cmd_hook(args) -> int | None:
         # Here, in the side-effect layer, for the same reasons the two calls above are:
         # the printed context is the product, and this must not be able to disturb it. The
         # sidecar read above is reused rather than repeated, and there is deliberately no
-        # rebuild — that costs 0.32 s against this path's ~0.4 s budget, and the next
-        # prompt's own write would invalidate the result anyway.
+        # rebuild: a full fold is the single most expensive thing this path could do, and
+        # the next prompt's own write would invalidate the result anyway.
+        #
+        # Measured 2026-08-14 on the live store (35,202 events), min of 5:
+        # `events.read_all()` 430 ms (the "0.36 s" this comment used to cite — the ledger
+        # grew). The ~0.4 s budget the two copies of this note claimed is NOT met: the
+        # session-start path (`hive state`, below) measures 699 ms end to end, worst of 5
+        # 1468 ms. Stated rather than quietly relabelled — the figure was a real target
+        # and the path is over it. What the budget SHOULD be is an open question, and
+        # deliberately not answered here: see docs/plans/2026-08-14-001.
         try:
             from .mindnet import autodeclare as mn_auto
             mn_auto.maybe_declare(_hook_prompt(raw), spine,
@@ -254,11 +262,22 @@ def cmd_state(args) -> int | None:
     except Exception:                                       # noqa: BLE001
         pass
     # MN-18 U4: refresh the MindNetwork projection here, stale-gated. The session-start
-    # hook runs `hive state`, this is the only command in that hook belonging to this repo,
-    # and the fold costs 0.32 s — invisible once per session, decisive on the prompt path
-    # where the hook must stay under ~0.4 s. Without it the projection never returns to
-    # fresh and per-task phase direction never appears. Silent on failure: printing STATE.md
-    # is this command's job and a projection rebuild must not be able to stop it.
+    # hook runs `hive state`, and this is the only command in that hook belonging to this
+    # repo. Without it the projection never returns to fresh and per-task phase direction
+    # never appears. Silent on failure: printing STATE.md is this command's job and a
+    # projection rebuild must not be able to stop it.
+    #
+    # Measured 2026-08-14 on the live store (35,202 events), min of 5: this refresh 82 ms
+    # when the gate finds it fresh and 643 ms when it actually rebuilds; `repo.tracking()`
+    # above 122 ms; `sopgate.probe()` (via the projection, not this path) 0.1 ms. The whole
+    # command is 699 ms end to end, worst of 5 1468 ms.
+    #
+    # That is OVER the "~0.4 s" both copies of this note used to claim, and saying so is
+    # the point of the correction: the number was a real target, the path exceeds it, and
+    # nothing here has been relabelled to make the target look like it was merely wrong.
+    # Choosing a replacement budget needs a decision about what session start is allowed
+    # to cost, which is bigger than the change that measured it — recorded as the open
+    # question in docs/plans/2026-08-14-001-feat-close-five-gaps-plan.md.
     try:
         from .mindnet import autodeclare as mn_auto
         mn_auto.refresh_projection(project)

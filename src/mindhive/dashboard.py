@@ -1736,8 +1736,17 @@ def _job_rules_reflect(project, request, emit) -> outcomes.Report:
     eligible = [s["signature"] for s in incidents.summaries(project)
                 if s["status"] == "active" and s["rule_source"] == "none"]
     if not eligible:
+        # Names the filter, not just its result. "no active failure without a
+        # lesson already" was true and unreadable: it reported that the count
+        # was zero without saying what had been counted, so a healthy store and
+        # a filter looking at the wrong fields produced the identical sentence.
+        # The two fields are the ones on the line above.
         return outcomes.Report(outcomes.NOTHING_TO_DO,
-                               "no active failure without a lesson already",
+                               "nothing to reflect: no incident with "
+                               "status=active and rule_source=none. Zero is "
+                               "the healthy answer here — it means every live "
+                               "failure has already produced a lesson, not "
+                               "that the search came up empty",
                                {"reflected": 0, "failed": 0, "pending": 0})
     reflected = failed = 0
     for signature in eligible[:limit]:
@@ -1793,6 +1802,52 @@ def _job_rules_resolve(project, request, emit) -> outcomes.Report:
 
 
 def _job_selftest(project, request, emit) -> outcomes.Report:
+    """Run the repo's own pytest suite, from the web server, on a browser click.
+
+    That sentence is alarming on purpose, so here is the justification the
+    five-surfaces review asked for — including the parts that weaken it.
+
+    **What it actually is.** Not pytest in-process. `verify.default_argv`
+    (`verify.py:69`) builds `[sys.executable, "-m", "pytest", "-q", <tests>]` and
+    `verify.stream` spawns it through `subprocess.Popen` (`verify.py:141`) from a
+    jobs worker thread, argv-list only — `shell=True` appears nowhere in that
+    module and a test pins its absence. Output is streamed line by line into the
+    job artifact rather than captured wholesale, so a four-minute suite is not
+    four minutes of an empty pane, and a process that dies mid-run is sealed as
+    `job_abandoned` on the next boot instead of staying "running" forever.
+
+    **What holds it safe — three things, stated at their real strength:**
+
+    * **The token.** One token for the WHOLE server, not per route:
+      `make_handler(token)` (`:527`) closes over a single value and `_check_token`
+      (`:592-598`) compares every request against it (constant-time, so it does
+      not leak by timing). It is normally delivered in the URL query string —
+      `stable_url` (`:1888-1894`) builds `http://127.0.0.1:<port>/?token=<tok>`,
+      which is what the launcher opens. A URL-borne bearer token is a materially
+      weaker hold than "per-route auth" would imply: it lands in shell history,
+      in whatever the browser keeps, and in any log that records a request line.
+      It is stated that way here rather than oversold, because a hold nobody has
+      described accurately is a hold nobody can audit.
+    * **The single-flight lock.** `_SELFTEST_LOCK` (`:88`) is passed to
+      `jobs.register_kind` (`:1832-1833`), so a second click while a run is in
+      flight is refused rather than queued. The worst case it prevents is
+      concrete: two pytest processes over the same working tree, writing the same
+      caches and temp files, each reporting results the other invalidated.
+    * **Local-only binding.** The server binds `127.0.0.1` explicitly
+      (`ThreadingHTTPServer(("127.0.0.1", port), handler)`, `:2014`), so nothing
+      off this machine can reach the route to begin with.
+
+    **What it costs when someone does click it.** A multi-minute, CPU-heavy
+    subprocess starts, on the machine already running the dashboard whose own
+    latency this project has spent a plan measuring. That is the honest price and
+    it is not hidden behind the word "selftest".
+
+    **Revocation.** Remove any ONE of those three holds and this justification is
+    void, not merely weaker: bind to `0.0.0.0` and the local-only argument is
+    gone; drop the lock and concurrent runs corrupt each other's tree; make the
+    token optional and an unauthenticated request starts a process. Writing that
+    down is the point of the docstring — the next person to touch any of the
+    three should find the condition stated before they trip it."""
     from . import selftest as selftest_mod
     # echo=False: the server's stdout is the terminal the dashboard was launched
     # from, and the person who wants this output is looking at the browser. `emit`
