@@ -19,8 +19,20 @@ import re
 
 import pytest
 
-from mindhive import (cat_board, dashboard_page, research_page, swarm_page,
-                      taskview, theme, workspace_page)
+from mindhive import (cat_board, dashboard_css, dashboard_js_actions,
+                      dashboard_js_core, dashboard_js_improve,
+                      dashboard_js_oversee, dashboard_js_skills,
+                      dashboard_js_views, dashboard_page, research_page,
+                      swarm_page, taskview, theme, workspace_page)
+
+# The shell document's source is now seven files: `dashboard_page` holds the
+# markup and the splice chain, and the stylesheet and the page JS live in the
+# fragment modules it assembles. Every scan in this file is over the DOCUMENT,
+# so `_source` reassembles it — reading the shell alone would scan a 210-line
+# file and report no colours, no shapes and no skeletons, passing everything.
+SHELL_FRAGMENTS = (dashboard_css, dashboard_js_core, dashboard_js_improve,
+                   dashboard_js_oversee, dashboard_js_views,
+                   dashboard_js_skills, dashboard_js_actions)
 
 # A hex colour, and not an HTML entity (`&#9679;`) or part of an identifier.
 HEX = re.compile(r"(?<![&\w])#([0-9a-fA-F]{3,8})(?![0-9a-fA-F\w-])")
@@ -44,7 +56,9 @@ IFRAME_SOURCES = (workspace_page, swarm_page, research_page)
 
 
 def _source(module) -> str:
-    return pathlib.Path(module.__file__).read_text(encoding="utf-8")
+    parts = [module, *SHELL_FRAGMENTS] if module is dashboard_page else [module]
+    return "\n".join(pathlib.Path(m.__file__).read_text(encoding="utf-8")
+                     for m in parts)
 
 
 def _literals(text) -> list:
@@ -233,7 +247,15 @@ def test_reduced_motion_silences_every_shimmer():
     guard = re.search(r"@media \(prefers-reduced-motion: reduce\) \{(.+?)\n  \}",
                       css, re.S)
     assert guard, "the reduced-motion guard is gone"
-    animated = set(re.findall(r"\.skel \.(\w+)[ ,{]", css.split("@media")[0]))
+    # Everything OUTSIDE the guard block, rather than everything before the first
+    # `@media`. The old form was an accident of one file's ordering: the sheet now
+    # lives in `dashboard_css`, whose own docstring says the word `@media`, and
+    # splitting on that would leave an empty prefix — no animated classes found,
+    # loop body never entered, and this test green for a page shipping motion at
+    # someone who asked for none.
+    outside = css[:guard.start()] + css[guard.end():]
+    animated = set(re.findall(r"\.skel \.(\w+)[ ,{]", outside))
+    assert animated, "no animated .skel rules found — this test stopped reading the sheet"
     for cls in sorted(animated):
         assert f".skel .{cls}" in guard.group(1), \
             f".skel .{cls} shimmers with no reduced-motion guard"

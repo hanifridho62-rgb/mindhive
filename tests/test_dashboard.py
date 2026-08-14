@@ -9,7 +9,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard, dashboard_page
+from mindhive import dashboard, dashboard_page, dashboard_post
 
 # Store isolation is provided by the autouse `isolate_store` fixture in
 # tests/conftest.py — every dashboard test (and its in-process server threads)
@@ -670,7 +670,9 @@ def test_the_pages_own_animations_honour_reduced_motion(dashboard_server):
 # happens: an animation added later, in any of the three fragments, with nothing
 # turning it off.
 _MOTION_GUARDS = {
-    # dashboard_page.py
+    # dashboard_css.py — the shell's own sheet, which ships the whole guard
+    # block for exactly this reason: the scan above is per FILE, so a sheet
+    # split from its reduced-motion rules would fail it.
     "header .dot.busy": "header .dot.busy",
     "header #live .blip": "header #live .blip",
     ".ovspin": ".ovspin",
@@ -701,10 +703,10 @@ def _css_rules(css):
 
 
 def test_every_animation_the_page_serves_is_stopped_under_reduced_motion(dashboard_server):
-    """The census behind the checklist above. Three modules contribute CSS to
-    this one page -- dashboard_page, cat_board and taskview -- and each guards
-    its own motion, so "did anyone add a pulse and forget" is a question no
-    single file can answer. This asks the assembled page.
+    """The census behind the checklist above. Three modules contribute animated
+    CSS to this one page -- dashboard_css, cat_board and taskview -- and each
+    guards its own motion, so "did anyone add a pulse and forget" is a question
+    no single file can answer. This asks the assembled page.
 
     SOURCE-SHAPE, stated plainly: it reads the served stylesheet, it does not
     apply it. It cannot prove a guard wins the cascade; it proves every live
@@ -1462,7 +1464,7 @@ def test_sync_uses_registered_project_folder(dashboard_server, monkeypatch):
         captured["project"] = project
         return "C:/code/test-project/MEMORY.md"
 
-    monkeypatch.setattr(dashboard.sync_mod, "sync", spy_sync)
+    monkeypatch.setattr(dashboard_post.sync_mod, "sync", spy_sync)
     base, token = dashboard_server
     status, obj = _post(base, "/api/sync", {"project": "test"}, token)
     assert status == 200 and obj["ok"] is True
@@ -1475,7 +1477,7 @@ def test_sync_falls_back_to_cwd_when_unregistered(dashboard_server, monkeypatch)
     """An unregistered project has no folder mapping, so sync uses the cwd."""
     import os
     captured = {}
-    monkeypatch.setattr(dashboard.sync_mod, "sync",
+    monkeypatch.setattr(dashboard_post.sync_mod, "sync",
                         lambda folder, project=None: captured.update(folder=folder) or "x")
     base, token = dashboard_server
     _post(base, "/api/sync", {"project": "never-registered"}, token)
