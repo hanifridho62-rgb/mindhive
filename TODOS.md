@@ -327,3 +327,55 @@ hard-coded rely on the same redirect.
 phase cannot be aggregated. Nothing was lost — the plan document itself carries the decisions —
 but the machine-readable half of two planning runs is simply absent, and it will keep being
 absent silently.
+
+---
+
+## 15. A merged PR whose code never reached master — the whole `fabricate` feature
+
+**Source:** branch audit, 2026-08-14.
+
+**What:** decide whether to land `feat(fabricate): the PRD assembly line` (`3a45aea`) on master,
+and until that decision is made, **do not delete**
+`claude/prd-assembly-line-40e466` or `claude/session-resumption-marker-40e466`.
+
+**Why this is not an ordinary stale branch:** PR org/repo#71 is `MERGED` — green, closed,
+2026-07-18. Its base was `claude/session-resumption-marker-40e466`, **not** `master`. So the
+merge succeeded into a branch and the trunk never received a line of it. Verified against
+`origin/master` today:
+
+```
+src/mindhive/fabricate.py        ABSENT
+tests/test_fabricate.py          ABSENT
+"fabrication" in events.py       0 occurrences
+```
+
+That is 1242 insertions across 7 files, 41 tests the commit message reports as passing, and a
+live-verified Windows Task Scheduler dispatch — `hive fabricate compile | dispatch | run | list`,
+the `fabrication` event type, and loop-mode autoresume. None of it is reachable from master.
+
+**Cost to rescue, measured (`git merge-tree`, non-destructive):** three conflicts, all in
+append-style registries — `docs/DATA_MODEL.md`, `src/mindhive/__main__.py`,
+`src/mindhive/events.py`. `src/mindhive/autoresume.py` and `src/mindhive/loop/engine.py`
+auto-merge. So the shape is "take both sides in three registries", not a rewrite — but the 41
+tests must be re-run against today's master, which has moved a long way since 2026-07-19.
+
+**The generalisable lesson, which outlives this item:** a PR being `MERGED` says only that its
+head reached its **base**. It says nothing about master. Any audit that trusts the merged flag
+instead of `git merge-base --is-ancestor <sha> origin/master` will report this feature as
+shipped.
+
+**Depends on:** nothing. It is independent of every other item here.
+
+---
+
+## 16. ~~`claude/gifted-mirzakhani-d842b5` — graph pinwheel from real nodes~~ — SUPERSEDED
+
+Closed 2026-08-14 by audit, not deferred. The branch carries one unmerged commit `a5c739d`
+(2026-06-24), "pinwheel view is now built from the real nodes". Master reached the same idea
+independently one day later in `c3ef3e0`, "node-based living pinwheel — symmetric spacing, star
+drift, twinkle, buzz", and went further. Master's `graphview.py` is 856 lines against the
+branch's 657.
+
+Kept here rather than deleted because the branch still exists and someone auditing it later will
+ask the same question: **the branch is safe to delete, nothing unique is lost.** That is the
+answer, with the commit that supersedes it named.
