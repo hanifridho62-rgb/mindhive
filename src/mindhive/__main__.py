@@ -3245,6 +3245,13 @@ def _build_parser() -> argparse.ArgumentParser:
     pkr.add_argument("--pack", default=None, help="limit output to one pack")
     pkr.set_defaults(func=cmd_packs_report)
 
+    # --- bench (time the dashboard's endpoints) ---
+    # The only group that registers its own parser instead of being wired
+    # inline here. Deliberate, and the reason is this file's size, not a new
+    # convention: see the comment above `bench.register`.
+    from . import bench as bench_mod
+    bench_mod.register(sub)
+
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
 
