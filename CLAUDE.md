@@ -107,3 +107,71 @@ Whenever you touch code in this checkout, run the test suite before calling
 the work done. If the user's ask implies shipping via PR, don't report success
 until CI (or the local test run standing in for it) is actually green — not
 "looks right."
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill
+tool before starting the work. When in doubt, invoke the skill — a skill run
+that turns out unnecessary is cheaper than an ad-hoc answer that skips a
+workflow's quality gates.
+
+**Scope is every installed skill, not one vendor's list.** This machine has
+**347 skills across 70 plugins**; gstack is roughly 40 of them. Routing to
+"the gstack skill that is closest" when a domain plugin fits better is the
+failure this section exists to prevent.
+
+The catalog is live, so read it rather than trusting any list written here:
+
+```
+hive skills list
+```
+
+`hive plugins recommend` scores the picks. The Skill tool's own listing is the
+other authoritative source, and it carries each skill's one-line description —
+consult the description before invoking, and match the task to the skill's
+stated scope.
+
+**Names must be exact, including any `plugin:` prefix.** `ce-code-review` is
+`compound-engineering:ce-code-review`; a bare or guessed name errors. A
+user-typed `/name` maps to the matching listed skill with the slash stripped.
+Built-in CLI commands (`/help`, `/clear`, `/config`, `/model`) are not skills
+and must not be routed through the Skill tool.
+
+**Order when several match:** process skills before implementation skills —
+brainstorming and debugging decide HOW to approach the work, so they run first
+and the domain skill runs inside their frame. "Let's build X" → brainstorm,
+then build. "Fix this bug" → debug, then the domain fix. Where a scoped and an
+unscoped variant of one name both exist, the one whose directory contains the
+files being edited wins.
+
+High-traffic routes, by intent. This is a shortcut for the common cases, not
+the boundary of what may be routed to:
+
+- Shape an idea, scope, strategy → `/office-hours`, `/spec`,
+  `/plan-ceo-review`, `superpowers:brainstorming`,
+  `compound-engineering:ce-brainstorm`
+- Plan and review the plan → `/plan-eng-review`, `/plan-design-review`,
+  `/plan-devex-review`, `/autoplan`, `compound-engineering:ce-plan`,
+  `superpowers:writing-plans`
+- Bugs, errors, "why is this broken" → `/investigate`,
+  `superpowers:systematic-debugging`, `compound-engineering:ce-debug`,
+  `error-diagnostics:*`, `incident-response:*`
+- Tests and TDD → `mindhive-python-tdd`, `superpowers:test-driven-development`,
+  `tdd-workflows:*`, `unit-testing:*`
+- Code review before landing → `/review`,
+  `compound-engineering:ce-code-review`, `thermo-nuclear-code-quality-review`,
+  `security-review`, `/cso`
+- Ship → `/ship`, `/land-and-deploy`,
+  `compound-engineering:ce-commit-push-pr`, `/canary`
+- This codebase's own subject matter → `mindhive-memory-search`,
+  `mindhive-python-patterns`, `mindhive-python-security`,
+  `mindhive-python-verification`, `windows-powershell-patterns`,
+  `claude-harness-patterns`
+- Domain work → the matching plugin family: `python-development:*`,
+  `backend-development:*`, `ui-design:*`, `security-scanning:*`,
+  `observability-monitoring:*`, `llm-application-dev:*`, and the rest that
+  `hive skills list` reports.
+
+The MANDATORY SOP in the ledger (`hive sop show execution-discipline`) already
+requires naming the skills a task will use before the first edit. This section
+is where that naming starts.
