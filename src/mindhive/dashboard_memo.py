@@ -12,29 +12,81 @@ FOLD is memoized, never the response, because `online` is a function of the wall
 clock rather than of the events. Every layer here stores the fold and re-derives
 that field on the way out.
 
+Each memo carries its OWN bound (``_BoundedMemo.max_entries``) because one
+shared cap could not fit both access patterns here: the two fold-holding memos
+want a small cap for entries that are individually huge, while the picker's
+``_STATS_MEMO`` is scanned end-to-end every poll and a cap under the namespace
+count drove its hit rate to exactly zero.
+
 ``dashboard`` re-exports the memos and the LRU helpers: the dashboard tests empty
 every ``*_MEMO`` between cases by scanning ``vars(dashboard)``, so they have to
-be reachable there, and a re-export is the same OrderedDict object."""
+be reachable there, and a re-export is the same OrderedDict object —
+``_BoundedMemo`` subclasses ``OrderedDict``, so that scan still finds them."""
 import collections
 import os
 
-# Both memos below are process-global and live for the life of the server, so
-# they are bounded rather than left to grow with the number of namespaces ever
-# polled. `hive projects` reports 56 stores on this machine, and HIVE MIND mode
-# plus a project picker makes visiting many of them a normal afternoon; each
-# entry holds a full telemetry fold and every session record for that project.
+# The FOLD-HOLDING memos (`_SESSIONS_MEMO`, `_CATS_MEMO`) are process-global and
+# live for the life of the server, so they are bounded rather than left to grow
+# with the number of namespaces ever polled. `hive projects` reports 60 stores on
+# this machine, and HIVE MIND mode plus a project picker makes visiting many of
+# them a normal afternoon; each entry holds a full telemetry fold and every
+# session record for that project. THIS is the size the cap was chosen for.
 #
-# An LRU rather than a size-only cap because the access pattern is extreme: one
+# An LRU rather than a size-only cap because their access pattern is extreme: one
 # namespace is hot (the picker's current selection) and the rest are cold the
 # moment it changes. Eviction costs a single recompute of the endpoint the gate
 # was added to make cheap — the same price a first visit pays.
 _MEMO_MAX = 8
 
+# `_STATS_MEMO` is a different animal and gets its own bound. Its entries are the
+# picker's small count dict plus the stat fingerprint, and — decisively — its
+# access pattern is the OPPOSITE of the one above: nothing is hot, because both
+# callers (`_get_projects` and `default_project`) walk EVERY name that
+# `_all_projects()` returns, in sorted order, on every poll. A sequential scan
+# longer than the bound is the one pattern an LRU degrades to zero on: one pass
+# writes an entry per namespace and evicts all but the last few, and the next
+# pass starts again at the name evicted earliest, so every single key misses.
+# Measured on the real store (60 namespaces, 8 slots), three identical passes
+# cost 1329 / 1214 / 2134 ms with 8 entries retained after each, while one hot
+# namespace read twice went 1207 -> 4.0 ms. The gate worked; the shared bound
+# made it unreachable. The same three passes with the bound below: 1002 / 9.3 /
+# 8.4 ms, 60 entries retained.
+#
+# 512 is a backstop, not the working size. The keys can only ever be namespaces
+# on disk — no other caller writes this memo — so the live entry count IS the
+# namespace count, and the cap exists for a pathological store rather than for
+# this one. Measured cost of a FULLY populated memo over this machine's real
+# store (60 namespaces, 1788 segment files): 443.5 KiB total, 7.6 KiB mean per
+# entry. The size tracks segment FILES rather than entries — the fingerprint is
+# one `[size, mtime_ns]` pair per segment, so two projects hold 87% of it
+# (mindhive 197 KiB / 888 segments, hanif 155 KiB / 667) and the 57 others cost
+# 1.2-10 KiB each. A store eight times this one still fits in single-digit MiB.
+_STATS_MEMO_MAX = 512
+
+
+class _BoundedMemo(collections.OrderedDict):
+    """An LRU memo carrying its OWN bound.
+
+    The bound travels with the memo rather than arriving as an argument because
+    `_memo_put` has four call sites across three modules, and a `bound=`
+    parameter makes every one of them responsible for remembering which memo it
+    is writing to. One that forgets restores the exact defect this class was
+    added to fix — silently, since a memo that evicts too eagerly still returns
+    correct answers, just never a cheap one."""
+
+    def __init__(self, max_entries: int):
+        super().__init__()
+        self.max_entries = max_entries
+
 
 def _memo_put(memo: "collections.OrderedDict", key, value) -> None:
+    # A plain OrderedDict (a test's scratch memo) falls back to the small shared
+    # bound: the conservative direction, since over-caching is the failure that
+    # costs memory rather than time.
+    bound = getattr(memo, "max_entries", _MEMO_MAX)
     memo[key] = value
     memo.move_to_end(key)
-    while len(memo) > _MEMO_MAX:
+    while len(memo) > bound:
         memo.popitem(last=False)
 
 
@@ -103,20 +155,22 @@ def _fingerprinted(memo: "collections.OrderedDict", proj, compute):
 
 
 # Per-project counts for the picker. `default_project()` computes these for
-# EVERY namespace on disk — 56 on this machine — at launch and on every project
-# list, and each one was a full `read_all`.
+# EVERY namespace on disk — 60 on this machine — at launch and on every project
+# list, and each one was a full `read_all`. Bounded for the namespace count, not
+# at `_MEMO_MAX`: see `_STATS_MEMO_MAX` above for why a shared bound cost this
+# memo its entire hit rate.
 # {project: (fingerprint, stats dict)}
-_STATS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+_STATS_MEMO = _BoundedMemo(_STATS_MEMO_MAX)
 
 
 # One memo of the session fold, shared by every poll of /api/mindnet/cats.
 # {(project, all_mode): (fingerprint, records)}
-_SESSIONS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+_SESSIONS_MEMO = _BoundedMemo(_MEMO_MAX)
 
 # The outer gate for the same endpoint, keyed on the stat-only ledger
 # fingerprint so an unchanged ledger is never even READ.
 # {project: (segment_stats, telemetry fold, session records)}
-_CATS_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+_CATS_MEMO = _BoundedMemo(_MEMO_MAX)
 
 
 def _with_online(records, stamp):

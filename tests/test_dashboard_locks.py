@@ -965,6 +965,95 @@ def test_an_append_re_reads_that_project_and_only_that_project(
     assert _stats_for(after, "other") == _stats_for(warm, "other")
 
 
+def _seed_namespaces(n):
+    """*n* distinct namespaces with one event each, named so they sort stably.
+
+    `_all_projects()` returns sorted names and BOTH loops in `/api/projects`
+    walk that whole list in that order — a sequential scan, which is the access
+    pattern an LRU is worst at."""
+    names = [f"ns-{i:02d}" for i in range(n)]
+    for name in names:
+        events.append_event("user_prompt", {"text": "hello"},
+                            session_id="sess-1", project=name)
+    return names
+
+
+def test_the_picker_caches_every_namespace_it_walks(dashboard_server, counters):
+    """The memo has to hold one entry per NAMESPACE, not per `_MEMO_MAX`.
+
+    `_get_projects` calls `_project_stats` for every name `_all_projects()`
+    returns, and `default_project()` — called in the same handler — loops the
+    same list again. With more namespaces than slots, one pass writes an entry
+    for each and evicts all but the last few, and because the next pass starts
+    again at the name evicted earliest, EVERY key misses. The memo stayed full,
+    the hit rate was zero, and nothing reported it.
+
+    Measured on the real store (60 namespaces, 8 slots) before this test
+    existed: three identical passes cost 1329 / 1214 / 2134 ms with 8 entries
+    retained after each, while one hot namespace read twice went 1207 -> 4.0 ms.
+    The gate worked; it was the bound that made it unreachable."""
+    base, token = dashboard_server
+    names = _seed_namespaces(dashboard._MEMO_MAX + 4)
+    status, warm = _get(base, PROJECTS, token)
+    assert status == 200
+    # CANARY for the assertion below: `reads == 0` is also what a picker that
+    # stopped looking at the store at all would produce. The first poll must be
+    # seen doing the real work, over every namespace seeded.
+    assert counters.reads.calls >= len(names), (
+        f"the first poll read {counters.reads.calls} ledgers for "
+        f"{len(names)} namespaces — it never did the work being cached")
+    assert {row["name"] for row in warm["projects"]} >= set(names), \
+        "the picker did not list the namespaces this test seeded"
+
+    counters.reset()
+    status, again = _get(base, PROJECTS, token)
+    assert status == 200
+    assert counters.reads.calls == 0, (
+        f"an unchanged store was re-read {counters.reads.calls}x across "
+        f"{len(names)} namespaces — the memo evicts entries it is about to "
+        f"need, so the second pass costs the same as the first")
+    assert len(dashboard._STATS_MEMO) == len(names), (
+        f"{len(dashboard._STATS_MEMO)} entries retained after walking "
+        f"{len(names)} namespaces — the bound, not the fingerprint, is what "
+        f"drops them")
+    assert again["projects"] == warm["projects"], \
+        "the cheap poll served a different picker than the expensive one"
+
+
+def test_the_fold_holding_memos_keep_their_own_small_bound():
+    """DISCRIMINATING, and the reason the test above is not fixed by raising
+    `_MEMO_MAX`.
+
+    The bound is shared by three memos with entries that differ by orders of
+    magnitude. `_STATS_MEMO` holds a count dict and a stat fingerprint;
+    `_SESSIONS_MEMO` and `_CATS_MEMO` each hold a full telemetry fold plus
+    every session record for that project, which is the size the small cap was
+    chosen for. Raising one number would pass the picker test by making the two
+    expensive memos hold 60 folds instead of 8."""
+    assert dashboard._MEMO_MAX <= 16, (
+        f"the fold-holding memos are bounded at {dashboard._MEMO_MAX}; their "
+        f"entries each carry a full telemetry fold, so this is not the knob "
+        f"the picker's namespace count may turn")
+    for memo in (dashboard._CATS_MEMO, dashboard._SESSIONS_MEMO):
+        memo.clear()
+        for i in range(dashboard._MEMO_MAX * 3):
+            dashboard._memo_put(memo, f"k-{i}", i)
+        assert len(memo) <= dashboard._MEMO_MAX, (
+            f"{len(memo)} folds retained against a bound of "
+            f"{dashboard._MEMO_MAX}")
+        memo.clear()
+
+    dashboard._STATS_MEMO.clear()
+    wanted = dashboard._MEMO_MAX * 3
+    for i in range(wanted):
+        dashboard._memo_put(dashboard._STATS_MEMO, f"ns-{i}", i)
+    assert len(dashboard._STATS_MEMO) == wanted, (
+        f"{len(dashboard._STATS_MEMO)} of {wanted} picker entries survived — "
+        f"the bound travels with the memo, or every call site has to remember "
+        f"which one it is writing to")
+    dashboard._STATS_MEMO.clear()
+
+
 def test_an_empty_fingerprint_never_matches_and_never_freezes_the_picker(
         dashboard_server, counters, monkeypatch):
     """DISCRIMINATING. `segment_stats` answers `{}` for ANY OSError as well as
