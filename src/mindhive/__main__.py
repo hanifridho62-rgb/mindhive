@@ -233,6 +233,26 @@ def cmd_state(args) -> int | None:
               f"'{paths.detect_project()}' — run from the project dir, set "
               f"MINDHIVE_PROJECT, or pass --project. See `hive projects`.",
               file=sys.stderr)
+    # Self-evident rather than something to remember to check. A branch that
+    # tracks nothing is invisible locally: `git status` says nothing about it,
+    # and `hive repo stale` answers `current` because its counts come off the
+    # integration ref, which resolves either way. So the checkout stops being
+    # able to notice it has fallen behind — and this repo's `master` sat that
+    # way long enough to drift 64 commits. This is the one command the
+    # session-start hook runs, it costs two git calls and no network, and it
+    # says nothing at all when the branch tracks something. Silent on any
+    # failure and outside a checkout: printing STATE.md is this command's job.
+    try:
+        from . import repo as repo_mod
+        track = repo_mod.tracking()
+        if track["upstream_missing"] and track["branch"]:
+            name = track["branch"]
+            print(f"warning: branch '{name}' tracks nothing — `git pull` here "
+                  f"fails, so this checkout cannot notice it has fallen "
+                  f"behind. Fix: git branch --set-upstream-to=origin/{name} "
+                  f"{name}  (then `hive repo stale`)", file=sys.stderr)
+    except Exception:                                       # noqa: BLE001
+        pass
     # MN-18 U4: refresh the MindNetwork projection here, stale-gated. The session-start
     # hook runs `hive state`, this is the only command in that hook belonging to this repo,
     # and the fold costs 0.32 s — invisible once per session, decisive on the prompt path
@@ -1010,6 +1030,19 @@ def cmd_repo_stale(args) -> int | None:
           + ("  [the comparison is older than the freshness window, so the "
              "counts above may already be wrong — `git fetch` to refresh]"
              if result["fetch_stale"] else ""))
+    # The counts above are measured against the integration ref, which resolves
+    # on any clone. Whether THIS branch tracks anything is the fact that decides
+    # if `git pull` works, and reporting only the first is how a checkout whose
+    # pull was broken read as `current`. Outside a checkout the reason already
+    # said so, and a second line about upstreams would only bury it.
+    if result["upstream_missing"] and result["reason"] != repo.NO_CHECKOUT:
+        branch = result["branch"]
+        print("  no upstream: `git pull` on this branch fails with \"no "
+              "tracking information\", so nothing here refreshes the "
+              f"{result['ref'] or 'remote'} the counts were measured against"
+              + (f"  [e.g. git branch --set-upstream-to=origin/{branch} "
+                 f"{branch}]" if branch
+                 else "  [detached HEAD — check out a branch first]"))
     return None
 
 

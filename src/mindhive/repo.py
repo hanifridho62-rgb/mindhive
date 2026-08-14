@@ -127,6 +127,51 @@ def _integration_ref(runner, root, timeout_s) -> str:
     return ""
 
 
+def _current_branch(runner, root, timeout_s) -> str:
+    """The checked-out branch, or "" on a detached HEAD — where git answers the
+    literal string ``HEAD``, which is a state, not a branch name."""
+    rc, out, _ = runner(["git", "rev-parse", "--abbrev-ref", "HEAD"], root,
+                        timeout_s)
+    name = out.strip() if rc == 0 else ""
+    return "" if name == "HEAD" else name
+
+
+def _upstream_ref(runner, root, timeout_s) -> str:
+    """The ref `git pull` would pull from, or "" when this branch tracks
+    nothing.
+
+    Deliberately NOT `_integration_ref`. That one answers a different question —
+    *where does a merge land* — and it resolves `origin/HEAD` on any ordinary
+    clone, including one whose own branch tracks nothing at all. Reading it as
+    an upstream is exactly how `hive repo stale` came to report `current — 0
+    behind / 0 ahead` for a `master` on which `git pull` was failing outright
+    with "There is no tracking information for the current branch"."""
+    rc, out, _ = runner(["git", "rev-parse", "--abbrev-ref",
+                         "--symbolic-full-name", "@{upstream}"], root, timeout_s)
+    return out.strip() if rc == 0 else ""
+
+
+def tracking(*, root=None, runner=None, timeout_s=PROBE_TIMEOUT_SECONDS) -> dict:
+    """Can this checkout pull, and from where? ``{branch, upstream,
+    upstream_missing}``. Never raises, never fetches.
+
+    Split out of `staleness` because it answers on its own and costs two git
+    calls (~85ms here) against that one's five (~250ms) — cheap enough to run
+    once per session on the orient path, where a checkout that cannot pull is
+    worth saying out loud. Nothing else reports it: `git status` is silent about
+    a missing upstream, and the drift counts are measured against a ref that
+    resolves whether or not this branch tracks anything."""
+    runner = runner or _default_runner
+    if root is None:
+        root = worktree_root()
+    if root is None:
+        return {"branch": "", "upstream": "", "upstream_missing": True}
+    root = str(root)
+    upstream = _upstream_ref(runner, root, timeout_s)
+    return {"branch": _current_branch(runner, root, timeout_s),
+            "upstream": upstream, "upstream_missing": not upstream}
+
+
 # --- the three probes ---------------------------------------------------------
 # Each takes the link fragment it understands and returns an `_answer`. A probe
 # that cannot tell says UNKNOWN with its own reason; it never guesses.
@@ -351,7 +396,7 @@ def staleness(*, root=None, runner=None, timeout_s=PROBE_TIMEOUT_SECONDS,
     """How far this checkout has drifted from its integration ref.
 
     Returns ``{state, reason, detail, behind, ahead, ref, fetch_age_hours,
-    fetch_stale}`` and never raises.
+    fetch_stale, branch, upstream, upstream_missing}`` and never raises.
 
     **It never fetches.** A probe that reached the network could not run
     anywhere a probe belongs: not on the prompt path, not in a hook, not on a
@@ -361,10 +406,18 @@ def staleness(*, root=None, runner=None, timeout_s=PROBE_TIMEOUT_SECONDS,
     only one of them means up to date. That pairing is the whole design: the
     count without the age is the misleading half.
 
+    ``upstream`` is the second half of the same bargain, and was added after
+    this probe answered ``current`` for a checkout whose `git pull` was broken.
+    The counts are measured against the INTEGRATION ref — where a merge lands —
+    which resolves on any clone. Whether this branch tracks anything is a
+    separate fact, and it is the one that decides if `git pull` works at all, so
+    it ships beside the counts instead of being inferred from them.
+
     ``unknown`` carries its reason, like every other answer in this module:
     ``no_checkout`` (not a git worktree), ``no_integration_ref`` (nothing to
-    compare against — a checkout whose branch has no upstream, which is the live
-    state of this repo's ``master``), or ``probe_failed``."""
+    compare against — no `origin/HEAD`, `origin/master` or `origin/main`, which
+    `git clone --branch` and `git worktree add` both leave absent), or
+    ``probe_failed``."""
     runner = runner or _default_runner
     if now is None:
         import time
@@ -378,40 +431,54 @@ def staleness(*, root=None, runner=None, timeout_s=PROBE_TIMEOUT_SECONDS,
 
     ref = _integration_ref(runner, root, timeout_s)
     age = _fetch_age_hours(runner, root, timeout_s, now)
+    # Asked for every state, including the unknown ones: a checkout that cannot
+    # be compared can still be one whose `git pull` is broken, and that is the
+    # more actionable of the two facts.
+    probe = tracking(root=root, runner=runner, timeout_s=timeout_s)
+    tracked = dict(branch=probe["branch"], upstream=probe["upstream"])
     if not ref:
         return _stale_answer(UNKNOWN, reason=NO_INTEGRATION_REF,
                              detail="no integration ref resolved (tried "
                                     + ", ".join(_INTEGRATION_REFS) + ")",
                              fetch_age_hours=age,
-                             max_age_hours=max_age_hours)
+                             max_age_hours=max_age_hours, **tracked)
     rc, out, err = runner(["git", "rev-list", "--left-right", "--count",
                            f"HEAD...{ref}"], root, timeout_s)
     if rc != 0:
         return _stale_answer(UNKNOWN, reason=PROBE_FAILED, ref=ref,
                              detail=_first_line(err)
                              or f"git rev-list exited {rc}",
-                             fetch_age_hours=age, max_age_hours=max_age_hours)
+                             fetch_age_hours=age, max_age_hours=max_age_hours,
+                             **tracked)
     parts = str(out or "").split()
     try:
         ahead, behind = int(parts[0]), int(parts[1])
     except (IndexError, ValueError):
         return _stale_answer(UNKNOWN, reason=PROBE_FAILED, ref=ref,
                              detail=f"unreadable rev-list output: {out!r}",
-                             fetch_age_hours=age, max_age_hours=max_age_hours)
+                             fetch_age_hours=age, max_age_hours=max_age_hours,
+                             **tracked)
     return _stale_answer(BEHIND if behind else CURRENT, ref=ref, ahead=ahead,
                          behind=behind, fetch_age_hours=age,
-                         max_age_hours=max_age_hours,
+                         max_age_hours=max_age_hours, **tracked,
                          detail=f"{behind} behind / {ahead} ahead of {ref}")
 
 
 def _stale_answer(state, *, reason="", detail="", ref="", ahead=0, behind=0,
-                  fetch_age_hours=None, max_age_hours=DEFAULT_MAX_AGE_HOURS) -> dict:
+                  fetch_age_hours=None, max_age_hours=DEFAULT_MAX_AGE_HOURS,
+                  branch="", upstream="") -> dict:
     """One staleness answer. ``fetch_stale`` is True when the snapshot this
     comparison used is older than *max_age_hours* — and also when its age could
-    not be read at all, because an unknown age is not evidence of a fresh one."""
+    not be read at all, because an unknown age is not evidence of a fresh one.
+
+    ``upstream_missing`` follows the same rule from the other side: it is True
+    whenever no tracking ref could be read, including outside a checkout, since
+    "we could not ask" is not evidence that `git pull` would work."""
     return {"state": state, "reason": reason,
             "detail": str(detail)[:MAX_DETAIL_CHARS], "ref": ref,
             "ahead": ahead, "behind": behind,
             "fetch_age_hours": fetch_age_hours,
             "fetch_stale": (fetch_age_hours is None
-                            or fetch_age_hours > max_age_hours)}
+                            or fetch_age_hours > max_age_hours),
+            "branch": branch, "upstream": upstream,
+            "upstream_missing": not upstream}

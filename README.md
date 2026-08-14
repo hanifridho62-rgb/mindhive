@@ -25,7 +25,7 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 ## Commands
 - `hive append <type> <payload> [--json] [--stdin] [--tags a,b]` — add an event
 - `hive project` — rebuild STATE.md + LEDGER/ + index.json + chain.json
-- `hive state` — print the live STATE.md
+- `hive state` — print the live STATE.md. Also warns (stderr, non-fatal) when this checkout's branch tracks nothing: `git pull` fails there and no drift count can notice it, which is invisible to `git status` and to `hive repo stale` alike
 - `hive recall "<query>" [--semantic]` — grep (default) or vector search
 - `hive rules summaries [--project P] [--json]` — structured lesson records (root cause, lesson, prevention rule, category, active rule) for every incident — the same data the dashboard **Improvements** view shows, for agents working headless. `--json` emits the raw list
 - `hive rules reflect [--limit N] [--cooldown-hours H] [--all-projects]` — bounded reflection pass over active un-reflected incidents via the `claude` CLI (default: 3 per batch, 6h cooldown; `--cooldown-hours 0` disables). `--all-projects` drains the backlog across every registered namespace — a manual drain, never invoked from hooks. The same pass also **reroutes** red leaking rules (below)
@@ -89,7 +89,7 @@ quietly fall behind the CLI again.
 - `hive sop preflight [--json]` — pre-execution report: is this session new or a continuation (with the ledger evidence), which SOPs are mandatory, what the improvements record already warns about
 - `hive briefing` — build and print `BRIEFING.md` (the full context; `MEMORY.md` is the compact digest of it)
 - `hive directives` — print the session operating directives
-- `hive repo stale [--max-age-hours H] [--json]` — how far this checkout has drifted from its integration ref. **Never fetches**: it compares against the ref as this checkout last saw it and reports the age of that snapshot alongside the count, because "0 behind" and "0 behind, last fetched in July" are different facts. `unknown` carries its reason (`no_checkout`, `no_integration_ref`, `probe_failed`)
+- `hive repo stale [--max-age-hours H] [--json]` — how far this checkout has drifted from its integration ref. **Never fetches**: it compares against the ref as this checkout last saw it and reports the age of that snapshot alongside the count, because "0 behind" and "0 behind, last fetched in July" are different facts. It also reports whether the branch **tracks anything at all**, because the counts are measured against the ref a merge lands on — which resolves on any clone — while `git pull` needs a ref this branch tracks, and a checkout answering "0 behind" with a broken pull has no way to notice drift in the first place. `unknown` carries its reason (`no_checkout`, `no_integration_ref`, `probe_failed`)
 - `hive premise check [--file F]` — check a prompt or handoff document's factual claims against the record: asserted file paths, roadmap ids, and test counts that contradict what is on disk, plus the claims it could not check
 
 ### Namespaces, hygiene & automation

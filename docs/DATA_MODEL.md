@@ -1406,6 +1406,27 @@ in July is not up to date. It never fetches — a probe that reached the network
 could not run on the prompt path, in a hook, or offline — and `unknown` carries
 its reason (`no_checkout`, `no_integration_ref`, `probe_failed`).
 
+The same rule has a second half, added after the probe reported `current — 0
+behind / 0 ahead of origin/HEAD` on this repo's `master` while `git pull` there
+was failing with *"There is no tracking information for the current branch"*.
+The counts are measured against the **integration** ref — where a merge lands —
+which resolves on any ordinary clone. Whether the branch tracks anything is a
+separate fact, and it is the one that decides whether the checkout can ever
+learn it has fallen behind. So `staleness` reports `branch`, `upstream` and
+`upstream_missing` beside the counts rather than letting one be inferred from
+the other, and `hive repo stale` names the condition and the command that fixes
+it. `upstream_missing` is true whenever no tracking ref could be read — "we
+could not ask" is not evidence that `git pull` works, the same reasoning that
+makes an unreadable fetch age count as stale.
+
+That answer is also **pushed rather than waited for**. `repo.tracking` is the
+two-call subset of the probe (~85ms, against ~250ms for the full one), cheap
+enough that `hive state` — the one command the session-start hook runs — asks
+every session and warns on stderr when the branch tracks nothing. It prints
+nothing when the branch tracks something, nothing outside a checkout, nothing
+on a detached HEAD, and nothing at all if the probe throws: printing STATE.md is
+that command's job and a diagnostic must not be able to stop it.
+
 ### 4.x Smart-zone session rotation (`mindhive.rotation`)
 
 Not an event type — a sidecar file plus a measurement rule. Recorded here because
