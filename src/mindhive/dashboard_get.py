@@ -39,7 +39,8 @@ from .briefing import briefing as build_briefing
 from .dashboard_data import (HIVEMIND_LABEL, HIVEMIND_PROJECT, _add_tallies,
                              _all_projects, _efficiency, _empty_tallies,
                              _project_stats, _safe_chain_ok, all_event_pairs,
-                             default_project, event_pairs, overview_stats)
+                             default_project, event_pairs, injection_status,
+                             overview_stats)
 from .dashboard_locks import _VERIFY_LOCK, _one_at_a_time
 from .dashboard_memo import (_CATS_MEMO, _ledger_fingerprint, _memo_get,
                              _memo_put, _sessions_cached, _with_online)
@@ -100,6 +101,11 @@ class GetRoutes:
         # The win is that the expensive branch stops being the uncacheable one:
         # 60 namespaces on this machine, one read each, and a second poll reads
         # none of them.
+        # `injection` rides the response but NOT the memo: it is a fact about the
+        # SOP sidecar, not about this namespace's ledger, so a cached copy would
+        # freeze the one field whose job is to report a degradation. None when
+        # healthy — see `injection_status`.
+        injection = injection_status()
         if am:
             names = _all_projects()
             per = [overview_stats(n) for n in names]
@@ -116,8 +122,10 @@ class GetRoutes:
                 "sessions": sum(s["sessions"] for s in per),
                 "by_type": by_type, "last_ts": max(stamps) if stamps else None,
                 "chain_ok": all(s["chain_ok"] for s in per) if names else False,
+                "injection": injection,
             })
-        return self._json({"project": proj, **overview_stats(proj)})
+        return self._json({"project": proj, **overview_stats(proj),
+                           "injection": injection})
 
     def _get_memory(self, proj, am, qs):
         # the semantic subset only — the intent/context layer. Build the
