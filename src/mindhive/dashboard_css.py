@@ -104,6 +104,14 @@ CSS = """\
   .card .big { font-size:26px; font-weight:600; }
   .card .lbl { font-size:12px; color:var(--muted); margin-top:2px; }
   .card .big.ok { color:var(--ok); } .card .big.bad { color:var(--bad); }
+  /* The SOP-injection strip. Rendered only for a DEGRADED verdict (the server
+     sends null for `verbatim`), so it never competes with the cards for
+     attention in the healthy case — and it is not a `.card`, because the cards
+     are this namespace's counts and this verdict is machine-global. */
+  .injwarn { border:1px solid var(--warn); border-radius:10px; padding:12px 14px;
+    margin:0 0 12px; background:var(--sunken); font-size:13px; }
+  .injwarn b { color:var(--warn); }
+  .injwarn .lbl { display:block; font-size:12px; color:var(--muted); margin-top:6px; }
   .types { margin-top:14px; display:flex; flex-wrap:wrap; gap:8px; }
   .pill { background:var(--raised); border:1px solid var(--line); border-radius:999px; padding:3px 10px; font-size:12px; }
   .pill b { color:var(--text-strong); }

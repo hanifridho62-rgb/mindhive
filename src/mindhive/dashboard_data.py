@@ -290,6 +290,48 @@ def _overview_fingerprint(proj):
     return (ledger, chain_stat)
 
 
+def injection_status() -> dict | None:
+    """What the per-prompt SOP injection is delivering, or **None when it is
+    healthy** — the panel's half of the same verdict `sopgate.notice` writes into
+    STATE.md and the MEMORY.md digest.
+
+    Three properties, each deliberate:
+
+    * **Silent when healthy.** `verbatim` returns None, so the strip appears only
+      for `silent` / `pointers_only` / `partial`. A banner in every healthy panel
+      is a banner every reader learns to skip, which is how the degraded case
+      gets missed. `sopgate.NOTICE_VERDICTS` is the shared list — this does not
+      re-enumerate the states.
+    * **Not memoized, and computed OUTSIDE `overview_stats`.** The verdict is a
+      fact about the SOP sidecar and `PROMPT_BUDGET`, not about the ledger, so it
+      does not move when `segment_stats` moves and does not stay put when they
+      stay put. Inside the overview memo it would freeze at whatever it said when
+      the ledger last changed — a stale answer on the surface whose entire job is
+      to report staleness.
+    * **The verdict is GLOBAL.** `probe` reads the global mandatory-SOP sidecar
+      and ignores its project argument, because the hook is registered
+      machine-wide. The caller renders it beside per-namespace numbers, so the
+      response says so and the panel prints it.
+
+    `probe` documents that it never raises; the guard is here anyway, because the
+    cost of being wrong about that is a 500 on the overview rather than one
+    missing line."""
+    from . import sopgate
+    try:
+        measured = sopgate.probe()
+        if str(measured.get("verdict") or "") not in sopgate.NOTICE_VERDICTS:
+            return None
+        return {
+            "verdict": str(measured.get("verdict")),
+            "sentence": sopgate.verdict_sentence(measured),
+            "scope": "global",
+            "pointers": [str(row.get("sop_id")) for row in measured.get("sops") or []
+                         if isinstance(row, dict) and row.get("delivered") == "pointer"],
+        }
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
 def _overview_uncached(proj: str) -> dict:
     """One read of *proj*'s log, folded into the overview counts, with the chain
     verdict derived from the same events — no second full read."""

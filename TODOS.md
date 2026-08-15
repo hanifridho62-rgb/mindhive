@@ -421,13 +421,28 @@ All three are re-derivable at serve time from fields the output rows already car
 seam like `_with_online` that dispatches on `kind` — **not** a second copy of each window's rule,
 which is what that function's docstring exists to forbid.
 
-**One genuine off-ledger input:** `list_runs` calls `_fix_plan_items(r["goal_dir"])`
-([loop/state.py:180](src/mindhive/loop/state.py:180)), which reads a plan file on disk. A run's
-plan can therefore change with no event appended. In practice a progressing run appends
-`loop_iteration` rows anyway, but "in practice" is not a cache invariant — the goal_dirs held by
-the cached entry would have to join the fingerprint, the way `chain.json` joined
-`/api/overview`'s. New goal_dirs need no special handling: a run cannot appear without a
-`loop_run_start` event, which moves the ledger stamp on its own.
+**Two genuine off-ledger inputs**, both verified by reading, not assumed:
+
+* `list_runs` calls `_fix_plan_items(r["goal_dir"])`
+  ([loop/state.py:180](src/mindhive/loop/state.py:180)), which reads
+  `<goal_dir>/fix_plan.md` from disk. A run's plan can change with no event appended. In practice
+  a progressing run appends `loop_iteration` rows anyway, but "in practice" is not a cache
+  invariant — the goal_dirs held by the cached entry would have to join the fingerprint, the way
+  `chain.json` joined `/api/overview`'s. New goal_dirs need no special handling: a run cannot
+  appear without a `loop_run_start` event, which moves the ledger stamp on its own.
+* `oversee.intended_use_map()` ([oversee.py:51](src/mindhive/oversee.py:51)) comes from the
+  **plugin inventory on disk** and is TTL-memoized for 60 s. It feeds `skill_trails` inside the
+  fold, so a fold cached against a ledger stamp can outlive the map it was built from.
+
+**A free win to take while in there:** `_get_oversee` reads the ledger **twice** per namespace —
+once itself and once inside `list_runs`, which has no `evs=` parameter the way
+`interactive_sessions` does. Adding one halves the cost of every miss, which matters more here
+than on `/api/overview` because misses stay common on an actively-written namespace.
+
+**Why it is a session of its own, not a fourth line in `_overview_fingerprint`:** four inputs
+(ledger, two off-ledger sources, and the clock) against the panel's highest-visibility surface.
+Getting it wrong does not return a stale number — it freezes a board that reports whether work is
+alive.
 
 **Measured cost:** 1114 / 1448 ms isolated and 4740 / 6843 ms under load in the after-profile
 ([T1 AFTER](docs/plans/2026-08-10-001-fix-feedback-loop-five-surfaces-plan.md)) — the same order

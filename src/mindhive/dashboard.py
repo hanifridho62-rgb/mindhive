@@ -40,7 +40,8 @@ from .dashboard_data import (ALL_TOKENS, HIVEMIND_LABEL,  # noqa: F401
                              _overview_counts, _overview_fingerprint,
                              _project_stats, _project_stats_uncached,
                              _safe_chain_ok, all_event_pairs, default_project,
-                             event_pairs, is_all, overview_stats)
+                             event_pairs, injection_status, is_all,
+                             overview_stats)
 from .dashboard_jobs import run_catch_up  # noqa: F401
 from .dashboard_locks import (REFLECT_BATCH_LIMIT,  # noqa: F401
                               _EMBED_LOCK, _HARVEST_LOCK, _INVOKE_LOCK,

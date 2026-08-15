@@ -401,8 +401,27 @@ JS = """\
       ? '<span class="big ok">OK</span>' : '<span class="big bad">CHECK</span>';
     const types = Object.entries(o.by_type || {}).sort((a,b)=>b[1]-a[1])
       .map(([t,n]) => '<span class="pill">'+esc(t)+' <b>'+n+'</b></span>').join('') || '<span class="lbl">no events yet</span>';
+    // The SOP-injection verdict, and ONLY when it is degraded — the server sends
+    // null for `verbatim`, so a healthy panel renders zero extra lines and this
+    // strip stays worth reading. It is deliberately NOT a card: the cards are
+    // counts for THIS namespace and this verdict is global, which the line says
+    // in its own words rather than leaving to the layout.
+    const inj = o.injection;
+    const injHTML = !inj ? '' : (
+      '<div class="injwarn"><b>SOP injection: '+esc(inj.verdict)+'</b> \\u2014 '
+      + esc(inj.sentence || '')
+      + ((inj.pointers || []).length
+         ? '<span class="lbl">arrived as pointers, not bodies: '
+           + inj.pointers.map(esc).join(', ')
+           + ' \\u2014 read before acting (<code>hive sop show &lt;id&gt;</code>)</span>'
+         : '')
+      + '<span class="lbl">This verdict is global to this machine, not '
+      + esc(o.project) + ' \\u2014 the per-prompt pass reads the global '
+      + 'mandatory-SOP sidecar. Full report: <code>hive sop injection</code></span>'
+      + '</div>');
     showHTML(
       '<h2 class="h">'+esc(o.project)+'</h2>'
+      + injHTML
       + '<div class="cards">'
       + (o.projects != null ? '<div class="card"><div class="big">'+o.projects+'</div><div class="lbl">projects</div></div>' : '')
       + '<div class="card"><div class="big">'+o.events+'</div><div class="lbl">events</div></div>'
