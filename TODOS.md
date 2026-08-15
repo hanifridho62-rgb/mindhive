@@ -258,6 +258,14 @@ entry per namespace touched.
 **Status:** spun out as its own session on 2026-08-14. If that landed, close this item; if it
 did not, the measurement above is the whole starting point.
 
+**A worked precedent now exists.** `/api/overview` hit the identical wall — one request folds
+every namespace — and took the separate-bound route rather than raising `_MEMO_MAX`:
+`_OVERVIEW_MEMO` in `dashboard_data.py` with its own `_OVERVIEW_MEMO_MAX` of 128, and
+`test_hive_mind_does_not_evict_the_entries_it_just_wrote`
+([tests/test_dashboard_overview_memo.py](tests/test_dashboard_overview_memo.py)) is the RED-on-8
+test this item asks for, written against 12 namespaces. Neither the constant nor the file this
+item names was touched, so the two changes do not collide.
+
 ---
 
 ## 11. A real-socket test is intermittent, and nobody has caught it in the act
@@ -379,3 +387,38 @@ branch's 657.
 Kept here rather than deleted because the branch still exists and someone auditing it later will
 ask the same question: **the branch is safe to delete, nothing unique is lost.** That is the
 answer, with the commit that supersedes it named.
+
+---
+
+## 17. `/api/oversee` is still a full read per poll, and it is the harder half
+
+**Source:** the `/api/overview` memo, 2026-08-15 — this is what that change deliberately did
+**not** do, recorded rather than dropped.
+
+**What:** put a gate in front of `_get_oversee`
+([dashboard_get.py:515](src/mindhive/dashboard_get.py:515)) the way `overview_stats`
+([dashboard_data.py](src/mindhive/dashboard_data.py)) now gates `/api/overview`.
+
+**Why it did not ride along:** the response is not a function of the ledger alone, in two
+independent ways, and each defeats a ledger-shaped fingerprint on its own.
+
+1. **`online` is wall-clock derived, from two producers.** Every card carries it and the
+   top-level `any_online` is folded from it. `dashboard_memo._with_online` already exists for
+   exactly this and is why the cats gate is safe — it memoizes the FOLD and re-derives `online`
+   on the way out. Here the field arrives from `oversee.interactive_sessions` **and** from
+   `loop.state.list_runs`, so one re-derivation seam has to cover both, and `list_runs`' rows do
+   not go through `_with_online` today.
+2. **`loop_state.list_runs(n)` does not read the event segments.** It reads loop state. A run
+   that starts, or a card that is dismissed, moves neither `segment_stats` nor `chain.json` — so
+   the compound fingerprint `/api/overview` uses would score a **hit** on a board that changed.
+   A third component is needed, over whatever `list_runs` actually stats.
+
+**Measured cost:** 1114 / 1448 ms isolated and 4740 / 6843 ms under load in the after-profile
+([T1 AFTER](docs/plans/2026-08-10-001-fix-feedback-loop-five-surfaces-plan.md)) — the same order
+as `/api/overview` before its gate, and it is polled by the Oversee section.
+
+**Behavioural cover needed, beyond the overview file's:** a card must go **offline** on an
+unchanged ledger purely by the clock advancing past `ONLINE_WINDOW_SECONDS`, and a dismissal
+must reach the next poll. Both are RED against any fingerprint built only from the segments —
+which is the point, and why this is a separate piece of work rather than a fourth line in
+`_overview_fingerprint`.

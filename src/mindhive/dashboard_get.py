@@ -38,8 +38,8 @@ from . import workspace as workspace_mod
 from .briefing import briefing as build_briefing
 from .dashboard_data import (HIVEMIND_LABEL, HIVEMIND_PROJECT, _add_tallies,
                              _all_projects, _efficiency, _empty_tallies,
-                             _overview_counts, _project_stats, _safe_chain_ok,
-                             all_event_pairs, default_project, event_pairs)
+                             _project_stats, _safe_chain_ok, all_event_pairs,
+                             default_project, event_pairs, overview_stats)
 from .dashboard_locks import _VERIFY_LOCK, _one_at_a_time
 from .dashboard_memo import (_CATS_MEMO, _ledger_fingerprint, _memo_get,
                              _memo_put, _sessions_cached, _with_online)
@@ -92,26 +92,32 @@ class GetRoutes:
         return self._json(chain.verify(proj))
 
     def _get_overview(self, proj, am, qs):
+        # Both branches now go through the same per-project memo: HIVE MIND sums
+        # folds instead of unifying every event in one pass, which is allowed
+        # only because the two agree exactly — distinct (project, session) pairs
+        # IS the sum of each project's distinct sessions, and the type tallies
+        # add. `test_hive_mind_totals_match_a_directly_unified_fold` pins that.
+        # The win is that the expensive branch stops being the uncacheable one:
+        # 60 namespaces on this machine, one read each, and a second poll reads
+        # none of them.
         if am:
             names = _all_projects()
-            # read each project's log ONCE, then derive stats AND the chain
-            # check from the same events (no second full read)
-            evs_by_proj = {n: events.read_all(n) for n in names}
-            stats = _overview_counts(
-                ((name, ev.session_id), ev)
-                for name, evs in evs_by_proj.items() for ev in evs)
+            per = [overview_stats(n) for n in names]
+            by_type = {}
+            for stats in per:
+                for etype, count in stats["by_type"].items():
+                    by_type[etype] = by_type.get(etype, 0) + count
+            stamps = [s["last_ts"] for s in per if s["last_ts"]]
             return self._json({
-                "project": HIVEMIND_LABEL, "projects": len(names), **stats,
-                "chain_ok": (all(_safe_chain_ok(n, evs_by_proj[n]) for n in names)
-                             if names else False),
+                "project": HIVEMIND_LABEL, "projects": len(names),
+                "events": sum(s["events"] for s in per),
+                "memory_events": sum(s["memory_events"] for s in per),
+                "auto_events": sum(s["auto_events"] for s in per),
+                "sessions": sum(s["sessions"] for s in per),
+                "by_type": by_type, "last_ts": max(stamps) if stamps else None,
+                "chain_ok": all(s["chain_ok"] for s in per) if names else False,
             })
-        evs = events.read_all(proj)
-        stats = _overview_counts((ev.session_id, ev) for ev in evs)
-        return self._json({
-            "project": proj, **stats,
-            # reuse the events we just read — no second full read
-            "chain_ok": bool(chain.verify(proj, evs=evs).get("ok")),
-        })
+        return self._json({"project": proj, **overview_stats(proj)})
 
     def _get_memory(self, proj, am, qs):
         # the semantic subset only — the intent/context layer. Build the
@@ -515,6 +521,21 @@ class GetRoutes:
         # run/session id; plans with no live card — notably interrupted
         # ones whose run already left the board — ride the top-level
         # ``plans`` list so a roadmap is never orphaned.
+        #
+        # DELIBERATELY NOT MEMOIZED, unlike its neighbour /api/overview, and the
+        # reason is worth having here rather than rediscovering: this response is
+        # not a function of the ledger alone, in two independent ways.
+        # `online` (per card, and `any_online` below) is a function of the WALL
+        # CLOCK — a cached copy freezes a session as working, or as gone, until
+        # the ledger next moves — and unlike the cats gate, where `_with_online`
+        # re-derives it over one fold, it arrives here from TWO producers:
+        # `interactive_sessions` and `loop_state.list_runs`. And `list_runs`
+        # reads loop state, not the event segments, so neither `segment_stats`
+        # nor `chain.json` moves when a run starts or a card is dismissed — a
+        # ledger-shaped fingerprint would score a hit on a board that changed.
+        # Both are fixable (a third fingerprint component, and one re-derivation
+        # seam covering both producers); neither is fixed, so this endpoint is
+        # still a full read per poll.
         from . import oversee as oversee_mod
         from . import roadmap as roadmap_mod
         from .loop import state as loop_state

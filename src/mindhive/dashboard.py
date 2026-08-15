@@ -34,12 +34,13 @@ from .dashboard_post import PostRoutes
 # definition, which is the whole point of it.
 from .dashboard_data import (ALL_TOKENS, HIVEMIND_LABEL,  # noqa: F401
                              HIVEMIND_PROJECT, LOW_SAMPLE_FLOOR,
+                             _OVERVIEW_MEMO, _OVERVIEW_MEMO_MAX,
                              _add_tallies, _all_projects, _efficiency,
                              _empty_tallies, _folder_for_project, _iso_utc,
-                             _overview_counts, _project_stats,
-                             _project_stats_uncached, _safe_chain_ok,
-                             all_event_pairs, default_project, event_pairs,
-                             is_all)
+                             _overview_counts, _overview_fingerprint,
+                             _project_stats, _project_stats_uncached,
+                             _safe_chain_ok, all_event_pairs, default_project,
+                             event_pairs, is_all, overview_stats)
 from .dashboard_jobs import run_catch_up  # noqa: F401
 from .dashboard_locks import (REFLECT_BATCH_LIMIT,  # noqa: F401
                               _EMBED_LOCK, _HARVEST_LOCK, _INVOKE_LOCK,
