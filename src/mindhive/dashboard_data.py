@@ -16,11 +16,12 @@ Three concerns, in the order they appear:
   dispositions that keep a thin sample from rendering as a confident percent.
 * **HIVE MIND** — the ``project="*"`` unified read-only lens across namespaces.
 """
+import collections
 import os
 import time
 
 from . import chain, events, paths
-from .dashboard_memo import _STATS_MEMO, _fingerprinted
+from .dashboard_memo import _STATS_MEMO, _fingerprinted, _ledger_fingerprint
 
 # --- project / session / memory separation -------------------------------
 # A "project" is a store namespace; a "session" is one append stream
@@ -213,3 +214,110 @@ def _safe_chain_ok(name: str, evs=None) -> bool:
         return bool(chain.verify(name, evs=evs).get("ok"))
     except Exception:
         return False
+
+
+# --- the overview fold, memoized -------------------------------------------
+# The endpoint a human waits on after clicking a section, and — unlike the cats
+# gate — one whose answer does NOT come from the event log alone. Two things
+# therefore differ from `_fingerprinted`, and both are deliberate:
+#
+# * **The fingerprint is compound.** `chain_ok` is read out of `chain.json`, a
+#   file beside the segments that `hive project` rewrites without appending a
+#   single event. On a `segment_stats`-only stamp the integrity light freezes at
+#   whatever it said on the first poll, for the life of the process, while every
+#   count beside it stays correct — the most convincing way to be wrong.
+#   `test_a_chain_refresh_invalidates_even_though_no_event_moved` was shown to
+#   fail against exactly that version before this line existed.
+# * **The bound is its own, and it is 128.** `_MEMO_MAX` is 8, sized for the
+#   picker's one-hot-key access pattern. HIVE MIND folds EVERY namespace in a
+#   single request — 60 on this machine — so an 8-slot memo evicts 52 of the 60
+#   entries that request just wrote and can never hit. That is not a hypothesis:
+#   /api/projects was measured at 1329 / 1214 / 2134 ms for three identical
+#   passes with 8 entries held after each. Raising the shared constant is the
+#   wrong fix (a `_SESSIONS_MEMO` / `_CATS_MEMO` entry holds a full telemetry
+#   fold, which is what that cap was chosen for); an overview entry is six
+#   integers and a type tally, so it can afford a bound above the namespace
+#   count.
+_OVERVIEW_MEMO_MAX = 128
+_OVERVIEW_MEMO: "collections.OrderedDict" = collections.OrderedDict()
+
+
+def _overview_memo_get(proj):
+    if proj not in _OVERVIEW_MEMO:
+        return None
+    _OVERVIEW_MEMO.move_to_end(proj)   # a read counts as use, or the hot key ages out
+    return _OVERVIEW_MEMO[proj]
+
+
+def _overview_memo_put(proj, value) -> None:
+    _OVERVIEW_MEMO[proj] = value
+    _OVERVIEW_MEMO.move_to_end(proj)
+    while len(_OVERVIEW_MEMO) > _OVERVIEW_MEMO_MAX:
+        _OVERVIEW_MEMO.popitem(last=False)
+
+
+def _chain_fingerprint(proj):
+    """`chain.json`'s stat, or **None when it cannot be trusted** — the same
+    contract `_ledger_fingerprint` keeps, for the same reason.
+
+    Absent is a real, stable state and gets a real stamp: `verify` answers
+    `no chain.json` for it, and the first `hive project` moves the stamp off
+    `(0, 0)`. An `OSError` that is not "missing" is a fault, and a fault must
+    never be encoded as a value a later poll can match — hence None, which no
+    `==` can hit."""
+    try:
+        st = (paths.project_dir(proj) / "chain.json").stat()
+    except FileNotFoundError:
+        return (0, 0)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _overview_fingerprint(proj):
+    """The stamp for *proj*'s overview: its ledger AND its chain file.
+
+    None from either half poisons the whole thing rather than being dropped —
+    a compound stamp with an untrusted component is an untrusted stamp, and the
+    half that is still good would otherwise license a hit on the half that
+    is not."""
+    ledger = _ledger_fingerprint(proj)
+    if ledger is None:
+        return None
+    chain_stat = _chain_fingerprint(proj)
+    if chain_stat is None:
+        return None
+    return (ledger, chain_stat)
+
+
+def _overview_uncached(proj: str) -> dict:
+    """One read of *proj*'s log, folded into the overview counts, with the chain
+    verdict derived from the same events — no second full read."""
+    evs = events.read_all(proj)
+    stats = _overview_counts((ev.session_id, ev) for ev in evs)
+    # `_safe_chain_ok` rather than a bare `chain.verify(...)["ok"]`: this value
+    # is now stored, and an exception escaping into a memoized path would take
+    # the whole overview down instead of one field's worth of it.
+    stats["chain_ok"] = _safe_chain_ok(proj, evs)
+    return stats
+
+
+def overview_stats(proj: str) -> dict:
+    """*proj*'s overview counts plus its chain verdict, recomputed only when the
+    ledger or the chain file moved. The single-project route returns this
+    directly; HIVE MIND sums one of these per namespace.
+
+    **Treat the result as read-only.** On a hit this IS the cached dict, and its
+    `by_type` is the cached dict's own — mutating either would rewrite history
+    for every later poll. Both current callers only read it: the single-project
+    route spreads it into a fresh response, and the am branch accumulates into a
+    new tally rather than adding into the first project's."""
+    fingerprint = _overview_fingerprint(proj)
+    if fingerprint is None:
+        return _overview_uncached(proj)
+    cached = _overview_memo_get(proj)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    value = _overview_uncached(proj)
+    _overview_memo_put(proj, (fingerprint, value))
+    return value

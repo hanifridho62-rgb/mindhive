@@ -1134,6 +1134,34 @@ of a fold but **how often the highest-frequency poller pays it** — from every 
 when the ledger moves. Stated as a limit rather than a headline: the endpoint a human waits on
 after clicking a section is not the endpoint that got faster.
 
+### Addendum — `/api/overview` now has a gate too (measured 2026-08-15)
+
+The sentence above ("the endpoint a human waits on after clicking a section is not the endpoint
+that got faster") was the finding this section was written to record, and it is what was acted
+on next. `/api/overview` now goes through `dashboard_data.overview_stats`, so **three of four
+endpoints in this table have a gate; `/api/oversee` still has none, deliberately** — see item 17
+in `TODOS.md` and the comment at `_get_oversee` for the two reasons a ledger-shaped fingerprint
+would be wrong there.
+
+A/B on two isolated servers, **one commit apart on the same branch** (`53a729e` on 54472 vs the
+overview memo on 54471), same store, same uptime, no browser, `hive bench dashboard`:
+
+| Endpoint | BEFORE `53a729e` cold / warm | AFTER cold / warm |
+|---|---|---|
+| `/api/overview` | 705.4 / 683.4 ms | 726.3 / **6.6 ms** |
+| `/api/oversee` | 887.9 / 838.5 ms | 872.1 / 857.5 ms (excluded — unchanged, as designed) |
+
+Two things this measurement is not allowed to hide:
+
+* **The first AFTER run showed no improvement at all** — 1370.9 ms cold, 1350.8 ms warm, four
+  samples all at full cost. That run is not discarded, because it is the honest steady state for
+  a namespace being written to while it is polled: the fingerprint moved between every sample,
+  so every sample was a legitimate miss. The gate makes an *unchanged* ledger cheap; it makes an
+  actively-appended one exactly as expensive as before, plus two `stat` calls. `mindhive` is the
+  namespace this machine writes to constantly.
+* **The cold path did not improve and cannot.** 705 → 726 ms is one full `read_all` either way,
+  inside the noise. Nothing here reduces the cost of a fold — W1a branch 2 still stands.
+
 ## T7 RESULT — pollers serialized (landed 2026-08-10)
 
 `refreshLive` and `pollCats` each raise an in-flight flag before their first `await` and clear
