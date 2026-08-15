@@ -247,3 +247,61 @@ def test_long_history_memory_stays_under_budget(tmp_path):
     assert "# PREVENTION RULES" in content
     assert "## Lessons & caveats" in content
     assert "## Key decisions" in content
+
+
+# --- the SOP-injection notice on the digest that loads itself ----------------
+# This is the half that matters. A renderer reached only by STATE.md passes every
+# unit test for the renderer while the auto-loaded digest stays silent, and
+# MEMORY.md is the file a session reads without being asked.
+
+def _mandatory_sop(text):
+    """A real mandatory SOP, materialised the way `record` does. Not a
+    hand-written sidecar: the rebuild inside `sync` regenerates this project's
+    slice from the events, so a hand-written row would be erased by the very
+    pass under test."""
+    from mindhive import sop
+    events.append_event("sop", {"action": "add",
+                                "sop_id": "execution-discipline",
+                                "title": "Execution discipline",
+                                "text": text, "mandatory": True},
+                        session_id="s1", ts="2026-08-14T00:00:00Z", tags=["sop"])
+    sop.write_sidecar()
+
+
+def _degraded_global_sidecar():
+    from mindhive import sopgate
+    _mandatory_sop("y" * (sopgate.PROMPT_BUDGET + 1))
+
+
+def _memory(tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(exist_ok=True)
+    events.append_event("state_set", {"task": "T", "verified": "v",
+                                      "next_step": "n", "open_questions": [],
+                                      "deferred": []},
+                        session_id="s", ts="2026-06-20T09:00:00Z")
+    return sync(r"C:\TEMP\demo", project=None,
+                home=fake_home).read_text(encoding="utf-8")
+
+
+def test_memory_md_carries_the_injection_notice_when_degraded(tmp_path):
+    _degraded_global_sidecar()
+    content = _memory(tmp_path)
+    assert "SOP injection: pointers_only" in content
+    assert "hive sop show execution-discipline" in content
+    assert "every session on this machine" in content
+
+
+def test_memory_md_carries_nothing_when_the_injection_is_healthy(tmp_path):
+    _mandatory_sop("read the exact file before editing it")
+    assert "SOP injection" not in _memory(tmp_path)
+
+
+def test_state_md_and_the_digest_agree_within_one_sync(tmp_path):
+    """The rebuild refreshes the sidecar the verdict is measured from, so the two
+    files must not report different verdicts for the same measurement."""
+    _degraded_global_sidecar()
+    content = _memory(tmp_path)
+    state = (paths.project_dir() / "STATE.md").read_text(encoding="utf-8")
+    assert "SOP injection: pointers_only" in state
+    assert "SOP injection: pointers_only" in content

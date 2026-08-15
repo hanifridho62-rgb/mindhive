@@ -985,6 +985,162 @@ Same two-server method, same four endpoints, browser attached with both pollers 
 "cold server, no browser" re-measurement would report the 0.9–1.9s column and prove nothing
 about what Hanif experiences.
 
+## T1 AFTER — the re-measurement (measured 2026-08-14)
+
+**One of the four endpoints improved because of this work, and it is the one the 2.5 s poller
+hits.** `/api/mindnet/cats` answers in 16–24 ms on the hit path against 0.87–0.92 s isolated
+and 6.0 s under load before. The other three are untouched by the cache layer, and
+`/api/projects` **cannot be helped by the memo it was given** — measured below, not inferred.
+
+> **Superseded 2026-08-15 — see `T5 RESULT` below.** "The memo it was given" was the operative
+> phrase and it turned out to be the whole defect: the memo was fine, its *bound* was shared with
+> two memos holding a far larger payload. Given its own bound, this endpoint went to 35–56 ms
+> warm. The measurements in this section are left exactly as taken — they were accurate for the
+> code that existed on 2026-08-14 — but the conclusion drawn from them was too strong.
+
+Taken with `hive bench dashboard` (this plan's successor added it: `src/mindhive/bench.py`), so
+the method is now a command anyone can re-run rather than a shell transcript:
+
+```
+hive bench dashboard --url http://127.0.0.1:54471 --label "<condition>" --project mindhive
+```
+
+### What was under measurement
+
+|  | isolated 54471 | live 54461 |
+|---|---|---|
+| code served | worktree `b8a4332` (`feat/close-five-gaps`) | main checkout `a90152d` (master) |
+| started | `PYTHONPATH=<worktree>/src … dashboard --port 54471 --no-browser` | plain `python -m mindhive dashboard`, by a launcher outside this session |
+| start time | 2026-08-14T16:24:27Z | 2026-08-14T16:31:17Z |
+| browser | none, by construction | **unverified** — see the condition gaps |
+| store | `mindhive`, 35,368 events over 885 segments | the same store |
+| client | `urllib`, 1 miss + 3 hit samples, means | the same |
+
+Start times are measured, not assumed: `Get-NetTCPConnection -LocalPort <p>` → `Get-Process`.
+Nothing here repointed the live process; `PYTHONPATH` was set only for the 54471 server and for
+the `hive bench` client process, which reads over HTTP and imports no dashboard code.
+
+### The numbers
+
+```
+before (2026-08-10, efa3751, curl -w, ranges)
+                    54471 alone        54461 real load
+/api/projects       1.76 - 1.86s       11.7 - 12.4s
+/api/overview       1.15 - 1.20s        6.4 -  8.3s
+/api/oversee        1.26 - 1.44s        8.6 -  9.5s
+/api/mindnet/cats   0.87 - 0.92s        6.0s
+
+after (2026-08-14, urllib, means, miss / hit)
+                    54471 settled      54471 fresh          54461
+                    (~6 min up)        (~1 min up)          (~7 min up)
+/api/projects       1781 / 2172 ms     5091 / 3552 ms       12841 / 9845 ms
+/api/overview        924 /  810 ms     1302 / 1361 ms        4505 / 3184 ms
+/api/oversee        1114 / 1448 ms     2435 / 1949 ms        4740 / 6843 ms
+/api/mindnet/cats    632 /   16 ms      780 /   13 ms        2495 /   24 ms
+
+serialization — sum of four measured serially vs wall clock for four concurrent
+54471 settled    3545 ms serial   3309 ms concurrent   1.07x
+54471 fresh      3557 ms serial   4686 ms concurrent   0.76x   concurrent SLOWER
+54461            20874 ms serial  13750 ms concurrent  1.52x
+```
+
+A fourth run exists and is reported rather than dropped: 54461 at 16:27:18Z gave
+7106 / 6316 · 2229 / 2687 · 3300 / 2726 · 1652 / 383 ms at ratio 1.02x. It is **not** in the
+table because it measured a process that has since exited and whose start time was never
+recorded — an unlabelled condition is not evidence. Its numbers sit between the two 54471
+columns and the 54461 column, which is consistent with the uptime finding below.
+
+### Per endpoint: improved, or not
+
+* **`/api/mindnet/cats` — improved, and this is the whole win.** 632 → 16 ms isolated
+  (39x), 2495 → 24 ms live (104x) on the hit path. T6's stat-only gate is doing exactly what
+  it was added for: the poller that fires every 2.5 s whatever section is open now costs a
+  `scandir`, not a fold.
+* **`/api/projects` — NOT improved.** 1781 ms isolated against 1.76–1.86 s before; 12841 ms
+  live against 11.7–12.4 s before. Its warm rows are sometimes *slower* than its cold row
+  (2172 vs 1781; 9845 is only 23% under 12841). T5's memo is real and reached, and it still
+  cannot help this endpoint — mechanism measured below. **[Superseded 2026-08-15: it could,
+  once given its own bound. 35–56 ms warm. See `T5 RESULT`.]**
+* **`/api/overview` — not improved by the cache, because no cache touches it.**
+  `_get_overview` (`src/mindhive/dashboard_get.py:94`) calls `events.read_all(proj)` and
+  `chain.verify` on every request, with no memo of any kind. The lower numbers (924 ms vs
+  1.15–1.20 s; 4505 ms vs 6.4–8.3 s) are load and poller-serialization effects, not caching,
+  and must not be reported as a cache win.
+* **`/api/oversee` — same, and same caution.** `_get_oversee` (`:509`) reads the whole ledger
+  per namespace per request. 1114 ms vs 1.26–1.44 s isolated; 4740 ms vs 8.6–9.5 s live, with
+  its live hit row (6843 ms) *above* its miss row (4740 ms).
+
+### Finding 1 — `/api/projects` cannot hit its memo: 60 namespaces, an 8-slot LRU
+
+`_MEMO_MAX = 8` (`src/mindhive/dashboard_memo.py:31`). `_get_projects`
+(`src/mindhive/dashboard_get.py:62`) calls `_project_stats` for **every** namespace, and this
+machine has 60. One request therefore writes 60 entries into eight slots and evicts 52 of them
+before the request even finishes; the next request misses on those 52. Three identical passes
+over all 60 namespaces in one process, plus the same memo on one hot namespace:
+
+```
+pass 1 (cold)   1328.8 ms    memo entries after: 8
+pass 2 (warm)   1213.6 ms    memo entries after: 8
+pass 3 (warm)   2133.5 ms    memo entries after: 8
+one namespace ('mindhive'), twice:   1207.0 ms  ->  4.0 ms
+```
+
+The memo is not broken — on the access pattern its own comment describes ("one namespace is
+hot… the rest are cold the moment it changes") it is a 300x win, and that pattern is the
+project picker's and `/api/mindnet/cats`'s. `/api/projects` is the exact inverse of it in a
+single request. **Not fixed here:** the unit that produced this section produces evidence, not
+behaviour. Recorded as a caveat and left as follow-up work with its measurement attached.
+
+### Finding 2 — uptime is worth ~3x, and the before-profile never recorded it
+
+The same 54471 process, measured about a minute after start and again about five minutes later:
+`/api/projects` 5091 → 1781 ms on the miss path, and the concurrency ratio moved from **0.76x**
+(four concurrent requests were *slower* than four serial ones — contention while startup work
+ran) to 1.07x. A freshly started dashboard is folding for its first responses and running
+catch-up. Every column above names its uptime for this reason; the before-profile's columns
+cannot be re-labelled after the fact, so the isolated comparison carries an unknown of this
+size.
+
+### Condition gaps, stated rather than papered over
+
+1. **Browser attachment on 54461 is unverified.** The before-profile's loaded column had a
+   browser attached with both pollers live. No endpoint exposes uptime or connection state, and
+   the launcher that started this process (parent of PID 7344) had already exited when it was
+   inspected. A plain `python -m mindhive dashboard` does open a browser, so attachment is
+   likely — likely is not measured. Read the 54461 column as "real load, browser unverified".
+2. **The client method changed** from `curl -w` ranges to `urllib` means. Ranges and means are
+   not the same statistic; the comparison is approximate by construction and is least unfair
+   between the miss rows.
+3. **Commit skew.** 54471 served this plan's successor code, 54461 served master. None of that
+   work touches these four endpoints, so the skew is not expected to move the numbers — an
+   assumption, recorded as one.
+4. **The store grew 39%** between the two measurements: 25.5k events at the before-profile,
+   35,368 now, across 885 segments. Every unmemoized fold — three of the four endpoints — got
+   bigger in the interval. The improvements above are net of that growth; the flat
+   `/api/projects` result is partly explained by it.
+5. **Restart evidence instead of a restart of my own.** G1 authorised restarting 54461 plainly
+   and grepping the served page before trusting the measurement. The restart happened at
+   16:31:17Z from outside this session, so the page was grepped rather than the process
+   restarted a second time — counts against `src/mindhive/dashboard*.py` in the main checkout:
+
+```
+showOversee   served 3  source 3      apiJob       served 2  source 2
+renderOversee served 6  source 6      JOB_POLL_MS  served 2  source 2
+showLog       served 2  source 2      jobText      served 3  source 3
+```
+
+   An earlier grep of the pre-restart process showed `renderOversee` 5, matching the master
+   commit of the time. The count moved with master, which is why the parity check was re-run
+   against the new process instead of being reused.
+
+### Does the exit criterion move?
+
+No. W1a's branch 2 (server fold cost) still holds, and the folds still dominate: three of the
+four endpoints read the whole ledger on every request. What this work changed is not the cost
+of a fold but **how often the highest-frequency poller pays it** — from every 2.5 s to only
+when the ledger moves. Stated as a limit rather than a headline: the endpoint a human waits on
+after clicking a section is not the endpoint that got faster.
+
 ## T7 RESULT — pollers serialized (landed 2026-08-10)
 
 `refreshLive` and `pollCats` each raise an in-flight flag before their first `await` and clear

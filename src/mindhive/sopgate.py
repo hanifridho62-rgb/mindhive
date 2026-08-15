@@ -247,6 +247,80 @@ _PROBE_VERDICTS = {
 }
 
 
+def verdict_sentence(measured) -> str:
+    """The one sentence describing what the injection is delivering.
+
+    Extracted so the outcomes-registry adapter below and the STATE.md notice
+    cannot drift into two phrasings of the same three states. `probe` already
+    refuses a second COMPUTATION of the fit rule for that reason; this refuses a
+    second VOCABULARY for the result. Never raises: a junk argument reads as
+    `silent`, which is the honest answer when nothing could be measured."""
+    measured = measured if isinstance(measured, dict) else {}
+    verdict = str(measured.get("verdict") or "silent")
+    budget = measured.get("budget", PROMPT_BUDGET)
+    mandatory = measured.get("mandatory", 0)
+    if verdict == "pointers_only":
+        return (f"no body fits the {budget}-char prompt budget — every prompt "
+                f"gets {mandatory} title(s) and `hive sop show` instead of the "
+                f"procedure (largest is {measured.get('largest_chars', 0)} chars)")
+    if verdict == "partial":
+        return (f"{measured.get('bodies', 0)} of {mandatory} mandatory bodies "
+                f"fit the {budget}-char budget; the other "
+                f"{measured.get('pointers', 0)} degraded to pointers")
+    if verdict == "verbatim":
+        return (f"every mandatory body rides in full — {mandatory} SOP(s), "
+                f"{measured.get('body_chars', 0)} of {budget} chars spent")
+    return ("no mandatory SOP in the global sidecar — nothing is injected, and "
+            "nothing was promised")
+
+
+# The states worth spending auto-loaded lines on. `verbatim` is excluded on
+# purpose: the tier working is not news, and a line that appears in every
+# healthy digest is a line every reader learns to skip.
+NOTICE_VERDICTS = ("silent", "pointers_only", "partial")
+
+
+def notice(result=None) -> str:
+    """One block for the projections when the injection is DEGRADED, or "" when
+    it is healthy — and "" for any junk value, which is why the guard lives here
+    rather than at the call site.
+
+    Why the projections at all, when `hive sop injection` already reports this:
+    that command has to be typed. A degradation that only a deliberate check can
+    find is one nobody finds, and the surface a session reads without being asked
+    is MEMORY.md — which is composed from the same `projector.compose_state` that
+    writes STATE.md, so entering there reaches both.
+
+    Two honest limits are stated in the block itself rather than left for a
+    reader to assume:
+
+    * **The verdict is global.** `probe` ignores its `project` argument and reads
+      the GLOBAL mandatory-SOP sidecar, deliberately (see `block_for`) — the hook
+      is registered machine-wide, so per-project data would make its reach a
+      fiction. STATE.md, by contrast, is per-namespace. Printing a global verdict
+      inside a per-namespace file without saying so invites exactly the wrong
+      reading.
+    * **It is as of the last rebuild**, not as of read time — the same property
+      the review, change-log and roadmap notices already have."""
+    if not isinstance(result, dict):
+        return ""
+    verdict = str(result.get("verdict") or "")
+    if verdict not in NOTICE_VERDICTS:
+        return ""
+    lines = [f"{SOP_MARK} **SOP injection: {verdict}** — {verdict_sentence(result)}"]
+    for row in result.get("sops") or []:
+        if not isinstance(row, dict) or row.get("delivered") != "pointer":
+            continue
+        lines.append(f"- `{row.get('sop_id')}` ({row.get('title')}) arrived as a "
+                     f"POINTER, not its body — {row.get('chars', 0):,} chars. "
+                     f"Read it before acting: `hive sop show {row.get('sop_id')}`")
+    lines.append("_This verdict is **global**, not this namespace: the per-prompt "
+                 "pass reads the global mandatory-SOP sidecar, so it describes "
+                 "every session on this machine. Measured at the last projection "
+                 "rebuild. Full report: `hive sop injection`._")
+    return "\n".join(lines)
+
+
 def render_probe(result: dict) -> str:
     """Human-readable probe report. Says what a session RECEIVES, not what the
     tier intends to send — the gap between those two is the whole finding."""
@@ -319,28 +393,15 @@ def _surface_probe(project=None) -> outcomes.Report:
     """
     measured = probe(project=project)
     verdict = measured["verdict"]
-    budget, mandatory = measured["budget"], measured["mandatory"]
+    # One sentence per verdict, shared with `notice` via `verdict_sentence`, so
+    # the registry surface and the auto-loaded digest cannot describe the same
+    # measurement in two different ways. Only the OUTCOME is decided here.
+    summary = verdict_sentence(measured)
     if verdict == "silent":
-        return outcomes.Report(
-            outcomes.NOTHING_TO_DO,
-            "no mandatory SOP in the global sidecar — nothing is injected, and "
-            "nothing was promised", measured)
-    if verdict == "pointers_only":
-        return outcomes.Report(
-            outcomes.DEGRADED,
-            f"no body fits the {budget}-char prompt budget — every prompt gets "
-            f"{mandatory} title(s) and `hive sop show` instead of the procedure "
-            f"(largest is {measured['largest_chars']} chars)", measured)
-    if verdict == "partial":
-        return outcomes.Report(
-            outcomes.DEGRADED,
-            f"{measured['bodies']} of {mandatory} mandatory bodies fit the "
-            f"{budget}-char budget; the other {measured['pointers']} degraded to "
-            f"pointers", measured)
-    return outcomes.Report(
-        outcomes.DID_WORK,
-        f"every mandatory body rides in full — {mandatory} SOP(s), "
-        f"{measured['body_chars']} of {budget} chars spent", measured)
+        return outcomes.Report(outcomes.NOTHING_TO_DO, summary, measured)
+    if verdict in ("pointers_only", "partial"):
+        return outcomes.Report(outcomes.DEGRADED, summary, measured)
+    return outcomes.Report(outcomes.DID_WORK, summary, measured)
 
 
 outcomes.register("sop-injection",

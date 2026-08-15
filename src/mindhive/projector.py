@@ -4,6 +4,11 @@ import os
 import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import roadmap
+# `sopgate` reaches only `outcomes` (stdlib), `sop` and `promptgate` (-> `paths`),
+# so this introduces no cycle either. Importing it here also means the
+# `sop-injection` surface is registered by anything that can rebuild a
+# projection, rather than only by the CLI entry point.
+from . import sopgate
 # Both reach only `sop` -> `events`, so a module-level import here introduces no
 # cycle (the same reason `roadmap` is imported this way rather than lazily).
 from .mindnet import phases as mn_phases, tasks as mn_tasks
@@ -21,7 +26,8 @@ def _ts_compact(ts: str) -> str:
     return ts.replace("-", "").replace(":", "").replace("T", "-").rstrip("Z")
 
 
-def build_state(evs, pending=None, health_note="", changelog_pending=None) -> str:
+def build_state(evs, pending=None, health_note="", changelog_pending=None,
+                injection=None) -> str:
     latest_state = None
     last_decision = None
     for ev in evs:
@@ -47,6 +53,16 @@ def build_state(evs, pending=None, health_note="", changelog_pending=None) -> st
     rm_note = roadmap.notice(evs)
     if rm_note:
         out.append(rm_note)
+    # What the per-prompt mandatory-SOP injection is actually delivering — but
+    # ONLY when it is degraded. A procedure that outgrew the prompt budget
+    # degrades to a pointer silently, per prompt, forever, and the block still
+    # arrives so nothing looks broken; `hive sop injection` reports it but has to
+    # be typed. Zero lines when healthy: a notice present in every digest is a
+    # notice every reader learns to skip. The guard for a junk value lives in
+    # `sopgate.notice`, not here.
+    inj_note = sopgate.notice(injection)
+    if inj_note:
+        out.append(inj_note)
     # Reflection-health warning (one line, KTD3): auto-reflection failing for
     # too long must be visible, not silent.
     if health_note:
@@ -120,7 +136,8 @@ def suggested_skills_block(project=None, evs=None) -> str:
         return ""
 
 
-def compose_state(evs, project=None, include_rules=True, suggestions=None) -> str:
+def compose_state(evs, project=None, include_rules=True, suggestions=None,
+                  injection=None) -> str:
     """Full STATE.md text: the state body (with any reflection-health notice)
     plus the capped prevention-rules block appended when non-empty (KTD2 —
     STATE.md is the single delivery choke point for rules), plus the compact
@@ -130,10 +147,23 @@ def compose_state(evs, project=None, include_rules=True, suggestions=None) -> st
 
     ``suggestions``: None -> compute the suggested-skills block here; an
     explicit str (possibly "") -> use as-is, so a caller composing the state
-    twice per pass (sync) runs the recommend chain exactly once."""
+    twice per pass (sync) runs the recommend chain exactly once.
+
+    ``injection``: None -> measure the per-prompt SOP injection here; an explicit
+    dict -> use as-is (``{}`` therefore means "render no injection notice").
+    Measured HERE and not in `cmd_state`, because `cmd_state` does not build
+    STATE.md — it prints the file. This function is `build_state`'s only caller
+    and it serves both projections: the STATE.md rebuild and `sync`'s embedded
+    digest, which is the copy MEMORY.md carries and the only one a session loads
+    without being asked. The cost is one small JSON read (`sop.read_global_sidecar`)
+    plus pure counting — not the two git subprocesses the tracking probe pays for
+    — and it is paid at rebuild, never on the prompt path."""
+    if injection is None:
+        injection = sopgate.probe(project=project)
     body = build_state(evs, pending=review.load_pending(project),
                        health_note=reflect.health_note(project),
-                       changelog_pending=changelog.load_pending(project))
+                       changelog_pending=changelog.load_pending(project),
+                       injection=injection)
     if include_rules:
         # Promoted (proven-permanent) rules ride FIRST — SOUL.md is only
         # meaningful if every session actually re-reads it.
@@ -256,6 +286,22 @@ def _project(project=None, evs=None, suggestions=None) -> dict:
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
 
+    # The mandatory-SOP sidecar is derived state like everything else written
+    # here, and this is the one place that already holds `evs` — so a full
+    # rebuild refreshes it for free rather than paying a second `read_all`.
+    # Best-effort: STATE.md and the LEDGER are this function's product, and a
+    # hot-path cache must never be able to fail the rebuild that feeds them.
+    #
+    # Refreshed BEFORE composing the state, not after, since `compose_state` now
+    # measures the injection off this sidecar. With the write after, STATE.md
+    # reported the verdict as of the PREVIOUS rebuild while the MEMORY.md digest
+    # `sync` composes next reported the current one — the two files disagreeing
+    # about the same measurement inside a single `hive sync`.
+    try:
+        sop.write_sidecar(project, evs=evs)
+    except Exception:                                       # noqa: BLE001
+        pass
+
     # Unique per writer, not the fixed "STATE.md.tmp" this used to be: the lock
     # above serialises threads in THIS process, but `hive sync` in a terminal is
     # another process and shares the directory. Two of them writing one fixed
@@ -276,16 +322,6 @@ def _project(project=None, evs=None, suggestions=None) -> dict:
                 tmp.unlink()
             except OSError:
                 pass
-
-    # The mandatory-SOP sidecar is derived state like everything else written
-    # here, and this is the one place that already holds `evs` — so a full
-    # rebuild refreshes it for free rather than paying a second `read_all`.
-    # Best-effort: STATE.md and the LEDGER are this function's product, and a
-    # hot-path cache must never be able to fail the rebuild that feeds them.
-    try:
-        sop.write_sidecar(project, evs=evs)
-    except Exception:                                       # noqa: BLE001
-        pass
 
     ldir = pdir / "LEDGER"
     ldir.mkdir(exist_ok=True)

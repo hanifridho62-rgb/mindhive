@@ -136,6 +136,56 @@ def test_state_warns_on_freshly_minted_namespace(tmp_path, monkeypatch, capsys):
     assert "no memory for detected project" in err.lower()
 
 
+def _tracking_answer(monkeypatch, **fields):
+    from mindhive import repo
+    answer = {"branch": "", "upstream": "", "upstream_missing": True}
+    answer.update(fields)
+    monkeypatch.setattr(repo, "tracking", lambda **kw: answer)
+
+
+def test_state_warns_when_the_checkout_cannot_pull(monkeypatch, capsys):
+    """The orient path is where this belongs: a branch that tracks nothing is
+    invisible to `git status` and reads as `current` from the drift counts, so
+    the checkout loses the ability to notice it has fallen behind — silently,
+    for as long as nobody thinks to look."""
+    _tracking_answer(monkeypatch, branch="master")
+    assert cli_mod.main(["state"]) == 0
+    err = capsys.readouterr().err
+    assert "tracks nothing" in err
+    assert "--set-upstream-to=origin/master master" in err
+
+
+def test_state_says_nothing_when_the_checkout_can_pull(monkeypatch, capsys):
+    """A warning on every healthy session is a warning nobody reads."""
+    _tracking_answer(monkeypatch, branch="master", upstream="origin/master",
+                     upstream_missing=False)
+    assert cli_mod.main(["state"]) == 0
+    assert "tracks nothing" not in capsys.readouterr().err
+
+
+def test_state_is_silent_outside_a_checkout_rather_than_naming_no_branch(
+        monkeypatch, capsys):
+    """Nothing to act on and nothing to name — a detached HEAD or a directory
+    that is not a checkout at all. `hive state` is not a git tool."""
+    _tracking_answer(monkeypatch)                   # missing upstream, no branch
+    assert cli_mod.main(["state"]) == 0
+    assert "tracks nothing" not in capsys.readouterr().err
+
+
+def test_state_still_prints_when_the_tracking_probe_breaks(monkeypatch, capsys):
+    """Fail-open, like the projection refresh beside it: printing STATE.md is
+    this command's job, and a diagnostic must never be able to stop it."""
+    from mindhive import repo
+
+    def boom(**kw):
+        raise RuntimeError("git exploded")
+    monkeypatch.setattr(repo, "tracking", boom)
+    assert cli_mod.main(["state"]) == 0
+    captured = capsys.readouterr()
+    assert "STATE" in captured.out
+    assert "git exploded" not in captured.err
+
+
 def test_flag_creates_judgment_incident_active_at_one(capsys):
     ret = cli_mod.main(["flag", "committed to master without permission"])
     assert ret == 0

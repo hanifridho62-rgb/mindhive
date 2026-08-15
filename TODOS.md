@@ -79,14 +79,30 @@ branch touches README first. The full restructure is this TODO.
 
 ---
 
-## 5. Split `__main__.py` (3790 lines)
+## 5. Split `__main__.py` (4141 lines, and now holding a raised ceiling)
 
 **What:** Split `src/mindhive/__main__.py` into per-domain modules, leaving only argparse wiring.
 
-**Why:** This repo's own ledger caveat already flags it — nearly 4x the thermo-nuclear threshold,
+**Why:** This repo's own ledger caveat already flags it — over 4x the thermo-nuclear threshold,
 and the debt lens proposes it every round it runs. It was 3761 lines when that caveat was
-written and is **3790** now. Every other module in `src/mindhive/` is 21–692 lines;
-`__main__.py` is the anomaly.
+written, 3790 when this item was filed, and **4141** as of 2026-08-14. Every other module in
+`src/mindhive/` is 21–692 lines; `__main__.py` is the anomaly.
+
+**What changed since this was filed:** the cap is now enforced.
+`tests/test_file_size_cap.py` fails the build on any module past 1000 lines that is not in
+`ALLOWED`, and `ALLOWED` is a shrink-only ratchet. `__main__.py` entered that list at 4082 and
+its ceiling has since been raised **once**, to 4141, with the arithmetic written into the
+comment beside it (33 lines from the `hive repo` reporting work, 26 from the five-gaps work).
+That raise is a debt entry, not a fix, and the comment says so. The next person who needs to
+raise it again should split the file instead — that is the whole point of a ratchet whose
+number is expensive to move.
+
+Two mitigations already in place, so a split is not the only lever:
+`bench.register(subparsers)` (`src/mindhive/bench.py`) wires its own group from its own module
+and cost this file two lines instead of forty; that is currently the only command that does so,
+and its docstring names the deviation. If a second command follows it, the pattern stops being
+a deviation and should be written down as the convention — which would also be a cheaper path
+out of this item than one large split session.
 
 **Pros:** stops the lens proposing it every round; every later CLI change gets cheaper; restores
 the repo's own module-size norm.
@@ -197,3 +213,184 @@ fetches outside `apiGet` inherits the bug again.
 
 **Behavioural cover:** `a_render_started_for_another_project_paints_nothing` in the node tier-1
 suite, with a mutant half that must fail.
+
+---
+
+## 10. ~~`/api/projects` cannot hit the memo it was given — 60 namespaces, an 8-slot LRU~~ — DONE
+
+Closed 2026-08-15. `_STATS_MEMO` now carries its own bound (`_STATS_MEMO_MAX` = 512) via
+`_BoundedMemo`, an `OrderedDict` subclass holding `max_entries`; the two fold-holding memos
+keep `_MEMO_MAX` = 8. The trap below was honoured — the shared constant was **not** raised, and
+a test asserts it stays at or under 16 so a later change cannot quietly take that shortcut.
+
+The same three passes that cost 1329 / 1214 / 2134 ms holding 8 entries now cost
+**1002 / 9.3 / 8.4 ms holding all 60**; end to end over HTTP, warm requests went from
+1.76–1.86 s to **35–56 ms**. Memory was measured rather than estimated: 443.5 KiB for a fully
+populated 60-entry memo, 7.6 KiB mean, and the size tracks segment *files* rather than entries.
+The after-measurement is `T5 RESULT` in the plan, which supersedes `T1 AFTER`'s reading of this
+endpoint as unimprovable.
+
+Kept rather than deleted, for the same reason as item 9: the diagnosis is the reusable part. An
+LRU whose bound is smaller than a sequential scan over its key set has a **0%** hit rate, not a
+reduced one — every pass restarts at the key evicted earliest. Any future memo added in front
+of a whole-namespace walk inherits this the moment its bound drops under the namespace count.
+
+**What it was:** give `_STATS_MEMO` a bound sized for the namespace count, separately from the two
+memos it then shared `_MEMO_MAX` with.
+
+**Why:** `_get_projects` ([dashboard_get.py:62](src/mindhive/dashboard_get.py:62)) calls
+`_project_stats` for **every** namespace, and this machine has 60. `_MEMO_MAX` is 8
+([dashboard_memo.py:31](src/mindhive/dashboard_memo.py:31)), so a single request writes 60
+entries into eight slots and evicts 52 of them before it finishes. The next request misses on
+those 52 — permanently. Measured, three identical passes over all 60 in one process:
+
+```
+pass 1 (cold)   1328.8 ms    memo entries after: 8
+pass 2 (warm)   1213.6 ms    memo entries after: 8
+pass 3 (warm)   2133.5 ms    memo entries after: 8
+one namespace ('mindhive'), twice:   1207.0 ms  ->  4.0 ms
+```
+
+End to end this is why `/api/projects` measured 1781 ms isolated and 12841 ms under load in the
+after-profile — essentially unchanged from the 1.76–1.86 s / 11.7–12.4 s before it.
+
+**The trap:** do **not** simply raise the shared constant. `_SESSIONS_MEMO` and `_CATS_MEMO`
+entries each hold a full telemetry fold plus every session record for a project, which is what
+the cap of 8 was chosen for ([dashboard_memo.py:21-30](src/mindhive/dashboard_memo.py:21)).
+`_STATS_MEMO` entries are small count dicts. The fix is a separate bound for the small one, or
+an unbounded fingerprinted map with its memory cost measured — not one number for three
+different payload sizes.
+
+**The memo is not broken.** On the access pattern its own comment describes — one namespace hot,
+the rest cold — it is a 300x win, and that is the picker's pattern and `/api/mindnet/cats`'s.
+`/api/projects` is the exact inverse of it inside one request.
+
+**Behavioural cover:** four cases in `tests/test_dashboard_locks.py`, each canary-checked against
+mutants. `test_the_picker_caches_every_namespace_it_walks` was the RED-on-old-code one — it seeds
+`_MEMO_MAX + 4` namespaces, polls twice and asserts zero ledger reads on the second pass, with its
+own guard that the first pass *did* read so it cannot pass for a picker that stopped reading
+altogether. `test_the_fold_holding_memos_keep_their_own_small_bound` is the one that makes "just
+raise the shared constant" fail. The other two guard the 512 ceiling in both directions and pin
+the `getattr` fallback branch for a memo carrying no bound.
+
+---
+
+## 11. A real-socket test is intermittent, and nobody has caught it in the act
+
+**Source:** observed across full-suite runs, 2026-08-12 → 2026-08-14.
+
+**What:** stabilise
+`tests/test_dashboard_http.py::test_a_refused_body_never_becomes_the_next_request`.
+
+**Why:** it has gone green / red / green on one unchanged tree under a full-suite run, and green
+every time in isolation. It passed in both full local runs and in CI on 2026-08-14, which is
+exactly what makes it dangerous — an intermittent that is currently passing reads as a fixed
+one. It is a real-socket test, so the failure is a scheduling race rather than a logic error.
+
+**The technique that already worked once:** the job-state race in this repo was fixed by parking
+the work instead of trusting the scheduler. The same shape applies here.
+
+**Cons of leaving it:** the next unrelated red run costs someone an afternoon deciding whether
+their change broke it.
+
+---
+
+## 12. The job polling flow has no browser-tier probe
+
+**Source:** deferred from the five-surfaces plan, restated 2026-08-14.
+
+**What:** a `-m browser` test that drives a long operation to completion and asserts the DOM
+updates *during* the poll, not only after it.
+
+**Why:** the 202-accepted job flow is the mechanism behind six long operations, and the tier
+that would prove the browser actually repaints mid-poll is the one layer never written. Server
+tests prove the job endpoint answers; node tests prove the render function behaves. Neither
+proves the page changes while a job is running, which is the entire user-visible promise.
+
+**Context:** the browser tier exists and is cheap to extend —
+`tests/test_dashboard_browser.py` starts a `ThreadingHTTPServer` on an ephemeral port
+(`("127.0.0.1", 0)`) and drives real Chromium; 14 tests run in ~30 s.
+
+---
+
+## 13. `origin` points at a repository name that only resolves by redirect
+
+**Source:** noticed while pushing `feat/close-five-gaps`, 2026-08-14.
+
+**What:** `git remote set-url origin https://github.com/hanifridho62-rgb/mindhive.git`.
+
+**Why:** `origin` is still
+`https://github.com/hanifridho62-rgb/Lintester-project.git`, and every push reaches
+`hanifridho62-rgb/mindhive` only because GitHub redirects renamed repositories. It works today
+and is verifiable (`gh repo view` reports `hanifridho62-rgb/mindhive`; the pushed ref is there),
+but the redirect is a courtesy, not a contract — and `README.md:59` still publishes the old name
+in a public install command, which ties this to item 1.
+
+**Cons of fixing:** none, beyond remembering that older clones and any script with the old URL
+hard-coded rely on the same redirect.
+
+---
+
+## 14. `/autoplan` cannot aggregate a phase on this machine — no `jq`
+
+**Source:** the five-gaps plan run, 2026-08-14.
+
+**What:** install `jq`, or teach the aggregation step a fallback that does not need it.
+
+**Why:** the planning skill writes a JSONL artifact per phase and forbids hand-rolling it.
+`jq` is not installed here (`command -v jq` is empty), so that artifact was not written and the
+phase cannot be aggregated. Nothing was lost — the plan document itself carries the decisions —
+but the machine-readable half of two planning runs is simply absent, and it will keep being
+absent silently.
+
+---
+
+## 15. A merged PR whose code never reached master — the whole `fabricate` feature
+
+**Source:** branch audit, 2026-08-14.
+
+**What:** decide whether to land `feat(fabricate): the PRD assembly line` (`3a45aea`) on master,
+and until that decision is made, **do not delete**
+`claude/prd-assembly-line-40e466` or `claude/session-resumption-marker-40e466`.
+
+**Why this is not an ordinary stale branch:** PR org/repo#71 is `MERGED` — green, closed,
+2026-07-18. Its base was `claude/session-resumption-marker-40e466`, **not** `master`. So the
+merge succeeded into a branch and the trunk never received a line of it. Verified against
+`origin/master` today:
+
+```
+src/mindhive/fabricate.py        ABSENT
+tests/test_fabricate.py          ABSENT
+"fabrication" in events.py       0 occurrences
+```
+
+That is 1242 insertions across 7 files, 41 tests the commit message reports as passing, and a
+live-verified Windows Task Scheduler dispatch — `hive fabricate compile | dispatch | run | list`,
+the `fabrication` event type, and loop-mode autoresume. None of it is reachable from master.
+
+**Cost to rescue, measured (`git merge-tree`, non-destructive):** three conflicts, all in
+append-style registries — `docs/DATA_MODEL.md`, `src/mindhive/__main__.py`,
+`src/mindhive/events.py`. `src/mindhive/autoresume.py` and `src/mindhive/loop/engine.py`
+auto-merge. So the shape is "take both sides in three registries", not a rewrite — but the 41
+tests must be re-run against today's master, which has moved a long way since 2026-07-19.
+
+**The generalisable lesson, which outlives this item:** a PR being `MERGED` says only that its
+head reached its **base**. It says nothing about master. Any audit that trusts the merged flag
+instead of `git merge-base --is-ancestor <sha> origin/master` will report this feature as
+shipped.
+
+**Depends on:** nothing. It is independent of every other item here.
+
+---
+
+## 16. ~~`claude/gifted-mirzakhani-d842b5` — graph pinwheel from real nodes~~ — SUPERSEDED
+
+Closed 2026-08-14 by audit, not deferred. The branch carries one unmerged commit `a5c739d`
+(2026-06-24), "pinwheel view is now built from the real nodes". Master reached the same idea
+independently one day later in `c3ef3e0`, "node-based living pinwheel — symmetric spacing, star
+drift, twinkle, buzz", and went further. Master's `graphview.py` is 856 lines against the
+branch's 657.
+
+Kept here rather than deleted because the branch still exists and someone auditing it later will
+ask the same question: **the branch is safe to delete, nothing unique is lost.** That is the
+answer, with the commit that supersedes it named.

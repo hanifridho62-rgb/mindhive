@@ -499,3 +499,93 @@ def test_surface_probe_is_registered_and_carries_the_measurement():
     _add()
     assert outcomes.run_probe("sop-injection").result["budget"] == \
         sopgate.PROMPT_BUDGET
+
+
+# --- the projections notice ---------------------------------------------------
+# `hive sop injection` already reports all of this, and has to be typed. These
+# cover the same measurement reaching the digest a session loads unasked.
+
+def _measured(*sizes):
+    """A probe result for bodies of the given sizes, without touching disk."""
+    rows = [{"sop_id": f"sop-{i}", "title": f"Procedure {i}", "text": "x" * n}
+            for i, n in enumerate(sizes, 1)]
+    return sopgate.probe(rows=rows)
+
+
+def test_a_healthy_injection_renders_no_notice_at_all():
+    """Zero lines when verbatim. A notice in every digest is a notice every
+    reader learns to skip, and these lines are auto-loaded into every session."""
+    measured = _measured(200)
+    assert measured["verdict"] == "verbatim"
+    assert sopgate.notice(measured) == ""
+
+
+@pytest.mark.parametrize("junk", [None, {}, "pointers_only", 7, [],
+                                  {"verdict": "nonsense"}])
+def test_a_junk_injection_value_renders_nothing(junk):
+    """`probe` itself cannot raise, so the guard belongs on the renderer: this is
+    reached from `build_state`, and a digest that fails to render is worse than
+    one missing a warning."""
+    assert sopgate.notice(junk) == ""
+
+
+def test_pointers_only_names_the_verdict_the_procedure_and_a_real_command():
+    measured = _measured(sopgate.PROMPT_BUDGET + 1)
+    assert measured["verdict"] == "pointers_only"
+    block = sopgate.notice(measured)
+    assert "pointers_only" in block                  # the verdict itself
+    assert "sop-1" in block and "Procedure 1" in block   # the affected procedure
+    assert "hive sop show sop-1" in block             # a command that exists
+    assert "hive sop injection" in block
+
+
+def test_partial_names_the_bodies_that_fit_and_the_ones_that_did_not():
+    measured = _measured(sopgate.PROMPT_BUDGET - 10, 500)
+    assert measured["verdict"] == "partial"
+    block = sopgate.notice(measured)
+    assert "partial" in block
+    assert "1 of 2" in block
+    # Only the degraded one is listed; the body that arrived needs no action.
+    assert "hive sop show sop-2" in block
+    assert "hive sop show sop-1" not in block
+
+
+def test_silent_renders_a_block_with_no_pointer_lines():
+    """An empty global sidecar on a machine that registered a mandatory SOP means
+    the sidecar broke, so it is worth a line — but nothing was promised either,
+    and the wording says so rather than implying a lost body."""
+    measured = _measured()
+    assert measured["verdict"] == "silent"
+    block = sopgate.notice(measured)
+    assert "silent" in block
+    assert "nothing was promised" in block
+    assert "POINTER" not in block
+
+
+def test_the_notice_says_the_verdict_is_global_not_this_namespace():
+    """`probe` ignores `project` and reads the GLOBAL sidecar by design, while
+    STATE.md is per-namespace. Printing one inside the other without saying so
+    invites the wrong reading."""
+    block = sopgate.notice(_measured(sopgate.PROMPT_BUDGET + 1))
+    assert "global" in block.lower()
+    assert "every session on this machine" in block
+
+
+def test_the_notice_reuses_the_surface_probes_own_sentence(monkeypatch):
+    """One vocabulary for one measurement. `probe` refuses a second computation
+    of the fit rule; this refuses a second phrasing of the result."""
+    _add("too-big", "Too big", "Z" * (sopgate.PROMPT_BUDGET + 1))
+    report = sopgate._surface_probe()
+    measured = report.result
+    assert report.summary in sopgate.notice(measured)
+    assert sopgate.verdict_sentence(measured) == report.summary
+
+
+def test_the_notice_never_carries_the_body_it_measured():
+    """The probe deliberately drops bodies, and the notice is auto-loaded into
+    every session — re-embedding a 3k-char procedure here would cost more than
+    the degradation it reports."""
+    body = "SECRET-BODY-TEXT" * 300
+    measured = sopgate.probe(rows=[{"sop_id": "big", "title": "Big",
+                                    "text": body}])
+    assert "SECRET-BODY-TEXT" not in sopgate.notice(measured)

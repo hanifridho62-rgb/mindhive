@@ -1835,6 +1835,40 @@ def test_reflect_noop_on_empty_store(dashboard_server):
     assert job["result"] == {"reflected": 0, "failed": 0, "pending": 0}
 
 
+def test_reflect_empty_case_explains_the_rule_that_makes_zero_healthy(
+        dashboard_server):
+    """A count is not an explanation. The old sentence ("no active failure
+    without a lesson already") reported the result of the filter without ever
+    naming the filter, so a reader had no way to tell a healthy zero from a
+    query that matched nothing because it was wrong.
+
+    The assertions are on the parts of the sentence that carry the rule — the
+    two fields actually filtered on, and the verdict that zero is the good
+    state — not on a module constant, which would pass whatever the constant
+    said."""
+    base, token = dashboard_server
+    job = _run_job(base, "/api/rules/reflect", {"project": "bare"}, token)
+    assert job["outcome"] == "nothing_to_do", job
+    summary = job["summary"]
+    assert "rule_source" in summary          # names what was counted...
+    assert "status=active" in summary        # ...both halves of the filter
+    assert "healthy" in summary              # names why zero is the good state
+    assert summary.strip()                   # outcomes.Report rejects empty
+
+
+def test_reflect_with_eligible_incidents_does_not_use_the_empty_case_sentence(
+        dashboard_server, monkeypatch):
+    """The empty-case explanation must not leak onto a run that did work."""
+    base, token = dashboard_server
+    _seed_incident("test", sig="sig:eligible")
+    monkeypatch.setattr(refl_mod, "reflect_incident",
+                        lambda sig, project=None: {"reflected": True})
+    job = _run_job(base, "/api/rules/reflect", {"project": "test"}, token)
+    assert job["outcome"] == "did_work", job
+    assert "rule_source" not in job["summary"]
+    assert "healthy" not in job["summary"]
+
+
 def test_reflect_rejected_for_hivemind(dashboard_server):
     base, token = dashboard_server
     status, obj = _post(base, "/api/rules/reflect", {"project": "*"}, token)
