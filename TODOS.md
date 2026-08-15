@@ -399,26 +399,42 @@ answer, with the commit that supersedes it named.
 ([dashboard_get.py:515](src/mindhive/dashboard_get.py:515)) the way `overview_stats`
 ([dashboard_data.py](src/mindhive/dashboard_data.py)) now gates `/api/overview`.
 
-**Why it did not ride along:** the response is not a function of the ledger alone, in two
-independent ways, and each defeats a ledger-shaped fingerprint on its own.
+**Why it did not ride along — and it is not the fingerprint.** Both producers are pure folds
+over `events.read_all` (`list_runs` at
+[loop/state.py:111](src/mindhive/loop/state.py:111), `interactive_sessions` at
+[oversee.py:234](src/mindhive/oversee.py:234)), so `segment_stats` would key this endpoint
+correctly. The obstacle is that the **wall clock decides three separate things inside the fold**,
+and a fold cached as-is freezes a board rather than a number:
 
-1. **`online` is wall-clock derived, from two producers.** Every card carries it and the
-   top-level `any_online` is folded from it. `dashboard_memo._with_online` already exists for
-   exactly this and is why the cats gate is safe — it memoizes the FOLD and re-derives `online`
-   on the way out. Here the field arrives from `oversee.interactive_sessions` **and** from
-   `loop.state.list_runs`, so one re-derivation seam has to cover both, and `list_runs`' rows do
-   not go through `_with_online` today.
-2. **`loop_state.list_runs(n)` does not read the event segments.** It reads loop state. A run
-   that starts, or a card that is dismissed, moves neither `segment_stats` nor `chain.json` — so
-   the compound fingerprint `/api/overview` uses would score a **hit** on a board that changed.
-   A third component is needed, over whatever `list_runs` actually stats.
+1. **A loop run's `online`** — `status == "running"` and last event within that run's own
+   `heartbeat_seconds` (default 15 min + 60 s slack),
+   [loop/state.py:175](src/mindhive/loop/state.py:175).
+2. **A chat session's `online`** — last event within `ONLINE_WINDOW_SECONDS` (180 s),
+   [oversee.py:314](src/mindhive/oversee.py:314). This is the only one
+   `dashboard_memo._with_online` already implements.
+3. **Whether a chat session is on the board at all** — idle past `ACTIVE_WINDOW_SECONDS` (6 h)
+   and the fold drops it, [oversee.py:308](src/mindhive/oversee.py:308). Cache the fold and an
+   aged-out session lingers until the ledger next moves.
+
+All three are re-derivable at serve time from fields the output rows already carry
+(`last_event_ts`, plus `status` / `heartbeat_seconds` on loop rows), so the shape of the fix is a
+seam like `_with_online` that dispatches on `kind` — **not** a second copy of each window's rule,
+which is what that function's docstring exists to forbid.
+
+**One genuine off-ledger input:** `list_runs` calls `_fix_plan_items(r["goal_dir"])`
+([loop/state.py:180](src/mindhive/loop/state.py:180)), which reads a plan file on disk. A run's
+plan can therefore change with no event appended. In practice a progressing run appends
+`loop_iteration` rows anyway, but "in practice" is not a cache invariant — the goal_dirs held by
+the cached entry would have to join the fingerprint, the way `chain.json` joined
+`/api/overview`'s. New goal_dirs need no special handling: a run cannot appear without a
+`loop_run_start` event, which moves the ledger stamp on its own.
 
 **Measured cost:** 1114 / 1448 ms isolated and 4740 / 6843 ms under load in the after-profile
 ([T1 AFTER](docs/plans/2026-08-10-001-fix-feedback-loop-five-surfaces-plan.md)) — the same order
 as `/api/overview` before its gate, and it is polled by the Oversee section.
 
-**Behavioural cover needed, beyond the overview file's:** a card must go **offline** on an
-unchanged ledger purely by the clock advancing past `ONLINE_WINDOW_SECONDS`, and a dismissal
-must reach the next poll. Both are RED against any fingerprint built only from the segments —
-which is the point, and why this is a separate piece of work rather than a fourth line in
-`_overview_fingerprint`.
+**Behavioural cover needed, beyond the overview file's:** three tests that hold the ledger still
+and move only the clock — a loop card must go offline past its own `heartbeat_seconds`, a chat
+card past 180 s, and a chat card must **leave the board** past 6 h. Each is RED against a fold
+cached without a re-derivation seam, which is the point, and why this is a separate piece of work
+rather than a fourth line in `_overview_fingerprint`.

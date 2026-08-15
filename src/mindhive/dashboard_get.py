@@ -523,19 +523,23 @@ class GetRoutes:
         # ``plans`` list so a roadmap is never orphaned.
         #
         # DELIBERATELY NOT MEMOIZED, unlike its neighbour /api/overview, and the
-        # reason is worth having here rather than rediscovering: this response is
-        # not a function of the ledger alone, in two independent ways.
-        # `online` (per card, and `any_online` below) is a function of the WALL
-        # CLOCK — a cached copy freezes a session as working, or as gone, until
-        # the ledger next moves — and unlike the cats gate, where `_with_online`
-        # re-derives it over one fold, it arrives here from TWO producers:
-        # `interactive_sessions` and `loop_state.list_runs`. And `list_runs`
-        # reads loop state, not the event segments, so neither `segment_stats`
-        # nor `chain.json` moves when a run starts or a card is dismissed — a
-        # ledger-shaped fingerprint would score a hit on a board that changed.
-        # Both are fixable (a third fingerprint component, and one re-derivation
-        # seam covering both producers); neither is fixed, so this endpoint is
-        # still a full read per poll.
+        # reason is worth having here rather than rediscovering. The fingerprint
+        # is not the problem — both producers below ARE pure folds over
+        # `read_all`, so `segment_stats` would key this correctly. The problem is
+        # that the WALL CLOCK decides three separate things INSIDE the fold, and
+        # a cached fold freezes a board rather than a number:
+        #   1. a loop run's `online` — `status == "running"` and last event
+        #      within that run's own `heartbeat_seconds` (default 15 min + 60 s),
+        #      decided in `loop.state.list_runs`;
+        #   2. a chat session's `online` — last event within
+        #      `oversee.ONLINE_WINDOW_SECONDS` (180 s);
+        #   3. whether a chat session is on the board AT ALL — idle past
+        #      `ACTIVE_WINDOW_SECONDS` (6 h) and it is dropped by the fold.
+        # `dashboard_memo._with_online` is the seam for (2) only. (1) and (3)
+        # need their own, and `list_runs` additionally reads each run's fix-plan
+        # file off `goal_dir` — the one genuine off-ledger input here. All of it
+        # is fixable; none of it is fixed, so this endpoint is still a full read
+        # per poll. TODOS item 17 carries the plan.
         from . import oversee as oversee_mod
         from . import roadmap as roadmap_mod
         from .loop import state as loop_state
