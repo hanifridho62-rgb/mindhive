@@ -1054,6 +1054,60 @@ def test_the_fold_holding_memos_keep_their_own_small_bound():
     dashboard._STATS_MEMO.clear()
 
 
+def test_the_picker_memo_still_evicts_at_its_own_bound():
+    """`_STATS_MEMO_MAX` is a real ceiling, not "unbounded with a number on it".
+
+    The bound this change RAISED is the same one whose smallness caused the
+    defect, so the ceiling deserves a guard of its own. A store with more
+    namespaces than `_STATS_MEMO_MAX` returns to the sequential-scan pathology
+    exactly as before — 0% hit rate, memo full, nothing reported — and the
+    number is the only thing standing between here and there.
+
+    Two directions are asserted because each fails differently: eviction that
+    never fires makes the memo grow without limit on a pathological store, and
+    eviction that fires early is the original bug at a larger number."""
+    memo = dashboard._BoundedMemo(dashboard._STATS_MEMO_MAX)
+    for i in range(dashboard._STATS_MEMO_MAX + 4):
+        dashboard._memo_put(memo, f"ns-{i:04d}", i)
+    assert len(memo) == dashboard._STATS_MEMO_MAX, (
+        f"{len(memo)} entries retained against a bound of "
+        f"{dashboard._STATS_MEMO_MAX} — the picker's memo either stopped "
+        f"evicting or evicts before its own ceiling")
+    assert dashboard._memo_get(memo, "ns-0000") is None, \
+        "the oldest entry survived past the bound, so nothing is evicting"
+    assert dashboard._memo_get(memo, f"ns-{dashboard._STATS_MEMO_MAX + 3:04d}") \
+        is not None, "the newest entry was evicted, so this is a FIFO backwards"
+    # The ceiling has to clear a real machine's namespace count by a margin, or
+    # it is the old bug with a bigger number. 60 namespaces here when this was
+    # written; `hive projects` is the live count.
+    assert dashboard._STATS_MEMO_MAX >= 256, (
+        f"_STATS_MEMO_MAX is {dashboard._STATS_MEMO_MAX} — too close to a "
+        f"plausible namespace count to be a backstop")
+
+
+def test_a_memo_carrying_no_bound_falls_back_to_the_small_one():
+    """The `getattr(memo, "max_entries", _MEMO_MAX)` default, exercised.
+
+    Every memo the server owns is a `_BoundedMemo`, so the fallback branch is
+    unreachable from production code and every other test in this file passes a
+    bounded memo — which means the branch would be dead in coverage terms and
+    the comment above it would be documenting a behaviour nothing verifies.
+
+    The direction matters, not just the number: an unrecognised memo must land
+    on the SMALL bound. Over-caching an unknown entry shape costs memory, which
+    is the failure worth defaulting away from; under-caching costs time, which
+    is the one the whole `_STATS_MEMO_MAX` split exists to buy back."""
+    plain = collections.OrderedDict()
+    assert not hasattr(plain, "max_entries"), \
+        "a plain OrderedDict grew a bound, so this no longer tests the default"
+    for i in range(dashboard._STATS_MEMO_MAX + 4):
+        dashboard._memo_put(plain, f"k-{i}", i)
+    assert len(plain) == dashboard._MEMO_MAX, (
+        f"{len(plain)} entries retained in a memo carrying no bound — the "
+        f"fallback must be `_MEMO_MAX` ({dashboard._MEMO_MAX}), not "
+        f"`_STATS_MEMO_MAX` ({dashboard._STATS_MEMO_MAX}) and not unbounded")
+
+
 def test_an_empty_fingerprint_never_matches_and_never_freezes_the_picker(
         dashboard_server, counters, monkeypatch):
     """DISCRIMINATING. `segment_stats` answers `{}` for ANY OSError as well as

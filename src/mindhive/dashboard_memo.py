@@ -68,12 +68,21 @@ class _BoundedMemo(collections.OrderedDict):
     """An LRU memo carrying its OWN bound.
 
     The bound travels with the memo rather than arriving as an argument because
-    `_memo_put` has four call sites across three modules, and a `bound=`
+    `_memo_put` has seven call sites across three modules (two here, one in
+    `dashboard_get`, four in `tests/test_dashboard_locks.py`), and a `bound=`
     parameter makes every one of them responsible for remembering which memo it
     is writing to. One that forgets restores the exact defect this class was
     added to fix — silently, since a memo that evicts too eagerly still returns
     correct answers, just never a cheap one."""
 
+    # `max_entries` is deliberately REQUIRED, which means `copy()` raises
+    # `TypeError` — `OrderedDict.copy` calls `self.__class__(self)` and passes
+    # no bound. That is the better failure. Giving it a default would make
+    # `copy()` succeed and hand back a memo silently carrying the SMALL bound,
+    # which is the under-caching bug this class exists to fix, reintroduced
+    # through the back door. Nothing copies these memos today; if something
+    # ever needs to, override `copy`/`__reduce__` to carry the bound across
+    # rather than adding a default here.
     def __init__(self, max_entries: int):
         super().__init__()
         self.max_entries = max_entries
