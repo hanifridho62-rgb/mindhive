@@ -293,3 +293,106 @@ def test_the_state_temp_file_is_unique_per_writer():
     projector.project()
     leftovers = list(paths.project_dir().glob("STATE.md*.tmp"))
     assert not leftovers, f"rebuild left temp files behind: {leftovers}"
+
+
+# --- the SOP-injection notice ------------------------------------------------
+# It enters HERE, and not in `cmd_state`, because `cmd_state` does not build
+# STATE.md -- it prints the file. `build_state`'s only caller is `compose_state`,
+# which serves both the STATE.md rebuild and the digest `sync` embeds in
+# MEMORY.md, so this is the one seam that reaches the surface a session loads
+# without being asked.
+
+def _degraded_sidecar():
+    """One mandatory SOP whose body is over the prompt budget — the live shape of
+    this machine's own store.
+
+    Seeded as a real `sop` event and materialised through `sop.write_sidecar`, not
+    by hand-writing the sidecar file: the sidecar is DERIVED state, and a rebuild
+    regenerates this project's slice from the events. A hand-written row is
+    therefore erased by the very rebuild under test, which is what made the first
+    version of these tests report `silent`."""
+    from mindhive import sop, sopgate
+    events.append_event("sop", {"action": "add",
+                                "sop_id": "execution-discipline",
+                                "title": "Execution discipline",
+                                "text": "y" * (sopgate.PROMPT_BUDGET + 1),
+                                "mandatory": True},
+                        session_id="s1", ts="2026-08-14T00:00:00Z", tags=["sop"])
+    sop.write_sidecar()
+
+
+def test_build_state_carries_the_injection_notice():
+    body = projector.build_state([], injection={"verdict": "pointers_only",
+                                                "budget": 3000, "mandatory": 1,
+                                                "bodies": 0, "pointers": 1,
+                                                "largest_chars": 3401,
+                                                "sops": [{"sop_id": "x",
+                                                          "title": "X",
+                                                          "chars": 3401,
+                                                          "delivered": "pointer"}]})
+    assert "SOP injection: pointers_only" in body
+    assert "hive sop show x" in body
+
+
+def test_the_injection_notice_does_not_displace_the_other_three():
+    """All four notices can be present at once. Each was added by a different
+    change and each one appends to the same list, so the regression to guard
+    against is a new one landing in place of an old one."""
+    from mindhive import roadmap
+    events.append_event("roadmap",
+                        {"action": "set", "plan_id": "a-plan",
+                         "prompt": "Add an interactive roadmap",
+                         "steps": ["one", "two"]},
+                        session_id="s1", ts="2026-07-17T10:00:00Z", tags=["roadmap"])
+    events.append_event("roadmap",
+                        {"action": "interrupt", "plan_id": "a-plan",
+                         "cause": "usage_limit"},
+                        session_id="s1", ts="2026-07-17T11:00:00Z", tags=["roadmap"])
+    evs = events.read_all()
+    assert roadmap.notice(evs)                      # the fixture actually fires
+    body = projector.build_state(
+        evs,
+        pending={"files": ["src/mindhive/x.py"], "batch_count": 1},
+        changelog_pending={"files": ["src/mindhive/y.py"]},
+        health_note="_reflection has been failing for 3 days_",
+        injection={"verdict": "pointers_only", "budget": 3000, "mandatory": 1,
+                   "bodies": 0, "pointers": 1, "largest_chars": 3401, "sops": []})
+    assert "Pending thermo-nuclear review" in body
+    assert "Unlogged code changes" in body
+    assert "Interrupted plan" in body
+    assert "reflection has been failing" in body
+    assert "SOP injection: pointers_only" in body
+
+
+def test_a_healthy_injection_adds_zero_lines():
+    """The cost of the healthy path, asserted rather than assumed."""
+    quiet = projector.build_state([], injection={})
+    healthy = projector.build_state(
+        [], injection={"verdict": "verbatim", "budget": 3000, "mandatory": 1,
+                       "bodies": 1, "pointers": 0, "body_chars": 900,
+                       "largest_chars": 900, "sops": []})
+    assert healthy == quiet
+    assert len(healthy.splitlines()) == len(quiet.splitlines())
+
+
+def test_compose_state_measures_the_injection_when_not_given_one():
+    """Nobody has to remember to pass it: the default is to measure."""
+    _degraded_sidecar()
+    body = projector.compose_state([], project="test", suggestions="")
+    assert "SOP injection: pointers_only" in body
+    assert "execution-discipline" in body
+
+
+def test_compose_state_honours_an_explicit_empty_injection():
+    _degraded_sidecar()
+    body = projector.compose_state([], project="test", suggestions="",
+                                   injection={})
+    assert "SOP injection" not in body
+
+
+def test_a_degraded_injection_reaches_the_written_state_file():
+    _degraded_sidecar()
+    projector.project()
+    state = (paths.project_dir() / "STATE.md").read_text(encoding="utf-8")
+    assert "SOP injection: pointers_only" in state
+    assert "every session on this machine" in state

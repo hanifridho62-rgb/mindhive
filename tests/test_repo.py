@@ -337,8 +337,11 @@ def test_the_freshness_window_is_the_caller_s_to_set(tmp_path):
 
 
 def test_no_integration_ref_is_unknown_with_its_own_reason():
-    """The live state of this repo's `master`: no upstream to compare against.
-    Reporting "current" there would be an invention."""
+    """Nothing to compare against — no `origin/HEAD`, `origin/master` or
+    `origin/main`, which `git clone --branch` and `git worktree add` both leave
+    absent. Reporting "current" there would be an invention. (This is NOT the
+    same condition as a branch with no upstream; see the tracking tests below,
+    which exist because the two were once conflated.)"""
     answer = repo.staleness(root=ROOT, runner=_runner({}), now=NOW)
     assert (answer["state"], answer["reason"]) == (repo.UNKNOWN,
                                                   repo.NO_INTEGRATION_REF)
@@ -386,3 +389,111 @@ def test_cli_repo_stale_reports_and_does_not_gate(capsys):
     out = capsys.readouterr().out
     assert "checkout staleness:" in out
     assert "fetched" in out or "never fetched" in out
+
+
+# --- staleness: can this checkout even pull? ----------------------------------
+#
+# The second pairing, and the one this repo learned the hard way. `hive repo
+# stale` reported `current — 0 behind / 0 ahead of origin/HEAD` on a `master`
+# where `git pull` was failing outright with "There is no tracking information
+# for the current branch". Both halves were true and the pair was misleading:
+# the counts are measured against the ref a MERGE lands on, which resolves on
+# any clone, while pulling needs a ref THIS BRANCH tracks. So the probe reported
+# no drift for a checkout that had no mechanism to notice drift at all — the
+# 64-commit drift in the comment at the top of this section is what that
+# produces if left alone.
+
+def _tracking(branch="master", upstream="origin/master"):
+    """Stubs for the two tracking questions. An empty *upstream* is git's own
+    failure for a branch that tracks nothing."""
+    return {"rev-parse --abbrev-ref HEAD": (0, f"{branch}\n", ""),
+            "@{upstream}": ((0, f"{upstream}\n", "") if upstream
+                            else (128, "", "fatal: no upstream configured"))}
+
+
+def test_the_integration_ref_is_not_read_as_an_upstream():
+    """DISCRIMINATING, and the exact live defect: `origin/HEAD` resolves, the
+    counts come back zero, and the branch still tracks nothing. Both facts
+    ship."""
+    answer = repo.staleness(root=ROOT, now=NOW, runner=_stale_runner(
+        extra=_tracking(upstream="")))
+    assert answer["state"] == repo.CURRENT       # the drift answer is unchanged
+    assert answer["ref"] == "origin/HEAD"        # measured against the merge ref
+    assert answer["upstream"] == ""              # …which is not what it pulls
+    assert answer["upstream_missing"] is True
+
+
+def test_a_tracked_branch_reports_the_ref_it_actually_pulls():
+    answer = repo.staleness(root=ROOT, now=NOW,
+                            runner=_stale_runner(extra=_tracking()))
+    assert answer["upstream"] == "origin/master"
+    assert answer["upstream_missing"] is False
+    assert answer["branch"] == "master"
+
+
+def test_a_detached_head_reports_no_branch_rather_than_git_s_literal_HEAD():
+    """`git rev-parse --abbrev-ref HEAD` answers the string "HEAD" when
+    detached. Passing that through would name a branch that does not exist and
+    invite a set-upstream command that cannot work."""
+    answer = repo.staleness(root=ROOT, now=NOW, runner=_stale_runner(
+        extra=_tracking(branch="HEAD", upstream="")))
+    assert answer["branch"] == ""
+    assert answer["upstream_missing"] is True
+
+
+def test_the_tracking_question_is_asked_even_when_the_drift_one_cannot_be():
+    """An unknown state is where a broken pull is MOST likely, so the probe
+    still asks. `git pull` being broken is the actionable half."""
+    answer = repo.staleness(root=ROOT, now=NOW,
+                            runner=_runner(_tracking(upstream="")))
+    assert answer["reason"] == repo.NO_INTEGRATION_REF
+    assert (answer["branch"], answer["upstream_missing"]) == ("master", True)
+
+
+def test_an_unreadable_tracking_probe_is_missing_not_present():
+    """Same rule as the fetch age: "we could not ask" is not evidence that
+    `git pull` works."""
+    answer = repo.staleness(root=ROOT, now=NOW, runner=_stale_runner())
+    assert answer["upstream_missing"] is True and answer["upstream"] == ""
+
+
+def test_tracking_answers_on_its_own_without_running_the_drift_probe():
+    """It is split out to be cheap: two git calls against staleness's five, so
+    the orient path can afford to ask every session."""
+    log = []
+    answer = repo.tracking(root=ROOT, runner=_runner(_tracking(), log=log))
+    assert answer == {"branch": "master", "upstream": "origin/master",
+                      "upstream_missing": False}
+    assert not any("rev-list" in cmd for cmd in log), log
+    assert len(log) == 2, log
+
+
+def test_tracking_outside_a_checkout_is_missing_not_present(monkeypatch):
+    monkeypatch.setattr(repo, "worktree_root", lambda: None)
+    answer = repo.tracking(runner=_runner({}))
+    assert answer["upstream_missing"] is True and answer["branch"] == ""
+
+
+def test_cli_repo_stale_names_a_missing_upstream_and_how_to_fix_it(capsys,
+                                                                   monkeypatch):
+    monkeypatch.setattr(repo, "staleness", lambda **kw: repo._stale_answer(
+        repo.CURRENT, ref="origin/HEAD", branch="master", upstream="",
+        fetch_age_hours=0.1))
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["repo", "stale"]) == 0
+    out = capsys.readouterr().out
+    assert "current — 0 behind" in out           # the old answer still shows
+    assert "no upstream" in out                  # …and no longer stands alone
+    assert "--set-upstream-to=origin/master master" in out
+
+
+def test_cli_repo_stale_does_not_add_an_upstream_line_outside_a_checkout(
+        capsys, monkeypatch):
+    """`no_checkout` already said it. A second line about tracking refs would
+    bury the reason the user can act on."""
+    monkeypatch.setattr(repo, "staleness", lambda **kw: repo._stale_answer(
+        repo.UNKNOWN, reason=repo.NO_CHECKOUT, detail="not inside a git checkout"))
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["repo", "stale"]) == 0
+    out = capsys.readouterr().out
+    assert "no_checkout" in out and "no upstream" not in out
