@@ -216,13 +216,27 @@ suite, with a mutant half that must fail.
 
 ---
 
-## 10. `/api/projects` cannot hit the memo it was given — 60 namespaces, an 8-slot LRU
+## 10. ~~`/api/projects` cannot hit the memo it was given — 60 namespaces, an 8-slot LRU~~ — DONE
 
-**Source:** the T1 after-measurement, 2026-08-14
-([T1 AFTER](docs/plans/2026-08-10-001-fix-feedback-loop-five-surfaces-plan.md)).
+Closed 2026-08-15. `_STATS_MEMO` now carries its own bound (`_STATS_MEMO_MAX` = 512) via
+`_BoundedMemo`, an `OrderedDict` subclass holding `max_entries`; the two fold-holding memos
+keep `_MEMO_MAX` = 8. The trap below was honoured — the shared constant was **not** raised, and
+a test asserts it stays at or under 16 so a later change cannot quietly take that shortcut.
 
-**What:** give `_STATS_MEMO` a bound sized for the namespace count, separately from the two
-memos it currently shares `_MEMO_MAX` with.
+The same three passes that cost 1329 / 1214 / 2134 ms holding 8 entries now cost
+**1002 / 9.3 / 8.4 ms holding all 60**; end to end over HTTP, warm requests went from
+1.76–1.86 s to **35–56 ms**. Memory was measured rather than estimated: 443.5 KiB for a fully
+populated 60-entry memo, 7.6 KiB mean, and the size tracks segment *files* rather than entries.
+The after-measurement is `T5 RESULT` in the plan, which supersedes `T1 AFTER`'s reading of this
+endpoint as unimprovable.
+
+Kept rather than deleted, for the same reason as item 9: the diagnosis is the reusable part. An
+LRU whose bound is smaller than a sequential scan over its key set has a **0%** hit rate, not a
+reduced one — every pass restarts at the key evicted earliest. Any future memo added in front
+of a whole-namespace walk inherits this the moment its bound drops under the namespace count.
+
+**What it was:** give `_STATS_MEMO` a bound sized for the namespace count, separately from the two
+memos it then shared `_MEMO_MAX` with.
 
 **Why:** `_get_projects` ([dashboard_get.py:62](src/mindhive/dashboard_get.py:62)) calls
 `_project_stats` for **every** namespace, and this machine has 60. `_MEMO_MAX` is 8
@@ -251,12 +265,13 @@ different payload sizes.
 the rest cold — it is a 300x win, and that is the picker's pattern and `/api/mindnet/cats`'s.
 `/api/projects` is the exact inverse of it inside one request.
 
-**Behavioural cover needed:** a test that is RED on today's code — a second pass over more than
-`_MEMO_MAX` namespaces must be materially cheaper than the first, or the memo must retain an
-entry per namespace touched.
-
-**Status:** spun out as its own session on 2026-08-14. If that landed, close this item; if it
-did not, the measurement above is the whole starting point.
+**Behavioural cover:** four cases in `tests/test_dashboard_locks.py`, each canary-checked against
+mutants. `test_the_picker_caches_every_namespace_it_walks` was the RED-on-old-code one — it seeds
+`_MEMO_MAX + 4` namespaces, polls twice and asserts zero ledger reads on the second pass, with its
+own guard that the first pass *did* read so it cannot pass for a picker that stopped reading
+altogether. `test_the_fold_holding_memos_keep_their_own_small_bound` is the one that makes "just
+raise the shared constant" fail. The other two guard the 512 ceiling in both directions and pin
+the `getattr` fallback branch for a memo carrying no bound.
 
 **A worked precedent now exists.** `/api/overview` hit the identical wall — one request folds
 every namespace — and took the separate-bound route rather than raising `_MEMO_MAX`:

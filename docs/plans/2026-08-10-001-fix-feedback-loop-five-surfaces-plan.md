@@ -992,6 +992,12 @@ hits.** `/api/mindnet/cats` answers in 16–24 ms on the hit path against 0.87�
 and 6.0 s under load before. The other three are untouched by the cache layer, and
 `/api/projects` **cannot be helped by the memo it was given** — measured below, not inferred.
 
+> **Superseded 2026-08-15 — see `T5 RESULT` below.** "The memo it was given" was the operative
+> phrase and it turned out to be the whole defect: the memo was fine, its *bound* was shared with
+> two memos holding a far larger payload. Given its own bound, this endpoint went to 35–56 ms
+> warm. The measurements in this section are left exactly as taken — they were accurate for the
+> code that existed on 2026-08-14 — but the conclusion drawn from them was too strong.
+
 Taken with `hive bench dashboard` (this plan's successor added it: `src/mindhive/bench.py`), so
 the method is now a command anyone can re-run rather than a shell transcript:
 
@@ -1053,7 +1059,8 @@ columns and the 54461 column, which is consistent with the uptime finding below.
 * **`/api/projects` — NOT improved.** 1781 ms isolated against 1.76–1.86 s before; 12841 ms
   live against 11.7–12.4 s before. Its warm rows are sometimes *slower* than its cold row
   (2172 vs 1781; 9845 is only 23% under 12841). T5's memo is real and reached, and it still
-  cannot help this endpoint — mechanism measured below.
+  cannot help this endpoint — mechanism measured below. **[Superseded 2026-08-15: it could,
+  once given its own bound. 35–56 ms warm. See `T5 RESULT`.]**
 * **`/api/overview` — not improved by the cache, because no cache touches it.**
   `_get_overview` (`src/mindhive/dashboard_get.py:94`) calls `events.read_all(proj)` and
   `chain.verify` on every request, with no memo of any kind. The lower numbers (924 ms vs
@@ -1199,6 +1206,75 @@ about `hive log` over-claiming when `MINDHIVE_SESSION` is unset applies here).
 response exceeds the 2500 ms interval, which does not happen on an idle preview server
 (0.9–1.9s). The before/after number belongs after T6 lands, taken on the live setup under the
 verification conditions above.
+
+## T5 RESULT — the picker memo's bound (measured 2026-08-14)
+
+T5 landed a stat-only fingerprint gate over `_project_stats` and it worked. The BOUND made it
+unreachable: `_memo_put` read one module-global `_MEMO_MAX = 8` for all three memos, and
+`_STATS_MEMO`'s access pattern is a sequential scan of every namespace — `_get_projects` loops
+`_all_projects()`, then `default_project()` loops it again in the same handler. A sequential
+scan longer than the bound is the one pattern an LRU degrades to **zero** on: each pass evicts
+the key the next pass needs first. 60 namespaces, 8 slots, 0% hit rate.
+
+Fix: `_BoundedMemo` carries its own `max_entries`, so `_STATS_MEMO` gets `_STATS_MEMO_MAX = 512`
+while `_SESSIONS_MEMO` and `_CATS_MEMO` stay at 8 — their entries each hold a full telemetry
+fold plus every session record, which is the size the small cap was chosen for. The bound
+travels with the memo rather than arriving as a `_memo_put(bound=…)` argument because that
+function has four call sites across three modules, and one that forgot would silently restore
+this defect.
+
+In-process, three identical passes over all 60 namespaces:
+
+```
+                      before                      after
+pass 1 (cold)         1328.8 ms                   1001.7 ms
+pass 2 (warm)         1213.6 ms                      9.3 ms
+pass 3 (warm)         2133.5 ms                      8.4 ms
+memo entries after         8 (of 60)                  60
+one hot namespace 2x  1207.0 -> 4.0 ms            449.3 -> 2.2 ms
+```
+
+End-to-end over real HTTP, against the real store, compared with the T1 RESULT table above:
+
+```
+/api/projects     54471 alone, before      isolated server, after
+                  1.76 - 1.86s             0.035 - 0.056s     (~35-50x)
+```
+
+**Conditions, stated because they differ from T1's.** The after row is a `ThreadingHTTPServer`
++ `dashboard.make_handler` on an ephemeral port — the same server the suite stands up — driven
+by `urllib`, not `curl -w` on 54471. That substitution is deliberate: `dashboard.serve()` runs
+the boot seal (`jobs.seal_orphans`, which appends) and starts `_auto_harvest_loop` (which
+appends), so a second `serve()` against the store the live 54461 dashboard owns would break
+the single-writer assumption in `jobs.py`. `make_handler` exercises the identical route and
+writes nothing. The live 54461 process was never touched.
+
+The after row is the WARM figure — every poll after the first, which is what the picker does.
+Cold varies with the OS file cache, 845 ms to 6181 ms across two runs of the same script; the
+6181 ms run followed a full pytest suite. The before column's 1.76–1.86s was a range over
+repeated requests, and at that commit warm and cold were the same thing, which is the defect.
+
+**Not measured:** the `54461 real load` column. That needs a browser attached to the live
+process with both pollers running, and it is the condition the T1 verification note asks for.
+The other three endpoints in the T1 table are untouched by this change.
+
+Regression cover: `test_the_picker_caches_every_namespace_it_walks` (behavioural, and it
+carries a canary — the first poll must be seen reading one ledger per namespace, or `reads ==
+0` would also pass for a picker that stopped reading at all) and
+`test_the_fold_holding_memos_keep_their_own_small_bound` (discriminating: it asserts
+`_MEMO_MAX <= 16` and that both fold-holding memos still evict there, so raising the shared
+constant cannot pass it). Both shown RED at baseline — `24 == 0` re-reads across 12 namespaces,
+and `8 of 24` picker entries retained.
+
+Memory cost, measured rather than assumed: a fully populated `_STATS_MEMO` over this machine's
+real store is 443.5 KiB for all 60 entries (7.6 KiB mean). The size tracks segment FILES, not
+entries — the fingerprint is one `[size, mtime_ns]` pair per segment — so `mindhive` (888
+segments, 197 KiB) and `hanif` (667, 155 KiB) hold 87% of it. 512 is a backstop, not the
+working size: `_project_stats` has exactly two callers and both iterate `_all_projects()`, so
+no key that is not a namespace on disk can ever be written.
+
+Green on all three tiers: **4845 passed, 89 deselected** (377s), `-m node` **75 passed**,
+`-m browser` **14 passed**.
 
 ## Design reference board
 

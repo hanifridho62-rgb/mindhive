@@ -49,7 +49,8 @@ from .dashboard_locks import (REFLECT_BATCH_LIMIT,  # noqa: F401
                               _SELFTEST_LOCK, _SYNC_LOCK, _VERIFY_LOCK,
                               _one_at_a_time)
 from .dashboard_memo import (_CATS_MEMO, _MEMO_MAX,  # noqa: F401
-                             _SESSIONS_MEMO, _STATS_MEMO, _fingerprinted,
+                             _SESSIONS_MEMO, _STATS_MEMO, _STATS_MEMO_MAX,
+                             _BoundedMemo, _fingerprinted,
                              _ledger_fingerprint, _memo_get, _memo_put,
                              _sessions_cached, _with_online)
 
