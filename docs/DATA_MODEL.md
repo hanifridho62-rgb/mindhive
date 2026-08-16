@@ -1363,31 +1363,54 @@ both used to degrade with nothing said.
 **`context_budget.json`** — `paths.project_dir()/context_budget.json`:
 
 ```json
-{"budget": 51000, "memory_lines": 200, "set_at": "2026-08-13T00:00:00Z"}
+{"budget": 51000, "memory_lines": 200, "memory_bytes": 25000,
+ "set_at": "2026-08-13T00:00:00Z"}
 ```
 
 Config, not a projection: it is not rebuildable from the ledger, exactly like
 `rules/enforce.json`. `budget` is the namespace's estimated-token ceiling for the
-auto-loaded surface; `memory_lines` is the line budget for the native `MEMORY.md`.
-Writes **merge**: setting the token budget never discards a line budget set
-earlier. A missing, corrupt or non-positive value reads as unset (token budget) or
-as `context.MEMORY_LINE_BUDGET` (line budget) — a bad value must not silence a
-real measurement.
+auto-loaded surface; `memory_lines` and `memory_bytes` are the two cuts the native
+loader applies to `MEMORY.md`. Writes **merge over all three**: these are set at
+three different moments, and setting one must never discard another. A missing,
+corrupt or non-positive value reads as unset (token budget) or as
+`context.MEMORY_LINE_BUDGET` / `context.MEMORY_BYTE_BUDGET` — a bad value must not
+silence a real measurement.
 
-Those two numbers bound different failures, which is why they are separate:
+Those numbers bound different failures, which is why they are separate:
 
 | | Bounds | Past it |
 |---|---|---|
 | `budget` | **cost** — tokens spent before work starts | reported; `hive context --check` exits 1 |
 | `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set |
+| `memory_bytes` | **loss** — and the cut that actually bit | same, and it is the one to check first: measured live at 404a7c0, the delivered digest stopped at LF byte ~24,900 |
 
-The loss case is the subtler one. `sync` caps ITEM COUNTS (`LESSONS_CAP`,
-`DECISIONS_CAP`) and no item count bounds lines, so the digest grew past the
-loader's limit and lost the two sections written last — the lessons and decisions
-the caps existed to protect. `context.memory_pressure` names which sections fall
-past the cut, `hive sync` warns the moment it writes such a file, and the
-`memory_truncated` finding is **high** severity because every other finding
-suggests trimming while this one reports something already gone.
+The loss case is the subtler one, and it has bitten twice for two different
+reasons. First: `sync` caps ITEM COUNTS (`LESSONS_CAP`, `DECISIONS_CAP`) and no
+item count bounds lines, so the digest grew past the loader's limit and lost the
+two sections written last — the lessons and decisions the caps existed to protect.
+Second, and only visible once measured: the loader's cut is a **byte** cut on
+LF-normalised content, not the line cut this sidecar originally modelled. At
+404a7c0 `MEMORY.md` was 202 lines against a 200-line budget, so the report read
+"over by 1" with `dropped == []`, while what a session actually received stopped
+at line 188 and `## Key decisions` (line 195) never arrived — a 14-line,
+whole-section loss reported as one line.
+
+Two consequences are load-bearing for anyone touching `context.memory_pressure`:
+
+* **Bytes are measured on the decoded text re-encoded as UTF-8, never
+  `stat().st_size`.** `sync` writes in text mode, so on Windows the file on disk
+  carries CRLF and is one byte per line larger than what the loader reads
+  (measured: 26,560 on disk vs 26,359 LF — a delta of exactly 201, the line
+  count). A guard reading `st_size` over-trims by that much forever.
+* **Both cuts are computed and the EARLIER one is reported** (`pressure["cut"]`
+  names its unit; `pressure["truncated"]` is the field callers branch on).
+  Reporting the other cut understates the damage, which is precisely how a
+  fourteen-line loss got reported as one.
+
+`context.memory_pressure` names which sections fall past that first cut, `hive
+sync` warns the moment it writes such a file, and the `memory_truncated` finding
+is **high** severity because every other finding suggests trimming while this one
+reports something already gone.
 
 **The per-prompt SOP budget** (`sopgate.PROMPT_BUDGET`, a constant rather than a
 sidecar — raising it is a code decision to spend more on every prompt, not a knob).
@@ -1623,9 +1646,14 @@ starts a process.
    `sop.fold`. Tests assert this.
 3. **Reads are total.** New code must skip malformed/unknown payloads, not
    raise — the ledger contains history written by every past version.
-4. **Context delivery is budgeted.** MEMORY.md caps: lessons 10 (pinned
-   first), decisions 5, timeline 40, SOP block `sop.BLOCK_FULL_BUDGET`.
-   Anything unbounded that rides MEMORY.md is a regression.
+4. **Context delivery is budgeted, in the unit the loader enforces.**
+   MEMORY.md caps: lessons 10 (pinned first), decisions 5, timeline 40, SOPs
+   `sop.DIGEST_ITEM_CAP` (titles + pointers — `BLOCK_FULL_BUDGET` bounds the
+   STATE.md rendering, a different file with no cut, and must not be cited as
+   MEMORY.md's bound: at 404a7c0 it was set *above* the delivery channel and
+   had never bitten). A cap on ITEM COUNT does not bound bytes, and bytes are
+   what the loader cuts on — so anything unbounded that rides MEMORY.md is a
+   regression, and so is a bound whose unit is not the loader's.
 5. **The semantic layer is optional.** Base install works without
    chromadb/sentence-transformers (`vectors._require_deps`).
 

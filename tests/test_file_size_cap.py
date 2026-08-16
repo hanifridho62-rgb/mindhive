@@ -18,8 +18,8 @@ that, and they close different holes:
 
 * an unlisted module going over → fail. This is the cap.
 * a LISTED module growing past its recorded count → fail. This is what keeps the
-  allowlist from turning into a licence. `__main__.py` is allowed to be 4082
-  lines; it is not allowed to become 4083.
+  allowlist from turning into a licence: a module is allowed to be exactly as
+  long as the day it was listed, and not one line longer.
 * a listed module dropping under the cap → fail, asking for its removal. Without
   this the list silently accumulates modules that were fixed years ago, and a
   future reader cannot tell which entries are live debt.
@@ -73,11 +73,32 @@ CAP = replenish.LINE_THRESHOLD
 # the same reason (see its docstring): inline argparse wiring would have added
 # forty more lines to this file, not three.
 #
+# Raised again, 4141 -> 4209, by the DX pass that added `hive plugins list`, the
+# did-you-mean suggester and the MEMORY.md byte budget. Same rule: the
+# arithmetic is written down rather than the number quietly edited.
+#   +33  `cmd_plugins_list` — a new command handler
+#   +10  its argparse block (3) and `--set-memory-bytes` (7)
+#    +8  the byte budget's gate and confirmation line in `cmd_context`
+#    +8  `cmd_plugins_list`'s empty case under `--json`: the hint moves to
+#        stderr and `{}` goes to stdout, so the stream stays parseable on the
+#        one machine guaranteed to hit that branch — the one that never scanned
+#    +7  the `_closest_command` shim over `cliparse`
+#    +4  the root parser taking `SuggestingParser` and a `metavar`
+#    +1  the `cliparse` import
+#    -3  `cmd_sync`, whose truncation warning collapsed onto the shared
+#        `context.pressure_headline` / `pressure_lost`
+# The suggester ITSELF is not in this number: `SuggestingParser` and its helpers
+# are 53 lines that went to `src/mindhive/cliparse.py` instead, because parser
+# BEHAVIOUR shared by all 21 subparser groups is not per-command wiring and does
+# not need the 39-command parser to be tested. That is the only reason this entry
+# moves by 60 and not by 113 — the split is the fix, and it was taken where it
+# was available.
+#
 # The real fix is splitting `__main__.py`, and raising a ceiling is not it. This
 # is a debt entry with its provenance attached, which is the most the list can
 # honestly hold until that split happens.
 ALLOWED = {
-    "__main__.py": 4141,          # the CLI surface; every command's argparse wiring
+    "__main__.py": 4209,          # the CLI surface; every command's argparse wiring
     "replenish.py": 2781,         # the suggestion lenses; a split is already deferred
     "workspace.py": 1462,         # MindParallel orchestration
     "research.py": 1353,          # Self-Reliant research runs

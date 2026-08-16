@@ -124,7 +124,8 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     sections.append("## Current State\n")
     sections.append("```\n"
                     + projector.compose_state(evs, project, include_rules=False,
-                                              suggestions=suggestions)
+                                              suggestions=suggestions,
+                                              digest=True)
                     + "```\n")
 
     rules_block = incidents.inject(project, evs=evs)

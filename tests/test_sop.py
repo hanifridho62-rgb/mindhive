@@ -172,13 +172,31 @@ def test_projector_delivers_block_and_ledger_entry():
     assert BODY in body
 
 
-def test_memory_md_variant_keeps_the_block():
-    # sync embeds compose_state(include_rules=False) into MEMORY.md — the SOP
-    # block must ride that variant or sessions never auto-load it.
+def test_the_rules_free_variant_still_carries_the_block():
+    # `include_rules=False` selects whether the PREVENTION RULES block rides,
+    # never whether SOPs do. Both state variants keep bodies inline; only the
+    # digest rendering (below) elides them.
     _add()
     evs = events.read_all()
-    assert "STANDARD OPERATING PROCEDURES" in \
-        projector.compose_state(evs, include_rules=False, suggestions="")
+    body = projector.compose_state(evs, include_rules=False, suggestions="")
+    assert "STANDARD OPERATING PROCEDURES" in body
+    assert BODY in body
+
+
+def test_the_digest_variant_swaps_bodies_for_pointers():
+    """This is the MEMORY.md path, and it is `digest=True` — NOT
+    `include_rules=False`, which is what the previous version of this test
+    exercised while its comment claimed otherwise. That test kept passing after
+    the digest rendering landed, so it would have gone on certifying a seam it
+    no longer touched."""
+    _add()
+    evs = events.read_all()
+    body = projector.compose_state(evs, include_rules=False, suggestions="",
+                                   digest=True)
+    assert "STANDARD OPERATING PROCEDURES" in body
+    assert "edit-discipline" in body
+    assert "hive sop show edit-discipline" in body
+    assert BODY not in body
 
 
 def test_briefing_lists_active_sops():

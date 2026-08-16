@@ -137,7 +137,7 @@ def suggested_skills_block(project=None, evs=None) -> str:
 
 
 def compose_state(evs, project=None, include_rules=True, suggestions=None,
-                  injection=None) -> str:
+                  injection=None, digest=False) -> str:
     """Full STATE.md text: the state body (with any reflection-health notice)
     plus the capped prevention-rules block appended when non-empty (KTD2 —
     STATE.md is the single delivery choke point for rules), plus the compact
@@ -177,7 +177,21 @@ def compose_state(evs, project=None, include_rules=True, suggestions=None,
     # include_rules=False state body into MEMORY.md and appends the rules
     # block separately, so gating SOPs on include_rules would drop them from
     # the one file every session auto-loads.
-    sop_block = sop.block(evs)
+    #
+    # `digest` picks the RENDERING, never whether they ride: STATE.md gets the
+    # bodies, MEMORY.md gets titles + pointers, because only MEMORY.md is
+    # auto-loaded into a channel the native loader cuts short. The ids whose
+    # mandatory bodies may be elided come from the `injection` measurement this
+    # function already computes above — a seam that exists, not a new file read
+    # — and anything unparseable yields an empty set, which keeps the bodies.
+    if digest:
+        injected = frozenset(
+            str(r.get("sop_id"))
+            for r in ((injection or {}).get("sops") or [])
+            if isinstance(r, dict) and r.get("delivered") == "body")
+        sop_block = sop.digest_block(evs, injected_ids=injected)
+    else:
+        sop_block = sop.block(evs)
     if sop_block:
         body = body + "\n" + sop_block + "\n"
     sugg = (suggested_skills_block(project, evs=evs)
