@@ -131,10 +131,38 @@ BUDGET_FILE = "context_budget.json"
 # sync`, right after writing it, and `hive context --check`, which gates on it.
 MEMORY_LINE_BUDGET = 200
 
+# Bytes of MEMORY.md the native loader will actually read, measured on
+# LF-NORMALIZED content — the frame the loader itself reports ("MEMORY.md is 201
+# lines and 25.7KB"), not the bytes on disk.
+#
+# The line budget alone was a wrong model, and wrong in the direction that keeps
+# it quiet. Measured on the live digest at 404a7c0: 202 lines against the
+# 200-line budget, so this module reported "over by 1" — while what the loader
+# actually delivered stopped at line 188, and '## Key decisions' (line 195) never
+# arrived. Fourteen lines and a whole section lost, reported as one line.
+#
+# 25,000 is inferred, not observed exactly: content through LF byte 24,878 was
+# delivered and the next line boundary is 25,024, so the true cap lies in
+# (24,878, 25,024] and 25,000 is the round candidate inside it. A guard that may
+# be ~120 bytes optimistic is strictly better than a line guard that is 25 KB
+# blind, and `memory_bytes` in BUDGET_FILE overrides it per namespace.
+#
+# Never measure this with `Path.stat().st_size`. `sync` writes through
+# `write_text`, so on Windows every \n becomes \r\n and the file on disk is one
+# byte per line larger than the content the loader reads — 26,560 on disk vs
+# 26,359 LF, a delta of exactly the line count.
+MEMORY_BYTE_BUDGET = 25_000
+
 # Sections of the digest, in the order `sync` writes them. Used to name WHICH
 # sections fall past the loader's cut — "over by 7 lines" is a number, "Key
 # decisions never arrives" is the consequence.
-_MEMORY_SECTION_RE = re.compile(r"^##+\s+(.+?)\s*$", re.MULTILINE)
+#
+# `#{1,6}`, not `##+`: the registry ('# STANDARD OPERATING PROCEDURES') and the
+# rules block ('# PREVENTION RULES') are TOP-LEVEL headings. Matching `##+` only
+# meant the field built to name what was lost could not see the two largest
+# things it might lose — a second, independent reason `dropped` came back empty
+# on a digest that was demonstrably losing sections.
+_MEMORY_SECTION_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
 
 def load_budget(project=None) -> int | None:
@@ -151,72 +179,172 @@ def load_budget(project=None) -> int | None:
         return None
 
 
-def save_budget(budget: int, project=None, memory_lines: int | None = None) -> dict:
+def save_budget(budget: int, project=None, memory_lines: int | None = None,
+                memory_bytes: int | None = None) -> dict:
     """Persist the namespace's token budget. Returns the stored record.
 
-    A `memory_lines` override is written only when given: absent, the file keeps
-    exactly the shape it has always had, so an older sidecar and a newer one both
-    read correctly and the default stays a constant in code rather than a value
-    silently baked into every namespace that ever ran this."""
+    An override is written only when given: absent, the file keeps exactly the
+    shape it has always had, so an older sidecar and a newer one both read
+    correctly and the defaults stay constants in code rather than values
+    silently baked into every namespace that ever ran this.
+
+    One sidecar now holds three numbers set at three different moments, so the
+    carry-forward is a merge over ALL of them from a single prior read: setting
+    the token budget must not silently discard a line or byte budget the
+    operator set earlier. `load_*` cannot answer "was it stored?" — they return
+    the default for absent and for corrupt alike — so the raw file is what
+    decides what carries forward."""
     import time
     data = {"budget": int(budget),
             "set_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"}
-    if memory_lines is None:
-        # Merge, never replace: setting the token budget must not silently
-        # discard a line budget the operator set earlier. `load_` cannot answer
-        # "was it stored?" — it returns the default for absent and for corrupt
-        # alike — so the raw file is what decides whether to carry one forward.
+    given = {"memory_lines": memory_lines, "memory_bytes": memory_bytes}
+    missing = [k for k, v in given.items() if v is None]
+    prior = {}
+    if missing:
         try:
-            prior = json.loads((paths.project_dir(project) / BUDGET_FILE)
-                               .read_text(encoding="utf-8"))
-            stored = prior.get("memory_lines") if isinstance(prior, dict) else None
-            if not isinstance(stored, bool) and isinstance(stored, (int, float)) \
-                    and stored > 0:
-                data["memory_lines"] = int(stored)
+            raw = json.loads((paths.project_dir(project) / BUDGET_FILE)
+                             .read_text(encoding="utf-8"))
+            prior = raw if isinstance(raw, dict) else {}
         except Exception:
-            pass
-    else:
-        data["memory_lines"] = int(memory_lines)
+            prior = {}
+    for key, value in given.items():
+        if value is not None:
+            data[key] = int(value)
+            continue
+        stored = prior.get(key)
+        if not isinstance(stored, bool) and isinstance(stored, (int, float)) \
+                and stored > 0:
+            data[key] = int(stored)
     paths.write_text_atomic(paths.project_dir(project) / BUDGET_FILE,
                             json.dumps(data, indent=2, sort_keys=True))
     return data
+
+
+def _load_positive(key: str, default: int, project=None) -> int:
+    """A positive integer from the budget sidecar, or `default`.
+
+    Total by construction: a missing, corrupt, boolean or non-positive value
+    reads as the default, because the wrong answer here is silence about a
+    truncated file."""
+    try:
+        obj = json.loads((paths.project_dir(project) / BUDGET_FILE)
+                         .read_text(encoding="utf-8"))
+        value = obj.get(key) if isinstance(obj, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        return int(value) if value > 0 else default
+    except Exception:
+        return default
+
+
+def load_memory_byte_budget(project=None) -> int:
+    """This namespace's MEMORY.md byte budget — the sidecar's `memory_bytes`, or
+    `MEMORY_BYTE_BUDGET`."""
+    return _load_positive("memory_bytes", MEMORY_BYTE_BUDGET, project)
 
 
 def load_memory_line_budget(project=None) -> int:
     """This namespace's MEMORY.md line budget — the sidecar's `memory_lines`, or
     `MEMORY_LINE_BUDGET`. Total: a corrupt or nonsensical value reads as the
     default, because the wrong answer here is silence about a truncated file."""
-    try:
-        path = paths.project_dir(project) / BUDGET_FILE
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        lines = obj.get("memory_lines") if isinstance(obj, dict) else None
-        if isinstance(lines, bool) or not isinstance(lines, (int, float)):
-            return MEMORY_LINE_BUDGET
-        return int(lines) if lines > 0 else MEMORY_LINE_BUDGET
-    except Exception:
-        return MEMORY_LINE_BUDGET
+    return _load_positive("memory_lines", MEMORY_LINE_BUDGET, project)
 
 
-def memory_pressure(path, budget: int | None = None, project=None) -> dict:
+def _char_offset_of_line(text: str, n: int) -> int:
+    """Character offset where line ``n + 1`` begins (0-based line count ``n``)."""
+    idx = 0
+    for _ in range(n):
+        nl = text.find("\n", idx)
+        if nl < 0:
+            return len(text)
+        idx = nl + 1
+    return idx
+
+
+def _char_offset_of_byte(text: str, nbytes: int) -> int:
+    """Character offset at which the UTF-8 encoding of ``text`` passes ``nbytes``.
+
+    ``errors="ignore"`` drops a multi-byte character straddling the boundary, so
+    the offset can be one character early — the right direction for a guard."""
+    raw = text.encode("utf-8")
+    if len(raw) <= nbytes:
+        return len(text)
+    return len(raw[:nbytes].decode("utf-8", errors="ignore"))
+
+
+def memory_pressure(path, budget: int | None = None, project=None,
+                    byte_budget: int | None = None) -> dict:
     """Does the native MEMORY.md fit the loader, and what is lost if not?
 
-    Returns ``{lines, budget, over, dropped, readable}``. ``dropped`` names the
-    digest sections that begin past the loader's cut — the sections a session
-    therefore never sees. Never raises: an unreadable or absent file reports
-    ``readable: False`` and zero pressure, because "we could not measure" must
-    not read as "it is fine"... which is why `over` is 0 there and `readable`
-    is the field a caller has to look at."""
+    Returns ``{lines, budget, over, bytes, byte_budget, over_bytes, cut,
+    truncated, dropped, readable, path}``.
+
+    TWO cuts, because the loader enforces two and this module used to model only
+    one. ``over`` is the line overflow, ``over_bytes`` the byte overflow on
+    LF-normalized content, and ``cut`` names whichever bites FIRST — that is the
+    one that decides what a session actually loses, and reporting the other
+    understates the damage. ``truncated`` is the field callers should branch on;
+    ``over`` alone answered "over by 1" about a digest that was losing fourteen
+    lines and a whole section.
+
+    ``dropped`` names the sections beginning past that first cut — the sections a
+    session therefore never sees.
+
+    Bytes are measured on the DECODED text re-encoded as UTF-8, never on
+    ``stat().st_size``: the on-disk file carries CRLF on Windows and is one byte
+    per line larger than what the loader reads. (``_read_text`` decodes with
+    ``errors="replace"``, so a corrupt digest is measured in the same frame the
+    loader sees rather than refusing to be measured at all.)
+
+    Never raises: an unreadable or absent file reports ``readable: False`` and
+    zero pressure, because "we could not measure" must not read as "it is
+    fine" — which is why ``truncated`` is False there and ``readable`` is the
+    field a caller has to look at."""
     budget = int(budget if budget is not None else load_memory_line_budget(project))
+    byte_budget = int(byte_budget if byte_budget is not None
+                      else load_memory_byte_budget(project))
     text = _read_text(Path(path)) if path else None
     if text is None:
-        return {"lines": 0, "budget": budget, "over": 0, "dropped": [],
+        return {"lines": 0, "budget": budget, "over": 0,
+                "bytes": 0, "byte_budget": byte_budget, "over_bytes": 0,
+                "cut": None, "truncated": False, "dropped": [],
                 "readable": False, "path": str(path or "")}
     lines = text.splitlines()
-    dropped = [m.group(1) for m in _MEMORY_SECTION_RE.finditer(text)
-               if text[:m.start()].count("\n") >= budget]
-    return {"lines": len(lines), "budget": budget,
-            "over": max(0, len(lines) - budget), "dropped": dropped,
-            "readable": True, "path": str(path)}
+    nbytes = len(text.encode("utf-8"))
+    over = max(0, len(lines) - budget)
+    over_bytes = max(0, nbytes - byte_budget)
+
+    cuts = []
+    if over:
+        cuts.append((_char_offset_of_line(text, budget), "lines"))
+    if over_bytes:
+        cuts.append((_char_offset_of_byte(text, byte_budget), "bytes"))
+    cut_at, cut = min(cuts) if cuts else (None, None)
+    dropped = ([m.group(1) for m in _MEMORY_SECTION_RE.finditer(text)
+                if m.start() >= cut_at] if cut_at is not None else [])
+
+    return {"lines": len(lines), "budget": budget, "over": over,
+            "bytes": nbytes, "byte_budget": byte_budget,
+            "over_bytes": over_bytes, "cut": cut, "truncated": cut is not None,
+            "dropped": dropped, "readable": True, "path": str(path)}
+
+
+def pressure_headline(pressure: dict) -> str:
+    """"MEMORY.md is X against a Y budget (over by Z)" — in the unit that bit.
+
+    One sentence, three callers (the finding, the probe, `hive sync`'s warning),
+    so the byte case cannot arrive at one surface and not the others."""
+    if pressure.get("cut") == "bytes":
+        return (f"MEMORY.md is {pressure['bytes']:,} bytes against a "
+                f"{pressure['byte_budget']:,}-byte loader budget (over by "
+                f"{pressure['over_bytes']:,})")
+    return (f"MEMORY.md is {pressure['lines']} lines against a "
+            f"{pressure['budget']}-line loader budget (over by "
+            f"{pressure['over']})")
+
+
+def pressure_lost(pressure: dict) -> str:
+    return ", ".join(pressure.get("dropped") or ()) or "the tail of the file"
 
 
 def estimate_tokens(text: str) -> int:
@@ -571,17 +699,15 @@ def _finding_memory_truncated(segments, project=None) -> list[Finding]:
         if s.name != "MEMORY.md" or not s.path:
             continue
         pressure = memory_pressure(s.path, project=project)
-        if not pressure["readable"] or not pressure["over"]:
+        if not pressure["readable"] or not pressure["truncated"]:
             continue
-        lost = (", ".join(pressure["dropped"]) if pressure["dropped"]
-                else "the tail of the file")
+        knob = "memory_bytes" if pressure["cut"] == "bytes" else "memory_lines"
         out.append(Finding(
             rule="memory_truncated", severity="high", subject=s.name,
-            message=(f"MEMORY.md is {pressure['lines']} lines against a "
-                     f"{pressure['budget']}-line loader budget (over by "
-                     f"{pressure['over']}). The loader reads part of the file, so "
-                     f"these never reach a session: {lost}. Trim the digest or "
-                     f"raise `memory_lines` in {BUDGET_FILE} deliberately."),
+            message=(f"{pressure_headline(pressure)}. The loader reads part of "
+                     f"the file, so these never reach a session: "
+                     f"{pressure_lost(pressure)}. Trim the digest or raise "
+                     f"`{knob}` in {BUDGET_FILE} deliberately."),
         ))
     return out
 
@@ -731,17 +857,16 @@ def _probe(project=None, path=None) -> outcomes.Report:
             outcomes.DEGRADED,
             f"MEMORY.md at {path} exists but could not be read — the pressure is "
             f"unmeasured, which is not the same as fine", pressure)
-    if pressure["over"]:
-        lost = ", ".join(pressure["dropped"]) or "the tail of the file"
+    if pressure["truncated"]:
         return outcomes.Report(
             outcomes.DEGRADED,
-            f"MEMORY.md is {pressure['lines']} lines against a "
-            f"{pressure['budget']}-line loader budget (over by "
-            f"{pressure['over']}) — these never reach a session: {lost}",
+            f"{pressure_headline(pressure)} — these never reach a session: "
+            f"{pressure_lost(pressure)}",
             pressure)
     return outcomes.Report(
         outcomes.DID_WORK,
         f"MEMORY.md is {pressure['lines']} of {pressure['budget']} loader lines "
+        f"and {pressure['bytes']:,} of {pressure['byte_budget']:,} bytes "
         f"— every section reaches a session", pressure)
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from contextlib import contextmanager
+from . import cliparse
 from . import events, projector, chain, paths
 from . import recall as recall_mod
 from . import export as export_mod
@@ -341,22 +342,30 @@ def cmd_context(args) -> int | None:
     origin = getattr(args, "origin", "all")
 
     set_memory_lines = getattr(args, "set_memory_lines", None)
-    if getattr(args, "set_budget", None) is not None or set_memory_lines is not None:
-        # One sidecar, one write. `--set-memory-lines` alone must not drop the
+    set_memory_bytes = getattr(args, "set_memory_bytes", None)
+    if (getattr(args, "set_budget", None) is not None
+            or set_memory_lines is not None or set_memory_bytes is not None):
+        # One sidecar, one write. A memory override alone must not drop the
         # token budget already stored there, so the current value is read back
-        # and rewritten when only the line budget is being changed.
+        # and rewritten when only a memory budget is being changed. The
+        # carry-forward between the two memory keys is save_budget's job.
         budget_value = getattr(args, "set_budget", None)
         if budget_value is None:
             budget_value = context_mod.load_budget(project)
         if budget_value is None:
-            print("error: --set-memory-lines needs a token budget too — pass "
+            flag = ("--set-memory-lines" if set_memory_lines is not None
+                    else "--set-memory-bytes")
+            print(f"error: {flag} needs a token budget too — pass "
                   "--set-budget N (the sidecar holds both)", file=sys.stderr)
             return 2
         data = context_mod.save_budget(budget_value, project=project,
-                                       memory_lines=set_memory_lines)
+                                       memory_lines=set_memory_lines,
+                                       memory_bytes=set_memory_bytes)
         print(f"context budget set to {data['budget']:,} est. tokens"
               + (f", MEMORY.md line budget {data['memory_lines']}"
                  if "memory_lines" in data else "")
+              + (f", MEMORY.md byte budget {data['memory_bytes']}"
+                 if "memory_bytes" in data else "")
               + f" (stored in {context_mod.BUDGET_FILE})")
         return None
 
@@ -2509,6 +2518,47 @@ def cmd_plugins_recommend(args) -> int | None:
     return None
 
 
+def cmd_plugins_list(args) -> int | None:
+    """The whole stored catalog — free and paid — as opposed to `recommend`,
+    which prints the top-N free picks.
+
+    Reads the snapshot on disk and never rescans: walking the plugin cache is
+    what `scan` and `autoscan` are for, and a `list` that silently paid that
+    cost would be a trap on the one command people reach for to look around."""
+    from . import plugins as plugins_mod
+    as_json = getattr(args, "json", False)
+    payload = plugins_mod.latest_catalog()
+    if not payload:
+        # The hint goes to stderr under --json and stdout otherwise. `--json` is
+        # a stream contract, and the empty case is exactly the one a machine
+        # that has never scanned hits first — prose on stdout there means the
+        # command is unparseable precisely when it is least expected to be.
+        print("(no plugin_catalog yet - run: hive plugins scan)",
+              file=sys.stderr if as_json else sys.stdout)
+        if as_json:
+            print("{}")
+        return None
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return None
+    c = payload.get("counts", {})
+    print(f"{c.get('plugins_total', 0)} plugins · {c.get('free', 0)} free · "
+          f"{c.get('paid', 0)} paid · {c.get('skills_total', 0)} skills "
+          f"(scanned {payload.get('scanned_at', '?')})")
+    for p in payload.get("free_plugins", []):
+        score = p.get("score", {}) or {}
+        eff = score.get("effectiveness", {}) or {}
+        flag = (f"  [demoted: {eff.get('demote_reason', '')}]"
+                if eff.get("demoted") else "")
+        print(f"  {p.get('name', '?')} {p.get('version', '')} "
+              f"· breadth {score.get('breadth_score', 0)} "
+              f"· rank {score.get('rank_score', 0)}{flag}")
+    for p in payload.get("paid_plugins", []):
+        print(f"  {p.get('name', '?')} {p.get('version', '')} "
+              f"  [paid: {p.get('free_reason', '')}]")
+    return None
+
+
 def cmd_skills_list(args) -> int | None:
     from . import plugins as plugins_mod
     res = plugins_mod.live_inventory()
@@ -2726,12 +2776,9 @@ def cmd_sync(args) -> int | None:
     # agent rather than to the person who ran sync.
     from . import context as context_mod
     pressure = context_mod.memory_pressure(native_path)
-    if pressure["readable"] and pressure["over"]:
-        lost = (", ".join(pressure["dropped"]) if pressure["dropped"]
-                else "the tail of the file")
-        print(f"warning: MEMORY.md is {pressure['lines']} lines against a "
-              f"{pressure['budget']}-line loader budget (over by "
-              f"{pressure['over']}); the loader will not reach: {lost}. "
+    if pressure["readable"] and pressure["truncated"]:
+        print(f"warning: {context_mod.pressure_headline(pressure)}; the loader "
+              f"will not reach: {context_mod.pressure_lost(pressure)}. "
               f"See `hive context --check`.", file=sys.stderr)
     return None
 
@@ -3135,11 +3182,22 @@ def cmd_enrich(args) -> int | None:
     return None
 
 
+def _closest_command(token: str, choices=None) -> str | None:
+    """`cliparse.closest_command` over the live top-level surface by default."""
+    if choices is None:
+        choices = cliparse.subparser_choices(_build_parser())
+    return cliparse.closest_command(token, choices)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the full `hive` argument parser. Every leaf subcommand binds its
     handler with set_defaults(func=...), so _run can dispatch on args.func."""
-    p = argparse.ArgumentParser(prog="hive", description="MIND HIVE memory CLI")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p = cliparse.SuggestingParser(prog="hive",
+                                  description="MIND HIVE memory CLI")
+    # metavar collapses the 39-name dump in the usage line to one placeholder.
+    # The per-command list with help text is unaffected — it renders from the
+    # choices, which `tests/test_docs_parity.py` still walks.
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
 
     a = sub.add_parser("append", help="append an event")
     a.add_argument("type")
@@ -3216,10 +3274,17 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(default: the native loader's own limit). Raising it "
                          "is a decision that the loader will read only part of "
                          "the file")
+    cx.add_argument("--set-memory-bytes", type=int, default=None,
+                    dest="set_memory_bytes",
+                    help="persist this namespace's MEMORY.md byte budget "
+                         "(default: the native loader's own limit, measured on "
+                         "LF-normalised content — not the on-disk size). "
+                         "Raising it is a decision that the loader will read "
+                         "only part of the file")
     cx.add_argument("--check", action="store_true",
                     help="exit 1 when the measured total exceeds the budget, or "
-                         "when MEMORY.md is past its line budget (the loader "
-                         "then drops the digest's tail sections)")
+                         "when MEMORY.md is past its line OR byte budget (the "
+                         "loader then drops the digest's tail sections)")
     cx.add_argument("--top", type=int, default=None,
                     help="show only the N heaviest contributors")
     cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",
@@ -3856,6 +3921,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- plugins (scan free skills/plugins, score, recommend) ---
     pl = sub.add_parser("plugins", help="catalog & recommend free skills/plugins")
     plsub = pl.add_subparsers(dest="plugins_cmd", required=True)
+    pll = plsub.add_parser("list", help="print the stored catalog: every plugin, free and paid")
+    pll.add_argument("--json", action="store_true", help="emit the raw catalog snapshot JSON")
+    pll.set_defaults(func=cmd_plugins_list)
     pls = plsub.add_parser("scan", help="scan cache, score, store a catalog snapshot")
     pls.add_argument("--cache", default=None, help="plugin cache dir (default: ~/.claude/plugins/cache)")
     pls.add_argument("--top", type=int, default=5, help="how many to recommend")

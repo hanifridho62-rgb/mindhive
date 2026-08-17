@@ -658,6 +658,38 @@ def test_cli_set_memory_lines_needs_a_token_budget(capsys):
     assert context.load_memory_line_budget(None) == 300
 
 
+def test_cli_set_memory_bytes_needs_a_token_budget_too(capsys):
+    """Same gate as the line budget, for the same reason: one sidecar holds all
+    three, so there is no half-configured state to write."""
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["context", "--set-memory-bytes", "24000"]) == 2
+    assert "--set-memory-bytes" in capsys.readouterr().err
+    assert cli_mod.main(["context", "--set-budget", "40000",
+                         "--set-memory-bytes", "24000"]) == 0
+    assert context.load_memory_byte_budget(None) == 24000
+
+
+def test_cli_confirmation_names_the_byte_budget_it_stored(capsys):
+    """The operator gets told what landed, not just that something did — the
+    byte budget is the one that actually decides truncation on this loader."""
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["context", "--set-budget", "40000",
+                         "--set-memory-bytes", "24000"]) == 0
+    assert "MEMORY.md byte budget 24000" in capsys.readouterr().out
+
+
+def test_cli_setting_one_memory_budget_keeps_the_other(capsys):
+    """Three numbers set at three different moments. Setting the newest one must
+    not silently erase the one the operator set last week."""
+    from mindhive import __main__ as cli_mod
+    assert cli_mod.main(["context", "--set-budget", "40000",
+                         "--set-memory-lines", "300"]) == 0
+    assert cli_mod.main(["context", "--set-budget", "40000",
+                         "--set-memory-bytes", "24000"]) == 0
+    assert context.load_memory_line_budget(None) == 300
+    assert context.load_memory_byte_budget(None) == 24000
+
+
 def test_sync_warns_when_the_digest_it_just_wrote_is_truncated(tmp_path,
                                                               monkeypatch,
                                                               capsys):
@@ -758,3 +790,122 @@ def test_probe_is_registered_and_defaults_to_the_main_repo_digest(monkeypatch):
                         lambda *a, **k: seen.append(1) or "C:/Users/x/repo")
     context._probe()
     assert seen, "the probe resolved its path without _memory_folder"
+
+
+# --------------------------------------------------------------------------
+# the BYTE dimension — the unit the loader actually enforces
+# --------------------------------------------------------------------------
+# Everything above models a LINE cap. Measured live at 404a7c0, that model was
+# wrong in a way that made it silent exactly when it mattered: MEMORY.md was 202
+# lines against a 200-line budget, so `memory_pressure` reported "over by 1" and
+# `dropped == []`. What the loader actually delivered stopped at LF byte ~24,900
+# — line 188 of 202 — and '## Key decisions' (line 195, byte 25,609) never
+# arrived at all. A 14-line, whole-section loss reported as one line.
+#
+# `dropped` was empty for a SECOND, independent reason: the section regex matched
+# `##+` only, and the registry and rules headings are single-hash. Both are fixed
+# here, and both have their own test, because either one alone still lies.
+
+def _heavy(tmp_path, nbytes: int, tail_section="Key decisions") -> Path:
+    """Few lines, many bytes — the shape a line budget cannot see."""
+    filler = "x" * 900
+    body = [filler for _ in range(max(1, nbytes // 901))]
+    return _write(tmp_path / "MEMORY.md",
+                  "\n".join(body + [f"## {tail_section}", "- something"]))
+
+
+def test_memory_pressure_reports_the_byte_overflow_and_what_it_costs(tmp_path):
+    path = _heavy(tmp_path, 30_000)
+    pressure = context.memory_pressure(path, budget=10_000, byte_budget=25_000)
+    assert pressure["over"] == 0                 # the LINE budget is untouched
+    assert pressure["over_bytes"] > 0
+    assert pressure["truncated"] is True
+    assert pressure["cut"] == "bytes"
+    assert pressure["dropped"] == ["Key decisions"]
+
+
+def test_the_byte_cut_is_measured_on_lf_content_not_on_the_bytes_on_disk(tmp_path):
+    """DISCRIMINATING, and the reason a `stat().st_size` guard is wrong.
+
+    `sync` writes with `write_text`, so on Windows every \\n becomes \\r\\n and the
+    file on disk is one byte per line LARGER than the content the loader reads.
+    Measured on the live digest: 26,560 on disk vs 26,359 LF — a delta of exactly
+    201, the line count. A guard reading st_size over-trims by that much forever."""
+    path = tmp_path / "MEMORY.md"
+    lf = ("y" * 98 + "\n") * 10                  # 990 LF bytes, 10 lines
+    path.write_bytes(lf.replace("\n", "\r\n").encode("utf-8"))   # 1000 on disk
+    assert path.stat().st_size == 1000
+    pressure = context.memory_pressure(path, budget=1000, byte_budget=995)
+    assert pressure["bytes"] == 990              # NOT 1000
+    assert pressure["over_bytes"] == 0
+    assert pressure["truncated"] is False
+
+
+def test_the_cut_that_bites_first_is_the_one_reported(tmp_path):
+    """Over both budgets, with a section between the two cuts: the earlier cut
+    decides what is lost, or the report understates the damage."""
+    path = _heavy(tmp_path, 30_000, tail_section="Tail")
+    pressure = context.memory_pressure(path, budget=5, byte_budget=25_000)
+    assert pressure["over"] > 0 and pressure["over_bytes"] > 0
+    assert pressure["cut"] == "lines"            # 5 lines bites long before 25 KB
+    assert "Tail" in pressure["dropped"]
+
+
+def test_dropped_names_a_single_hash_section_too(tmp_path):
+    """The live miss. '# STANDARD OPERATING PROCEDURES' and '# PREVENTION RULES'
+    are top-level headings; a `##+` regex cannot name either, so the field built
+    to say what was lost stayed empty while whole sections went missing."""
+    path = _write(tmp_path / "MEMORY.md",
+                  "\n".join([f"line {i}" for i in range(30)]
+                            + ["# STANDARD OPERATING PROCEDURES", "- x"]))
+    pressure = context.memory_pressure(path, budget=20)
+    assert pressure["dropped"] == ["STANDARD OPERATING PROCEDURES"]
+
+
+def test_memory_byte_budget_is_configurable_per_namespace():
+    assert context.load_memory_byte_budget("test") == context.MEMORY_BYTE_BUDGET
+    context.save_budget(30000, project="test", memory_bytes=40000)
+    assert context.load_memory_byte_budget("test") == 40000
+
+
+def test_setting_one_budget_never_wipes_the_other_two():
+    """One sidecar holds three numbers set at three different moments."""
+    context.save_budget(30000, project="test", memory_lines=400,
+                        memory_bytes=40000)
+    context.save_budget(31000, project="test")
+    assert context.load_budget("test") == 31000
+    assert context.load_memory_line_budget("test") == 400
+    assert context.load_memory_byte_budget("test") == 40000
+
+
+def test_corrupt_byte_budget_falls_back_to_the_default():
+    _write(paths.project_dir("test") / context.BUDGET_FILE,
+           '{"budget": 100, "memory_bytes": "banana"}')
+    assert context.load_memory_byte_budget("test") == context.MEMORY_BYTE_BUDGET
+
+
+def test_cli_check_fails_on_a_byte_truncated_digest(tmp_path, monkeypatch, capsys):
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _heavy(tmp_path, 30_000))
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 1
+    assert "TRUNCATED" in capsys.readouterr().err
+
+
+def test_cli_check_passes_when_the_digest_fits_both_cuts(tmp_path, monkeypatch,
+                                                         capsys):
+    """CANARY for the test above: same command, same budgets, a lighter file."""
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _heavy(tmp_path, 3_000))
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    assert "TRUNCATED" not in capsys.readouterr().err
+
+
+def test_probe_reports_byte_truncation_as_degraded(tmp_path):
+    """Before this, the probe certified the live 26 KB digest as 'every section
+    reaches a session' while '## Key decisions' reached none."""
+    report = context._probe(project="test", path=_heavy(tmp_path, 30_000))
+    assert report.outcome == outcomes.DEGRADED
+    assert not report.worked
+    assert "Key decisions" in report.summary

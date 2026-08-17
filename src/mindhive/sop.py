@@ -10,11 +10,22 @@ place, so the full lifecycle of every procedure stays auditable, and because
 ``sop`` is a semantic type it rides the LEDGER, the hash chain, the Memory
 view, and keyword recall for free.
 
-Delivery: the active set renders as one block appended to STATE.md
-(projector.compose_state), which sync embeds into the auto-loaded MEMORY.md —
-so every session starts with the SOPs in context. The block is budgeted:
-bodies beyond BLOCK_FULL_BUDGET render as title-only pointers instead of
-growing context cost forever (full text stays one `hive sop show` away).
+Delivery: TWO renderings of the same registry, because the two files they
+reach are read in different ways.
+
+* ``block()`` → STATE.md (``projector.compose_state``). Read on demand and in
+  full, so it carries the bodies; beyond ``BLOCK_FULL_BUDGET`` a body renders
+  as a title-only pointer instead of growing context cost forever.
+* ``digest_block()`` → the MEMORY.md digest ``sync`` writes
+  (``compose_state(..., digest=True)``). Auto-loaded, and the native loader
+  stops partway through it — so this one carries titles and `hive sop show`
+  pointers, bounded by ``DIGEST_ITEM_CAP``, and elides a mandatory body only
+  when ``sopgate`` is verifiably re-asserting it verbatim every prompt.
+
+The split exists because one rendering could not be both: at 404a7c0 the
+STATE.md block was 58.7% of an auto-loaded file that the loader was already
+cutting short, and the sections it pushed past the cut were the lessons and
+decisions the digest exists to deliver.
 
 Two tiers. An ordinary SOP is scope-matched: follow it when the task falls in
 its scope. A **mandatory** SOP (``mandatory: true`` on the event, `hive sop
@@ -52,6 +63,25 @@ MAX_TEXT_CHARS = 4000
 # Once the running total would exceed this, remaining SOPs render as one-line
 # pointers. Deterministic: same registry in, same block out.
 BLOCK_FULL_BUDGET = 16000
+
+# How many scope-matched SOPs the MEMORY.md digest names before it stops
+# listing and says how many it dropped.
+#
+# An ITEM cap, not a byte cap, and it belongs to a different file than
+# BLOCK_FULL_BUDGET on purpose. STATE.md is read on demand and has no cut;
+# MEMORY.md is auto-loaded and the native loader stops partway through it, so
+# the digest is the copy that must stay small. A byte bound would also pick
+# which procedures keep their bodies by `(created, sop_id)` — i.e. by age,
+# which has nothing to do with relevance — and would move the cliff every time
+# a body was edited. Naming every SOP and eliding every body makes the section
+# a near-constant instead: it grows one line per SOP, not one procedure.
+#
+# Measured, and the reason this exists: at 404a7c0 `block()` rendered 15,463
+# chars into a 202-line digest against a ~200-line loader budget — 58.7% of the
+# file — while BLOCK_FULL_BUDGET (16,000) had never once bitten, because the
+# ordinary bodies totalled 11,425. A ceiling set above the delivery channel is
+# not a budget.
+DIGEST_ITEM_CAP = 12
 
 
 def validate_payload(payload) -> None:
@@ -449,5 +479,77 @@ def block(evs) -> str:
         else:
             out.append(f"_(body elided for context budget — read it with: "
                        f"`hive sop show {r['sop_id']}`)_")
+        out.append("")
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def digest_block(evs, injected_ids=()) -> str:
+    """The MEMORY.md rendering of the same registry: titles and pointers.
+
+    A sibling of `block()` rather than a `digest=` branch inside it, so "the
+    STATE.md rendering did not move" is structural rather than something a test
+    has to keep proving. STATE.md is the full-fidelity read every pointer here
+    points at; this is the copy that has to survive a loader which stops partway
+    through the file.
+
+    Two tiers, handled differently because their delivery differs:
+
+    * **Scope-matched SOPs** render as one line each — id, version, title, and
+      the command that prints the body — up to `DIGEST_ITEM_CAP`, then a count
+      of what was not listed. Nothing is lost: `hive sop list` and `hive sop
+      show <id>` reach all of it, and STATE.md still carries every body inline.
+    * **Mandatory SOPs** keep their bodies UNLESS `injected_ids` says that same
+      body is already being re-asserted verbatim on every prompt. That
+      condition is the whole safety argument. `sopgate.probe` can report
+      `pointers_only` or `partial` — states in which the per-prompt pass ships
+      a pointer rather than the text — and eliding the body here in that state
+      would leave it in front of no reader at all. The caller derives the ids
+      from that measurement; an empty set (missing or corrupt sidecar, verdict
+      `silent`) therefore keeps every body, which is the fail-safe direction.
+
+    Pure: same `(evs, injected_ids)` in, same bytes out. `injected_ids` is used
+    only as a membership test, so a set, frozenset, list or tuple all render
+    identically.
+    """
+    sops = current(evs)
+    if not sops:
+        return ""
+    injected = set(injected_ids or ())
+    must = [r for r in sops if r.get("mandatory")]
+    rest = [r for r in sops if not r.get("mandatory")]
+    out = [
+        "# STANDARD OPERATING PROCEDURES (managed — `hive sop`)",
+        "_Digest view: titles and pointers. Full bodies ride STATE.md "
+        "(`hive state`); read one with `hive sop show <id>`, list them all with "
+        "`hive sop list`._",
+        "",
+    ]
+    if must:
+        out += [
+            "## MANDATORY — follow these on every task, without being asked",
+            "",
+        ]
+        for i, r in enumerate(must, 1):
+            out.append(f"### MANDATORY SOP {i}: {r['title']}  "
+                       f"`[{r['sop_id']} v{r['version']}]`")
+            if r["sop_id"] in injected:
+                # Wording constraint, not style: tests/test_sync.py asserts the
+                # literal "SOP injection" is ABSENT from a healthy digest, and
+                # healthy is exactly when this line renders.
+                out.append("_Body omitted here because the prompt hook "
+                           "re-asserts it verbatim every turn — read it with: "
+                           f"`hive sop show {r['sop_id']}`._")
+            else:
+                out.append(r["text"])
+            out.append("")
+    if rest:
+        out += ["## Scope-matched SOPs — follow when the task falls in scope",
+                ""]
+        for r in rest[:DIGEST_ITEM_CAP]:
+            out.append(f"- `{r['sop_id']}` v{r['version']}: {r['title']} "
+                       f"— `hive sop show {r['sop_id']}`")
+        extra = len(rest) - DIGEST_ITEM_CAP
+        if extra > 0:
+            out.append(f"- _(+{extra} more active SOP(s) — `hive sop list`)_")
         out.append("")
     return "\n".join(out).rstrip("\n") + "\n"
