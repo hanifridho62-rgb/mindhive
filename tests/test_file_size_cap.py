@@ -94,11 +94,54 @@ CAP = replenish.LINE_THRESHOLD
 # moves by 60 and not by 113 — the split is the fix, and it was taken where it
 # was available.
 #
+# Raised again, 4209 -> 4213, by the `hive pg` group (the Postgres read mirror
+# and its four AI tools). Same rule: the arithmetic, not a quiet edit.
+#   +1  a blank line separating the new block from `bench`'s
+#   +1  the `# --- pg (…) ---` section comment, matching every other block here
+#   +1  `from . import pgcli as pgcli_mod`
+#   +1  `pgcli_mod.register(sub)`
+# The group ITSELF — six subcommands, ~200 lines of argparse, printing and
+# envelope handling — is in `src/mindhive/pgcli.py`, which is why this moves by
+# 4 and not by 200. That is the same trade `bench.register` took, and `pg` being
+# the second module to take it is what retires the deviation its docstring
+# flagged: two self-registering groups is a convention, and `docs/session-legend.md`
+# now records it as one. `bench`'s own comment here was rewritten in place — same
+# line count — because it claimed to be the only such group, which stopped being
+# true in this change.
+#
 # The real fix is splitting `__main__.py`, and raising a ceiling is not it. This
 # is a debt entry with its provenance attached, which is the most the list can
 # honestly hold until that split happens.
+#
+# Raised again, 4213 -> 4235, by the semantic-index work — both in commands, not
+# in wiring:
+#   +9   `cmd_embed` now indexes BOTH collections (files and events) and prints
+#        each count, with a docstring saying why half a semantic layer is worse
+#        than none
+#   +13  `cmd_recall` renders TWO hit shapes: a file hit has `file`, an event
+#        hit has type/ts/session and no filename. The old line was
+#        `print(f"{h['file']}…")`, which raised KeyError on every event hit
+# The split is still the real fix. This is still a debt entry.
+#
+# `pgtools.py` was on this list and is NOT any more, which is the only outcome
+# the entry was ever supposed to have. It joined at 1180 as the AI tool surface
+# plus the shared result shaper, and the obvious split — shaper apart from tools
+# — was deferred because this repo had already been bitten by exactly that
+# refactor ("a mechanical module split silently breaks monkeypatch addresses"),
+# and mixing it into the change that added the tools would have left neither
+# verified. It was then raised twice: to 1253, when `_stale_notice` gained the
+# repair command and the actor who can run it, and to 1275, for a one-line
+# forwarder to the eighth tool in `pgsearch.py`.
+#
+# TODOS item 18 took the split as its own change. `pgshape.py` holds the shaper
+# at 460 lines and `pgtools.py` is 877 — both under the cap, so the entry is
+# DELETED rather than lowered, which is the win this file's own
+# `test_no_allowlisted_module_is_secretly_under_the_cap` exists to force. The
+# monkeypatch hazard was answered rather than hoped away: `pgtools` re-exports
+# every moved name and `tests/test_pgshape.py` asserts each is the same OBJECT,
+# and the names the tests actually patch never moved at all.
 ALLOWED = {
-    "__main__.py": 4209,          # the CLI surface; every command's argparse wiring
+    "__main__.py": 4235,          # the CLI surface; every command's argparse wiring
     "replenish.py": 2781,         # the suggestion lenses; a split is already deferred
     "workspace.py": 1462,         # MindParallel orchestration
     "research.py": 1353,          # Self-Reliant research runs

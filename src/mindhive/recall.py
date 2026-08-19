@@ -66,7 +66,19 @@ def _frontmatter_boost_tokens(text: str):
 def recall(query, project=None, semantic=False, limit=10, force=False):
     if semantic:
         from . import vectors
-        return vectors.semantic_recall(query, project=project, limit=limit, force=force)
+        # EVENT vectors first, files as the fallback. A file-level hit points at
+        # LEDGER/decisions.md and shows 200 characters of it; an event-level hit
+        # IS the decision, with its timestamp and session. The fallback is not
+        # decoration -- the event index is empty until `hive embed` has run
+        # once, and returning nothing there would look like "no such memory"
+        # rather than "not indexed yet".
+        if vectors.indexed_event_count(project) > 0:
+            hits = vectors.semantic_recall_events(query, project=project,
+                                                  limit=limit, force=force)
+            if hits:
+                return hits
+        return vectors.semantic_recall(query, project=project, limit=limit,
+                                       force=force)
     ldir = paths.project_dir(project) / "LEDGER"
     if not ldir.exists():
         return []

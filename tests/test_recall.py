@@ -168,3 +168,68 @@ def test_recall_regression_fee_tier_query():
     assert hits
     assert "fee" in hits[0]["snippet"].lower()
     assert "tier" in hits[0]["snippet"].lower()
+
+
+# --- which semantic index answers -------------------------------------------
+#
+# `--semantic` has two indexes behind it now. A file-level hit points at
+# LEDGER/decisions.md and shows 200 characters of it; an event-level hit IS the
+# decision, with its timestamp and session. These pin the routing between them,
+# because getting it wrong is invisible: both return plausible-looking hits.
+
+
+def _fake_vectors(monkeypatch, *, count, event_hits, file_hits):
+    """Replace the vector layer wholesale. Records what was asked of it."""
+    from mindhive import vectors
+    seen = {"events": 0, "files": 0}
+
+    def _count(project=None):
+        return count
+
+    def _events(query, project=None, limit=10, force=False, types=None):
+        seen["events"] += 1
+        return list(event_hits)
+
+    def _files(query, project=None, limit=10, force=False):
+        seen["files"] += 1
+        return list(file_hits)
+
+    monkeypatch.setattr(vectors, "indexed_event_count", _count)
+    monkeypatch.setattr(vectors, "semantic_recall_events", _events)
+    monkeypatch.setattr(vectors, "semantic_recall", _files)
+    return seen
+
+
+_EVENT_HIT = {"id": "abc", "type": "decision", "ts": "2026-01-01T00:00:00Z",
+              "session_id": "alpha", "snippet": "the memo itself", "score": 0.8}
+_FILE_HIT = {"file": "decisions.md", "snippet": "a file", "score": 0.5}
+
+
+def test_semantic_recall_prefers_the_event_index(monkeypatch):
+    seen = _fake_vectors(monkeypatch, count=42, event_hits=[_EVENT_HIT],
+                         file_hits=[_FILE_HIT])
+    hits = recall.recall("postgres", semantic=True)
+    assert hits == [_EVENT_HIT]
+    assert seen == {"events": 1, "files": 0}
+
+
+def test_semantic_recall_falls_back_when_nothing_is_indexed(monkeypatch):
+    """The event index is empty until `hive embed` has run once. Returning
+    nothing there would read as "no such memory" rather than "not indexed yet",
+    which is the more damaging of the two errors."""
+    seen = _fake_vectors(monkeypatch, count=0, event_hits=[_EVENT_HIT],
+                         file_hits=[_FILE_HIT])
+    hits = recall.recall("postgres", semantic=True)
+    assert hits == [_FILE_HIT]
+    assert seen == {"events": 0, "files": 1}, (
+        "the event index was queried despite being empty")
+
+
+def test_semantic_recall_falls_back_when_the_event_index_has_no_answer(
+        monkeypatch):
+    """A populated index that misses this particular query still leaves the
+    coarser file-level index worth asking."""
+    seen = _fake_vectors(monkeypatch, count=42, event_hits=[],
+                         file_hits=[_FILE_HIT])
+    assert recall.recall("postgres", semantic=True) == [_FILE_HIT]
+    assert seen == {"events": 1, "files": 1}

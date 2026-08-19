@@ -1,0 +1,44 @@
+-- 005_drop_unmatchable_order_index.sql -- delete an index nothing can use.
+--
+-- APPLIED FILES ARE IMMUTABLE, so this corrects 002 rather than editing it.
+--
+-- 002_indexes.sql created `events_order_idx (project, ts_key, segment,
+-- seg_line)` and its comment claims the ordered read gets "an index-order scan,
+-- no sort node". Measured against a real server on 37,452 real events, it does
+-- not, and -- this is the part worth writing down -- NO index can give it one.
+--
+-- Two independent reasons, both observed rather than reasoned:
+--
+-- 1. THE EXPRESSION NEVER MATCHES. `ts_key` is GENERATED ALWAYS AS
+--    (COALESCE(ts, '')), and Postgres does not rewrite an ORDER BY expression
+--    into a reference to the generated column that stores it.
+--    `pgstore.READ_ALL_SQL` must order by `COALESCE(ts, '')`, because the
+--    reader's view does not expose `ts_key` and the reader holds no privilege
+--    on the base table where it lives. An index on the EXPRESSION was built and
+--    tried, with and without an explicit COLLATE "C"; with `enable_seqscan=off`
+--    AND `enable_sort=off` the planner still chose a bitmap scan plus a sort
+--    over an index-ordered scan, which for a whole-namespace read is the right
+--    call -- ordered index access would mean 37k random heap fetches.
+--
+-- 2. THE BARRIER SITS IN BETWEEN. `mindhive_ro.events` is
+--    `security_barrier = true`, so every plan through it carries a Subquery
+--    Scan node between the ORDER BY and the table. The ordering is applied
+--    ABOVE the barrier, where no index on the base relation is reachable. This
+--    is structural, not a costing accident, and it holds for LIMIT queries too:
+--    `... ORDER BY COALESCE(ts,'') DESC LIMIT 20` through the view still plans
+--    as Parallel Seq Scan -> top-N heapsort.
+--
+-- The barrier is worth more than the sort. It is what stops a leaky operator
+-- from being evaluated against another namespace's rows before the project
+-- filter, and the sort it costs is 64-69 ms on 37k events -- paid only by
+-- `read_all_strict`, i.e. by the parity gate, not by any AI tool call. The
+-- filtered tool queries are unaffected: they get Index Cond on
+-- `events_session_idx` / `events_type_idx` and then a top-N heapsort over the
+-- few hundred matching rows (measured: 1.6 ms and 0.3 ms).
+--
+-- So the honest fix is to delete the index rather than to replace it. It can
+-- never be matched, nothing else references it, and every row loaded pays to
+-- maintain it. The claim in 002's comment is corrected in docs/DATA_MODEL.md
+-- rather than in 002, which is immutable.
+
+DROP INDEX IF EXISTS mindhive.events_order_idx;

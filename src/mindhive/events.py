@@ -314,41 +314,47 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None, proje
     seg = d / f"{session_id}.jsonl"
     with open(seg, "a", encoding="utf-8") as f:
         f.write(canonical_json(to_dict(ev)) + "\n")
-    _maybe_mirror_to_pg(ev, project)
     return ev
 
 
-def _maybe_mirror_to_pg(ev, project=None) -> None:
-    """Phase B dual-write seam. Default backend 'file' is a no-op so behavior is
-    unchanged. When MINDHIVE_EVENT_BACKEND is 'dual' or 'pg', mirror the event
-    into Postgres via the CC-v3 host bridge (event_write.append_pg), which never
-    raises — the file segment written just above is the source of truth, so a
-    Postgres failure degrades to file-only. The host import is deferred so
-    MindHive stays standalone (no asyncpg) in 'file' mode."""
-    backend = os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower()
-    if backend not in ("dual", "pg"):
-        return
-    try:
-        from scripts.core import event_write
-    except Exception:
-        return  # CC-v3 host bridge not importable -> stay file-only
-    event_write.append_pg(
-        project or paths.detect_project(),
-        ev.type, ev.payload, ev.session_id, ev.tags, ts=ev.ts,
-    )
+# THE APPEND PATH TOUCHES POSTGRES IN NO WAY AT ALL, under every value of
+# `MINDHIVE_EVENT_BACKEND`. `append_event` writes one line to one file and
+# returns.
+#
+# A `_maybe_mirror_to_pg` seam used to sit on that last line, calling
+# `pgstore.mirror_one`. It is gone, and its absence is the design rather than an
+# omission:
+#
+# * `pgstore` holds the READER credential and `mindhive_reader` is read-only at
+#   the ROLE level, so a single-row INSERT from there was refused by the server.
+#   The seam had been raising on every call since the day it was written.
+# * A row-level writer would have had to compute `seg_line` itself, and
+#   `pgmirror.scan_segments` numbers it by PHYSICAL line — blank and torn rows
+#   included. The two would have agreed until the first blank line.
+#
+# The mirror now follows the ledger through `pgmirror.refresh_changed`, which
+# reloads only the segments whose bytes moved and is called by the scheduled
+# `autosync` run and by `hive pg refresh`. `MINDHIVE_EVENT_BACKEND` keeps its
+# meaning for READS — see `_maybe_read_from_pg` directly below, which is now the
+# only seam in this module.
 
 
 def _maybe_read_from_pg(project=None):
-    """Phase B read seam (U8). Returns events from Postgres ONLY when the backend
-    is 'pg' (post-retirement); for 'file' and 'dual' the file store is still the
-    canonical read, so this returns None and the caller reads files. Falls back
-    to file (returns None) on any host/DB failure. Host import is deferred."""
+    """Read one namespace from the Postgres mirror, or None to read the files.
+
+    Returns rows ONLY under backend 'pg'. Under 'file' and 'dual' the file store
+    is still the canonical read, so this returns None before importing anything
+    and the caller falls through to the segments.
+
+    `read_all_or_none` is the TOTAL reader: None on any failure, never an empty
+    list, because an empty list is indistinguishable from a namespace with no
+    history. `read_all_strict` — the one with no fallback — is for the parity
+    gate and is deliberately not reachable from here."""
     if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower() != "pg":
         return None
     try:
-        from scripts.core import event_write
-
-        return event_write.read_pg(project or paths.detect_project())
+        from . import pgstore
+        return pgstore.read_all_or_none(project)
     except Exception:
         return None  # degrade to file read
 
