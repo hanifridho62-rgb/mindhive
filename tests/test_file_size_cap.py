@@ -94,11 +94,66 @@ CAP = replenish.LINE_THRESHOLD
 # moves by 60 and not by 113 — the split is the fix, and it was taken where it
 # was available.
 #
+# Raised again, 4209 -> 4213, by the `hive pg` group (the Postgres read mirror
+# and its four AI tools). Same rule: the arithmetic, not a quiet edit.
+#   +1  a blank line separating the new block from `bench`'s
+#   +1  the `# --- pg (…) ---` section comment, matching every other block here
+#   +1  `from . import pgcli as pgcli_mod`
+#   +1  `pgcli_mod.register(sub)`
+# The group ITSELF — six subcommands, ~200 lines of argparse, printing and
+# envelope handling — is in `src/mindhive/pgcli.py`, which is why this moves by
+# 4 and not by 200. That is the same trade `bench.register` took, and `pg` being
+# the second module to take it is what retires the deviation its docstring
+# flagged: two self-registering groups is a convention, and `docs/session-legend.md`
+# now records it as one. `bench`'s own comment here was rewritten in place — same
+# line count — because it claimed to be the only such group, which stopped being
+# true in this change.
+#
 # The real fix is splitting `__main__.py`, and raising a ceiling is not it. This
 # is a debt entry with its provenance attached, which is the most the list can
 # honestly hold until that split happens.
+#
+# Raised again, 4213 -> 4235, by the semantic-index work — both in commands, not
+# in wiring:
+#   +9   `cmd_embed` now indexes BOTH collections (files and events) and prints
+#        each count, with a docstring saying why half a semantic layer is worse
+#        than none
+#   +13  `cmd_recall` renders TWO hit shapes: a file hit has `file`, an event
+#        hit has type/ts/session and no filename. The old line was
+#        `print(f"{h['file']}…")`, which raised KeyError on every event hit
+# The split is still the real fix. This is still a debt entry.
+#
+# `pgtools.py` joins the list at 1180. It is the AI tool surface: seven tools,
+# each with argument validation, a paged SQL statement and a docstring the model
+# actually reads, plus the shared result shaper (truncation detection, payload
+# summarisation, the error envelope). The obvious split — shaper apart from
+# tools — is deferred rather than done here because this repo has already been
+# bitten by exactly that refactor: "a mechanical module split silently breaks
+# monkeypatch addresses", and `tests/test_pgtools.py` patches `pgtools._run`,
+# `pgtools._session` and `pgstore.mirror_health` by module path. Splitting it
+# in the same change that adds the tools would mix a refactor into a feature and
+# leave neither verified. Recorded in TODOS.md instead.
+#
+# 1233 -> 1253 (+20), and the raise is justified by what the lines DO rather than
+# by the file being on the list already. `_stale_notice` previously told a model
+# that the mirror was behind and why, and stopped there — problem and cause, no
+# fix and no actor. An agent reading it did the only thing it could: reach for
+# `hive pg rebuild`, get `MINDHIVE_PG_DSN_ADMIN is not set`, and have no way to
+# learn that the reader role it connects with is read-only at the ROLE level and
+# structurally cannot repair anything. The +20 lines name the repair command, name
+# who has to run it, and say why it is not the reader. That is the difference
+# between a notice and a dead end; it is not new surface area.
+# 1253 -> 1275 (+22), and the +22 is a FORWARDER, not a tool. The eighth tool
+# (`search_events_by_meaning`) lives in `pgsearch.py`, at 288 lines, because it
+# is the only one needing an encoder and NumPy while this module is imported by
+# `mcp_server` at startup to list every tool with the database down. What was
+# added here is the one-line call plus the docstring saying why the body is
+# elsewhere and why the dispatch table must still hold the callable. Putting the
+# ~150-line body here instead would have been the cheaper diff and the worse
+# module.
 ALLOWED = {
-    "__main__.py": 4209,          # the CLI surface; every command's argparse wiring
+    "__main__.py": 4235,          # the CLI surface; every command's argparse wiring
+    "pgtools.py": 1275,           # the eight AI tools + the shared result shaper
     "replenish.py": 2781,         # the suggestion lenses; a split is already deferred
     "workspace.py": 1462,         # MindParallel orchestration
     "research.py": 1353,          # Self-Reliant research runs

@@ -29,6 +29,36 @@ def register(project, transcripts, folder) -> list:
     return reg
 
 
+def _refresh_mirror(project) -> bool:
+    """Bring the Postgres read mirror level with the ledger. Best-effort.
+
+    THIS IS WHAT MAKES THE MIRROR FOLLOW THE LEDGER. Nothing on the append path
+    writes to Postgres — a single-row seam cannot, because the module on that
+    path holds a role-level read-only credential — so the mirror advances here,
+    on a schedule, reloading only the segments whose bytes moved.
+
+    Three properties, in the order of what they prevent:
+
+    1. **Costs one `os.environ.get` on a machine with no Postgres.** The admin
+       DSN is absent from a normal environment, which is the common case and must
+       stay free.
+    2. **Cannot fail a sync.** A projection that was written and a MEMORY.md that
+       was refreshed are not undone by a mirror that could not be reached; the
+       import is inside the guard so a missing driver is a False, not a crash.
+    3. **Silent is fine, invisible is not.** The return value rides the per-project
+       result row, and a mirror that did not advance still reports itself through
+       `mirror_health`'s `stale` — which now carries the repair command."""
+    import os
+    if not (os.environ.get("MINDHIVE_PG_DSN_ADMIN") or "").strip():
+        return False
+    try:
+        from . import pgmirror
+        out = pgmirror.refresh_changed(project)
+        return bool(out.get("verified", {}).get("ok"))
+    except Exception:
+        return False
+
+
 def run_all(now=None) -> list:
     """Auto-discover and capture EVERY project from Claude transcripts, then
     rebuild projections + graph for each project that changed this run. Write the
@@ -54,7 +84,8 @@ def run_all(now=None) -> list:
             graph.build(proj, semantic=False)
             results.append({"project": proj,
                             "new_events": info.get("new_events", 0),
-                            "synced": proj in folders})
+                            "synced": proj in folders,
+                            "mirrored": _refresh_mirror(proj)})
         except Exception as e:  # one bad project must not abort the rest
             results.append({"project": proj, "error": str(e)})
     return results

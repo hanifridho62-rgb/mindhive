@@ -490,7 +490,20 @@ def cmd_recall(args) -> int | None:
                                limit=args.limit, force=args.force):
         score = h.get("score")
         tag = f" [score {score:g}]" if isinstance(score, (int, float)) else ""
-        print(f"{h['file']}{tag}\n  {h['snippet']}")
+        # Two hit shapes reach here. A FILE hit carries `file`; an EVENT
+        # hit carries `type`/`ts`/`session_id` and no filename, because the
+        # thing found is a memo rather than a document. Rendering the
+        # event's own coordinates is the point of indexing events at all --
+        # 'decision, 2026-08-15, session manual' is citable,
+        # 'LEDGER/decisions.md' is not.
+        if "file" in h:
+            head = h["file"]
+        else:
+            head = f"{h.get('type') or 'event'} · {h.get('ts') or 'no ts'}"
+            if h.get("session_id"):
+                head += f" · {h['session_id']}"
+        print(f"{head}{tag}")
+        print(f"  {h['snippet']}")
     return None
 
 
@@ -525,8 +538,17 @@ def cmd_export(args) -> int | None:
 
 
 def cmd_embed(args) -> int | None:
+    """Index BOTH collections: the LEDGER projections and the events.
+
+    Both, not either, because they answer different questions -- "which file
+    covers this topic" against "which memo said this" -- and an operator who ran
+    `hive embed` and got only one of them has a semantic layer that silently
+    half-works. The event pass is incremental, so the second run costs a scan
+    rather than 37k encodes."""
     from . import vectors
-    print(json.dumps(vectors.embed(force=args.force)))
+    out = {"files": vectors.embed(force=args.force),
+           "events": vectors.embed_events(force=args.force)}
+    print(json.dumps(out))
     return None
 
 
@@ -3330,11 +3352,15 @@ def _build_parser() -> argparse.ArgumentParser:
     pkr.set_defaults(func=cmd_packs_report)
 
     # --- bench (time the dashboard's endpoints) ---
-    # The only group that registers its own parser instead of being wired
-    # inline here. Deliberate, and the reason is this file's size, not a new
-    # convention: see the comment above `bench.register`.
+    # First of the groups that register their own parser instead of being wired
+    # inline here. `pg` below is the second, which is what makes this the
+    # CONVENTION for a multi-subcommand group rather than bench's deviation.
     from . import bench as bench_mod
     bench_mod.register(sub)
+
+    # --- pg (the Postgres read mirror and its seven AI tools) ---
+    from . import pgcli as pgcli_mod
+    pgcli_mod.register(sub)
 
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)

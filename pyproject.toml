@@ -14,6 +14,19 @@ build = ["pyinstaller>=6"]
 # contributor install by reflex. Runtime `dependencies` stays empty — this never
 # reaches the PyInstaller binary.
 browser = ["playwright>=1.40"]
+# The Postgres read mirror (`hive pg`) and its MCP tool surface. TWO extras, not
+# one, because they fail at different times and want different messages: a
+# machine can legitimately have the driver and not the SDK, and
+# `pgstore._require_pg` / `mcp_server._require_mcp` each name only their own.
+# Runtime `dependencies` stays EMPTY — `hive`, the dashboard, the hooks and the
+# whole default test tier must keep working with neither installed, which is the
+# state of this machine and of CI.
+#
+# `psycopg[binary]` rather than plain `psycopg`: the source build needs libpq
+# headers, which a Windows developer does not have. Bounded below 4 so a future
+# major cannot land silently on the one platform this repo runs on.
+pg = ["psycopg[binary]>=3.3,<4", "psycopg_pool>=3.2"]
+mcp = ["mcp>=1.2"]
 
 [project.scripts]
 hive = "mindhive.__main__:main"
@@ -24,6 +37,17 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# `packages.find` finds PACKAGES, and ships `.py` files only. Without the entry
+# below the three migrations are present in a checkout and absent from every
+# wheel and from the frozen exe — and `pgmirror.apply_migrations` would then find
+# ZERO migrations and report success, because "nothing pending" and "nothing at
+# all" are indistinguishable to it. The operator gets an empty database and a
+# green command. `tests/test_pg_packaging.py` matches every file on disk against
+# these patterns, so a typo'd package name or a `*.psql` cannot satisfy the
+# declaration while shipping nothing.
+[tool.setuptools.package-data]
+"mindhive.pgmigrations" = ["*.sql"]
 
 [tool.pytest.ini_options]
 # `node` is deselected by DEFAULT, and that is the whole reason it exists.
@@ -40,5 +64,6 @@ where = ["src"]
 markers = [
     "node: JavaScript unit tests executed through the node binary. Deselected by default (see above); run with `pytest -m node`.",
     "browser: end-to-end tests that drive a real Chromium through Playwright. Deselected by default for the same reason as `node`, and additionally because they need `pip install -e .[browser]` plus `playwright install chromium`. Run with `pytest -m browser`.",
+    "pg: tests that need a live PostgreSQL server (MINDHIVE_PG_DSN_ADMIN and MINDHIVE_PG_DSN_RO). Deselected by default for the same reason as `node` and `browser`: no server exists on CI or on a fresh checkout, and a tier that errors everywhere is a tier people learn to ignore. Run with `pytest -m pg`. They are the only tests that can answer whether the SQL actually compiles, whether the reader role can actually read, and whether 37k events round-trip to the same chain head -- a fake cannot.",
 ]
-addopts = "-m 'not node and not browser'"
+addopts = "-m 'not node and not browser and not pg'"

@@ -249,6 +249,41 @@ def test_a_non_file_event_backend_bypasses_the_overview_memo(
     assert again["events"] == warm["events"], "the bypass changed the overview"
 
 
+def test_the_dual_backend_keeps_the_memo_because_it_still_reads_files(
+        dashboard_server, counters, monkeypatch):
+    """RED before the fix, and its sibling above is what let the defect through.
+
+    The guard disabled the memo for ANY backend that is not `file`, justified by
+    a docstring claiming `events.read_all` short-circuits to Postgres when the
+    backend is `pg` **or `dual`**. It does not. `_maybe_read_from_pg` returns
+    before its import unless the value is exactly `pg`, so under `dual` the
+    reader still folds the local segments — and `segment_stats` fingerprints
+    exactly the files that were just read. The stamp is as trustworthy as it is
+    under `file`.
+
+    `dual` is the FIRST step of the documented file → dual → pg path and it
+    changes nothing about reads, so the guard reverted a measured 1.6 ms →
+    751 ms on every poll of a dashboard that polls, buying no correctness.
+
+    The sibling test only ever exercised `pg`, where the guard and the reader
+    happen to agree — which is why a guard that disagreed with the reader on
+    `dual` passed every test in this file."""
+    base, token = dashboard_server
+    _seed()
+    _status, warm = _get(base, OVERVIEW, token)
+
+    monkeypatch.setenv("MINDHIVE_EVENT_BACKEND", "dual")
+
+    counters.reset()
+    status, again = _get(base, OVERVIEW, token)
+    assert status == 200
+    assert counters.reads.calls == 0, (
+        "`dual` re-read the ledger. Reads still come from the files under this "
+        "backend, so the segment fingerprint is exactly as trustworthy as it is "
+        "under `file` and the memo must still serve")
+    assert again["events"] == warm["events"], "the memo served a different answer"
+
+
 def test_the_overview_fingerprint_is_a_real_stamp_when_it_can_be_trusted():
     """CANARY for both guards above. They assert an ABSENCE of caching, which a
     fingerprint that returned None unconditionally would also produce — and that

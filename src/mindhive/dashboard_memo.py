@@ -123,18 +123,28 @@ def _ledger_fingerprint(proj) -> dict | None:
       key: `{} == {}` would score a hit, so one transient directory error would
       freeze the cached answer for the life of the process — silently, which is
       the one failure mode a cache must not have.
-    * **A non-file backend has no fingerprint at all.** `events.read_all`
-      short-circuits to Postgres when `MINDHIVE_EVENT_BACKEND` is `pg` or `dual`,
+    * **A `pg` backend has no fingerprint at all.** `events.read_all`
+      short-circuits to Postgres when `MINDHIVE_EVENT_BACKEND` is exactly `pg`,
       while `segment_stats` keeps stat'ing the local `.jsonl` segments — which,
       on the documented file → dual → pg migration path, are still on disk and
       never change again. The fingerprint would be non-empty and stable forever:
       every poll a hit, the view frozen at the first response, nothing reporting
       it.
 
+      **`dual` is NOT such a backend, and reading it as one was a defect.** This
+      guard said `!= "file"` and this paragraph said "`pg` or `dual`"; the
+      reader (`events._maybe_read_from_pg`) says `!= "pg"`. Under `dual` the
+      fold still comes off the local segments, so the stamp is exactly as
+      trustworthy as under `file` — and disabling the memo there cost a measured
+      1.6 ms → 751 ms on every poll, on the FIRST step of the migration path,
+      for no correctness at all. The comparison below is now spelled the same
+      way as the reader's, `.lower()` and all, so the two cannot disagree about
+      a value like `"pg "` either.
+
     Returning None for both, rather than a falsy-but-comparable value, is what
     makes the guards impossible to half-apply: there is no value here that a `==`
     can match, so an untrusted fingerprint cannot become a hit by accident."""
-    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").strip().lower() != "file":
+    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower() == "pg":
         return None
     from .mindnet import sidecar as sidecar_mod
     stats = sidecar_mod.segment_stats(proj)

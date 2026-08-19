@@ -118,3 +118,84 @@ jobs:
 
       - name: Run browser tier tests
         run: python -m pytest -m browser -q
+
+  # The pg tier, deselected by default for the same reason as node and browser:
+  # it needs a server, and a tier that errors on every fresh checkout is a tier
+  # people learn to ignore. Without this job NOTHING about the Postgres read
+  # mirror is verified on CI — not that the SQL compiles, not that the reader
+  # role can read, not that 37k events round-trip to the same chain head, not
+  # that a second statement cannot ride in on `query_database`. A green badge
+  # said nothing about any of it, which is the exact shape of the MCP defect
+  # this project already shipped: 37 passing tests around a `main()` that died
+  # on startup, because the seam chosen so tests need no dependency does not
+  # test the dependency.
+  #
+  # ubuntu only, and deliberately NOT folded into the OS/Python matrix: service
+  # containers are a Linux-runner feature, so `windows-latest` cannot host one,
+  # and the thing under test is SQL executed by a server whose behaviour has no
+  # client-OS dimension.
+  pg-tests:
+    name: pg tier (Postgres 17)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17          # pinned, never `latest` — migrations are
+        env:                        # digest-checked against this server's SQL
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mindhive
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # `.[pg]` on top of `.[dev]`: the driver is an extra precisely so the
+      # default tier keeps working without it, which is the state of a fresh
+      # checkout and of every other job in this file.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev,pg]
+
+      - name: Apply migrations
+        env:
+          MINDHIVE_PG_DSN_ADMIN: postgresql://postgres:postgres@localhost:5432/mindhive
+        run: python -m mindhive pg migrate
+
+      # STEP ORDER IS LOAD-BEARING: this must follow `pg migrate`, because
+      # `mindhive_reader` does not exist until 003 runs, and 003 creates it
+      # LOGIN with no password on purpose ("The operator sets it out of band
+      # ... so no secret is ever" committed). CI is one such operator.
+      #
+      # The password is GENERATED here and never written down: no repository
+      # secret, no literal in the tree, so
+      # `test_no_credential_literal_anywhere_in_src_or_tests` stays green with
+      # no allowlist entry. `::add-mask::` keeps it out of the run log.
+      - name: Give the reader role a password
+        env:
+          PGPASSWORD: postgres
+        run: |
+          PW=$(openssl rand -hex 16)
+          echo "::add-mask::$PW"
+          psql -h localhost -U postgres -d mindhive \
+            -c "ALTER ROLE mindhive_reader PASSWORD '$PW'"
+          echo "MINDHIVE_PG_DSN_RO=postgresql://mindhive_reader:$PW@localhost:5432/mindhive" \
+            >> "$GITHUB_ENV"
+
+      # `-m pg` overrides the deselect in pyproject.toml (-m is last-one-wins),
+      # exactly as the node and browser jobs above rely on.
+      - name: Run pg tier tests
+        env:
+          MINDHIVE_PG_DSN_ADMIN: postgresql://postgres:postgres@localhost:5432/mindhive
+        run: python -m pytest -m pg -q
