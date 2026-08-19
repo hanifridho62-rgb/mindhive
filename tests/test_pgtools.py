@@ -26,7 +26,7 @@ import time
 
 import pytest
 
-from mindhive import pgschema, pgstore, pgtools
+from mindhive import pgschema, pgsearch, pgstore, pgtools
 
 # Every registered tool, so the contract tests below (no tool raises, every
 # tool answers inside the budget, every response carries freshness) cover the
@@ -331,8 +331,17 @@ def test_every_tool_answers_backend_unavailable_with_no_server(name, monkeypatch
     `deps_available` is forced True so the assertion is about the SERVER being
     absent rather than the driver: on this machine both are true at once, and
     without the override every tool would legitimately answer `deps_missing` and
-    this test would prove the wrong half."""
+    this test would prove the wrong half.
+
+    `_missing_deps` is forced empty for the same reason and it is NOT the same
+    gate: `search_events_by_meaning` needs numpy and the encoder on top of the
+    driver, and CI installs .[dev,pg] without .[vectors]. Unforced, this one
+    parametrisation would assert `backend_unavailable` on a machine with the
+    extras and `deps_missing` on one without -- the same test proving two
+    different things, which is how it passed here and failed on all four CI
+    jobs."""
     monkeypatch.setattr(pgstore, "deps_available", lambda: True)
+    monkeypatch.setattr(pgsearch, "_missing_deps", lambda: [])
     env = _call(name, **_minimal_args(name))
     assert env["ok"] is False
     assert env["error"]["code"] == "backend_unavailable"
@@ -390,6 +399,7 @@ def test_an_open_breaker_is_reported_in_the_wire_vocabulary(name, monkeypatch):
     indistinguishable from an unreachable backend, and a code with no rule
     attached is a code the model invents behaviour for."""
     monkeypatch.setattr(pgstore, "unavailable_reason", lambda: "breaker_open")
+    monkeypatch.setattr(pgsearch, "_missing_deps", lambda: [])
     env = _call(name, **_minimal_args(name))
     assert env["error"]["code"] == "backend_unavailable"
     assert env["breaker"] == "open", "the real state is reported in its own field"
@@ -1235,28 +1245,38 @@ def test_every_published_error_code_is_reachable():
     that happened, a name that exists only in the vocabulary."""
     import ast
     from pathlib import Path
-    src = Path(pgtools.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    from mindhive import pgsearch, pgshape
 
-    docstrings = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef)):
-            doc = ast.get_docstring(node, clean=False)
-            if doc is not None:
-                docstrings.add(doc)
+    # THREE modules, because the surface is three modules: `pgshape` publishes
+    # the vocabulary and the remedies, `pgtools` raises most of them, and
+    # `pgsearch` is the only place `deps_missing` is ever reached. Scanning
+    # `pgtools` alone called that one dead the moment the split happened.
+    used, docstrings = set(), set()
+    for mod in (pgtools, pgshape, pgsearch):
+        tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc is not None:
+                    docstrings.add(doc)
 
-    # Every string literal EXCEPT the ones inside the ERROR_CODES tuple itself,
-    # which is the definition and cannot count as a use.
-    defining = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-                getattr(t, "id", None) == "ERROR_CODES" for t in node.targets):
-            defining = {id(n) for n in ast.walk(node.value)}
+        # The three VOCABULARY tables are definitions, and a definition cannot
+        # count as a use. Excluding `_REMEDIES` in particular is what keeps this
+        # test honest: a code with a remedy and no raise is precisely the dead
+        # entry being hunted.
+        defining = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", None) in ("ERROR_CODES", "_REASON_TO_WIRE",
+                                               "_REMEDIES")
+                    for t in node.targets):
+                defining |= {id(n) for n in ast.walk(node.value)}
 
-    used = {n.value for n in ast.walk(tree)
-            if isinstance(n, ast.Constant) and isinstance(n.value, str)
-            and n.value not in docstrings and id(n) not in defining}
+        used |= {n.value for n in ast.walk(tree)
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and id(n) not in defining}
+    used -= docstrings
 
     unreachable = [c for c in pgtools.ERROR_CODES if c not in used]
     assert unreachable == [], (
@@ -1268,7 +1288,10 @@ def test_the_scan_above_would_notice_a_dead_code():
     fail. Without this, an over-broad `used` set would pass for anything."""
     import ast
     from pathlib import Path
-    src = Path(pgtools.__file__).read_text(encoding="utf-8")
-    used = {n.value for n in ast.walk(ast.parse(src))
-            if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    from mindhive import pgsearch, pgshape
+    used = set()
+    for mod in (pgtools, pgshape, pgsearch):
+        src = Path(mod.__file__).read_text(encoding="utf-8")
+        used |= {n.value for n in ast.walk(ast.parse(src))
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)}
     assert "mirror_stale_but_fabricated" not in used

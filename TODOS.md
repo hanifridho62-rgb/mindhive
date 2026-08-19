@@ -469,7 +469,7 @@ card past 180 s, and a chat card must **leave the board** past 6 h. Each is RED 
 cached without a re-derivation seam, which is the point, and why this is a separate piece of work
 rather than a fourth line in `_overview_fingerprint`.
 
-## 18. `pgtools.py` is 1253 lines and now holds a twice-raised ceiling
+## 18. ~~`pgtools.py` is 1253 lines and now holds a twice-raised ceiling~~ — DONE
 
 `tests/test_file_size_cap.py` caps a module at 1000 lines. `pgtools.py` went past it
 with the state-shaped trio (`get_latest_event`, `search_events_by_type`,
@@ -495,6 +495,14 @@ that adds the tools would leave neither verified.
 `tests/test_pgtools.py` green before and after, and re-run `pytest -m pg` (32 tests, needs a
 server — and now a CI job, see item 20) because the shaper is what every one of those
 envelopes goes through.
+
+**Done, 2026-08-19.** `pgshape.py` is 460 lines, `pgtools.py` is 877, and the entry is
+**deleted** from `tests/test_file_size_cap.py` rather than lowered — both are under the
+1000-line cap. The block was moved by anchor-located line range rather than retyped, so its
+docstrings are byte-identical to what they were. The monkeypatch hazard was answered rather
+than hoped away: `pgtools` re-exports every moved name and `tests/test_pgshape.py` asserts
+each one is the SAME OBJECT as `pgshape`'s, so an import that silently forked into a copy
+fails a test instead of a production path. The names the tests actually patch never moved.
 
 ## 19. ~~The mirror does not follow the ledger — `_insert_one` still raises~~ — DONE
 

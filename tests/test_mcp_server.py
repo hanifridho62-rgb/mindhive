@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from mindhive import mcp_server, pgschema, pgstore, pgtools
+from mindhive import mcp_server, pgschema, pgsearch, pgstore, pgtools
 
 REPO = Path(__file__).resolve().parents[1]
 SRC = REPO / "src" / "mindhive"
@@ -152,8 +152,14 @@ def test_the_registry_and_the_dispatch_table_hold_the_same_names():
 def test_every_tool_fails_structurally_with_no_backend(name, monkeypatch):
     """S10's free gate. `deps_available` is forced True so this is about the
     SERVER being down rather than the driver being absent — on this machine both
-    are true, and the unforced case is covered below."""
+    are true, and the unforced case is covered below.
+
+    `_missing_deps` is the eighth tool's own gate, forced for the same reason:
+    without it this parametrisation asserts a different code on a runner with
+    the vector extras than on one without, which is exactly how it passed
+    locally and failed on all four CI jobs."""
     monkeypatch.setattr(pgstore, "deps_available", lambda: True)
+    monkeypatch.setattr(pgsearch, "_missing_deps", lambda: [])
     payload, is_error = mcp_server.handle_call(name, _args(name))
     assert payload["ok"] is False
     assert payload["error"]["code"] == "backend_unavailable"

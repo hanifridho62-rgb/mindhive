@@ -123,37 +123,25 @@ CAP = replenish.LINE_THRESHOLD
 #        `print(f"{h['file']}…")`, which raised KeyError on every event hit
 # The split is still the real fix. This is still a debt entry.
 #
-# `pgtools.py` joins the list at 1180. It is the AI tool surface: seven tools,
-# each with argument validation, a paged SQL statement and a docstring the model
-# actually reads, plus the shared result shaper (truncation detection, payload
-# summarisation, the error envelope). The obvious split — shaper apart from
-# tools — is deferred rather than done here because this repo has already been
-# bitten by exactly that refactor: "a mechanical module split silently breaks
-# monkeypatch addresses", and `tests/test_pgtools.py` patches `pgtools._run`,
-# `pgtools._session` and `pgstore.mirror_health` by module path. Splitting it
-# in the same change that adds the tools would mix a refactor into a feature and
-# leave neither verified. Recorded in TODOS.md instead.
+# `pgtools.py` was on this list and is NOT any more, which is the only outcome
+# the entry was ever supposed to have. It joined at 1180 as the AI tool surface
+# plus the shared result shaper, and the obvious split — shaper apart from tools
+# — was deferred because this repo had already been bitten by exactly that
+# refactor ("a mechanical module split silently breaks monkeypatch addresses"),
+# and mixing it into the change that added the tools would have left neither
+# verified. It was then raised twice: to 1253, when `_stale_notice` gained the
+# repair command and the actor who can run it, and to 1275, for a one-line
+# forwarder to the eighth tool in `pgsearch.py`.
 #
-# 1233 -> 1253 (+20), and the raise is justified by what the lines DO rather than
-# by the file being on the list already. `_stale_notice` previously told a model
-# that the mirror was behind and why, and stopped there — problem and cause, no
-# fix and no actor. An agent reading it did the only thing it could: reach for
-# `hive pg rebuild`, get `MINDHIVE_PG_DSN_ADMIN is not set`, and have no way to
-# learn that the reader role it connects with is read-only at the ROLE level and
-# structurally cannot repair anything. The +20 lines name the repair command, name
-# who has to run it, and say why it is not the reader. That is the difference
-# between a notice and a dead end; it is not new surface area.
-# 1253 -> 1275 (+22), and the +22 is a FORWARDER, not a tool. The eighth tool
-# (`search_events_by_meaning`) lives in `pgsearch.py`, at 288 lines, because it
-# is the only one needing an encoder and NumPy while this module is imported by
-# `mcp_server` at startup to list every tool with the database down. What was
-# added here is the one-line call plus the docstring saying why the body is
-# elsewhere and why the dispatch table must still hold the callable. Putting the
-# ~150-line body here instead would have been the cheaper diff and the worse
-# module.
+# TODOS item 18 took the split as its own change. `pgshape.py` holds the shaper
+# at 460 lines and `pgtools.py` is 877 — both under the cap, so the entry is
+# DELETED rather than lowered, which is the win this file's own
+# `test_no_allowlisted_module_is_secretly_under_the_cap` exists to force. The
+# monkeypatch hazard was answered rather than hoped away: `pgtools` re-exports
+# every moved name and `tests/test_pgshape.py` asserts each is the same OBJECT,
+# and the names the tests actually patch never moved at all.
 ALLOWED = {
     "__main__.py": 4235,          # the CLI surface; every command's argparse wiring
-    "pgtools.py": 1275,           # the eight AI tools + the shared result shaper
     "replenish.py": 2781,         # the suggestion lenses; a split is already deferred
     "workspace.py": 1462,         # MindParallel orchestration
     "research.py": 1353,          # Self-Reliant research runs
