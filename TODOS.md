@@ -468,3 +468,77 @@ and move only the clock — a loop card must go offline past its own `heartbeat_
 card past 180 s, and a chat card must **leave the board** past 6 h. Each is RED against a fold
 cached without a re-derivation seam, which is the point, and why this is a separate piece of work
 rather than a fourth line in `_overview_fingerprint`.
+
+## 18. `pgtools.py` is 1253 lines and now holds a twice-raised ceiling
+
+`tests/test_file_size_cap.py` caps a module at 1000 lines. `pgtools.py` went past it
+with the state-shaped trio (`get_latest_event`, `search_events_by_type`,
+`get_current_state`) and was added to `ALLOWED` at 1180 — a debt entry, which the cap's
+own message says is not a fix. It has been raised twice since: 1233, then **1253** when
+`_stale_notice` grew the repair command and the actor who can run it. Neither raise added
+surface area, and neither is a reason not to split.
+
+**The split that fits:** the module is two things wearing one name. The **result shaper**
+(`summarise_payload`, `stream_rows`, `shape_rows`, `envelope`, `error_envelope`,
+`notice_for`, `_fit_response` — roughly 350 lines) is pure Python over rows and has no
+opinion about which tool called it. The **seven tools** are argument validation plus one
+SQL statement each. `pgshape.py` + `pgtools.py` is the obvious cut.
+
+**Why it was not taken in the same change as the tools:** this repo has already been bitten
+by exactly that refactor — "a mechanical module split silently breaks monkeypatch
+addresses" (splitting `dashboard.py` moved three patch targets). `tests/test_pgtools.py`
+patches `pgtools._run`, `pgtools._session` and `pgstore.mirror_health` by module path, and
+`tests/test_mcp_server.py` patches through the registry. Mixing a refactor into the feature
+that adds the tools would leave neither verified.
+
+**What makes it safe when taken:** do it as its own change, with the 141 tests in
+`tests/test_pgtools.py` green before and after, and re-run `pytest -m pg` (32 tests, needs a
+server — and now a CI job, see item 20) because the shaper is what every one of those
+envelopes goes through.
+
+## 19. ~~The mirror does not follow the ledger — `_insert_one` still raises~~ — DONE
+
+**Resolved by deleting the seam, not by implementing it.** `pgstore.mirror_one` and
+`_insert_one` are gone; `events.append_event` now writes one line to one file and returns,
+under **every** value of `MINDHIVE_EVENT_BACKEND`. The mirror follows the ledger from a
+schedule instead: `pgmirror.refresh_changed` reloads only the segments whose bytes moved,
+called by `hive pg refresh` and by every `hive autosync` run that finds an admin DSN.
+
+The three reasons deletion beat implementation, all of them already in the entry above and
+none of them softened by a fix:
+
+* **The credential.** `pgstore` holds the reader DSN and `mindhive_reader` carries
+  `default_transaction_read_only` set on the ROLE, so the INSERT was refused by the server
+  on every call. Repairing the seam meant putting the owner DSN on the append path, which is
+  the one thing the module split exists to prevent.
+* **`seg_line`.** A second write path would have had to compute it, and it is
+  `scan_segments`' `enumerate` index over every *physical* line — blank and torn rows
+  included. Two loaders agree until the first segment gains an empty line.
+* **The cheaper alternative, priced.** It was the right one. A per-segment reload writes the
+  rows of one session file, not 37k; the write is incremental, the verification fold
+  deliberately is not, because `parity` is what re-stamps `ledger_fingerprint` and a refresh
+  that skipped it would report the mirror stale forever.
+
+**Kept as a known limit:** the fingerprint is per-segment byte size, so a same-length
+in-place edit is invisible to it. That is corruption rather than an update on an append-only
+hash-chained ledger, and `parity` — the chain comparison — is what catches it;
+`tests/test_pg_live.py::test_a_same_length_in_place_edit_is_invisible_to_the_fingerprint`
+states the limit and proves parity still bites. If the fingerprint ever gains a field,
+`pgstore._ledger_fingerprint` has to gain it in the same change or every namespace reports
+itself permanently stale.
+
+## 20. ~~The `pg` tier does not run on CI~~ — DONE
+
+A sixth job, `pg-tests`, runs `pytest -m pg` against a `postgres:17` service container on
+`ubuntu-latest` (the service-container feature is Linux-runner only, so this job cannot be
+folded into the Windows matrix). It applies the migrations with the owner DSN, then mints a
+random password for `mindhive_reader` with `openssl rand`, masks it with `::add-mask::`, and
+passes it to the tests through `$GITHUB_ENV` — so no credential is written down anywhere,
+which is the same rule `tests/test_pg_repo_gates.py` enforces on the repo.
+
+**Non-vacuity, proven:** two mutants to `003_roles_and_views.sql`, each applied to a
+throwaway database — deleting the reader's `GRANT SELECT` on the read-only view, and handing
+the reader the base table the split exists to hide — each turn the tier red on the test that
+names the property. So the assertions bite. **Not proven:** that the workflow YAML itself
+runs them, which needs a push and a real run; the job is unexercised until this branch is
+pushed and its checks come back.

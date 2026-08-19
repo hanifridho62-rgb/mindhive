@@ -41,6 +41,13 @@ The auto-loaded memory file lives OUTSIDE the store:
 `sync.sync()` = usage note + embedded STATE body + prevention rules + capped
 lessons + top decisions. This is the context Claude reads at session start.
 
+There is one further place the same events can appear, and it is **not** in this
+table because it is not part of the store: an optional **Postgres read mirror**
+(§4.18). It holds a copy of `events/*.jsonl`, rebuilt from those files, and is
+rebuildable in the strongest sense — deleting the whole database loses nothing.
+Nothing in MindHive reads it unless an operator opts in, and nothing writes
+history to it ever.
+
 ## 2. The event record (the one true schema)
 
 Every row in every `events/*.jsonl` segment:
@@ -1636,6 +1643,310 @@ weaker — bind `0.0.0.0` and local-only is gone; drop the lock and concurrent r
 corrupt each other's tree; make the token optional and an unauthenticated request
 starts a process.
 
+### 4.18 The Postgres read mirror (ADR 0009)
+
+An optional second copy of the ledger, in Postgres, existing for exactly one
+reason: **giving an AI a query surface**. Not speed — `events.read_all` was
+measured at **0.46 s for 37,038 events across 921 segments** (2026-08-17), which
+is not a crisis. The gap it closes is that an agent has no structured way to ask
+this data a question at all: "which sessions hit `tool_failed` after a
+`policy_denied`" is a fold in Python and one `SELECT` in SQL.
+
+**The direction of authority is the whole design.** The file ledger stays
+canonical and stays the **sole writer**. `MINDHIVE_EVENT_BACKEND` stays `file`;
+nothing in this feature flips it, and `tests/test_pg_repo_gates.py` asserts that
+nothing under `src/` writes it. Postgres is downstream of the files the way
+`STATE.md` is, and it is more disposable than any projection in §1: the store
+does not contain it, `hive verify` does not consult it, and a dropped database
+is a `hive pg rebuild` away.
+
+| Module | Role | Credential |
+|---|---|---|
+| `pgschema.py` | the shape: column list, `EVENT_TYPE_CLASSES`, row↔`Event` mapping | none |
+| `pgmigrations/*.sql` | `001` table + anomaly view, `002` indexes, `003` roles + the reader's view, `004` `mirror_state` for the reader + object ownership, `005` drops the ordering index `002` created | — |
+| `pgmirror.py` | migrate / rebuild / parity — the only module that writes | `MINDHIVE_PG_DSN_ADMIN` |
+| `pgstore.py` | the read DAL: `READ_ALL_SQL`, `read_all_strict`, `read_all_or_none`, `mirror_one` | `MINDHIVE_PG_DSN_RO` |
+| `pgtools.py` | the seven AI tools and their result shaping | `MINDHIVE_PG_DSN_RO` |
+| `mcp_server.py` / `pgcli.py` | the two surfaces over one registry: MCP, and `hive pg` | — |
+
+**Two credentials, split by module, and the split is checked.** No module on the
+AI path imports the admin DSN; `pgmirror` is its only reader. A test also asserts
+that `enforce.py`, `sopgate.py`, `rotation/hook.py` and `mindnet/enforcer.py`
+reach none of this cluster — those four run on hot hook paths where a socket
+would be an outage, not a slow feature.
+
+#### The table, and the columns that are not obvious
+
+`mindhive.events` mirrors §2's record, plus the bookkeeping that makes file
+order derivable. Full commentary is in `pgmigrations/001_schema.sql`; the parts a
+reader must not "simplify":
+
+- **`ts` is `TEXT`, verbatim, never reparsed.** `chain.compute_chain` hashes
+  canonical JSON of this string, so a `TIMESTAMPTZ` round trip — which normalises
+  offset spelling, fractional seconds and the trailing `Z` — breaks chain-head
+  parity, the single gate that proves the mirror faithful. It is **nullable** for
+  the same reason the ledger admits `{"ts": null}`: reads check key presence only.
+- **`ts_utc TIMESTAMPTZ` is filled by the loader, not generated.** Postgres
+  requires a generated column's expression to be `IMMUTABLE`, and every
+  text→timestamp path is `STABLE` (`DateStyle`/`TimeZone` dependent), so
+  `GENERATED ALWAYS AS (ts::timestamptz) STORED` fails at `CREATE TABLE`. It is
+  NULL when `ts` is not the canonical shape — a reportable anomaly
+  (`mindhive.events_anomalies`), never a load failure.
+- **`segment` is the source FILENAME, `seg_line` its 0-based line index.**
+  Counting blank and malformed lines, because that is what the file order counts.
+- **`global_seq BIGINT` is identity only.** It is the requested primary key and
+  it is honoured — what changed is that no ordering rests on it.
+- Every text column is `COLLATE "C"` so Postgres compares byte-wise, matching
+  Python's code-point comparison. A Windows-installed cluster otherwise defaults
+  to a locale collation that ignores punctuation at the primary level, which is
+  precisely the distinction the ordering below turns on.
+
+#### The ordering contract, and the invariant it corrects
+
+```sql
+ORDER BY COALESCE(ts, ''), segment, seg_line     -- pgstore.READ_ALL_SQL
+```
+
+ADR 0006 claimed `ORDER BY ts, session_id, id` reproduces file order, because the
+segment is `<session_id>.jsonl`. **It does not, and the counter-example is in the
+live store.** `events.read_all` sorts on `(ev.ts or "", seg.name, line_index)` —
+the *filename*. Where one session id is a proper prefix of another, the separator
+that follows decides: `-` is `0x2D`, `.` is `0x2E`, so `-` sorts below `.` and the
+two orders invert. The store already holds `verify.jsonl` and
+`verify-e2e-001.jsonl`:
+
+```
+by session_id : ['verify', 'verify-e2e-001']
+by filename   : ['verify-e2e-001.jsonl', 'verify.jsonl']
+```
+
+Two sessions, opposite orders, therefore two different chain heads — so the
+parity gate built on that invariant would have failed against its own store, and
+the failure would have read as data corruption rather than a sort key.
+`COALESCE` carries the second half of the correction: Python sorts a NULL `ts`
+**first** (`ev.ts or ""`), Postgres sorts NULLs **last** by default.
+
+#### The index 002 created, and why 005 drops it
+
+`002_indexes.sql` created `events_order_idx (project, ts_key, segment, seg_line)`
+to serve the ordered full read. **It never did, and no index can**, which EXPLAIN
+showed and reasoning did not:
+
+- the ordered read is `ORDER BY COALESCE(ts, '')`, and Postgres does not match
+  that expression to the `ts_key` generated column, so the index is not
+  considered even with `enable_seqscan=off` and `enable_sort=off`;
+- `mindhive_ro.events` is `security_barrier`, which puts a Subquery Scan between
+  the ORDER BY and the table — the reader could not use an index-ordered path
+  even if the expression matched.
+
+Measured on 37k rows: `Sort Method: external merge Disk: 11728kB`,
+`Execution Time: 69.290 ms`. The filtered tool queries are unaffected (1.6 ms and
+0.3 ms) because they are served by the *other* indexes 002 created, which are
+plain column indexes. 005 therefore drops the unmatchable one and adds no
+replacement — an index that is never chosen is write amplification plus a false
+claim in the schema.
+
+#### The parity gate
+
+`hive pg parity` folds the file ledger and the mirror through
+`chain.compute_chain` and compares heads. Two properties make it worth trusting:
+
+- **`read_all_strict` has no file fallback**, deliberately. A strict reader that
+  degraded to the files would make the gate compare the file ledger with itself
+  and pass while proving nothing.
+- **`parity_ok` in `mindhive.mirror_state` is durable, and the tools refuse when
+  it is false.** Unlike staleness — which is bounded and reportable ("the mirror
+  is one session behind") — a parity failure is unbounded: rows may be missing,
+  duplicated or misordered and you cannot say which. `mirror_state` keeps both
+  heads rather than one boolean, because "they differ" is not actionable.
+- **Lag is not divergence, and a correct PREFIX passes.** `compute_chain` takes a
+  `checkpoint`, so one fold yields both the ledger's head and its head at exactly
+  the number of rows the mirror holds. A mirror that is behind passes by PROOF —
+  every row it holds hashes to the same chain — rather than by an assumption
+  drawn from append-only-ness. What still fails: a row edited in place (same
+  count, different head), a mirror longer than its source, and any reordering.
+
+  This is not a refinement, it is what makes the feature usable. Measured: all
+  four tools returned `parity_failed` against a mirror whose chain head was
+  correct, because the ledger had grown 3,782 bytes since the rebuild. A live
+  append-only ledger is stale within seconds, so `parity_ok` and `stale` are
+  answered separately and never ANDed — `pgstore.mirror_health` computes the
+  second from a `stat` per segment (`ledger_fingerprint`), not a second fold.
+
+#### The seam, and what it costs when unused
+
+`events._maybe_mirror_to_pg` / `_maybe_read_from_pg` are the two functions ADR
+0006 left behind. They imported `scripts.core.event_write` — a module in the
+CC-v3 repository, never on this process's path — inside a bare `except`, so
+flipping `MINDHIVE_EVENT_BACKEND` did **nothing at all**, silently, for as long
+as the seam existed. That is the "seam tapi mati" this work was asked to fix.
+Both now target `pgstore`, in-package. The `MINDHIVE_EVENT_BACKEND` guard is
+unchanged and returns **before** any import, so the default `file` path costs one
+`os.environ.get` plus one comparison, and `import mindhive.events` never pays for
+`psycopg`. Capture never depends on the database: the file line is on disk before
+the mirror is consulted, `mirror_one` cannot raise, and a one-strike circuit
+breaker means 50 appends against a dead host cost one connect timeout, not fifty.
+
+#### Read-only, in layers, and only one of them is the defence
+
+The seven tools exist so an AI issues SQL instead of shell commands. Four
+answer "show me events" (`query_database`, `get_recent_events`,
+`search_events_by_payload`, `get_session_summary`); three answer "what IS the
+state", which is the question an agent actually opens a session with:
+`get_latest_event` (one row, the tip of one session), `search_events_by_type`
+(every event of one kind, newest first) and `get_current_state`
+(`DISTINCT ON (event_type)` — the newest row of every kind, in one round trip).
+
+`get_current_state` is **not** `STATE.md` and does not re-run the projector;
+there is no `current_state` table. Inventing one would put two derivations of
+"the current state" in the system, with the SQL one looking authoritative
+because it came from a database.
+
+**Every paged tool defaults to 20 rows** (`pgtools.DEFAULT_LIMIT`) and takes
+`offset`, capped at 10,000 because OFFSET makes the server walk and discard every
+skipped row. The bound is the point rather than a detail: the context window is
+the resource being protected, and a tool that CAN return thousands of rows
+eventually will. The enforcement that makes that safe is **L5 — the
+`mindhive_reader` role** (`003_roles_and_views.sql`): it holds no privilege on
+`mindhive.events` at all, sees only the `security_barrier` view
+`mindhive_ro.events`, and carries `default_transaction_read_only`,
+`statement_timeout`, `lock_timeout` and `log_min_duration_statement = 0` set on
+the ROLE, so they survive a bug in the Python layer. The Python-side SQL shape
+check is a belt for message quality; the design property under test is that
+deleting it changes no outcome for any hostile input.
+
+Namespace scope is the **view's** predicate, not a model-written one:
+`WHERE project = current_setting('mindhive.project', true)`. An unset setting
+yields NULL and therefore **zero rows** — the fail-closed direction — and
+`project` is absent from the select list, so the model cannot write a namespace
+predicate it could get wrong.
+
+It can, however, **choose** the namespace: `project` is an ordinary tool
+argument, and naming another one reads that project's ledger. That is stated
+here because the code has always worked this way and two comments used to claim
+the opposite. Every namespace in this mirror belongs to the same operator and
+the same machine, so this is context hygiene rather than a boundary — but an
+agent asked about *this* repo can read another one's memory if it names it.
+
+**Three residuals this does not fix**, named because naming them is the
+mitigation available at this layer:
+
+1. **Queryability, not disclosure.** The file ledger already holds prompts and
+   responses in plaintext. What the mirror adds is that bulk-searching them for a
+   secret becomes one tool call instead of a grep over 900+ segments.
+2. **A second copy, on a service.** The mirror is a full copy of the ledger
+   living outside `~/.mindhive`, with its own WAL, its own backups if anyone
+   configures them, and its own file permissions. `hive gc` does not reach it and
+   deleting a namespace's segments does not delete its rows — `hive pg rebuild`
+   is what makes the mirror forget.
+3. **Every AI statement is logged in plaintext.** `log_min_duration_statement = 0`
+   is set on the `mindhive_reader` role (deliberately: it is the audit trail for
+   what an agent actually asked). That log is a third copy of every query, and
+   queries carry the search terms — which is the part worth knowing before
+   pointing this at anything shared.
+
+A redaction control (`MINDHIVE_PG_REDACT`, an opt-in list of event types whose
+text is elided in the envelope) was designed and **not built**. It would not
+address any of the three above — all three are about copies of the data at rest,
+not about what the envelope shows — so shipping it would have bought the
+appearance of a privacy control rather than one.
+
+#### The vector index (006), and why the bytes are BYTEA
+
+`mindhive.event_embeddings` is the second table in this schema, keyed by
+`(project, segment, seg_line, model)` — the ledger's own ordering key plus the
+encoder's name, so a vector lines up row for row with `mindhive.events` and two
+models can coexist instead of silently mixing two incompatible geometries under
+one name.
+
+**There is no pgvector on a stock server**, and installing an extension is not
+something this project can ask of a machine it does not administer. So the
+vector is a `BYTEA` of little-endian float32, L2-normalised on write (cosine
+similarity is then a plain dot product), and the ranking happens in NumPy. That
+was measured before it was chosen, over the same 1,000 x 384 vectors:
+
+| shape | COPY in | rank 1,000 | on disk |
+|---|---|---|---|
+| `BYTEA` + NumPy | 19.6 ms | 10.4 ms | 2120 kB |
+| `real[]` + SQL dot product | 107.4 ms | 101.7 ms | 2120 kB |
+
+Same size on disk, 5.5x faster to load, 10x faster to rank. Three CHECK
+constraints carry the invariants the reader cannot re-derive:
+`octet_length(embedding) = dim * 4` (a short blob reshapes without error into a
+matrix of the wrong length — every score after it is garbage that looks like
+data), `dim > 0 AND dim <= 4096`, and `seg_line >= 0`.
+
+Two views, both `security_barrier` and both owned by `mindhive_owner`:
+`mindhive_ro.event_embeddings` is metadata only, exposing
+`octet_length(embedding) AS embedding_bytes` rather than the bytes, so a
+`SELECT *` from a curious agent cannot blow a context window with 384 floats per
+row; `mindhive_ro.event_vectors` carries the bytes and exists for the one tool
+that ranks them.
+
+`hive pg embed` fills it, on the admin credential, and is **incremental by
+content**: the stored `event_id` is the same content hash the chain covers, so
+an event rewritten at the same `(segment, seg_line)` is re-encoded rather than
+left with a stale vector — and a stale vector still returns confident-looking
+hits, which is why presence alone is the wrong test. Three orderings are
+deliberate: probe the recorded keys on a short connection **closed before the
+model loads**, encode outside every transaction, then DELETE the superseded rows
+and COPY the new ones in **one** transaction. Measured on this ledger: 664
+vectors in 47.9 s first run, 0.98 s on a re-run with no encoder loaded at all.
+
+#### Status: proven against a server, with the gaps named
+
+`psycopg` and `mcp` are optional extras (`.[pg]`, `.[mcp]`), guarded the way
+`vectors.py` guards chromadb, and the base install stays dependency-free.
+Everything answers structurally with neither installed — which remains the state
+of CI.
+
+**Every statement here has now been executed by PostgreSQL 17.11.** What that
+run established, on the real 37k-event ledger unless noted:
+
+- all six migrations apply; a second run applies nothing; a migration whose
+  bytes changed after being recorded is REFUSED rather than re-run or skipped;
+- 37,435 events loaded, and the file ledger's chain head equals the mirror's —
+  `exact`, `lag 0`. That single hash is what "byte-faithful" means here: verbatim
+  `ts`, a JSONB round trip that preserves payload semantics (`canonical_json`
+  sorts keys, so key reordering is invisible to the chain), and an ordering
+  contract that matches Python's;
+- the gate is non-vacuous in all four directions — proven on a constructed
+  fixture, because the real ledger cannot exercise the tie-break (33,974 distinct
+  timestamps, 868 shared across segments, **zero** that invert under
+  `session_id` ordering);
+- the reader role is not a superuser, carries `default_transaction_read_only=on`
+  and `statement_timeout=5s`, has no privilege on `mindhive.events` at all, and
+  returns **zero rows** when the namespace setting is unset;
+- all eight tools answer; a second statement smuggled into `query_database` does
+  not execute (checked by looking for the table it would have created);
+- `EXPLAIN` measurements are in the two sections above.
+
+**Three defects only a live server exposed**, all fixed here: `mirror_state` was
+unreadable by the reader role (003 revoked the schema out from under it, so
+`mirror_health` could only ever fail closed — that is what 004 fixes); 003 left
+views and three tables owned by the migration runner, which matters because the
+views are deliberately not `security_invoker`; and 002's ordering index is
+unmatchable rather than merely unused (005).
+
+**What is still NOT proven, stated plainly:**
+
+- **The `pg` tier is deselected by default**, alongside `node` and `browser`.
+  It now runs on CI in a job of its own, against a `postgres:17` service
+  container, but a green *default* run still says nothing about the SQL — read
+  the pg job, not the badge.
+- **The semantic tier needs an encoder CI does not install.** `hive pg embed`
+  and `search_events_by_meaning` need `pip install -e .[vectors]`; without it
+  both answer `deps_missing` and name the extra. The pg-tier LOADER tests need
+  neither import -- they replace the encoder with a deterministic stand-in, and
+  packing is `struct` plus `math` -- so they run on CI; the four SEARCH tests
+  skip there and say which extra is missing, and the registry gate asserts the
+  shape of the refusal instead. The real `all-MiniLM-L6-v2` runs in exactly one
+  test, which is the only one that can say the feature WORKS rather than that
+  it runs, and it runs on a developer machine, not on CI.
+- **The cluster used is a scratch one** (port 5433, loopback, trust auth,
+  binaries unpacked into a temp directory). Nothing about a production
+  deployment — TLS, real authentication, backups — has been exercised.
+
 ## 5. Invariants — do not break these
 
 1. **Append-only, verbatim.** Never mutate, reorder, or delete ledger lines.
@@ -1655,7 +1966,17 @@ starts a process.
    what the loader cuts on — so anything unbounded that rides MEMORY.md is a
    regression, and so is a bound whose unit is not the loader's.
 5. **The semantic layer is optional.** Base install works without
-   chromadb/sentence-transformers (`vectors._require_deps`).
+   chromadb/sentence-transformers (`vectors._require_deps`). The Postgres
+   mirror joins it under the same rule: `psycopg` and `mcp` are extras, and
+   `import mindhive.events` must not pay for either.
+6. **The Postgres mirror never becomes the source, and never re-derives the
+   order.** The file ledger is the sole writer; `MINDHIVE_EVENT_BACKEND` stays
+   `file` and nothing in `src/` may set it. The mirror's ordering contract is
+   `(COALESCE(ts,''), segment, seg_line)` — the segment **filename**, never
+   `session_id` (they disagree, live, on `verify` vs `verify-e2e-001`), and
+   `COALESCE` because Python sorts a NULL `ts` first where Postgres sorts it
+   last. Both halves are what chain-head parity rests on, so a "simplification"
+   of either reads as data corruption rather than as a sort key (§4.18).
 
 ## 6. Adding a new event type (the extension procedure)
 
