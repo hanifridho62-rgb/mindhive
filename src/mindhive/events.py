@@ -42,6 +42,18 @@ SEMANTIC_TYPES = {
     # satisfaction records verified_by (python | agent | human) so a claim
     # nobody machine-checked can never fold as if it had been.
     "mindnet_phase",
+    # Participatory consensus (see consensus/): one framed input from one
+    # subject, and the weighted fold over a window of them. Semantic so both
+    # ride the LEDGER and the hash chain, and so `hive pg embed` indexes them —
+    # a board-level number a reader can search for by meaning is the point, and
+    # a deterministic type would be invisible to that.
+    #
+    # ONE type for every population and every instrument: `kind` inside the
+    # payload is the discriminant, so a youth anxiety sample and an executive's
+    # strategic input differ there and nowhere else. A second type per
+    # population would put the demographic into the schema.
+    "contribution",
+    "consensus_record",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
@@ -238,6 +250,23 @@ _PAYLOAD_CONTRACTS = {
     "job_started": (".jobs", "the dashboard writes these as it runs a job"),
     "job_finished": (".jobs", "the dashboard writes these as it runs a job"),
     "job_abandoned": (".jobs", "written only by the boot seal, jobs.seal_orphans"),
+    # Participatory consensus. Two types, two submodules — the same split
+    # `mindnet_task` / `mindnet_phase` use, because this table calls one
+    # `validate_payload` per module and cannot pass the type down.
+    #
+    # Both are gated rather than left free-text because the round's own meaning
+    # is folded back out of them. A contribution with no `subject` breaks the
+    # per-subject weight normalisation for everyone else in the frame, and a
+    # `consensus_record` whose inputs carry no weight or reason is exactly the
+    # untraceable conclusion the PRD names as a failure condition — permanent,
+    # since this store is append-only, and authoritative-looking forever after.
+    "contribution": (".consensus.contributions",
+                     "hive consensus contribute --frame F --kind K "
+                     "--subject S --value V"),
+    "consensus_record": (".consensus.records",
+                         "hive consensus fold --frame F — the fold is the only "
+                         "writer, so a hand-appended record is almost "
+                         "certainly a mistake"),
 }
 
 

@@ -109,6 +109,30 @@ A **one-way copy** of the event ledger in PostgreSQL, so an AI can query it inst
 - `hive pg tool <name> [--arg k=v ...] [--list] [--json]` — run one of the eight AI tools — four that show events (`query_database`, `get_recent_events`, `search_events_by_payload`, `get_session_summary`), three that answer "what IS the state" (`get_latest_event`, `search_events_by_type`, `get_current_state`), and one that searches by **meaning** rather than by string (`search_events_by_meaning`, nearest-neighbour over the vectors `hive pg embed` wrote) — and print the exact envelope a model would receive. `--arg` values are parsed as JSON when they parse and kept as strings when they do not, so `limit=50` is an integer and `session_id=manual` is a string. This is the same dispatch table the MCP server reads, which is the point: the human debug surface cannot drift from the AI one
 - `hive pg mcp` — serve those eight tools to an MCP host over **stdio** (no port, no token, reachable only by the process that spawned it). `python -m mindhive.mcp_server` is the same `main()` and is the recommended spelling on Windows, where a console-script shim can go stale against an editable install
 
+### Participatory consensus (`hive consensus`)
+
+Many framed inputs, one number, and a route from the number back to every input
+that produced it. Contributions are ordinary ledger events, so the consensus a
+frame reaches is **derived** — re-runnable from the same events and covered by
+the same hash chain. Nothing here writes a table or a sidecar.
+
+- `hive consensus contribute --frame F --kind K --subject S --value V [--confidence C] [--session S] [--project P]` — append one framed contribution. `--kind` is the instrument (`biometric.resting_hr`, `strategic.direction`) and it is the **only** thing that separates one population's inputs from another's — one event type serves a youth anxiety frame and a board strategy frame alike. `--value` is parsed as a number when it parses and kept as a string when it does not. A contribution **may not state its own weight**; the fold assigns it and records why. Prints the content-addressed `ref` a later `trace` resolves
+- `hive consensus fold --frame F [--start T] [--end T] [--json] [--project P]` — fold the frame's window into a `consensus_record`. Window bounds are ISO timestamps, **inclusive at both ends**, defaulting to the earliest and latest input. Two rules, and neither is an average of the population: every **subject** carries total weight 1 however many times they contributed (so fifty samples from one participant do not outvote fifty participants), times any confidence they stated; the answer is then the **weighted median** for a numeric frame and the heaviest distinct value for a categorical one. The frame decides which from its own data, so an operator never has to know. An empty window **exits 0** — "nobody answered this week" is a success, and a non-zero there would train whoever scheduled it to ignore the code
+- `hive consensus trace --frame F [--json] [--project P]` — walk the frame's newest record back to the events it folded, showing the weight and the stated reason for each. **Exits non-zero when any input resolves to no event in the ledger**, the same gate semantics as `hive pg parity`: non-zero when the claim cannot be *proven*, not only when it is known false. A frame that was never folded exits 0 — nothing to audit yet is not a failed audit
+
+The `consensus_record` contract is enforced at the append surface, not by
+convention: a record whose inputs do not each carry a weight, a written reason,
+and an `occurrence` is **refused**. An untraceable conclusion in an append-only
+store would be permanent and would keep looking authoritative, which is the
+failure this family exists to make impossible.
+
+`occurrence` is there because a `ref` is a *content* address: two identical
+contributions — same subject, same value, same second — hash to the same ref, so
+the ref alone names "one of these". It is the 1-based rank of the row among the
+events under its ref, which is what makes three identical inputs resolve to three
+events, and makes a record claiming three of them **unprovable** against a ledger
+holding one.
+
 ### Namespaces, hygiene & automation
 
 - `hive projects` — list namespaces (registered vs unregistered)

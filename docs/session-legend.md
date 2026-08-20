@@ -31,7 +31,7 @@ Console entry point: `hive` → `mindhive.__main__:main` (`pyproject.toml`
 directives context packs verify selftest premise recall consolidate gc export
 embed briefing review log replenish sop roadmap mindnet autoresume graph plugins
 skills clusters sync dashboard pg harvest autosync loop flag failures rules
-triggers enrich`.
+triggers enrich consensus`.
 
 > **Probing the CLI from a worktree gives you the wrong branch.** The venv's
 > editable install points at `C:\Users\hanif\mindhive`, so a bare
@@ -191,6 +191,28 @@ false: ordering by bare `session_id` diverges from ordering by segment filename
 | `mcp_server.py` | The MCP adapter over the shared registry, **stdio transport** — no port, no auth surface, reachable only by the process that spawned it. `python -m mindhive.mcp_server` and `hive pg mcp` are two spellings of one `main()`. **Nothing may print to stdout but MCP frames**, exactly the rule `pre_tool_use.ps1` / `user_prompt_submit.ps1` / `stop.ps1` already live under; logging is stderr, and a test scans the module's AST for stray writes. |
 | `pgcli.py` | The `hive pg {status,migrate,rebuild,refresh,embed,parity,tool,mcp}` group. `embed` is the only verb here that loads a model, and it prints the loader's own dict — including `skipped`, which is the evidence the incremental path worked and the only thing distinguishing a cheap re-run from one that silently re-encoded everything. `refresh` is a distinct verb rather than a flag on `rebuild` because it is what a stale mirror's own notice names, and an operator repairing one mid-session should not have to remember which flag makes the cheap path happen. **The second module to register itself onto `__main__`'s subparsers** (`register(sub)`, four lines in `__main__.py` instead of ~200) — which retires the deviation `bench.register`'s docstring flagged and makes this **the convention** for a new multi-subcommand group: build the parser beside the handlers that read it, and give `__main__.py` an import and a call. A printer, never a second implementation: `hive pg tool` dispatches through the shared registry and prints the envelope, so there is exactly one code path and the human debug surface cannot drift from the AI one. |
 | `pgmigrations/*.sql` | `001_schema.sql`, `002_indexes.sql`, `003_roles_and_views.sql`, `004_mirror_state_view_and_ownership.sql`, `005_drop_unmatchable_order_index.sql`, `006_event_embeddings.sql`, read with `importlib.resources` and **declared as `package-data` in `pyproject.toml`** — `packages.find` ships `.py` files only, so without that entry a wheel or frozen exe carries no SQL and `apply_migrations` finds zero migrations and reports success. `CREATE OR REPLACE VIEW` cannot change a view's column list — that needs an explicit `DROP` in a **new** file, never an edit to an applied one, and the file headers say so. |
+
+### `consensus/` — participatory consensus (`hive consensus`)
+
+Many framed contributions folded into **one number that can be walked back to
+every input that produced it**. The PRD's two hard rules are the whole design:
+no naive averaging, and no black boxes.
+
+| File | Owns |
+|---|---|
+| `consensus/__init__.py` | The fold and the audit walk. `fold_window(evs, frame_id, start, end)` is a **pure function over a list of events** — no store, no I/O — and returns `None` for an empty window, which is `nothing_to_do`, not an error. The rule is named and versioned in every record it writes (`RULE_VERSION = "subject-share-weighted-median-v1"`) so two rules can coexist in one ledger and be compared instead of one migrating over the other. It refuses naive averaging twice: **per-subject normalisation** (every SUBJECT carries total weight 1 split across however many contributions they sent, so fifty samples from one participant do not outvote fifty participants) and a **weighted MEDIAN**, which one extreme value moves by at most one rank where it moves a mean without limit. Weights are `fractions.Fraction` and not floats for one concrete reason: the answer is decided where cumulative weight reaches exactly half the total, and three float shares of `1/3` sum to `0.9999999999999999`, which picks the wrong side of the boundary on the very fixture the rule exists for. A frame decides its own aggregation from its data (all-numeric → median, otherwise weighted mode over the stringified values), so the same pipeline serves a resting-heart-rate frame and a strategic-direction frame without the caller declaring which. `event_ref` is the content address — SHA-256 over the same canonical bytes the hash chain covers — and `trace` REPORTS a ref it cannot resolve as `found: False` rather than raising, because a crash there hides the one thing the reader asked to see. |
+| `consensus/contributions.py` | The `contribution` append contract. Refuses a body with no frame, kind, subject, or value; a boolean value; a confidence outside `[0, 1]`; and — the load-bearing one — a **self-claimed `weight`**. A sender may not set its own influence: the rule assigns it and the record says which rule did. |
+| `consensus/records.py` | The `consensus_record` append contract, which is the anti-black-box rule expressed as a gate rather than a convention. Every input row must carry `ref`, `occurrence`, a positive `weight`, and a `reason`; the record must carry `rule_version`, a window closed at BOTH ends (an open window names no determinate set of events, so the number cannot be recomputed), and `subjects`. **`occurrence` is not decoration**: a ref is a content address, so two byte-identical contributions — same subject, same value, same second — share one, and a ref-only trail reported three inputs as proven against a ledger holding one event. It is the 1-based rank of the row among the events under its ref. Refs are checked for SHAPE, never resolved — resolving means reading the whole ledger, which an append-surface validator must not do; resolvability is `trace`'s job. |
+| `consensus/cli.py` | The `hive consensus {contribute,fold,trace}` group — parser AND handlers, registered by `register(sub)` beside `bench` and `pgcli`, so its flags sit next to the handler that reads them and `__main__.py` grows by one line rather than a hundred. Exit codes are the contract: `0` for a fold and for an **empty** window; `1` on a refused body; `1` from `trace` when any input resolves to no event — `hive pg parity`'s semantics, non-zero when the claim cannot be PROVEN rather than only when it is known false. |
+
+Both types are registered in `events._PAYLOAD_CONTRACTS`, so `hive append
+contribution '<json>'` is gated by exactly the same validator as
+`hive consensus contribute`, and in `pgschema.EVENT_TYPE_CLASSES` as `semantic`,
+so both are indexed by `hive pg embed` and reachable from
+`search_events_by_meaning` — a board-level number nobody can find by meaning is
+a number nobody reads. **Still plan, not built:** the HTTP routes, the background
+job, and the dashboard section (see
+`docs/plans/2026-08-19-001-participatory-intelligence-gateway-plan.md`).
 
 ### Dashboard (port 54461)
 

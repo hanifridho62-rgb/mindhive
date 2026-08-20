@@ -658,6 +658,11 @@ EVENT_TYPE_CLASSES = {
     # semantic — human meaning, rides the LEDGER, the Memory view and recall
     "caveat":              "semantic",
     "code_change":         "semantic",
+    # Participatory consensus (see consensus/). Semantic so both are indexed by
+    # `hive pg embed` and reachable from `search_events_by_meaning` — a
+    # board-level number nobody can find by meaning is a number nobody reads.
+    "consensus_record":    "semantic",
+    "contribution":        "semantic",
     "decision":            "semantic",
     "experiment_result":   "semantic",
     "learning":            "semantic",

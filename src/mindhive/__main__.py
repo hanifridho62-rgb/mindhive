@@ -3351,16 +3351,15 @@ def _build_parser() -> argparse.ArgumentParser:
     pkr.add_argument("--pack", default=None, help="limit output to one pack")
     pkr.set_defaults(func=cmd_packs_report)
 
-    # --- bench (time the dashboard's endpoints) ---
-    # First of the groups that register their own parser instead of being wired
-    # inline here. `pg` below is the second, which is what makes this the
-    # CONVENTION for a multi-subcommand group rather than bench's deviation.
-    from . import bench as bench_mod
+    # --- the groups that own their own parser AND their own handlers ---------
+    # Two lines each instead of ~180: the verbs live in the group's register().
+    # One named call per group and NOT a loop: the `pg` group's own test reads
+    # these calls with ast, and a loop hides the group list from that gate.
+    from . import bench as bench_mod, pgcli as pgcli_mod
+    from .consensus import cli as consensus_cli
     bench_mod.register(sub)
-
-    # --- pg (the Postgres read mirror and its seven AI tools) ---
-    from . import pgcli as pgcli_mod
     pgcli_mod.register(sub)
+    consensus_cli.register(sub)
 
     sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
     sub.add_parser("selftest", help="run test suite").set_defaults(func=cmd_selftest)
