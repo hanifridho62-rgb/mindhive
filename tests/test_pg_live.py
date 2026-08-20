@@ -199,19 +199,32 @@ def test_adversarial_number_shapes_survive_the_jsonb_round_trip(migrated, store)
     loaded = pgmirror.rebuild(store["name"])
     assert loaded["rows"] == len(payloads)
 
-    # The head first: it covers every column at once and is what `hive pg
-    # parity` actually gates on.
-    v = pgmirror.parity(store["name"])
-    assert v["ok"] is True and v["exact"] is True, v
-    assert v["file_head"] == v["pg_head"]
-
-    # Then per payload, because a head mismatch only says "something differs"
-    # and whoever debugs it needs to be told WHICH number moved.
+    # PER SHAPE FIRST, then the head. The order is the whole point and it was
+    # wrong: the head assertion covers every column at once, so it fails first
+    # and reports only "something differs" plus two hashes, and the loop that
+    # knows WHICH number moved never runs. This tier is the only place that can
+    # answer the question at all — the model in test_pg_numeric_parity.py is
+    # self-consistent by construction and stays green whatever the server does
+    # — so a failure here that cannot name its shape leaves nobody able to
+    # debug it. Same assertions, and now down to the key rather than the row.
     back = pgstore.read_all_strict(store["name"])
     assert len(back) == len(payloads)
     for i, (sent, got) in enumerate(zip(payloads, back)):
+        for key in sent:
+            assert events_mod.canonical_json({key: sent[key]}) == \
+                events_mod.canonical_json({key: got.payload.get(key)}), (
+                    f"payload {i}, shape {key!r}: sent "
+                    f"{events_mod.canonical_json(sent[key])} and the mirror "
+                    f"returned {events_mod.canonical_json(got.payload.get(key))}")
         assert events_mod.canonical_json(sent) == \
-            events_mod.canonical_json(got.payload), f"payload {i} changed"
+            events_mod.canonical_json(got.payload), (
+                f"payload {i} changed as a whole while every key matched "
+                f"individually — a key was added or dropped: "
+                f"sent {sorted(sent)} got {sorted(got.payload)}")
+
+    v = pgmirror.parity(store["name"])
+    assert v["ok"] is True and v["exact"] is True, v
+    assert v["file_head"] == v["pg_head"]
 
 
 @needs_server
