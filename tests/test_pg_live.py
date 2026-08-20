@@ -638,12 +638,22 @@ def test_the_cli_help_names_every_tool_it_can_run():
     """A default-tier test: no server needed to catch a stale count in prose.
 
     `hive pg mcp`'s help said "the four tools" for as long as there were seven,
-    which is the kind of drift a reader trusts precisely because it is specific."""
+    which is the kind of drift a reader trusts precisely because it is specific.
+
+    PYTHONPATH is not decoration. `cwd` alone does not put this checkout's
+    `src/` on the child's path, so the subprocess resolved `mindhive` through
+    the editable install — which points at the MAIN clone, not this worktree.
+    Run from a worktree whose main clone sits on a branch without the `pg`
+    group and the child answered `invalid choice: 'pg'`: a test that passed or
+    failed on what some other checkout happened to have, asserting against
+    prose it never read. Every other subprocess in the pg tests already sets
+    this; this one was the straggler."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=os.path.join(repo, "src"))
     out = subprocess.run([sys.executable, "-m", "mindhive", "pg", "--help"],
-                         capture_output=True, text=True,
-                         cwd=os.path.dirname(os.path.dirname(
-                             os.path.abspath(__file__))))
+                         capture_output=True, text=True, cwd=repo, env=env)
     from mindhive import pgtools
+    assert out.returncode == 0, out.stderr
     assert "four tools" not in out.stdout
     assert f"{len(pgtools.TOOL_FUNCTIONS)}" in out.stdout or \
            "seven" in out.stdout
