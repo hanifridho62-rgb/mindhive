@@ -274,8 +274,13 @@ def test_the_panel_is_clamped_into_the_viewport():
     leave the window, so the actual proof was measuring all seven panels in a
     browser. What this test defends is that the clamp is not quietly deleted."""
     js = cat_board.script()
-    body = js[js.index("function catPanel"):]
-    body = body[:body.index("function paintCats")]
+    # Sliced at `mnPanel`, which is where the clamp lives now that both
+    # strips share one panel renderer. That move is the reason this gate
+    # matters MORE than it did: the session strip sits at the end of the
+    # same header, so its rightmost cat opens the same panel past the same
+    # edge, and it inherits the fix only by going through this function.
+    body = js[js.index("function mnPanel"):]
+    body = body[:body.index("function catPanel")]
     assert "clientWidth" in body, "the panel no longer clamps to the viewport width"
     assert "Math.min" in body and "Math.max" in body, (
         "the clamp needs both bounds: min keeps it inside the right edge, max keeps "
@@ -285,6 +290,21 @@ def test_the_panel_is_clamped_into_the_viewport():
     assert body.index("p.style.display = 'block'") < body.index("clientWidth"), (
         "the panel is measured while still hidden — its width reads 0 and the "
         "clamp silently does nothing")
+
+
+def test_both_strips_render_through_the_one_clamped_panel():
+    """The clamp above is inherited, not copied. A second panel renderer is
+    how the faculty cat and the session cat would start describing the same
+    four fields differently -- and how one of them would quietly lose the
+    viewport clamp again."""
+    js = cat_board.script()
+    assert js.count("function mnPanel(") == 1
+    for caller in ("function catPanel(", "function sessPanel("):
+        body = js[js.index(caller):]
+        body = body[:body.index("}", body.index("mnPanel("))]
+        assert "mnPanel(" in body, caller + " no longer uses the shared panel"
+        assert "clientWidth" not in body, (
+            caller + ' grew its own clamp — there must be exactly one')
 
 
 def test_a_page_without_the_strip_does_not_crash_the_board():

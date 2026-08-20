@@ -1,5 +1,6 @@
 # tests/test_dashboard.py
 import json
+import pathlib
 import re
 import socket
 import time
@@ -9,6 +10,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
+import mindhive
 from mindhive import dashboard, dashboard_page, dashboard_post
 
 # Store isolation is provided by the autouse `isolate_store` fixture in
@@ -2814,3 +2816,229 @@ def test_page_has_enrich_hooks(dashboard_server):
     assert "/api/enrich/toggle" in body
     # HIVE MIND stub: the panel must never silently vanish under "*"
     assert "pick a concrete project in the header" in body
+
+
+# --- Oversee: a plan attaches to the session CONTINUING it -------------------
+#
+# WHY. The match was `plan_id == run_id`, so a plan could only ever ride the
+# card of the session that created it. `roadmap.auto_plan_id` now lets a later
+# session continue that plan, and the fold stamps the plan's `session_id` with
+# whoever last wrote to it -- so this is the reader half of the same fix. Both
+# halves are needed: without the attach the card shows no roadmap at all, and
+# without the live_ids half the very same plan ALSO stays in the top-level
+# awaiting-resume list, which is the pile the user reported.
+
+def _live_chat(sid="chat-1", text="live chat work"):
+    """A chat session whose last event is now, so the fold keeps it on board."""
+    import datetime as _dt
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev_mod.append_event("session_start", {}, session_id=sid, ts=ts,
+                        project="test")
+    ev_mod.append_event("user_prompt", {"text": text}, session_id=sid, ts=ts,
+                        project="test")
+    return ts
+
+
+def _plan_continued_by(sid, plan_id="sess-prev"):
+    """A plan declared by an earlier session and last written by *sid*."""
+    ev_mod.append_event("roadmap",
+                        {"action": "set", "plan_id": plan_id,
+                         "prompt": "Build the parser fix",
+                         "steps": [{"text": "a", "status": "done"},
+                                   {"text": "b", "status": "active"}]},
+                        session_id="sess-prev", ts="2026-07-07T09:00:00Z",
+                        tags=["roadmap", "auto"], project="test")
+    ev_mod.append_event("roadmap",
+                        {"action": "interrupt", "plan_id": plan_id,
+                         "cause": "session_end"},
+                        session_id="sess-prev", ts="2026-07-07T10:00:00Z",
+                        tags=["roadmap", "auto"], project="test")
+    ev_mod.append_event("roadmap",
+                        {"action": "resume", "plan_id": plan_id},
+                        session_id=sid, ts="2026-07-07T11:00:00Z",
+                        tags=["roadmap", "auto"], project="test")
+
+
+def test_oversee_attaches_a_plan_to_the_session_continuing_it(dashboard_server):
+    base, token = dashboard_server
+    _live_chat("chat-1")
+    _plan_continued_by("chat-1")
+    obj = json.loads(_get(base, "/api/oversee?project=test", token)[1])
+    card = [r for r in obj["runs"] if r["run_id"] == "chat-1"][0]
+    assert card.get("roadmap", {}).get("plan_id") == "sess-prev"
+    assert card["roadmap"]["progress"] == {"done": 1, "total": 2}
+
+
+def test_a_continued_plan_leaves_the_awaiting_resume_pile(dashboard_server):
+    """The pile the user is looking at. A plan on a live card is not awaiting
+    anything, and listing it in both places is what made the count grow while
+    nothing appeared to move."""
+    base, token = dashboard_server
+    _live_chat("chat-1")
+    _plan_continued_by("chat-1")
+    obj = json.loads(_get(base, "/api/oversee?project=test", token)[1])
+    assert [p["plan_id"] for p in obj["plans"]] == []
+
+
+def test_a_plan_with_no_live_session_still_rides_the_plans_list(dashboard_server):
+    """The counterweight: an orphaned plan must NOT vanish. Attaching by session
+    id could quietly hide every plan whose session has aged off the board."""
+    base, token = dashboard_server
+    _plan_continued_by("chat-gone")
+    obj = json.loads(_get(base, "/api/oversee?project=test", token)[1])
+    assert [p["plan_id"] for p in obj["plans"]] == ["sess-prev"]
+
+
+# --- no absolute stamp reaches the page unconverted ---------------------------
+
+# Fields that hold an ISO ledger stamp. Escaping one straight into the page is
+# how the dashboard printed UTC-only for its whole life: correct, and unreadable
+# to the person in Jakarta reading it.
+#
+# `first_ts` and `last_ts` are listed because they were MISSING, and the omission
+# was not free: this gate reported green over a page that still printed three raw
+# stamps. A gate that certifies a gap is worse than no gate, so the two rules
+# below are deliberately harder to satisfy dishonestly than the code is to fix.
+_STAMP_FIELDS = ("ts", "started", "last_event_ts", "updated", "created",
+                 "interrupted_at", "archived_at", "first_ts", "last_ts")
+_FIELD_RE = "|".join(_STAMP_FIELDS)
+# Rule A -- escaped straight into the page. The `\(*` is the fix for the one
+# spelling that slipped through: `esc((k.ts || '').slice(11, 16))` opens a second
+# paren before the field, and a pattern demanding `esc(IDENT.` is blind to it
+# while a reader skims straight over the difference.
+_RAW_STAMP = re.compile(
+    r"esc\(\s*\(*\s*[A-Za-z_][A-Za-z_0-9]*\.(" + _FIELD_RE + r")\b")
+# Rule B -- concatenated into markup with no clock at all. Rule A anchors on
+# `esc(`, which made DELETING the escaping the cheapest way to go green: a
+# formatting bug traded for an injection hole, gate still green. This rule asks
+# the question from the other side -- on a line that builds HTML, every stamp
+# must pass through the clock, escaped or not -- so between the two there is no
+# cheap way out that is not also the correct fix.
+_HTML_LINE = re.compile(r"""'[^']*<|"[^"]*<""")
+_ANY_STAMP = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\.(" + _FIELD_RE + r")\b")
+_CLOCKED = ("fmtTs(", "fmtHm(")
+
+
+def _unclocked_html_stamps(line):
+    """Stamps on a markup-building line that no clock call wraps."""
+    if not _HTML_LINE.search(line):
+        return []
+    out = []
+    for m in _ANY_STAMP.finditer(line):
+        before = line[max(0, m.start() - 8):m.start()]
+        if not any(c in before for c in _CLOCKED):
+            out.append(m.group(0))
+    return out
+
+
+def _js_modules():
+    """Every module that contributes JS to the page, not only the ones named
+    `dashboard_js_*`. `taskview.py` sits outside that glob, which is exactly why
+    its two raw stamps stayed invisible here while being visible on the page --
+    the glob was this gate's blind spot, not an oversight inside it."""
+    root = pathlib.Path(mindhive.__file__).parent
+    mods = sorted(root.glob("dashboard_js_*.py"))
+    assert mods, "no dashboard JS modules found - this gate would pass vacuously"
+    for extra in ("taskview.py", "cat_board.py"):
+        p = root / extra
+        assert p.exists(), f"{extra} is gone - this gate stopped covering it"
+        mods.append(p)
+    return mods
+
+
+def test_no_dashboard_js_module_prints_a_raw_ledger_stamp():
+    """The anti-rot half of the clock work. Converting the sites that existed
+    fixes today; this is what stops the next one being added raw, which is the
+    only way a mixed-format page can come back."""
+    offenders = []
+    for path in _js_modules():
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if _RAW_STAMP.search(line):
+                offenders.append(f"{path.name}:{i}: {line.strip()}")
+    assert offenders == [], (
+        "these render a ledger stamp without fmtTs, so they print UTC only:"
+        + "\n  " + "\n  ".join(offenders))
+
+
+def test_no_module_concatenates_a_stamp_into_markup_without_the_clock():
+    """The other half, and the one that closes the gate's own escape hatch: a
+    line failing the rule above could be made green by deleting `esc(`, which is
+    a strictly worse page. Here the requirement is the clock itself, so the only
+    way through both rules is to actually convert the stamp."""
+    offenders = []
+    for path in _js_modules():
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for hit in _unclocked_html_stamps(line):
+                offenders.append(f"{path.name}:{i}: {hit} in {line.strip()}")
+    assert offenders == [], (
+        "these build markup around a ledger stamp no clock call wraps:"
+        + "\n  " + "\n  ".join(offenders))
+
+
+# The exact lines that shipped past the first version of this gate, plus the
+# shortcut it rewarded. Kept verbatim so the canary tests the spellings that
+# really occurred rather than a paraphrase of them.
+_CANARY_LINES = (
+    # `last_ts` was not in _STAMP_FIELDS.
+    """      + '<div class="card">'+esc(o.last_ts || '\\u2014')+'</div>'""",
+    # The regex demanded `esc(IDENT.` and this opens a paren first.
+    """      + '">\\u2726</span> <span class="dup">'+esc((k.ts || '').slice(11, 16))""",
+    # taskview.py was outside the glob _js_modules() used to walk.
+    """      + '<span class="tspan">'+esc(s.first_ts||'')+' \\u2192 '""",
+    # And the cheapest way to go green on an esc-anchored rule: drop the esc.
+    """      + '<span class="tspan">'+s.last_ts+'</span>'""",
+)
+
+# The same three sites as they are spelled now. A rule that fires on everything
+# is a wall, not a gate.
+_CONVERTED_LINES = (
+    """      + '<div class="card">'+esc(fmtTs(o.last_ts) || '\\u2014')+'</div>'""",
+    """      + '">\\u2726</span> <span class="dup">'+esc(fmtHm(k.ts))""",
+    """      + '<span class="tspan">'+esc(fmtTs(s.first_ts||''))+' \\u2192 '""",
+)
+
+
+def test_the_stamp_gate_fires_on_every_spelling_it_has_missed():
+    """The canary. A negative assertion is only worth its silence if the rule
+    behind it can speak, and this gate's silence was already wrong once for three
+    separate reasons -- so each historical spelling is checked against the rules
+    directly rather than trusted to be caught."""
+    for line in _CANARY_LINES:
+        assert _RAW_STAMP.search(line) or _unclocked_html_stamps(line), line
+
+
+def test_the_stamp_gate_stays_silent_on_the_converted_forms():
+    """The counterweight: both rules have to pass the current spellings, or the
+    fix they exist to protect could not have been applied."""
+    for line in _CONVERTED_LINES:
+        assert not _RAW_STAMP.search(line), line
+        assert _unclocked_html_stamps(line) == [], line
+
+
+def test_the_modules_that_render_stamps_still_call_the_clock():
+    """The canary for the gates above, which a module could satisfy by printing
+    no timestamp at all. These six render one, and each has to convert it --
+    `dashboard_js_core.py` and `taskview.py` joined the list when their raw
+    stamps were finally found, and they are the two the old glob missed."""
+    expected = {"dashboard_js_core.py", "dashboard_js_improve.py",
+                "dashboard_js_oversee.py", "dashboard_js_skills.py",
+                "dashboard_js_views.py", "taskview.py"}
+    calls = {p.name for p in _js_modules()
+             if "fmtTs(" in p.read_text(encoding="utf-8")}
+    assert expected <= calls, f"stopped converting stamps: {expected - calls}"
+
+
+def test_the_clock_face_helper_is_spliced_and_called():
+    """`fmtHm` exists for the one site where a full date will not fit: the skill
+    trail's marker is five characters wide by design. Spliced but never called,
+    and called but never spliced, are both SILENT -- the page is assembled by
+    string replace, so a missing placeholder is a no-op rather than an error, and
+    this repo has already served a page whose helper was missing."""
+    from mindhive import taskview
+
+    page = dashboard_page.render_page("tok", tasks_css=taskview.CARDS_CSS,
+                                     tasks_js=taskview.CARDS_JS)
+    assert page.count("function fmtHm(") == 1, (
+        "the clock face is not on the page exactly once")
+    assert "esc(fmtHm(" in page, (
+        "fmtHm is defined on the page but nothing calls it")

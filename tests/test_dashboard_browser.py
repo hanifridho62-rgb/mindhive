@@ -35,6 +35,7 @@ report a serene pass. `test_the_page_is_visible_to_its_own_pollers` asserts that
 premise instead of assuming it.
 """
 import contextlib
+import json
 import threading
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -474,3 +475,213 @@ def test_the_probe_fails_against_a_page_with_that_guard_removed(browser, why, pr
     with serving(mutation) as mutant_url:
         with pytest.raises(AssertionError):
             probe(browser, mutant_url)
+
+
+# --- the session cat answers the four questions on click ---------------------
+#
+# The endpoint is covered over real HTTP in `test_mindnet_cat_board.py` and the
+# provider as a pure function in `test_mindnet_ui_sessions.py`. What only a
+# browser can show is the part the user actually does: clicking the cat and
+# reading the panel. The payload is stubbed rather than seeded, so this probe
+# tests the PAGE and nothing behind it -- a strip that renders the right cat
+# from the right JSON is the claim, and a ledger fixture would drag two folds
+# and a memo into a question that is neither.
+
+CATS_PAYLOAD = {
+    "cats": [],
+    "sessions": [{
+        "session_id": "chat-probe-1",
+        "display": "working",
+        "kind": "chat",
+        "title": "wire the cats up",
+        "doing": "writing the panel",
+        "task": "Answer the four questions",
+        "phase": "step 2/3: render the panel",
+        "skill": "compound-engineering:ce-plan",
+        "age_secs": 12,
+    }],
+    "sessions_total": 1,
+    "sessions_hidden": 0,
+    "producers": {"session": True},
+    "dim_after_secs": 180,
+    "hide_after_secs": 21600,
+    "idle_vanish_secs": 15,
+    "online_after_secs": 180,
+}
+
+
+def _stub_cats(page):
+    """Serve one known session cat, whatever the local ledger holds."""
+    page.route("**/api/mindnet/cats*", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps(CATS_PAYLOAD)))
+
+
+def probe_session_cat_panel(browser, url):
+    with opened(browser, url) as page:
+        _stub_cats(page)
+        settled(page)
+        cat = page.locator("#mn-sessions .mn-sess").first
+        cat.wait_for(state="visible", timeout=15000)
+        # Before the click there must be no panel: a panel that is always open
+        # would make every assertion below pass without a click happening.
+        assert page.locator("#mn-cat-panel").is_visible() is False
+        cat.click()
+        panel = page.locator("#mn-cat-panel")
+        panel.wait_for(state="visible", timeout=5000)
+        rows = page.evaluate("""() => Array.from(
+          document.querySelectorAll('#mn-cat-panel .kv'))
+            .map(d => [d.children[0].textContent, d.children[1].textContent])""")
+        heading = page.locator("#mn-cat-panel h3").text_content()
+        # A second click closes it -- the cat is a toggle, like the faculty cat.
+        cat.click()
+        closed = page.locator("#mn-cat-panel").is_visible()
+    fields = dict(rows)
+    assert heading == "wire the cats up", heading
+    assert fields["task"] == "Answer the four questions", fields
+    assert fields["phase"] == "step 2/3: render the panel", fields
+    assert fields["skill"] == "compound-engineering:ce-plan", fields
+    assert fields["state"] == "working", fields
+    assert closed is False, "clicking the open cat again did not close its panel"
+
+
+def probe_session_cat_panel_dashes_what_it_does_not_know(browser, url):
+    """A session with no plan and no skill yet. The panel must still open and
+    must say so with a dash -- rendering the string "undefined" into the DOM is
+    the failure this repo has already shipped once for `origin`."""
+    with opened(browser, url) as page:
+        page.route("**/api/mindnet/cats*", lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps(dict(CATS_PAYLOAD, sessions=[
+                dict(CATS_PAYLOAD["sessions"][0], task="", phase="", skill="")]))))
+        settled(page)
+        cat = page.locator("#mn-sessions .mn-sess").first
+        cat.wait_for(state="visible", timeout=15000)
+        cat.click()
+        page.locator("#mn-cat-panel").wait_for(state="visible", timeout=5000)
+        values = page.evaluate("""() => Array.from(
+          document.querySelectorAll('#mn-cat-panel .kv'))
+            .map(d => d.children[1].textContent)""")
+    assert "undefined" not in values, values
+    assert "null" not in values, values
+    assert values.count("\u2014") >= 3, values
+
+
+def test_a_session_cat_opens_a_panel_naming_task_phase_and_skill(browser, url):
+    probe_session_cat_panel(browser, url)
+
+
+def test_a_session_cat_panel_dashes_the_unknown(browser, url):
+    probe_session_cat_panel_dashes_what_it_does_not_know(browser, url)
+
+
+# --- one panel, two strips: who owns it --------------------------------------
+#
+# `paintCats` and `paintSessions` run back to back off ONE 2.5 s poll, and every
+# bug in this area was one of them reaching into the other's open panel:
+#
+#   F11  the faculty strip's empty-board branch hid the panel unconditionally,
+#        and an empty faculty board is the COMMON case -- most sessions emit no
+#        faculty telemetry at all -- so a session panel closed itself roughly
+#        one poll after every click, which reads as the click not working.
+#   F9   the faculty cat's own handler swept only `#mn-cats .mn-cat.sel`, so
+#        clicking a faculty cat after a session cat left BOTH marked selected
+#        while the panel described one of them.
+#
+# Neither is visible without a real DOM, two real strips and a real click: the
+# race is between two paint functions and a user, and none of the three exists
+# in a unit test.
+
+FACULTY_ROW = {"faculty": "task-graph", "display": "active", "status": "active",
+               "task_id": "t1", "phase": "plan", "skill": "mindhive-python-tdd",
+               "age_secs": 5}
+
+
+def probe_one_panel_one_selection(browser, url):
+    with opened(browser, url) as page:
+        page.route("**/api/mindnet/cats*", lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps(dict(CATS_PAYLOAD, cats=[FACULTY_ROW],
+                                 producers={"session": True, "faculty": True}))))
+        settled(page)
+        sess = page.locator("#mn-sessions .mn-sess").first
+        fac = page.locator("#mn-cats .mn-cat").first
+        sess.wait_for(state="visible", timeout=15000)
+        fac.wait_for(state="visible", timeout=15000)
+        sess.click()
+        page.locator("#mn-cat-panel").wait_for(state="visible", timeout=5000)
+        after_session = page.evaluate(
+            "() => document.querySelectorAll('.mn-cat.sel, .mn-sess.sel').length")
+        fac.click()
+        page.locator("#mn-cat-panel").wait_for(state="visible", timeout=5000)
+        after_faculty = page.evaluate(
+            "() => document.querySelectorAll('.mn-cat.sel, .mn-sess.sel').length")
+        heading = page.locator("#mn-cat-panel h3").text_content()
+    assert after_session == 1, f"{after_session} cats selected after one click"
+    assert after_faculty == 1, (
+        f"{after_faculty} cats read as selected while one panel describes one "
+        "of them")
+    assert heading != "wire the cats up", (
+        "the panel still describes the session cat after a faculty click")
+
+
+def probe_an_empty_faculty_board_leaves_the_session_panel_open(browser, url):
+    """F11 head on. The payload has NO faculty cats, which is the normal case,
+    and the faculty strip repaints on the same tick as the session strip."""
+    with opened(browser, url) as page:
+        _stub_cats(page)                        # cats: [] -- the common shape
+        settled(page)
+        cat = page.locator("#mn-sessions .mn-sess").first
+        cat.wait_for(state="visible", timeout=15000)
+        cat.click()
+        panel = page.locator("#mn-cat-panel")
+        panel.wait_for(state="visible", timeout=5000)
+        # Sit through more than one full poll. The panel closing itself here is
+        # the bug: nothing was clicked, and the user is still reading it.
+        page.wait_for_timeout(6000)
+        still_open = panel.is_visible()
+        selected = page.evaluate(
+            "() => document.querySelectorAll('.mn-sess.sel').length")
+    assert still_open, (
+        "the empty faculty board closed a panel the session strip owns")
+    assert selected == 1, "the poll dropped the session cat's selection"
+
+
+def probe_session_strip_does_not_execute_ledger_text(browser, url):
+    """The session strip is the newest surface rendering text a person wrote,
+    `esc()` covers `&<>` and NOT quotes, and the panel's values go through it.
+    A payload shaped like markup must arrive as characters."""
+    hostile = "<img src=x onerror=window.__pwned=1>"
+    quoted = '" onmouseover="window.__pwned=1'
+    with opened(browser, url) as page:
+        page.route("**/api/mindnet/cats*", lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps(dict(CATS_PAYLOAD, sessions=[dict(
+                CATS_PAYLOAD["sessions"][0], title=hostile, task=hostile,
+                phase=quoted, skill=hostile, doing=hostile)]))))
+        settled(page)
+        cat = page.locator("#mn-sessions .mn-sess").first
+        cat.wait_for(state="visible", timeout=15000)
+        cat.click()
+        page.locator("#mn-cat-panel").wait_for(state="visible", timeout=5000)
+        page.wait_for_timeout(500)
+        pwned = page.evaluate("() => !!window.__pwned")
+        injected = page.evaluate(
+            "() => document.querySelectorAll('#mn-cat-panel img').length")
+        heading = page.locator("#mn-cat-panel h3").text_content()
+    assert pwned is False, "ledger text executed as script"
+    assert injected == 0, "ledger text became a real element"
+    assert heading == hostile, (
+        f"the markup was not rendered as characters: {heading!r}")
+
+
+def test_exactly_one_cat_is_selected_across_both_strips(browser, url):
+    probe_one_panel_one_selection(browser, url)
+
+
+def test_an_empty_faculty_board_does_not_close_the_session_panel(browser, url):
+    probe_an_empty_faculty_board_leaves_the_session_panel_open(browser, url)
+
+
+def test_the_session_panel_renders_hostile_ledger_text_as_characters(browser, url):
+    probe_session_strip_does_not_execute_ledger_text(browser, url)

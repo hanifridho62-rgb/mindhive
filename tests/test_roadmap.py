@@ -887,3 +887,453 @@ def test_probe_is_registered_under_its_surface_name():
     surface = outcomes.get("roadmap-retirement")
     assert surface is not None
     assert surface.probe is roadmap._probe
+
+
+# --- which plan does this session's auto-managed work belong to? --------------
+#
+# WHY THIS EXISTS. "plan_id == session_id" was the answer in four places, and
+# it is the reason the dashboard grew a permanent pile under "N awaiting
+# resume": a session ends, `autoclose_session` interrupts its plan, the next
+# session has a new id and therefore mints a NEW plan, and the old one can
+# never be matched to a live card again. Progress froze by construction, and
+# the replenishment injector's `(new)` steps landed on whichever plan the
+# session happened to own rather than on the work actually being continued.
+
+def _auto_set(plan_id, session, ts, steps=None, prompt=PROMPT):
+    """An AUTO-tagged plan, the shape `sync_from_todos` writes."""
+    return events.append_event(
+        "roadmap", {"action": "set", "plan_id": plan_id, "prompt": prompt,
+                    "steps": list(STEPS) if steps is None else steps},
+        session_id=session, ts=ts, tags=["roadmap", roadmap.AUTO_TAG])
+
+
+def _auto_ev(action, plan_id, session, ts, **kw):
+    return events.append_event(
+        "roadmap", {"action": action, "plan_id": plan_id, **kw},
+        session_id=session, ts=ts, tags=["roadmap", roadmap.AUTO_TAG])
+
+
+NOW = "2026-08-20T12:00:00Z"
+
+
+def _resolve(sid, now=NOW):
+    return roadmap.auto_plan_id(sid, roadmap.fold(events.read_all()), now=now)
+
+
+def test_auto_plan_id_prefers_the_sessions_own_plan():
+    """A session that already owns a plan keeps it — adoption must never
+    redirect work away from the plan this session itself declared."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    _auto_set("sess-b", "sess-b", "2026-08-20T11:00:00Z")
+    assert _resolve("sess-b") == "sess-b"
+
+
+def test_auto_plan_id_adopts_the_plan_the_previous_session_left_interrupted():
+    """The defect, inverted: the new session continues the paused plan."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    assert _resolve("sess-b") == "sess-a"
+
+
+def test_auto_plan_id_adopts_a_usage_capped_plan_too():
+    """`session_end` is not the only pause. The module's whole reason for the
+    interrupt marker is the usage cap, and a rotation successor has to pick up
+    exactly that plan — so the rule is the STATUS, never the cause string."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="api_cap")
+    assert _resolve("sess-b") == "sess-a"
+
+
+def test_auto_plan_id_leaves_an_active_plan_to_the_session_that_owns_it():
+    """Two Claudes at once is normal here. An ACTIVE plan has a live owner, and
+    stealing it would make two sessions overwrite one record's steps."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    assert _resolve("sess-b") == "sess-b"
+
+
+@pytest.mark.parametrize("action,kw", [("complete", {}),
+                                       ("archive", {"reason": "superseded"})])
+def test_auto_plan_id_never_revives_a_retired_plan(action, kw):
+    """Completing or archiving a plan IS the user's way of saying "not this
+    one" — it has to be the escape hatch from adoption, or there is none."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev(action, "sess-a", "sess-a", "2026-08-20T10:30:00Z", **kw)
+    assert _resolve("sess-b") == "sess-b"
+
+
+def test_auto_plan_id_never_adopts_a_human_declared_plan():
+    """The guard all three writers already enforce, now enforced one layer
+    earlier: a hand-written `hive roadmap set` is nobody's to adopt."""
+    _set(plan_id="sess-a", ts="2026-08-20T10:00:00Z", session="sess-a")
+    _ev("interrupt", plan_id="sess-a", ts="2026-08-20T10:30:00Z",
+        session="sess-a", cause="session_end")
+    assert _resolve("sess-b") == "sess-b"
+
+
+def test_auto_plan_id_does_not_resurrect_a_plan_abandoned_long_ago():
+    """The bound that keeps adoption from being permanent. Without it, a plan
+    paused in March is still "the work" in August, and an unrelated task
+    inherits its ask forever."""
+    _auto_set("sess-a", "sess-a", "2026-05-01T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-05-01T10:30:00Z",
+             cause="session_end")
+    assert _resolve("sess-b") == "sess-b"
+
+
+def test_auto_plan_id_adopts_the_newest_of_several_candidates():
+    """Discriminating on purpose: with two adoptable plans, an implementation
+    that returns the first match in fold order passes every test above and
+    fails this one."""
+    _auto_set("sess-old", "sess-old", "2026-08-19T10:00:00Z")
+    _auto_ev("interrupt", "sess-old", "sess-old", "2026-08-19T10:30:00Z",
+             cause="session_end")
+    _auto_set("sess-new", "sess-new", "2026-08-20T09:00:00Z")
+    _auto_ev("interrupt", "sess-new", "sess-new", "2026-08-20T09:30:00Z",
+             cause="session_end")
+    assert _resolve("sess-b") == "sess-new"
+
+
+def test_auto_plan_id_stays_on_the_plan_this_session_already_continued():
+    """The canary for a defect adoption creates on its own. Once session B has
+    adopted A, A is ACTIVE again — so the interrupted-plan rule can no longer
+    find it, and `autoclose_session("sess-b")` would resolve to a plan that
+    does not exist and leave A active forever with nobody working it."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    _auto_set("sess-a", "sess-b", "2026-08-20T11:00:00Z")   # B adopted it
+    assert _resolve("sess-b") == "sess-a"
+
+
+def test_auto_plan_id_does_not_claim_a_plan_this_session_merely_retired():
+    """`session_id` is stamped by the LAST event, and completing a plan is an
+    event. Without the retirement check, the session that closed a plan would
+    keep resolving to it and re-open it on the next TodoWrite."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("complete", "sess-a", "sess-b", "2026-08-20T11:00:00Z")
+    assert _resolve("sess-b") == "sess-b"
+
+
+# --- the writers, now that the question has one answer ------------------------
+
+def _todo(text, status="pending"):
+    return {"content": text, "status": status}
+
+
+def test_sync_from_todos_continues_the_paused_plan_instead_of_minting_one():
+    """The user-visible defect: a second session used to add a whole new plan
+    while the real one sat under awaiting-resume, matching no live card."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    ev = roadmap.sync_from_todos("sess-b", [_todo("two", "in_progress")],
+                                 ts=NOW)
+    assert ev is not None and ev.payload["plan_id"] == "sess-a"
+    reg = roadmap.fold(events.read_all())
+    assert "sess-b" not in reg, "a second plan was minted anyway"
+    assert reg["sess-a"]["status"] == "active", "the plan was not revived"
+    # THE line that makes the dashboard able to find it again.
+    assert reg["sess-a"]["session_id"] == "sess-b"
+
+
+def test_continuing_a_plan_keeps_the_progress_it_already_made():
+    """Discriminating, and the trap adoption sets for itself: `set` replaces the
+    step list WHOLESALE, so carrying a plan forward while rebuilding its steps
+    from the new session's TodoWrite alone would reset its progress to zero in
+    the same breath as continuing it — the exact opposite of the ask."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z",
+              steps=[{"text": "one", "status": "done"},
+                     {"text": "two", "status": "pending"}])
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    ev = roadmap.sync_from_todos("sess-b", [_todo("two", "in_progress")],
+                                ts=NOW)
+    # Asserted on the event this call WROTE, not on the record it may have
+    # left alone. Reading the fold straight away passes without the fix for
+    # the emptiest possible reason: plan sess-a still holds its own untouched
+    # steps while the sync quietly built a second plan beside it.
+    assert ev is not None and ev.payload["plan_id"] == "sess-a"
+    assert [s["text"] for s in ev.payload["steps"]] == ["one", "two"]
+    rec = roadmap.fold(events.read_all())["sess-a"]
+    assert rec["progress"]["done"] == 1 and rec["progress"]["total"] == 2
+
+
+def test_continuing_a_plan_keeps_the_original_ask_and_retitles_it():
+    """`Asked:` is the plan's provenance — the one field a resumed session must
+    not overwrite. The title is the opposite: it names what is being worked
+    NOW, so the card does not read as last session's job."""
+    events.append_event("user_prompt", {"text": "carry on with the mirror"},
+                        session_id="sess-b", ts="2026-08-20T11:00:00Z")
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    ev = roadmap.sync_from_todos("sess-b", [_todo("two", "in_progress")],
+                                ts=NOW)
+    assert ev is not None and ev.payload["plan_id"] == "sess-a"
+    assert ev.payload["prompt"] == PROMPT
+    assert ev.payload["title"] == "carry on with the mirror"
+
+
+def test_its_own_plan_still_replaces_its_steps_wholesale():
+    """The counterweight. History is carried for a CONTINUED plan only; inside
+    the session that owns it, deleting a todo must still delete the step, or
+    every plan grows forever and TodoWrite stops being authoritative."""
+    roadmap.sync_from_todos("sess-a", [_todo("one", "completed"),
+                                       _todo("two")], ts=NOW)
+    roadmap.sync_from_todos("sess-a", [_todo("two")], ts=NOW)
+    rec = roadmap.fold(events.read_all())["sess-a"]
+    assert [s["text"] for s in rec["steps"]] == ["two"]
+
+
+def test_autoclose_interrupts_the_plan_the_session_was_continuing():
+    """Without the resolver this returned None: the session had no plan of its
+    own, so nothing was interrupted and the plan stayed active with nobody
+    working it — invisible in the awaiting-resume list it belongs in."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    roadmap.sync_from_todos("sess-b", [_todo("two", "in_progress")], ts=NOW)
+    ev = roadmap.autoclose_session("sess-b", ts="2026-08-20T13:00:00Z")
+    assert ev is not None and ev.payload["plan_id"] == "sess-a"
+    rec = roadmap.fold(events.read_all())["sess-a"]
+    assert rec["status"] == "interrupted"
+
+
+def test_autoclose_completes_a_continued_plan_whose_work_is_finished():
+    """The earned exit still has to be reachable through a continuation, or a
+    plan carried across sessions can only ever be interrupted, never done."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z",
+              steps=[{"text": "one", "status": "done"}])
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    roadmap.sync_from_todos("sess-b", [_todo("one", "completed")], ts=NOW)
+    ev = roadmap.autoclose_session("sess-b", ts="2026-08-20T13:00:00Z")
+    assert ev is not None and ev.payload["action"] == "complete"
+    assert roadmap.fold(events.read_all())["sess-a"]["status"] == "completed"
+
+
+# --- the index every reader of "whose plan is this" needs ---------------------
+
+def test_by_session_maps_a_plan_to_the_session_working_it():
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("resume", "sess-a", "sess-b", "2026-08-20T11:00:00Z")
+    idx = roadmap.by_session(roadmap.fold(events.read_all()))
+    assert set(idx) == {"sess-b"}
+    assert idx["sess-b"]["plan_id"] == "sess-a"
+
+
+def test_by_session_drops_a_completed_plan():
+    """A finished plan is not what a session is working on, and showing it on a
+    live card is how the board claims progress that already ended."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("complete", "sess-a", "sess-a", "2026-08-20T11:00:00Z")
+    assert roadmap.by_session(roadmap.fold(events.read_all())) == {}
+
+
+def test_by_session_keeps_the_plan_the_session_touched_last():
+    """Discriminating: a session that wrote to two plans has one current one,
+    and an implementation that lets dict order decide passes without this."""
+    _auto_set("plan-old", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_set("plan-new", "sess-a", "2026-08-20T11:00:00Z")
+    idx = roadmap.by_session(roadmap.fold(events.read_all()))
+    assert idx["sess-a"]["plan_id"] == "plan-new"
+
+
+def test_by_session_drops_an_archived_plan():
+    """F6. `RETIRED_STATUSES` is completed AND archived, and archiving is the
+    DELIBERATE exit -- the user attached a reason to it. Reading only
+    `completed` here put a plan the user had explicitly retired back onto a live
+    Oversee card and back into the session cat's phase line."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("archive", "sess-a", "sess-a", "2026-08-20T11:00:00Z",
+             reason="superseded by the mirror work")
+    assert roadmap.by_session(roadmap.fold(events.read_all())) == {}
+
+
+def test_by_session_ignores_a_human_declared_plan():
+    """F7, first half: the AUTO predicate `auto_plan_id` already applies. A
+    session that ran `hive roadmap step` against a hand-written plan was
+    otherwise indexed here as working it, while the card kept showing the
+    session's own auto plan -- one session, two surfaces, two answers."""
+    _set(plan_id="plan-human", ts="2026-08-20T10:00:00Z", session="sess-a")
+    assert roadmap.by_session(roadmap.fold(events.read_all())) == {}
+
+
+def test_by_session_breaks_a_same_second_tie_the_way_the_writer_does():
+    """F7, second half, and discriminating: two plans updated in the SAME
+    second. Comparing `updated` alone leaves the winner to fold order, and
+    same-second writes are routine enough here that the ledger carries its own
+    tie-break for them. The writer compares `(updated, plan_id)`, so the reader
+    has to land on `plan-b` -- fold order would hand back `plan-a`."""
+    _auto_set("plan-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_set("plan-b", "sess-a", "2026-08-20T10:00:00Z")
+    idx = roadmap.by_session(roadmap.fold(events.read_all()))
+    assert idx["sess-a"]["plan_id"] == "plan-b"
+
+
+def test_plan_for_session_prefers_the_plan_the_session_declared_itself():
+    """The composition used to be spelled inline on the Oversee card while the
+    session cat consulted the adoption index alone. Here they differ: the index
+    names `plan-other` (newer), and the right answer is the session's own."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_set("plan-other", "sess-a", "2026-08-20T11:00:00Z")
+    reg = roadmap.fold(events.read_all())
+    assert roadmap.by_session(reg)["sess-a"]["plan_id"] == "plan-other"
+    assert roadmap.plan_for_session(reg, "sess-a")["plan_id"] == "sess-a"
+
+
+def test_plan_for_session_falls_through_when_its_own_plan_is_retired():
+    """Completing a plan is how the user says not-this-one, and it has to mean
+    that on every surface -- not only inside `plans()`. The session then shows
+    the plan it adopted rather than the one it finished."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("complete", "sess-a", "sess-a", "2026-08-20T10:30:00Z")
+    _auto_set("plan-other", "sess-a", "2026-08-20T11:00:00Z")
+    reg = roadmap.fold(events.read_all())
+    assert roadmap.plan_for_session(reg, "sess-a")["plan_id"] == "plan-other"
+
+
+def test_plan_for_session_is_total_about_having_no_answer():
+    """A session with no plan is the COMMON case -- most sessions never declare
+    one -- so the helper returns None rather than raising, and an empty or
+    missing registry is not a special case either."""
+    assert roadmap.plan_for_session({}, "sess-a") is None
+    assert roadmap.plan_for_session(None, "") is None
+
+
+# --- the carry: what a continued plan keeps, and what has to make room --------
+
+def test_continuing_a_plan_keeps_the_steps_that_are_still_left():
+    """F1, and the half the progress test above cannot see. `set` replaces the
+    step list WHOLESALE and the writer rebuilt it from this session's TodoWrite
+    alone, so a step the adopted plan had NOT finished -- and that this session
+    has not listed yet -- was deleted. The plan visibly shrank while `progress`
+    rose, and "what is still left" is the thing the feature exists to show."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z",
+              steps=[{"text": "one", "status": "done"},
+                     {"text": "two", "status": "pending"},
+                     {"text": "three", "status": "pending"}])
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    ev = roadmap.sync_from_todos("sess-b", [_todo("two", "in_progress")],
+                                ts=NOW)
+    assert ev is not None and ev.payload["plan_id"] == "sess-a"
+    assert [s["text"] for s in ev.payload["steps"]] == ["one", "two", "three"]
+    got = {s["text"]: s["status"] for s in ev.payload["steps"]}
+    assert got["one"] == "done", "recorded progress was undone"
+    assert got["two"] == "active", "the live session's own status lost"
+    assert got["three"] == "pending"
+
+
+def test_a_continued_plan_at_the_cap_keeps_this_sessions_own_todos():
+    """F3. The trim used to cut the tail, which is where the LIVE session's
+    steps sit -- and `autoclose_session` then read a plan with nothing
+    unfinished and marked it COMPLETE. One cap collision and the session's whole
+    visible workload left every view. Room is reserved for the live todos
+    instead: a finished carried step already recorded its progress in the plan's
+    history, a live todo has nowhere else to be."""
+    steps = [{"text": f"old {i}", "status": "done"}
+             for i in range(roadmap.MAX_STEPS)]
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z", steps=steps)
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    ev = roadmap.sync_from_todos("sess-b", [_todo("mine", "in_progress")],
+                                ts=NOW)
+    assert ev is not None and ev.payload["plan_id"] == "sess-a"
+    texts = [s["text"] for s in ev.payload["steps"]]
+    assert len(texts) == roadmap.MAX_STEPS, texts
+    assert "mine" in texts, "the live session's own todo was trimmed away"
+    assert "old 0" not in texts, "the trim took a live step over the oldest one"
+    # The second half of the defect, and the reason it was worth a P1: a plan
+    # trimmed down to finished steps looks DONE to the session-end writer.
+    assert roadmap.autoclose_session(
+        "sess-b", ts="2026-08-20T13:00:00Z").payload["action"] == "interrupt"
+
+
+# --- session end: authorship, not adoption -----------------------------------
+
+def test_autoclose_does_nothing_for_a_session_that_wrote_no_roadmap_event():
+    """F5. `autoclose_session` resolved through `auto_plan_id`, which ADOPTS an
+    interrupted plan inside the resume window -- right for a writer STARTING
+    work, wrong for one ending it. Adoption at session end cannot mean the
+    session worked the plan, and the all-steps-done branch would then `complete`
+    a stranger's plan on the strength of it, retiring from every view a plan its
+    real owner had only paused."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z",
+              steps=[{"text": "one", "status": "done"}])
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:30:00Z",
+             cause="session_end")
+    n = len(events.read_all())
+    assert roadmap.autoclose_session("sess-b", ts="2026-08-20T13:00:00Z") is None
+    assert len(events.read_all()) == n, "an event was written about someone else"
+    assert roadmap.fold(events.read_all())["sess-a"]["status"] == "interrupted"
+
+
+def test_autoclose_closes_the_plan_this_session_authored_not_one_it_could_adopt():
+    """The discriminating case for resolving by AUTHORSHIP, and the one a
+    `session_id` stamp cannot answer. B worked plan A; C then wrote to the same
+    record, so the fold's `session_id` is C's and "the plan whose session_id is
+    B" finds nothing. Plan D meanwhile sits interrupted inside the window --
+    resolving the way a STARTING writer does hands B plan D, a plan it never
+    touched, and closes that instead. B's own `set` is still in the log."""
+    _auto_set("sess-a", "sess-a", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "sess-a", "sess-a", "2026-08-20T10:15:00Z",
+             cause="session_end")
+    roadmap.sync_from_todos("sess-b", [_todo("two", "in_progress")],
+                            ts="2026-08-20T10:30:00Z")     # B continues A
+    _auto_set("sess-a", "sess-c", "2026-08-20T11:00:00Z")  # C overwrites it
+    _auto_set("plan-d", "sess-d", "2026-08-20T11:30:00Z")  # an adoptable...
+    _auto_ev("interrupt", "plan-d", "sess-d", "2026-08-20T11:45:00Z",
+             cause="session_end")                          # ...paused plan
+    ev = roadmap.autoclose_session("sess-b", ts="2026-08-20T13:00:00Z")
+    assert ev is not None and ev.payload["plan_id"] == "sess-a", (
+        "session end closed a plan this session never wrote to")
+    assert roadmap.fold(events.read_all())["sess-a"]["status"] == "interrupted"
+
+
+def test_a_pause_stamped_in_the_future_is_not_a_recent_pause():
+    """F13. Candidates are RANKED by that same string, so an unbounded pause
+    wins every round forever and every genuinely recent plan loses to it -- one
+    bad clock or one hand-written row redirects adoption permanently. The window
+    has a far edge for the same reason it has a near one."""
+    _auto_set("plan-future", "sess-x", "2026-08-20T10:00:00Z")
+    _auto_ev("interrupt", "plan-future", "sess-x", "2027-01-01T00:00:00Z",
+             cause="session_end")
+    _auto_set("plan-real", "sess-y", "2026-08-20T11:00:00Z")
+    _auto_ev("interrupt", "plan-real", "sess-y", "2026-08-20T11:30:00Z",
+             cause="session_end")
+    assert _resolve("sess-b") == "plan-real"
+
+
+@pytest.mark.parametrize("action,kw", [("complete", {}),
+                                       ("archive", {"reason": "superseded"})])
+def test_a_session_revives_its_own_retired_plan_on_the_next_todowrite(action, kw):
+    """The limit of the escape hatch, measured rather than assumed. `complete`
+    and `archive` stop ADOPTION dead -- both other rules test RETIRED_STATUSES --
+    but rule 1 returns the session's own plan without looking at its status, so
+    one more TodoWrite sets it active again.
+
+    Pinned rather than fixed. The behaviour predates the resolver (`plan_id` was
+    unconditionally `sid`, with no retired guard anywhere), and refusing it needs
+    a second plan id for post-retirement work in the same session -- a schema
+    decision, not a defect fix. What was wrong was the docstring claiming
+    otherwise; this test is what makes the claim checkable either way, so a
+    future change of mind goes red here instead of surprising a reader."""
+    roadmap.sync_from_todos(SID, TODOS, ts="2026-08-20T10:00:00Z")
+    _auto_ev(action, SID, SID, "2026-08-20T10:30:00Z", **kw)
+    reg = roadmap.fold(events.read_all())
+    assert reg[SID]["status"] == ("completed" if action == "complete"
+                                 else "archived")
+    assert roadmap.auto_plan_id(SID, reg, now="2026-08-20T11:00:00Z") == SID
+    assert roadmap.sync_from_todos(
+        SID, [_todo("something new")], ts="2026-08-20T11:00:00Z") is not None
+    assert roadmap.fold(events.read_all())[SID]["status"] == "active"
+    # The counterweight, and the half that IS guarded: another session gets
+    # nothing from a retired plan, whichever way it was retired.
+    assert roadmap.auto_plan_id(
+        "sess-other", roadmap.fold(events.read_all()),
+        now="2026-08-20T11:30:00Z") == "sess-other"

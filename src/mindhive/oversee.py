@@ -256,6 +256,14 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 "total_cost_usd": 0.0, "total_tokens": 0, "last_event_ts": e.ts,
                 "ended": False, "doing": None, "done": [], "planned": [],
                 "not_yet": [], "files": [], "task": "",
+                # The two questions this card is FOR, and neither had an
+                # answer on it: `task` names what the session is working on
+                # (folded from state_set, then deleted on the way out), and
+                # `blockers` names what is in the way. A session with no
+                # open questions still carries the empty list, because a key
+                # that appears only sometimes is how a renderer starts
+                # failing on the quiet case rather than the loud one.
+                "blockers": [],
                 # provenance: Self-Reliant runs log into research-<id> streams;
                 # the label rides the card so Oversee shows whose work this is
                 # (filled by the per-event pass below — same idiom as
@@ -287,6 +295,14 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             t = headline(_text(e.payload))
             if t:
                 s["planned"].append(t)
+        elif e.type == "open_question":
+            # Deliberately its own list rather than folded into `planned`:
+            # an unanswered question is not a next step, and a card that
+            # renders them together tells the reader work is queued when
+            # what is actually queued is a decision.
+            t = headline(_text(e.payload))
+            if t:
+                s["blockers"].append(t)
         elif e.type in ("decision", "experiment_result", "caveat"):
             t = headline(_text(e.payload))
             if t:
@@ -322,10 +338,10 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
         files = s.pop("files")
         s["done"] = s["done"][-_DONE_CAP:] + [f"touched {p}" for p in files[-_DONE_CAP:]]
         s["planned"] = s["planned"][-_DONE_CAP:]
+        s["blockers"] = s["blockers"][-_DONE_CAP:]
         sk = trails.get(sid, [])
         s["skills_total"] = len(sk)
         s["skills"] = sk[-_DONE_CAP:]
-        s.pop("task", None)
         out.append(s)
     out.reverse()
     return out

@@ -253,6 +253,9 @@ CARDS_CSS = """
 
 CARDS_JS = """
   // --- Sessions notification center (injected by taskview.py) ---
+  // Spliced into the SAME page scope as dashboard_js_core, so the shared
+  // helpers -- esc, escAttr, and the fmtTs/fmtHm clock -- are in scope here
+  // and every stamp this file renders is expected to use them.
   // Expansion state and fetched levels live at module level so the 2.5s live
   // re-render never collapses what the user opened (recorded lesson). There is
   // deliberately NO delete affordance anywhere in this view: the history is an
@@ -406,7 +409,7 @@ CARDS_JS = """
       + esc(s.session_id)+'</span>'
       + srPill(s.origin)
       + '<span class="tchip">'+chipText(s.activity||{})+'</span>'
-      + '<span class="tspan">'+esc(s.first_ts||'')+' \\u2192 '+esc(s.last_ts||'')+'</span>'
+      + '<span class="tspan">'+esc(fmtTs(s.first_ts||''))+' \\u2192 '+esc(fmtTs(s.last_ts||''))+'</span>'
       + '</div>' + body + '</div>';
   }
   function paintTaskCards(){

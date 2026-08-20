@@ -87,7 +87,7 @@ JS = """\
       .filter(Boolean).join(' \\u00b7 ');
     const ago = skillAgo(k.ts);
     return '<div class="snip ovskill"><span class="'+(k.ok === false ? 'sbad' : 'sok')
-      + '">\\u2726</span> <span class="dup">'+esc((k.ts || '').slice(11, 16))
+      + '">\\u2726</span> <span class="dup">'+esc(fmtHm(k.ts))
       + (ago ? ' \\u00b7 '+esc(ago) : '')+'</span> '
       + '<span class="ovsklink" style="cursor:pointer;text-decoration:underline" '
       + 'data-skill="'+escAttr(k.name || '')+'" data-plugin="'+escAttr(k.plugin || '')
@@ -124,7 +124,11 @@ JS = """\
     (r.planned || []).forEach(t => steps.push({text:t, status:'pending', note:''}));
     (r.not_yet || []).forEach(t => steps.push({text:t, status:'skipped', note:''}));
     const done = steps.filter(s => s.status === 'done').length;
-    return {plan_id:r.run_id, prompt:r.title || r.run_id, title:'',
+    // `r.task` ahead of the title: the synthesised panel labels this field
+    // `Asked:`, and the task is the closest thing a chat session has to a
+    // declared ask. The title is a prompt headline, which is a fair
+    // fallback and a poor first choice.
+    return {plan_id:r.run_id, prompt:r.task || r.title || r.run_id, title:'',
             status:'active', cause:'', synthesized:true, steps:steps,
             progress:{done:done, total:steps.length}};
   }
@@ -212,13 +216,23 @@ JS = """\
                     + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';
     if (open){
+      // The task FIRST, because it is the question the card exists to
+      // answer -- what is this session working on. It is not the title: the
+      // title is the prompt headline, and collapsing the two is what left
+      // the task with nowhere to appear.
+      if (r.task) body += '<div class="snip"><span class="ovtask">'
+        + 'working on</span> '+esc(r.task)+'</div>';
       body += ovGroup(r.done, '\\u2713', 'ovdone');
       if (r.doing) body += ovRow('\\u25d0', 'ovspin', r.doing);
       body += ovGroup(r.planned, '\\u25cb', 'ovpend')
             + ovGroup(r.not_yet, '\\u25cb', 'ovpend', true);
+      // Open questions, last and undimmed: they are the one group the
+      // reader is scanning for when the answer to 'how far along' is
+      // 'stuck'.
+      body += ovGroup(r.blockers, '\\u26a0', 'ovblock');
       body += ovSkills(r);
-      body += '<div class="snip dup">started '+esc(r.started||'')
-            + ' \\u00b7 last event '+esc(r.last_event_ts||'')+'</div>';
+      body += '<div class="snip dup">started '+esc(fmtTs(r.started))
+            + ' \\u00b7 last event '+esc(fmtTs(r.last_event_ts))+'</div>';
     }
     if (RM_OPEN.has(r.run_id)){
       body += rmPanel(r.roadmap || rmFromCard(r), r.run_id);

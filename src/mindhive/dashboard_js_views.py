@@ -44,7 +44,7 @@ JS = """\
       + '<ul class="hits">' + res.entries.map(e =>
         '<li><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
         + ((e.files||[]).length ? '<div class="snip">'+(e.files||[]).map(esc).join(' \\u00b7 ')+'</div>' : '')
-        + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+        + '<div class="snip dup">'+esc(fmtTs(e.ts))+' \\u00b7 session '+esc(e.session||'')
         + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
       + '</ul>');
   }
@@ -71,11 +71,11 @@ JS = """\
       + ' <span class="pill">'+esc(r.sop_id)+' v'+r.version+'</span>'
       + (showProj && r.project ? ' <span class="pill">'+esc(r.project)+'</span>' : '')
       + '</div><div class="snip" style="white-space:pre-wrap">'+esc(r.text)+'</div>'
-      + '<div class="snip dup">created '+esc(r.created||'')+' \\u00b7 updated '+esc(r.updated||'')+'</div></li>').join('');
+      + '<div class="snip dup">created '+esc(fmtTs(r.created))+' \\u00b7 updated '+esc(fmtTs(r.updated))+'</div></li>').join('');
     const hist = res.history.map(e =>
       '<li><div class="file">'+sopBadge(e.action)+' '+esc(e.sop_id)
       + (e.title ? ' \\u2014 '+esc(e.title) : '') + '</div>'
-      + '<div class="snip dup">'+esc(e.ts||'')+' \\u00b7 session '+esc(e.session||'')
+      + '<div class="snip dup">'+esc(fmtTs(e.ts))+' \\u00b7 session '+esc(e.session||'')
       + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') + '</div></li>').join('');
     showHTML('<h2 class="h">'+res.active.length+' active SOP'
       + (res.active.length===1?'':'s')+' (auto-loaded each session)</h2>'

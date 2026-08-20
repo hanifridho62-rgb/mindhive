@@ -150,6 +150,11 @@ CSS = """\
   .legend { font-size:12px; color:var(--muted); margin:2px 0 10px; }
   .ovdone { color:var(--ok); font-weight:600; }
   .ovpend { color:var(--faint); }
+  /* An open question is a warning, not a pending step: same row shape, a
+     colour that says the work may be blocked rather than merely queued. */
+  .ovblock { color:var(--warn); font-weight:600; }
+  .ovtask { color:var(--faint); text-transform:uppercase; font-size:10px;
+            letter-spacing:.4px; margin-right:4px; }
   .ovspin { color:var(--warn); display:inline-block; animation: pulse 1.6s infinite; }
   /* Interactive roadmap panel (Oversee): ask + progress bar + stepper */
   .rmwrap { margin:8px 0 4px; padding:8px 10px; background:var(--inset);
