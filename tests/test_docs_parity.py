@@ -120,3 +120,108 @@ def test_the_pg_enumeration_actually_finds_the_group():
     assert len(subs) >= 7, subs
     for expected in ("migrate", "rebuild", "refresh", "parity", "tool"):
         assert expected in subs
+
+
+# --------------------------------------------------------------------------
+# the mirror's column contract — findable, and described in the present tense
+# --------------------------------------------------------------------------
+#
+# WHY THESE EXIST. Four Postgres "constraints" were once put to this project as
+# open problems — duplicate the payload as TEXT so it stays hashable, add an
+# outbox to replace a dual-write, add a global sequence, loosen the constraints
+# so odd rows are skipped rather than rejected — and all four were already
+# solved, and already written down. The reader had not failed; the documents
+# had. `docs/DATA_MODEL.md` §4.18 held every answer, nothing pointed at it, and
+# its seam subsection still described a write path that had been DELETED,
+# naming `pgstore.mirror_one` as current. A stale document is worse than a
+# missing one: it answers, and it answers confidently.
+#
+# Both halves are gates now. The pointer has to resolve, and the section has to
+# stop describing a dead function in the present tense.
+
+def _data_model() -> str:
+    return (REPO_ROOT / "docs" / "DATA_MODEL.md").read_text(
+        encoding="utf-8", errors="replace")
+
+
+def _seam_section() -> str:
+    """§4.18's seam subsection: its start heading up to the next heading."""
+    text = _data_model()
+    start = text.index("#### The seam, and what it costs when unused")
+    return text[start:text.index("\n#### ", start + 1)]
+
+
+def test_the_status_contract_pointer_resolves_to_a_real_heading():
+    """`hive pg status` names a doc section, so that section has to exist.
+
+    A pointer at a renamed heading is how a cross-reference dies: nothing
+    fails, and the reader concludes the documentation was never written."""
+    from mindhive import pgcli
+    assert pgcli.CONTRACT_DOC == "docs/DATA_MODEL.md"
+    assert (REPO_ROOT / pgcli.CONTRACT_DOC).exists()
+    assert f"#### {pgcli.CONTRACT_SECTION}" in _data_model(), (
+        f"`hive pg status` points at {pgcli.CONTRACT_SECTION!r}, which is not "
+        "a heading in docs/DATA_MODEL.md")
+
+
+def test_the_readme_points_readers_at_the_column_contract():
+    """The README is what people read first. Invariants reachable only by
+    knowing to open a 2,000-line reference are not reachable."""
+    from mindhive import pgcli
+    readme = _readme()
+    assert pgcli.CONTRACT_SECTION in readme, (
+        "README.md does not point at the column contract — which is how four "
+        "already-solved constraints came to be raised as open problems")
+    assert "DATA_MODEL.md" in readme
+
+
+# Identifiers §4.18's seam subsection presents as CURRENT. Curated on purpose: a
+# gate over every identifier in a 2,000-line document would be noise, and this
+# is the one subsection that has already gone stale.
+SEAM_LIVE = {
+    "events": ["_maybe_read_from_pg"],
+    "pgmirror": ["refresh_changed", "scan_segments", "parity"],
+}
+
+# Names the same subsection presents as HISTORY. If one comes back, the prose
+# calling it dead is the thing that is now wrong, and this failure asks for it.
+SEAM_DEAD = {"pgstore": ["mirror_one"], "events": ["_maybe_mirror_to_pg"]}
+
+
+def test_the_seam_section_names_only_functions_that_exist():
+    import importlib
+    section = _seam_section()
+    for mod_name, names in SEAM_LIVE.items():
+        mod = importlib.import_module(f"mindhive.{mod_name}")
+        for name in names:
+            assert name in section, (
+                f"{name} is gate-checked but §4.18's seam section no longer "
+                "mentions it — update SEAM_LIVE or the section")
+            assert hasattr(mod, name), (
+                f"docs/DATA_MODEL.md §4.18 presents {mod_name}.{name} as "
+                "current, and it does not exist")
+
+
+def test_the_seam_section_does_not_present_a_deleted_writer_as_live():
+    """The exact staleness that already happened, pinned so it cannot recur.
+
+    `mirror_one` and `_maybe_mirror_to_pg` may be NAMED — a reader who meets
+    them in an old plan needs somewhere to learn they are dead — but they must
+    not exist in the code while the section calls them gone."""
+    import importlib
+    for mod_name, names in SEAM_DEAD.items():
+        mod = importlib.import_module(f"mindhive.{mod_name}")
+        for name in names:
+            assert not hasattr(mod, name), (
+                f"{mod_name}.{name} exists again, while docs/DATA_MODEL.md "
+                "§4.18 still describes it as deleted. Fix whichever is wrong.")
+
+
+def test_the_seam_section_says_the_one_seam_is_a_read():
+    """The claim README.md already makes, and the one the stale draft
+    contradicted. Checked as substance rather than as a phrase count: the
+    section must locate the seam on the read side and speak about the append
+    path."""
+    section = _seam_section().lower()
+    assert "read side" in section or "read-side" in section
+    assert "append path" in section

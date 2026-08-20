@@ -157,6 +157,95 @@ def test_a_loaded_namespace_reaches_the_same_chain_head_as_its_files(migrated,
     assert v["file_head"] == v["pg_head"]
 
 
+def write_payload_segment(store, session_id, payloads):
+    """One segment whose rows carry arbitrary PAYLOADS rather than text.
+
+    `write_segment` above hard-codes `{"text": ...}`, which is right for the
+    ordering and privilege tests and useless here: the whole question is what
+    Postgres does to a payload's numbers. Written through
+    `events.canonical_json` rather than `json.dumps` so the bytes on disk are
+    exactly the bytes the chain hashes -- a fixture written any other way could
+    differ from the ledger in the very dimension under test."""
+    from mindhive import events as events_mod
+    path = store["events"] / f"{session_id}.jsonl"
+    path.write_text("".join(
+        events_mod.canonical_json(
+            {"ts": "2026-01-01T00:00:0%dZ" % i, "session_id": session_id,
+             "type": "decision", "payload": payload, "tags": []}) + "\n"
+        for i, payload in enumerate(payloads)), encoding="utf-8")
+    return path
+
+
+@needs_server
+def test_adversarial_number_shapes_survive_the_jsonb_round_trip(migrated, store):
+    """The numeric half of "byte-faithful" -- the half the real ledger cannot ask.
+
+    `tests/test_pg_numeric_parity.py` models `numeric_out` in Python and proves
+    that model self-consistent and armed. Only THIS test proves the model
+    matches the server. It imports that file's fixture instead of restating it,
+    so the two tiers can never drift into asking different questions.
+
+    The measured reason it is needed: the live ledger holds 10,841 payload
+    numbers and not one of them in a shape this round trip could change, so the
+    37k-event parity run above stays green on this dimension whatever Postgres
+    does with a number.
+    """
+    from mindhive import pgmirror, pgstore, events as events_mod
+    from tests.test_pg_numeric_parity import ADVERSARIAL, ORDINARY
+
+    payloads = [ADVERSARIAL, ORDINARY, {"tiny": 1e-09, "wide": 2 ** 60}]
+    write_payload_segment(store, "numbers", payloads)
+
+    loaded = pgmirror.rebuild(store["name"])
+    assert loaded["rows"] == len(payloads)
+
+    # The head first: it covers every column at once and is what `hive pg
+    # parity` actually gates on.
+    v = pgmirror.parity(store["name"])
+    assert v["ok"] is True and v["exact"] is True, v
+    assert v["file_head"] == v["pg_head"]
+
+    # Then per payload, because a head mismatch only says "something differs"
+    # and whoever debugs it needs to be told WHICH number moved.
+    back = pgstore.read_all_strict(store["name"])
+    assert len(back) == len(payloads)
+    for i, (sent, got) in enumerate(zip(payloads, back)):
+        assert events_mod.canonical_json(sent) == \
+            events_mod.canonical_json(got.payload), f"payload {i} changed"
+
+
+@needs_server
+def test_a_payload_the_mirror_cannot_hold_verbatim_is_never_green(migrated,
+                                                                 store):
+    """`-0.0`: the one shape the Python model says does not survive.
+
+    Deliberately NOT written as "the value comes back 0.0". Whether `numeric`
+    keeps the sign of zero is a claim about a server this test's author never
+    observed, and a test that asserts an unverified branch fails for the wrong
+    reason when the guess is wrong.
+
+    What is asserted instead is the property that actually matters, and it holds
+    either way: the mirror may not differ from the ledger SILENTLY. If the value
+    came back unchanged there is nothing to report and parity is green; if it
+    changed, parity must be red. A faithful mirror is not one that never
+    differs -- it is one that cannot differ without saying so.
+    """
+    from mindhive import pgmirror, pgstore
+    write_payload_segment(store, "negzero", [{"signed_zero": -0.0}])
+    pgmirror.rebuild(store["name"])
+
+    returned = pgstore.read_all_strict(store["name"])[0].payload["signed_zero"]
+    verdict = pgmirror.parity(store["name"])
+    if json.dumps(returned) == "-0.0":
+        assert verdict["ok"] is True, (
+            "the value survived, so parity had no reason to fail: " + str(verdict))
+    else:
+        assert verdict["ok"] is False, (
+            f"the mirror holds {json.dumps(returned)} where the ledger holds "
+            "-0.0, and parity reported no problem")
+
+
+
 @needs_server
 def test_an_empty_mirror_fails_parity_rather_than_passing_vacuously(migrated,
                                                                    store):

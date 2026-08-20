@@ -50,6 +50,19 @@ def _parse_args(pairs) -> dict:
     return out
 
 
+# The single pointer from the operator surface to the mirror's column
+# contract. Named here rather than inlined into the print, because a string
+# that appears in exactly one place can be gate-checked:
+# `tests/test_docs_parity.py` asserts this section still exists under this
+# heading. The four columns most often proposed for "simplification" — one
+# JSONB payload rather than two, `ts` as TEXT rather than TIMESTAMPTZ,
+# `global_seq` as identity rather than sort key, and what `numeric` does to a
+# number's spelling — are all explained there, and each has been proposed by
+# a reader who never found it.
+CONTRACT_DOC = "docs/DATA_MODEL.md"
+CONTRACT_SECTION = "The table, and the columns that are not obvious"
+
+
 def cmd_status(args) -> int:
     """What the mirror can do right now, and why it cannot do the rest.
 
@@ -71,6 +84,8 @@ def cmd_status(args) -> int:
         "schema_version": pgmirror.SCHEMA_VERSION,
         "migrations": pgmirror.migration_files(),
         "freshness": pgstore.mirror_health(getattr(args, "project", None)),
+        "contract": {"doc": CONTRACT_DOC,
+                     "section": CONTRACT_SECTION},
     }
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2))
@@ -93,6 +108,8 @@ def cmd_status(args) -> int:
         print(f"  freshness:                       "
               f"{'stale' if fresh.get('stale') else 'fresh'} — "
               f"{fresh.get('stale_reason') or 'up to date'}")
+        print(f"  column contract:                 {CONTRACT_DOC} — "
+              f"{CONTRACT_SECTION}")
     return 0 if report["available"] else 1
 
 
