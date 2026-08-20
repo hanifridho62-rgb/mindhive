@@ -351,3 +351,100 @@ def test_record_failure_malformed_is_logged_not_raised():
     assert "error" in res
     log = paths.store_home() / "hooks_errors.log"
     assert "post_tool_use_failure" in log.read_text(encoding="utf-8")
+
+
+# --- the harness's per-item task tools ----------------------------------------
+# `TodoWrite` posts a whole list and this hook has always handled it. It is not
+# the tool this harness sends: across all 592 transcripts on this machine
+# TodoWrite appears 0 times and TaskCreate/TaskUpdate 585 times, which is why
+# the auto-sync had produced 0 roadmap events in 61 namespaces while the hook
+# around it appended 23,973. These tests are the fixture that reproduces that:
+# they were red against a hook gated on the name TodoWrite alone.
+
+def _task_raw(tool, inp, response, session_id="sess-2"):
+    return json.dumps({"session_id": session_id, "tool_name": tool,
+                       "tool_input": inp, "tool_response": response})
+
+
+def test_record_taskcreate_syncs_session_roadmap():
+    raw = _task_raw("TaskCreate",
+                    {"subject": "wire the mirror", "description": "…",
+                     "activeForm": "wiring the mirror"},
+                    "Task #1 created successfully: wire the mirror")
+    assert hookcapture.record_post_tool_use(raw, project="test") == \
+        {"appended": 1}
+    (ev,) = [e for e in events.read_all("test") if e.type == "roadmap"]
+    assert ev.payload["plan_id"] == "sess-2"
+    assert ev.payload["steps"] == [{"text": "wire the mirror",
+                                    "status": "pending"}]
+    assert "auto" in ev.tags and "roadmap" in ev.tags
+
+
+def test_record_taskupdate_moves_the_step_the_harness_named():
+    """Two calls, one plan: the second event has to describe the SAME plan with
+    the step advanced, not mint a second one."""
+    hookcapture.record_post_tool_use(
+        _task_raw("TaskCreate", {"subject": "step one"},
+                  "Task #1 created successfully: step one"), project="test")
+    hookcapture.record_post_tool_use(
+        _task_raw("TaskCreate", {"subject": "step two"},
+                  "Task #2 created successfully: step two"), project="test")
+    hookcapture.record_post_tool_use(
+        _task_raw("TaskUpdate", {"taskId": "2", "status": "completed"},
+                  "Updated task #2 status"), project="test")
+    evs = [e for e in events.read_all("test") if e.type == "roadmap"]
+    assert {e.payload["plan_id"] for e in evs} == {"sess-2"}
+    assert evs[-1].payload["steps"] == [{"text": "step one", "status": "pending"},
+                                        {"text": "step two", "status": "done"}]
+
+
+def test_a_task_call_with_nothing_to_sync_appends_nothing():
+    raw = _task_raw("TaskUpdate", {"taskId": "9", "status": "completed"},
+                    "Updated task #9 status")
+    assert hookcapture.record_post_tool_use(raw, project="test") == \
+        {"appended": 0}
+    assert not events.read_all("test")
+
+
+def test_extract_events_still_ignores_the_task_tools():
+    """Same reason TodoWrite is excluded: the pure mapping is mirrored by
+    harvest.py, and replaying historical task calls from a transcript could
+    only reorder the registry, never improve it."""
+    for tool, inp in (("TaskCreate", {"subject": "x"}),
+                      ("TaskUpdate", {"taskId": "1", "status": "completed"})):
+        assert hookcapture.extract_events({"tool_name": tool,
+                                           "tool_input": inp}) == []
+
+
+def test_task_sync_failure_is_logged_not_raised(monkeypatch):
+    from mindhive import tasktool
+
+    def boom(*a, **k):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(tasktool, "record", boom)
+    raw = _task_raw("TaskCreate", {"subject": "x"},
+                    "Task #1 created successfully: x")
+    res = hookcapture.record_post_tool_use(raw, project="test")
+    assert res == {"appended": 0}
+    log = paths.store_home() / "hooks_errors.log"
+    assert "todo_roadmap" in log.read_text(encoding="utf-8")
+
+
+def test_the_hooks_tool_list_and_tasktools_own_list_agree():
+    """The two spellings must not drift: a name that exists in one list and not
+    the other is precisely how the auto-sync went silent for its whole life."""
+    from mindhive import tasktool
+    assert set(hookcapture._TODO_TOOLS) == \
+        {"TodoWrite"} | set(tasktool.TASK_TOOLS)
+
+
+def test_response_text_reads_a_bare_content_block_list():
+    """A tool_response is not contractually a string — transcripts store
+    results as exactly this block list, and `tasktool` reads task ids through
+    the same function, so the shape has to count here too."""
+    assert hookcapture._response_text(
+        [{"type": "text", "text": "hello"},
+         {"type": "text", "text": "world"}]) == "hello world"
+    assert hookcapture._response_text([{"no": "text"}]) == ""
+    assert hookcapture._response_text([]) == ""

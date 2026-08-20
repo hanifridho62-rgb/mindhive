@@ -103,8 +103,67 @@ def _text(value) -> str:
     return str(value) if isinstance(value, (str, int, float)) and value != "" else ""
 
 
-def board(sessions, now, cap=SESSION_CAP) -> dict:
+def _last_skill(session) -> str:
+    """The most recent skill on this session's trail, plugin-qualified.
+
+    `oversee` already folds the trail and attaches its tail to the record, so
+    this reads that answer rather than recomputing one -- the same rule that
+    keeps `online` owned by one module. The plugin prefix is not decoration:
+    `ce-plan` alone is ambiguous across plugins, and every other surface in
+    this repo spells it `compound-engineering:ce-plan`."""
+    trail = session.get("skills")
+    if not isinstance(trail, list) or not trail:
+        return ""
+    last = trail[-1]
+    if not isinstance(last, dict):
+        return ""
+    name = _text(last.get("name"))
+    plugin = _text(last.get("plugin"))
+    if plugin and name:
+        return plugin + ":" + name
+    return name
+
+
+def _phase(plan) -> str:
+    """How far the session's plan has got, in the plan's own terms.
+
+    The position comes from the ACTIVE step's index and never from the done
+    count. A plan with one step finished and nothing started is not on step 2 --
+    it is between steps, and saying otherwise invents a position no step holds.
+    That case reports progress instead, which is true and is still an answer.
+
+    An interrupted plan says so here, because a strip reading `step 2/3` for a
+    plan nobody is advancing is exactly the report that hid the stall. Total:
+    any shape this function does not recognise yields the empty string, so one
+    malformed plan cannot blank the strip."""
+    if not isinstance(plan, dict):
+        return ""
+    steps = plan.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return ""
+    total = len(steps)
+    at, text = None, ''
+    for i, step in enumerate(steps):
+        if isinstance(step, dict) and step.get("status") == "active":
+            at, text = i, _text(step.get("text"))
+            break
+    if at is None:
+        done = sum(1 for step in steps
+                   if isinstance(step, dict) and step.get("status") == "done")
+        return "%d/%d steps done" % (done, total)
+    where = "step %d/%d" % (at + 1, total)
+    if plan.get("status") == "interrupted":
+        where = "interrupted at " + where
+    return _clip(where + (": " + text if text else ""))
+
+
+def board(sessions, now, cap=SESSION_CAP, plans=None) -> dict:
     """The render-ready session board for *sessions* at *now*.
+
+    *plans* is `roadmap.by_session`'s index, or None: the plan each
+    session is currently working, used for `phase`. Optional because the strip
+    is still correct without a roadmap in the ledger at all -- a session with
+    no plan reports an empty phase, not a missing key.
 
     *sessions* is `oversee.interactive_sessions`'s output — already filtered to live,
     non-dismissed runs, already carrying its own `online` verdict. Returns
@@ -158,6 +217,15 @@ def board(sessions, now, cap=SESSION_CAP) -> dict:
             # is payload nobody reads.
             "title": _clip(_text(s.get("title"))),
             "doing": _clip(_text(s.get("doing"))),
+            # The four questions an operator asks a cat. `task` is what the
+            # session said it is working on (state_set, folded by oversee),
+            # `phase` is how far its plan has got, `skill` is what it last
+            # invoked, and `display` above already carries active-or-not. None
+            # of them is computed here; all four are read from answers that
+            # already exist, so no surface can disagree with another.
+            "task": _clip(_text(s.get("task"))),
+            "phase": _phase((plans or {}).get(sid)),
+            "skill": _last_skill(s),
             "age_secs": int(age),
         })
     rows.sort(key=lambda r: (r["display"] != DISPLAY_WORKING, r["age_secs"],

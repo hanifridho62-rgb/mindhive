@@ -157,6 +157,124 @@ def test_a_loaded_namespace_reaches_the_same_chain_head_as_its_files(migrated,
     assert v["file_head"] == v["pg_head"]
 
 
+def write_payload_segment(store, session_id, payloads):
+    """One segment whose rows carry arbitrary PAYLOADS rather than text.
+
+    `write_segment` above hard-codes `{"text": ...}`, which is right for the
+    ordering and privilege tests and useless here: the whole question is what
+    Postgres does to a payload's numbers. Written through
+    `events.canonical_json` rather than `json.dumps` so the bytes on disk are
+    exactly the bytes the chain hashes -- a fixture written any other way could
+    differ from the ledger in the very dimension under test."""
+    from mindhive import events as events_mod
+    path = store["events"] / f"{session_id}.jsonl"
+    path.write_text("".join(
+        events_mod.canonical_json(
+            {"ts": "2026-01-01T00:00:0%dZ" % i, "session_id": session_id,
+             "type": "decision", "payload": payload, "tags": []}) + "\n"
+        for i, payload in enumerate(payloads)), encoding="utf-8")
+    return path
+
+
+@needs_server
+def test_adversarial_number_shapes_survive_the_jsonb_round_trip(migrated, store):
+    """The numeric half of "byte-faithful" -- the half the real ledger cannot ask.
+
+    `tests/test_pg_numeric_parity.py` models `numeric_out` in Python and proves
+    that model self-consistent and armed. Only THIS test proves the model
+    matches the server. It imports that file's fixture instead of restating it,
+    so the two tiers can never drift into asking different questions.
+
+    The measured reason it is needed: the live ledger holds 10,841 payload
+    numbers and not one of them in a shape this round trip could change, so the
+    37k-event parity run above stays green on this dimension whatever Postgres
+    does with a number.
+    """
+    from mindhive import pgmirror, pgstore, events as events_mod
+    from tests.test_pg_numeric_parity import ADVERSARIAL, ORDINARY
+
+    # Exactly the shared fixture and nothing else. A third payload used to be
+    # spelled out here -- 1e-09 and 2**60 -- which is precisely the drift the
+    # docstring above promises cannot happen: two shapes asked of the server
+    # that the model had never answered for. Both now live in that file's own
+    # groups, where the model vets them too.
+    payloads = [ADVERSARIAL, ORDINARY]
+    write_payload_segment(store, "numbers", payloads)
+
+    loaded = pgmirror.rebuild(store["name"])
+    assert loaded["rows"] == len(payloads)
+
+    # PER SHAPE FIRST, then the head. The order is the whole point and it was
+    # wrong: the head assertion covers every column at once, so it fails first
+    # and reports only "something differs" plus two hashes, and the loop that
+    # knows WHICH number moved never runs. This tier is the only place that can
+    # answer the question at all — the model in test_pg_numeric_parity.py is
+    # self-consistent by construction and stays green whatever the server does
+    # — so a failure here that cannot name its shape leaves nobody able to
+    # debug it. Same assertions, and now down to the key rather than the row.
+    back = pgstore.read_all_strict(store["name"])
+    assert len(back) == len(payloads)
+    for i, (sent, got) in enumerate(zip(payloads, back)):
+        for key in sent:
+            assert events_mod.canonical_json({key: sent[key]}) == \
+                events_mod.canonical_json({key: got.payload.get(key)}), (
+                    f"payload {i}, shape {key!r}: sent "
+                    f"{events_mod.canonical_json(sent[key])} and the mirror "
+                    f"returned {events_mod.canonical_json(got.payload.get(key))}")
+        assert events_mod.canonical_json(sent) == \
+            events_mod.canonical_json(got.payload), (
+                f"payload {i} changed as a whole while every key matched "
+                f"individually — a key was added or dropped: "
+                f"sent {sorted(sent)} got {sorted(got.payload)}")
+
+    v = pgmirror.parity(store["name"])
+    assert v["ok"] is True and v["exact"] is True, v
+    assert v["file_head"] == v["pg_head"]
+
+
+@needs_server
+@pytest.mark.parametrize("shape", ["large_exponent", "signed_zero"])
+def test_a_payload_the_mirror_cannot_hold_verbatim_is_never_green(migrated,
+                                                                 store,
+                                                                 shape):
+    """The shapes the Python model says do NOT survive, asked of the server.
+
+    `-0.0` was here first and was described as the only one. It is not: this
+    tier found `large_exponent` (1e+30) by contradicting the model, which had
+    decided float-versus-int from the literal it SENT rather than the text that
+    came BACK. That one matters more -- it is a whole class, every float at or
+    above 1e+16, where `-0.0` is a single value.
+
+    Deliberately NOT written as "the value comes back X". What each shape
+    becomes is a claim about a server, and a test that asserts an unverified
+    branch fails for the wrong reason when the guess is wrong. What is asserted
+    instead holds either way: the mirror may not differ from the ledger
+    SILENTLY. Unchanged, and parity has nothing to report; changed, and parity
+    must be red. A faithful mirror is not one that never differs -- it is one
+    that cannot differ without saying so.
+    """
+    from mindhive import events as events_mod, pgmirror, pgstore
+    from tests.test_pg_numeric_parity import DOES_NOT_SURVIVE
+
+    value = DOES_NOT_SURVIVE[shape]
+    write_payload_segment(store, shape, [{shape: value}])
+    pgmirror.rebuild(store["name"])
+
+    returned = pgstore.read_all_strict(store["name"])[0].payload[shape]
+    verdict = pgmirror.parity(store["name"])
+    sent_bytes = events_mod.canonical_json(value)
+    back_bytes = events_mod.canonical_json(returned)
+    if back_bytes == sent_bytes:
+        assert verdict["ok"] is True, (
+            f"{shape} survived as {sent_bytes}, so parity had no reason to "
+            f"fail: {verdict}")
+    else:
+        assert verdict["ok"] is False, (
+            f"the mirror holds {back_bytes} where the ledger holds "
+            f"{sent_bytes}, and parity reported no problem")
+
+
+
 @needs_server
 def test_an_empty_mirror_fails_parity_rather_than_passing_vacuously(migrated,
                                                                    store):
@@ -549,12 +667,22 @@ def test_the_cli_help_names_every_tool_it_can_run():
     """A default-tier test: no server needed to catch a stale count in prose.
 
     `hive pg mcp`'s help said "the four tools" for as long as there were seven,
-    which is the kind of drift a reader trusts precisely because it is specific."""
+    which is the kind of drift a reader trusts precisely because it is specific.
+
+    PYTHONPATH is not decoration. `cwd` alone does not put this checkout's
+    `src/` on the child's path, so the subprocess resolved `mindhive` through
+    the editable install — which points at the MAIN clone, not this worktree.
+    Run from a worktree whose main clone sits on a branch without the `pg`
+    group and the child answered `invalid choice: 'pg'`: a test that passed or
+    failed on what some other checkout happened to have, asserting against
+    prose it never read. Every other subprocess in the pg tests already sets
+    this; this one was the straggler."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=os.path.join(repo, "src"))
     out = subprocess.run([sys.executable, "-m", "mindhive", "pg", "--help"],
-                         capture_output=True, text=True,
-                         cwd=os.path.dirname(os.path.dirname(
-                             os.path.abspath(__file__))))
+                         capture_output=True, text=True, cwd=repo, env=env)
     from mindhive import pgtools
+    assert out.returncode == 0, out.stderr
     assert "four tools" not in out.stdout
     assert f"{len(pgtools.TOOL_FUNCTIONS)}" in out.stdout or \
            "seven" in out.stdout

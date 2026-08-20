@@ -328,3 +328,79 @@ def test_a_full_round_through_the_real_sink_records_the_placement():
     row = [e.payload for e in events.read_all()
            if e.type == "work_injected" and e.payload["outcome"] == "landed"][0]
     assert row["plan_id"] == SID and row["step_index"] == 0
+
+
+# --- the injector lands on the plan being CONTINUED, not on a fresh one -------
+#
+# WHY. `roadmap_sink(session_id)` used the session id as the plan id, so the
+# replenishment injector's evidence-backed steps landed on a plan the session
+# had only just minted -- while the plan holding the actual work sat interrupted
+# under the dashboard's awaiting-resume pile. That is the shape the user
+# reported: new steps appear, and they do not match the work session.
+
+# Every stamp here is EXPLICIT. `_set` defaults to the wall clock, and two
+# `set` events landing in the same second are ordered by session id rather
+# than by which was written first -- so the plan's own older set sorted after
+# the injector's and silently won. A fixture that leans on the clock is
+# testing the tie-break, not the sink.
+PREV_SET = "2026-08-20T09:00:00Z"
+PREV_PAUSED = "2026-08-20T10:00:00Z"
+INJECTED_AT = "2026-08-20T11:00:00Z"
+
+
+def _interrupted_plan(plan_id="sess-prev"):
+    payload = {"action": "set", "plan_id": plan_id,
+               "prompt": "build the thing", "title": "build the thing",
+               "steps": [{"text": "already finished", "status": "done"},
+                         {"text": "still to do", "status": "pending"}]}
+    roadmap.validate_payload(payload)
+    events.append_event("roadmap", payload, session_id=plan_id, ts=PREV_SET,
+                        tags=["roadmap", roadmap.AUTO_TAG])
+    events.append_event("roadmap", {"action": "interrupt", "plan_id": plan_id,
+                                    "cause": "session_end"},
+                        session_id=plan_id, ts=PREV_PAUSED,
+                        tags=["roadmap", roadmap.AUTO_TAG])
+
+
+def test_injected_steps_land_on_the_plan_the_session_is_continuing():
+    _interrupted_plan()
+    sink = replenish_sinks.roadmap_sink("sess-next", ts=INJECTED_AT)
+    placements, dropped = sink([_cand()])
+    assert dropped == 0
+    rec = _rec("sess-prev")
+    assert [s["text"] for s in rec["steps"]] \
+        == ["already finished", "still to do", "Run the test suite"]
+    assert rec["steps"][-1]["new"] is True
+    assert _rec("sess-next") is None, "a second plan was minted anyway"
+
+
+def test_the_audit_row_points_at_the_plan_that_received_the_step():
+    """`Placement.plan_id` is the audit trail -- it is what a later reader
+    follows from a spent fingerprint back to the work it produced. Resolving the
+    plan without resolving the placement would leave that pointer aimed at a
+    plan which never received the step, and the trail would dead-end."""
+    _interrupted_plan()
+    placements, _ = replenish_sinks.roadmap_sink(
+        "sess-next", ts=INJECTED_AT)([_cand()])
+    assert [p.plan_id for p in placements] == ["sess-prev"]
+    assert [p.step_index for p in placements] == [2]
+
+
+def test_a_dry_run_still_reports_the_continued_plan():
+    """append=False runs the identical placement math. If it resolved to a
+    different plan than the real run, the preview would promise work somewhere
+    the real run would never write it."""
+    _interrupted_plan()
+    placements, _ = replenish_sinks.roadmap_sink(
+        "sess-next", append=False, ts=INJECTED_AT)([_cand()])
+    assert [p.plan_id for p in placements] == ["sess-prev"]
+    assert _rec("sess-prev")["steps"][-1]["text"] == "still to do"
+
+
+def test_the_injector_keeps_minting_a_plan_when_there_is_nothing_to_continue():
+    """The counterweight: with no adoptable plan the old behaviour is exactly
+    right, and a first session must still get a roadmap."""
+    placements, _ = replenish_sinks.roadmap_sink(SID, ts=INJECTED_AT)(
+        [_cand()])
+    assert [p.plan_id for p in placements] == [SID]
+    assert _rec(SID)["steps"][0]["new"] is True

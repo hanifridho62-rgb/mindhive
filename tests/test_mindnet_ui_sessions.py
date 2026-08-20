@@ -274,3 +274,101 @@ def test_the_kind_comes_from_the_id_when_oversee_only_ever_says_chat():
     assert us._kind("ws-abc", "chat") == "agent"
     assert us._kind("research-abc", "chat") == "research"
     assert us._kind("54e0d771-aedd", "chat") == "chat"
+
+
+# --- what the cat answers when you open it ----------------------------------
+#
+# WHY. The strip drew a cat and a caption and nothing else, so the four
+# questions the operator actually asks it -- what task, what phase, which
+# skill, active or not -- had no answer on this surface. They were being asked
+# of the FACULTY board instead, which reads `mindnet_activity`: 729 rows on the
+# real ledger, zero of them carrying a task_id or a phase, and the newest 13
+# days past `ui_cats.HIDE_AFTER_SECS`. That board is not where a live Claude
+# session is described; this one is.
+#
+# Nothing new is emitted for any of it. `task` is folded by
+# `oversee.interactive_sessions` from `state_set`, `skill` comes off the trail
+# that fold already attaches, and `phase` is read from the roadmap plan the
+# session is working. KTD1 holds: this module renders answers, it does not
+# recompute them.
+
+def _plan(plan_id="sess-plan", steps=None, status="active"):
+    steps = steps if steps is not None else [
+        {"text": "design the data model", "status": "done", "new": False},
+        {"text": "build the fold", "status": "active", "new": False},
+        {"text": "render the panel", "status": "pending", "new": False},
+    ]
+    done = sum(1 for s in steps if s["status"] == "done")
+    return {"plan_id": plan_id, "prompt": "ship the roadmap", "title": "",
+            "status": status, "steps": steps,
+            "progress": {"done": done, "total": len(steps)}}
+
+
+def test_the_cat_carries_the_task_the_session_declared():
+    s = _sess()
+    s["task"] = "Port the Postgres read mirror"
+    out = us.board([s], NOW)
+    assert out["cats"][0]["task"] == "Port the Postgres read mirror"
+
+
+def test_the_cat_names_the_last_skill_the_session_used():
+    s = _sess()
+    s["skills"] = [{"name": "ce-plan", "plugin": "compound-engineering"},
+                   {"name": "mindhive-python-tdd", "plugin": ""}]
+    s["skills_total"] = 2
+    out = us.board([s], NOW)
+    assert out["cats"][0]["skill"] == "mindhive-python-tdd"
+
+
+def test_a_plugin_skill_is_named_with_its_prefix():
+    """`ce-plan` alone is ambiguous across plugins, and the prefix is how every
+    other surface in this repo spells it."""
+    s = _sess()
+    s["skills"] = [{"name": "ce-plan", "plugin": "compound-engineering"}]
+    out = us.board([s], NOW)
+    assert out["cats"][0]["skill"] == "compound-engineering:ce-plan"
+
+
+def test_the_phase_is_the_active_step_and_its_position():
+    """"Sudah sampai mana" answered exactly: which step, out of how many, by
+    name. The position comes from the ACTIVE step's index, never from the done
+    count -- a plan with two done steps and no active one is not on step 3."""
+    out = us.board([_sess()], NOW, plans={"abc123def456": _plan()})
+    assert out["cats"][0]["phase"] == "step 2/3: build the fold"
+
+
+def test_a_plan_with_no_active_step_reports_progress_instead_of_a_position():
+    """The discriminating case. An implementation that prints `done + 1` says
+    "step 2/2" for a plan that has finished one step and started nothing --
+    inventing a position no step holds."""
+    plan = _plan(steps=[{"text": "one", "status": "done", "new": False},
+                        {"text": "two", "status": "pending", "new": False}])
+    out = us.board([_sess()], NOW, plans={"abc123def456": plan})
+    assert out["cats"][0]["phase"] == "1/2 steps done"
+
+
+def test_an_interrupted_plan_says_so_in_the_phase():
+    """The state the operator is hunting for: work paused mid-plan. Reading
+    "step 2/3" for a plan nobody is advancing is the report that hid it."""
+    out = us.board([_sess()], NOW,
+                   plans={"abc123def456": _plan(status="interrupted")})
+    assert out["cats"][0]["phase"] == "interrupted at step 2/3: build the fold"
+
+
+def test_a_session_with_no_plan_has_an_empty_phase_not_a_missing_key():
+    out = us.board([_sess()], NOW)
+    cat = out["cats"][0]
+    assert cat["phase"] == "" and cat["task"] == "" and cat["skill"] == ""
+
+
+def test_a_junk_plan_is_dropped_rather_than_blanking_the_strip():
+    """Totality, the contract this module already keeps for session rows: one
+    malformed plan must not take the board down with it."""
+    for junk in ("not a plan", None, {"steps": "nope"}, {"progress": 7}):
+        out = us.board([_sess()], NOW, plans={"abc123def456": junk})
+        assert out["cats"][0]["phase"] == ""
+
+
+def test_the_plans_argument_is_optional_so_older_callers_still_work():
+    out = us.board([_sess()], NOW, us.SESSION_CAP)
+    assert out["total"] == 1

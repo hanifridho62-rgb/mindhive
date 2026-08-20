@@ -141,6 +141,28 @@ def _read_until_closed(sock):
         out += chunk
 
 
+def _send_or_already_gone(sock, data) -> bool:
+    """Send *data*; True when it went out, False when the peer had already gone.
+
+    The write side of the reset `_read_until_closed` documents, and the reason
+    T2 was intermittent — it failed roughly one run in five, locally and on CI,
+    for the behaviour it exists to prove. Refusing an oversized body without
+    draining it leaves unread bytes in the server's receive buffer, so its close
+    aborts the connection; a client still writing that megabyte, or writing
+    anything after it, then dies with WinError 10053 here (EPIPE/ECONNRESET on
+    POSIX). That is the server being CORRECT a few microseconds earlier than
+    usual, not a failure, and every assertion downstream holds a fortiori: a
+    request that could not even be sent was certainly not answered.
+
+    Nothing weakens. `_read_until_closed` still sees the whole stream, and the
+    caller still requires that at most one response was framed on it."""
+    try:
+        sock.sendall(data)
+        return True
+    except OSError:
+        return False
+
+
 def _seed():
     events.append_event("user_prompt", {"text": "do the thing"},
                         session_id="sess-1", project="test")
@@ -257,17 +279,33 @@ def test_a_refused_body_never_becomes_the_next_request(server):
         assert first is not None and first[0].startswith(b"HTTP/1.1 200"), \
             "the connection is not reusable at all, so T2 cannot be under test"
 
-        sock.sendall(_request_bytes("POST", f"/api/append?token={TOKEN}",
-                                    body=b"x" * (handler.MAX_BODY_BYTES + 1)))
-        sock.sendall(_request_bytes("GET", PROJECTS))
+        # Neither write may assume the peer is still there: the refusal closes
+        # without draining, and that close aborts a connection the client is
+        # still writing to. See `_send_or_already_gone`.
+        _send_or_already_gone(sock, _request_bytes(
+            "POST", f"/api/append?token={TOKEN}",
+            body=b"x" * (handler.MAX_BODY_BYTES + 1)))
+        queued = _send_or_already_gone(sock, _request_bytes("GET", PROJECTS))
         stream, closed = _read_until_closed(sock)
 
         assert closed, "a connection with an unread body on it was kept for reuse"
         assert stream.count(b"HTTP/1.1 ") <= 1, (
             f"{stream.count(b'HTTP/1.1 ')} responses after the refusal — the "
-            f"junk body was read as a request line: {stream[:300]!r}")
+            f"junk body was read as a request line: {stream[:300]!r} "
+            f"(the GET behind the refusal was {'sent' if queued else 'never sent'})")
         if stream:
-            assert b"request body too large" in stream, stream[:300]
+            # The abort discards whatever had not left the wire, and the
+            # refusal's 48-byte body is small enough to be exactly what goes —
+            # `_read_until_closed` says as much for the EOF and the same is
+            # true of the payload. So the STATUS LINE is what must always
+            # hold; the reason phrase is asserted whenever it survived. This
+            # was the second half of T2's intermittency: a run where the
+            # headers arrived and the body did not read as "the server gave
+            # the wrong reason" when it had given the right one.
+            head, _, body = stream.partition(b"\r\n\r\n")
+            assert head.startswith(b"HTTP/1.1 500"), stream[:300]
+            if body:
+                assert b"request body too large" in body, stream[:300]
             assert b'"projects"' not in stream, \
                 "the GET behind the refusal was answered from a desynced stream"
     finally:

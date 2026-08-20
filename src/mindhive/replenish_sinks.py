@@ -57,7 +57,13 @@ def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
 
     def sink(kept):
         rows = ev_mod.read_all(project) if evs is None else evs
-        rec = rm_mod.fold(rows).get(sid)
+        # The plan being CONTINUED, which is not always this session's own.
+        # Landing evidence-backed steps on a freshly minted plan while the
+        # work sat interrupted elsewhere is exactly what made injected steps
+        # look unrelated to the session that received them.
+        registry = rm_mod.fold(rows)
+        plan_id = rm_mod.auto_plan_id(sid, registry, now=ts)
+        rec = registry.get(plan_id)
         if rec is not None and rm_mod.AUTO_TAG not in (rec.get("tags") or []):
             # The guard `sync_from_todos` and `autoclose_session` both enforce.
             # A `set` overwrites the record's tags and title wholesale, so
@@ -83,8 +89,13 @@ def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
         # session's first prompt, the same source `sync_from_todos` uses, so the
         # card reads as this session's work rather than as the injector's.
         prompt = rec["prompt"] if rec else rm_mod._session_prompt(rows, sid)
-        payload = {"action": "set", "plan_id": sid, "prompt": prompt,
-                   "title": prompt[:rm_mod.MAX_TITLE_CHARS], "steps": steps}
+        # The injector ADDS work; it does not rename it. `sync_from_todos`
+        # titles a continued plan with the resuming session's headline, and
+        # deriving the title from the prompt here would overwrite that on the
+        # next injection -- the card would snap back to the original ask.
+        title = (rec.get("title") if rec else "") or prompt
+        payload = {"action": "set", "plan_id": plan_id, "prompt": prompt,
+                   "title": title[:rm_mod.MAX_TITLE_CHARS], "steps": steps}
         # Validated even on a dry run: a preview that skipped the contract could
         # promise work the real run would then refuse to write.
         rm_mod.validate_payload(payload)
@@ -95,7 +106,10 @@ def roadmap_sink(session_id, project=None, evs=None, ts=None, append=True):
             ev_mod.append_event("roadmap", payload, session_id=sid,
                                 tags=["roadmap", rm_mod.AUTO_TAG, "replenish"],
                                 ts=ts, project=project)
-        placements = [Placement(c.fingerprint, sid, len(existing) + i)
+        # `plan_id`, not `sid`: a Placement IS the audit pointer from a spent
+        # fingerprint to the work it produced, and aiming it at a plan that
+        # never received the step leaves the trail dead-ended.
+        placements = [Placement(c.fingerprint, plan_id, len(existing) + i)
                       for i, c in enumerate(take)]
         return placements, dropped
 

@@ -340,6 +340,18 @@ def validation_script_of(task) -> str:
     return getattr(task, "validation_script", "") or ""
 
 
+def _batch_phase(batch, graph):
+    """The declared phase of the batch's representative task, or None.
+
+    None rather than a guess when the batch is empty or the task carries no
+    phase: a cat lit for work with no phase must not claim one, and `emit`
+    already treats None as absent."""
+    if not batch:
+        return None
+    task = (graph or {}).get(batch[0])
+    return getattr(task, "phase", None) or None
+
+
 def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
               max_workers=None, root=None, payload_for=None, isolate=False,
               runner_kwargs=None):
@@ -457,8 +469,13 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     # wave (active on the way in, idle on the way out, even on an exception), so
     # the `task-graph` cat is lit for exactly as long as the wave runs.
     from . import telemetry as tel_mod
+    # The phase of the SAME task `task_id` names, so the cat's two fields
+    # describe one task instead of two. Read off the graph rather than
+    # invented: `telemetry.fold` drops any phase outside `tasks.PHASES`, so a
+    # made-up label would vanish between the write and the panel and read as
+    # if nothing had been emitted.
     with tel_mod.busy(_WAVE_FACULTY, task_id=batch[0] if batch else None,
-                      project=project):
+                      phase=_batch_phase(batch, graph), project=project):
         with cf.ThreadPoolExecutor(
                 max_workers=max(1, min(len(batch), cap))) as pool:
             results = list(pool.map(one, batch))
@@ -557,7 +574,11 @@ def completion_gate_default(graph, task_id, project=None, records=None):
     # ends — including on the exception path below, which is exactly where a cat stuck
     # awake forever would be most misleading.
     from . import telemetry as tel_mod
-    with tel_mod.busy(_GATE_FACULTY, task_id=task_id, project=project):
+    # Same rule as the wave: the phase of the task being gated, not the name
+    # of the gate. Restating the faculty in its own phase row tells the reader
+    # nothing they cannot see from the cat.
+    with tel_mod.busy(_GATE_FACULTY, task_id=task_id,
+                      phase=_batch_phase([task_id], graph), project=project):
         try:
             return t_mod.can_complete(graph, task_id,
                                       c_mod.satisfaction_predicate(records))

@@ -20,7 +20,7 @@ Spliced in, in the order the browser needs them:
 
 * ``dashboard_css.CSS`` — this page's own stylesheet, including the
   reduced-motion guard for every animation it declares.
-* ``dashboard_js_core.JS`` — element handles, the real-time engine, the
+* ``dashboard_js_core.script()`` — element handles, the real-time engine, the
   render/paint choke points, project scoping, Overview. Everything else calls
   into it.
 * ``dashboard_js_improve.JS`` — Memory and Improvements.
@@ -193,7 +193,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
 </script>
 </body></html>""" \
     .replace("/*__DASH_CSS__*/", dashboard_css.CSS) \
-    .replace("/*__JS_CORE__*/", dashboard_js_core.JS) \
+    .replace("/*__JS_CORE__*/", dashboard_js_core.script()) \
     .replace("/*__JS_IMPROVE__*/", dashboard_js_improve.JS) \
     .replace("/*__JS_OVERSEE__*/", dashboard_js_oversee.JS) \
     .replace("/*__JS_VIEWS__*/", dashboard_js_views.JS) \

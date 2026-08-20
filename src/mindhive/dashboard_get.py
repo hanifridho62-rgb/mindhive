@@ -377,6 +377,7 @@ class GetRoutes:
         from .mindnet import telemetry as tel_mod
         from .mindnet import ui_cats as cats_mod
         from .mindnet import ui_sessions as sess_mod
+        from . import roadmap as roadmap_mod
         # ONE clock for both boards. The faculty side ages rows from an ISO
         # string and `oversee` decides liveness from an epoch float; reading
         # the clock twice would let a session straddle the two and render as
@@ -422,7 +423,8 @@ class GetRoutes:
         fp = None if am else _ledger_fingerprint(proj)
         memo = _memo_get(_CATS_MEMO, proj) if fp else None
         if memo is not None and memo[0] == fp:
-            tel_state, records, have_sessions = memo[1], memo[2], True
+            tel_state, records, plan_index = memo[1], memo[2], memo[3]
+            have_sessions = True
         else:
             # ONE ledger read for both folds. They ask different questions of
             # the SAME events, and `interactive_sessions` takes `evs` for
@@ -431,6 +433,17 @@ class GetRoutes:
             evs = [e for _, e in all_event_pairs()] if am else \
                 events.read_all(proj)
             tel_state = tel_mod.fold(evs)
+            # THIRD fold on the same read, and the cheapest of them: it is
+            # what lets a session cat answer how far along its plan is. The
+            # plan lives two API calls away from this strip, and a phase that
+            # is only correct on the Oversee card is the kind of half-wired
+            # surface this endpoint's own comments were written about.
+            rmap = roadmap_mod.fold(evs)
+            idx = roadmap_mod.by_session(rmap)
+            # Resolved exactly as the Oversee card resolves it, through the
+            # one helper -- the cat used to consult the adoption index alone,
+            # so a session with a plan of its own got a phase on the card and
+            # nothing (or a different plan) on the cat.
             # The session half is isolated. `oversee.interactive_sessions` is
             # not documented as total and it folds every event twice
             # internally — letting it raise would 500 the whole endpoint and
@@ -442,19 +455,36 @@ class GetRoutes:
                 have_sessions = True
             except Exception:               # noqa: BLE001
                 records, have_sessions = [], False
+            # Built from `records`, so it has to come after the fold that
+            # produces them -- and before the memo that stores the pair, so
+            # a hit serves a plan_index that matches its own session list.
+            plan_index = {}
+            for row in records:
+                # `run_id`, not `session_id`: these rows are the union of
+                # loop runs and chat sessions, and `ui_sessions.board`
+                # reads the same key to look the plan back up. Keying this
+                # index on anything else builds it empty in silence.
+                sid = row.get("run_id")
+                if not sid:
+                    continue
+                plan = roadmap_mod.plan_for_session(rmap, sid, idx)
+                if plan is not None:
+                    plan_index[sid] = plan
             # Only a fold that SUCCEEDED is memoized. Storing the degraded
             # answer would pin "cannot know" behind the gate until the ledger
             # next moved; re-attempting costs exactly what this endpoint cost
             # before the gate existed, which is the honest price of a fault.
             if fp and have_sessions:
-                _memo_put(_CATS_MEMO, proj, (fp, tel_state, records))
+                _memo_put(_CATS_MEMO, proj,
+                          (fp, tel_state, records, plan_index))
         # Both boards render from THIS call's clock, whatever the gate did.
         # `_with_online` runs unconditionally — on a miss it is a redundant
         # (idempotent) second pass over a few dozen rows, which is the price
         # of there being exactly one place that can freeze `online`.
         cats = cats_mod.board(tel_state, now)
         try:
-            sessions = sess_mod.board(_with_online(records, stamp), now)
+            sessions = sess_mod.board(_with_online(records, stamp),
+                                      now, plans=plan_index)
         except Exception:                       # noqa: BLE001
             sessions = {"cats": (), "total": 0, "hidden": 0}
             have_sessions = False
@@ -560,17 +590,32 @@ class GetRoutes:
             evs = events.read_all(n)
             res = loop_state.list_runs(n)
             rmap = roadmap_mod.fold(evs)
-            live_ids = set()
+            # A plan belongs to whoever is WORKING it, and that is not
+            # always the session that created it: `roadmap.auto_plan_id`
+            # lets a later session continue a paused plan, and the fold
+            # stamps `session_id` with whoever last wrote to it. Matching on
+            # plan_id alone made one plan invisible on the live card and
+            # stranded in the awaiting-resume list at the same time -- the
+            # pile that grows while nothing appears to move.
+            by_session = roadmap_mod.by_session(rmap)
+            # Keyed by PLAN id, not run id. The two coincided only while the
+            # match was identity; the orphan list below has to exclude the
+            # plan that actually got attached.
+            live_plans = set()
             for r in res["runs"] + oversee_mod.interactive_sessions(
                     n, evs=evs, intended_use=iu):
                 r["project"] = n
-                plan = rmap.get(r["run_id"])
-                if plan is not None and plan["status"] != "completed":
+                plan = roadmap_mod.plan_for_session(
+                    rmap, r["run_id"], by_session)
+                # The helper already refuses a retired plan; the guard that
+                # stood here tested the string "completed" and let an
+                # ARCHIVED one through.
+                if plan is not None:
                     r["roadmap"] = plan
-                live_ids.add(r["run_id"])
+                    live_plans.add(plan["plan_id"])
                 runs.append(r)
             for p in roadmap_mod.plans(evs):
-                if p["plan_id"] not in live_ids:
+                if p["plan_id"] not in live_plans:
                     plans.append(dict(p, project=n))
             dismissed += res["dismissed"]
         runs.sort(key=lambda r: r.get("started") or "", reverse=True)

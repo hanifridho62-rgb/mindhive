@@ -1700,6 +1700,24 @@ reader must not "simplify":
   Python's code-point comparison. A Windows-installed cluster otherwise defaults
   to a locale collation that ignores punctuation at the primary level, which is
   precisely the distinction the ordering below turns on.
+- **`payload` is `JSONB`, and it is chain-safe in a NARROWER way than "keys get
+  sorted".** `canonical_json` sorts keys, so JSONB's internal key reordering is
+  invisible to the chain — that much is well known and is stated again below.
+  What key sorting does not cover is number **spelling**. JSONB stores every
+  number as `numeric`: exact, arbitrary precision, scale preserved, and with no
+  exponent notation at all — so `1e-07` is returned as `0.0000001`. The chain
+  survives that because the printed form parses back to the same float64 and
+  `json.dumps` re-emits `1e-07`. **One shape does not survive: `numeric` has no
+  signed zero, so `-0.0` returns as `0.0` and the head moves.** It cannot
+  currently occur (the live ledger holds 10,841 payload numbers and not one
+  float ending in `.0`, signed or not) and it cannot occur *silently*, because
+  parity compares exactly these heads. Both halves are fixtures rather than
+  prose: `tests/test_pg_numeric_parity.py` models `numeric_out` and proves the
+  fixture armed, and
+  `tests/test_pg_live.py::test_adversarial_number_shapes_survive_the_jsonb_round_trip`
+  asks a real server. That measurement is also why they had to be written: with
+  zero adversarial shapes in the ledger, the 37k-event parity run below is green
+  on this dimension whatever Postgres does with a number.
 
 #### The ordering contract, and the invariant it corrects
 
@@ -1775,17 +1793,39 @@ claim in the schema.
 
 #### The seam, and what it costs when unused
 
-`events._maybe_mirror_to_pg` / `_maybe_read_from_pg` are the two functions ADR
-0006 left behind. They imported `scripts.core.event_write` — a module in the
-CC-v3 repository, never on this process's path — inside a bare `except`, so
-flipping `MINDHIVE_EVENT_BACKEND` did **nothing at all**, silently, for as long
-as the seam existed. That is the "seam tapi mati" this work was asked to fix.
-Both now target `pgstore`, in-package. The `MINDHIVE_EVENT_BACKEND` guard is
-unchanged and returns **before** any import, so the default `file` path costs one
-`os.environ.get` plus one comparison, and `import mindhive.events` never pays for
-`psycopg`. Capture never depends on the database: the file line is on disk before
-the mirror is consulted, `mirror_one` cannot raise, and a one-strike circuit
-breaker means 50 appends against a dead host cost one connect timeout, not fifty.
+There is exactly ONE seam, and it is on the READ side: `events._maybe_read_from_pg`.
+**Nothing on the append path touches Postgres, under any value of
+`MINDHIVE_EVENT_BACKEND`.**
+
+**This corrects an earlier draft of this section**, which described a write seam
+as live and in-package. ADR 0006 left behind `events._maybe_mirror_to_pg`,
+calling `pgstore.mirror_one`, and the draft recorded both as current. They are
+gone, and their absence is the design rather than an omission:
+
+- `pgstore` holds the READER credential, and `mindhive_reader` is
+  `default_transaction_read_only` **at the role level** — a single-row `INSERT`
+  from there was refused by the server, so that seam had been raising on every
+  call since the day it was written;
+- a row-level writer would have had to compute `seg_line` itself, while
+  `pgmirror.scan_segments` numbers by PHYSICAL line, blank and torn rows
+  included. The two would have agreed until the first blank line and then
+  diverged with no obvious cause.
+
+`scripts.core.event_write` (a module in the CC-v3 repository, never on this
+process's path) and `pgstore.mirror_one` appear nowhere in `src/`. They are
+**history**, kept named here because a reader who meets them in an old plan or
+an old review needs to be able to find out they are dead — deleting the names
+would leave that reader with nothing to search for. What must not happen again
+is this section presenting them as live, and that is now a gate rather than a
+promise: `tests/test_docs_parity.py` asserts every identifier this section
+presents as CURRENT still exists in `src/`.
+
+The mirror follows the ledger through `pgmirror.refresh_changed` instead —
+reload only the segments whose bytes moved, then re-run parity — called by the
+scheduled `autosync` run and by `hive pg refresh`. One loader, one credential,
+no second code path to drift. `MINDHIVE_EVENT_BACKEND` keeps its meaning for
+READS only, and the `file` default returns before any import, so
+`import mindhive.events` never pays for `psycopg`.
 
 #### Read-only, in layers, and only one of them is the defence
 
@@ -1977,6 +2017,14 @@ unmatchable rather than merely unused (005).
    `COALESCE` because Python sorts a NULL `ts` first where Postgres sorts it
    last. Both halves are what chain-head parity rests on, so a "simplification"
    of either reads as data corruption rather than as a sort key (§4.18).
+
+7. **A payload number's SPELLING is not part of its identity — except at zero.**
+   The mirror's `JSONB` column stores numbers as `numeric`, which has no
+   exponent notation and no signed zero. Exponent forms survive the round trip
+   because the printed value re-parses to the same float64; `-0.0` does not, and
+   comes back `0.0`. So nothing may depend on how a number was written, and
+   anything that widens what a payload can hold here is checked against
+   **chain-head parity**, never against a row count (§4.18).
 
 ## 6. Adding a new event type (the extension procedure)
 

@@ -283,23 +283,30 @@ item names was touched, so the two changes do not collide.
 
 ---
 
-## 11. A real-socket test is intermittent, and nobody has caught it in the act
+## 11. A real-socket test is intermittent, and nobody has caught it in the act — CAUGHT AND FIXED 2026-08-20
 
-**Source:** observed across full-suite runs, 2026-08-12 → 2026-08-14.
+**Source:** observed across full-suite runs, 2026-08-12 → 2026-08-14. Reproduced on demand and
+closed 2026-08-20.
 
-**What:** stabilise
-`tests/test_dashboard_http.py::test_a_refused_body_never_becomes_the_next_request`.
+**What was wrong:** two races, both in the TEST, both on the same platform behaviour the file's
+own `_read_until_closed` already documents — refusing an oversized body without draining it
+leaves unread bytes inbound, so the server's close ABORTS the connection instead of delivering a
+clean FIN, and whatever had not left the wire is discarded.
 
-**Why:** it has gone green / red / green on one unchanged tree under a full-suite run, and green
-every time in isolation. It passed in both full local runs and in CI on 2026-08-14, which is
-exactly what makes it dangerous — an intermittent that is currently passing reads as a fixed
-one. It is a real-socket test, so the failure is a scheduling race rather than a logic error.
+1. The client's `sendall` after the refusal died with `WinError 10053`. That is the server being
+   correct a few microseconds early; the request that could not be sent was certainly not
+   answered. Now `_send_or_already_gone` records it and the assertions hold a fortiori.
+2. The abort truncated the server's OWN 48-byte refusal body, so a run where the headers
+   arrived and the body did not read as "the server gave the wrong reason" when it had given the
+   right one. The status line is now what always holds; the reason phrase is asserted whenever
+   it survived.
 
-**The technique that already worked once:** the job-state race in this repo was fixed by parking
-the work instead of trusting the scheduler. The same shape applies here.
+**Evidence:** ~20% red before (2 of 40 after fix 1, ~1 in 5 before either), **0 of 100 runs red
+after**. Still discriminating, not vacuous: with the refusal no longer closing the connection it
+is red 5/6, and with the size cap removed entirely 6/6.
 
-**Cons of leaving it:** the next unrelated red run costs someone an afternoon deciding whether
-their change broke it.
+**Not a server change.** `src/mindhive/dashboard.py` was mutated only to prove the guard bites,
+and restored byte-identical.
 
 ---
 

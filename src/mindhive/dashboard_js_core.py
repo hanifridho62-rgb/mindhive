@@ -19,6 +19,63 @@ every fragment shares one scope and function declarations hoist across the seams
 The split is for readers and for the cap, and it buys no isolation — a function
 here may be called from any other fragment, and is.
 """
+# Every stamp in this ledger is UTC, and every reader of this dashboard is
+# in Jakarta. Printing one without the other means doing the arithmetic in
+# your head on every glance -- and getting it wrong at the two moments it
+# matters most, because 20:00Z and 03:00 WIB are the same instant on
+# DIFFERENT DAYS.
+#
+# Its own constant, not a few lines inside the page script, for the same
+# reason `PAINT_GUARD_JS` is: a pure function of a string can be executed by
+# a test, and `tests/test_dashboard_clock_node.py` runs exactly these bytes
+# under node. A copy retyped in a fixture would keep passing after the
+# page's own copy changed.
+CLOCK_JS = """\
+  // Asia/Jakarta is UTC+7 and has no daylight saving -- it has had none
+  // since 1964 -- so the offset is arithmetic rather than a timezone
+  // database lookup. `Intl` would work and would also make the page's
+  // output depend on which ICU data the browser shipped with; a fixed
+  // offset is the same answer everywhere, including under node.
+  const WIB_OFFSET_MIN = 7 * 60;
+  function fmtTs(iso){
+    const raw = String(iso == null ? '' : iso);
+    if (!raw) return '';
+    const t = Date.parse(raw);
+    // Unparseable is shown VERBATIM, never blanked and never thrown on. A
+    // stamp this page cannot read is still evidence, and swallowing it
+    // would hide a malformed row instead of surfacing it.
+    if (!isFinite(t)) return raw;
+    const utc = new Date(t), wib = new Date(t + WIB_OFFSET_MIN * 60000);
+    const p = n => String(n).padStart(2, '0');
+    const day = x => x.getUTCFullYear() + '-' + p(x.getUTCMonth() + 1)
+                     + '-' + p(x.getUTCDate());
+    const hm = x => p(x.getUTCHours()) + ':' + p(x.getUTCMinutes());
+    // The WIB DATE is printed only when it differs. Suppressing it always
+    // would render 20:00Z as a bare '03:00 WIB' and read as seven hours
+    // ago rather than tomorrow morning; printing it always would double
+    // the length of every stamp on the page for no information.
+    const rolled = day(utc) !== day(wib);
+    return day(utc) + ' ' + hm(utc) + 'Z \u00b7 '
+      + (rolled ? day(wib) + ' ' : '') + hm(wib) + ' WIB';
+  }
+  function fmtHm(iso){
+    // The clock-face form: the same two zones, no date. For stamps that
+    // share a line with other text and whose date is already established by
+    // the group they sit in -- the skill trail's marker is 5 characters wide
+    // by design. Same totality rule as fmtTs: unparseable comes back
+    // verbatim, so a malformed row is surfaced rather than blanked.
+    const raw = String(iso == null ? '' : iso);
+    if (!raw) return '';
+    const t = Date.parse(raw);
+    if (!isFinite(t)) return raw;
+    const p = n => String(n).padStart(2, '0');
+    const hm = x => p(x.getUTCHours()) + ':' + p(x.getUTCMinutes());
+    return hm(new Date(t)) + 'Z \u00b7 '
+      + hm(new Date(t + WIB_OFFSET_MIN * 60000)) + ' WIB';
+  }
+"""
+
+
 JS = """\
   const TOKEN = __TOKEN__;
   const out = document.getElementById('out');
@@ -158,6 +215,7 @@ JS = """\
   setInterval(refreshLive, LIVE_MS);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshLive(); });
 
+/*__CLOCK__*/
   function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
   function u(path){ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }
   // Busy state WITHOUT locking the nav. Disabling every nav button was the old
@@ -429,7 +487,16 @@ JS = """\
       + '<div class="card"><div class="big">'+(o.auto_events ?? '—')+'</div><div class="lbl">session / auto</div></div>'
       + '<div class="card"><div class="big">'+(o.sessions ?? '—')+'</div><div class="lbl">sessions</div></div>'
       + '<div class="card"><div>'+chip+'</div><div class="lbl">hash chain</div></div>'
-      + '<div class="card"><div class="big" style="font-size:15px">'+esc(o.last_ts || '—')+'</div><div class="lbl">last activity</div></div>'
+      + '<div class="card"><div class="big" style="font-size:15px">'+esc(fmtTs(o.last_ts) || '—')+'</div><div class="lbl">last activity</div></div>'
       + '</div><div class="types">'+types+'</div>');
   }
 """
+
+
+def script() -> str:
+    """The core script with the clock helper spliced in.
+
+    Spliced rather than concatenated so the helper lands ABOVE its callers in
+    one shared scope -- `fmtTs` is used by the improve, oversee, skills and
+    views modules, exactly as `esc` is."""
+    return JS.replace("/*__CLOCK__*/", CLOCK_JS)

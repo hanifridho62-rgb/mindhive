@@ -49,7 +49,7 @@ JS = """\
       + (SESSION ? ' in '+esc(SESSION) : '')+(showProj?' across all projects':'')+'</h2><ul class="hits">'
       + items.map(m => '<li><div class="file">'
           + (showProj && m.project ? esc(m.project)+' · ' : '')
-          + esc(m.type)+' · '+esc(m.ts)+' · '+esc(m.session)
+          + esc(m.type)+' · '+esc(fmtTs(m.ts))+' · '+esc(m.session)
           + (m.tags && m.tags.length ? ' · ['+esc(m.tags.join(', '))+']' : '')
           + (m.similar_count ? ' · <span class="dup">+'+m.similar_count+' similar</span>' : '')
           + srPill(m.origin)
@@ -293,7 +293,7 @@ JS = """\
     const open = IMP_EXPANDED.has(noteKey(m));
     return '<li class="noterow" data-key="'+escAttr(noteKey(m))+'" style="cursor:pointer"><div class="file">'
       + (showProj && m.project ? esc(m.project)+' \\u00b7 ' : '')
-      + esc(m.ts||'')+' \\u00b7 <span class="pill">manual</span>'
+      + esc(fmtTs(m.ts))+' \\u00b7 <span class="pill">manual</span>'
       + srPill(m.origin)
       + (m.similar_count ? ' <span class="dup">+'+m.similar_count+' similar</span>' : '')
       + '</div><div class="snip'+(open?'':' one')+'">'+esc(m.text||'')+'</div></li>';

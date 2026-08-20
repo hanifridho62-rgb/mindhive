@@ -421,3 +421,59 @@ def test_the_overflow_is_reported_rather_than_dropped(server):
     assert len(body["sessions"]) == sess_mod.SESSION_CAP
     assert body["sessions_total"] >= sess_mod.SESSION_CAP + 3
     assert body["sessions_hidden"] == body["sessions_total"] - sess_mod.SESSION_CAP
+
+
+# --- the session cat answers task / phase / skill over real HTTP -------------
+#
+# `ui_sessions` is covered as a pure function in its own file. What this adds is
+# the wiring: the endpoint has to FOLD the roadmap and hand the index over, or
+# `phase` is empty on a page where the plan exists two API calls away. That is
+# the shape of failure this file was written for -- a filter that works in the
+# provider and is bypassed by the endpoint.
+
+def _live_session(sid="chat-cats-1"):
+    import datetime as _dt
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events.append_event("session_start", {}, session_id=sid, ts=ts)
+    events.append_event("user_prompt", {"text": "wire the cats up"},
+                        session_id=sid, ts=ts)
+    events.append_event("state_set", {"task": "Answer the four questions"},
+                        session_id=sid, ts=ts)
+    events.append_event("skill_used",
+                        {"name": "mindhive-python-tdd", "plugin": "", "ok": True},
+                        session_id=sid, ts=ts)
+    return ts
+
+
+def _plan_for(sid, ts, plan_id="cats-plan"):
+    events.append_event(
+        "roadmap",
+        {"action": "set", "plan_id": plan_id, "prompt": "wire the cats up",
+         "steps": [{"text": "fold the data", "status": "done"},
+                   {"text": "render the panel", "status": "active"}]},
+        session_id=sid, ts=ts, tags=["roadmap", "auto"])
+
+
+def test_a_session_cat_carries_task_phase_and_skill(server):
+    base, token = server
+    ts = _live_session()
+    _plan_for("chat-cats-1", ts)
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    cats = [c for c in body["sessions"] if c["session_id"] == "chat-cats-1"]
+    assert len(cats) == 1, body["sessions"]
+    cat = cats[0]
+    assert cat["task"] == "Answer the four questions"
+    assert cat["phase"] == "step 2/2: render the panel"
+    assert cat["skill"] == "mindhive-python-tdd"
+    assert cat["display"] == "working"
+
+
+def test_a_session_cat_without_a_plan_still_answers_the_rest(server):
+    """The counterweight. Folding the roadmap must not become a precondition
+    for the strip: most sessions have no plan, and they still have a task."""
+    base, token = server
+    _live_session()
+    _status, body = _get(base, "/api/mindnet/cats", token)
+    cat = [c for c in body["sessions"] if c["session_id"] == "chat-cats-1"][0]
+    assert cat["phase"] == ""
+    assert cat["task"] == "Answer the four questions"

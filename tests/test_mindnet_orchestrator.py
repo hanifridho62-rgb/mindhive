@@ -1824,3 +1824,53 @@ def test_no_runner_kwargs_leaves_the_call_shape_untouched():
                     apply_status=lambda g, d, f: g, root="/tmp",
                     completion_gate=lambda g, t: None)
     assert "context_cfg" not in r.kwargs["a"]
+
+
+# --- the cat feed says WHICH task and WHICH phase ----------------------------
+#
+# Both emitters here passed a `task_id` and no `phase`, and the real ledger
+# shows what that cost: 729 `mindnet_activity` rows, every one of them with an
+# empty phase, feeding a panel built with a row labelled `phase`. The value is
+# not free-form -- `telemetry.fold` drops any phase outside `tasks.PHASES` --
+# so the only honest one is the phase of the task the faculty is working, which
+# both sites already have in scope through `graph`.
+
+def _activity_payloads(faculty=None):
+    return [e.payload for e in _activity_rows()
+            if faculty is None or e.payload.get("faculty") == faculty]
+
+
+def test_the_wave_cat_names_the_phase_of_the_task_it_is_running():
+    _declare("a")
+    orc.orchestrate(_graph(_task("a", phase="execution")),
+                    runner=FakeRunner(), execute=True)
+    rows = _activity_payloads(orc._WAVE_FACULTY)
+    assert rows, "the wave emitted no cat feed at all"
+    assert {r.get("phase") for r in rows} == {"execution"}
+    assert {r.get("task_id") for r in rows} == {"a"}
+
+
+def test_the_wave_phase_survives_the_fold():
+    """The assertion that matters, and the one a payload check cannot make:
+    `telemetry.fold` re-validates `phase` on the way OUT and silently drops
+    anything outside `tasks.PHASES`. A phase written but not foldable reaches
+    the panel as an empty row, which is indistinguishable from never writing
+    it."""
+    _declare("a")
+    orc.orchestrate(_graph(_task("a", phase="audit-code")),
+                    runner=FakeRunner(), execute=True)
+    from mindhive.mindnet import telemetry as tel_mod
+    state = tel_mod.fold(events.read_all())
+    assert state[orc._WAVE_FACULTY].phase == "audit-code"
+    assert state[orc._WAVE_FACULTY].task_id == "a"
+
+
+def test_an_empty_wave_emits_no_phase_rather_than_a_wrong_one():
+    """`task_id` is already the representative first task, and with no batch
+    there is no representative. Inventing a phase here would light the cat for
+    work that has no phase at all."""
+    _declare("a")
+    orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_COMPLETED)),
+                    runner=FakeRunner(), execute=True)
+    for row in _activity_payloads(orc._WAVE_FACULTY):
+        assert row.get("phase") in (None, "")

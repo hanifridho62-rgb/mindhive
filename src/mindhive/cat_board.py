@@ -107,6 +107,10 @@ CSS = """
      board exists to show. */
   .mn-cat.dim svg { animation:none; filter:grayscale(100%); }
   .mn-cat.sel { border-color:#e8b64c; }
+  /* The session cat answers the same four questions on click, so it carries
+     the same affordance and the same selected border. */
+  .mn-sess { cursor:pointer; }
+  .mn-sess.sel { border-color:#e8b64c; }
   @keyframes mn-bob { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-2px)} }
   /* Motion is a signal on this board, not decoration — but it is not a signal
      anybody asked to be shaken by. Keyed on `mn-cat-sprite`, which `catSVG`
@@ -209,45 +213,93 @@ _JS = """
     if (s < 3600) return Math.floor(s/60) + 'm';
     return (s/3600).toFixed(1) + 'h';
   }
-  function catPanel(cat, el){
+  // ONE panel renderer for both strips. The faculty cat and the session cat
+  // answer the same four questions -- what task, what phase, which skill,
+  // active or not -- off different producers, and two copies of this would be
+  // two places for those answers to start being formatted differently.
+  const CAT_DASH = '\\u2014';
+  function mnPanel(heading, rows, el, warning){
     const p = document.getElementById('mn-cat-panel');
     if (!p) return;
-    // textContent throughout: task_id and phase are ledger-supplied strings and
-    // this is the one place they reach the DOM.
+    // textContent throughout: every value here is ledger-supplied prose and
+    // this is the one place it reaches the DOM.
     p.innerHTML = '';
     const h = document.createElement('h3');
-    h.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
+    h.textContent = heading;
     p.appendChild(h);
-    const rows = [['task', cat.task_id || '\\u2014'], ['phase', cat.phase || '\\u2014'],
-                  ['skill', cat.skill || '\\u2014'], ['state', cat.status],
-                  ['last seen', catAge(cat.age_secs) + ' ago']];
     for (const [k, v] of rows){
       const d = document.createElement('div'); d.className = 'kv';
       const a = document.createElement('span'); a.textContent = k;
-      const b = document.createElement('span'); b.textContent = v;
+      const b = document.createElement('span'); b.textContent = v || CAT_DASH;
       d.appendChild(a); d.appendChild(b); p.appendChild(d);
     }
-    // The reason this board exists: awake but not moving is a stuck parallel run,
-    // and the user asked to be able to see that at a glance.
-    if (cat.status === 'active' && cat.age_secs >= 900){
+    if (warning){
       const w = document.createElement('div'); w.className = 'warn';
-      w.textContent = 'active with no update for ' + catAge(cat.age_secs)
-        + ' \\u2014 possible silent hang';
+      w.textContent = warning;
       p.appendChild(w);
     }
-    // Show it first, then measure: a display:none panel has no width, so clamping
-    // against its own size has to happen after it is laid out.
+    // Show it first, then measure: a display:none panel has no width, so
+    // clamping against its own size has to happen after it is laid out.
     p.style.display = 'block';
     const r = el.getBoundingClientRect();
     p.style.top = Math.round(r.bottom + 6) + 'px';
-    // Clamp to the viewport. Left-aligning to the cat is fine on the swarm page,
-    // where the strip starts at the left edge — but the dashboard puts the strip at
-    // the END of its header, so a cat near the right edge pushed the panel off
-    // screen entirely. Found by opening the real page, not by a unit test: nothing
-    // in a string-comparison test can see a rectangle leave the window.
+    // Clamp to the viewport. Left-aligning to the cat is fine on the swarm
+    // page, where the strip starts at the left edge -- but the dashboard puts
+    // its strips at the END of the header, so a cat near the right edge pushed
+    // the panel off screen entirely. Found by opening the real page, not by a
+    // unit test: nothing in a string comparison can see a rectangle leave the
+    // window.
     const w = p.getBoundingClientRect().width || 210;
     const max = Math.max(4, document.documentElement.clientWidth - w - 8);
     p.style.left = Math.round(Math.min(Math.max(4, r.left), max)) + 'px';
+  }
+  function catPanel(cat, el){
+    mnPanel(CAT_LABEL[cat.faculty] || cat.faculty,
+            [['task', cat.task_id], ['phase', cat.phase],
+             ['skill', cat.skill], ['state', cat.status],
+             ['last seen', catAge(cat.age_secs) + ' ago']], el,
+            // The reason this board exists: awake but not moving is a stuck
+            // parallel run, and the user asked to see that at a glance.
+            (cat.status === 'active' && cat.age_secs >= 900)
+              ? 'active with no update for ' + catAge(cat.age_secs)
+                + ' \\u2014 possible silent hang' : '');
+  }
+  // The session cat's four answers. Same questions, live producers: `task` is
+  // folded from state_set, `phase` is the roadmap plan's active step, `skill`
+  // is the tail of the session's own skill trail, and `display` is oversee's
+  // liveness verdict -- never a second opinion formed here.
+  function sessPanel(s, el){
+    mnPanel(s.title || ((s.kind || 'chat') + ' session'),
+            [['task', s.task], ['phase', s.phase], ['skill', s.skill],
+             ['state', s.display === 'working' ? 'working' : 'quiet'],
+             ['doing', s.doing],
+             ['last seen', catAge(s.age_secs) + ' ago']], el, '');
+  }
+  // Which strip the shared panel currently belongs to. Both strips repaint
+  // from the SAME poll, so without an owner each one's housekeeping reaches
+  // into the other's open panel: the faculty strip's empty-board branch was
+  // closing session panels one poll after every click, and an empty faculty
+  // board is the common case, not the rare one.
+  let PANEL_OWNER = null;              // 'cat' | 'sess' | null
+  function mnOpen(owner, el, render){
+    // One entry point, so 'exactly one cat is selected anywhere' holds by
+    // construction rather than by both handlers remembering to sweep both
+    // strips. The faculty handler did not, and two cats read as selected.
+    document.querySelectorAll('.mn-cat.sel, .mn-sess.sel')
+      .forEach(x => x.classList.remove('sel'));
+    el.classList.add('sel');
+    PANEL_OWNER = owner;
+    render();
+  }
+  function mnClosePanel(owner){
+    // A strip may only close what it owns. `null` is the outside click,
+    // which owns everything.
+    if (owner && PANEL_OWNER !== owner) return;
+    const p = document.getElementById('mn-cat-panel');
+    if (p) p.style.display = 'none';
+    PANEL_OWNER = null;
+    document.querySelectorAll('.mn-cat.sel, .mn-sess.sel')
+      .forEach(x => x.classList.remove('sel'));
   }
   function paintCats(cats){
     const bar = document.getElementById('mn-cats');
@@ -265,8 +317,12 @@ _JS = """
       const n = document.createElement('span');
       n.className = 'none'; n.textContent = 'no MindNetwork activity';
       bar.appendChild(n);
-      if (panel) panel.style.display = 'none';
+      mnClosePanel('cat');
       return;
+    }
+    // A faculty that vanished from the board cannot keep describing itself.
+    if (openFaculty && !cats.some(c => c.faculty === openFaculty)){
+      mnClosePanel('cat');
     }
     for (const cat of cats){
       const el = document.createElement('span');
@@ -282,22 +338,21 @@ _JS = """
       el.onclick = (ev) => {
         ev.stopPropagation();
         const already = el.classList.contains('sel');
-        bar.querySelectorAll('.mn-cat.sel').forEach(x => x.classList.remove('sel'));
-        if (already){ if (panel) panel.style.display = 'none'; }
-        else { el.classList.add('sel'); catPanel(cat, el); }
+        if (already){ mnClosePanel('cat'); }
+        else { mnOpen('cat', el, () => catPanel(cat, el)); }
       };
       // Re-open the panel the poll just replaced, so a refresh does not close a
       // panel the user is reading.
       if (cat.faculty === openFaculty){ el.classList.add('sel'); }
       bar.appendChild(el);
-      if (cat.faculty === openFaculty){ catPanel(cat, el); }
+      if (cat.faculty === openFaculty){
+        PANEL_OWNER = 'cat';
+        catPanel(cat, el);
+      }
     }
   }
   document.addEventListener('click', () => {
-    const p = document.getElementById('mn-cat-panel');
-    if (p) p.style.display = 'none';
-    document.querySelectorAll('#mn-cats .mn-cat.sel')
-      .forEach(x => x.classList.remove('sel'));
+    mnClosePanel(null);               // the outside click owns every panel
   });
 
   // --- MN-19: the session strip -------------------------------------------
@@ -344,10 +399,25 @@ _JS = """
     const rows = (board && board.sessions) || [];
     const producers = (board && board.producers) || {};
     const hidden = (board && board.sessions_hidden) || 0;
+    // task/phase/skill join the signature: they are what an open panel is
+    // showing, and a strip that refuses to repaint when they change would
+    // leave the reader looking at a stale phase.
     const sig = JSON.stringify([rows.map(s => [s.session_id, s.display, s.kind,
-                                               s.title, s.doing]),
+                                               s.title, s.doing, s.task,
+                                               s.phase, s.skill]),
                                 hidden, producers.session]);
     if (sig === SESS_SIG) return;
+    // Which cat the user has open, so a repaint does not close a panel they
+    // are reading -- the rule the faculty strip already keeps.
+    const openSel = bar.querySelector('.mn-sess.sel');
+    const openSid = openSel ? openSel.dataset.session : null;
+    // A panel describing a session that has left the poll -- ended, timed
+    // out, or dropped below the cap -- is worse than no panel: every field
+    // in it is frozen at whatever the last payload said, and nothing on the
+    // page says so. Closing covers the empty-rows branch below as well.
+    if (openSid && !rows.some(r => r.session_id === openSid)){
+      mnClosePanel('sess');
+    }
     // Cleared, not set, before the build: assigning the new signature up front
     // meant a throw mid-build left a half-painted strip that every identical
     // poll afterwards refused to repair. Set it only once the strip is whole.
@@ -394,8 +464,20 @@ _JS = """
       el.appendChild(t);
       el.title = (s.display === 'working' ? 'working' : 'quiet')
         + ' \\u2014 ' + (s.kind || 'chat') + ' \\u2014 last seen '
-        + catAge(s.age_secs) + ' ago';
+        + catAge(s.age_secs) + ' ago \\u2014 click for detail';
+      el.dataset.session = s.session_id;
+      el.onclick = (ev) => {
+        ev.stopPropagation();
+        const already = el.classList.contains('sel');
+        if (already){ mnClosePanel('sess'); }
+        else { mnOpen('sess', el, () => sessPanel(s, el)); }
+      };
+      if (s.session_id === openSid){ el.classList.add('sel'); }
       bar.appendChild(el);
+      if (s.session_id === openSid){
+        PANEL_OWNER = 'sess';          // the repaint keeps the ownership
+        sessPanel(s, el);
+      }
     }
     if (hidden > 0){
       const more = document.createElement('span');

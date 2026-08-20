@@ -398,3 +398,70 @@ def test_append_false_picks_without_recording():
     assert _replenish.direct_skill(["ce-plan"], session_id=TSID,
                                    append=False) == "ce-plan"
     assert [e for e in events.read_all() if e.type == "skill_directed"] == []
+
+
+# --- what the card says it is working on, and what is in the way -------------
+#
+# WHY. The card folded `task` out of every `state_set` and then deleted it on
+# the way out (`s.pop("task", None)`), so the one field that names what the
+# session is actually working on survived only as a title fallback -- and the
+# user reading the Oversee card saw a prompt headline where they had asked for
+# the task. The problems half had no producer at all: `open_question` events
+# were folded by nothing, so "ada masalah apa?" had no answer on the surface
+# built to answer it.
+
+def test_the_card_carries_the_task_it_was_told_it_is_working_on():
+    _ev("session_start", {}, 0)
+    _ev("user_prompt", {"text": "look at the mirror"}, 1)
+    _ev("state_set", {"task": "Port the Postgres read mirror",
+                      "next_step": "measure the numeric round trip"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["task"] == "Port the Postgres read mirror"
+    # The title stays the prompt headline: the two answer different questions
+    # and collapsing them is what hid the task in the first place.
+    assert s["title"] == "look at the mirror"
+    assert "measure the numeric round trip" in s["planned"]
+
+
+def test_the_newest_state_set_wins_the_task():
+    """`state_set` is last-one-wins state, and the fold has to agree with the
+    projections that already treat it that way."""
+    _ev("session_start", {}, 0)
+    _ev("state_set", {"task": "first framing"}, 1)
+    _ev("state_set", {"task": "what it actually turned into"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["task"] == "what it actually turned into"
+
+
+def test_an_empty_task_does_not_erase_the_one_already_folded():
+    """A later `state_set` that omits the task is not a retraction. Without the
+    guard the card blanks out mid-session for a payload that said nothing."""
+    _ev("session_start", {}, 0)
+    _ev("state_set", {"task": "Port the mirror"}, 1)
+    _ev("state_set", {"next_step": "keep going"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["task"] == "Port the mirror"
+
+
+def test_open_questions_become_the_cards_blockers():
+    _ev("session_start", {}, 0)
+    _ev("open_question", {"text": "does numeric keep the sign of zero?"}, 1)
+    _ev("open_question", {"text": "is the pg tier reachable from here?"}, 2)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["blockers"] == ["does numeric keep the sign of zero?",
+                             "is the pg tier reachable from here?"]
+
+
+def test_a_session_with_no_open_questions_has_an_empty_blockers_list():
+    """Shape stability: the renderer reads `blockers` on every card, and a key
+    that appears only sometimes is how a surface starts throwing on the quiet
+    case instead of the loud one."""
+    _ev("session_start", {}, 0)
+    _ev("user_prompt", {"text": "nothing is wrong"}, 1)
+    s = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
+    assert s["blockers"] == [] and s["task"] == ""

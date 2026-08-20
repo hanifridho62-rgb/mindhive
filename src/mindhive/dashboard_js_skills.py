@@ -241,7 +241,7 @@ JS = """\
       + ' call'+(hist.length===1?'':'s')+'</span><ul class="hits">'
       + hist.map(h => '<li><div class="file">'
           + (h.ok ? '<span class="ok">\\u2714 ok</span>' : '<span class="err">\\u2716 failed</span>')
-          + ' \\u00b7 '+esc(h.ts||'')+(h.session ? ' \\u00b7 '+esc(h.session) : '')+'</div>'
+          + ' \\u00b7 '+esc(fmtTs(h.ts))+(h.session ? ' \\u00b7 '+esc(h.session) : '')+'</div>'
           + (h.text ? '<div class="snip one">'+esc(h.text)+'</div>' : '')+'</li>').join('')
       + '</ul></div>';
   }

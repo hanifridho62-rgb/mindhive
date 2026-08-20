@@ -16,6 +16,11 @@ from . import events, paths
 # back-harvest agree on what each tool means.
 _FILE_TOOLS = ("Edit", "Write", "NotebookEdit")
 _CMD_TOOLS = ("Bash", "PowerShell")
+# Every tool whose call feeds the session roadmap. Spelled out rather than
+# imported from `tasktool` so this module keeps no module-scope dependency on
+# it; `tests/test_hookcapture.py` asserts the two lists agree, because a name
+# that drifts apart here is exactly how the feature went silent the first time.
+_TODO_TOOLS = ("TodoWrite", "TaskCreate", "TaskUpdate")
 # Shared truncation caps — harvest.py reuses these so both capture paths
 # truncate identically (the dedup key depends on identical text).
 CMD_MAX = 180
@@ -66,21 +71,34 @@ def _response_ok(resp) -> bool:
     return True
 
 
+def _blocks_text(blocks) -> str:
+    """Joined ``text`` parts of a content-block list, or ""."""
+    parts = [b.get("text", "") for b in blocks
+             if isinstance(b, dict) and isinstance(b.get("text"), str)]
+    return " ".join(x for x in parts if x).strip()
+
+
 def _response_text(resp) -> str:
-    """Best-effort short text from a Skill tool_response: a plain string, the
-    first non-empty string field, or joined ``text`` parts of a content-block
-    list. Empty string when nothing readable is found."""
+    """Best-effort short text from a tool_response: a plain string, the first
+    non-empty string field, or joined ``text`` parts of a content-block list —
+    whether that list is nested under a key or IS the response. Empty string
+    when nothing readable is found.
+
+    The bare-list case is here because a tool_response is not contractually a
+    string: transcripts store results as exactly that block list, and two
+    readers disagreeing about which shapes count is how a harness change goes
+    unnoticed. `tasktool` reads task ids through this same function."""
     if isinstance(resp, str):
         return resp
+    if isinstance(resp, list):
+        return _blocks_text(resp)
     if isinstance(resp, dict):
         for key in ("text", "result", "output", "error", "content"):
             v = resp.get(key)
             if isinstance(v, str) and v.strip():
                 return v
             if isinstance(v, list):
-                parts = [b.get("text", "") for b in v
-                         if isinstance(b, dict) and isinstance(b.get("text"), str)]
-                joined = " ".join(x for x in parts if x).strip()
+                joined = _blocks_text(v)
                 if joined:
                     return joined
     return ""
@@ -282,17 +300,32 @@ def record_post_tool_use(raw: str, project=None, now=None) -> dict:
         payload = json.loads(raw)
         sid = payload.get("session_id") if isinstance(payload, dict) else None
         appended = 0
-        if isinstance(payload, dict) and payload.get("tool_name") == "TodoWrite":
+        tool = payload.get("tool_name") if isinstance(payload, dict) else None
+        if tool in _TODO_TOOLS:
             # Session roadmap auto-sync (roadmap.py): the todo list IS the
             # session's plan + progress. Deliberately NOT in extract_events —
             # that pure mapping is mirrored by harvest.py, and replaying
-            # historical TodoWrite snapshots from transcripts could only
-            # reorder the registry, never improve it. Best-effort: a sync
-            # failure is logged, never breaks capture.
+            # historical todo snapshots from transcripts could only reorder the
+            # registry, never improve it. Best-effort: a sync failure is
+            # logged, never breaks capture.
+            #
+            # TWO tools reach the same writer because two shapes exist and only
+            # one of them is what this harness sends. `TodoWrite` posts a whole
+            # list, so its payload IS the snapshot. `TaskCreate`/`TaskUpdate`
+            # post one item at a time and carry no list at all, so the snapshot
+            # is accumulated across calls by `tasktool` — which is why gating
+            # on the name `TodoWrite` alone left the whole feature with 0 real
+            # inputs in 61 namespaces while this hook appended 23,973 events.
             try:
-                from . import roadmap
+                from . import roadmap, tasktool
                 inp = payload.get("tool_input") or {}
-                if roadmap.sync_from_todos(sid, inp.get("todos"),
+                if tool == "TodoWrite":
+                    todos = inp.get("todos")
+                else:
+                    todos = tasktool.record(sid, tool, inp,
+                                            payload.get("tool_response"),
+                                            project=project)
+                if roadmap.sync_from_todos(sid, todos,
                                            project=project, ts=now):
                     appended += 1
             except Exception as e:
