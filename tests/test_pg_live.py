@@ -193,7 +193,12 @@ def test_adversarial_number_shapes_survive_the_jsonb_round_trip(migrated, store)
     from mindhive import pgmirror, pgstore, events as events_mod
     from tests.test_pg_numeric_parity import ADVERSARIAL, ORDINARY
 
-    payloads = [ADVERSARIAL, ORDINARY, {"tiny": 1e-09, "wide": 2 ** 60}]
+    # Exactly the shared fixture and nothing else. A third payload used to be
+    # spelled out here -- 1e-09 and 2**60 -- which is precisely the drift the
+    # docstring above promises cannot happen: two shapes asked of the server
+    # that the model had never answered for. Both now live in that file's own
+    # groups, where the model vets them too.
+    payloads = [ADVERSARIAL, ORDINARY]
     write_payload_segment(store, "numbers", payloads)
 
     loaded = pgmirror.rebuild(store["name"])
@@ -228,34 +233,45 @@ def test_adversarial_number_shapes_survive_the_jsonb_round_trip(migrated, store)
 
 
 @needs_server
+@pytest.mark.parametrize("shape", ["large_exponent", "signed_zero"])
 def test_a_payload_the_mirror_cannot_hold_verbatim_is_never_green(migrated,
-                                                                 store):
-    """`-0.0`: the one shape the Python model says does not survive.
+                                                                 store,
+                                                                 shape):
+    """The shapes the Python model says do NOT survive, asked of the server.
 
-    Deliberately NOT written as "the value comes back 0.0". Whether `numeric`
-    keeps the sign of zero is a claim about a server this test's author never
-    observed, and a test that asserts an unverified branch fails for the wrong
-    reason when the guess is wrong.
+    `-0.0` was here first and was described as the only one. It is not: this
+    tier found `large_exponent` (1e+30) by contradicting the model, which had
+    decided float-versus-int from the literal it SENT rather than the text that
+    came BACK. That one matters more -- it is a whole class, every float at or
+    above 1e+16, where `-0.0` is a single value.
 
-    What is asserted instead is the property that actually matters, and it holds
-    either way: the mirror may not differ from the ledger SILENTLY. If the value
-    came back unchanged there is nothing to report and parity is green; if it
-    changed, parity must be red. A faithful mirror is not one that never
-    differs -- it is one that cannot differ without saying so.
+    Deliberately NOT written as "the value comes back X". What each shape
+    becomes is a claim about a server, and a test that asserts an unverified
+    branch fails for the wrong reason when the guess is wrong. What is asserted
+    instead holds either way: the mirror may not differ from the ledger
+    SILENTLY. Unchanged, and parity has nothing to report; changed, and parity
+    must be red. A faithful mirror is not one that never differs -- it is one
+    that cannot differ without saying so.
     """
-    from mindhive import pgmirror, pgstore
-    write_payload_segment(store, "negzero", [{"signed_zero": -0.0}])
+    from mindhive import events as events_mod, pgmirror, pgstore
+    from tests.test_pg_numeric_parity import DOES_NOT_SURVIVE
+
+    value = DOES_NOT_SURVIVE[shape]
+    write_payload_segment(store, shape, [{shape: value}])
     pgmirror.rebuild(store["name"])
 
-    returned = pgstore.read_all_strict(store["name"])[0].payload["signed_zero"]
+    returned = pgstore.read_all_strict(store["name"])[0].payload[shape]
     verdict = pgmirror.parity(store["name"])
-    if json.dumps(returned) == "-0.0":
+    sent_bytes = events_mod.canonical_json(value)
+    back_bytes = events_mod.canonical_json(returned)
+    if back_bytes == sent_bytes:
         assert verdict["ok"] is True, (
-            "the value survived, so parity had no reason to fail: " + str(verdict))
+            f"{shape} survived as {sent_bytes}, so parity had no reason to "
+            f"fail: {verdict}")
     else:
         assert verdict["ok"] is False, (
-            f"the mirror holds {json.dumps(returned)} where the ledger holds "
-            "-0.0, and parity reported no problem")
+            f"the mirror holds {back_bytes} where the ledger holds "
+            f"{sent_bytes}, and parity reported no problem")
 
 
 

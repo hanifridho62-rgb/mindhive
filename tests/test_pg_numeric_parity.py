@@ -25,6 +25,15 @@ re-emits `1e-07` again. Key sorting, the property `docs/DATA_MODEL.md` names,
 does not cover this at all: that is about key ORDER, and this is about value
 SPELLING.
 
+AND THAT SURVIVAL ARGUMENT HAS A HOLE, which a real PostgreSQL 17 found and
+this model's first cut hid. Parsing the printed form lands on the same float64
+only while the printed form still LOOKS like a float. `1e+30` prints back as
+thirty-one plain digits with no decimal point, so `json.loads` reads an `int`
+and `canonical_json` writes the integer. Same value, different type, different
+bytes, different chain head. The boundary is exactly where `json.dumps`
+switches to exponent form -- `1e+16` -- and `DOES_NOT_SURVIVE` below is the
+group that names it.
+
 THREE KINDS OF HAZARD, kept apart because they are proven by different means:
 
 * SPELLING_COLLAPSES -- text in differs from text out. The model below shows it.
@@ -45,6 +54,8 @@ CONFIRMED -- said plainly so a green run here is never mistaken for one there.
 import json
 import math
 import struct
+
+import pytest
 from decimal import Decimal
 
 from mindhive import chain, events
@@ -74,6 +85,26 @@ def numeric_out(literal: str) -> str:
     return format(value, "f")
 
 
+def reparsed(literal: str):
+    """The value psycopg hands back for one number, both steps modelled.
+
+    THE BUG THIS FIXES, because it is subtle and it shipped. A round trip is
+    two steps: the server RENDERS the number to text, and `json.loads` then
+    RE-READS that text. Deciding float-versus-int from the literal that was
+    SENT models only the first step, while json's own dispatch runs on the
+    second. `1e+30` is sent as a float and comes back as the text
+    `1000000000000000000000000000000` -- no decimal point, no exponent, so
+    json reads an `int`. The model claimed that shape survived; a real
+    PostgreSQL 17 said otherwise, and the server was right.
+
+    `numeric_out` never emits an exponent, so in practice the decimal point
+    decides. The exponent characters are tested anyway: this function models
+    json's rule, and should not quietly depend on a property of the other.
+    """
+    out = numeric_out(literal)
+    return float(out) if any(c in out for c in ".eE") else int(out)
+
+
 def through_jsonb(payload):
     """`payload` as it comes back out of a `JSONB` column.
 
@@ -85,9 +116,7 @@ def through_jsonb(payload):
     the case a hand-written walker forgets.
     """
     sent = events.canonical_json(payload)
-    return json.loads(sent,
-                      parse_float=lambda s: float(numeric_out(s)),
-                      parse_int=lambda s: int(numeric_out(s)))
+    return json.loads(sent, parse_float=reparsed, parse_int=reparsed)
 
 
 def through_float32(payload):
@@ -119,8 +148,8 @@ def head_of(payloads) -> str:
 
 # Exponent notation has no representation in `numeric`, so the text changes.
 SPELLING_COLLAPSES = {
-    "large_exponent": 1e+30,                   # '1e+30' -> 31 plain digits
     "small_exponent": 1e-07,                   # '1e-07' -> '0.0000001'
+    "tiny_exponent": 1e-09,                    # '1e-09' -> '0.000000001'
     "nested": {"deep": [{"inner": 2.5e-08}]},  # rendering must reach any depth
 }
 
@@ -128,6 +157,7 @@ SPELLING_COLLAPSES = {
 PRECISION_HAZARDS = {
     "seventeen_digits": 0.30000000000000004,   # shortest-repr float64
     "big_int": 12345678901234567890,           # past float64's exact range
+    "wide_int": 2 ** 60,                       # exact in numeric, not in f32
 }
 
 # `numeric` keeps scale, so this is text-identical AND survives float32 (100.0
@@ -136,6 +166,23 @@ PRECISION_HAZARDS = {
 # came back. Listed separately so it is never counted as proof of anything here.
 SERVER_ONLY = {"trailing_zero": 100.0}
 
+# THE SHAPES THAT DO NOT SURVIVE, kept together because the property they
+# prove is the opposite one: a mirror is not faithful because it never
+# differs, it is faithful because it cannot differ SILENTLY. Both of these
+# move the chain head, so `hive pg parity` reports them -- which is the
+# whole reason parity is a hash comparison and not a row count.
+#
+# `signed_zero` came from reading `numeric`'s documented semantics.
+# `large_exponent` came from a real PostgreSQL 17 contradicting this file's
+# own model, and it is the more interesting of the two: it is a whole CLASS
+# -- every float at or above 1e+16 -- not one boundary value.
+DOES_NOT_SURVIVE = {
+    "large_exponent": 1e+30,                   # comes back an int
+    "signed_zero": -0.0,                       # numeric has no signed zero
+}
+
+# Everything CLAIMED to survive. `DOES_NOT_SURVIVE` is deliberately not in
+# here: this dict is what both tiers assert byte-fidelity over.
 ADVERSARIAL = {**SPELLING_COLLAPSES, **PRECISION_HAZARDS, **SERVER_ONLY}
 
 # What the live ledger actually holds, measured: integers and short decimals.
@@ -223,21 +270,51 @@ def test_a_big_int_comes_back_an_int_and_not_a_float():
     assert isinstance(out, int) and out == PRECISION_HAZARDS["big_int"]
 
 
-def test_negative_zero_is_the_one_shape_that_does_not_survive():
-    """The boundary, pinned rather than left to be discovered in production.
+@pytest.mark.parametrize("name", sorted(DOES_NOT_SURVIVE))
+def test_every_shape_that_does_not_survive_moves_the_head(name):
+    """The exceptions, pinned rather than left to surface in production.
 
-    `numeric` has no signed zero, so `-0.0` returns as `0.0`, `canonical_json`
-    writes `0.0` instead of `-0.0`, and the chain head moves. The mirror is NOT
-    unconditionally faithful, and this is the exact and only exception found.
+    Not silent, and that is the property being asserted: `hive pg parity`
+    compares these very heads, so a shape that breaks the round trip is a
+    shape the gate reports. A faithful mirror is not one that never differs --
+    it is one that cannot differ without saying so.
 
-    It is currently unreachable: the measured ledger holds no float ending in
-    `.0` at all, signed or not. And it is not silent if it ever arrives --
-    `hive pg parity` compares these very heads, so the shape that breaks the
-    round trip is the shape the gate reports. That is the whole reason parity is
-    a hash comparison and not a row count.
+    Both are currently unreachable on the real ledger, measured: it holds no
+    float in exponent form and none ending in `.0`, signed or not.
     """
-    payload = {"signed_zero": -0.0}
-    assert json.dumps(payload["signed_zero"]) == "-0.0"
+    payload = {name: DOES_NOT_SURVIVE[name]}
     returned = through_jsonb(payload)
-    assert json.dumps(returned["signed_zero"]) == "0.0"
-    assert head_of([payload]) != head_of([returned])
+    assert head_of([payload]) != head_of([returned]), (
+        f"{name} survives after all, so it belongs in ADVERSARIAL")
+
+
+def test_the_two_exceptions_break_in_the_ways_recorded():
+    """Not just THAT they differ but HOW, so a future change that breaks
+    them differently is not silently absorbed by the test above."""
+    assert json.dumps(-0.0) == "-0.0"
+    assert json.dumps(through_jsonb({"signed_zero": -0.0})["signed_zero"]) \
+        == "0.0"
+    back = through_jsonb({"large_exponent": 1e+30})["large_exponent"]
+    assert isinstance(back, int) and back == 10 ** 30
+
+
+def test_the_rule_is_the_decimal_point_and_1e16_is_where_it_bites():
+    """WHY `large_exponent` fails and `trailing_zero` does not, as a rule
+    rather than as two examples.
+
+    A float survives iff the text `numeric_out` prints still contains a decimal
+    point, because that is what makes `json.loads` read a float back. `1e+16`
+    is exactly where `json.dumps` switches to exponent form, and exactly where
+    the plain rendering stops having a dot -- so the boundary of the failing
+    class and the boundary of json's own formatting are one number. Below it, a
+    whole-numbered float round-trips fine, which is why `100.0` is safe.
+    """
+    for whole in (5.0, 100.0, 1e+15):
+        payload = {"v": whole}
+        assert head_of([payload]) == head_of([through_jsonb(payload)]), whole
+    for exponent_form in (1e+16, 1e+17, 1e+30):
+        payload = {"v": exponent_form}
+        assert head_of([payload]) != head_of([through_jsonb(payload)]), \
+            exponent_form
+    assert json.dumps(1e+15) == "1000000000000000.0"   # a dot: survives
+    assert json.dumps(1e+16) == "1e+16"                # no dot: does not
