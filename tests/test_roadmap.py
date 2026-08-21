@@ -1337,3 +1337,229 @@ def test_a_session_revives_its_own_retired_plan_on_the_next_todowrite(action, kw
     assert roadmap.auto_plan_id(
         "sess-other", roadmap.fold(events.read_all()),
         now="2026-08-20T11:30:00Z") == "sess-other"
+
+
+# --- AUTO_TAG liveness ------------------------------------------------------
+# `fold` sets rec["tags"] from the LATEST event and seven call sites read it to
+# decide whether a plan is auto-synced. That makes the tag a live wire: any
+# write that forgets it silently converts an auto plan into a human-declared
+# one, and the conversion is invisible -- nothing errors, the plan just stops
+# being synced and stops being autoclosed, forever.
+
+def test_an_update_keeps_the_plans_auto_tag():
+    """`hive roadmap resume` on an interrupted auto plan is the most
+    natural command anyone would run on one, and it used to end that plan's
+    auto-sync permanently: `record` appends tags=["roadmap"], `fold` replaces
+    rec["tags"] with the latest event's, and `sync_from_todos` then returns None
+    for the rest of the plan's life while `autoclose_session` skips it.
+
+    An update is not a declaration. Only `set` declares a plan, so only `set`
+    may re-tag one."""
+    from mindhive import events as ev, roadmap as rm
+
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "p1", "prompt": "the ask",
+                     "steps": [{"text": "one", "status": "pending"}]},
+                    tags=["roadmap", rm.AUTO_TAG])
+    rm.record("step", "p1", index=0, status="done")
+    rec = rm.fold(ev.read_all())["p1"]
+    assert rm.AUTO_TAG in rec["tags"], (
+        "a step update stripped the auto tag, so this plan will never sync "
+        "or autoclose again")
+
+
+def test_an_interrupt_then_resume_still_leaves_the_plan_auto():
+    """The exact sequence a human runs on an interrupted plan, end to
+    end -- two more chances to drop the tag."""
+    from mindhive import events as ev, roadmap as rm
+
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "p2", "prompt": "the ask",
+                     "steps": [{"text": "one", "status": "pending"}]},
+                    tags=["roadmap", rm.AUTO_TAG])
+    rm.record("interrupt", "p2", cause="session_end")
+    rm.record("resume", "p2")
+    rec = rm.fold(ev.read_all())["p2"]
+    assert rm.AUTO_TAG in rec["tags"]
+    assert rec["status"] == "active"
+
+
+def test_a_set_may_still_replace_the_tags():
+    """The other half, and it must not regress: a `set` IS a declaration,
+    and `replenish_sinks` relies on tags being replaced wholesale by one --
+    that is why it refuses to convert a human-declared plan rather than
+    trusting the write."""
+    from mindhive import events as ev, roadmap as rm
+
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "p3", "prompt": "the ask",
+                     "steps": [{"text": "one", "status": "pending"}]},
+                    tags=["roadmap", rm.AUTO_TAG])
+    rm.record("set", "p3", prompt="the ask",
+              steps=[{"text": "one", "status": "pending"}], tags=["roadmap"])
+    rec = rm.fold(ev.read_all())["p3"]
+    assert rec["tags"] == ["roadmap"]
+
+
+def test_an_explicit_tag_list_still_wins():
+    """Carrying the plan's tags is the DEFAULT, not an override: a caller
+    that names its own tags gets exactly those."""
+    from mindhive import events as ev, roadmap as rm
+
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "p4", "prompt": "the ask",
+                     "steps": [{"text": "one", "status": "pending"}]},
+                    tags=["roadmap", rm.AUTO_TAG])
+    rm.record("step", "p4", index=0, status="done", tags=["roadmap", "manual"])
+    rec = rm.fold(ev.read_all())["p4"]
+    assert rec["tags"] == ["roadmap", "manual"]
+
+
+def test_the_loop_engines_snapshot_can_actually_be_adopted(monkeypatch,
+                                                          tmp_path):
+    """A usage-cap snapshot exists to be RESUMED, and only an auto-tagged
+    plan can be: `auto_plan_id`'s third rule refuses anything without the tag.
+    Written with ["roadmap"] alone the snapshot was invisible to the successor
+    the rotation starts -- the one reader it is written for -- and nothing
+    caught that because `_snapshot_interrupted_plan` had no test at all.
+
+    So this asserts the end property rather than the tag: a fresh session with
+    no plan of its own resolves to THIS plan. The task loader is stubbed at the
+    module seam because what is under test is the write, not how a loop dir is
+    read."""
+    from mindhive import events as ev, roadmap as rm, roadmap_auto
+    from mindhive.loop import engine
+
+    class _Tasks:
+        prompt = "# build the thing"
+        fix_plan = ""
+
+    monkeypatch.setattr(engine.task_mod, "load_tasks", lambda d: _Tasks())
+    engine._snapshot_interrupted_plan("test", "run-1",
+                                      str(tmp_path / ".hive-loop"), "usage")
+
+    registry = rm.fold(ev.read_all("test"))
+    rec = registry.get("run-1")
+    assert rec is not None, "the snapshot wrote no plan at all"
+    assert rec["status"] == "interrupted"
+    assert rm.AUTO_TAG in rec["tags"]
+    assert roadmap_auto.auto_plan_id("other-session", registry) == "run-1", \
+        "the successor cannot adopt the marker written for it"
+
+
+# --- the plan has to show the work being done NOW ---------------------------
+
+def _inject(plan, n, project="test"):
+    """*n* injected steps on *plan*, the shape replenish_sinks writes."""
+    from mindhive import events as ev
+    from mindhive import roadmap_auto
+
+    steps = [{"text": "injected %02d" % i, "status": "pending",
+              "new": True} for i in range(n)]
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": plan, "prompt": "the ask",
+                     "title": "the ask", "steps": steps},
+                    session_id=plan,
+                    tags=["roadmap", roadmap_auto.AUTO_TAG],
+                    project=project)
+
+
+def _todos(*pairs):
+    return [{"content": t, "status": s} for t, s in pairs]
+
+
+def test_injected_steps_never_hide_the_whole_live_workload():
+    """MEASURED: 50 injected steps left 0 of 2 live todos on the plan.
+
+    `room = MAX_STEPS - len(carried)` reserves the budget for carried steps
+    FIRST, so a plan whose injected steps reach the cap has no room left for
+    the session's own work at all -- and the comment two lines above it
+    describes fixing this exact failure in the other direction. A plan that
+    cannot show the work being done right now has failed its only job: it is
+    what the Oversee card and STATE.md render.
+
+    Injected steps still WIN the budget, which is the right asymmetry and is
+    argued for in the module. They just no longer win all of it."""
+    from mindhive import roadmap, roadmap_auto
+
+    _inject("sess-2", roadmap.MAX_STEPS)
+    roadmap_auto.sync_from_todos("sess-2",
+                                 _todos(("live one", "in_progress"),
+                                        ("live two", "pending")),
+                                 project="test")
+    rec = roadmap.fold(events.read_all("test"))["sess-2"]
+    texts = [s["text"] for s in rec["steps"]]
+    assert "live one" in texts and "live two" in texts, (
+        "the session's whole visible workload was dropped for carried "
+        "steps: %s" % texts[:4])
+    assert len(texts) <= roadmap.MAX_STEPS
+
+
+def test_a_nearly_full_plan_still_shows_this_sessions_work():
+    """The reachable case, and the one that measured worst: 48 injected
+    steps plus 20 live todos put TWO of the 20 on the plan. Nothing is at any
+    cap here -- 48 is simply what a few replenishment rounds leave behind."""
+    from mindhive import roadmap, roadmap_auto
+
+    _inject("sess-3", 48)
+    roadmap_auto.sync_from_todos(
+        "sess-3", _todos(*[("live %02d" % i, "pending") for i in range(20)]),
+        project="test")
+    rec = roadmap.fold(events.read_all("test"))["sess-3"]
+    live = [s["text"] for s in rec["steps"] if s["text"].startswith("live")]
+    assert len(live) == 20, "only %d of 20 live todos reached the plan" % len(live)
+
+
+# --- which plan did this session actually WORK? ------------------------------
+
+def test_session_close_ignores_a_write_naming_another_plan():
+    """MEASURED: one unrelated roadmap write redirected the whole
+    session close. `_authored_plan_id` returns the plan named by the session's
+    LAST roadmap event, whatever plan that was -- so a session that wrote its
+    own plan and then touched another one (loop/engine's usage-cap snapshot
+    stamps the live session and names its run id; so does any hand-typed
+    `hive roadmap set --plan other`) closed the STRANGER: run-99 went to
+    `interrupted` and the session's real plan stayed `active` with nobody
+    working it. That is the exact symptom `_authored_plan_id` was introduced
+    to remove, re-entering through its own fix.
+
+    Authorship is now RECORDED rather than inferred: the two writers that
+    sync a session's own plan tag their writes, the way replenish_sinks
+    already tags its injections."""
+    from mindhive import events as ev, roadmap, roadmap_auto
+
+    roadmap_auto.sync_from_todos("sess-4",
+                                 _todos(("real work", "in_progress")),
+                                 project="test")
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "run-99",
+                     "prompt": "a loop run", "title": "a loop run",
+                     "steps": [{"text": "x", "status": "pending"}]},
+                    session_id="sess-4",
+                    tags=["roadmap", roadmap_auto.AUTO_TAG], project="test")
+    closed = roadmap_auto.autoclose_session("sess-4", project="test")
+    assert closed is not None, "the session closed nothing at all"
+    assert closed.payload["plan_id"] == "sess-4", (
+        "closed %r -- a stranger's plan"  % closed.payload["plan_id"])
+    reg = roadmap.fold(ev.read_all("test"))
+    assert reg["sess-4"]["status"] == "interrupted"
+    assert reg["run-99"]["status"] == "active", (
+        "the loop run's plan was interrupted by a session that never "
+        "worked it")
+
+
+def test_a_ledger_with_no_work_tag_still_closes_the_newest_write():
+    """The fallback, and it is not optional: every roadmap event written
+    before this change carries no work tag, and a resolver that required one
+    would stop closing every plan already in the ledger. With nothing tagged,
+    the old rule stands -- newest write wins."""
+    from mindhive import events as ev, roadmap, roadmap_auto
+
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "old-plan",
+                     "prompt": "the ask", "title": "the ask",
+                     "steps": [{"text": "x", "status": "pending"}]},
+                    session_id="sess-5",
+                    tags=["roadmap", roadmap_auto.AUTO_TAG], project="test")
+    closed = roadmap_auto.autoclose_session("sess-5", project="test")
+    assert closed is not None and closed.payload["plan_id"] == "old-plan"

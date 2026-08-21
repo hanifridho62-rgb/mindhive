@@ -90,9 +90,14 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause):
         int_payload.update(_relay_state(project, run_id, cause, steps))
         roadmap_mod.validate_payload(set_payload)
         roadmap_mod.validate_payload(int_payload)
-        events.append_event("roadmap", set_payload, tags=["roadmap"],
+        # AUTO-TAGGED, because this snapshot exists to be RESUMED and only
+        # an auto plan can be: `auto_plan_id`'s third rule refuses anything
+        # without the tag. Written with ["roadmap"] alone it was invisible
+        # to the successor the rotation starts -- the one reader it is for.
+        snap_tags = ["roadmap", roadmap_mod.AUTO_TAG]
+        events.append_event("roadmap", set_payload, tags=snap_tags,
                             project=project)
-        events.append_event("roadmap", int_payload, tags=["roadmap"],
+        events.append_event("roadmap", int_payload, tags=snap_tags,
                             project=project)
         # Delivery leg (autoresume.py): schedule the marker to re-enter
         # Claude once the usage window reopens — same best-effort stance as

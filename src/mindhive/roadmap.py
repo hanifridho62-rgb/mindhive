@@ -708,6 +708,7 @@ def _step_from_item(item, status: str) -> dict:
 # the names it needs have to exist before it is loaded.
 from .roadmap_auto import (  # noqa: E402,F401
     AUTO_TAG,
+    WORK_TAG,
     RESUME_WINDOW_HOURS,
     _hours_before,
     _session_prompt,
@@ -717,6 +718,36 @@ from .roadmap_auto import (  # noqa: E402,F401
     sync_from_todos,
     todos_to_steps,
 )
+def _tags_for(action, rec, tags):
+    """Tags for one `record` write, so a plan cannot lose its provenance.
+
+    `fold` sets rec["tags"] from the LATEST event and seven call sites read it
+    to decide whether a plan is auto-synced, which makes the tag a live wire.
+    `record` appended ["roadmap"] for every action, so ANY of them stripped
+    `auto` from an auto plan: `hive roadmap resume` on an interrupted one --
+    the most natural command anyone would run on it -- made `sync_from_todos`
+    return None for the rest of that plan's life and `autoclose_session` skip
+    it, silently, with nothing to see in any output.
+
+    The rule is the distinction the actions already draw. A `set` DECLARES a
+    plan and may re-tag it -- `replenish_sinks` depends on exactly that, which
+    is why it refuses to convert a human-declared plan rather than trusting
+    its own write. Every other action UPDATES a plan that already exists, and
+    an update inherits what that plan already is. A caller that names its own
+    tags still gets exactly those; inheriting is the default, not an override.
+    """
+    explicit = [t for t in (tags or []) if t != "roadmap"]
+    if explicit or action == "set" or rec is None:
+        return ["roadmap"] + explicit
+    # `WORK_TAG` is deliberately NOT inherited. It records that a write
+    # was a session syncing its own plan, which is a fact about the WRITE;
+    # inherited from the plan, a hand-typed `step` on a plan some other
+    # session had worked would claim that session's authorship, and
+    # `_authored_plan_id` would close the wrong plan again -- the defect
+    # the tag exists to fix, re-entering through the tag.
+    return ["roadmap"] + [t for t in (rec.get("tags") or [])
+                          if t not in ("roadmap", WORK_TAG)]
+
 def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
            status=None, note=None, cause=None, reason=None, work_branch=None,
            work_pr=None, work_commits=None, tags=None, session_id=None,
@@ -796,7 +827,7 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
                 f"there is no unverifiable step left to archive")
     return ev_mod.append_event(
         "roadmap", payload, session_id=session_id,
-        tags=["roadmap"] + [t for t in (tags or []) if t != "roadmap"],
+        tags=_tags_for(action, rec, tags),
         project=project)
 
 

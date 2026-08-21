@@ -45,7 +45,7 @@ def make_record(**overrides) -> dict:
         "window": {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
         "inputs": [
             {"ref": "a" * 64, "occurrence": 1, "weight": 1.0,
-             "reason": "subject-share 1/1"},
+             "weight_exact": "1", "reason": "subject-share 1/1"},
         ],
         "value": 62,
         "value_kind": "numeric",
@@ -126,7 +126,14 @@ def test_contribution_payload_refuses_a_self_claimed_weight():
 def test_contribution_payload_accepts_a_minimal_valid_body():
     # The silence half of every fire/silence pair above.
     contributions.validate_payload(make_contribution())
-    contributions.validate_payload(make_contribution(confidence=0.0))
+    # NOT 0.0, which this line used to assert was valid. The range is
+    # half-open: 0 multiplies the weight to nothing, the record contract
+    # refuses a zero weight, and the contribution cannot be un-appended — so
+    # accepting it meant one contribution could make a frame permanently
+    # unfoldable. See
+    # test_a_zero_confidence_contribution_is_refused_at_the_append_surface.
+    contributions.validate_payload(make_contribution(confidence=0.001))
+    contributions.validate_payload(make_contribution(confidence=1.0))
     contributions.validate_payload(make_contribution(value="expand"))
 
 
@@ -157,18 +164,20 @@ def test_record_payload_requires_every_input_to_carry_a_weight_and_a_reason():
     # THE black-box guard. A number whose weights are not recorded cannot be
     # walked backwards, which is the failure condition the PRD names.
     no_weight = make_record(
-        inputs=[{"ref": "a" * 64, "occurrence": 1, "reason": "because"}])
+        inputs=[{"ref": "a" * 64, "occurrence": 1, "weight_exact": "1",
+                 "reason": "because"}])
     with pytest.raises(ValueError):
         records.validate_payload(no_weight)
 
     no_reason = make_record(
-        inputs=[{"ref": "a" * 64, "occurrence": 1, "weight": 1.0}])
+        inputs=[{"ref": "a" * 64, "occurrence": 1, "weight": 1.0,
+                 "weight_exact": "1"}])
     with pytest.raises(ValueError):
         records.validate_payload(no_reason)
 
     blank_reason = make_record(
         inputs=[{"ref": "a" * 64, "occurrence": 1, "weight": 1.0,
-                 "reason": "   "}])
+                 "weight_exact": "1", "reason": "   "}])
     with pytest.raises(ValueError):
         records.validate_payload(blank_reason)
 
@@ -179,17 +188,19 @@ def test_record_payload_requires_an_occurrence_on_every_input():
     # would prove one event — the ambiguity this field exists to remove.
     with pytest.raises(ValueError):
         records.validate_payload(make_record(
-            inputs=[{"ref": "a" * 64, "weight": 1.0, "reason": "no occurrence"}]))
+            inputs=[{"ref": "a" * 64, "weight": 1.0, "weight_exact": "1",
+                     "reason": "no occurrence"}]))
     with pytest.raises(ValueError):
         records.validate_payload(make_record(
             inputs=[{"ref": "a" * 64, "occurrence": 0, "weight": 1.0,
+                     "weight_exact": "1",
                      "reason": "1-based, so 0 names nothing"}]))
 
 
 def test_record_payload_requires_a_ref_on_every_input():
     with pytest.raises(ValueError):
         records.validate_payload(
-            make_record(inputs=[{"weight": 1.0, "reason": "no ref"}]))
+            make_record(inputs=[{"weight": 1.0, "weight_exact": "1", "reason": "no ref"}]))
 
 
 def test_record_payload_accepts_a_minimal_valid_body():
@@ -519,3 +530,183 @@ def test_cli_trace_exits_non_zero_when_a_ref_cannot_be_resolved():
 def test_cli_trace_without_a_record_is_a_success():
     from mindhive import __main__ as cli_mod
     assert cli_mod.main(["consensus", "trace", "--frame", "never-folded"]) == 0
+
+
+# --- what a measured audit pass found ----------------------------------------
+
+def test_a_zero_confidence_contribution_is_refused_at_the_append_surface():
+    """MEASURED: `confidence: 0` sits inside [0.0, 1.0], so the contract
+    accepted it; the fold then weighed the row 0; and `records.validate_payload`
+    -- which requires a POSITIVE weight, for its own good reason -- refused the
+    fold's own output. `fold_and_record` raised ValueError, and because the
+    contribution is in an append-only ledger it would raise on every later run:
+    one legal contribution bricked a frame permanently.
+
+    A withheld input is not a weaker input. Refused at the surface, where an
+    append-only store has to be defended, with the corrective hint."""
+    with pytest.raises(ValueError) as e:
+        contributions.validate_payload(make_contribution(confidence=0))
+    assert "weightless" in str(e.value).lower()
+    contributions.validate_payload(make_contribution(confidence=0.01))
+
+
+def test_a_weightless_row_already_in_the_ledger_cannot_brick_the_frame():
+    """The other half. The gate above stops new ones; this is a frame that
+    already holds one, which no gate can undo. The fold drops rows that carry
+    no weight -- they moved no median and can be argued with from the event
+    itself -- so the frame keeps folding."""
+    evs = [contribution_event("s-a", 10, confidence=0),
+           contribution_event("s-b", 70)]
+    folded = consensus.fold_window(evs, "f1")
+    assert folded is not None, "one weightless row killed the whole frame"
+    records.validate_payload(folded)
+    assert folded["value"] == 70
+    assert len(folded["inputs"]) == 1
+    assert folded["subjects"] == 1
+
+
+def test_a_frame_whose_every_row_is_weightless_folds_to_none():
+    """`None` is the module's native answer for nothing to fold, and it is
+    what `fold_and_record` already treats as a success. An empty `inputs` list
+    would be refused by the record contract instead -- the brick again."""
+    evs = [contribution_event("s-a", 10, confidence=0),
+           contribution_event("s-b", 70, confidence=0)]
+    assert consensus.fold_window(evs, "f1") is None
+
+
+def test_a_non_finite_value_never_reaches_the_ledger():
+    """MEASURED: `canonical_json({"value": float("nan")})` returned
+    `{"value":NaN}` and that is what landed on disk -- a bare `NaN` token, which
+    is not JSON, inside a hash-chained append-only ledger. Python's own reader
+    accepts it, which is what kept it invisible; the Postgres mirror's JSONB and
+    every strict parser downstream do not.
+
+    Three gates, because the hole was three-deep: the contribution contract, the
+    record contract, and `canonical_json` itself -- the one writer every event
+    type goes through, so it is the seam that has to hold."""
+    import math
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            contributions.validate_payload(make_contribution(value=bad))
+        with pytest.raises(ValueError):
+            records.validate_payload(make_record(value=bad))
+        with pytest.raises(ValueError):
+            events.canonical_json({"value": bad})
+    assert math.isfinite(62)
+    contributions.validate_payload(make_contribution(value=62))
+
+
+def test_the_mode_tie_break_really_is_the_smallest_value():
+    """The docstring says ties break on the lexicographically smallest
+    value. MEASURED: ('a','b') -> 'a' but ('a','ab') -> 'ab' and ('x','xy') ->
+    'xy'. `[-ord(c) for c in value]` compares element-wise and then LENGTH, so a
+    string that is a prefix of its rival loses to it -- the opposite of what was
+    promised, on exactly the values a category name and its longer form take.
+    A determinism rule that is wrong is not determinism."""
+    from fractions import Fraction
+
+    half = Fraction(1, 2)
+    for pair in (("a", "b"), ("a", "ab"), ("x", "xy"), ("ab", "b")):
+        got = consensus._weighted_mode([(pair[0], half), (pair[1], half)])
+        assert got == min(pair), (
+            "tie %s broke to %r, not the smallest %r" % (pair, got, min(pair)))
+
+
+def test_the_published_weights_re_derive_the_recorded_value():
+    """THE trace guarantee, and it was broken. MEASURED: a frame of three
+    contributions from one subject plus one from another records value 50.0
+    (exact shares 1/3,1/3,1/3,1) while the same median computed from the
+    PUBLISHED weights -- `round(float(Fraction(1,3)), 6)` -- gives 90. The
+    record's own numbers did not reproduce the record's own answer, which is the
+    black box this module's whole contract exists to refuse, arriving through
+    the audit trail rather than around it.
+
+    The module's header already explains why the weights are Fractions and not
+    floats. The record now publishes that exact share too."""
+    from fractions import Fraction
+
+    evs = [contribution_event("flooder", 10), contribution_event("flooder", 10),
+           contribution_event("flooder", 10), contribution_event("solo", 90)]
+    folded = consensus.fold_window(evs, "f1")
+    records.validate_payload(folded)
+    exact = [Fraction(row["weight_exact"]) for row in folded["inputs"]]
+    assert exact == [Fraction(1, 3)] * 3 + [Fraction(1)]
+    redrawn = consensus._weighted_median(
+        list(zip([10, 10, 10, 90], exact)))
+    assert redrawn == folded["value"], (
+        "the trail publishes %r but re-derives %r" % (folded["value"], redrawn))
+
+
+def test_the_record_contract_requires_the_exact_share():
+    """Required, not merely written. The rounded float is a rendering for a
+    human; the exact share is what makes the record re-derivable, and this file
+    already holds that a record missing what it needs is refused at the surface
+    rather than trusted downstream."""
+    body = make_record()
+    del body["inputs"][0]["weight_exact"]
+    with pytest.raises(ValueError):
+        records.validate_payload(body)
+    for junk in ("", "   ", "1/0", "0/3", "-1/3", "one third", 0.333):
+        with pytest.raises(ValueError):
+            records.validate_payload(make_record(
+                inputs=[{"ref": "a" * 64, "occurrence": 1, "weight": 1.0,
+                         "weight_exact": junk,
+                         "reason": "subject-share 1/1"}]))
+
+
+def test_one_participant_under_two_spellings_gets_one_share():
+    """MEASURED: 'alice', 'alice ' and 'Alice' counted as three subjects,
+    each taking a full share against bob's one -- the flooding the per-subject
+    rule is the module's first anti-gaming claim. The contract VALIDATES
+    `subject.strip()` and then keys on the unstripped string, so a trailing
+    space passed as a distinct participant.
+
+    Whitespace is fixed here. CASE is deliberately NOT folded: a subject id may
+    legitimately be case-sensitive, and quietly merging 'Alice' into 'alice'
+    would be a policy decision wearing a bug fix's clothes."""
+    evs = [contribution_event("alice", 10), contribution_event("alice ", 10),
+           contribution_event(" alice", 10), contribution_event("bob", 90)]
+    folded = consensus.fold_window(evs, "f1")
+    assert folded["subjects"] == 2, (
+        "counted %d subjects for 2 participants" % folded["subjects"])
+    assert folded["value"] == 50, (
+        "one voter under three spellings still outweighs the other")
+
+
+def test_latest_record_is_last_wins_not_max_on_the_timestamp():
+    """The docstring's rule, which had no test: last-wins over
+    `read_all`'s (ts, segment, line) order rather than a max() on `ts`, so two
+    records folded inside the SAME second resolve here the way they resolve
+    everywhere else that reads this ledger. The existing test uses one record
+    per frame, so ordering never arose in it."""
+    first = events.Event(ts="2026-08-08T00:00:00Z", session_id="s1",
+                         type=consensus.RECORD_TYPE,
+                         payload={"frame_id": "f1", "value": 10}, tags=[])
+    second = events.Event(ts="2026-08-08T00:00:00Z", session_id="s1",
+                          type=consensus.RECORD_TYPE,
+                          payload={"frame_id": "f1", "value": 20}, tags=[])
+    assert consensus.latest_record([first, second], "f1")["value"] == 20
+    assert consensus.latest_record([second, first], "f1")["value"] == 10
+
+
+def test_a_mixed_frame_is_still_categorical_and_says_so():
+    """NOT a fix -- a pin. MEASURED: four numeric subjects fold to median
+    25; adding ONE string subject folds the same frame to mode '20'. The
+    aggregation is chosen from the data, which is what lets one pipeline serve a
+    heart-rate frame and a strategic-direction frame, and it also means one
+    mistyped row silently changes the rule for everyone in a 400-subject frame
+    -- while `kind`, a declared discriminant, sits unread on every event.
+
+    Changing that changes the RULE, so it changes RULE_VERSION, so it is not a
+    bug fix to slip in under one. This test states the current behaviour
+    exactly, so whoever decides to change it has to change a test that says
+    what they are giving up."""
+    numeric = [contribution_event(s, v) for s, v in
+               (("a", 10), ("b", 20), ("c", 30), ("d", 40))]
+    assert consensus.fold_window(numeric, "f1")["value"] == 25
+    assert consensus.fold_window(numeric, "f1")["value_kind"] == "numeric"
+    mixed = numeric + [contribution_event("e", "20")]
+    folded = consensus.fold_window(mixed, "f1")
+    assert folded["value"] == "20"
+    assert folded["value_kind"] == "categorical"

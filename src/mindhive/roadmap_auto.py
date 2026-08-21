@@ -46,6 +46,23 @@ from .sop import ID_RE
 
 AUTO_TAG = "auto"
 
+# Which plan this session actually WORKED, recorded rather than inferred.
+#
+# `_authored_plan_id` used to answer that from the session's LAST roadmap
+# event, whatever plan it named -- so one unrelated write redirected the whole
+# session close: measured, `run-99` went to `interrupted` and the session's own
+# plan stayed `active` with nobody working it. A write naming another plan is
+# ordinary (loop/engine's usage-cap snapshot stamps the live session and names
+# its run id; so does any hand-typed `hive roadmap set --plan other`), so the
+# inference was wrong rather than unlucky.
+#
+# A third tag is the pattern this ledger already uses for exactly this -- 
+# `replenish_sinks` marks its injections `replenish` the same way. It is a
+# property of the WRITE and not of the plan, which is why `roadmap._tags_for`
+# refuses to inherit it: inherited, a manual `step` on a plan some other
+# session had worked would claim authorship it never had.
+WORK_TAG = "session-work"
+
 # How long a paused plan stays adoptable. The bound is what keeps adoption from
 # being permanent: without it, a plan interrupted in March is still the work in
 # August, and an unrelated task silently inherits its ask. Three days covers a
@@ -231,6 +248,12 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
         return None
     steps = todos_to_steps(todos)
     if not steps:
+        # `[]` is not None. An empty LIST is the harness saying every task is
+        # gone, and collapsing it into "nothing to say" left the deleted step
+        # on the plan forever. Anything else that folds to no steps (None, a
+        # malformed payload) still says nothing.
+        if isinstance(todos, list) and not todos:
+            return _clear_plan(sid, project=project, evs=evs, ts=ts)
         return None
     if evs is None:
         evs = ev_mod.read_all(project)
@@ -293,7 +316,17 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
         # session's whole visible workload gone. Oldest carried steps go
         # first: a finished step already recorded its progress in the
         # plan's history, a live todo has nowhere else to be.
-        room = max(0, rm_mod.MAX_STEPS - len(carried))
+        # A FLOOR, because reserving the budget for carried steps FIRST was
+        # the same failure in the other direction, and it measured worse:
+        # 50 injected steps left `room` 0 and dropped the session's ENTIRE
+        # visible workload -- every current todo, on every later call, for
+        # as long as the plan stayed full -- and 48 left two of twenty.
+        # Injected steps still win the budget, which is the asymmetry
+        # argued for above; they no longer win all of it, because a plan
+        # that cannot show the work being done NOW has failed the only job
+        # it has: it is what the Oversee card and STATE.md render.
+        floor = min(len(merged), rm_mod.MAX_STEPS // 2)
+        room = max(rm_mod.MAX_STEPS - len(carried), floor)
         if len(merged) > room:
             drop = len(merged) - room
             kept = []
@@ -303,7 +336,27 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
                     continue
                 kept.append(s)
             merged = kept
-        steps = merged[:room] + list(carried.values())[:rm_mod.MAX_STEPS]
+        live_kept = merged[:room]
+        steps = (live_kept + list(carried.values()))[:rm_mod.MAX_STEPS]
+        # NOT a silent cap. The floor can only be honoured by dropping
+        # carried steps, and an injected step that leaves a plan does not
+        # come back -- its fingerprint is already spent, so no later round
+        # re-proposes it. Whoever reads the plan afterwards is entitled to
+        # know the plan is not the whole story.
+        lost = len(live_kept) + len(carried) - len(steps)
+        if lost:
+            try:
+                from . import hookcapture
+                hookcapture.log_hook_error(
+                    "roadmap_steps_capped",
+                    RuntimeError(
+                        f"plan {plan_id}: {lost} injected step(s) dropped "
+                        f"to keep {len(live_kept)} live step(s) visible at "
+                        f"the {rm_mod.MAX_STEPS}-step cap; an injected "
+                        "step is not re-proposed once its fingerprint is "
+                        "spent"))
+            except Exception:
+                pass          # a notice must never fail a sync
     asked = _session_prompt(evs, sid)
     # The ask is PROVENANCE: a continued plan keeps the prompt it was
     # declared with, because that is the one field a resuming session must
@@ -327,9 +380,59 @@ def sync_from_todos(session_id, todos, project=None, evs=None, ts=None):
                "title": title, "steps": steps}
     rm_mod.validate_payload(payload)
     return ev_mod.append_event("roadmap", payload, session_id=sid,
-                               tags=["roadmap", AUTO_TAG], ts=ts,
-                               project=project)
+                               tags=["roadmap", AUTO_TAG, WORK_TAG],
+                               ts=ts, project=project)
 
+
+def _clear_plan(session_id, project=None, evs=None, ts=None):
+    """Every task the harness had is gone. Say so, honestly.
+
+    `record` answers `[]` for "this session's list is empty now" and None for
+    "nothing to say about this call", and that distinction used to die one line
+    into this module: `if not steps: return None` collapsed them. So deleting
+    tasks one at a time worked until the LAST one, and then the final step sat
+    pending on the plan forever -- the Oversee card and the awaiting-resume list
+    reporting work the harness had deleted, with no later call able to clear it
+    because every later list is empty too.
+
+    `roadmap set requires a non-empty steps list`, so an empty plan cannot be
+    written and should not be: a plan with no steps is not a plan. Two honest
+    exits instead, and which one applies is not a judgement call:
+
+    * INJECTED steps survive. A step marked `new` came from the replenishment
+      injector with evidence behind it, and this module already holds that a
+      trimmed todo reappears on the next call while an injected step never comes
+      back. So the harness's steps clear and the injected ones stay, as a `set`.
+    * Otherwise `archive`, with a reason -- the documented state between
+      finished and still open. Nothing was completed, so `complete` would lie;
+      nothing is left, so `active` lies too.
+
+    Human-declared plans are untouched, like everywhere else here."""
+    from . import roadmap as rm_mod
+    if evs is None:
+        evs = ev_mod.read_all(project)
+    registry = rm_mod.fold(list(evs))
+    plan_id = auto_plan_id(session_id, registry, now=ts)
+    rec = registry.get(plan_id)
+    if rec is None or AUTO_TAG not in (rec.get("tags") or []):
+        return None
+    if rec.get("status") in rm_mod.RETIRED_STATUSES:
+        return None
+    if not rec.get("steps"):
+        return None                      # already empty: nothing to clear
+    carried = [dict(s) for s in rec["steps"] if s.get("new")]
+    if carried:
+        payload = {"action": "set", "plan_id": plan_id,
+                   "prompt": rec["prompt"],
+                   "title": rec.get("title") or rec["prompt"],
+                   "steps": carried[:rm_mod.MAX_STEPS]}
+    else:
+        payload = {"action": "archive", "plan_id": plan_id,
+                   "reason": "every task the harness had was deleted"}
+    rm_mod.validate_payload(payload)
+    return ev_mod.append_event("roadmap", payload, session_id=session_id,
+                               tags=["roadmap", AUTO_TAG, WORK_TAG],
+                               ts=ts, project=project)
 
 def _authored_plan_id(evs, session_id) -> str:
     """The plan THIS session actually wrote to, newest write wins.
@@ -351,6 +454,7 @@ def _authored_plan_id(evs, session_id) -> str:
     and a session that wrote no roadmap event at all yields "".
     """
     out = ""
+    worked = ""
     for ev in evs:
         if getattr(ev, "type", None) != "roadmap":
             continue
@@ -359,7 +463,14 @@ def _authored_plan_id(evs, session_id) -> str:
         p = getattr(ev, "payload", None)
         if isinstance(p, dict) and p.get("plan_id"):
             out = str(p["plan_id"])
-    return out
+            if WORK_TAG in (getattr(ev, "tags", None) or []):
+                worked = out
+    # A write that CLAIMED the work wins over one that merely happened
+    # last, and the fallback is the old rule verbatim -- every roadmap
+    # event written before `WORK_TAG` existed carries none, and a resolver
+    # that required one would stop closing every plan already in the
+    # ledger.
+    return worked or out
 
 
 def autoclose_session(session_id, project=None, evs=None, ts=None):

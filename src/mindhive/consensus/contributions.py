@@ -25,9 +25,12 @@ WHAT THIS REFUSES, AND WHY EACH REFUSAL IS LOAD-BEARING:
 * **A self-claimed `weight`.** The contributor does not get to say how much they
   count. Accepting it would make the record an account of what senders asked for
   rather than of what the rule decided, which is the black box the PRD forbids.
-* **A `confidence` outside [0, 1].** It multiplies the weight. Unbounded, one
+* **A `confidence` outside (0, 1].** It multiplies the weight. Unbounded, one
   contribution with `confidence: 10_000` is a self-claimed weight wearing a
-  different name.
+  different name — and the range is HALF-OPEN because 0 is the other end of
+  the same problem: it weighs the row to nothing, the record contract refuses
+  a zero weight, and this ledger is append-only, so one 0-confidence row made
+  a frame unfoldable for good. A withheld input is not a weaker input.
 
 WHAT IT DELIBERATELY ALLOWS: extra keys (a `unit`, a device id, a note). A
 frame's instrument knows things this contract does not, and rejecting unknown
@@ -39,7 +42,10 @@ Python and would fold as 1 into a numeric frame it does not belong to.
 """
 
 # Present as a module constant so a test can assert the boundary rather than a
-# literal that could drift from the message.
+# literal that could drift from the message. The interval is HALF-OPEN:
+# `CONFIDENCE_MIN` is excluded, checked separately below with its own message,
+# because a zero weight is refused by the record contract and cannot be
+# withdrawn from an append-only ledger.
 CONFIDENCE_MIN = 0.0
 CONFIDENCE_MAX = 1.0
 
@@ -47,7 +53,15 @@ _REQUIRED_STRINGS = ("frame_id", "kind", "subject")
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A finite number. `math.isfinite` is part of the test and not a
+    nicety: `float('nan')` is an instance of `float`, so without it a NaN
+    measurement passed this contract and `canonical_json` wrote a bare `NaN`
+    token -- not JSON -- into a hash-chained segment, permanently."""
+    import math
+
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def validate_payload(payload) -> None:
@@ -82,6 +96,21 @@ def validate_payload(payload) -> None:
 
     conf = payload.get("confidence")
     if conf is not None:
+        # ZERO is refused separately, and it is not pedantry. It multiplies
+        # the weight, so the row weighs nothing; the fold then publishes a
+        # zero weight; and `records.validate_payload` requires a POSITIVE
+        # one, for its own good reason -- so `fold_and_record` raised, and
+        # kept raising, because the contribution was already in an
+        # append-only ledger. One legal contribution bricked a frame.
+        #
+        # A withheld input is not a weaker input. Send the value with no
+        # confidence, or do not send it.
+        if _is_number(conf) and conf == 0:
+            raise ValueError(
+                "contribution confidence 0 makes the contribution weightless "
+                "— it would carry no weight in the fold, and a record whose "
+                "input has no weight is refused, so the frame could never "
+                "be folded again. Omit confidence, or state a positive one")
         if not _is_number(conf) or not CONFIDENCE_MIN <= conf <= CONFIDENCE_MAX:
             raise ValueError(
                 "contribution confidence must be a number in "

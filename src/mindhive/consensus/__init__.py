@@ -98,7 +98,30 @@ def _rows(evs, frame_id, start=None, end=None) -> list[dict]:
         subject = payload.get("subject")
         if not isinstance(subject, str) or not subject.strip():
             continue
+        # STRIPPED, because this is the identity the whole per-subject rule
+        # is keyed on. The contract validates `subject.strip()` and the fold
+        # then grouped on the raw string, so 'alice' and 'alice ' were two
+        # participants: measured, three spellings of one voter took three
+        # full shares against another's one, which is precisely the
+        # flooding this module's first anti-gaming claim refuses.
+        #
+        # CASE is deliberately not folded. A subject id may legitimately be
+        # case-sensitive, and merging 'Alice' into 'alice' is a policy
+        # decision, not a bug fix.
+        subject = subject.strip()
         if "value" not in payload:
+            continue
+        # A stated confidence of 0 makes the row weigh nothing, and a row
+        # that weighs nothing is not an input: it moves no median, and the
+        # record contract rightly refuses a zero weight. Dropped HERE, not
+        # after weighing, so it does not consume a share of its subject's
+        # weight either. `contributions.validate_payload` now refuses it at
+        # the surface; this is for the frames that already hold one, which
+        # no gate can undo -- and where the alternative was a ValueError on
+        # every fold of that frame, forever.
+        conf = payload.get("confidence")
+        if (isinstance(conf, (int, float)) and not isinstance(conf, bool)
+                and conf == 0):
             continue
         ts = getattr(ev, "ts", "") or ""
         if start is not None and ts < start:
@@ -177,7 +200,13 @@ def _weighted_mode(pairs):
     totals = {}
     for value, weight in pairs:
         totals[value] = totals.get(value, Fraction(0)) + weight
-    best = max(totals.items(), key=lambda kv: (kv[1], [-ord(c) for c in kv[0]]))
+    # `min` on (-weight, value), not `max` on a negated-ordinal list. That
+    # list compared element-wise and THEN by length, so a value that is a
+    # prefix of its rival lost to it: measured, ('a','ab') broke to 'ab' and
+    # ('x','xy') to 'xy' — the opposite of the rule stated above, on exactly
+    # the shapes a category name and its longer form take. A determinism
+    # rule that is wrong is not determinism.
+    best = min(totals.items(), key=lambda kv: (-kv[1], kv[0]))
     return best[0]
 
 
@@ -209,6 +238,14 @@ def fold_window(evs, frame_id, start=None, end=None) -> "dict | None":
     if not rows:
         return None
     _weigh(rows)
+    # The record contract requires a POSITIVE weight on every input, and
+    # this fold is its only writer — so the invariant is enforced where it
+    # is produced rather than discovered at the append surface, where the
+    # only outcome left is a raise. `_rows` already drops the one known way
+    # to weigh nothing; this covers any later one.
+    rows = [row for row in rows if row["weight"] > 0]
+    if not rows:
+        return None
 
     numbers = [_as_number(row["value"]) for row in rows]
     numeric = all(n is not None for n in numbers)
@@ -233,9 +270,14 @@ def fold_window(evs, frame_id, start=None, end=None) -> "dict | None":
     for row in rows:
         ref = event_ref(row["ev"])
         seen[ref] = seen.get(ref, 0) + 1
+        # BOTH forms. The float is what a human reads; `weight_exact` is
+        # what makes the record re-derivable, and without it the published
+        # trail did not reproduce the published value (1/3 -> 0.333333,
+        # three of which sum to 0.999999, which walks off the median).
         inputs.append({"ref": ref,
                        "occurrence": seen[ref],
                        "weight": round(float(row["weight"]), 6),
+                       "weight_exact": str(row["weight"]),
                        "reason": row["reason"]})
 
     stamps = sorted(row["ts"] for row in rows)
