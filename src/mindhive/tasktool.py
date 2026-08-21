@@ -155,6 +155,31 @@ def _exclusive(project=None):
             if time.monotonic() >= deadline:
                 break
             time.sleep(_LOCK_SPIN_S)
+        except PermissionError:
+            # CONTENTION, not an unwritable directory, and it landed in the arm
+            # below for the whole life of this lock. On Windows a name whose
+            # holder has closed its fd and called `unlink` is DELETE-PENDING
+            # until the entry actually goes, and a create against a
+            # delete-pending name answers ACCESS_DENIED rather than EEXIST. So
+            # the one error that clears in microseconds took the arm that fails
+            # open INSTANTLY, without waiting at all -- the loser walked into
+            # the critical section beside the next holder and the last writer
+            # published a snapshot read before the other's write.
+            #
+            # Caught in the act rather than reasoned about: under 12-way CPU
+            # load, with `os.open` audited and both sections timestamped, every
+            # lost task came with exactly one overlapping critical section and a
+            # PermissionError on the .lock path in the process that lost it.
+            # 1:1, and no loss without an overlap. The symptom was one create of
+            # fifty vanishing, ~8-15% of runs, which `_LOCK_WAIT_S` could not
+            # touch because this arm never waited.
+            #
+            # It waits now, and the deadline still bounds it: the fail-open
+            # below survives for the failure that CANNOT clear -- an unwritable
+            # directory, which is what its comment was always describing.
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_LOCK_SPIN_S)
         except OSError:
             break       # unwritable directory: fail open, never raise
     try:

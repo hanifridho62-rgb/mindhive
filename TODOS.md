@@ -603,7 +603,47 @@ pushed and its checks come back.
 
 ---
 
-## 21. The task sidecar lock still loses one write in fifty, and I do not know why
+## 21. ~~The task sidecar lock still loses one write in fifty, and I do not know why~~ — ROOT CAUSE FOUND AND FIXED 2026-08-21
+
+**It was `except OSError: break`.** On Windows a lock file whose holder has closed its fd and
+called `unlink` is **DELETE-PENDING** until the directory entry actually goes, and a
+`os.open(O_CREAT | O_EXCL)` against a delete-pending name answers **ACCESS_DENIED**, not EEXIST.
+`_exclusive` caught `FileExistsError` in its waiting arm and everything else in the fail-open arm
+below it — whose comment describes an unwritable directory. So the one error that clears in
+*microseconds* took the arm that fails open **instantly, without waiting at all**: the loser
+walked into the critical section beside the next holder, and the last writer published a snapshot
+read before the other's write.
+
+That is also why `_LOCK_WAIT_S` could not touch it — that arm never waited — and why every
+attempt to instrument it made it vanish (four times out of five): the window is microseconds wide.
+
+**Caught in the act, not inferred.** Under 12-way CPU load, with `os.open` audited and both
+critical sections timestamped with `time.time_ns()` (comparable across processes, sub-microsecond
+on Windows, unlike `perf_counter` which is per-process and `monotonic` which is a 15 ms tick here):
+
+| | losses | overlapping sections | ACCESS_DENIED bails |
+|---|---|---|---|
+| before, under load | 4 of 64 rounds | 4 — one per loss, **1:1** | present in the losing process |
+| after, under load | **0 of 30** | **0** | **1** — still happening, no longer harmful |
+
+The bail still occurs after the fix. That is the point: the window is real and still gets hit, and
+making it *wait* removes the overlap and the loss without removing the condition.
+
+**The fix** is one arm and the distinction it draws: an unwritable directory fails the same way
+forever, delete-pending clears at once — so ACCESS_DENIED waits like EEXIST, bounded by the same
+deadline, and fail-open survives for the failure that genuinely cannot clear.
+`test_a_delete_pending_lock_makes_the_waiter_wait_not_barge_in` pins the mechanism
+deterministically (one injected refusal, then the lock must actually be *held*), because the race
+that found it is not something a suite can rely on reproducing.
+
+**What this corrects about PR #114.** That PR reported the sidecar lock as the finished P0 fix and
+was 7/7 green on CI. Both were true and neither was evidence: at 8–15% the test passes most runs,
+Windows matrix included. The whole-session clobber really was fixed; a single lost create was not,
+and a lost create can never be reached again because `_update` refuses an id it has never seen.
+
+---
+
+<details><summary>The original entry, kept for the four hypotheses it killed</summary>
 
 **Source:** the full default tier on 2026-08-21, one run red and the previous run green on the
 same tree. Measured before being written down.
@@ -644,3 +684,5 @@ rather than adding work inside the critical section.
 
 **Cons of leaving it:** an intermittent that is currently passing reads as a fixed one, which is
 exactly what TODOS 11 cost someone. And this one is on the data-loss path.
+
+</details>

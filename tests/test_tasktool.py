@@ -504,3 +504,52 @@ def test_an_empty_list_keeps_injected_steps_instead_of_archiving():
     rec = roadmap.fold(events.read_all("test"))["sess-2"]
     assert rec["status"] == "active"
     assert [s["text"] for s in rec["steps"]] == ["injected step"]
+
+
+def test_a_delete_pending_lock_makes_the_waiter_wait_not_barge_in(monkeypatch):
+    """DETERMINISTIC, where the race that found this is not.
+
+    On Windows a lock file whose name is DELETE-PENDING -- the holder has closed
+    its fd and called `unlink`, and the directory entry has not gone yet --
+    answers `os.open(O_CREAT | O_EXCL)` with ACCESS_DENIED, not EEXIST.
+    `_exclusive` caught `FileExistsError` in its waiting arm and everything else
+    in `except OSError: break`, whose comment describes an unwritable directory.
+    So the one error that clears in MICROSECONDS took the arm that fails open
+    INSTANTLY, without waiting at all -- and the loser walked into the critical
+    section beside the new holder, where the last writer published a snapshot
+    taken before the other's write.
+
+    Measured under 12-way CPU load before the fix, with `os.open` audited and
+    both sections timestamped: every lost task came with exactly one overlapping
+    critical section, and the process that lost it had logged a PermissionError
+    on the `.lock` path. 1:1, no loss without an overlap.
+
+    The distinction the fix draws: an unwritable directory fails the same way
+    forever, delete-pending clears at once. So ACCESS_DENIED has to WAIT like
+    EEXIST, and the deadline still bounds it -- fail-open survives for the case
+    that cannot clear, which is what the comment was always about.
+
+    This test is the mechanism, not the symptom: one refusal, and the lock must
+    then actually be HELD. A `_LOCK_WAIT_S` of 2 s over a 10 ms spin means the
+    retry costs one tick.
+    """
+    calls = []
+    real_open = os.open
+
+    def one_access_denied(path, flags, *a, **kw):
+        if str(path).endswith(".lock") and not calls:
+            calls.append(str(path))
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *a, **kw)
+
+    lock = tasktool.sidecar_path("test").with_name(tasktool.SIDECAR + ".lock")
+    monkeypatch.setattr(os, "open", one_access_denied)
+    with tasktool._exclusive("test"):
+        held = lock.exists()
+
+    assert calls, "the fixture never reached the lock's own open"
+    assert held, (
+        "the lock was NOT held: one ACCESS_DENIED made _exclusive fail open "
+        "instead of waiting, so two hook processes can share the critical "
+        "section and the last writer publishes a stale snapshot")
+    assert not lock.exists(), "the lock outlived its holder"
