@@ -304,6 +304,14 @@ def _fix_plan_fingerprint(goal_dirs):
     rule `_ledger_fingerprint` applies to `{}`, because a fault that compares
     equal to itself is how a transient error pins a cache open for good.
 
+    `ValueError` is in that same arm because `os.stat` raises it, NOT an OSError,
+    for a path with an embedded NUL — before the call reaches the OS. `goal_dir`
+    comes off an event payload and the reader this mirrors treats it as untrusted
+    and survives it (`pathlib`'s `is_file()` swallows the ValueError, so the card
+    renders with an empty checklist). Letting it escape here 500s the whole
+    Oversee board on every poll, permanently, since an append-only ledger cannot
+    un-write the row.
+
     Every named `goal_dir` is stat'ed, including ones `_fix_plan_items` would
     refuse to read (it requires a real `.hive-loop` directory). That
     over-invalidates in the safe direction and keeps this function from having
@@ -314,7 +322,7 @@ def _fix_plan_fingerprint(goal_dirs):
             st = os.stat(os.path.join(d, "fix_plan.md"))
         except FileNotFoundError:
             out.append((d, -1, 0))
-        except OSError:
+        except (OSError, ValueError):
             return None
         else:
             out.append((d, st.st_size, st.st_mtime_ns))
@@ -368,6 +376,15 @@ def _oversee_cached(proj, iu_digest, stamp, compute):
     that and hide a card that belongs on the board. One comparison retires the
     whole class by treating it as a miss.
 
+    The ledger is stamped BEFORE the fold and the stamp is required to still
+    hold after it. Stamping only afterwards described the ledger as of T+delta
+    while the board was read at T, so an event that landed inside that window was
+    in the KEY and absent from the BOARD — and the next poll matched the key and
+    served the older board, until some further append happened to move the stamp
+    again. That window is the fold itself: 900 ms on the real store, on the
+    dashboard's hottest projection. Nothing cached at all is the correct outcome
+    for a fold that raced an append; the next poll simply folds again.
+
     Treat the result as read-only: it IS the cached object. The caller's
     clock-dependent fields come from `_with_liveness`, which copies."""
     cached = _memo_get(_OVERSEE_MEMO, proj)
@@ -376,9 +393,12 @@ def _oversee_cached(proj, iu_digest, stamp, compute):
         if folded_at <= stamp and fingerprint == _oversee_fingerprint(
                 proj, board["goal_dirs"], iu_digest):
             return board
+    before = _ledger_fingerprint(proj)
     board = compute()
     fingerprint = _oversee_fingerprint(proj, board["goal_dirs"], iu_digest)
-    if fingerprint is not None:
+    # `before is None` fails this comparison too, which is right: an unstampable
+    # ledger was never cacheable.
+    if fingerprint is not None and fingerprint[0] == before:
         _memo_put(_OVERSEE_MEMO, proj, (fingerprint, stamp, board))
     return board
 

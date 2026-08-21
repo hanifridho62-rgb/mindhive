@@ -553,3 +553,112 @@ def test_a_delete_pending_lock_makes_the_waiter_wait_not_barge_in(monkeypatch):
         "instead of waiting, so two hook processes can share the critical "
         "section and the last writer publishes a stale snapshot")
     assert not lock.exists(), "the lock outlived its holder"
+
+
+# --- the cost of the delete-pending fix, on the fault it must NOT wait for ----
+# `PermissionError` is not only the delete-pending signal. `os.open` answers
+# EACCES for a directory that simply cannot be written, and Python maps errno 13
+# to PermissionError for both -- so the arm added for the transient case sits in
+# front of `except OSError` and swallows the permanent one too. Measured before
+# these tests: a permanent EACCES took 2.004 s over 190 attempts where the code
+# before the fix broke out in 0.000 s over 1. This module runs inside a
+# PostToolUse hook on every task-tool call, and its own header says a hook that
+# blocks is worse than an unserialised write, so that regression is worse than
+# the bug it came with.
+#
+# The bound is a spin COUNT, not a second timeout, and it is asserted as a count:
+# elapsed time is a flaky proxy on a loaded machine, while "how many times did it
+# retry" is exactly the property. The window it exists for was measured in
+# microseconds, so a handful of 10 ms spins is four orders of magnitude of
+# margin; anything slower than that is indistinguishable from permanent, and
+# fail-open is the documented contract for permanent.
+
+def test_a_permanent_access_denied_fails_open_instead_of_spinning_the_deadline(
+        monkeypatch):
+    """RED against an uncapped PermissionError arm: it retried until the 2 s
+    deadline, ~190 attempts, on a fault that can never clear."""
+    import time as _time
+
+    attempts = []
+    real_open = os.open
+
+    def denied(path, *a, **kw):
+        if str(path).endswith(".lock"):
+            attempts.append(path)
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", denied)
+    t0 = _time.monotonic()
+    with tasktool._exclusive(project="test"):
+        held = True
+    elapsed = _time.monotonic() - t0
+
+    assert held, "the context must still yield: this path fails OPEN, never raises"
+    assert len(attempts) <= tasktool._LOCK_DENIED_SPINS + 1, (
+        f"{len(attempts)} attempts against a fault that cannot clear — the arm "
+        f"is spinning the whole deadline again")
+    # A generous ceiling on purpose: the assertion that matters is the count
+    # above. This one only catches a cap that is nominally in place but wired to
+    # a sleep long enough to stall the hook anyway.
+    assert elapsed < tasktool._LOCK_WAIT_S / 2, elapsed
+
+
+def test_the_cap_is_still_wide_enough_to_ride_out_a_real_delete_pending_window(
+        monkeypatch):
+    """The other side of the same cap: TODOS 21's fix must survive it.
+
+    Three refusals in a row, and the lock must still be HELD afterwards. A cap of
+    zero would pass the test above while quietly undoing the fix this arm exists
+    for, so the two directions are asserted together.
+
+    The refusal count is a LITERAL, not `_LOCK_DENIED_SPINS`. Deriving it from the
+    constant made the test move with the mutation: at a cap of 0 the fixture
+    refused zero times and the test passed having exercised nothing, which is the
+    shape of proof that proves the opposite of what it claims. The constant is
+    asserted separately, as the contract it is."""
+    assert tasktool._LOCK_DENIED_SPINS >= 3, (
+        "the budget no longer covers the window this arm was added for")
+    refusals = {"left": 3}
+    real_open = os.open
+
+    def flaky(path, *a, **kw):
+        if str(path).endswith(".lock") and refusals["left"] > 0:
+            refusals["left"] -= 1
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", flaky)
+    lock = tasktool.sidecar_path("test").with_name(tasktool.SIDECAR + ".lock")
+    with tasktool._exclusive(project="test"):
+        held = lock.exists()
+
+    assert refusals["left"] == 0, "the fixture never reached the open it refuses"
+    assert held, ("the waiter gave up inside its own budget — a delete-pending "
+                  "lock is contention and must be waited out")
+    assert not lock.exists(), "the lock outlived its holder"
+
+
+def test_a_permanent_non_permission_oserror_still_fails_open_immediately():
+    """The arm the PermissionError clause sits in front of. EROFS/ENOSPC cannot
+    clear either, and they must not have been dragged into the waiting path:
+    measured at 1 attempt, 0.000 s, and that must stay true."""
+    attempts = []
+    real_open = os.open
+
+    def readonly(path, *a, **kw):
+        if str(path).endswith(".lock"):
+            attempts.append(path)
+            raise OSError(30, "Read-only file system")
+        return real_open(path, *a, **kw)
+
+    os.open = readonly
+    try:
+        with tasktool._exclusive(project="test"):
+            held = True
+    finally:
+        os.open = real_open
+
+    assert held
+    assert len(attempts) == 1, (
+        f"{len(attempts)} attempts — a non-EACCES OSError is being retried")

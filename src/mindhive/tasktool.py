@@ -128,6 +128,20 @@ def save(state, project=None) -> None:
 _LOCK_WAIT_S = 2.0      # total patience before writing unlocked anyway
 _LOCK_SPIN_S = 0.01     # between attempts
 _LOCK_STALE_S = 30.0    # older than this and the holder is dead, not slow
+# ACCESS_DENIED gets its OWN, much smaller budget, because it is the one error
+# code that arrives for both a transient and a permanent cause: a delete-pending
+# name (clears in microseconds) and a directory that cannot be written (never
+# clears). Nothing in the error distinguishes them -- `errno` is 13 either way,
+# and stat'ing the path to see whether an entry exists fails with ACCESS_DENIED
+# for a delete-pending file too, so there is no cheap property to branch on.
+#
+# A COUNT rather than a second deadline, and a small one: waiting 50 ms covers
+# the transient case with four orders of magnitude to spare, while anything
+# slower than that is indistinguishable from permanent -- and for permanent,
+# failing open is this module's documented contract. Uncapped it cost a measured
+# 2.004 s over 190 attempts on a fault that could never clear, inside a hook that
+# runs on every task-tool call.
+_LOCK_DENIED_SPINS = 5
 
 
 @contextlib.contextmanager
@@ -137,6 +151,7 @@ def _exclusive(project=None):
     lock = sidecar_path(project).with_name(SIDECAR + ".lock")
     fd = None
     deadline = time.monotonic() + _LOCK_WAIT_S
+    denied = 0
     while True:
         try:
             lock.parent.mkdir(parents=True, exist_ok=True)
@@ -174,10 +189,18 @@ def _exclusive(project=None):
             # fifty vanishing, ~8-15% of runs, which `_LOCK_WAIT_S` could not
             # touch because this arm never waited.
             #
-            # It waits now, and the deadline still bounds it: the fail-open
-            # below survives for the failure that CANNOT clear -- an unwritable
-            # directory, which is what its comment was always describing.
-            if time.monotonic() >= deadline:
+            # It waits now, but only `_LOCK_DENIED_SPINS` times. The first
+            # version of this arm waited out the whole `_LOCK_WAIT_S`, and that
+            # was wrong for the reason the comment below states and this clause
+            # then contradicted: an unwritable directory raises EACCES too, so
+            # `except OSError` never saw it again and the permanent fault it
+            # exists for started costing 2.004 s over 190 attempts -- inside a
+            # hook, which this module's header rates worse than an unserialised
+            # write. Capped, the transient case still gets 50 ms against a window
+            # measured in microseconds, and the permanent one fails open in 50 ms
+            # instead of two seconds.
+            denied += 1
+            if denied > _LOCK_DENIED_SPINS or time.monotonic() >= deadline:
                 break
             time.sleep(_LOCK_SPIN_S)
         except OSError:

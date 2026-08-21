@@ -479,3 +479,78 @@ def test_hive_mind_does_not_evict_the_entries_it_just_wrote(dashboard_server,
         f"{counters.reads.calls} namespaces re-read on an unchanged store — the "
         f"memo is evicting entries the same request wrote")
     assert again == warm
+
+
+# --- the two faults an adversarial audit found in the gate itself --------------
+# Reported by independent review of the commit that added it, and each one
+# REPRODUCED here before being fixed — the audit's own verification stage died to
+# a usage limit, so nothing it said was taken on trust.
+
+def test_an_append_that_lands_during_the_fold_is_not_baked_into_the_key():
+    """RED against a fingerprint stamped AFTER the fold.
+
+    The fold reads the ledger at T and the fingerprint was stat'ed at T+delta, so
+    an event appended inside that window was described by the KEY while being
+    absent from the BOARD. The next poll then matched the key and served the
+    board that predates the event — and kept serving it, because only a further
+    append could move the stamp again. On the real store this fold takes 900 ms,
+    which is how wide that window is on the hottest projection in the dashboard.
+
+    Direct rather than over HTTP, deliberately: the failure is a two-instant race
+    inside one call, and the only way to place an append at the instant between
+    them is to be the thing doing the folding."""
+    from mindhive import dashboard_memo as dm
+
+    events.append_event("loop_run_start",
+                        {"run_id": "r1", "title": "first", "goal_dir": ""},
+                        session_id="s1", project="test")
+    folds = {"n": 0}
+
+    def fold(inject):
+        def _c():
+            folds["n"] += 1
+            titles = [e.payload.get("title") for e in events.read_all("test")
+                      if e.type == "loop_run_start"]
+            if inject:
+                # Lands after the read, before the caller stamps.
+                events.append_event(
+                    "loop_run_start",
+                    {"run_id": "r2", "title": "mid-fold", "goal_dir": ""},
+                    session_id="s1", project="test")
+            return {"runs": [{"run_id": t} for t in titles], "plans": [],
+                    "dismissed": 0, "goal_dirs": ()}
+        return _c
+
+    iu = dm._intended_use_digest({})
+    dm._oversee_cached("test", iu, time.time(), fold(inject=True))
+    board = dm._oversee_cached("test", iu, time.time(), fold(inject=False))
+
+    assert folds["n"] == 2, (
+        "the second poll was a cache HIT, so the event that landed during the "
+        "first fold can never reach the board")
+    assert [r["run_id"] for r in board["runs"]] == ["first", "mid-fold"]
+
+
+def test_an_unstattable_goal_dir_degrades_like_the_reader_instead_of_raising():
+    """RED against `except OSError` alone: `os.stat` raises ValueError, not
+    OSError, for a path with an embedded NUL — before it reaches the OS.
+
+    `goal_dir` comes straight off a `loop_run_start` payload, which
+    `loop.state._fix_plan_items` documents as untrusted and survives (pathlib's
+    `is_file()` swallows the ValueError, so the card renders with an empty
+    checklist). The gate went through `os.stat` directly and let it escape, and
+    this store already holds 7 corrupt rows, so a NUL is not hypothetical. The
+    escape reaches `_get_oversee` and 500s the endpoint on EVERY poll — the whole
+    Oversee board, loop cards and awaiting-resume plans alike — permanently,
+    because an append-only ledger cannot un-write the row."""
+    from mindhive import dashboard_memo as dm
+    from mindhive.loop import state as loop_state
+
+    bad = "C:/x\x00y/.hive-loop"
+    # The rule being matched: the reader degrades rather than raising.
+    assert loop_state._fix_plan_items(bad) == {"done": [], "planned": [],
+                                              "not_yet": []}
+    # So the gate must treat it as a fault (None poisons the fingerprint, which
+    # means "do not cache"), never as an exception.
+    assert dm._fix_plan_fingerprint((bad,)) is None
+    assert dm._oversee_fingerprint("test", (bad,), "digest") is None
