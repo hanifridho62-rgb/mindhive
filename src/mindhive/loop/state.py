@@ -99,7 +99,8 @@ def _injected_counts(evs) -> dict:
 
 
 def list_runs(project=None, *, now_fn=time.time,
-              heartbeat_seconds=DEFAULT_HEARTBEAT_SECONDS) -> dict:
+              heartbeat_seconds=DEFAULT_HEARTBEAT_SECONDS,
+              evs=None) -> dict:
     """Project loop events into per-run Oversee records, newest first.
 
     Dismissed runs (graceful exit, breaker trip, manual delete) are excluded —
@@ -108,7 +109,13 @@ def list_runs(project=None, *, now_fn=time.time,
     # One read, split two ways. The injected counts come off `work_injected`
     # rows, which are not loop events, and a second `read_all` for them would
     # double the cost of the single-threaded dashboard's hottest projection.
-    all_evs = events.read_all(project)
+    #
+    # `evs` lets a caller that has ALREADY read the ledger hand it over, spelled
+    # the same way as `oversee.interactive_sessions`'s parameter because
+    # /api/oversee calls both on one read. Without it that endpoint read the
+    # same ledger TWICE per namespace — 365 ms a time on the real store — to
+    # fold two views of the same events.
+    all_evs = evs if evs is not None else events.read_all(project)
     evs = [e for e in all_evs if e.type in _LOOP_TYPES]
     injected = _injected_counts(all_evs)
     runs, order, dismissed = {}, [], {}

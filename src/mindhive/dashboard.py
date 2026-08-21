@@ -49,10 +49,13 @@ from .dashboard_locks import (REFLECT_BATCH_LIMIT,  # noqa: F401
                               _SELFTEST_LOCK, _SYNC_LOCK, _VERIFY_LOCK,
                               _one_at_a_time)
 from .dashboard_memo import (_CATS_MEMO, _MEMO_MAX,  # noqa: F401
-                             _SESSIONS_MEMO, _STATS_MEMO, _STATS_MEMO_MAX,
-                             _BoundedMemo, _fingerprinted,
-                             _ledger_fingerprint, _memo_get, _memo_put,
-                             _sessions_cached, _with_online)
+                             _OVERSEE_MEMO, _OVERSEE_MEMO_MAX, _SESSIONS_MEMO,
+                             _STATS_MEMO, _STATS_MEMO_MAX, _BoundedMemo,
+                             _fingerprinted, _fix_plan_fingerprint,
+                             _intended_use_digest, _ledger_fingerprint,
+                             _memo_get, _memo_put, _oversee_cached,
+                             _oversee_fingerprint, _sessions_cached,
+                             _with_liveness, _with_online)
 
 # A fixed default port + a token persisted under the store home keep the
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).

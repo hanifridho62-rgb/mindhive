@@ -42,8 +42,10 @@ from .dashboard_data import (HIVEMIND_LABEL, HIVEMIND_PROJECT, _add_tallies,
                              default_project, event_pairs, injection_status,
                              overview_stats)
 from .dashboard_locks import _VERIFY_LOCK, _one_at_a_time
-from .dashboard_memo import (_CATS_MEMO, _ledger_fingerprint, _memo_get,
-                             _memo_put, _sessions_cached, _with_online)
+from .dashboard_memo import (_CATS_MEMO, _intended_use_digest,
+                             _ledger_fingerprint, _memo_get, _memo_put,
+                             _oversee_cached, _sessions_cached, _with_liveness,
+                             _with_online)
 from .research_page import render_research
 from .swarm_page import render_swarm
 from .workspace_page import render_parallel
@@ -560,24 +562,31 @@ class GetRoutes:
         # ones whose run already left the board — ride the top-level
         # ``plans`` list so a roadmap is never orphaned.
         #
-        # DELIBERATELY NOT MEMOIZED, unlike its neighbour /api/overview, and the
-        # reason is worth having here rather than rediscovering. The fingerprint
-        # is not the problem — both producers below ARE pure folds over
-        # `read_all`, so `segment_stats` would key this correctly. The problem is
-        # that the WALL CLOCK decides three separate things INSIDE the fold, and
-        # a cached fold freezes a board rather than a number:
+        # GATED like its neighbour /api/overview, but the gate needed more than
+        # a fingerprint to be safe here, and that is why this endpoint was the
+        # last one to get one. Both producers below ARE pure folds over
+        # `read_all`, so `segment_stats` keys them correctly; the obstacle was
+        # that the WALL CLOCK decides three separate things INSIDE the fold, so
+        # a fold cached as-is freezes a BOARD rather than a number:
         #   1. a loop run's `online` — `status == "running"` and last event
-        #      within that run's own `heartbeat_seconds` (default 15 min + 60 s),
-        #      decided in `loop.state.list_runs`;
+        #      within that run's OWN `heartbeat_seconds` (default 15 min + 60 s);
         #   2. a chat session's `online` — last event within
         #      `oversee.ONLINE_WINDOW_SECONDS` (180 s);
         #   3. whether a chat session is on the board AT ALL — idle past
-        #      `ACTIVE_WINDOW_SECONDS` (6 h) and it is dropped by the fold.
-        # `dashboard_memo._with_online` is the seam for (2) only. (1) and (3)
-        # need their own, and `list_runs` additionally reads each run's fix-plan
-        # file off `goal_dir` — the one genuine off-ledger input here. All of it
-        # is fixable; none of it is fixed, so this endpoint is still a full read
-        # per poll. TODOS item 17 carries the plan.
+        #      `ACTIVE_WINDOW_SECONDS` (6 h) and the fold drops it.
+        # All three are re-derived on the way out by `_with_liveness`, which
+        # DISPATCHES on `kind`: `_with_online` was the seam for (2) alone, and
+        # applying it to a loop row would call a live 15-minute run offline
+        # twelve times too early. (3) is a drop rather than a field, which is
+        # safe over a cached fold in one direction only — ageing can only remove
+        # a card — so `_oversee_cached` refuses an entry folded after this
+        # stamp. The plan split has to be computed from the SURVIVING rows for
+        # the same reason.
+        #
+        # Two off-ledger inputs join the fingerprint because nothing appends an
+        # event when they change: each run's `fix_plan.md`, read off `goal_dir`
+        # by `list_runs`, and the plugin inventory's intended-use map, which
+        # feeds `skill_trails` inside the fold.
         from . import oversee as oversee_mod
         from . import roadmap as roadmap_mod
         from .loop import state as loop_state
@@ -585,10 +594,14 @@ class GetRoutes:
         # Built once per request (60 s memoized) so every card's skill trail
         # gets the intended-use "why" fallback without a per-session rescan.
         iu = oversee_mod.intended_use_map()
-        runs, plans, dismissed = [], [], 0
-        for n in names:
+        iu_digest = _intended_use_digest(iu)
+        stamp = time.time()
+
+        def fold_board(n):
             evs = events.read_all(n)
-            res = loop_state.list_runs(n)
+            # ONE read, folded four ways. `list_runs` had no `evs=` parameter,
+            # so this endpoint read the same ledger twice per namespace.
+            res = loop_state.list_runs(n, evs=evs, now_fn=lambda: stamp)
             rmap = roadmap_mod.fold(evs)
             # A plan belongs to whoever is WORKING it, and that is not
             # always the session that created it: `roadmap.auto_plan_id`
@@ -598,12 +611,9 @@ class GetRoutes:
             # stranded in the awaiting-resume list at the same time -- the
             # pile that grows while nothing appears to move.
             by_session = roadmap_mod.by_session(rmap)
-            # Keyed by PLAN id, not run id. The two coincided only while the
-            # match was identity; the orphan list below has to exclude the
-            # plan that actually got attached.
-            live_plans = set()
+            rows = []
             for r in res["runs"] + oversee_mod.interactive_sessions(
-                    n, evs=evs, intended_use=iu):
+                    n, evs=evs, intended_use=iu, now_fn=lambda: stamp):
                 r["project"] = n
                 plan = roadmap_mod.plan_for_session(
                     rmap, r["run_id"], by_session)
@@ -612,12 +622,33 @@ class GetRoutes:
                 # ARCHIVED one through.
                 if plan is not None:
                     r["roadmap"] = plan
-                    live_plans.add(plan["plan_id"])
-                runs.append(r)
-            for p in roadmap_mod.plans(evs):
-                if p["plan_id"] not in live_plans:
-                    plans.append(dict(p, project=n))
-            dismissed += res["dismissed"]
+                rows.append(r)
+            return {"runs": rows,
+                    "plans": [dict(p, project=n)
+                              for p in roadmap_mod.plans(evs)],
+                    "dismissed": res["dismissed"],
+                    # The entry's own fingerprint input: these are the files
+                    # `_fix_plan_items` read to build it.
+                    "goal_dirs": tuple(sorted({r["goal_dir"] for r in res["runs"]
+                                               if r.get("goal_dir")}))}
+
+        runs, plans, dismissed = [], [], 0
+        for n in names:
+            board = _oversee_cached(n, iu_digest, stamp,
+                                    lambda n=n: fold_board(n))
+            live = _with_liveness(board["runs"], stamp)
+            # Keyed by PLAN id, not run id — the two coincided only while the
+            # match was identity — and computed from the rows that SURVIVED the
+            # clock. When ageing takes a card off the board it has to take its
+            # plan out of this set too, or the roadmap is orphaned in neither
+            # list: gone from the board with its card, and absent from the
+            # awaiting-resume list that exists to catch exactly that.
+            live_plans = {r["roadmap"]["plan_id"] for r in live
+                          if r.get("roadmap")}
+            runs.extend(live)
+            plans.extend(p for p in board["plans"]
+                         if p["plan_id"] not in live_plans)
+            dismissed += board["dismissed"]
         runs.sort(key=lambda r: r.get("started") or "", reverse=True)
         plans.sort(key=lambda p: p.get("updated") or "", reverse=True)
         return self._json({"runs": runs, "dismissed": dismissed,

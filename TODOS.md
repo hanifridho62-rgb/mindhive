@@ -412,7 +412,48 @@ answer, with the commit that supersedes it named.
 
 ---
 
-## 17. `/api/oversee` is still a full read per poll, and it is the harder half
+## 17. ~~`/api/oversee` is still a full read per poll, and it is the harder half~~ — DONE 2026-08-21
+
+**Measured through the real seam** (a GET on an ephemeral port against the real store, four
+consecutive polls, never port 54461), and the board served is byte-identical either way —
+`cards=6 plans=1 dismissed=0 any_online=True` on `mindhive`, `7 / 3 / 0 / True` on HIVE MIND:
+
+| | before | after |
+|---|---|---|
+| `?project=mindhive` | 1012 / 887 / 875 / 846 ms | **651 / 3 / 25 / 3 ms** |
+| `?project=*` (HIVE MIND, 60 namespaces) | 1721 / 1681 / 1726 / 1639 ms | **617 / 27 / 31 / 31 ms** |
+
+The first poll halves because of the free win below; the rest are the gate. HIVE MIND's warm poll
+stays at ~30 ms rather than ~3 because it still stats sixty namespaces to ask each one whether it
+moved — which is the cost the gate is made of, not a miss.
+
+**What shipped:** `_OVERSEE_MEMO` + `_oversee_cached` + `_with_liveness` in
+[dashboard_memo.py](src/mindhive/dashboard_memo.py), a rewritten `_get_oversee`, and `evs=` on
+`list_runs`. Three details that the plan below did not have, all found by writing it:
+
+* **The plan split had to move too.** `live_plans` was computed while iterating the fold's rows,
+  so a card the clock removed at serve time took its plan out of the board *and* left it out of
+  the orphan `plans` list — invisible in both places at once. It is now computed from the rows
+  that survived `_with_liveness`.
+* **The drop rule is safe over a cached fold in one direction only.** Ageing can only ever
+  *remove* a card, so a fold taken at T0 filtered at T1 ≥ T0 is exactly a fresh fold at T1. A
+  clock that jumps *backward* would invert that, so the entry records its own fold stamp and an
+  entry folded after the serve stamp is a miss.
+* **A `fix_plan.md` fault must not be a stamp.** `_fix_plan_fingerprint` gives an absent file a
+  real stamp (`-1`) but returns `None` for any other `OSError` — `_ledger_fingerprint`'s rule for
+  `{}`, for the same reason: a fault that compares equal to itself pins the cache open silently.
+
+**Verified, not asserted:** 14 tests in
+[tests/test_dashboard_oversee_memo.py](tests/test_dashboard_oversee_memo.py). All 14 passed on the
+first run after the implementation, which is indistinguishable from 14 tests that assert nothing —
+so eight mutations were applied and each was caught by the test named for it (11 distinct tests
+red-then-green). The two absence-of-caching guards are covered by a fingerprint canary, because a
+`_oversee_fingerprint` returning `None` unconditionally would pass them both.
+
+---
+
+<details><summary>The original plan, kept because the three clock decisions are the reason this
+endpoint was the last one gated</summary>
 
 **Source:** the `/api/overview` memo, 2026-08-15 — this is what that change deliberately did
 **not** do, recorded rather than dropped.
@@ -475,6 +516,8 @@ and move only the clock — a loop card must go offline past its own `heartbeat_
 card past 180 s, and a chat card must **leave the board** past 6 h. Each is RED against a fold
 cached without a re-derivation seam, which is the point, and why this is a separate piece of work
 rather than a fourth line in `_overview_fingerprint`.
+
+</details>
 
 ## 18. ~~`pgtools.py` is 1253 lines and now holds a twice-raised ceiling~~ — DONE
 
@@ -557,3 +600,47 @@ the reader the base table the split exists to hide — each turn the tier red on
 names the property. So the assertions bite. **Not proven:** that the workflow YAML itself
 runs them, which needs a push and a real run; the job is unexercised until this branch is
 pushed and its checks come back.
+
+---
+
+## 21. The task sidecar lock still loses one write in fifty, and I do not know why
+
+**Source:** the full default tier on 2026-08-21, one run red and the previous run green on the
+same tree. Measured before being written down.
+
+**What:** `tests/test_tasktool.py::test_two_processes_do_not_clobber_each_others_lists` fails
+intermittently — **1/12 standalone, 3/20 and 3/20 in two direct twenty-round probes, and 1 of 2
+full-suite runs**. The loss is always exactly one task out of fifty, from one session, and both
+sessions are always present.
+
+**So the P0 is genuinely fixed and this is its residue.** Before the lock, a whole session's list
+vanished; that no longer happens in any round. What remains is a single lost create — which still
+matters, because `_update` refuses an id it has never seen, so a lost create can never be reached
+again.
+
+**PR #114's 7/7 green CI is not evidence the lock is sound.** At 8–15% it passes most of the time,
+including on the Windows matrix.
+
+**Ruled out by measurement, not by reading the code:**
+
+* **Not the fail-open deadline.** An instrumented clone of `_exclusive` logged **1000
+  acquisitions, 0 failed open**. Raising `_LOCK_WAIT_S` from 2 s to 60 s did not clear the loss
+  (3/20 → 1/20, then 3/20 → 0/20 — consistent with noise at n=20).
+* **Not a dropped write.** `paths.write_text_atomic` never raised across 40 rounds, so
+  `save`'s `except Exception: pass` ([tasktool.py:114](src/mindhive/tasktool.py:114)) had nothing
+  to swallow. This was the leading hypothesis, since the repo already carries a caveat about
+  `os.replace` raising `PermissionError` on the destination on Windows.
+* **Not a snapshot taken outside the lock.** `load` and `save` are both inside it
+  ([tasktool.py:358-375](src/mindhive/tasktool.py:358)).
+* **Not eviction.** `_evicted` caps *sessions* at `MAX_SESSIONS` (12) and there are two; the
+  per-session `MAX_TASKS` trim needs 51 tasks in one session and each has 25.
+
+**The clue worth starting from:** instrumentation hides it two attempts out of three, and the arm
+that hid it was the line-for-line clone of `_exclusive` itself (0/20), while wrapping the *writer*
+kept it (3/20). That points at the lock's own timing rather than at the write. A probe that
+perturbs the thing it measures is the wrong instrument here; the next attempt should record from
+*outside* the process — e.g. a filesystem watch on the lock path, or an `os.open` audit hook —
+rather than adding work inside the critical section.
+
+**Cons of leaving it:** an intermittent that is currently passing reads as a fixed one, which is
+exactly what TODOS 11 cost someone. And this one is on the data-loss path.
