@@ -1578,13 +1578,16 @@ def cmd_mindnet_declare(args) -> int | None:
     if why:
         return _mn_error(why)
 
-    with _mn_work(project, sid, args.task_id):
+    # Stamped on the way IN: `tasks.feed_phase` owns which phase that is.
+    at = t_mod.feed_phase(_mn_projection(project), args.task_id,
+                          args.triviality_bypass)
+    with _mn_work(project, sid, args.task_id, at):
         events.append_event("mindnet_task", task_payload, session_id=sid,
                             tags=["mindnet", "task"], project=project)
         ev = _mn_phase_event(phase_payload, sid, project)
     rec = _mn_projection(project).records.get(args.task_id)
     print(f"mindnet declare: {args.task_id} at "
-          f"'{rec.phase if rec is not None else t_mod.PHASES[0]}' @ {ev.ts}")
+          f"'{rec.phase if rec is not None else at}' @ {ev.ts}")
     return None
 
 

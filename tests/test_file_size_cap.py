@@ -123,6 +123,20 @@ CAP = replenish.LINE_THRESHOLD
 #        `print(f"{h['file']}…")`, which raised KeyError on every event hit
 # The split is still the real fix. This is still a debt entry.
 #
+# Raised again, 4235 -> 4237, by `hive mindnet declare` naming a phase on the cat
+# feed. `_mn_work` was handed one by every other mutating command and by
+# `declare` alone was not, so the FIRST command an operator runs lit a cat whose
+# `phase` row rendered an em-dash -- a field reading "nothing to report" while
+# meaning "nobody passed it".
+#   +1  `at = t_mod.feed_phase(...)` does not fit on one line
+#   +1  the comment naming where the rule lives
+# The rule ITSELF -- which phase a declare stamps, why a re-declare keeps the
+# phase it is AT rather than taking the entry, and the totality contract -- is
+# 28 lines in `mindnet/tasks.py::feed_phase`, next to `entry_phase` and
+# `PHASES`, which is why this entry moves by 2 and not by 30. Same trade
+# `bench.register` and `pgcli.register` took: the CLI keeps the wiring, the
+# module keeps the behaviour.
+#
 # `pgtools.py` was on this list and is NOT any more, which is the only outcome
 # the entry was ever supposed to have. It joined at 1180 as the AI tool surface
 # plus the shared result shaper, and the obvious split — shaper apart from tools
@@ -141,7 +155,7 @@ CAP = replenish.LINE_THRESHOLD
 # every moved name and `tests/test_pgshape.py` asserts each is the same OBJECT,
 # and the names the tests actually patch never moved at all.
 ALLOWED = {
-    "__main__.py": 4235,          # the CLI surface; every command's argparse wiring
+    "__main__.py": 4237,          # the CLI surface; every command's argparse wiring
     "replenish.py": 2781,         # the suggestion lenses; a split is already deferred
     "workspace.py": 1462,         # MindParallel orchestration
     "research.py": 1353,          # Self-Reliant research runs
