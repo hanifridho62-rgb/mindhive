@@ -139,6 +139,14 @@ class Activity(NamedTuple):
     task_id: str = ""
     phase: str = ""
     ts: str = ""
+    # The EVENT's session, not a payload field — so no emitter has to be taught
+    # to repeat what `append_event` already stamps, and the 40k rows already in
+    # the ledger carry it. It is here because the click-through panel's `skill`
+    # row is answered by joining this faculty to what that SAME session directed;
+    # joining project-wide would let one session's skills label a cat another
+    # session lit, and `paths.detect_project` collapses every worktree of a repo
+    # onto one namespace, so that is the common case rather than the exotic one.
+    session: str = ""
 
 
 # --- emitting ------------------------------------------------------------------------
@@ -276,7 +284,9 @@ def fold(evs) -> dict:
         state[faculty] = Activity(faculty=faculty, status=status,
                                   task_id=_task_id(p.get("task_id")),
                                   phase=phase if phase in PHASES else "",
-                                  ts=str(getattr(ev, "ts", "") or ""))
+                                  ts=str(getattr(ev, "ts", "") or ""),
+                                  session=str(getattr(ev, "session_id", "")
+                                              or ""))
     return state
 
 

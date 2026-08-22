@@ -153,7 +153,7 @@ def cmd_hook(args) -> int | None:
         # Durable causal trace: record which skills the gate directed so Oversee
         # can later show the honest "directed by prompt-gate" why. Best-effort
         # and self-guarding — never disturbs the context printed above.
-        promptgate.record_direction(raw)
+        promptgate.record_direction(raw, sc=spine)
         # MN-17: light the cats for the faculties this turn actually used. AFTER the
         # print, for the same reason `record_direction` is: stdout is the context
         # channel, and a telemetry write must never be able to interleave with it.
@@ -168,7 +168,7 @@ def cmd_hook(args) -> int | None:
             # PostToolUse hook happens to find — the catalog cats would dim
             # mid-turn, which is the very thing the beat exists to prevent.
             promptgate.announce_faculties(mn_inject.engaged_faculties(spine),
-                                          session_id=_hook_session(raw))
+                                          session_id=_hook_session(raw), sc=spine)
         # MN-18: bring a task into existence so the spine has something to speak about.
         # Nothing else in the tree did this — `hive mindnet declare` is hand-run and
         # `decompose` needs a parent — so the phase spine, the SOP section and the
@@ -1578,13 +1578,16 @@ def cmd_mindnet_declare(args) -> int | None:
     if why:
         return _mn_error(why)
 
-    with _mn_work(project, sid, args.task_id):
+    # Stamped on the way IN: `tasks.feed_phase` owns which phase that is.
+    at = t_mod.feed_phase(_mn_projection(project), args.task_id,
+                          args.triviality_bypass)
+    with _mn_work(project, sid, args.task_id, at):
         events.append_event("mindnet_task", task_payload, session_id=sid,
                             tags=["mindnet", "task"], project=project)
         ev = _mn_phase_event(phase_payload, sid, project)
     rec = _mn_projection(project).records.get(args.task_id)
     print(f"mindnet declare: {args.task_id} at "
-          f"'{rec.phase if rec is not None else t_mod.PHASES[0]}' @ {ev.ts}")
+          f"'{rec.phase if rec is not None else at}' @ {ev.ts}")
     return None
 
 

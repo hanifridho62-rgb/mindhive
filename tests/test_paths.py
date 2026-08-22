@@ -150,3 +150,37 @@ def test_write_text_atomic_leaves_no_tmp_file(tmp_path):
     # The temp file is renamed onto the target — nothing should linger.
     assert [q.name for q in tmp_path.iterdir()] == ["file.txt"]
     assert not (tmp_path / "file.txt.tmp").exists()
+
+
+def test_write_text_atomic_uses_a_private_temp_name(tmp_path, monkeypatch):
+    """Two writers of ONE path must not share one temp file.
+
+    The temp name was `<target>.tmp` for every writer of that target, and
+    every hook is its own process. Two concurrent writers then wrote the same
+    temp path and `os.replace` published whichever bytes happened to be there
+    -- one process's snapshot landing under the other's name. That is the
+    mechanism under the sidecar clobbering measured in tasktool: 19 call sites
+    share this function, so the fix belongs here and not in any one of them.
+
+    Asserted at the seam rather than by racing real processes: the name handed
+    to `os.replace` has to differ between two calls on the SAME target.
+    """
+    import os
+
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(str(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    target = tmp_path / "shared.json"
+    paths.write_text_atomic(target, "first")
+    paths.write_text_atomic(target, "second")
+    assert len(seen) == 2
+    assert seen[0] != seen[1], (
+        "both writers used the same temp path (%s), so a concurrent writer "
+        "can publish another process's bytes" % seen[0])
+    assert target.read_text(encoding="utf-8") == "second"
+    assert [q.name for q in tmp_path.iterdir()] == ["shared.json"]

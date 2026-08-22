@@ -264,6 +264,27 @@ def active(sc):
     return (best[1], best[2]) if best else (None, None)
 
 
+def steering(sc) -> tuple:
+    """``(task_id, phase)`` for the task this turn steers, or ``("", "")``.
+
+    The faculty cats and the injected block are two reports on ONE turn, and this
+    is the join between them: `promptgate.announce_faculties` stamps these two
+    fields on every cat it lights, and `cat_board.catPanel` renders them as the
+    panel's `task` and `phase` rows. Derived from `active` rather than by a second
+    walk of the records — two answers to "what is this turn steering" is two
+    answers the operator has to reconcile, and one of them is wrong.
+
+    Strings, and both of them, always. This runs on EVERY user prompt inside a
+    best-effort announce that must not be able to disturb the printed context, so
+    anything unreadable is ``("", "")`` -- which `ui_cats.board` publishes as an
+    empty field and the panel renders as an em-dash, the honest answer when
+    nothing is declared. Never a partial tuple: a caller length-checking this
+    would be a caller that can get it wrong."""
+    rec, _task = active(sc)
+    return (str(getattr(rec, "task_id", "") or ""),
+            str(getattr(rec, "phase", "") or ""))
+
+
 # --- rendering ---------------------------------------------------------------------
 
 def _criterion(phase) -> str:

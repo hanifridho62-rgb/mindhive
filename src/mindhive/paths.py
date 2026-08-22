@@ -1,4 +1,5 @@
 # src/mindhive/paths.py
+import itertools
 import os
 import re
 import subprocess
@@ -14,6 +15,10 @@ def store_home() -> Path:
     return Path(os.environ.get("MINDHIVE_HOME", str(Path.home() / ".mindhive")))
 
 
+# Per-process, per-call temp-file discriminator. See write_text_atomic.
+_TMP_SEQ = itertools.count(1)
+
+
 def write_text_atomic(path, text: str) -> None:
     """Write ``text`` to ``path`` via a temp file + ``os.replace`` so a
     concurrent reader always sees either the whole old file or the whole new
@@ -25,9 +30,30 @@ def write_text_atomic(path, text: str) -> None:
     ``Path``."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    # A temp name PRIVATE to this writer. It used to be `<target>.tmp` for
+    # every writer of that target, and on this machine every hook is its own
+    # process: two concurrent writers of one path wrote the same temp file
+    # and `os.replace` published whichever bytes happened to be there, so one
+    # process's snapshot landed under the other's name. That is the mechanism
+    # under the sidecar clobbering measured in `tasktool` -- a whole 25-task
+    # session gone from `task_tools.json`. 19 call sites share this function,
+    # so the fix belongs here rather than in any one of them. The pid keeps
+    # the name unique across processes, the counter across threads and repeat
+    # calls inside one.
+    tmp = path.with_name("%s.%d.%d.tmp" % (path.name, os.getpid(),
+                                           next(_TMP_SEQ)))
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        # A shared name self-healed: the next writer overwrote the litter. A
+        # unique one never will, so a failed write has to clean up after
+        # itself or leave a file per failure behind forever.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def normalize(name: str) -> str:

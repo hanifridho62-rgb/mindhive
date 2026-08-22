@@ -325,7 +325,20 @@ def to_dict(ev: "Event") -> dict:
 
 
 def canonical_json(obj) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """The ledger's one serialiser, and the bytes the hash chain covers.
+
+    `allow_nan=False` because the default emits BARE `NaN` / `Infinity`
+    tokens, which are not JSON. Measured: a contribution carrying
+    `float('nan')` wrote `{"value":NaN}` straight into an append-only,
+    hash-chained segment. Python's own reader accepts those tokens, which is
+    exactly what kept it invisible -- nothing here would ever have
+    complained -- while the Postgres mirror's JSONB and every strict parser
+    downstream reject the row, and the chain makes it permanent.
+
+    Refusing at the writer is the only place this can be caught for every
+    event type at once, so it is refused here and not in one contract."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
 
 
 def now_iso() -> str:

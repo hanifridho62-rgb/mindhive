@@ -6,11 +6,15 @@ plan's steps wholesale. The tool that used to supply one -- `TodoWrite`, which
 posts its entire list every call -- is not the tool this harness sends. It sends
 `TaskCreate` and `TaskUpdate`, one item at a time, and neither the call nor its
 result carries the other items. So the list is accumulated across calls, and
-these tests pin the two facts a plausible implementation gets wrong: the id
-comes off the RESULT (a parallel batch answers out of order), and `deleted` is a
-real status that removes a task rather than describing one.
+these tests pin the three facts a plausible implementation gets wrong: the id
+comes off the RESULT (a parallel batch answers out of order), that result is the
+STRUCTURED object and not the prose line a human sees, and `deleted` is a real
+status that removes a task rather than describing one.
 """
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -239,8 +243,14 @@ def test_recency_is_counted_not_timed():
     _rec("a", "TaskCreate", *_created(1, "first"))
     _rec("b", "TaskCreate", *_created(1, "second"))
     state = tasktool.load("test")
-    assert state["a"]["seen"] == state["b"]["seen"]     # same second, normally
+    # NOT `seen == seen`. That was the assert, and it was an intermittent of
+    # exactly the kind this repo already tracks two of: `seen` is a
+    # one-second stamp, two sidecar writes take real milliseconds, and a run
+    # straddling a UTC second boundary went red with correct code. The claim
+    # this test makes is carried entirely by the counter; the stamp is only
+    # required to be monotone.
     assert state["b"]["n"] > state["a"]["n"]
+    assert state["a"]["seen"] <= state["b"]["seen"]
 
 
 def test_an_entry_written_before_the_counter_existed_still_sorts():
@@ -255,3 +265,400 @@ def test_an_entry_written_before_the_counter_existed_still_sorts():
     for i in range(tasktool.MAX_SESSIONS):
         _rec(f"s{i}", "TaskCreate", *_created(1, f"new {i}"))
     assert "legacy" not in tasktool.load("test")
+
+
+# --- the shape the hook is ACTUALLY handed -----------------------------------
+# Every helper above feeds `_created`, whose response is the prose line
+# `Task #N created successfully: ...`. That is what the transcript RENDERS and
+# what a human reads back; it is NOT what the hook is handed. Measured on the
+# 18 MB transcript of the session that caught this, 2026-08-20:
+# `"toolUseResult":"Task #` appears 0 times, while every task result carries a
+# structured `taskId`. Reading only the prose put every create under
+# `_SUBJECT_KEY`, so every later update looked up an id that was never a key and
+# the plan froze at 0/N -- live, on the first real traffic the feature ever saw.
+
+def _created_real(n, subject, **extra):
+    """One TaskCreate, with the STRUCTURED result the hook receives."""
+    inp = {"subject": subject, "description": subject,
+           "activeForm": "doing " + subject, **extra}
+    return inp, {"success": True, "taskId": str(n), "subject": subject}
+
+
+def _updated_real(n, frm, to):
+    """One TaskUpdate, verbatim the shape the transcript recorded:
+    {"success": true, "taskId": "1", "updatedFields": ["status"],
+     "statusChange": {"from": "pending", "to": "in_progress"}}"""
+    return ({"taskId": str(n), "status": to},
+            {"success": True, "taskId": str(n), "updatedFields": ["status"],
+             "statusChange": {"from": frm, "to": to}})
+
+
+def test_the_structured_result_yields_an_id_not_the_subject_fallback():
+    inp, resp = _created_real(1, "restart the dashboard")
+    assert _rec("s1", "TaskCreate", inp, resp) == [
+        {"content": "restart the dashboard", "status": "pending"}]
+    assert list(tasktool.load("test")["s1"]["tasks"]) == ["1"], (
+        "the create fell back to the subject key, so no update can reach it")
+
+
+def test_create_then_update_moves_the_step_with_the_real_shapes():
+    """THE REGRESSION, replayed exactly as production sent it: five creates
+    and one update. Before the fix the update was dropped and the plan stayed
+    at 0/5 -- the very symptom the whole feature exists to remove."""
+    for i in (1, 2, 3, 4, 5):
+        _rec("s1", "TaskCreate", *_created_real(i, f"step {i}"))
+    out = _rec("s1", "TaskUpdate", *_updated_real(3, "pending", "completed"))
+    assert out is not None, "the update was dropped, so progress cannot move"
+    assert out[2] == {"content": "step 3", "status": "completed"}
+    assert [x["status"] for x in out] == ["pending", "pending", "completed",
+                                          "pending", "pending"]
+
+
+def test_the_structured_id_wins_over_a_number_in_the_prose():
+    """Both readers can fire on one response. The structured field is the
+    harness's own answer; the prose is a rendering of it, and a rendering that
+    disagrees must not win."""
+    resp = {"taskId": "4",
+            "text": "Task #9 created successfully: two numbers"}
+    _rec("s1", "TaskCreate", {"subject": "two numbers"}, resp)
+    assert list(tasktool.load("test")["s1"]["tasks"]) == ["4"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ({"taskId": 7}, "7"),                    # an int id is still an id
+    ({"taskId": "  8  "}, "8"),              # trimmed, like every other field
+    ({"task_id": "9"}, "9"),                 # snake spelling
+    ({"id": "10"}, "10"),                    # bare
+    ({"taskId": True}, ""),                  # isinstance(True, int) is True
+    ({"taskId": None}, ""),
+    ({"taskId": ""}, ""),
+    ({"success": True}, ""),                 # nothing readable at all
+    ("Task #11 created successfully: x", "11"),   # the prose still works
+])
+def test_the_id_reader_takes_the_spellings_and_refuses_the_rest(raw, expected):
+    assert tasktool._result_id(raw) == expected
+
+
+def test_a_frozen_plan_is_never_silent_again():
+    """The class, not the instance. If EVERY stored key is subject-based then
+    no create ever read an id, so no update can ever land and the plan freezes at
+    0/N. That is precisely how this feature spent its whole life dead while the
+    hook around it appended 23,973 events without one error. One line in
+    hooks_errors.log is the difference between finding that in minutes and
+    finding it in months."""
+    log = paths.store_home() / "hooks_errors.log"
+    _rec("s1", "TaskCreate", {"subject": "no id anywhere"}, {"success": True})
+    assert list(tasktool.load("test")["s1"]["tasks"]) == \
+        [tasktool._SUBJECT_KEY + "no id anywhere"]
+    assert _rec("s1", "TaskUpdate", {"taskId": "1", "status": "completed"},
+                {"success": True, "taskId": "1"}) is None
+    assert "tasktool_id_drift" in log.read_text(encoding="utf-8")
+
+
+def test_the_alarm_stays_quiet_when_ids_plainly_work():
+    """An update for a task that was evicted, or created before the hook was
+    wired, is ordinary and must not cry drift. The signature is that NO key has an
+    id -- not that this one is missing."""
+    log = paths.store_home() / "hooks_errors.log"
+    _rec("s1", "TaskCreate", *_created_real(1, "has an id"))
+    assert _rec("s1", "TaskUpdate", {"taskId": "99", "status": "completed"},
+                {"success": True, "taskId": "99"}) is None
+    assert not log.exists() or "tasktool_id_drift" not in \
+        log.read_text(encoding="utf-8")
+
+
+# --- what the pre-merge audit found ------------------------------------------
+
+def test_a_batch_records_every_task_not_just_the_first():
+    """`any()` over a GENERATOR stops at the first truthy element, and
+    `_create` returns True for every entry with a subject -- so entry 1 landed
+    and entries 2..N were never folded at all. The docstring one line above
+    said "folding each entry keeps the work visible"; the code dropped all but
+    one step of the plan, and the batch branch had no test that entered it.
+
+    A batch result carries no id, so the lost tasks can never be reintroduced
+    by a later TaskUpdate -- the loss is permanent, not a missed resync."""
+    batch = {"tasks": [{"subject": "alpha"}, {"subject": "beta"},
+                       {"subject": "gamma"}, {"subject": "delta"}]}
+    out = _rec("s1", "TaskCreate", batch, "created 4 tasks")
+    # Every entry lands. The ORDER is lexical, not the batch's own: entries in a
+    # batch carry no id, so they are keyed by SUBJECT -- which is exactly what
+    # makes the same create arriving twice update one entry instead of
+    # duplicating a step -- and `todos()` sorts its keys. Declared order is
+    # cosmetic, dedup is correctness, so the trade is deliberate and "delta"
+    # sorting before "gamma" is the shape of it.
+    assert [x["content"] for x in out] == ["alpha", "beta", "delta", "gamma"]
+    assert len(tasktool.load("test")["s1"]["tasks"]) == 4
+
+
+def test_a_refused_create_neither_lands_nor_overwrites():
+    """An error envelope is not a creation receipt.
+
+    `_response_text` reads a dict's `error` key by design, so a failure whose
+    message happens to name a task number handed that number to `_create`,
+    which wrote its new record straight over the existing one -- destroying a
+    completed step's text and reverting its status, then writing that
+    regression into the ledger through the roadmap `set`.
+
+    `_response_ok` exists in the same module for exactly this discrimination
+    and the Skill path already calls it."""
+    _rec("s1", "TaskCreate", *_created_real(12, "deploy"))
+    _rec("s1", "TaskUpdate", *_updated_real(12, "pending", "completed"))
+    refused = {"is_error": True,
+               "error": "Cannot create: task #12 must be unblocked first"}
+    assert _rec("s1", "TaskCreate", {"subject": "write docs"},
+                refused) is None
+    tasks = tasktool.load("test")["s1"]["tasks"]
+    assert tasks == {"12": {"text": "deploy", "status": "completed"}}
+
+
+def test_two_processes_do_not_clobber_each_others_lists(tmp_path):
+    """MEASURED, not reasoned: this is the P0.
+
+    `record` was load-modify-save with no serialisation, and every PostToolUse
+    hook is its own process. Each concurrent writer folded onto a stale
+    whole-file snapshot and the last one to land became the file -- dropping
+    not just the other call's task but every task, and every SESSION, the
+    loser had not yet seen. The audit measured 13 of 50 tasks surviving with
+    this exact shape, and whole sessions absent from the file in two of three
+    trials.
+
+    Real processes on purpose. An in-process simulation would prove something
+    about monkeypatching; the defect is about two interpreters."""
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import sys" + chr(10)
+        + "from mindhive import tasktool" + chr(10)
+        + "sid = sys.argv[1]" + chr(10)
+        + "for i in range(25):" + chr(10)
+        + "    tasktool.record(sid, 'TaskCreate',"
+        + "                    {'subject': sid + ' task ' + str(i)},"
+        + "                    {'success': True,"
+        + "                     'taskId': sid + '-' + str(i)},"
+        + "                    project='probe')" + chr(10),
+        encoding="utf-8")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ,
+               PYTHONPATH=os.path.join(repo, "src"),
+               MINDHIVE_HOME=str(tmp_path / "store"))
+    procs = [subprocess.Popen([sys.executable, str(worker), sid], env=env)
+             for sid in ("sess-a", "sess-b")]
+    for p in procs:
+        assert p.wait(timeout=180) == 0
+
+    sidecar = tmp_path / "store" / "probe" / "task_tools.json"
+    state = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert set(state) == {"sess-a", "sess-b"}, (
+        "a whole session's list was clobbered: %s" % sorted(state))
+    for sid in ("sess-a", "sess-b"):
+        assert len(state[sid]["tasks"]) == 25, (
+            "%s kept %d of 25 tasks" % (sid, len(state[sid]["tasks"])))
+
+
+def test_deleting_the_last_task_clears_the_plan():
+    """The final delete has to reach the ledger.
+
+    `record` returns `[]` for "the list is empty now" and None for "nothing to
+    say", and the docstring calls that distinction deliberate -- but the only
+    consumer collapsed it: `sync_from_todos` computed `steps` and returned None
+    `if not steps`. So deleting tasks one at a time worked until the last one,
+    and then the final step stayed pending on the plan forever. The Oversee
+    card and the awaiting-resume list kept reporting work the harness had
+    deleted, and no later call could clear it because every later list is empty.
+
+    `roadmap set requires a non-empty steps list`, so the honest exit is
+    `archive` with a reason -- the documented state between finished and still
+    open."""
+    from mindhive import roadmap, roadmap_auto
+
+    out = _rec("sess-2", "TaskCreate", *_created_real(1, "only step"))
+    assert roadmap_auto.sync_from_todos("sess-2", out, project="test")
+    gone = _rec("sess-2", "TaskUpdate",
+                {"taskId": "1", "status": "deleted"},
+                {"success": True, "taskId": "1"})
+    assert gone == []
+    assert roadmap_auto.sync_from_todos("sess-2", gone, project="test"), \
+        "the final delete never reached the ledger"
+    rec = roadmap.fold(events.read_all("test"))["sess-2"]
+    assert rec["status"] == "archived"
+    assert "deleted" in rec["archive_reason"].lower()
+
+
+def test_an_empty_list_keeps_injected_steps_instead_of_archiving():
+    """The other half of the same decision. An injected step is
+    evidence-backed work the replenishment injector put on the plan, and this
+    module already holds that a trimmed todo reappears while an injected step
+    never comes back. So an empty todo list clears the harness's steps and
+    keeps the injected ones -- a `set` with what is left, not an archive."""
+    from mindhive import events as ev, roadmap, roadmap_auto
+
+    ev.append_event("roadmap",
+                    {"action": "set", "plan_id": "sess-2",
+                     "prompt": "the ask", "title": "the ask",
+                     "steps": [{"text": "harness step", "status": "pending"},
+                               {"text": "injected step", "status": "pending",
+                                "new": True}]},
+                    session_id="sess-2", tags=["roadmap", "auto"],
+                    project="test")
+    assert roadmap_auto.sync_from_todos("sess-2", [], project="test")
+    rec = roadmap.fold(events.read_all("test"))["sess-2"]
+    assert rec["status"] == "active"
+    assert [s["text"] for s in rec["steps"]] == ["injected step"]
+
+
+def test_a_delete_pending_lock_makes_the_waiter_wait_not_barge_in(monkeypatch):
+    """DETERMINISTIC, where the race that found this is not.
+
+    On Windows a lock file whose name is DELETE-PENDING -- the holder has closed
+    its fd and called `unlink`, and the directory entry has not gone yet --
+    answers `os.open(O_CREAT | O_EXCL)` with ACCESS_DENIED, not EEXIST.
+    `_exclusive` caught `FileExistsError` in its waiting arm and everything else
+    in `except OSError: break`, whose comment describes an unwritable directory.
+    So the one error that clears in MICROSECONDS took the arm that fails open
+    INSTANTLY, without waiting at all -- and the loser walked into the critical
+    section beside the new holder, where the last writer published a snapshot
+    taken before the other's write.
+
+    Measured under 12-way CPU load before the fix, with `os.open` audited and
+    both sections timestamped: every lost task came with exactly one overlapping
+    critical section, and the process that lost it had logged a PermissionError
+    on the `.lock` path. 1:1, no loss without an overlap.
+
+    The distinction the fix draws: an unwritable directory fails the same way
+    forever, delete-pending clears at once. So ACCESS_DENIED has to WAIT like
+    EEXIST, and the deadline still bounds it -- fail-open survives for the case
+    that cannot clear, which is what the comment was always about.
+
+    This test is the mechanism, not the symptom: one refusal, and the lock must
+    then actually be HELD. A `_LOCK_WAIT_S` of 2 s over a 10 ms spin means the
+    retry costs one tick.
+    """
+    calls = []
+    real_open = os.open
+
+    def one_access_denied(path, flags, *a, **kw):
+        if str(path).endswith(".lock") and not calls:
+            calls.append(str(path))
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *a, **kw)
+
+    lock = tasktool.sidecar_path("test").with_name(tasktool.SIDECAR + ".lock")
+    monkeypatch.setattr(os, "open", one_access_denied)
+    with tasktool._exclusive("test"):
+        held = lock.exists()
+
+    assert calls, "the fixture never reached the lock's own open"
+    assert held, (
+        "the lock was NOT held: one ACCESS_DENIED made _exclusive fail open "
+        "instead of waiting, so two hook processes can share the critical "
+        "section and the last writer publishes a stale snapshot")
+    assert not lock.exists(), "the lock outlived its holder"
+
+
+# --- the cost of the delete-pending fix, on the fault it must NOT wait for ----
+# `PermissionError` is not only the delete-pending signal. `os.open` answers
+# EACCES for a directory that simply cannot be written, and Python maps errno 13
+# to PermissionError for both -- so the arm added for the transient case sits in
+# front of `except OSError` and swallows the permanent one too. Measured before
+# these tests: a permanent EACCES took 2.004 s over 190 attempts where the code
+# before the fix broke out in 0.000 s over 1. This module runs inside a
+# PostToolUse hook on every task-tool call, and its own header says a hook that
+# blocks is worse than an unserialised write, so that regression is worse than
+# the bug it came with.
+#
+# The bound is a spin COUNT, not a second timeout, and it is asserted as a count:
+# elapsed time is a flaky proxy on a loaded machine, while "how many times did it
+# retry" is exactly the property. The window it exists for was measured in
+# microseconds, so a handful of 10 ms spins is four orders of magnitude of
+# margin; anything slower than that is indistinguishable from permanent, and
+# fail-open is the documented contract for permanent.
+
+def test_a_permanent_access_denied_fails_open_instead_of_spinning_the_deadline(
+        monkeypatch):
+    """RED against an uncapped PermissionError arm: it retried until the 2 s
+    deadline, ~190 attempts, on a fault that can never clear."""
+    import time as _time
+
+    attempts = []
+    real_open = os.open
+
+    def denied(path, *a, **kw):
+        if str(path).endswith(".lock"):
+            attempts.append(path)
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", denied)
+    t0 = _time.monotonic()
+    with tasktool._exclusive(project="test"):
+        held = True
+    elapsed = _time.monotonic() - t0
+
+    assert held, "the context must still yield: this path fails OPEN, never raises"
+    assert len(attempts) <= tasktool._LOCK_DENIED_SPINS + 1, (
+        f"{len(attempts)} attempts against a fault that cannot clear — the arm "
+        f"is spinning the whole deadline again")
+    # A generous ceiling on purpose: the assertion that matters is the count
+    # above. This one only catches a cap that is nominally in place but wired to
+    # a sleep long enough to stall the hook anyway.
+    assert elapsed < tasktool._LOCK_WAIT_S / 2, elapsed
+
+
+def test_the_cap_is_still_wide_enough_to_ride_out_a_real_delete_pending_window(
+        monkeypatch):
+    """The other side of the same cap: TODOS 21's fix must survive it.
+
+    Three refusals in a row, and the lock must still be HELD afterwards. A cap of
+    zero would pass the test above while quietly undoing the fix this arm exists
+    for, so the two directions are asserted together.
+
+    The refusal count is a LITERAL, not `_LOCK_DENIED_SPINS`. Deriving it from the
+    constant made the test move with the mutation: at a cap of 0 the fixture
+    refused zero times and the test passed having exercised nothing, which is the
+    shape of proof that proves the opposite of what it claims. The constant is
+    asserted separately, as the contract it is."""
+    assert tasktool._LOCK_DENIED_SPINS >= 3, (
+        "the budget no longer covers the window this arm was added for")
+    refusals = {"left": 3}
+    real_open = os.open
+
+    def flaky(path, *a, **kw):
+        if str(path).endswith(".lock") and refusals["left"] > 0:
+            refusals["left"] -= 1
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(os, "open", flaky)
+    lock = tasktool.sidecar_path("test").with_name(tasktool.SIDECAR + ".lock")
+    with tasktool._exclusive(project="test"):
+        held = lock.exists()
+
+    assert refusals["left"] == 0, "the fixture never reached the open it refuses"
+    assert held, ("the waiter gave up inside its own budget — a delete-pending "
+                  "lock is contention and must be waited out")
+    assert not lock.exists(), "the lock outlived its holder"
+
+
+def test_a_permanent_non_permission_oserror_still_fails_open_immediately():
+    """The arm the PermissionError clause sits in front of. EROFS/ENOSPC cannot
+    clear either, and they must not have been dragged into the waiting path:
+    measured at 1 attempt, 0.000 s, and that must stay true."""
+    attempts = []
+    real_open = os.open
+
+    def readonly(path, *a, **kw):
+        if str(path).endswith(".lock"):
+            attempts.append(path)
+            raise OSError(30, "Read-only file system")
+        return real_open(path, *a, **kw)
+
+    os.open = readonly
+    try:
+        with tasktool._exclusive(project="test"):
+            held = True
+    finally:
+        os.open = real_open
+
+    assert held
+    assert len(attempts) == 1, (
+        f"{len(attempts)} attempts — a non-EACCES OSError is being retried")

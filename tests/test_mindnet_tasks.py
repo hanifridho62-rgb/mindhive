@@ -791,3 +791,53 @@ def test_open_descendants_outrank_every_other_reason():
     ok = _sat(("p", t_mod.TRIVIAL_EXIT_PHASE), ("p", t_mod.PHASES[-1]))
     reason = t_mod.can_complete(g, "p", satisfied=ok)
     assert reason is not None and "descendant" in reason
+
+
+# --- the entry phase, and the phase a declare puts on the cat feed ---------------
+
+
+def test_entry_phase_is_the_rule_fold_actually_applies():
+    """One home, asserted against the fold rather than against a literal: if
+    `fold` and `entry_phase` ever disagree, the operator is told one thing and
+    the graph records another."""
+    for tid, bypass in (("plain", False), ("trivial", True)):
+        _declare(task_id=tid, triviality_bypass=bypass)
+    folded = t_mod.fold(events.read_all())
+    for tid, bypass in (("plain", False), ("trivial", True)):
+        assert t_mod.entry_phase(bypass) == folded[tid].phase, tid
+    assert t_mod.entry_phase(False) != t_mod.entry_phase(True)
+
+
+class _State:
+    def __init__(self, records):
+        self.records = records
+
+
+class _Rec:
+    def __init__(self, phase):
+        self.phase = phase
+
+
+def test_feed_phase_prefers_where_the_task_already_is():
+    state = _State({"t": _Rec(t_mod.PHASES[-1])})
+    assert t_mod.feed_phase(state, "t") == t_mod.PHASES[-1]
+    # ...even when the caller asks for a bypass, because the record wins.
+    assert t_mod.feed_phase(state, "t", True) == t_mod.PHASES[-1]
+
+
+def test_feed_phase_falls_back_to_the_entry_for_a_task_nobody_knows():
+    state = _State({"other": _Rec(t_mod.PHASES[-1])})
+    assert t_mod.feed_phase(state, "t") == t_mod.entry_phase(False)
+    assert t_mod.feed_phase(state, "t", True) == t_mod.entry_phase(True)
+
+
+@pytest.mark.parametrize("state", [None, object(), _State(None),
+                                   _State({"t": None}), _State({"t": object()}),
+                                   _State({"t": _Rec("")})])
+def test_feed_phase_is_total_and_never_answers_empty(state):
+    """A feed row carrying NO phase is the half-answer this function exists to
+    end, so every shape it cannot read has to degrade to the entry rather than
+    to "" -- and none of them may raise, because this runs inside the one
+    command an operator types first."""
+    got = t_mod.feed_phase(state, "t")
+    assert got == t_mod.entry_phase(False), (state, got)

@@ -653,8 +653,35 @@ def _beat_path(project=None, session_id=None):
 _ANNOUNCED_THIS_TURN = False
 
 
-def announce_faculties(faculties, project=None, session_id=None) -> int:
+def _steered(sc) -> tuple:
+    """``(task_id, phase)`` for the task *sc* says this turn steers, or ``("", "")``.
+
+    A wrapper only for the fail-open: `inject.steering` is already total on every
+    shape it can be handed, but IMPORTING it is not, and this module is reached
+    from a hook whose stdout is the context channel -- an ImportError raised while
+    labelling a cat would cost the prompt. Local import for the same reason
+    `telemetry` is imported locally throughout this file: `mindnet` is a heavier
+    subtree than the gate needs on a path that also runs for non-code prompts."""
+    if sc is None:
+        return ("", "")
+    try:
+        from .mindnet import inject as mn_inject
+        return mn_inject.steering(sc)
+    except Exception:                                       # noqa: BLE001
+        return ("", "")
+
+
+def announce_faculties(faculties, project=None, session_id=None, sc=None) -> int:
     """Light each faculty in *faculties*. Returns how many rows landed.
+
+    *sc* is the turn's `Sidecar`, and it is what makes a lit cat say anything
+    beyond its own name: `inject.steering` reads the task this turn steers off it
+    and every row is stamped with that ``task_id`` and ``phase``. Without it the
+    click-through panel's two top rows are em-dashes on every prompt-gate cat --
+    which is what they were, on every turn, while the spine in the same hook
+    invocation knew both. Optional, and ``None`` is a real answer: a turn with no
+    declared task leaves the rows empty rather than inventing a name the ledger
+    cannot back.
 
     `active` ONLY — no paired `idle`, and that is the fix rather than an omission.
     This used to write both in the same second, and `ui_cats` hides an idle faculty
@@ -672,11 +699,13 @@ def announce_faculties(faculties, project=None, session_id=None) -> int:
     Never raises. A cat that cannot be logged must not disturb the prompt — the same
     contract `telemetry.emit` and `record_direction` already keep."""
     from .mindnet import telemetry as tel_mod
+    task_id, phase = _steered(sc)
     lit, written = [], 0
     for faculty in sorted(faculties or ()):
         try:
             if tel_mod.emit(faculty, tel_mod.STATUS_ACTIVE, project=project,
-                            session_id=session_id) is None:
+                            session_id=session_id, task_id=task_id or None,
+                            phase=phase or None) is None:
                 continue
             lit.append(faculty)
             written += 1
@@ -699,14 +728,26 @@ def announce_faculties(faculties, project=None, session_id=None) -> int:
                     old = json.loads(path.read_text(encoding="utf-8"))
                     keep |= {f for f in (old.get("faculties") or [])
                              if isinstance(f, str)}
+                    # ...and INHERIT the task, for the same reason. Only one of a
+                    # turn's two announces need be handed the spine, and letting
+                    # the other blank it here would leave the beat re-asserting
+                    # phase-less rows for the rest of the turn.
+                    task_id = task_id or str(old.get("task_id") or "")
+                    phase = phase or str(old.get("phase") or "")
                 except Exception:                           # noqa: BLE001
                     pass
             _ANNOUNCED_THIS_TURN = True
             # Atomic, like `_write_manifest` above: readers are OTHER PROCESSES
             # on every tool call, and a truncate-then-write is a torn read for
             # whichever one lands mid-write.
+            # `task_id`/`phase` ride along because the BEAT has to re-assert
+            # them: `telemetry.fold` is last-write-wins and the beat fires from
+            # every tool call, so a beat re-emitting the faculty alone would blank
+            # both rows on the first call after this announce -- correct for one
+            # poll of the board and empty for every poll after it.
             paths.write_text_atomic(path, json.dumps(
-                {"faculties": sorted(keep), "session_id": session_id or ""}))
+                {"faculties": sorted(keep), "session_id": session_id or "",
+                 "task_id": task_id, "phase": phase}))
         except Exception:                                   # noqa: BLE001
             pass
     return written
@@ -751,10 +792,18 @@ def beat_faculties(project=None, session_id=None) -> int:
         if not isinstance(faculties, list) or not faculties:
             return 0
         sid = session_id or (data.get("session_id") or None)
+        # Off the MARKER, never a fresh `sidecar.read`: this runs on every tool
+        # call and its whole no-op branch is one `stat`, so the turn's answer is
+        # carried rather than recomputed. A marker written before these keys
+        # existed yields None for both, which `emit` simply omits -- the
+        # pre-change behaviour, not a crash.
+        task_id = data.get("task_id") or None
+        phase = data.get("phase") or None
         written = 0
         for faculty in faculties:
             if tel_mod.emit(faculty, tel_mod.STATUS_ACTIVE, project=project,
-                            session_id=sid) is not None:
+                            session_id=sid, task_id=task_id,
+                            phase=phase) is not None:
                 written += 1
         # Re-arm even when nothing landed, or a down ledger would make every
         # subsequent tool call retry the write on the hot path.
@@ -764,7 +813,7 @@ def beat_faculties(project=None, session_id=None) -> int:
         return 0
 
 
-def record_direction(raw: str, project=None):
+def record_direction(raw: str, project=None, sc=None):
     """Best-effort: append one ``skill_directed`` event naming every skill this prompt's
     injection actually directed, so Oversee can later show the honest causal "why" and
     training can tell a suggestion that gets taken from one that never does.
@@ -773,6 +822,11 @@ def record_direction(raw: str, project=None):
     well-phrased code prompt directed skills through the MN-14/MN-15 catalog and
     recorded nothing at all — exactly the case MN-14 opened up, and the reason there was
     no feedback signal to learn from.
+
+    *sc* is the turn's `Sidecar`, threaded straight through to the announce below.
+    It matters HERE specifically: the Skills and History cats are lit on this path
+    and not by the hook's spine announce, so a sidecar handed to only the other
+    call site would leave exactly those two panels reporting no task.
 
     Returns the event or None. Never raises — a write failure must never disturb the
     UserPromptSubmit hook (fail-open, like the gate)."""
@@ -806,7 +860,8 @@ def record_direction(raw: str, project=None):
             announce_faculties(
                 pb_ann.engaged(manifest.get("playbook"), pb_ann.infer(prompt),
                                prompt, exclude=exclude),
-                project=project, session_id=payload.get("session_id") or None)
+                project=project, session_id=payload.get("session_id") or None,
+                sc=sc)
         if not skills:
             return None
         from . import events as ev_mod

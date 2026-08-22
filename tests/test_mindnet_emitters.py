@@ -385,3 +385,66 @@ def test_each_wired_faculty_has_a_cat_label(faculty):
     legend and the board must stay in step — that pairing is the whole UI."""
     from mindhive import cat_board
     assert cat_board.CAT_LABEL.get(faculty), f"{faculty} has no cat caption"
+
+
+# --- the cats the OPERATOR clicked on, and what they say about the task ------------
+# MN-17 proved each faculty lights. It did not ask what the lit cat then REPORTS,
+# and the answer was "nothing": `announce_faculties` emitted the faculty alone, so
+# the click-through panel's `task` and `phase` rows were em-dashes on every
+# prompt-gate cat. The two cats in that panel — Skills and History — come from
+# `record_direction`, not from the spine announce, so threading the sidecar into
+# only one of the hook's two announce calls would leave exactly the rows that
+# prompted this change still empty. Both call sites are pinned below.
+
+
+def _pairs(project="test"):
+    """``(task_id, phase)`` per activity row, keyed by faculty."""
+    return {e.payload["faculty"]: (e.payload.get("task_id"),
+                                   e.payload.get("phase"))
+            for e in events.read_all(project)
+            if e.type == tel.EVENT_TYPE and isinstance(e.payload, dict)
+            and e.payload.get("faculty")}
+
+
+def test_the_catalog_cats_name_the_task_the_spine_is_steering():
+    """`record_direction`'s own announce — the Skills and History cats.
+
+    `_spine_with_advice` builds the sidecar through the real declare/rebuild path,
+    so the task named here is one `inject.active` genuinely selected rather than a
+    literal this test chose."""
+    sc = _spine_with_advice("test")
+    _seed("test")
+    promptgate.record_direction(
+        json.dumps({"prompt": "buatkan fitur export CSV di dashboard",
+                    "session_id": "s-trigger"}), project="test", sc=sc)
+    pairs = _pairs()
+    assert pairs, "record_direction lit no cat at all"
+    assert set(pairs.values()) == {("mn17-advice", tel.PHASES[0])}, pairs
+
+
+def test_the_hook_puts_the_steered_task_on_every_cat_it_lights():
+    """The wiring, at the real entry point.
+
+    Two announce calls in one hook invocation; this asserts the property across
+    whatever the turn lit, so neither call site can be the one that was forgotten.
+    `assert pairs` keeps it from passing vacuously on a turn that lit nothing —
+    the exact way a negative goes quiet."""
+    import io
+    import sys
+    from mindhive import __main__ as cli_mod
+    _spine_with_advice("test")
+    _seed("test")
+    raw_payload = json.dumps({
+        "prompt": "buatkan fitur export CSV di dashboard",
+        "session_id": "s-hook"})
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(sys, "stdin", io.StringIO(raw_payload))
+        mp.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+        assert cli_mod.main(["hook", "user_prompt_submit"]) == 0
+    finally:
+        mp.undo()
+    pairs = _pairs()
+    assert pairs, "the hook lit no cat at all"
+    assert set(pairs.values()) == {("mn17-advice", tel.PHASES[0])}, pairs

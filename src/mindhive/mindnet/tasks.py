@@ -83,6 +83,41 @@ TRIVIAL_ENTRY_PHASE = "execution"
 TRIVIAL_EXIT_PHASE = "audit-bug"
 
 
+def entry_phase(triviality_bypass=False) -> str:
+    """The phase a task is BORN in. `fold` derives it and `feed_phase` needs the
+    same answer before a declare has landed, so it lives here once -- two
+    spellings of it is the drift `TRIVIAL_ENTRY_PHASE`'s own comment warns
+    about."""
+    return TRIVIAL_ENTRY_PHASE if triviality_bypass else PHASES[0]
+
+
+def feed_phase(state, task_id, triviality_bypass=False) -> str:
+    """Which phase a DECLARE should stamp on the cat feed for *task_id*.
+
+    *state* is the phase projection as it stands BEFORE the declare lands (a
+    `controller.PhaseState`, or anything carrying a `records` mapping). `None`
+    is accepted and means nothing is known.
+
+    A task already on the board keeps the phase it is AT. `declare` is
+    idempotent by contract -- re-running it to sharpen a title is invited by its
+    own docstring -- so a re-declare of a task at `audit-bug` is not a task at
+    `brainstorm`. Deriving the entry unconditionally would put a confidently
+    WRONG phase on the operator's board where the old code put nothing at all,
+    and of those two that is the worse failure: an em-dash reads as "unknown",
+    a phase name reads as fact.
+
+    Only a genuinely new task takes `entry_phase`. The reason this cannot just
+    read the projection AFTERWARDS is that `telemetry.busy` stamps its `active`
+    row on the way IN, when no record for a new task exists yet.
+
+    Total on the way in, like every other fold here: an unreadable projection
+    degrades to the derived entry, because a feed row carrying no phase at all
+    is the half-answer this function exists to end."""
+    records = getattr(state, "records", None)
+    rec = records.get(task_id) if isinstance(records, dict) else None
+    return getattr(rec, "phase", "") or entry_phase(triviality_bypass)
+
+
 def _at_or_past(phase, mark) -> bool:
     """True when *phase* sits at or beyond *mark* in the pipeline. Total on
     both sides: an unrecognised phase answers False rather than raising, so a
@@ -728,7 +763,7 @@ def fold(evs) -> dict:
                     # to the forward-skip ban. DERIVED here rather than taken
                     # from the payload: an entry phase a caller could name is
                     # the teleport this module just stopped accepting.
-                    phase=TRIVIAL_ENTRY_PHASE if trivial else PHASES[0],
+                    phase=entry_phase(trivial),
                     language_context=_id_tuple(p.get("language_context")),
                     validation_script=str(
                         p.get("validation_script") or "")[:MAX_SCRIPT_CHARS],

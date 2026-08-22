@@ -23,6 +23,8 @@ every ``*_MEMO`` between cases by scanning ``vars(dashboard)``, so they have to
 be reachable there, and a re-export is the same OrderedDict object —
 ``_BoundedMemo`` subclasses ``OrderedDict``, so that scan still finds them."""
 import collections
+import hashlib
+import json
 import os
 
 # The FOLD-HOLDING memos (`_SESSIONS_MEMO`, `_CATS_MEMO`) are process-global and
@@ -62,6 +64,19 @@ _MEMO_MAX = 8
 # (mindhive 197 KiB / 888 segments, hanif 155 KiB / 667) and the 57 others cost
 # 1.2-10 KiB each. A store eight times this one still fits in single-digit MiB.
 _STATS_MEMO_MAX = 512
+
+# `_OVERSEE_MEMO` gets the third bound, and for `_STATS_MEMO`'s reason rather
+# than `_MEMO_MAX`'s: HIVE MIND folds EVERY namespace in one request, so a cap
+# under the namespace count would evict most of what that single request just
+# wrote and could never hit. 128 over this machine's 60 is the same headroom
+# `_OVERVIEW_MEMO_MAX` was given for the same access pattern.
+#
+# Affordable because an oversee entry is bounded by the BOARD, not by the fold:
+# it holds the live cards and the roadmap plans, not the events they came from.
+# Measured on the real store — mindhive, 40554 events, 6 cards, 2 plans: 6.9
+# KiB; hanif, 8490 events, 0 cards, 2 plans: 1.2 KiB. A full 128 slots of the
+# busiest namespace still fits under a megabyte.
+_OVERSEE_MEMO_MAX = 128
 
 
 class _BoundedMemo(collections.OrderedDict):
@@ -191,6 +206,14 @@ _SESSIONS_MEMO = _BoundedMemo(_MEMO_MAX)
 # {project: (segment_stats, telemetry fold, session records)}
 _CATS_MEMO = _BoundedMemo(_MEMO_MAX)
 
+# The gate for /api/oversee. Holds the whole BOARD fold — the cards, their
+# attached roadmaps, the orphan-plan candidates, and the goal_dirs the entry was
+# built from (which have to join its own fingerprint; see
+# `_fix_plan_fingerprint`). Every clock-dependent field is re-derived by
+# `_with_liveness` on the way out.
+# {project: (fingerprint, fold stamp, board)}
+_OVERSEE_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+
 
 def _with_online(records, stamp):
     """*records* with `online` re-derived at *stamp*.
@@ -215,6 +238,169 @@ def _with_online(records, stamp):
                                    and (stamp - last)
                                    < oversee_mod.ONLINE_WINDOW_SECONDS)))
     return out
+
+
+def _with_liveness(records, stamp):
+    """*records* with liveness re-derived at *stamp*, dispatching on KIND.
+
+    The seam that makes gating /api/oversee safe, and the reason `_with_online`
+    could not simply be reused: the wall clock decides THREE things on that
+    board and they are not the same rule.
+
+    * A **loop run** is online while its status is still `running` and its last
+      event is inside ITS OWN `heartbeat_seconds` — default 15 min + 60 s.
+      Applying the chat window here would call a perfectly live run offline
+      after 180 seconds, twelve times too early, which is worse than no
+      liveness at all: it reports running work as dead.
+    * A **chat session** is online inside `ONLINE_WINDOW_SECONDS` (180 s).
+    * A chat session idle past `ACTIVE_WINDOW_SECONDS` (6 h) is not offline, it
+      is GONE — `oversee.interactive_sessions` refuses to emit it. That makes
+      the third decision a drop rather than a field, and it is also what
+      justifies caching the fold at all: ageing can only ever REMOVE a card,
+      never add one, so a fold taken at T0 and filtered at T1 >= T0 is exactly
+      what a fresh fold at T1 would have produced. `_oversee_cached` enforces
+      the T1 >= T0 half.
+
+    Both rules are the producers' own lines applied to the producers' own
+    constants, read off fields the rows already carry — not a second
+    implementation of liveness, which would be free to drift from them.
+
+    An unrecognised `kind` gets the chat rule. Of the two guesses that is the
+    one that cannot report a dead session as working, which is the failure that
+    matters on a board someone watches to decide whether to intervene.
+
+    Idempotent by construction — `dict(r, online=…)` replaces the key rather
+    than reading it, and never mutates the cached row."""
+    from . import oversee as oversee_mod
+    from .loop.state import DEFAULT_HEARTBEAT_SECONDS, _ts_epoch
+    out = []
+    for r in records:
+        last = _ts_epoch(r.get("last_event_ts"))
+        if r.get("kind") == "loop":
+            window = r.get("heartbeat_seconds") or DEFAULT_HEARTBEAT_SECONDS
+            online = bool(r.get("status") == "running" and last is not None
+                          and (stamp - last) < window)
+        else:
+            if (last is None
+                    or (stamp - last) >= oversee_mod.ACTIVE_WINDOW_SECONDS):
+                continue
+            online = (stamp - last) < oversee_mod.ONLINE_WINDOW_SECONDS
+        out.append(dict(r, online=online))
+    return out
+
+
+def _fix_plan_fingerprint(goal_dirs):
+    """A stat-only stamp over each run's ``fix_plan.md``, or None for a fault.
+
+    The second term of /api/oversee's fingerprint, and the same shape as the
+    `chain.json` term in `_overview_fingerprint`: `loop.state._fix_plan_items`
+    reads this file off the run's `goal_dir`, so a run's checklist can change
+    with NO event appended and a ledger-only stamp does not move for it. Cached
+    without this term, a run's plan would be frozen at whatever it said on the
+    first poll for the life of the process.
+
+    A missing file gets a real stamp (`-1`) rather than being skipped, so
+    creating one counts as a change. Any OTHER `OSError` returns None — the same
+    rule `_ledger_fingerprint` applies to `{}`, because a fault that compares
+    equal to itself is how a transient error pins a cache open for good.
+
+    `ValueError` is in that same arm because `os.stat` raises it, NOT an OSError,
+    for a path with an embedded NUL — before the call reaches the OS. `goal_dir`
+    comes off an event payload and the reader this mirrors treats it as untrusted
+    and survives it (`pathlib`'s `is_file()` swallows the ValueError, so the card
+    renders with an empty checklist). Letting it escape here 500s the whole
+    Oversee board on every poll, permanently, since an append-only ledger cannot
+    un-write the row.
+
+    Every named `goal_dir` is stat'ed, including ones `_fix_plan_items` would
+    refuse to read (it requires a real `.hive-loop` directory). That
+    over-invalidates in the safe direction and keeps this function from having
+    to re-implement, and then drift from, the reader's admission rule."""
+    out = []
+    for d in goal_dirs or ():
+        try:
+            st = os.stat(os.path.join(d, "fix_plan.md"))
+        except FileNotFoundError:
+            out.append((d, -1, 0))
+        except (OSError, ValueError):
+            return None
+        else:
+            out.append((d, st.st_size, st.st_mtime_ns))
+    return tuple(out)
+
+
+def _intended_use_digest(iu) -> str:
+    """A content digest of `oversee.intended_use_map()`, the third term.
+
+    That map comes off the plugin inventory on disk, is TTL-memoized for 60 s,
+    and feeds `skill_trails` INSIDE the fold — so a board cached against a
+    ledger stamp can outlive the map it was built from and report a skill's
+    "why" from an inventory that no longer says it.
+
+    A CONTENT digest, not the object's identity: the TTL rebuilds an equal dict
+    every minute, and keying on identity would throw the whole memo away on a
+    schedule for no change at all. Computed once per request by the caller and
+    never once per namespace — HIVE MIND would otherwise hash the same 347
+    entries sixty times over."""
+    blob = json.dumps(iu or {}, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _oversee_fingerprint(proj, goal_dirs, iu_digest):
+    """/api/oversee's compound fingerprint: the ledger, the fix-plan files of
+    the runs on the board, and the intended-use map.
+
+    None from ANY term poisons the whole, exactly as in `_overview_fingerprint`:
+    a compound stamp with one untrustworthy half is not a weaker stamp, it is a
+    cache key that can compare equal after the world has moved."""
+    ledger = _ledger_fingerprint(proj)
+    if ledger is None:
+        return None
+    fixes = _fix_plan_fingerprint(goal_dirs)
+    if fixes is None:
+        return None
+    return (ledger, fixes, iu_digest)
+
+
+def _oversee_cached(proj, iu_digest, stamp, compute):
+    """*compute*'s board for *proj*, recomputed only when something it depends
+    on actually moved.
+
+    The `goal_dirs` in the fingerprint come from the CACHED entry, which is not
+    circular: `goal_dir` is read off an event, so a board whose runs changed had
+    its ledger term move first.
+
+    `folded_at <= stamp` is what keeps `_with_liveness`'s drop rule exact.
+    Ageing only ever removes cards, so filtering an older fold at a newer stamp
+    is right — but a clock that jumped BACKWARD (an NTP correction) would invert
+    that and hide a card that belongs on the board. One comparison retires the
+    whole class by treating it as a miss.
+
+    The ledger is stamped BEFORE the fold and the stamp is required to still
+    hold after it. Stamping only afterwards described the ledger as of T+delta
+    while the board was read at T, so an event that landed inside that window was
+    in the KEY and absent from the BOARD — and the next poll matched the key and
+    served the older board, until some further append happened to move the stamp
+    again. That window is the fold itself: 900 ms on the real store, on the
+    dashboard's hottest projection. Nothing cached at all is the correct outcome
+    for a fold that raced an append; the next poll simply folds again.
+
+    Treat the result as read-only: it IS the cached object. The caller's
+    clock-dependent fields come from `_with_liveness`, which copies."""
+    cached = _memo_get(_OVERSEE_MEMO, proj)
+    if cached is not None:
+        fingerprint, folded_at, board = cached
+        if folded_at <= stamp and fingerprint == _oversee_fingerprint(
+                proj, board["goal_dirs"], iu_digest):
+            return board
+    before = _ledger_fingerprint(proj)
+    board = compute()
+    fingerprint = _oversee_fingerprint(proj, board["goal_dirs"], iu_digest)
+    # `before is None` fails this comparison too, which is right: an unstampable
+    # ledger was never cacheable.
+    if fingerprint is not None and fingerprint[0] == before:
+        _memo_put(_OVERSEE_MEMO, proj, (fingerprint, stamp, board))
+    return board
 
 
 def _sessions_cached(proj, am, evs, stamp):

@@ -40,13 +40,23 @@ performs I/O cannot run where this one has to. Resolvability is `consensus.trace
 job, and `hive consensus trace` exits non-zero when a ref resolves to nothing.
 """
 import re
+from fractions import Fraction
 
 _REF_RE = re.compile(r"^[0-9a-f]{64}$")
+# `Fraction`'s own str: "1/3", or plain "1" when the denominator is 1.
+_EXACT_RE = re.compile(r"^[0-9]+(/[0-9]+)?$")
 VALUE_KINDS = ("numeric", "categorical")
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A finite number — see the same guard in `contributions`: a NaN
+    reaches `canonical_json` as a bare `NaN` token, which is not JSON, in a
+    ledger that cannot be rewritten."""
+    import math
+
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def validate_payload(payload) -> None:
@@ -103,6 +113,35 @@ def validate_payload(payload) -> None:
                 f"consensus_record {where} requires a positive weight — an "
                 "input whose weight is not recorded cannot be argued with, "
                 "which is the black box this contract exists to refuse")
+        # THE EXACT SHARE, required. The float above is a rendering for a
+        # human and it is lossy: measured, a frame whose exact weights are
+        # 1/3,1/3,1/3,1 records the value 50 while the same median computed
+        # from the PUBLISHED weights (0.333333) gives 90. A record whose own
+        # numbers do not reproduce its own answer is the black box this
+        # contract exists to refuse, arriving through the audit trail
+        # instead of around it. The module header already argues why the
+        # weights are Fractions; this is that argument reaching the record.
+        exact = row.get("weight_exact")
+        if not isinstance(exact, str) or not _EXACT_RE.match(exact.strip()):
+            raise ValueError(
+                f"consensus_record {where} requires weight_exact: the "
+                "weight as an exact fraction ('1/3', or '1'). The rounded "
+                "float cannot re-derive the value it helped produce")
+        try:
+            share = Fraction(exact.strip())
+        except (ValueError, ZeroDivisionError):
+            raise ValueError(
+                f"consensus_record {where} weight_exact {exact!r} is not a "
+                "readable fraction")
+        if share <= 0:
+            raise ValueError(
+                f"consensus_record {where} weight_exact must be positive")
+        if abs(float(share) - weight) > 1e-6:
+            raise ValueError(
+                f"consensus_record {where} weight {weight} and "
+                f"weight_exact {exact!r} disagree — the float is supposed "
+                "to be a rendering OF the exact share, so a record that "
+                "states both must state one thing")
         reason = row.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError(

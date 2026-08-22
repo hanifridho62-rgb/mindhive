@@ -702,6 +702,76 @@ def test_a_mutating_command_emits_faculty_telemetry():
     assert tel_mod.STATUS_ACTIVE in statuses and tel_mod.STATUS_IDLE in statuses
 
 
+def _cat_rows():
+    """Every `task-graph` activity payload in the store."""
+    return [e.payload for e in events.read_all()
+            if e.type == "mindnet_activity"
+            and e.payload.get("faculty") == "task-graph"]
+
+
+def test_a_declare_names_on_the_feed_the_phase_it_landed_in():
+    """RED before this unit: the feed carried the task and an EMPTY phase.
+
+    `_mn_work` was handed a phase by every other mutating command and by
+    `declare` alone was not, so the one command that CREATES a task -- the first
+    an operator runs, and the only cat they see if they run nothing else --
+    reported half an answer. `cat_board.catPanel` renders an em-dash for an
+    empty field, which reads as "this faculty has no phase" rather than "nobody
+    passed one", and that is the exact failure MN-17 exists to prevent: a board
+    that looks complete while a field was never wired."""
+    _ok("mindnet", "declare", TASK, "--title", "U7 operator surface")
+    rows = _cat_rows()
+    assert rows, "the declare lit no cat at all"
+    assert {r.get("task_id") for r in rows} == {TASK}
+    assert {r.get("phase") for r in rows} == {t_mod.PHASES[0]}, rows
+
+
+def test_the_phase_on_the_feed_is_the_one_the_graph_actually_recorded():
+    """Not a literal, and this is the half that matters.
+
+    A hardcoded "brainstorm" would pass here while telling the operator
+    something false about a BYPASSED task, which `tasks.fold` is required to
+    bear at `execution`. So both entries are exercised and the value asserted
+    against is the record's own phase -- if the derivation ever moves, this test
+    follows it instead of pinning a stale copy of it."""
+    for task, extra in ((TASK, ()), ("mn1-u7-trivial", ("--triviality-bypass",))):
+        _ok("mindnet", "declare", task, "--title", "U7", *extra)
+        want = t_mod.fold(events.read_all())[task].phase
+        rows = [r for r in _cat_rows() if r.get("task_id") == task]
+        assert rows, f"no cat row for {task}"
+        assert {r.get("phase") for r in rows} == {want}, (task, want, rows)
+    # ...and the two entries really do differ, or the loop proved nothing.
+    folded = t_mod.fold(events.read_all())
+    assert folded[TASK].phase != folded["mn1-u7-trivial"].phase
+
+
+def test_the_declare_line_and_the_cat_feed_cannot_disagree(capsys):
+    """One home for the entry phase. The printed line reads the projection and
+    the feed is stamped before that projection exists, so they are two paths to
+    the same fact -- which is precisely how they drift."""
+    _ok("mindnet", "declare", "mn1-u7-trivial", "--title", "U7",
+        "--triviality-bypass")
+    printed = capsys.readouterr().out
+    rows = _cat_rows()
+    assert t_mod.TRIVIAL_ENTRY_PHASE in printed, printed
+    assert {r.get("phase") for r in rows} == {t_mod.TRIVIAL_ENTRY_PHASE}, rows
+
+
+def test_a_re_declare_reports_where_the_task_IS_not_where_tasks_start():
+    """`declare` is idempotent BY DESIGN -- its own docstring invites re-running
+    it to sharpen a title -- and a task being re-declared at `audit-bug` is not
+    at `brainstorm`. Deriving the entry unconditionally would put a confidently
+    WRONG phase on the board where the old code put nothing at all, and of the
+    two that is the worse failure: an em-dash reads as "unknown", a phase name
+    reads as fact."""
+    _walk_trivial(target="audit-bug", script=_script("--mode", "ok"))
+    before = len(_cat_rows())
+    _ok("mindnet", "declare", TASK, "--title", "U7 operator surface, sharpened")
+    fresh = _cat_rows()[before:]
+    assert fresh, "the re-declare lit no cat"
+    assert {r.get("phase") for r in fresh} == {"audit-bug"}, fresh
+
+
 # --- purity / totality canaries ---------------------------------------------------
 
 def test_the_phase_axis_payloads_the_cli_writes_pass_the_writer_contract():
