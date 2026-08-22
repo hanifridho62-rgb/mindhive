@@ -821,3 +821,45 @@ def test_engaged_faculties_agrees_with_the_stale_block():
     lit = i_mod.engaged_faculties(sc)
     assert ("sop" in lit) == ("stream the export" in out)
     assert ("improvements" in lit) == ("buffering the whole file" in out)
+
+
+# =================================================================================
+# 9. `steering` — what the CAT says has to be what the BLOCK says
+# =================================================================================
+# The faculty cats and the injected block are two reports on ONE turn. Before this
+# unit the cats reported neither task nor phase: `promptgate.announce_faculties`
+# called `telemetry.emit` with the faculty and nothing else, so every prompt-gate
+# cat's click-through panel read `task —  phase —` while the spine, in the same
+# hook invocation, knew both. `steering` is the one place that answer is derived,
+# and it derives it from `active` rather than re-implementing the choice — two
+# answers to "what is this turn steering" is two answers the operator has to
+# reconcile, and one of them is wrong.
+
+
+def test_steering_reports_the_task_active_itself_chose():
+    """Asserted against `active`'s own return, not against a literal. A second
+    selection rule here would drift from the block on the first tie-break change
+    and nothing would notice."""
+    sc = _one(task_id="mn1-u9", phase="prd")
+    rec, _task = i_mod.active(sc)
+    assert i_mod.steering(sc) == (rec.task_id, rec.phase) == ("mn1-u9", "prd")
+
+
+@pytest.mark.parametrize("status", ["blocked", "completed", "abandoned"])
+def test_steering_is_silent_for_a_task_that_is_not_workable(status):
+    """Same filter as `active`, and it has to be the same one: a task finished
+    months ago labelling every cat on the board is worse than an empty row, which
+    is at least honest. The canary is inline — the SAME builder with a workable
+    status must fill, or this negative would pass on a `steering` that can never
+    answer at all."""
+    assert i_mod.steering(_one(status=status)) == ("", "")
+    assert i_mod.steering(_one(status="in_progress")) == ("mn1-u9", "plan")
+
+
+@pytest.mark.parametrize("sc", [None, object(), "not a sidecar", _sc()])
+def test_steering_is_total_on_the_prompt_hot_path(sc):
+    """This runs on EVERY user prompt, inside a best-effort announce that must not
+    be able to disturb the printed context. Anything it cannot read is ("", "") —
+    an em-dash on the board — never an exception, and never a partial tuple a
+    caller would have to length-check."""
+    assert i_mod.steering(sc) == ("", "")

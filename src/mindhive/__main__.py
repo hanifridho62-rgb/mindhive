@@ -153,7 +153,7 @@ def cmd_hook(args) -> int | None:
         # Durable causal trace: record which skills the gate directed so Oversee
         # can later show the honest "directed by prompt-gate" why. Best-effort
         # and self-guarding — never disturbs the context printed above.
-        promptgate.record_direction(raw)
+        promptgate.record_direction(raw, sc=spine)
         # MN-17: light the cats for the faculties this turn actually used. AFTER the
         # print, for the same reason `record_direction` is: stdout is the context
         # channel, and a telemetry write must never be able to interleave with it.
@@ -168,7 +168,7 @@ def cmd_hook(args) -> int | None:
             # PostToolUse hook happens to find — the catalog cats would dim
             # mid-turn, which is the very thing the beat exists to prevent.
             promptgate.announce_faculties(mn_inject.engaged_faculties(spine),
-                                          session_id=_hook_session(raw))
+                                          session_id=_hook_session(raw), sc=spine)
         # MN-18: bring a task into existence so the spine has something to speak about.
         # Nothing else in the tree did this — `hive mindnet declare` is hand-run and
         # `decompose` needs a parent — so the phase spine, the SOP section and the

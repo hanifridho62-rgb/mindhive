@@ -28,6 +28,10 @@ import pytest
 
 from mindhive import events as ev_mod
 from mindhive import promptgate as pg
+from mindhive.mindnet import controller as c_mod
+from mindhive.mindnet import inject as i_mod
+from mindhive.mindnet import sidecar as s_mod
+from mindhive.mindnet import tasks as t_mod
 from mindhive.mindnet import telemetry as tel
 from mindhive.mindnet import ui_cats
 
@@ -56,6 +60,32 @@ def _age_marker(seconds, session_id=None):
     path = pg._beat_path(None, session_id)
     old = time.time() - seconds
     os.utime(path, (old, old))
+
+
+TASK, PHASE = "mn1-u9", "plan"
+
+
+def _spine(task_id=TASK, phase=PHASE, status="in_progress"):
+    """A `Sidecar` as `read` would have returned it, carrying one workable task.
+
+    Built from the real dataclasses rather than a stub with the right attribute
+    names: what `announce_faculties` is handed at runtime IS this shape, and a
+    stub would keep passing after the shape changed — a failure mode this project
+    has already hit (`_spine_with_advice`'s docstring records it)."""
+    rec = c_mod.PhaseRecord(task_id=task_id, phase=phase)
+    task = t_mod.Task(task_id=task_id, title="Wire the panel", status=status)
+    return s_mod.Sidecar(c_mod.PhaseState({task_id: rec}, {}), True, "",
+                         {"events_seen": 0, "last_ts": "", "segments": {}},
+                         {task_id: task})
+
+
+def _marker(session_id=None):
+    return json.loads(pg._beat_path(None, session_id).read_text(encoding="utf-8"))
+
+
+def _pairs():
+    """``(task_id, phase)`` for every activity row, as the payload carries it."""
+    return [(e.payload.get("task_id"), e.payload.get("phase")) for e in _rows()]
 
 
 # --- lighting ---------------------------------------------------------------
@@ -282,3 +312,98 @@ def test_the_marker_write_is_atomic():
     src = inspect.getsource(pg.announce_faculties)
     assert "write_text_atomic" in src
     assert ".write_text(" not in src
+
+
+# --- the task and phase the cat is ABOUT ------------------------------------------
+# `ui_cats.board` has always published `task_id` and `phase` on every cat, and
+# `cat_board.catPanel` has always rendered them. Nothing on the prompt-gate path
+# ever supplied either: `announce_faculties` called `telemetry.emit(faculty,
+# ACTIVE)` and stopped. So the panel showed `task —  phase —` for every faculty the
+# gate lights, on every turn, while the spine in the same hook invocation knew both
+# — a field reading "nothing to report" where the truth was "nobody passed it".
+
+
+def test_an_announced_cat_names_the_task_the_spine_is_steering():
+    """The row the operator actually reads."""
+    pg.announce_faculties({"sop"}, sc=_spine())
+    assert _pairs() == [(TASK, PHASE)]
+
+
+def test_a_turn_with_no_task_leaves_both_rows_empty_rather_than_guessing():
+    """An em-dash is the correct answer when nothing is declared, and it must stay
+    the answer — inventing a task here would put a name on the board that the
+    ledger cannot back. Canary inline: the same call WITH a spine fills, so this
+    negative cannot pass on an announce that never fills anything."""
+    pg.announce_faculties({"sop"})
+    assert _pairs() == [(None, None)]
+
+    pg.announce_faculties({"history"}, sc=_spine())
+    assert (TASK, PHASE) in _pairs()
+
+
+def test_the_beat_re_asserts_the_task_and_not_only_the_faculty():
+    """THE load-bearing one. `telemetry.fold` is last-write-wins and the beat fires
+    from `PostToolUse`, so a beat that re-emitted the faculty WITHOUT the task
+    would blank both rows on the first tool call of the turn — the fields correct
+    for one poll of the board and empty for every poll after it. Asserted through
+    the fold, because the fold is what the endpoint serves."""
+    pg.announce_faculties({"sop"}, sc=_spine())
+    _age_marker(pg.FACULTY_BEAT_SECS + 5)
+    assert pg.beat_faculties() == 1
+    state = tel.fold(ev_mod.read_all())
+    assert (state["sop"].task_id, state["sop"].phase) == (TASK, PHASE)
+
+
+def test_the_second_announce_of_a_turn_does_not_drop_the_task():
+    """One hook invocation announces TWICE — the catalog's cats from
+    `record_direction`, the spine's from the hook body — and the second takes the
+    union branch that REWRITES the marker. Losing the task there is the same
+    last-write-wins blanking as above, one step further along."""
+    pg.announce_faculties({"history"}, sc=_spine())
+    pg.announce_faculties({"sop"})
+    data = _marker()
+    assert (data.get("task_id"), data.get("phase")) == (TASK, PHASE)
+    assert data["faculties"] == ["history", "sop"], "the union itself regressed"
+
+
+def test_a_marker_written_before_this_change_still_beats():
+    """Totality in the direction that actually happens: a marker left by the
+    version before this one carries no `task_id` key at all. A beat that raised on
+    it would strand the cat mid-turn — and a stranded lit cat is what `ui_cats`
+    calls worse than a missing one."""
+    pg.announce_faculties({"sop"}, sc=_spine())
+    pg._beat_path(None, None).write_text(
+        json.dumps({"faculties": ["sop"], "session_id": ""}), encoding="utf-8")
+    _age_marker(pg.FACULTY_BEAT_SECS + 5)
+    assert pg.beat_faculties() == 1
+    assert _pairs()[-1] == (None, None)
+
+
+def test_the_beat_reads_the_marker_and_never_the_sidecar():
+    """`beat_faculties` runs on EVERY tool call, and its whole no-op path is one
+    `stat`. Re-deriving the task from a fresh `sidecar.read` there would put a JSON
+    read on that path for an answer the turn already computed, so the marker
+    carries it. Pinned by making the sidecar unreadable and requiring the beat to
+    still name the task."""
+    pg.announce_faculties({"sop"}, sc=_spine())
+
+    def _explode(*a, **kw):
+        raise AssertionError("the beat must not read the sidecar per tool call")
+
+    original = s_mod.read
+    s_mod.read = _explode
+    try:
+        _age_marker(pg.FACULTY_BEAT_SECS + 5)
+        assert pg.beat_faculties() == 1
+    finally:
+        s_mod.read = original
+    assert _pairs()[-1] == (TASK, PHASE)
+
+
+def test_the_announce_and_the_injector_cannot_disagree_about_the_task():
+    """Two reports on one turn, one source. `steering` is asserted here as the
+    source rather than the literal so that a change to the selection rule moves
+    both together or fails loudly (invariant 10)."""
+    sc = _spine()
+    pg.announce_faculties({"sop"}, sc=sc)
+    assert _pairs() == [i_mod.steering(sc)]
