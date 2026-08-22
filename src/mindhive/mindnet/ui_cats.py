@@ -69,6 +69,62 @@ IDLE_VANISH_SECS = 15
 DISPLAY_ACTIVE = "active"
 DISPLAY_DIM = "dim"
 
+# The one faculty whose engagement IS a skill, and therefore the only one the
+# panel's `skill` row can answer without guessing. `playbook.engaged` lights it
+# from `selected_skills` and `promptgate.record_direction` writes those same
+# names to a `skill_directed` event, so the two ends of the join are the same
+# selection. `history` lights from RECORDS and `sop` from a procedure; labelling
+# either of them with a skill name would be a confident wrong answer where an
+# empty row is the correct one.
+SKILL_FACULTY = "skill-plugin"
+DIRECTION_EVENT = "skill_directed"
+
+
+def directions_by_session(evs) -> dict:
+    """``session -> the newest directed skill names``, comma-joined.
+
+    Newest wins, which is not a choice made here so much as the rule the faculty
+    fold already runs on: a faculty's most recent state IS its state, so its most
+    recent direction is the matching partner. Total for the same reason
+    `telemetry.fold` is — these rows were written by every past version of the
+    gate and one malformed payload must not take out the board."""
+    out: dict = {}
+    for ev in evs or []:
+        if getattr(ev, "type", None) != DIRECTION_EVENT:
+            continue
+        sid = str(getattr(ev, "session_id", "") or "")
+        if not sid:
+            continue
+        p = getattr(ev, "payload", None)
+        rows = p.get("skills") if isinstance(p, dict) else None
+        if not isinstance(rows, list):
+            continue
+        names = [str(r.get("name") or "").strip() for r in rows
+                 if isinstance(r, dict)]
+        names = [n for n in names if n]
+        # An empty list is a real answer and must overwrite an older one: the
+        # gate directing nothing this turn is not the same as it never having
+        # spoken, and keeping the stale names would label the cat with skills
+        # that are no longer running.
+        out[sid] = ", ".join(names)
+    return out
+
+
+def skill_overlay(state, directions) -> dict:
+    """The ``faculty -> skill`` overlay `board` takes, built from *state*'s own
+    sessions.
+
+    Per SESSION, never per project: `paths.detect_project` collapses every
+    worktree of a repo onto one namespace, so a project-wide join would routinely
+    label one session's cat with another session's skills — the same trap
+    `promptgate._beat_path` is keyed by session to avoid."""
+    if not isinstance(state, dict) or not isinstance(directions, dict):
+        return {}
+    act = state.get(SKILL_FACULTY)
+    session = str(getattr(act, "session", "") or "") if act is not None else ""
+    named = directions.get(session, "") if session else ""
+    return {SKILL_FACULTY: named} if named else {}
+
 
 def _parse(ts):
     """*ts* as an aware datetime, or ``None``.

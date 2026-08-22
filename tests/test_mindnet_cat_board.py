@@ -477,3 +477,103 @@ def test_a_session_cat_without_a_plan_still_answers_the_rest(server):
     cat = [c for c in body["sessions"] if c["session_id"] == "chat-cats-1"][0]
     assert cat["phase"] == ""
     assert cat["task"] == "Answer the four questions"
+
+
+# --- the panel's `skill` row had no producer at all ---------------------------
+# `ui_cats.board` has taken a `skills` overlay since MN-5 and documents it as the
+# click-through panel's source, and NO production caller ever passed one: the one
+# call in the tree is `cats_mod.board(tel_state, now)`. So `lookup` was always
+# `{}` and the row rendered an em-dash for every faculty, for every session, on
+# both pages — a field that reads as "nothing to report" when it means "never
+# wired". That is the exact failure `playbook.engaged`'s docstring says the board
+# exists to avoid, and it had it in its own panel.
+#
+# Filled for `skill-plugin` ONLY, and that narrowness is the point. That is the
+# one faculty whose engagement IS a skill: `playbook.engaged` lights it from
+# `selected_skills`, and `record_direction` writes those same names to
+# `skill_directed`. `history` lights from RECORDS, `sop` from a procedure —
+# naming any of them a "skill" would be a confident wrong answer where an empty
+# one is correct.
+
+def _fresh():
+    """`_CATS_MEMO` is process-global and keyed on the project name, which every
+    test in this file shares. The per-test store makes the fingerprint differ in
+    practice, but relying on that is relying on a coincidence."""
+    dashboard._CATS_MEMO.clear()
+    dashboard._SESSIONS_MEMO.clear()
+
+
+def _direct(names, session_id="s1", ts=None):
+    events.append_event("skill_directed",
+                        {"skills": [{"name": n} for n in names]},
+                        session_id=session_id, ts=ts, project="test")
+
+
+def _light(faculty, session_id="s1"):
+    assert tel.emit(faculty, tel.STATUS_ACTIVE,
+                    session_id=session_id) is not None
+
+
+def _rows(server):
+    base, token = server
+    with urllib.request.urlopen(
+            f"{base}/api/mindnet/cats?project=test&token={token}",
+            timeout=20) as r:
+        body = json.loads(r.read().decode("utf-8"))
+    return {c["faculty"]: c for c in body["cats"]}
+
+
+def test_a_skill_plugin_cat_names_the_skill_that_lit_it(server):
+    """RED against `board(tel_state, now)`: the overlay was never supplied."""
+    _fresh()
+    _direct(["ce-code-review"])
+    _light("skill-plugin")
+    row = _rows(server)["skill-plugin"]
+    assert row["skill"] == "ce-code-review", row
+
+
+def test_the_newest_direction_wins_the_way_the_faculty_fold_does(server):
+    """Last write wins is already this fold's whole rule — the overlay must not
+    invent a different one."""
+    _fresh()
+    _direct(["older-skill"], ts="2026-08-01T10:00:00Z")
+    _direct(["newer-skill", "second-skill"], ts="2026-08-01T10:05:00Z")
+    _light("skill-plugin")
+    assert _rows(server)["skill-plugin"]["skill"] == "newer-skill, second-skill"
+
+
+def test_another_sessions_direction_does_not_leak_onto_the_cat(server):
+    """The join is per SESSION, not per project. `paths.detect_project`
+    deliberately collapses every worktree of a repo onto one namespace, so a
+    project-wide join would let one session's skills label a cat another session
+    lit — the same mistake `_beat_path` was keyed by session to avoid."""
+    _fresh()
+    _direct(["not-mine"], session_id="other")
+    _light("skill-plugin", session_id="mine")
+    assert _rows(server)["skill-plugin"]["skill"] == ""
+
+
+def test_a_faculty_whose_engagement_is_not_a_skill_reports_none(server):
+    """`history` lights from records. A direction in the SAME session must not
+    be borrowed to label it — an empty row is the correct answer here, and this
+    test is what stops the overlay being widened to every faculty."""
+    _fresh()
+    _direct(["ce-code-review"])
+    _light("history")
+    _light("skill-plugin")
+    rows = _rows(server)
+    assert rows["history"]["skill"] == ""
+    assert rows["skill-plugin"]["skill"] == "ce-code-review"
+
+
+def test_the_overlay_survives_the_cats_gate(server):
+    """`_CATS_MEMO` answers the common case without reading the ledger, so an
+    overlay computed outside the memo would be present on the miss and gone on
+    every hit after it — a field that flickers empty on a 2.5 s timer."""
+    _fresh()
+    _direct(["ce-code-review"])
+    _light("skill-plugin")
+    first = _rows(server)["skill-plugin"]["skill"]
+    second = _rows(server)["skill-plugin"]["skill"]
+    third = _rows(server)["skill-plugin"]["skill"]
+    assert first == second == third == "ce-code-review", (first, second, third)

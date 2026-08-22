@@ -426,6 +426,7 @@ class GetRoutes:
         memo = _memo_get(_CATS_MEMO, proj) if fp else None
         if memo is not None and memo[0] == fp:
             tel_state, records, plan_index = memo[1], memo[2], memo[3]
+            directions = memo[4]
             have_sessions = True
         else:
             # ONE ledger read for both folds. They ask different questions of
@@ -442,6 +443,12 @@ class GetRoutes:
             # surface this endpoint's own comments were written about.
             rmap = roadmap_mod.fold(evs)
             idx = roadmap_mod.by_session(rmap)
+            # FOURTH fold on the same read, and it must be memoized WITH the
+            # others: the panel's `skill` row is a join between a faculty and
+            # what its own session directed, and computing it outside the memo
+            # would fill the row on a miss and blank it on every hit after —
+            # a field that flickers empty on a 2.5 s timer.
+            directions = cats_mod.directions_by_session(evs)
             # Resolved exactly as the Oversee card resolves it, through the
             # one helper -- the cat used to consult the adoption index alone,
             # so a session with a plan of its own got a phase on the card and
@@ -478,12 +485,18 @@ class GetRoutes:
             # before the gate existed, which is the honest price of a fault.
             if fp and have_sessions:
                 _memo_put(_CATS_MEMO, proj,
-                          (fp, tel_state, records, plan_index))
+                          (fp, tel_state, records, plan_index, directions))
         # Both boards render from THIS call's clock, whatever the gate did.
         # `_with_online` runs unconditionally — on a miss it is a redundant
         # (idempotent) second pass over a few dozen rows, which is the price
         # of there being exactly one place that can freeze `online`.
-        cats = cats_mod.board(tel_state, now)
+        # `skills=` is the overlay `board` has documented since MN-5 and that no
+        # production caller ever supplied, so the click-through panel's `skill`
+        # row rendered an em-dash for every faculty on both pages — a field that
+        # reads "nothing to report" while meaning "never wired", which is the
+        # one failure this board exists to avoid.
+        cats = cats_mod.board(tel_state, now,
+                             skills=cats_mod.skill_overlay(tel_state, directions))
         try:
             sessions = sess_mod.board(_with_online(records, stamp),
                                       now, plans=plan_index)

@@ -354,14 +354,19 @@ def test_the_fold_is_bounded_by_the_canonical_set():
 # --- round-trip ------------------------------------------------------------------------
 
 def test_emitted_events_fold_back_to_the_states_they_recorded():
-    tel.emit("sop", tel.STATUS_ACTIVE, task_id=TASK, phase="plan")
+    tel.emit("sop", tel.STATUS_ACTIVE, task_id=TASK, phase="plan",
+             session_id="s-round-trip")
     tel.emit("history", tel.STATUS_ACTIVE)
     tel.emit("pr-green", tel.STATUS_IDLE)
     state = tel.fold(events.read_all())
     assert set(state) == {"sop", "history", "pr-green"}
+    # `session` is the one field of this round trip that comes off the
+    # ENVELOPE rather than the payload -- `emit` never writes it into the
+    # body -- so naming it here is what proves the fold reads the event and
+    # not just its dict. `ui_cats.skill_overlay` joins on exactly this.
     assert state["sop"] == tel.Activity(
         faculty="sop", status="active", task_id=TASK, phase="plan",
-        ts=state["sop"].ts)
+        ts=state["sop"].ts, session="s-round-trip")
     assert state["sop"].ts
     assert tel.awake(state) == ("sop", "history")
 
