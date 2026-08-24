@@ -686,6 +686,7 @@ EVENT_TYPE_CLASSES = {
     "invoke_result":       "deterministic",
     "job_abandoned":       "deterministic",
     "job_finished":        "deterministic",
+    "context_injected":    "deterministic",
     "job_started":         "deterministic",
     "loop_iteration":      "deterministic",
     "loop_run_dismissed":  "deterministic",

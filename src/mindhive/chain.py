@@ -62,7 +62,12 @@ def write_chain(project=None, evs=None) -> dict:
     c = compute_chain(sealable(rows))
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
-    (pdir / "chain.json").write_text(events.canonical_json(c), encoding="utf-8")
+    # Atomic: the dashboard overview poll and `hive verify` both parse this
+    # file, and a plain write_text truncates before it writes -- measured, a
+    # reader caught the empty window on 6206 of 15421 tries. verify() already
+    # had a `corrupt_chain_file` branch for exactly that, which reported the
+    # LEDGER as corrupt when only the checkpoint was mid-write.
+    paths.write_text_atomic(pdir / "chain.json", events.canonical_json(c))
     return c
 
 
@@ -80,7 +85,7 @@ def verify(project=None, evs=None) -> dict:
         return {"ok": False, "reason": "no chain.json (run: hive project)",
                 "actual": compute_chain(rows)}
     try:
-        stored = json.loads(p.read_text(encoding="utf-8"))
+        stored = json.loads(paths.read_text_retry(p))
     except (json.JSONDecodeError, OSError) as e:
         # A corrupt/truncated chain.json must not crash verify() — callers like
         # the dashboard overview poll rely on it always returning a verdict.

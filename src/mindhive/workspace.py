@@ -392,11 +392,9 @@ def profile_trust(profile: str = "default", folder: str = "") -> dict:
                 entry["hasTrustDialogAccepted"] = True
             else:
                 projects[key] = {"hasTrustDialogAccepted": True}
-        tmp = state_path.with_suffix(".json.tmp")
         try:
-            tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(tmp, state_path)
+            paths.write_text_atomic(
+                state_path, json.dumps(st, ensure_ascii=False, indent=2))
         except OSError as e:
             return {"ok": False, "error": str(e)}
     return {"ok": True, "detail": f"trusted {folder} for profile {profile}"}
@@ -1313,12 +1311,8 @@ def _write_board_locked(tasks: list) -> None:
     """Atomic write (temp + replace): a concurrent reader — the dashboard's
     board poll, or another thread's load_board — must never catch the file
     mid-truncate and see an empty board. Caller holds _BOARD_LOCK."""
-    p = _board_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False, indent=1),
-                   encoding="utf-8")
-    os.replace(tmp, p)
+    paths.write_text_atomic(
+        _board_path(), json.dumps({"tasks": tasks}, ensure_ascii=False, indent=1))
 
 
 def save_board(board: dict) -> dict:

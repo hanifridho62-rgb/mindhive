@@ -1,4 +1,5 @@
 # src/mindhive/events.py
+import contextlib
 import importlib
 import json
 import os
@@ -180,6 +181,21 @@ DETERMINISTIC_TYPES = {
     # membership would put a LEDGER markdown file, a Memory-view row and a
     # recall-corpus entry on disk per button press.
     "job_started", "job_finished", "job_abandoned",
+    # What the six UserPromptSubmit injectors actually delivered this turn (see
+    # injectors.py). One row per CHANGED turn, never one per prompt: at 200
+    # prompts a day, one-row-per-turn is 73,000 rows a year against a
+    # 41,470-event store — 1.76x the whole ledger — and `chain.compute_chain`
+    # folds `read_all()` with no type filter, so every one of them is re-hashed
+    # by every `hive verify`, permanently. Content dedup does not help; the cost
+    # is driven by rows, not bytes. A run of identical turns writes nothing and
+    # the row that closes it carries `unchanged_turns`, so the history stays
+    # exactly reconstructible.
+    #
+    # Deterministic for the same reason as `job_started` and `work_injected`:
+    # machine telemetry carrying no human intent. Semantic membership would put
+    # a LEDGER markdown file, a Memory-view row and a recall-corpus entry on
+    # disk for every prompt anyone ever types.
+    "context_injected",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 
@@ -345,6 +361,97 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
 
+# The append lock. `msvcrt` on Windows, `fcntl` everywhere else; both give a
+# real OS byte-range lock, so the kernel releases it if the holder dies.
+try:                                                    # pragma: no cover
+    import msvcrt
+    _flock = None
+except ImportError:                                     # pragma: no cover
+    msvcrt = None
+    import fcntl as _flock
+
+# How long an append waits for its segment before writing anyway. The critical
+# section is one small write, so reaching this bound means something is wedged
+# rather than merely busy.
+_LOCK_WAIT_S = 10.0
+
+
+@contextlib.contextmanager
+def _append_lock(project):
+    """Serialise ledger appends for one namespace ACROSS PROCESSES AND THREADS.
+
+    `open(seg, "a")` is NOT an atomic append on Windows: the CRT seeks to end and
+    then writes, two syscalls, so two processes can take the same offset and the
+    second silently overwrites the first. Measured here with six processes
+    appending sixty rows each into one segment: 72 of 360 rows GONE, five runs
+    out of five; twelve-way lost 606 of 2400. The same race tears rows, leaving
+    the exact fragment `_row_to_event` above was hardened to tolerate -- reads
+    were made total long before the write was made atomic, and the seven corrupt
+    rows in the live ledger between 2026-07-19 and 2026-08-12 are its
+    fingerprints.
+
+    `os.write` on an O_APPEND descriptor was measured as the cheaper fix and is
+    NOT one (328 lost against 322 for the plain write): Windows has no
+    atomic-append syscall to reach for, so the serialisation has to be explicit.
+
+    An OS byte-range lock, rather than the O_CREAT|O_EXCL sidecar pattern
+    `tasktool` uses: same zero-loss result, three times faster under twelve-way
+    contention (0.89s against 2.68s), and no stale lock file can wedge later
+    appends, because the kernel drops the lock when the holding process exits.
+
+    ONE lock for the whole namespace, held in the project directory rather than
+    a companion beside each segment. Per-segment would allow more parallelism
+    that nothing here needs -- the real contention is several tool calls inside
+    ONE session, which share a segment anyway -- and it would leave a `.lock`
+    next to each of the live store's ~930 segments. `events/` holds segments and
+    nothing else; that is worth more than the parallelism.
+
+    Threads are covered as well as processes: Windows locks are per HANDLE, and
+    each caller opens its own, so two threads of the dashboard's
+    ThreadingHTTPServer contend exactly as two processes do. Measured: twelve
+    threads x 100 appends, 1200 of 1200 intact, worst single append 0.317s while
+    ten spinners fought them for the CPU.
+
+    Fails OPEN in both directions -- if the lock cannot be created, and if the
+    deadline passes. A process that writes unserialised has a bad day; a process
+    that refuses to record the caller's event has lost it forever.
+    """
+    fd, held = None, False
+    try:
+        lock = paths.project_dir(project) / "append.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o666)
+    except OSError:
+        yield
+        return
+    try:
+        deadline = time.monotonic() + _LOCK_WAIT_S
+        while True:
+            try:
+                if msvcrt is not None:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    _flock.flock(fd, _flock.LOCK_EX | _flock.LOCK_NB)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.001)
+        yield
+    finally:
+        if held:
+            try:
+                if msvcrt is not None:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    _flock.flock(fd, _flock.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
 def append_event(event_type, payload, session_id=None, tags=None, ts=None, project=None) -> "Event":
     if event_type not in VALID_TYPES:
         raise ValueError(f"unknown event type: {event_type}")
@@ -354,8 +461,9 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None, proje
     d = paths.events_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     seg = d / f"{session_id}.jsonl"
-    with open(seg, "a", encoding="utf-8") as f:
-        f.write(canonical_json(to_dict(ev)) + "\n")
+    with _append_lock(project):
+        with open(seg, "a", encoding="utf-8") as f:
+            f.write(canonical_json(to_dict(ev)) + "\n")
     return ev
 
 
@@ -460,7 +568,15 @@ def corrupt_rows(project=None) -> list[dict]:
     read_all() skips exactly these rows so folds and projections stay total;
     this is the strict companion that REPORTS them, so `hive verify` and the
     dashboard can show corruption instead of it passing silently. Returns [] for
-    a clean store. Each row: ``{segment, line, reason, preview}``."""
+    a clean store. Each row: ``{segment, line, reason, preview}``.
+
+    `line` is ZERO-BASED, so `sed -n 40p` finds the row this reports as 39. That
+    is off by one from every editor and every other line-numbering tool, and it
+    cost real time during an investigation, but it is not a typo to fix here:
+    `pgmirror.scan_segments` numbers `seg_line` the same way, that number is a
+    stored join key in the Postgres mirror, and the two agreeing matters more
+    than either matching `sed`. Add one before quoting a line number to a human.
+    """
     d = paths.events_dir(project)
     out: list[dict] = []
     if not d.exists():

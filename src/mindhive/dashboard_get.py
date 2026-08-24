@@ -365,6 +365,25 @@ class GetRoutes:
         return self._json(plugins_mod.call_history(name, project=proj,
                                                    limit=limit, evs=evs))
 
+    def _get_injection(self, proj, am, qs):
+        # What the six UserPromptSubmit injectors delivered, per turn.
+        #
+        # ITS OWN ROUTE rather than a field on /api/oversee, and the reason is
+        # not tidiness: that board is a fold over the SESSIONS on it, while an
+        # injection belongs to a TURN, and the newest turn routinely belongs to
+        # a session with no tool events yet -- one that the board has therefore
+        # not drawn. Folding this in would drop exactly the most recent case,
+        # which is the one the operator opened the page to see.
+        #
+        # No gate needed and none wanted: both reads below are one O(1) sidecar
+        # file. That is the whole point of keeping the ring off the ledger --
+        # `/api/mindnet/cats` had to be gated only because it folded `read_all`
+        # on a route every open page polls.
+        from . import injectors as inj_mod
+        return self._json({"ok": True,
+                           "current": inj_mod.read_last(proj),
+                           "recent": inj_mod.recent_turns(proj)})
+
     def _get_mindnet_cats(self, proj, am, qs):
         # MN-5's cat board: which faculties are awake, dimming, or gone.
         # Imported lazily like the other mindnet touchpoints so a dashboard
@@ -750,6 +769,7 @@ class GetRoutes:
         "/api/recall": _get_recall,
         "/api/graph": _get_graph,
         "/api/mindnet/cats": _get_mindnet_cats,
+        "/api/injection": _get_injection,
         "/api/plugins/recommend": _get_plugins_recommend,
         "/api/plugins/inventory": _get_plugins_inventory,
         "/api/skills/detail": _get_skills_detail,

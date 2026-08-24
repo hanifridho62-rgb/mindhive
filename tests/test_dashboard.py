@@ -691,6 +691,12 @@ _MOTION_GUARDS = {
     ".mn-cat.active svg": ".mn-cat-sprite",
     ".mn-sess.working .mn-cat-sprite": ".mn-cat-sprite",
     ".mn-sess": ".mn-sess",
+    # The injection row: only a VERBATIM turn bobs. A turn that delivered
+    # nothing must not move -- that is the whole point of the three states --
+    # so this is one entry, not three. The sprite guard reaches it because
+    # `catSVG` stamps `.mn-cat-sprite` on every cat it draws, and the guard
+    # carries `!important`, which is what beats this rule's higher specificity.
+    ".mn-inj.verbatim .mn-cat-sprite": ".mn-cat-sprite",
     # taskview.py
     ".tstat.ongoing": ".tstat.ongoing",
 }

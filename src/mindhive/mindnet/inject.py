@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import re
 
+from .. import injectors
 from . import phases as ph_mod
 from . import sidecar as s_mod
 from . import tasks as t_mod
@@ -529,11 +530,34 @@ def extend_hook_context(context, raw, project=None, sc=None) -> dict:
         text = block(sc)
         if not text:
             return context
-        base = context if isinstance(context, dict) else {}
-        hso = dict(base.get("hookSpecificOutput") or {})
-        prev = str(hso.get("additionalContext") or "")
-        hso["hookEventName"] = "UserPromptSubmit"
-        hso["additionalContext"] = f"{prev}\n{text}" if prev else text
-        return dict(base, hookSpecificOutput=hso)
+        return injectors.merge_hook_context(context, text, sep="\n")
     except Exception:
         return context
+
+
+# --- T2: the injection probe ----------------------------------------------------
+
+def probe(sc=None, project=None) -> dict:
+    """What the spine would steer with, and whether it can steer at all.
+
+    The `partial` branch is not hypothetical: on 2026-08-23 the live sidecar was
+    stale, so every prompt that day received `AGNOSTIC_BLOCK` — the shorter
+    "projection is out of date" text — instead of per-task direction, and
+    nothing recorded the difference. That is the state this verdict names."""
+    if sc is None:
+        try:
+            from . import sidecar as _sidecar
+            sc = _sidecar.read(project)
+        except Exception:                                   # noqa: BLE001
+            sc = None
+    if sc is None:
+        return {"verdict": "silent", "chars": 0,
+                "reason": "no MindNetwork sidecar could be read"}
+    if not getattr(sc, "fresh", False):
+        return {"verdict": "partial", "chars": len(AGNOSTIC_BLOCK),
+                "reason": ("sidecar projection is out of date — the agnostic block "
+                           "ships and no per-task direction is given; "
+                           "run `hive mindnet rebuild`"),
+                "text": AGNOSTIC_BLOCK}
+    return {"verdict": "verbatim", "chars": 0,
+            "reason": "spine fresh — per-task direction available this turn"}

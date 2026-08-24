@@ -318,7 +318,7 @@ def _load_state(project) -> dict:
     p = _state_path(project)
     if p.exists():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            return json.loads(paths.read_text_retry(p))
         except Exception:
             return {}
     return {}
@@ -326,7 +326,10 @@ def _load_state(project) -> dict:
 
 def _save_state(project, state):
     paths.project_dir(project).mkdir(parents=True, exist_ok=True)
-    _state_path(project).write_text(events.canonical_json(state), encoding="utf-8")
+    # Atomic: `_load_state` answers {} for an unparseable file, so a reader
+    # that catches this mid-write does not see an error -- it sees a cursor
+    # reset to the beginning, which is the same shape as a first run.
+    paths.write_text_atomic(_state_path(project), events.canonical_json(state))
 
 
 def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:

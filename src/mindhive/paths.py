@@ -1,6 +1,7 @@
 # src/mindhive/paths.py
 import itertools
 import os
+import time
 import re
 import subprocess
 from pathlib import Path
@@ -17,6 +18,58 @@ def store_home() -> Path:
 
 # Per-process, per-call temp-file discriminator. See write_text_atomic.
 _TMP_SEQ = itertools.count(1)
+
+
+# A publish that loses a race with a READER retries this many times, doubling
+# the wait each time from this base: 5, 10, 20 ... 320ms, ~635ms before it gives
+# up. `workspace.load_board` retries the READER side of the identical violation
+# with a flat 4 x 20ms; the writer side is measurably harder and needed its own
+# numbers rather than a matching pair that loses.
+_REPLACE_TRIES = 8
+_REPLACE_BACKOFF = 0.005
+
+
+def _replace_with_retry(tmp, path) -> None:
+    """`os.replace` is atomic on Windows; it is not always ALLOWED.
+
+    Windows refuses to replace a destination that another process holds open
+    without FILE_SHARE_DELETE, and Python's `open()` does not ask for it. So
+    every reader of a published file is, for the instant it holds the handle, a
+    reason for the publish to raise PermissionError (WinError 5) -- against the
+    DESTINATION, a file that exists and is perfectly intact.
+
+    That is not hypothetical and it is not rare. A reader looping on one file
+    made the unguarded version raise inside 0.25s, every run. Nineteen call
+    sites reach this function, and `chain.write_chain` is one of them with no
+    try/except of its own, so a dashboard poll landing on `chain.json` at the
+    wrong microsecond could take `hive project` down with it.
+
+    The backoff was measured, not guessed. 600 publishes against one reader,
+    counting publishes that never landed::
+
+        reader           none   4x20ms   8x5ms-exp   12x10ms
+        tight loop        264       38           0         0
+        1ms between        67        0           0         0
+        5ms between        19        0           0         0
+
+    Doubling wins twice over a flat wait: it is the only bounded policy that
+    survives a reader holding the handle continuously, AND it is faster there
+    (9.1s against 11.0s for those 600), because the common case clears on the
+    first 5ms sleep instead of always paying 20.
+
+    Past the last try the error is RAISED, not swallowed. A publish that never
+    happened must not look like one that did -- that is the failure this whole
+    function exists to prevent, and eating the exception here would reintroduce
+    it one layer up.
+    """
+    for attempt in range(_REPLACE_TRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_TRIES:
+                raise
+            time.sleep(_REPLACE_BACKOFF * (2 ** attempt))
 
 
 def write_text_atomic(path, text: str) -> None:
@@ -44,7 +97,7 @@ def write_text_atomic(path, text: str) -> None:
                                            next(_TMP_SEQ)))
     try:
         tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         # A shared name self-healed: the next writer overwrote the litter. A
         # unique one never will, so a failed write has to clean up after
@@ -54,6 +107,38 @@ def write_text_atomic(path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def read_text_retry(path) -> str:
+    """Read a file that a writer may be publishing over, without being denied.
+
+    The mirror of `_replace_with_retry`, and the reason it is needed: making
+    the write atomic removes torn CONTENT entirely (measured, 6218 torn reads
+    in 15977 became 0) but leaves a SHARING VIOLATION -- for the instant
+    `os.replace` holds the destination, a reader's `open()` is refused. 300
+    refusals in 56483 reads, against a writer publishing flat out.
+
+    Callers turn that refusal into a wrong answer rather than an error, which
+    is why it matters: `chain.verify` catches OSError and reports
+    `corrupt_chain_file`, showing the whole LEDGER as corrupt when only the
+    checkpoint was being replaced; `harvest._load_state` catches everything and
+    answers `{}`, a cursor reset wearing a first run's costume.
+
+    A MISSING file raises. Absence is a real answer, retrying it cannot change
+    it, and the common first-run path must not pay eight sleeps to learn so --
+    `workspace.load_board` draws the line in exactly the same place. Only
+    PermissionError is transient, and only now that torn content is impossible:
+    a JSON error from this file means the file is really damaged, so retrying
+    it would be waiting for a bug to fix itself.
+    """
+    for attempt in range(_REPLACE_TRIES):
+        try:
+            return Path(path).read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_TRIES:
+                raise
+            time.sleep(_REPLACE_BACKOFF * (2 ** attempt))
+    raise AssertionError("unreachable")          # pragma: no cover
 
 
 def normalize(name: str) -> str:

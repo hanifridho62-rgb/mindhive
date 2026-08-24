@@ -291,10 +291,9 @@ def build_and_store(root=None, lanes=None, project=None,
     """
     payload = build(root=root, lanes=lanes, use_git=use_git)
     p = _db_path(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(ev_mod.canonical_json(payload), encoding="utf-8")
-    tmp.replace(p)  # atomic overwrite-in-place — no unbounded growth
+    # Atomic overwrite-in-place via the shared writer (private tmp + retry); no
+    # unbounded growth, and no `<name>.tmp` two concurrent writers could share.
+    paths.write_text_atomic(p, ev_mod.canonical_json(payload))
     return payload
 
 

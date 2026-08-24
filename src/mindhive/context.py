@@ -21,7 +21,7 @@ which is the enforcement hook adoption flows and scripts gate on. Without a
 persisted budget, ``over_budget`` was computed and thrown away every run — a
 silent regression path for every new plugin or adopted skill.
 
-Two origins are measured:
+Three origins are measured:
 
 ``hive``    the artifacts this tool itself maintains — STATE.md, BRIEFING.md,
             SOUL.md in the namespace directory, plus the native MEMORY.md that
@@ -29,6 +29,10 @@ Two origins are measured:
 ``claude``  the wider always-on load — the user's CLAUDE.md and the trigger
             description of every installed plugin skill, which is resident in
             context before any work begins.
+``hook``    what the UserPromptSubmit injectors add to EVERY prompt, read from
+            the injection sidecar. The first two are paid once per session; this
+            one is paid per turn, and leaving it out was the difference between
+            a report that read under budget and a turn that was over it.
 
 The pipeline is four stages over one currency, the ``Segment``: collect (the
 only stage that touches the filesystem), ``analyze`` (totals, ranking, share,
@@ -95,11 +99,11 @@ _TRAILING_PUNCT = ".,;:!?)]}'\""
 class Segment:
     """One measured contributor to auto-loaded context."""
     name: str
-    origin: str          # "hive" | "claude"
+    origin: str          # "hive" | "claude" | "hook"
     path: str            # "" when the segment is not a single file
     nbytes: int
     tokens: int
-    kind: str            # "artifact" | "skill" | "instructions"
+    kind: str            # "artifact" | "skill" | "instructions" | "injection"
     detail: str = ""
 
 
@@ -523,6 +527,45 @@ def collect_claude(home: Path | None = None,
 # --------------------------------------------------------------------------
 # analysis
 # --------------------------------------------------------------------------
+
+def collect_hook(project: str | None = None) -> list[Segment]:
+    """T9 — the per-PROMPT load, read from the injection sidecar.
+
+    The other two collectors measure what is resident before any work begins.
+    This one measures what every single prompt spends on top of that, which is
+    the half `--check` was blind to: the report read 2,996 tokens under budget
+    while one turn was quietly spending ~1,235 of them, and a budget that cannot
+    see the recurring cost cannot be exceeded for a reason it can name.
+
+    Reads the sidecar, never the ledger: this is a reporting path and
+    `events.read_all` is 0.36 s on the live store. One segment per registered
+    pass, INCLUDING the ones that stayed quiet -- a pass missing from a report
+    reads as a pass that does not exist, and only "had nothing to say" is true.
+
+    Total, like every collector here: a store with no recorded turn, or a
+    sidecar that will not parse, is an empty list rather than an exception."""
+    try:
+        from . import injectors
+        rows = injectors.read_last(project=project).get("injectors") or []
+    except Exception:                                   # noqa: BLE001
+        return []
+    out: list[Segment] = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("name"):
+            continue
+        try:
+            nbytes = int(row.get("chars") or 0)
+            tokens = int(row.get("tokens") or 0)
+        except (TypeError, ValueError):
+            continue
+        verdict = str(row.get("verdict") or "?")
+        reason = str(row.get("reason") or "")
+        out.append(Segment(
+            name=str(row["name"]), origin="hook", path="", nbytes=nbytes,
+            tokens=tokens, kind="injection",
+            detail=f"{verdict}: {reason}" if reason else verdict))
+    return out
+
 
 def analyze(segments: list[Segment], budget: int | None = None) -> dict:
     """Total, rank, and (optionally) compare against a token budget.

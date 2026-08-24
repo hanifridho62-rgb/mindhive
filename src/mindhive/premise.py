@@ -84,7 +84,7 @@ import os
 import re
 from pathlib import Path
 
-from . import roadmap, verify
+from . import injectors, roadmap, verify
 
 PREMISE_MARK = "[mindhive-premise]"
 
@@ -548,11 +548,7 @@ def extend_hook_context(context, raw, project=None) -> dict:
                              root=None))
         if not block:
             return context
-        hso = (context or {}).get("hookSpecificOutput") or {}
-        existing = str(hso.get("additionalContext") or "")
-        merged = f"{existing}\n\n{block}" if existing else block
-        return dict(context or {}, hookSpecificOutput=dict(
-            hso, hookEventName="UserPromptSubmit", additionalContext=merged))
+        return injectors.merge_hook_context(context, block)
     except Exception:                                   # noqa: BLE001
         return context
 
@@ -584,3 +580,31 @@ def _events_for(claims, project=None):
         return ev_mod.read_all(project)
     except Exception:                                   # noqa: BLE001
         return []
+
+
+# --- T2: the injection probe ----------------------------------------------------
+
+def probe(prompt=None, project=None) -> dict:
+    """What this pass would deliver.
+
+    Without a prompt the honest answer is a readiness report, not a size: this
+    pass fires only on prompts that ASSERT checkable facts, so `silent` here
+    means "nothing asserted", which is a different fact from "fell open" and is
+    exactly the distinction `injectors.py` exists to preserve. Measured across
+    five prompt shapes on 2026-08-23 it contributed zero characters to all five,
+    which is very likely correct behaviour and is recorded as a thing to
+    instrument rather than a thing to fix."""
+    if not prompt:
+        return {"verdict": "silent", "chars": 0,
+                "reason": ("fires only on prompts asserting checkable facts "
+                           "(paths, roadmap ids, test counts); no prompt to check")}
+    claims = 0
+    try:
+        claims = len(_PATH_RE.findall(str(prompt)[:PREMISE_SCAN_CAP]))
+    except Exception:                                       # noqa: BLE001
+        claims = 0
+    if not claims:
+        return {"verdict": "silent", "chars": 0,
+                "reason": "prompt asserts no checkable path, roadmap id or test count"}
+    return {"verdict": "verbatim", "chars": 0,
+            "reason": f"{claims} checkable claim(s) found in prompt"}

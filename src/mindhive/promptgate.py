@@ -19,7 +19,6 @@ payload yields no injection; the gate can never break a prompt.
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 
@@ -403,20 +402,23 @@ def _manifest_path(project=None):
 def load_manifest(project=None) -> dict:
     """The trained trigger manifest, or {} when missing/corrupt (fail-open)."""
     try:
-        obj = json.loads(_manifest_path(project).read_text(encoding="utf-8"))
+        obj = json.loads(paths.read_text_retry(_manifest_path(project)))
         return obj if isinstance(obj, dict) else {}
     except (OSError, json.JSONDecodeError, ValueError):
+        # A missing manifest is a real {} (first run); a read denied by a
+        # concurrent publish is retried by read_text_retry before it lands here.
         return {}
 
 
 def _write_manifest(project, data) -> None:
-    p = _manifest_path(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # Per-writer tmp name: two concurrent session-start trainers must never
-    # interleave into one tmp file before the atomic rename.
-    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, p)
+    # Through the shared atomic writer. The hand-rolled version scoped its temp
+    # name by pid ALONE — enough for two processes, NOT for two threads of one,
+    # and the dashboard serves on threads, so two trainers in one process could
+    # share `<name>.<pid>.tmp` and publish a torn hybrid. `write_text_atomic`
+    # adds a per-call counter, and retries the Windows publish that a concurrent
+    # reader of this every-prompt manifest can otherwise refuse.
+    paths.write_text_atomic(
+        _manifest_path(project), json.dumps(data, indent=2, sort_keys=True))
 
 
 def _age_hours(ts: str):
@@ -923,3 +925,27 @@ def hook_context(raw: str, project=None) -> dict:
         }}
     except Exception:
         return {}
+
+
+# --- T2: the injection probe ----------------------------------------------------
+
+def probe(project=None) -> dict:
+    """What the gate could deliver this session, read off the trained manifest.
+
+    Deliberately reports READINESS, not size: what this pass injects depends on
+    the prompt (`assess(prompt)["skip"]` decides), and a probe that invented a
+    prompt to measure would be reporting on a prompt nobody typed. Measured
+    2026-08-23, its real contribution swung 0 to 1,464 chars across five prompt
+    shapes — the only variable part of the whole pipeline."""
+    manifest = load_manifest(project)
+    if not manifest:
+        return {"verdict": "silent", "chars": 0,
+                "reason": "no trigger manifest on disk — the gate can direct nothing"}
+    rules = manifest.get("rules")
+    count = len(rules) if isinstance(rules, (list, dict, tuple)) else 0
+    if not count:
+        return {"verdict": "partial", "chars": 0,
+                "reason": "manifest present but carries no trained rules"}
+    return {"verdict": "verbatim", "chars": 0,
+            "reason": (f"{count} trained rule(s) ready; fires on an "
+                       "underspecified or code-work prompt")}

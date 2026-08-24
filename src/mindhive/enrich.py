@@ -482,3 +482,20 @@ def extend_hook_context(context, raw, project=None) -> dict:
         return dict(context, hookSpecificOutput=new_hso)
     except Exception:
         return context
+
+
+# --- T2: the injection probe ----------------------------------------------------
+
+def probe(project=None) -> dict:
+    """Whether enrichment would extend the gate's context at all.
+
+    `silent` here is a SETTING, not a fault, and the reason says so — the whole
+    point of a three-state verdict is that an operator can tell a switched-off
+    pass from a broken one."""
+    s = settings(project)
+    on = bool(s.get("enabled"))
+    src = s.get("source") or "default"
+    return {"verdict": "verbatim" if on else "silent", "chars": 0,
+            "reason": (f"enrichment enabled (source: {src}); extends the gate's "
+                       "context when the gate fires" if on
+                       else f"enrichment switched off (source: {src})")}

@@ -12,6 +12,9 @@ pre-created .hive-loop dir) still set their own env in-body. monkeypatch applies
 those AFTER this fixture, so the in-body values win — those files keep their
 local helper on purpose.
 """
+import os
+from pathlib import Path
+
 import pytest
 
 
@@ -22,3 +25,34 @@ def isolate_store(tmp_path, monkeypatch):
     # Auto-resume scheduling must never register a REAL Windows scheduled
     # task from inside the suite (autoresume._timer_enabled reads this).
     monkeypatch.setenv("MINDHIVE_AUTORESUME_TIMER", "off")
+    yield
+    # The isolation is only as good as the last line of the test. A blanket
+    # `monkeypatch.undo()` inside a test body -- reached for to restore one
+    # patched attribute -- also undoes THIS fixture, because pytest hands the
+    # whole module one function-scoped monkeypatch. Everything the test writes
+    # after that lands in the developer's real ~/.mindhive, silently: no error,
+    # no failed assertion, just rows quietly appearing in the live store.
+    #
+    # It had been happening since 2026-08-13. `~/.mindhive/test/events/manual.jsonl`
+    # held 82 job_started/job_finished pairs, one per full suite run, all from a
+    # single test that called undo() to put `threading.Thread` back. Nothing
+    # reported it because nothing was watching for it.
+    #
+    # This check is what watches. It costs one string comparison per test and it
+    # names the test that escaped, at the moment it escapes.
+    # The bar is "not the developer's real store", NOT "exactly tmp_path". A
+    # first cut demanded equality and reported 138 failures on a green suite:
+    # setting MINDHIVE_HOME to a tmp SUBDIR is a documented, supported variant
+    # (tests/test_vectors.py:10 uses `tmp_path / "store"`), and a check that
+    # forbids the supported case is a broken check, not a strict one.
+    home = os.environ.get("MINDHIVE_HOME")
+    real = Path.home() / ".mindhive"
+    escaped = not home or Path(home).resolve() == real.resolve()
+    assert not escaped, (
+        "this test left MINDHIVE_HOME pointing at the REAL store (%s) — "
+        "everything it wrote after that moment landed in the developer's live "
+        "ledger, silently. A blanket monkeypatch.undo() is the usual cause, "
+        "because pytest hands this fixture and the test body the same "
+        "function-scoped monkeypatch; restore the one attribute you patched "
+        "instead, or scope it with `with monkeypatch.context() as m:`."
+        % (home or "unset -> ~/.mindhive"))

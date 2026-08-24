@@ -150,10 +150,11 @@ def queue(evs, session_id=None, project=None):
         "created_at": ev_mod.now_iso(),
         "session_id": session_id,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(marker, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # One shared idiom (paths.write_text_atomic), not a fifth hand-rolled copy.
+    # The private-tmp-name and Windows publish-retry both live there; the copies
+    # here all used `<name>.json.tmp`, the shared name whose clobber that helper
+    # was written to end.
+    paths.write_text_atomic(path, json.dumps(marker, indent=2))
     return marker
 
 
@@ -192,10 +193,7 @@ def clear(project=None) -> bool:
 def _write_marker(marker, project=None) -> None:
     """Persist the marker through the module's own temp-file-plus-replace idiom."""
     path = pending_path(project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(marker, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    paths.write_text_atomic(path, json.dumps(marker, indent=2))
 
 
 def discharge(files, project=None) -> dict | None:

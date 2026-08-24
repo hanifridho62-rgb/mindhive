@@ -1,6 +1,5 @@
 # src/mindhive/projector.py
 import hashlib
-import os
 import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import roadmap
@@ -323,19 +322,12 @@ def _project(project=None, evs=None, suggestions=None) -> dict:
     # atomic rename lands a file that is atomically corrupt. A unique name makes
     # each render internally consistent no matter who else is writing; the
     # rename stays atomic, so the loser simply loses cleanly.
-    tmp = pdir / f"STATE.md.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        tmp.write_text(compose_state(evs, project, suggestions=suggestions),
-                       encoding="utf-8")
-        tmp.replace(pdir / "STATE.md")
-    finally:
-        # A crash between write and replace would otherwise leave a uniquely
-        # named orphan behind forever, which the fixed name never could.
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    # The shared writer already does what this block hand-rolled: a temp name
+    # unique per process AND per call (so concurrent renders never interleave),
+    # cleanup of the temp on any failure, and a retry of the Windows publish the
+    # dashboard's constant STATE.md reads can otherwise refuse.
+    paths.write_text_atomic(pdir / "STATE.md",
+                            compose_state(evs, project, suggestions=suggestions))
 
     ldir = pdir / "LEDGER"
     ldir.mkdir(exist_ok=True)
@@ -350,7 +342,9 @@ def _project(project=None, evs=None, suggestions=None) -> dict:
             f.unlink()
             pruned += 1
 
-    (pdir / "index.json").write_text(
-        events.canonical_json(build_index(entries)), encoding="utf-8")
+    # Atomic, for the same reason as chain.json below it: this is a
+    # projection the dashboard parses while `hive project` is rewriting it.
+    paths.write_text_atomic(pdir / "index.json",
+                            events.canonical_json(build_index(entries)))
     chain.write_chain(project, evs=evs)  # reuse the events we already read
     return {"events": len(evs), "ledger": len(entries), "pruned": pruned}

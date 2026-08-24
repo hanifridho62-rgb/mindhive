@@ -491,11 +491,8 @@ class Leaderboard:
         return exps if isinstance(exps, list) else []
 
     def _write(self, experiments: list) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"experiments": experiments},
-                                  ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, self._path)
+        paths.write_text_atomic(self._path, json.dumps(
+            {"experiments": experiments}, ensure_ascii=False, indent=1))
 
     def add(self, record: dict) -> dict:
         rec = dict(record)
@@ -960,12 +957,9 @@ class ResearchController:
         try:
             prds = self.prds()
             prds.append(parse_prd(report, self._count, self._goal))
-            pj = self._prds_path()
-            pj.parent.mkdir(parents=True, exist_ok=True)
-            tmp = pj.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(prds, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            os.replace(tmp, pj)
+            paths.write_text_atomic(
+                self._prds_path(),
+                json.dumps(prds, ensure_ascii=False, indent=1))
         except OSError as e:
             self.emit(f"· PRD {self._count} ledgered, but its card-store "
                       f"write failed: {e}")
@@ -994,12 +988,9 @@ class ResearchController:
             merged = self.skill_tally()
             for k, v in self._tally.items():
                 merged[k] = v
-            p = self._tally_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            os.replace(tmp, p)
+            paths.write_text_atomic(
+                self._tally_path(),
+                json.dumps(merged, ensure_ascii=False, indent=1))
         except OSError:
             pass                          # the tally must never crash the loop
 
