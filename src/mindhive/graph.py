@@ -212,9 +212,9 @@ def build(project=None, semantic: bool = False, _evs=None) -> dict:
     pdir.mkdir(parents=True, exist_ok=True)
     from . import events as ev_mod2  # canonical_json lives here
     gfile = pdir / "graph.json"
-    tmp = pdir / "graph.json.tmp"
-    tmp.write_text(ev_mod2.canonical_json(result), encoding="utf-8")
-    tmp.replace(gfile)
+    # Shared writer: the old `graph.json.tmp` was one fixed name two concurrent
+    # graph builds would both write and then both rename, publishing a hybrid.
+    paths.write_text_atomic(gfile, ev_mod2.canonical_json(result))
 
     return result
 

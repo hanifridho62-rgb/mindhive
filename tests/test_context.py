@@ -909,3 +909,84 @@ def test_probe_reports_byte_truncation_as_degraded(tmp_path):
     assert report.outcome == outcomes.DEGRADED
     assert not report.worked
     assert "Key decisions" in report.summary
+
+
+# --------------------------------------------------------------------------
+# T9 — the `hook` origin: what a single PROMPT spends, not just the session
+# --------------------------------------------------------------------------
+
+def _record(rows, project="test"):
+    from mindhive import injectors
+    payload = [injectors.Injection(name=n, verdict=v, chars=c, tokens=c // 4,
+                                   ms=1, reason=f"{n} says {v}", text="x" * c)
+               for n, v, c in rows]
+    injectors.record_turn(payload, session_id="s1", project=project)
+
+
+def test_collect_hook_reports_one_segment_per_pass_that_spoke():
+    """G5, in one sentence: `hive context --check` measured the session-start
+    load and called it the total, while six injectors spent ~1,235 tokens on
+    every single prompt and appeared nowhere. A budget that omits the per-turn
+    cost reads under budget while the turn is over it."""
+    _record([("sopgate", "verbatim", 2945), ("style", "verbatim", 676)])
+    segs = context.collect_hook(project="test")
+    assert {s.name for s in segs} == {"sopgate", "style"}
+    assert all(s.origin == "hook" for s in segs)
+    assert sum(s.tokens for s in segs) > 0
+
+
+def test_a_pass_that_stayed_silent_is_still_listed_at_zero():
+    """The same rule the cats follow. A pass missing from the report reads as a
+    pass that does not exist; a pass listed at zero reads as one that had
+    nothing to say, and only the second is true."""
+    _record([("premise", "silent", 0), ("style", "verbatim", 676)])
+    segs = context.collect_hook(project="test")
+    silent = [s for s in segs if s.name == "premise"]
+    assert len(silent) == 1
+    assert silent[0].tokens == 0
+    assert "silent" in silent[0].detail
+
+
+def test_the_hook_origin_lands_in_the_analysis_beside_the_other_two():
+    """`analyze` is origin-agnostic by design, so a third origin needs no change
+    there. This is the test that proves that claim rather than asserting it."""
+    _record([("sopgate", "verbatim", 2945)])
+    segs = (context.collect_hive(project="test")
+            + context.collect_hook(project="test"))
+    report = context.analyze(segs, budget=50_000)
+    assert "hook" in report["by_origin"]
+    assert report["by_origin"]["hook"]["tokens"] > 0
+
+
+def test_the_hook_total_actually_moves_the_measured_total():
+    """The point of the whole task. Without this origin the two totals are
+    identical, and a report that cannot tell them apart cannot be over budget
+    for a reason it can name."""
+    _record([("sopgate", "verbatim", 2945), ("style", "verbatim", 676)])
+    hive_only = context.analyze(context.collect_hive(project="test"))
+    with_hook = context.analyze(context.collect_hive(project="test")
+                                + context.collect_hook(project="test"))
+    assert with_hook["total_tokens"] > hive_only["total_tokens"]
+
+
+def test_collect_hook_is_empty_and_silent_without_a_sidecar():
+    """Totality. A store where no prompt has run yet is an empty list, never an
+    exception on a reporting path."""
+    assert context.collect_hook(project="never-written") == []
+
+
+def test_collect_hook_survives_a_corrupt_sidecar(tmp_path):
+    from mindhive import injectors
+    p = injectors.sidecar_path(project="test")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json", encoding="utf-8")
+    assert context.collect_hook(project="test") == []
+
+
+def test_the_cli_reports_the_hook_origin(capsys):
+    from mindhive import __main__ as cli_mod
+    _record([("sopgate", "verbatim", 2945)])
+    assert cli_mod.main(["context", "--origin", "hook"]) == 0
+    out = capsys.readouterr().out
+    assert "hook" in out
+    assert "sopgate" in out

@@ -101,10 +101,7 @@ def queue(evs, session_id=None, project=None):
         "created_at": ev_mod.now_iso(),
         "session_id": session_id,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(marker, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    paths.write_text_atomic(path, json.dumps(marker, indent=2))
     return marker
 
 

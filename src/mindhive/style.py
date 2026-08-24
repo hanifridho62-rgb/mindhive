@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import paths
+from . import injectors, paths
 from .promptgate import PROMPT_SCAN_CAP
 
 # Marker so an injected style block is greppable in a transcript and tellable
@@ -296,10 +296,22 @@ def extend_hook_context(context, raw, project=None) -> dict:
                           payload.get("session_id"), project)
         if not block:
             return context
-        hso = (context or {}).get("hookSpecificOutput") or {}
-        existing = str(hso.get("additionalContext") or "")
-        merged = f"{block}\n\n{existing}" if existing else block
-        return dict(context or {}, hookSpecificOutput=dict(
-            hso, hookEventName="UserPromptSubmit", additionalContext=merged))
+        return injectors.merge_hook_context(context, block, prepend=True)
     except Exception:                                       # noqa: BLE001
         return context
+
+
+# --- T2: the injection probe ----------------------------------------------------
+
+def probe(project=None) -> dict:
+    """What this pass would deliver, without running it.
+
+    Reports `CAVEMAN_BLOCK` directly rather than calling `block_for`: the
+    standing default is what an operator is asking about, and `block_for` would
+    make the answer depend on a `text` argument a probe does not have. Free of
+    side effects by construction — `resolve_mode` only writes when it is given a
+    `session_id`, and this never gives it one."""
+    return {"verdict": "verbatim", "chars": len(CAVEMAN_BLOCK),
+            "reason": (f"standing reply style, {len(CAVEMAN_BLOCK)} chars, "
+                       "unconditional on human-typed prompts"),
+            "text": CAVEMAN_BLOCK}

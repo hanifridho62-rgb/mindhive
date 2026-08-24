@@ -161,6 +161,28 @@ CSS = """
   #mn-cat-panel .kv { display:flex; gap:6px; }
   #mn-cat-panel .kv span:first-child { color:#8b949e; min-width:58px; }
   #mn-cat-panel .warn { margin-top:5px; color:#ff9e64; }
+  /* The injection row (T5/T6). One cat per TURN, not per injector: seven cats
+     times twelve turns is eighty-four sprites and no signal. The turn's cat
+     carries the turn's worst state, and the panel breaks it down. */
+  #mn-inject { display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+    margin:6px 0 10px; }
+  #mn-inject .lbl { color:#8b949e; font-size:11px; margin-right:2px; }
+  #mn-inject .none { color:#8b949e; font-size:11px; }
+  .mn-inj { display:inline-flex; align-items:center; gap:4px; padding:2px 6px;
+    border:1px solid #30363d; border-radius:8px; cursor:pointer; font-size:11px;
+    color:#e6e8ef; }
+  .mn-inj .n { color:#8b949e; }
+  .mn-inj.sel { border-color:#e8b64c; }
+  /* Three states, three DISTINCT paints. Absence cannot express failure --
+     `.blind` above exists because "nothing is happening" and "I cannot know"
+     once rendered identically, and this row must not repeat that. */
+  .mn-inj.verbatim { border-color:#3fb950; }
+  .mn-inj.partial { border-color:#ff9e64; }
+  .mn-inj.silent { filter:grayscale(100%); opacity:.5; }
+  .mn-inj.verbatim .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
+  #mn-cat-panel .mn-body { margin:6px 0 0; max-height:280px; overflow:auto;
+    white-space:pre-wrap; word-break:break-word; font-size:11px; color:#c9d1d9;
+    background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:6px; }
 """
 
 # The strip's own markup. The initial "no activity" text is what the page shows
@@ -218,7 +240,8 @@ _JS = """
   // active or not -- off different producers, and two copies of this would be
   // two places for those answers to start being formatted differently.
   const CAT_DASH = '\\u2014';
-  function mnPanel(heading, rows, el, warning){
+  const CAT_DOT = ' \\u00b7 ';
+  function mnPanel(heading, rows, el, warning, body){
     const p = document.getElementById('mn-cat-panel');
     if (!p) return;
     // textContent throughout: every value here is ledger-supplied prose and
@@ -237,6 +260,15 @@ _JS = """
       const w = document.createElement('div'); w.className = 'warn';
       w.textContent = warning;
       p.appendChild(w);
+    }
+    // The replayed block is arbitrary ledger text -- prompts, SOP bodies,
+    // whatever a pass composed. textContent, never innerHTML: an innerHTML path
+    // here would make every injected block a script vector in the operator's
+    // own dashboard.
+    if (body){
+      const b = document.createElement('pre'); b.className = 'mn-body';
+      b.textContent = body;
+      p.appendChild(b);
     }
     // Show it first, then measure: a display:none panel has no width, so
     // clamping against its own size has to happen after it is laid out.
@@ -280,12 +312,12 @@ _JS = """
   // into the other's open panel: the faculty strip's empty-board branch was
   // closing session panels one poll after every click, and an empty faculty
   // board is the common case, not the rare one.
-  let PANEL_OWNER = null;              // 'cat' | 'sess' | null
+  let PANEL_OWNER = null;              // 'cat' | 'sess' | 'inj' | null
   function mnOpen(owner, el, render){
     // One entry point, so 'exactly one cat is selected anywhere' holds by
     // construction rather than by both handlers remembering to sweep both
     // strips. The faculty handler did not, and two cats read as selected.
-    document.querySelectorAll('.mn-cat.sel, .mn-sess.sel')
+    document.querySelectorAll('.mn-cat.sel, .mn-sess.sel, .mn-inj.sel')
       .forEach(x => x.classList.remove('sel'));
     el.classList.add('sel');
     PANEL_OWNER = owner;
@@ -298,7 +330,7 @@ _JS = """
     const p = document.getElementById('mn-cat-panel');
     if (p) p.style.display = 'none';
     PANEL_OWNER = null;
-    document.querySelectorAll('.mn-cat.sel, .mn-sess.sel')
+    document.querySelectorAll('.mn-cat.sel, .mn-sess.sel, .mn-inj.sel')
       .forEach(x => x.classList.remove('sel'));
   }
   function paintCats(cats){
@@ -486,6 +518,84 @@ _JS = """
       bar.appendChild(more);
     }
     SESS_SIG = sig;                  // the strip is whole; now remember it
+  }
+  // --- the injection row (T5/T6) ---------------------------------------------
+  // One cat per TURN. Its class is the turn's worst state, so a degraded pass is
+  // visible from the strip without opening anything; the panel names which one.
+  function turnVerdict(t){
+    const vs = (t.injectors || []).map(i => i.verdict);
+    if (vs.indexOf('partial') >= 0) return 'partial';
+    if (vs.indexOf('verbatim') >= 0) return 'verbatim';
+    return 'silent';                 // every pass stayed quiet this turn
+  }
+  function injPanel(t, el, block){
+    const rows = [];
+    for (const i of (t.injectors || [])){
+      rows.push([i.name, i.verdict + CAT_DOT + i.chars + ' chars'
+                 + (i.reason ? CAT_DOT + i.reason : '')]);
+    }
+    rows.push(['total', t.total_chars + ' chars / ' + t.total_tokens + ' tokens']);
+    if (t.repeats > 1) rows.push(['repeated', t.repeats + ' identical turns']);
+    // The operator's question is what Claude READ, which is the composed order
+    // and not any one pass's fragment -- so the whole turn rides the panel.
+    mnPanel('injection ' + (t.ts || ''), rows, el,
+            block ? '' : 'whole turn text is kept for the current turn only',
+            block || '');
+  }
+  function paintInjections(data){
+    const box = document.getElementById('mn-inject');
+    if (!box) return;
+    const turns = (data && data.recent) || [];
+    const cur = (data && data.current) || {};
+    // The repaint guard SESS_SIG carries, keyed on the ELEMENT rather than a
+    // module variable. `showHTML` replaces the whole Oversee subtree, so a
+    // module-level signature would suppress the repaint of a container that
+    // had just been recreated EMPTY -- the row would vanish on the first
+    // unchanged poll after any other Oversee repaint. A fresh element carries
+    // no dataset, so it always paints; a surviving one is compared as before,
+    // and a 2.5 s poll still cannot close a panel someone is reading nor
+    // restart a 1.6 s animation mid-bob.
+    const sig = JSON.stringify(turns.map(t => [t.signature, t.repeats]));
+    if (box.dataset.sig === sig) return;
+    if (PANEL_OWNER === 'inj') mnClosePanel('inj');
+    box.innerHTML = '';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl'; lbl.textContent = 'injection';
+    box.appendChild(lbl);
+    if (!turns.length){
+      const none = document.createElement('span');
+      none.className = 'none';
+      none.textContent = 'nothing injected yet';
+      box.appendChild(none);
+      box.dataset.sig = sig;
+      return;
+    }
+    for (const t of turns){
+      const spoke = (t.injectors || []).filter(i => i.verdict !== 'silent').length;
+      const total = (t.injectors || []).length;
+      const el = document.createElement('span');
+      el.className = 'mn-inj ' + turnVerdict(t);
+      el.innerHTML = catSVG(idCat(t.signature || ''), 18);
+      const n = document.createElement('span');
+      n.className = 'n';
+      n.textContent = t.total_chars + 'c' + (t.repeats > 1 ? ' x' + t.repeats : '');
+      el.appendChild(n);
+      // Hover gives the title, the click gives the whole thing. Both were asked
+      // for by name.
+      el.title = 'injection ' + (t.ts || '') + CAT_DOT + turnVerdict(t)
+        + CAT_DOT + spoke + ' of ' + total + ' spoke' + CAT_DOT
+        + t.total_chars + ' chars';
+      const block = (t.signature && t.signature === cur.signature)
+        ? (cur.block || '') : '';
+      el.addEventListener('click', ev => {
+        ev.stopPropagation();
+        const already = el.classList.contains('sel');
+        if (already){ mnClosePanel('inj'); }
+        else { mnOpen('inj', el, () => injPanel(t, el, block)); }
+      });
+      box.appendChild(el);
+    }
+    box.dataset.sig = sig;           // the row is whole; now remember it
   }
 """
 

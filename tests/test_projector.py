@@ -275,20 +275,30 @@ def test_two_rebuilds_of_one_project_never_overlap():
         f"project directory, so they interleave STATE.md and race the LEDGER prune")
 
 
-def test_the_state_temp_file_is_unique_per_writer():
+def test_state_is_published_through_the_one_shared_atomic_writer():
     """The lock covers one process; `hive sync` in a terminal is another.
 
     A fixed `STATE.md.tmp` lets two processes interleave their bytes into one
-    file that is then atomically renamed -- an atomically corrupt STATE.md. A
-    unique name makes each render internally consistent regardless of who else
-    is writing, and the loser of the rename simply loses cleanly.
+    file that is then atomically renamed -- an atomically corrupt STATE.md. The
+    guarantee against that no longer lives HERE: STATE.md is published through
+    `paths.write_text_atomic`, whose temp name is unique per process AND per
+    call and whose own tests (`test_paths.py`) prove both the uniqueness and
+    the Windows publish-retry. This test's job is to keep STATE.md ON that
+    writer, so a revert to a hand-rolled fixed-name `tmp.replace` goes red.
+
+    The earlier version asserted `os.getpid()`/`threading.get_ident()` appeared
+    in this module's source. That was a test coupled to an implementation detail
+    that has since moved one layer down, and a behaviour-preserving refactor
+    turned it red for the wrong reason -- so it is re-aimed at the contract, not
+    the moved mechanism.
     """
     body = open(projector.__file__, encoding="utf-8").read()
-    fixed = 'pdir / "STATE.md.tmp"'
-    assert fixed not in body, (
-        "the temp path is fixed again, so two processes share one scratch file")
-    assert "os.getpid()" in body and "threading.get_ident()" in body, (
-        "the temp name is not unique per process and thread")
+    assert 'pdir / "STATE.md.tmp"' not in body, (
+        "STATE.md has a fixed-name scratch file again — two processes share it")
+    assert 'tmp.replace(pdir / "STATE.md")' not in body, (
+        "STATE.md is renamed by a hand-rolled temp again, not the shared writer")
+    assert 'write_text_atomic(pdir / "STATE.md"' in body, (
+        "STATE.md is no longer published through paths.write_text_atomic")
     # and no orphan is left behind by a normal rebuild
     projector.project()
     leftovers = list(paths.project_dir().glob("STATE.md*.tmp"))

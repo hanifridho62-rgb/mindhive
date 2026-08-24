@@ -197,13 +197,21 @@ def test_a_job_whose_thread_will_not_start_does_not_wedge_its_kind(monkeypatch):
         def start(self):
             raise RuntimeError("can't start new thread")
 
+    real_thread = threading.Thread
     monkeypatch.setattr(threading, "Thread", RefusesToStart)
     job = jobs.start("nothread", "test")
     assert job.state == jobs.FINISHED
     assert job.report.outcome == outcomes.FAILED
     assert "thread" in job.report.summary
     assert jobs.running_id("nothread") is None, "the kind stayed marked running"
-    monkeypatch.undo()
+    # Put back ONLY threading.Thread. A blanket `monkeypatch.undo()` stood here
+    # and also undid conftest's autouse `isolate_store`, because pytest hands the
+    # test one function-scoped monkeypatch for both. Every `jobs.start` below it
+    # then wrote to the developer's REAL ~/.mindhive: 82 job_started/job_finished
+    # pairs accumulated there, one per suite run, between 2026-08-13 and
+    # 2026-08-24. conftest now asserts the isolation survived, so this cannot
+    # regress silently again.
+    monkeypatch.setattr(threading, "Thread", real_thread)
     assert lock.acquire(blocking=False), "the lock was never given back"
     lock.release()
     second = jobs.start("nothread", "test")

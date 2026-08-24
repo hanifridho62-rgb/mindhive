@@ -143,11 +143,7 @@ def _load_marker() -> dict:
 def _save_marker(marker: dict) -> None:
     # Atomic temp+replace: concurrent passes for different projects must not
     # tear each other's cooldown entries with a partial write.
-    p = _marker_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(marker), encoding="utf-8")
-    tmp.replace(p)
+    paths.write_text_atomic(_marker_path(), json.dumps(marker))
 
 
 def consolidate(project=None, limit=DEFAULT_LIMIT,

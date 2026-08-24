@@ -211,7 +211,7 @@ JS = """\
       // loop growing its own work visible, and a cost the operator can see.
       + (r.injected_count ? ' <span class="pill rmnew" title="work the injector '
           + 'added to this run\\u2019s plan from the record">'+r.injected_count
-          + ' injected</span>' : '')
+          + ' added to plan</span>' : '')
       + (r.online ? ' <span class="pill" style="color:var(--ok);border-color:var(--ok-edge)">'
                     + (chat ? 'online \\u2014 working' : 'online')+'</span>' : '');
     let body = '';
@@ -351,6 +351,12 @@ JS = """\
     const ta = view.querySelector('#enprompt');
     if (ta) ta.oninput = () => { EN_PROMPT = ta.value; };
   }
+  let INJ_DATA = null;
+  // The row's own markup. `paintInjections` (cat_board.py) fills it after the
+  // markup lands, for the same reason `paintCats` does: one implementation of
+  // the cat, drawn from one place, so the two strips cannot drift into showing
+  // different numbers of cats with nothing to say which is lying.
+  function injRow(){ return '<div id="mn-inject"></div>'; }
   function paintOversee(){
     if (!OV_DATA) return;
     // Online/offline strip: shown ONLY while Claude is working on a session.
@@ -368,14 +374,15 @@ JS = """\
         + '<ul class="hits">'+plans.map(p => rmPlanCard(p, showProj)).join('')+'</ul>'
       : '';
     if (!OV_DATA.runs.length && !plans.length){
-      showHTML(enPanel() + online + '<h2 class="h">No work sessions \\u2014 interactive '
+      showHTML(enPanel() + online + injRow() + '<h2 class="h">No work sessions \\u2014 interactive '
         + 'Claude sessions appear here as their telemetry flows, and '
         + '<code>hive loop</code> runs join them. Finished sessions are '
         + 'removed automatically.</h2>');
       wireEnrich();
+      paintInjections(INJ_DATA);
       return;
     }
-    showHTML(enPanel() + online + strip
+    showHTML(enPanel() + online + injRow() + strip
       + (OV_DATA.runs.length
         ? '<h2 class="h">'+OV_DATA.runs.length+' work session'
           + (OV_DATA.runs.length===1?'':'s')
@@ -384,6 +391,9 @@ JS = """\
           + '<ul class="hits">'+OV_DATA.runs.map(r => ovCard(r, showProj)).join('')+'</ul>'
         : ''));
     wireEnrich();
+    // After showHTML, never before: the container has to be in the DOM for
+    // the painter to find it.
+    paintInjections(INJ_DATA);
     view.querySelectorAll('.ovtitle').forEach(el => el.onclick = () => {
       const rid = el.closest('li').dataset.rid;
       if (OV_EXPANDED.has(rid)) OV_EXPANDED.delete(rid); else OV_EXPANDED.add(rid);
@@ -414,14 +424,16 @@ JS = """\
     // panel — a repaint would eat the caret and the click-in-progress.
     const ae = document.activeElement;
     if (ae && ae.closest && ae.closest('#enpanel')) return;
-    const [res, es] = await Promise.all([apiGet('/api/oversee'),
-                                         apiGet('/api/enrich/settings')]);
+    const [res, es, inj] = await Promise.all([apiGet('/api/oversee'),
+                                         apiGet('/api/enrich/settings'),
+                                         apiGet('/api/injection')]);
     // The clobber the user reported was this exact render landing late. Discard
     // before the throw too — see renderImprovements for why.
     if (!shouldPaint(liveFn, renderOversee)) return;   // newer section owns the panel
     if (!res || res.ok === false) throw new Error((res && res.error) || 'oversee fetch failed');
     OV_DATA = res;
     EN_SET = (es && typeof es.enabled === 'boolean') ? es : {enabled: true};
+    INJ_DATA = inj;
     paintOversee();
   }
   async function deleteRun(rid, proj){

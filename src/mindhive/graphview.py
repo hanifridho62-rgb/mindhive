@@ -849,8 +849,5 @@ def export(project=None, out: str | None = None, semantic: bool = False) -> Path
 
     html = render_html(graph_data)
     dest = Path(out) if out else (pdir / "graph.html")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    tmp.write_text(html, encoding="utf-8")
-    tmp.replace(dest)
+    paths.write_text_atomic(dest, html)      # shared writer: private tmp + retry
     return dest

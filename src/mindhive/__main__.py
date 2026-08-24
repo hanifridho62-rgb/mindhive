@@ -33,6 +33,11 @@ def _print_recommendations(payload: dict, scanned: bool) -> None:
 # long if/elif ladder. Per-command heavy imports stay local to the handler that
 # needs them (keeps `hive` startup cheap and import side effects scoped).
 
+def cmd_symbols(args) -> int | None:
+    from . import symbols as symbols_mod
+    return symbols_mod.cli(args)
+
+
 def cmd_append(args) -> int | None:
     if args.stdin:
         raw = sys.stdin.read()
@@ -100,59 +105,35 @@ def cmd_hook(args) -> int | None:
         if decision:
             print(json.dumps(decision))
     elif args.stage == "user_prompt_submit":
-        # Prompt-quality gate: inject skill-trigger directives when the typed
-        # prompt is underspecified. Print ONLY when the gate fires (stdout is
-        # the hook's context channel); a clear prompt prints nothing. When
-        # prompt enrichment is enabled (the default), the fired context also
-        # carries the clarifying questions (see enrich.extend_hook_context —
-        # additive, sidecar-only read, fail-open).
-        from . import enrich, premise, promptgate, sopgate, style
+        # The seven-pass injection pipeline, and the load-bearing ORDER it runs
+        # in, live in `injectors.run_pipeline` -- see that docstring. This branch
+        # owns only what surrounds it: the one spine read, the print, and the
+        # two best-effort telemetry writes that must follow the print.
+        from . import injectors as _inj, promptgate
         from .mindnet import inject as mn_inject
-        context = promptgate.hook_context(raw)
-        if context:
-            context = enrich.extend_hook_context(context, raw)
-        # MN-1 U9: the phase spine steers EVERY turn, including a clear prompt —
-        # that unconditional reach is the whole point, so this call sits outside
-        # the `if` above rather than riding the gate's decision. Sidecar-only
-        # read, additive, fail-open; it returns `context` untouched (possibly
-        # falsy) whenever there is nothing to say or anything goes wrong, so the
-        # print below still fires only when a subsystem actually spoke.
-        # The sidecar is read ONCE here and threaded in, rather than letting the
-        # injector read it and then reading it again to ask what it used (MN-17).
+        # Read ONCE here and threaded in, rather than letting the injector read
+        # it and then reading it again to ask what it used (MN-17):
+        # `record_direction` and `announce_faculties` below need this same spine.
         try:
             from .mindnet import sidecar as mn_sidecar
             spine = mn_sidecar.read()
         except Exception:                                   # noqa: BLE001
             spine = None
-        context = mn_inject.extend_hook_context(context, raw, sc=spine)
-        # §0's mechanical half: check the checkable factual claims this prompt
-        # makes against the filesystem, the roadmap fold, and the last recorded
-        # test run, and report contradictions. Unconditional for the same reason
-        # the spine above is, and with a sharper edge — `promptgate` stops
-        # scanning at PROMPT_SCAN_CAP, so the long, assertion-dense prompts most
-        # likely to carry a stale or fabricated premise are exactly the ones its
-        # gate never sees. Additive and fail-open: it returns `context`
-        # unchanged whenever nothing is contradicted or anything goes wrong.
-        context = premise.extend_hook_context(context, raw)
-        # The MANDATORY SOP pass: the user's own standing procedures, verbatim,
-        # on every prompt. Unconditional for the same reason the spine and the
-        # style pass are — a procedure declared to hold on every task, delivered
-        # only at session start, is exactly the instruction that decays by turn
-        # 80. Reads the materialized sidecar, never the ledger: `read_all` is
-        # 0.36 s on the live store and this sits on the per-prompt hot path.
-        context = sopgate.extend_hook_context(context, raw)
-        # The standing reply-style pass: caveman by default, normal prose when
-        # the prompt asks to be taught. Unconditional on human-typed prompts for
-        # the same reason the spine above is — a style that only re-asserts
-        # itself when some other subsystem happened to speak is not a standing
-        # style. It runs LAST so it prepends to whatever the earlier passes
-        # produced, and it is the one pass that creates the context from nothing.
-        context = style.extend_hook_context(context, raw)
+        context, _rows = _inj.run_pipeline(raw, spine=spine)
         if context:
             print(json.dumps(context))
+        # AFTER the print, for the reason `record_direction` below documents:
+        # stdout is the context channel and a telemetry write must never be able
+        # to interleave with it. Guarded twice -- `record_turn` is already total,
+        # and this `except` is the second belt, because the one thing this
+        # feature must never do is break the prompt it exists to observe.
+        try:
+            _inj.record_turn(_rows, session_id=_hook_session(raw))
+        except Exception:                                   # noqa: BLE001
+            pass
         # Durable causal trace: record which skills the gate directed so Oversee
         # can later show the honest "directed by prompt-gate" why. Best-effort
-        # and self-guarding — never disturbs the context printed above.
+        # and self-guarding -- never disturbs the context printed above.
         promptgate.record_direction(raw, sc=spine)
         # MN-17: light the cats for the faculties this turn actually used. AFTER the
         # print, for the same reason `record_direction` is: stdout is the context
@@ -374,6 +355,10 @@ def cmd_context(args) -> int | None:
         segments += context_mod.collect_hive(project=project)
     if origin in ("all", "claude"):
         segments += context_mod.collect_claude()
+    # T9: the per-turn cost. Last, so the two session-start origins keep the
+    # order a reader is used to and the new one reads as an addition.
+    if origin in ("all", "hook"):
+        segments += context_mod.collect_hook(project=project)
 
     budget = getattr(args, "budget", None)
     if budget is None:
@@ -3233,6 +3218,14 @@ def _build_parser() -> argparse.ArgumentParser:
     a.add_argument("--stdin", action="store_true", help="read payload from stdin")
     a.set_defaults(func=cmd_append)
 
+    sy = sub.add_parser("symbols",
+                        help="zero-token symbol index of a source tree")
+    sy.add_argument("path", nargs="?", default=None,
+                    help="tree to map (default: the current directory)")
+    sy.add_argument("--budget", type=int, default=None, help="token budget")
+    sy.add_argument("--json", action="store_true")
+    sy.set_defaults(func=cmd_symbols)
+
     hk = sub.add_parser("hook", help="handle a live Claude Code hook payload (reads stdin)")
     hk.add_argument("stage",
                     choices=["post_tool_use", "post_tool_use_failure",
@@ -3312,7 +3305,8 @@ def _build_parser() -> argparse.ArgumentParser:
                          "loader then drops the digest's tail sections)")
     cx.add_argument("--top", type=int, default=None,
                     help="show only the N heaviest contributors")
-    cx.add_argument("--origin", choices=["hive", "claude", "all"], default="all",
+    cx.add_argument("--origin", choices=["hive", "claude", "hook", "all"],
+                    default="all",
                     help="limit the report to one origin (default: all)")
     cx.set_defaults(func=cmd_context)
 

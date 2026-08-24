@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import NamedTuple
@@ -387,21 +386,6 @@ def read(project=None) -> Sidecar:
 
 # --- the write path -------------------------------------------------------------------
 
-def _tmp_path(p) -> Path:
-    """A temp sibling unique to THIS writer.
-
-    Not `paths.write_text_atomic`: it derives its temp path from the target
-    alone (`paths.py:28`), so two writers share one `.tmp`, the second truncates
-    the first mid-write, and `os.replace` publishes the hybrid — atomic
-    publication of a torn file. `promptgate._write_manifest`
-    (`promptgate.py:319`) pid-scopes for exactly this reason.
-
-    The thread ident goes in too, which is one step past that idiom and is
-    needed here: the dashboard serves on threads, so two writers inside ONE
-    process collide on a name scoped only by pid."""
-    return p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-
-
 def write(state, stamp, project=None, tasks=None, advice=None) -> Path:
     """Serialize *state* + *stamp* (+ the *tasks* graph, + MN-3 *advice*) to the
     sidecar, atomically.
@@ -409,20 +393,13 @@ def write(state, stamp, project=None, tasks=None, advice=None) -> Path:
     Raises `OSError` on a filesystem failure — this is the low-level primitive
     and its callers decide what a failure means. `rebuild` turns it into a
     reported reason; nothing on the hook path calls it at all."""
+    # Through the shared atomic writer, which now owns the pid+counter temp
+    # name this module used to hand-roll (and whose stale `_tmp_path` comment
+    # claimed `write_text_atomic` could not do). Its per-call counter is unique
+    # across the dashboard's threads exactly as the old pid+tid name was, and it
+    # retries the Windows publish a concurrent sidecar reader can refuse.
     p = sidecar_path(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _tmp_path(p)
-    try:
-        tmp.write_text(_encode(state, stamp, tasks, advice), encoding="utf-8")
-        os.replace(tmp, p)
-    except OSError:
-        # A half-written tmp left behind is litter that accumulates one file per
-        # failed write, and pid+tid names mean it never gets reused.
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    paths.write_text_atomic(p, _encode(state, stamp, tasks, advice))
     return p
 
 

@@ -151,3 +151,74 @@ def test_origin_of_marks_self_reliant_output():
     assert events.origin_of("sess-1") is None
     assert events.origin_of(None) is None
     assert events.origin_of("researchy-session") is None   # prefix, not substring
+
+
+def test_concurrent_appends_never_lose_or_tear_a_row(tmp_path):
+    """The ledger is the one file in this system that may never lose a write.
+
+    Measured before the lock landed, six processes x sixty appends into one
+    segment: 72 of 360 rows simply GONE, 5 runs out of 5, worst case 606 of 2400
+    at twelve-way. The loss is a Windows story -- `open(seg, "a")` there is
+    seek-to-end THEN write, two syscalls, so two processes seek to the same
+    offset and the second overwrites the first -- but the same race also tears
+    rows, leaving exactly the `:"command_run"}` fragment that this file's
+    total-read test above was written to TOLERATE. Reads were made total years
+    before the write was made atomic; this test is the other half.
+
+    Processes, not threads, and that is not incidental: threads share one
+    interpreter and would serialise on the GIL for a write this small, so a
+    threaded version of this test passes against the broken code and proves
+    nothing.
+
+    `os.write` on an O_APPEND descriptor was measured too and does NOT fix it
+    (328 lost vs 322 for the plain write) -- Windows has no atomic-append
+    syscall to reach for, so the serialisation has to be explicit.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    nproc, nrows = 6, 60
+    src = str(Path(events.__file__).resolve().parents[1])
+    child = tmp_path / "appender.py"
+    child.write_text(
+        "import os, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "from mindhive import events\n"
+        "tag, n = sys.argv[1], int(sys.argv[2])\n"
+        "for i in range(n):\n"
+        "    events.append_event('command_run',\n"
+        "                        {'desc': '%%s-%%d' %% (tag, i),\n"
+        "                         'text': 'x' * 120},\n"
+        "                        session_id='race', tags=['auto'],\n"
+        "                        project='test')\n" % src,
+        encoding="utf-8")
+
+    env = dict(os.environ, MINDHIVE_HOME=str(tmp_path), MINDHIVE_PROJECT="test",
+               MINDHIVE_AUTORESUME_TIMER="off")
+    procs = [subprocess.Popen([sys.executable, str(child), "p%d" % i, str(nrows)],
+                              env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+             for i in range(nproc)]
+    for p in procs:
+        _out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, err.decode("utf-8", "replace")[-800:]
+
+    seg = paths.events_dir("test") / "race.jsonl"
+    survived = set()
+    for line in seg.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            survived.add(json.loads(line)["payload"]["desc"])
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    expected = {"p%d-%d" % (p, i) for p in range(nproc) for i in range(nrows)}
+    missing = expected - survived
+    assert not missing, (
+        "%d of %d appended rows never reached the ledger — the append raced"
+        % (len(missing), len(expected)))
+    assert events.corrupt_rows("test") == [], "concurrent appends tore a row"

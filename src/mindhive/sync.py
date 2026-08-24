@@ -146,10 +146,10 @@ def sync(folder: str, project=None, include_briefing: bool = True,
     content = "\n".join(sections)
 
     # Write to native path (create parent dirs)
+    from . import paths
     dest = native_memory_path(folder, home=home)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.parent / "MEMORY.md.tmp"
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(dest)
+    # Shared writer: `MEMORY.md.tmp` was a fixed name a concurrent sync could
+    # clobber, and Claude Code reads MEMORY.md, so the publish is retried.
+    paths.write_text_atomic(dest, content)
 
     return dest

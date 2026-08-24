@@ -210,8 +210,6 @@ def briefing(project=None, evs=None) -> Path:
     pdir = paths.project_dir(project)
     pdir.mkdir(parents=True, exist_ok=True)
     content = build_briefing(evs)
-    tmp = pdir / "BRIEFING.md.tmp"
-    tmp.write_text(content, encoding="utf-8")
     dest = pdir / "BRIEFING.md"
-    tmp.replace(dest)
+    paths.write_text_atomic(dest, content)   # shared writer: private tmp + retry
     return dest

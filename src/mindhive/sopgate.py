@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import json
 
-from . import outcomes, sop
+from . import injectors, outcomes, sop
 from .promptgate import PROMPT_SCAN_CAP
 
 # Marker so an injected SOP block is greppable in a transcript and tellable
@@ -366,11 +366,7 @@ def extend_hook_context(context, raw, project=None) -> dict:
         block = block_for(str(prompt)[:PROMPT_SCAN_CAP], project)
         if not block:
             return context
-        hso = (context or {}).get("hookSpecificOutput") or {}
-        existing = str(hso.get("additionalContext") or "")
-        merged = f"{block}\n\n{existing}" if existing else block
-        return dict(context or {}, hookSpecificOutput=dict(
-            hso, hookEventName="UserPromptSubmit", additionalContext=merged))
+        return injectors.merge_hook_context(context, block, prepend=True)
     except Exception:                                       # noqa: BLE001
         return context
 
