@@ -39,6 +39,28 @@ def test_corrupt_rows_surfaces_skipped_rows(tmp_path):
     assert all(r["segment"] == seg.name for r in bad)
 
 
+def test_read_stays_total_when_a_torn_write_splits_a_utf8_character(tmp_path):
+    # The total-read contract at FILE-DECODE granularity, not just per line. A
+    # crash or unserialised append mid-character leaves invalid UTF-8 bytes, and
+    # `read_text(encoding="utf-8")` without errors= raises UnicodeDecodeError
+    # BEFORE splitlines — so the per-line JSON guard never runs and read_all /
+    # corrupt_rows take down every dashboard section and CLI command on one torn
+    # byte-run, the exact outage the line-level guard exists to prevent. And it
+    # is reachable: canonical_json writes non-ASCII as UTF-8 (ensure_ascii=False),
+    # so a tear can land mid-character; `verify` itself reads through corrupt_rows.
+    events.append_event("decision", {"text": "before"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    seg = next(paths.events_dir("test").glob("*.jsonl"))
+    with open(seg, "ab") as f:              # a dangling UTF-8 lead byte: the start
+        f.write(b"\xc3")                    # of a 2-byte sequence, no continuation
+    # read_all must skip the torn byte-run and still return the good row.
+    assert [e.payload.get("text") for e in events.read_all("test")] == ["before"]
+    # corrupt_rows must SURFACE it rather than crashing verify().
+    bad = events.corrupt_rows("test")
+    assert any(r["segment"] == seg.name and "unparseable" in r["reason"]
+               for r in bad)
+
+
 def test_canonical_json_is_stable():
     a = events.canonical_json({"b": 1, "a": 2})
     b = events.canonical_json({"a": 2, "b": 1})

@@ -276,7 +276,8 @@ def scan_segments(project: str | None = None) -> list:
     if not d.exists():
         return rows
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(seg.read_text(encoding="utf-8").splitlines()):
+        for i, line in enumerate(
+                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
             line = line.strip()
             if not line:
                 continue
