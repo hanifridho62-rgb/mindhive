@@ -549,7 +549,8 @@ def read_all(project=None) -> list["Event"]:
     if not d.exists():
         return []
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(seg.read_text(encoding="utf-8").splitlines()):
+        for i, line in enumerate(
+                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
             line = line.strip()
             if not line:
                 continue
@@ -582,7 +583,8 @@ def corrupt_rows(project=None) -> list[dict]:
     if not d.exists():
         return out
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(seg.read_text(encoding="utf-8").splitlines()):
+        for i, line in enumerate(
+                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
             s = line.strip()
             if not s:
                 continue
