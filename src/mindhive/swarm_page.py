@@ -12,7 +12,7 @@ Pure presentation: token in, HTML string out; all state is server-side.
 """
 import json
 
-from . import cat_board, theme
+from . import cat_board, pane, theme
 
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -63,6 +63,25 @@ _PAGE = """<!doctype html>
      snapshot, so "moving" means "the server says this agent is running" and
      never a guess the page made on its own. */
   .chip.running .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
+  /* The hover dance reaches every OTHER cat on this page for free, because
+     `cat_board.CSS` keys it on `.mn-cat-sprite` and this page interpolates that
+     sheet. It cannot reach a RUNNING chip's cat: the bob rule directly above is
+     three classes to the shared rule's two, so it wins, and the one cat an
+     operator is most likely to point at would be the one cat that ignored them.
+     Naming it here rather than in `cat_board.CSS` keeps the ownership the reduce
+     block below already states — `.chip` is this page's furniture, and the
+     shared sheet does not know it exists.
+
+     The three keyframe sets and the reasoning behind them live in
+     `cat_board.CSS`, which this page interpolates whole; only the SELECTOR is
+     this page's business. Copying the tracks here would be the drift the note
+     above the bob rule already warns about — and would silently fork the
+     choreography the first time either copy is tuned. */
+  .chip.running .mn-cat-sprite:hover {
+    transform-origin:center bottom;
+    animation:mn-dance-step 620ms ease-in-out infinite,
+              mn-dance-tilt 780ms ease-in-out infinite,
+              mn-dance-squash 520ms ease-in-out infinite; }
   /* This page's OWN motion, silenced by the same preference. `cat_board.CSS`
      carries the guard for every cat sprite, but it cannot name `.dot`/`.badge` —
      those are this page's furniture and do not exist on the dashboard. Without
@@ -418,7 +437,8 @@ _PAGE = """<!doctype html>
     // something is wrong.
     await pollCats();
   }
-  (async function loop(){ await poll(); setTimeout(loop, 1200); })();
+  /*__PANE__*/
+  (async function loop(){ if (!paneHidden()) await poll(); setTimeout(loop, 1200); })();
 </script>
 </body></html>"""
 
@@ -430,6 +450,9 @@ _PAGE = """<!doctype html>
 # is already gone cannot be placed by anything a request carries, which is the
 # ordering the token substitution below has to reason about explicitly.
 _PAGE = _PAGE.replace("/*__STATUS__*/", theme.STATUS_CSS)
+# The pane guard rides the same import-time substitution as the palette,
+# and for the same reason: it is one decision shared by three documents.
+_PAGE = _PAGE.replace(pane.MARKER, pane.PANE_JS)
 
 
 def render_swarm(token: str) -> str:

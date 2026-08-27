@@ -104,6 +104,17 @@ const DEFAULT_PAYLOAD = { ok: true };
 // only watches the pixels measures half the interface.
 const PANEL_IDS = new Set(['view', 'out', 'ann', 'status']);
 
+// The three panes `only()` switches between. SHOWING one of these is a panel
+// event in its own right, and it is not covered by the write probe above: only()
+// hides the other two rather than emptying them, so a pane that is switched back
+// on still holds the markup it had. Once showHTML/showText skip a write whose
+// payload is already there, a stale render can take the whole panel back while
+// writing nothing at all -- which is what the reader actually sees, and what
+// this set exists to keep visible. `graph` is here and not in PANEL_IDS for the
+// same reason: the frame is a panel the user can be looking at, but nothing is
+// ever written INTO it from this page.
+const PANE_IDS = new Set(['view', 'out', 'graph']);
+
 // The module-level cache each renderer writes on the far side of its await. A
 // stale response that skips the paint but still writes here reintroduces the
 // bug on the next repaint, so the caches are asserted separately.
@@ -191,7 +202,15 @@ function makeElement(id, onPanelWrite) {
       contains: (c) => classes.has(c),
       toggle: (c, force) => {
         const on = force === undefined ? !classes.has(c) : !!force;
+        const was = classes.has(c);
         if (on) classes.add(c); else classes.delete(c);
+        // Taking the panel IS a paint, even when nothing is written into it.
+        // Recorded only on the hidden -> shown TRANSITION: only() runs on every
+        // paint, and the pane that is already up must not log an event for
+        // staying up, or every legitimate repaint would read as a takeover.
+        if (c === 'hidden' && was && !on && PANE_IDS.has(id)) {
+          onPanelWrite({ id, prop: 'shown', value: 'took the panel' });
+        }
         return on;
       },
     },
@@ -235,11 +254,35 @@ function newWorld(scriptSrc) {
     body: makeElement('body', () => {}),
     getElementById,
     querySelectorAll: () => [],
-    querySelector: () => null,
+    // `nav` is the one selector this stub has to answer. The page marks the
+    // rail from inside every section function (`markSection`), so a null here
+    // is not a missing convenience -- it threw on the first line of boot and
+    // took the whole harness down with it, which is how a tier that is
+    // deselected by default reports a page-level regression: as 74 setup
+    // errors, once somebody finally runs it. Everything else stays null; the
+    // rail's buttons still come back empty, because what this file measures is
+    // which render reaches the paint, not what the rail looks like.
+    querySelector: (sel) => (sel === 'nav' ? getElementById('nav') : null),
     createElement: (tag) => makeElement('<' + tag + '>', () => {}),
     addEventListener() {},
   };
 
+  // The body the fixture hands back for one request. Keyed by PATH, with one
+  // exception that a vacuous case earned: a payload that already NAMES a project
+  // is answered for the project that was ASKED FOR. The scope case switches the
+  // picker and lets the previous namespace's answer land last -- and while every
+  // project got the same body, "alpha's rows under beta's label" rendered markup
+  // identical to beta's own, so nothing could observe it. The real server answers
+  // for the project in the query; so does this. Payloads with no `project` key
+  // are left exactly as written, so no other case changes shape.
+  function payloadFor(rec) {
+    const base = Object.hasOwn(PAYLOADS, rec.path) ? PAYLOADS[rec.path] : DEFAULT_PAYLOAD;
+    if (!base || typeof base !== 'object' || Array.isArray(base)) return base;
+    if (!Object.hasOwn(base, 'project')) return base;
+    const m = /[?&]project=([^&]*)/.exec(rec.url);
+    if (!m || !m[1]) return base;
+    return { ...base, project: decodeURIComponent(m[1]) };
+  }
   function respond(payload) {
     const isText = typeof payload === 'string';
     return {
@@ -316,7 +359,7 @@ function newWorld(scriptSrc) {
       for (const rec of recs) {
         if (rec.done) continue;
         rec.done = true;
-        rec.resolve(respond(Object.hasOwn(PAYLOADS, rec.path) ? PAYLOADS[rec.path] : DEFAULT_PAYLOAD));
+        rec.resolve(respond(payloadFor(rec)));
       }
     },
     /** Answer with a body the fixture table does not carry — a server-side
@@ -914,9 +957,159 @@ async function projectSwitchDiscardsTheOldAnswer(scriptSrc) {
 }
 
 function withoutTheScopeCheck(src) {
-  const from = 'if (PROJECT !== scope) throw StaleScope(scope);';
+  // The empty-scope half rides along deliberately: this mutation removes the
+  // WHOLE guard, and an anchor naming only the comparison silently stops
+  // matching the next time the condition grows a clause -- which is exactly
+  // what happened when it did. The node tier went red rather than letting the
+  // case quietly stop discriminating, which is the whole point of it.
+  const from = "if (scope !== '' && PROJECT !== scope) throw StaleScope(scope);";
   const out = src.replace(from, '');
   return { src: out, changed: out !== src };
+}
+
+// The other side of the same guard. The FIRST answer of a session is asked for
+// with no project at all -- `withProj` omits the parameter, so the server
+// answers from its own default -- and lands after loadProjects has set PROJECT
+// to exactly that default. Reading that as a switch discarded the reader's own
+// first click: measured in a browser as `building graph - failed` under a panel
+// reading `a response for project "" arrived after the picker had already
+// moved`, while the identical click seconds later rendered 22.8 MB.
+async function theFirstAnswerOfTheSessionIsKept(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();                  // boot issues /api/projects; it stays parked
+  if (w.eval('PROJECT') !== '') {
+    return { error: 'PROJECT is ' + JSON.stringify(w.eval('PROJECT')) + ' at boot, ' +
+                    'so this world never enters the window the case is about' };
+  }
+  const mark = w.pending.length;
+  w.eval('showOverview()');
+  await w.settle();
+  const asked = w.since(mark);
+  if (!asked.length) return { error: 'showOverview issued no request' };
+
+  // loadProjects lands: '' becomes the very project the server just answered for.
+  w.eval("PROJECT = 'alpha';");
+  const before = w.panelWrites.length;
+  w.answer(asked);
+  await w.settle();
+  // A DISCARDED answer still writes the panel: the throw reaches run()'s fail(),
+  // which paints the refusal there and stamps `loading overview - failed`.
+  // Counting writes alone therefore cannot tell the data from the error -- and
+  // did not, which is how the first version of this case reported the mutant as
+  // painting normally. Each entry is {id, prop, value}, so the text is read off
+  // `.value`; matching String(entry) matched nothing at all, which is the second
+  // way this case managed to look decisive while measuring nothing.
+  const painted = w.panelWrites.slice(before);
+  const text = (x) => String((x && x.value) || '');
+  const stale = painted.some(
+    (x) => text(x).includes('arrived after the picker had already moved'));
+  // The two outcomes write DIFFERENT elements, which is what makes this exact:
+  // the overview lands as markup in `#view` and announces `- ready`, while a
+  // refusal lands as an `<span class="err">` in `#out` and announces `- failed`.
+  const data = !stale && painted.some(
+    (x) => x && x.id === 'view' && x.prop === 'innerHTML');
+  return { painted, stale, data };
+}
+
+function withoutTheEmptyScopeAllowance(src) {
+  const from = "if (scope !== '' && PROJECT !== scope) throw StaleScope(scope);";
+  const to = 'if (PROJECT !== scope) throw StaleScope(scope);';
+  const out = src.replace(from, to);
+  return { src: out, changed: out !== src };
+}
+
+
+// --- tier 8: the picker and the board must name the same project -------------
+//
+// `loadProjects` restores the reader's last pick from localStorage. A namespace
+// that has since been deleted is still a string, and it used to win outright.
+// A <select> whose value matches no option falls back to its FIRST — here '*',
+// the unified view — so the picker read HIVE MIND while every request carried
+// `a-project-that-was-deleted` and the board stayed empty, reload after reload.
+//
+// `current` deliberately echoes the vanished name: the real server answers with
+// the project it was ASKED for, which is exactly why it cannot be trusted as a
+// fallback on its own.
+const PROJECTS_BODY = {
+  hivemind: { name: 'HIVE MIND', events: 3 },
+  projects: [{ name: 'alpha', events: 2 }, { name: 'beta', events: 1 }],
+  current: 'a-project-that-was-deleted',
+  default: 'alpha',
+};
+
+async function loadProjectsRemembering(scriptSrc, remembered) {
+  const w = newWorld(scriptSrc);
+  await w.settle();                    // boot's own /api/projects stays parked
+  // Set BEFORE the call, so apiGet captures the remembered name as its scope —
+  // the faithful ordering, and the one where the empty-scope allowance is not
+  // what decides the outcome.
+  w.eval('PROJECT = ' + JSON.stringify(remembered) + ';');
+  const mark = w.pending.length;
+  w.eval('loadProjects()');
+  await w.settle();
+  const asked = w.since(mark).filter((r) => r.path === '/api/projects');
+  if (!asked.length) return { error: 'loadProjects issued no request' };
+  w.answerWith(asked, PROJECTS_BODY);
+  await w.settle();
+
+  // Read off the element rather than out of `panelWrites`: the recorder fires
+  // only for PANEL_IDS, which the picker is not one of, and it truncates what it
+  // does record to 160 characters — neither of which this case can work with.
+  const markup = String(w.eval("document.getElementById('proj').innerHTML") || '');
+  if (!markup) return { error: 'loadProjects never wrote the picker' };
+  const sel = /<option value="([^"]*)"[^>]*selected/.exec(markup);
+  return {
+    project: w.eval('PROJECT'),
+    selected: sel ? sel[1] : null,
+    offered: [...markup.matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]),
+  };
+}
+
+function withoutTheOfferedCheck(src) {
+  const from = "const cur = [PROJECT, data.current, data.default].find(n => n && offered.has(n)) || '';";
+  const to = "const cur = PROJECT || data.current || data.default || '';";
+  const out = src.replace(from, to);
+  return { src: out, changed: out !== src };
+}
+
+async function projectPickerCases() {
+  const kept = await loadProjectsRemembering(PAGE_JS, 'beta');
+  record('a_remembered_project_that_still_exists_is_kept',
+         !kept.error && kept.project === 'beta' && kept.selected === 'beta',
+         kept.error || (kept.project === 'beta' && kept.selected === 'beta'
+           ? "the reader's own pick survived and the picker shows it"
+           : 'a project the server DOES offer was not kept (PROJECT ' +
+             JSON.stringify(kept.project) + ', picker ' +
+             JSON.stringify(kept.selected) + ') — a fix that simply ignores the ' +
+             'remembered value would pass the case below and fail here'));
+
+  const gone = await loadProjectsRemembering(PAGE_JS, 'a-project-that-was-deleted');
+  const agree = !gone.error && gone.project === gone.selected &&
+                gone.offered.includes(gone.project);
+  record('a_remembered_project_the_server_no_longer_offers_is_dropped', agree,
+         gone.error || (agree
+           ? 'dropped to ' + JSON.stringify(gone.project) + ', which the picker shows'
+           : 'the board is scoped to ' + JSON.stringify(gone.project) +
+             ' while the picker shows ' + JSON.stringify(gone.selected) +
+             ' — offered: ' + JSON.stringify(gone.offered)));
+
+  const m = withoutTheOfferedCheck(PAGE_JS);
+  record('the_offered_check_in_loadProjects_is_removable', m.changed,
+         m.changed ? 'found the offered-set selection in loadProjects'
+                   : 'no offered-set selection found in loadProjects — the cases ' +
+                     'above cannot be made to fail, so treat them as unproven');
+  if (!m.changed) return;
+  const rm = await loadProjectsRemembering(m.src, 'a-project-that-was-deleted');
+  record('without_the_offered_check_the_picker_and_the_board_disagree',
+         !rm.error && rm.project === 'a-project-that-was-deleted' &&
+           rm.selected === null,
+         rm.error || (rm.selected === null &&
+                      rm.project === 'a-project-that-was-deleted'
+           ? 'check removed → the vanished project is kept and NO option is ' +
+             'marked selected, so the picker falls back to its first'
+           : 'check removed and the outcome did not change (PROJECT ' +
+             JSON.stringify(rm.project) + ', picker ' + JSON.stringify(rm.selected) +
+             ') — the cases above do not discriminate'));
 }
 
 async function scopeCases() {
@@ -949,6 +1142,27 @@ async function scopeCases() {
            ? 'check removed → the previous project\'s rows land on the new project'
            : 'check removed and NOTHING changed — the case above does not ' +
              'discriminate, so treat its pass as unproven'));
+  const boot = await theFirstAnswerOfTheSessionIsKept(PAGE_JS);
+  record('an_answer_asked_before_the_picker_settled_still_paints',
+         !boot.error && boot.data,
+         boot.error || (boot.data
+           ? 'asked with no project, answered once one existed, and painted'
+           : 'the first answer of the session was discarded — the guard read the ' +
+             'empty boot scope as a project the reader had switched away from'));
+
+  const b = withoutTheEmptyScopeAllowance(PAGE_JS);
+  record('the_empty_scope_allowance_is_one_removable_expression', b.changed,
+         b.changed ? 'found the empty-scope allowance in apiGet'
+                   : 'no empty-scope allowance found in apiGet — the case above ' +
+                     'cannot be made to fail, so treat it as unproven');
+  if (!b.changed) return;
+  const rb = await theFirstAnswerOfTheSessionIsKept(b.src);
+  record('removing_the_empty_scope_allowance_discards_the_first_answer',
+         !rb.error && rb.stale === true,
+         rb.error || (rb.stale
+           ? "allowance removed → the session's first answer is refused as stale"
+           : 'allowance removed and the answer went through anyway — the case ' +
+             'above does not discriminate, so treat its pass as unproven'));
 }
 
 // --- tier 8: honesty of the surrounding report ------------------------------
@@ -1091,6 +1305,107 @@ async function honestyCases() {
            JSON.stringify(pm.pausedTitle) + ' — the case above does not discriminate');
 }
 
+// --- tier 9: the whole-panel repaint guard ----------------------------------
+//
+// showText/showHTML skip the write when the payload they were handed is already
+// on the pane. That is one branch and three ways to get it wrong, so all three
+// are driven here rather than reasoned about:
+//
+//   - it does not actually skip (the guard is decoration and the churn is back),
+//   - it skips a payload that CHANGED (the section freezes and the poll is a lie),
+//   - it treats "already painted" as "already visible" and leaves the pane hidden
+//     (the two-click blank board, reintroduced through a new door).
+//
+// Driven through the page's own paint entry points, not through a renderer: the
+// guard sits in showText/showHTML and every renderer reaches it the same way, so
+// handing the payloads in directly makes "identical" and "changed" facts of the
+// scenario instead of facts of a fixture.
+
+async function repaintScenario(scriptSrc) {
+  const w = newWorld(scriptSrc);
+  await w.settle();                          // boot's /api/projects stays in flight
+  const view = w.getElementById('view');
+  const n = () => w.panelWrites.length;
+
+  let m = n(); w.eval("showHTML('<p>alpha</p>')"); const first = n() - m;
+  m = n();     w.eval("showHTML('<p>alpha</p>')"); const repeat = n() - m;
+  m = n();     w.eval("showHTML('<p>beta</p>')");  const changed = n() - m;
+  const afterChange = view.innerHTML;
+
+  // Another section takes the panel. #view is HIDDEN and still holds `<p>beta</p>`.
+  w.eval("showText('a text pane')");
+  const hiddenAfterText = view.classList.contains('hidden');
+
+  // The same markup arrives again: the stamp matches, so nothing needs writing —
+  // but the pane the reader is looking at is the wrong one, and only() must
+  // still run. A guard that returns before it is the blank board.
+  m = n();     w.eval("showHTML('<p>beta</p>')");
+  const backEvents = w.panelWrites.slice(m).map((e) => e.prop);
+  const shownAgain = !view.classList.contains('hidden');
+
+  return { first, repeat, changed, afterChange, hiddenAfterText, backEvents, shownAgain };
+}
+
+function withoutTheRepaintGuard(src) {
+  const from = 'if (!wasHidden && el.dataset.paint === sig) return false;';
+  const out = src.replace(from, '');
+  return { src: out, changed: out !== src };
+}
+
+async function repaintGuardCases() {
+  const r = await repaintScenario(PAGE_JS);
+  record('a_first_paint_writes_the_panel', r.first === 1,
+         r.first === 1 ? 'the opening paint reached the pane'
+                       : 'the opening paint produced ' + r.first + ' panel event(s), ' +
+                         'so every count below is measured against nothing');
+  record('an_identical_repaint_writes_nothing', r.first === 1 && r.repeat === 0,
+         r.repeat === 0 ? 'the second identical payload was skipped'
+                        : 'the same markup was written again (' + r.repeat + ' panel ' +
+                          'event(s)) — the 2.5 s poll still re-parses the panel, ' +
+                          'dropping the reader\'s selection and focus with it');
+  record('a_changed_payload_still_repaints',
+         r.changed === 1 && r.afterChange === '<p>beta</p>',
+         r.changed === 1 && r.afterChange === '<p>beta</p>'
+           ? 'a different payload wrote through'
+           : 'the pane holds ' + JSON.stringify(r.afterChange) + ' after ' +
+             r.changed + ' write(s) — the guard is suppressing real changes, ' +
+             'which freezes the section while the chip goes on saying live');
+  record('a_matching_payload_still_puts_the_pane_back_on_screen',
+         r.hiddenAfterText && r.shownAgain,
+         !r.hiddenAfterText
+           ? 'the text pane never hid #view, so this case never reached the ' +
+             'state it exists to test'
+           : r.shownAgain
+             ? 'the pane came back on screen'
+             : 'the stamp matched and the pane stayed hidden: rail on the ' +
+               'section, reader looking at the previous one — the two-click ' +
+               'blank board, back through the repaint guard');
+  // The narrowed rule, and it is not a detail: an animation replays only when
+  // the nodes are re-inserted, so a re-arrival that skipped its write would
+  // arrive with no entrance at all. The guard is for the POLL; a section switch
+  // repaints once either way.
+  record('a_re_arrival_repaints_even_when_the_payload_is_unchanged',
+         r.backEvents.includes('innerHTML'),
+         r.backEvents.includes('innerHTML')
+           ? 'arriving again rewrote the pane, so its entrance can play'
+           : 'arriving again produced only ' + JSON.stringify(r.backEvents) +
+             ' — the markup was never re-inserted, so the section appears with ' +
+             'no entrance and any CSS staged on arrival is dead');
+
+  const mut = withoutTheRepaintGuard(PAGE_JS);
+  record('the_repaint_guard_is_one_removable_expression', mut.changed,
+         mut.changed ? 'found the stamp comparison in paintInto'
+                     : 'no stamp comparison found in paintInto — the cases above ' +
+                       'cannot be made to fail, so treat them as unproven');
+  if (!mut.changed) return;
+  const rm = await repaintScenario(mut.src);
+  record('removing_the_repaint_guard_writes_the_same_markup_again', rm.repeat > 0,
+         rm.repeat > 0
+           ? 'guard removed \u2192 the identical payload is written again'
+           : 'guard removed and NOTHING changed — the case above does not ' +
+             'discriminate, so treat its pass as unproven');
+}
+
 // --- the census: neither list may drift out from under the other ------------
 function censusCases(renderers) {
   // If the regex stops matching the emitted page, every case below it becomes
@@ -1123,7 +1438,9 @@ async function main() {
   await stuckPollCases();
   await catsPollCases();
   await scopeCases();
+  await projectPickerCases();
   await honestyCases();
+  await repaintGuardCases();
 
   const ok = cases.every((c) => c.ok);
   process.stdout.write(JSON.stringify({ ok, renderers, cases }, null, 1));

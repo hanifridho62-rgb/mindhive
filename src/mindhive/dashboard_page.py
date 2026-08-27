@@ -115,6 +115,20 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
 /*__DASH_CSS__*/
 </style></head>
 <body>
+<!-- First in the DOM because that is the only place a skip link works: the rail
+     is 26 buttons and it comes before the panel, so without this the keyboard
+     pays 27 tabs to reach the first control inside the section it just chose.
+     It is a plain anchor to `#panel`, which carries `tabindex="-1"` so the jump
+     MOVES FOCUS rather than only scrolling -- an anchor to a non-focusable
+     element leaves the keyboard exactly where it was, which is the standard way
+     this feature ships broken. `#panel` and not `#view`: `showSkeleton` refuses
+     to paint while the focus is inside `#view`, so focusing the pane itself
+     would have quietly turned the loading placeholder off. -->
+<a id="skip" href="#panel">skip to content</a>
+<!-- Where the reader is inside a long section. Fixed under the header, scaled
+     rather than resized, and outside <main> for the same reason #totop is: it
+     belongs to the viewport, not to the section. -->
+<div id="prog" aria-hidden="true"></div>
 <header>
   <h1>MIND HIVE</h1>
   <span id="busy" class="dot"></span>
@@ -127,27 +141,34 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
 </header>
 <main>
   <nav aria-label="sections">
-    <button onclick="showOverview()">Overview</button>
+    <!-- ONE indicator that travels, rather than sixteen that light up. The
+         active button carries the STATE (`.on` for the eye, `aria-current` for
+         assistive tech); this bar is the part that MOVES, a single absolutely
+         positioned element translated to the active button's offset. Switching
+         section therefore animates one compositor property on one node instead
+         of repainting two rows of buttons. -->
+    <span id="navdot" aria-hidden="true"></span>
+    <button data-sec="overview" onclick="showOverview()">Overview</button>
     <div class="group">Work</div>
-    <button onclick="showOversee()">Oversee</button>
+    <button data-sec="oversee" onclick="showOversee()">Oversee</button>
     <div class="group">Memory</div>
-    <button onclick="showMemory()">Memory</button>
-    <button onclick="showSessions()">Sessions</button>
-    <button onclick="showImprovements(true)">Improvements</button>
-    <button onclick="showLog()">Log</button>
-    <button onclick="showSops()">SOP</button>
+    <button data-sec="memory" onclick="showMemory()">Memory</button>
+    <button data-sec="sessions" onclick="showSessions()">Sessions</button>
+    <button data-sec="improvements" onclick="showImprovements(true)">Improvements</button>
+    <button data-sec="log" onclick="showLog()">Log</button>
+    <button data-sec="sops" onclick="showSops()">SOP</button>
     <div class="group">View</div>
-    <button onclick="showState()">State</button>
-    <button onclick="showBriefing()">Briefing</button>
-    <button onclick="showRecall()">Recall</button>
-    <button onclick="showGraph()">Graph</button>
-    <button onclick="showSkillPanel()">Skill &amp; Plugin</button>
+    <button data-sec="state" onclick="showState()">State</button>
+    <button data-sec="briefing" onclick="showBriefing()">Briefing</button>
+    <button data-sec="recall" onclick="showRecall()">Recall</button>
+    <button data-sec="graph" onclick="showGraph()">Graph</button>
+    <button data-sec="skills" onclick="showSkillPanel()">Skill &amp; Plugin</button>
     <div class="group">Workspace</div>
-    <button onclick="showWorkspace('parallel')">MindParallel</button>
-    <button onclick="showWorkspace('swarm')">MindSwarm</button>
-    <button onclick="showWorkspace('research')">Self-Reliant</button>
+    <button data-sec="ws-parallel" onclick="showWorkspace('parallel')">MindParallel</button>
+    <button data-sec="ws-swarm" onclick="showWorkspace('swarm')">MindSwarm</button>
+    <button data-sec="ws-research" onclick="showWorkspace('research')">Self-Reliant</button>
     <div class="group">Actions</div>
-    <button onclick="showAppend()">Append memory</button>
+    <button data-sec="append" onclick="showAppend()">Append memory</button>
     <button onclick="doExport()">Export handoff.md</button>
     <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
     <button onclick="doAction('/api/sync','Sync')">Sync</button>
@@ -176,13 +197,22 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
        away. A live region has to sit outside the thing whose busyness it
        reports. -->
   <div id="ann" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
-  <section class="panel" id="panel" aria-busy="false">
+  <!-- `tabindex="-1"` is what makes the skip link above move the focus and not
+       just the scroll position. -1 keeps it out of the tab ORDER: it is a
+       target, never a stop. -->
+  <section class="panel" id="panel" aria-busy="false" tabindex="-1">
     <div id="controls"></div>
     <div id="view"></div>
     <pre id="out" class="hidden"></pre>
     <iframe id="graph" class="hidden"></iframe>
   </section>
 </main>
+<!-- Outside <main> because it belongs to the viewport, not to the section: it is
+     position:fixed, and nesting it inside the scrolling content would put a
+     fixed element inside a grid item for no reason. Ships in the markup rather
+     than being injected on first scroll so the sheet, not a script, decides
+     whether it is visible. -->
+<button id="totop" aria-label="back to top" title="back to top">&uarr; top</button>
 <script>
 /*__JS_CORE__*/
 /*__JS_IMPROVE__*/

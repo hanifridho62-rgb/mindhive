@@ -237,7 +237,13 @@ CARDS_CSS = """
   .tspan { font-size:11px; color:var(--dim); margin-left:auto; }
   .trows { list-style:none; padding:0; margin:8px 0 0; }
   .trow { border-top:1px solid var(--raised); padding:5px 2px; }
-  .tlab { cursor:pointer; }
+  /* Both of these carry `cursor:pointer` and neither answered it. No
+     transition on purpose: these sit inside a card that repaints on a poll, and
+     an instant tint cannot be caught half-applied by a rebuild the way a
+     travelling one can. */
+  .tlab { cursor:pointer; border-radius:4px; }
+  .tlab:hover { background:var(--hover-tint); }
+  .tcard .thead:hover { background:var(--hover-tint); }
   .tpath { color:var(--link); } .tplus { color:var(--ok); } .tminus { color:var(--bad); }
   .tbad { color:var(--bad); } .tnote { color:var(--warn); }
   .tbody { margin:6px 0 4px 16px; }

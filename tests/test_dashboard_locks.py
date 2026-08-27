@@ -28,7 +28,8 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard, dashboard_get, dashboard_jobs, events, jobs
+from mindhive import (dashboard, dashboard_get, dashboard_jobs,
+                      dashboard_memo, dedupe, events, jobs, paths, taskview)
 
 # Patch targets are the module that OWNS the name, not the one that re-exports
 # it. `dashboard` still exposes the locks and memos (same objects), but the code
@@ -1181,3 +1182,723 @@ def test_the_fingerprint_is_a_real_stamp_when_it_can_be_trusted():
                         session_id="sess-1", project="test")
     assert dashboard._ledger_fingerprint("test") != trusted, \
         "an appended event did not move the stamp"
+
+
+# --- the gate in front of /api/improvements ---------------------------------
+# The last polled route that read the WHOLE ledger on every tick. Measured on
+# the real store before the gate: 415 ms of `read_all` over 44951 events plus
+# 118 ms of `summaries` over 155 signatures, and `renderPlugins` asks for this
+# route on every 2.5 s poll while Skills is open. A/B on the same store, four
+# identical requests, byte-identical 438886-byte response either way: 562 ms per
+# repeat without the gate, 107 ms with it.
+#
+# Its fingerprint has a term the cats gate does not need — the incident RECORDS
+# on disk — because `incidents.summaries` reads them and a reflection pass
+# rewrites one with no event appended.
+
+IMPROVE = "/api/improvements?project=test"
+
+
+def _seed_lesson(project="test", signature="pymodule:mindhive"):
+    """One real incident record plus one caveat, so both halves of the response
+    have content and an empty payload cannot pass a test by accident."""
+    incidents = importlib.import_module("mindhive.incidents")
+    for i in range(2):
+        events.append_event("tool_failed",
+                            {"text": f"err {signature}", "signature": signature,
+                             "action": f"cmd{i}"},
+                            session_id=f"s{i}", tags=["auto", "failure"],
+                            project=project)
+    incidents.audit(project=project)
+    incidents.project(project=project)
+    events.append_event("caveat", {"text": "never embed while a trade is open"},
+                        session_id="s9", project=project)
+    return incidents
+
+
+def test_an_unchanged_improvements_store_is_never_read_again(dashboard_server,
+                                                             counters):
+    base, token = dashboard_server
+    _seed_lesson()
+    status, warm = _get(base, IMPROVE, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, "the first poll must actually do the work"
+    assert warm["auto"] and warm["manual"],         "the fixture produced nothing, so a cheap second poll would prove nothing"
+
+    counters.reset()
+    status, again = _get(base, IMPROVE, token)
+    assert status == 200
+    assert counters.reads.calls == 0, "an unchanged ledger was read anyway"
+    # Cheap AND the same: a gate that served a different payload would be a
+    # regression dressed as a speedup.
+    assert again == warm
+
+
+def test_appending_a_caveat_invalidates_the_improvements_gate(dashboard_server,
+                                                              counters):
+    base, token = dashboard_server
+    _seed_lesson()
+    _get(base, IMPROVE, token)
+    counters.reset()
+    _get(base, IMPROVE, token)
+    assert counters.reads.calls == 0             # the gate holds while nothing moves
+
+    events.append_event("caveat", {"text": "the second lesson, learned later"},
+                        session_id="s9", project="test")
+    counters.reset()
+    _status, body = _get(base, IMPROVE, token)
+    assert counters.reads.calls == 1, "an appended event must re-read the ledger"
+    assert any("learned later" in m["text"] for m in body["manual"]),         "the new caveat never reached the panel"
+
+
+def test_rewriting_an_incident_record_invalidates_the_improvements_gate(
+        dashboard_server, counters):
+    """The term a ledger-only stamp cannot see, and the reason the fingerprint
+    is compound. `incidents.summaries` reads `rules/incidents/*.md`; a reflection
+    pass, a resolution or a decay rewrites one of those files with NO event
+    appended, so a ledger-only gate would serve the old verdict for the life of
+    the process.
+
+    CANARY by MUTATION at the module seam: with `_incidents_fingerprint` pinned
+    to a constant — the ledger-only gate this test exists to forbid — the very
+    same rewrite must go unnoticed. Without that half, a test that merely sees
+    the new text would also pass against a gate that never caches at all.
+    """
+    import pytest as _pytest
+    base, token = dashboard_server
+    _seed_lesson()
+    _get(base, IMPROVE, token)                   # warm
+
+    record = next(iter(sorted(
+        (paths.project_dir("test") / "rules" / "incidents").glob("*.md"))))
+    original = record.read_text(encoding="utf-8")
+    # The Human Evaluation placeholder is what an operator (or `hive rules
+    # resolve`) replaces, and `derive_active` reads it straight back out as the
+    # record's active rule — a real edit to a real field, not a synthetic one.
+    placeholder = "<!-- leave blank to accept Auto; fill to override -->"
+    assert original.count(placeholder) == 1, \
+        f"the record has no Human Evaluation placeholder:\n{original[:400]}"
+
+    def rewrite(verdict):
+        record.write_text(original.replace(placeholder, verdict), encoding="utf-8")
+
+    rewrite("REFLECTED-LATER")
+    counters.reset()
+    _status, body = _get(base, IMPROVE, token)
+    assert counters.reads.calls == 1, \
+        "a rewritten incident record must invalidate the memo"
+    assert any(a.get("active_rule") == "REFLECTED-LATER" for a in body["auto"]), \
+        f"the rewrite never reached the panel: {[a.get('active_rule') for a in body['auto']]}"
+    assert any(a.get("rule_source") == "human" for a in body["auto"])
+
+    # The canary. A gate stamped on the ledger alone cannot see this rewrite.
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dashboard_memo, "_incidents_fingerprint",
+                   lambda _proj: ("pinned",))
+        _get(base, IMPROVE, token)               # warm under the pinned stamp
+        rewrite("NEVER-SEEN")
+        counters.reset()
+        _status, stale = _get(base, IMPROVE, token)
+        assert counters.reads.calls == 0, \
+            "the pinned-stamp control did not even score a cache hit"
+        assert not any(a.get("active_rule") == "NEVER-SEEN" for a in stale["auto"]), \
+            ("a ledger-only stamp saw the rewrite anyway, so the test above "
+             "proves nothing about the incidents term")
+
+
+def test_hive_mind_improvements_is_gated_one_namespace_at_a_time(dashboard_server,
+                                                                 counters):
+    """Unlike /api/mindnet/cats, HIVE MIND here is NOT a bypass. The fold is
+    per-project and so is its fingerprint, so the unified view is the sum of
+    per-namespace hits — which is what makes the all-projects poll affordable at
+    all, since it is the mode that reads every ledger on the machine."""
+    base, token = dashboard_server
+    _seed_lesson("test")
+    _seed_lesson("other", signature="pymodule:other")
+
+    status, warm = _get(base, "/api/improvements?project=*", token)
+    assert status == 200
+    assert counters.reads.calls >= 2, "both namespaces must be read the first time"
+    assert {a["project"] for a in warm["auto"]} == {"test", "other"}
+
+    counters.reset()
+    status, again = _get(base, "/api/improvements?project=*", token)
+    assert status == 200
+    assert counters.reads.calls == 0, \
+        "HIVE MIND re-read every namespace although none of them moved"
+    assert again == warm
+
+
+def test_the_efficiency_tiles_follow_the_clock_across_a_cache_hit(
+        dashboard_server, counters, monkeypatch):
+    """The trap this memo is shaped around. The lessons are a function of the
+    STORE; the efficiency tiles are a function of the CLOCK — their windows are
+    cut against `now`. Caching the response instead of the fold would freeze the
+    window boundaries at whatever they were when the store last moved, so a board
+    left open overnight would go on reporting yesterday's "last 24h" as today's,
+    with no event able to correct it."""
+    base, token = dashboard_server
+    _seed_lesson()
+    clock = _FakeTime(time.time())
+    monkeypatch.setattr(dashboard_get, "time", clock)
+
+    _status, warm = _get(base, IMPROVE, token)
+    day = warm["stats"]["day"]
+    assert day["cur_actions"] >= 2, \
+        "no actions landed in the current day window, so ageing it proves nothing"
+
+    counters.reset()
+    clock.now += 3 * 86400              # the seeded failures fall out of `day`
+    _status, aged = _get(base, IMPROVE, token)
+    assert counters.reads.calls == 0, \
+        "the store did not move, so this must have been a cache hit"
+    assert aged["stats"]["day"]["cur_actions"] == 0, \
+        "a cached response froze the efficiency window against the clock"
+    assert aged["auto"] == warm["auto"], "the lessons are not clock-dependent"
+
+
+# --- the four polled routes that read the WHOLE ledger on every tick ---------
+#
+# The shell polls the live section's endpoint every 2500 ms. Four of those
+# endpoints had no gate at all. Measured on the real store (45k events, 60
+# namespaces), three identical requests each, cold / warm / warm2 in ms:
+#
+#     /api/changelog   450 / 426 / 407   ->   386 /  37 /   4
+#     /api/sops        427 / 425 / 433   ->   408 /   3 /   3
+#     /api/memory      467 / 477 / 482   ->   437 /  52 /  36
+#     /api/sessions    464 / 457 / 444   ->   485 /  13 /  52
+#
+# Warm costing the same as cold is the signature of no gate: the whole
+# `events.read_all` ran again for a fold whose inputs had not moved. Each answer
+# was compared byte for byte against the ungated fold afterwards, single project
+# AND HIVE MIND — which is how the sessions list turned out to need one stable
+# sort on `first_ts` to reproduce its old tie order: without it, two sessions
+# sharing an exact `last_ts` swapped at row 508 of 2101.
+#
+# `?project=test` on every path for the reason `CATS` gives above: without it
+# do_GET calls default_project(), which reads EVERY namespace and would drown
+# the counts the gate is being measured by.
+
+POLLED_GATES = [
+    ("changelog", "/api/changelog?project=test",
+     lambda t: events.append_event("code_change",
+                                   {"category": "update", "text": "seeded " + t},
+                                   session_id="s-" + t, project="test"),
+     lambda b: b["entries"]),
+    ("sops", "/api/sops?project=test",
+     lambda t: events.append_event("sop",
+                                   {"action": "publish", "sop_id": "sop-" + t,
+                                    "title": "t " + t, "text": "body " + t},
+                                   session_id="s-" + t, project="test"),
+     lambda b: b["history"]),
+    ("memory", "/api/memory?project=test",
+     lambda t: events.append_event("decision", {"text": "seeded decision " + t},
+                                   session_id="s-" + t, project="test"),
+     lambda b: b),
+    ("sessions", "/api/sessions?project=test",
+     lambda t: events.append_event("user_prompt", {"text": "seeded prompt " + t},
+                                   session_id="s-" + t, project="test"),
+     lambda b: b),
+    # Not on the 2.5 s poll — the Skills board polls /api/plugins/inventory —
+    # but both of these ran a full `read_all` on every visit to the section, and
+    # `/api/skills/status` spent 378 ms of it to return 28 bytes.
+    ("skills-status", "/api/skills/status?project=test",
+     lambda t: events.append_event("invoke_result", {"name": "skill-" + t},
+                                   session_id="s-" + t, project="test"),
+     lambda b: b["counts"]),
+    ("skills-stats", "/api/skills/stats?project=test",
+     lambda t: events.append_event("invoke_result", {"name": "skill-" + t},
+                                   session_id="s-" + t, project="test"),
+     lambda b: b["stats"]),
+]
+
+_GATE_IDS = [g[0] for g in POLLED_GATES]
+
+
+@pytest.mark.parametrize("name,path,seed,rows", POLLED_GATES, ids=_GATE_IDS)
+def test_an_unchanged_ledger_is_never_read_again_for_a_polled_route(
+        dashboard_server, counters, name, path, seed, rows):
+    base, token = dashboard_server
+    seed("one")
+    status, warm = _get(base, path, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, "the first poll must actually do the work"
+    assert rows(warm), \
+        "the fixture produced nothing, so a cheap second poll would prove nothing"
+
+    counters.reset()
+    status, again = _get(base, path, token)
+    assert status == 200
+    assert counters.reads.calls == 0, f"{name}: an unchanged ledger was read anyway"
+    # Cheap AND the same: a gate that served a different payload would be a
+    # regression dressed as a speedup.
+    assert again == warm, f"{name}: the gate served a different payload"
+
+
+@pytest.mark.parametrize("name,path,seed,rows", POLLED_GATES, ids=_GATE_IDS)
+def test_an_appended_event_invalidates_a_polled_routes_gate(
+        dashboard_server, counters, name, path, seed, rows):
+    base, token = dashboard_server
+    seed("one")
+    _status, warm = _get(base, path, token)
+    counters.reset()
+    _get(base, path, token)
+    assert counters.reads.calls == 0, \
+        f"{name}: the gate did not hold while nothing moved, so the case below " \
+        f"cannot tell an invalidation from a cache that never worked"
+
+    seed("two")
+    counters.reset()
+    _status, after = _get(base, path, token)
+    assert counters.reads.calls >= 1, \
+        f"{name}: an appended event must re-read the ledger"
+    assert len(rows(after)) > len(rows(warm)), \
+        f"{name}: the new event never reached the panel"
+
+
+def _seed_card(session_id, text):
+    """One row on one task card. `command_run` is a projected kind, so the card
+    it lands on is provably non-empty — a card that projects to nothing cannot
+    tell a working gate from a broken one."""
+    events.append_event("command_run", {"text": text},
+                        session_id=session_id, project="test")
+
+
+def _card(base, token, session_id):
+    return _get(base, "/api/task?project=test&session=" + session_id, token)
+
+
+def test_an_unchanged_ledger_is_never_read_again_for_a_task_card(
+        dashboard_server, counters):
+    """Expanding the same card twice must read the ledger once."""
+    base, token = dashboard_server
+    _seed_card("sess-a", "ran one")
+
+    status, warm = _card(base, token, "sess-a")
+    assert status == 200
+    assert counters.reads.calls >= 1, "the first expand must actually do the work"
+    assert warm["items"], \
+        "the fixture produced no rows, so a cheap second expand proves nothing"
+
+    counters.reset()
+    status, again = _card(base, token, "sess-a")
+    assert status == 200
+    assert counters.reads.calls == 0, "an unchanged ledger was read anyway"
+    assert again == warm, "the gate served a different card"
+
+
+def test_a_second_task_card_is_served_from_the_first_cards_read(
+        dashboard_server, counters):
+    """The test that separates this gate from a per-session cache.
+
+    `/api/task` used to read the WHOLE ledger and keep one session's events, so
+    every new card paid a full read — the cost a user meets when they expand
+    several cards in a row, and exactly the cost a per-(project, session) memo
+    would NOT have removed. The fold is grouped by `session_id` and cached as a
+    whole precisely so the SECOND card is free, so that is what is asserted
+    here: a different session, zero reads, and its own correct rows."""
+    base, token = dashboard_server
+    _seed_card("sess-a", "ran one")
+    _seed_card("sess-b", "ran two")
+
+    _status, first = _card(base, token, "sess-a")
+    assert first["items"], "card A produced nothing to compare against"
+
+    counters.reset()
+    status, second = _card(base, token, "sess-b")
+    assert status == 200
+    assert counters.reads.calls == 0, \
+        "a second card re-read the ledger; the fold is not grouped"
+    assert [r["text"] for r in second["items"]] == ["ran two"], \
+        "card B was served card A's rows, or none at all"
+
+
+def test_an_appended_event_reaches_the_task_card(dashboard_server, counters):
+    base, token = dashboard_server
+    _seed_card("sess-a", "ran one")
+    _status, warm = _card(base, token, "sess-a")
+    counters.reset()
+    _card(base, token, "sess-a")
+    assert counters.reads.calls == 0, \
+        "the gate did not hold while nothing moved, so the case below cannot " \
+        "tell an invalidation from a cache that never worked"
+
+    _seed_card("sess-a", "ran two")
+    counters.reset()
+    _status, after = _card(base, token, "sess-a")
+    assert counters.reads.calls >= 1, "an appended event must re-read the ledger"
+    assert len(after["items"]) > len(warm["items"]), \
+        "the new event never reached the card"
+
+
+def test_an_unknown_session_is_an_empty_card_not_an_error(dashboard_server):
+    """A session the grouped fold never saw answers exactly as the old
+    per-session filter did: an empty card. Anything else — a 404, a null, a
+    KeyError — would be a new failure mode introduced by the lookup."""
+    base, token = dashboard_server
+    _seed_card("sess-a", "ran one")
+    status, body = _card(base, token, "no-such-session")
+    assert status == 200
+    assert body == {"items": [], "total": 0, "truncated": 0}
+
+
+# --- the Skills board's own poll -------------------------------------------
+# `renderPlugins` is the LIVE function for that section, so everything below is
+# on a 2.5 s timer, not a click.
+
+@pytest.fixture
+def fake_inventory(monkeypatch):
+    """One skill, from a fake disk. The real `live_inventory` walks this
+    machine's ~/.claude (347 skills, 256 ms cold), which would make these tests
+    depend on the developer's plugin folder and pay for a scan they do not test.
+    The returned dict is mutable so a test can MOVE the signature — that is the
+    inventory term of the stamp, and the term a ledger-only gate would miss."""
+    from mindhive import plugins as plugins_mod
+    state = {"sig": "sig-one"}
+    # THREE skills, not one: `top=1` has to be a real truncation or the test
+    # that pins `top` into the memo key compares a list against itself.
+    monkeypatch.setattr(plugins_mod, "live_inventory", lambda *a, **k: {
+        "changed": True, "signature": state["sig"], "inventory": {
+            "plugins": [{"name": "p", "skills": [
+                {"name": "tester", "trigger": "Use when tests fail."},
+                {"name": "shipper", "trigger": "Use when shipping a release."},
+                {"name": "digger", "trigger": "Use when digging into a bug."}]}],
+            "local_skills": [], "counts": {}}})
+    monkeypatch.setattr(plugins_mod, "inventory_signature",
+                        lambda *a, **k: state["sig"])
+    return state
+
+
+def _rank(base, token, extra=""):
+    return _get(base, "/api/skills/recommend?project=test" + extra, token)
+
+
+def test_the_skills_ranking_is_not_recomputed_while_nothing_moved(
+        dashboard_server, counters, fake_inventory):
+    base, token = dashboard_server
+    _seed("sess-1")
+    status, warm = _rank(base, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, "the first tick must actually do the work"
+    assert warm["recommendations"], \
+        "the fixture ranked nothing, so a cheap second tick proves nothing"
+
+    counters.reset()
+    status, again = _rank(base, token)
+    assert status == 200
+    assert counters.reads.calls == 0, "an unchanged store was read anyway"
+    assert again == warm, "the gate served a different ranking"
+
+
+def test_an_appended_event_invalidates_the_skills_ranking(
+        dashboard_server, counters, fake_inventory):
+    base, token = dashboard_server
+    _seed("sess-1")
+    _rank(base, token)
+    counters.reset()
+    _rank(base, token)
+    assert counters.reads.calls == 0, \
+        "the gate did not hold while nothing moved, so the case below cannot " \
+        "tell an invalidation from a cache that never worked"
+
+    events.append_event("next_step", {"text": "run the tests"},
+                        session_id="sess-2", project="test")
+    counters.reset()
+    _rank(base, token)
+    assert counters.reads.calls >= 1, "an appended event must re-read the ledger"
+
+
+def test_an_installed_skill_invalidates_the_skills_ranking(
+        dashboard_server, counters, fake_inventory):
+    """The term a ledger-only stamp would miss.
+
+    `recommend_for` ranks the skills that are ON DISK. Installing or removing a
+    plugin appends no event and touches no incident record, so a stamp made of
+    those two alone compares equal after the world moved — and the board would
+    go on recommending a skill that is gone, or never offer one that arrived,
+    until the server restarted."""
+    base, token = dashboard_server
+    _seed("sess-1")
+    _rank(base, token)
+    counters.reset()
+    _rank(base, token)
+    assert counters.reads.calls == 0, "the gate did not hold, so this proves nothing"
+
+    fake_inventory["sig"] = "sig-two"            # a plugin arrived on disk
+    counters.reset()
+    status, after = _rank(base, token)
+    assert status == 200
+    assert counters.reads.calls >= 1, \
+        "a changed skill inventory did not invalidate the ranking"
+
+
+def test_the_ranking_top_is_part_of_the_gates_key(dashboard_server,
+                                                  fake_inventory):
+    """`top` TRUNCATES the ranking, so one key for every `top` would serve a
+    short list to a caller that asked for the whole thing."""
+    base, token = dashboard_server
+    _seed("sess-1")
+    _status, full = _rank(base, token)
+    _status, one = _rank(base, token, extra="&top=1")
+    assert len(full["recommendations"]) > 1, \
+        "the fixture ranked one skill, so `top=1` truncates nothing and this " \
+        "test cannot tell a shared key from a separate one"
+    assert len(one["recommendations"]) == 1, \
+        "top=1 was served the full ranking from the other key"
+
+
+def _seed_call(name, session_id, text):
+    events.append_event("invoke_result", {"name": name, "text": text},
+                        session_id=session_id, project="test")
+
+
+def _history(base, token, name, limit=25):
+    return _get(base, "/api/skills/history?project=test&name=" + name
+                + "&limit=" + str(limit), token)
+
+
+def test_every_expanded_skill_is_served_from_one_read(dashboard_server,
+                                                      counters):
+    """The board re-fetches the history of EVERY expanded skill on every tick,
+    and each one used to be its own `read_all` — three skills open meant three
+    whole-ledger reads a tick. One grouped fold has to serve all of them."""
+    base, token = dashboard_server
+    _seed_call("alpha", "s1", "ran alpha")
+    _seed_call("beta", "s1", "ran beta")
+
+    _status, first = _history(base, token, "alpha")
+    assert [r["text"] for r in first] == ["ran alpha"]
+
+    counters.reset()
+    status, second = _history(base, token, "beta")
+    assert status == 200
+    assert counters.reads.calls == 0, \
+        "a second expanded skill re-read the ledger; the fold is not grouped"
+    assert [r["text"] for r in second] == ["ran beta"], \
+        "the second skill was served the first one's calls, or none at all"
+
+
+def test_a_second_limit_is_served_from_the_same_fold(dashboard_server,
+                                                     counters):
+    """`limit` slices the cached list rather than being part of the key."""
+    base, token = dashboard_server
+    for i in range(3):
+        _seed_call("alpha", "s1", "call %d" % i)
+    _status, all_rows = _history(base, token, "alpha", limit=25)
+    assert len(all_rows) == 3
+
+    counters.reset()
+    _status, two = _history(base, token, "alpha", limit=2)
+    assert counters.reads.calls == 0, "a different limit re-read the ledger"
+    assert two == all_rows[:2], "the slice did not match the full fold's head"
+
+
+def test_an_appended_call_reaches_the_skill_history(dashboard_server, counters):
+    base, token = dashboard_server
+    _seed_call("alpha", "s1", "first")
+    _status, warm = _history(base, token, "alpha")
+    counters.reset()
+    _history(base, token, "alpha")
+    assert counters.reads.calls == 0, \
+        "the gate did not hold while nothing moved, so the case below cannot " \
+        "tell an invalidation from a cache that never worked"
+
+    _seed_call("alpha", "s1", "second")
+    counters.reset()
+    _status, after = _history(base, token, "alpha")
+    assert counters.reads.calls >= 1, "an appended call must re-read the ledger"
+    assert len(after) == len(warm) + 1, "the new call never reached the panel"
+    assert after[0]["text"] == "second", "newest-first order was lost"
+
+
+@pytest.fixture
+def collapses(monkeypatch):
+    """Counts calls to the near-duplicate collapse.
+
+    The claim is about CALLS, not milliseconds — the same reason `counters`
+    counts reads. `dashboard_get` looks the function up on the module at call
+    time, so patching the owner is enough."""
+    counter = _Counter(dedupe.collapse)
+    monkeypatch.setattr(dedupe, "collapse", counter)
+    return counter
+
+
+def _seed_caveat(text, ts=None):
+    """A manual lesson — a `caveat` is what `_improvements_fold` puts in the
+    manual half, and it is the half `dedupe.collapse` runs over.
+
+    Named for the EVENT, not for the concept, because `_seed_lesson` above is
+    already a different helper with a different signature. Two module-level
+    helpers sharing a name do not collide at import — the second simply wins,
+    and the six callers of the first then fail with a `TypeError` about an
+    argument they never passed, raised from a line that names neither."""
+    events.append_event("caveat", {"text": text}, session_id="s1",
+                        project="test", **({"ts": ts} if ts else {}))
+
+
+def test_the_lesson_collapse_is_not_repeated_while_nothing_moved(
+        dashboard_server, collapses):
+    """76 ms of the ~108 ms this route cost warm, after its fold was already
+    gated: `dedupe.collapse` compares every lesson against every representative
+    it has kept. It is pure and its input is a deterministic sort of an
+    already-cached list, so a second poll must not run it again."""
+    base, token = dashboard_server
+    _seed_caveat("the ledger is append-only and hash chained")
+    _seed_caveat("a stop hook must fail open, never block")
+
+    status, warm = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    assert collapses.calls >= 1, "the first poll must actually collapse"
+    assert warm["manual"], \
+        "the fixture produced no manual lessons, so a cheap second poll " \
+        "would prove nothing"
+
+    collapses.calls = 0
+    status, again = _get(base, "/api/improvements?project=test", token)
+    assert status == 200
+    assert collapses.calls == 0, "an unchanged store was collapsed again"
+    assert again == warm, "the gate served a different set of lessons"
+
+
+def test_an_appended_lesson_is_collapsed_again(dashboard_server, collapses):
+    base, token = dashboard_server
+    _seed_caveat("the ledger is append-only and hash chained")
+    _status, warm = _get(base, "/api/improvements?project=test", token)
+    collapses.calls = 0
+    _get(base, "/api/improvements?project=test", token)
+    assert collapses.calls == 0, \
+        "the gate did not hold while nothing moved, so the case below cannot " \
+        "tell an invalidation from a cache that never worked"
+
+    _seed_caveat("a worktree serves whatever branch is checked out")
+    collapses.calls = 0
+    _status, after = _get(base, "/api/improvements?project=test", token)
+    assert collapses.calls >= 1, "an appended lesson must be collapsed again"
+    assert len(after["manual"]) > len(warm["manual"]), \
+        "the new lesson never reached the panel"
+
+
+def test_hive_mind_keeps_the_lessons_in_one_time_order(dashboard_server):
+    """HIVE MIND collapses the MERGED list, and the difference is the order.
+
+    The tempting optimisation is to collapse each namespace separately and
+    concatenate — every namespace then gets a cache entry and `*` is free. The
+    REPRESENTATIVES would be identical: `dedupe.collapse` clusters on
+    `(type, project)` and every manual row carries its project, so two
+    namespaces can never merge. What changes is the sequence: collapse emits in
+    input order, so merging first gives one global newest-first list while
+    concatenating gives them grouped by project.
+
+    The fixture interleaves two namespaces in time so the two orders DISAGREE —
+    `zzz` owns both the newest and the oldest lesson. A fixture where each
+    namespace occupied its own time range would pass either way."""
+    base, token = dashboard_server
+    for proj, ts, text in (
+            ("zzz", "2026-01-03T00:00:00Z", "zzz is the newest lesson"),
+            ("aaa", "2026-01-02T00:00:00Z", "aaa sits in the middle"),
+            ("zzz", "2026-01-01T00:00:00Z", "zzz is also the oldest lesson")):
+        events.append_event("caveat", {"text": text}, session_id="s1",
+                            project=proj, ts=ts)
+
+    status, merged = _get(base, "/api/improvements?project=*", token)
+    assert status == 200
+    order = [(m["project"], m["ts"]) for m in merged["manual"]
+             if m["project"] in ("aaa", "zzz")]
+    assert order == [("zzz", "2026-01-03T00:00:00Z"),
+                     ("aaa", "2026-01-02T00:00:00Z"),
+                     ("zzz", "2026-01-01T00:00:00Z")], \
+        f"HIVE MIND lessons are grouped by namespace, not by time: {order}"
+
+
+def test_the_session_status_follows_the_clock_across_a_cache_hit(
+        dashboard_server, counters, monkeypatch):
+    """`status` is a function of the WALL CLOCK and is the one field the sessions
+    gate deliberately does not store.
+
+    A cached status freezes: a session that was `ongoing` when the fold ran would
+    still read `ongoing` an hour later, on a board whose entire job is to say
+    which sessions are alive. The clock is moved at the module seam
+    `taskview.status_of` actually reads, rather than by patching `status_of`
+    itself — a test that stubbed the function would pass against an
+    implementation that cached its result and never called it.
+
+    Note the ordering: the clock is moved BEFORE the second request, and the
+    session board it produces has to disagree with the first while the ledger
+    behind it did not move at all."""
+    base, token = dashboard_server
+    events.append_event("user_prompt", {"text": "still going"},
+                        session_id="live-1", project="test")
+    _status, warm = _get(base, "/api/sessions?project=test", token)
+    assert [r for r in warm if r["status"] == "ongoing"], \
+        "the seeded session did not read as ongoing, so ageing it proves nothing"
+
+    # `_FakeTime`, not a bare stub: `status_of` is not the only thing in
+    # `taskview` that reaches into `time`, and a stub carrying only `time()`
+    # answered the whole request with a 500.
+    clock = _FakeTime(time.time())
+    monkeypatch.setattr(taskview, "time", clock)
+    clock.now += taskview.ACTIVE_WINDOW_SECS + 60
+    counters.reset()
+    _status, aged = _get(base, "/api/sessions?project=test", token)
+    assert counters.reads.calls == 0, \
+        "the ledger did not move, so this must have been a cache hit"
+    assert not [r for r in aged if r["status"] == "ongoing"], \
+        "a cached status froze the session board against the clock"
+    # Everything else is a pure fold of the ledger and must NOT have moved.
+    assert [{k: v for k, v in r.items() if k != "status"} for r in aged] == \
+           [{k: v for k, v in r.items() if k != "status"} for r in warm]
+
+
+def test_sessions_sharing_a_last_ts_keep_their_original_order(dashboard_server):
+    """The regression the gate introduced and a byte-comparison caught.
+
+    Before the gate this list came out of ONE globally ts-sorted stream, so
+    `sorted(..., key=last_ts, reverse=True)` — which is stable — broke ties in
+    each session's order of FIRST APPEARANCE. Folding per namespace and
+    concatenating breaks them in `_all_projects()` order instead, which is
+    alphabetical. On the real store that swapped two sessions sharing
+    `2026-08-10T00:27:10Z` at row 508 of 2101: a view whose contents had not
+    changed, reordered.
+
+    The fixture is built so the two answers DISAGREE. `aaa` sorts first
+    alphabetically but its session starts five seconds later, so a concatenation
+    order puts it first and the original order puts `zzz` first. A fixture where
+    both orders agree would pass either way."""
+    base, token = dashboard_server
+    for ts in ("2026-01-01T00:00:05Z", "2026-01-02T00:00:00Z"):
+        events.append_event("user_prompt", {"text": "a"}, session_id="sess-aaa",
+                            ts=ts, project="aaa")
+    for ts in ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"):
+        events.append_event("user_prompt", {"text": "z"}, session_id="sess-zzz",
+                            ts=ts, project="zzz")
+
+    _status, rows = _get(base, "/api/sessions?project=*", token)
+    tied = [r["session_id"] for r in rows
+            if r["last_ts"] == "2026-01-02T00:00:00Z"]
+    assert tied == ["sess-zzz", "sess-aaa"], (
+        "sessions sharing a last_ts must stay in first-appearance order; got "
+        f"{tied}")
+
+
+def test_the_changelog_pending_marker_is_read_on_every_poll(dashboard_server,
+                                                            counters):
+    """`pending` is a per-project SIDECAR, not an event, so the segment
+    fingerprint cannot see it move. It is read outside the gate on purpose:
+    cached, the blocking "unlogged code changes" banner would stay up — or stay
+    down — until some unrelated event happened to move the stamp."""
+    base, token = dashboard_server
+    events.append_event("code_change", {"category": "update", "text": "an entry"},
+                        session_id="s1", project="test")
+    _status, warm = _get(base, "/api/changelog?project=test", token)
+    assert warm["pending"] is None, "the fixture already had a marker"
+
+    changelog_mod = importlib.import_module("mindhive.changelog")
+    paths.write_text_atomic(changelog_mod.pending_path("test"),
+                            json.dumps({"files": ["src/mindhive/thing.py"]}))
+    counters.reset()
+    _status, after = _get(base, "/api/changelog?project=test", token)
+    assert counters.reads.calls == 0, \
+        "the ledger did not move, so the ENTRIES must still have been cached"
+    assert after["pending"] == {"files": ["src/mindhive/thing.py"]}, \
+        "the pending marker was cached along with the entries"
+    assert after["entries"] == warm["entries"]

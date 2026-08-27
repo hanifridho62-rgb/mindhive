@@ -318,21 +318,25 @@ Properties that hold for all of them — do not weaken:
 
 ### What composes a prompt's injected context
 
-`__main__.cmd_hook`, stage `user_prompt_submit`, in this order:
+`injectors.run_pipeline`, called by `__main__.cmd_hook` at stage `user_prompt_submit`. **The order lives in that one function**, not in the caller — it used to exist only as the sequence of statements inside `cmd_hook`, which is how this section came to describe five passes while seven ran.
 
-1. `promptgate.hook_context(raw)` — fires only on an underspecified prompt.
-2. `enrich.extend_hook_context` — **only if** the gate above fired.
-3. `mindnet.inject.extend_hook_context` — unconditional (the spine steers every
-   turn); sidecar is read **once** here and threaded in.
-4. `premise.extend_hook_context` — unconditional.
-5. `style.extend_hook_context` — **last**, so it prepends to whatever the
-   earlier passes produced. Like `mindnet.inject` and `premise`, it can build a
-   context from a `None`/empty one when every earlier pass stayed silent.
-6. `print(json.dumps(context))` — then, strictly *after* the print, the
-   side-effect layer: `record_direction`, `announce_faculties`, autodeclare.
+Generated from the registry; regenerate with `hive inject table --markers`.
 
-That ordering is load-bearing. New passes go before step 5, and anything that
-writes to the ledger goes after step 6.
+<!-- BEGIN GENERATED injection-pipeline -- hive inject table -->
+| # | pass | entry point | runs | writes | what it delivers |
+|---|------|-------------|------|--------|------------------|
+| 1 | `promptgate` | `promptgate.hook_context` | only on an underspecified prompt | creates | skill-trigger directives when the typed prompt is thin; a clear prompt yields no context at all, which is why every later pass tolerates a falsy one |
+| 2 | `enrich` | `enrich.extend_hook_context` | only if promptgate fired | appends | clarifying questions attached to a gate that already fired; it extends a context and never creates one |
+| 3 | `mindnet` | `mindnet.inject.extend_hook_context` | every turn | appends | the phase spine's per-task direction; the sidecar is read ONCE here and threaded on to the callers that need it afterwards |
+| 4 | `premise` | `premise.extend_hook_context` | every turn | appends | the checkable claims the prompt makes -- paths, roadmap ids, test counts -- checked against the record |
+| 5 | `sopgate` | `sopgate.extend_hook_context` | every turn | prepends | the mandatory SOPs verbatim; over budget a body degrades to a POINTER, never a truncation, because half a procedure reads like a whole one |
+| 6 | `symbols` | `symbols.extend_hook_context` | only when MINDHIVE_SYMBOLS is set | appends | the zero-token structural map; second-to-last so a map appended after the style block cannot sit ahead of it and take the truncation |
+| 7 | `style` | `style.extend_hook_context` | every turn | prepends | the standing reply style; LAST, and that placement is the contract -- it prepends, so running last is what makes it survive truncation of everything before it |
+<!-- END GENERATED injection-pipeline -->
+
+Then, and strictly *after* `print(json.dumps(context))`, the side-effect layer: `record_direction`, `announce_faculties`, autodeclare, and `injectors.record_turn`.
+
+That ordering is load-bearing. A new pass goes before `style`, anything that writes to the ledger goes after the print, and the row that records the turn is appended only when the turn's SIGNATURE changed — one row per prompt would be 1.76x this entire store in a year, and `hive verify` re-hashes every one of them forever.
 
 ## Hazards (learned the hard way — do not repeat)
 

@@ -47,6 +47,7 @@ import threading
 import time
 
 from . import claude_cli, events as ev_mod, paths, runlog
+from .dashboard_query import qs_int
 
 # Profile names end up interpolated into a Windows `cmd /k` string by
 # profile_login, so restrict them to an identifier-safe charset — no shell
@@ -1384,7 +1385,7 @@ def api_get(action, proj=None, qs=None) -> dict:
         return MANAGER.list()
     if action == "output":
         return MANAGER.output((qs.get("id") or [""])[0],
-                              since=int((qs.get("since") or ["0"])[0]))
+                              since=qs_int(qs, "since", 0))
     if action == "profiles":
         return {"ok": True, "profiles": load_profiles(),
                 "models": MODEL_CHOICES}

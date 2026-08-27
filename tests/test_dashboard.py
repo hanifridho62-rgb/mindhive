@@ -216,8 +216,18 @@ def test_run_marks_the_view_picked_before_it_awaits(dashboard_server):
     picked = body_of_run.index("viewPicked = true;")
     busy = body_of_run.index("setBusy(true, label);")
     assert picked < busy, "viewPicked must be set before run() does anything else"
-    # panel swaps that never reach run() count too
-    assert "function only(el){ viewPicked = true;" in body
+    # Panel swaps that never reach run() count too, and they are checked the
+    # same way rather than by pinning the one-line shape only() used to have:
+    # the flag must be the FIRST statement in the function, whatever the
+    # formatting around it.
+    o_start = body.index("function only(el){")
+    body_of_only = body[o_start:o_start + 1800]   # the comment inside grows
+    o_picked = body_of_only.index("viewPicked = true;")
+    o_toggle = body_of_only.index("classList.toggle('hidden'")
+    assert o_picked < o_toggle, "viewPicked must be set before only() touches the panel"
+    assert body_of_only[:o_picked].strip() == "function only(el){", (
+        "viewPicked is no longer only()'s first statement: "
+        + repr(body_of_only[:o_picked]))
 
 
 def test_both_pollers_skip_a_tick_instead_of_queueing(dashboard_server):
@@ -687,6 +697,56 @@ _MOTION_GUARDS = {
     ".skel .tile": ".skel .tile",
     ".skel .line": ".skel .line",
     ".skel .pane": ".skel .pane",
+    # The pointer feedback. These are TRANSITIONS, not animations, and they are
+    # listed for the same reason the pulses are: the census reads
+    # `animation|transition` alike, because a hover that travels is motion
+    # whether a keyframe block declares it or a shorthand does. Reduced motion
+    # takes the travel away and keeps the state -- the hover rules still apply
+    # their colour and their 2px lift, they just stop being animated to.
+    # One-shot, on arriving at Overview. It is listed like every repeating
+    # animation because the census cannot tell one-shot from endless, and
+    # because the guard is right either way: a reduced-motion reader gets the
+    # cards, immediately, with no travel.
+    ".cards.enter .card": ".cards.enter .card",
+    # The changed-value flash. Two selectors, one effect, both listed: a media
+    # query adds no specificity, so there is no shorthand that reaches them.
+    ".cards .big.bump": ".cards .big.bump",
+    ".types .pill b.bump": ".types .pill b.bump",
+    "nav button": "nav button",
+    ".card": ".card",
+    "button.mini": "button.mini",
+    # The travelling section indicator. One element, one compositor property.
+    "#navdot": "#navdot",
+    # Round C: the three surfaces that carried `cursor:pointer` and answered it
+    # with nothing. All three fade a GROUND colour, none of them travels, and
+    # reduced motion takes the fade away and keeps the tint -- the state, not
+    # the journey to it.
+    "button": "button",
+    "header #live": "header #live",
+    ".rmstep": ".rmstep",
+    # Round D. The panel's entrance is a one-shot on a section SWAP, so a
+    # reduced-motion reader loses the 220 ms of travel and keeps every section
+    # exactly as reachable as before. The three form controls fade one border
+    # colour between them and are listed separately because the guard side
+    # splits on commas too.
+    "section.panel.swap": "section.panel.swap",
+    # Round E. The way back to the top of a long section fades and rises; under
+    # reduced motion it simply IS there once the threshold is crossed, which is
+    # state without movement -- the thing the setting actually asks for.
+    "#totop": "#totop",
+    "input": "input",
+    "select": "select",
+    "textarea": "textarea",
+    # Round F, and all three are the same bargain the Round C entries struck:
+    # reduced motion takes the TRAVEL and keeps the state. The row under the
+    # pointer still lights, the skip link still arrives when it is focused (it
+    # simply appears rather than sliding down from above the fold), and the
+    # progress bar still fades in for a section long enough to have a position.
+    # The bar's own SCALE is not transitioned in either context — it has to
+    # track the wheel exactly — so there is nothing there for this to stop.
+    ".hits li": ".hits li",
+    "#skip": "#skip",
+    "#prog": "#prog",
     # cat_board.py
     ".mn-cat.active svg": ".mn-cat-sprite",
     ".mn-sess.working .mn-cat-sprite": ".mn-cat-sprite",
@@ -697,6 +757,19 @@ _MOTION_GUARDS = {
     # `catSVG` stamps `.mn-cat-sprite` on every cat it draws, and the guard
     # carries `!important`, which is what beats this rule's higher specificity.
     ".mn-inj.verbatim .mn-cat-sprite": ".mn-cat-sprite",
+    # The hover dance, one census row per selector. Five rows for one effect is
+    # the point of the map rather than a flaw in it: the four qualified ones
+    # exist only because the rules that turn an ambient bob on out-specify a
+    # bare sprite-plus-hover, so if a later change deletes the bob from one of
+    # those states, the row left behind here is what says the override outlived
+    # the thing it was overriding. All five are stopped by the same sprite
+    # guard, and that pairing is text-different-same-elements for exactly the
+    # reason `.mn-cat.active svg` above is.
+    ".mn-cat-sprite:hover": ".mn-cat-sprite",
+    ".mn-cat.active svg:hover": ".mn-cat-sprite",
+    ".mn-cat.dim svg:hover": ".mn-cat-sprite",
+    ".mn-sess.working .mn-cat-sprite:hover": ".mn-cat-sprite",
+    ".mn-inj.verbatim .mn-cat-sprite:hover": ".mn-cat-sprite",
     # taskview.py
     ".tstat.ongoing": ".tstat.ongoing",
 }
@@ -766,6 +839,52 @@ def test_every_animation_the_page_serves_is_stopped_under_reduced_motion(dashboa
         assert "!important" in " ".join(stopped[guard_sel]), (
             f"the guard for {on_sel} ({guard_sel}) is not !important, so the "
             "more specific rule that turns the animation on still wins")
+
+
+def test_every_grey_cat_the_page_paints_has_its_hover_dance_capped(dashboard_server):
+    """Grey is this page's word for absence, and a looping hover dance is its
+    loudest claim to be alive. Every state that greys a cat therefore needs a row
+    in the `animation-iteration-count:1` rule, or pointing at a dead thing makes
+    it dance.
+
+    Computed from the SERVED page rather than listed here, because the listed
+    version is the one that rots. The dance landed covering exactly one of the
+    three grey states -- a faculty gone quiet -- and shipped a silent injection
+    and an idle session dancing on loop for a while before anybody looked. A
+    written census would have been just as wrong and looked just as complete.
+
+    The pairing is by class prefix (`.mn-inj.silent` -> `.mn-inj.silent
+    .mn-cat-sprite:hover`), not by whole selector: the rule that GREYS a thing
+    and the rule that caps its dance address different nodes -- one the box, one
+    the sprite inside it -- so they can never be the same string. What the
+    browser tier proves, and this cannot, is that the cap then actually stops
+    the motion; this only proves nobody added a fourth grey state and forgot."""
+    base, token = dashboard_server
+    status, body = _get(base, "/")
+    css = re.sub(r"/\*.*?\*/", "",
+                 body[body.index("<style>"):body.index("</style>")], flags=re.S)
+
+    greyed, capped = set(), set()
+    for sel, decls in _css_rules(css):
+        for one in sel.split(","):
+            one = " ".join(one.split())
+            if "grayscale(100%)" in decls:
+                # The leading compound selector is the state; the rest is which
+                # node inside it carries the filter, which is not the point here.
+                greyed.add(one.split(" ")[0])
+            if re.search(r"animation-iteration-count\s*:\s*1\b", decls):
+                capped.add(one.split(" ")[0].replace(":hover", ""))
+
+    assert greyed, (
+        "no rule on the page greys a cat at all — either the three grey states "
+        "were removed or this test stopped finding them, and both need looking at")
+    assert greyed <= capped, (
+        f"a grey state's hover dance is uncapped: {sorted(greyed - capped)}.\n"
+        f"  states that grey a cat: {sorted(greyed)}\n"
+        f"  states whose dance is capped to one pass: {sorted(capped)}\n"
+        "Grey says 'this did not happen' — a quiet faculty, an idle session, an "
+        "injection that delivered nothing. A dance that never ends says the "
+        "opposite, and on the injection row that is the one fact the row carries.")
 
 
 def test_the_live_chip_stops_claiming_live_after_three_failed_ticks(dashboard_server):
@@ -965,17 +1084,38 @@ def test_skills_invoke_requires_token(dashboard_server):
         assert e.code == 403
 
 
-def test_skills_history_endpoint_returns_list(dashboard_server, monkeypatch):
-    from mindhive import plugins as plugins_mod
-    seen = {}
-    monkeypatch.setattr(plugins_mod, "call_history",
-        lambda name, project=None, limit=20, evs=None: seen.update(name=name, limit=limit)
-        or [{"ts": "t", "ok": True, "text": "x", "session": "s"}])
+def test_skills_history_endpoint_returns_the_calls_for_that_skill_newest_first(
+        dashboard_server):
+    """REPLACES a version that monkeypatched `plugins.call_history` and asserted
+    it was reached with (name, limit). That stopped being the path when this
+    route was gated: a single project now folds EVERY skill's history inline in
+    one pass, caches it on the ledger fingerprint, and slices the name that was
+    asked for -- `call_history` is left on the HIVE MIND path only. The old test
+    therefore asserted an internal the route no longer calls and went red the
+    moment the gate landed, and it went red for a reason that says nothing about
+    what the route answers.
+
+    Seeded rather than patched, and DISCRIMINATING on both parameters: four
+    calls across two skills, asking for three of one of them with a limit of
+    two. A route that ignored `name` would answer four rows, one that ignored
+    `limit` would answer three, and one that folded in the wrong direction would
+    answer the two oldest instead of the two newest."""
+    from mindhive import events
+    for name, ts, text in (("foo", "2026-07-01T10:00:00Z", "first foo"),
+                           ("foo", "2026-07-01T11:00:00Z", "second foo"),
+                           ("foo", "2026-07-01T12:00:00Z", "third foo"),
+                           ("bar", "2026-07-01T13:00:00Z", "only bar")):
+        events.append_event("invoke_result", {"name": name, "text": text},
+                            session_id="s", ts=ts, project="test")
     base, token = dashboard_server
-    status, body = _get(base, "/api/skills/history?name=foo&limit=7", token)
+    status, body = _get(
+        base, "/api/skills/history?name=foo&limit=2&project=test", token)
     assert status == 200
-    assert json.loads(body) == [{"ts": "t", "ok": True, "text": "x", "session": "s"}]
-    assert seen == {"name": "foo", "limit": 7}
+    rows = json.loads(body)
+    assert [r["text"] for r in rows] == ["third foo", "second foo"], (
+        f"the route answered {[r.get('text') for r in rows]} — expected the two "
+        f"newest calls of `foo`, newest first, and nothing belonging to `bar`")
+    assert all(r["ok"] for r in rows) and all(r["session"] == "s" for r in rows)
 
 
 def test_skills_history_requires_token(dashboard_server):
@@ -3048,3 +3188,275 @@ def test_the_clock_face_helper_is_spliced_and_called():
         "the clock face is not on the page exactly once")
     assert "esc(fmtHm(" in page, (
         "fmtHm is defined on the page but nothing calls it")
+
+
+def test_every_nav_button_that_owns_a_section_is_marked_and_nothing_else_is():
+    """The rail's active state is a PAIRING across two files, so it is audited
+    as one.
+
+    `data-sec` on a button in `dashboard_page.py` and `markSection('<id>')`
+    inside that section's own function are two halves of a single fact, written
+    in different modules -- and neither half fails loudly alone. A button
+    carrying an id nothing marks simply never lights; a `markSection` call for
+    an id no button carries marks nothing at all. Both stay invisible until
+    someone watches the rail stop keeping up with the panel.
+
+    The three workspace ids are COMPUTED -- one function serves three buttons,
+    so it marks `'ws-' + view` -- and are checked by that prefix rather than
+    expanded here. Expanding them would re-implement the mapping this test
+    exists to audit, and a test that re-implements its subject agrees with it by
+    construction."""
+    import re as _re
+    from mindhive import taskview
+
+    page = dashboard_page.render_page("tok", tasks_css=taskview.CARDS_CSS,
+                                      tasks_js=taskview.CARDS_JS)
+    nav = page[page.index('<nav aria-label="sections">'):page.index("</nav>")]
+    owned, actions = {}, []
+    for attrs in _re.findall(r"<button([^>]*)>", nav):
+        sec = _re.search(r'data-sec="([^"]+)"', attrs)
+        call = _re.search(r'onclick="([^"(]+)', attrs).group(1)
+        if sec:
+            owned[sec.group(1)] = call
+        else:
+            actions.append(call)
+
+    assert page.count("function markSection(") == 1, (
+        "markSection is not defined on the page exactly once, so either nothing "
+        "marks the rail or two definitions are racing to")
+    assert owned, "no nav button declares a data-sec at all"
+
+    unowned = [c for c in actions if c.startswith("show")]
+    assert not unowned, (
+        f"these nav buttons switch section but own no data-sec, so the rail "
+        f"cannot say they are showing: {sorted(unowned)}")
+    stray = sorted(s for s, call in owned.items() if not call.startswith("show"))
+    assert not stray, (
+        f"these data-sec ids sit on buttons that do NOT switch section, so "
+        f"`data-sec` has stopped meaning 'this button owns a section': {stray}")
+
+    marked = set(_re.findall(r"markSection\('([^']+)'\)", page))
+    computed = "markSection('ws-' + view)" in page
+    unmarked = sorted(s for s in owned
+                      if s not in marked and not (s.startswith("ws-") and computed))
+    assert not unmarked, (
+        f"these buttons own a section that nothing marks, so clicking them "
+        f"leaves the rail pointing at the previous section: {unmarked}")
+    orphans = sorted(m for m in marked if m not in owned)
+    assert not orphans, (
+        f"these sections mark an id no button carries, so the mark lands on "
+        f"nothing: {orphans}")
+
+
+# Selectors that declare `cursor:pointer` and are deliberately answered by
+# something OTHER than their own `:hover` rule. Empty, and meant to stay that
+# way: the honest exemption is a parent that lights instead, and that parent
+# then has to be named here with its reason, the way `_MOTION_GUARDS` names its
+# pairings. An empty map is a stronger statement than a missing one.
+_POINTER_EXEMPT = {}
+
+
+def test_every_pointer_cursor_surface_answers_the_cursor():
+    """`cursor:pointer` is a promise the page makes before the click.
+
+    A surface that changes the cursor is saying "this does something"; one that
+    then sits perfectly still under the pointer takes the promise back, and the
+    operator is left clicking to find out. Five shipped that way: the live chip
+    in the header, roadmap steps in Oversee, the session card's head and its
+    label, and the workspace tabs -- plus every plain `<button>`, which had no
+    pointer cursor at all because it was still wearing the OS default.
+
+    Read from the SOURCE rather than from a browser, on purpose. A live sweep
+    can only see the surfaces the current store happens to render -- an empty
+    roadmap has no steps, an empty session list has no cards -- so it would fall
+    quiet exactly where a regression is easiest to miss. The rule blocks are all
+    there whatever the data says.
+
+    Matching is on the last compound of each selector (`.rmstep` out of
+    `.rmstep.rmfirst`), deliberately loose: the question is whether the surface
+    is answered AT ALL, not whether one particular rule answers it."""
+    import pathlib as _pl
+    import re as _re
+    from mindhive import dashboard_page as _dp
+
+    pkg = _pl.Path(_dp.__file__).parent
+    dead = []
+    for path in sorted(pkg.rglob("*.py")):
+        src = _re.sub(r"/\*.*?\*/", " ",
+                      path.read_text(encoding="utf-8", errors="replace"), flags=_re.S)
+        hovers = _re.findall(r"([^{}\n][^{}]*?:hover[^{}]*?)\{", src)
+        for block in _re.finditer(r"([^{}\n][^{}]*?)\{([^{}]*)\}", src):
+            sel, body = block.group(1).strip(), block.group(2)
+            if "cursor:pointer" not in body.replace(" ", ""):
+                continue
+            if not _re.match(r"^[.#a-zA-Z\[][^;()]*$", sel):
+                continue                      # prose or code, not a rule
+            for one in (x.strip() for x in sel.split(",")):
+                if not one or one in _POINTER_EXEMPT:
+                    continue
+                key = one.split()[-1].split(":")[0]
+                if not any(key in h for h in hovers):
+                    dead.append(path.name + ": `" + one + "`")
+    assert not dead, (
+        "these surfaces change the cursor to a hand and then do not react to it "
+        "at all, so the page promises something is clickable and gives no sign "
+        "of it under the pointer:\n  " + "\n  ".join(sorted(set(dead))))
+
+
+# --- the paint-stamp registry ------------------------------------------------
+#
+# `paintInto` is the one place a whole pane is written. It stamps #view / #out
+# with a signature of what it painted and skips a byte-identical rewrite, which
+# is what stops the 2.5 s poll re-parsing an unchanged panel under the reader's
+# selection. The stamp is only safe while it describes what is actually on
+# screen, so anything that changes a pane WITHOUT coming through paintInto has
+# to drop it -- otherwise a later payload that happens to match the stale stamp
+# is skipped against a DOM that has since moved on.
+#
+# Two registries, because only one of them can be enforced mechanically.
+
+# Assigns a pane's OWN innerHTML/textContent. `_PANE_WRITE_RE` finds these, so a
+# new one that forgets to drop the stamp fails the census below by construction.
+_DIRECT_PANE_WRITERS = {
+    "fail": ("out", "delete out.dataset.paint;"),
+}
+
+# Mutates INSIDE a pane -- children, attributes, values. No regex can find these
+# without parsing JavaScript, so this half is a written list and the test can
+# only check that each entry still exists and still drops its stamp. That is a
+# real limit and it is stated rather than papered over: a new in-place writer
+# will not be caught here, and the executed cases in tests/node/ are what stand
+# behind it.
+_SUBTREE_WRITERS = {
+    "ovRefresh": ("view", "delete view.dataset.paint;"),
+}
+
+# Both ways a pane can be named: the module-scope `out`/`view` bindings, and a
+# fresh lookup by id. The second form matched nothing when this was written,
+# which is exactly when to include it -- a census that only knows the spelling
+# already in use stops being a census the first time someone types the other.
+_PANE_WRITE_RE = re.compile(
+    r"(?:\b(?:out|view)|getElementById\(\s*['\"](?:out|view)['\"]\s*\))"
+    r"\.(?:innerHTML|textContent)\s*=[^=]")
+_TOP_LEVEL_FN_RE = re.compile(r"\n  (?:async )?function (\w+)\s*\(")
+
+
+def _enclosing_function(page, at):
+    """The top-level function containing offset `at`.
+
+    Top-level declarations in the emitted script sit at exactly two spaces and
+    every nested block is indented four or more, which is the same property
+    `_js_block` relies on to find a function's end."""
+    last = None
+    for m in _TOP_LEVEL_FN_RE.finditer(page, 0, at):
+        last = m
+    return last.group(1) if last else None
+
+
+@pytest.mark.parametrize("fn,pane,drop",
+                         [(k, v[0], v[1]) for k, v in
+                          list(_DIRECT_PANE_WRITERS.items()) + list(_SUBTREE_WRITERS.items())])
+def test_every_registered_panel_writer_drops_the_paint_stamp(fn, pane, drop, dashboard_server):
+    """A writer that bypasses paintInto must invalidate the stamp it invalidated.
+
+    fail() is the one that bites: it writes an error into #out directly, and
+    without the drop the next successful render of that same section computes
+    the signature the pane was stamped with BEFORE the error, matches it, and
+    skips -- leaving a stale failure on screen under a "ready" status. That is
+    the exact class of lie the live-health chip exists to stop, arriving through
+    the paint path instead."""
+    base, token = dashboard_server
+    _, page = _get(base, "/", token)
+    block = _js_block(page, "function %s(" % fn)
+    assert drop in block, (
+        "%s writes %s past paintInto and never drops its paint stamp, so the "
+        "next payload that matches the stale signature will be skipped against "
+        "a pane that has already moved on" % (fn, pane))
+
+
+def test_no_unregistered_function_writes_a_pane_behind_the_paint_stamp(dashboard_server):
+    """The census, and the half of the registry that cannot go stale silently.
+
+    Every `out.innerHTML = ` / `view.textContent = ` style assignment in the
+    served page is attributed to the top-level function it sits in, and that
+    function must be a registered direct writer. paintInto itself is invisible
+    to this: it writes `el[prop]`, which is the point -- the pane it touches is
+    a parameter, and the stamp is its own business."""
+    base, token = dashboard_server
+    _, page = _get(base, "/", token)
+    hits = list(_PANE_WRITE_RE.finditer(page))
+    assert hits, ("no direct pane assignment found anywhere in the served page "
+                  "— the pattern this census is built on no longer matches, so "
+                  "it is passing vacuously")
+    stray = sorted({fn for fn in (_enclosing_function(page, m.start()) for m in hits)
+                    if fn not in _DIRECT_PANE_WRITERS})
+    assert not stray, (
+        "these functions write a pane directly instead of going through "
+        "paintInto: %s. Either route them through paintInto, or register them "
+        "in _DIRECT_PANE_WRITERS with the `delete <pane>.dataset.paint;` that "
+        "keeps the repaint guard honest." % ", ".join(stray))
+
+
+# --- the export button's scope ---------------------------------------------
+# Reproduced against a live server before it was fixed: with two namespaces in
+# the store, `/api/state?project=beta` answered beta while
+# `/api/export?project=beta` answered ALPHA — silently, under a 200 and an
+# attachment filename. Two independent halves, so two tests.
+
+
+def _two_namespaces():
+    """alpha and beta, each with a STATE.md that names itself. `detect_project`
+    answers `test` under the autouse fixture, which is a THIRD name — so a route
+    that ignores its parameter cannot accidentally return the right file."""
+    from mindhive import paths as hp
+    for name, marker in (("alpha", "ALPHA-STATE-MARKER"),
+                         ("beta", "BETA-STATE-MARKER")):
+        d = hp.project_dir(name)
+        (d / "events").mkdir(parents=True, exist_ok=True)
+        (d / "STATE.md").write_text(marker, encoding="utf-8")
+
+
+def test_export_returns_the_handoff_of_the_project_that_was_asked_for(dashboard_server):
+    """DISCRIMINATING both ways: each project is asked for, and each answer must
+    carry its OWN marker and NOT the other's. Asking for one name only would
+    pass against a route hardwired to that name — which is exactly the defect,
+    wearing a different constant."""
+    base, token = dashboard_server
+    _two_namespaces()
+
+    status, body = _get(base, "/api/export?project=beta", token)
+    assert status == 200
+    assert "BETA-STATE-MARKER" in body, body[:200]
+    assert "ALPHA-STATE-MARKER" not in body
+
+    status, body = _get(base, "/api/export?project=alpha", token)
+    assert status == 200
+    assert "ALPHA-STATE-MARKER" in body, body[:200]
+    assert "BETA-STATE-MARKER" not in body
+
+
+def test_export_under_hive_mind_says_so_instead_of_downloading_one_project(dashboard_server):
+    """`project_dir("*")` is not a directory, and the old code's answer to the
+    unified view was one arbitrary project's handoff under an attachment
+    filename — a file that lies about its own scope. Same sentence and same
+    shape as `/api/state` and `/api/briefing` give the same question."""
+    base, token = dashboard_server
+    _two_namespaces()
+
+    status, body = _get(base, "/api/export?project=*", token)
+    assert status == 200
+    assert "HIVE MIND" in body and "pick a single project" in body
+    assert "ALPHA-STATE-MARKER" not in body
+    assert "BETA-STATE-MARKER" not in body
+
+
+def test_the_export_button_sends_the_project_the_panel_is_showing():
+    """The other half, and the one a server-side test cannot see. A download has
+    to be a NAVIGATION, so `doExport` is the one request on the page that does
+    not go through `apiGet` — and `u()` appends only the token. The route can be
+    perfectly scoped and the button still ask an unscoped question."""
+    page = dashboard_page.render_page("tok")
+    m = re.search(r"function doExport\(\)\{[^}]*\}", page)
+    assert m, "doExport is no longer a one-line function — re-aim this census"
+    assert "withProj(" in m.group(0), (
+        f"the export button does not carry the project: {m.group(0)}")

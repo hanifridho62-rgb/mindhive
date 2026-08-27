@@ -95,26 +95,49 @@ def _empty_tallies() -> dict:
     return {key: [0, 0, 0, 0] for key, _ in _EFF_WINDOWS}
 
 
-def _add_tallies(tallies: dict, evs, now: float) -> None:
-    """Accumulate one project's tool-action counts into the window tallies.
-    Called once per project; HIVE MIND sums across projects before rating."""
+def _tool_action_rows(evs) -> list:
+    """`(ts, type)` for the events the efficiency windows count, and nothing else.
+
+    The whole ledger reduced to the part `_add_tallies_rows` reads. It exists so
+    a caller can CACHE the reduction: the windows are cut against `now`, so the
+    tallies themselves must be recomputed every request, but the events they are
+    cut from do not change between requests. On the real store this turns 44951
+    Event objects into a few thousand two-tuples of a timestamp string and an
+    interned type name — small enough to keep, and clock-free, which is the
+    property that makes keeping it safe.
+
+    A null `ts` is dropped here rather than guarded downstream, exactly as
+    `signal_stats` drops it: a corrupt segment must not land in any window."""
+    return [(ev.ts, ev.type) for ev in evs
+            if ev.type in _TOOL_ACTION_TYPES and ev.ts]
+
+
+def _add_tallies_rows(tallies: dict, rows, now: float) -> None:
+    """Accumulate `(ts, type)` rows into the window tallies at *now*."""
     cuts = {key: (_iso_utc(now - span), _iso_utc(now - 2 * span))
             for key, span in _EFF_WINDOWS}
-    for ev in evs:
-        if ev.type not in _TOOL_ACTION_TYPES or not ev.ts:
-            continue          # guard a null ts (corrupt segment) like signal_stats
+    for ts, etype in rows:
         for key, _ in _EFF_WINDOWS:
             cur_cut, prev_cut = cuts[key]
-            if ev.ts >= cur_cut:
+            if ts >= cur_cut:
                 i = 0
-            elif ev.ts >= prev_cut:
+            elif ts >= prev_cut:
                 i = 2
             else:
                 continue
             t = tallies[key]
             t[i + 1] += 1
-            if ev.type == "tool_failed":
+            if etype == "tool_failed":
                 t[i] += 1
+
+
+def _add_tallies(tallies: dict, evs, now: float) -> None:
+    """Accumulate one project's tool-action counts into the window tallies.
+    Called once per project; HIVE MIND sums across projects before rating.
+
+    Kept as the events-shaped door onto `_add_tallies_rows` — it is this
+    module's long-standing public surface and four tests call it directly."""
+    _add_tallies_rows(tallies, _tool_action_rows(evs), now)
 
 
 def _efficiency(tallies: dict) -> dict:

@@ -20,6 +20,39 @@ def _graph():
     }
 
 
+def test_a_node_answers_the_cursor_and_stops_under_reduced_motion():
+    """The dashboard's own hover motion is executed in the browser tier; this
+    page's is not, and deliberately: `/api/graph` renders every node of the real
+    store into one document — 21 MB against this ledger — so driving it under
+    Playwright would cost more than the rule is worth. Source shape is what is
+    affordable here, so it is what is claimed: the pairing is asserted, not the
+    cascade.
+
+    Both halves matter. The animation is what the operator asked for; the fill
+    is what survives when they have asked the operating system for less motion,
+    and a node that answered the cursor with nothing at all in that mode would
+    be a regression dressed as accessibility. The guard needs `!important` for
+    the reason the cat sheet's does: a media query adds no specificity, and the
+    rule it has to beat is the same `:hover` rule."""
+    css = graphview.render_html(_graph())
+    assert "animation:gv-pop" in css, "a graph node has no hover motion at all"
+    assert "@keyframes gv-pop" in css, "the hover rule names keyframes that do not ship"
+    assert "transform:scale(" in css, (
+        "gv-pop animates something other than transform — the earlier "
+        "stroke-width version measured +5.3ms task and +0.7ms layout against a "
+        "no-animation control, where transform measured as no cost at all")
+    assert "transform-box: fill-box" in css, (
+        "without fill-box an SVG child scales about the viewBox origin, so a "
+        "hovered node does not grow in place — it flies across the canvas")
+    assert "fill: #566070" in css, (
+        "the hover fill is gone, so a reduced-motion viewer gets no hover "
+        "feedback from a node at all")
+    guard = css[css.index("@media (prefers-reduced-motion: reduce)"):]
+    assert "animation:none !important" in guard, (
+        "gv-pop keeps running under prefers-reduced-motion, and this page "
+        "inherits no guard from the dashboard — it is served on its own")
+
+
 def test_render_html_contains_every_node_id():
     html = graphview.render_html(_graph())
     for node in _graph()["nodes"]:

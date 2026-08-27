@@ -458,10 +458,86 @@ def test_the_session_strip_does_not_rebuild_when_nothing_changed():
     and would defeat the guard entirely."""
     js = cat_board.script()
     body = js[js.index("function paintSessions("):]
-    assert "SESS_SIG" in body and "if (sig === SESS_SIG) return;" in body
+    # The guard's CONSEQUENT is a block, not a bare return: an unchanged poll
+    # still has to refresh the ages (the clock ticks even when the strip does
+    # not), so what this pins is the comparison and the early exit, not the
+    # one-line shape the guard happened to have before the clock split.
+    assert "SESS_SIG" in body and "if (sig === SESS_SIG){" in body         and "return;" in body[body.index("if (sig === SESS_SIG){"):]
     sig = body[body.index("const sig ="):body.index("if (sig === SESS_SIG)")]
     assert "age_secs" not in sig, (
         "age is in the repaint signature, so the guard can never fire")
+
+
+def _painters():
+    """Every `paint*` function in the shared script, name -> body.
+
+    Split on the declarations rather than brace-matched, which is enough here
+    and honest about it: these are top-level `function paint…(){}` declarations
+    in one generated string, so the text between two of them is exactly one
+    body. A painter nested inside another would break this, and there are none.
+    """
+    js = cat_board.script()
+    starts = [(m.start(), m.group(1))
+              for m in re.finditer(r"\bfunction (paint\w+)\s*\(", js)]
+    out = {}
+    for i, (pos, name) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(js)
+        out[name] = js[pos:end]
+    return out
+
+
+def test_every_strip_that_rebuilds_itself_guards_against_an_unchanged_poll():
+    """A census, not a list: computed from the script so a FOURTH painter added
+    later cannot ship without a guard.
+
+    The rule it enforces is one this file already states twice, once per strip
+    that learned it the hard way. A painter that clears its container and
+    rebuilds it hands every child a new element on every poll, and a new element
+    restarts its animation from 0%. `paintSessions` carries `SESS_SIG` for that
+    reason and `paintInjections` carries `dataset.sig` for the same one — and
+    `paintCats` carried neither for as long as nobody looked. Measured on the
+    live board: a dim cat, whose hover dance is capped to a single pass, moved
+    in four bursts across eight seconds, spaced at the 2.5 s poll interval.
+
+    Two halves, because a guard can fail in both directions. It has to EXIST,
+    and it has to be able to fire — a signature that folds in `age_secs`, which
+    changes on every single poll, is a guard that is never once true.
+
+    What this cannot see is whether the guard wins at runtime; the browser tier
+    asserts that by node identity. This asserts that nobody forgot."""
+    rebuilders = {name: body for name, body in _painters().items()
+                  if re.search(r"innerHTML\s*=\s*''", body)}
+    assert len(rebuilders) >= 3, (
+        f"only {sorted(rebuilders)} rebuild their container — this census was "
+        f"written against three and a painter it cannot see is a painter it "
+        f"cannot check")
+
+    for name, body in sorted(rebuilders.items()):
+        m = re.search(r"const sig = (.+?);\n", body, re.S)
+        assert m, (
+            f"{name} clears and rebuilds its container with no repaint "
+            f"signature, so every poll hands its cats new elements and restarts "
+            f"their animations mid-pass")
+        # Both operand orders, deliberately. `paintSessions` writes
+        # `sig === SESS_SIG` and the two dataset-keyed painters write
+        # `bar.dataset.sig === sig`; the direction of an equality is not a
+        # contract, and a census that insisted on one would be testing house
+        # style while claiming to test the guard.
+        held = r"(?:\w+\.dataset\.sig|[A-Z_]+SIG)"
+        # Both consequent shapes, for the same reason both operand orders are
+        # allowed. `paintInjections` exits on a bare `return;`; the two strips
+        # that also refresh their clock on a held poll run a short block and
+        # return out of it. The contract is "compares, then leaves without
+        # rebuilding" — a block that falls through would still reach
+        # `innerHTML = ''`, so `return;` inside it is the half that matters.
+        assert re.search(rf"if \(\s*(?:sig\s*===\s*{held}|{held}\s*===\s*sig)\s*\)"
+                         rf"\s*(?:return;|\{{[^{{}}]*return;)", body), (
+            f"{name} computes a signature and never compares it — the guard is "
+            f"present in the source and absent at runtime")
+        assert "age_secs" not in m.group(1), (
+            f"{name}'s repaint signature includes `age_secs`, which changes on "
+            f"every poll — the comparison can never be true, so the guard is "
+            f"decorative and the strip still rebuilds every tick")
 
 
 def test_the_strip_reports_what_it_could_not_show():

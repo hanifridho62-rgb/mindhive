@@ -169,6 +169,22 @@ def test_the_replenishment_pill_no_longer_says_plain_injected():
     assert "injected</span>" not in ov.JS
 
 
+def test_the_replenishment_pill_still_says_what_it_counts():
+    """The canary for the assertion above, which is bare-negative without it.
+
+    "The word is gone" is satisfied just as well by a card that lost the pill
+    altogether, and the pill is the whole point -- it is what makes a loop
+    growing its own work visible. This file's own header says a silence is only
+    meaningful from something proven able to speak; the pill is the speaker."""
+    from mindhive import dashboard_js_oversee as ov
+    assert "added to plan</span>" in ov.JS, (
+        "the replenishment pill is gone, not renamed -- G6 asked for one word "
+        "to change, not for the count to stop being shown")
+    assert "r.injected_count" in ov.JS, (
+        "the pill no longer reads the field it counts, so it can only ever "
+        "render as absent")
+
+
 def test_an_unchanged_turn_still_seeds_an_empty_ring():
     """Found by driving the REAL hook, not by a test.
 

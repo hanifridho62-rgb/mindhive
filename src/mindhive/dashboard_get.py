@@ -37,14 +37,21 @@ from . import research as research_mod
 from . import workspace as workspace_mod
 from .briefing import briefing as build_briefing
 from .dashboard_data import (HIVEMIND_LABEL, HIVEMIND_PROJECT, _add_tallies,
-                             _all_projects, _efficiency, _empty_tallies,
-                             _project_stats, _safe_chain_ok, all_event_pairs,
+                             _add_tallies_rows, _all_projects, _efficiency,
+                             _empty_tallies, _project_stats, _safe_chain_ok,
+                             _tool_action_rows, all_event_pairs,
                              default_project, event_pairs, injection_status,
                              overview_stats)
 from .dashboard_locks import _VERIFY_LOCK, _one_at_a_time
-from .dashboard_memo import (_CATS_MEMO, _intended_use_digest,
-                             _ledger_fingerprint, _memo_get, _memo_put,
-                             _oversee_cached, _sessions_cached, _with_liveness,
+from .dashboard_query import qs_int
+from .dashboard_memo import (_CATS_MEMO, _changelog_cached, _improve_cached,
+                             _intended_use_digest, _ledger_fingerprint,
+                             _manual_collapsed_cached, _memo_get, _memo_put,
+                             _memory_rows_cached, _oversee_cached,
+                             _recommend_cached, _session_rows_cached,
+                             _sessions_cached, _skill_calls_cached,
+                             _skill_history_cached, _skill_stats_cached,
+                             _sops_cached, _task_cards_cached, _with_liveness,
                              _with_online)
 from .research_page import render_research
 from .swarm_page import render_swarm
@@ -133,11 +140,31 @@ class GetRoutes:
         # the semantic subset only — the intent/context layer. Build the
         # (project, Event) rows once so the projection + dedupe.collapse lives
         # in a single place instead of once per am / single-project branch.
+        #
+        # Gated per project on the ledger fingerprint. The TYPE filter is a pure
+        # fold, and it was reading the whole ledger on every 2.5 s tick with the
+        # Memory section open — measured warm at 482 ms, the same as cold.
+        # `session` and `limit` cut the cached list afterwards, so they stay out
+        # of the key.
         from . import roadmap as roadmap_mod
         session = (qs.get("session") or [None])[0]
-        limit = int((qs.get("limit") or ["200"])[0])
-        rows = [(n, e) for n, e in event_pairs(proj, am)
-                if e.type in events.MEMORY_VIEW_TYPES]
+        limit = qs_int(qs, "limit", 200)
+
+        def memory_pairs(n):
+            return [(n, e) for e in events.read_all(n)
+                    if e.type in events.MEMORY_VIEW_TYPES]
+
+        if am:
+            rows = []
+            for n in _all_projects():
+                rows.extend(_memory_rows_cached(n, lambda n=n: memory_pairs(n)))
+            # `all_event_pairs` sorts the unified stream by ts and the filter
+            # preserved that order; sorting the concatenation restores it. Python
+            # sorts stably, so ties still fall in `_all_projects()` order — which
+            # is the order they were concatenated in before, too.
+            rows.sort(key=lambda pe: pe[1].ts or "")
+        else:
+            rows = _memory_rows_cached(proj, lambda: memory_pairs(proj))
         if session:
             rows = [(n, e) for n, e in rows if e.session_id == session]
         rows = list(reversed(rows))[:limit]      # newest first
@@ -161,73 +188,139 @@ class GetRoutes:
             for n, e in rows
         ]))
 
+    def _improvements_fold(self, n):
+        """One project's Improvements fold, and every part of it is a pure
+        function of that project's ledger and incident records — no clock, so it
+        is cacheable as a whole. `signal_stats`, `classify_resolution` and
+        `classify_triage` were each checked for a clock read before this was
+        split out; the one time-dependent part of the response, the efficiency
+        tiles, is cut from `rows` by the caller at request time."""
+        from . import incidents
+        evs = events.read_all(n)
+        stats_map = incidents.signal_stats(n, evs=evs)
+        auto = []
+        for s in incidents.summaries(n):
+            st = stats_map.get(s["signature"], {})
+            resolution = incidents.classify_resolution(s, st)
+            auto.append(dict(
+                s, project=n, source="auto",
+                first_seen=st.get("first_seen"),
+                last_seen=st.get("last_seen"),
+                leaks=st.get("leaks", 0),
+                reroutes=st.get("reroutes", 0),
+                last_reroute=st.get("last_reroute"),
+                resolution=resolution,
+                **incidents.classify_triage(resolution, s)))
+        manual = []
+        for e in evs:
+            if e.type != "caveat":
+                continue
+            manual.append({
+                "ts": e.ts, "type": e.type, "session": e.session_id,
+                "project": n, "source": "manual", "tags": e.tags,
+                "origin": events.origin_of(e.session_id, e.tags),
+                "text": (e.payload.get("text", "")
+                         if isinstance(e.payload, dict) else str(e.payload)),
+            })
+        return {"auto": auto, "manual": manual,
+                "rows": _tool_action_rows(evs)}
+
     def _get_improvements(self, proj, am, qs):
         # Lessons learned: machine-learned incident lessons (auto) plus
         # user-dictated caveat notes (manual), kept as two shapes so long
         # status memos can't masquerade as lesson cards. One event pass per
         # project feeds the caveats, the per-signature enrichment
         # (timestamps, leaks, resolution glyph), and the efficiency tiles.
-        from . import incidents
+        #
+        # Gated, because this was the last polled route reading the WHOLE ledger
+        # on every tick: measured on the real store, 415 ms of `read_all` over
+        # 44951 events plus 118 ms of `summaries` over 155 signatures, and
+        # `renderPlugins` asks for it every 2.5 s while Skills is open. The
+        # fingerprint carries the incident FILES as well as the ledger, because
+        # a reflection pass rewrites a lesson without appending an event.
         names = _all_projects() if am else [proj]
         now = time.time()
         auto, manual = [], []
         tallies = _empty_tallies()
         for n in names:
-            evs = events.read_all(n)
-            _add_tallies(tallies, evs, now)
-            stats_map = incidents.signal_stats(n, evs=evs)
-            for s in incidents.summaries(n):
-                st = stats_map.get(s["signature"], {})
-                resolution = incidents.classify_resolution(s, st)
-                auto.append(dict(
-                    s, project=n, source="auto",
-                    first_seen=st.get("first_seen"),
-                    last_seen=st.get("last_seen"),
-                    leaks=st.get("leaks", 0),
-                    reroutes=st.get("reroutes", 0),
-                    last_reroute=st.get("last_reroute"),
-                    resolution=resolution,
-                    **incidents.classify_triage(resolution, s)))
-            for e in evs:
-                if e.type != "caveat":
-                    continue
-                manual.append({
-                    "ts": e.ts, "type": e.type, "session": e.session_id,
-                    "project": n, "source": "manual", "tags": e.tags,
-                    "origin": events.origin_of(e.session_id, e.tags),
-                    "text": (e.payload.get("text", "")
-                             if isinstance(e.payload, dict) else str(e.payload)),
-                })
+            fold = _improve_cached(n, lambda n=n: self._improvements_fold(n))
+            # Copies out of the cached lists: the sort below is in place, and
+            # the entry is shared with every later poll.
+            auto.extend(fold["auto"])
+            manual.extend(fold["manual"])
+            _add_tallies_rows(tallies, fold["rows"], now)
         auto.sort(key=lambda s: s.get("occurrences", 0), reverse=True)
         manual.sort(key=lambda m: m.get("ts") or "", reverse=True)
-        return self._json({"auto": auto, "manual": dedupe.collapse(manual),
+        # The collapse is the last expensive thing on this route: 76 ms of the
+        # ~108 ms it still cost warm once the fold itself was gated. On the
+        # single-project path its input is a deterministic sort of an
+        # already-cached list, so it carries the same stamp.
+        #
+        # HIVE MIND collapses the MERGED list and is left uncached. Not because
+        # the representatives would differ — `dedupe.collapse` clusters on
+        # `(type, project)` and every manual row carries its project, so two
+        # namespaces can never merge — but because of their ORDER: collapse
+        # emits representatives in input order, so the merged list yields one
+        # global newest-first sequence while a per-namespace concatenation
+        # yields them grouped by project. Same lessons, different list.
+        collapsed = (dedupe.collapse(manual) if am else
+                     _manual_collapsed_cached(proj,
+                                              lambda: dedupe.collapse(manual)))
+        return self._json({"auto": auto, "manual": collapsed,
                            "stats": _efficiency(tallies)})
 
     def _get_sessions(self, proj, am, qs):
-        by: dict = {}
-        for name, e in event_pairs(proj, am):
-            key = (name, e.session_id)
-            s = by.get(key)
-            if s is None:
-                s = by[key] = {"session_id": e.session_id, "project": name,
-                               "events": 0, "memory": 0,
-                               "origin": None,
-                               "first_ts": e.ts, "last_ts": e.ts, "_evs": []}
-            s["events"] += 1
-            s["_evs"].append(e)
-            if not s["origin"]:
-                s["origin"] = events.origin_of(e.session_id, e.tags)
-            if e.type in events.MEMORY_VIEW_TYPES:
-                s["memory"] += 1
-            if e.ts and e.ts < s["first_ts"]:
-                s["first_ts"] = e.ts
-            if e.ts and e.ts > s["last_ts"]:
-                s["last_ts"] = e.ts
-        out = sorted(by.values(), key=lambda s: s["last_ts"] or "", reverse=True)
-        for s in out:
-            s["activity"] = taskview.tally(s.pop("_evs"))
-            s["status"] = taskview.status_of(s["last_ts"])
-        return self._json(out)
+        # Gated per project on the ledger fingerprint: this fold read the whole
+        # ledger on every 2.5 s tick with the Sessions section open — measured
+        # warm at 444 ms, the same as cold. Everything cached here is a pure
+        # function of one project's events; `status` is not, and is re-derived
+        # below onto a copy.
+        def fold(n):
+            by: dict = {}
+            for e in events.read_all(n):
+                s = by.get(e.session_id)
+                if s is None:
+                    s = by[e.session_id] = {
+                        "session_id": e.session_id, "project": n,
+                        "events": 0, "memory": 0, "origin": None,
+                        "first_ts": e.ts, "last_ts": e.ts, "_evs": []}
+                s["events"] += 1
+                s["_evs"].append(e)
+                if not s["origin"]:
+                    s["origin"] = events.origin_of(e.session_id, e.tags)
+                if e.type in events.MEMORY_VIEW_TYPES:
+                    s["memory"] += 1
+                if e.ts and e.ts < s["first_ts"]:
+                    s["first_ts"] = e.ts
+                if e.ts and e.ts > s["last_ts"]:
+                    s["last_ts"] = e.ts
+            rows = list(by.values())
+            for s in rows:
+                s["activity"] = taskview.tally(s.pop("_evs"))
+            return rows
+
+        # Grouping was already keyed on (project, session_id), so folding one
+        # project at a time groups identically.
+        rows = []
+        for n in (_all_projects() if am else [proj]):
+            rows.extend(_session_rows_cached(n, lambda n=n: fold(n)))
+        # The ORDER is reproduced, not approximated. `sorted(reverse=True)` is
+        # stable, so the old list's ties fell in the dict's insertion order —
+        # which was each session's FIRST appearance in one globally ts-sorted
+        # stream, i.e. `first_ts`, ties broken by namespace order and then by
+        # position within that namespace. These rows arrive concatenated in
+        # exactly that nesting, so one stable sort on `first_ts` restores the
+        # same sequence before the `last_ts` sort runs over it.
+        #
+        # Skipping this reordered the HIVE MIND list at row 508 of 2101 on the
+        # real store: two sessions sharing `2026-08-10T00:27:10Z` swapped, which
+        # is a visible change to a view whose contents did not change.
+        rows.sort(key=lambda s: s["first_ts"] or "")
+        out = sorted(rows, key=lambda s: s["last_ts"] or "", reverse=True)
+        # `status` is a function of the WALL CLOCK, so it is derived per response
+        # onto a copy — storing it would freeze a session as active forever.
+        return self._json([dict(s, status=taskview.status_of(s["last_ts"]))
+                           for s in out])
 
     def _get_changelog(self, proj, am, qs):
         # Mandatory code change-log. Shape and ordering delegate to
@@ -236,17 +329,27 @@ class GetRoutes:
         # per-project sidecar, so HIVE MIND shows entries without a
         # pending banner; categories ride along so the UI never hardcodes
         # the taxonomy.
+        #
+        # Gated per project: the fold is pure over one ledger, and it was reading
+        # all of it on every 2.5 s tick while the Log section is open — measured
+        # warm at 407 ms against the real store, the same as cold. The pending
+        # marker stays outside the gate; it is a sidecar the fingerprint cannot
+        # see move.
         from . import changelog as changelog_mod
+
+        def fold(n):
+            return changelog_mod.entries(events.read_all(n), project=n)
+
         if am:
             rows = []
             for n in _all_projects():
-                rows.extend(changelog_mod.entries(events.read_all(n),
-                                                  project=n))
+                rows.extend(_changelog_cached(n, lambda n=n: fold(n)))
             rows.sort(key=lambda r: r["ts"] or "", reverse=True)
             pending = None
         else:
-            rows = changelog_mod.entries(events.read_all(proj),
-                                         project=proj)
+            # A copy, because the entry is shared with every later poll and the
+            # response is handed on to callers that may sort it in place.
+            rows = list(_changelog_cached(proj, lambda: fold(proj)))
             pending = changelog_mod.load_pending(proj)
         return self._json({"entries": rows,
                            "categories": list(changelog_mod.CATEGORIES),
@@ -256,21 +359,29 @@ class GetRoutes:
         # Managed SOP registry. Active set and history both delegate to
         # sop.py (one source of truth for fold/ordering), so this view
         # can never disagree with `hive sop list` / `hive sop show`.
+        #
+        # Gated for `_get_changelog`'s reason and by the same measurement: 433 ms
+        # warm, identical to cold, every 2.5 s while the SOPs section is open.
         from . import sop as sop_mod
+
+        def fold(n):
+            evs = events.read_all(n)
+            return sop_mod.current(evs), sop_mod.entries(evs, project=n)
+
         if am:
             active, hist = [], []
             for n in _all_projects():
-                evs = events.read_all(n)
-                for r in sop_mod.current(evs):
-                    active.append(dict(r, project=n))
-                hist.extend(sop_mod.entries(evs, project=n))
+                cur, ents = _sops_cached(n, lambda n=n: fold(n))
+                active.extend(dict(r, project=n) for r in cur)
+                hist.extend(ents)
             active.sort(key=lambda r: (r.get("created") or "",
                                        r.get("sop_id") or ""))
             hist.sort(key=lambda r: r["ts"] or "", reverse=True)
         else:
-            evs = events.read_all(proj)
-            active = sop_mod.current(evs)
-            hist = sop_mod.entries(evs, project=proj)
+            # Copies for `_get_changelog`'s reason: both lists are shared with
+            # every later poll of this project.
+            cur, ents = _sops_cached(proj, lambda: fold(proj))
+            active, hist = list(cur), list(ents)
         return self._json({"active": active, "history": hist,
                            "actions": list(sop_mod.ACTIONS)})
 
@@ -282,9 +393,20 @@ class GetRoutes:
         if am and not tproj:
             return self._json({"ok": False,
                                "error": "session_project required"}, 400)
-        evs = [e for e in events.read_all(tproj or proj)
-               if e.session_id == sid]
-        return self._json(taskview.items(evs))
+        # One grouped fold serves every card in the namespace (see
+        # `_task_cards_cached`). A session the fold never saw answers exactly
+        # as the old per-session filter did — `taskview.items([])` — so an
+        # unknown id still gets an empty card rather than a 404.
+        name = tproj or proj
+
+        def fold(n):
+            by_sid = {}
+            for ev in events.read_all(n):
+                by_sid.setdefault(ev.session_id, []).append(ev)
+            return {k: taskview.items(rows) for k, rows in by_sid.items()}
+
+        cards = _task_cards_cached(name, lambda: fold(name))
+        return self._json(cards.get(sid) or taskview.items([]))
 
     def _get_task_detail(self, proj, am, qs):
         sid = (qs.get("session") or [""])[0]
@@ -293,7 +415,7 @@ class GetRoutes:
     def _get_recall(self, proj, am, qs):
         q = (qs.get("q") or [""])[0]
         semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
-        limit = int((qs.get("limit") or ["10"])[0])
+        limit = qs_int(qs, "limit", 10)
         force = (qs.get("force") or ["0"])[0] in ("1", "true")
         if am:
             hits = []
@@ -355,15 +477,59 @@ class GetRoutes:
         # both derived from the ledger in a single pass. HIVE MIND merges
         # every namespace's ledger, mirroring /api/improvements — skills
         # telemetry must not read "*" as a literal (empty) namespace.
-        evs = [e for _, e in all_event_pairs()] if am else None
-        return self._json(plugins_mod.call_stats(project=proj, evs=evs))
+        #
+        # Gated on the single-project path, which is the one the board takes:
+        # measured at 378 ms warm for a 28-byte response, all of it `read_all`.
+        # HIVE MIND folds a MERGED event list and cannot be composed from
+        # per-project folds — "last outcome per skill" across namespaces is not
+        # the merge of each namespace's last outcome — so that path is left
+        # reading, and says so rather than pretending to be covered.
+        if am:
+            evs = [e for _, e in all_event_pairs()]
+            return self._json(plugins_mod.call_stats(project=proj, evs=evs))
+        return self._json(_skill_calls_cached(
+            proj, lambda: plugins_mod.call_stats(project=proj)))
 
     def _get_skills_history(self, proj, am, qs):
+        # One fold per namespace serves every expanded skill. The board
+        # re-fetches this for EACH expanded skill on every 2.5 s tick, and each
+        # one used to be its own full `read_all` — three skills open meant three
+        # whole-ledger reads a tick. `limit` slices the cached list rather than
+        # being part of the key, so a second limit costs nothing either.
         name = (qs.get("name") or [""])[0]
-        limit = int((qs.get("limit") or ["20"])[0])
-        evs = [e for _, e in all_event_pairs()] if am else None
-        return self._json(plugins_mod.call_history(name, project=proj,
-                                                   limit=limit, evs=evs))
+        limit = qs_int(qs, "limit", 20)
+        if am:
+            evs = [e for _, e in all_event_pairs()]
+            return self._json(plugins_mod.call_history(name, project=proj,
+                                                       limit=limit, evs=evs))
+
+        def fold(n):
+            by_name = {}
+            for ev in events.read_all(n):
+                p = ev.payload if isinstance(ev.payload, dict) else {}
+                if ev.type == "invoke_result":
+                    key = p.get("name")
+                    row = {"ts": ev.ts, "ok": True, "text": p.get("text", ""),
+                           "session": ev.session_id}
+                elif ev.type == "tool_failed":
+                    sig = str(p.get("signature") or "")
+                    key = sig[6:] if sig.startswith("skill:") else None
+                    row = {"ts": ev.ts, "ok": False, "text": p.get("text", ""),
+                           "session": ev.session_id}
+                else:
+                    continue
+                if key is None:
+                    continue
+                by_name.setdefault(key, []).append(row)
+            # `call_history` folds chronologically and reverses, which keeps
+            # append order on equal timestamps. Reversing each list here is the
+            # same operation on the same sequence.
+            for rows in by_name.values():
+                rows.reverse()
+            return by_name
+
+        hist = _skill_history_cached(proj, lambda: fold(proj))
+        return self._json(hist.get(name, [])[:max(0, limit)])
 
     def _get_injection(self, proj, am, qs):
         # What the six UserPromptSubmit injectors delivered, per turn.
@@ -547,24 +713,38 @@ class GetRoutes:
     def _get_skills_stats(self, proj, am, qs):
         # per-skill completion-rate telemetry aggregated from the ledger
         # (skill_used / invoke_result / tool_failed skill:*) — U5/KTD5
-        evs = [e for _, e in all_event_pairs()] if am else None
-        return self._json({"stats": plugins_mod.skill_stats(project=proj,
-                                                            evs=evs)})
+        #
+        # Gated for `_get_skills_status`'s reason and by the same measurement:
+        # 407 ms warm, identical to cold, on every visit to the section.
+        if am:
+            evs = [e for _, e in all_event_pairs()]
+            return self._json({"stats": plugins_mod.skill_stats(project=proj,
+                                                                evs=evs)})
+        return self._json({"stats": _skill_stats_cached(
+            proj, lambda: plugins_mod.skill_stats(project=proj))})
 
     def _get_skills_recommend(self, proj, am, qs):
         # deterministic most-needed-skills ranking (U6/KTD6): one ledger
         # read feeds both the stats and the need extraction. HIVE MIND
         # merges events AND incident summaries across every namespace.
+        #
+        # Gated on the single-project path: `renderPlugins` is the Skills
+        # section's LIVE function, so this ran every 2.5 s at 641 ms a tick.
+        # The stamp covers all three of its inputs (see `_recommend_fingerprint`),
+        # not just the ledger. HIVE MIND merges events and incidents across every
+        # namespace and is left reading, like the other skills endpoints.
         top = (qs.get("top") or [None])[0]
-        evs = summ = None
+        top = int(top) if top else None
         if am:
             from . import incidents
             evs = [e for _, e in all_event_pairs()]
             summ = [s for n in _all_projects()
                     for s in incidents.summaries(project=n)]
-        return self._json(plugins_mod.recommend_for(
-            project=proj, evs=evs, top=int(top) if top else None,
-            incident_summaries=summ))
+            return self._json(plugins_mod.recommend_for(
+                project=proj, evs=evs, top=top, incident_summaries=summ))
+        return self._json(_recommend_cached(
+            proj, top,
+            lambda: plugins_mod.recommend_for(project=proj, top=top)))
 
     def _get_skills_trail(self, proj, am, qs):
         # Durable per-session skill trail (agent-native parity with the CLI
@@ -713,7 +893,26 @@ class GetRoutes:
             action, proj=default_project() if am else proj, qs=qs))
 
     def _get_export(self, proj, am, qs):
-        path = export_mod.export()
+        """The handoff for the project the panel is SHOWING.
+
+        `export_mod.export()` was called with no argument, so it defaulted to
+        `paths.project_dir(None)` -> `detect_project()` — the namespace derived
+        from the dashboard PROCESS's cwd, which has nothing to do with the
+        picker. Reproduced against a live server with two namespaces: the
+        control `/api/state?project=beta` answered beta's STATE.md while
+        `/api/export?project=beta` returned alpha's, silently, under a 200 and
+        an attachment filename. It also WRITES `handoff.md` into whichever
+        project it picked, so the wrong namespace grew a file as well.
+
+        HIVE MIND answers in words rather than a file, and NOT as an
+        attachment: `project_dir("*")` is not a directory, and a downloaded
+        handoff.md whose body explains itself is worse than a page that does.
+        Same sentence and same shape as `_get_state` / `_get_briefing`.
+        """
+        if am:
+            return self._send(200, "HIVE MIND unifies every project — pick a single "
+                              "project to export its handoff.", "text/plain; charset=utf-8")
+        path = export_mod.export(proj)
         data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/markdown; charset=utf-8")

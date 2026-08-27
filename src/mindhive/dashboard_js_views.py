@@ -42,13 +42,21 @@ JS = """\
     showHTML(pend + '<h2 class="h">'+res.entries.length+' change-log entr'
       + (res.entries.length===1?'y':'ies')+'</h2>'
       + '<ul class="hits">' + res.entries.map(e =>
-        '<li><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
+        // `two` asks the sheet for the two-column row: the sentence on the
+        // left at the board's reading measure, the file list and the stamp
+        // beside it instead of stacked under it. This section is the one with
+        // the shape for it -- 270 rows of prose plus two lines of metadata,
+        // where the metadata is what the reader scans and the prose is what
+        // they read. Not asked for by the SOP list two functions below, whose
+        // `.snip` holds the procedure's whole body: a 26em side column is the
+        // right home for a file list and the wrong one for a paragraph.
+        '<li class="two"><div class="file">'+logBadge(e.category)+' '+esc(e.text)+'</div>'
         + ((e.files||[]).length ? '<div class="snip">'+(e.files||[]).map(esc).join(' \\u00b7 ')+'</div>' : '')
         + '<div class="snip dup">'+esc(fmtTs(e.ts))+' \\u00b7 session '+esc(e.session||'')
         + (showProj && e.project ? ' \\u00b7 '+esc(e.project) : '') +'</div></li>').join('')
       + '</ul>');
   }
-  function showLog(){ controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog, 'rows'); }
+  function showLog(){ markSection('log'); controls.innerHTML=''; liveFn = renderLog; run('loading change log', renderLog, 'rows'); }
 
   function sopBadge(action){
     const colors = {add:'var(--cat-minor)', update:'var(--cat-update)', 'delete':'var(--cat-deletion)'};
@@ -84,15 +92,16 @@ JS = """\
       + (res.history.length===1?'':'s')+')</h2>'
       + '<ul class="hits">'+hist+'</ul>');
   }
-  function showSops(){ controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops, 'rows'); }
+  function showSops(){ markSection('sops'); controls.innerHTML=''; liveFn = renderSops; run('loading SOPs', renderSops, 'rows'); }
 
   async function renderState(){
     const s = await apiGet('/api/state');
     if (!shouldPaint(liveFn, renderState)) return;     // newer section owns the panel
     showText(s);
   }
-  function showState(){ controls.innerHTML=''; liveFn = renderState; run('loading state', renderState, 'block'); }
+  function showState(){ markSection('state'); controls.innerHTML=''; liveFn = renderState; run('loading state', renderState, 'block'); }
   function showBriefing(){
+    markSection('briefing');
     controls.innerHTML=''; liveFn = null;
     // liveFn is null here, so shouldPaint cannot guard this one — run()'s
     // generation does. Without it, /api/briefing (1.2-1.9s on the 31k store)
@@ -104,6 +113,7 @@ JS = """\
   }
 
   function showRecall(){
+    markSection('recall');
     liveFn = null;
     controls.innerHTML = '<div class="row"><input id="q" placeholder="search query" style="min-width:260px">'
       + '<label><input type="checkbox" id="sem"> semantic</label>'
@@ -126,7 +136,9 @@ JS = """\
       if (!current()) return;
       if (!hits.length) { showText('No matches for "'+q+'".'); return; }
       showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
-        + hits.map(h => '<li><div class="file">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
+        // The one row in sixteen whose `.file` really is a file: `path` puts the
+        // link blue back on it, which the shared rule stopped being.
+        + hits.map(h => '<li><div class="file path">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
         + '</ul>');
     }, 'rows');
   }
@@ -136,6 +148,7 @@ JS = """\
   // opt-in build (an embedding search per event) so they stay off by default;
   // ticking the box reloads with ?semantic=1.
   function showGraph(){
+    markSection('graph');
     liveFn = null;
     let semantic = false;
     controls.innerHTML = '<label class="ctl" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">'
@@ -152,16 +165,60 @@ JS = """\
     load();
   }
 
+  // A frame that answers neither load nor error must not hold the busy chip
+  // open for the rest of the session. Long enough that a slow workspace page
+  // still gets to announce itself honestly.
+  const WS_LOAD_MS = 15000;
+
   // Workspace views (MindParallel / MindSwarm / Self-Reliant) are full pages
-  // served by the server and loaded by URL — srcdoc must be cleared first or
+  // served by the server and loaded by URL - srcdoc must be cleared first or
   // it wins over src. 'research' lives under its own /api/research family.
+  //
+  // Through run() for the GENERATION, not for the busy chip. This was the one
+  // section entry that swapped the panel without going through run(), so it
+  // never bumped RUN_GEN - and the run belonging to the section being LEFT
+  // therefore still passed its own current() check. Its 150 ms skeleton timer
+  // then fired into #view, and paintInto's only(view) hid the frame the reader
+  // had already chosen: the section button reads ws-parallel while the panel
+  // shows Overview's placeholder over a blank frame, a section that never
+  // arrives. Measured on the real page in 2 of 4 clicks made inside the
+  // skeleton window and 0 of 2 outside it; the variance is the overview memo,
+  // which resolves inside 150 ms once warm and fires no skeleton at all.
+  //
+  // Bumping RUN_GEN by hand was the smaller change and the wrong one: it would
+  // retire the stale run without adopting run()'s finally, and that finally is
+  // where setBusy(false) lives - the chip would have stuck on forever.
+  //
+  // No `shape` argument: a skeleton paints into #view, which is precisely the
+  // clobber above. The frame is its own placeholder.
   function showWorkspace(view){
+    markSection('ws-' + view);
     controls.innerHTML=''; liveFn = null;
-    only(graph);
-    graph.removeAttribute('srcdoc');
-    graph.src = u(withProj(view === 'research' ? '/api/research/page'
-                                               : '/api/workspace/'+view));
-    announce(view + ' workspace \\u2014 loading');
+    run('loading ' + view + ' workspace', () => new Promise(resolve => {
+      only(graph);
+      const want = u(withProj(view === 'research' ? '/api/research/page'
+                                                  : '/api/workspace/'+view));
+      // Already showing this exact page: keep the document rather than loading
+      // it again. It holds whatever the reader typed and has not saved, its
+      // scroll position and its expanded rows, and re-navigating discarded all
+      // of it on every visit - measured with MindParallel's project-name field,
+      // which nothing but the reader ever writes: typed, glanced at Overview,
+      // came back to an empty box. Keeping it costs no staleness either, since
+      // the page's own loop resumes on its next tick now the frame is visible.
+      if (!graph.hasAttribute('srcdoc') && graph.getAttribute('src') === want)
+        return resolve();
+      graph.removeAttribute('srcdoc');
+      const done = () => {
+        clearTimeout(timer);
+        graph.removeEventListener('load', done);
+        graph.removeEventListener('error', done);
+        resolve();
+      };
+      const timer = setTimeout(done, WS_LOAD_MS);
+      graph.addEventListener('load', done);
+      graph.addEventListener('error', done);
+      graph.src = want;
+    }));
   }
 
   // Self-Reliant (an iframe) can ask the parent to open the Memory view filtered
@@ -177,6 +234,7 @@ JS = """\
   });
 
   function showAppend(){
+    markSection('append');
     liveFn = null;
     controls.innerHTML = '<div class="row"><select id="etype">'
       + ['decision','caveat','experiment_result','next_step','open_question','state_set']

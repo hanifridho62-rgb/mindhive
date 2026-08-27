@@ -25,7 +25,7 @@ JS = """\
   // placed HERE would run before the await and catch nothing, which would read
   // as protection while providing none.
   async function renderSessions(){ return renderTaskCards(); }
-  function showSessions(){ controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions, 'rows'); }
+  function showSessions(){ markSection('sessions'); controls.innerHTML=''; liveFn = renderSessions; run('loading sessions', renderSessions, 'rows'); }
   function openSession(sid){ SESSION = sid; showMemory(); }
 
   // --- Oversee: live Claude work — loop runs AND interactive sessions ---
@@ -343,7 +343,14 @@ JS = """\
       // record the act, fire-and-forget: copying is real use, previews are not
       apiPost('/api/enrich/preview',
               {prompt: EN_PROMPT, answers: EN_ANSWERS, record: true});
+      // Restored on a timer, not by the next repaint. It used to be the
+      // latter by accident -- the 2.5 s poll rebuilt this whole panel and the
+      // label came back with it -- and the panel repaint guard ended that.
+      // A label that only reverts when unrelated data happens to change is a
+      // bug wearing a feature's clothes either way.
+      const was = cp.textContent;
       cp.textContent = 'copied \\u2713';
+      setTimeout(() => { cp.textContent = was; }, 1200);
     };
     view.querySelectorAll('.enans').forEach(el => {
       el.oninput = () => { EN_ANSWERS[el.dataset.qid] = el.value; };
@@ -447,6 +454,6 @@ JS = """\
       await renderOversee();
     });
   }
-  function showOversee(){ controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee, 'rows'); }
-  function showOverview(){ controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview, 'cards'); }
+  function showOversee(){ markSection('oversee'); controls.innerHTML=''; liveFn = renderOversee; run('loading oversee', renderOversee, 'rows'); }
+  function showOverview(){ markSection('overview'); controls.innerHTML=''; liveFn = renderOverview; run('loading overview', renderOverview, 'cards'); }
 """

@@ -448,7 +448,7 @@ JS = """\
       paintPlugins();
       el = Array.from(view.querySelectorAll('.skrow')).find(li => li.dataset.name === name);
     }
-    if (el) el.scrollIntoView({behavior: REDUCE_MOTION ? 'auto' : 'smooth',
+    if (el) el.scrollIntoView({behavior: reduceMotion() ? 'auto' : 'smooth',
                                block: 'center'});
   }
   function syncPlugControls(){
@@ -511,6 +511,7 @@ JS = """\
   function onPlugSrc(v){ PLUG_SRC = v; paintPlugins(); }
   function onPlugMeasured(v){ PLUG_MEASURED = v; paintPlugins(); }
   function showSkillPanel(){
+    markSection('skills');
     const statusOpts = [['all','all'],['fail','red (failed)'],['uncalled','grey (uncalled)'],['ok','green (ok)']]
       .map(kv => '<option value="'+kv[0]+'"'+(PLUG_STATUSF===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
     const sortOpts = [['status','needs attention'],['name','name'],['source','plugin']]
@@ -528,7 +529,11 @@ JS = """\
     liveFn = renderPlugins;
     run('loading skill & plugin', renderPlugins, 'rows');
   }
-  function doExport(){ window.location = u('/api/export'); }
+  // withProj as well as u: this is the ONE fetch on the page that does not
+  // go through apiGet (a download has to be a navigation), so it was also
+  // the one that never carried the picker's project — the server was
+  // being asked a question with the scope left off.
+  function doExport(){ window.location = u(withProj('/api/export')); }
 
   // A server-side refusal is `{ok:false, error:"…"}` with HTTP 200 — the six
   // one-at-a-time locks answer that way on purpose, so the page can render it.
