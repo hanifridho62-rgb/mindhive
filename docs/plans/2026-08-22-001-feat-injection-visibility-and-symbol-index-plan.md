@@ -579,26 +579,26 @@ as TODOS #1. It is the one dimension this plan does not move.
 
 Synthesized from this review's findings. Each task derives from a specific finding above.
 
-- [ ] **T1 (P1, human: ~1d / CC: ~45min)** — `injectors.py` — Add the injector registry, `Injection`, and three-state `VERDICTS`
+- [x] **T1 (P1, human: ~1d / CC: ~45min)** — `injectors.py` — Add the injector registry, `Injection`, and three-state `VERDICTS`
   - Surfaced by: §4 G2 — the injector list lives only in `cmd_hook`'s body; nothing can enumerate it
   - Files: `src/mindhive/injectors.py`, `tests/test_injectors.py`
   - Verify: a test pins `INJECTOR_NAMES` distinct from `telemetry.FACULTIES`, and pins `VERDICTS` against `sopgate.VERDICTS`
-
-- [ ] **T2 (P1, human: ~1d / CC: ~45min)** — six injectors — Give each a `probe()` returning `Injection`, modelled on `sopgate.probe`
+  - **Landed** 2026-08-23 (change-log `major_change @ 2026-08-23T14:29:43Z`, 10 files); the checkbox was simply never ticked, which left the plan reading as though its four foundational tasks were outstanding. Verified against the code before ticking, not from the record: `VERDICTS`, `class Injection` and `INJECTOR_NAMES` are all in `injectors.py`
+- [x] **T2 (P1, human: ~1d / CC: ~45min)** — six injectors — Give each a `probe()` returning `Injection`, modelled on `sopgate.probe`
   - Surfaced by: §4 G3 — an external delta of 0 cannot separate "nothing to say" from "fell open"
   - Files: `promptgate.py`, `enrich.py`, `mindnet/inject.py`, `premise.py`, `sopgate.py`, `style.py`
   - Verify: each `probe()` returns `silent` on a forced fault and the prompt context is unchanged
-
-- [ ] **T3 (P1, human: ~4h / CC: ~20min)** — `events.py` + `injectors.py` — Register `context_injected` in `DETERMINISTIC_TYPES`, one row per turn, hash-deduped replay text
+  - **Landed** 2026-08-23 (change-log `major_change @ 2026-08-23T14:29:43Z`, 10 files); the checkbox was simply never ticked, which left the plan reading as though its four foundational tasks were outstanding. Verified against the code before ticking, not from the record: all seven registered modules define a module-level `probe()` (`promptgate`, `enrich`, `mindnet.inject`, `premise`, `sopgate`, `style`, `symbols`) — six when this line was written, seven since T8
+- [x] **T3 (P1, human: ~4h / CC: ~20min)** — `events.py` + `injectors.py` — Register `context_injected` in `DETERMINISTIC_TYPES`, one row per turn, hash-deduped replay text
   - Surfaced by: §11.3 — 6 rows/prompt against a 41,488-event ledger whose `read_all` is 430 ms
   - Files: `src/mindhive/events.py`, `src/mindhive/injectors.py`, `tests/test_events.py`
   - Verify: one row per turn asserted; a canary asserts the type is NOT in `SEMANTIC_TYPES`
-
-- [ ] **T4 (P1, human: ~2h / CC: ~15min)** — `__main__.cmd_hook` — Route the six calls through the recorder, outside their own try
+  - **Landed** 2026-08-23 (change-log `major_change @ 2026-08-23T14:29:43Z`, 10 files); the checkbox was simply never ticked, which left the plan reading as though its four foundational tasks were outstanding. Verified against the code before ticking, not from the record: `"context_injected"` is a member of `events.DETERMINISTIC_TYPES`, and `record_turn` appends one row per CHANGED turn rather than per turn
+- [x] **T4 (P1, human: ~2h / CC: ~15min)** — `__main__.cmd_hook` — Route the six calls through the recorder, outside their own try
   - Surfaced by: §4 G3 — fail-open must survive exactly as it is
   - Files: `src/mindhive/__main__.py:102-195`, `tests/test_hook_injection.py`
   - Verify: a raising injector still returns the context untouched and still prints; the recorder writes `silent`
-
+  - **Landed** 2026-08-23 (change-log `major_change @ 2026-08-23T14:29:43Z`, 10 files); the checkbox was simply never ticked, which left the plan reading as though its four foundational tasks were outstanding. Verified against the code before ticking, not from the record: `__main__.cmd_hook` calls `injectors.run_pipeline` and then `injectors.record_turn`, the latter strictly after the print
 - [x] **T5 (P1, human: ~1d / CC: ~1h)** — `cat_board.py` + `dashboard_js_oversee.py` — The per-turn injection row with three visual states
   - Surfaced by: §4 G4 + E2 — Oversee has no cats; absence cannot express failure
   - Files: `src/mindhive/cat_board.py`, `src/mindhive/dashboard_js_oversee.py`, `src/mindhive/dashboard_get.py`
@@ -629,25 +629,29 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Verify: `hive context --check` shows a `hook` row and a total larger than the session-only figure
   - **Landed.** `context.collect_hook` reads the injection sidecar, never the ledger. `hive context --origin hook` lists all seven passes including the ones at zero; `--origin all` now prints a `hook` line beside `hive` and `claude`. Verified through the real CLI against a real hook run.
 
-- [ ] **T10 (P2, human: ~2h / CC: ~10min)** — `__main__.py` — `hive inject show [--turn last] [--json]`
+- [x] **T10 (P2, human: ~2h / CC: ~10min)** — `__main__.py` — `hive inject show [--turn last] [--json]`
   - Surfaced by: §5 Pass 1 — no entry point exists; `hive sop injection` answers 1 of 6
   - Files: `src/mindhive/__main__.py`, `tests/test_cli_inject.py`
   - Verify: exit code 0 and six rows on a real turn; `--json` parseable on stdout even when empty
+  - **Landed**, as `hive inject show [--turn last|N] [--project P] [--json]`. SEVEN rows, not six — `symbols` landed after this line was written, and the report is built from the REGISTRY rather than from the record precisely so that a pass added later cannot go missing from it; a pass with no row this turn is reported as such. Behaviour lives in `injectors.cli` and the group self-registers (`injectors.register`, the fourth module to), because `__main__.py` had six lines of headroom under its ratchet and inline wiring needed ten. `--turn N` indexes the recent ring and says `index only: no text on the ring` rather than showing an empty block. Exercised against the real sidecar: exit 0, seven rows, `--json` parses, and the empty case puts `{}` on stdout with the hint on stderr
 
-- [ ] **T11 (P3, human: ~30min / CC: ~5min)** — `dashboard_js_oversee.py:212` — Relabel the replenish pill to `N added to plan`
+- [x] **T11 (P3, human: ~30min / CC: ~5min)** — `dashboard_js_oversee.py:212` — Relabel the replenish pill to `N added to plan`
   - Surfaced by: §4 G6 (T2) — one word, two meanings, same card
   - Files: `src/mindhive/dashboard_js_oversee.py`, whichever test pins the string
   - Verify: grep finds no remaining `injected` label on the replenish pill
+  - **Landed**, and the relabel itself was already done — what was missing was the other half of the pin. `test_the_replenishment_pill_no_longer_says_plain_injected` asserted only that the word is GONE, which a card that had lost the pill entirely satisfies just as well. `test_the_replenishment_pill_still_says_what_it_counts` is the canary, and it was proven red by cutting the pill
 
-- [ ] **T12 (P2, human: ~3h / CC: ~20min)** — `docs/session-legend.md` + `README.md` — Generated pipeline table
+- [x] **T12 (P2, human: ~3h / CC: ~20min)** — `docs/session-legend.md` + `README.md` — Generated pipeline table
   - Surfaced by: §4 G7 — the composition order lives only in a function body
   - Files: `docs/session-legend.md`, `README.md`
   - Verify: the table is generated from `INJECTORS`; a test fails if a registry member is missing from it
+  - **Landed.** `injectors.PIPELINE_NOTES` + `pipeline_table()`, surfaced as `hive inject table [--markers]`, carried by both documents between generated markers, and compared by `tests/test_cli_inject.py` in both directions (registered-but-undocumented AND documented-but-retired). The gap was worse than G7 recorded: `docs/session-legend.md` described a FIVE-pass pipeline. `sopgate` and `symbols` had each been added exactly where its numbered list said to add them, and the list was never touched either time — it also still credited `__main__.cmd_hook` with an order that had moved into `run_pipeline`
 
-- [ ] **T13 (P2, human: ~4h / CC: ~30min)** — `tests/test_dashboard_browser.py` — Browser-tier probe: hover, click, three states
+- [x] **T13 (P2, human: ~4h / CC: ~30min)** — `tests/test_dashboard_browser.py` — Browser-tier probe: hover, click, three states
   - Surfaced by: T3 — hover and click are the ask, and only a browser can prove them
   - Files: `tests/test_dashboard_browser.py`
   - Verify: `pytest -m browser` green; panel stays inside the viewport near the right edge
+  - **Landed:** four probes (three states, hover, click open/close, viewport clamp) seeded through the REAL sidecar and served by the real `/api/injection`, with seven canary mutants, all proven red. Two corrections came out of building it. The states are asserted on COMPUTED STYLE, not class names — a class nothing answers is a state nobody can see. And the clamp probe does not bite at 1500px: the strip's rightmost cat sits at x=790 and a ~210px panel ends at 1000, so the guard could be cut with the probe still green. It runs at 900px, clicks the rightmost cat by measurement rather than the last in the DOM (the row wraps), and asserts FIRST that an unclamped panel would have overflowed
 
 ---
 

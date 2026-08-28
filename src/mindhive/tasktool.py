@@ -260,22 +260,40 @@ def _result_id(response) -> str:
 
     TWO SHAPES, and the one this shipped reading was the one a human sees. A
     transcript renders a create as `Task #1 created successfully: ...`; the field
-    the HOOK is handed is the structured object,
-    `{"success": true, "taskId": "1", "updatedFields": [...], ...}`. Measured on
-    the 18 MB transcript that caught it: `"toolUseResult":"Task #` appears 0
-    times. Matching only the prose meant every create landed under
-    `_SUBJECT_KEY`, every later update looked up an id that was never a key, and
-    the plan froze at 0/N -- the exact symptom this whole feature exists to
-    remove.
+    the HOOK is handed is a structured object. Measured on the 18 MB transcript
+    that caught it: `"toolUseResult":"Task #` appears 0 times. Matching only the
+    prose meant every create landed under `_SUBJECT_KEY`, every later update
+    looked up an id that was never a key, and the plan froze at 0/N -- the exact
+    symptom this whole feature exists to remove.
 
     So the structured id wins, and the prose stays as the fallback: it is real in
     the rendered form, and neither shape is contractual. A disagreement between
     them is not a tie -- the structured field is the harness's own answer and the
     prose is a rendering of it.
+
+    AND THE STRUCTURED ID IS NESTED. The first fix read the right field off the
+    wrong object, and left the symptom standing for a second round: `TaskUpdate`
+    answers `{"success": true, "taskId": "1", ...}`, and reading a top-level
+    `taskId` was generalised from it -- but the call that has to SUPPLY the key
+    is the create, and a create answers `{"task": {"id": "1", "subject": ...}}`.
+    Re-measured 2026-08-24 over all 541 transcripts on this machine, every
+    paired TaskCreate result: 241 of 241 nested, 0 with a top-level id in any
+    spelling. So the plan still froze at 0/N, now with a green test above it
+    whose fixture asserted a shape nobody sends.
+
+    The nested holder is therefore tried FIRST -- it is the only create shape
+    ever observed -- and the flat one stays, because it is exactly what an
+    update answers and dropping it would trade one blind spot for another.
     """
+    holders = []
     if isinstance(response, dict):
+        nested = response.get("task")
+        if isinstance(nested, dict):
+            holders.append(nested)
+        holders.append(response)
+    for holder in holders:
         for key in ("taskId", "task_id", "id"):
-            value = response.get(key)
+            value = holder.get(key)
             # `isinstance(True, int)` is True, and a boolean is not an id.
             if isinstance(value, (str, int)) and not isinstance(value, bool):
                 found = str(value).strip()
@@ -332,7 +350,19 @@ def _create(tasks, inp, response) -> bool:
     # Keyed by subject when the id is unknown, so the SAME create arriving
     # twice updates one entry instead of duplicating a step -- it just can
     # never be reached by a later TaskUpdate, which carries only an id.
-    tasks[_result_id(response) or (_SUBJECT_KEY + subject)] = rec
+    found = _result_id(response)
+    if found:
+        # LEARNING THE ID SUPERSEDES THE PLACEHOLDER. The subject key exists
+        # only because no id could be read; once one can, keeping both rows
+        # puts the same step on the plan twice -- once tickable, once frozen
+        # at pending forever, because nothing can ever address the ghost.
+        # Measured on this session's real traffic replayed over the sidecar
+        # the old reader left: `6/12`, every step doubled. Undercounting is a
+        # gap; double-counting is a wrong answer that reads as a right one.
+        # Nothing is lost with the ghost: an update could never have touched
+        # it, so its status can only be whatever its own create declared.
+        tasks.pop(_SUBJECT_KEY + subject, None)
+    tasks[found or (_SUBJECT_KEY + subject)] = rec
     return True
 
 

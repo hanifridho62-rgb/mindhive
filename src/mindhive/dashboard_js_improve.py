@@ -63,6 +63,7 @@ JS = """\
     paintMemory();
   }
   function showMemory(){
+    markSection('memory');
     controls.innerHTML =
       (SESSION ? '<div class="row">filtered to session <b>'+esc(SESSION)+'</b> '
         + '<button onclick="clearSession()">show all</button></div>' : '')
@@ -390,6 +391,7 @@ JS = """\
   function onImpStatus(v){ IMP_STATUS = v; paintImprovements(); }
   function onImpCat(v){ IMP_CAT = v; paintImprovements(); }
   function showImprovements(clearBanner){
+    markSection('improvements');
     if (clearBanner) IMP_BANNER = '';
     const sortOpts = [['critical','most critical'],['new','newest'],['freq','most frequent']]
       .map(kv => '<option value="'+kv[0]+'"'+(IMP_SORT===kv[0]?' selected':'')+'>'

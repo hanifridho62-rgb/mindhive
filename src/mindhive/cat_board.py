@@ -180,6 +180,118 @@ CSS = """
   .mn-inj.partial { border-color:#ff9e64; }
   .mn-inj.silent { filter:grayscale(100%); opacity:.5; }
   .mn-inj.verbatim .mn-cat-sprite { animation:mn-bob 1.6s ease-in-out infinite; }
+  /* The hover dance. The ask was motion that is COMPLEX — a cat that actually
+     dances — while staying cheap to render, and those two pull in opposite
+     directions only if you assume cost scales with choreography. It does not.
+     Cost scales with WHICH PROPERTIES you animate; the compositor does not
+     charge by the keyframe. Measured on this page against a no-animation
+     control of 40 identical sprites: one cat dancing for three straight
+     seconds cost -0.7ms of task time, i.e. nothing above noise. Three
+     simultaneous tracks are as free as the single 220ms perk this replaces.
+
+     Why three animations and not one. Two animations that both write the
+     `transform` SHORTHAND cannot be relied on to combine — one list entry
+     wins the property. The individual transform properties (`translate`,
+     `rotate`, `scale`) are separate animatable properties that compose by
+     construction, so three tracks run at once without fighting: verified in
+     the browser, where the shorthand pair left translate/rotate/scale all
+     `none` and only `transform` moving, while the individual triple moved all
+     three independently. That is the whole trick — complexity comes from
+     LAYERING cheap tracks, not from a more expensive one.
+
+     The durations are deliberately not multiples of each other (620/780/520).
+     Tracks that share a period land in the same pose every loop, which reads
+     as a tic; drifting periods take ~10s to repeat a pose, which reads as
+     dancing. Squash-and-stretch is the classic weight cue and is why `scale`
+     takes two values, not one — a uniform pulse reads as a throb, not a hop.
+
+     `transform-origin: center bottom` puts the pivot at the cat's feet, so it
+     rocks like something standing up rather than spinning about its middle.
+     No `transform-box` here, unlike `graphview`'s node: this sprite is the
+     OUTER `<svg>`, an HTML-flow replaced element whose origin already resolves
+     against its border box (measured: `14px 28px` on a 28px sprite, identical
+     with and without `fill-box`). `graphview` needs it because there the
+     animated element is a `<circle>` INSIDE an svg, which would otherwise
+     pivot about the viewBox origin.
+
+     The four extra selectors are load-bearing, not decoration. Every rule that
+     turns an ambient bob ON is MORE specific than a bare sprite-plus-hover
+     (`.mn-sess.working .mn-cat-sprite` is three classes to its two), so without
+     naming them the dance would be silently missing on exactly the cats an
+     operator hovers most: the lit ones. Declared LAST in this sheet, so the
+     ties it does make are won on source order.
+
+     Hover REPLACES the bob (the `animation` list is rewritten wholesale) and
+     the bob resumes on leave. It loops while the cursor stays and stops the
+     instant it leaves — an operator-chosen motion, not ambient motion, which
+     is why looping is acceptable here and would not be on the strip at rest:
+     the same choreography running on all 40 cats at once measured +183ms per
+     three seconds. One cat is free; forty is not. Do not promote this to an
+     ambient rule.
+
+     And no `!important` anywhere, deliberately: the reduced-motion block above
+     turns every sprite animation off with one, and an important rule at this
+     specificity would outrank the guard instead of obeying it. `animation:none`
+     kills all three tracks, because it clears the whole list. */
+  .mn-cat-sprite:hover,
+  .mn-cat.active svg:hover,
+  .mn-cat.dim svg:hover,
+  .mn-sess.working .mn-cat-sprite:hover,
+  .mn-inj.verbatim .mn-cat-sprite:hover {
+    transform-origin:center bottom;
+    animation:mn-dance-step 620ms ease-in-out infinite,
+              mn-dance-tilt 780ms ease-in-out infinite,
+              mn-dance-squash 520ms ease-in-out infinite; }
+  @keyframes mn-dance-step { 0% { translate:0 0 }
+                             15% { translate:-1.5px -4px }
+                             30% { translate:-2px 0 }
+                             50% { translate:0 -5px }
+                             65% { translate:2px 0 }
+                             80% { translate:1.5px -4px }
+                             100% { translate:0 0 } }
+  @keyframes mn-dance-tilt { 0% { rotate:0deg }
+                             20% { rotate:-9deg }
+                             50% { rotate:2deg }
+                             75% { rotate:9deg }
+                             100% { rotate:0deg } }
+  @keyframes mn-dance-squash { 0% { scale:1 1 }
+                               12% { scale:1.12 .88 }
+                               28% { scale:.94 1.14 }
+                               50% { scale:1.1 .9 }
+                               70% { scale:.96 1.1 }
+                               100% { scale:1 1 } }
+  /* A GREY cat dances once, not forever. Grey is this board's whole vocabulary
+     for absence, and it is spoken in three places, all of which had to be named
+     here: a faculty gone quiet (`.mn-cat.dim`), a Claude session sitting idle
+     (`.mn-sess.resting`), and -- the one that matters most -- a turn whose
+     injection delivered NOTHING (`.mn-inj.silent`). Each pairs `filter:
+     grayscale(100%)` with reduced opacity for the same reason: the row must be
+     able to say "this did not happen". An endless dance is the loudest claim to
+     be alive available on this page, and on a silent injection it would say the
+     opposite of the only thing that row exists to report.
+
+     Three selectors and not one, because there is no ancestor the three share.
+     They are three different strips. A single `.mn-cat-sprite:hover` override
+     would reach the live cats too and stop the dance everywhere.
+
+     Still moving at all, though. A cat that answered nothing would bring back
+     the older defect the qualified selectors exist for: the cats worth pointing
+     at are the ones that ignore you. One pass says "seen", a loop says "well",
+     and those are different sentences.
+
+     Iteration count only -- the same three tracks, no second choreography to
+     keep in step with the first. They end staggered, because 520/620/780ms is
+     the point, and each track's 100% IS its rest pose, so nothing snaps: the
+     motion decays over 260ms instead of stopping dead. A cat waking briefly
+     and settling back is exactly the reading a grey cat should get.
+
+     Declared after the rules it narrows, so it wins on source order where the
+     specificity ties -- and it sets no `animation` shorthand, so the
+     reduced-motion guard's `animation:none` is untouched and still clears all
+     three tracks. */
+  .mn-cat.dim svg:hover,
+  .mn-sess.resting .mn-cat-sprite:hover,
+  .mn-inj.silent .mn-cat-sprite:hover { animation-iteration-count:1; }
   #mn-cat-panel .mn-body { margin:6px 0 0; max-height:280px; overflow:auto;
     white-space:pre-wrap; word-break:break-word; font-size:11px; color:#c9d1d9;
     background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:6px; }
@@ -234,6 +346,57 @@ _JS = """
     if (s < 60) return s + 's';
     if (s < 3600) return Math.floor(s/60) + 'm';
     return (s/3600).toFixed(1) + 'h';
+  }
+  // The two hover titles, extracted so the repaint guards can re-apply them
+  // WITHOUT rebuilding a strip. Both read `age_secs`, which is the one field
+  // deliberately outside every repaint signature -- it ticks on every poll and
+  // a signature holding it could never match, so the guard would never fire.
+  //
+  // That exclusion had a cost nobody had measured. A strip whose signature is
+  // unchanged was skipped entirely, so its ages froze -- not "a poll behind",
+  // which is what the guard's own comment claimed, but frozen until some OTHER
+  // field changed. Driven to 9000 s against a strip painted at 400 s, both
+  // strips still read "6m ago" and "1m ago", and the open panel with them.
+  //
+  // Splitting the work is what makes both true at once: STRUCTURE is rebuilt
+  // only when the signature moves, so an animation is never restarted
+  // mid-pass, and TEXT is re-applied every poll, so nothing goes stale.
+  // Assigning `title` and rewriting the panel's own children touches no cat
+  // element, and a CSS animation is indifferent to both.
+  function catTitle(cat){
+    return (CAT_LABEL[cat.faculty] || cat.faculty)
+      + ' \\u2014 ' + cat.status + ', last seen ' + catAge(cat.age_secs) + ' ago';
+  }
+  function sessTitle(s){
+    return (s.display === 'working' ? 'working' : 'quiet')
+      + ' \\u2014 ' + (s.kind || 'chat') + ' \\u2014 last seen '
+      + catAge(s.age_secs) + ' ago \\u2014 click for detail';
+  }
+  // Re-apply the time-dependent text on a poll that changed nothing structural.
+  // Keyed by the dataset the painters already stamp, so a row that is somehow
+  // missing is skipped rather than throwing out of the caller's poll -- the
+  // same totality every painter here keeps.
+  // `dataKey` names the dataset attribute the painter stamped; `keyOf` reads the
+  // matching value off the payload row. They are separate parameters because
+  // the two strips disagree -- `data-faculty` holds `row.faculty`, `data-session`
+  // holds `row.session_id` -- and deriving one from the other would be a rule
+  // that happens to hold for two strips and silently breaks on the third.
+  function mnRefreshAges(bar, rows, sel, dataKey, keyOf, titleOf, panelOf){
+    if (!bar) return;
+    const byKey = {};
+    for (const el of bar.querySelectorAll(sel)) byKey[el.dataset[dataKey]] = el;
+    for (const row of rows){
+      const el = byKey[keyOf(row)];
+      if (!el) continue;
+      // FIRST, and not merely tidiness: the click handler renders the panel
+      // from `el._row`, so leaving it behind here would make a cat whose hover
+      // title reads "2.5h ago" open a panel reading "6m ago".
+      el._row = row;
+      el.title = titleOf(row);
+      // An OPEN panel is the case that matters most: it is the one surface a
+      // reader is looking at while the number in it goes wrong.
+      if (el.classList.contains('sel')) panelOf(row, el);
+    }
   }
   // ONE panel renderer for both strips. The faculty cat and the session cat
   // answer the same four questions -- what task, what phase, which skill,
@@ -338,8 +501,38 @@ _JS = """
     // A page may carry the script without the strip; painting nothing is the
     // right answer there, not a TypeError that takes out the caller's poll.
     if (!bar) return;
+    // The third strip's repaint guard, and the last one to get it: sessions
+    // carry SESS_SIG and the injection row carries `dataset.sig` for exactly
+    // this, and both comments describe the defect this strip still had. Every
+    // 2.5 s poll ran `innerHTML = ''` and rebuilt identical nodes, so an
+    // animation on a faculty cat could never finish -- it was restarted from
+    // 0% before its first pass was over. Measured on the live board with the
+    // cursor parked on a dim cat: four movement bursts in eight seconds,
+    // spaced 2.5 s apart. One pass is what a grey cat is supposed to get.
+    //
+    // Keyed on the ELEMENT rather than a module variable, following the
+    // injection row. A fresh container carries no dataset and therefore always
+    // paints, so a strip that some other repaint recreated EMPTY can never be
+    // left that way by a signature that outlived it.
+    //
+    // `age_secs` is deliberately absent, the same trade SESS_SIG documents: it
+    // changes every poll and would defeat the guard completely, so the hover
+    // title may lag one poll behind while the motion stays whole. `status` IS
+    // in it, because the title's other half and the panel both read it.
+    const sig = JSON.stringify(cats.map(c => [c.faculty, c.display, c.status]));
+    if (bar.dataset.sig === sig){
+      // Structure is unchanged; the CLOCK is not. Refresh the text and leave
+      // every element -- and every running animation -- exactly where it is.
+      mnRefreshAges(bar, cats, '.mn-cat', 'faculty', c => c.faculty,
+                    catTitle, catPanel);
+      return;
+    }
     const open = bar.querySelector('.mn-cat.sel');
     const openFaculty = open ? open.dataset.faculty : null;
+    // Cleared, not set, before the build -- SESS_SIG's hard-won rule. Assigning
+    // the new signature up front means a throw mid-build leaves a half-painted
+    // strip that every identical poll afterwards refuses to repair.
+    delete bar.dataset.sig;
     bar.innerHTML = '';
     const lbl = document.createElement('span');
     lbl.className = 'lbl'; lbl.textContent = 'faculties';
@@ -350,6 +543,7 @@ _JS = """
       n.className = 'none'; n.textContent = 'no MindNetwork activity';
       bar.appendChild(n);
       mnClosePanel('cat');
+      bar.dataset.sig = sig;
       return;
     }
     // A faculty that vanished from the board cannot keep describing itself.
@@ -365,13 +559,20 @@ _JS = """
       t.className = 'cap';
       t.textContent = CAT_LABEL[cat.faculty] || cat.faculty;
       el.appendChild(t);
-      el.title = (CAT_LABEL[cat.faculty] || cat.faculty)
-        + ' \\u2014 ' + cat.status + ', last seen ' + catAge(cat.age_secs) + ' ago';
+      el.title = catTitle(cat);      // one copy, shared with the refresh path
+      // The row lives ON the element, and the click handler reads it from
+      // there. Capturing `cat` in the closure instead is the obvious version
+      // and it goes stale the moment a repaint is SKIPPED: the guard holds the
+      // element, `mnRefreshAges` moves its title to "2.5h ago", and the closure
+      // still holds the payload from the last paint that actually ran -- so the
+      // hover said 2.5h and the panel that opened underneath it said 6m.
+      // Measured exactly that way before this line existed.
+      el._row = cat;
       el.onclick = (ev) => {
         ev.stopPropagation();
         const already = el.classList.contains('sel');
         if (already){ mnClosePanel('cat'); }
-        else { mnOpen('cat', el, () => catPanel(cat, el)); }
+        else { mnOpen('cat', el, () => catPanel(el._row, el)); }
       };
       // Re-open the panel the poll just replaced, so a refresh does not close a
       // panel the user is reading.
@@ -382,6 +583,7 @@ _JS = """
         catPanel(cat, el);
       }
     }
+    bar.dataset.sig = sig;             // the strip is whole; now remember it
   }
   document.addEventListener('click', () => {
     mnClosePanel(null);               // the outside click owns every panel
@@ -421,9 +623,16 @@ _JS = """
   // What was last drawn, per strip. `paintSessions` rebuilds its container, and
   // rebuilding on every 1.2 s poll restarts a 1.6 s bob before it can finish —
   // the same defect fixed for the swarm chips. `age_secs` is deliberately NOT in
-  // the signature: it changes every poll and would defeat the guard entirely, so
-  // the hover tooltip may lag a poll behind while the animation stays whole.
-  // That trade is the right way round — the motion IS the feature.
+  // the signature: it changes every poll and would defeat the guard entirely.
+  //
+  // This used to end "so the hover tooltip may lag a poll behind — that trade is
+  // the right way round". Both halves of that were wrong, and the correction is
+  // worth keeping because the sentence read so reasonably. It was not one poll:
+  // a skipped poll re-rendered NOTHING, so the age froze until some other field
+  // moved — measured at 400 s and again at 9000 s, the strip still said "1m
+  // ago", and so did the open panel. And it was not a trade that had to be made:
+  // `mnRefreshAges` re-applies the text without touching an element, so the
+  // structure can be held and the clock can still move.
   let SESS_SIG = null;
   function paintSessions(board){
     const bar = document.getElementById('mn-sessions');
@@ -438,7 +647,12 @@ _JS = """
                                                s.title, s.doing, s.task,
                                                s.phase, s.skill]),
                                 hidden, producers.session]);
-    if (sig === SESS_SIG) return;
+    if (sig === SESS_SIG){
+      // Same split as the faculty strip: structure held, clock refreshed.
+      mnRefreshAges(bar, rows, '.mn-sess', 'session', s => s.session_id,
+                    sessTitle, sessPanel);
+      return;
+    }
     // Which cat the user has open, so a repaint does not close a panel they
     // are reading -- the rule the faculty strip already keeps.
     const openSel = bar.querySelector('.mn-sess.sel');
@@ -494,15 +708,14 @@ _JS = """
       // the one place they reach the DOM.
       t.textContent = s.doing || s.title || (s.kind + ' session');
       el.appendChild(t);
-      el.title = (s.display === 'working' ? 'working' : 'quiet')
-        + ' \\u2014 ' + (s.kind || 'chat') + ' \\u2014 last seen '
-        + catAge(s.age_secs) + ' ago \\u2014 click for detail';
+      el.title = sessTitle(s);       // one copy, shared with the refresh path
       el.dataset.session = s.session_id;
+      el._row = s;                   // read by the handler, kept fresh on skip
       el.onclick = (ev) => {
         ev.stopPropagation();
         const already = el.classList.contains('sel');
         if (already){ mnClosePanel('sess'); }
-        else { mnOpen('sess', el, () => sessPanel(s, el)); }
+        else { mnOpen('sess', el, () => sessPanel(el._row, el)); }
       };
       if (s.session_id === openSid){ el.classList.add('sel'); }
       bar.appendChild(el);

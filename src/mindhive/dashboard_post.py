@@ -30,6 +30,7 @@ from . import research as research_mod
 from . import sync as sync_mod
 from . import workspace as workspace_mod
 from .dashboard_data import _folder_for_project, default_project, is_all
+from .dashboard_query import body_num
 from .dashboard_locks import (REFLECT_BATCH_LIMIT, _INVOKE_LOCK, _PLUGINS_LOCK,
                               _PROJECT_LOCK, _REFLECT_LOCK, _SYNC_LOCK,
                               _one_at_a_time)
@@ -144,8 +145,8 @@ class PostRoutes:
         if is_all(proj):                       # global scan; see _post_plugins_scan
             proj = default_project()
         res = plugins_mod.ensure_fresh(
-            top_n=int(body.get("top", 5)),
-            max_age_hours=float(body.get("max_age_hours", 24)),
+            top_n=body_num(body, "top", 5),
+            max_age_hours=body_num(body, "max_age_hours", 24, float),
             force=bool(body.get("force", False)),
             project=proj,
         )

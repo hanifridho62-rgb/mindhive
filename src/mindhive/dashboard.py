@@ -18,6 +18,8 @@ from . import projector
 from . import jobs
 from . import taskview
 from .dashboard_page import render_page
+from .dashboard_query import (BadRequest, body_num,  # noqa: F401
+                              host_is_local, is_safe_project, qs_int)
 # The route halves, mixed into the handler by `make_handler` below, and the
 # job module the background harvest loop reaches through.
 from . import dashboard_jobs as jobs_mod
@@ -35,7 +37,8 @@ from .dashboard_post import PostRoutes
 from .dashboard_data import (ALL_TOKENS, HIVEMIND_LABEL,  # noqa: F401
                              HIVEMIND_PROJECT, LOW_SAMPLE_FLOOR,
                              _OVERVIEW_MEMO, _OVERVIEW_MEMO_MAX,
-                             _add_tallies, _all_projects, _efficiency,
+                             _add_tallies, _add_tallies_rows, _all_projects,
+                             _efficiency, _tool_action_rows,
                              _empty_tallies, _folder_for_project, _iso_utc,
                              _overview_counts, _overview_fingerprint,
                              _project_stats, _project_stats_uncached,
@@ -48,7 +51,7 @@ from .dashboard_locks import (REFLECT_BATCH_LIMIT,  # noqa: F401
                               _PLUGINS_LOCK, _PROJECT_LOCK, _REFLECT_LOCK,
                               _SELFTEST_LOCK, _SYNC_LOCK, _VERIFY_LOCK,
                               _one_at_a_time)
-from .dashboard_memo import (_CATS_MEMO, _MEMO_MAX,  # noqa: F401
+from .dashboard_memo import (_CATS_MEMO, _IMPROVE_MEMO, _MEMO_MAX,  # noqa: F401
                              _OVERSEE_MEMO, _OVERSEE_MEMO_MAX, _SESSIONS_MEMO,
                              _STATS_MEMO, _STATS_MEMO_MAX, _BoundedMemo,
                              _fingerprinted, _fix_plan_fingerprint,
@@ -159,14 +162,31 @@ def make_handler(token: str):
                 return None
             return self._json({"ok": False, "error": str(exc)}, 500)
 
+        def _bad_request(self, exc):
+            """`_fail`'s twin for the caller's mistakes: 400, and the message is
+            one we wrote (`invalid limit`), never an interpreter string. Shares
+            `_fail`'s already-answered rule for the same keep-alive reason."""
+            if self._responded:
+                self.close_connection = True
+                return None
+            return self._json({"ok": False, "error": str(exc)}, 400)
+
         # --- helpers ---
         def _check_token(self) -> bool:
             qs = parse_qs(urlparse(self.path).query)
             supplied = self.headers.get("X-Hive-Token") or (qs.get("token") or [None])[0]
             if supplied is None:
                 return False
-            # constant-time compare to avoid leaking the token via timing
-            return secrets.compare_digest(str(supplied), str(token))
+            # Constant-time compare to avoid leaking the token via timing — on
+            # BYTES, not str. `compare_digest` raises TypeError the moment either
+            # str operand carries a non-ASCII character, and `?token=caf%C3%A9`
+            # is a thing any caller can send. That raise escaped `do_GET`
+            # entirely (this check ran outside its try), so the connection died
+            # with ZERO bytes written and a traceback on the console: a wrong
+            # token with an accent in it was not a 403, it was a dropped request.
+            # Encoding both sides keeps the comparison constant-time and total.
+            return secrets.compare_digest(str(supplied).encode("utf-8"),
+                                          str(token).encode("utf-8"))
 
         # Compress bodies above one MTU when the client accepts gzip — the
         # page is ~72KB (→ ~22KB) and the Improvements/graph JSON payloads
@@ -237,26 +257,59 @@ def make_handler(token: str):
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8")) if raw else {}
 
+        def _local_only(self) -> bool:
+            """Answer 403 unless the Host header names loopback; True when it did.
+
+            See `dashboard_query.host_is_local` for why a server bound to
+            127.0.0.1 still needs this. Checked before anything else a route
+            could leak, `/` included — `/` is the one that carries the token.
+            """
+            if host_is_local(self.headers.get("Host")):
+                return True
+            self._json({"ok": False, "error": "forbidden host"}, 403)
+            return False
+
+        def _project_or_400(self, proj):
+            """The project when it can only name one directory under the store,
+            else None with a 400 already sent. HIVE MIND's tokens are answered
+            first: they never reach a path join."""
+            if is_all(proj) or is_safe_project(proj):
+                return proj
+            self._json({"ok": False, "error": "invalid project"}, 400)
+            return None
+
         # --- routing ---
         def do_GET(self):
-            parsed = urlparse(self.path)
-            route = parsed.path
-            if route == "/":
-                return self._send(200,
-                                  render_page(token,
-                                              tasks_css=taskview.CARDS_CSS,
-                                              tasks_js=taskview.CARDS_JS),
-                                  "text/html; charset=utf-8")
-            if not self._check_token():
-                return self._json({"ok": False, "error": "forbidden"}, 403)
-            handler = self._GET_ROUTES.get(route)
-            if handler is None:
-                return self._json({"ok": False, "error": "not found"}, 404)
-            qs = parse_qs(parsed.query)
-            proj = (qs.get("project") or [None])[0] or default_project()
-            am = is_all(proj)
+            # The WHOLE method runs inside the guard, not just route dispatch.
+            # `_check_token`, `render_page` and `default_project` all used to sit
+            # outside it, and each can raise — `_check_token` provably did — which
+            # produced a zero-byte answer and a console traceback instead of a
+            # response. Nothing above the try may do work that can fail.
             try:
+                if not self._local_only():
+                    return None
+                parsed = urlparse(self.path)
+                route = parsed.path
+                if route == "/":
+                    return self._send(200,
+                                      render_page(token,
+                                                  tasks_css=taskview.CARDS_CSS,
+                                                  tasks_js=taskview.CARDS_JS),
+                                      "text/html; charset=utf-8")
+                if not self._check_token():
+                    return self._json({"ok": False, "error": "forbidden"}, 403)
+                handler = self._GET_ROUTES.get(route)
+                if handler is None:
+                    return self._json({"ok": False, "error": "not found"}, 404)
+                qs = parse_qs(parsed.query)
+                proj = (qs.get("project") or [None])[0] or default_project()
+                if self._project_or_400(proj) is None:
+                    return None
+                am = is_all(proj)
                 return handler(self, proj, am, qs)
+            except BadRequest as e:
+                # The caller's mistake, named. Before `_fail`, which is for ours.
+                return self._bad_request(e)
             except Exception as e:  # never crash the server
                 # Unexpected failure -> 500 so monitoring and clients can tell a
                 # server fault apart from a normal empty/negative result. Expected
@@ -275,10 +328,16 @@ def make_handler(token: str):
                 body = self._body()
             except Exception as e:
                 return self._fail(e)
+            # AFTER the drain, for the reason above: an early answer to a client
+            # still writing is a reset, not a refusal it can read.
+            if not self._local_only():
+                return None
             if not self._check_token():
                 return self._json({"ok": False, "error": "forbidden"}, 403)
             try:
                 proj = body.get("project") or default_project()
+                if self._project_or_400(proj) is None:
+                    return None
                 if is_all(proj):
                     if route == "/api/project":
                         # Takes the SAME lock as _post_project. This branch
@@ -311,6 +370,8 @@ def make_handler(token: str):
                 if handler is None:
                     return self._json({"ok": False, "error": "not found"}, 404)
                 return handler(self, proj, body)
+            except BadRequest as e:
+                return self._bad_request(e)
             except Exception as e:
                 # Unexpected failure -> 500 (see do_GET). The HIVE MIND read-only
                 # guard and the "type is required" check return ok:False, 200

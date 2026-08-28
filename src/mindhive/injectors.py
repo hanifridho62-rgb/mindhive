@@ -58,6 +58,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -84,6 +85,63 @@ INJECTOR_NAMES = ("promptgate", "enrich", "mindnet", "premise",
 # it in the composed text and take the truncation instead.
 PIPELINE_ORDER = ("promptgate", "enrich", "mindnet", "premise",
                   "sopgate", "symbols", "style")
+
+# What each registered pass IS, keyed by the same names — so the prose about the
+# pipeline is generated from the pipeline rather than maintained beside it.
+#
+# `docs/session-legend.md` carried a hand-written numbered list of this pipeline.
+# By the time T12 came to look at it, that list named FIVE passes out of seven:
+# `sopgate` and `symbols` had both been added, both had gone in "before step 5"
+# exactly as the list instructed, and the list itself was never touched. It also
+# still credited `__main__.cmd_hook` with an order that had moved into
+# `run_pipeline`, and called `style` step 5 of 6 when it is step 7 of 7.
+#
+# None of that was noticed by anything, because a prose list has nothing to
+# disagree with. `tests/test_cli_inject.py` now regenerates this table and
+# compares it against both documents, so a pass added without a line here fails
+# a test instead of quietly making the docs wrong for the next reader.
+#
+# The columns are the four facts a reader actually needs: where it runs, WHETHER
+# it runs (three of the seven are conditional), which END of the context it
+# writes to, and what it delivers. Direction is here rather than in prose
+# because it is the load-bearing one -- `style` prepends and runs last, and
+# those two facts together are the only reason its block survives truncation.
+PIPELINE_NOTES = {
+    "promptgate": (
+        "promptgate.hook_context", "only on an underspecified prompt", "creates",
+        "skill-trigger directives when the typed prompt is thin; a clear prompt "
+        "yields no context at all, which is why every later pass tolerates a "
+        "falsy one"),
+    "enrich": (
+        "enrich.extend_hook_context", "only if promptgate fired", "appends",
+        "clarifying questions attached to a gate that already fired; it extends "
+        "a context and never creates one"),
+    "mindnet": (
+        "mindnet.inject.extend_hook_context", "every turn", "appends",
+        "the phase spine's per-task direction; the sidecar is read ONCE here and "
+        "threaded on to the callers that need it afterwards"),
+    "premise": (
+        "premise.extend_hook_context", "every turn", "appends",
+        "the checkable claims the prompt makes -- paths, roadmap ids, test "
+        "counts -- checked against the record"),
+    "sopgate": (
+        "sopgate.extend_hook_context", "every turn", "prepends",
+        "the mandatory SOPs verbatim; over budget a body degrades to a POINTER, "
+        "never a truncation, because half a procedure reads like a whole one"),
+    "symbols": (
+        "symbols.extend_hook_context", "only when MINDHIVE_SYMBOLS is set",
+        "appends",
+        "the zero-token structural map; second-to-last so a map appended after "
+        "the style block cannot sit ahead of it and take the truncation"),
+    "style": (
+        "style.extend_hook_context", "every turn", "prepends",
+        "the standing reply style; LAST, and that placement is the contract -- "
+        "it prepends, so running last is what makes it survive truncation of "
+        "everything before it"),
+}
+
+DOC_MARKER = "injection-pipeline"
+
 
 EVENT_TYPE = "context_injected"
 
@@ -539,3 +597,267 @@ def recent_turns(project=None) -> list:
     a request handler."""
     ring = read_last(project=project).get("recent")
     return [r for r in ring if isinstance(r, dict)] if isinstance(ring, list) else []
+
+
+# --- the CLI ---------------------------------------------------------------
+
+def registry_rows(doc) -> list:
+    """One row per REGISTERED injector, in `PIPELINE_ORDER`, recorded or not.
+
+    Folding the sidecar's own list would answer a different question than the
+    one this command exists for. A pass that contributes nothing still writes a
+    row today, but a pass that never RAN -- one added to the registry after the
+    sidecar on disk was written, or one whose module failed to import -- writes
+    none, so a report built from the record alone shows six passes where seven
+    are registered, and says nothing whatever about the seventh. That is the
+    exact blindness this module was built to end, reproduced one layer up.
+    `recorded` carries the difference: false means the registry knows this pass
+    and this turn does not mention it.
+
+    Drift the other way is reported rather than dropped. A name in the record
+    but absent from `PIPELINE_ORDER` means a pass was renamed or retired while a
+    sidecar written by the older build is still on disk, and comparing the two
+    lists by eye is how that goes unnoticed."""
+    seen = {}
+    for r in ((doc or {}).get("injectors") or []):
+        if isinstance(r, dict) and r.get("name"):
+            seen[str(r["name"])] = r
+
+    def row(name, rec, **extra):
+        rec = rec or {}
+        return dict({
+            "name": name,
+            "verdict": str(rec.get("verdict") or "silent"),
+            "chars": int(rec.get("chars") or 0),
+            "tokens": int(rec.get("tokens") or 0),
+            "ms": int(rec.get("ms") or 0),
+            "reason": str(rec.get("reason") or "no row recorded for this turn"),
+            "recorded": bool(rec),
+        }, **extra)
+
+    rows = [row(n, seen.pop(n, None)) for n in PIPELINE_ORDER]
+    rows += [row(n, rec, unregistered=True) for n, rec in sorted(seen.items())]
+    return rows
+
+
+def turn_report(which="last", project=None) -> dict:
+    """The report `hive inject show` renders, as data.
+
+    Kept apart from the printing so the tests -- and anything later that wants
+    this answer -- can ask without going through argparse and parsing stdout.
+
+    ``{}`` means no turn has ever been recorded. ``{"error": ...}`` means the
+    turn asked for does not exist. Two different answers deliberately, because
+    "the hook has never run here" and "there is no turn 9" call for different
+    fixes, and one empty dict for both would hide the first behind the second."""
+    doc = read_last(project=project)
+    ring = recent_turns(project=project)
+    label = str(which if which is not None else "last").strip().lower()
+
+    if label in ("", "last", "current", "now"):
+        if not doc:
+            return {}
+        sig = str(doc.get("signature") or "")
+        # The ring head's timestamp belongs to this turn only when it IS this
+        # turn. Claiming it otherwise would date the current injection with the
+        # moment some earlier one happened to be recorded.
+        head = ring[0] if ring else {}
+        ts = str(head.get("ts") or "") if str(head.get("signature") or "") == sig else ""
+        return {
+            "turn": "last", "ts": ts,
+            "session_id": str(doc.get("session_id") or ""),
+            "signature": sig,
+            "unchanged_turns": int(doc.get("unchanged_turns") or 0),
+            "total_chars": int(doc.get("total_chars") or 0),
+            "total_tokens": int(doc.get("total_tokens") or 0),
+            "block": str(doc.get("block") or ""),
+            "has_text": True,
+            "injectors": registry_rows(doc),
+            "recent_turns": len(ring),
+        }
+
+    try:
+        idx = int(label)
+    except ValueError:
+        return {"error": "unknown turn %r: expected 'last' or an index" % (which,)}
+    if not ring:
+        return {"error": "no recorded turns, so there is no turn %d" % idx}
+    if not 0 <= idx < len(ring):
+        return {"error": "turn %d is outside the recent ring (0-%d, newest first)"
+                         % (idx, len(ring) - 1)}
+    e = ring[idx]
+    return {
+        "turn": str(idx), "ts": str(e.get("ts") or ""),
+        "session_id": str(e.get("session_id") or ""),
+        "signature": str(e.get("signature") or ""),
+        "repeats": int(e.get("repeats") or 1),
+        "total_chars": int(e.get("total_chars") or 0),
+        "total_tokens": int(e.get("total_tokens") or 0),
+        # The ring is the INDEX, not the archive: it carries no injected text,
+        # by the same design that bounds it at all. `has_text` says so, because
+        # an empty `block` here must not read as "this turn injected nothing".
+        "block": "", "has_text": False,
+        "injectors": registry_rows(e),
+        "recent_turns": len(ring),
+    }
+
+
+def render_turn(rep) -> str:
+    """The human table. ASCII only, deliberately.
+
+    A Windows console is cp1252 unless something changed it, and printing a
+    character outside that page raises `UnicodeEncodeError` -- turning a
+    read-only report into a traceback on the platform this project is developed
+    on. `hive symbols` prints `~N tokens` for the same reason."""
+    rows = list(rep.get("injectors") or [])
+    wide = max([len(str(r["name"])) for r in rows] + [4])
+    head = [
+        "turn %s | %s | session %s" % (
+            rep.get("turn", "?"),
+            (rep.get("signature") or "")[:12] or "(unsigned)",
+            rep.get("session_id") or "(none)"),
+        "%d pass(es) | %d chars ~%d tokens%s" % (
+            len(rows), rep.get("total_chars", 0), rep.get("total_tokens", 0),
+            "" if rep.get("has_text") else "  (index only: no text on the ring)"),
+    ]
+    if rep.get("ts"):
+        head[0] += " | %s" % rep["ts"]
+    if rep.get("unchanged_turns"):
+        head.append("unchanged for %d further turn(s) -- no row was written "
+                    "for them" % rep["unchanged_turns"])
+    if int(rep.get("repeats") or 1) > 1:
+        head.append("this injection repeated %d times" % rep["repeats"])
+
+    body = ["", "  %-*s  %-8s  %7s  %6s  %5s  %s"
+            % (wide, "pass", "verdict", "chars", "tokens", "ms", "reason")]
+    for r in rows:
+        flag = "" if r.get("recorded") else "  <- registered, no row this turn"
+        if r.get("unregistered"):
+            flag = "  <- in the record, NOT in the registry"
+        body.append("  %-*s  %-8s  %7d  %6d  %5d  %s%s"
+                    % (wide, r["name"], r["verdict"], r["chars"], r["tokens"],
+                       r["ms"], r["reason"], flag))
+    if rep.get("has_text"):
+        body.append("")
+        body.append("  composed block: %d chars (hive inject show --json "
+                    "carries it)" % len(rep.get("block") or ""))
+    return "\n".join(head + body)
+
+
+
+def pipeline_table() -> str:
+    """The composition order as a markdown table, generated from the registry.
+
+    The one home of this prose. `docs/session-legend.md` and `README.md` carry
+    its output between generated markers, and a test regenerates it and compares
+    -- so the documents cannot go on describing a five-pass pipeline after a
+    sixth and seventh are added, which is what they did.
+
+    Raises `KeyError` for a registered pass with no note, deliberately: a pass
+    that reaches the prompt path undocumented is the failure this exists to
+    prevent, and returning a table with a blank row would hide it inside the
+    very artefact meant to reveal it."""
+    out = ["| # | pass | entry point | runs | writes | what it delivers |",
+           "|---|------|-------------|------|--------|------------------|"]
+    for i, name in enumerate(PIPELINE_ORDER, 1):
+        entry, when, direction, what = PIPELINE_NOTES[name]
+        out.append("| %d | `%s` | `%s` | %s | %s | %s |"
+                   % (i, name, entry, when, direction, what))
+    return "\n".join(out)
+
+
+def doc_block(marker=DOC_MARKER) -> str:
+    """The table wrapped in the markers the documents carry it between."""
+    return "\n".join([f"<!-- BEGIN GENERATED {marker} -- hive inject table -->",
+                      pipeline_table(),
+                      f"<!-- END GENERATED {marker} -->"])
+
+
+def extract_doc_block(text, marker=DOC_MARKER) -> str:
+    """What a document currently carries between those markers, or ``""``.
+
+    Total: a document that lost its markers reads as "carries nothing", which
+    the comparing test reports as a missing block rather than as a crash."""
+    begin = f"<!-- BEGIN GENERATED {marker}"
+    end = f"<!-- END GENERATED {marker} -->"
+    try:
+        i = text.index(begin)
+        j = text.index(end, i) + len(end)
+    except ValueError:
+        return ""
+    return text[i:j]
+
+
+def cli(args) -> int:
+    """`hive inject show [--turn last|N] [--project P] [--json]`.
+
+    The behaviour lives here rather than in `__main__.py` for the reason
+    `symbols.cli` gives: that file sits a handful of lines under its size
+    ratchet and `tests/test_file_size_cap.py` is explicit that the allowlist is
+    a ceiling and not a licence. `register()` below is the ONE line it gains."""
+    as_json = bool(getattr(args, "json", False))
+    rep = turn_report(getattr(args, "turn", None),
+                      project=getattr(args, "project", None))
+
+    if rep.get("error"):
+        print(rep["error"], file=sys.stderr)
+        if as_json:
+            print("{}")
+        return 2
+
+    if not rep:
+        # Under --json the hint goes to stderr and `{}` to stdout, so the one
+        # machine guaranteed to reach this branch -- the one whose hook has
+        # never run -- still gets something parseable. Exit 0: nothing recorded
+        # yet is an answer, not a failure.
+        print("(no injection recorded yet -- the sidecar is written by the "
+              "UserPromptSubmit hook: hive hook user_prompt_submit)",
+              file=sys.stderr if as_json else sys.stdout)
+        if as_json:
+            print("{}")
+        return 0
+
+    if as_json:
+        # ensure_ascii stays ON (the default): `block` carries whatever the SOP
+        # and style passes injected, which includes characters no cp1252
+        # console can encode. Escaped is still parseable; a traceback is not.
+        print(json.dumps(rep, indent=2))
+        return 0
+    print(render_turn(rep))
+    return 0
+
+
+def cli_table(args) -> int:
+    """`hive inject table [--markers]` — regenerate the documented pipeline."""
+    print(doc_block() if getattr(args, "markers", False) else pipeline_table())
+    return 0
+
+
+def register(subparsers) -> None:
+    """Wire the `inject` group onto ``__main__``'s subparser set.
+
+    The fourth module to register itself this way, after `bench`, `pgcli` and
+    `consensus.cli` -- the convention `docs/session-legend.md` records. It buys
+    `__main__.py` ONE line for this command instead of ten, and that file had
+    six lines of headroom under its ratchet, so ten was not available."""
+    ij = subparsers.add_parser(
+        "inject", help="what the context-injection pipeline delivered this turn")
+    isub = ij.add_subparsers(dest="inject_cmd", required=True)
+    sh = isub.add_parser(
+        "show", help="every registered pass, its verdict, size and reason")
+    sh.add_argument("--turn", default="last",
+                    help="'last' (the current turn, with its composed text) or "
+                         "an index into the recent ring, 0 = newest")
+    sh.add_argument("--project", default=None,
+                    help="namespace (default: this repo)")
+    sh.add_argument("--json", action="store_true",
+                    help="machine-readable report on stdout, even when empty")
+    sh.set_defaults(func=cli)
+
+    tb = isub.add_parser(
+        "table", help="the composition order as markdown, generated from the "
+                      "registry (what the docs carry)")
+    tb.add_argument("--markers", action="store_true",
+                    help="wrap it in the generated-block markers the documents "
+                         "use, ready to paste back")
+    tb.set_defaults(func=cli_table)

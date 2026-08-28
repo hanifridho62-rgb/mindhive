@@ -3352,9 +3352,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # Two lines each instead of ~180: the verbs live in the group's register().
     # One named call per group and NOT a loop: the `pg` group's own test reads
     # these calls with ast, and a loop hides the group list from that gate.
-    from . import bench as bench_mod, pgcli as pgcli_mod
+    from . import (bench as bench_mod, injectors as injectors_mod,
+                   pgcli as pgcli_mod)
     from .consensus import cli as consensus_cli
     bench_mod.register(sub)
+    injectors_mod.register(sub)
     pgcli_mod.register(sub)
     consensus_cli.register(sub)
 

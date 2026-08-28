@@ -273,15 +273,29 @@ def test_an_entry_written_before_the_counter_existed_still_sorts():
 # what a human reads back; it is NOT what the hook is handed. Measured on the
 # 18 MB transcript of the session that caught this, 2026-08-20:
 # `"toolUseResult":"Task #` appears 0 times, while every task result carries a
-# structured `taskId`. Reading only the prose put every create under
-# `_SUBJECT_KEY`, so every later update looked up an id that was never a key and
-# the plan froze at 0/N -- live, on the first real traffic the feature ever saw.
+# structured id. Reading only the prose put every create under `_SUBJECT_KEY`,
+# so every later update looked up an id that was never a key and the plan froze
+# at 0/N -- live, on the first real traffic the feature ever saw.
+#
+# CORRECTS THE FIRST FIX, which read the structured id off the wrong LEVEL and
+# so left the symptom exactly where it was. `TaskUpdate` answers with a
+# top-level `taskId`; `TaskCreate` does not, and it was the create that had to
+# supply the key. The fixture below asserted a create shape nobody sends, which
+# is why a green suite sat on top of a dead feature for a second round -- a
+# regression test whose fixture cannot reproduce the defect reads exactly like
+# one that can.
+#
+# Re-measured 2026-08-24 across all 541 transcripts on this machine, every
+# paired TaskCreate result: 241 of 241 are `{"task": {"id", "subject"}}`, 0
+# carry a top-level id of any spelling, and 0 use the batch form. The nested
+# shape is not one possibility among several -- it is the only one observed.
 
 def _created_real(n, subject, **extra):
-    """One TaskCreate, with the STRUCTURED result the hook receives."""
+    """One TaskCreate, with the STRUCTURED result the hook receives -- id
+    NESTED under `task`, verbatim the 241 results the transcripts hold."""
     inp = {"subject": subject, "description": subject,
            "activeForm": "doing " + subject, **extra}
-    return inp, {"success": True, "taskId": str(n), "subject": subject}
+    return inp, {"task": {"id": str(n), "subject": subject}}
 
 
 def _updated_real(n, frm, to):
@@ -328,6 +342,10 @@ def test_the_structured_id_wins_over_a_number_in_the_prose():
     ({"taskId": 7}, "7"),                    # an int id is still an id
     ({"taskId": "  8  "}, "8"),              # trimmed, like every other field
     ({"task_id": "9"}, "9"),                 # snake spelling
+    ({"task": {"id": "12", "subject": "x"}}, "12"),   # THE observed shape
+    ({"task": {"taskId": 13}}, "13"),        # nested, other spelling
+    ({"task": {"subject": "no id"}}, ""),    # nested and still unreadable
+    ({"task": "not a dict"}, ""),            # nested and not even a holder
     ({"id": "10"}, "10"),                    # bare
     ({"taskId": True}, ""),                  # isinstance(True, int) is True
     ({"taskId": None}, ""),
@@ -662,3 +680,100 @@ def test_a_permanent_non_permission_oserror_still_fails_open_immediately():
     assert held
     assert len(attempts) == 1, (
         f"{len(attempts)} attempts — a non-EACCES OSError is being retried")
+
+
+# --- the symptom, end to end -------------------------------------------------
+
+def _hook(sid, tool, inp, resp):
+    """One PostToolUse call, exactly as the hook shim delivers it."""
+    from mindhive import hookcapture
+    return hookcapture.record_post_tool_use(
+        json.dumps({"session_id": sid, "tool_name": tool,
+                    "tool_input": inp, "tool_response": resp}),
+        project="test")
+
+
+def _plan(sid):
+    from mindhive import roadmap
+    return roadmap.fold(events.read_all("test")).get(sid)
+
+
+def test_the_oversee_card_moves_off_zero_as_the_session_works():
+    """THE REPORTED SYMPTOM, replayed from the transcript that shows it.
+
+    Session 58da8c5b on 2026-08-20 issued six TaskCreates and seven TaskUpdates.
+    Its Oversee card read `0/6 steps done - 0%` with every step pending, and it
+    still read that four days later -- while the transcript records all six
+    tasks reaching `completed`. The card was not merely incomplete, it was
+    WRONG: the work was done and the board said none of it was.
+
+    This drives the whole seam the way production does -- hook payload in,
+    roadmap record out -- because every unit below passed while the feature was
+    dead, and a test that starts after the id is read cannot see an id that was
+    never read."""
+    sid = "58da8c5b-6ffe-48c3-a249-3060b00fe7ae"
+    subjects = ["Change-log the tasktool structured-id fix",
+                "Fold the merge into the ledger and report the audit",
+                "Grep the served page for showOversee / renderOversee",
+                "Prove the roadmap auto-sync fired on real traffic",
+                "Restart the live dashboard on 54461",
+                "Watch master CI run 32428490032 to a conclusion"]
+    for i, subj in enumerate(subjects, start=1):
+        _hook(sid, "TaskCreate", *_created_real(i, subj))
+
+    plan = _plan(sid)
+    assert plan is not None, "six creates produced no plan at all"
+    assert plan["progress"] == {"done": 0, "total": 6}
+
+    # The first step starts: the card must say WHICH step is running, which is
+    # the half the report called invisible.
+    _hook(sid, "TaskUpdate", *_updated_real(1, "pending", "in_progress"))
+    plan = _plan(sid)
+    assert [s["status"] for s in plan["steps"]] == [
+        "active", "pending", "pending", "pending", "pending", "pending"]
+
+    # ... and the rest finish, in the order the transcript recorded.
+    for n, frm in ((3, "pending"), (2, "pending"), (1, "in_progress"),
+                   (4, "pending"), (6, "pending"), (5, "pending")):
+        _hook(sid, "TaskUpdate", *_updated_real(n, frm, "completed"))
+
+    plan = _plan(sid)
+    assert plan["progress"] == {"done": 6, "total": 6}, (
+        "the plan froze at 0/6 -- every update named an id no create ever "
+        "stored, so the board reports none of the work that happened")
+    assert {s["status"] for s in plan["steps"]} == {"done"}
+
+
+def test_learning_a_task_s_id_replaces_its_placeholder_instead_of_doubling_it():
+    """A create whose result carried no id lands under `_SUBJECT_KEY` -- a row
+    nothing can ever update. When the SAME subject is created again and this
+    time the id is readable, the placeholder has to go: keeping both puts the
+    step on the plan twice, once tickable and once frozen at pending forever.
+
+    Measured, not imagined. Replaying this session's real traffic on top of the
+    sidecar the broken reader left behind produced `6/12`, every step listed
+    twice -- six done and six permanently pending. A plan that double-counts its
+    own work is worse than one that undercounts it: `6/12` reads as half
+    finished when the truth is all of it."""
+    subject = "restart the dashboard"
+    _rec("s1", "TaskCreate", {"subject": subject}, {"success": True})
+    assert list(tasktool.load("test")["s1"]["tasks"]) ==         [tasktool._SUBJECT_KEY + subject]
+
+    out = _rec("s1", "TaskCreate", *_created_real(1, subject))
+    assert list(tasktool.load("test")["s1"]["tasks"]) == ["1"], (
+        "the placeholder survived alongside the id-keyed row, so the plan "
+        "carries the same step twice")
+    assert out == [{"content": subject, "status": "pending"}]
+
+    # And the promoted row is reachable, which the placeholder never was.
+    out = _rec("s1", "TaskUpdate", *_updated_real(1, "pending", "completed"))
+    assert out == [{"content": subject, "status": "completed"}]
+
+
+def test_a_placeholder_for_a_different_subject_is_left_alone():
+    """Only the placeholder for THIS subject is superseded. A create that
+    learns its id says nothing about some other untrackable task, and sweeping
+    those away would delete work the plan still has to show."""
+    _rec("s1", "TaskCreate", {"subject": "untrackable"}, {"success": True})
+    _rec("s1", "TaskCreate", *_created_real(1, "trackable"))
+    assert sorted(tasktool.load("test")["s1"]["tasks"]) ==         ["1", tasktool._SUBJECT_KEY + "untrackable"]

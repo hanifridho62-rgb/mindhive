@@ -215,6 +215,319 @@ _CATS_MEMO = _BoundedMemo(_MEMO_MAX)
 _OVERSEE_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
 
 
+# The gate for /api/improvements, and the third memo to need a bound ABOVE the
+# namespace count for `_OVERSEE_MEMO_MAX`'s reason: HIVE MIND folds every
+# namespace inside one request, so a smaller cap would evict most of what that
+# single request just wrote and could never hit.
+#
+# What it holds is the CLOCK-FREE fold only — the enriched incident lessons, the
+# caveat cards, and `_tool_action_rows`. The efficiency tiles are deliberately
+# NOT in here: they are cut against `now`, so caching them would freeze the
+# window boundaries at whatever they were when the ledger last moved, and a board
+# left open overnight would report yesterday's "last 24h" as today's. Same rule
+# as `_with_online` and `_with_liveness` — memoize the fold, re-derive the clock.
+#
+# Measured, because an entry here is bigger than any other memo's and the bound
+# is only affordable if the real numbers say so. A FULLY populated memo over this
+# machine's whole store — all 61 namespaces folded — is 10.9 MiB, mean 184 KiB
+# per entry, and ONE namespace is 54% of it (mindhive: 5.93 MiB, 27733 action
+# rows, 211 caveats, 155 lessons). Every other namespace is under 800 KiB. The
+# 128 slots are a backstop over a store of 61, exactly as for `_OVERSEE_MEMO`.
+#
+# What it buys, A/B'd on that same store with four identical requests and a
+# byte-identical 438886-byte response either way: 562 ms per repeat request
+# without the gate, 107 ms with it. The first request costs the same both ways,
+# as it must.
+# {project: (fingerprint, {"auto": [...], "manual": [...], "rows": [...]})}
+# Two more polled routes that are PURE folds of one project's ledger and were
+# reading all of it on every 2.5 s tick. Measured on the real store, asking each
+# three times in a row (cold / warm / warm2):
+#
+#     /api/changelog   450 / 426 / 407 ms      Log section
+#     /api/sops        427 / 425 / 433 ms      SOPs section
+#
+# Warm costs the same as cold, which is the signature of no gate at all: the
+# whole 45k-event `read_all` runs again for a fold whose inputs did not move.
+# `_OVERSEE_MEMO_MAX` for `_STATS_MEMO`'s reason rather than `_MEMO_MAX`'s —
+# HIVE MIND folds EVERY namespace in one request, so a cap under the namespace
+# count would evict most of what that single request just wrote.
+_CHANGELOG_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+_SOPS_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+
+
+def _changelog_cached(proj, compute):
+    """One project's change-log rows, recomputed only when its ledger moved.
+
+    The PENDING marker is deliberately not in here: it is a sidecar file that
+    changes without an event, so a fingerprint over the segments cannot see it
+    move. The caller reads it every time, which costs one small file read."""
+    return _fingerprinted(_CHANGELOG_MEMO, proj, compute)
+
+
+def _sops_cached(proj, compute):
+    """One project's ``(active, history)`` SOP fold, on the same fingerprint."""
+    return _fingerprinted(_SOPS_MEMO, proj, compute)
+
+
+# The other two polled routes the same measurement caught, both ungated:
+#
+#     /api/memory     467 / 477 / 482 ms       Memory section
+#     /api/sessions   464 / 457 / 444 ms       Sessions section
+#
+# `_SESSION_ROWS_MEMO` is NOT `_SESSIONS_MEMO`, and the two are deliberately
+# separate: that one memoizes `oversee.interactive_sessions` for the cats strip
+# and is keyed on `(len(evs), newest ts)`, so it needs the events and cannot skip
+# the read. This one gates the read itself, like every other `_fingerprinted`
+# caller.
+_MEMORY_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+_SESSION_ROWS_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+
+
+def _memory_rows_cached(proj, compute):
+    """One project's memory-view pairs — the TYPE filter, before session/limit.
+
+    Keyed on the project alone, deliberately. The filtered list is a pure fold of
+    the ledger; `session` and `limit` cut it afterwards and cost nothing. Keying
+    on the query string instead would give every distinct limit its own entry and
+    its own full read, which is the gate spent on the one thing it was meant to
+    avoid."""
+    return _fingerprinted(_MEMORY_MEMO, proj, compute)
+
+
+def _session_rows_cached(proj, compute):
+    """One project's session rows, WITHOUT the clock-dependent `status`.
+
+    `taskview.status_of(last_ts)` compares against the wall clock, so a stored
+    status would freeze at whatever it was when the fold ran and the board would
+    go on calling a long-dead session active. It is re-derived per response, the
+    way `_with_online` re-derives liveness on top of the cached cats fold."""
+    return _fingerprinted(_SESSION_ROWS_MEMO, proj, compute)
+
+
+# The Skills board's two telemetry routes. Not on the 2.5 s poll — `renderPlugins`
+# polls `/api/plugins/inventory` — but both run on every visit to the section and
+# on every refresh of it, and both were a full `read_all` each:
+#
+#     /api/skills/status   454 / 423 / 378 ms      for a 28-BYTE response
+#     /api/skills/stats    457 / 413 / 407 ms
+#
+# `plugins.call_stats` and `plugins.skill_stats` are pure folds over one ledger —
+# no clock in either — so the same stat-only gate applies unchanged.
+_SKILL_CALLS_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+_SKILL_STATS_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+
+
+def _skill_calls_cached(proj, compute):
+    """`plugins.call_stats` for one project, recomputed only when it moved."""
+    return _fingerprinted(_SKILL_CALLS_MEMO, proj, compute)
+
+
+def _skill_stats_cached(proj, compute):
+    """`plugins.skill_stats` for one project, on the same fingerprint."""
+    return _fingerprinted(_SKILL_STATS_MEMO, proj, compute)
+
+
+# Every task card in one namespace, from ONE read.
+#
+# `/api/task` read the WHOLE ledger and kept the events of a single session:
+# 451 ms per card expanded, and the Sessions view expands cards one at a time,
+# so five cards cost 2.3 s of folding that the GIL serialises against the poll
+# still running underneath. Measured on the real store, 817 of 1042 sessions
+# project to ZERO rows — that is 451 ms to produce a 41-byte answer.
+#
+# So the fold is grouped by `session_id` and the whole group is cached, rather
+# than caching one session at a time: grouping 45,552 events and projecting all
+# 1,042 sessions costs 19 ms ON TOP of the read it already had to do, and then
+# every other card in that namespace is free. A per-session memo would leave
+# each NEW card paying the full read, which is the case that hurts.
+#
+# Bounded at `_MEMO_MAX`, NOT `_OVERSEE_MEMO_MAX`: the measured entry is 3.5 MB
+# of projection for one namespace, which puts it with the fold-holding memos —
+# individually huge, so few of them — and not with the picker's stats.
+_TASK_MEMO = _BoundedMemo(_MEMO_MAX)
+
+
+def _task_cards_cached(proj, compute):
+    """`{session_id: taskview.items(...)}` for *proj*, recomputed only when the
+    ledger moved. `taskview.items` is a pure fold with no clock in it (unlike
+    `taskview.status_of`, which is why the sessions LIST re-derives status on
+    the way out and this does not have to)."""
+    return _fingerprinted(_TASK_MEMO, proj, compute)
+
+
+_IMPROVE_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+
+
+def _incidents_fingerprint(project):
+    """A stat-only stamp over *project*'s incident RECORDS, or None for a fault.
+
+    The second term of /api/improvements' fingerprint, and it is load-bearing
+    rather than belt-and-braces: `incidents.summaries` reads
+    `rules/incidents/*.md` off the disk, and a reflection pass, a resolution, or
+    a decay-to-expired rewrites one of those files with NO event appended. Cached
+    on a ledger stamp alone, a lesson's verdict would be frozen at whatever it
+    said on the first poll for the life of the process.
+
+    A MISSING directory stamps as `()` rather than None: "this project has no
+    incident records" is a definite state, and the first record created makes the
+    directory exist and the stamp non-empty. Any other `OSError` returns None —
+    `_ledger_fingerprint`'s rule, because a fault that compares equal to itself
+    is how a transient error pins a cache open for good.
+
+    The path comes from `incidents._incident_dir`, the reader's own, so this
+    cannot drift from the directory it claims to be watching."""
+    from . import incidents as incidents_mod
+    try:
+        with os.scandir(incidents_mod._incident_dir(project)) as it:
+            out = [(e.name, e.stat().st_size, e.stat().st_mtime_ns)
+                   for e in it if e.name.endswith(".md")]
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError):
+        return None
+    return tuple(sorted(out))
+
+
+def _improve_fingerprint(proj):
+    """The ledger AND the incident records. None from either half poisons the
+    whole, exactly as in `_overview_fingerprint`: a compound stamp with one
+    untrustworthy term is not a weaker stamp, it is a key that can compare equal
+    after the world has moved."""
+    ledger = _ledger_fingerprint(proj)
+    if ledger is None:
+        return None
+    records = _incidents_fingerprint(proj)
+    if records is None:
+        return None
+    return (ledger, records)
+
+
+def _improve_stamped(memo, proj, compute):
+    """*compute*'s clock-free result for *proj* in *memo*, recomputed only when
+    its ledger or its incident records moved.
+
+    Stamped BEFORE the work and required to still hold after it — `_oversee_cached`
+    documents why at length: stamping only afterwards describes the store as of
+    T+delta while the fold was read at T, so anything that landed inside that
+    window is in the KEY and absent from the VALUE, and the next poll matches the
+    key and serves the older answer. Not caching a fold that raced a write is the
+    correct outcome; the next poll simply folds again.
+
+    Treat the result as read-only: it IS the cached object.
+
+    The memo is a parameter because two different products of the same store
+    share this stamp — the improvements fold and the collapse over its manual
+    half — and giving the second one its own copy of this double-stamping
+    would be two chances to get the ordering wrong instead of one."""
+    before = _improve_fingerprint(proj)
+    if before is not None:
+        cached = _memo_get(memo, proj)
+        if cached is not None and cached[0] == before:
+            return cached[1]
+    value = compute()
+    # `before is None` fails this comparison too, which is right: an unstampable
+    # store was never cacheable.
+    if before is not None and _improve_fingerprint(proj) == before:
+        _memo_put(memo, proj, (before, value))
+    return value
+
+
+def _improve_cached(proj, compute):
+    """The improvements fold for *proj*. The caller copies into its own lists
+    before sorting, and `dedupe.collapse` documents that it does not mutate its
+    input."""
+    return _improve_stamped(_IMPROVE_MEMO, proj, compute)
+
+
+# The near-duplicate collapse over the manual half. Measured on the real store
+# it was 76 ms of the ~108 ms this route still cost warm AFTER the fold was
+# gated — `dedupe.collapse` compares every item against every representative it
+# has kept, and 215 manual rows collapse to 114.
+#
+# Cacheable for the same reason the fold is: `collapse` is pure, it does not
+# mutate its input, and on the single-project path its input is a deterministic
+# sort of an already-cached list. It is deliberately NOT folded into
+# `_improvements_fold`, because the HIVE MIND view collapses the MERGED list and
+# collapsing per namespace first is a different answer — the same shape of
+# mistake the sessions tie-order regression was.
+_MANUAL_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+
+
+def _manual_collapsed_cached(proj, compute):
+    """The collapsed manual lessons for *proj*, on the improvements stamp."""
+    return _improve_stamped(_MANUAL_MEMO, proj, compute)
+
+
+# --- the Skills board's own poll ------------------------------------------
+#
+# `renderPlugins` is the LIVE function for the Skills section, so it fans out to
+# five endpoints every 2.5 s — plus one `/api/skills/history` per expanded skill.
+# Two of those were still full ledger reads:
+#
+#     /api/skills/recommend   641 ms warm, EVERY tick
+#     /api/skills/history     one full read PER EXPANDED SKILL, every tick
+#
+# Both are gated here. They need different stamps because they read different
+# things, and using one stamp for both would either freeze an answer or refuse
+# to cache one that was perfectly cacheable.
+_RECOMMEND_MEMO = _BoundedMemo(_OVERSEE_MEMO_MAX)
+_SKILL_HISTORY_MEMO = _BoundedMemo(_MEMO_MAX)
+
+
+def _recommend_fingerprint(proj):
+    """The ledger, the incident records, AND the installed skills on disk.
+
+    `plugins.recommend_for` reads all three: `read_all` (440 ms), the incident
+    summaries (130 ms), and `live_inventory()` for the skill set being ranked. A
+    ledger-only stamp would pin the ranking against a plugin installed or removed
+    mid-session — the disk half moves with no event appended, exactly the case
+    `_incidents_fingerprint` exists for.
+
+    The third term is `plugins.inventory_signature`, the inventory's OWN gate
+    (16 ms of stat work, and the same function `live_inventory` consults to
+    decide whether to rebuild), so this cannot drift from what the ranking will
+    actually see. A fault in any term poisons the whole stamp, per
+    `_improve_fingerprint`."""
+    both = _improve_fingerprint(proj)
+    if both is None:
+        return None
+    try:
+        from . import plugins as plugins_mod
+        return both + (plugins_mod.inventory_signature(),)
+    except Exception:
+        return None
+
+
+def _recommend_cached(proj, top, compute):
+    """The most-needed-skills ranking for *proj*, recomputed only when the
+    ledger, the incidents, or the installed skills moved.
+
+    Keyed on `(proj, top)` because `top` TRUNCATES the result: one key for both
+    would serve a 5-row ranking to a caller that asked for all of them."""
+    fingerprint = _recommend_fingerprint(proj)
+    if fingerprint is None:
+        return compute()
+    key = (proj, top)
+    cached = _memo_get(_RECOMMEND_MEMO, key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    value = compute()
+    _memo_put(_RECOMMEND_MEMO, key, (fingerprint, value))
+    return value
+
+
+def _skill_history_cached(proj, compute):
+    """`{skill name: [calls, newest first]}` for *proj*, on the ledger stamp.
+
+    Grouped by name for `/api/task`'s reason: the board re-fetches the history of
+    EVERY expanded skill on every tick, so caching one name at a time would leave
+    each additional expanded skill paying its own full read. `plugins.call_history`
+    is a pure fold with no clock in it, and the per-name sequence a single pass
+    produces is the same one it produces — the slice to `limit` happens at the
+    call site, not here, so one cached fold serves every limit."""
+    return _fingerprinted(_SKILL_HISTORY_MEMO, proj, compute)
+
+
 def _with_online(records, stamp):
     """*records* with `online` re-derived at *stamp*.
 

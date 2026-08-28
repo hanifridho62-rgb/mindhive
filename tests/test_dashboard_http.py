@@ -23,6 +23,7 @@ import json
 import socket
 import threading
 from http.server import ThreadingHTTPServer
+from urllib.parse import quote
 
 import pytest
 
@@ -76,17 +77,27 @@ def _connect(address, timeout=10.0):
     return sock
 
 
-def _request_bytes(method, path, body=b"", content_length=None):
+def _request_bytes(method, path, body=b"", content_length=None,
+                   host="127.0.0.1", extra=()):
     """One raw request. `content_length` is separate from `len(body)` on purpose:
     claiming a length and then sending less (or nothing) is precisely how a
-    client hangs up mid-body, and that case has its own branch in `_drain`."""
+    client hangs up mid-body, and that case has its own branch in `_drain`.
+
+    `host` and `extra` default to exactly what every earlier caller sent, so the
+    connection tests below are byte-identical to before they existed. The header
+    block is latin-1, not ascii: a Host or a token header is where a non-ASCII
+    byte reaches the server, and encoding it as ascii here would make the TEST
+    raise instead of the request being sent."""
     declared = len(body) if content_length is None else content_length
-    head = (f"{method} {path} HTTP/1.1\r\n"
-            f"Host: 127.0.0.1\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {declared}\r\n"
-            f"\r\n")
-    return head.encode("ascii") + body
+    head = f"{method} {path} HTTP/1.1\r\n"
+    if host is not None:
+        head += f"Host: {host}\r\n"
+    for name, value in extra:
+        head += f"{name}: {value}\r\n"
+    head += (f"Content-Type: application/json\r\n"
+             f"Content-Length: {declared}\r\n"
+             f"\r\n")
+    return head.encode("latin-1") + body
 
 
 def _read_response(sock):
@@ -445,3 +456,172 @@ def test_the_responded_flag_is_per_request_not_per_connection(server):
                 f"{answer[0]!r} — the flag is per-connection, not per-request")
     finally:
         sock.close()
+
+
+# --- the request boundary: what the server believes about a caller ----------
+# Each of the four below was reproduced against a live server on an ephemeral
+# port before it was written, and each fix was re-verified the same way. They
+# live here rather than beside the route tests because all four are answered
+# BEFORE dispatch — the subject is the boundary, not the route.
+
+
+def _one_exchange(address, request, timeout=10.0):
+    """Send one request on a fresh connection and read one response.
+
+    Returns None when the server closed without framing a complete response —
+    which is a real outcome here, not a test bug, and the one the non-ASCII
+    token case is about.
+    """
+    sock = _connect(address, timeout=timeout)
+    try:
+        sock.sendall(request)
+        return _read_response(sock)
+    except (ConnectionAbortedError, ConnectionResetError):
+        return None
+    finally:
+        sock.close()
+
+
+@pytest.mark.parametrize("where", ["query", "header"])
+def test_a_non_ascii_token_is_answered_403_not_dropped(server, where):
+    """DISCRIMINATING on there being an ANSWER AT ALL, not on the status.
+
+    `secrets.compare_digest` raises TypeError the moment either str operand
+    carries a non-ASCII character, and the token check ran OUTSIDE do_GET's try,
+    so `?token=caf%C3%A9` produced zero bytes on the wire and a traceback on the
+    console. A test asserting only "not 200" would have passed against that
+    server, because a dropped connection is also not 200 — so the assertion that
+    carries the regression is `resp is not None`.
+
+    Both doors are covered: the query parameter and the `X-Hive-Token` header
+    reach the same comparison by different routes.
+    """
+    address, _token, _handler = server
+    if where == "query":
+        request = _request_bytes("GET", "/api/projects?token=caf%C3%A9")
+    else:
+        request = _request_bytes("GET", "/api/projects",
+                                 extra=[("X-Hive-Token", "caf\u00c3\u00a9")])
+
+    resp = _one_exchange(address, request)
+
+    assert resp is not None, (
+        "the server closed without answering: a token it cannot compare is "
+        "still a token it must REFUSE")
+    status, _headers, body = resp
+    assert status.startswith(b"HTTP/1.1 403"), status
+    assert b"forbidden" in body, body
+
+
+def test_a_foreign_host_never_reaches_the_page_that_carries_the_token(server):
+    """DNS rebinding, and why binding 127.0.0.1 is not the whole answer.
+
+    A page served from a domain the attacker owns, resolving to 127.0.0.1, is a
+    local client and is same-origin with us. `GET /` needs no token and the HTML
+    it returns embeds one, so a single rebound `fetch` is full ledger access.
+
+    CANARY, and it is the load-bearing half: the identical request with a
+    loopback Host must still return the page WITH the token in it. Without that,
+    this test would pass just as happily against a server that had stopped
+    serving `/` at all.
+    """
+    address, token, _handler = server
+
+    status, _headers, body = _one_exchange(
+        address, _request_bytes("GET", "/", host="evil.example.com"))
+    assert status.startswith(b"HTTP/1.1 403"), status
+    assert token.encode() not in body, "the token was handed to a foreign origin"
+
+    status, _headers, body = _one_exchange(
+        address, _request_bytes("GET", "/", host="127.0.0.1"))
+    assert status.startswith(b"HTTP/1.1 200"), status
+    assert token.encode() in body, (
+        "canary: the loopback request did not carry the token either, so the "
+        "403 above proves nothing about the Host check")
+
+
+def test_a_project_that_escapes_the_store_is_refused_by_name(server, tmp_path,
+                                                             monkeypatch):
+    """`paths.project_dir` is `store_home() / project`, unsanitised, so the
+    `project=` parameter IS a path component and `../x` reads outside the store.
+
+    CANARY by MUTATION, at the module seam: with `is_safe_project` forced to
+    True, the very same request must return the file planted outside the store.
+    A traversal test whose fixture does not actually traverse proves nothing and
+    reads exactly like one that does.
+    """
+    address, token, _handler = server
+    outside = tmp_path.parent / f"escaped-{tmp_path.name}"
+    (outside / "ns").mkdir(parents=True, exist_ok=True)
+    (outside / "ns" / "STATE.md").write_text("CANARY-OUTSIDE-THE-STORE",
+                                             encoding="utf-8")
+    # tmp_path IS the store home (see the autouse isolate_store fixture).
+    escape = f"../{outside.name}/ns"
+    path = f"/api/state?token={token}&project={quote(escape, safe='')}"
+
+    status, _headers, body = _one_exchange(address, _request_bytes("GET", path))
+    assert status.startswith(b"HTTP/1.1 400"), status
+    assert b"invalid project" in body, body
+    assert b"CANARY-OUTSIDE-THE-STORE" not in body
+
+    monkeypatch.setattr(dashboard, "is_safe_project", lambda p: True)
+    status, _headers, body = _one_exchange(address, _request_bytes("GET", path))
+    assert b"CANARY-OUTSIDE-THE-STORE" in body, (
+        "canary: with the guard removed the request read nothing outside the "
+        f"store, so the refusal above is not evidence — got {body[:200]!r}")
+
+
+def test_an_unparseable_limit_is_refused_by_name_not_by_traceback(server):
+    """DISCRIMINATING on the MESSAGE and the CODE together.
+
+    `int((qs.get("limit") or ["200"])[0])` let a caller's typo out as
+    `500 {"ok": false, "error": "invalid literal for int() with base 10: 'abc'"}`
+    — the interpreter's sentence, over a status that claims the SERVER faulted.
+    Same defect the Content-Length path was fixed for, same answer.
+
+    CANARY: a parseable limit on the same route must still answer 200, so this
+    cannot pass against a server that refuses every `limit`.
+    """
+    address, token, _handler = server
+
+    status, _headers, body = _one_exchange(
+        address, _request_bytes("GET", f"/api/memory?token={token}&limit=abc"))
+    assert status.startswith(b"HTTP/1.1 400"), status
+    assert json.loads(body.decode("utf-8")) == {"ok": False,
+                                                "error": "invalid limit"}
+    assert b"literal" not in body, body
+
+    status, _headers, _body = _one_exchange(
+        address, _request_bytes("GET", f"/api/memory?token={token}&limit=5"))
+    assert status.startswith(b"HTTP/1.1 200"), (
+        "canary: a valid limit was refused too, so the 400 above says nothing "
+        "about the unparseable one")
+
+
+def test_a_non_numeric_scan_parameter_is_refused_by_name_not_by_traceback(server):
+    """The POST twin of the case above, DISCRIMINATING on WHICH field is named.
+
+    The GET side was fixed and the POST side kept the shape. Both answers below
+    were read off a live server before this test existed:
+
+        {"top": "abc"}            500 invalid literal for int() with base 10: 'abc'
+        {"max_age_hours": "soon"} 500 could not convert string to float: 'soon'
+
+    CANARY, and it is the point of the second case: it sends a VALID `top`
+    beside the bad `max_age_hours`. An implementation that answered 400 to
+    anything wrong on this route would satisfy a test that only read the status
+    code; it cannot satisfy one that reads the field name back.
+    """
+    address, token, _handler = server
+
+    for payload, named in (({"project": "test", "top": "abc"}, "top"),
+                           ({"project": "test", "top": 5,
+                             "max_age_hours": "soon"}, "max_age_hours")):
+        body = json.dumps(payload).encode("utf-8")
+        status, _headers, out = _one_exchange(
+            address, _request_bytes("POST", f"/api/plugins/autoscan?token={token}",
+                                    body))
+        assert status.startswith(b"HTTP/1.1 400"), (payload, status)
+        assert json.loads(out.decode("utf-8")) == {"ok": False,
+                                                   "error": f"invalid {named}"}
+        assert b"literal" not in out and b"convert" not in out, out

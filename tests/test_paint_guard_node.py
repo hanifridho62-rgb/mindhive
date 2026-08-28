@@ -285,6 +285,44 @@ def test_a_project_switch_discards_the_previous_namespaces_answer(report, case):
 
 
 @pytest.mark.parametrize("case", [
+    "an_answer_asked_before_the_picker_settled_still_paints",
+    "the_empty_scope_allowance_is_one_removable_expression",
+    "removing_the_empty_scope_allowance_discards_the_first_answer",
+])
+def test_the_first_answer_of_a_session_is_not_read_as_a_project_switch(report, case):
+    """The boot half of the same guard, which the switch cases cannot reach.
+
+    A section clicked before the picker settles asks with NO project -- `withProj`
+    omits the parameter entirely -- so the server answers from `default_project()`,
+    and `loadProjects` then sets PROJECT to that very project. That transition is
+    an acquisition, not a switch, and treating it as one threw away the reader's
+    own first click. The removability case is what keeps the pass honest: with the
+    allowance taken back out, the same answer must be discarded."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
+    "a_remembered_project_that_still_exists_is_kept",
+    "a_remembered_project_the_server_no_longer_offers_is_dropped",
+    "the_offered_check_in_loadProjects_is_removable",
+    "without_the_offered_check_the_picker_and_the_board_disagree",
+])
+def test_the_picker_and_the_board_name_the_same_project(report, case):
+    """A remembered project the server no longer lists used to win outright.
+
+    `loadProjects` restored the reader's last pick from localStorage, and a
+    deleted namespace is still a string. A `<select>` whose value matches no
+    option falls back to its FIRST -- here `*`, the unified view -- so the picker
+    read HIVE MIND, the widest scope there is, while every request carried the
+    vanished project and the board stayed empty. Nothing said so, and nothing
+    rewrote the remembered value, so it came back on every reload.
+
+    The first case is what stops the fix from being "ignore what was remembered":
+    a project the server DOES offer has to survive."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
     "the_refusal_check_is_removable",
     "the_stamp_check_is_removable",
     "the_paused_check_is_removable",
@@ -309,4 +347,33 @@ def test_the_page_does_not_report_what_did_not_happen(report, case):
 
     Each is checked against the real page and against a copy with that one
     check removed, which must fail."""
+    _case(report, case)
+
+
+@pytest.mark.parametrize("case", [
+    "a_first_paint_writes_the_panel",
+    "an_identical_repaint_writes_nothing",
+    "a_changed_payload_still_repaints",
+    "a_matching_payload_still_puts_the_pane_back_on_screen",
+    "a_re_arrival_repaints_even_when_the_payload_is_unchanged",
+    "the_repaint_guard_is_one_removable_expression",
+    "removing_the_repaint_guard_writes_the_same_markup_again",
+])
+def test_an_unchanged_panel_is_not_repainted_every_two_and_a_half_seconds(report, case):
+    """The 2.5 s poll re-runs the whole renderer whether or not anything moved.
+
+    Eight of the nine live sections end that render in showText/showHTML with a
+    COMPLETE payload, so an idle board re-parsed its entire panel every tick:
+    the reader's text selection collapsed, focus on a control inside the panel
+    fell back to <body>, :hover reset, and every entrance animation replayed
+    from 0%. Overview already avoided it with a data-shape signature and the cat
+    strips with dataset.sig; the list sections now avoid it by stamping what was
+    painted and skipping a byte-identical write.
+
+    Executed rather than asserted from the source, because the branch has three
+    distinct ways to be wrong and only one of them is visible in the text: not
+    skipping at all, skipping a payload that CHANGED, and mistaking "already
+    painted" for "already visible" — the last of which is the two-click blank
+    board arriving through a new door. The final case removes the comparison and
+    requires the identical repaint to come back."""
     _case(report, case)

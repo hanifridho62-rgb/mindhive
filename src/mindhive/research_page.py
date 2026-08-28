@@ -13,7 +13,7 @@ in research.py; only the staged recipe persists in localStorage.
 """
 import json
 
-from . import theme
+from . import pane, theme
 
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -536,7 +536,8 @@ _PAGE = """<!doctype html>
 
   // boot
   paintRecipe(); loadSkills(); loadProfiles(); loadSources();
-  (async function loop(){ await poll(); setTimeout(loop, 1000); })();
+  /*__PANE__*/
+  (async function loop(){ if (!paneHidden()) await poll(); setTimeout(loop, 1000); })();
 </script>
 </body></html>"""
 
@@ -548,6 +549,9 @@ _PAGE = """<!doctype html>
 # is already gone cannot be placed by anything a request carries, which is the
 # ordering the token substitution below has to reason about explicitly.
 _PAGE = _PAGE.replace("/*__STATUS__*/", theme.STATUS_CSS)
+# The pane guard rides the same import-time substitution as the palette,
+# and for the same reason: it is one decision shared by three documents.
+_PAGE = _PAGE.replace(pane.MARKER, pane.PANE_JS)
 
 
 def render_research(token: str) -> str:

@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 
 from . import paths
+from .dashboard_query import qs_int
 
 # The product contract: one TRAINING run gets a 5-minute budget regardless of
 # hardware (origin R2) — that budget lives inside autoresearch's train.py and
@@ -1318,7 +1319,7 @@ def api_get(action, proj=None, qs=None) -> dict:
         return {"ok": True, "experiments": ctl.leaderboard.ranked(),
                 "best": ctl.leaderboard.best(), "tally": ctl.skill_tally()}
     if action == "output":
-        return ctl.output(since=int((qs.get("since") or ["0"])[0]))
+        return ctl.output(since=qs_int(qs, "since", 0))
     if action == "learnings":
         return {"ok": True, "learnings": ctl.learnings_text()}
     if action == "prds":

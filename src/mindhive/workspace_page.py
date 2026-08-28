@@ -24,7 +24,7 @@ browser's own (localStorage).
 """
 import json
 
-from . import theme
+from . import pane, theme
 
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -69,6 +69,14 @@ _PAGE = """<!doctype html>
     border:1px solid #30363d; border-bottom:none; border-radius:8px 8px 0 0;
     background:#161b22; font-size:12px; white-space:nowrap; }
   .tab.on { background:#0e1116; border-color:#58a6ff; }
+  /* An unselected tab carried `cursor:pointer` and answered it with nothing.
+     `currentColor` rather than a literal: this page is served without the shell
+     palette, so a hover colour here would be a new hex in a document whose
+     every colour is already spoken for -- and it would have to be a hex the
+     no-duplicate-literal rule then has to live with. The tab's own text colour
+     is brighter than its resting border either way, which is the whole signal.
+     It cannot be mistaken for `.on`, which is blue. */
+  .tab:hover { border-color:currentColor; }
   .tab .tprof { color:#8b949e; font-size:11px; }
   .split { display:flex; flex:1; min-width:0; min-height:0; gap:6px; }
   .split.v { flex-direction:column; }
@@ -759,8 +767,12 @@ _PAGE = """<!doctype html>
 
   // boot
   loadLayout(); buildGrid(); loadProfiles(); loadSkills(); loadBoard();
-  setInterval(loadAuth, 30000);        // auth health drifts (token expiry)
-  (async function loop(){ await poll(); POLLED = true; setTimeout(loop, 1000); })();
+  // Guarded like the poll below it: token expiry does not need watching
+  // while nobody is looking at the answer.
+  setInterval(() => { if (!paneHidden()) loadAuth(); }, 30000);
+  /*__PANE__*/
+  (async function loop(){ if (!paneHidden()) { await poll(); POLLED = true; }
+                          setTimeout(loop, 1000); })();
 </script>
 </body></html>"""
 
@@ -772,6 +784,9 @@ _PAGE = """<!doctype html>
 # is already gone cannot be placed by anything a request carries, which is the
 # ordering the token substitution below has to reason about explicitly.
 _PAGE = _PAGE.replace("/*__STATUS__*/", theme.STATUS_CSS)
+# The pane guard rides the same import-time substitution as the palette,
+# and for the same reason: it is one decision shared by three documents.
+_PAGE = _PAGE.replace(pane.MARKER, pane.PANE_JS)
 
 
 def render_parallel(token: str) -> str:
