@@ -183,8 +183,82 @@ def opened(browser, url, delay_path=None, delay_ms=0, **context_kw):
 
 
 def settled(page):
+    """The section on screen is the one that finished loading.
+
+    The status chip alone cannot say that. `setBusy(false)` writes 'ready' as
+    its RESTING state and the shell is SERVED with that resting text already in
+    place, so between `domcontentloaded` and boot's first `run()` the chip reads
+    'ready' about a section nobody has asked for yet. Measured on Linux, three
+    runs: 'ready' at 5-15 ms, the rail marked at 46-49 ms, the overview grid
+    painted at 90-112 ms. Every probe that read the page straight after this
+    helper was reading that 40-90 ms hole; on Windows they passed only because
+    the next Playwright round-trip cost more than the render did, which is not a
+    guarantee of anything and stopped being true on a Linux runner.
+
+    `RUN_GEN` closes the window because it counts run() calls rather than
+    describing a mood: `>= 1` says a section has been ASKED for, and 'ready'
+    then says none is still in flight. Both halves are needed -- the counter
+    alone would return while the first fetch is still out, and the chip alone is
+    what was already wrong.
+    """
     page.wait_for_function(
-        "document.getElementById('status').textContent === 'ready'", timeout=30000)
+        """() => {
+          const s = document.getElementById('status');
+          return typeof RUN_GEN === 'number' && RUN_GEN >= 1
+                 && !!s && s.textContent === 'ready';
+        }""", timeout=30000)
+
+
+# The guard on the guard. `settled()` is the helper 49 assertions stand behind,
+# so a regression in it does not fail loudly -- it makes every probe read the
+# page a little too early, which on a fast enough machine still passes.
+SETTLE_HOLD_MS = 2000
+
+
+def test_settled_waits_for_a_section_and_not_for_the_served_word_ready(browser, url):
+    """The status chip is not a section signal, and the shell PROVES it.
+
+    `dashboard_page.py` serves `<span id="status">ready</span>` in the markup,
+    and boot is `await loadProjects(); if (!viewPicked) showOverview();` -- so
+    across the whole projects fetch the chip already reads 'ready' about a
+    section that has not been asked for yet. The old `settled()` waited for
+    exactly that string and returned into the hole: measured on Linux, 'ready'
+    at 5-15 ms, the rail marked at 46-49 ms, the overview grid painted at
+    90-112 ms. Eight probes failed there on Linux and passed on Windows, where
+    the next round-trip happened to cost more than the render did.
+
+    The fixture is the defect, not a re-statement of the fix: `/api/projects`
+    is held for two seconds, which widens that window from tens of milliseconds
+    to a size no scheduler can close. The first half asserts the OLD condition
+    is satisfied while `RUN_GEN` is still 0 and no grid exists -- if that ever
+    stops being true this test is no longer reproducing anything and says so
+    rather than passing quietly. The second half is what `settled()` now owes
+    its callers.
+    """
+    with opened(browser, url, delay_path="/api/projects",
+                delay_ms=SETTLE_HOLD_MS) as page:
+        STATE = """() => ({
+          gen: (typeof RUN_GEN === 'number' ? RUN_GEN : null),
+          status: (document.getElementById('status') || {}).textContent,
+          on: document.querySelectorAll('nav button.on').length,
+          grid: !!document.querySelector('#view .cards[data-shape]'),
+        })"""
+        # The old condition, verbatim rather than described.
+        page.wait_for_function(
+            "document.getElementById('status').textContent === 'ready'",
+            timeout=10000)
+        early = page.evaluate(STATE)
+        assert early["gen"] == 0 and not early["grid"] and early["on"] == 0, (
+            f"the held projects fetch did not reproduce the window this test "
+            f"exists for -- boot had already picked a section by the time the "
+            f"old condition was met: {early}")
+
+        settled(page)
+        after = page.evaluate(STATE)
+        assert after["gen"] >= 1, (
+            f"settled() returned before any section had been asked for: {after}")
+        assert after["on"] == 1 and after["grid"], (
+            f"settled() returned before the section reached the screen: {after}")
 
 
 # ---------------------------------------------------------------- the probes
