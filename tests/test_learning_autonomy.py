@@ -36,6 +36,22 @@ def test_fallback_verdict_covers_curated_families():
     assert reflect.fallback_verdict("git:worktree-locked")["task_category"] == "git_merge"
 
 
+def test_fallback_verdict_covers_the_missing_symbol_family():
+    # pysymbol:* has a mechanical, knowable fix (check the module's real
+    # surface), so it earns a deterministic rule like its pymodule: sibling.
+    v = reflect.fallback_verdict("pysymbol:mindhive")
+    assert "mindhive" in v["prevention_rule"]
+    assert v["task_category"] == "dependency"
+
+
+def test_fallback_verdict_never_fabricates_for_an_unknown_exception():
+    # pyexc:* names the exception TYPE but not the root cause — an
+    # AssertionError in a probe has no rule known in advance. Fabricating one
+    # is the failure this guards.
+    assert reflect.fallback_verdict("pyexc:assertionerror:b51a60734d") == {}
+    assert reflect.fallback_verdict("pyexc:keyerror:a387873c88") == {}
+
+
 def test_fallback_verdict_never_fabricates_for_unknown_families():
     assert reflect.fallback_verdict("raw:abc1234567") == {}
     assert reflect.fallback_verdict("judgment:rejected-x-y") == {}

@@ -147,6 +147,18 @@ def fallback_verdict(signature: str) -> dict:
             f"Before running code that imports '{pkg}', verify it is "
             "installed in the target environment (quick import check) and "
             "install it or guard the import if not.", "dependency")
+    if sig.startswith("pysymbol:"):
+        pkg = sig[len("pysymbol:"):] or "that module"
+        return _fb(
+            f"Code referenced a name that does not exist in '{pkg}' — the "
+            "import or attribute was assumed rather than checked (or read "
+            "from a different checkout).",
+            "A module's real surface is one grep away; recalling it from "
+            "memory is where this family of failures comes from.",
+            f"Before importing a name from '{pkg}' or reaching for one of its "
+            "attributes, confirm that symbol is actually defined in the file "
+            "you are importing from — grep the definition, never recall it.",
+            "dependency")
     if sig.startswith("pscmd:"):
         cmd = sig[len("pscmd:"):] or "that command"
         return _fb(
