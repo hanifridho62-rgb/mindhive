@@ -2169,9 +2169,9 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     reason: this is not the hook path, and an orchestration that could disagree
     with `hive mindnet list` about the graph would be worse than a slow one.
 
-    Exit 1 on `stalled` — work remains and nothing can advance it, which is
-    operator-actionable. A zero exit there would let a wrapping CI step pass
-    while the graph is stuck. `capped` is the same: it means the run gave up."""
+    Exit 1 on `stalled`, `capped` and `awaiting-validation` — work remains and a
+    zero exit would let a wrapping CI step pass while the graph is stuck, gave
+    up, or holds agent output nothing has verified. See DATA_MODEL.md §4.6."""
     from dataclasses import asdict
     from .mindnet import agent as ag_mod
     from .mindnet import executor as x_mod
@@ -2308,9 +2308,10 @@ def cmd_mindnet_orchestrate(args) -> int | None:
                 print(f"    {tid}: {path}")
         if not args.execute:
             print("  this was a dry run — add --execute to actually run it")
-    # `dry-run` and `settled` are successes; the other two are not.
-    return 1 if out.outcome in (orc_mod.OUTCOME_STALLED,
-                                orc_mod.OUTCOME_CAPPED) else None
+    # `dry-run` and `settled` are the successes. `awaiting-validation` is NOT one:
+    # the agents ran, but nothing is verified until `hive mindnet validate` says so.
+    return 1 if out.outcome in (orc_mod.OUTCOME_STALLED, orc_mod.OUTCOME_CAPPED,
+                                orc_mod.OUTCOME_AWAITING_VALIDATION) else None
 
 
 def cmd_mindnet_enforce(args) -> int | None:
@@ -3856,6 +3857,10 @@ def _build_parser() -> argparse.ArgumentParser:
     mno.add_argument("--session", default=None)
     mno.add_argument("--json", action="store_true")
     mno.set_defaults(func=cmd_mindnet_orchestrate)
+
+    # Self-registering, the same trade `bench` makes; see briefcli's docstring.
+    from .mindnet import briefcli as briefcli_mod
+    briefcli_mod.register(mnsub)
 
     # MN-6's blast-radius gate. Bare = status; the two directions are mutually
     # exclusive because `--enable --disable` has no defensible reading and

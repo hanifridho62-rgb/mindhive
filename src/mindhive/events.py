@@ -108,6 +108,28 @@ DETERMINISTIC_TYPES = {
     # (MindSwarm's mission state is a plain instance attribute that dies with
     # the server).
     "mindnet_activity",
+    # One row per task briefed for an orchestrated agent. Payload
+    # {task_id, chars, skills, sops, constraints, symbols, gated, empty_reason}.
+    #
+    # This exists because the feature it measures can fail INVISIBLY. `advice`
+    # answers EMPTY for a task whose words overlap nothing, and the symbol slice
+    # is inert unless `MINDHIVE_SYMBOLS` is set — which it is not by default — so
+    # the briefing composer can ship, hand every agent a prompt with no
+    # task-specific context in it at all, and have every run still report
+    # success. The counts are the only thing that can contradict that, and
+    # `gated` is what keeps "switched off" from being reported as "matched
+    # nothing", which are different problems with different fixes.
+    #
+    # Deterministic, for the same reason as `mindnet_activity`: this is
+    # machine-generated telemetry carrying no human intent, and semantic
+    # membership would put a LEDGER markdown file, a Memory-view row and a
+    # recall-corpus entry on disk per briefed task — one per agent per wave.
+    #
+    # The brief's TEXT is not in the payload. It goes to `runlog` under the
+    # task's key plus `agent.BRIEF_KEY_SUFFIX`, because a full prompt block in
+    # every row would put kilobytes per task on the hash chain, and `hive verify`
+    # re-hashes the whole ledger.
+    "mindnet_brief",
     # One row per PreToolUse refusal — the evidence a denial ever happened.
     # Payload {signature, tool_name, decision, reason}; `signature` is ``""``
     # for the learned-matcher tier, which has no signature to report, and the

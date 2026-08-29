@@ -1585,8 +1585,13 @@ def test_an_agent_that_declines_the_task_is_not_marked_completed():
     assert out.skipped == ["a"]
     assert _status_rows() == []
     assert t_mod.fold(events.read_all())["a"].status == t_mod.STATUS_PENDING
-    assert out.outcome == orc.OUTCOME_STALLED, (
+    assert out.outcome != orc.OUTCOME_SETTLED, (
         "the run reported success for work nobody did")
+    # Was `== OUTCOME_STALLED`, which was this case being reported with the word
+    # for a wedged graph. It is not wedged: the agent ran and replied, and `hive
+    # mindnet validate` is what moves it. That assertion has been sharpened rather
+    # than relaxed — the line above still holds the P0 this test was written for.
+    assert out.outcome == orc.OUTCOME_AWAITING_VALIDATION
 
 
 def test_an_isolation_failure_that_RAISES_does_not_abort_the_wave(gitrepo,
@@ -1874,3 +1879,229 @@ def test_an_empty_wave_emits_no_phase_rather_than_a_wrong_one():
                     runner=FakeRunner(), execute=True)
     for row in _activity_payloads(orc._WAVE_FACULTY):
         assert row.get("phase") in (None, "")
+
+
+# --- E2/E3: a wave that writes no status row is the LAST wave -----------------
+#
+# Proved by running the real loop: under the default agent runner, `agent.run`'s
+# SUCCESS path returns `ran-unverified` (agent.py:494), `_run_wave` routes that to
+# `skipped` without a status row (:504), `_persist` with no rows returns the graph
+# unchanged (:630), and `before == after` breaks the loop (:781). Wave 0 is always
+# the last wave. Two consequences the code did not account for:
+#
+#   E2  a retry scheduled for "the next wave" can never fire, so the recovery from
+#       a `worktree add` collision has to happen inside `one()`.
+#   E3  "everything ran, nothing verified" and "genuinely stuck" print the same
+#       word, and they need opposite actions from the operator.
+#
+# Neither of these touches the termination predicate itself. That is deliberate:
+# `test_a_wave_that_changes_nothing_terminates_instead_of_spinning` guards a real
+# anti-spin property and must stay green.
+
+def _isolated_ok(tmp, tid):
+    from mindhive.mindnet import worktree as wt_mod
+    d = Path(tmp) / tid
+    d.mkdir(parents=True, exist_ok=True)
+    return wt_mod.Isolated(task_id=tid, path=str(d), branch=f"mn9/{tid}",
+                           base="HEAD", ok=True)
+
+
+def test_an_isolation_collision_is_retried_inside_the_same_wave(tmp_path,
+                                                                monkeypatch):
+    """E2. A collision writes no status row, so the loop breaks and there is no
+    later wave to retry in — recovery has to happen where the collision happened."""
+    from mindhive.mindnet import worktree as wt_mod
+    attempts = {}
+
+    def flaky_add(root, tid):
+        attempts[tid] = attempts.get(tid, 0) + 1
+        if attempts[tid] == 1:
+            # A git-level failure: the shape a contended `.git` produces, and the
+            # only shape a retry can possibly help with.
+            return wt_mod.Isolated(
+                task_id=tid, ok=False, retryable=True,
+                reason="fatal: Unable to create '.git/index.lock': File exists")
+        return _isolated_ok(tmp_path, tid)
+
+    monkeypatch.setattr(wt_mod, "add", flaky_add)
+    monkeypatch.setattr(wt_mod, "retire",
+                        lambda *a, **k: wt_mod.Retired(removed=True))
+
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("a")), runner=fake, execute=True, isolate=True,
+                    root=str(tmp_path), apply_status=lambda g, d, f: g)
+
+    assert attempts.get("a") == 2, (
+        f"the collision was attempted {attempts.get('a')} time(s) — a bounded "
+        f"retry inside the wave should have tried again")
+    assert fake.calls == ["a"], (
+        "the retry succeeded but the runner was never reached, so the task still "
+        "did no work")
+
+
+def test_the_retry_is_bounded_and_gives_up_as_a_skip(tmp_path, monkeypatch):
+    """The canary for the retry: an add that ALWAYS collides must stop, not spin,
+    and must still leave the task PENDING rather than writing a status row — the
+    MN-7 P0 that a status row deletes the task's whole subtree."""
+    from mindhive.mindnet import worktree as wt_mod
+    attempts = {"n": 0}
+
+    def always_fails(root, tid):
+        attempts["n"] += 1
+        return wt_mod.Isolated(task_id=tid, ok=False, retryable=True,
+                               reason="fatal: Unable to create index.lock")
+
+    monkeypatch.setattr(wt_mod, "add", always_fails)
+    fake = FakeRunner()
+    out = orc.orchestrate(_graph(_task("a")), runner=fake, execute=True,
+                          isolate=True, root=str(tmp_path),
+                          apply_status=lambda g, d, f: g)
+
+    assert 1 < attempts["n"] <= 10, (
+        f"{attempts['n']} attempts — the retry must be bounded, and must be a "
+        f"retry rather than a single try")
+    assert fake.calls == [], "the runner ran despite never getting a checkout"
+    assert out.skipped == ["a"], (
+        "an unrecoverable environmental failure must stay a skip, so the task "
+        "keeps its PENDING status and its subtree survives")
+
+
+def test_a_deliberate_refusal_is_never_retried(tmp_path, monkeypatch):
+    """The other half of the retry's contract, and the more important half.
+
+    `worktree.add` refuses an existing directory ON PURPOSE — it holds a previous
+    run's uncommitted work and the operator has to look at it. Retrying that is not
+    resilience, it is 0.5 s of pretending a permanent condition is a transient one,
+    and the third attempt's reason reads as if git were flaky when nothing is."""
+    from mindhive.mindnet import worktree as wt_mod
+    attempts = {"n": 0}
+
+    def refuses(root, tid):
+        attempts["n"] += 1
+        return wt_mod.Isolated(
+            task_id=tid, ok=False,          # retryable defaults False
+            reason="already exists — a previous run left it behind")
+
+    monkeypatch.setattr(wt_mod, "add", refuses)
+    out = orc.orchestrate(_graph(_task("a")), runner=FakeRunner(), execute=True,
+                          isolate=True, root=str(tmp_path),
+                          apply_status=lambda g, d, f: g)
+
+    assert attempts["n"] == 1, (
+        f"a deliberate refusal was attempted {attempts['n']} times — only a "
+        f"git-level failure is retryable")
+    assert out.skipped == ["a"]
+
+
+def test_a_wave_where_everything_ran_but_nothing_verified_is_not_called_stalled():
+    """E3. `stalled` means nobody can make progress. A wave of agents that all ran
+    and replied is a different state needing a different action — `hive mindnet
+    validate` — and printing the same word for both sends the operator looking for
+    a blockage that is not there."""
+    fake = FakeRunner(results={"a": "ran-unverified"})
+    out = orc.orchestrate(_linear(), runner=fake, execute=True)
+
+    assert fake.calls == ["a"], "the wave did not run at all"
+    assert out.outcome == orc.OUTCOME_AWAITING_VALIDATION, (
+        f"a wave that ran and produced unverified work reported {out.outcome!r}")
+
+
+def test_a_graph_nobody_can_advance_is_still_called_stalled():
+    """The canary for E3. If `awaiting-validation` swallowed the genuinely-stuck
+    case too, the new outcome would carry no information at all."""
+    fake = FakeRunner()
+    out = orc.orchestrate(_graph(_task("a", status=t_mod.STATUS_BLOCKED),
+                                 _task("b", deps=("a",))),
+                          runner=fake, execute=True)
+
+    assert fake.calls == [], "the graph should have offered nothing to run"
+    assert out.outcome == orc.OUTCOME_STALLED, (
+        f"a blocked graph reported {out.outcome!r} — the new outcome has "
+        f"swallowed the case it was supposed to be distinguished from")
+
+
+# --- the briefing DELIVERY path (found missing by /review, 2026-08-29) --------
+
+def test_a_wave_publishes_its_briefing_context_to_the_payload_seam():
+    """Nothing pinned this, and it is the whole delivery path.
+
+    `payload_of(task)` takes one argument, so the wave's `brief.WaveContext`
+    reaches `agent.prompt_for` through a published module cell rather than a
+    parameter. Rebinding `brief.published` to a no-op left 237 orchestrator tests
+    green — every agent would have been briefed with nothing, and every run would
+    still have reported success. That is the exact failure mode the brief's own
+    telemetry exists to make impossible, reproduced one level up.
+
+    Asserted at the seam a real agent reads it from, not by inspecting the source:
+    a structural check passes for a context that is published and then ignored."""
+    from mindhive.mindnet import brief as br_mod
+
+    seen = {}
+
+    def payload_for(task):
+        # Exactly what `agent.prompt_for` does to find its context.
+        ctx = br_mod.current()
+        seen[getattr(task, "task_id", "?")] = ctx
+        return "script"
+
+    fake = FakeRunner()
+    orc.orchestrate(_linear(), runner=fake, execute=True,
+                    payload_for=payload_for,
+                    apply_status=lambda graph, done, failed: graph)
+
+    assert seen, "the payload seam was never called"
+    ctx = seen.get("a")
+    assert ctx is not None, (
+        "no wave context was published — every agent in this wave would have "
+        "been briefed with nothing while the run still reported success")
+    assert isinstance(ctx, br_mod.WaveContext)
+    assert ctx.wave == 0, (
+        f"the context does not know its wave (got {ctx.wave!r}); the brief's "
+        "artifact key is wave-scoped and falls back to a clobbering bare id")
+
+
+def test_the_published_context_does_not_outlive_its_wave():
+    """`published` restores on the way out, including on an exception. A stale
+    context is indistinguishable from a fresh one at the point of use, so a wave
+    that died must not leave the next one briefing from its records."""
+    from mindhive.mindnet import brief as br_mod
+
+    assert br_mod.current() is None, "a context leaked in before this test"
+
+    def exploding_payload(task):
+        raise RuntimeError("the payload composer failed")
+
+    fake = FakeRunner()
+    orc.orchestrate(_linear(), runner=fake, execute=True,
+                    payload_for=exploding_payload,
+                    apply_status=lambda graph, done, failed: graph)
+
+    assert br_mod.current() is None, (
+        "the wave's context outlived the wave — the next orchestration would "
+        "brief its agents from a dead run's ledger snapshot")
+
+
+def test_a_composer_fault_costs_one_task_not_the_whole_wave():
+    """The hazard `one()`'s isolation branch already documents, on the payload
+    seam — found by the test above raising and taking the wave with it.
+
+    `payload_of` is `agent.prompt_for` for a real wave, and that reaches `advice`,
+    `plugins`, `sop` and the ledger with no try/except of its own. Composed
+    outside the guard, one bad brief escaped `one()`, re-raised out of
+    `pool.map`, and discarded the results of every sibling agent that had already
+    finished — so a re-run duplicates real agent work that already succeeded."""
+    fake = FakeRunner()
+
+    def payload_for(task):
+        if getattr(task, "task_id", "") == "a":
+            raise RuntimeError("the composer failed for this task only")
+        return "script"
+
+    graph = _graph(_task("a"), _task("b"), _task("c"))
+    out = orc.orchestrate(graph, runner=fake, execute=True,
+                          payload_for=payload_for,
+                          apply_status=lambda graph, done, failed: graph)
+
+    assert set(fake.calls) == {"b", "c"}, (
+        f"siblings lost to one composer fault — the runner saw {fake.calls}")
+    assert out is not None, "the wave died instead of reporting the one failure"

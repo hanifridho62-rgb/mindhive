@@ -123,6 +123,16 @@ for MN-5's cat board, `mindnet/telemetry.py`: faculty ∈ skill-plugin, sop,
 improvements, history, task-graph, compatibility, pr-green; status ∈ active,
 idle; `task_id`/`phase` are decoration and are dropped when malformed rather
 than losing the event),
+`mindnet_brief` (`{task_id, chars, skills, sops, constraints, symbols, gated,
+empty_reason}` — one row per briefing composed for a spawned agent,
+`mindnet/agent.py:_record_brief` via `mindnet/brief.py`: the counts per advice
+source, plus `gated` (a list) naming any source that was switched OFF rather
+than empty — `symbols=0` and `gated=["symbols"]` need opposite fixes, so they
+are separate fields, and `docs/runbook-empty-brief.md` turns on that
+distinction. `chars` sizes the brief without carrying it. The brief's TEXT is
+deliberately NOT in the payload; it goes to the run log under
+`<task_id>-brief`, because `hive verify` re-hashes the whole ledger and
+kilobytes per task would be paid on every integrity check),
 `policy_denied` (`{signature, tool_name, decision, reason}` — one row per
 `PreToolUse` refusal, written by `enforce.hook_decision`: `signature` is the
 `POLICY_CHECKS` id an operator would disable in the manifest, and `""` for the
@@ -791,6 +801,16 @@ ancestor set by definition. Measured on `MAX_NODES` all-ready nodes at
 | `settled` | nothing left to do | 0 |
 | `stalled` | work remains, nothing can advance it | 1 |
 | `capped` | hit `MAX_WAVES` with work outstanding | 1 |
+| `awaiting-validation` | agents ran and replied; nothing is verified until `hive mindnet validate` says so | 1 |
+| `usage-halted` | an agent reported a quota/auth condition and the run stopped spawning | 1 |
+
+`awaiting-validation` is split out of `stalled`, not out of `settled`. The agent
+runner's success result is `ran-unverified`, which writes no status row — so
+`before == after` and the wave loop stops exactly as it does on a genuinely wedged
+graph. The two print the same word and need opposite things from the operator
+(`hive mindnet validate` here, an investigation there), which is the whole reason
+the outcome exists. It stays on the exit-1 side because a wrapping CI step that
+passed here would be reporting unverified work as done.
 
 `RESULT_STATUS` and `NON_EXECUTING_RESULTS` together **partition**
 `executor.RUN_RESULTS`: `ok` → `completed`, `fail`/`timeout` → `blocked`, and

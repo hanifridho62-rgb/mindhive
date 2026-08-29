@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
+import time
 from dataclasses import dataclass, field, replace
 
 from . import executor as x_mod
@@ -108,8 +109,35 @@ OUTCOME_DRY_RUN = "dry-run"      # planned only; no child ever started
 # anything — and unlike a task failure, nothing about waiting is going to change by
 # running more of them now.
 OUTCOME_USAGE = "usage-halted"
+# `stalled` means nobody can advance. A wave of agents that all ran and replied is
+# a DIFFERENT state that happened to print the same word, because the agent
+# runner's success result is `ran-unverified` (agent.py) and an unverified result
+# writes no status row — so `before == after` and the loop stops, exactly as it
+# stops when the graph is genuinely wedged.
+#
+# The two need opposite things from the operator: `hive mindnet validate` here,
+# and an investigation there. This is reporting only; the termination predicate is
+# untouched, which is why `test_a_wave_that_changes_nothing_terminates_instead_of_
+# spinning` stays green.
+#
+# It IS on the CLI's exit-1 side, with `stalled` and `capped`. The distinction it
+# draws is diagnostic, not a promotion to success: the agents ran, but nothing is
+# verified until `hive mindnet validate` says so, and a wrapping CI step that
+# passed here would be reporting unverified work as done. See `__main__.py`'s
+# `cmd_mindnet_orchestrate` and `test_orchestrate_exits_non_zero_when_the_wave_
+# only_awaits_validation`.
+OUTCOME_AWAITING_VALIDATION = "awaiting-validation"
 OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
-            OUTCOME_USAGE)
+            OUTCOME_USAGE, OUTCOME_AWAITING_VALIDATION)
+
+# The bounded retry for a `git worktree add` that git itself refused. Bounded, and
+# INSIDE the wave: a retry scheduled for "the next wave" can never run, because a
+# failed isolation writes no status row, so `before == after` and this wave is the
+# last one. Only `Isolated.retryable` failures are retried — every refusal
+# `worktree.add` makes on purpose is permanent and describes something an operator
+# has to look at.
+ISOLATION_ATTEMPTS = 3
+ISOLATION_BACKOFF_S = 0.2
 
 # A runaway backstop, not a budget — the same role `MAX_NODES` and
 # `MAX_DEPS_PER_TASK` play for the graph. A legal graph can need at most one wave
@@ -352,11 +380,46 @@ def _batch_phase(batch, graph):
     return getattr(task, "phase", None) or None
 
 
+def _isolate_with_retry(wt_mod, root, tid, attempts=None, backoff=None):
+    """`worktree.add`, retried while git itself keeps refusing. Answers `Isolated`.
+
+    **Inside the wave, deliberately.** The obvious place for this is "try again
+    next wave", and that place does not exist: a failed isolation comes back as
+    `refused`/`executed=False`, which maps to `skipped` and writes no status row,
+    so `_persist` returns the graph unchanged, `before == after`, and the loop
+    breaks. Running the real loop against a runner that always collides gives
+    `outcome: stalled | waves: 1`. There is no next wave to retry in.
+
+    Only `retryable` failures are retried. Every other refusal `worktree.add`
+    makes is a decision, not a fault: an existing directory holds a previous run's
+    uncommitted work, a branch with unmerged commits would lose them. Retrying
+    those spends the backoff pretending a settled answer is a flaky one, and the
+    final attempt's reason then reads as if git were unreliable when nothing is.
+
+    The lock in `worktree` is what makes collisions rare; this is what makes the
+    ones that still happen survivable. Both are needed — a lock cannot help with a
+    `.git` contended by something outside this process."""
+    n = ISOLATION_ATTEMPTS if attempts is None else max(1, int(attempts))
+    wait = ISOLATION_BACKOFF_S if backoff is None else float(backoff)
+    iso = wt_mod.add(root, tid)
+    for attempt in range(1, n):
+        if iso.ok or not getattr(iso, "retryable", False):
+            return iso
+        time.sleep(wait * attempt)
+        iso = wt_mod.add(root, tid)
+    return iso
+
+
 def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
               max_workers=None, root=None, payload_for=None, isolate=False,
               runner_kwargs=None):
     """Submit *batch* concurrently; return ``(completed, blocked, skipped,
-    reasons)``.
+    reasons, isolated, starved, unverified)``.
+
+    ``unverified`` is the subset of *skipped* that actually RAN and came back with
+    a result nothing has checked — the agent runner's success path. It is carried
+    separately because "everything ran, nothing is verified yet" and "nothing could
+    run" are the same shape here and need opposite things from the operator.
 
     **A status row is written only for a task whose child actually RAN.** Tasks
     whose run never started come back as `skipped` and keep their PENDING status —
@@ -390,6 +453,15 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     as the only thing an operator ever saw."""
     env = _child_env(project)
     done, failed, skipped, unknown, reasons = [], [], [], [], {}
+    unverified: list = []
+    # `isolated` is written from INSIDE the pool, unlike everything else here,
+    # which the workers return and this thread merges. That is correct today only
+    # because CPython's GIL makes a dict assignment on a distinct key atomic —
+    # nothing in this function guards it. Under a free-threaded build
+    # (`python3.14t`, and this project's own interpreter is 3.14) it is a real
+    # race, and what it would lose is the record saying a worktree was KEPT and
+    # where the agent's uncommitted work is. TODOS 22 carries the fix: return it
+    # from the worker like every other result. Do not add a second such write.
     cap = DEFAULT_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
 
     payload_of = payload_for or validation_script_of
@@ -397,7 +469,6 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
 
     def one(tid):
         task = graph.get(tid)
-        script = payload_of(task)
         # `runner_kwargs` carries what only SOME runners understand — the agent
         # runner's smart-zone config, for instance, which `executor.execute`
         # has no parameter for. Passed by the caller that chose the runner, so
@@ -410,7 +481,7 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
         if isolate:
             from . import worktree as wt_mod
             try:
-                iso = wt_mod.add(root, tid)
+                iso = _isolate_with_retry(wt_mod, root, tid)
             except Exception as exc:                   # noqa: BLE001
                 # `worktree.add` promises to answer a value, but this sits OUTSIDE
                 # the try below, so a raise here escapes `one()`, re-raises out of
@@ -440,6 +511,23 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
         if timeout_s is not None:
             kwargs["timeout_s"] = timeout_s
         try:
+            # Composed AFTER isolation, and that ordering is load-bearing. For a
+            # real agent wave `payload_of` is `agent.prompt_for`, which appends a
+            # `mindnet_brief` row and writes an artifact as a side effect — so
+            # composing it above the isolation branch left one of each behind for
+            # every task whose worktree git refused and whose agent therefore
+            # never started. Those rows are the only measurement this feature
+            # has, and a row for an agent that never spawned inflates its
+            # denominator silently.
+            #
+            # INSIDE the try, for the same reason the isolation call above is
+            # guarded: `payload_of` is now `agent.prompt_for`, which reaches
+            # `advice`, `plugins`, `sop` and the ledger, and it carries no
+            # try/except of its own. Outside, one composer fault escaped `one()`,
+            # re-raised out of `pool.map`, and discarded the results of every
+            # sibling agent that had already finished — turning a bad brief into
+            # lost agent work, and a re-run into duplicated agent work.
+            script = payload_of(task)
             return tid, runner(run_key(index, tid), script, **kwargs), None
         except Exception as exc:                       # noqa: BLE001 — see above
             return tid, None, f"{type(exc).__name__}: {exc}"
@@ -474,8 +562,30 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     # invented: `telemetry.fold` drops any phase outside `tasks.PHASES`, so a
     # made-up label would vanish between the write and the panel and read as
     # if nothing had been emitted.
+    # The wave's briefing context, resolved ONCE and published for the duration.
+    #
+    # Resolved HERE rather than per task because two of its three parts are
+    # identical for every task in the wave and expensive: the ledger read is
+    # 504 ms and `plugins.recommend_for` — which takes no task at all — is
+    # another 279 ms. Per task, at 12 lanes, that is GIL-held Python the last
+    # `claude -p` in the wave waits behind before it is even spawned.
+    #
+    # Published rather than passed because the seam below calls `payload_of(task)`
+    # with one argument, and widening that would force `validation_script_of`,
+    # which wants none of this, to grow a parameter it never reads.
+    #
+    # ONCE PER WAVE, not once per run. A run-lifetime snapshot is cheaper and
+    # wrong: wave N would be briefed without wave N-1's failures, which is the
+    # entire reason an orchestrated swarm beats N separate agents.
+    #
+    # Assigned before the pool is constructed and only read after, so no lock is
+    # needed — and `published` restores the previous value on the way out even if
+    # the wave raises, so one wave can never brief the next.
+    from . import brief as br_mod
     with tel_mod.busy(_WAVE_FACULTY, task_id=batch[0] if batch else None,
-                      phase=_batch_phase(batch, graph), project=project):
+                      phase=_batch_phase(batch, graph), project=project), \
+            br_mod.published(br_mod.wave_context(project, root=root,
+                                                 wave=index)):
         with cf.ThreadPoolExecutor(
                 max_workers=max(1, min(len(batch), cap))) as pool:
             results = list(pool.map(one, batch))
@@ -505,7 +615,12 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             # It ran, and its outcome is not evidence of anything. No status row:
             # an agent's say-so must not mark a task COMPLETED, and a wall-clock
             # timeout must not mark it BLOCKED and delete its whole subtree.
+            #
+            # Recorded separately as well, because this is the agent runner's
+            # SUCCESS path: without the distinction a wave in which every agent
+            # ran and replied reports the same `stalled` as a wedged graph.
             skipped.append(tid)
+            unverified.append(tid)
             continue
         if RESULT_STATUS[value] == t_mod.STATUS_COMPLETED:
             done.append(tid)
@@ -523,7 +638,7 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     starved = any(ag_check.is_usage_limit(r) for _t, r, _e in results
                   if r is not None)
     return (sorted(done), sorted(failed), sorted(skipped), reasons,
-            isolated, starved)
+            isolated, starved, sorted(unverified))
 
 
 def _refresh(project=None) -> None:
@@ -720,6 +835,10 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     branches: dict = {}
     kept: dict = {}
     capped = False
+    # Whether any child actually RAN and came back unverified. That is the agent
+    # runner's success path, and it is what separates `awaiting-validation` from
+    # `stalled` at the end.
+    ran_unverified = False
 
     for index in range(cap):
         batch = frontier(g, limit)
@@ -733,10 +852,11 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
             continue
 
         before = {tid: getattr(t, "status", None) for tid, t in g.items()}
-        done, failed, held, why, iso, starved = _run_wave(
+        done, failed, held, why, iso, starved, unverified = _run_wave(
             batch, g, runner, index, project=project, timeout_s=timeout_s,
             max_workers=max_workers, root=root, payload_for=payload_for,
             isolate=isolate, runner_kwargs=runner_kwargs)
+        ran_unverified = ran_unverified or bool(unverified)
         why_map = dict(why)
         # THE PR-GREEN GATE. A run succeeding is not the same as a task being
         # finished: the founding requirement is that a task is not done until its
@@ -790,7 +910,14 @@ def orchestrate(graph, runner=x_mod.execute, execute=False, limit=None,
     if capped:
         outcome = OUTCOME_CAPPED
     elif _has_open_work(g):
-        outcome = OUTCOME_STALLED
+        # Open work AND something actually ran without being verified: the agent
+        # runner's normal ending, and recoverable by `hive mindnet validate`.
+        # `stalled` is reserved for the case it used to be confused with — work
+        # remains and nothing moved it. Only `UNVERIFIED_RESULTS` counts here; a
+        # task the pr-green gate held is a different question (its reason already
+        # names what evidence is missing) and is deliberately not folded in.
+        outcome = (OUTCOME_AWAITING_VALIDATION if ran_unverified
+                   else OUTCOME_STALLED)
     else:
         outcome = OUTCOME_SETTLED
     return Orchestration(outcome=outcome, waves=waves, completed=completed,

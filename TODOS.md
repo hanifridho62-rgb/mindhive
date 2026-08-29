@@ -686,3 +686,70 @@ rather than adding work inside the critical section.
 exactly what TODOS 11 cost someone. And this one is on the data-loss path.
 
 </details>
+
+## 22. The orchestrator's thread-safety is written against the GIL, and this machine runs 3.14
+
+`_run_wave`'s `one()` writes `isolated[tid]` from inside the thread pool
+([orchestrator.py:422](src/mindhive/mindnet/orchestrator.py:422),
+[:460](src/mindhive/mindnet/orchestrator.py:460),
+[:462](src/mindhive/mindnet/orchestrator.py:462)). Distinct-key dict assignment is atomic under
+CPython's GIL, so this is correct today and has never misbehaved. It is correct *because of the
+GIL*, not because anything guards it.
+
+The interpreter on this machine is **3.14**, the first release where a free-threaded build is a
+supported configuration rather than an experiment. Under `python3.14t` this becomes a real data
+race, and the failure mode is a lost or torn `Isolated` record — which is the thing that tells the
+operator a worktree was kept and where their agent's uncommitted work is.
+
+Found during `/plan-eng-review` of the Lintester plan, 2026-08-29. The eng review adds a comment
+naming the dependency, which is the honest minimum; it does not fix it.
+
+**What it would take:** audit every mutable structure written from inside `_run_wave`'s pool
+(`isolated`, and whatever the per-wave context cell turns into), and either lock them or make the
+workers return values the main thread merges — the latter is the shape `results = list(pool.map(...))`
+already uses for everything else, so `isolated` is the one that broke the pattern.
+
+**Cons of leaving it:** nothing fails until someone runs a free-threaded interpreter, and then it
+fails silently and intermittently on the path that reports where uncommitted work went.
+
+## 23. Nobody has measured whether briefing a sub-agent actually helps
+
+Branch 1 of the Lintester work builds a per-task briefing composer and the telemetry to prove the
+brief *arrives*. It does not, and cannot, prove the brief **helps** — that needs an A/B over real
+runs, and the CEO plan states explicitly that Branch 2 (the rolling frontier, the `hive lintester`
+front door, the repair loop) only opens if it does.
+
+So the gate on roughly a week of planned work is a measurement nobody has scheduled.
+
+**What it would take:** the same task graph run twice with the brief gated off and on, comparing
+something better than vibes — `ran-unverified` versus validated completions, or agent turn count to
+first evidence. `hive mindnet brief` (E12) gives the off/on switch a per-task inspection surface,
+and E9's per-source telemetry gives the counts; what is missing is the harness that runs both arms
+and the decision about what counts as better.
+
+**Cons of leaving it:** Branch 2 gets built on the assumption instead of the measurement, which is
+the failure this project's own record already names more than once.
+
+## 24. The mindhive-orchestrator skill Claude actually loads is two minor versions old
+
+`.claude-plugin/plugin.json` declares `0.5.0`. The copy Claude Code actually loads is
+`~/.claude/plugins/cache/mindhive-dev/mindhive/0.3.0/skills/mindhive-orchestrator/SKILL.md`.
+Measured 2026-08-29: repo 215 lines, cache 147, 305 diff lines. They are not cosmetically apart —
+they describe different pipelines under the same `name:`:
+
+| | repo (0.5.0) | loaded cache (0.3.0) |
+|---|---|---|
+| trigger | `/mindhive-orchestrator [idea]` | `/mindhive [idea]` |
+| shape | ten-stage sequential, engine restricted to superpowers + compound-engineering | interview → skill selection → execution → learning, Recommendation Matrix |
+| fan-out | parallel sub-agents over a file-complexity cluster database | not present |
+
+This is what made the SKILL.md audit during `/plan-eng-review` ambiguous: reading the repo copy and
+invoking the skill are reading two different documents, and nothing in either says so.
+
+**What it would take:** refresh the installed plugin so the cache carries 0.5.0. That is an action
+on the user's global `~/.claude/plugins` install, not an edit in this repo — hand-writing the repo
+body into a directory named `0.3.0` would make the cache lie about which version it holds, and the
+next legitimate plugin update would silently revert it.
+
+**Cons of leaving it:** every future audit of this skill has the same ambiguity, and anyone typing
+`/mindhive-orchestrator` gets a skill whose description says `/mindhive`.

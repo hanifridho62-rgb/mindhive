@@ -18,7 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        # 3.14 is the version this project is actually developed on and the one
+        # CI had never run — `requires-python` is >=3.11, so it was always in
+        # scope and simply untested. It is added here UNVERIFIED: GitHub Actions
+        # is billing-blocked on this account, so no run of this matrix has
+        # executed. Saying that plainly is the point; a leg nobody has seen go
+        # green is a claim, not evidence.
+        python-version: ["3.11", "3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v5
