@@ -727,6 +727,19 @@ first evidence. `hive mindnet brief` (E12) gives the off/on switch a per-task in
 and E9's per-source telemetry gives the counts; what is missing is the harness that runs both arms
 and the decision about what counts as better.
 
+**Sharpened by the red-team pass, 2026-08-29.** On the agent path the wave loop can only ever run
+ONCE, so part of the design's stated benefit is already unreachable. `agent.run`'s success result
+is `ran-unverified`, which `_run_wave` routes to `skipped` with no status row; `apply_status` then
+returns an identical graph, `before == after`, and the loop breaks. A second wave happens only
+when agents FAIL. That means `brief.wave_context`'s justification for resolving per wave rather
+than per run — "wave N would be briefed without wave N-1's failures, which is the entire reason an
+orchestrated swarm beats N separate agents" — describes a property the termination predicate
+forbids in the successful case. It also answers what `awaiting-validation` changes about later
+waves: there are none.
+
+So the A/B below is measuring a one-wave brief, and the comment in `orchestrator._run_wave` should
+either say so or the loop should run the validation gate inside the wave.
+
 **Cons of leaving it:** Branch 2 gets built on the assumption instead of the measurement, which is
 the failure this project's own record already names more than once.
 
@@ -753,3 +766,59 @@ next legitimate plugin update would silently revert it.
 
 **Cons of leaving it:** every future audit of this skill has the same ambiguity, and anyone typing
 `/mindhive-orchestrator` gets a skill whose description says `/mindhive`.
+
+---
+
+## 25. The brief cannot see its own failures, and cannot report an attack it survived
+
+Found by the red-team pass on 2026-08-29, after the six specialist passes. Both halves are
+observability gaps in the feature whose whole justification is that a silent no-op must be
+impossible.
+
+**Failures are indistinguishable from emptiness.** `brief.wave_context` has three
+`except Exception` branches — the ledger read, `plugins.recommend_for`, the sidecar — and none
+records that it fired. `_symbol_slice`'s catch-all does the same. So a context in which all three
+failed produces exactly the observable state of a healthy context that legitimately matched
+nothing: `chars=0`, `skills=0`, `sops=0`, `constraints=0`, `gated=()`, and
+`empty_reason="every source resolved empty for this task"`. Only `symbols` gets a marker, and only
+for the one failure mode that is a config switch rather than an error.
+
+**A defused line is counted nowhere.** `_section` filters falsy results, `safe_block` drops lines,
+and `Stats` counts the resolver's rows rather than the rendered ones. Five hostile lines defusing
+to nothing produce `skills=3 chars=0` plus that same "resolved empty" reason. The one signal that
+an injection attempt actually reached the composer is discarded — the feature can be under active
+attack and every run still reports success.
+
+**What it would take:** extend the `gated` vocabulary into a `failures` tuple carried on
+`WaveContext` and `Stats` (`events`, `plugins`, `sidecar`, `symbols`), have `_defused` report
+whether it dropped, tally that through `_section`/`safe_block` onto a `dropped` count, and emit
+both in the `mindnet_brief` payload and `briefcli._describe`.
+
+**Cons of leaving it:** the telemetry added in E9 answers "did the brief arrive" and cannot answer
+"did it arrive because everything worked". Those need different fixes and currently print the same
+line.
+
+## 26. A prompt-injected agent can write the next wave's briefing
+
+`advice.resolve_sops` renders SOP bodies verbatim, and `resolve_constraints` renders incident
+`root_cause`/`lesson` text. Both are ledger- and file-backed. Every spawned child has `hive` on
+PATH and is *instructed* to run it (`agent.prompt_for` closes with `hive log <category> ...`).
+
+So a wave-1 agent that has been prompt-injected can append one `sop` or `incident` row, and that
+text is composed into every subsequent agent's brief — inside the fence, indistinguishable from
+human-authored project history. `Stats` records counts, not sources, so the amplification leaves
+no trace.
+
+The fence's own docstring records the risk of a well-formed imperative sentence as ACCEPTED,
+because a sentence recording what someone did is indistinguishable from one telling you to do it.
+That argument was made about *humans and past sessions* writing the ledger. It was not made about
+a previous agent in the same swarm, which is a different threat model: the writer is inside the
+blast radius, not outside it.
+
+**What it would take:** record the writing session/actor on `sop` and `incident` rows, then either
+exclude rows authored by `mn-*` orchestration sessions from brief composition, or render them
+under a heading that names the author. At minimum, add a per-source breakdown to the
+`mindnet_brief` payload so an operator can see agent-authored lines entering the fence.
+
+**Cons of leaving it:** the swarm can teach itself something an attacker wrote once, and nothing
+in the record shows where it came from.

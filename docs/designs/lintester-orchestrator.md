@@ -204,6 +204,22 @@ block inside an explicitly labelled "context, not instructions" fence so the sub
 provenance. That is a convention, not an enforcement boundary, and it is recorded here as an
 accepted risk rather than a solved one.
 
+**As shipped (2026-08-29), part of that convention became enforcement.** The paragraph above was
+written at plan time; the `/review` round then found three ways to forge the fence and one to hide
+inside it, so `brief._defused` now does more than call `safe_text`. It NFKC-normalises (so a
+compatibility form cannot smuggle a rule glyph past the scan), drops `Cf` codepoints *and* the
+blank-rendering non-`Cf` ones the `Cf` test misses (U+115F, U+1160, U+17B4, U+17B5, U+2800, U+3164,
+U+FFA0), and strips any rule-plus-`CONTEXT` pair whatever its glyph or casing — em dash, `===`,
+box-drawing — by anchoring the scan on the rare literal and expanding outward within a 160-character
+window. That anchoring is not a style choice: the first version anchored on the dashes and
+backtracked quadratically, 6.5 s on one hostile 2000-character line, in the parent process. A line
+that has not reached a fixed point after 8 passes is dropped rather than rendered.
+
+What the paragraph above still gets right is the part that matters: none of this stops a single
+well-formed imperative sentence, because a constraint *is* one. The boundary remains
+provenance-labelling, not enforcement, and the forgery defences only stop the label itself from
+being counterfeited.
+
 ---
 
 ## Outside voice — what a second, independent model caught

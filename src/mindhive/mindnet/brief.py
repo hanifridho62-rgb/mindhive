@@ -113,7 +113,7 @@ SYMBOL_TITLE = "Where things live in this repository"
 
 # Per-line cap, BOUND to the injector's rather than repeated. Both cap the same
 # `advice.resolve` rows for the same reason; two independent 240s over one dataset
-# is the drift this module's `SYMBOL_BUDGET` comment argues against.
+# is the drift `SYMBOL_BUDGET_FALLBACK`'s comment argues against.
 MAX_LINE_CHARS = inj_mod.MAX_ADVICE_ITEM_CHARS
 
 # The symbol slice is one pre-rendered block, not a list of rows, so it gets its
