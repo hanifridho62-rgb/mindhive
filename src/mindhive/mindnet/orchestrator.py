@@ -527,7 +527,29 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             # re-raised out of `pool.map`, and discarded the results of every
             # sibling agent that had already finished — turning a bad brief into
             # lost agent work, and a re-run into duplicated agent work.
-            script = payload_of(task)
+            #
+            # Caught SEPARATELY from the runner's raise below, because the two
+            # mean opposite things and one `except` made them one thing. A
+            # non-None error travels back as `failed`, and `failed` is what
+            # `blocked.extend(failed)` and `apply_status(g, done, failed)`
+            # consume — so a fault in THIS process wrote a durable BLOCKED row
+            # against a task whose child was never spawned, and BLOCKED deletes
+            # that task's whole subtree (the MN-7 P0). The runner raising is a
+            # statement about the child; `payload_of` raising is a statement
+            # about us, and it is not evidence about the task at all.
+            #
+            # Same `refused`/`executed=False` shape the isolation branch returns
+            # above, for the same reason: MN-8's existing classification maps it
+            # to `skipped`, which writes nothing and leaves the task PENDING. No
+            # new branch in the mapping, and no new way to be wrong.
+            try:
+                script = payload_of(task)
+            except Exception as exc:                   # noqa: BLE001 — see above
+                return tid, x_mod.RunResult(
+                    result="refused", executed=False,
+                    run_key=run_key(index, tid),
+                    reason=f"could not compose a payload: "
+                           f"{type(exc).__name__}: {exc}"), None
             return tid, runner(run_key(index, tid), script, **kwargs), None
         except Exception as exc:                       # noqa: BLE001 — see above
             return tid, None, f"{type(exc).__name__}: {exc}"

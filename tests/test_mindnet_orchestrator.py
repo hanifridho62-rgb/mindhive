@@ -2089,19 +2089,56 @@ def test_a_composer_fault_costs_one_task_not_the_whole_wave():
     `plugins`, `sop` and the ledger with no try/except of its own. Composed
     outside the guard, one bad brief escaped `one()`, re-raised out of
     `pool.map`, and discarded the results of every sibling agent that had already
-    finished — so a re-run duplicates real agent work that already succeeded."""
+    finished — so a re-run duplicates real agent work that already succeeded.
+
+    Moving it inside the guard fixed that and bought a second defect: the
+    composer raise and the RUNNER raise came back through one `except`, and a
+    non-None error is read as `failed` -> `blocked.extend(failed)` ->
+    `apply_status(g, done, failed)`. So a fault in the PARENT process wrote a
+    durable BLOCKED row against a task whose child never started, and BLOCKED
+    deletes that task's whole subtree — the MN-7 P0. `/autoplan` §4.2,
+    2026-08-30, settled it: both adversarial voices were right, about different
+    consequences of the same line.
+
+    `failed` is asserted at the `apply_status` SEAM rather than by inspecting a
+    persisted graph, because that seam is where the deletion is decided. A task
+    that never reaches `failed` cannot have its subtree removed, whatever
+    `_persist` later does with the ones that do."""
     fake = FakeRunner()
+    applied = []
 
     def payload_for(task):
         if getattr(task, "task_id", "") == "a":
             raise RuntimeError("the composer failed for this task only")
         return "script"
 
+    def apply_status(graph, done, failed):
+        applied.append((tuple(sorted(done)), tuple(sorted(failed))))
+        return graph
+
     graph = _graph(_task("a"), _task("b"), _task("c"))
     out = orc.orchestrate(graph, runner=fake, execute=True,
-                          payload_for=payload_for,
-                          apply_status=lambda graph, done, failed: graph)
+                          payload_for=payload_for, apply_status=apply_status)
 
     assert set(fake.calls) == {"b", "c"}, (
         f"siblings lost to one composer fault — the runner saw {fake.calls}")
     assert out is not None, "the wave died instead of reporting the one failure"
+
+    # The task the PARENT process failed to brief. Nothing ran for it, so it
+    # belongs exactly where every other did-not-run outcome already lands.
+    assert "a" in out.skipped, (
+        f"a composer fault must leave the task PENDING and skipped; "
+        f"skipped={out.skipped} blocked={out.blocked}")
+    assert "a" not in out.blocked, (
+        "a fault in the parent marked the child's task BLOCKED — the row that "
+        "deletes its subtree")
+    assert applied, "apply_status was never called, so the seam proves nothing"
+    for done, failed in applied:
+        assert "a" not in failed, (
+            f"'a' reached the status writer as failed={failed} — a durable "
+            f"BLOCKED row for a task whose agent was never spawned")
+
+    # The cause still travels. Suppressing the ROW must not suppress the REASON,
+    # or a composer failing for every task reads as a quiet no-op.
+    assert "composer failed" in out.reasons.get("a", ""), (
+        f"the fault's cause was lost: {out.reasons.get('a')!r}")
