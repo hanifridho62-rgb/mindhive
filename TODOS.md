@@ -743,6 +743,25 @@ either say so or the loop should run the validation gate inside the wave.
 **Cons of leaving it:** Branch 2 gets built on the assumption instead of the measurement, which is
 the failure this project's own record already names more than once.
 
+**The gate itself, written here because a review document is not where a condition lives.**
+At the `/autoplan` gate on 2026-08-30 the owner chose to ship `brief.enabled()` **default ON**,
+and made that choice *conditional on this paragraph existing*. So this is the condition, not a
+note about one:
+
+- The composer is ON for every orchestrated wave, by default, right now. Nobody has shown it
+  helps. That combination is deliberate and it is the reason this entry cannot be closed by
+  arguing about it.
+- **Branch 2 does not open until the A/B above actually runs.** The rolling frontier, the
+  `hive lintester` front door and the repair loop are gated on a measured result, not on the
+  composer having shipped.
+- If the measurement comes back neutral or negative, the honest move is flipping the default
+  OFF — not rescoping the metric to whatever the brief happened to improve. Writing that down
+  in advance is the whole point of writing it down.
+
+The off switch is `MINDHIVE_BRIEF=0` (`brief.ENV_SWITCH`), and `hive mindnet brief <task>` shows
+exactly what a child would receive with it either way, which is the per-task inspection surface
+the A/B needs.
+
 ## 24. The mindhive-orchestrator skill Claude actually loads is two minor versions old
 
 `.claude-plugin/plugin.json` declares `0.5.0`. The copy Claude Code actually loads is
