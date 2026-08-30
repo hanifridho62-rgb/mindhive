@@ -41,8 +41,8 @@ the record. Run it on anything here you are about to act on.
 
 | Claim | Command that proves or refutes it |
 |---|---|
-| Branch has 2 commits, `cc290f5` on top of `a234fb8` | `git log --oneline -2` |
-| HEAD is `cc290f5755e243ccba156edc459b65566a0aad37` | `git rev-parse HEAD` |
+| Branch has 3 commits: `8efabdb` (this PRD) on `cc290f5` on `a234fb8` | `git log --oneline -3` |
+| HEAD is `8efabdb` — this document is itself the tip commit | `git rev-parse HEAD` |
 | Branch is 3 behind / 2 ahead of `origin/master` | `git rev-list --left-right --count origin/master...HEAD` |
 | Branch has NO remote copy and NO PR | `git ls-remote --heads origin claude/lintester-mindhive-orchestration-77909c` (empty) and `gh pr list --head claude/lintester-mindhive-orchestration-77909c` |
 | `origin` redirects to `hanifridho62-rgb/mindhive` | `git remote -v` says `Lintester-project.git`; `gh repo view --json nameWithOwner` says `hanifridho62-rgb/mindhive` |
@@ -157,10 +157,24 @@ entirely** (all 8 agents hit the account session limit; zero results, 392,977
 subagent tokens spent); **run 2** is `wf_be81d3eb-308`, journal at
 `…/subagents/workflows/wf_be81d3eb-308/journal.jsonl`.
 
-All six lenses reported: **25 findings**. Three skeptic verdicts had landed when
-this PRD was written; the concurrency, test-vacuity and cli-contract verdicts
-and both judge agents were **still in flight**. §4 marks each finding's verdict
-status honestly — do not treat an unverified finding as confirmed.
+All six lenses reported: **25 findings**. But **run 2 did not finish either.**
+Its six attackers all returned; then three agents stopped without producing a
+result and the run's task record is gone (`TaskOutput w4c9bkg7f` →
+`No task found`). Confirmed from the journal — 9 result rows, 20 started, 8
+failed (the run-1 corpses):
+
+- skeptic verdicts that LANDED: fence-bypass, resource-exhaustion,
+  integrity-blast-radius;
+- skeptic verdicts that NEVER LANDED: **concurrency, test-vacuity,
+  cli-contract**;
+- **neither judge agent ran at all** — there is no synthesis and no
+  completeness critic. The workflow returned `surviving_count: 0`, which is an
+  artefact of the post-processing running over missing verdicts, **not** a
+  finding that nothing survived.
+
+So of the 25 findings, only 7 have been through a skeptic (6 confirmed, 1
+refuted). The other 18 are **one agent's unverified word**. §4 keeps the two
+groups apart; do not collapse them.
 
 ---
 
@@ -187,7 +201,14 @@ py -c "import json;J=r'C:\Users\hanif\.claude\projects\C--Users-hanif-mindhive--
 **REFUTED — do not fix:** `tid-unsanitised` (`agent.py:153`). The render half is
 true, but the skeptic proved the scenario is unreachable.
 
-### 4.2 Reported, verdict NOT yet in — verify before acting
+### 4.2 Reported by ONE agent, never refuted or confirmed — verify before acting
+
+These 18 come from lenses whose skeptic never ran (§3.3). Treat each as a
+hypothesis with a named probe, not as a defect list. The cheapest way to close
+this gap is to re-run just the missing half:
+`Workflow({scriptPath: '…/lintester-adversarial-pass-wf_be81d3eb-308.js', resumeFromRunId: 'wf_be81d3eb-308'})`
+— the six attackers replay from cache, so only the three missing verifiers and
+the two judges actually cost anything.
 
 **Concurrency lens.** `brief-key-collides-with-sibling-transcript` (HIGH,
 `agent.py:255`) — a task's brief key equals a sibling's transcript run key, so
@@ -227,8 +248,11 @@ effect over adding two more codepoints to a frozenset.
 
 ## 5. The queue — what will be run, in this order
 
-1. **Drain `wf_be81d3eb-308`.** Read the remaining verdicts and both judge
-   agents. Anything the skeptic refuted is dropped, not fixed.
+1. **Finish `wf_be81d3eb-308`** — it never completed. Resume it (§4.2) so the
+   concurrency, test-vacuity and cli-contract findings get a skeptic and the two
+   judges actually run. Anything a skeptic refutes is dropped, not fixed. If you
+   choose to skip this, the 18 unverified findings stay unverified and the PR
+   body must say so.
 2. **Fix the confirmed findings.** Test-first: each fix gets a regression test
    proven RED by reverting the fix *in place*. A mutation that leaves a second
    control standing proves nothing (§8).
@@ -284,12 +308,19 @@ before them, came from the same model family that wrote the code. Report this as
 absent coverage; it is recorded that way in the gstack review log
 (`codex_coverage: "MISSING"`).
 
-### 6.3 Account session limits killed a whole workflow once
+### 6.3 Account session limits took out BOTH workflow runs
 
 Run 1 lost all 8 agents to `You've hit your session limit` and returned zero
-results. If you hit it again, the workflow resumes with
-`Workflow({scriptPath: …, resumeFromRunId: 'wf_be81d3eb-308'})` and completed
-agents replay from cache.
+results, after 392,977 subagent tokens. Run 2 got its six attackers through,
+then lost three agents silently — three skeptics and both judges never produced
+a result, and the task record is gone. **Neither run ever produced a
+synthesis.** The `surviving_count: 0` the workflow returned is post-processing
+over absent verdicts, not a verdict of its own.
+
+Resume with `Workflow({scriptPath: …, resumeFromRunId: 'wf_be81d3eb-308'})` —
+finished agents replay from cache, so only the missing five cost tokens. If you
+are on a fresh account, that headroom is the reason to do it before anything
+else in §5.
 
 ### 6.4 Environments that do not exist on this machine
 
@@ -391,12 +422,13 @@ Re-read them with `py -m mindhive recall "<term>" --semantic`; they are dated
 
 > Continue Lintester Branch 1 in the worktree
 > `C:\Users\hanif\mindhive\.claude\worktrees\lintester-mindhive-orchestration-77909c`
-> (branch `claude/lintester-mindhive-orchestration-77909c`, HEAD `cc290f5`).
+> (branch `claude/lintester-mindhive-orchestration-77909c`, HEAD `8efabdb`).
 > **The ledger is the source of truth** — orient with `hive state`, then
 > `hive log show | head -60`, then `git log --oneline -3`, before believing any
 > summary, including this one.
 > The plan is `docs/prds/2026-08-30-001-lintester-branch-1-landing-prd.md`.
-> Work its §5 queue in order: drain workflow `wf_be81d3eb-308`, fix the
+> Work its §5 queue in order: finish workflow `wf_be81d3eb-308` (it stalled —
+> three skeptics and both judges never ran), fix the
 > skeptic-confirmed findings in §4.1 test-first, settle the §4.2 contradiction
 > with a probe, trim the `__main__.py` ratchet (§6.1 — the rebase makes it 4238
 > against a 4237 cap), rebase onto `origin/master`, get the full suite green,
