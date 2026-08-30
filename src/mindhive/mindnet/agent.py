@@ -158,7 +158,20 @@ def prompt_for(task, phase=None, ctx=None) -> str:
     # make every honest task's prompt worse to constrain a hostile one.
     title = br_mod.safe_line(getattr(task, "title", ""))
     desc = br_mod.safe_block(getattr(task, "description", ""))
-    langs = [str(x) for x in (getattr(task, "language_context", ()) or ())]
+    # The fifth field, and the one that had NO sanitiser at all. It arrives from
+    # the sidecar like the phase does, and it renders at column 0 OUTSIDE the
+    # fence — so raw it forged both a fence close and a `[mindnet]` directive
+    # header three lines above this prompt's own "do NOT commit, push" rule
+    # (/autoplan, 2026-08-30). Every hardening the fence adds was bypassed by one
+    # field, which is worse than none: a partial fence reads as a whole one.
+    #
+    # Per element, BEFORE the join. Defusing the joined string would flatten a
+    # hostile newline too, but it sorts on the RAW values and cannot drop an
+    # entry that defuses to nothing — which leaves a dangling separator in the
+    # rendered line.
+    langs = [s for s in (br_mod.safe_line(x)
+                         for x in (getattr(task, "language_context", ()) or ()))
+             if s]
     # Defused before it is rendered. This value now comes from the sidecar — a
     # file on disk that `sidecar._row` does not re-validate — and it lands in the
     # prompt HEADER, outside the fence, where nothing marks it as background.
