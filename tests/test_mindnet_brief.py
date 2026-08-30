@@ -546,15 +546,15 @@ def test_a_brief_artifact_is_filed_under_its_own_wave(monkeypatch):
     history."""
     from mindhive.mindnet import agent as ag_mod
 
-    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=0)) == "mn7-w0-t1-brief"
-    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=2)) == "mn7-w2-t1-brief"
+    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=0)) == "mn7-w0-t1_brief"
+    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=2)) == "mn7-w2-t1_brief"
     assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=0)) != \
         ag_mod._brief_key("t1", br_mod.WaveContext(wave=1)), (
         "two waves of one task share an artifact key — the retry overwrites the "
         "attempt an operator is reading to understand it")
     # No wave (the read-only `hive mindnet brief` path) still answers a key.
-    assert ag_mod._brief_key("t1", br_mod.WaveContext()) == "t1-brief"
-    assert ag_mod._brief_key("t1", None) == "t1-brief"
+    assert ag_mod._brief_key("t1", br_mod.WaveContext()) == "t1_brief"
+    assert ag_mod._brief_key("t1", None) == "t1_brief"
 
 
 # --- the red-team round: what the six specialists' fixes left open ------------
@@ -738,3 +738,56 @@ def test_the_preview_command_resolves_a_root_rather_than_omitting_one(
     # that _rows supplied it rather than leaving the fallback to decide.
     assert seen["root"] is not None, (
         "_rows omitted the root — the symbol slice would index the caller's cwd")
+
+
+def test_no_task_id_the_decomposer_can_mint_reaches_a_briefs_artifact_path():
+    """The product's own decomposer could mint the id that overwrites a brief.
+
+    `decompose.slugify("Brief", parent_id="t1")` returns the `ID_RE`-legal id
+    `t1-brief`, and `orchestrator.run_key(0, "t1-brief")` then produced exactly
+    the string `_brief_key("t1", wave=0)` produced. `runlog.write_once` resolves
+    both to one `artifact_path`, so one of the two files silently won — and which
+    one depends on scheduling.
+
+    Asserted at the FILENAME layer as well as the key layer, because that is
+    where the collision actually happens. A suffix that looks distinct in the key
+    but is rewritten by `runlog._safe` on the way to a path fixes nothing: `#`,
+    the first candidate, is `[^A-Za-z0-9_-]` and comes back out as `-`."""
+    from mindhive import runlog
+    from mindhive.mindnet import agent as ag_mod
+    from mindhive.mindnet import brief as br_mod
+    from mindhive.mindnet import decompose as dec_mod
+    from mindhive.mindnet import orchestrator as orc_mod
+
+    victim = dec_mod.slugify("Brief", parent_id="t1")
+    assert victim == "t1-brief", (
+        f"the decomposer no longer mints the colliding id ({victim!r}); this "
+        f"test's premise needs rechecking, not deleting")
+
+    brief_key = ag_mod._brief_key("t1", br_mod.WaveContext(wave=0))
+    child_key = orc_mod.run_key(0, victim)
+    assert brief_key != child_key, (
+        f"a brief and a real task's transcript share the key {brief_key!r}")
+    assert runlog.artifact_path(brief_key) != runlog.artifact_path(child_key), (
+        f"distinct keys, one file: {runlog.artifact_path(brief_key)}")
+
+
+def test_the_brief_suffix_lives_outside_the_task_id_charset_at_both_layers():
+    """The guarantee as a CLASS, not one worked example.
+
+    `tasks.ID_RE` is `^[a-z0-9][a-z0-9-]{0,63}$` and `run_key` adds only
+    `mn7-w<n>-`, so if the suffix's separator cannot appear in a legal task id,
+    no task id can produce a brief's key — including ones nobody has thought of.
+    The second assertion is the one that rules out `#`: the separator has to
+    survive `runlog._safe` too, or the two keys converge again one layer down."""
+    from mindhive import runlog
+    from mindhive.mindnet import agent as ag_mod
+    from mindhive.mindnet import tasks as t_mod
+
+    suffix = ag_mod.BRIEF_KEY_SUFFIX
+    assert not t_mod.ID_RE.match(f"t1{suffix}"), (
+        f"a task id can be spelled {f't1{suffix}'!r}, so the suffix is "
+        f"reachable and the collision is only hidden")
+    assert runlog._safe(f"mn7-w0-t1{suffix}").endswith(suffix), (
+        f"{suffix!r} does not survive the filename sanitiser — the keys differ "
+        f"but the paths do not")

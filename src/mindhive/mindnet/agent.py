@@ -245,7 +245,20 @@ def _artifact(run_key, text, project=None):
 # child's transcript. `runlog.write_once` resolves straight to
 # `artifact_path(run_key)`, so two writes under one key are one file, and the
 # survivor is whichever wrote last — silently.
-BRIEF_KEY_SUFFIX = "-brief"
+#
+# UNDERSCORE, and that is the whole guarantee rather than a spelling choice.
+# `-brief` was reachable: `tasks.ID_RE` is `^[a-z0-9][a-z0-9-]{0,63}$`, the
+# product's own `decompose.slugify("Brief", parent_id="t1")` mints the legal id
+# `t1-brief`, and `run_key(0, "t1-brief")` then equalled `_brief_key("t1",
+# wave=0)` exactly. `_` is outside `ID_RE`, so no task id — not one that exists,
+# not one anybody can later name — can produce this key. A property of the
+# charset, not a list of ids to avoid (/autoplan, 2026-08-30).
+#
+# It also has to survive `runlog._safe`, which rewrites `[^A-Za-z0-9_-]+` to `-`
+# on the way to a filename. That rules out the obvious first pick: `#brief`
+# becomes `-brief` in the path and the two keys converge again one layer down.
+# `_` is in the allowed class, so the distinction reaches the disk.
+BRIEF_KEY_SUFFIX = "_brief"
 
 
 def _brief_key(task_id, ctx=None) -> str:
