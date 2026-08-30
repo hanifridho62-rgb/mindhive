@@ -288,8 +288,21 @@ def _symbol_slice(project=None, root=None):
     run still says it succeeded. That is the precise failure the telemetry around
     this feature exists to make impossible.
 
-    The root is passed EXPLICITLY. `symbols.default_root()` falls back to
+    The root is passed EXPLICITLY, and a caller that cannot supply one gets the
+    slice GATED rather than a fallback. `symbols.default_root()` falls back to
     `Path.cwd()`, and a wave's cwd is the parent's, not the isolated checkout's.
+
+    This function used to state that invariant and not enforce it — the fallback
+    line was still here, and `briefcli._rows` was the caller that omitted the
+    root. `cached_text` does not merely read: it indexes the tree it is given and
+    WRITES `cache_path(project)`. So `hive mindnet brief`, whose own help says it
+    "reads only; starts nothing", indexed whatever directory the operator was
+    standing in and left a poisoned cache for the next real wave to brief its
+    agents from (`/autoplan`, 2026-08-30). Latent only because `MINDHIVE_SYMBOLS`
+    is unset here, which is a fuse rather than a fix.
+
+    Gating is the honest answer for a caller with no root: the source did not
+    contribute, and `gated` is exactly the channel that says so.
 
     `cached_text` answers a PAIR — `(text, reason)` — and the first version of
     this wrapper kept the pair. A 2-tuple is always truthy, so the `or ""` never
@@ -302,9 +315,10 @@ def _symbol_slice(project=None, root=None):
         from .. import symbols as sym_mod
         if not sym_mod.enabled():
             return "", ("symbols",)
-        target = root if root is not None else sym_mod.default_root()
+        if root is None:
+            return "", ("symbols",)
         budget = getattr(sym_mod, "BUDGET_TOKENS", SYMBOL_BUDGET_FALLBACK)
-        text, _reason = sym_mod.cached_text(root=target, budget=budget,
+        text, _reason = sym_mod.cached_text(root=root, budget=budget,
                                             project=project)
         return (text or ""), ()
     except Exception:                                  # noqa: BLE001

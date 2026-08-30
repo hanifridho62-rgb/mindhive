@@ -94,6 +94,7 @@ def _rows(task_id=None, project=None):
     real wave uses, so what this prints is what an agent would actually get
     rather than a second code path that agrees by coincidence."""
     from .. import events as ev_mod
+    from .. import paths as p_mod
     from . import tasks as t_mod
 
     evs = ev_mod.read_all(project)
@@ -103,7 +104,19 @@ def _rows(task_id=None, project=None):
         wanted = [] if task is None else [task]
     else:
         wanted = [graph[k] for k in sorted(graph)]
-    ctx = br_mod.wave_context(project=project, evs=evs)
+    # The root is resolved and passed EXPLICITLY, the same way `orchestrator`
+    # resolves it once and hands it down. Omitting it is not a smaller version of
+    # passing it: `_symbol_slice` used to fall through to `symbols.default_root()`
+    # -> `Path.cwd()`, and `cached_text` INDEXES the tree it is given and writes
+    # `cache_path(project)`. This command's own help says it "reads only; starts
+    # nothing", and it was indexing whatever directory the operator happened to be
+    # standing in and leaving that behind for the next real wave to brief from.
+    #
+    # `worktree_root` answers None outside a checkout, which now gates the symbol
+    # source rather than silently indexing the cwd — a preview run from anywhere
+    # is worth slightly less and can no longer corrupt anything.
+    ctx = br_mod.wave_context(project=project, evs=evs,
+                              root=p_mod.worktree_root())
     return [(t, br_mod.build(t, ctx)) for t in wanted], ctx
 
 

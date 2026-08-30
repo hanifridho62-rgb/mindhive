@@ -682,3 +682,59 @@ def test_a_description_cannot_impersonate_the_prompts_own_voice():
     # The real rule still stands, and the description is still readable.
     assert "Do NOT commit, push, or open a pull request" in out
     assert "> real description" in out
+
+
+# --- the preview command must not write ---------------------------------------
+#
+# `hive mindnet brief --help` says "reads only; starts nothing". It omitted the
+# root, so `_symbol_slice` fell through to `symbols.default_root()` -> Path.cwd()
+# and `cached_text` indexed the operator's cwd and overwrote cache_path(project).
+# Latent only because MINDHIVE_SYMBOLS is unset, which is a fuse, not a fix.
+
+def test_a_rootless_wave_context_gates_symbols_instead_of_indexing_the_cwd(
+        monkeypatch):
+    """The invariant `_symbol_slice`'s docstring already claimed. A caller that
+    cannot supply a root gets the slice GATED — never `Path.cwd()`."""
+    from mindhive import symbols as sym_mod
+
+    called = {"n": 0}
+
+    def spy_cached_text(root=None, budget=None, project=None):
+        called["n"] += 1
+        return ("pkg/mod.py: thing()", "built")
+
+    monkeypatch.setattr(sym_mod, "enabled", lambda: True)
+    monkeypatch.setattr(sym_mod, "cached_text", spy_cached_text)
+
+    ctx = br_mod.wave_context(project="test", evs=[], root=None)
+
+    assert called["n"] == 0, (
+        "a rootless caller reached symbols.cached_text — that indexes a tree "
+        "and writes the cache")
+    assert ctx.symbols == ""
+    assert "symbols" in ctx.gated, (
+        "a rootless slice must report itself gated, not silently empty")
+
+
+def test_the_preview_command_resolves_a_root_rather_than_omitting_one(
+        monkeypatch):
+    """`briefcli._rows` is the caller that omitted it. It must pass the worktree
+    root explicitly, the same way `orchestrator._run_wave` does."""
+    from mindhive.mindnet import briefcli as bc_mod
+
+    seen = {}
+
+    def spy_wave_context(project=None, root=None, wave=None, evs=None):
+        seen["root_kwarg_present"] = True
+        seen["root"] = root
+        return _ctx()
+
+    monkeypatch.setattr(br_mod, "wave_context", spy_wave_context)
+    monkeypatch.setattr(bc_mod, "br_mod", br_mod)
+    bc_mod._rows(task_id=None, project="test")
+
+    assert seen.get("root_kwarg_present"), "_rows never called wave_context"
+    # In this checkout the worktree root resolves; the assertion that matters is
+    # that _rows supplied it rather than leaving the fallback to decide.
+    assert seen["root"] is not None, (
+        "_rows omitted the root — the symbol slice would index the caller's cwd")
