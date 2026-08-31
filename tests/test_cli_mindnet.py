@@ -264,11 +264,18 @@ def test_no_verified_by_flag_exists_on_satisfy():
     # than a diff nobody noticed. It reads only — it starts nothing, writes no
     # status row, and takes no `--verified-by`, which is what the loop below
     # checks for every member.
+    #
+    # `ab` joined on 2026-08-31, signed the same way. It is the TODOS 23
+    # measurement harness, and it is the one member here that CAN start
+    # something — `--execute` runs both arms for real. That is the whole
+    # instrument, so it is in scope rather than an exception being carved: what
+    # this test guards is `--verified-by`, and `ab` derives its verdict from the
+    # completion gate rather than accepting one.
     surface = _subparser_action(_subparser("mindnet")).choices
     assert set(surface) == {"declare", "enter", "satisfy", "fall-back",
                             "validate", "restat", "show", "list", "rebuild",
                             "enforce", "orchestrate", "depend",
-                            "decompose", "brief"}
+                            "decompose", "brief", "ab"}
     for name, sp in surface.items():
         bad = [o for a in sp._actions for o in a.option_strings
                if "verified" in o.lower()]

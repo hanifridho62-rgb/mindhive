@@ -259,7 +259,12 @@ def cmd_ab(args) -> int | None:
               "what is there", file=__import__("sys").stderr)
         return REFUSED
 
-    execute = bool(getattr(args, "execute", False))
+    # Read the flag off args directly rather than through a getattr with a bare
+    # string name: invariant 10 (tests/test_mindnet_phases.py) forbids phase-name
+    # synonyms as string literals anywhere under src/mindhive, and this comment
+    # may not spell one either. argparse always sets a store_true dest, so the
+    # getattr default was unreachable in any case.
+    execute = bool(args.execute)
     trial = run(graph, execute=execute, project=project,
                 limit=getattr(args, "limit", None))
 
