@@ -275,6 +275,19 @@ def wave_context(project=None, evs=None, root=None, wave=None) -> WaveContext:
     Every import is local. This module sits on the path that composes a prompt
     for a real subprocess, and `advice` reaches `plugins`, `sop` and `incidents`
     — a lot of machinery to load for a caller that may only ever render."""
+    if not enabled():
+        # BEFORE any of it. `build()` has always gated on this, but the
+        # orchestrator writes `published(wave_context(...))` and Python evaluates
+        # the argument first — so the ledger read, `recommend_for` and the symbol
+        # slice all ran in the parent, while the lanes waited, and a gate three
+        # frames later discarded the lot. Measured ON 2.62s / OFF 1.32s: the off
+        # switch billed half price for nothing (/autoplan, 2026-08-30).
+        #
+        # `gated=("brief",)` rather than an unmarked empty context, and it is the
+        # same string `build()` uses for the same reason: a source that was
+        # switched OFF and a source that ran and found nothing are different
+        # problems with different fixes, and an empty tuple says neither.
+        return WaveContext(project=project, wave=wave, gated=("brief",))
     rows: tuple = ()
     reco = None
     records: dict = {}

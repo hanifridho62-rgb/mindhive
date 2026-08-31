@@ -954,3 +954,51 @@ def test_the_typed_read_is_exactly_the_filter_of_the_full_read():
     assert typed == expected, "the typed read is not the filter of the full read"
     assert typed, "the fixture seeded nothing the composer reads"
     assert len(typed) < len(ev_mod.read_all("test"))
+
+
+# --- the off switch -----------------------------------------------------------
+
+def test_the_off_switch_skips_the_work_instead_of_composing_and_discarding_it(
+        monkeypatch):
+    """`MINDHIVE_BRIEF=0` has to cost nothing, and it used to cost about half.
+
+    `build()` has always returned early when the switch is off — but the
+    orchestrator writes `published(wave_context(...))`, and Python evaluates the
+    ARGUMENT first. So the ledger read, `plugins.recommend_for` and the symbol
+    slice all ran, in the parent, while the lanes waited, and their results were
+    then thrown away by a gate three frames later. Measured before this fix:
+    ON 2.62s, OFF 1.32s — found independently by two reviewers, one by reading
+    and one by timing (/autoplan, 2026-08-30).
+
+    Asserted as zero CALLS rather than as elapsed time: a timing assertion on a
+    shared machine is a flake, and the property is not "faster", it is "does not
+    run"."""
+    from mindhive import events as ev_mod
+    from mindhive import plugins as plugins_mod
+    from mindhive import symbols as sym_mod
+
+    calls = []
+    monkeypatch.setattr(ev_mod, "read_types",
+                        lambda types, project=None: calls.append("events") or [])
+    monkeypatch.setattr(plugins_mod, "recommend_for",
+                        lambda project=None, evs=None: calls.append("plugins"))
+    monkeypatch.setattr(sym_mod, "enabled", lambda: True)
+    monkeypatch.setattr(sym_mod, "cached_text",
+                        lambda root=None, budget=None, project=None:
+                        (calls.append("symbols"), ("", None))[1])
+
+    monkeypatch.setenv(br_mod.ENV_SWITCH, "0")
+    off = br_mod.wave_context(project="test", root="/some/checkout", wave=0)
+    assert calls == [], (
+        f"the switch is off and the composer still did the work: {calls}")
+    # Still a usable context, and it SAYS why it is empty rather than looking
+    # like a source that ran and found nothing.
+    assert off.gated and "brief" in off.gated, (
+        f"an off switch that reports no reason is indistinguishable from an "
+        f"empty ledger: gated={off.gated}")
+
+    # The off-path must not become the only path.
+    monkeypatch.setenv(br_mod.ENV_SWITCH, "1")
+    br_mod.wave_context(project="test", root="/some/checkout", wave=0)
+    assert set(calls) == {"events", "plugins", "symbols"}, (
+        f"with the switch ON the sources did not all run: {calls}")
