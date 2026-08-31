@@ -412,17 +412,71 @@ _DEFUSE_PASSES = 8
 # to appear rather than the least. A hyphen-only class let all three through
 # (red team, 2026-08-29), which is what an earlier comment here wrongly called
 # "any dashed banner".
-_RULE_CHARS = (
-    "-=#_~*+."                                     # ASCII rules
-    "‐‑‒–—―"         # hyphen .. horizontal bar
-    "−⁃─━┄┅┈┉╌╍"
-    "═║―⎯⏤﹘﹣－ー"
-)
-_RULE_RE = re.compile(f"[{re.escape(_RULE_CHARS)}]{{2,}}")
+# WORD-CATEGORY codepoints that nonetheless RENDER as a horizontal rule. This is
+# the irreducible remainder of the enumeration: `\w` matches letters, and these
+# ARE letters — `ㅡ` HANGUL LETTER EU is category Lo, `ー` KATAKANA-HIRAGANA
+# PROLONGED SOUND MARK is Lm, `_` is Pc. A character that IS a letter and LOOKS
+# like a rule cannot be identified by Unicode category, so it has to be named.
+# Three entries instead of thirty, because everything category-shaped is handled
+# by the class below rather than by this list.
+_RULE_WORDLIKE = unicodedata.normalize(
+    "NFKC", "_" + chr(0x3161) + chr(0x30FC))
+
+# NFKC-normalized, and that is load-bearing rather than tidy. `_visible` runs NFKC
+# BEFORE `_strip_fences` ever sees the text, so what reaches the rule below is the
+# normalized form, not the codepoint an attacker typed. Written literally, the list
+# above misses HANGUL LETTER EU entirely: U+3161 normalizes to U+1173 HANGUL
+# JUNGSEONG EU, so a pattern built on U+3161 matches a character that can no longer
+# be present. That was a real red test, not a hypothetical. Normalizing the SET the
+# same way the TEXT is normalized makes the two agree by construction, and it also
+# folds in the halfwidth and fullwidth variants for free — U+FF3F -> `_`,
+# U+FF70 -> U+30FC — which is why those need no entry of their own.
+
+# What counts as the RULE in a banner: a run of THREE OR MORE of one character
+# that is not a letter, digit or space. By EFFECT, not by enumeration.
+#
+# The old version listed ~30 codepoints. A list is the wrong shape for this: the
+# attacker picks the glyph, so every list is a list of the glyphs somebody thought
+# of. Measured at the render layer, 8 of 13 rule-drawing glyphs walked straight
+# through it — FULL BLOCK, BLACK RECTANGLE, both EIGHTH BLOCKs, MODIFIER LETTER
+# MINUS, HANGUL LETTER EU, and two more picked at review time precisely because
+# they were in no list (/autoplan, 2026-08-30).
+#
+# TWO or more, unchanged: a banner drawn in two em dashes is still a banner, and
+# `test_a_fence_close_built_from_any_rule_glyph_cannot_end_the_block` pins that.
+# The false positives a run of two invites are handled by _BANNER_GAP_RE below,
+# which is a better lever than run length — raising the run to three bought prose
+# safety by reopening the two-glyph hole, which is trading one leak for another.
+_RULE_RE = re.compile("([^" + chr(92) + "w" + chr(92) + "s]|["
+                      + re.escape(_RULE_WORDLIKE) + "])" + chr(92) + "1{1,}")
 _CONTEXT_RE = re.compile(r"\bCONTEXT\b", re.IGNORECASE)
 
 # How far either side of the word CONTEXT a rule may sit and still be one banner.
 _FENCE_WINDOW = 160
+
+# What may sit BETWEEN a rule and the word CONTEXT for the pair to read as a banner.
+#
+# This is the half that tells a forged fence apart from an ordinary sentence, and
+# without it the rule above is a menace to honest text. Pre-fix, a constraint
+# reading "the retry path -- see the note below -- reruns the wave. Some context:
+# the loop breaks when nothing moved... and the ratio is 3--4x." rendered as "the
+# retry path -- see the note below and the ratio is 3--4x." — a whole clause deleted
+# out of the middle of a real memo, silently, because two unrelated dash runs
+# happened to sit within 160 characters of the word "context". The author is never
+# told; the agent just reads a sentence that no longer says what was written.
+#
+# A banner is `RULE  words  CONTEXT  words  RULE` with nothing between but the
+# banner's own words. A sentence is not: it carries the punctuation that ends
+# clauses. So the gap may hold anything EXCEPT `.,:;!?`, and at most
+# `_BANNER_GAP` characters of it. Both honest examples above are rejected on the
+# punctuation clause — `wave. Some ` and `context: the ` — while `--- END CONTEXT ---`,
+# `-- END CONTEXT --` and `[END CONTEXT]` all pass it.
+#
+# Deliberately NOT a whitespace-only gap: `safe_text` collapses newlines before this
+# runs, so a real fence and its surrounding prose end up on one line and "the banner
+# is alone on its line" is not a property that survives to here.
+_BANNER_GAP = 24
+_BANNER_GAP_RE = re.compile(r"[^.,:;!?]{0,%d}\Z" % _BANNER_GAP)
 
 # Blank-rendering characters that are NOT Unicode category `Cf`, so a category
 # test alone misses them. `[mind<U+3164>net]` round-tripped through the whole
@@ -489,6 +543,16 @@ def _strip_fences(text: str) -> str:
                                    m.start()):
             left = r                         # the LAST rule run before CONTEXT
         right = _RULE_RE.search(text, m.end(), min(n, m.end() + _FENCE_WINDOW))
+        # Both gaps must be banner-shaped. Only the NEAREST rule on each side is
+        # tested and that is sufficient: an earlier left rule spans everything this
+        # one does plus a rule run, which is punctuation, so it cannot pass a gap
+        # test this one failed. Same argument mirrored on the right.
+        if left is not None and not _BANNER_GAP_RE.match(text, left.end(),
+                                                         m.start()):
+            left = None
+        if right is not None and not _BANNER_GAP_RE.match(text, m.end(),
+                                                          right.start()):
+            right = None
         if left is None or right is None:
             # A bare mention of the word, not a banner. Keep it and move past.
             out.append(text[i:m.end()])
