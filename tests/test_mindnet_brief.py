@@ -1074,3 +1074,66 @@ def test_the_rule_does_not_eat_honest_prose():
                      "3--4x"):
         assert fragment in out, (
             f"the rule destroyed honest prose: {fragment!r} is gone")
+
+
+# --- what the PRD calls information hiding, asserted end to end ---------------
+#
+# The per-task property is already pinned where it is decided — `advice.resolve`
+# has three tests that go red if it stops discriminating by task
+# (tests/test_mindnet_advice.py::test_an_unrelated_skill_is_not_offered and its
+# two siblings). What no test covered is the composed article an agent actually
+# receives: `build` reads a SHARED `WaveContext`, and every source on it except
+# `advice.resolve` is wave-wide, so a future hoist that moved one more source
+# from per-task to per-wave would leak sibling material into a brief without
+# touching `advice` at all and without turning any existing test red.
+#
+# Asserted on the RESOLVED TEXT, never on the task id or title: `render` emits
+# neither, so `assert other.task_id not in text` passes against any composer
+# whatsoever. That assertion was in the first draft of this test and it is the
+# trap worth naming — it reads like coverage and is a tautology.
+
+def test_two_tasks_in_one_wave_do_not_receive_each_others_material(monkeypatch):
+    """One shared context, two tasks, disjoint briefs.
+
+    The end-to-end statement of the PRD's information-hiding requirement: what
+    reaches task A carries nothing that belongs only to task B."""
+    from mindhive import plugins as plugins_mod
+
+    catalog = [
+        ("ce-migrate", "Use when migrating database schemas safely"),
+        ("css-gradients", "Use when adjusting a css gradient on a footer"),
+    ]
+
+    def _rec(name, description):
+        # The real `recommend_for` row shape — see tests/test_mindnet_advice.py:66.
+        return {"name": name, "plugin": "p", "description": description,
+                "provenance": "estimated", "score": 0.5, "reason": "matches"}
+
+    monkeypatch.setattr(
+        plugins_mod, "recommend_for",
+        lambda *a, **k: {"coverage": {"measured": 0, "total": len(catalog)},
+                         "recommendations": [_rec(n, w) for n, w in catalog],
+                         "discontinued": []})
+
+    ctx = br_mod.wave_context(project="test", evs=[], root=None)
+    a = br_mod.build(_task("a", title="database migration for the ledger",
+                           desc="migrate the schema"), ctx)
+    b = br_mod.build(_task("b", title="adjust the css gradient on the footer",
+                           desc="the gradient is wrong"), ctx)
+
+    # Guard against a vacuous pass: if neither brief resolved anything, the two
+    # disjointness assertions below are trivially true and prove nothing.
+    assert a.stats.skills or b.stats.skills, (
+        "neither task resolved a skill, so the disjointness assertions below "
+        f"cannot discriminate. a={a.stats} b={b.stats}")
+
+    if a.stats.skills:
+        assert "ce-migrate" in a.text
+        assert "css-gradients" not in a.text, (
+            "task 'a' was handed the skill that matches only task 'b' — the "
+            f"wave's shared context leaked sibling material. Got:\n{a.text}")
+    if b.stats.skills:
+        assert "css-gradients" in b.text
+        assert "ce-migrate" not in b.text, (
+            "task 'b' was handed the skill that matches only task 'a'. Got:\n"
+            f"{b.text}")
