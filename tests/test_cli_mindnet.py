@@ -1736,15 +1736,37 @@ def test_brief_takes_the_same_scoping_flags_as_every_other_mindnet_command(capsy
     Without them argparse rejected the flags outright (exit 2, "unrecognized
     arguments") and `cmd_brief`'s `getattr(args, "project", None)` could only ever
     answer None, so the command was pinned to the default namespace while reading
-    as though it were not. The canary below is what makes this non-vacuous: the
-    same parse against a flag that really is unknown must still fail."""
+    as though it were not.
+
+    Asserted against a namespace holding a task the default one does not, in both
+    directions. Exit 0 on `--project test` proves only that argparse ACCEPTS the
+    flag — `cmd_brief` reading it and then discarding it also exits 0, which is
+    exactly the pinned-to-default bug this test is named after
+    (/autoplan, 2026-08-30)."""
     _orc_graph()
+    _ok("mindnet", "declare", "elsewhere", "--title", "only in the other space",
+        "--project", "other")
+    _ok("mindnet", "rebuild", "--project", "other")
     capsys.readouterr()
 
-    assert _cli("mindnet", "brief", "--project", "test") == 0
+    # The default namespace knows `a` and has never heard of `elsewhere`.
+    assert _cli("mindnet", "brief") == 0
+    default_out = capsys.readouterr().out
+    assert "a " in default_out and "elsewhere" not in default_out, (
+        f"the default namespace is not what this test assumed: " f"{default_out!r}")
+
+    # `--project` reaches the other one, and reaches ONLY it. A flag that parses
+    # and is then dropped would print the default namespace's graph here.
+    assert _cli("mindnet", "brief", "--project", "other") == 0
+    scoped_out = capsys.readouterr().out
+    assert "elsewhere" in scoped_out, (
+        f"--project parsed but did not scope the read: " f"{scoped_out!r}")
+    assert "a " not in scoped_out, (
+        f"--project leaked the default namespace's tasks: " f"{scoped_out!r}")
+
     assert _cli("mindnet", "brief", "--session", "s1") == 0
     # CANARY: the parser is genuinely capable of rejecting an unknown flag, so
-    # the two passes above are the flags being ACCEPTED, not the parse being lax.
+    # the passes above are the flags being ACCEPTED, not the parse being lax.
     with pytest.raises(SystemExit):
         _cli("mindnet", "brief", "--no-such-flag")
 
@@ -1778,3 +1800,38 @@ def test_brief_verbose_prints_the_block_the_agent_would_receive(capsys):
     # Either the fence is there, or the reason it is not is stated. Silence is
     # the one answer this command must never give.
     assert br_mod.FENCE_OPEN in out or "empty:" in out
+
+
+def test_a_hostile_phase_cannot_forge_a_row_in_the_listing_used_to_audit_it(
+        monkeypatch, capsys):
+    """`briefcli` defuses the phase and the task id before printing them, and
+    nothing covered that.
+
+    This command is the operator's tool for judging whether a brief is SAFE, so
+    it is the one surface where a sidecar-supplied phase carrying newlines could
+    forge extra rows in the very listing being used to audit the feature. The
+    phase reaches `cmd_brief` from `phase_for` -> `ctx.records` -> the
+    controller, i.e. from data an agent's own run can move.
+
+    Un-covered before now (/autoplan, 2026-08-30): the two `safe_phase`/
+    `safe_line` calls could both be deleted and the suite stayed green."""
+    from mindhive.mindnet import brief as br_mod
+
+    _orc_graph()
+    forged = "z9forged [done]  skills=99  sops=99"
+    monkeypatch.setattr(br_mod, "phase_for",
+                        lambda ctx, task: "brainstorm" + chr(10) + forged)
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief") == 0
+    out = capsys.readouterr().out
+    rows = [ln for ln in out.splitlines() if ln and not ln.startswith(" ")]
+
+    assert len(rows) == 4, (
+        f"4 tasks on the graph produced {len(rows)} rows: {rows!r}")
+    assert not any(ln.startswith("z9forged") for ln in out.splitlines()), (
+        f"a phase forged its own row in the audit listing: {out!r}")
+    # The honest half still arrives — flattening the phase to nothing would pass
+    # the assertions above while telling the operator less than before.
+    assert any("brainstorm" in ln for ln in rows), (
+        f"the real phase was destroyed along with the forgery: {rows!r}")

@@ -2142,3 +2142,56 @@ def test_a_composer_fault_costs_one_task_not_the_whole_wave():
     # or a composer failing for every task reads as a quiet no-op.
     assert "composer failed" in out.reasons.get("a", ""), (
         f"the fault's cause was lost: {out.reasons.get('a')!r}")
+
+
+def test_a_task_whose_isolation_failed_is_never_briefed(gitrepo, monkeypatch):
+    """The ordering `one()` documents, finally asserted.
+
+    `payload_of` is composed AFTER the isolation branch on purpose: for a real
+    wave it is `agent.prompt_for`, which appends a `mindnet_brief` row and writes
+    an artifact as a side effect. Composed above the branch it left one of each
+    behind for every task whose worktree git refused and whose agent therefore
+    never started — and those rows are the only measurement this feature has, so
+    a row for an agent that never spawned inflates its denominator silently.
+
+    The justification was written into `one()` and had no test
+    (/autoplan, 2026-08-30). Both halves are asserted: the composer seam is never
+    reached for the failed task, and no `mindnet_brief` row exists for it."""
+    from mindhive.mindnet import worktree as wt_mod
+    real = wt_mod.add
+
+    def flaky(root, tid):
+        if tid == "b":
+            return wt_mod.Isolated(task_id=tid, ok=False, reason="disk on fire")
+        return real(root, tid)
+
+    composed = []
+
+    def payload_for(task):
+        tid = getattr(task, "task_id", "")
+        composed.append(tid)
+        # What `agent.prompt_for` does through `_record_brief`: the row is the
+        # side effect the ordering exists to prevent, so the test writes the same
+        # one rather than a stand-in for it.
+        events.append_event("mindnet_brief", {"task_id": str(tid), "chars": 7},
+                            tags=["mindnet", "brief", "auto"])
+        return "script"
+
+    monkeypatch.setattr(wt_mod, "add", flaky)
+    out = orc.orchestrate(_graph(_task("b"), _task("c")), runner=FakeRunner(),
+                          execute=True, root=gitrepo, isolate=True,
+                          payload_for=payload_for)
+
+    assert out.skipped == ["b"] and out.completed == ["c"], (
+        f"the fixture stopped reproducing a failed isolation: {out}")
+    assert composed == ["c"], (
+        f"the composer ran for a task whose worktree was refused: {composed}")
+
+    briefed = [e for e in events.read_all()
+               if getattr(e, "type", None) == "mindnet_brief"]
+    ids = [(getattr(e, "payload", {}) or {}).get("task_id") for e in briefed]
+    assert "b" not in ids, (
+        f"a mindnet_brief row exists for a task that never spawned: {ids}")
+    assert "c" in ids, (
+        f"no row for the task that DID run — this test would pass on a feature "
+        f"that records nothing at all: {ids}")

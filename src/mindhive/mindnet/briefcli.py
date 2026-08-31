@@ -51,8 +51,11 @@ from . import brief as br_mod
 
 # What `hive mindnet` returns when it refuses. A local copy of `__main__.MN_REFUSED`
 # rather than an import, because `__main__` imports THIS module to register the
-# subcommand and the reverse import closes the cycle. `test_briefcli_refuses_like_
-# its_siblings` pins the two equal, so the copy cannot drift.
+# subcommand and the reverse import closes the cycle.
+# `tests/test_cli_mindnet.py::test_brief_refuses_a_missing_task_the_way_its_siblings_do`
+# pins the two equal, so the copy cannot drift. (The name cited here until
+# 2026-08-30 — `test_briefcli_refuses_like_its_siblings` — greps to nothing; a
+# citation that resolves to no test reads as coverage and is not any.)
 REFUSED = 2
 
 

@@ -139,12 +139,23 @@ def test_stripping_the_fence_cannot_reassemble_the_directive_marker():
 
 def test_the_composer_routes_its_text_through_inject_safe_text():
     """Structural, not behavioural. If a future edit renders a resolved line by
-    f-string instead, the assertion above still passes for THAT payload while
-    the sanitiser silently stops covering the render path."""
-    src = inspect.getsource(br_mod)
-    assert "safe_text" in src, (
-        "the composer no longer mentions inject.safe_text — the sanitiser and "
-        "the renderer have drifted apart")
+    f-string instead, the behavioural assertion above still passes for THAT
+    payload while the sanitiser silently stops covering the render path.
+
+    Asserted over the CALLS in the parse tree, the way
+    `test_the_composer_has_one_advice_source` below already does. The first
+    version asserted `"safe_text" in inspect.getsource(br_mod)` — and the module
+    mentions the name 11 times while calling it twice, so deleting both calls
+    left this test green on the prose that explains them (/autoplan, 2026-08-30).
+    A test that a docstring can satisfy is not a test."""
+    import ast
+    tree = ast.parse(inspect.getsource(br_mod))
+    called = {node.func.attr for node in ast.walk(tree)
+              if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Attribute)}
+    assert "safe_text" in called, (
+        "the composer no longer CALLS inject.safe_text — the sanitiser and the "
+        "renderer have drifted apart, whatever the module still says about it")
 
 
 # --- one advice source --------------------------------------------------------
@@ -337,26 +348,62 @@ def test_the_symbol_slice_is_resolved_against_an_explicit_root(monkeypatch):
 
     def spy_cached_text(root=None, budget=None, project=None):
         seen["root"] = root
-        return "pkg/mod.py: thing()"
+        # The REAL contract shape, `(text, reason)`. Returning a bare string made
+        # this test vacuous: `text, _reason = cached_text(...)` raised
+        # `ValueError` on unpacking, `_symbol_slice`'s rescue swallowed it, and
+        # the root assertion below passed against a context whose symbol slice
+        # was empty. It certified the spy, not the code (/autoplan, 2026-08-30).
+        # This is the same defect `brief.py` records in its own history, left in
+        # place one test away from where it was fixed.
+        return "pkg/mod.py: thing()", None
 
     from mindhive import symbols as sym_mod
     monkeypatch.setattr(sym_mod, "enabled", lambda: True)
     monkeypatch.setattr(sym_mod, "cached_text", spy_cached_text)
 
-    br_mod.wave_context(project="test", evs=[], root="/some/isolated/checkout")
+    ctx = br_mod.wave_context(project="test", evs=[],
+                              root="/some/isolated/checkout")
     assert seen["root"] == "/some/isolated/checkout"
+    # The half that makes the assertion above mean something: the slice actually
+    # arrived. Without this, a rescue that discards the result still passes.
+    assert ctx.symbols, (
+        "the root reached `cached_text` and its answer was dropped on the way "
+        "back — a swallowed raise looks identical to an empty index")
+    assert "symbols" not in ctx.gated, (
+        f"the source ran and produced text, yet reports itself gated: "
+        f"{ctx.gated}")
 
 
 # --- the artifact key ---------------------------------------------------------
 
-def test_the_brief_artifact_key_differs_from_the_child_transcript_key():
+def test_the_brief_artifact_key_differs_from_the_child_transcript_key(monkeypatch):
     """`runlog.write_once` resolves straight to `artifact_path(run_key)`, so two
     writes under one key are ONE file and the survivor is whichever wrote last.
     Reusing the run key would silently overwrite the agent's transcript with its
-    own briefing, or the other way round."""
+    own briefing, or the other way round.
+
+    Asserted over the keys the two writers ACTUALLY hand `runlog`, for the same
+    task in the same wave. The first version asserted
+    `f"t1{BRIEF_KEY_SUFFIX}" != "t1"` — a tautology over a string the test built
+    itself, satisfied by any non-empty suffix including one that collides with a
+    real transcript (/autoplan, 2026-08-30)."""
+    from mindhive import runlog
     from mindhive.mindnet import agent as ag_mod
-    assert ag_mod.BRIEF_KEY_SUFFIX
-    assert f"t1{ag_mod.BRIEF_KEY_SUFFIX}" != "t1"
+    from mindhive.mindnet import orchestrator as orc_mod
+
+    keys = []
+    monkeypatch.setattr(runlog, "write_once",
+                        lambda key, text, project=None: keys.append(str(key)))
+
+    built = br_mod.Brief(text="the briefing", stats=br_mod.Stats())
+    ag_mod._record_brief("t1", built, br_mod.WaveContext(wave=0))
+    assert keys, "the brief was never filed, so this proves nothing"
+
+    transcript = orc_mod.run_key(0, "t1")
+    assert keys[0] != transcript, (
+        f"the brief and the child's transcript share the key {transcript!r}")
+    assert runlog.artifact_path(keys[0]) != runlog.artifact_path(transcript), (
+        f"distinct keys, one file: {runlog.artifact_path(transcript)}")
 
 
 def test_composing_a_prompt_records_what_the_brief_contained(monkeypatch):
@@ -543,18 +590,31 @@ def test_a_brief_artifact_is_filed_under_its_own_wave(monkeypatch):
     writes under one key are one file and the survivor is whichever wrote last.
     A task RETRIED in a later wave is exactly the case an operator reads these
     artifacts to understand, and the bare-id key made it the case that lost its
-    history."""
+    history.
+
+    Driven through `_record_brief` rather than by calling `_brief_key` four
+    times. The helper's return value is not what matters — what matters is the
+    key `runlog.write_once` is actually handed, and a helper asserted in
+    isolation stays green even after its only caller stops using it
+    (/autoplan, 2026-08-30)."""
+    from mindhive import runlog
     from mindhive.mindnet import agent as ag_mod
 
-    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=0)) == "mn7-w0-t1_brief"
-    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=2)) == "mn7-w2-t1_brief"
-    assert ag_mod._brief_key("t1", br_mod.WaveContext(wave=0)) != \
-        ag_mod._brief_key("t1", br_mod.WaveContext(wave=1)), (
+    keys = []
+    monkeypatch.setattr(runlog, "write_once",
+                        lambda key, text, project=None: keys.append(str(key)))
+
+    built = br_mod.Brief(text="a brief worth filing", stats=br_mod.Stats())
+    ag_mod._record_brief("t1", built, br_mod.WaveContext(wave=0))
+    ag_mod._record_brief("t1", built, br_mod.WaveContext(wave=2))
+    # No wave: the read-only `hive mindnet brief` path still files under a key.
+    ag_mod._record_brief("t1", built, br_mod.WaveContext())
+
+    assert keys == ["mn7-w0-t1_brief", "mn7-w2-t1_brief", "t1_brief"], (
+        f"the writer was handed {keys}")
+    assert keys[0] != keys[1], (
         "two waves of one task share an artifact key — the retry overwrites the "
         "attempt an operator is reading to understand it")
-    # No wave (the read-only `hive mindnet brief` path) still answers a key.
-    assert ag_mod._brief_key("t1", br_mod.WaveContext()) == "t1_brief"
-    assert ag_mod._brief_key("t1", None) == "t1_brief"
 
 
 # --- the red-team round: what the six specialists' fixes left open ------------
@@ -791,3 +851,25 @@ def test_the_brief_suffix_lives_outside_the_task_id_charset_at_both_layers():
     assert runlog._safe(f"mn7-w0-t1{suffix}").endswith(suffix), (
         f"{suffix!r} does not survive the filename sanitiser — the keys differ "
         f"but the paths do not")
+
+
+def test_the_symbol_stat_is_a_presence_flag_and_not_a_line_count():
+    """`Stats.symbols` is documented as 0/1, and it lands on an append-only
+    hash-chained ledger — so a reader summing it across rows is counting briefs
+    that HAD a slice, not symbols. A meaning recorded wrong there is recorded
+    wrong permanently, and nothing under `tests/` asserted this field at all
+    before now (/autoplan, 2026-08-30).
+
+    A three-line slice is the discriminating case: a line count answers 3, a
+    character count answers 47, and only a presence flag answers 1."""
+    slice_text = "pkg/a.py: one()\npkg/b.py: two()\npkg/c.py: three()"
+
+    built = br_mod.build(_task(), _ctx(symbols=slice_text))
+    assert built.stats.symbols == 1, (
+        f"a three-line slice reported {built.stats.symbols}; the field is a "
+        f"presence flag and every row already on the ledger means 0 or 1")
+
+    absent = br_mod.build(_task(), _ctx(symbols=""))
+    assert absent.stats.symbols == 0, (
+        f"no slice reported {absent.stats.symbols} — 0 and 1 are the only two "
+        f"values a reader of these rows can interpret")
