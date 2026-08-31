@@ -687,30 +687,33 @@ exactly what TODOS 11 cost someone. And this one is on the data-loss path.
 
 </details>
 
-## 22. The orchestrator's thread-safety is written against the GIL, and this machine runs 3.14
+## 22. ~~The orchestrator's thread-safety is written against the GIL~~ — CLOSED 2026-08-31
 
-`_run_wave`'s `one()` writes `isolated[tid]` from inside the thread pool
-([orchestrator.py:422](src/mindhive/mindnet/orchestrator.py:422),
-[:460](src/mindhive/mindnet/orchestrator.py:460),
-[:462](src/mindhive/mindnet/orchestrator.py:462)). Distinct-key dict assignment is atomic under
-CPython's GIL, so this is correct today and has never misbehaved. It is correct *because of the
-GIL*, not because anything guards it.
+`_run_wave`'s `one()` used to write `isolated[tid]` from inside the thread pool while every other
+result in the function was returned and merged on the main thread. Distinct-key dict assignment is
+atomic under CPython's GIL, so it never misbehaved — it was correct *because of* the GIL, not
+because anything guarded it. Under a free-threaded build (`python3.14t`; this machine's interpreter
+is 3.14) it was a real data race, and the failure mode was a lost or torn `Isolated` record: the one
+thing that tells the operator a worktree was kept and where their agent's uncommitted work is.
 
-The interpreter on this machine is **3.14**, the first release where a free-threaded build is a
-supported configuration rather than an experiment. Under `python3.14t` this becomes a real data
-race, and the failure mode is a lost or torn `Isolated` record — which is the thing that tells the
-operator a worktree was kept and where their agent's uncommitted work is.
+**Fixed** the way this file prescribed — the worker returns it and the main thread merges, matching
+the shape `results = list(pool.map(...))` already used for everything else. The one subtlety is
+recorded in the code and worth repeating here, because it defeats the obvious version of the same
+fix: the teardown that decides whether a tree was KEPT runs in `one`'s `finally`, which executes
+after the return tuple has been built. A worker returning the `Isolated` **value** therefore carries
+the pre-teardown record and reports a kept worktree as cleanly retired — losing exactly what the
+race lost, by a different route. The worker returns a one-slot `dict` instead, read after it has
+fully unwound.
 
-Found during `/plan-eng-review` of the Lintester plan, 2026-08-29. The eng review adds a comment
-naming the dependency, which is the honest minimum; it does not fix it.
+Both wrong versions are pinned by tests, each against the mutation that matches its claim:
+`test_the_kept_worktree_reason_survives_the_worker_return` fails against the value-return, and
+`test_no_shared_mapping_is_written_from_inside_the_wave_worker` (an AST check on `one`) fails against
+the original cross-thread write. The AST check is deliberate: the behaviour this forbids is invisible
+on a GIL build, which is why the defect survived review in the first place.
 
-**What it would take:** audit every mutable structure written from inside `_run_wave`'s pool
-(`isolated`, and whatever the per-wave context cell turns into), and either lock them or make the
-workers return values the main thread merges — the latter is the shape `results = list(pool.map(...))`
-already uses for everything else, so `isolated` is the one that broke the pattern.
-
-**Cons of leaving it:** nothing fails until someone runs a free-threaded interpreter, and then it
-fails silently and intermittently on the path that reports where uncommitted work went.
+**Still not demonstrated:** the race itself. No free-threaded interpreter is installed here, so the
+tests pin the two properties that make the race impossible rather than reproducing it. Anyone with
+`python3.14t` can settle that directly.
 
 ## 23. Nobody has measured whether briefing a sub-agent actually helps
 

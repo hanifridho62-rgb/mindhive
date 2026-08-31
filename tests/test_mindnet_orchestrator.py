@@ -2195,3 +2195,80 @@ def test_a_task_whose_isolation_failed_is_never_briefed(gitrepo, monkeypatch):
     assert "c" in ids, (
         f"no row for the task that DID run — this test would pass on a feature "
         f"that records nothing at all: {ids}")
+
+
+# --- the kept-worktree record is merged, not published across threads ---------
+#
+# TODOS 22. `isolated[tid]` used to be assigned from INSIDE the thread pool while
+# every other result in `_run_wave` was returned and merged on the main thread.
+# That was safe only because CPython's GIL makes a dict assignment on a distinct
+# key atomic; under a free-threaded build it is a real race, and what it stood to
+# lose is the pointer to an agent's UNCOMMITTED work.
+#
+# The race itself cannot be demonstrated here — no free-threaded interpreter is
+# installed on this machine — so these two tests pin the two properties that make
+# the race impossible instead, and both of them fail against the obvious wrong fix.
+
+def test_the_kept_worktree_reason_survives_the_worker_return(gitrepo,
+                                                             monkeypatch):
+    """The teardown's verdict is what reaches `isolated`, not the pre-teardown one.
+
+    This is the test that rejects the naive fix. `one`'s teardown runs in a
+    `finally`, which executes AFTER the return tuple is built — so a worker that
+    returned the `Isolated` VALUE would carry the record as it stood before
+    teardown and would report a KEPT worktree as cleanly retired. The pointer to
+    the agent's uncommitted work is exactly what would be lost, which is the same
+    loss the race caused, arriving by a different route."""
+    from mindhive.mindnet import worktree as wt_mod
+
+    def kept_retire(root, path, branch, base):
+        return wt_mod.Retired(kept=True, reason="kept: holds uncommitted work")
+
+    monkeypatch.setattr(wt_mod, "retire", kept_retire)
+
+    fake = FakeRunner()
+    out = orc.orchestrate(_graph(_task("b")), runner=fake, execute=True,
+                          root=gitrepo, isolate=True)
+
+    # `kept` is built as `{t: i.path for t, i in iso.items() if i.ok and i.reason}`,
+    # and only teardown ever sets that reason — so an empty `kept` here IS the
+    # pre-teardown record arriving, observed through the public surface an
+    # operator actually reads.
+    assert "b" in out.kept, (
+        "the worktree `retire` refused to delete is missing from `kept`, so the "
+        "record reaching the merge predates teardown and the agent's "
+        f"uncommitted work has no pointer. Got kept={out.kept!r}")
+
+
+def test_no_shared_mapping_is_written_from_inside_the_wave_worker(gitrepo):
+    """The structural half: `one` assigns into nothing it does not own.
+
+    Checked on the AST rather than by observing behaviour, because the behaviour
+    this forbids is invisible on a GIL build — that is the whole reason the defect
+    survived review. A subscript assignment inside `one` whose base name is not
+    local to `one` is a write across the pool boundary."""
+    import ast
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(orc._run_wave))
+    wave = ast.parse(src).body[0]
+    one = next(n for n in ast.walk(wave)
+               if isinstance(n, ast.FunctionDef) and n.name == "one")
+
+    local = {a.arg for a in one.args.args}
+    for node in ast.walk(one):
+        if isinstance(node, ast.Assign):
+            local |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            local.add(node.target.id)
+
+    escaping = sorted({
+        t.value.id
+        for node in ast.walk(one) if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+        and t.value.id not in local})
+    assert not escaping, (
+        "`one` writes into a mapping it does not own, from inside the thread "
+        f"pool: {escaping}. Return it and merge on the main thread instead.")

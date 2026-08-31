@@ -454,20 +454,33 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
     env = _child_env(project)
     done, failed, skipped, unknown, reasons = [], [], [], [], {}
     unverified: list = []
-    # `isolated` is written from INSIDE the pool, unlike everything else here,
-    # which the workers return and this thread merges. That is correct today only
-    # because CPython's GIL makes a dict assignment on a distinct key atomic —
-    # nothing in this function guards it. Under a free-threaded build
-    # (`python3.14t`, and this project's own interpreter is 3.14) it is a real
-    # race, and what it would lose is the record saying a worktree was KEPT and
-    # where the agent's uncommitted work is. TODOS 22 carries the fix: return it
-    # from the worker like every other result. Do not add a second such write.
+    # `isolated` is now merged HERE, from what the workers return, like every
+    # other result in this function. It used to be written from inside the pool,
+    # and that was correct only because CPython's GIL makes a dict assignment on a
+    # distinct key atomic — nothing guarded it. Under a free-threaded build
+    # (`python3.14t`; this project's own interpreter is 3.14) it was a real race,
+    # and what it stood to lose is the record saying a worktree was KEPT and where
+    # an agent's uncommitted work is — the one pointer back to work nobody has
+    # committed yet.
+    #
+    # The worker returns a one-slot `dict` rather than the value, and that
+    # indirection is the whole reason this works. The teardown that decides
+    # whether a tree was kept runs in `one`'s `finally`, which executes AFTER the
+    # return tuple has been built — so a returned VALUE would always carry the
+    # pre-teardown record and silently lose exactly the kept-tree case this
+    # protects. A returned mutable slot is read after the worker has fully
+    # unwound, so the teardown's update is the one that lands.
+    #
+    # Do not reintroduce a write to a shared dict from inside the pool.
     cap = DEFAULT_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
 
     payload_of = payload_for or validation_script_of
     isolated: dict = {}
 
     def one(tid):
+        # This worker's private one-slot record, returned rather than published.
+        # See the note on `isolated` above for why it is a slot and not a value.
+        slot: dict = {}
         task = graph.get(tid)
         # `runner_kwargs` carries what only SOME runners understand — the agent
         # runner's smart-zone config, for instance, which `executor.execute`
@@ -490,7 +503,7 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                 iso = wt_mod.Isolated(
                     task_id=tid, ok=False,
                     reason=f"isolation raised {type(exc).__name__}: {exc}")
-            isolated[tid] = iso
+            slot["iso"] = iso
             if not iso.ok:
                 # An environmental failure, so it must NOT write a status row.
                 # Reusing the `refused`/executed=False shape means MN-8's existing
@@ -498,7 +511,7 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                 # mapping, and the MN-7 P0 lesson holds by construction.
                 return tid, x_mod.RunResult(
                     result="refused", executed=False, run_key=run_key(index, tid),
-                    reason=f"could not isolate a checkout: {iso.reason}"), None
+                    reason=f"could not isolate a checkout: {iso.reason}"), None, slot
             task_root = iso.path
             # Its OWN ledger segment. `events.append_event` appends to
             # `<session_id>.jsonl` unlocked, so concurrent agents sharing a
@@ -549,10 +562,10 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                     result="refused", executed=False,
                     run_key=run_key(index, tid),
                     reason=f"could not compose a payload: "
-                           f"{type(exc).__name__}: {exc}"), None
-            return tid, runner(run_key(index, tid), script, **kwargs), None
+                           f"{type(exc).__name__}: {exc}"), None, slot
+            return tid, runner(run_key(index, tid), script, **kwargs), None, slot
         except Exception as exc:                       # noqa: BLE001 — see above
-            return tid, None, f"{type(exc).__name__}: {exc}"
+            return tid, None, f"{type(exc).__name__}: {exc}", slot
         finally:
             if iso is not None and iso.ok:
                 # `finally`: a worktree left behind by a crashed run accumulates
@@ -567,9 +580,9 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                     from . import worktree as wt_mod2
                     kept = wt_mod2.retire(root, iso.path, iso.branch, iso.base)
                     if kept.kept:
-                        isolated[tid] = replace(iso, reason=kept.reason)
+                        slot["iso"] = replace(iso, reason=kept.reason)
                 except Exception as exc:               # noqa: BLE001
-                    isolated[tid] = replace(
+                    slot["iso"] = replace(
                         iso, reason=f"kept {iso.path}: cleanup raised "
                                     f"{type(exc).__name__}: {exc}")
 
@@ -612,7 +625,12 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
                 max_workers=max(1, min(len(batch), cap))) as pool:
             results = list(pool.map(one, batch))
 
-    for tid, res, err in results:
+    for tid, res, err, slot in results:
+        # Merged here, single-threaded, after the pool has closed. `iso` is absent
+        # for a task that was never isolated, which is not the same as a task whose
+        # isolation failed — that one carries an `Isolated(ok=False)`.
+        if slot.get("iso") is not None:
+            isolated[tid] = slot["iso"]
         if err is not None or res is None:
             failed.append(tid)
             reasons[tid] = err or "the runner returned nothing"
@@ -657,7 +675,7 @@ def _run_wave(batch, graph, runner, index, project=None, timeout_s=None,
             f"NON_EXECUTING_RESULTS must together classify every declared result "
             f"before it can be acted on")
     from . import agent as ag_check
-    starved = any(ag_check.is_usage_limit(r) for _t, r, _e in results
+    starved = any(ag_check.is_usage_limit(r) for _t, r, _e, _s in results
                   if r is not None)
     return (sorted(done), sorted(failed), sorted(skipped), reasons,
             isolated, starved, sorted(unverified))
