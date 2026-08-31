@@ -881,8 +881,11 @@ def _seed_mixed_ledger():
     """A store holding rows the composer reads AND rows it does not."""
     from mindhive import events as ev_mod
 
+    # `add`, not `upsert`: `sop.ACTIONS` is ("add", "update", "delete"), so an
+    # `upsert` row is dropped by `sop.fold` and the seeded SOP never lands. It
+    # read as a fixture and behaved as noise.
     ev_mod.append_event("sop", {
-        "action": "upsert", "sop_id": "worktree-locking",
+        "action": "add", "sop_id": "worktree-locking",
         "title": "Serialise worktree add behind a lock",
         "text": "concurrent git worktree add collides in the thread pool",
         "mandatory": True}, tags=["sop"], project="test")
@@ -924,13 +927,19 @@ def test_narrowing_the_ledger_read_does_not_change_what_an_agent_receives():
     assert br_mod.build(task, full) == br_mod.build(task, typed), (
         "the narrowed read changed the brief an agent receives")
     # And the brief is not empty on both sides, or the equality is two blanks.
+    #
+    # On `sops`, NOT `skills`. `advice.resolve_skills` reads the machine's
+    # installed plugin catalog through `plugins.recommend_for`, and a CI runner
+    # has no `~/.claude` — so a skills-based guard passes only on a developer
+    # box and takes the whole test red on every matrix leg. Proven by running
+    # this test with HOME pointed at an empty directory: identical failure on
+    # Windows, so it was never a Linux question. `sops` comes from the row this
+    # fixture seeds itself, which is also the row the narrowing could drop.
     built = br_mod.build(task, typed)
-    assert built.text and built.stats.skills >= 1, (
+    assert built.text and built.stats.sops >= 1, (
         f"both sides composed nothing, so the equality above is two blanks: "
         f"{built.stats}")
-    # The row a narrowed read could plausibly have dropped is present. (Whether
-    # `advice.resolve_sops` then MATCHES it is a separate question about that
-    # resolver's keyword overlap, and not what this test is about.)
+    # The row a narrowed read could plausibly have dropped is present.
     assert any(e.type == "sop" for e in typed.evs), (
         "the seeded `sop` row did not survive the narrowed read")
 
