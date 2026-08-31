@@ -86,9 +86,24 @@ def prompt_for(task) -> str:
     what not to include — because the parser tolerates surrounding prose but cannot
     recover from a different shape. `slugify` handles ids so the model is told to
     write plain titles rather than guessing this repo's `ID_RE`."""
-    tid = str(getattr(task, "task_id", "") or "?")
-    title = str(getattr(task, "title", "") or "").strip()
-    desc = str(getattr(task, "description", "") or "").strip()
+    # Defused through the SAME two helpers `agent.prompt_for` uses, not a second
+    # implementation of the idea. This is the OTHER prompt this package sends to a
+    # model, and it was rendering both fields raw at column 0 with no fence — so
+    # every attack the agent path was hardened against in this branch applied here
+    # verbatim, three files away, in a function whose sibling looked solved.
+    #
+    # Not a theoretical exposure: `declare` on an existing id is an UPSERT (see
+    # this module's docstring), so a reply this prompt is talked into producing can
+    # rewrite a real task's title. The proposal surface is a write surface.
+    #
+    # Imported inside the function the way `agent.prompt_for` imports it, for the
+    # same reason: `brief` reaches back into this package and a module-level import
+    # would close the ring.
+    from . import brief as br_mod
+
+    tid = br_mod.safe_line(getattr(task, "task_id", "")) or "?"
+    title = br_mod.safe_line(getattr(task, "title", ""))
+    desc = br_mod.safe_block(getattr(task, "description", ""))
 
     lines = [
         "Break one software task into the subtasks that finishing it actually "
@@ -98,7 +113,11 @@ def prompt_for(task) -> str:
         f"Title:       {title or '(none recorded)'}",
     ]
     if desc:
-        lines += ["", "Description:", desc]
+        # Quoted per line, matching `agent.prompt_for`. `safe_block` keeps the line
+        # structure an honest description needs; the marker is what stops any of
+        # those lines reaching column 0 and speaking in the prompt's own voice.
+        lines += ["", "Description:"]
+        lines += [f"> {ln}" if ln else ">" for ln in desc.splitlines()]
     lines += [
         "",
         "Rules:",
