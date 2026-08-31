@@ -724,6 +724,26 @@ front door, the repair loop) only opens if it does.
 
 So the gate on roughly a week of planned work is a measurement nobody has scheduled.
 
+**The harness now exists — the measurement still has not run. 2026-08-31.**
+`hive mindnet ab` (`src/mindhive/mindnet/ab.py`) runs one graph twice, brief OFF then ON, and
+grades the pair. It supplies the two things this entry said were missing: the harness, and the
+decision about what counts as better. The decision is in `ab.verdict_for`, written before any
+result was seen — primary metric is VALIDATED completions (tasks that passed the completion gate),
+and a zero-against-zero pair is graded `inconclusive`, never `neutral`.
+
+That last rule is the important one and it is why building the harness did not close this entry.
+The red-team note below establishes that `ran-unverified` routes to `skipped` with no status row, so
+a completely successful run scores zero in BOTH arms. A harness that called that `neutral` would
+close the Branch 2 gate on data that could not have moved — the dead-lens shape this repo has
+already recorded once. So the instrument now refuses to grade a run it could not have measured, and
+says which metric to reach for instead.
+
+**This entry stays OPEN.** An instrument that has not been run measures nothing, and the gate the
+owner wrote is that Branch 2 does not open until the A/B *runs*. What remains is: a task graph whose
+tasks actually reach validation, `hive mindnet ab --execute --record` against it, and the resulting
+`experiment_result` row read. Turn-count-to-first-evidence was considered and is NOT implementable
+today — `loop_iteration`'s payload carries no task id, so it would need a second instrument first.
+
 **What it would take:** the same task graph run twice with the brief gated off and on, comparing
 something better than vibes — `ran-unverified` versus validated completions, or agent turn count to
 first evidence. `hive mindnet brief` (E12) gives the off/on switch a per-task inspection surface,
