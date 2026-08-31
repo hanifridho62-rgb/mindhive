@@ -100,7 +100,10 @@ def _rows(task_id=None, project=None):
     from .. import paths as p_mod
     from . import tasks as t_mod
 
-    evs = ev_mod.read_all(project)
+    # The same union the wave uses, so this preview reads exactly what a real
+    # wave reads. `tasks.fold` needs `mindnet_task`; everything else in the
+    # tuple is for the `wave_context` call below, which receives THIS list.
+    evs = ev_mod.read_types(br_mod.BRIEF_EVENT_TYPES, project)
     graph = t_mod.fold(evs)
     if task_id is not None:
         task = graph.get(str(task_id))

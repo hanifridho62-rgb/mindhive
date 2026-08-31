@@ -873,3 +873,84 @@ def test_the_symbol_stat_is_a_presence_flag_and_not_a_line_count():
     assert absent.stats.symbols == 0, (
         f"no slice reported {absent.stats.symbols} — 0 and 1 are the only two "
         f"values a reader of these rows can interpret")
+
+
+# --- the narrowed ledger read -------------------------------------------------
+
+def _seed_mixed_ledger():
+    """A store holding rows the composer reads AND rows it does not."""
+    from mindhive import events as ev_mod
+
+    ev_mod.append_event("sop", {
+        "action": "upsert", "sop_id": "worktree-locking",
+        "title": "Serialise worktree add behind a lock",
+        "text": "concurrent git worktree add collides in the thread pool",
+        "mandatory": True}, tags=["sop"], project="test")
+    # Noise: real event types no `ctx.evs` consumer has a branch for. Each is
+    # dropped on arrival today, so reading them only to discard them is the cost
+    # `BRIEF_EVENT_TYPES` removes.
+    for i in range(12):
+        ev_mod.append_event("decision", {"text": f"an unrelated decision {i}"},
+                            tags=["noise"], project="test")
+        ev_mod.append_event("caveat", {"text": f"an unrelated caveat {i}"},
+                            tags=["noise"], project="test")
+
+
+def test_narrowing_the_ledger_read_does_not_change_what_an_agent_receives():
+    """The invariant that makes `BRIEF_EVENT_TYPES` safe, pinned at the output.
+
+    `wave_context` no longer reads the whole ledger; it reads the union of types
+    its consumers actually gate on. That is only sound if the brief an agent is
+    handed is IDENTICAL either way — a performance fix that changes what a child
+    is told is a regression wearing a benchmark.
+
+    Asserted on the composed `Brief` (text AND stats), not on row counts, because
+    the hazard this guards is a future consumer of `ctx.evs` added without
+    extending the tuple: it would see a narrowed ledger and degrade silently
+    rather than raise, and this is the assertion that would go red."""
+    from mindhive import events as ev_mod
+
+    _seed_mixed_ledger()
+    task = _task()
+
+    full = br_mod.wave_context(project="test", evs=ev_mod.read_all("test"))
+    typed = br_mod.wave_context(project="test")      # goes through `read_types`
+
+    # The narrowing really happened — otherwise the equality below is vacuous.
+    assert len(full.evs) > len(typed.evs), (
+        f"the typed read kept everything ({len(typed.evs)} of {len(full.evs)}); "
+        f"this test proves nothing until it actually narrows")
+
+    assert br_mod.build(task, full) == br_mod.build(task, typed), (
+        "the narrowed read changed the brief an agent receives")
+    # And the brief is not empty on both sides, or the equality is two blanks.
+    built = br_mod.build(task, typed)
+    assert built.text and built.stats.skills >= 1, (
+        f"both sides composed nothing, so the equality above is two blanks: "
+        f"{built.stats}")
+    # The row a narrowed read could plausibly have dropped is present. (Whether
+    # `advice.resolve_sops` then MATCHES it is a separate question about that
+    # resolver's keyword overlap, and not what this test is about.)
+    assert any(e.type == "sop" for e in typed.evs), (
+        "the seeded `sop` row did not survive the narrowed read")
+
+
+def test_the_typed_read_is_exactly_the_filter_of_the_full_read():
+    """The ordering invariant, at the `events` layer.
+
+    `read_types` filters BEFORE the sort. That cannot reorder survivors — the
+    `(ts, segment, line)` key is unique per row — but the folds downstream are
+    order-sensitive (`sop.fold` is sequential, `tasks.fold` drops a lifecycle
+    event whose declare has not been folded yet), so a future refactor that
+    filtered after a differently-keyed sort would break them silently."""
+    from mindhive import events as ev_mod
+
+    _seed_mixed_ledger()
+    want = br_mod.BRIEF_EVENT_TYPES
+
+    typed = ev_mod.read_types(want, "test")
+    expected = [e for e in ev_mod.read_all("test") if e.type in want]
+
+    assert typed == expected, "the typed read is not the filter of the full read"
+    assert typed, "the fixture seeded nothing the composer reads"
+    assert len(typed) < len(ev_mod.read_all("test"))

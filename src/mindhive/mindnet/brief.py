@@ -236,6 +236,34 @@ def current():
     return _WAVE
 
 
+# Every event type any consumer of `WaveContext.evs` actually reads. Each of them
+# opens with a type gate and has no else branch, so the rest of the ledger is
+# discarded on arrival — reading it only to throw it away kept 50,003 `Event`
+# objects resident for the whole wave, published and frozen, while 12 lanes waited
+# to spawn behind it.
+#
+# Verified by reading every gate rather than by inference:
+#   skill_used / invoke_result / tool_failed  `plugins._skill_calls` (plugins.py:590,
+#                                             :597, :605) -> `recommend_for`
+#   next_step                                 `recommend.extract_needs` (recommend.py:97)
+#   sop                                       `sop.fold` via `sop.current`
+#                                             (sop.py:161, :241) <- `advice.resolve_sops`
+#   mindnet_task                              `tasks.fold` (tasks.py:709)
+#
+# ONE union rather than a per-site set: `briefcli._rows` folds the task graph from
+# the SAME list it then hands to `wave_context`, so two sets would have to be kept
+# in union by hand. Narrowing the preview's copy to `mindnet_task` would strip the
+# SOP block and the skill telemetry out of the briefs it prints, and this command
+# exists precisely to show what a real wave would compose.
+#
+# A NEW consumer of `ctx.evs` added without extending this tuple sees a narrowed
+# ledger and degrades SILENTLY rather than raising — on the agent-spawn path. That
+# is the one hazard here, and it is why `test_the_composed_brief_is_identical_...`
+# pins the whole composition rather than the row count.
+BRIEF_EVENT_TYPES = ("skill_used", "invoke_result", "tool_failed", "next_step",
+                     "sop", "mindnet_task")
+
+
 def wave_context(project=None, evs=None, root=None, wave=None) -> WaveContext:
     """Resolve everything a wave's briefs share. Total — answers a context whose
     fields are empty rather than raising.
@@ -253,7 +281,8 @@ def wave_context(project=None, evs=None, root=None, wave=None) -> WaveContext:
     tasks: dict = {}
     try:
         from .. import events as ev_mod
-        rows = tuple(evs) if evs is not None else tuple(ev_mod.read_all(project))
+        rows = (tuple(evs) if evs is not None
+                else tuple(ev_mod.read_types(BRIEF_EVENT_TYPES, project)))
     except Exception:                                  # noqa: BLE001
         rows = ()
     try:
