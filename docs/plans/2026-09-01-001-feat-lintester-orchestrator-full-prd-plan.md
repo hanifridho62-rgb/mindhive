@@ -484,3 +484,89 @@ Recorded rather than asked, because this plan runs in a pipeline with no synchro
 2. "Merge manually via Claude Code" means merging the branch into `master` locally after a conflict probe, not merging PR #119 through the GitHub API — the API path would still be subject to the same account whose billing is blocked.
 3. `resource.setrlimit` is expected to be genuinely exercised only on the WSL Ubuntu legs. Its Windows behaviour is a reported degradation, not a tested enforcement.
 4. The existing `MINDHIVE_SYMBOLS` global gate stays default-off for all non-mission callers; only the mission path opts in.
+
+---
+
+## Delivery record — 2026-09-01
+
+The Requirements table above is a FROZEN baseline: it records the verified state
+at `bd6ccf3` and is deliberately not edited, because a dated audit that gets
+rewritten as work lands stops being evidence of anything. This section records
+what happened to the two items that were still `SEBAGIAN` at the end of the
+first pass.
+
+**WB1.4 — the AST scope is now per sub-task, not per wave.** `wave_context`
+resolves ONE repo-wide symbol slice and `_compose` handed every task in the wave
+the same bytes. That is right for the incumbent, whose waves are sets of related
+tasks, and wrong for a lintester mission, whose units own different directories
+by construction — measured before the fix as the same 3,896-character block,
+byte for byte, in every unit's brief. `symbols.build_map` / `symbols.focus` split
+the one expensive parse from the per-unit rendering, and
+`LintesterOrchestrator._task_context` narrows each task's context to the modules
+that task owns plus their direct neighbours in BOTH directions of the import
+graph — what they import, and what imports them, which is the half a naive
+implementation drops. A unit that owns no module keeps the wave slice rather
+than being briefed with a header saying its repository has no code in it.
+
+Proven on the real command, not only at the seam. `hive lintester "tighten
+src/mindhive/orchestrator/payoff.py and src/mindhive/selftest.py" --payoff`
+composed two briefs of 3,006 and 2,391 characters carrying:
+
+```
+  # symbol index: 7 of 336 modules, scoped to the 1 this unit owns and their direct neighbours
+  # symbol index: 5 of 336 modules, scoped to the 1 this unit owns and their direct neighbours
+```
+
+**WB5.5 — the fall-back now moves the tree as well as the ledger.**
+`default_fall_back` moves the task back one phase, which is a record;
+`worktree.rollback` discards the lane checkout's uncommitted work, which is what
+the next attempt actually reads. Without it a repair began on top of whatever the
+failed attempt left half-written. It is the only function in the package that can
+delete an agent's output, so it is bounded three ways: `is_lane_path` requires
+`<root>/.worktrees/lane-N` with a numeric N (the main checkout, the incumbent's
+task-keyed trees, and anything a caller merely claims is a lane are refused, with
+a reason); commits are never touched, so a lane that committed its work keeps it;
+and it is opt-in — `RepairLoop` defaults it to `None` and only a real run with
+isolated lanes wires it.
+
+The audit's other half of WB5.5 — "stderr is truncated at 2,000 characters" — was
+already answered by `defused_stderr`, which bounds the RAW text to a tail window
+before defusing and takes the tail again after, at a line boundary. A Python
+traceback's diagnosis is its LAST line; a head-first cut would have thrown away
+the part worth injecting.
+
+**Also closed, found while verifying the above.**
+
+- `queue.QueueEntry` measured a unit's cost in integer milliseconds, so any
+  attempt shorter than a millisecond floored to `0` and all three readers
+  downstream dropped it as "this unit never reported a duration" — leaving
+  `payoff.calibrate` scored only on the units slow enough to survive the
+  flooring, which is the bias that makes a bad estimator look good. It records
+  `elapsed_ns` now, with an injectable clock on the scheduler for the same reason
+  `bench.run_once` takes one.
+- `payoff.folded` kept its samples apart by keying on `f"{i}:{unit}"`. That did
+  stop the collapse, and cost two things: the operator was shown `0:writer`
+  instead of `writer`, and sorting composite keys ordered the history
+  lexicographically — so the "most recent samples" the command prints were
+  whichever dozen happened to start with a 9. It scores an ordered sequence now.
+- `_reading` computed the rate spread and then dropped it from the verdict
+  whenever the rank correlation was uncomputable. Units estimated at the SAME
+  weight that cost four times as much as each other say the estimate is wrong
+  about magnitude, and that is a finding even where nothing can be said about
+  order.
+- `selftest.run` took its root from `Path(__file__).resolve().parents[2]`. Under
+  the editable install that resolves to the MAIN checkout whichever worktree the
+  operator is in, so `hive selftest` on a feature branch collected the main
+  checkout's tests, passed, and said so. It takes the root from
+  `paths.worktree_root` now, falling back to the packaged location outside a
+  repository or inside one that is not a MindHive checkout — and points the
+  child's `PYTHONPATH` at that root's `src`, because collecting the branch's
+  tests while the child imports the editable install is the same false green one
+  layer down.
+
+**Assumption 2 is superseded.** It reads "merging manually … not merging PR #119
+through the GitHub API — the API path would still be subject to the same account
+whose billing is blocked." The billing block has been lifted. All nine CI jobs —
+both OSes across 3.11/3.12/3.14, the node tier, the browser tier and the Postgres
+17 tier — ran and passed on this branch, so the pg tier is no longer unverified
+either and the manual-merge condition no longer applies.
