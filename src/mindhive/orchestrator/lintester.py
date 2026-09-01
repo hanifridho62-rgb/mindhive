@@ -266,18 +266,38 @@ class LintesterOrchestrator:
         """Repo paths named in *description* that actually exist.
 
         Deliberately conservative: a token that does not resolve to a file is not
-        a file, and guessing would weight a task by a path that is not there."""
+        a file, and guessing would weight a task by a path that is not there.
+
+        CONTAINED to the repo root, and that is a security boundary rather than
+        tidiness. A description is model-written — `decompose.run` composes it —
+        and `Path(base) / "/etc/passwd"` discards *base* entirely on POSIX, while
+        `..` walks out of it on both platforms. Anything that resolves outside
+        the root would then be opened and AST-parsed by
+        `metrics.calculate_workload_weight` and handed to `git log`. Nothing is
+        echoed back into a prompt, so the leak is only the derived weight — but
+        reading arbitrary files off the operator's disk on a sub-agent's say-so
+        is not a thing this should do at all."""
         from pathlib import Path
 
         base = Path(self.root) if self.root else Path.cwd()
+        try:
+            root = base.resolve()
+        except OSError:                                 # pragma: no cover - odd fs
+            return ()
         out = []
         for token in str(description or "").replace(",", " ").split():
             token = token.strip("`'\"()[]<>;:")
             if "/" not in token and "\\" not in token:
                 continue
-            candidate = base / token
-            if candidate.is_file():
-                out.append(candidate.as_posix())
+            try:
+                candidate = (base / token).resolve()
+                if not candidate.is_relative_to(root):
+                    continue
+                if not candidate.is_file():
+                    continue
+            except (OSError, ValueError):
+                continue
+            out.append(candidate.as_posix())
         return tuple(dict.fromkeys(out))
 
     def _weigh(self, task_id, description, files) -> int:
@@ -395,9 +415,13 @@ class LintesterOrchestrator:
         command that fans real sub-agents at a repository on a bare invocation is
         a hazard, not a convenience."""
         text = _clean(intent)
-        available, why = res_mod.limits_available()
-        enforcement = (res_mod.KERNEL if (available and not self.limits.empty)
-                       else res_mod.TIMEOUT_ONLY)
+        # `resilience.fencing` owns this, and asking it rather than deriving it
+        # here is the fix for a real cross-platform defect: this used to take the
+        # reason straight off `limits_available()`, which answers an empty string
+        # wherever `resource` imports, so every POSIX run reported `timeout-only`
+        # and gave the operator no reason for it. Windows hid the bug, because
+        # there the reason is non-empty for an unrelated cause.
+        enforcement, why = res_mod.fencing(self.limits)
         if not text:
             return Mission(outcome="refused", enforcement=enforcement,
                            enforcement_reason=why,
@@ -483,8 +507,15 @@ class LintesterOrchestrator:
             completed, failed = asyncio.run(scheduler.run())
         except KeyboardInterrupt:
             released = wt_mod.release_lanes(self.root, trees)
+            # The reason must not promise a sidecar nobody asked for. With no
+            # `checkpoint_dir` the scheduler's writer is a no-op, and telling the
+            # operator "the checkpoint holds what was left" would send them to
+            # look for a file that was never written.
+            left = ("the checkpoint holds what was left"
+                    if checkpoint_dir else
+                    "nothing was checkpointed — no checkpoint directory was given")
             return Mission(intent=text, mission_id=mission_id, outcome="partial",
-                           reason="interrupted; the checkpoint holds what was left",
+                           reason=f"interrupted; {left}",
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            kept=tuple(r.reason for r in released if r.kept),
                            enforcement=enforcement, enforcement_reason=why,
@@ -506,8 +537,13 @@ class LintesterOrchestrator:
 
 
 def run_mission(intent, root=None, project=None, lanes=DEFAULT_LANES,
-                dry_run=True, **kwargs) -> Mission:
-    """One-call convenience over `LintesterOrchestrator`, for the CLI."""
+                dry_run=True, checkpoint_dir=None, **kwargs) -> Mission:
+    """One-call convenience over `LintesterOrchestrator`.
+
+    *checkpoint_dir* is named explicitly because it belongs to `execute_mission`,
+    not to the constructor: left in `**kwargs` it was forwarded to
+    `LintesterOrchestrator(...)`, which has no such field, so the one caller who
+    tried to resume a mission through this function got a `TypeError` instead."""
     return LintesterOrchestrator(root=root, project=project, lanes=lanes,
-                                 **kwargs).execute_mission(intent,
-                                                           dry_run=dry_run)
+                                 **kwargs).execute_mission(
+        intent, dry_run=dry_run, checkpoint_dir=checkpoint_dir)

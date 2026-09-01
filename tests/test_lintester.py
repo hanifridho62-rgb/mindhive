@@ -161,18 +161,31 @@ def test_the_skill_clause_names_the_skill_not_its_whole_catalog_blurb():
     assert lint._skill_name("ce-code-review") == "ce-code-review"
 
 
-def test_the_skill_clause_is_bounded():
+def test_the_skill_clause_is_bounded(monkeypatch):
+    """Exercises `_skills_for`, not the test's own slicing.
+
+    The version this replaces re-did the trim inline and asserted on its OWN
+    result, so it stayed green with `[:MAX_MUST_USE]` deleted from the
+    production path — it proved that Python slices lists. Stubbing
+    `advice.resolve` is what makes the assertion reach the code under test."""
+    from mindhive.mindnet import advice as adv_mod
+
     class _Ctx:
         evs = ()
         reco = None
         project = "test"
 
+    many = tuple(f"skill-{i} — a long catalog description that must be cut"
+                 for i in range(10))
+    monkeypatch.setattr(adv_mod, "resolve",
+                        lambda *_a, **_k: type("R", (), {"skills": many})())
+
     orch = lint.LintesterOrchestrator(project="test")
-    many = tuple(f"skill-{i} — a description" for i in range(10))
-    monkey = type("R", (), {"skills": many})()
-    orch._skills_for.__self__            # sanity: bound method
-    got = tuple(lint._skill_name(s) for s in monkey.skills)[:lint.MAX_MUST_USE]
+    got = orch._skills_for(lint.AgentTask(task_id="t1"), _Ctx())
+
     assert len(got) == lint.MAX_MUST_USE == 3
+    assert got == ("skill-0", "skill-1", "skill-2"), (
+        "the clause carried catalog blurbs instead of bare skill names")
 
 
 # --- weights reach the packer -------------------------------------------------
@@ -335,11 +348,30 @@ def test_a_mission_that_cannot_isolate_any_lane_is_refused(tmp_path):
 def test_the_mission_reports_how_strongly_its_children_were_fenced():
     from mindhive.orchestrator import resilience as res_mod
 
+    # The default asks for no ceiling, so the answer is the SAME on every
+    # platform and the assertion is an equality, not a truthiness check. The
+    # weaker `assert got.enforcement_reason` this replaces passed on Windows —
+    # where the reason is non-empty because `resource` is missing — and failed on
+    # both Ubuntu legs, where it was the empty string. A report that says "not
+    # fenced" and gives no reason is the exact gap the field exists to close.
     got = lint.LintesterOrchestrator(
         decomposer=_two_units, project="test").execute_mission("x")
-    assert got.enforcement in (res_mod.KERNEL, res_mod.TIMEOUT_ONLY)
-    if got.enforcement == res_mod.TIMEOUT_ONLY:
-        assert got.enforcement_reason
+    assert got.enforcement == res_mod.TIMEOUT_ONLY
+    assert got.enforcement_reason == res_mod.NO_LIMITS_REASON
+
+    # Asking for a ceiling splits by platform, and each branch is pinned to one
+    # value rather than to "something truthy".
+    fenced = lint.LintesterOrchestrator(
+        decomposer=_two_units, project="test",
+        limits=res_mod.Limits(memory_bytes=1 << 30)).execute_mission("x")
+    available, why = res_mod.limits_available()
+    if available:
+        assert fenced.enforcement == res_mod.KERNEL
+        assert fenced.enforcement_reason == ""
+    else:
+        assert fenced.enforcement == res_mod.TIMEOUT_ONLY
+        assert fenced.enforcement_reason == why
+        assert "resource" in why
 
 
 def test_the_report_serialises_to_json_able_primitives():
@@ -365,3 +397,77 @@ def test_a_repair_block_is_appended_not_substituted():
 def test_an_empty_repair_block_leaves_the_task_alone():
     task = lint.AgentTask(task_id="t1", description="original")
     assert task.with_repair("   ") is task
+
+
+# --- review fixes: the paths a description must not be able to reach -----------
+
+def test_a_description_cannot_weight_a_file_outside_the_repo_root(tmp_path):
+    """`_files_for` is fed model-written text; it must not escape *root*.
+
+    Both escapes are checked because they fail differently: an ABSOLUTE token
+    makes `Path(base) / token` discard *base* entirely on POSIX, while `..`
+    walks out of it on every platform. A path that got through would be opened
+    and AST-parsed by `metrics.calculate_workload_weight`."""
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    inside = root / "src" / "real.py"
+    inside.write_text("x = 1\n", encoding="utf-8")
+    outside = tmp_path / "secret.py"
+    outside.write_text("y = 2\n", encoding="utf-8")
+
+    orc = lint.LintesterOrchestrator(root=root, project="test")
+    got = orc._files_for(
+        f"touch src/real.py and {outside.as_posix()} and ../secret.py")
+
+    assert inside.resolve().as_posix() in got, "the in-repo file was dropped"
+    assert all("secret.py" not in p for p in got), (
+        f"a path outside the root survived containment: {got}")
+
+
+def test_the_escape_check_is_what_drops_it_not_a_missing_file(tmp_path):
+    """Negative half of the pair. Without it the test above passes for the
+    wrong reason — a token that names nothing is dropped anyway, so the
+    assertion would hold even with containment removed."""
+    root = tmp_path / "repo"
+    root.mkdir(parents=True)
+    outside = tmp_path / "secret.py"
+    outside.write_text("y = 2\n", encoding="utf-8")
+
+    assert outside.is_file(), "fixture: the outside file must really exist"
+    orc = lint.LintesterOrchestrator(root=root, project="test")
+    assert orc._files_for(outside.as_posix()) == ()
+
+
+def test_an_interrupt_without_a_checkpoint_dir_does_not_claim_one(monkeypatch):
+    """The reason line must not send an operator looking for a file that was
+    never written."""
+    def _boom(coro):
+        coro.close()            # or pytest reports a never-awaited coroutine
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lint.asyncio, "run", _boom)
+    orc = lint.LintesterOrchestrator(
+        project="test", decomposer=_two_units,
+        runner=lambda e, ln: True)
+    monkeypatch.setattr(lint.wt_mod, "acquire_lanes",
+                        lambda root, n, mid="": [
+                            lint.wt_mod.LaneWorktree(lane_id=i, ok=True,
+                                                     path=f"lane-{i}")
+                            for i in range(n)])
+    monkeypatch.setattr(lint.wt_mod, "release_lanes", lambda root, trees: [])
+
+    bare = orc.execute_mission("x", dry_run=False)
+    assert bare.outcome == "partial"
+    assert "no checkpoint directory was given" in bare.reason
+
+    kept = orc.execute_mission("x", dry_run=False, checkpoint_dir="somewhere")
+    assert "the checkpoint holds what was left" in kept.reason
+
+
+def test_run_mission_forwards_the_checkpoint_dir_instead_of_raising(tmp_path):
+    """It used to land in `**kwargs` and reach the constructor, which has no
+    such field — a `TypeError` on the one call that wanted to be resumable."""
+    got = lint.run_mission("x", root=tmp_path, project="test",
+                           checkpoint_dir=tmp_path / "cp",
+                           decomposer=_two_units)
+    assert got.outcome == "dry-run"

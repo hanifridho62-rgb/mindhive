@@ -51,7 +51,24 @@ def test_no_limits_requested_is_reported_as_such_not_as_a_fence():
     got = r.run_sandboxed([sys.executable, "-c", "pass"])
     assert got.ok
     assert got.enforcement == r.TIMEOUT_ONLY
-    assert "no limits" in got.reason
+    # Equality against the shared constant, not a substring of it. The substring
+    # this replaces let the sandbox and the mission report drift apart until the
+    # Ubuntu legs caught them; one constant asserted exactly is what keeps the
+    # two sites from wording the same fact differently again.
+    assert got.reason == r.NO_LIMITS_REASON
+
+
+def test_the_sandbox_and_the_mission_answer_fencing_from_one_place():
+    """Both callers must agree, on this platform, whatever it is."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    limits = r.Limits()
+    sandboxed = r.run_sandboxed([sys.executable, "-c", "pass"], limits=limits)
+    mission = lint_mod.LintesterOrchestrator(
+        project="test", limits=limits,
+        decomposer=lambda rid, t, i: [(rid, t, i)]).execute_mission("x")
+    assert (sandboxed.enforcement, sandboxed.reason) == r.fencing(limits)
+    assert (mission.enforcement, mission.enforcement_reason) == r.fencing(limits)
 
 
 def test_a_child_over_the_timeout_is_killed_on_every_platform():
@@ -454,3 +471,54 @@ def test_the_guard_records_what_it_ran():
     guard = r.Guard(breaker=_breaker())
     assert guard.run("k", [sys.executable, "-c", "pass"]).ok
     assert guard.breaker.state_of("k") == "CLOSED"
+
+
+def test_a_huge_stderr_is_bounded_before_it_is_defused_not_after():
+    """`safe_block` runs several regex passes PER LINE, so defusing megabytes
+    and then cutting to 2000 chars does the whole cost for none of the value.
+
+    The discriminator is WHICH end survives. The window is taken from the tail,
+    because a failure's diagnosis is its last lines — this project's own
+    signature classifier keys off the line that terminates a traceback. With the
+    trim removed, the full text defuses and `[:limit]` keeps the HEAD instead,
+    so the marker assertions below invert."""
+    head = "FIRST-LINE-MARKER\n"
+    filler = "".join(f"noise line {i}\n" for i in range(60_000))
+    tail = "LAST-LINE-MARKER: ValueError: the real diagnosis\n"
+    raw = head + filler + tail
+    assert len(raw) > r.MAX_STDERR_CHARS * r._RAW_STDERR_WINDOW
+
+    got = r.defused_stderr(raw)
+
+    assert len(got) <= r.MAX_STDERR_CHARS
+    assert "LAST-LINE-MARKER" in got, "the diagnostic tail was cut away"
+    assert "FIRST-LINE-MARKER" not in got, (
+        "the head survived, so the whole input was defused before the cut")
+
+
+def test_the_repair_prompt_carries_the_defused_tail_under_its_header():
+    raw = "x\n" * 100_000 + "TAIL-MARKER: boom\n"
+    prompt = r.repair_prompt(raw)
+    assert prompt.startswith(r.REPAIR_HEADER)
+    assert "TAIL-MARKER" in prompt
+
+
+def test_the_defuser_is_never_asked_to_clean_more_than_the_window(monkeypatch):
+    """The pre-trim is a COST bound, and a cost bound has no output signature —
+    `_tail` returns the same characters either way, so the two tests above stay
+    green with the trim removed. This one asserts the thing that actually
+    changes: how much text `safe_block` is handed. Measured, not timed, so it
+    does not flake on a loaded machine."""
+    from mindhive.mindnet import brief as brief_mod
+
+    seen = []
+    real = brief_mod.safe_block
+    monkeypatch.setattr(brief_mod, "safe_block",
+                        lambda v: seen.append(len(str(v))) or real(v))
+
+    raw = "noise line\n" * 200_000
+    r.defused_stderr(raw)
+
+    assert seen, "the defuser was never called"
+    assert seen[0] < len(raw), "the whole input was handed to the defuser"
+    assert seen[0] <= r.MAX_STDERR_CHARS * r._RAW_STDERR_WINDOW
