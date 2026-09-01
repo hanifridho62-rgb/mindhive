@@ -40,6 +40,18 @@ def cmd_lintester(args) -> int | None:
     mission = LintesterOrchestrator(
         root=args.root, project=args.project,
         lanes=args.lanes if args.lanes is not None else None,
+        # The unattended half of the reflect/resolve loop, wired HERE and not in
+        # `RepairLoop`. `reflect_on_open` runs the same `resolve.resolve_batch`
+        # that `hive rules resolve` runs, which spends real agent tokens — so a
+        # default buried in the library would make every suite that drives a
+        # breaker open pay for it. The front door is the one place where "without
+        # intervention" actually means something, because it is the one place a
+        # person typed the command and walked away.
+        #
+        # Before this, `reflect_on_open` was called from nothing but its own
+        # tests: the seam worked, the breaker opened, and no anomaly was ever
+        # recorded, resolved or remembered on a real run.
+        reflector=_reflector(),
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
 
@@ -56,6 +68,16 @@ def cmd_lintester(args) -> int | None:
     if scored is not None:
         _print_payoff(scored)
     return 0 if mission.outcome in ("ok", "dry-run") else 1
+
+
+def _reflector():
+    """The reflect/resolve callback a real invocation gets.
+
+    A function rather than a direct reference so the import stays lazy and a test
+    can see exactly what the command wired."""
+    from . import resilience as res_mod
+
+    return res_mod.reflect_on_open
 
 
 def _payoff(mission):

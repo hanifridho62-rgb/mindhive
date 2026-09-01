@@ -177,3 +177,68 @@ def test_the_command_runs_for_real_as_a_subprocess(tmp_path):
 def test_register_is_the_only_public_wiring_this_module_exposes():
     assert callable(lint_cli.register)
     assert callable(lint_cli.cmd_lintester)
+
+
+# --- WB6: the unattended reflect/resolve loop ---------------------------------
+
+def test_the_command_wires_the_unattended_reflector(monkeypatch):
+    """WB6.2/6.3, and the gap this test was written for.
+
+    `resilience.reflect_on_open` records the anomaly, runs the same
+    `resolve.resolve_batch` that `hive rules resolve` runs, and persists the
+    result to `orchestrator_memory.json`. It was fully implemented and fully
+    unit-tested, and NOTHING in production ever called it: `reflector` defaults
+    to `None` on both `LintesterOrchestrator` and `RepairLoop`, and the command
+    passed nothing. A breaker could open on a real run and no anomaly would be
+    recorded, resolved or remembered.
+
+    Asserted at the construction seam rather than by opening a breaker for real,
+    because resolving for real spends agent tokens."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import resilience as res_mod
+
+    seen = {}
+    real = lint_mod.LintesterOrchestrator
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    assert _cli("lintester", "rotate the ledger segment") == 0
+    assert seen.get("reflector") is res_mod.reflect_on_open, (
+        f"the command wired {seen.get('reflector')!r}; an opened breaker would "
+        f"record, resolve and remember nothing on a real run")
+
+
+def test_the_reflector_reaches_the_repair_loop_that_calls_it(monkeypatch):
+    """The other half of the wiring. A reflector the command sets but the repair
+    loop never receives would pass the test above and still do nothing."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import resilience as res_mod
+
+    got = {}
+    real_init = res_mod.RepairLoop.__init__
+
+    def spy(self, *a, **kw):
+        got["reflector"] = kw.get("reflector")
+        return real_init(self, *a, **kw)
+
+    monkeypatch.setattr(res_mod.RepairLoop, "__init__", spy)
+    monkeypatch.setattr(lint_mod.wt_mod, "acquire_lanes",
+                        lambda root, n, mid="": [
+                            lint_mod.wt_mod.LaneWorktree(lane_id=i, ok=True,
+                                                         path=f"lane-{i}")
+                            for i in range(n)])
+    monkeypatch.setattr(lint_mod.wt_mod, "release_lanes", lambda root, trees: [])
+
+    marker = object()
+    lint_mod.LintesterOrchestrator(
+        project="test", reflector=marker,
+        decomposer=lambda rid, t, i: [(rid, t, i)],
+        runner=lambda entry, lane: True).execute_mission("x", dry_run=False)
+
+    assert got["reflector"] is marker, (
+        f"the repair loop was built with {got.get('reflector')!r}, so the "
+        f"orchestrator's reflector never reaches the code that calls it")
