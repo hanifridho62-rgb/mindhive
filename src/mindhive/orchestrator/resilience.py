@@ -419,7 +419,8 @@ class RepairLoop:
     Callable, so it drops straight into `WorkStealingScheduler(repair=...)`."""
 
     def __init__(self, breaker=None, max_attempts=DEFAULT_MAX_ATTEMPTS,
-                 fall_back=None, key_for=None, project=None, reflector=None):
+                 fall_back=None, key_for=None, project=None, reflector=None,
+                 rollback=None):
         self.breaker = breaker if breaker is not None else ToolCircuitBreaker()
         self.max_attempts = max(1, int(max_attempts))
         self.fall_back = fall_back if fall_back is not None else default_fall_back
@@ -427,6 +428,13 @@ class RepairLoop:
                                                      or "task"))
         self.project = project
         self.reflector = reflector
+        # The tree half of a fall-back, and DEFAULT-OFF on purpose. `fall_back`
+        # moves the task back a phase in the ledger; this discards the lane
+        # checkout's uncommitted work. One is a record and the other deletes
+        # files, so the second is never a library default — the caller that owns
+        # the checkouts wires it, and only for a run that made them.
+        self.rollback = rollback
+        self.rollbacks: list = []
         self.decisions: list = []
         self.fall_backs = 0
         self.reflections: list = []
@@ -523,6 +531,31 @@ class RepairLoop:
         self.reflections.append({"key": key, "signature": signature,
                                  "result": out})
 
+    def _roll_back(self, lane) -> None:
+        """Discard the lane checkout's half-written work before the retry.
+
+        Ordered BEFORE the re-queue deliberately: the point is that the next
+        attempt reads a tree at its last commit rather than one carrying
+        whatever the failed attempt left behind. Total, and a failure here does
+        not cancel the retry — a repair on a dirty tree is worse than one on a
+        clean tree and better than none.
+
+        The outcome is recorded either way, because "the lane was rolled back"
+        and "the rollback was refused" are different facts and a mission report
+        that showed neither would let a refusal pass for a rollback."""
+        if self.rollback is None or lane is None:
+            return
+        try:
+            out = self.rollback(lane)
+        except Exception as exc:                        # noqa: BLE001
+            self.rollbacks.append({"lane": getattr(lane, "lane_id", -1),
+                                   "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self.rollbacks.append({"lane": getattr(lane, "lane_id", -1),
+                               "ok": bool(getattr(out, "ok", False)),
+                               "changed": bool(getattr(out, "changed", False)),
+                               "reason": str(getattr(out, "reason", "") or "")})
+
     async def __call__(self, entry, lane) -> bool:
         """The scheduler's `repair` seam. Re-queues on ITS OWN lane."""
         decision = self.observe(entry)
@@ -534,6 +567,7 @@ class RepairLoop:
                 entry.task = task.with_repair(decision.prompt_suffix)
             except AttributeError:
                 pass
+        self._roll_back(lane)
         await lane.push(entry)
         return True
 

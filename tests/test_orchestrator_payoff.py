@@ -261,3 +261,351 @@ def test_a_report_that_is_not_a_like_for_like_comparison_says_so_when_printed():
         cli_mod._print_payoff(pf.compare({"a": 2, "b": 2}, deps={"b": ["a"]},
                                          lanes=2))
     assert "not a like-for-like comparison" in buf.getvalue()
+
+
+# --- is the weight any good? ---------------------------------------------------
+#
+# Everything above scores a POLICY given an estimate. This half scores the
+# ESTIMATE, which every number above inherits: `simulate_lanes` packs by
+# `metrics.calculate_workload_weight` and then runs for `actual`, and if those
+# two are unrelated the packing is arbitrary and its `4/3` bound buys nothing.
+#
+# `test_a_backwards_estimate_is_reported_as_backwards` is the one that matters
+# most here, for the same reason `test_the_harness_reports_the_incumbent_winning`
+# matters above: a calibration that can only report "the weight is fine" is
+# unfalsifiable and measures nothing.
+
+
+def _samples(pairs):
+    """`{unit: weight}` and `{unit: ms}` from ``[(unit, weight, ms), ...]``."""
+    return ({u: w for u, w, _ in pairs}, {u: ms for u, _, ms in pairs})
+
+
+def test_a_weight_that_orders_the_work_is_reported_as_ordering_it():
+    weights, durations = _samples([("a", 1, 10.0), ("b", 2, 20.0),
+                                   ("c", 3, 30.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert got.units == 3
+    assert got.rho == pytest.approx(1.0)
+    assert "the weight orders the work" in got.verdict
+
+
+def test_a_backwards_estimate_is_reported_as_backwards():
+    """The falsifying case. Without it every other assertion here passes for a
+    function that returns "looks good" whatever it is handed."""
+    weights, durations = _samples([("a", 1, 30.0), ("b", 2, 20.0),
+                                   ("c", 3, 10.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert got.rho == pytest.approx(-1.0)
+    assert "BACKWARDS" in got.verdict
+
+
+def test_an_estimate_that_predicts_nothing_says_so_rather_than_hedging():
+    weights, durations = _samples([("a", 1, 20.0), ("b", 2, 10.0),
+                                   ("c", 3, 30.0), ("d", 4, 15.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert -0.3 < got.rho < 0.3, got.rho
+    assert "does not predict the order" in got.verdict
+
+
+def test_a_sub_millisecond_unit_is_a_sample_rather_than_a_unit_that_never_ran():
+    """The regression that made this whole half report nothing. `elapsed_ms`
+    was an integer, so a unit faster than a millisecond floored to zero and was
+    dropped here as unmeasured -- leaving the estimate scored only on the units
+    slow enough to survive the flooring."""
+    weights, durations = _samples([("fast", 1, 0.25), ("slow", 4, 4.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert got.units == 2, got.verdict
+    assert [s.ms for s in got.samples] == [0.25, 4.0]
+
+
+def test_a_unit_that_reported_no_duration_is_not_a_sample():
+    """A unit that never ran carried as a zero would drag the correlation
+    toward whatever the unrun units happened to be estimated at."""
+    weights, durations = _samples([("ran", 1, 5.0), ("never", 9, 0.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert [s.unit for s in got.samples] == ["ran"]
+    assert got.rho is None
+    assert "one measured unit cannot show" in got.verdict
+
+
+def test_a_duration_for_a_unit_nobody_estimated_is_ignored():
+    got = pf.calibrate({"a": 1}, {"a": 5.0, "ghost": 9.0})
+    assert [s.unit for s in got.samples] == ["a"]
+
+
+def test_no_measured_unit_at_all_is_reported_as_unchecked_not_as_flat():
+    got = pf.calibrate({"a": 1, "b": 2}, {})
+    assert got.units == 0
+    assert got.rho is None
+    assert "still unchecked" in got.verdict
+
+
+def test_a_correlation_that_cannot_be_computed_is_none_not_zero():
+    """``0.0`` would say "the weight predicts nothing", which is a finding.
+    Every weight being the same is not that finding -- it is silence."""
+    weights, durations = _samples([("a", 2, 10.0), ("b", 2, 20.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert got.rho is None
+    assert "nothing about the order can be read" in got.verdict
+
+
+def test_tied_weights_share_a_rank_rather_than_taking_dict_order():
+    """Two units estimated the same is the common case. Breaking that tie by
+    position would let the order the dict arrived in show up as correlation."""
+    assert pf._ranks([5, 5, 9]) == [1.5, 1.5, 3.0]
+    assert pf._ranks([9, 5, 5]) == [3.0, 1.5, 1.5]
+
+
+def test_the_spread_is_reported_even_when_the_order_cannot_be():
+    """Two units estimated at the SAME weight that cost four times as much as
+    each other say the estimate is wrong about magnitude, and that is a finding
+    even though nothing can be said about order. It used to be computed and
+    then left out of the sentence anybody reads."""
+    weights, durations = _samples([("a", 1, 10.0), ("b", 1, 40.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert got.rho is None
+    assert got.spread == pytest.approx(4.0)
+    assert "nothing about the order can be read" in got.verdict
+    assert "4.0x the cheapest" in got.verdict
+
+
+def test_the_spread_rides_a_readable_correlation_too():
+    weights, durations = _samples([("a", 1, 10.0), ("b", 2, 80.0)])
+    got = pf.calibrate(weights, durations)
+
+    assert got.spread == pytest.approx(4.0)
+    assert "4.0x the cheapest" in got.verdict
+
+
+def test_one_rate_alone_reports_no_spread_rather_than_a_ratio_of_one():
+    """A single rate has nothing to be a ratio against, and 1.0 would read as
+    a measured finding that the estimate is uniform."""
+    got = pf.calibrate({"a": 1}, {"a": 10.0, "b": 20.0})
+
+    assert got.spread == 0.0
+    assert "the cheapest" not in got.verdict
+
+
+def test_an_unweighted_sample_has_no_rate_rather_than_a_zero_divide():
+    assert pf.Sample(unit="a", weight=0, ms=10.0).ms_per_weight == 0.0
+
+
+@pytest.mark.parametrize("bad", [None, "", "abc", object()])
+def test_a_duration_that_is_not_a_number_does_not_raise(bad):
+    got = pf.calibrate({"a": 1, "b": 2}, {"a": bad, "b": 4.0})
+    assert [s.unit for s in got.samples] == ["b"]
+
+
+def test_the_calibration_serialises_to_json_able_primitives():
+    import json
+
+    weights, durations = _samples([("a", 1, 0.25), ("b", 2, 4.5)])
+    got = pf.calibrate(weights, durations).as_dict()
+
+    assert json.loads(json.dumps(got))["samples"][0]["ms"] == 0.25
+
+
+# --- the samples outlive the mission -------------------------------------------
+
+def test_samples_round_trip_through_the_record():
+    pf.record_samples([pf.Sample(unit="a", weight=2, ms=0.25)],
+                      mission_id="m1", project="test")
+    got = pf.history("test")
+
+    assert [(s.unit, s.weight, s.ms) for s in got] == [("a", 2, 0.25)]
+
+
+def test_a_second_mission_appends_rather_than_replacing():
+    """One mission's units answer nothing about an estimator; forty units over
+    ten missions begin to."""
+    pf.record_samples([pf.Sample(unit="a", weight=1, ms=1.0)], project="test")
+    pf.record_samples([pf.Sample(unit="a", weight=1, ms=2.0)], project="test")
+
+    assert [s.ms for s in pf.history("test")] == [1.0, 2.0]
+
+
+def test_the_same_unit_measured_twice_is_two_samples_not_one():
+    """`folded` scores a sequence. Folded through a dict keyed by unit id it
+    would keep only the last measurement and quietly turn a history of forty
+    into a history of one."""
+    pf.record_samples([pf.Sample(unit="a", weight=1, ms=1.0)], project="test")
+    pf.record_samples([pf.Sample(unit="a", weight=9, ms=9.0)], project="test")
+
+    assert pf.folded("test").units == 2
+    assert [s.ms for s in pf.folded("test").samples] == [1.0, 9.0]
+
+
+def test_the_folded_history_carries_the_unit_name_the_operator_recorded():
+    pf.record_samples([pf.Sample(unit="writer", weight=1, ms=1.0),
+                       pf.Sample(unit="reader", weight=2, ms=2.0)],
+                      project="test")
+
+    assert [s.unit for s in pf.folded("test").samples] == ["writer", "reader"]
+
+
+def test_the_history_keeps_the_order_it_was_recorded_in():
+    """`--calibration` prints the TAIL of this list as the most recent samples.
+    Ordered by anything else, that tail is a different dozen — an earlier cut
+    sorted composite `"{i}:{unit}"` keys, which put "9..." last whatever the
+    real order was."""
+    for i in range(12):
+        pf.record_samples([pf.Sample(unit=f"u{i}", weight=1, ms=float(i + 1))],
+                          project="test")
+
+    assert [s.unit for s in pf.folded("test").samples[-3:]] == ["u9", "u10",
+                                                               "u11"]
+
+
+def test_a_sample_with_no_measured_time_is_not_recorded():
+    kept = pf.record_samples([pf.Sample(unit="a", weight=1, ms=0.0)],
+                             project="test")
+    assert kept == 0
+    assert pf.history("test") == ()
+
+
+def test_the_record_is_capped_so_it_stays_a_file_a_person_can_read():
+    pf.record_samples([pf.Sample(unit=f"u{i}", weight=1, ms=1.0)
+                       for i in range(pf.MAX_SAMPLES + 25)], project="test")
+    got = pf.history("test")
+
+    assert len(got) == pf.MAX_SAMPLES
+    assert got[-1].unit == f"u{pf.MAX_SAMPLES + 24}", "the OLDEST must go first"
+
+
+def test_a_record_that_does_not_exist_reads_as_no_samples():
+    assert pf.history("test") == ()
+    assert pf.folded("test").units == 0
+
+
+def test_a_corrupt_record_reads_as_no_samples_rather_than_raising():
+    target = pf.samples_path("test")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{not json", encoding="utf-8")
+
+    assert pf.history("test") == ()
+
+
+def test_a_row_that_is_not_a_sample_is_skipped_not_guessed_at():
+    import json
+
+    target = pf.samples_path("test")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"samples": [
+        "not a dict", {"unit": "a", "weight": 1, "ms": 3.0},
+        {"unit": "b", "weight": "x", "ms": 1.0}]}), encoding="utf-8")
+
+    assert [s.unit for s in pf.history("test")] == ["a"]
+
+
+def test_a_store_that_cannot_be_written_does_not_fail_the_mission(monkeypatch):
+    from mindhive import paths
+
+    def _boom(*_a, **_kw):
+        raise OSError("nope")
+
+    monkeypatch.setattr(paths, "write_text_atomic", _boom)
+    assert pf.record_samples([pf.Sample(unit="a", weight=1, ms=1.0)],
+                             project="test") == 1
+
+
+# --- the durable finding -------------------------------------------------------
+
+def _experiment_rows():
+    from mindhive import events as ev_mod
+    return [e for e in ev_mod.read_all("test") if e.type == "experiment_result"]
+
+
+def test_a_scored_calibration_lands_in_the_ledger_as_one_row():
+    weights, durations = _samples([("a", 1, 10.0), ("b", 2, 20.0)])
+    cal = pf.calibrate(weights, durations)
+
+    assert pf.record_result(cal, mission_id="m1", project="test") is True
+    rows = _experiment_rows()
+    assert len(rows) == 1, "one row per mission, never one per unit"
+    assert "m1" in rows[0].payload["text"]
+    assert rows[0].payload["units"] == 2
+
+
+def test_a_calibration_with_nothing_to_say_records_nothing():
+    """The negative half. A row saying "one unit, no correlation" is noise in
+    the memo stream it lands in."""
+    cal = pf.calibrate({"a": 1}, {"a": 5.0})
+
+    assert pf.record_result(cal, mission_id="m1", project="test") is False
+    assert pf.record_result(None, project="test") is False
+    assert _experiment_rows() == []
+
+
+# --- the calibration reaches the operator --------------------------------------
+
+def test_the_calibration_is_readable_from_the_command_line(capsys):
+    """Printed, not merely recorded. A measurement nobody can read is the same
+    as no measurement."""
+    from mindhive import __main__ as cli_mod
+
+    pf.record_samples([pf.Sample(unit="a", weight=1, ms=10.0),
+                       pf.Sample(unit="b", weight=4, ms=40.0)],
+                      mission_id="m1", project="test")
+
+    assert cli_mod.main(["lintester", "--calibration"]) == 0
+    out = capsys.readouterr().out
+    assert "weight calibration over 2 recorded sample(s)" in out
+    assert "the weight orders the work" in out
+    assert "a: weight 1 -> 10.000 ms" in out
+
+
+def test_the_calibration_is_asked_of_the_record_without_planning_a_mission():
+    """It is a question about history, not a mission. Demanding an intent to
+    ask it would mean planning a mission nobody wanted to read one line."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    started = []
+
+    class _Args:
+        calibration = True
+        project = "test"
+        intent = ""
+
+    from mindhive.orchestrator import lintester as lint_mod
+    real = lint_mod.LintesterOrchestrator.execute_mission
+    try:
+        lint_mod.LintesterOrchestrator.execute_mission = (
+            lambda self, *a, **kw: started.append(1))
+        assert cli_mod.cmd_lintester(_Args()) == 0
+    finally:
+        lint_mod.LintesterOrchestrator.execute_mission = real
+    assert started == [], "asking for the record started a mission"
+
+
+def test_an_empty_record_says_how_to_produce_one(capsys):
+    from mindhive import __main__ as cli_mod
+
+    assert cli_mod.main(["lintester", "--calibration"]) == 0
+    out = capsys.readouterr().out
+    assert "no mission has recorded a measured duration yet" in out
+    assert "--execute" in out
+
+
+def test_a_sub_millisecond_sample_is_printed_as_the_duration_it_was(capsys):
+    """Printed at `%d` it read as `0 ms` — a measurement rendered as its own
+    absence, in the one place an operator would look for it."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    pf.record_samples([pf.Sample(unit="fast", weight=1, ms=0.25),
+                       pf.Sample(unit="slow", weight=4, ms=4.0)],
+                      project="test")
+    cli_mod._print_calibration("test")
+    out = capsys.readouterr().out
+
+    assert "  fast: weight 1 -> 0.250 ms" in out
+    assert "-> 0 ms" not in out, "a measurement was rendered as its own absence"
+    assert "0:fast" not in out, (
+        "an internal key reached the operator instead of the unit name")

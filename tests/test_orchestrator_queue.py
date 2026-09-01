@@ -403,3 +403,121 @@ def test_an_async_success_hook_is_awaited():
     _drive(q.WorkStealingScheduler([lane], runner=lambda e, ln: True,
                                    on_success=_hook).run)
     assert seen == ["t0"]
+
+
+# --- what a unit really cost ---------------------------------------------------
+#
+# The only measurement in this package of what a unit ACTUALLY took, and
+# `payoff.calibrate` scores `metrics.calculate_workload_weight` against it. Its
+# unit of record therefore has to be FINER than the thing it measures. Recorded
+# as an integer millisecond it was not: `int(seconds * 1000)` floors every
+# attempt shorter than a millisecond to zero, and all three readers downstream
+# treat a zero as "this unit never reported a duration" and drop it — so the
+# calibration was scored only on the units slow enough to survive the flooring,
+# which is the bias that would make a bad estimator look good.
+#
+# The clock is injectable for the same reason `bench.run_once` takes one: an
+# assertion about the unit of record must not be an assertion about how fast the
+# machine running the tests happens to be.
+
+def _ticks(*values):
+    """A pinned clock over *values*, in nanoseconds, one read at a time."""
+    it = iter(values)
+    return lambda: next(it)
+
+
+def test_a_unit_faster_than_a_millisecond_still_reports_what_it_cost():
+    """250 microseconds is a real duration. Floored to an integer millisecond
+    it becomes indistinguishable from a unit that never ran at all."""
+    lane = q.WorkerLane(0, [_entry("quick")])
+    sched = q.WorkStealingScheduler([lane], runner=lambda e, ln: True,
+                                    clock=_ticks(1_000_000_000,
+                                                 1_000_250_000))
+    completed, _failed = _drive(sched.run)
+
+    assert completed[0].elapsed_ns == 250_000
+    assert completed[0].elapsed_ms == pytest.approx(0.25)
+
+
+def test_a_real_clock_measures_a_real_unit_without_being_told_the_answer():
+    """The pinned-clock test above proves the arithmetic; this one proves the
+    default clock is wired to it at all. No upper bound is asserted — that
+    would be an assertion about the machine, and a flaky one."""
+    lane = q.WorkerLane(0, [_entry("t0")])
+    completed, _failed = _drive(q.WorkStealingScheduler(
+        [lane], runner=lambda e, ln: True).run)
+
+    assert completed[0].elapsed_ns > 0
+    assert completed[0].elapsed_ms > 0.0
+
+
+def test_a_unit_that_never_ran_reports_no_duration():
+    """The canary. Without it every assertion above passes for an accumulator
+    that reports a duration for a unit nothing ever dispatched."""
+    assert q.QueueEntry(task=_Task("never")).elapsed_ns == 0
+    assert q.QueueEntry(task=_Task("never")).elapsed_ms == 0.0
+
+
+def test_two_attempts_at_one_unit_cost_the_mission_both_of_them():
+    """Accumulated, not replaced. A unit that failed after four minutes and
+    then passed in one cost five, and a calibration told it cost one would be
+    scoring the estimate against the cheaper half of what happened."""
+    seen = []
+
+    def runner(entry, lane):
+        seen.append(entry.task_id)
+        return len(seen) > 1                            # fails once, then passes
+
+    async def repair(entry, lane):
+        await lane.push(entry)
+        return True
+
+    lane = q.WorkerLane(0, [_entry("a")])
+    sched = q.WorkStealingScheduler(
+        [lane], runner, repair=repair,
+        clock=_ticks(0, 1_000_000,                      # attempt one: 1 ms
+                     5_000_000, 8_000_000))             # attempt two: 3 ms
+    completed, failed = _drive(sched.run)
+
+    assert not failed
+    assert completed[0].elapsed_ns == 4_000_000, "the failed attempt was free"
+    assert completed[0].elapsed_ms == pytest.approx(4.0)
+
+
+def test_an_interrupted_attempt_still_reports_what_it_spent(tmp_path):
+    """A unit that burned four minutes and was then interrupted did cost the
+    mission four minutes. The checkpoint is where a resumed run reads it."""
+    def runner(entry, lane):
+        raise KeyboardInterrupt
+
+    lane = q.WorkerLane(0, [_entry("t0")])
+    sched = q.WorkStealingScheduler([lane], runner, mission_id="m1",
+                                    checkpoint_dir=tmp_path,
+                                    clock=_ticks(0, 240_000_000_000))
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(sched.run())
+
+    row = _read(tmp_path, "m1", 0)["entries"][0]
+    assert row["task_id"] == "t0"
+    assert row["elapsed_ms"] == pytest.approx(240_000.0)
+
+
+def test_a_clock_that_runs_backwards_cannot_subtract_from_the_total():
+    """`perf_counter_ns` is monotonic and an injected clock is whatever the
+    caller made it. A negative interval added to the running total would make a
+    unit that ran twice look cheaper than one that ran once."""
+    lane = q.WorkerLane(0, [_entry("a")])
+    sched = q.WorkStealingScheduler([lane], runner=lambda e, ln: True,
+                                    clock=_ticks(5_000_000, 1_000_000))
+    completed, _failed = _drive(sched.run)
+
+    assert completed[0].elapsed_ns == 0
+
+
+def test_the_checkpoint_carries_the_duration_in_milliseconds():
+    """`elapsed_ns` is the measurement; the sidecar is read by people and by
+    `resume`, and milliseconds is the unit the rest of this repository reports
+    durations in."""
+    entry = q.QueueEntry(task=_Task("a"))
+    entry.elapsed_ns = 1_234_567
+    assert entry.as_dict()["elapsed_ms"] == pytest.approx(1.235)

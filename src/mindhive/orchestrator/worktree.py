@@ -134,6 +134,107 @@ def release(root, lane_worktree) -> Released:
                     reason=str(getattr(ret, "reason", "") or ""))
 
 
+@dataclass(frozen=True)
+class RolledBack:
+    """What `rollback` did to one lane. `changed` means work was discarded."""
+
+    lane_id: int = -1
+    ok: bool = False
+    changed: bool = False
+    reason: str = ""
+
+
+def is_lane_path(root, path) -> bool:
+    """Whether *path* is a lane checkout THIS module made under *root*.
+
+    The guard `rollback` stands on, and the reason it is a separate predicate is
+    that it has to be testable on its own: everything it rejects is a directory
+    somebody would otherwise be about to discard the contents of."""
+    try:
+        base = (Path(root).resolve() / LANE_DIR).resolve()
+        target = Path(path).resolve()
+    except OSError:                                     # pragma: no cover - odd fs
+        return False
+    if target == base or base not in target.parents:
+        return False
+    name = target.name
+    if not name.startswith(LANE_PREFIX):
+        return False
+    return name[len(LANE_PREFIX):].isdigit()
+
+
+def rollback(root, lane_worktree) -> RolledBack:
+    """Discard a lane checkout's UNCOMMITTED work, so a retry starts clean.
+
+    The repair loop's other half. `default_fall_back` moves the task back a
+    phase in the ledger, which is a record; this moves the working tree back to
+    its last commit, which is the thing the next attempt actually reads. Without
+    it a second attempt starts on top of whatever the first one left half-written
+    and the failure it was given to repair is not the only thing wrong with the
+    tree.
+
+    This is the only function in this package that can delete an agent's output,
+    so three things bound it:
+
+    * **the path must be a lane checkout.** `is_lane_path` requires
+      `<root>/.worktrees/lane-N` with a numeric N. The main checkout, the
+      incumbent's task-keyed trees under `.claude/worktrees`, and anything a
+      caller merely claims is a lane are all refused, with a reason.
+    * **commits are never touched.** `checkout -- .` and `clean -fd` discard
+      what was never committed. A lane that committed its work keeps every
+      commit, and `release` still refuses to reset a branch holding them.
+    * **it is opt-in.** `RepairLoop` takes it as a seam and defaults to None;
+      `lintester` wires it only for a real run with isolated lanes.
+
+    Total: answers a value, never raises."""
+    lane_id = int(getattr(lane_worktree, "lane_id", -1))
+    path = str(getattr(lane_worktree, "path", "") or "")
+    if not path:
+        return RolledBack(lane_id=lane_id, reason="no path to roll back")
+    if not is_lane_path(root, path):
+        return RolledBack(lane_id=lane_id,
+                          reason=(f"{path} is not a {LANE_DIR}/{LANE_PREFIX}N "
+                                  f"checkout under {root}; discarding nothing"))
+    # `mn_wt._git` rather than a second `subprocess.run` here. It is private, and
+    # reaching for it is still the lesser evil: it carries the timeout, the
+    # `shell=False` rule and `paths.NO_WINDOW`, and this module's whole premise
+    # is that a second git driver drifting from the first is how an agent's work
+    # gets deleted by code that looks correct. `_GIT_LOCK` for the same reason
+    # `add` and `retire` take it — a linked worktree's checkout writes into the
+    # common git directory, where a concurrent prune is waiting to race it.
+    #
+    # Both seams are taken INSIDE the guard, not just the import. Reaching for
+    # another module's privates is a drift risk this comment already names, and
+    # a rename on the incumbent's side would otherwise raise an AttributeError
+    # out of a function whose docstring promises it answers a value — from
+    # inside a repair loop, where the caller can least afford a surprise.
+    try:
+        from ..mindnet import worktree as mn_wt
+        git, lock = mn_wt._git, mn_wt._GIT_LOCK
+    except Exception as exc:                            # noqa: BLE001
+        return RolledBack(lane_id=lane_id,
+                          reason=f"cannot load the worktree driver: "
+                                 f"{type(exc).__name__}: {exc}")
+    with lock:
+        ok, out, err = git(path, "status", "--porcelain")
+        if not ok:
+            return RolledBack(lane_id=lane_id,
+                              reason=f"git status failed: {err or 'no reason'}")
+        if not out:
+            return RolledBack(lane_id=lane_id, ok=True, changed=False,
+                              reason="the lane was already clean")
+        ok, _out, err = git(path, "checkout", "--", ".")
+        if not ok:
+            return RolledBack(lane_id=lane_id,
+                              reason=f"git checkout failed: {err or 'no reason'}")
+        ok, _out, err = git(path, "clean", "-fd")
+        if not ok:
+            return RolledBack(lane_id=lane_id,
+                              reason=f"git clean failed: {err or 'no reason'}")
+    return RolledBack(lane_id=lane_id, ok=True, changed=True,
+                      reason="uncommitted work discarded; commits kept")
+
+
 def acquire_lanes(root, count, mission_id="") -> list:
     """One `LaneWorktree` per lane, in lane order.
 

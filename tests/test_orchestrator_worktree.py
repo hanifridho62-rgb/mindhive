@@ -162,3 +162,191 @@ def test_the_incumbent_default_naming_is_untouched(repo):
     assert got.path == str(mn_wt.path_for(repo, "t1"))
     assert got.branch == mn_wt.branch_for("t1")
     mn_wt.retire(repo, got.path, got.branch, got.base)
+
+
+# --- the rollback (U10 / WB5.5) ------------------------------------------------
+#
+# The only function in this package that can DELETE an agent's output, which is
+# the same hazard `test_release_keeps_a_lane_that_holds_work` above exists for.
+# The guard tests are therefore the load-bearing ones here, not the happy path:
+# every path `is_lane_path` rejects is a directory somebody would otherwise be
+# about to discard the contents of.
+
+
+def _lane(repo, lane_id=0, mission="m1"):
+    got = lw.acquire(repo, lane_id, mission)
+    assert got.ok, got.reason
+    return got
+
+
+def test_a_rollback_discards_the_half_written_work_a_failed_attempt_left(repo):
+    """The point of the whole thing: attempt two must read a tree at its last
+    commit, not one carrying whatever attempt one left behind."""
+    lane = _lane(repo)
+    path = repo / ".worktrees" / "lane-0"
+    (path / "half-written.txt").write_text("partial\n", encoding="utf-8")
+    (path / "seed.txt").write_text("clobbered\n", encoding="utf-8")
+
+    got = lw.rollback(repo, lane)
+
+    assert got.ok and got.changed, got.reason
+    assert not (path / "half-written.txt").exists()
+    assert (path / "seed.txt").read_text(encoding="utf-8") == "seed\n"
+    assert "discarded" in got.reason
+
+
+def test_a_rollback_keeps_every_commit_the_lane_made(repo):
+    """`checkout -- .` and `clean -fd` discard what was never committed. Work
+    the agent committed is work it decided to keep, and this must not be the
+    thing that throws it away."""
+    lane = _lane(repo)
+    path = repo / ".worktrees" / "lane-0"
+    (path / "kept.txt").write_text("committed work\n", encoding="utf-8")
+    _git(path, "add", "kept.txt")
+    _git(path, "commit", "-qm", "the agent's own commit")
+
+    got = lw.rollback(repo, lane)
+
+    assert got.ok and not got.changed, got.reason
+    assert (path / "kept.txt").exists(), "a committed file was discarded"
+    assert "already clean" in got.reason
+
+
+def test_a_clean_lane_reports_that_nothing_was_discarded(repo):
+    """`changed` is the field a mission report reads to say whether work was
+    thrown away. A clean rollback that claimed it discarded something would put
+    a loss in the report that never happened."""
+    got = lw.rollback(repo, _lane(repo))
+    assert got.ok and not got.changed
+    assert "already clean" in got.reason
+
+
+def test_the_main_checkout_is_refused_rather_than_discarded(repo):
+    """The failure this guard exists for. A caller that hands the repository
+    root to a function whose job is `clean -fd` deletes the developer's tree."""
+    (repo / "uncommitted.txt").write_text("mine\n", encoding="utf-8")
+
+    got = lw.rollback(repo, lw.LaneWorktree(lane_id=0, path=str(repo)))
+
+    assert not got.ok and not got.changed
+    assert "discarding nothing" in got.reason
+    assert (repo / "uncommitted.txt").exists()
+
+
+def test_the_incumbents_task_keyed_worktree_is_refused(repo):
+    """`.claude/worktrees/<task>` is the incumbent's namespace, not a lane. A
+    guard that only checked "is it under the repo" would discard those too."""
+    other = repo / ".claude" / "worktrees" / "some-task"
+    other.mkdir(parents=True)
+    (other / "work.txt").write_text("not mine to delete\n", encoding="utf-8")
+
+    got = lw.rollback(repo, lw.LaneWorktree(lane_id=0, path=str(other)))
+
+    assert not got.ok
+    assert (other / "work.txt").exists()
+
+
+@pytest.mark.parametrize("name", ["notalane", "lane-", "lane-x", "lane-1x",
+                                  "LANE-1"])
+def test_a_directory_that_merely_sits_beside_the_lanes_is_refused(repo, name):
+    target = repo / ".worktrees" / name
+    target.mkdir(parents=True)
+    assert lw.is_lane_path(repo, target) is False
+    assert lw.rollback(repo, lw.LaneWorktree(lane_id=0,
+                                             path=str(target))).ok is False
+
+
+def test_the_lane_directory_itself_is_not_a_lane(repo):
+    """`.worktrees` holds every lane. Rolling IT back would discard all of them
+    at once."""
+    (repo / ".worktrees").mkdir(exist_ok=True)
+    assert lw.is_lane_path(repo, repo / ".worktrees") is False
+
+
+def test_a_real_lane_path_is_accepted(repo):
+    """The positive half. Without it every rejection above passes for a
+    predicate that answers False to everything."""
+    assert lw.is_lane_path(repo, lw.lane_path_for(repo, 0)) is True
+    assert lw.is_lane_path(repo, lw.lane_path_for(repo, 12)) is True
+
+
+def test_a_file_inside_a_lane_is_not_itself_a_lane(repo):
+    assert lw.is_lane_path(repo, lw.lane_path_for(repo, 0) / "src") is False
+
+
+def test_a_rollback_without_a_path_is_refused_rather_than_guessed(repo):
+    got = lw.rollback(repo, lw.LaneWorktree(lane_id=3))
+    assert not got.ok and got.lane_id == 3
+    assert "no path" in got.reason
+
+
+def test_a_rollback_of_a_lane_that_is_not_on_disk_answers_a_reason(repo):
+    """Total: it answers a value, never raises. The path passes the guard and
+    git then refuses, which is a different fact from a refused guard."""
+    got = lw.rollback(repo, lw.LaneWorktree(lane_id=9,
+                                            path=str(lw.lane_path_for(repo, 9))))
+    assert not got.ok and not got.changed
+    assert "git status failed" in got.reason
+
+
+def test_the_git_calls_belong_to_the_incumbent_here_too(monkeypatch, repo):
+    """Same rule as `acquire`: a second git driver drifting from the first is
+    how an agent's work gets deleted by code that looks correct."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    seen = []
+
+    def fake_git(cwd, *args):
+        seen.append(tuple(str(a) for a in args))
+        return (False, "", "patched")
+
+    lane = _lane(repo)                                  # acquired on REAL git
+    monkeypatch.setattr(mn_wt, "_git", fake_git)
+    got = lw.rollback(repo, lane)
+
+    assert not got.ok and "patched" in got.reason
+    assert seen == [("status", "--porcelain")], (
+        "rollback issued its own git command, or ran clean after a failed status")
+
+
+def test_a_failing_checkout_stops_before_the_clean(monkeypatch, repo):
+    """Ordering matters: `clean -fd` after a failed `checkout` would delete
+    untracked files while leaving the tracked ones half-restored."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    seen = []
+    real = mn_wt._git
+
+    def fake_git(cwd, *args):
+        seen.append(args[0])
+        if args[0] == "checkout":
+            return (False, "", "checkout refused")
+        return real(cwd, *args)
+
+    lane = _lane(repo)
+    (repo / ".worktrees" / "lane-0" / "dirty.txt").write_text("x\n",
+                                                             encoding="utf-8")
+    monkeypatch.setattr(mn_wt, "_git", fake_git)
+    got = lw.rollback(repo, lane)
+
+    assert not got.ok
+    assert "git checkout failed" in got.reason
+    assert "clean" not in seen
+    assert (repo / ".worktrees" / "lane-0" / "dirty.txt").exists()
+
+
+def test_the_incumbent_renaming_its_private_seam_is_reported_not_raised(
+        monkeypatch, repo):
+    """`rollback` reaches for `mn_wt._git` and `mn_wt._GIT_LOCK`, which are
+    private and may be renamed without anyone thinking of this caller. Its
+    docstring promises it answers a value and never raises, and it is called
+    from inside a repair loop — the place least able to absorb a surprise."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    lane = _lane(repo)
+    monkeypatch.delattr(mn_wt, "_git")
+    got = lw.rollback(repo, lane)
+
+    assert not got.ok and not got.changed
+    assert "cannot load the worktree driver" in got.reason
+    assert "AttributeError" in got.reason

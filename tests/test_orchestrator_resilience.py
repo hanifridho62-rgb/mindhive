@@ -563,3 +563,128 @@ def test_crediting_a_success_never_raises_at_the_scheduler():
     loop = r.RepairLoop(breaker=_Hostile(), fall_back=lambda e: False)
     assert loop.succeeded(type("E", (), {"task_id": "k", "attempts": 1})()) == ""
     assert "error" in loop.recoveries[-1]
+
+
+# --- the tree half of a fall-back (WB5.5) --------------------------------------
+#
+# `fall_back` moves the task back a phase in the ledger, which is a record.
+# `rollback` discards the lane checkout's uncommitted work, which deletes files.
+# They are not the same act and the second one is DEFAULT-OFF for that reason:
+# `test_a_loop_with_no_rollback_wired_discards_nothing` is the assertion that
+# keeps it that way, and it is the one worth keeping if only one survives.
+
+
+class _Rolled:
+    def __init__(self, ok=True, changed=True, reason="uncommitted work discarded"):
+        self.ok = ok
+        self.changed = changed
+        self.reason = reason
+
+
+def test_a_loop_with_no_rollback_wired_discards_nothing():
+    """The default. A library that deletes an agent's files unless you opt out
+    is the wrong way round, and nothing here should be able to reach a tree the
+    caller did not hand it."""
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=3,
+                        fall_back=lambda e: True)
+
+    assert loop.rollback is None
+    assert asyncio.run(loop(_entry("t1", attempts=1),
+                            q.WorkerLane(0, worktree="tree"))) is True
+    assert loop.rollbacks == []
+
+
+def test_a_repaired_attempt_rolls_its_own_lane_back():
+    seen = []
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=3,
+                        fall_back=lambda e: True,
+                        rollback=lambda lane: seen.append(lane.lane_id)
+                        or _Rolled())
+    lane = q.WorkerLane(4, worktree="tree")
+
+    assert asyncio.run(loop(_entry("t1", attempts=1), lane)) is True
+    assert seen == [4], "the repair retried on top of the failed attempt's tree"
+    assert loop.rollbacks == [{"lane": 4, "ok": True, "changed": True,
+                               "reason": "uncommitted work discarded"}]
+
+
+def test_an_abandoned_unit_is_not_rolled_back():
+    """Nothing is retrying it, so there is no next attempt to clean a tree for
+    — and discarding the work anyway would destroy the evidence of why it was
+    abandoned."""
+    seen = []
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=2,
+                        fall_back=lambda e: True,
+                        rollback=lambda lane: seen.append(lane) or _Rolled())
+
+    assert asyncio.run(loop(_entry("t1", attempts=2),
+                            q.WorkerLane(0, worktree="tree"))) is False
+    assert seen == []
+
+
+def test_a_refused_rollback_is_recorded_as_a_refusal_not_as_a_rollback():
+    """"The lane was rolled back" and "the rollback was refused" are different
+    facts. A report that showed neither would let one pass for the other."""
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=3,
+                        fall_back=lambda e: True,
+                        rollback=lambda lane: _Rolled(
+                            ok=False, changed=False,
+                            reason="not a lane checkout; discarding nothing"))
+    asyncio.run(loop(_entry("t1", attempts=1), q.WorkerLane(2,
+                                                           worktree="tree")))
+
+    assert loop.rollbacks == [{"lane": 2, "ok": False, "changed": False,
+                               "reason": "not a lane checkout; discarding "
+                                         "nothing"}]
+
+
+def test_a_rollback_that_raises_does_not_cancel_the_retry():
+    """A repair on a dirty tree is worse than one on a clean tree and better
+    than none."""
+    def _boom(lane):
+        raise OSError("git is wedged")
+
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=3,
+                        fall_back=lambda e: True, rollback=_boom)
+    lane = q.WorkerLane(1, worktree="tree")
+
+    assert asyncio.run(loop(_entry("t1", attempts=1), lane)) is True
+    assert lane.depth() == 1, "the unit was dropped when the rollback blew up"
+    assert loop.rollbacks == [{"lane": 1, "error": "OSError: git is wedged"}]
+
+
+def test_a_lane_with_no_checkout_records_the_refusal_rather_than_skipping_it():
+    """The seam decides, not the loop. `worktree.rollback` already refuses a
+    lane with no path and says why; deciding it a second time here would put
+    one rule in two places, and a repair that ran on a tree nobody isolated
+    would vanish from the mission report instead of being named."""
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=3,
+                        fall_back=lambda e: True,
+                        rollback=lambda lane: _Rolled(
+                            ok=False, changed=False,
+                            reason="no path to roll back"))
+
+    asyncio.run(loop(_entry("t1", attempts=1), q.WorkerLane(0)))
+    assert loop.rollbacks == [{"lane": 0, "ok": False, "changed": False,
+                               "reason": "no path to roll back"}]
+
+
+def test_the_rollback_runs_before_the_unit_is_back_in_the_queue():
+    """Ordering is the whole point: the next attempt has to read a tree at its
+    last commit. Rolling back after the re-queue leaves a window in which
+    another worker can take the unit and start on the dirty tree."""
+    order = []
+    loop = r.RepairLoop(breaker=_breaker(), max_attempts=3,
+                        fall_back=lambda e: True,
+                        rollback=lambda lane: order.append("rollback")
+                        or _Rolled())
+
+    class _Spy(q.WorkerLane):
+        async def push(self, entry):
+            order.append("push")
+            return await super().push(entry)
+
+    lane = _Spy(0, worktree="tree")
+    asyncio.run(loop(_entry("t1", attempts=1), lane))
+
+    assert order == ["rollback", "push"]

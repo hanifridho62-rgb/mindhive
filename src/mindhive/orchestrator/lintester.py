@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from . import metrics as metrics_mod
+from . import payoff as payoff_mod
 from . import queue as queue_mod
 from . import resilience as res_mod
 from . import worktree as wt_mod
@@ -180,6 +181,14 @@ class Mission:
     open_keys: tuple = ()
     dry_run: bool = True
     decomposition: str = ROOT_ONLY
+    # What each lane's checkout was rolled back to before a retry, and what was
+    # refused. Empty on a dry run, which starts no lane and therefore discards
+    # nothing.
+    rollbacks: tuple = ()
+    # The weight scored against the time the units really took — see
+    # `payoff.calibrate`. Empty on a dry run: nothing ran, so nothing was timed,
+    # and a zeroed report would read as a measurement that came back flat.
+    calibration: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -202,6 +211,8 @@ class Mission:
             "reflections": list(self.reflections),
             "recoveries": list(self.recoveries),
             "open_keys": list(self.open_keys),
+            "rollbacks": list(self.rollbacks),
+            "calibration": dict(self.calibration),
         }
 
 
@@ -309,6 +320,10 @@ class LintesterOrchestrator:
     runner: object = None
     reflector: object = None
     evs: object = None
+    # The symbol map, built at most once per mission and only when a unit
+    # actually owns a file. `init=False` because it is a cache, not a
+    # collaborator: nothing outside this object should be able to hand it one.
+    _smap: object = field(default=None, init=False, repr=False, compare=False)
 
     # ---- naming -------------------------------------------------------------
 
@@ -476,6 +491,48 @@ class LintesterOrchestrator:
             return ()
         return tuple(dict.fromkeys(n for n in names if n))[:MAX_MUST_USE]
 
+    def _symbol_map(self):
+        """The repository's parsed symbol map, built at most once per mission.
+
+        Lazy, because a mission whose units name no file never needs it and the
+        scan is a real parse of every module in the tree. Cached on the instance
+        for the same reason `wave_context` is resolved once: N units would
+        otherwise pay N scans of one unchanged tree."""
+        if self._smap is None:
+            try:
+                from .. import symbols as sym_mod
+                self._smap = sym_mod.build_map(self.root)
+            except Exception:                           # noqa: BLE001
+                self._smap = False                      # asked once, and failed
+        return self._smap or None
+
+    def _task_context(self, files, ctx):
+        """*ctx* with the symbol slice narrowed to what THIS unit can reach.
+
+        `wave_context` resolves one repo-wide slice and every task in the wave
+        was briefed with the same bytes — correct for the incumbent, which runs
+        a wave of related tasks, and wrong here: a lintester mission fans units
+        that own DIFFERENT directories, and a map of the whole repository tells
+        each of them mostly about code it does not own.
+
+        Falls back to the wave slice whenever the narrow one comes back empty —
+        a unit that owns no module is better served by the repository's shape
+        than by a header saying it has none. The context is frozen, so this
+        replaces it rather than mutating what the other lanes are reading."""
+        if ctx is None or not files:
+            return ctx
+        smap = self._symbol_map()
+        if smap is None:
+            return ctx
+        try:
+            from .. import symbols as sym_mod
+            sliced = sym_mod.focus(smap, files)
+        except Exception:                               # noqa: BLE001
+            return ctx
+        if not sliced:
+            return ctx
+        return dataclasses.replace(ctx, symbols=sliced)
+
     def _compose(self, task_id, title, description, files, weight, lane_id,
                  worktree_path, ctx) -> AgentTask:
         partial = AgentTask(task_id=task_id, title=title,
@@ -483,13 +540,14 @@ class LintesterOrchestrator:
                             weight=int(weight), lane_id=int(lane_id),
                             worktree_path=str(worktree_path or ""))
         brief_text = ""
+        task_ctx = self._task_context(files, ctx)
         try:
             from ..mindnet import brief as brief_mod
-            brief_text = str(brief_mod.build(partial, ctx).text or "")
+            brief_text = str(brief_mod.build(partial, task_ctx).text or "")
         except Exception:                               # noqa: BLE001
             brief_text = ""
         return dataclasses.replace(partial, brief_text=brief_text,
-                                   must_use=self._skills_for(partial, ctx))
+                                   must_use=self._skills_for(partial, task_ctx))
 
     # ---- running ------------------------------------------------------------
 
@@ -512,6 +570,47 @@ class LintesterOrchestrator:
         return _RunOutcome(ok=ran, result="ok" if ran else "fail",
                            reason=str(getattr(res, "reason", "") or ""),
                            stderr=str(getattr(res, "stderr", "") or ""))
+
+    def _rollback_for(self, lane):
+        """Roll one lane's checkout back to its last commit. `RepairLoop`'s seam.
+
+        A method rather than a lambda because it carries the root the guard in
+        `worktree.rollback` checks the lane path against, and that guard is the
+        only thing standing between a repair and the main checkout."""
+        return wt_mod.rollback(self.root, getattr(lane, "worktree", None))
+
+    def _calibrate(self, mission_id, weights, entries):
+        """Score the weights against what the units really cost, and keep it.
+
+        Called on the real path only. The estimate is what the packer believed;
+        `elapsed_ms` is what the scheduler measured; until these two were put
+        beside each other nothing in this repository could say whether the
+        weight was worth computing.
+
+        Total: a mission that ran is not failed by a store that cannot be
+        written or by a correlation that cannot be computed."""
+        durations = {}
+        for entry in entries or ():
+            tid = str(getattr(entry, "task_id", "") or "")
+            # FLOAT milliseconds. `QueueEntry` measures in nanoseconds so that a
+            # unit faster than a millisecond is still a measurement; coercing to
+            # `int` here would floor it back to zero, and the `> 0` guard below
+            # would then drop it as a unit that never ran.
+            ms = float(getattr(entry, "elapsed_ms", 0.0) or 0.0)
+            if tid and ms > 0:
+                durations[tid] = durations.get(tid, 0.0) + ms
+        try:
+            cal = payoff_mod.calibrate(weights, durations)
+        except Exception:                               # noqa: BLE001
+            return payoff_mod.Calibration()
+        try:
+            payoff_mod.record_samples(cal.samples, mission_id=mission_id,
+                                      project=self.project)
+            payoff_mod.record_result(cal, mission_id=mission_id,
+                                     project=self.project)
+        except Exception:                               # noqa: BLE001
+            pass
+        return cal
 
     # ---- the entry point ----------------------------------------------------
 
@@ -608,7 +707,15 @@ class LintesterOrchestrator:
         repair = res_mod.RepairLoop(breaker=breaker,
                                     max_attempts=self.max_attempts,
                                     project=self.project,
-                                    reflector=self.reflector)
+                                    reflector=self.reflector,
+                                    # Wired HERE and nowhere else. This is the
+                                    # one call in the mission that can delete an
+                                    # agent's files, and it is only ever handed
+                                    # to a run that made the lane checkouts it
+                                    # is pointed at — never a dry run, which
+                                    # returns above, and never a library
+                                    # default.
+                                    rollback=self._rollback_for)
         lanes = [queue_mod.WorkerLane(lid, ents, worktree=tree)
                  for lid, ents, tree in runnable]
         scheduler = queue_mod.WorkStealingScheduler(
@@ -639,6 +746,9 @@ class LintesterOrchestrator:
         done = tuple(e.task_id for e in completed)
         bad = tuple(f"{e.task_id}: {e.reason}" for e in failed)
         outcome = "ok" if not bad else "partial"
+        cal = self._calibrate(mission_id,
+                              {tid: u[4] for tid, u in by_id.items()},
+                              list(completed) + list(failed))
         return Mission(
             intent=text, mission_id=mission_id, outcome=outcome,
             reason="" if not bad else f"{len(bad)} of {len(tasks)} unit(s) failed",
@@ -649,6 +759,8 @@ class LintesterOrchestrator:
             reflections=tuple(str(r) for r in repair.reflections),
             recoveries=tuple(str(r) for r in repair.recoveries),
             open_keys=tuple(breaker.open_keys()),
+            rollbacks=tuple(str(r) for r in repair.rollbacks),
+            calibration=cal.as_dict(),
             decomposition=split, dry_run=False)
 
 

@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,6 +83,29 @@ class QueueEntry:
     reason: str = ""
     lane_id: int = -1
     result: object = None
+    # Wall time this unit has actually cost, summed over every attempt. The
+    # scheduler is the only place that can measure it, and it is measured
+    # because nothing else in this repository records what a unit REALLY took
+    # against the weight it was estimated at — which is the assumption every
+    # scheduling number here rests on. Accumulated rather than replaced: two
+    # attempts at one unit cost the mission both of them.
+    #
+    # NANOSECONDS, and that is the whole point rather than a flourish.
+    # `payoff.calibrate` scores the weight against this number, and every reader
+    # between here and there drops a duration of zero as "this unit never
+    # reported one". Held as an integer millisecond it was floored by `int()`,
+    # so a unit faster than a millisecond was indistinguishable from a unit that
+    # never ran — and the calibration was left scored only on the units slow
+    # enough to survive the flooring, which is exactly the bias that would make
+    # a bad estimator look good. Integer nanoseconds also add exactly, where a
+    # float accumulated across retries drifts.
+    elapsed_ns: int = 0
+
+    @property
+    def elapsed_ms(self) -> float:
+        """`elapsed_ns` in milliseconds — the unit the rest of this repository
+        reports durations in, and the one `payoff.Sample` carries."""
+        return self.elapsed_ns / 1_000_000.0
 
     @property
     def task_id(self) -> str:
@@ -94,7 +118,8 @@ class QueueEntry:
     def as_dict(self) -> dict:
         return {"task_id": self.task_id, "state": self.state,
                 "attempts": int(self.attempts), "reason": str(self.reason),
-                "lane": int(self.lane_id)}
+                "lane": int(self.lane_id),
+                "elapsed_ms": round(self.elapsed_ms, 3)}
 
 
 class WorkerLane:
@@ -222,14 +247,21 @@ class WorkStealingScheduler:
     breaker's state records the worst the mission ever saw rather than where the
     target stands now. Called as ``on_success(entry, lane)`` when a unit
     validates. Its return value is ignored and an exception from it is swallowed
-    — crediting a recovery must never fail a unit that already passed."""
+    — crediting a recovery must never fail a unit that already passed.
+
+    *clock* answers nanoseconds and defaults to `time.perf_counter_ns`. It is a
+    seam for the same reason `bench.run_once` takes one: what this scheduler
+    measures is scored against an estimate by `payoff.calibrate`, and a test of
+    that arithmetic must not double as a test of how fast the machine running
+    it happens to be."""
 
     def __init__(self, lanes, runner, repair=None, mission_id="",
-                 checkpoint_dir=None, on_success=None):
+                 checkpoint_dir=None, on_success=None, clock=None):
         self.lanes = list(lanes or ())
         self.runner = runner
         self.repair = repair
         self.on_success = on_success
+        self.clock = clock if clock is not None else time.perf_counter_ns
         self.mission_id = str(mission_id or "")
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.completed: list = []
@@ -288,6 +320,7 @@ class WorkStealingScheduler:
                 continue
             self._inflight += 1
             self._active.setdefault(lane.lane_id, []).append(entry)
+            started = int(self.clock())
             try:
                 entry.attempts += 1
                 try:
@@ -310,6 +343,16 @@ class WorkStealingScheduler:
                                         or "the runner reported failure")
             finally:
                 self._inflight -= 1
+                # In the `finally`, so a cancelled attempt still reports what it
+                # spent before it was cut off. A unit that burned four minutes
+                # and was then interrupted did cost the mission four minutes.
+                #
+                # `max(0, ...)` because an interval is never negative: the
+                # default clock is monotonic, an injected one is whatever the
+                # caller made it, and a negative interval added to a running
+                # total would make a unit that ran twice look cheaper than one
+                # that ran once.
+                entry.elapsed_ns += max(0, int(self.clock()) - started)
             # Reached only when the attempt RESOLVED. An interrupt or a
             # cancellation propagates past this line, leaving the entry in
             # `_active` deliberately: the checkpoint `run()` writes on its way

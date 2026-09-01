@@ -583,3 +583,137 @@ def test_the_cli_budget_defaults_rather_than_requiring_a_flag(capsys):
     from mindhive import __main__ as cli_mod
     assert cli_mod.main(["symbols", str(REAL_SRC), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["budget"] == symbols.BUDGET_TOKENS
+
+
+# --- the per-unit slice -------------------------------------------------------
+#
+# WB1.4's open half. The wave-scoped slice is one artifact resolved once and
+# handed to every task in the wave, which is right for the incumbent — a wave is
+# a set of related tasks — and wrong for a lintester mission, whose units own
+# DIFFERENT directories by construction. Measured before this existed: the same
+# 3,896-character block, byte for byte, in every unit's brief.
+
+
+def _three_module_tree(tmp_path):
+    """`core` <- `web`, and `lonely`, which no module in the tree touches."""
+    _write(tmp_path, "core.py",
+           "import json\n\n\ndef fold(rows):\n    return json.dumps(rows)\n")
+    _write(tmp_path, "web.py",
+           "from core import fold\n\n\ndef serve(rows):\n    return fold(rows)\n")
+    _write(tmp_path, "lonely.py",
+           "def unrelated():\n    return 1\n")
+    return symbols.build_map(tmp_path)
+
+
+def test_a_slice_carries_the_module_the_unit_owns(tmp_path):
+    smap = _three_module_tree(tmp_path)
+    got = symbols.focus(smap, [tmp_path / "core.py"])
+
+    assert "core.py" in got
+    assert "fold" in got, "the unit's own functions are the point of the slice"
+
+
+def test_two_units_in_one_repository_are_given_different_slices(tmp_path):
+    """The whole of WB1.4. Before this, `wave_context` resolved one repo-wide
+    block and `_compose` gave every unit the same bytes, so a per-task slice was
+    reported as delivered while every task read the same map."""
+    smap = _three_module_tree(tmp_path)
+
+    owned = symbols.focus(smap, [tmp_path / "core.py"])
+    other = symbols.focus(smap, [tmp_path / "lonely.py"])
+
+    assert owned and other
+    assert owned != other
+    assert "lonely.py" not in owned, (
+        "a module nothing in the unit's neighbourhood touches is not its "
+        "business, and carrying it is the repo-wide slice again")
+
+
+def test_the_neighbourhood_reaches_back_along_the_import_edge(tmp_path):
+    """`web` imports `core`, so a unit that owns `core` must be shown `web`.
+
+    The reverse edge is the half a naive implementation drops: `graph` answers
+    what a module imports, and the question an agent editing `core.fold` needs
+    answered is who CALLS it."""
+    smap = _three_module_tree(tmp_path)
+    got = symbols.focus(smap, [tmp_path / "core.py"])
+
+    assert "web.py" in got, got
+
+
+def test_a_unit_that_owns_no_module_gets_no_slice_rather_than_an_empty_one(
+        tmp_path):
+    """`""` is the signal to fall back to the wave slice. An empty rendered map
+    — a header saying zero of three — would brief the agent with a statement
+    that its repository has no code in it."""
+    smap = _three_module_tree(tmp_path)
+    _write(tmp_path, "notes.md", "# not python\n")
+
+    assert symbols.focus(smap, [tmp_path / "notes.md"]) == ""
+    assert symbols.focus(smap, []) == ""
+    assert symbols.focus(smap, [tmp_path.parent / "outside.py"]) == ""
+
+
+def test_a_map_built_from_a_relative_root_still_matches_a_resolved_path(
+        tmp_path, monkeypatch):
+    """The defect this fixes, pinned. `lintester._files_for` answers RESOLVED
+    absolute paths; `Path.relative_to` between one of those and a relative root
+    raises rather than matching, so a map built from `src/mindhive` answered an
+    empty slice for every unit and nothing anywhere reported a fault."""
+    _write(tmp_path, "pkg/core.py", "def f():\n    return 1\n")
+    monkeypatch.chdir(tmp_path)
+
+    smap = symbols.build_map("pkg")
+    got = symbols.focus(smap, [(tmp_path / "pkg" / "core.py").resolve()])
+
+    assert "core.py" in got
+
+
+def test_the_slice_says_how_many_modules_it_left_out(tmp_path):
+    """Same rule the repo-wide index is held to: a map that drops modules and
+    does not say so reads as a map of a smaller repository."""
+    smap = _three_module_tree(tmp_path)
+    got = symbols.focus(smap, [tmp_path / "core.py"])
+
+    assert got.startswith("# symbol index:")
+    assert f"of {smap.total} modules" in got
+    assert "this unit owns" in got, (
+        "the header must not claim the repo-wide ranking it did not do")
+
+
+def test_the_budget_cuts_the_neighbour_before_it_cuts_the_owner(tmp_path):
+    """Greedy in the order `focus` builds: owned modules first, neighbours
+    after. A budget that dropped the unit's OWN module while keeping a module it
+    merely imports would be a map of everything except the thing being worked
+    on."""
+    smap = _three_module_tree(tmp_path)
+    tight = symbols.focus(smap, [tmp_path / "core.py"], budget=32)
+    wide = symbols.focus(smap, [tmp_path / "core.py"], budget=4096)
+
+    assert injectors._tokens(len(tight)) <= 32
+    assert "core.py" in tight and "web.py" not in tight
+    assert "core.py" in wide and "web.py" in wide
+    assert "1 of 3 modules" in tight, "a cut map must still say what it cut"
+
+
+def test_a_budget_that_fits_nothing_answers_no_slice_at_all(tmp_path):
+    """Not a header on its own. `""` already means "fall back to the wave
+    slice", and a lone header saying one of three would be a map with no map in
+    it — worse than the repo-wide block it displaced."""
+    smap = _three_module_tree(tmp_path)
+    assert symbols.focus(smap, [tmp_path / "core.py"], budget=8) == ""
+
+
+def test_one_map_serves_many_units_without_re_parsing(tmp_path, monkeypatch):
+    """`build_map` is separated from `focus` for a cost reason, and a change
+    that quietly re-scanned per unit would restore the cost it was split to
+    avoid — silently, since every slice would still be correct."""
+    smap = _three_module_tree(tmp_path)
+    calls = []
+    monkeypatch.setattr(symbols, "scan",
+                        lambda root: calls.append(root) or [])
+
+    for rel in ("core.py", "web.py", "lonely.py"):
+        symbols.focus(smap, [tmp_path / rel])
+
+    assert calls == [], "focus parsed the tree again"

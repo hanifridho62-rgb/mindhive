@@ -30,6 +30,13 @@ def cmd_lintester(args) -> int | None:
     """Plan (and optionally run) one mission from one intent."""
     from .lintester import LintesterOrchestrator
 
+    if getattr(args, "calibration", False):
+        # Answered BEFORE the intent check: reading what past missions measured
+        # is a question about the record, not a mission, and demanding an intent
+        # to ask it would mean planning a mission nobody wanted in order to read
+        # one line of history.
+        return _print_calibration(args.project)
+
     intent = str(getattr(args, "intent", "") or "").strip()
     if not intent:
         print("lintester: an intent is required — try: "
@@ -95,6 +102,23 @@ def _payoff(mission):
                               lanes=max(1, len(mission.lanes)))
 
 
+def _print_calibration(project=None) -> int:
+    """Print every sample recorded so far, scored as one set."""
+    from . import payoff as payoff_mod
+
+    cal = payoff_mod.folded(project)
+    print(f"weight calibration over {cal.units} recorded sample(s): "
+          f"{cal.verdict}")
+    for sample in cal.samples[-12:]:
+        print(f"  {sample.unit}: weight {sample.weight} -> "
+              f"{sample.ms:.3f} ms "
+              f"({sample.ms_per_weight:.3f} ms per weight-unit)")
+    if not cal.samples:
+        print("  no mission has recorded a measured duration yet; a real run "
+              "with --execute records one sample per unit")
+    return 0
+
+
 def _print_payoff(scored) -> None:
     print(f"  payoff over {scored.units} unit(s): {scored.verdict}")
     print(f"    static waves: makespan {scored.waves.makespan}, "
@@ -134,6 +158,11 @@ def _print(mission) -> None:
         print(f"  FAILED {line}")
     for line in mission.kept:
         print(f"  kept: {line}")
+    for line in mission.rollbacks:
+        print(f"  rollback: {line}")
+    verdict = str((mission.calibration or {}).get("verdict") or "")
+    if verdict:
+        print(f"  weight against measured time: {verdict}")
 
 
 def register(subparsers) -> None:
@@ -156,4 +185,7 @@ def register(subparsers) -> None:
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")
+    p.add_argument("--calibration", action="store_true",
+                   help="print what past runs measured — the weight against "
+                        "the wall time it predicted — and start no mission")
     p.set_defaults(func=cmd_lintester)

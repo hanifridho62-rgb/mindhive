@@ -606,3 +606,266 @@ def test_a_preview_unit_id_is_derived_from_its_directory(repo):
     assert all(("/" not in i and "\\" not in i) for i in ids), ids
     assert any(i.endswith("-src-pkg") for i in ids), ids
     assert any(i.endswith("-tests-unit") for i in ids), ids
+
+
+# --- the per-unit symbol slice (WB1.4) ----------------------------------------
+
+def _py_repo(tmp_path):
+    """Two units' worth of Python, in two directories, plus a shared module."""
+    for rel, text in (
+            ("src/pkg/writer.py",
+             "from pkg.shared import fmt\n\n\ndef write(rows):\n"
+             "    return fmt(rows)\n"),
+            ("src/pkg/shared.py", "def fmt(rows):\n    return list(rows)\n"),
+            ("tests/unit/test_writer.py",
+             "def test_write():\n    assert True\n")):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_each_unit_is_briefed_with_the_slice_of_the_map_it_owns(tmp_path):
+    """WB1.4's open half, closed. `wave_context` resolves ONE symbol slice and
+    every task in the wave used to receive the same bytes — measured at 3,896
+    characters, identical in every brief. A mission's units own different
+    directories by construction, so a repo-wide map tells each of them mostly
+    about code it does not own."""
+    from mindhive.mindnet import brief as brief_mod
+
+    root = _py_repo(tmp_path)
+    orc = lint.LintesterOrchestrator(root=root, project="test")
+    ctx = brief_mod.WaveContext(project="test", symbols="WAVE-WIDE-BLOCK")
+
+    writer = orc._task_context([str(root / "src" / "pkg" / "writer.py")], ctx)
+    covers = orc._task_context([str(root / "tests" / "unit" / "test_writer.py")],
+                               ctx)
+
+    assert writer.symbols != ctx.symbols, "the unit was given the wave's block"
+    assert writer.symbols != covers.symbols, (
+        "two units in different directories were given the same map")
+    assert "writer.py" in writer.symbols
+    assert "test_writer.py" in covers.symbols
+
+
+def test_a_unit_that_owns_no_module_keeps_the_wave_slice(tmp_path):
+    """The fall-back, and it is deliberate: a unit that touches no Python is
+    better served by the repository's shape than by a header telling it the
+    repository has nothing in it."""
+    from mindhive.mindnet import brief as brief_mod
+
+    root = _py_repo(tmp_path)
+    (root / "README.md").write_text("# docs\n", encoding="utf-8")
+    ctx = brief_mod.WaveContext(project="test", symbols="WAVE-WIDE-BLOCK")
+    orc = lint.LintesterOrchestrator(root=root, project="test")
+
+    assert orc._task_context([str(root / "README.md")], ctx) is ctx
+    assert orc._task_context([], ctx) is ctx
+    assert orc._task_context(["x"], None) is None
+
+
+def test_the_symbol_map_is_built_once_for_the_whole_mission(tmp_path,
+                                                            monkeypatch):
+    """A scan per unit would be a full parse of the tree per unit. The cache is
+    the reason `build_map` and `focus` are separate functions at all."""
+    from mindhive import symbols as sym_mod
+    from mindhive.mindnet import brief as brief_mod
+
+    root = _py_repo(tmp_path)
+    built = []
+    real = sym_mod.build_map
+    monkeypatch.setattr(sym_mod, "build_map",
+                        lambda r=None: built.append(r) or real(r))
+    orc = lint.LintesterOrchestrator(root=root, project="test")
+    ctx = brief_mod.WaveContext(project="test", symbols="W")
+
+    for rel in ("src/pkg/writer.py", "src/pkg/shared.py",
+                "tests/unit/test_writer.py"):
+        orc._task_context([str(root / rel)], ctx)
+
+    assert len(built) == 1, f"the tree was parsed {len(built)} times"
+
+
+def test_a_symbol_map_that_cannot_be_built_is_asked_for_once(tmp_path,
+                                                             monkeypatch):
+    """Total, and not retried. A map that failed will fail again, and a mission
+    that retried it per unit would pay the failure N times over."""
+    from mindhive import symbols as sym_mod
+    from mindhive.mindnet import brief as brief_mod
+
+    calls = []
+
+    def _boom(_root=None):
+        calls.append(1)
+        raise OSError("no tree here")
+
+    monkeypatch.setattr(sym_mod, "build_map", _boom)
+    orc = lint.LintesterOrchestrator(root=tmp_path, project="test")
+    ctx = brief_mod.WaveContext(project="test", symbols="W")
+
+    assert orc._task_context(["a.py"], ctx) is ctx
+    assert orc._task_context(["b.py"], ctx) is ctx
+    assert len(calls) == 1
+
+
+# --- the lane rollback, wired (WB5.5) -----------------------------------------
+
+def test_a_real_run_hands_the_repair_loop_a_rollback_bound_to_its_own_root(
+        repo, monkeypatch):
+    """The seam is wired at the mission, never as a library default, and it
+    carries the root that `worktree.rollback`'s guard checks the lane path
+    against — the only thing standing between a repair and the main checkout."""
+    seen = {}
+    real = lint.res_mod.RepairLoop
+
+    def _spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(lint.res_mod, "RepairLoop", _spy)
+    lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2, decomposer=_two_units,
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    assert callable(seen.get("rollback")), seen
+    lane = type("L", (), {"worktree": None})()
+    assert seen["rollback"](lane).ok is False, (
+        "a lane with no checkout must be refused, not guessed at")
+
+
+def test_a_failed_unit_has_its_lane_rolled_back_before_the_retry(repo):
+    """End to end on a real checkout: the child writes a file, fails, and the
+    next attempt must not find that file waiting for it."""
+    seen = []
+
+    def runner(entry, lane):
+        from pathlib import Path
+        scratch = Path(lane.worktree_path) / "half-written.txt"
+        seen.append(scratch.exists())
+        scratch.write_text("partial\n", encoding="utf-8")
+        return len(seen) > 1
+
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=1,
+        decomposer=lambda *_a: [("t-one", "One", "one unit")],
+        runner=runner, max_attempts=3).execute_mission("do it", dry_run=False)
+
+    assert seen == [False, False], (
+        "the retry saw the failed attempt's leftovers still on disk")
+    assert got.outcome == "ok", got.reason
+    assert any("discarded" in line for line in got.rollbacks), got.rollbacks
+
+
+# --- what the units really cost (TODOS 27's open item) ------------------------
+
+def test_a_real_run_scores_the_weight_against_the_time_it_predicted(repo):
+    """The open question TODOS 27 leaves: every scheduling number in this
+    package assumes `calculate_workload_weight` predicts how long a child runs,
+    and nothing measured it. `elapsed_ms` measures it and this is where the two
+    are put beside each other."""
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2, decomposer=_two_units,
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    cal = got.calibration
+    assert cal["units"] == 2, cal
+    assert {s["unit"] for s in cal["samples"]} == {"t-ledger", "t-worktree"}
+    assert all(s["ms"] > 0 for s in cal["samples"]), (
+        "a unit that ran must report the time it took")
+    assert cal["verdict"]
+
+
+def test_the_samples_outlive_the_mission_that_measured_them(repo):
+    """One mission's units answer nothing about an estimator; forty units over
+    ten missions begin to. So the samples accumulate rather than being reported
+    and dropped."""
+    from mindhive.orchestrator import payoff as pf
+
+    for _ in range(2):
+        lint.LintesterOrchestrator(
+            root=repo, project="test", lanes=2, decomposer=_two_units,
+            runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    assert len(pf.history("test")) == 4
+
+
+def test_a_dry_run_measures_nothing_and_says_so_by_staying_empty(repo):
+    """A zeroed calibration would read as a measurement that came back flat."""
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", decomposer=_two_units,
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=True)
+
+    assert got.calibration == {}
+    assert got.rollbacks == ()
+
+
+def _two_directories(tmp_path):
+    """Two units' worth of Python, in two directories, with one symbol each
+    that appears NOWHERE in the descriptions — so an assertion on that name can
+    only be satisfied by the AST slice, never by the prompt echoing its own
+    task description back."""
+    for rel, text in (
+            ("src/alpha/writer.py",
+             "def alphaonlysymbol(rows):\n    return list(rows)\n"),
+            ("src/beta/checker.py",
+             "def betaonlysymbol(rows):\n    return len(rows)\n")):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def _two_scoped_units(_root_id, _title, _intent):
+    return [
+        ("t-alpha", "Alpha", "rework src/alpha/writer.py end to end", None),
+        ("t-beta", "Beta", "rework src/beta/checker.py end to end", None),
+    ]
+
+
+def test_each_briefed_task_carries_its_own_ast_scope_and_not_its_siblings(
+        tmp_path):
+    """WB1.4's acceptance criterion, end to end rather than at the seam.
+
+    `test_each_unit_is_briefed_with_the_slice_of_the_map_it_owns` proves
+    `_task_context` narrows the context. This proves the narrowed context
+    survives `brief.build` and reaches `AgentTask.brief_text` — the field an
+    agent is actually handed. The two are different claims and only the second
+    is what the requirement says."""
+    root = _two_directories(tmp_path)
+    got = lint.LintesterOrchestrator(
+        root=root, project="test",
+        decomposer=_two_scoped_units).execute_mission("rework both")
+
+    by_id = {t.task_id: t for t in got.tasks}
+    alpha, beta = by_id["t-alpha"].brief_text, by_id["t-beta"].brief_text
+
+    assert alpha and beta, "both briefs are empty, so this compares two blanks"
+    assert "alphaonlysymbol" in alpha
+    assert "alphaonlysymbol" not in beta, (
+        "task B was handed task A's AST scope")
+    assert "betaonlysymbol" in beta
+    assert "betaonlysymbol" not in alpha
+
+
+def test_the_briefed_slice_says_it_is_scoped_to_the_unit(tmp_path):
+    """The header is the operator's only way to tell a per-unit slice from the
+    repo-wide one, and the two are one string apart in the composed prompt."""
+    root = _two_directories(tmp_path)
+    got = lint.LintesterOrchestrator(
+        root=root, project="test",
+        decomposer=_two_scoped_units).execute_mission("rework both")
+
+    assert "this unit owns" in got.tasks[0].brief_text
+
+
+def test_a_unit_naming_no_file_is_still_briefed(tmp_path):
+    """The fall-back reaching the composed prompt. A unit that owns no module
+    must come back with the repository's shape, not with an empty brief."""
+    root = _two_directories(tmp_path)
+    got = lint.LintesterOrchestrator(
+        root=root, project="test",
+        decomposer=lambda *_a: [("t-none", "None", "no path here at all",
+                                 None)]).execute_mission("do it")
+
+    assert got.tasks[0].brief_text
+    assert "this unit owns" not in got.tasks[0].brief_text
