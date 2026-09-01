@@ -344,3 +344,62 @@ def test_the_checkpoint_is_valid_json_on_disk(tmp_path):
     q.write_checkpoint(tmp_path, "m8", lane)
     raw = q.checkpoint_path(tmp_path, "m8", 0).read_text(encoding="utf-8")
     assert json.loads(raw)["entries"][0]["task_id"] == "a"
+
+
+# --- the success half of the repair seam ---------------------------------------
+
+def test_a_validated_unit_is_credited_through_on_success():
+    """Without this seam the breaker behind `repair` is failure-only: `repair`
+    fires on failures alone, so nothing ever tells it a target recovered."""
+    seen = []
+    lane = q.WorkerLane(0, [_entry("t0"), _entry("t1")])
+    sched = q.WorkStealingScheduler(
+        [lane], runner=lambda e, ln: True,
+        on_success=lambda e, ln: seen.append(e.task_id))
+    done, bad = _drive(sched.run)
+
+    assert [e.task_id for e in done] == ["t1", "t0"]     # LIFO
+    assert bad == []
+    assert sorted(seen) == ["t0", "t1"]
+
+
+def test_a_failing_unit_is_not_credited_as_a_success():
+    """The negative half. Without it the test above passes for a hook that
+    fires on every unit regardless of outcome."""
+    seen = []
+    lane = q.WorkerLane(0, [_entry("bad")])
+    sched = q.WorkStealingScheduler(
+        [lane], runner=lambda e, ln: False,
+        on_success=lambda e, ln: seen.append(e.task_id))
+    done, bad = _drive(sched.run)
+
+    assert done == []
+    assert [e.task_id for e in bad] == ["bad"]
+    assert seen == [], "a failed unit was credited as a recovery"
+
+
+def test_a_raising_success_hook_cannot_fail_a_unit_that_passed():
+    def _boom(entry, lane):
+        raise RuntimeError("bookkeeping blew up")
+
+    lane = q.WorkerLane(0, [_entry("t0")])
+    sched = q.WorkStealingScheduler([lane], runner=lambda e, ln: True,
+                                    on_success=_boom)
+    done, bad = _drive(sched.run)
+
+    assert [e.task_id for e in done] == ["t0"]
+    assert bad == []
+    assert done[0].state == q.VALIDATED
+
+
+def test_an_async_success_hook_is_awaited():
+    seen = []
+
+    async def _hook(entry, lane):
+        await asyncio.sleep(0)
+        seen.append(entry.task_id)
+
+    lane = q.WorkerLane(0, [_entry("t0")])
+    _drive(q.WorkStealingScheduler([lane], runner=lambda e, ln: True,
+                                   on_success=_hook).run)
+    assert seen == ["t0"]

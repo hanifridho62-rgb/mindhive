@@ -522,3 +522,44 @@ def test_the_defuser_is_never_asked_to_clean_more_than_the_window(monkeypatch):
     assert seen, "the defuser was never called"
     assert seen[0] < len(raw), "the whole input was handed to the defuser"
     assert seen[0] <= r.MAX_STDERR_CHARS * r._RAW_STDERR_WINDOW
+
+
+def test_a_recovered_target_closes_its_breaker():
+    """TODOS 28. The breaker used to be failure-only: `observe` is the only
+    other caller of `record` on the scheduler's path and it always passes
+    `False`, so a key could open and never close, and the ONE probe a HALF_OPEN
+    key is allowed was spent without its result being recorded."""
+    now = [0.0]
+    breaker = r.ToolCircuitBreaker(same_error=2, cooldown_s=10.0,
+                                   clock=lambda: now[0])
+    loop = r.RepairLoop(breaker=breaker, fall_back=lambda e: False)
+
+    class _E:
+        task_id = "runner"
+        attempts = 1
+        reason = "boom"
+        result = None
+
+    entry = _E()
+    loop.observe(entry)
+    loop.observe(entry)
+    assert breaker.state_of("runner") == "OPEN"
+
+    now[0] = 11.0
+    assert breaker.allow("runner") is True
+    assert breaker.state_of("runner") == "HALF_OPEN"
+
+    assert loop.succeeded(entry) == "CLOSED"
+    assert breaker.state_of("runner") == "CLOSED"
+    assert breaker.open_keys() == ()
+    assert loop.recoveries and loop.recoveries[-1]["key"] == "runner"
+
+
+def test_crediting_a_success_never_raises_at_the_scheduler():
+    class _Hostile:
+        def record(self, *_a, **_k):
+            raise RuntimeError("breaker exploded")
+
+    loop = r.RepairLoop(breaker=_Hostile(), fall_back=lambda e: False)
+    assert loop.succeeded(type("E", (), {"task_id": "k", "attempts": 1})()) == ""
+    assert "error" in loop.recoveries[-1]

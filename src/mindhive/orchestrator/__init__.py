@@ -15,6 +15,8 @@ delegates to the incumbent that already owns its work:
 
     metrics.py     -> clusters.file_complexity / git_churn, mindnet.telemetry
     queue.py       -> nothing; the scheduling layer had no incumbent
+    payoff.py      -> clusters.shard_plan, and a faithful model of the
+                      incumbent mindnet.orchestrator's own wave loop
     worktree.py    -> mindnet.worktree.add / retire, which own the git calls
     resilience.py  -> loop.safeguards.CircuitBreaker, mindnet.controller
     lintester.py   -> mindnet.autodeclare / decompose / brief / orchestrator
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 from .lintester import AgentTask, LintesterOrchestrator, Mission, run_mission
 from .metrics import ComplexityVisitor, Weight, calculate_workload_weight
+from .payoff import Payoff, Schedule, simulate_lanes, simulate_waves
 from .queue import (ABANDONED, FAILED, QUEUED, RUNNING, VALIDATED, QueueEntry,
                     WorkerLane, WorkStealingScheduler)
 from .resilience import (Limits, RepairLoop, SandboxResult, ToolCircuitBreaker,
@@ -46,9 +49,9 @@ from .worktree import LaneWorktree, lane_path_for
 
 __all__ = [
     "ABANDONED", "AgentTask", "ComplexityVisitor", "FAILED", "LaneWorktree",
-    "Limits", "LintesterOrchestrator", "Mission", "QUEUED", "QueueEntry",
-    "RUNNING", "RepairLoop", "SandboxResult", "ToolCircuitBreaker",
-    "VALIDATED", "Weight", "WorkStealingScheduler", "WorkerLane",
-    "calculate_workload_weight", "lane_path_for", "run_mission",
-    "run_sandboxed",
+    "Limits", "LintesterOrchestrator", "Mission", "Payoff", "QUEUED",
+    "QueueEntry", "RUNNING", "RepairLoop", "SandboxResult", "Schedule",
+    "ToolCircuitBreaker", "VALIDATED", "Weight", "WorkStealingScheduler",
+    "WorkerLane", "calculate_workload_weight", "lane_path_for", "run_mission",
+    "run_sandboxed", "simulate_lanes", "simulate_waves",
 ]

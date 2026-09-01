@@ -430,6 +430,9 @@ class RepairLoop:
         self.decisions: list = []
         self.fall_backs = 0
         self.reflections: list = []
+        # Successes credited back to the breaker, so a mission report can say a
+        # target RECOVERED rather than only that it once failed.
+        self.recoveries: list = []
 
     def observe(self, entry) -> RepairDecision:
         """Decide what happens to one failed *entry*. Appends no side effects
@@ -480,6 +483,30 @@ class RepairLoop:
                                   reason="re-queued with the failure quoted")
         self.decisions.append(decision)
         return decision
+
+    def succeeded(self, entry, lane=None) -> str:
+        """Credit *entry*'s key with a success. Answers the resulting state.
+
+        `WorkStealingScheduler(on_success=...)` calls this. Without it the
+        breaker is failure-only — `observe` is the only other caller of `record`
+        on this path and it always passes `False` — so a key could open and
+        never close, and the single probe a HALF_OPEN key is allowed would be
+        spent without its result ever being recorded. That made the breaker's
+        state a record of the worst the mission ever saw.
+
+        Total: a breaker that cannot record a success must not fail the unit
+        that just succeeded."""
+        key = self.key_for(entry)
+        try:
+            state = self.breaker.record(key, True)
+        except Exception as exc:                        # noqa: BLE001
+            self.recoveries.append({"key": key,
+                                    "error": f"{type(exc).__name__}: {exc}"})
+            return ""
+        self.recoveries.append({"key": key, "state": state,
+                                "attempts": int(getattr(entry, "attempts", 0)
+                                                or 0)})
+        return state
 
     def _reflect(self, key, signature) -> None:
         if self.reflector is None:

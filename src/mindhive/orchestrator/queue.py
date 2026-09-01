@@ -214,13 +214,22 @@ class WorkStealingScheduler:
     called as ``repair(entry, lane)`` after a failure and answers whether the
     entry was re-queued. It must push the entry back onto ITS OWN lane; the
     scheduler does not move failed work between lanes, because a repair prompt is
-    composed against the lane's worktree."""
+    composed against the lane's worktree.
+
+    *on_success* is `repair`'s other half and exists because without it the
+    breaker behind `repair` only ever hears about failures: it can open and it
+    can never close, and a HALF_OPEN probe that SUCCEEDS is thrown away, so the
+    breaker's state records the worst the mission ever saw rather than where the
+    target stands now. Called as ``on_success(entry, lane)`` when a unit
+    validates. Its return value is ignored and an exception from it is swallowed
+    — crediting a recovery must never fail a unit that already passed."""
 
     def __init__(self, lanes, runner, repair=None, mission_id="",
-                 checkpoint_dir=None):
+                 checkpoint_dir=None, on_success=None):
         self.lanes = list(lanes or ())
         self.runner = runner
         self.repair = repair
+        self.on_success = on_success
         self.mission_id = str(mission_id or "")
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.completed: list = []
@@ -313,6 +322,13 @@ class WorkStealingScheduler:
                 pass
             if entry.state == VALIDATED:
                 self.completed.append(entry)
+                if self.on_success is not None:
+                    try:
+                        await _maybe_await(self.on_success(entry, lane))
+                    except Exception:                   # noqa: BLE001
+                        # A unit that passed has passed. Bookkeeping about that
+                        # success must not be able to turn it into a failure.
+                        pass
                 continue
             requeued = False
             if self.repair is not None:

@@ -867,7 +867,7 @@ in the record shows where it came from.
 
 ---
 
-## 27. The mission pipeline is built, but its decomposition and its payoff are both unmeasured
+## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
 
 `src/mindhive/orchestrator/` shipped on 2026-09-01 and closes all 22 open items from
 the PRD conformance sweep: `LintesterOrchestrator.execute_mission`, an `ast.NodeVisitor`
@@ -877,28 +877,107 @@ sandbox, a per-target circuit breaker, a closed repair loop, and `hive lintester
 `docs/designs/lintester-orchestrator.md` records the owner's override of the four
 "Explicitly NOT in scope" bullets that this contradicts.
 
-Three things are honestly still open.
+One thing is honestly still open; three are closed and kept here for their record.
 
-**Decomposition needs an agent, so a dry run shows one unit.** `execute_mission` calls
-`decompose.run` only when actually starting work; without a `decomposer` injected, a dry
-run answers the root task alone. That is deliberate — inventing subtasks locally would
-make the preview report a plan the real run would not produce — but it means the lane
-packing a dry run shows is the packing of one task, which is not much of a preview. A
-cheap local decomposer (split by cluster, say) would give the dry run something to show
-without lying, and does not exist.
+**CLOSED 2026-09-01 — a dry run now previews a split, and says it is a preview.**
+`lintester.preview_units` groups the repo files the intent itself names by
+`clusters.cluster_key` and answers one unit per directory. It invents nothing: the only
+input is a fact the intent already carried, and the units it makes are labelled
+`local-preview` on `Mission.decomposition`, which `as_dict` and `cli._print` both carry,
+so no reader can mistake the preview for what `decompose.run` would propose. Fewer than
+two directories is not a split and falls back to `root-only` rather than dressing one
+unit up as a decomposition. A preview unit also carries its OWN file set rather than
+letting `_files_for` re-read a description that still names the whole intent — otherwise
+every unit would claim every file, which is exactly what `clusters.shard_plan`'s
+ownership invariant exists to prevent. Measured on the real tree: the intent "add a retry
+to the ledger writer in src/mindhive/events.py and cover it in tests/test_events.py" now
+plans 2 units across 2 lanes at weights 1020 and 484, where it used to plan 1.
 
-**Nobody has measured whether the lanes help.** This is TODOS 23 one level up: 23 asks
-whether a brief helps one agent, and this asks whether weighted lanes plus stealing beat
-the incumbent `hive mindnet orchestrate`'s static waves on the same graph. `hive mindnet
-ab` is the harness for the first question; there is no harness for the second, and the
-answer is not obvious — stealing only pays when lane depths diverge.
+**MEASURED 2026-09-01 — the lanes do help, but not for the reason the PRD gives.**
+The harness that did not exist is `src/mindhive/orchestrator/payoff.py`, reachable as
+`hive lintester "<intent>" --payoff`. It simulates both policies on one unit set:
+the incumbent's frontier-plus-barrier with a dynamic pool inside each wave (faithful to
+`_run_wave`, which is `ThreadPoolExecutor` + `pool.map`, so workers really do pull), and
+`shard_plan`'s weighted lanes with LIFO-local / FIFO-steal (faithful to
+`WorkStealingScheduler`, down to the victim being the sibling with the most QUEUED
+entries — a count, not a weight).
 
-**The sandbox has never been exercised under a real kernel ceiling on this machine.**
-`import resource` is POSIX-only and this is Windows, so `run_sandboxed` reports
-`timeout-only` here and the two `setrlimit` tests skip. They run — and pass — on the WSL
-Ubuntu legs of the local CI stand-in, which is the only place they have ever run. GitHub
-Actions is billing-blocked, so no hosted runner has executed them.
+Three findings, all reproducible from the tests that pin them:
 
-**Cons of leaving it:** the mechanism is complete and green, and its central claim —
-that this schedules work better than static waves — rests on argument rather than
-measurement.
+* **Lanes win, over 4000 random dependency-free unit sets: sooner on 1528, later on 1,
+  level on 2471.** `tests/test_orchestrator_payoff.py` pins the losing set too, because
+  a harness that can only agree with its own design measures nothing.
+* **The win comes from ORDERING, not from stealing.** `frontier` sorts for determinism,
+  so a heavy unit late in the sort tails the whole wave — naive-order list scheduling,
+  bound `2 - 1/m`. `shard_plan` places the heaviest cluster first, bound `4/3`. Credit
+  the packer, not the thief.
+* **Stealing fired ZERO times across all 4000 runs** when the weight a lane is packed by
+  is also the duration it runs for. That is not dead code, it is code that can only pay
+  when the estimate is wrong — which is why the harness takes an `actual` duration map
+  apart from the weight. Feed it a wrong estimate and steals appear immediately.
+
+What is still NOT measured, and is the real open question: whether
+`calculate_workload_weight` predicts how long a child actually runs. Every number above
+inherits that assumption. Nothing in this repo records a real child's wall time against
+its estimated weight, so the divergence that decides whether stealing ever pays in
+practice is unknown.
+
+**CLOSED 2026-09-01 — the sandbox has now run under a real kernel ceiling.**
+`import resource` is POSIX-only and this is Windows, so `run_sandboxed` still reports
+`timeout-only` here and the two `setrlimit` tests still skip locally. They pass on the WSL
+Ubuntu legs, and — correcting what this entry said when it was written — GitHub Actions is
+no longer billing-blocked: run `33469713585` on PR #119 executed all nine jobs, ubuntu
+legs included, so a hosted runner has now exercised them.
+
+**Cons of leaving it:** the mechanism is complete, green, and now measured on the
+scheduling question. What no measurement here touches is whether the WEIGHT is any good
+— the harness scores a policy given an estimate, and the estimate itself has never been
+checked against a real child's wall time. That is the one open item above, and it is the
+one that matters.
+
+---
+
+## 28. The lane breaker is failure-only, so it can open but never close — FIXED
+
+Recorded from the review of `1022232`, which fixed six other findings in the same diff
+and left this one because closing it is a design change rather than a repair.
+
+**Fixed 2026-09-01.** `WorkStealingScheduler` takes an `on_success` hook and calls it
+where it marks an entry validated; `RepairLoop.succeeded` records the success against the
+same key `observe` records failures against, and `lintester.execute_mission` wires the
+two together. A target that failed and then passed is reported on `Mission.recoveries`,
+and `Mission.open_keys` reports what is still broken — separate fields, because "it broke
+once and recovered" and "it is still broken" are different facts. The description below
+stands as the record of what was wrong.
+
+`WorkStealingScheduler` calls its `repair` seam only on a failure. `RepairLoop.observe`
+is the only caller of `ToolCircuitBreaker.record` on that path, and it always passes
+`False` — grep it: `resilience.py:440` is `record(key, False, signature)` and there is no
+sibling. `queue.py:314` handles the `validated` case and tells nothing.
+
+So on the default lane path a breaker only ever hears about failures. Two consequences,
+and the second is the one that matters:
+
+* It can never return to `CLOSED`, because closing needs a recorded success.
+* After the cooldown, `allow()` promotes the key to `HALF_OPEN` and lets exactly one
+  probe out. If that probe SUCCEEDS, nothing records it — the breaker stays `HALF_OPEN`
+  and the key stays in `_probing`. The next `observe` clears it, because `record` runs
+  before `allow` there, so nothing wedges; but the success was still thrown away.
+
+`Guard.run` (`resilience.py:658`) does record both outcomes. It is simply not what the
+scheduler's default runner uses — `lintester._run_child` calls `mindnet.agent.run`
+directly.
+
+The fix is a success hook on the scheduler: where `queue.py` marks an entry `validated`,
+give `repair` (or a sibling seam) a chance to record it, so the breaker learns the target
+recovered. That is a new seam on a class the whole mission runs through, which is why it
+is written down rather than slipped into a fix commit.
+
+**Blast radius today is bounded**, which is why this is a TODO and not a P1: keys default
+to task ids, so one task's breaker cannot refuse another's, and `max_attempts=2` stops
+the retry loop before the breaker's thresholds usually matter. It bites when a key is
+made coarser — per-tool rather than per-task, which is what the PRD's "circuit breaker
+for sub-agent tool calls" actually describes.
+
+**Cons of leaving it:** a target that recovers is never credited for it, so the breaker's
+state is a record of the worst the mission ever saw rather than of where it stands.

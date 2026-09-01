@@ -471,3 +471,138 @@ def test_run_mission_forwards_the_checkpoint_dir_instead_of_raising(tmp_path):
                            checkpoint_dir=tmp_path / "cp",
                            decomposer=_two_units)
     assert got.outcome == "dry-run"
+
+
+def test_a_unit_that_fails_then_passes_is_reported_as_a_recovery(monkeypatch):
+    """End-to-end wiring of the breaker's success half.
+
+    The unit tests for `on_success` live in `test_orchestrator_queue.py` and
+    `test_orchestrator_resilience.py`; this one exists because both stayed green
+    with `lintester` passing `on_success=None` — the seam worked and nothing
+    used it. Asserted through the Mission report, which is what an operator
+    actually reads."""
+    monkeypatch.setattr(lint.wt_mod, "acquire_lanes",
+                        lambda root, n, mid="": [
+                            lint.wt_mod.LaneWorktree(lane_id=i, ok=True,
+                                                     path=f"lane-{i}")
+                            for i in range(n)])
+    monkeypatch.setattr(lint.wt_mod, "release_lanes", lambda root, trees: [])
+
+    tries = {}
+
+    def _flaky(entry, lane):
+        n = tries.get(entry.task_id, 0) + 1
+        tries[entry.task_id] = n
+        return n > 1          # fails once, then passes
+
+    got = lint.LintesterOrchestrator(
+        project="test", decomposer=_two_units, runner=_flaky,
+        max_attempts=3).execute_mission("x", dry_run=False)
+
+    assert got.outcome == "ok", got.failed
+    assert sorted(got.completed) == ["t-ledger", "t-worktree"]
+    assert got.recoveries, (
+        "a unit failed and then passed, and the report credited nothing — "
+        "the scheduler's success hook is not wired to the repair loop")
+    assert len(got.recoveries) == 2
+    assert got.open_keys == (), (
+        f"a recovered target is still reported as broken: {got.open_keys}")
+    assert tries == {"t-worktree": 2, "t-ledger": 2}
+
+
+# --- the local preview decomposer (TODOS 27a) ---------------------------------
+
+def _two_dir_repo(root):
+    """A repo whose files sit in two directories, so a split has something to
+    split on. Returns the intent naming one file from each."""
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "tests" / "unit").mkdir(parents=True)
+    (root / "src" / "pkg" / "writer.py").write_text(
+        "def write(x):\n    if x:\n        return 1\n    return 0\n",
+        encoding="utf-8")
+    (root / "tests" / "unit" / "test_writer.py").write_text(
+        "def test_write():\n    assert True\n", encoding="utf-8")
+    return ("retry the writer in src/pkg/writer.py and cover it in "
+            "tests/unit/test_writer.py")
+
+
+def test_a_dry_run_splits_the_intent_by_the_directories_it_names(repo):
+    """TODOS 27a. A dry run used to answer one unit whatever the intent said,
+    so the lane plan it printed could never be more than a placeholder."""
+    intent = _two_dir_repo(repo)
+    got = lint.LintesterOrchestrator(root=repo, project="test",
+                                     lanes=2).execute_mission(intent)
+
+    assert got.outcome == "dry-run"
+    assert got.decomposition == lint.PREVIEW
+    assert len(got.tasks) == 2, [t.task_id for t in got.tasks]
+
+
+def test_a_preview_unit_owns_only_its_own_directorys_files(repo):
+    """The ownership invariant, which is the whole reason the preview carries
+    its own file set instead of letting `_files_for` re-read a description that
+    still names the entire intent. Two lanes claiming one file is exactly what
+    `clusters.shard_plan` exists to prevent."""
+    intent = _two_dir_repo(repo)
+    got = lint.LintesterOrchestrator(root=repo, project="test",
+                                     lanes=2).execute_mission(intent)
+
+    owned = [set(t.files) for t in got.tasks]
+    assert all(owned), f"a preview unit owns no file at all: {owned}"
+    assert owned[0].isdisjoint(owned[1]), (
+        f"two units claim the same file: {owned}")
+    assert {len(o) for o in owned} == {1}, (
+        f"a unit was handed the whole intent's files, not its own: {owned}")
+
+
+def test_one_directory_is_not_a_split_and_is_not_reported_as_one(repo):
+    """The negative case that makes the one above mean something. With every
+    named file in one directory there is nothing to preview, and the mission
+    must say `root-only` rather than dress a single unit up as a split."""
+    (repo / "src").mkdir()
+    (repo / "src" / "a.py").write_text("a = 1\n", encoding="utf-8")
+    (repo / "src" / "b.py").write_text("b = 2\n", encoding="utf-8")
+    got = lint.LintesterOrchestrator(root=repo, project="test").execute_mission(
+        "touch src/a.py and src/b.py")
+
+    assert got.decomposition == lint.ROOT_ONLY
+    assert len(got.tasks) == 1
+
+
+def test_the_preview_never_stands_in_for_an_injected_decomposer(repo):
+    """A caller who supplied a decomposer gets that decomposer's split, and the
+    report says so. The preview is a fallback, never an override."""
+    got = lint.LintesterOrchestrator(root=repo, project="test",
+                                     decomposer=_two_units).execute_mission(
+        _two_dir_repo(repo))
+
+    assert got.decomposition == lint.INJECTED
+    assert sorted(t.task_id for t in got.tasks) == ["t-ledger", "t-worktree"]
+
+
+def test_the_split_source_reaches_the_operator(repo, capsys):
+    """A locally-derived preview reported as a real decomposition would be a
+    lie about what the run would produce, so it has to be legible in BOTH the
+    machine report and the printed one."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    got = lint.LintesterOrchestrator(root=repo, project="test",
+                                     lanes=2).execute_mission(
+        _two_dir_repo(repo))
+
+    assert got.as_dict()["decomposition"] == lint.PREVIEW
+    cli_mod._print(got)
+    assert lint.PREVIEW in capsys.readouterr().out
+
+
+def test_a_preview_unit_id_is_derived_from_its_directory(repo):
+    """Ids are read by people and used in paths, so `src/mindhive` may not
+    travel as itself."""
+    got = lint.LintesterOrchestrator(root=repo, project="test",
+                                     lanes=2).execute_mission(
+        _two_dir_repo(repo))
+
+    ids = sorted(t.task_id for t in got.tasks)
+    assert all(("/" not in i and "\\" not in i) for i in ids), ids
+    assert any(i.endswith("-src-pkg") for i in ids), ids
+    assert any(i.endswith("-tests-unit") for i in ids), ids

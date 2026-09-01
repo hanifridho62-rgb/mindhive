@@ -60,6 +60,16 @@ DEFAULT_LANES = 4
 # enumerated, and fanning fifty children at one repo is how a machine falls over.
 MAX_TASKS = 24
 
+# Where a mission's unit list came from. Reported on `Mission.decomposition`,
+# because the four are not the same claim and an operator reading a fan-out plan
+# is entitled to know which one they are looking at: a real split proposed by an
+# agent, a caller's own decomposer, a directory split this module derived from
+# the intent's own file paths, or no split at all.
+INJECTED = "injected"
+AGENT = "agent"
+PREVIEW = "local-preview"
+ROOT_ONLY = "root-only"
+
 DEFAULT_TIMEOUT_S = 900
 
 MUST_USE_LEAD = ("Skills the record says work here. Use them via the Skill tool "
@@ -162,13 +172,21 @@ class Mission:
     enforcement_reason: str = ""
     steals: int = 0
     reflections: tuple = ()
+    # A target that failed and then passed. Reported separately from
+    # `open_keys` because "it broke once and recovered" and "it is still broken"
+    # are different facts, and a report carrying only the first is the one that
+    # sends an operator hunting a fault that already cleared.
+    recoveries: tuple = ()
+    open_keys: tuple = ()
     dry_run: bool = True
+    decomposition: str = ROOT_ONLY
 
     def as_dict(self) -> dict:
         return {
             "intent": self.intent, "mission": self.mission_id,
             "outcome": self.outcome, "reason": self.reason,
             "dry_run": bool(self.dry_run),
+            "decomposition": self.decomposition,
             "enforcement": self.enforcement,
             "enforcement_reason": self.enforcement_reason,
             "steals": int(self.steals),
@@ -182,6 +200,8 @@ class Mission:
             "completed": list(self.completed), "failed": list(self.failed),
             "kept": list(self.kept),
             "reflections": list(self.reflections),
+            "recoveries": list(self.recoveries),
+            "open_keys": list(self.open_keys),
         }
 
 
@@ -190,6 +210,85 @@ def _clean(text) -> str:
         return str(text or "").strip()
     except (ValueError, TypeError):
         return ""
+
+
+def _unit(item) -> tuple:
+    """``(task_id, title, description, files_or_None)`` from a decomposer row.
+
+    A decomposer — injected, or `decompose.run` — answers three fields and lets
+    `_files_for` derive the rest from the description. The local preview answers
+    four, because its whole point is that each unit owns ONE directory:
+    re-deriving a preview unit's files from a description that still carries the
+    entire intent would hand every unit every file, and two lanes claiming the
+    same file is the exact thing `clusters.shard_plan` exists to prevent."""
+    row = tuple(item)
+    files = row[3] if len(row) > 3 else None
+    return (str(row[0]), str(row[1]), str(row[2]),
+            None if files is None else tuple(files))
+
+
+# The blank line between a preview unit's intent and its scope note. A named
+# constant rather than an inline escape: the description is composed inside a
+# nested f-string expression, where an escape is both hard to read and easy to
+# mangle into a syntax error.
+_PARA = """
+
+"""
+
+
+def _slug(text) -> str:
+    """A task-id-safe form of a cluster key. Ids are read by people and used in
+    paths, so `src/mindhive/orchestrator` may not travel as itself."""
+    out = "".join(c if (c.isalnum() or c == "-") else "-"
+                  for c in str(text).lower()).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out or "cluster"
+
+
+def preview_units(root_id, title, intent, files, root=None) -> list:
+    """One unit per directory the *intent*'s own file paths fall in.
+
+    Honest by construction, and that constraint is the whole design. A real run
+    asks `decompose.run`, which needs an agent; inventing subtasks locally and
+    letting them stand in for that agent's answer would make a dry run show a
+    plan the real run would never produce. So this splits on nothing but a fact
+    the intent already carries — the repo files it names — grouped by the same
+    `clusters.cluster_key` the lane packer packs by. The caller labels the
+    result `PREVIEW`, and `Mission.decomposition` carries that label out, so no
+    reader downstream can mistake it for what an agent proposed.
+
+    Fewer than two directories is not a split, and the caller falls back to the
+    root task alone rather than dressing a single unit up as a decomposition."""
+    from pathlib import Path
+
+    from .. import clusters as clusters_mod
+
+    base = Path(root) if root else Path.cwd()
+    try:
+        anchor = base.resolve()
+    except OSError:                                     # pragma: no cover - odd fs
+        return []
+    groups: dict = {}
+    for path in files or ():
+        try:
+            full = Path(path).resolve()
+            rel = full.relative_to(anchor).as_posix()
+        except (OSError, ValueError):
+            continue
+        groups.setdefault(clusters_mod.cluster_key(rel), {})[rel] = full.as_posix()
+    if len(groups) < 2:
+        return []
+    out = []
+    for key in sorted(groups):
+        members = groups[key]
+        # The description shows repo-relative paths because a person reads it;
+        # the file tuple carries the resolved ones because `_weigh` opens them.
+        out.append((f"{root_id}-{_slug(key)}", f"{title} [{key}]",
+                    _PARA.join((intent, f"This unit owns {key} only: "
+                                + ", ".join(sorted(members)))),
+                    tuple(members[k] for k in sorted(members))))
+    return out[:MAX_TASKS]
 
 
 @dataclass
@@ -230,21 +329,29 @@ class LintesterOrchestrator:
 
     # ---- decomposition ------------------------------------------------------
 
-    def _subtasks(self, root_id, title, intent, dry_run) -> list:
-        """``[(task_id, title, description)]`` for the units to run.
+    def _subtasks(self, root_id, title, intent, dry_run) -> tuple:
+        """``([(task_id, title, description, files)], source)`` for the units.
 
-        With an injected *decomposer*, that. Otherwise a real run asks
-        `decompose.run`, and a dry run answers the root task alone and says so —
-        decomposition needs an agent, and inventing subtasks locally would make a
-        dry run report a plan the real run would not produce."""
+        *files* is `None` on every row but the preview's — see `_unit`.
+
+        *source* names WHERE the split came from, and it is returned rather than
+        inferred because the four origins are not interchangeable: an injected
+        decomposer, the real `decompose.run` agent, the local preview below, or
+        no split at all. `Mission.decomposition` carries it out to the operator
+        so a preview can never be read as the agent's answer."""
         if self.decomposer is not None:
             try:
-                out = list(self.decomposer(root_id, title, intent) or ())
+                out = [_unit(u) for u
+                       in (self.decomposer(root_id, title, intent) or ())]
             except Exception:                           # noqa: BLE001
                 out = []
-            return out[:MAX_TASKS]
+            return out[:MAX_TASKS], INJECTED
         if dry_run:
-            return [(root_id, title, intent)]
+            units = preview_units(root_id, title, intent,
+                                  self._files_for(intent), self.root)
+            if units:
+                return units[:MAX_TASKS], PREVIEW
+            return [(root_id, title, intent, None)], ROOT_ONLY
         try:
             from ..mindnet import decompose as dec_mod
             graph = {root_id: AgentTask(task_id=root_id, title=title,
@@ -255,10 +362,10 @@ class LintesterOrchestrator:
         except Exception:                               # noqa: BLE001
             proposals = []
         if not proposals:
-            return [(root_id, title, intent)]
-        return [(str(p.task_id), str(p.title), str(getattr(p, "description", "")
-                                                   or p.title))
-                for p in proposals][:MAX_TASKS]
+            return [(root_id, title, intent, None)], ROOT_ONLY
+        return [(str(p.task_id), str(p.title),
+                 str(getattr(p, "description", "") or p.title), None)
+                for p in proposals][:MAX_TASKS], AGENT
 
     # ---- weighting and lane packing -----------------------------------------
 
@@ -429,16 +536,20 @@ class LintesterOrchestrator:
 
         mission_id = self._mission_id(text)
         root_id, title = self._name(text)
-        subtasks = self._subtasks(root_id, title, text, dry_run)
+        subtasks, split = self._subtasks(root_id, title, text, dry_run)
         if not subtasks:
             return Mission(intent=text, mission_id=mission_id, outcome="refused",
                            enforcement=enforcement, enforcement_reason=why,
+                           decomposition=split,
                            reason=("the graph is empty — decomposition produced "
                                    "no unit and the intent yielded none"))
 
         units = []
-        for tid, ttl, desc in subtasks:
-            files = self._files_for(desc)
+        for tid, ttl, desc, given in subtasks:
+            # A unit that came with its own file set keeps it. Only the preview
+            # does, and see `_unit` for why re-deriving those would collapse the
+            # split it just made.
+            files = self._files_for(desc) if given is None else given
             units.append((str(tid), str(ttl), str(desc), files,
                           self._weigh(str(tid), desc, files)))
 
@@ -480,7 +591,7 @@ class LintesterOrchestrator:
                                    "flag to fan agents at these lanes"),
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            enforcement=enforcement, enforcement_reason=why,
-                           dry_run=True)
+                           decomposition=split, dry_run=True)
 
         runnable = [(lid, ents, tree) for lid, ents, tree in lane_entries
                     if getattr(tree, "ok", False) and ents]
@@ -491,7 +602,7 @@ class LintesterOrchestrator:
                                    "reason"),
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            enforcement=enforcement, enforcement_reason=why,
-                           dry_run=False)
+                           decomposition=split, dry_run=False)
 
         breaker = res_mod.ToolCircuitBreaker()
         repair = res_mod.RepairLoop(breaker=breaker,
@@ -502,7 +613,10 @@ class LintesterOrchestrator:
                  for lid, ents, tree in runnable]
         scheduler = queue_mod.WorkStealingScheduler(
             lanes, self.runner or self._run_child, repair=repair,
-            mission_id=mission_id, checkpoint_dir=checkpoint_dir)
+            mission_id=mission_id, checkpoint_dir=checkpoint_dir,
+            # Both halves of the breaker, not just the failing one. `repair`
+            # alone made it failure-only: it could open and never close.
+            on_success=repair.succeeded)
         try:
             completed, failed = asyncio.run(scheduler.run())
         except KeyboardInterrupt:
@@ -519,7 +633,7 @@ class LintesterOrchestrator:
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            kept=tuple(r.reason for r in released if r.kept),
                            enforcement=enforcement, enforcement_reason=why,
-                           dry_run=False)
+                           decomposition=split, dry_run=False)
 
         released = wt_mod.release_lanes(self.root, trees)
         done = tuple(e.task_id for e in completed)
@@ -533,7 +647,9 @@ class LintesterOrchestrator:
             enforcement=enforcement, enforcement_reason=why,
             steals=int(scheduler.steals),
             reflections=tuple(str(r) for r in repair.reflections),
-            dry_run=False)
+            recoveries=tuple(str(r) for r in repair.recoveries),
+            open_keys=tuple(breaker.open_keys()),
+            decomposition=split, dry_run=False)
 
 
 def run_mission(intent, root=None, project=None, lanes=DEFAULT_LANES,

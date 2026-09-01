@@ -43,12 +43,46 @@ def cmd_lintester(args) -> int | None:
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
 
+    report = mission.as_dict()
+    scored = _payoff(mission) if getattr(args, "payoff", False) else None
+    if scored is not None:
+        report["payoff"] = scored.as_dict()
+
     if args.json:
-        print(json.dumps(mission.as_dict(), indent=2, sort_keys=True))
+        print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if mission.outcome in ("ok", "dry-run") else 1
 
     _print(mission)
+    if scored is not None:
+        _print_payoff(scored)
     return 0 if mission.outcome in ("ok", "dry-run") else 1
+
+
+def _payoff(mission):
+    """Score THIS mission's own units under both scheduling policies.
+
+    The units a mission plans carry no dependencies — `WorkStealingScheduler`
+    has no dependency model — so this measures the one thing that does differ:
+    the incumbent takes its batch in sort order, the lanes pack heaviest-first.
+    No `actual` is passed, so the durations are the estimates, and `payoff`'s
+    own docstring records what that costs: a perfect estimate is the case where
+    stealing can never fire."""
+    from . import payoff as payoff_mod
+
+    return payoff_mod.compare({t.task_id: int(t.weight) for t in mission.tasks},
+                              lanes=max(1, len(mission.lanes)))
+
+
+def _print_payoff(scored) -> None:
+    print(f"  payoff over {scored.units} unit(s): {scored.verdict}")
+    print(f"    static waves: makespan {scored.waves.makespan}, "
+          f"idle {scored.waves.idle}, "
+          f"{scored.waves.waves} wave(s) on {scored.waves.workers} worker(s)")
+    print(f"    weighted lanes: makespan {scored.lanes.makespan}, "
+          f"idle {scored.lanes.idle}, {scored.lanes.steals} steal(s) "
+          f"across {scored.lanes.workers} lane(s)")
+    if not scored.comparable:
+        print("    (not a like-for-like comparison — see the verdict)")
 
 
 def _print(mission) -> None:
@@ -59,7 +93,8 @@ def _print(mission) -> None:
     print(f"  fencing: {mission.enforcement}"
           + (f" ({mission.enforcement_reason})" if mission.enforcement_reason
              else ""))
-    print(f"  {len(mission.tasks)} unit(s) across {len(mission.lanes)} lane(s)")
+    print(f"  {len(mission.tasks)} unit(s) across {len(mission.lanes)} lane(s)"
+          f", split: {mission.decomposition}")
     for lane in mission.lanes:
         where = lane.get("worktree") or "(not isolated)"
         print(f"  lane {lane.get('lane')}: {len(lane.get('tasks', []))} unit(s) "
@@ -96,4 +131,7 @@ def register(subparsers) -> None:
                    help="emit the mission report as JSON")
     p.add_argument("--execute", action="store_true",
                    help="actually start sub-agents (default: plan only)")
+    p.add_argument("--payoff", action="store_true",
+                   help="also score this unit set under both scheduling "
+                        "policies (TODOS 27b)")
     p.set_defaults(func=cmd_lintester)
