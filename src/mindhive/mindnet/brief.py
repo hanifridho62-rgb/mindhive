@@ -264,7 +264,8 @@ BRIEF_EVENT_TYPES = ("skill_used", "invoke_result", "tool_failed", "next_step",
                      "sop", "mindnet_task")
 
 
-def wave_context(project=None, evs=None, root=None, wave=None) -> WaveContext:
+def wave_context(project=None, evs=None, root=None, wave=None,
+                 symbols=None) -> WaveContext:
     """Resolve everything a wave's briefs share. Total — answers a context whose
     fields are empty rather than raising.
 
@@ -314,13 +315,13 @@ def wave_context(project=None, evs=None, root=None, wave=None) -> WaveContext:
         tasks = dict(getattr(side, "tasks", {}) or {})
     except Exception:                                  # noqa: BLE001
         records, tasks = {}, {}
-    slice_text, gated = _symbol_slice(project, root)
+    slice_text, gated = _symbol_slice(project, root, symbols)
     return WaveContext(evs=rows, reco=reco, records=records, tasks=tasks,
                        project=project, symbols=slice_text, gated=gated,
                        wave=wave)
 
 
-def _symbol_slice(project=None, root=None):
+def _symbol_slice(project=None, root=None, want=None):
     """``(text, gated)`` for the repository's symbol index.
 
     ``gated`` names the sources that are switched OFF rather than empty, and it
@@ -353,9 +354,22 @@ def _symbol_slice(project=None, root=None):
     — while `Stats.symbols` reported 1 and the run reported success (`/review`,
     2026-08-29). The suite missed it because its only symbols-on test returned a
     bare string from a spy, so the fixture disagreed with the real contract."""
+    # *want* is the per-caller opt-in, and it is tri-state on purpose:
+    # ``None`` follows `MINDHIVE_SYMBOLS` exactly as this always has, ``True``
+    # opts THIS call in, ``False`` opts it out. It exists because the mission
+    # pipeline needs the slice for its own children and must not switch it on
+    # for anyone else: setting the env var inside a scheduler is visible to
+    # every concurrent lane AND to the parent process for as long as the
+    # mission runs, which is a global flag change dressed up as a local one.
+    #
+    # The gate order matters. `want is False` short-circuits before the env is
+    # consulted, so an explicit opt-OUT cannot be overridden by an operator's
+    # exported switch.
     try:
         from .. import symbols as sym_mod
-        if not sym_mod.enabled():
+        if want is False:
+            return "", ("symbols",)
+        if want is not True and not sym_mod.enabled():
             return "", ("symbols",)
         if root is None:
             return "", ("symbols",)

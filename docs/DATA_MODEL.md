@@ -35,6 +35,7 @@ the git main-repo directory name, normalized to a kebab-case slug
 | `harvest_state.json`      | Cursor: which transcript lines were already harvested. | `harvest` | no (cursor) |
 | `pending_review.json`, `pending_changelog.json` | Sidecar gates: files awaiting thermo-review / a mandatory change-log entry. | `review`, `changelog` | self-healing |
 | `chroma/`                 | Optional vector index for `--semantic` recall. | `vectors.embed` | yes |
+| `orchestrator_memory.json` | Projection: the resolution set a lintester mission's breaker triggered, folded from `incidents.summaries`. The ledger stays the source of truth; delete this and `orchestrator.resilience.remember` rebuilds it byte-identically. | `orchestrator.resilience.remember` | yes |
 
 The auto-loaded memory file lives OUTSIDE the store:
 `~/.claude/projects/<encoded-folder>/memory/MEMORY.md`, composed by

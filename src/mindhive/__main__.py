@@ -3976,6 +3976,10 @@ def _build_parser() -> argparse.ArgumentParser:
     from . import clusterscli as clusterscli_mod
     clusterscli_mod.register(sub)
 
+    # --- lintester --- the same trade; the mission pipeline's front door.
+    from .orchestrator import cli as lintester_cli
+    lintester_cli.register(sub)
+
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")
     sp.add_argument("--folder", default=None,

@@ -864,3 +864,41 @@ under a heading that names the author. At minimum, add a per-source breakdown to
 
 **Cons of leaving it:** the swarm can teach itself something an attacker wrote once, and nothing
 in the record shows where it came from.
+
+---
+
+## 27. The mission pipeline is built, but its decomposition and its payoff are both unmeasured
+
+`src/mindhive/orchestrator/` shipped on 2026-09-01 and closes all 22 open items from
+the PRD conformance sweep: `LintesterOrchestrator.execute_mission`, an `ast.NodeVisitor`
+cyclomatic metric, `git log --numstat` churn, an asyncio work-stealing scheduler with a
+per-lane resume checkpoint, `.worktrees/lane-N` isolation, a POSIX-guarded `setrlimit`
+sandbox, a per-target circuit breaker, a closed repair loop, and `hive lintester`.
+`docs/designs/lintester-orchestrator.md` records the owner's override of the four
+"Explicitly NOT in scope" bullets that this contradicts.
+
+Three things are honestly still open.
+
+**Decomposition needs an agent, so a dry run shows one unit.** `execute_mission` calls
+`decompose.run` only when actually starting work; without a `decomposer` injected, a dry
+run answers the root task alone. That is deliberate — inventing subtasks locally would
+make the preview report a plan the real run would not produce — but it means the lane
+packing a dry run shows is the packing of one task, which is not much of a preview. A
+cheap local decomposer (split by cluster, say) would give the dry run something to show
+without lying, and does not exist.
+
+**Nobody has measured whether the lanes help.** This is TODOS 23 one level up: 23 asks
+whether a brief helps one agent, and this asks whether weighted lanes plus stealing beat
+the incumbent `hive mindnet orchestrate`'s static waves on the same graph. `hive mindnet
+ab` is the harness for the first question; there is no harness for the second, and the
+answer is not obvious — stealing only pays when lane depths diverge.
+
+**The sandbox has never been exercised under a real kernel ceiling on this machine.**
+`import resource` is POSIX-only and this is Windows, so `run_sandboxed` reports
+`timeout-only` here and the two `setrlimit` tests skip. They run — and pass — on the WSL
+Ubuntu legs of the local CI stand-in, which is the only place they have ever run. GitHub
+Actions is billing-blocked, so no hosted runner has executed them.
+
+**Cons of leaving it:** the mechanism is complete and green, and its central claim —
+that this schedules work better than static waves — rests on argument rather than
+measurement.

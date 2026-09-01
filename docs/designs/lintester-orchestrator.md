@@ -183,6 +183,47 @@ Then measure whether briefed agents actually do better work, and only then open 
 - `pybreaker` or any runtime dependency. `pyproject.toml:6` is `dependencies = []` deliberately.
 - B4 (`--numstat` churn) and E4 (dashboard panel) — deferred to TODOS, not rejected.
 
+### OVERRIDDEN by the owner, 2026-09-01
+
+The five bullets above stay exactly as written, because the reasoning is what
+makes the override reviewable. A conformance sweep against the real tree found
+22 of the original PRD's 27 items open (6 partial, 16 absent), and the owner
+overrode the first four after reading it. What shipped is
+`src/mindhive/orchestrator/`, and it is honest about each objection rather than
+silent about it:
+
+- **The package.** Overridden. The stated reason — six proposed modules have
+  shipped incumbents — was correct and still is, so every module in the package
+  DELEGATES: `metrics` to `clusters` and `mindnet.telemetry`, `worktree` to
+  `mindnet.worktree.add` / `retire`, `resilience` to
+  `loop.safeguards.CircuitBreaker`, `lintester` to `autodeclare` / `decompose` /
+  `brief`. Nothing is forked, deleted, or bypassed.
+  `tests/test_orchestrator_worktree.py::test_the_git_calls_belong_to_the_incumbent_not_this_module`
+  fails if that ever stops being true.
+- **The work-stealing queue.** Overridden, with the objection adopted as an
+  invariant rather than argued with: an entry is stealable ONLY while its state
+  is `queued`, and `WorkerLane.take` makes the pop and the running transition one
+  critical section. A child holding a written stdin is never stolen from,
+  because its entry left the queue before the write.
+  `tests/test_orchestrator_queue.py::test_a_running_entry_is_never_stolen` is
+  the guard. The `orchestrator.py:29-35` rejection of asyncio for the WAVE
+  RUNNER stands untouched — that runner is still a thread pool, and the new
+  event loop reaches blocking children through `run_in_executor`.
+- **The `setrlimit` sandbox.** Overridden and POSIX-guarded. `import resource`
+  still fails on this machine, so `run_sandboxed` reports `enforcement` as
+  `kernel` or `timeout-only` with a reason, and the Windows leg of the suite
+  ASSERTS the degradation rather than skipping. A sandbox that reported success
+  while enforcing nothing would be worse than none.
+- **`pybreaker` / any runtime dependency.** NOT overridden. `pyproject.toml:6`
+  is still `dependencies = []`; the breaker is the one already in
+  `loop/safeguards.py`, and everything new is stdlib.
+- **B4 (`--numstat` churn).** Built, in `orchestrator/metrics.py`, alongside a
+  real `ast.NodeVisitor` cyclomatic count. `clusters.git_churn` and
+  `clusters.file_complexity` are unchanged and still right for their caller.
+  **E4 (dashboard panel)** stays deferred — the owner's list did not include it.
+
+Plan: `docs/plans/2026-09-01-001-feat-lintester-orchestrator-full-prd-plan.md`.
+
 ---
 
 ## Trust boundary (accepted risk)

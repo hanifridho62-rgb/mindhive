@@ -131,7 +131,7 @@ def path_for(root, task_id) -> Path:
     return Path(root).joinpath(*WORKTREE_DIR) / f"{PREFIX}-{task_id}"
 
 
-def add(root, task_id) -> Isolated:
+def add(root, task_id, path=None, branch=None) -> Isolated:
     """Create an isolated checkout for *task_id*, or answer why not.
 
     Idempotent in the direction that matters: an existing directory is REFUSED
@@ -140,17 +140,27 @@ def add(root, task_id) -> Isolated:
     that work. Refusing makes the operator look, which is the only safe option
     when the alternatives are "silently wrong" and "silently destructive".
 
+    *path* and *branch* override the task-keyed defaults, and exist for exactly
+    one caller: `orchestrator.worktree`, whose PRD spells its checkouts
+    `.worktrees/lane-N` rather than `.claude/worktrees/mn9-<task>`. They are
+    optional, they default to the derivations this module has always used, and
+    every existing caller passes positionally — so nothing about the incumbent
+    behaviour moves. The alternative was a second module issuing its own `git
+    worktree add`, which would have to re-derive the two rules below that keep
+    committed work reachable, and would drift from them the first time one
+    changed.
+
     Serialised against every other call into this module — see `_GIT_LOCK`."""
     with _GIT_LOCK:
-        return _add(root, task_id)
+        return _add(root, task_id, path, branch)
 
 
-def _add(root, task_id) -> Isolated:
+def _add(root, task_id, path=None, branch=None) -> Isolated:
     """`add`'s body. Split out only so the lock's extent is one readable line
     rather than an indent wrapping fifty."""
     tid = str(task_id)
-    target = path_for(root, tid)
-    branch = branch_for(tid)
+    target = Path(path) if path else path_for(root, tid)
+    branch = str(branch) if branch else branch_for(tid)
 
     if target.exists():
         return Isolated(task_id=tid, path=str(target), branch=branch, ok=False,
