@@ -129,8 +129,13 @@ def validate_stored(payload) -> None:
             f"{VERIFIED_BY!r} — nothing else may record a mechanical run")
 
 
-def _stream(argv, echo: bool, emit=None):
+def _stream(argv, echo: bool, emit=None, env=None):
     """Run *argv* and return ``(exit_code, output, error)``.
+
+    *env* replaces the child's environment wholesale when given, and ``None``
+    means inherit. The caller builds it — `selftest` points `PYTHONPATH` at the
+    checkout under test — because this function knows nothing about which
+    source tree the command is meant to import.
 
     Line-streamed rather than captured wholesale so a four-minute suite still
     prints as it goes; the buffer is what becomes the artifact. argv list only
@@ -145,6 +150,7 @@ def _stream(argv, echo: bool, emit=None):
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, ValueError) as e:
@@ -189,7 +195,7 @@ def _stream(argv, echo: bool, emit=None):
 
 
 def run_and_record(argv=None, project=None, root=None, echo: bool = True,
-                   emit=None) -> dict:
+                   emit=None, env=None) -> dict:
     """Run a test command, record the result, return
     ``{exit_code, counts, error, artifact, excerpt}``.
 
@@ -197,7 +203,7 @@ def run_and_record(argv=None, project=None, root=None, echo: bool = True,
     artifact. Never raises for a failing or missing command — a failure is a
     result to record, not an exception to hide."""
     cmd = list(argv) if argv else default_argv(root)
-    code, output, error = _stream(cmd, echo, emit)
+    code, output, error = _stream(cmd, echo, emit, env=env)
     counts = parse_summary(output)
     excerpt = output.strip()[:runlog.EXCERPT_CHARS]
 

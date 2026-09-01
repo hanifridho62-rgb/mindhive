@@ -16,13 +16,78 @@ silence; `verify._stream` echoes while it buffers.
 the server's stdout is not where that person is looking. Both are line-by-line
 for the same reason — the alternative is a pane that stays empty for four minutes
 and then fills all at once.
+
+## Which checkout gets tested
+
+`mindhive` is installed EDITABLE against the main checkout, so
+``Path(__file__).resolve().parents[2]`` resolves THERE whichever worktree the
+operator is standing in. Taking the root from that was a false green, which is
+the worst kind of wrong answer: `hive selftest` on a feature branch collected the
+main checkout's tests, passed, and said so, while the branch's own tests were
+never executed.
+
+So the root comes from `paths.worktree_root` — the git worktree the operator is
+actually in — and the packaged location is the fall-back for the two cases where
+that answers nothing useful: outside a repository, and inside one that is not a
+MindHive checkout (`hive` is on PATH everywhere, and pointing pytest at a
+stranger's `tests/` is a worse failure than running the packaged suite).
+
+`PYTHONPATH` moves with it, and that is not a separate nicety. Collecting the
+branch's tests while the child still imports the editable install is the same
+false green one layer down: the branch's assertions would run against the main
+checkout's code.
 """
+import os
 from pathlib import Path
 
-from . import verify
+from . import paths, verify
 
 
-def run(emit=None, echo: bool = True) -> dict:
+def packaged_root() -> Path:
+    """The checkout this module was installed from. The fall-back, never the
+    default — under an editable install it is the MAIN checkout regardless of
+    where the operator is."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _is_checkout(root) -> bool:
+    """Whether *root* holds both halves of a MindHive checkout.
+
+    Both, not either: a directory with a `tests/` and no `src/mindhive` is
+    somebody else's repository, and running its suite under this command's name
+    would report their result as ours."""
+    try:
+        base = Path(root)
+        return (base / "tests").is_dir() and (base / "src" / "mindhive").is_dir()
+    except (OSError, TypeError, ValueError):            # pragma: no cover - odd fs
+        return False
+
+
+def suite_root(cwd=None) -> Path:
+    """The checkout whose suite this run should collect."""
+    here = paths.worktree_root(cwd)
+    if here is not None and _is_checkout(here):
+        return Path(here)
+    return packaged_root()
+
+
+def child_env(root):
+    """The environment the child runs in, or ``None`` to inherit unchanged.
+
+    Prepended rather than assigned: whatever the operator put on `PYTHONPATH` is
+    still theirs, and the checkout under test only has to win the lookup.
+    ``None`` when there is no `<root>/src` to point at — a wheel install has
+    none, and inventing one would break the import this exists to fix."""
+    src = Path(root) / "src"
+    if not src.is_dir():
+        return None
+    env = dict(os.environ)
+    prior = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(src) + ((os.pathsep + prior) if prior else "")
+    return env
+
+
+def run(emit=None, echo: bool = True, cwd=None) -> dict:
     """Run the suite, record the run, and return verify's full result.
 
     Returns the whole dict rather than just the exit code: the caller that reports
@@ -30,5 +95,6 @@ def run(emit=None, echo: bool = True) -> dict:
     that is actually useful. `cmd_selftest` takes `exit_code` back out of it for
     the process status.
     """
-    root = Path(__file__).resolve().parents[2]
-    return verify.run_and_record(verify.default_argv(root), emit=emit, echo=echo)
+    root = suite_root(cwd)
+    return verify.run_and_record(verify.default_argv(root), emit=emit,
+                                 echo=echo, env=child_env(root))
