@@ -396,10 +396,30 @@ def derive_active(auto_section: str, human_section: str):
     return "", "none"
 
 
+# How many contributing session ids the frontmatter carries. Bounded because a
+# signature hit by hundreds of sessions would otherwise put a kilobyte of ids in
+# a header nobody reads — and because `sessions:` already carries the TRUE count,
+# a reader can tell a complete list from a truncated one by comparing the two.
+# That comparison is what lets `advice.resolve_constraints` fail open rather than
+# withhold a record on a partial view of who wrote it.
+MAX_SESSION_IDS = 20
+
+
 def _render(signature, rec, status, auto_body, human_body, active, source, flag="") -> str:
     actions = "\n".join(f"- `{a}`" for a in rec["actions"][:5]) or "- (unknown)"
     sessions = ", ".join(rec["sessions"][:5]) + (
         f" (+{len(rec['sessions']) - 5})" if len(rec["sessions"]) > 5 else "")
+    # The ids themselves, not just how many. The body's "Sample sessions" line has
+    # carried them since this file was written, but it is prose in a section a
+    # parser has no contract with — and `summaries()` dropped them entirely, so
+    # nothing downstream could ask WHO produced a failure. `advice` needs that to
+    # tell a constraint distilled from a human's failures from one an injected
+    # agent manufactured (TODOS 26).
+    #
+    # A NEW key. `sessions:` keeps its meaning — an int the dashboard's
+    # Improvements view reads — because changing a live consumer's type to serve
+    # a new reader breaks the old one.
+    session_ids = ", ".join(rec["sessions"][:MAX_SESSION_IDS])
     active_body = f"> {active}" if active else "> (none yet)"
     return f"""---
 signature: {signature}
@@ -408,6 +428,7 @@ occurrences: {rec['occurrences']}
 rule_source: {source}
 flag: {flag}
 sessions: {len(rec['sessions'])}
+session_ids: {session_ids}
 ---
 
 # Incident: {signature}
@@ -657,7 +678,20 @@ def demote(signature, project=None) -> dict:
     return {"demoted": True}
 
 
-_FM_KEYS = ("signature", "status", "occurrences", "rule_source", "flag", "sessions")
+_FM_KEYS = ("signature", "status", "occurrences", "rule_source", "flag",
+            "sessions", "session_ids")
+
+
+def _id_list(value) -> list:
+    """A comma-separated frontmatter value as a list of ids. Total.
+
+    `_frontmatter` coerces an all-digit value to `int`, so a record whose only
+    contributing session id was numeric arrives here as a number rather than a
+    string — hence the `str()` rather than a `.split` on whatever was decoded."""
+    try:
+        return [p for p in (s.strip() for s in str(value or "").split(",")) if p]
+    except (ValueError, TypeError):
+        return []
 
 
 def _frontmatter(text: str) -> dict:
@@ -862,6 +896,13 @@ def summaries(project=None, include_expired=False) -> list:
             # innerHTML unescaped or break the occurrences sort (int vs str).
             "occurrences": _as_int(fm.get("occurrences")),
             "sessions": _as_int(fm.get("sessions")),
+            # The ids behind that count, bounded by `MAX_SESSION_IDS`. EMPTY for
+            # every record written before this key existed, which is the honest
+            # answer — authorship was not captured then, and a consumer must not
+            # read "no ids" as "no human wrote this". `sessions` above is the
+            # true count, so a reader can tell a complete list from a truncated
+            # or absent one by comparing lengths.
+            "session_ids": _id_list(fm.get("session_ids")),
             "rule_source": source,
             "flag": fm.get("flag", ""),
             "excerpt": _raw_excerpt(secs.get("Raw Signal", "")),

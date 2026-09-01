@@ -127,11 +127,29 @@ def _rows(task_id=None, project=None):
 
 
 def _describe(stats) -> str:
-    """One line of counts, with the gated sources named rather than shown as 0."""
+    """One line of counts, with the gated sources named rather than shown as 0.
+
+    `failures`, `dropped` and `authored` print ONLY when non-zero, unlike the
+    four counts above. They are exceptions rather than measurements — a
+    permanent `dropped=0  authored=0` on every line would train the operator to
+    skim past exactly the segment that matters on the day it is not zero, which
+    is the same argument the module docstring makes about an empty fence.
+
+    The `--json` branch carries them unconditionally, because a machine reader
+    wants the key present rather than having to tell "absent" from "zero"."""
     parts = [f"skills={stats.skills}", f"sops={stats.sops}",
              f"constraints={stats.constraints}", f"symbols={stats.symbols}"]
     if stats.gated:
         parts.append("gated=" + ",".join(stats.gated))
+    failures = tuple(getattr(stats, "failures", ()) or ())
+    if failures:
+        parts.append("failed=" + ",".join(failures))
+    dropped = int(getattr(stats, "dropped", 0) or 0)
+    if dropped:
+        parts.append(f"dropped={dropped}")
+    authored = int(getattr(stats, "authored", 0) or 0)
+    if authored:
+        parts.append(f"withheld={authored}")
     return "  ".join(parts)
 
 
@@ -159,6 +177,10 @@ def cmd_brief(args) -> int | None:
         print(json.dumps({
             "enabled": br_mod.enabled(),
             "gated": list(ctx.gated),
+            # Context-level, beside `gated` and for the same reason: an operator
+            # asking "why is every brief empty" needs to know the sidecar threw
+            # before they go looking at the tasks.
+            "failures": list(getattr(ctx, "failures", ()) or ()),
             # An OBJECT keyed by task id, matching `mindnet list --json`. An array
             # under the same key name in the same command family is two shapes one
             # consumer has to tell apart at runtime.
@@ -169,6 +191,9 @@ def cmd_brief(args) -> int | None:
                 "skills": b.stats.skills, "sops": b.stats.sops,
                 "constraints": b.stats.constraints, "symbols": b.stats.symbols,
                 "gated": list(b.stats.gated),
+                "failures": list(getattr(b.stats, "failures", ()) or ()),
+                "dropped": int(getattr(b.stats, "dropped", 0) or 0),
+                "authored": int(getattr(b.stats, "authored", 0) or 0),
                 "empty_reason": b.stats.empty_reason,
                 "text": b.text if getattr(args, "verbose", False) else None,
             } for t, b in rows},

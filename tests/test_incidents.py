@@ -704,3 +704,100 @@ def test_project_with_evs_matches_fresh_read(tmp_path, monkeypatch):
     incidents.project(project="test", threshold=2, evs=evs)
     assert incidents.load("pymodule:evs", project="test") == fresh
     assert fresh["status"] == "active"
+
+
+# --- TODOS 26: who produced a failure, not just how many did ------------------
+#
+# `_collect` has always built a `sessions[]` list of ids, and the record body has
+# always printed a "Sample sessions" line. But that line is prose in a section no
+# parser has a contract with, and `summaries()` returned only the COUNT — so
+# nothing downstream could ask WHO produced a failure. `advice.resolve_constraints`
+# needs that to tell a constraint distilled from a human's failures from one an
+# injected agent manufactured.
+
+def test_a_record_carries_the_ids_behind_its_session_count(tmp_path):
+    _add_failure("pyexc:Widget", "python w.py", "s1")
+    _add_failure("pyexc:Widget", "python w.py", "mn9-t4")
+    incidents.project(project="test", threshold=2)
+
+    rec = incidents.load("pyexc:Widget", project="test")
+    assert "session_ids" in rec, "the frontmatter carries no authorship at all"
+    assert "s1" in str(rec["session_ids"])
+    assert "mn9-t4" in str(rec["session_ids"])
+
+
+def test_summaries_reads_the_ids_back_as_a_list(tmp_path):
+    _add_failure("pyexc:Widget", "python w.py", "s1")
+    _add_failure("pyexc:Widget", "python w.py", "mn9-t4")
+    incidents.project(project="test", threshold=2)
+
+    rows = [r for r in incidents.summaries(project="test")
+            if r["signature"] == "pyexc:Widget"]
+    assert rows, "the record vanished from summaries()"
+    # As a SET: `_collect` folds whatever order the reader delivers, and two
+    # failures stamped inside the same second have no defined order between
+    # them. Nothing downstream reads position — `agent_authored_incident` asks
+    # whether ANY contributor was human — so asserting an order would pin a
+    # detail the code does not promise and does not owe.
+    assert set(rows[0]["session_ids"]) == {"s1", "mn9-t4"}
+
+
+def test_the_existing_session_count_keeps_its_type(tmp_path):
+    """`sessions` is an INT the dashboard's Improvements view reads. Changing a
+    live consumer's type to serve a new reader breaks the old one, so the ids
+    went into a NEW key instead."""
+    _add_failure("pyexc:Widget", "python w.py", "s1")
+    _add_failure("pyexc:Widget", "python w.py", "s2")
+    incidents.project(project="test", threshold=2)
+
+    rows = [r for r in incidents.summaries(project="test")
+            if r["signature"] == "pyexc:Widget"]
+    assert rows[0]["sessions"] == 2
+    assert isinstance(rows[0]["sessions"], int)
+
+
+def test_a_record_written_before_this_key_existed_still_reads(tmp_path):
+    """Every incident file already on disk. It must parse, and it must report an
+    EMPTY id list rather than raising or inventing one — absent authorship is
+    unknown authorship, and `advice` reads that as human."""
+    _add_failure("pyexc:Widget", "python w.py", "s1")
+    _add_failure("pyexc:Widget", "python w.py", "s2")
+    incidents.project(project="test", threshold=2)
+
+    path = list((paths.project_dir("test") / "rules" / "incidents").glob("*.md"))[0]
+    body = "\n".join(ln for ln in path.read_text(encoding="utf-8").splitlines()
+                     if not ln.startswith("session_ids:"))
+    path.write_text(body, encoding="utf-8")
+
+    rows = [r for r in incidents.summaries(project="test")
+            if r["signature"] == "pyexc:Widget"]
+    assert rows, "a record written before the key existed stopped parsing"
+    assert rows[0]["session_ids"] == []
+    assert rows[0]["sessions"] == 2, "the pre-existing count was lost too"
+
+
+def test_the_stored_id_list_is_bounded_and_the_count_stays_true(tmp_path):
+    """The truncation `advice.agent_authored_incident` fails open on. The list
+    is capped; `sessions` is not — so comparing the two tells a complete list
+    from a partial one, which is what makes failing open decidable rather than a
+    guess."""
+    total = incidents.MAX_SESSION_IDS + 5
+    for i in range(total):
+        _add_failure("pyexc:Widget", "python w.py", f"s{i}")
+    incidents.project(project="test", threshold=2)
+
+    rows = [r for r in incidents.summaries(project="test")
+            if r["signature"] == "pyexc:Widget"]
+    assert len(rows[0]["session_ids"]) == incidents.MAX_SESSION_IDS
+    assert rows[0]["sessions"] == total
+    assert rows[0]["sessions"] > len(rows[0]["session_ids"]), (
+        "a truncated list is indistinguishable from a complete one")
+
+
+def test_the_id_parser_is_total(tmp_path):
+    """`_frontmatter` coerces an all-digit value to `int`, so a record whose only
+    contributing session id was numeric arrives as a number rather than a string."""
+    assert incidents._id_list(None) == []
+    assert incidents._id_list("") == []
+    assert incidents._id_list(12345) == ["12345"]
+    assert incidents._id_list("a, b ,, c") == ["a", "b", "c"]

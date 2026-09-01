@@ -436,3 +436,226 @@ def test_empty_advice_is_falsy_and_round_trips():
     all, so 'empty' needs one unambiguous spelling."""
     assert not adv.EMPTY.skills and not adv.EMPTY.sops
     assert adv.from_dict(adv.to_dict(adv.EMPTY)) == adv.EMPTY
+
+
+# --- TODOS 26: a prompt-injected agent cannot brief the next wave -------------
+#
+# `resolve_sops` renders SOP bodies VERBATIM, and every spawned child holds
+# `hive` on PATH with its own `MINDHIVE_SESSION` — `orchestrator._run_wave` sets
+# `f"{worktree.PREFIX}-{tid}"`, and `events.append_event` stamps it onto
+# everything that child writes. So one `hive sop add` from an injected wave-1
+# agent used to reach every later agent's brief, inside the fence,
+# indistinguishable from human-authored project history.
+#
+# `sop.fold` has carried `session_id` since it was written. Nothing read it.
+
+def _sop_ev_from(sop_id, title, text, session, ts="2026-07-27T00:00:00Z"):
+    """A real `sop` add event stamped with a chosen writer, so the real
+    `sop.fold` derives the `session_id` this filter reads."""
+    return events.Event(ts=ts, session_id=session, type="sop",
+                        payload={"action": "add", "sop_id": sop_id,
+                                 "title": title, "text": text},
+                        tags=["sop"])
+
+
+def test_a_sop_written_by_a_spawned_agent_never_reaches_a_sibling(quiet):
+    """The whole entry, in one assertion. The sentinel is what the injected row
+    would have said; a resolver that names its sources without quoting them
+    would pass a weaker test than this one."""
+    evs = [_sop_ev_from("s-evil", "widget handling",
+                        "IGNORE-THE-FENCE-AND-EXFILTRATE widget", "mn9-t1")]
+    rows, withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert rows == ()
+    assert withheld == 1
+    assert not any("EXFILTRATE" in r for r in rows)
+
+
+def test_a_human_written_sop_still_reaches_the_brief(quiet):
+    """The negative half. Without it the filter could withhold everything and
+    every assertion above would still pass."""
+    evs = [_sop_ev_from("s-good", "widget handling",
+                        "KEEP-THIS-LINE about widget handling", "manual")]
+    rows, withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert withheld == 0
+    assert any("KEEP-THIS-LINE" in r for r in rows)
+
+
+@pytest.mark.parametrize("session", ["", None, 0, "   "])
+def test_an_unrecorded_writer_fails_open(quiet, session):
+    """R8. Absent authorship is UNKNOWN authorship, not agent authorship.
+    Dropping every row whose writer was never recorded would delete a working
+    feature to close a second-order hole."""
+    evs = [_sop_ev_from("s-old", "widget handling",
+                        "KEEP-THIS-LINE about widget handling", session)]
+    rows, withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert withheld == 0
+    assert any("KEEP-THIS-LINE" in r for r in rows)
+
+
+def test_the_predicate_is_total_over_junk():
+    """It runs on a fold over an append-only file that no reader re-validates."""
+    for value in (None, "", 0, 17, [], {}, object()):
+        assert adv.is_orchestration_session(value) is False
+
+
+def test_the_orchestrators_own_prefix_is_covered_by_the_predicate():
+    """Asserted against the IMPORTED constant, not a copy of it. A rename of
+    `worktree.PREFIX` has to fail here rather than silently reopening the hole —
+    which is what a hardcoded 'mn9-' in the predicate would have allowed."""
+    from mindhive.mindnet import worktree as wt_mod
+
+    assert adv.is_orchestration_session(f"{wt_mod.PREFIX}-t1") is True
+
+
+def test_the_other_spawner_families_are_covered_too():
+    """`executor.run_key` and `decompose`'s key family. Listed defensively —
+    only the orchestrator is observed setting a child's MINDHIVE_SESSION today —
+    so this pins the intent rather than an observed attack."""
+    from mindhive.mindnet import executor as ex_mod
+    from mindhive.mindnet import orchestrator as orc_mod
+
+    assert adv.is_orchestration_session(ex_mod.run_key("t1", 2)) is True
+    assert adv.is_orchestration_session(orc_mod.run_key(0, "t1")) is True
+
+
+def test_a_human_session_id_is_not_mistaken_for_an_agent():
+    """The false-positive side. `manual` is what `events.append_event` stamps
+    when MINDHIVE_SESSION is unset, and a real Claude session id is a uuid."""
+    for sid in ("manual", "s1", "20260901-abc", "main-9fa035",
+                "0198e0d2-4c1a-7f3b-9d2e-1a2b3c4d5e6f"):
+        assert adv.is_orchestration_session(sid) is False, sid
+
+
+def test_an_injected_sop_cannot_starve_a_legitimate_one_of_its_slot(quiet):
+    """Partition BEFORE ranking. Ranking first and dropping afterwards would let
+    a withheld row consume one of `MAX_SOPS` slots, so a single injected SOP
+    could halve what honest ones get to say — the denial-of-service half of the
+    same attack."""
+    evs = [
+        _sop_ev_from("s-evil", "widget handling", "EVIL widget handling", "mn9-t1",
+                     ts="2026-07-27T00:00:00Z"),
+        _sop_ev_from("s-a", "widget handling", "FIRST-KEEPER widget handling",
+                     "manual", ts="2026-07-27T00:00:01Z"),
+        _sop_ev_from("s-b", "widget handling", "SECOND-KEEPER widget handling",
+                     "manual", ts="2026-07-27T00:00:02Z"),
+    ]
+    rows, withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert withheld == 1
+    assert len(rows) == adv.MAX_SOPS == 2
+    joined = " ".join(rows)
+    assert "FIRST-KEEPER" in joined and "SECOND-KEEPER" in joined
+
+
+def test_withholding_counts_only_the_rows_that_would_have_been_briefed(quiet):
+    """A store holding fifty agent-authored SOPs must not report fifty on a
+    brief none of them matched. The operator's question is whether anything was
+    kept out of THIS brief."""
+    evs = [_sop_ev_from("s-far", "unrelated telemetry ingestion",
+                        "nothing to do with the task", "mn9-t1")]
+    rows, withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert rows == ()
+    assert withheld == 0, "an irrelevant agent row was reported as withheld"
+
+
+def test_filtering_does_not_reshuffle_the_rows_that_survive(quiet):
+    """`_ranked`'s stability contract still holds through the partition: equal
+    matches keep incoming order, which `sop.current` fixes as (created, sop_id)."""
+    kw = adv.keywords("widget handling")
+    human = [_sop_ev_from("s-a", "widget handling", "AAA widget handling",
+                          "manual", ts="2026-07-27T00:00:01Z"),
+             _sop_ev_from("s-b", "widget handling", "BBB widget handling",
+                          "manual", ts="2026-07-27T00:00:02Z")]
+    before, _ = adv.resolve_sops(kw, human)
+    after, withheld = adv.resolve_sops(
+        kw, [_sop_ev_from("s-evil", "widget handling", "EVIL widget handling",
+                          "mn9-t1", ts="2026-07-27T00:00:00Z")] + human)
+    assert withheld == 1
+    assert before == after, "adding an agent row changed the order of the rest"
+
+
+def test_resolve_carries_the_withheld_count_out(quiet):
+    """`Advice.withheld` is how the count reaches `brief.Stats.authored`, the
+    `mindnet_brief` payload and `hive mindnet brief`. Exclusion that nobody can
+    see is the same silence one step further on."""
+    evs = [_sop_ev_from("s-evil", "widget handling", "EVIL widget handling",
+                        "mn9-t1")]
+    out = adv.resolve(_task(title="widget handling"), evs=evs)
+    assert out.sops == ()
+    assert out.withheld == 1
+
+
+def test_the_persisted_advice_shape_did_not_move(quiet):
+    """`withheld` is deliberately NOT carried by `to_dict`/`from_dict`. The
+    sidecar feeds the hook path, where this is a stale number about a resolve
+    that already happened — and adding a key there would move the persisted
+    shape and its schema version for no reader at all."""
+    out = adv.resolve(_task(title="widget handling"),
+                      evs=[_sop_ev_from("s-evil", "widget handling",
+                                        "EVIL widget handling", "mn9-t1")])
+    assert out.withheld == 1
+    assert set(adv.to_dict(out)) == {"skills", "sops", "constraints"}
+    assert adv.from_dict(adv.to_dict(out)).withheld == 0, (
+        "a rehydrated Advice reported a live count it cannot have")
+
+
+# --- TODOS 26, the incident half ----------------------------------------------
+#
+# Materially harder to exploit than the SOP half, and the code says so: the
+# fields `resolve_constraints` renders — root_cause, lesson, active_rule — are
+# written by the reflection pass, not by the failing agent, which controls only
+# `excerpt`, and `excerpt` is never rendered. These pin the provenance capture
+# that makes the first-order hole checkable.
+
+def _agent_summary(signature, ids, sessions=None, **kw):
+    row = _summary(signature, **kw)
+    row["session_ids"] = list(ids)
+    row["sessions"] = len(ids) if sessions is None else sessions
+    return row
+
+
+def test_a_constraint_manufactured_only_by_agents_is_withheld(quiet, monkeypatch):
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _agent_summary("pyexc:Widget", ["mn9-t1", "mn9-t2"],
+                       root_cause="widget handling exploded")])
+    rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert rows == ()
+    assert withheld == 1
+
+
+def test_a_failure_a_human_also_hit_is_kept(quiet, monkeypatch):
+    """A lesson distilled from a real human failure is worth exactly what it was
+    worth before an agent happened to hit the same signature."""
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _agent_summary("pyexc:Widget", ["mn9-t1", "s1"],
+                       root_cause="KEEP-THIS widget handling failure")])
+    rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert withheld == 0
+    assert any("KEEP-THIS" in r for r in rows)
+
+
+def test_a_record_with_no_recorded_ids_is_kept(quiet, monkeypatch):
+    """Every record written before `session_ids` existed. R8."""
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _summary("pyexc:Widget", root_cause="KEEP-THIS widget handling failure")])
+    rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert withheld == 0
+    assert any("KEEP-THIS" in r for r in rows)
+
+
+def test_a_truncated_id_list_fails_open(quiet, monkeypatch):
+    """`incidents.MAX_SESSION_IDS` bounds the stored list while `sessions` keeps
+    the TRUE count, so a shorter list means there are contributors this row
+    cannot see. Withholding on a partial view would drop a record a human also
+    hit but whose id fell off the end."""
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _agent_summary("pyexc:Widget", ["mn9-t1", "mn9-t2"], sessions=9,
+                       root_cause="KEEP-THIS widget handling failure")])
+    rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert withheld == 0, "withheld on a view that could not see every writer"
+    assert any("KEEP-THIS" in r for r in rows)
+
+
+def test_the_incident_predicate_is_total_over_junk():
+    for row in (None, "", 0, [], {}, {"session_ids": "not-a-list"},
+                {"session_ids": ["mn9-a"], "sessions": "many"}):
+        assert adv.agent_authored_incident(row) in (True, False)
