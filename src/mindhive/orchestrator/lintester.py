@@ -320,6 +320,13 @@ class LintesterOrchestrator:
     runner: object = None
     reflector: object = None
     evs: object = None
+    # WB7's observation seam. `bus` is anything with `emit(kind, **fields)`;
+    # `observer` is an async context manager FACTORY the caller supplies, run
+    # around the lane phase. Both are duck-typed on purpose: this module must
+    # not import a renderer, so the front door (`cli.py`) is what knows the
+    # board exists and hands one in. See `dashboard.py`'s first paragraph.
+    bus: object = None
+    observer: object = None
     # The symbol map, built at most once per mission and only when a unit
     # actually owns a file. `init=False` because it is a cache, not a
     # collaborator: nothing outside this object should be able to hand it one.
@@ -330,6 +337,16 @@ class LintesterOrchestrator:
     def _mission_id(self, intent) -> str:
         digest = hashlib.sha1(intent.encode("utf-8")).hexdigest()[:8]
         return f"{MISSION_PREFIX}-{digest}"
+
+    def _emit(self, kind, **fields) -> None:
+        """Publish one state change. A board must never fail a mission."""
+        bus = self.bus
+        if bus is None:
+            return
+        try:
+            bus.emit(kind, **fields)
+        except Exception:                               # noqa: BLE001
+            pass
 
     def _name(self, intent) -> tuple:
         """``(task_id, title)`` for the root task, from the incumbent deriver."""
@@ -635,6 +652,11 @@ class LintesterOrchestrator:
 
         mission_id = self._mission_id(text)
         root_id, title = self._name(text)
+        # Announced BEFORE the shape is known, and announced again below once
+        # it is. A header that stays blank through the slowest phase of the
+        # mission is a header that is missing exactly when it is wanted.
+        self._emit("mission_started", mission_id=mission_id, intent=text)
+        self._emit("brain_phase", phase="Decomposing Intent", detail=title)
         subtasks, split = self._subtasks(root_id, title, text, dry_run)
         if not subtasks:
             return Mission(intent=text, mission_id=mission_id, outcome="refused",
@@ -643,22 +665,35 @@ class LintesterOrchestrator:
                            reason=("the graph is empty — decomposition produced "
                                    "no unit and the intent yielded none"))
 
+        self._emit("brain_phase", phase="Parsing AST",
+                   detail=f"{len(subtasks)} unit(s)")
         units = []
         for tid, ttl, desc, given in subtasks:
             # A unit that came with its own file set keeps it. Only the preview
             # does, and see `_unit` for why re-deriving those would collapse the
             # split it just made.
             files = self._files_for(desc) if given is None else given
+            # Per unit, not once for the loop: `_weigh` is where the AST parse
+            # and the churn lookup actually happen, so a phase line emitted
+            # after the loop would name the work as starting when it has ended.
+            self._emit("brain_phase", phase="Calculating Weights",
+                       detail=str(tid))
             units.append((str(tid), str(ttl), str(desc), files,
                           self._weigh(str(tid), desc, files)))
 
+        self._emit("brain_phase", phase="Packing Lanes",
+                   detail=f"{len(units)} unit(s)")
         plan = self._lane_plan(units)
         by_id = {u[0]: u for u in units}
 
+        self._emit("brain_phase", phase="Isolating Worktrees",
+                   detail=f"{len(plan)} lane(s)")
         trees = ([wt_mod.LaneWorktree(lane_id=ln["lane"], ok=True)
                   for ln in plan] if dry_run
                  else wt_mod.acquire_lanes(self.root, len(plan), mission_id))
         ctx = self._context()
+        self._emit("brain_phase", phase="Composing Briefs",
+                   detail=f"{len(units)} unit(s)")
 
         tasks: list = []
         lanes_out: list = []
@@ -684,7 +719,12 @@ class LintesterOrchestrator:
                               "reason": str(getattr(tree, "reason", "") or "")})
             lane_entries.append((lane_id, entries, tree))
 
+        self._emit("mission_started", mission_id=mission_id, intent=text,
+                   lanes=len(lanes_out), units=len(tasks))
+
         if dry_run:
+            self._emit("mission_finished", mission_id=mission_id,
+                       outcome="dry-run", reason="nothing was started")
             return Mission(intent=text, mission_id=mission_id, outcome="dry-run",
                            reason=("nothing was started; re-run with the execute "
                                    "flag to fan agents at these lanes"),
@@ -695,6 +735,9 @@ class LintesterOrchestrator:
         runnable = [(lid, ents, tree) for lid, ents, tree in lane_entries
                     if getattr(tree, "ok", False) and ents]
         if not runnable:
+            self._emit("mission_finished", mission_id=mission_id,
+                       outcome="refused",
+                       reason="no lane could be isolated")
             wt_mod.release_lanes(self.root, trees)
             return Mission(intent=text, mission_id=mission_id, outcome="refused",
                            reason=("no lane could be isolated — see each lane's "
@@ -715,7 +758,8 @@ class LintesterOrchestrator:
                                     # is pointed at — never a dry run, which
                                     # returns above, and never a library
                                     # default.
-                                    rollback=self._rollback_for)
+                                    rollback=self._rollback_for,
+                                    bus=self.bus)
         lanes = [queue_mod.WorkerLane(lid, ents, worktree=tree)
                  for lid, ents, tree in runnable]
         scheduler = queue_mod.WorkStealingScheduler(
@@ -723,9 +767,30 @@ class LintesterOrchestrator:
             mission_id=mission_id, checkpoint_dir=checkpoint_dir,
             # Both halves of the breaker, not just the failing one. `repair`
             # alone made it failure-only: it could open and never close.
-            on_success=repair.succeeded)
+            on_success=repair.succeeded, bus=self.bus)
+        self._emit("brain_phase", phase="Running Lanes",
+                   detail=f"{len(lanes)} lane(s)")
+
+        async def _drive():
+            """The lane phase, with the caller's observer wrapped around it.
+
+            Inside the loop on purpose. The bus hands work published from a
+            worker thread back through `call_soon_threadsafe`, so it has to be
+            told which loop that is — and a board that subscribed before the
+            loop existed would build its queue against the wrong one."""
+            binder = getattr(self.bus, "bind", None)
+            if callable(binder):
+                try:
+                    binder()
+                except Exception:                       # noqa: BLE001
+                    pass
+            if self.observer is None:
+                return await scheduler.run()
+            async with self.observer():
+                return await scheduler.run()
+
         try:
-            completed, failed = asyncio.run(scheduler.run())
+            completed, failed = asyncio.run(_drive())
         except KeyboardInterrupt:
             released = wt_mod.release_lanes(self.root, trees)
             # The reason must not promise a sidecar nobody asked for. With no
@@ -742,6 +807,8 @@ class LintesterOrchestrator:
                            enforcement=enforcement, enforcement_reason=why,
                            decomposition=split, dry_run=False)
 
+        self._emit("brain_phase", phase="Merging Worktrees",
+                   detail=f"{len(trees)} lane(s)")
         released = wt_mod.release_lanes(self.root, trees)
         done = tuple(e.task_id for e in completed)
         bad = tuple(f"{e.task_id}: {e.reason}" for e in failed)
@@ -749,6 +816,11 @@ class LintesterOrchestrator:
         cal = self._calibrate(mission_id,
                               {tid: u[4] for tid, u in by_id.items()},
                               list(completed) + list(failed))
+        self._emit("mission_finished", mission_id=mission_id, outcome=outcome,
+                   completed=len(done), failed=len(bad),
+                   steals=int(scheduler.steals),
+                   reason=("" if not bad
+                           else f"{len(bad)} of {len(tasks)} unit(s) failed"))
         return Mission(
             intent=text, mission_id=mission_id, outcome=outcome,
             reason="" if not bad else f"{len(bad)} of {len(tasks)} unit(s) failed",

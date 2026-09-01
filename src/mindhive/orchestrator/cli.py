@@ -24,6 +24,7 @@ unnecessary and a violation.
 from __future__ import annotations
 
 import json
+import sys
 
 
 def cmd_lintester(args) -> int | None:
@@ -44,6 +45,11 @@ def cmd_lintester(args) -> int | None:
         return 2
 
     started = bool(args.execute)
+    bus, observer, why = _observer(args, started)
+    if why:
+        # stderr, not stdout: `--json` is a machine surface and a friendly
+        # note printed into it is a parse error at the other end.
+        print(f"lintester: {why}", file=sys.stderr)
     mission = LintesterOrchestrator(
         root=args.root, project=args.project,
         lanes=args.lanes if args.lanes is not None else None,
@@ -59,6 +65,7 @@ def cmd_lintester(args) -> int | None:
         # tests: the seam worked, the breaker opened, and no anomaly was ever
         # recorded, resolved or remembered on a real run.
         reflector=_reflector(),
+        bus=bus, observer=observer,
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
 
@@ -75,6 +82,34 @@ def cmd_lintester(args) -> int | None:
     if scored is not None:
         _print_payoff(scored)
     return 0 if mission.outcome in ("ok", "dry-run") else 1
+
+
+def _observer(args, started):
+    """``(bus, observer, why)`` for this invocation.
+
+    *why* is a sentence for the operator when the board was ASKED for and
+    is not going to appear. Silence there would be the worse failure: a
+    flag that does nothing and says nothing teaches the operator that the
+    feature is broken rather than that this run did not qualify.
+
+    Two runs do not qualify. A dry run publishes a handful of phase lines
+    and stops, so a full-screen live board would seize the terminal for a
+    tenth of a second and take the plan's own report down with it. And
+    `--json` owns stdout, which is where the board writes."""
+    if not bool(getattr(args, "board", False)):
+        return None, None, ""
+    if getattr(args, "json", False):
+        return None, None, ("the board is off — it writes to stdout, which "
+                            "the JSON report owns")
+    if not started:
+        return None, None, ("the board is off — a plan publishes a few phase "
+                            "lines and stops; add the flag that starts work "
+                            "to watch lanes run")
+    from . import dashboard as dash_mod
+
+    bus = dash_mod.EventBus()
+    available, reason = dash_mod.rich_available()
+    return bus, (lambda: dash_mod.attach(bus)), ("" if available else reason)
 
 
 def _reflector():
@@ -185,6 +220,8 @@ def register(subparsers) -> None:
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")
+    p.add_argument("--board", action="store_true",
+                   help="watch the lanes live in the terminal (WB7). Needs a run that starts work; install the tui extra for the full board")
     p.add_argument("--calibration", action="store_true",
                    help="print what past runs measured — the weight against "
                         "the wall time it predicted — and start no mission")

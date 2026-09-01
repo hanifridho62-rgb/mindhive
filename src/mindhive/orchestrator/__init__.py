@@ -44,6 +44,9 @@ from .lintester import AgentTask, LintesterOrchestrator, Mission, run_mission
 from .metrics import ComplexityVisitor, Weight, calculate_workload_weight
 from .payoff import (Calibration, Payoff, Sample, Schedule, calibrate,
                      simulate_lanes, simulate_waves)
+from .dashboard import (Board, Dashboard, EventBus, FallbackTriggered,
+                        LaneView, TaskStarted, WorkStolen, attach,
+                        render_plain)
 from .queue import (ABANDONED, FAILED, QUEUED, RUNNING, VALIDATED, QueueEntry,
                     WorkerLane, WorkStealingScheduler)
 from .resilience import (Limits, RepairLoop, SandboxResult, ToolCircuitBreaker,
@@ -51,11 +54,13 @@ from .resilience import (Limits, RepairLoop, SandboxResult, ToolCircuitBreaker,
 from .worktree import LaneWorktree, lane_path_for, rollback
 
 __all__ = [
-    "ABANDONED", "AgentTask", "Calibration", "ComplexityVisitor", "FAILED",
+    "ABANDONED", "AgentTask", "Board", "Calibration", "ComplexityVisitor",
+    "Dashboard", "EventBus", "FAILED", "FallbackTriggered", "LaneView",
     "LaneWorktree", "Limits", "LintesterOrchestrator", "Mission", "Payoff",
     "QUEUED", "QueueEntry", "RUNNING", "RepairLoop", "Sample", "SandboxResult",
-    "Schedule", "ToolCircuitBreaker", "VALIDATED", "Weight",
-    "WorkStealingScheduler", "WorkerLane", "calculate_workload_weight",
-    "calibrate", "lane_path_for", "rollback", "run_mission", "run_sandboxed",
-    "simulate_lanes", "simulate_waves",
+    "Schedule", "TaskStarted", "ToolCircuitBreaker", "VALIDATED", "Weight",
+    "WorkStealingScheduler", "WorkStolen", "WorkerLane", "attach",
+    "calculate_workload_weight", "calibrate", "lane_path_for", "render_plain",
+    "rollback", "run_mission", "run_sandboxed", "simulate_lanes",
+    "simulate_waves",
 ]

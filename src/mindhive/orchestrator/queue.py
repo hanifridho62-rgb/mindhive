@@ -256,7 +256,7 @@ class WorkStealingScheduler:
     it happens to be."""
 
     def __init__(self, lanes, runner, repair=None, mission_id="",
-                 checkpoint_dir=None, on_success=None, clock=None):
+                 checkpoint_dir=None, on_success=None, clock=None, bus=None):
         self.lanes = list(lanes or ())
         self.runner = runner
         self.repair = repair
@@ -274,6 +274,29 @@ class WorkStealingScheduler:
         # checkpoint built from the deques alone LOSES exactly the unit that was
         # running when the process died — the one most worth resuming.
         self._active: dict = {}
+        # WB7's observation seam, and the ONLY thing this module knows about a
+        # display: something with `emit(kind, **fields)`. No import, no event
+        # class, no rendering — see `dashboard.py`'s first paragraph for why the
+        # arrow is only allowed to point that way.
+        self.bus = bus
+        self.observer_drops = 0
+        self.observer_error = ""
+
+    def _emit(self, kind, **fields) -> None:
+        """Publish one state change. Total, and reported when it is not.
+
+        A board is derived state: losing a frame costs a frame. Swallowing the
+        failure with no count would cost something else — an operator watching a
+        board that silently stopped being about this mission."""
+        bus = self.bus
+        if bus is None:
+            return
+        try:
+            bus.emit(kind, **fields)
+        except Exception as exc:                        # noqa: BLE001
+            self.observer_drops += 1
+            if not self.observer_error:
+                self.observer_error = f"{type(exc).__name__}: {exc}"
 
     async def _run_one(self, entry, lane):
         import inspect
@@ -301,6 +324,9 @@ class WorkStealingScheduler:
             entry = await victim.steal()
             if entry is not None:
                 self.steals += 1
+                self._emit("work_stolen", lane=lane.lane_id,
+                           victim=victim.lane_id, task_id=entry.task_id,
+                           target=target_of(entry))
                 await lane.push(entry)
                 return await lane.take()
         return None
@@ -323,6 +349,9 @@ class WorkStealingScheduler:
             started = int(self.clock())
             try:
                 entry.attempts += 1
+                self._emit("task_started", lane=lane.lane_id,
+                           task_id=entry.task_id, target=target_of(entry),
+                           weight=weight_of(entry), attempt=entry.attempts)
                 try:
                     result = await self._run_one(entry, lane)
                 except asyncio.CancelledError:
@@ -363,6 +392,9 @@ class WorkStealingScheduler:
                 self._active.get(lane.lane_id, []).remove(entry)
             except ValueError:                          # pragma: no cover
                 pass
+            self._emit("task_finished", lane=lane.lane_id,
+                       task_id=entry.task_id, state=entry.state,
+                       elapsed_ms=entry.elapsed_ms, reason=entry.reason)
             if entry.state == VALIDATED:
                 self.completed.append(entry)
                 if self.on_success is not None:
@@ -415,6 +447,9 @@ class WorkStealingScheduler:
         finish."""
         if not self.lanes:
             return [], []
+        for lane in self.lanes:
+            self._emit("lane_opened", lane=lane.lane_id,
+                       worktree=lane.worktree_path, depth=lane.depth())
         try:
             await asyncio.gather(*(self._work(ln) for ln in self.lanes))
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -425,6 +460,29 @@ class WorkStealingScheduler:
         for lane in self.lanes:
             self._checkpoint(lane)
         return self.completed, self.failed
+
+
+def target_of(entry) -> str:
+    """The file a unit is about, for the board's Target column.
+
+    Public because `resilience` and `lintester` publish the same column and two
+    spellings of "which file is this" would drift the moment one of them learned
+    about a second field. Falls back to the task id, which is never empty and is
+    a truer answer than a blank cell: a unit with no file really is about
+    itself."""
+    task = getattr(entry, "task", None)
+    files = tuple(getattr(task, "files", ()) or ())
+    if files:
+        return str(files[0])
+    return str(getattr(entry, "task_id", "") or "")
+
+
+def weight_of(entry) -> int:
+    """A unit's estimated weight — the Load Metric column."""
+    try:
+        return int(getattr(getattr(entry, "task", None), "weight", 0) or 0)
+    except (TypeError, ValueError):                     # pragma: no cover - guard
+        return 0
 
 
 async def _maybe_await(value):
