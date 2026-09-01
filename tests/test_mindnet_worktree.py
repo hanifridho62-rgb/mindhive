@@ -19,7 +19,11 @@ encode a guess about argv for the exact commands whose semantics are the questio
 and `test_retire_keeps_a_worktree_that_is_ahead` are the two whose failure silently
 destroys output, which is the entire reason for running agents in the first place.
 """
+import concurrent.futures as cf
+import contextlib
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -391,3 +395,117 @@ def test_add_does_not_raise_when_the_worktree_parent_is_a_file(repo):
     got = wt.add(repo, "t1")
     assert got.ok is False
     assert got.reason
+
+
+# --- E1: two lanes, one .git --------------------------------------------------
+#
+# `add` and `retire` both run from inside the orchestrator's thread pool
+# (`orchestrator.py:413` and `:458`), against one shared `.git`. `retire` ends with
+# `git worktree prune`, which is GLOBAL over `.git/worktrees/` — so it can sweep an
+# admin entry another lane is in the middle of creating.
+#
+# These assertions are about MUTUAL EXCLUSION, not about speed: with the lock in
+# place two `add` calls cannot overlap, whatever the machine is doing. The delay is
+# injected only so the CANARY's positive assertion is robust — without it, an
+# unserialised run could finish each call before the next began and the instrument
+# would report "no overlap" for the wrong reason.
+
+def _recording_git(monkeypatch, seconds=0.05):
+    """Record every git call's interval, and slow each one so overlap is visible.
+
+    The interval measured is the GIT CALL, not the `add()` call. That distinction
+    is the whole instrument: a lane blocked on the lock has not entered `.git`
+    yet, so timing `add()` from the outside reports every waiter as an overlap and
+    the test can never pass, lock or no lock."""
+    real = wt._git
+    calls, guard = [], threading.Lock()
+
+    def rec(root, *args):
+        t0 = time.perf_counter()
+        out = real(root, *args)
+        time.sleep(seconds)
+        t1 = time.perf_counter()
+        with guard:
+            calls.append((t0, t1, threading.current_thread().name,
+                          " ".join(str(a) for a in args[:2])))
+        return out
+
+    monkeypatch.setattr(wt, "_git", rec)
+    return calls
+
+
+def _concurrent(ops):
+    """Run every ``(label, fn)`` at once; answer ``{label: result}``."""
+    results, guard = {}, threading.Lock()
+
+    def one(item):
+        label, fn = item
+        out = fn()
+        with guard:
+            results[label] = out
+
+    with cf.ThreadPoolExecutor(max_workers=len(ops)) as pool:
+        list(pool.map(one, ops))
+    return results
+
+
+def _cross_thread_overlaps(calls):
+    """Git calls from DIFFERENT threads that were inside `.git` together.
+
+    Adjacent pairs suffice: under a lock the sorted intervals are disjoint, so any
+    violation shows up between neighbours."""
+    ordered = sorted(calls)
+    return [(a[2], a[3], b[2], b[3])
+            for a, b in zip(ordered, ordered[1:])
+            if b[0] < a[1] and a[2] != b[2]]
+
+
+def test_concurrent_adds_never_overlap(repo, monkeypatch):
+    """The E1 contract. Four lanes calling `add` at once must be serialised, so no
+    two git invocations are ever inside one `.git` together."""
+    calls = _recording_git(monkeypatch)
+    results = _concurrent([(tid, (lambda t=tid: wt.add(repo, t)))
+                           for tid in ("t1", "t2", "t3", "t4")])
+
+    assert all(r.ok for r in results.values()), \
+        [r.reason for r in results.values() if not r.ok]
+    assert calls, "no git calls were recorded — the instrument is not wired in"
+    assert _cross_thread_overlaps(calls) == [], \
+        f"git ran concurrently against one .git: {_cross_thread_overlaps(calls)}"
+
+
+def test_the_overlap_instrument_can_see_an_unserialised_add(repo, monkeypatch):
+    """The canary. The test above asserts an ABSENCE, and an absence is evidence
+    only from an instrument that can report a presence.
+
+    Same harness, same inputs, lock replaced by a no-op — it must report overlap.
+    If this goes green the test above proves nothing, and the lock could be deleted
+    without either of them noticing."""
+    calls = _recording_git(monkeypatch)
+    monkeypatch.setattr(wt, "_GIT_LOCK", contextlib.nullcontext())
+    _concurrent([(tid, (lambda t=tid: wt.add(repo, t)))
+                 for tid in ("t1", "t2", "t3", "t4")])
+
+    # Deliberately no assertion on `ok`: unserialised adds are ALLOWED to collide —
+    # that collision is the defect. Only the instrument is under test here.
+    assert _cross_thread_overlaps(calls), (
+        "the harness saw no overlap even with the lock disabled, so it cannot "
+        "distinguish serialised from concurrent and the E1 test is vacuous")
+
+
+def test_retire_is_serialised_against_add(repo, monkeypatch):
+    """`retire` ends with `git worktree prune`, which is global over
+    `.git/worktrees/`. Locking only `add` would leave prune free to run while
+    another lane's admin entry is half-written."""
+    settled = wt.add(repo, "keep")
+    assert settled.ok, settled.reason
+    calls = _recording_git(monkeypatch)
+
+    _concurrent([("add-t1", lambda: wt.add(repo, "t1")),
+                 ("add-t2", lambda: wt.add(repo, "t2")),
+                 ("retire-keep", lambda: wt.retire(repo, settled.path,
+                                                   settled.branch, settled.base))])
+
+    assert calls, "no git calls were recorded — the instrument is not wired in"
+    assert _cross_thread_overlaps(calls) == [], \
+        f"add and retire ran against one .git together: {_cross_thread_overlaps(calls)}"

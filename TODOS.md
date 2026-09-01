@@ -686,3 +686,298 @@ rather than adding work inside the critical section.
 exactly what TODOS 11 cost someone. And this one is on the data-loss path.
 
 </details>
+
+## 22. ~~The orchestrator's thread-safety is written against the GIL~~ — CLOSED 2026-08-31
+
+`_run_wave`'s `one()` used to write `isolated[tid]` from inside the thread pool while every other
+result in the function was returned and merged on the main thread. Distinct-key dict assignment is
+atomic under CPython's GIL, so it never misbehaved — it was correct *because of* the GIL, not
+because anything guarded it. Under a free-threaded build (`python3.14t`; this machine's interpreter
+is 3.14) it was a real data race, and the failure mode was a lost or torn `Isolated` record: the one
+thing that tells the operator a worktree was kept and where their agent's uncommitted work is.
+
+**Fixed** the way this file prescribed — the worker returns it and the main thread merges, matching
+the shape `results = list(pool.map(...))` already used for everything else. The one subtlety is
+recorded in the code and worth repeating here, because it defeats the obvious version of the same
+fix: the teardown that decides whether a tree was KEPT runs in `one`'s `finally`, which executes
+after the return tuple has been built. A worker returning the `Isolated` **value** therefore carries
+the pre-teardown record and reports a kept worktree as cleanly retired — losing exactly what the
+race lost, by a different route. The worker returns a one-slot `dict` instead, read after it has
+fully unwound.
+
+Both wrong versions are pinned by tests, each against the mutation that matches its claim:
+`test_the_kept_worktree_reason_survives_the_worker_return` fails against the value-return, and
+`test_no_shared_mapping_is_written_from_inside_the_wave_worker` (an AST check on `one`) fails against
+the original cross-thread write. The AST check is deliberate: the behaviour this forbids is invisible
+on a GIL build, which is why the defect survived review in the first place.
+
+**Still not demonstrated:** the race itself. No free-threaded interpreter is installed here, so the
+tests pin the two properties that make the race impossible rather than reproducing it. Anyone with
+`python3.14t` can settle that directly.
+
+## 23. Nobody has measured whether briefing a sub-agent actually helps
+
+Branch 1 of the Lintester work builds a per-task briefing composer and the telemetry to prove the
+brief *arrives*. It does not, and cannot, prove the brief **helps** — that needs an A/B over real
+runs, and the CEO plan states explicitly that Branch 2 (the rolling frontier, the `hive lintester`
+front door, the repair loop) only opens if it does.
+
+So the gate on roughly a week of planned work is a measurement nobody has scheduled.
+
+**The harness now exists — the measurement still has not run. 2026-08-31.**
+`hive mindnet ab` (`src/mindhive/mindnet/ab.py`) runs one graph twice, brief OFF then ON, and
+grades the pair. It supplies the two things this entry said were missing: the harness, and the
+decision about what counts as better. The decision is in `ab.verdict_for`, written before any
+result was seen — primary metric is VALIDATED completions (tasks that passed the completion gate),
+and a zero-against-zero pair is graded `inconclusive`, never `neutral`.
+
+That last rule is the important one and it is why building the harness did not close this entry.
+The red-team note below establishes that `ran-unverified` routes to `skipped` with no status row, so
+a completely successful run scores zero in BOTH arms. A harness that called that `neutral` would
+close the Branch 2 gate on data that could not have moved — the dead-lens shape this repo has
+already recorded once. So the instrument now refuses to grade a run it could not have measured, and
+says which metric to reach for instead.
+
+**This entry stays OPEN.** An instrument that has not been run measures nothing, and the gate the
+owner wrote is that Branch 2 does not open until the A/B *runs*. What remains is: a task graph whose
+tasks actually reach validation, `hive mindnet ab --execute --record` against it, and the resulting
+`experiment_result` row read. Turn-count-to-first-evidence was considered and is NOT implementable
+today — `loop_iteration`'s payload carries no task id, so it would need a second instrument first.
+
+**What it would take:** the same task graph run twice with the brief gated off and on, comparing
+something better than vibes — `ran-unverified` versus validated completions, or agent turn count to
+first evidence. `hive mindnet brief` (E12) gives the off/on switch a per-task inspection surface,
+and E9's per-source telemetry gives the counts; what is missing is the harness that runs both arms
+and the decision about what counts as better.
+
+**Sharpened by the red-team pass, 2026-08-29.** On the agent path the wave loop can only ever run
+ONCE, so part of the design's stated benefit is already unreachable. `agent.run`'s success result
+is `ran-unverified`, which `_run_wave` routes to `skipped` with no status row; `apply_status` then
+returns an identical graph, `before == after`, and the loop breaks. A second wave happens only
+when agents FAIL. That means `brief.wave_context`'s justification for resolving per wave rather
+than per run — "wave N would be briefed without wave N-1's failures, which is the entire reason an
+orchestrated swarm beats N separate agents" — describes a property the termination predicate
+forbids in the successful case. It also answers what `awaiting-validation` changes about later
+waves: there are none.
+
+So the A/B below is measuring a one-wave brief, and the comment in `orchestrator._run_wave` should
+either say so or the loop should run the validation gate inside the wave.
+
+**Cons of leaving it:** Branch 2 gets built on the assumption instead of the measurement, which is
+the failure this project's own record already names more than once.
+
+**The gate itself, written here because a review document is not where a condition lives.**
+At the `/autoplan` gate on 2026-08-30 the owner chose to ship `brief.enabled()` **default ON**,
+and made that choice *conditional on this paragraph existing*. So this is the condition, not a
+note about one:
+
+- The composer is ON for every orchestrated wave, by default, right now. Nobody has shown it
+  helps. That combination is deliberate and it is the reason this entry cannot be closed by
+  arguing about it.
+- **Branch 2 does not open until the A/B above actually runs.** The rolling frontier, the
+  `hive lintester` front door and the repair loop are gated on a measured result, not on the
+  composer having shipped.
+- If the measurement comes back neutral or negative, the honest move is flipping the default
+  OFF — not rescoping the metric to whatever the brief happened to improve. Writing that down
+  in advance is the whole point of writing it down.
+
+The off switch is `MINDHIVE_BRIEF=0` (`brief.ENV_SWITCH`), and `hive mindnet brief <task>` shows
+exactly what a child would receive with it either way, which is the per-task inspection surface
+the A/B needs.
+
+## 24. The mindhive-orchestrator skill Claude actually loads is two minor versions old
+
+`.claude-plugin/plugin.json` declares `0.5.0`. The copy Claude Code actually loads is
+`~/.claude/plugins/cache/mindhive-dev/mindhive/0.3.0/skills/mindhive-orchestrator/SKILL.md`.
+Measured 2026-08-29: repo 215 lines, cache 147, 305 diff lines. They are not cosmetically apart —
+they describe different pipelines under the same `name:`:
+
+| | repo (0.5.0) | loaded cache (0.3.0) |
+|---|---|---|
+| trigger | `/mindhive-orchestrator [idea]` | `/mindhive [idea]` |
+| shape | ten-stage sequential, engine restricted to superpowers + compound-engineering | interview → skill selection → execution → learning, Recommendation Matrix |
+| fan-out | parallel sub-agents over a file-complexity cluster database | not present |
+
+This is what made the SKILL.md audit during `/plan-eng-review` ambiguous: reading the repo copy and
+invoking the skill are reading two different documents, and nothing in either says so.
+
+**What it would take:** refresh the installed plugin so the cache carries 0.5.0. That is an action
+on the user's global `~/.claude/plugins` install, not an edit in this repo — hand-writing the repo
+body into a directory named `0.3.0` would make the cache lie about which version it holds, and the
+next legitimate plugin update would silently revert it.
+
+**Cons of leaving it:** every future audit of this skill has the same ambiguity, and anyone typing
+`/mindhive-orchestrator` gets a skill whose description says `/mindhive`.
+
+---
+
+## 25. The brief cannot see its own failures, and cannot report an attack it survived
+
+Found by the red-team pass on 2026-08-29, after the six specialist passes. Both halves are
+observability gaps in the feature whose whole justification is that a silent no-op must be
+impossible.
+
+**Failures are indistinguishable from emptiness.** `brief.wave_context` has three
+`except Exception` branches — the ledger read, `plugins.recommend_for`, the sidecar — and none
+records that it fired. `_symbol_slice`'s catch-all does the same. So a context in which all three
+failed produces exactly the observable state of a healthy context that legitimately matched
+nothing: `chars=0`, `skills=0`, `sops=0`, `constraints=0`, `gated=()`, and
+`empty_reason="every source resolved empty for this task"`. Only `symbols` gets a marker, and only
+for the one failure mode that is a config switch rather than an error.
+
+**A defused line is counted nowhere.** `_section` filters falsy results, `safe_block` drops lines,
+and `Stats` counts the resolver's rows rather than the rendered ones. Five hostile lines defusing
+to nothing produce `skills=3 chars=0` plus that same "resolved empty" reason. The one signal that
+an injection attempt actually reached the composer is discarded — the feature can be under active
+attack and every run still reports success.
+
+**What it would take:** extend the `gated` vocabulary into a `failures` tuple carried on
+`WaveContext` and `Stats` (`events`, `plugins`, `sidecar`, `symbols`), have `_defused` report
+whether it dropped, tally that through `_section`/`safe_block` onto a `dropped` count, and emit
+both in the `mindnet_brief` payload and `briefcli._describe`.
+
+**Cons of leaving it:** the telemetry added in E9 answers "did the brief arrive" and cannot answer
+"did it arrive because everything worked". Those need different fixes and currently print the same
+line.
+
+## 26. A prompt-injected agent can write the next wave's briefing
+
+`advice.resolve_sops` renders SOP bodies verbatim, and `resolve_constraints` renders incident
+`root_cause`/`lesson` text. Both are ledger- and file-backed. Every spawned child has `hive` on
+PATH and is *instructed* to run it (`agent.prompt_for` closes with `hive log <category> ...`).
+
+So a wave-1 agent that has been prompt-injected can append one `sop` or `incident` row, and that
+text is composed into every subsequent agent's brief — inside the fence, indistinguishable from
+human-authored project history. `Stats` records counts, not sources, so the amplification leaves
+no trace.
+
+The fence's own docstring records the risk of a well-formed imperative sentence as ACCEPTED,
+because a sentence recording what someone did is indistinguishable from one telling you to do it.
+That argument was made about *humans and past sessions* writing the ledger. It was not made about
+a previous agent in the same swarm, which is a different threat model: the writer is inside the
+blast radius, not outside it.
+
+**What it would take:** record the writing session/actor on `sop` and `incident` rows, then either
+exclude rows authored by `mn-*` orchestration sessions from brief composition, or render them
+under a heading that names the author. At minimum, add a per-source breakdown to the
+`mindnet_brief` payload so an operator can see agent-authored lines entering the fence.
+
+**Cons of leaving it:** the swarm can teach itself something an attacker wrote once, and nothing
+in the record shows where it came from.
+
+---
+
+## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
+
+`src/mindhive/orchestrator/` shipped on 2026-09-01 and closes all 22 open items from
+the PRD conformance sweep: `LintesterOrchestrator.execute_mission`, an `ast.NodeVisitor`
+cyclomatic metric, `git log --numstat` churn, an asyncio work-stealing scheduler with a
+per-lane resume checkpoint, `.worktrees/lane-N` isolation, a POSIX-guarded `setrlimit`
+sandbox, a per-target circuit breaker, a closed repair loop, and `hive lintester`.
+`docs/designs/lintester-orchestrator.md` records the owner's override of the four
+"Explicitly NOT in scope" bullets that this contradicts.
+
+One thing is honestly still open; three are closed and kept here for their record.
+
+**CLOSED 2026-09-01 — a dry run now previews a split, and says it is a preview.**
+`lintester.preview_units` groups the repo files the intent itself names by
+`clusters.cluster_key` and answers one unit per directory. It invents nothing: the only
+input is a fact the intent already carried, and the units it makes are labelled
+`local-preview` on `Mission.decomposition`, which `as_dict` and `cli._print` both carry,
+so no reader can mistake the preview for what `decompose.run` would propose. Fewer than
+two directories is not a split and falls back to `root-only` rather than dressing one
+unit up as a decomposition. A preview unit also carries its OWN file set rather than
+letting `_files_for` re-read a description that still names the whole intent — otherwise
+every unit would claim every file, which is exactly what `clusters.shard_plan`'s
+ownership invariant exists to prevent. Measured on the real tree: the intent "add a retry
+to the ledger writer in src/mindhive/events.py and cover it in tests/test_events.py" now
+plans 2 units across 2 lanes at weights 1020 and 484, where it used to plan 1.
+
+**MEASURED 2026-09-01 — the lanes do help, but not for the reason the PRD gives.**
+The harness that did not exist is `src/mindhive/orchestrator/payoff.py`, reachable as
+`hive lintester "<intent>" --payoff`. It simulates both policies on one unit set:
+the incumbent's frontier-plus-barrier with a dynamic pool inside each wave (faithful to
+`_run_wave`, which is `ThreadPoolExecutor` + `pool.map`, so workers really do pull), and
+`shard_plan`'s weighted lanes with LIFO-local / FIFO-steal (faithful to
+`WorkStealingScheduler`, down to the victim being the sibling with the most QUEUED
+entries — a count, not a weight).
+
+Three findings, all reproducible from the tests that pin them:
+
+* **Lanes win, over 4000 random dependency-free unit sets: sooner on 1528, later on 1,
+  level on 2471.** `tests/test_orchestrator_payoff.py` pins the losing set too, because
+  a harness that can only agree with its own design measures nothing.
+* **The win comes from ORDERING, not from stealing.** `frontier` sorts for determinism,
+  so a heavy unit late in the sort tails the whole wave — naive-order list scheduling,
+  bound `2 - 1/m`. `shard_plan` places the heaviest cluster first, bound `4/3`. Credit
+  the packer, not the thief.
+* **Stealing fired ZERO times across all 4000 runs** when the weight a lane is packed by
+  is also the duration it runs for. That is not dead code, it is code that can only pay
+  when the estimate is wrong — which is why the harness takes an `actual` duration map
+  apart from the weight. Feed it a wrong estimate and steals appear immediately.
+
+What is still NOT measured, and is the real open question: whether
+`calculate_workload_weight` predicts how long a child actually runs. Every number above
+inherits that assumption. Nothing in this repo records a real child's wall time against
+its estimated weight, so the divergence that decides whether stealing ever pays in
+practice is unknown.
+
+**CLOSED 2026-09-01 — the sandbox has now run under a real kernel ceiling.**
+`import resource` is POSIX-only and this is Windows, so `run_sandboxed` still reports
+`timeout-only` here and the two `setrlimit` tests still skip locally. They pass on the WSL
+Ubuntu legs, and — correcting what this entry said when it was written — GitHub Actions is
+no longer billing-blocked: run `33469713585` on PR #119 executed all nine jobs, ubuntu
+legs included, so a hosted runner has now exercised them.
+
+**Cons of leaving it:** the mechanism is complete, green, and now measured on the
+scheduling question. What no measurement here touches is whether the WEIGHT is any good
+— the harness scores a policy given an estimate, and the estimate itself has never been
+checked against a real child's wall time. That is the one open item above, and it is the
+one that matters.
+
+---
+
+## 28. The lane breaker is failure-only, so it can open but never close — FIXED
+
+Recorded from the review of `1022232`, which fixed six other findings in the same diff
+and left this one because closing it is a design change rather than a repair.
+
+**Fixed 2026-09-01.** `WorkStealingScheduler` takes an `on_success` hook and calls it
+where it marks an entry validated; `RepairLoop.succeeded` records the success against the
+same key `observe` records failures against, and `lintester.execute_mission` wires the
+two together. A target that failed and then passed is reported on `Mission.recoveries`,
+and `Mission.open_keys` reports what is still broken — separate fields, because "it broke
+once and recovered" and "it is still broken" are different facts. The description below
+stands as the record of what was wrong.
+
+`WorkStealingScheduler` calls its `repair` seam only on a failure. `RepairLoop.observe`
+is the only caller of `ToolCircuitBreaker.record` on that path, and it always passes
+`False` — grep it: `resilience.py:440` is `record(key, False, signature)` and there is no
+sibling. `queue.py:314` handles the `validated` case and tells nothing.
+
+So on the default lane path a breaker only ever hears about failures. Two consequences,
+and the second is the one that matters:
+
+* It can never return to `CLOSED`, because closing needs a recorded success.
+* After the cooldown, `allow()` promotes the key to `HALF_OPEN` and lets exactly one
+  probe out. If that probe SUCCEEDS, nothing records it — the breaker stays `HALF_OPEN`
+  and the key stays in `_probing`. The next `observe` clears it, because `record` runs
+  before `allow` there, so nothing wedges; but the success was still thrown away.
+
+`Guard.run` (`resilience.py:658`) does record both outcomes. It is simply not what the
+scheduler's default runner uses — `lintester._run_child` calls `mindnet.agent.run`
+directly.
+
+The fix is a success hook on the scheduler: where `queue.py` marks an entry `validated`,
+give `repair` (or a sibling seam) a chance to record it, so the breaker learns the target
+recovered. That is a new seam on a class the whole mission runs through, which is why it
+is written down rather than slipped into a fix commit.
+
+**Blast radius today is bounded**, which is why this is a TODO and not a P1: keys default
+to task ids, so one task's breaker cannot refuse another's, and `max_attempts=2` stops
+the retry loop before the breaker's thresholds usually matter. It bites when a key is
+made coarser — per-tool rather than per-task, which is what the PRD's "circuit breaker
+for sub-agent tool calls" actually describes.
+
+**Cons of leaving it:** a target that recovers is never credited for it, so the breaker's
+state is a record of the worst the mission ever saw rather than of where it stands.

@@ -33,10 +33,33 @@ the task's whole subtree from the graph permanently.
 from __future__ import annotations
 
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from .. import paths
+
+# One lock for every git command this module runs, held across the WHOLE of `add`
+# and the whole of `retire`.
+#
+# The orchestrator calls both from inside its thread pool (`orchestrator.py:413`
+# and `:458`), and every lane points at the SAME `.git`. `retire` ends with
+# `git worktree prune` (below), which is global over `.git/worktrees/` — so
+# without this it can sweep an admin entry another lane is in the middle of
+# creating, and the loss reports as a task that mysteriously has no checkout.
+#
+# COARSE on purpose. Locking only the mutations would let the read-only queries
+# run free and measured 2.2 s per wave faster at 12 lanes — against an agent
+# timeout of 1800 s. That trade buys a rule ("is this call inside or outside the
+# lock?") that has to be re-decided every time a git command is added here, and
+# nothing fails when it is decided wrong. The whole function is the critical
+# section; there is no second rule to remember.
+#
+# Re-entrant because `retire` calls `state`, which runs git of its own. Today
+# `state` does not lock, so a plain `Lock` would also work — an `RLock` means a
+# future edit that gives `state` the same protection cannot hang the pool. A
+# deadlock inside an orchestrator is a far worse failure than a muddier boundary.
+_GIT_LOCK = threading.RLock()
 
 # Where isolated checkouts live, relative to the repo root. `.claude/worktrees/` is
 # this repo's existing convention — the session that wrote this module is running
@@ -53,7 +76,16 @@ _TIMEOUT_S = 60
 
 @dataclass(frozen=True)
 class Isolated:
-    """One task's checkout. ``ok=False`` carries git's own reason."""
+    """One task's checkout. ``ok=False`` carries git's own reason.
+
+    ``retryable`` separates the two kinds of failure, and the separation is the
+    whole point: a contended `.git` produces a transient git error that trying
+    again fixes, while every refusal this module makes on purpose — an existing
+    directory, a branch holding unmerged commits, an unusable parent — is
+    PERMANENT and describes something an operator has to look at. Retrying those
+    is not resilience; it spends time pretending a settled answer is a flaky one,
+    and the last attempt's reason then reads as if git were unreliable when
+    nothing is. Only the `git worktree add` failure path sets this."""
 
     task_id: str
     path: str = ""
@@ -61,6 +93,7 @@ class Isolated:
     base: str = ""          # the commit the branch was created from
     ok: bool = False
     reason: str = ""
+    retryable: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,17 +131,36 @@ def path_for(root, task_id) -> Path:
     return Path(root).joinpath(*WORKTREE_DIR) / f"{PREFIX}-{task_id}"
 
 
-def add(root, task_id) -> Isolated:
+def add(root, task_id, path=None, branch=None) -> Isolated:
     """Create an isolated checkout for *task_id*, or answer why not.
 
     Idempotent in the direction that matters: an existing directory is REFUSED
     rather than reused or clobbered. Reusing it would hand an agent a tree holding
     a previous run's uncommitted work and call it clean; clobbering it would delete
     that work. Refusing makes the operator look, which is the only safe option
-    when the alternatives are "silently wrong" and "silently destructive"."""
+    when the alternatives are "silently wrong" and "silently destructive".
+
+    *path* and *branch* override the task-keyed defaults, and exist for exactly
+    one caller: `orchestrator.worktree`, whose PRD spells its checkouts
+    `.worktrees/lane-N` rather than `.claude/worktrees/mn9-<task>`. They are
+    optional, they default to the derivations this module has always used, and
+    every existing caller passes positionally — so nothing about the incumbent
+    behaviour moves. The alternative was a second module issuing its own `git
+    worktree add`, which would have to re-derive the two rules below that keep
+    committed work reachable, and would drift from them the first time one
+    changed.
+
+    Serialised against every other call into this module — see `_GIT_LOCK`."""
+    with _GIT_LOCK:
+        return _add(root, task_id, path, branch)
+
+
+def _add(root, task_id, path=None, branch=None) -> Isolated:
+    """`add`'s body. Split out only so the lock's extent is one readable line
+    rather than an indent wrapping fifty."""
     tid = str(task_id)
-    target = path_for(root, tid)
-    branch = branch_for(tid)
+    target = Path(path) if path else path_for(root, tid)
+    branch = str(branch) if branch else branch_for(tid)
 
     if target.exists():
         return Isolated(task_id=tid, path=str(target), branch=branch, ok=False,
@@ -163,8 +215,13 @@ def add(root, task_id) -> Isolated:
 
     ok, _out, err = _git(root, "worktree", "add", "-B", branch, str(target))
     if not ok:
+        # The ONLY retryable path. Everything above is a decision this module
+        # made deliberately; this is git reporting that it could not do the work,
+        # which on a contended `.git` is exactly the transient the caller's
+        # bounded retry exists for.
         return Isolated(task_id=tid, path=str(target), branch=branch, base=base,
-                        ok=False, reason=err or "git worktree add failed")
+                        ok=False, retryable=True,
+                        reason=err or "git worktree add failed")
     return Isolated(task_id=tid, path=str(target), branch=branch, base=base,
                     ok=True)
 
@@ -214,7 +271,17 @@ def retire(root, path, branch="", base="") -> Retired:
 
     Ignored files count as work. `git status --porcelain` omits them, so a plain
     `--porcelain` read called an agent's output under `dist/`, `build/` or any
-    other ignored path "clean" and `remove --force` erased it."""
+    other ignored path "clean" and `remove --force` erased it.
+
+    Serialised against every other call into this module — see `_GIT_LOCK`. The
+    `prune` below is why that matters: it is global over `.git/worktrees/`, so it
+    must never run while another lane's `add` is half-finished."""
+    with _GIT_LOCK:
+        return _retire(root, path, branch, base)
+
+
+def _retire(root, path, branch="", base="") -> Retired:
+    """`retire`'s body — see `_add` for why this is split."""
     target = Path(path)
     if not target.exists():
         return Retired(removed=False, kept=False,

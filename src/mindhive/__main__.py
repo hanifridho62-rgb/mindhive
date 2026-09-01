@@ -2169,9 +2169,9 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     reason: this is not the hook path, and an orchestration that could disagree
     with `hive mindnet list` about the graph would be worse than a slow one.
 
-    Exit 1 on `stalled` — work remains and nothing can advance it, which is
-    operator-actionable. A zero exit there would let a wrapping CI step pass
-    while the graph is stuck. `capped` is the same: it means the run gave up."""
+    Exit 1 on `stalled`, `capped` and `awaiting-validation` — work remains and a
+    zero exit would let a wrapping CI step pass while the graph is stuck, gave
+    up, or holds agent output nothing has verified. See DATA_MODEL.md §4.6."""
     from dataclasses import asdict
     from .mindnet import agent as ag_mod
     from .mindnet import executor as x_mod
@@ -2308,9 +2308,10 @@ def cmd_mindnet_orchestrate(args) -> int | None:
                 print(f"    {tid}: {path}")
         if not args.execute:
             print("  this was a dry run — add --execute to actually run it")
-    # `dry-run` and `settled` are successes; the other two are not.
-    return 1 if out.outcome in (orc_mod.OUTCOME_STALLED,
-                                orc_mod.OUTCOME_CAPPED) else None
+    # `dry-run` and `settled` are the successes. `awaiting-validation` is NOT one:
+    # the agents ran, but nothing is verified until `hive mindnet validate` says so.
+    return 1 if out.outcome in (orc_mod.OUTCOME_STALLED, orc_mod.OUTCOME_CAPPED,
+                                orc_mod.OUTCOME_AWAITING_VALIDATION) else None
 
 
 def cmd_mindnet_enforce(args) -> int | None:
@@ -2734,45 +2735,6 @@ def cmd_skills_trail(args) -> int | None:
     return None
 
 
-def cmd_clusters_build(args) -> int | None:
-    """Build the cluster DB (parallel-orchestration layer) and store the sidecar."""
-    from . import clusters as clusters_mod
-    payload = clusters_mod.build_and_store(root=args.root, lanes=args.lanes,
-                                           use_git=args.git)
-    c = payload["counts"]
-    print(f"clustered {c['files']} files into {c['clusters']} clusters "
-          f"-> {c['lanes']} lane(s); stored cluster_db.json")
-    return None
-
-
-def cmd_clusters_show(args) -> int | None:
-    from . import clusters as clusters_mod
-    payload = clusters_mod.latest()
-    if not payload:
-        print("(no cluster_db yet - run: hive clusters build)")
-        return None
-    c = payload["counts"]
-    print(f"cluster DB from {payload.get('generated_at', '?')} "
-          f"({c['files']} files, {c['clusters']} clusters)")
-    for key, info in payload.get("clusters", {}).items():
-        print(f"  {key}  [weight {info['weight']}, {len(info['files'])} files]")
-    return None
-
-
-def cmd_clusters_plan(args) -> int | None:
-    """Print the file-ownership-safe shard plan the orchestrator fans out to
-    parallel sub-agents. Computes fresh (does not require a stored DB)."""
-    from . import clusters as clusters_mod
-    payload = clusters_mod.build(root=args.root, lanes=args.lanes, use_git=args.git)
-    plan = payload["shard_plan"]
-    print(f"{len(plan)} parallel lane(s) for {payload['counts']['files']} files:")
-    for lane in plan:
-        print(f"  lane {lane['lane']}: {len(lane['files'])} files across "
-              f"{len(lane['clusters'])} cluster(s) "
-              f"[est_complexity {lane['est_complexity']}]")
-        for key in lane["clusters"]:
-            print(f"      - {key}")
-    return None
 
 
 def cmd_sync(args) -> int | None:
@@ -3859,6 +3821,12 @@ def _build_parser() -> argparse.ArgumentParser:
     mno.add_argument("--json", action="store_true")
     mno.set_defaults(func=cmd_mindnet_orchestrate)
 
+    # Self-registering, the same trade `bench` makes; see briefcli's docstring.
+    from .mindnet import briefcli as briefcli_mod
+    briefcli_mod.register(mnsub)
+    from .mindnet import ab as mn_ab_mod
+    mn_ab_mod.register(mnsub)
+
     # MN-6's blast-radius gate. Bare = status; the two directions are mutually
     # exclusive because `--enable --disable` has no defensible reading and
     # silently picking one is how a toggle for a repo-freezing rule goes wrong.
@@ -4006,22 +3974,13 @@ def _build_parser() -> argparse.ArgumentParser:
     skt.add_argument("--project", default=None, help="target namespace")
     skt.set_defaults(func=cmd_skills_trail)
 
-    # --- clusters: parallel-orchestration layer for /mindhive-orchestrator ---
-    cl = sub.add_parser("clusters",
-                        help="cluster the repo, classify file complexity, plan parallel lanes")
-    clsub = cl.add_subparsers(dest="clusters_cmd", required=True)
-    for _name, _help, _fn in (
-        ("build", "cluster the repo + store cluster_db.json", cmd_clusters_build),
-        ("plan", "print the file-ownership-safe parallel shard plan", cmd_clusters_plan),
-    ):
-        _p = clsub.add_parser(_name, help=_help)
-        _p.add_argument("--root", default=None, help="repo root to scan (default: cwd)")
-        _p.add_argument("--lanes", type=int, default=None,
-                        help="number of parallel lanes (default: one per cluster; clamped to [1, n])")
-        _p.add_argument("--git", action="store_true",
-                        help="weight complexity by git churn (opt-in; no-op if git is absent)")
-        _p.set_defaults(func=_fn)
-    clsub.add_parser("show", help="print the latest stored cluster DB").set_defaults(func=cmd_clusters_show)
+    # --- clusters --- self-registering, the trade `bench` and `briefcli` make.
+    from . import clusterscli as clusterscli_mod
+    clusterscli_mod.register(sub)
+
+    # --- lintester --- the same trade; the mission pipeline's front door.
+    from .orchestrator import cli as lintester_cli
+    lintester_cli.register(sub)
 
     # --- sync ---
     sp = sub.add_parser("sync", help="write native MEMORY.md for desktop auto-load")

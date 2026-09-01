@@ -236,14 +236,22 @@ def _ranked(rows, task_kw, text_of, limit):
 
 # --- the three sources ---------------------------------------------------------------
 
-def resolve_skills(task_kw, evs, project=None) -> tuple:
+def resolve_skills(task_kw, evs, project=None, reco=None) -> tuple:
     """The top matching skills, each rendered with its INTENDED USE.
 
     The description is the payload, not the decoration: a name alone sends the
     agent looking for the catalog again, which is the behaviour this whole
-    module exists to delete."""
+    module exists to delete.
+
+    *reco* is `plugins.recommend_for`'s answer, already computed. It takes no
+    task and is consulted here BEFORE `task_kw` is touched below, so one wave's
+    tasks all get the identical query result and re-running it per task buys
+    nothing — 279 ms of the 445 ms this function costs, measured. Passing it in
+    is therefore behaviour-preserving by construction, not by promise; ``None``
+    keeps the standalone caller's behaviour exactly as it was."""
     from .. import plugins as plugins_mod
-    reco = plugins_mod.recommend_for(project, evs=evs)
+    if reco is None:
+        reco = plugins_mod.recommend_for(project, evs=evs)
     rows = [r for r in (reco or {}).get("recommendations") or []
             if isinstance(r, dict)]
     picks = _ranked(rows, task_kw,
@@ -313,12 +321,17 @@ def resolve_constraints(task_kw, project=None) -> tuple:
 
 # --- the entry point -------------------------------------------------------------------
 
-def resolve(task, evs=None, project=None) -> Advice:
+def resolve(task, evs=None, project=None, reco=None) -> Advice:
     """Resolved advice for *task*, or `EMPTY`.
 
     *evs* is the caller's already-read event list — the whole point of the
     write-time design. Passing ``None`` reads the ledger, which is correct for a
     standalone caller and wrong for anything on a hot path.
+
+    *reco* is the same bargain one level down: `plugins.recommend_for`'s answer,
+    which is task-blind and therefore shared by every task in a wave. Hoisting
+    *evs* alone captures 504 ms of a 949 ms call and leaves 279 ms of identical
+    recomputation behind — see `resolve_skills`.
 
     Each source is isolated: a fault in one leaves the other two intact. Total
     by construction — a resolver that raises would take down whatever write
@@ -332,7 +345,7 @@ def resolve(task, evs=None, project=None) -> Advice:
         except Exception:
             evs = []
     try:
-        skills = resolve_skills(kw, evs, project)
+        skills = resolve_skills(kw, evs, project, reco=reco)
     except Exception:
         skills = ()
     try:

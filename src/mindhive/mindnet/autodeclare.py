@@ -118,7 +118,7 @@ def _active_records(sidecar):
     return records if isinstance(records, dict) else None
 
 
-def declare(decision, session_id=None, project=None):
+def declare(decision, session_id=None, project=None, description=None):
     """Append *decision* on BOTH axes. Returns the two events, or None.
 
     Both or neither. A task on the graph axis with no phase record is the half-declared
@@ -141,7 +141,14 @@ def declare(decision, session_id=None, project=None):
              "title": decision.title,
              # Provenance, so `hive mindnet list` distinguishes a machine-declared task
              # from one the operator wrote by hand. Permanent, like everything here.
-             "description": AUTO_DESCRIPTION},
+             #
+             # *description* overrides it, and the override is the whole reason
+             # the parameter exists: this default is boilerplate about HOW the
+             # task was declared, and a sub-agent briefed from it is told nothing
+             # about WHAT it was declared for. A caller that holds the operator's
+             # real words — the mission pipeline does — should pass them, and
+             # every caller that does not keeps the provenance line unchanged.
+             "description": str(description or "").strip() or AUTO_DESCRIPTION},
             session_id=session_id, tags=["mindnet", "task", "auto"], project=project)
         phase_ev = ev_mod.append_event(
             "mindnet_phase",

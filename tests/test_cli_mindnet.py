@@ -258,11 +258,24 @@ def test_no_verified_by_flag_exists_on_satisfy():
     assert options, "the satisfy subparser has no options at all"
     assert not [o for o in options if "verified" in o.lower()]
     # And the whole `mindnet` surface, not just this one subcommand.
+    #
+    # `brief` joined this set deliberately, and this failing is the point: a
+    # frozen surface makes adding a command a decision somebody signed rather
+    # than a diff nobody noticed. It reads only — it starts nothing, writes no
+    # status row, and takes no `--verified-by`, which is what the loop below
+    # checks for every member.
+    #
+    # `ab` joined on 2026-08-31, signed the same way. It is the TODOS 23
+    # measurement harness, and it is the one member here that CAN start
+    # something — `--execute` runs both arms for real. That is the whole
+    # instrument, so it is in scope rather than an exception being carved: what
+    # this test guards is `--verified-by`, and `ab` derives its verdict from the
+    # completion gate rather than accepting one.
     surface = _subparser_action(_subparser("mindnet")).choices
     assert set(surface) == {"declare", "enter", "satisfy", "fall-back",
                             "validate", "restat", "show", "list", "rebuild",
                             "enforce", "orchestrate", "depend",
-                            "decompose"}
+                            "decompose", "brief", "ab"}
     for name, sp in surface.items():
         bad = [o for a in sp._actions for o in a.option_strings
                if "verified" in o.lower()]
@@ -1165,7 +1178,7 @@ def test_orchestrate_bare_is_a_dry_run_that_spawns_nothing(capsys, monkeypatch):
     _orc_graph()
     calls = []
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda *a, **k: calls.append(a) or ([], [], [], {}, {}, False))
+                        lambda *a, **k: calls.append(a) or ([], [], [], {}, {}, False, []))
 
     assert _cli("mindnet", "orchestrate") == 0
     out = capsys.readouterr().out
@@ -1191,7 +1204,7 @@ def test_orchestrate_execute_drives_a_diamond_to_settled(capsys, monkeypatch):
                         lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False, []))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 0
     out = capsys.readouterr().out
@@ -1207,10 +1220,39 @@ def test_orchestrate_exits_non_zero_when_the_graph_stalls(capsys, monkeypatch):
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
                             [], sorted(batch), [],
-                            {t: "synthetic failure" for t in batch}, {}, False))
+                            {t: "synthetic failure" for t in batch}, {}, False, []))
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
     assert "stalled" in capsys.readouterr().out
+
+
+def test_orchestrate_exits_non_zero_when_the_wave_only_awaits_validation(
+        capsys, monkeypatch):
+    """`awaiting-validation` is on the FAILURE side of the exit code, decided in
+    /review 2026-08-29.
+
+    Splitting it out of `stalled` was about labelling the state honestly, not
+    about promoting it to a success. The agents ran and replied; nothing is
+    verified until `hive mindnet validate` says so, and the pre-branch behaviour
+    for exactly this situation was exit 1. An automation that wraps this command
+    would otherwise read exit 0 and treat unvalidated work as finished — a silent
+    change nobody asked for, which is what this test exists to prevent.
+
+    The seventh tuple slot is `unverified`: the tasks that RAN and came back
+    without writing a status row, which is what distinguishes this from a stall.
+    """
+    from mindhive.mindnet import orchestrator as orc_mod
+    _orc_graph()
+    monkeypatch.setattr(orc_mod, "_run_wave",
+                        lambda batch, *a, **k: (
+                            [], [], sorted(batch),
+                            {t: "ran-unverified" for t in batch}, {}, False,
+                            sorted(batch)))
+
+    assert _cli("mindnet", "orchestrate", "--execute") == 1
+    out = capsys.readouterr().out
+    assert orc_mod.OUTCOME_AWAITING_VALIDATION in out
+    assert "stalled" not in out, "the state it was split out of must not reappear"
 
 
 def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
@@ -1223,7 +1265,7 @@ def test_orchestrate_json_carries_the_whole_run(capsys, monkeypatch):
                         lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False, []))
     capsys.readouterr()                       # drop the fixture's declare noise
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 0
@@ -1259,7 +1301,7 @@ def test_orchestrate_leaves_the_sidecar_fresh(monkeypatch):
                         lambda graph, tid, **kw: None)
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
-                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False))
+                        lambda batch, *a, **k: (sorted(batch), [], [], {}, {}, False, []))
     _ok("mindnet", "orchestrate", "--execute")
     assert sc_mod.read().fresh is True
 
@@ -1273,7 +1315,8 @@ def test_orchestrate_text_output_names_why_each_task_blocked(capsys,
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
                             [], sorted(batch), [],
-                            {t: "the validation run exited 3" for t in batch}, {}, False))
+                            {t: "the validation run exited 3" for t in batch}, {}, False,
+                            []))
     capsys.readouterr()
 
     assert _cli("mindnet", "orchestrate", "--execute") == 1
@@ -1289,7 +1332,8 @@ def test_orchestrate_json_carries_the_blocked_reasons(capsys, monkeypatch):
     _orc_graph()
     monkeypatch.setattr(orc_mod, "_run_wave",
                         lambda batch, *a, **k: (
-                            [], sorted(batch), [], {t: "refused" for t in batch}, {}, False))
+                            [], sorted(batch), [], {t: "refused" for t in batch}, {}, False,
+                            []))
     capsys.readouterr()
 
     assert _cli("mindnet", "orchestrate", "--execute", "--json") == 1
@@ -1606,3 +1650,195 @@ def test_decompose_json_is_machine_readable(capsys, monkeypatch):
 
 def test_decompose_is_on_the_frozen_subcommand_surface():
     assert "decompose" in _subparser_action(_subparser("mindnet")).choices
+
+
+# --- `hive mindnet brief` — the briefing's inspection surface ------------------
+#
+# A subcommand rather than an `orchestrate --preview-brief` flag, because
+# `__main__.py` had six lines of ratchet headroom and a flag does not fit in six.
+# It registers itself, the trade `bench` and `pgcli` already took.
+
+def test_brief_is_on_the_subcommand_surface():
+    """The registration itself. `briefcli.register(mnsub)` is two lines in
+    `__main__.py`, and two lines are easy to lose in a merge — at which point the
+    command silently stops existing."""
+    assert "brief" in _subparser_action(_subparser("mindnet")).choices
+
+
+def test_brief_names_the_task_and_its_counts(capsys):
+    """The counts are the point. A brief that arrived empty and a brief that
+    never ran look identical in the prompt; they do not look identical here."""
+    _orc_graph()
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief", "a") == 0
+    out = capsys.readouterr().out
+    assert "a " in out
+    for label in ("skills=", "sops=", "constraints=", "symbols="):
+        assert label in out, f"the counts do not report {label}"
+
+
+def test_brief_reports_a_gated_source_as_gated_not_as_zero(capsys, monkeypatch):
+    """`symbols` ships inert unless `MINDHIVE_SYMBOLS` is set. Printing `0` for a
+    source nobody switched on sends the operator looking for a broken index."""
+    monkeypatch.delenv("MINDHIVE_SYMBOLS", raising=False)
+    _orc_graph()
+    capsys.readouterr()
+
+    _cli("mindnet", "brief", "a")
+    assert "gated=" in capsys.readouterr().out
+
+
+def test_brief_refuses_a_missing_task_the_way_its_siblings_do(capsys):
+    """The only failure this command has, and it must refuse in the house shape.
+
+    An EMPTY brief is NOT a failure — it is a normal outcome with a reason, and
+    exiting non-zero on it would fail a CI step for a task nobody has recorded
+    anything about yet. A MISSING task is, and the first version answered it with
+    prose on stdout and exit 1 while every sibling answered `error:` on stderr and
+    `MN_REFUSED` — so a caller could not tell this command's refusal from the
+    others' by either channel or code."""
+    from mindhive.mindnet import briefcli as bc_mod
+    _orc_graph()
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief", "nope") == cli_mod.MN_REFUSED
+    cap = capsys.readouterr()
+    assert "no task" in cap.err, "the refusal must reach stderr, like its siblings"
+    assert cap.out == "", "nothing on stdout — a --json caller parses that stream"
+    # The local copy of the exit code cannot drift from the one `__main__` owns.
+    assert bc_mod.REFUSED == cli_mod.MN_REFUSED
+
+
+def test_brief_refuses_a_missing_task_without_writing_to_the_json_stream(capsys):
+    """The refusal fires BEFORE the `--json` branch, so `--json` must not emit
+    half a document. The first version printed prose to stdout ahead of that
+    branch, which handed a parsing caller a stream that was neither."""
+    _orc_graph()
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief", "nope", "--json") == cli_mod.MN_REFUSED
+    cap = capsys.readouterr()
+    assert cap.out == "", "a --json refusal must leave stdout empty, not partial"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(cap.out or "")
+
+
+def test_brief_json_keys_tasks_by_id_like_its_sibling(capsys):
+    """`mindnet list --json` emits `tasks` as an OBJECT keyed by task id. Two
+    shapes under one key name in one command family is a discrimination every
+    consumer has to make at runtime, so this pins them equal."""
+    _orc_graph()
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief", "--json") == 0
+    tasks = json.loads(capsys.readouterr().out)["tasks"]
+    assert isinstance(tasks, dict), "tasks must be an object, not an array"
+    assert "a" in tasks and tasks["a"]["task_id"] == "a"
+
+
+def test_brief_takes_the_same_scoping_flags_as_every_other_mindnet_command(capsys):
+    """`--project` and `--session` are not extras — every sibling takes both.
+
+    Without them argparse rejected the flags outright (exit 2, "unrecognized
+    arguments") and `cmd_brief`'s `getattr(args, "project", None)` could only ever
+    answer None, so the command was pinned to the default namespace while reading
+    as though it were not.
+
+    Asserted against a namespace holding a task the default one does not, in both
+    directions. Exit 0 on `--project test` proves only that argparse ACCEPTS the
+    flag — `cmd_brief` reading it and then discarding it also exits 0, which is
+    exactly the pinned-to-default bug this test is named after
+    (/autoplan, 2026-08-30)."""
+    _orc_graph()
+    _ok("mindnet", "declare", "elsewhere", "--title", "only in the other space",
+        "--project", "other")
+    _ok("mindnet", "rebuild", "--project", "other")
+    capsys.readouterr()
+
+    # The default namespace knows `a` and has never heard of `elsewhere`.
+    assert _cli("mindnet", "brief") == 0
+    default_out = capsys.readouterr().out
+    assert "a " in default_out and "elsewhere" not in default_out, (
+        f"the default namespace is not what this test assumed: " f"{default_out!r}")
+
+    # `--project` reaches the other one, and reaches ONLY it. A flag that parses
+    # and is then dropped would print the default namespace's graph here.
+    assert _cli("mindnet", "brief", "--project", "other") == 0
+    scoped_out = capsys.readouterr().out
+    assert "elsewhere" in scoped_out, (
+        f"--project parsed but did not scope the read: " f"{scoped_out!r}")
+    assert "a " not in scoped_out, (
+        f"--project leaked the default namespace's tasks: " f"{scoped_out!r}")
+
+    assert _cli("mindnet", "brief", "--session", "s1") == 0
+    # CANARY: the parser is genuinely capable of rejecting an unknown flag, so
+    # the passes above are the flags being ACCEPTED, not the parse being lax.
+    with pytest.raises(SystemExit):
+        _cli("mindnet", "brief", "--no-such-flag")
+
+
+def test_brief_json_carries_the_counts_and_the_reason(capsys):
+    """The agent-facing surface. Without the reason as data, an agent seeing an
+    empty brief has to guess between 'switched off', 'no context published' and
+    'matched nothing'."""
+    _orc_graph()
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief", "a", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    row = data["tasks"]["a"]
+    assert row["task_id"] == "a"
+    for key in ("skills", "sops", "constraints", "symbols", "gated",
+                "empty_reason", "phase", "chars"):
+        assert key in row, f"the json does not carry {key}"
+    assert row["text"] is None, "the full text should be behind --verbose"
+
+
+def test_brief_verbose_prints_the_block_the_agent_would_receive(capsys):
+    """The whole reason the command exists: seeing the actual text, without
+    starting an agent to find out."""
+    from mindhive.mindnet import brief as br_mod
+    _orc_graph()
+    capsys.readouterr()
+
+    _cli("mindnet", "brief", "a", "--verbose")
+    out = capsys.readouterr().out
+    # Either the fence is there, or the reason it is not is stated. Silence is
+    # the one answer this command must never give.
+    assert br_mod.FENCE_OPEN in out or "empty:" in out
+
+
+def test_a_hostile_phase_cannot_forge_a_row_in_the_listing_used_to_audit_it(
+        monkeypatch, capsys):
+    """`briefcli` defuses the phase and the task id before printing them, and
+    nothing covered that.
+
+    This command is the operator's tool for judging whether a brief is SAFE, so
+    it is the one surface where a sidecar-supplied phase carrying newlines could
+    forge extra rows in the very listing being used to audit the feature. The
+    phase reaches `cmd_brief` from `phase_for` -> `ctx.records` -> the
+    controller, i.e. from data an agent's own run can move.
+
+    Un-covered before now (/autoplan, 2026-08-30): the two `safe_phase`/
+    `safe_line` calls could both be deleted and the suite stayed green."""
+    from mindhive.mindnet import brief as br_mod
+
+    _orc_graph()
+    forged = "z9forged [done]  skills=99  sops=99"
+    monkeypatch.setattr(br_mod, "phase_for",
+                        lambda ctx, task: "brainstorm" + chr(10) + forged)
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief") == 0
+    out = capsys.readouterr().out
+    rows = [ln for ln in out.splitlines() if ln and not ln.startswith(" ")]
+
+    assert len(rows) == 4, (
+        f"4 tasks on the graph produced {len(rows)} rows: {rows!r}")
+    assert not any(ln.startswith("z9forged") for ln in out.splitlines()), (
+        f"a phase forged its own row in the audit listing: {out!r}")
+    # The honest half still arrives — flattening the phase to nothing would pass
+    # the assertions above while telling the operator less than before.
+    assert any("brainstorm" in ln for ln in rows), (
+        f"the real phase was destroyed along with the forgery: {rows!r}")

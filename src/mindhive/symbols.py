@@ -48,6 +48,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from . import events, injectors, paths
 
@@ -428,6 +429,135 @@ def index(root=None, budget=BUDGET_TOKENS) -> dict:
             "tokens": injectors._tokens(len(text)), "chars": len(text),
             "ms": int((time.perf_counter() - t0) * 1000),
             "files": kept, "text": text}
+
+
+# --- one unit's neighbourhood -----------------------------------------------
+
+class Map(NamedTuple):
+    """One parse of a tree, kept so several slices can share it.
+
+    `index` scans, resolves and ranks on every call, which is right for the
+    per-prompt hook: one caller, one artifact. A mission wants N artifacts from
+    the SAME tree — one per unit — and re-parsing 335 modules per unit would
+    cost more than the slices are worth. So the expensive half is separated from
+    the rendering half, and the caller holds on to it."""
+
+    root: str
+    entries: tuple
+    graph: dict
+    externals: dict
+    scores: dict
+    importers: dict
+    by_file: dict
+    by_module: dict
+
+    @property
+    def total(self) -> int:
+        return len(self.entries)
+
+
+def build_map(root=None) -> Map:
+    """Scan, resolve and rank *root* once — `index`'s expensive half, reusable.
+
+    `importers` is the reverse of `graph` and is built here rather than derived
+    per call: a unit's neighbourhood is what it imports AND what imports it, and
+    the second half is not reachable from `graph` without a full pass."""
+    root = Path(root) if root is not None else default_root()
+    # RESOLVED, and the slice depends on it: `focus` is handed the paths
+    # `lintester._files_for` already resolved, and `Path.relative_to` between a
+    # resolved path and a relative root raises rather than matching — so a map
+    # built from a relative root answered an empty slice for every unit, with no
+    # error anywhere to say why.
+    try:
+        root = root.resolve()
+    except OSError:                                     # pragma: no cover - odd fs
+        pass
+    entries = scan(root)
+    g, ext = resolve_imports(entries)
+    importers: dict = {}
+    for owner, targets in g.items():
+        for target in targets:
+            importers.setdefault(target, set()).add(owner)
+    return Map(root=str(root), entries=tuple(entries), graph=g, externals=ext,
+               scores=rank(g), importers=importers,
+               by_file={e["file"]: e for e in entries},
+               by_module={e["module"]: e for e in entries})
+
+
+def _rel_of(root: Path, path) -> str:
+    """*path* as a repo-relative posix path, or ``""`` when it is outside."""
+    try:
+        return Path(path).resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return ""
+
+
+def owned_modules(smap, files) -> list:
+    """The modules of *files* that *smap* actually holds, in rank order.
+
+    A path the map does not hold — a text file, a path outside the root, a
+    module the scan skipped — is dropped rather than guessed at."""
+    root = Path(smap.root)
+    out = []
+    for path in files or ():
+        rel = _rel_of(root, path)
+        entry = smap.by_file.get(rel)
+        if entry is not None:
+            out.append(entry["module"])
+    return sorted(dict.fromkeys(out),
+                  key=lambda m: (-smap.scores.get(m, 0.0), m))
+
+
+def _focus_header(included, owned, total) -> str:
+    # Deliberately NOT `_header`'s wording, which ends "ranked by import graph".
+    # That is true of the whole-repo index and false here: this slice is chosen
+    # by which modules the unit owns, and rank only orders what survived the
+    # choice. Borrowing the other header would overstate what the slice is.
+    return (f"# symbol index: {included} of {total} modules, scoped to the "
+            f"{owned} this unit owns and their direct neighbours")
+
+
+def _focus_render(files, owned, total) -> str:
+    return "\n".join([_focus_header(len(files), owned, total)]
+                     + [_line(f) for f in files])
+
+
+def focus(smap, files, budget=BUDGET_TOKENS) -> str:
+    """The slice of *smap* one unit can actually reach.
+
+    Its own modules first, then their direct neighbours in the import graph —
+    what they import, and what imports them. Same budget rule as `index`: a
+    module is added only while the WHOLE rendered artifact still fits, so the
+    header is always present and always says how much was left out.
+
+    Answers ``""`` when the unit owns no module this map holds. That is the
+    signal to fall back to the repo-wide slice rather than brief an agent with
+    an empty map — a unit that touches no Python is better served by the
+    repository's shape than by a header saying it has none."""
+    owned = owned_modules(smap, files)
+    if not owned:
+        return ""
+    near: set = set()
+    for module in owned:
+        near |= set(smap.graph.get(module, ()) or ())
+        near |= set(smap.importers.get(module, ()) or ())
+    ordered = owned + sorted(near - set(owned),
+                             key=lambda m: (-smap.scores.get(m, 0.0), m))
+    kept: list = []
+    for module in ordered:
+        entry = smap.by_module.get(module)
+        if entry is None:                               # pragma: no cover
+            continue
+        deps = (set(smap.graph.get(module, ()) or ())
+                | set(smap.externals.get(module, ()) or ()))
+        trial = kept + [_trim(entry, deps)]
+        if injectors._tokens(len(_focus_render(trial, len(owned),
+                                               smap.total))) > budget:
+            break
+        kept = trial
+    if not kept:
+        return ""
+    return _focus_render(kept, len(owned), smap.total)
 
 
 # --- the cache, and the seventh injector ------------------------------------

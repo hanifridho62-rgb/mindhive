@@ -108,6 +108,28 @@ DETERMINISTIC_TYPES = {
     # (MindSwarm's mission state is a plain instance attribute that dies with
     # the server).
     "mindnet_activity",
+    # One row per task briefed for an orchestrated agent. Payload
+    # {task_id, chars, skills, sops, constraints, symbols, gated, empty_reason}.
+    #
+    # This exists because the feature it measures can fail INVISIBLY. `advice`
+    # answers EMPTY for a task whose words overlap nothing, and the symbol slice
+    # is inert unless `MINDHIVE_SYMBOLS` is set — which it is not by default — so
+    # the briefing composer can ship, hand every agent a prompt with no
+    # task-specific context in it at all, and have every run still report
+    # success. The counts are the only thing that can contradict that, and
+    # `gated` is what keeps "switched off" from being reported as "matched
+    # nothing", which are different problems with different fixes.
+    #
+    # Deterministic, for the same reason as `mindnet_activity`: this is
+    # machine-generated telemetry carrying no human intent, and semantic
+    # membership would put a LEDGER markdown file, a Memory-view row and a
+    # recall-corpus entry on disk per briefed task — one per agent per wave.
+    #
+    # The brief's TEXT is not in the payload. It goes to `runlog` under the
+    # task's key plus `agent.BRIEF_KEY_SUFFIX`, because a full prompt block in
+    # every row would put kilobytes per task on the hash chain, and `hive verify`
+    # re-hashes the whole ledger.
+    "mindnet_brief",
     # One row per PreToolUse refusal — the evidence a denial ever happened.
     # Payload {signature, tool_name, decision, reason}; `signature` is ``""``
     # for the learned-matcher tier, which has no signature to report, and the
@@ -557,6 +579,61 @@ def read_all(project=None) -> list["Event"]:
             ev = _row_to_event(line)
             if ev is None:
                 continue          # skip a malformed/torn row (reads stay total)
+            rows.append((ev.ts or "", seg.name, i, ev))
+    rows.sort(key=lambda t: (t[0], t[1], t[2]))
+    return [r[3] for r in rows]
+
+
+def read_types(types, project=None) -> list["Event"]:
+    """Every event whose ``type`` is in *types*, in `read_all`'s exact order.
+
+    **What this is, stated plainly, because it was nearly mislabelled.** This is a
+    RETENTION and LATENCY fix, not a bounded reader. It still opens every segment
+    and still parses every line: measured on the live store, 1079/1079 segments and
+    27.8 MB read, 50,019 lines `json.loads`-ed, to keep 1,451 events. What changes
+    is what survives the call — 1,451 `Event` objects instead of 50,003 — and the
+    tuple-build and sort that dominated the cost (1.54 s -> 0.42 s, best of 3).
+
+    It therefore does NOT discharge `CLAUDE.md`'s "no unbounded scans" guardrail,
+    and no comment here should claim it does (/autoplan skeptic, 2026-08-30). That
+    rule sits under "Data-access guardrails", is scoped "to answer a question", and
+    closes with "Self-audit before answering": it governs the agent's own inspection
+    tier, not library internals — `read_all` has 130 call sites across
+    `src/mindhive/`, and none of them are rule breaches either. The genuinely
+    bounded typed reader is `pgtools.search_events_by_type`, which is index-served
+    and takes a limit; it needs the Postgres mirror, which is not available on every
+    machine, so it cannot be what the composer depends on.
+
+    Three seams are shared with `read_all` deliberately, and changing any of them
+    here silently forks the two readers:
+      * `_maybe_read_from_pg` first, so `MINDHIVE_EVENT_BACKEND=pg` does not make
+        one reader answer from the mirror and the other from the file store;
+      * `_row_to_event`, so a torn or malformed row is skipped identically and
+        reads stay total;
+      * the `(ts, segment name, line index)` sort key. Filtering BEFORE the sort
+        cannot reorder the survivors — the key is unique per row, so there are no
+        ties to break differently — which is what lets the order-sensitive folds
+        downstream (`sop.fold`, `tasks.fold`, the skill-call pairing) see exactly
+        what a full read would have shown them."""
+    want = frozenset(str(t) for t in types)
+    pg = _maybe_read_from_pg(project)
+    if pg is not None:
+        return [e for e in pg if e.type in want]
+    d = paths.events_dir(project)
+    rows = []
+    if not d.exists():
+        return []
+    for seg in sorted(d.glob("*.jsonl")):
+        for i, line in enumerate(
+                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            ev = _row_to_event(line)
+            if ev is None:
+                continue          # skip a malformed/torn row (reads stay total)
+            if ev.type not in want:
+                continue
             rows.append((ev.ts or "", seg.name, i, ev))
     rows.sort(key=lambda t: (t[0], t[1], t[2]))
     return [r[3] for r in rows]

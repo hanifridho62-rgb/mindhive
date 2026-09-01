@@ -694,6 +694,7 @@ EVENT_TYPE_CLASSES = {
     "loop_run_start":      "deterministic",
     "memory_consolidated": "deterministic",
     "mindnet_activity":    "deterministic",
+    "mindnet_brief":       "deterministic",
     "plugin_catalog":      "deterministic",
     "policy_denied":       "deterministic",
     "prompt_enriched":     "deterministic",

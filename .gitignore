@@ -14,3 +14,8 @@ __pycache__/
 # any other clone an agent's worktree showed up as untracked changes in the parent
 # repo, and this project's own change-log detection reads git status.
 .claude/worktrees/
+
+# Lane checkouts the lintester mission pipeline creates (.worktrees/lane-N).
+# Same reason .claude/worktrees/ is here: a linked worktree left in the parent
+# repo shows up as untracked changes, and this project reads git status.
+.worktrees/
