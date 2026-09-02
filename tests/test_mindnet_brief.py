@@ -1492,6 +1492,22 @@ def test_a_failed_source_outranks_a_dropped_line_in_the_reason():
     assert "raised" in br_mod._empty_reason("", ("events",), 5)
 
 
+def test_one_failed_source_is_not_reported_as_no_source_surviving():
+    """The reason this function exists is that the sentence it replaced was a
+    claim which was false. "no source survived" is the same defect rewritten
+    when only one of four did: `symbols` is the likeliest to fail alone — off
+    by default, its cache recorded flaky on Windows — and telling an operator
+    whose ledger, plugins and sidecar all worked that nothing survived points
+    the investigation away from the one source the sentence then names."""
+    one = br_mod._empty_reason("", ("symbols",), 0)
+    assert "no source survived" not in one, one
+    assert "1 of 4 sources failed" in one
+    assert "symbols" in one and "raised" in one
+
+    every = br_mod._empty_reason("", br_mod.FAILURE_SOURCES, 0)
+    assert every.startswith("no source survived"), every
+
+
 def test_a_brief_whose_lines_were_all_defused_says_so_end_to_end(monkeypatch):
     """The seam test above proves the sentence; this proves `build` reaches it
     with the real count, through the real renderer."""

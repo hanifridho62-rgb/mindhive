@@ -919,7 +919,17 @@ def _empty_reason(text, failures, dropped) -> str:
     if text:
         return ""
     if failures:
-        return ("no source survived: " + ", ".join(failures) +
+        # Count the sources, do not assert about them. "no source survived" is
+        # only true when they ALL failed, and the single most likely failure is
+        # `symbols` alone — off by default, and its cache is recorded as flaky
+        # on Windows. Telling an operator whose ledger, plugins and sidecar all
+        # worked that nothing survived points the investigation away from the
+        # one source named two words later. This function exists because the
+        # sentence it replaced was false in the cases that matter; a
+        # replacement false in the commonest one is the same defect rewritten.
+        head = ("no source survived" if len(failures) >= len(FAILURE_SOURCES)
+                else f"{len(failures)} of {len(FAILURE_SOURCES)} sources failed")
+        return (head + ": " + ", ".join(failures) +
                 " raised while the wave context was resolved")
     if dropped:
         return (f"{dropped} line(s) were emptied by the defuser, so nothing "

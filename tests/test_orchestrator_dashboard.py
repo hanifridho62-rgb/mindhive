@@ -767,9 +767,15 @@ def test_closing_a_runner_that_never_started_is_a_no_op():
 # --- the decoupling, checked as text -----------------------------------------
 
 _PRODUCERS = ("queue.py", "resilience.py", "lintester.py")
-_IMPORT_RE = re.compile(r"^\s*(?:from\s+\S*\s+import\s+[^\n]*\bdashboard\b"
-                        r"|import\s+[^\n]*\bdashboard\b"
-                        r"|from\s+\.?dashboard\s+import)", re.MULTILINE)
+# BOTH halves. Splitting `dashboard.py` at its 1000-line cap moved the event
+# classes, the bus and the fold into `board.py`, and a scanner that still only
+# knew the old name would have left a back door exactly as wide as the front
+# one it guards. `\b` keeps `board` from matching inside `dashboard`, so the
+# two alternations stay independent rather than one shadowing the other.
+_TARGET = r"(?:dashboard|board)"
+_IMPORT_RE = re.compile(rf"^\s*(?:from\s+\S*\s+import\s+[^\n]*\b{_TARGET}\b"
+                        rf"|import\s+[^\n]*\b{_TARGET}\b"
+                        rf"|from\s+\.?{_TARGET}\s+import)", re.MULTILINE)
 
 
 def _producer_source(name) -> str:
@@ -791,6 +797,10 @@ def test_no_producer_imports_the_board_it_feeds(name):
     "from .dashboard import TaskStarted",
     "import mindhive.orchestrator.dashboard",
     "    from . import dashboard",
+    "from . import board as board_mod",
+    "from .board import TaskStarted",
+    "import mindhive.orchestrator.board",
+    "    from . import board",
 ])
 def test_the_import_scanner_catches_a_planted_import(planted):
     """The canary. Without it a passing guard proves only that the scanner found
@@ -875,6 +885,102 @@ def test_a_real_dry_run_fills_a_board_end_to_end(tmp_path):
     assert board.phase == dash.PHASE_DONE
     text = dash.render_plain(board)
     assert "LINTESTER BRAIN" in text
+    assert board.mission_id in text
+
+
+# --- the subscription window, and the events that fell outside it -------------
+#
+# The three tests above replay a `Recorder` into an OFFLINE board, and that is
+# exactly how the defect below survived them: a replay has no subscription
+# window, so it cannot notice that the real one opens too late. A code review
+# caught it and a real `--execute` run confirmed it — 19 events published, 7
+# delivered, `dropped == 0`, and a header reading `(no mission)  Waiting` over a
+# mission that had just completed two units.
+
+def _git(root, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(root), *args],
+                          capture_output=True, text=True, check=False)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "T")
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(root, "add", "seed.txt")
+    _git(root, "commit", "-qm", "seed")
+    return root
+
+
+def _two_units(_root_id, _title, _intent):
+    return [("t-worktree", "Serialise the worktree add", "worktree add lock"),
+            ("t-ledger", "Rotate the ledger segment", "ledger segment append")]
+
+
+def test_a_publish_with_nobody_listening_is_held_rather_than_discarded():
+    """The bus promises it 'counts what it could not deliver rather than hiding
+    it'. Before this, a publish with no subscriber returned silently and was
+    neither delivered NOR counted."""
+    bus = dash.EventBus()
+    bus.emit("mission_started", mission_id="m-1", intent="do the thing")
+    bus.emit("brain_phase", phase=dash.PHASE_PARSING, detail="two files")
+    assert bus.published == 2
+    assert bus.dropped == 0
+
+    queue = bus.subscribe()
+    assert queue.qsize() == 2, "the backlog did not reach the first subscriber"
+    board = dash.Board()
+    while not queue.empty():
+        board.apply(queue.get_nowait())
+    assert board.mission_id == "m-1"
+    assert board.phase == dash.PHASE_PARSING
+
+
+def test_a_backlog_that_overflows_counts_the_loss_rather_than_hiding_it():
+    """Bounded for the same reason a subscriber's queue is: a buffer that grows
+    without a listener is a leak. The loss is COUNTED, which is the half the
+    silent return never did."""
+    bus = dash.EventBus(capacity=3)
+    for i in range(5):
+        bus.emit("note", text=f"n{i}")
+    assert bus.published == 5
+    assert bus.dropped == 2
+    held = bus.drain()
+    assert [e.text for e in held] == ["n2", "n3", "n4"], "kept the wrong end"
+    assert bus.drain() == (), "drain did not clear what it handed over"
+
+
+def test_the_header_survives_a_real_execute_mission(repo):
+    """THE regression. A real bus, a real Dashboard subscribed through the real
+    observer seam, a real mission — and the header pane has to say what mission
+    ran, over what intent, and how it ended."""
+    bus = dash.EventBus()
+    board = dash.Board()
+    stream = io.StringIO()
+
+    mission = lint_mod.LintesterOrchestrator(
+        root=repo, project="wb7-header", lanes=2, decomposer=_two_units,
+        runner=lambda e, ln: True, bus=bus,
+        observer=lambda: dash.attach(bus, board=board, plain=True,
+                                     stream=stream),
+    ).execute_mission("make the ledger writer retry", dry_run=False)
+    for event in bus.drain():
+        board.apply(event)
+
+    assert mission.outcome == "ok", mission.reason
+    assert bus.dropped == 0
+    assert board.mission_id.startswith(lint_mod.MISSION_PREFIX)
+    assert board.intent == "make the ledger writer retry"
+    assert board.units == 2, "the header counted no units for a two-unit mission"
+    assert board.completed == 2
+    assert board.phase == dash.PHASE_DONE
+    assert board.outcome == "ok"
+    text = dash.render_plain(board, dash.ASCII_ICONS)
+    assert "(no mission)" not in text
     assert board.mission_id in text
 
 
@@ -1034,8 +1140,8 @@ def _args(**kwargs):
 def test_the_flag_is_off_by_default_and_costs_nothing():
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, why = cli_mod._observer(_args(), False)
-    assert (bus, observer, why) == (None, None, "")
+    bus, observer, why, board = cli_mod._observer(_args(), False)
+    assert (bus, observer, why, board) == (None, None, "", None)
 
 
 def test_the_board_refuses_a_plan_and_says_why():
@@ -1043,33 +1149,189 @@ def test_the_board_refuses_a_plan_and_says_why():
     feature is broken rather than that this run did not qualify."""
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, why = cli_mod._observer(_args(board=True), False)
-    assert bus is None and observer is None
+    bus, observer, why, board = cli_mod._observer(_args(board=True), False)
+    assert bus is None and observer is None and board is None
     assert "plan" in why and why
 
 
 def test_the_board_refuses_to_share_stdout_with_the_json_report():
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, why = cli_mod._observer(_args(board=True, json=True), True)
-    assert bus is None and observer is None
+    bus, observer, why, board = cli_mod._observer(
+        _args(board=True, json=True), True)
+    assert bus is None and observer is None and board is None
     assert "stdout" in why
 
 
 def test_a_started_run_gets_a_real_bus_and_a_real_observer():
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, _why = cli_mod._observer(_args(board=True), True)
+    bus, observer, _why, board = cli_mod._observer(_args(board=True), True)
     assert isinstance(bus, dash.EventBus)
+    assert isinstance(board, dash.Board)
     assert callable(observer)
 
     async def drive():
         async with observer() as runner:
             assert isinstance(runner, dash.Dashboard)
+            assert runner.board is board, "the front door lost its own board"
         return True
 
     assert asyncio.run(drive()) is True
     assert bus.subscribers == 0, "the observer left a subscriber behind"
+
+
+def test_the_front_door_draws_a_closing_board_after_the_mission_returns(capsys):
+    """`Live` leaves nothing behind when it exits, and the mission's last two
+    events are published after the lane phase has torn it down. The closing
+    frame is the one the operator can still read."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    bus = dash.EventBus()
+    board = dash.Board()
+    bus.emit("mission_started", mission_id="mn-abc", intent="do it", units=2)
+    bus.emit("brain_phase", phase=dash.PHASE_MERGING)
+    bus.emit("mission_finished", mission_id="mn-abc", outcome="ok", completed=2)
+
+    cli_mod._close_board(bus, board)
+
+    text = capsys.readouterr().out
+    assert "mn-abc" in text, "the closing board never named the mission"
+    assert dash.PHASE_DONE in text
+    assert board.outcome == "ok"
+    assert "dropped" not in text, "a permanent zero teaches the operator to skim"
+
+
+def test_the_closing_board_reports_what_the_bus_could_not_deliver(capsys):
+    """`dropped` and `unknown` had no reader anywhere in `src/`: the process
+    exited holding both. Non-zero only, for the reason `hive mindnet brief`
+    already prints `failed=` / `dropped=` / `withheld=` only when non-zero."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    bus = dash.EventBus(capacity=2)
+    for i in range(4):
+        bus.emit("note", text=f"n{i}")
+    bus.emit("no_such_kind", whatever=1)                # drift — also a Note
+    # Five published into a backlog that holds two, so three fell off the old
+    # end. The drift is counted separately, on `unknown`.
+    assert bus.dropped == 3 and bus.unknown
+
+    cli_mod._close_board(bus, dash.Board())
+
+    text = capsys.readouterr().out
+    assert "3 event(s) dropped" in text, text
+    assert "unrecognised" in text and "no_such_kind" in text
+
+
+def test_a_closing_board_that_cannot_be_drawn_costs_the_report_nothing():
+    """Same bargain as everywhere else on this path: a display is derived
+    state, and losing it must never take the mission report with it."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    class Exploding:
+        def drain(self):
+            raise RuntimeError("no board for you")
+
+    cli_mod._close_board(Exploding(), dash.Board())     # must not raise
+
+
+# --- the observer must never be able to harm the observed ---------------------
+#
+# `_paint` and `_run_live` were guarded; the FALLBACK path was not, and it is
+# the path CI takes (`rich` is not in `dev`) and the path any machine without
+# `rich` takes. One malformed field in one event reached `log_line`, raised out
+# of `_drain` -> `_pump` -> `_run` -> the display task -> `asyncio.run`, and
+# killed the mission the board was only watching — orphaning its lane
+# worktrees on the way out.
+
+def test_a_bad_field_in_the_log_path_costs_a_line_and_not_the_mission():
+    """`make_event` filters by field NAME and does not coerce, and the module
+    accepts that a string seam can drift. So a drifted value reaches the
+    renderer, and the renderer must absorb it."""
+    bus = dash.EventBus()
+    stream = Stream()
+
+    async def go():
+        async with dash.attach(bus, plain=True, stream=stream) as runner:
+            # `elapsed_ms` is a number everywhere else; `log_line` does
+            # `float(...)` on it.
+            bus.emit("task_finished", task_id="t-1", lane=0,
+                     state="validated", elapsed_ms="12ms")
+            bus.emit("task_finished", task_id="t-2", lane=0,
+                     state="validated", elapsed_ms=8)
+            await asyncio.sleep(0)
+        return runner
+
+    runner = drive(go)                                  # must not raise
+    assert runner.render_errors >= 1, "the bad line was not counted"
+    assert "ValueError" in (runner.last_render_error or "")
+    # The good event still logged and still folded — one bad line costs one
+    # line, and the run carries on.
+    assert "t-2" in stream.getvalue()
+    assert runner.board.completed >= 1, "a display fault cost a unit"
+
+
+def test_a_closing_render_that_raises_does_not_escape_the_display_task():
+    """The last line `_run` prints is a whole-board render, and it sat outside
+    every guard in the file."""
+    bus = dash.EventBus()
+    stream = Stream()
+
+    async def go():
+        async with dash.attach(bus, plain=True, stream=stream) as runner:
+            runner.board = None                         # the render will raise
+        return runner
+
+    runner = drive(go)                                  # must not raise
+    assert runner.render_errors >= 1
+
+
+def test_the_mission_producer_counts_what_the_bus_lost():
+    """The two lane-side producers count a failed publish. This one used a bare
+    `pass`, so the module publishing the header the operator reads was the one
+    whose losses left no trace."""
+    class Exploding:
+        def emit(self, kind, **fields):
+            raise RuntimeError("no bus for you")
+
+    orch = lint_mod.LintesterOrchestrator(bus=Exploding())
+    orch._emit("brain_phase", phase=dash.PHASE_PARSING)
+    orch._emit("brain_phase", phase=dash.PHASE_PACKING)
+    assert orch.observer_drops == 2
+    assert "RuntimeError" in orch.observer_error
+
+
+def test_the_last_event_repairs_a_tally_the_queue_dropped():
+    """A `task_finished` lost to backpressure under-counts for the rest of the
+    run. The mission publishes its true totals in its final event, and the fold
+    used to read the outcome off it and discard them."""
+    board = board_with(
+        dash.make_event("mission_started", mission_id="m-1", units=4, lanes=2)[0],
+        dash.make_event("task_finished", task_id="t-1", lane=0,
+                        state="validated")[0],
+    )
+    assert board.completed == 1, "precondition: three finishes were dropped"
+
+    board.apply(dash.make_event("mission_finished", mission_id="m-1",
+                                outcome="ok", completed=4, steals=3)[0])
+    assert board.completed == 4, "the closing totals were thrown away"
+    assert board.steals == 3
+    assert board.outcome == "ok"
+
+
+def test_the_closing_totals_never_undo_a_repair_the_board_already_folded():
+    """`max`, not assignment. The mission computes its totals after the repair
+    loop has spoken, so a fold that already moved a retried unit out of `failed`
+    must not have it moved back."""
+    board = board_with(
+        dash.make_event("task_finished", task_id="t-1", lane=0,
+                        state="validated")[0],
+        dash.make_event("task_finished", task_id="t-2", lane=0,
+                        state="validated")[0],
+    )
+    board.apply(dash.make_event("mission_finished", outcome="ok",
+                                completed=1, failed=0)[0])
+    assert board.completed == 2, "a stale closing total overwrote a live one"
 
 
 def test_the_mission_binds_the_bus_to_the_loop_it_actually_runs_on():

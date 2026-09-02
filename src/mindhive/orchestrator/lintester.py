@@ -327,6 +327,10 @@ class LintesterOrchestrator:
     # board exists and hands one in. See `dashboard.py`'s first paragraph.
     bus: object = None
     observer: object = None
+    # What the seam LOST, held the way the two sibling producers hold it.
+    # `init=False`: these are a tally, not a collaborator.
+    observer_drops: int = field(default=0, init=False, repr=False, compare=False)
+    observer_error: str = field(default="", init=False, repr=False, compare=False)
     # The symbol map, built at most once per mission and only when a unit
     # actually owns a file. `init=False` because it is a cache, not a
     # collaborator: nothing outside this object should be able to hand it one.
@@ -339,14 +343,22 @@ class LintesterOrchestrator:
         return f"{MISSION_PREFIX}-{digest}"
 
     def _emit(self, kind, **fields) -> None:
-        """Publish one state change. A board must never fail a mission."""
+        """Publish one state change. A board must never fail a mission.
+
+        Counted, the way `queue.WorkStealingScheduler._emit` and
+        `resilience.RepairLoop._emit` count. This one used a bare `pass` and so
+        was the one producer of the three whose losses left no trace at all —
+        which is the failure the other two exist to avoid, in the module that
+        publishes the header the operator reads."""
         bus = self.bus
         if bus is None:
             return
         try:
             bus.emit(kind, **fields)
-        except Exception:                               # noqa: BLE001
-            pass
+        except Exception as exc:                        # noqa: BLE001
+            self.observer_drops += 1
+            if not self.observer_error:
+                self.observer_error = f"{type(exc).__name__}: {exc}"
 
     def _name(self, intent) -> tuple:
         """``(task_id, title)`` for the root task, from the incumbent deriver."""
