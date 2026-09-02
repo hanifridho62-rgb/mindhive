@@ -18,12 +18,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        # 3.14 is the version this project is actually developed on and the one
+        # 3.14 is the version this project is actually developed on, and the one
         # CI had never run — `requires-python` is >=3.11, so it was always in
-        # scope and simply untested. It is added here UNVERIFIED: GitHub Actions
-        # is billing-blocked on this account, so no run of this matrix has
-        # executed. Saying that plainly is the point; a leg nobody has seen go
-        # green is a claim, not evidence.
+        # scope and simply untested. It shipped UNVERIFIED because Actions was
+        # billing-blocked; that block is gone and the leg has now been SEEN go
+        # green twice, on run 33469713585 (PR #119) and run 33623302130 (PR
+        # #120, head 3e6d924, 9/9 checks), on both ubuntu and windows. It has
+        # still never run on the maintainer's own machine, so the evidence is
+        # CI-only — which is the whole reason this leg exists.
         python-version: ["3.11", "3.12", "3.14"]
 
     steps:
