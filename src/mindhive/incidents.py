@@ -12,7 +12,9 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from . import events, paths
+# `sig_mod`, not `sig`: auto_promote() binds a local `sig` for the signature
+# string, and a module shadowed by a loop variable is a trap, not a shortcut.
+from . import events, paths, signature as sig_mod
 
 THRESHOLD = 2                       # recurrence gate N (D2)
 DECAY_DAYS = 14                     # candidate staleness horizon (KTD4 decay)
@@ -234,6 +236,14 @@ def leaks(project=None, signature=None, by_sig=None, life=None) -> int:
     act = _activation_ts(project, signature, life=life)
     if not act:
         return 0
+    # A rule_expired wipes the slate the same way a reroute does. Failures from
+    # before a signature decayed — or was retired as a classifier artifact —
+    # are not leaks against the rule that re-entered afterwards; counting them
+    # would grade a re-climbing incident on history it has already paid for,
+    # and no recurrence could ever clear it.
+    exp = _latest_expiry_ts(project, signature, life=life)
+    if exp and exp > act:
+        act = exp
     r_ts, r_sess = _latest_reroute(project, signature, life=life)
     anchor, skip = (r_ts, r_sess) if (r_ts and r_ts > act) else (act, None)
     if by_sig is None:
@@ -275,6 +285,57 @@ def _status_and_flag(project, signature, rec, threshold, source,
     return "active", flag
 
 
+def reclassified(project=None, evs=None, by_sig=None, life=None) -> dict:
+    """``raw:`` buckets whose OWN stored excerpts no longer classify to them.
+
+    A signature is frozen into its tool_failed event at capture time, so fixing
+    signature.py splits only FUTURE failures — the old bucket keeps every
+    occurrence and every leak it ever had. Those counts can only rise, so the
+    incident is red forever: it can never be resolved (no new failure can reach
+    it) and it never stops injecting its prevention rule. raw:37c59e9cae was
+    exactly that — 45 occurrences, all 45 re-classifying into named families
+    once the classifier learned to read the line that ends a traceback.
+
+    Replaying the CURRENT classifier over the excerpts the bucket itself stored
+    is what tells a stale bucket from a live one. Returns ``signature ->
+    {"into": {new_sig: n}, "retirable": bool}`` for each ``raw:`` bucket where
+    NO live excerpt still classifies to it. ``retirable`` is true only when
+    every one of them now lands in a NAMED family: a bucket still holding text
+    nothing can diagnose keeps its red card for a human, because retiring it
+    would drop the evidence rather than re-file it. Named families are never
+    candidates — ``pymodule:tools`` means the same thing whatever this module
+    learns next, and signatures minted elsewhere (``judgment:*``,
+    ``workspace:*``) were never this classifier's to re-read.
+    """
+    if evs is None:
+        evs = events.read_all(project)
+    if life is None:
+        life = _lifecycle_index(evs)
+    if by_sig is None:
+        by_sig = _failures_by_sig(project, evs=evs)
+    out = {}
+    for signature, sig_evs in by_sig.items():
+        if sig_mod.is_diagnostic(signature):
+            continue
+        live = _live_failures(project, signature, sig_evs, life=life)
+        texts = [str(e.payload.get("text") or "") if isinstance(e.payload, dict)
+                 else "" for e in live]
+        if not texts or not all(t.strip() for t in texts):
+            continue          # nothing to replay, or an excerpt we never stored
+        into = {}
+        for t in texts:
+            s = sig_mod.signature(t)
+            into[s] = into.get(s, 0) + 1
+        if signature in into:
+            continue                      # still reachable — a live bucket
+        out[signature] = {
+            "into": into,
+            "retirable": all(sig_mod.is_diagnostic(s) for s in into),
+            "last_ts": live[-1].ts,
+        }
+    return out
+
+
 def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
     """Emit a one-time rule_activated event (stamped at the threshold-crossing
     failure's ts) for any signature that has reached its recurrence threshold
@@ -284,13 +345,43 @@ def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
     judgment:flag:* incidents, which never expire. Idempotent: an expiry zeroes
     the live count, so re-running appends nothing new. Pass evs to reuse an
     events.read_all() result (one ledger pass total instead of several per
-    signature)."""
-    activated = expired = 0
+    signature).
+
+    Retirement rides the same rule_expired lifecycle: a ``raw:`` bucket the
+    current classifier can no longer mint (see reclassified) expires with
+    ``reason: reclassified``, which drops it out of injection and off the red
+    list while leaving its record on disk. Nothing is lost: should that error
+    recur under the current classifier the signature climbs candidate→active
+    again on its post-expiry occurrences alone, and leaks() re-anchors at the
+    expiry so the re-entered rule is not graded on the retired bucket's
+    history. What it does NOT do is mint a second rule_activated — a signature
+    activated before it was retired keeps that first activation, so its very
+    first post-expiry recurrence already reads as a leak. Retirement is a
+    lifecycle reset for accounting, not a fresh identity."""
+    activated = expired = retired = 0
     now_secs = _ts_secs(now) if now else time.time()
     if evs is None:
         evs = events.read_all(project)
     life = _lifecycle_index(evs)
-    for signature, sig_evs in _failures_by_sig(project, evs=evs).items():
+    by_sig = _failures_by_sig(project, evs=evs)
+    stale = {s: info for s, info in
+             reclassified(project, evs=evs, by_sig=by_sig, life=life).items()
+             if info["retirable"]}
+    for signature in sorted(stale):
+        # Stamped at the bucket's LAST failure, not at wall-clock now: a
+        # failure that already happened but has not been harvested yet would
+        # otherwise land in the dead zone between the two and never be counted.
+        # It also keeps the operation deterministic, which is what lets the
+        # tests assert the ts instead of a clock reading.
+        events.append_event(
+            "rule_expired",
+            {"signature": signature, "reason": "reclassified",
+             "into": stale[signature]["into"]},
+            tags=["lifecycle"], ts=stale[signature]["last_ts"], project=project)
+        retired += 1
+    for signature, sig_evs in by_sig.items():
+        if signature in stale:
+            continue                      # just retired; do not also activate it
         live = _live_failures(project, signature, sig_evs, life=life)
         thr = _threshold_for(signature, threshold)
         if len(live) >= thr and not _has_lifecycle(
@@ -306,7 +397,7 @@ def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
                 events.append_event("rule_expired", {"signature": signature},
                                     tags=["lifecycle"], project=project)
                 expired += 1
-    return {"activated": activated, "expired": expired}
+    return {"activated": activated, "expired": expired, "retired": retired}
 
 
 def _safe_name(signature: str) -> str:
@@ -718,6 +809,7 @@ def signal_stats(project=None, evs=None) -> dict:
         evs = events.read_all(project)
     fails = {}                          # sig -> [(ts, session_id), ...] in ts order
     act_ts = {}                         # sig -> first rule_activated ts
+    exp_ts = {}                         # sig -> latest rule_expired ts
     reroutes = {}                       # sig -> {n, ts, sess} (latest reroute)
     demoted = set()                     # sigs with an explicit rule_demoted event
     sess_last = {}                      # session_id -> latest activity ts
@@ -740,9 +832,18 @@ def signal_stats(project=None, evs=None) -> dict:
                 rr["ts"], rr["sess"] = ev.ts, ev.session_id
         elif ev.type == "rule_demoted":
             demoted.add(s)
+        elif ev.type == "rule_expired":
+            if ev.ts and ev.ts > exp_ts.get(s, ""):
+                exp_ts[s] = ev.ts
     out = {}
     for s, hits in fails.items():
         act = act_ts.get(s)
+        # Same re-anchor as leaks(): an expiry (decay, or retirement of a
+        # bucket the classifier can no longer mint) starts the accounting over,
+        # so the Improvements view and the record agree about what leaked.
+        ex = exp_ts.get(s)
+        if act and ex and ex > act:
+            act = ex
         rr = reroutes.get(s) or {}
         if act and rr.get("ts") and rr["ts"] > act:
             anchor, anchor_sess = rr["ts"], rr.get("sess")

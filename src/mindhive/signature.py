@@ -37,6 +37,21 @@ _PS_TERM = re.compile(r"The term '([^']+)'")
 _PS_NOTRECOG = re.compile(r"'([^']+)' is not recognized")
 _EXIT_CODE = re.compile(r"exit code (\d+)", re.I)
 
+# Every named family below says WHAT went wrong, so one fix serves every
+# failure under it. ``raw:<hash>`` is the opposite: the fallback minted when
+# nothing matched, identified only by a hash of text this module could not
+# read. Nothing else mints ``raw:`` — so when this module later learns to read
+# something, that prefix is what marks the buckets whose identity was only ever
+# our own ignorance (see incidents.reclassified).
+FALLBACK_PREFIX = "raw:"
+
+
+def is_diagnostic(sig_text) -> bool:
+    """True when a signature NAMES a root cause instead of hashing an error
+    nothing recognised."""
+    return bool(sig_text) and not str(sig_text).startswith(FALLBACK_PREFIX)
+
+
 # A Python traceback's own header is no more diagnostic than "Exit code <n>":
 # the line that TERMINATES the traceback is. Folding in `Traceback (most recent
 # call last):` as the detail line collapsed every uncaught Python exception
