@@ -74,6 +74,20 @@ def _is_injected_prompt(text: str) -> bool:
     return text.lstrip()[:40].lower().startswith("base directory for this skill:")
 
 
+def _is_injected(o, text: str) -> bool:
+    """True when this user-ROLE message was not authored by the user.
+
+    Claude Code delivers skill bodies, workflow references and other injected
+    documents as user-role messages, and stamps them ``isMeta: True``; a really
+    typed prompt carries ``origin``/``permissionMode``/``promptSource`` instead
+    and has no ``isMeta``. The envelope is the reliable signal, the text prefix
+    is not: only SOME injected bodies open with the skill marker. A reference
+    document that merely CONTAINS 'Caveat:' mid-body passed the prefix guard
+    and was mined for a memo, minting junk caveats from text the user never
+    wrote. The prefix check stays as a fallback for rows without the field."""
+    return bool((o or {}).get("isMeta")) or _is_injected_prompt(text)
+
+
 _CMD_NAME_RE = re.compile(r"<command-name>\s*/?([^<\s]+)\s*</command-name>")
 _SKILL_BODY_MARK = "base directory for this skill:"
 
@@ -198,6 +212,7 @@ def _items_from_obj(o) -> list:
     elif t == "user":
         text = _user_text(msg.get("content")).strip()
         low = text.lower()
+        injected = _is_injected(o, text)
         # Pick the marker that appears FIRST in the text (smallest position),
         # not whichever happens to come first in _MARKERS.
         best = None  # (position, marker)
@@ -205,7 +220,12 @@ def _items_from_obj(o) -> list:
             i = low.find(m)
             if i != -1 and (best is None or i < best[0]):
                 best = (i, m)
-        if best is not None:
+        # A memo is an assertion ATTRIBUTED to the user, so only user-authored
+        # text may mint one. skill_used below is deliberately left ungated: it
+        # is a structural fact about the session, and a slash invocation is
+        # recorded ONLY on the injected body it arrives with, so gating it
+        # would lose the capture entirely.
+        if best is not None and not injected:
             pos, m = best
             val = text[pos + len(m):].strip()
             if val:
@@ -221,7 +241,7 @@ def _items_from_obj(o) -> list:
                 items.append({"kind": "memo", "value": _cap_words(val), "memo_type": mtype})
         # Capture the typed prompt itself so EVERY prompt enters the hive — not
         # only marker-bearing ones. Skip injected skill bodies (not user-typed).
-        if text and not _is_injected_prompt(text):
+        if text and not injected:
             prompt = _clean_prompt(text)
             if prompt:
                 items.append({"kind": "user_prompt", "value": _cap_words(prompt)})
