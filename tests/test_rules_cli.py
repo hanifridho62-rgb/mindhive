@@ -245,3 +245,21 @@ def test_rules_summaries_carry_triage(tmp_path, capsys):
     # the human-readable digest carries the same mark
     cli.main(["rules", "summaries", "--project", "test"])
     assert "FIX WITH CLAUDE" in capsys.readouterr().out
+
+
+def test_rules_list_reports_the_projected_status_not_the_occurrence_count(capsys):
+    # A retired bucket keeps every occurrence it ever had, so deriving the
+    # status from the count alone printed `[active]` for a record whose own
+    # frontmatter said `expired` — the CLI view that made the dead bucket look
+    # alive. Both list commands read the projection now.
+    _seed()
+    events.append_event("rule_expired", {"signature": "pymodule:mindhive",
+                                         "reason": "reclassified"},
+                        tags=["lifecycle"], project="test")
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:mindhive", project="test")["status"] == "expired"
+
+    assert cli.main(["rules", "list", "--project", "test"]) == 0
+    assert "expired" in capsys.readouterr().out
+    assert cli.main(["failures", "list", "--project", "test"]) == 0
+    assert "expired" in capsys.readouterr().out
