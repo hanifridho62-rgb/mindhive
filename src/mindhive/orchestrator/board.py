@@ -227,9 +227,13 @@ class EventBus:
     def bind(self, loop=None):
         """Remember which loop the subscribers' queues belong to.
 
-        Called by `subscribe`, and separately by the mission just before it
-        starts its lanes, so a bus built before the loop existed still knows
-        where to hand work published from a worker thread."""
+        `subscribe` is the only caller in `src` today — checked, because the
+        line that stood here claimed the mission called it too, just before
+        starting its lanes, and nothing does. It stays public for a caller
+        that builds a bus before the loop exists and publishes from a worker
+        thread, and because `subscribe` will not re-bind a loop it already
+        remembers: a bus reused across two `asyncio.run` calls keeps the
+        first, closed loop, and every later publish is counted as dropped."""
         if loop is not None:
             self._loop = loop
             return self._loop
