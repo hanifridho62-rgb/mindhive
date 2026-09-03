@@ -641,6 +641,11 @@ def _seed(session_id="sess-1"):
 CATS = "/api/mindnet/cats?project=test"
 
 
+def _but_age(row):
+    """*row* without `age_secs` — the fields a memo gate actually owns."""
+    return {k: v for k, v in row.items() if k != "age_secs"}
+
+
 def test_an_unchanged_ledger_reads_nothing_and_folds_nothing(
         dashboard_server, counters):
     base, token = dashboard_server
@@ -658,10 +663,53 @@ def test_an_unchanged_ledger_reads_nothing_and_folds_nothing(
     # Shape and content are unchanged, not merely cheap — a gate that served a
     # different payload would be a regression dressed as a speedup.
     assert set(again) == set(warm)
-    assert again["cats"] == warm["cats"]
+    # Every field the GATE is responsible for, compared exactly. `age_secs` is
+    # excluded because it is not one of them: `ui_cats.board` computes it as
+    # `int(age)` against THIS call's clock, outside the memo, exactly as
+    # `dashboard_get` documents — "Both boards render from THIS call's clock,
+    # whatever the gate did". Two polls that straddle a whole-second tick
+    # therefore differ by design, and asserting equality over it made this
+    # test fail under full-suite load while proving nothing about the gate.
+    # It is the same narrowing, for the same reason, as the `session_id`
+    # comparison below.
+    #
+    # `display` deliberately STAYS in the exact set. It is also derived from
+    # `now`, but only through the 180 s and 6 h boundaries of
+    # `ui_cats.classify` — three orders of magnitude from the one-second tick
+    # that broke `age_secs` on an event seeded moments earlier.
+    assert ([_but_age(c) for c in again["cats"]]
+            == [_but_age(c) for c in warm["cats"]])
+    # The clock field is still checked, as a clock: it may advance, and it
+    # may never run backwards.
+    ages_warm = [c["age_secs"] for c in warm["cats"]]
+    ages_again = [c["age_secs"] for c in again["cats"]]
+    assert all(b >= a for a, b in zip(ages_warm, ages_again)), (
+        "the board's age ran backwards: %r then %r" % (ages_warm, ages_again))
     assert again["producers"] == warm["producers"]
     assert [c["session_id"] for c in again["sessions"]] == \
            [c["session_id"] for c in warm["sessions"]]
+
+
+def test_the_narrowed_cats_comparison_still_catches_a_changed_payload():
+    """CANARY for the comparison above: dropping `age_secs` must not blind it.
+
+    A gate that served a genuinely different board — another faculty, a stale
+    phase, a lost skill overlay — has to still fail that assertion, or
+    excluding the clock field would have turned the check into decoration."""
+    warm = [{"faculty": "sop", "display": "awake", "status": "active",
+             "task_id": "T-1", "phase": "build", "age_secs": 0, "skill": "x"}]
+    strip = lambda rows: [_but_age(c) for c in rows]
+    for field, value in (("faculty", "roadmap"), ("display", "dim"),
+                         ("status", "done"), ("task_id", "T-2"),
+                         ("phase", "verify"), ("skill", "")):
+        drifted = [dict(warm[0], **{field: value})]
+        assert strip(drifted) != strip(warm), (
+            "a changed %s slipped through the narrowed comparison" % field)
+    # A dropped row must be caught too, not just a changed field.
+    assert strip([]) != strip(warm)
+    # ...and the one field the comparison is DESIGNED to ignore does pass
+    # through it, which is the whole point of the exclusion.
+    assert strip([dict(warm[0], age_secs=7)]) == strip(warm)
 
 
 def test_appending_an_event_invalidates_the_gate(dashboard_server, counters):
