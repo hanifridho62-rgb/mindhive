@@ -532,6 +532,10 @@ CSS = """\
   .statusDot.sok { color:var(--ok-strong); }
   .statusDot.sbad { color:var(--bad-strong); }
   .statusDot.snone { color:var(--dot-idle); }
+  /* called, but no outcome was ever witnessed (a slash invocation fires no
+     tool, so nothing reads a result). `--warn` is the same colour `.pill.est`
+     uses for "there is a number here, but it is not measured". */
+  .statusDot.sunobs { color:var(--warn); }
   .legitem { cursor:pointer; padding:1px 5px; border-radius:6px; }
   .legitem:hover { background:var(--hover-tint); }
   .legitem.on { background:#233; outline:1px solid var(--accent-edge); }

@@ -35,7 +35,7 @@ JS = """\
   let PLUG_REC = {coverage: {measured: 0, total: 0}, recommendations: []};
   let PLUG_RULES = {};              // 'skill:<name>' -> improvements auto lesson
   let PLUG_QUERY = '';
-  let PLUG_STATUSF = 'all';         // all | ok | fail | uncalled
+  let PLUG_STATUSF = 'all';         // all | ok | fail | unobserved | uncalled
   let PLUG_SRC = 'all';             // source plugin filter ('local' = standalone)
   let PLUG_MEASURED = false;        // measured-only toggle
   let PLUG_SORT = 'status';         // status | name | source
@@ -48,20 +48,29 @@ JS = """\
   const PLUG_CALLING = new Set();   // in-flight invokes (button spinner state)
   const PLUG_REFLECTING = new Set();  // in-flight reflect_one calls
   let PLUG_GEN = 0;                 // poll generation: stale fetches discard themselves
+  // Four states, not three. `unobserved` is a skill that WAS called with no
+  // outcome ever witnessed — a slash invocation fires no tool, so nothing
+  // reads a result and nothing can ever mark it failed. It must not collapse
+  // into either neighbour: green would claim a success nobody saw, and grey
+  // says "never called" about a skill that ran.
+  const PLUG_DOT = {ok: ['sok', 'last call succeeded'],
+    fail: ['sbad', 'last call FAILED \\u2014 see Needed changes'],
+    unobserved: ['sunobs', 'called \\u2014 outcome never observed '
+      + '(slash invocations fire no tool, so no result is read)'],
+    uncalled: ['snone', 'never called']};
   function statusDot(status){
-    const cls = status === 'ok' ? 'sok' : (status === 'fail' ? 'sbad' : 'snone');
-    const title = status === 'ok' ? 'last call succeeded'
-      : (status === 'fail' ? 'last call FAILED \\u2014 see Needed changes' : 'never called');
-    return '<span class="statusDot '+cls+'" title="'+title+'">\\u25cf</span>';
+    const d = PLUG_DOT[status] || PLUG_DOT.uncalled;
+    return '<span class="statusDot '+d[0]+'" title="'+d[1]+'">\\u25cf</span>';
   }
   const PLUG_STATUS_LEGEND = {
-    ok:       ['sok',  'green \\u2014 last call succeeded'],
-    fail:     ['sbad', 'red \\u2014 last call failed'],
-    uncalled: ['snone','grey \\u2014 never called']};
+    ok:         ['sok',   'green \\u2014 last call succeeded'],
+    fail:       ['sbad',  'red \\u2014 last call failed'],
+    unobserved: ['sunobs','amber \\u2014 called, outcome not observed'],
+    uncalled:   ['snone', 'grey \\u2014 never called']};
   // legend items double as one-click status filters (click again to clear);
   // the trailing badge explains `estimated` provenance, which isn't a filter.
   function plugLegend(){
-    return '<div class="legend">'+['ok','fail','uncalled'].map(k =>
+    return '<div class="legend">'+['ok','fail','unobserved','uncalled'].map(k =>
       '<span class="legitem'+(PLUG_STATUSF===k?' on':'')+'" title="click to filter" '
       + 'onclick="setPlugStatus('+escAttr(JSON.stringify(k))+')">'
       + '<span class="statusDot '+PLUG_STATUS_LEGEND[k][0]+'">\\u25cf</span>'
@@ -80,15 +89,26 @@ JS = """\
   function plugStrip(){
     const c = PLUG_INV.counts || {};
     const cov = PLUG_REC.coverage || {};
-    let calls = 0, ok = 0;
-    Object.values(PLUG_STATS).forEach(s => { calls += s.calls||0; ok += s.ok||0; });
-    const rate = calls ? Math.round(ok/calls*100)+'%' : '\\u2014';
+    let calls = 0, ok = 0, unobs = 0;
+    Object.values(PLUG_STATS).forEach(s => {
+      calls += s.calls||0; ok += s.ok||0; unobs += s.unobserved||0; });
+    // The denominator is calls whose OUTCOME was observed, not all calls.
+    // Counting slash invocations in would push the headline rate toward 0%
+    // as they accumulate — reporting failures that were never observed, the
+    // mirror image of the inflation this exists to avoid.
+    const seen = calls - unobs;
+    const rate = seen ? Math.round(ok/seen*100)+'%' : '\\u2014';
     const measured = cov.measured ?? 0;
     const total = cov.total ?? (c.skills_total ?? 0);
     // Cold-start honesty: before any skill has been called, show WHY the tiles
-    // read zero rather than a bare '0/0' that looks broken.
-    const rateLbl = calls ? ('completion rate \\u00b7 '+ok+'/'+calls+' calls')
-                          : 'completion rate \\u00b7 no calls recorded yet';
+    // read zero rather than a bare '0/0' that looks broken. When calls exist
+    // but none was observed, say that instead of showing a bare dash.
+    const rateLbl = seen ? ('completion rate \\u00b7 '+ok+'/'+seen+' observed call'
+                            +(seen===1?'':'s')
+                            +(unobs ? ' \\u00b7 '+unobs+' unobserved' : ''))
+      : (calls ? 'completion rate \\u00b7 '+calls+' call'+(calls===1?'':'s')
+                 +', none with an observed outcome'
+               : 'completion rate \\u00b7 no calls recorded yet');
     const measuredLbl = measured ? 'measured (\\u22653 calls)'
                                  : 'measured \\u00b7 call skills to start measuring';
     return '<div class="cards" style="margin-bottom:12px">'
@@ -102,7 +122,7 @@ JS = """\
     status: ['needs-attention first', 'healthy first'],
     name:   ['name A\\u2192Z', 'name Z\\u2192A'],
     source: ['by plugin A\\u2192Z', 'by plugin Z\\u2192A']};
-  const PLUG_STATUS_RANK = {fail: 0, uncalled: 1, ok: 2};
+  const PLUG_STATUS_RANK = {fail: 0, uncalled: 1, unobserved: 2, ok: 3};
   function plugDirLabel(){ return PLUG_SORT_LABELS[PLUG_SORT][PLUG_DIR==='asc' ? 0 : 1]; }
   function syncPlugDirBtn(){ const b = document.getElementById('plugdir'); if (b) b.textContent = plugDirLabel(); }
   function onPlugSort(v){ PLUG_SORT = v; syncPlugDirBtn(); paintPlugins(); }
@@ -136,7 +156,11 @@ JS = """\
       const st = PLUG_STATS[name] || null;
       const rec = recMap[name] || null;
       out.push({name: name, plugin: plugin, trigger: trigger || '',
-        status: (st && st.last_outcome) || PLUG_STATUS[name] || 'uncalled',
+        // `last_outcome` is null for a call whose outcome was never observed,
+        // so falling straight through to 'uncalled' would report a skill that
+        // ran as never called. Check the call count before giving up.
+        status: (st && st.last_outcome) || PLUG_STATUS[name]
+                || (st && st.calls ? 'unobserved' : 'uncalled'),
         stats: st, rec: rec,
         estimated: !!(rec && rec.provenance === 'estimated'),
         measured: rec ? rec.provenance === 'measured'
@@ -205,7 +229,9 @@ JS = """\
       return '<div class="skmeta"><b>Metrics</b> <span class="lbl">\\u2014 (uncalled)</span></div>';
     return '<div class="skmeta"><b>Metrics</b> <span class="lbl">'
       + st.calls+' call'+(st.calls===1?'':'s')+' \\u00b7 '+(st.ok||0)+' ok \\u00b7 '
-      + (st.fail||0)+' fail \\u00b7 completion '+fmtRate(st.completion_rate)
+      + (st.fail||0)+' fail'
+      + (st.unobserved ? ' \\u00b7 '+st.unobserved+' unobserved' : '')
+      + ' \\u00b7 completion '+fmtRate(st.completion_rate)
       + ' \\u00b7 last outcome '+esc(st.last_outcome||'\\u2014')
       + ' \\u00b7 last used '+esc(st.last_used||'\\u2014')+'</span></div>';
   }
@@ -512,7 +538,8 @@ JS = """\
   function onPlugMeasured(v){ PLUG_MEASURED = v; paintPlugins(); }
   function showSkillPanel(){
     markSection('skills');
-    const statusOpts = [['all','all'],['fail','red (failed)'],['uncalled','grey (uncalled)'],['ok','green (ok)']]
+    const statusOpts = [['all','all'],['fail','red (failed)'],['uncalled','grey (uncalled)'],
+                        ['unobserved','amber (outcome unobserved)'],['ok','green (ok)']]
       .map(kv => '<option value="'+kv[0]+'"'+(PLUG_STATUSF===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
     const sortOpts = [['status','needs attention'],['name','name'],['source','plugin']]
       .map(kv => '<option value="'+kv[0]+'"'+(PLUG_SORT===kv[0]?' selected':'')+'>'+kv[1]+'</option>').join('');
