@@ -1902,3 +1902,102 @@ def test_the_changelog_pending_marker_is_read_on_every_poll(dashboard_server,
     assert after["pending"] == {"files": ["src/mindhive/thing.py"]}, \
         "the pending marker was cached along with the entries"
     assert after["entries"] == warm["entries"]
+
+
+# --- the lock must be released BEFORE the answer is published ---------------
+#
+# `_one_at_a_time` released in a `finally` that runs AFTER the handler has
+# already written its response. `wbufsize` is 0 on BaseHTTPRequestHandler, so
+# `wfile` is an unbuffered `_SocketWriter` and those bytes are on the wire
+# inside `fn` — several statements before `lock.release()`. A caller that has
+# a complete response in hand and immediately calls again could therefore be
+# refused by the endpoint its OWN previous call was still holding, and the
+# refusal body has no `scanned` key:
+#
+#     {"ok": False, "error": "a plugin scan is already running"}
+#
+# That is what turned tests/test_dashboard.py::test_plugins_autoscan_is_stale_gated
+# red on CI run 33693887912 (ubuntu-latest, py3.11) with `KeyError: 'scanned'`.
+# Reproduced here off-CI at 8/400 by firing request #2 down a pre-connected
+# socket, in a process whose only threads were MainThread and serve_forever.
+#
+# The assertion below is deterministic rather than a repeat of that race: it
+# watches the exact instant the promise is published — the first byte written
+# to the socket — and requires the lock to be free by then.
+
+
+class _WatchingWriter:
+    """Wraps the handler's `wfile` and records who held the lock at the moment
+    each response's FIRST byte was written."""
+
+    def __init__(self, inner, path, seen, lock):
+        self._inner, self._path, self._seen, self._lock = inner, path, seen, lock
+        self._first = True
+
+    def write(self, data):
+        if self._first:
+            self._first = False
+            self._seen.append((self._path, self._lock.locked()))
+        return self._inner.write(data)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.fixture
+def lock_watching_server():
+    """A real dashboard whose every response records, at its first written byte,
+    whether _PLUGINS_LOCK was still held. Yields (base, token, seen)."""
+    token = "test-token-123"
+    base_handler = dashboard.make_handler(token)
+    seen = []
+
+    class Watching(base_handler):
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            real = self.wfile
+            self.wfile = _WatchingWriter(real, self.path, seen,
+                                         dashboard._PLUGINS_LOCK)
+            try:
+                return super()._send(code, body, ctype)
+            finally:
+                self.wfile = real
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Watching)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", token, seen
+    finally:
+        server.shutdown()
+
+
+def test_guarded_route_has_released_its_lock_before_it_answers(
+        lock_watching_server, monkeypatch):
+    monkeypatch.setattr("mindhive.plugins.ensure_fresh",
+                        lambda **kw: {"scanned": True, "age_hours": 0.0,
+                                      "payload": {}})
+    base, token, seen = lock_watching_server
+    assert not dashboard._PLUGINS_LOCK.locked(), "fixture started with a held lock"
+
+    status, body = _post(base, "/api/plugins/autoscan", {}, token)
+
+    assert status == 200 and body["scanned"] is True
+    held = [(p, h) for p, h in seen if "/api/plugins/autoscan" in p]
+    assert held, "the watcher never saw the autoscan response being written"
+    assert held == [(held[0][0], False)], (
+        "the response was published while _PLUGINS_LOCK was still held, so the "
+        "caller's very next call can be refused by its own previous one")
+
+
+def test_a_genuinely_concurrent_caller_is_still_refused(lock_watching_server):
+    """CANARY for the test above. Releasing earlier must not disarm the guard:
+    with the lock held by somebody else, the route must still refuse, and the
+    refusal must still be the 200 body the page renders."""
+    base, token, _seen = lock_watching_server
+    dashboard._PLUGINS_LOCK.acquire()
+    try:
+        status, body = _post(base, "/api/plugins/autoscan", {}, token)
+    finally:
+        dashboard._PLUGINS_LOCK.release()
+
+    assert status == 200
+    assert body == {"ok": False, "error": "a plugin scan is already running"}
