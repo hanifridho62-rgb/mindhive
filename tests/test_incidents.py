@@ -801,3 +801,196 @@ def test_the_id_parser_is_total(tmp_path):
     assert incidents._id_list("") == []
     assert incidents._id_list(12345) == ["12345"]
     assert incidents._id_list("a, b ,, c") == ["a", "b", "c"]
+
+from mindhive import signature as sig_mod
+
+
+# --- retirement of buckets the classifier can no longer mint (raw:37c59e9cae) ---
+
+# The exact text whose fallback hash IS the production mega-bucket: a harness
+# "Exit code 1" header over a traceback truncated before its exception line.
+# That is the one input that can still reach raw:37c59e9cae, which is why the
+# bucket must stay reachable rather than be deleted.
+_TRUNCATED = "Exit code 1\nTraceback (most recent call last):\n"
+_KEYERROR = ("Exit code 1\nTraceback (most recent call last):\n"
+             '  File "<string>", line 1, in <module>\n'
+             "KeyError: 'task5'\n")
+_ASSERT = ("Exit code 1\nTraceback (most recent call last):\n"
+           '  File "<string>", line 3, in <module>\n'
+           "AssertionError: expected 2 rows\n")
+
+
+def _add_failure_text(sig, text, session, ts):
+    """A failure whose stored excerpt is the real error text — what capture
+    actually writes, and what re-classification needs to replay."""
+    events.append_event("tool_failed",
+                        {"text": text, "signature": sig, "action": "probe"},
+                        session_id=session, tags=["auto", "failure"], ts=ts,
+                        project="test")
+
+
+def test_truncated_traceback_still_mints_the_old_mega_bucket():
+    # Anchors the residual case the classifier fix left behind on purpose: an
+    # "Exit code 1" header over a traceback cut before its exception line
+    # carries no diagnosis, so it still falls back to the same hash.
+    assert sig_mod.signature(_TRUNCATED) == "raw:37c59e9cae"
+    assert not sig_mod.is_diagnostic("raw:37c59e9cae")
+    assert sig_mod.is_diagnostic(sig_mod.signature(_KEYERROR))
+
+
+def test_reclassified_bucket_retires_and_stops_injecting():
+    stale = sig_mod.signature(_TRUNCATED)
+    _add_failure_text(stale, _KEYERROR, "s1", _rel_ts(-7200))
+    _add_failure_text(stale, _ASSERT, "s2", _rel_ts(-3600))
+    incidents.project(project="test", threshold=2)
+    _write_auto(stale, "- Prevention rule: check the assumption first")
+    incidents.project(project="test", threshold=2)
+    assert incidents.inject(project="test") != ""          # injecting before
+
+    res = incidents.audit(project="test", threshold=2)
+    assert res["retired"] == 1
+    (ev,) = [e for e in events.read_all("test") if e.type == "rule_expired"]
+    assert ev.payload["signature"] == stale
+    assert ev.payload["reason"] == "reclassified"
+    assert sorted(ev.payload["into"]) == sorted(
+        [sig_mod.signature(_KEYERROR), sig_mod.signature(_ASSERT)])
+
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(stale, project="test")["status"] == "expired"
+    assert incidents.inject(project="test") == ""          # no longer injecting
+    assert incidents.summaries(project="test") == []
+    assert incidents.summaries(project="test", include_expired=True)
+    # idempotent: the expiry zeroes the live count, so nothing to replay
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+
+
+def test_bucket_whose_excerpts_still_classify_to_it_is_kept():
+    # The discriminating sibling: same fallback signature, but its excerpts
+    # STILL mint it, so the bucket is live and must keep its red card.
+    live = sig_mod.signature(_TRUNCATED)
+    _add_failure_text(live, _TRUNCATED, "s1", _rel_ts(-7200))
+    _add_failure_text(live, _TRUNCATED, "s2", _rel_ts(-3600))
+    assert incidents.reclassified(project="test") == {}
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(live, project="test")["status"] == "active"
+
+
+def test_reclassified_into_another_fallback_is_left_for_a_human():
+    # Every excerpt moved, but into another raw: bucket — the failures are
+    # still undiagnosed, so retiring would drop evidence, not re-file it.
+    stale = "raw:0000000000"
+    _add_failure_text(stale, "boom something", "s1", _rel_ts(-7200))
+    _add_failure_text(stale, "boom something", "s2", _rel_ts(-3600))
+    rec = incidents.reclassified(project="test")
+    assert rec[stale]["retirable"] is False
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(stale, project="test")["status"] == "active"
+
+
+def test_named_family_is_never_retired_by_reclassification():
+    # pymodule:/edit:/judgment:/workspace: signatures mean the same thing
+    # whatever signature.py learns next — and judgment:*/workspace:* were minted
+    # elsewhere entirely, so replaying the classifier over them proves nothing.
+    for s, text in (("pymodule:mindhive", "err pymodule:mindhive"),
+                    ("judgment:rejected:read:read-9b9a8d", "the user chose not to"),
+                    ("workspace:agent", "boom something")):
+        _add_failure_text(s, text, "s1", _rel_ts(-7200))
+        _add_failure_text(s, text, "s2", _rel_ts(-3600))
+    assert incidents.reclassified(project="test") == {}
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+    incidents.project(project="test", threshold=2)
+    assert incidents.load("pymodule:mindhive", project="test")["status"] == "active"
+
+
+def test_retired_signature_reenters_the_climb_when_it_really_recurs():
+    stale = sig_mod.signature(_TRUNCATED)
+    _add_failure_text(stale, _KEYERROR, "s1", _rel_ts(-7200))
+    _add_failure_text(stale, _ASSERT, "s2", _rel_ts(-3600))
+    assert incidents.audit(project="test", threshold=2)["retired"] == 1
+    # a genuinely truncated traceback still mints this signature today
+    _add_failure_text(stale, _TRUNCATED, "s3", _rel_ts(60))
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(stale, project="test")["status"] == "candidate"
+    _add_failure_text(stale, _TRUNCATED, "s4", _rel_ts(120))
+    assert incidents.audit(project="test", threshold=2)["activated"] == 1
+    incidents.project(project="test", threshold=2)
+    assert incidents.load(stale, project="test")["status"] == "active"
+
+
+def test_a_malformed_excerpt_does_not_crash_the_audit():
+    # audit() runs from the dashboard's 3s job and from harvest, so a payload
+    # whose `text` is not a string must not take the whole pass down with it.
+    events.append_event("tool_failed",
+                        {"text": 12345, "signature": "raw:0000000001",
+                         "action": "probe"},
+                        session_id="s1", tags=["auto", "failure"],
+                        ts=_rel_ts(-3600), project="test")
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+
+
+def test_retirement_is_stamped_at_the_last_failure_not_at_the_clock():
+    # Wall-clock now would open a dead zone: a failure that already happened but
+    # has not been harvested yet carries an earlier ts, so it would land before
+    # the expiry and never be counted again. Stamping at the bucket's own last
+    # failure closes that window — and makes the pass deterministic.
+    stale = sig_mod.signature(_TRUNCATED)
+    _add_failure_text(stale, _KEYERROR, "s1", "2026-07-01T10:00:00Z")
+    _add_failure_text(stale, _ASSERT, "s2", "2026-07-01T11:00:00Z")
+    assert incidents.audit(project="test", threshold=2)["retired"] == 1
+    (ev,) = [e for e in events.read_all("test") if e.type == "rule_expired"]
+    assert ev.ts == "2026-07-01T11:00:00Z"
+
+
+def test_a_bucket_with_an_unstored_excerpt_is_never_retired():
+    # No excerpt, nothing to replay — the bucket cannot be PROVEN stale, and an
+    # unprovable retirement is a guess.
+    stale = "raw:0000000002"
+    _add_failure_text(stale, _KEYERROR, "s1", _rel_ts(-7200))
+    _add_failure_text(stale, "", "s2", _rel_ts(-3600))
+    assert incidents.reclassified(project="test") == {}
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+
+
+def test_a_bucket_only_half_re_diagnosed_is_kept_for_a_human():
+    # The real raw:e5637cbd18 shape: most excerpts now name a root cause, but
+    # some still fall back to raw:. Retiring would drop that half's evidence.
+    mixed = "raw:0000000003"
+    _add_failure_text(mixed, _KEYERROR, "s1", _rel_ts(-7200))
+    _add_failure_text(mixed, "boom something", "s2", _rel_ts(-3600))
+    rec = incidents.reclassified(project="test")
+    assert rec[mixed]["retirable"] is False
+    assert len(rec[mixed]["into"]) == 2
+    assert incidents.audit(project="test", threshold=2)["retired"] == 0
+
+
+def test_one_audit_retires_every_stale_bucket_it_finds():
+    for i, text in enumerate((_KEYERROR, _ASSERT)):
+        sig = "raw:000000001%d" % i
+        _add_failure_text(sig, text, "s1", _rel_ts(-7200))
+        _add_failure_text(sig, text, "s2", _rel_ts(-3600))
+    res = incidents.audit(project="test", threshold=2)
+    assert res["retired"] == 2
+    assert res["activated"] == 0          # retired instead of activated
+    exps = sorted(e.payload["signature"] for e in events.read_all("test")
+                  if e.type == "rule_expired")
+    assert exps == ["raw:0000000010", "raw:0000000011"]
+
+
+def test_an_expiry_re_anchors_the_leak_count():
+    # Without this a retired-then-recurring signature is graded on the history
+    # it was retired FOR, so no recurrence could ever clear it again.
+    sig = "pymodule:leaky"
+    _add_failure_ts(sig, "x", "s1", "2026-07-01T10:00:00Z")
+    _add_failure_ts(sig, "y", "s2", "2026-07-01T11:00:00Z")      # activation
+    incidents.audit(project="test", threshold=2)
+    _add_failure_ts(sig, "z", "s3", "2026-07-01T12:00:00Z")      # a real leak
+    assert incidents.leaks(project="test", signature=sig) == 1
+    assert incidents.signal_stats("test")[sig]["leaks"] == 1
+    events.append_event("rule_expired", {"signature": sig},
+                        tags=["lifecycle"], ts="2026-07-01T13:00:00Z",
+                        project="test")
+    _add_failure_ts(sig, "w", "s4", "2026-07-01T14:00:00Z")      # after the reset
+    assert incidents.leaks(project="test", signature=sig) == 1
+    assert incidents.signal_stats("test")[sig]["leaks"] == 1
