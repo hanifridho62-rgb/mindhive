@@ -125,6 +125,46 @@ MAX_REASON_CHARS = MAX_ITEM_CHARS - len(CONSTRAINT_TEMPLATE.format(reason=""))
 # One shared word is noise; two is a signal.
 MIN_OVERLAP = 2
 
+# Session-id prefixes that mean "a spawned orchestration agent wrote this row".
+#
+# The threat this closes: `resolve_sops` renders SOP bodies VERBATIM, and every
+# spawned child holds `hive` on PATH — `agent.prompt_for` closes by instructing
+# it to run `hive log` — with its own `MINDHIVE_SESSION`, which
+# `events.append_event` stamps onto everything it writes. So a wave-1 agent that
+# has been prompt-injected can append one `sop` row, and that text is composed
+# into every subsequent agent's brief, inside the fence, indistinguishable from
+# human-authored project history (TODOS 26).
+#
+# The fence's own docstring records the well-formed-imperative-sentence risk as
+# ACCEPTED. That argument was made about HUMANS and past sessions writing the
+# ledger — a writer outside the blast radius. A previous agent in the same swarm
+# is inside it. Different threat model; the accepted risk does not cover it.
+#
+# A FAMILY rather than one literal (`orchestrator._run_wave` sets
+# `f"{worktree.PREFIX}-{tid}"`, `PREFIX = "mn9"`). Only that one is observed
+# setting a child's `MINDHIVE_SESSION` today; `mn7-` (`orchestrator.run_key`),
+# `mn11-` (`decompose`) and `mn-` (`executor.run_key`) are the same family,
+# listed defensively rather than because a spawn path was seen writing SOPs
+# through them. One hardcoded string would go stale the first time a new spawner
+# appeared, so `test_the_orchestrators_own_prefix_is_covered` asserts against the
+# imported constant rather than a copy of it.
+ORCHESTRATION_PREFIXES = ("mn9-", "mn7-", "mn11-", "mn-")
+
+
+def is_orchestration_session(session_id) -> bool:
+    """Whether *session_id* belongs to a spawned orchestration agent.
+
+    Total, and FAILS OPEN. A missing, blank or unstringifiable id is unknown
+    authorship, which answers False — the row is composed. Dropping every row
+    whose author was never recorded would delete a working feature to close a
+    second-order hole, and every SOP written before session stamping, and every
+    incident record written before this change."""
+    try:
+        sid = str(session_id or "").strip()
+    except (ValueError, TypeError):
+        return False
+    return bool(sid) and sid.startswith(ORCHESTRATION_PREFIXES)
+
 
 class Advice(NamedTuple):
     """Resolved, rendered, sanitized advice for one task.
@@ -134,6 +174,14 @@ class Advice(NamedTuple):
     skills: tuple = ()
     sops: tuple = ()
     constraints: tuple = ()
+    # How many RELEVANT rows were withheld because a spawned orchestration agent
+    # wrote them (TODOS 26). Appended last, and deliberately NOT carried by
+    # `to_dict`/`from_dict`: the sidecar feeds the hook path, where this is a
+    # stale number about a resolve that already happened, and adding a key there
+    # would move the persisted shape and its schema version for no reader. It
+    # travels `resolve` -> `brief.build` -> `Stats.authored` and no further, so a
+    # rehydrated `Advice` correctly reports 0.
+    withheld: int = 0
 
 
 EMPTY = Advice()
@@ -268,20 +316,48 @@ def resolve_skills(task_kw, evs, project=None, reco=None) -> tuple:
     return tuple(out)
 
 
-def resolve_sops(task_kw, evs) -> tuple:
-    """The top matching SOPs, carrying their REAL BODIES.
+def _sop_text(r) -> str:
+    return (f"{r.get('sop_id', '')} {r.get('title', '')} {r.get('text', '')}")
+
+
+def resolve_sops(task_kw, evs):
+    """``(rows, withheld)`` — the top matching SOPs carrying their REAL BODIES,
+    and how many RELEVANT rows were withheld because an agent wrote them.
 
     `sop.current` is a pure fold over the events already in hand, so this costs
     nothing beyond the read the caller had already paid — and it inherits the
     registry's own lifecycle rules, so a deleted SOP is absent here without this
-    module knowing what 'deleted' means."""
+    module knowing what 'deleted' means. It also already carries `session_id`
+    (`sop.fold` writes the latest event's), which is the whole reason TODOS 26 is
+    fixable without a store migration: the marker was on disk and nothing read it.
+
+    **Partition BEFORE ranking, not after.** Ranking first and dropping
+    afterwards would let a withheld row consume one of the `MAX_SOPS` slots, so a
+    single injected SOP could halve what a legitimate one gets to say — the
+    denial-of-service half of the same attack.
+
+    `withheld` counts the agent-authored rows that WOULD have been relevant, not
+    every agent-authored row in the store. A store holding fifty of them should
+    not report fifty on a brief none of them matched; the operator's question is
+    whether anything was kept out of THIS brief.
+
+    Exclusion rather than a heading naming the author, which TODOS 26 offers as
+    the alternative: the fence already says everything inside it is background,
+    so a second label adds a word rather than a control. The row still exists —
+    in the ledger, in `hive sop list`, in STATE.md. It is only kept off the edge
+    the amplification travels along. And it is never silent: the count rides out
+    to `Stats.authored`, the `mindnet_brief` payload and `hive mindnet brief`."""
     from .. import sop as sop_mod
-    rows = sop_mod.current(evs or [])
-    picks = _ranked(
-        [r for r in rows if isinstance(r, dict)], task_kw,
-        lambda r: f"{r.get('sop_id', '')} {r.get('title', '')} "
-                  f"{r.get('text', '')}",
-        MAX_SOPS)
+    rows = [r for r in sop_mod.current(evs or []) if isinstance(r, dict)]
+    kept, agent = [], []
+    for r in rows:
+        (agent if is_orchestration_session(r.get("session_id")) else kept
+         ).append(r)
+    # Uncapped limit on the withheld side: this is a count, not a render, and
+    # capping it at MAX_SOPS would under-report a store with several relevant
+    # injected rows — which is precisely the case worth seeing.
+    withheld = len(_ranked(agent, task_kw, _sop_text, len(agent))) if agent else 0
+    picks = _ranked(kept, task_kw, _sop_text, MAX_SOPS)
     out = []
     for r in picks:
         sid = safe_text(r.get("sop_id"), 64)
@@ -290,24 +366,68 @@ def resolve_sops(task_kw, evs) -> tuple:
         if not body:
             continue
         out.append(safe_text(f"[{sid}] {title}: {body}", MAX_ITEM_CHARS))
-    return tuple(out)
+    return tuple(out), withheld
 
 
-def resolve_constraints(task_kw, project=None) -> tuple:
-    """Prior failures matching this task, rendered as prohibitions.
+def _constraint_text(r) -> str:
+    return " ".join(str(r.get(k, "") or "") for k in
+                    ("signature", "excerpt", "root_cause", "lesson",
+                     "active_rule"))
+
+
+def agent_authored_incident(row) -> bool:
+    """Whether an incident summary was produced ONLY by orchestration sessions.
+
+    Three ways to answer False, and all three are the fail-open case (R8):
+
+    - **No ids recorded.** Every record written before `session_ids` existed.
+      Absent authorship is unknown authorship, not agent authorship.
+    - **The list is truncated.** `incidents.MAX_SESSION_IDS` bounds what the
+      frontmatter carries while `sessions` keeps the true count, so a shorter
+      list means there are contributors this row cannot see. Withholding on a
+      partial view would drop a record a human also hit.
+    - **Any contributor is not an orchestration session.** A failure a human ALSO
+      hit is not agent-manufactured, and the lesson distilled from it is worth
+      exactly as much as it was before an agent happened to hit it too.
+
+    Worth stating plainly what this does and does not close, because the shape
+    invites overclaiming: the incident path is materially HARDER to exploit than
+    the SOP path. `resolve_constraints` renders `root_cause`, `lesson` and
+    `active_rule` — all written by the reflection pass, not by the failing agent,
+    which controls only `excerpt`, and `excerpt` is never rendered. So this
+    closes a second-order hole and captures the provenance that makes the
+    first-order one checkable. It is not the same size of hole as `resolve_sops`'."""
+    if not isinstance(row, dict):
+        return False
+    ids = [str(s) for s in (row.get("session_ids") or [])]
+    if not ids:
+        return False
+    try:
+        total = int(row.get("sessions") or 0)
+    except (ValueError, TypeError):
+        total = 0
+    if total > len(ids):
+        return False
+    return all(is_orchestration_session(s) for s in ids)
+
+
+def resolve_constraints(task_kw, project=None):
+    """``(rows, withheld)`` — prior failures matching this task rendered as
+    prohibitions, and how many relevant ones an agent manufactured.
 
     A summary with no recorded reason is SKIPPED rather than rendered with an
     empty slot: "failed due to ." costs prompt budget and teaches the agent to
-    discount the constraints that do say something."""
+    discount the constraints that do say something.
+
+    Partitioned before ranking for the same reason `resolve_sops` is; see there."""
     from .. import incidents as inc_mod
     rows = [r for r in (inc_mod.summaries(project) or [])
             if isinstance(r, dict)]
-    picks = _ranked(
-        rows, task_kw,
-        lambda r: " ".join(str(r.get(k, "") or "") for k in
-                           ("signature", "excerpt", "root_cause", "lesson",
-                            "active_rule")),
-        MAX_CONSTRAINTS)
+    kept = [r for r in rows if not agent_authored_incident(r)]
+    agent = [r for r in rows if agent_authored_incident(r)]
+    withheld = (len(_ranked(agent, task_kw, _constraint_text, len(agent)))
+                if agent else 0)
+    picks = _ranked(kept, task_kw, _constraint_text, MAX_CONSTRAINTS)
     out = []
     for r in picks:
         reason = safe_text(r.get("root_cause") or r.get("lesson")
@@ -316,7 +436,7 @@ def resolve_constraints(task_kw, project=None) -> tuple:
             continue
         out.append(safe_text(CONSTRAINT_TEMPLATE.format(reason=reason),
                              MAX_ITEM_CHARS))
-    return tuple(out)
+    return tuple(out), withheld
 
 
 # --- the entry point -------------------------------------------------------------------
@@ -344,16 +464,19 @@ def resolve(task, evs=None, project=None, reco=None) -> Advice:
             evs = ev_mod.read_all(project)
         except Exception:
             evs = []
+    withheld = 0
     try:
         skills = resolve_skills(kw, evs, project, reco=reco)
     except Exception:
         skills = ()
     try:
-        sops = resolve_sops(kw, evs)
+        sops, sop_withheld = resolve_sops(kw, evs)
+        withheld += sop_withheld
     except Exception:
         sops = ()
     try:
-        constraints = resolve_constraints(kw, project)
+        constraints, con_withheld = resolve_constraints(kw, project)
+        withheld += con_withheld
     except Exception:
         constraints = ()
     # MN-17 note, deliberately NOT an emitter. Announcing the `sop` / `improvements`
@@ -362,7 +485,8 @@ def resolve(task, evs=None, project=None, reco=None) -> Advice:
     # broke "same events in, same bytes out" — `test_rebuild_stays_byte_idempotent_with_
     # advice` caught it immediately. The faculties are announced from the hook instead,
     # where advice is CONSULTED rather than computed. See `inject.engaged_faculties`.
-    return Advice(skills=skills, sops=sops, constraints=constraints)
+    return Advice(skills=skills, sops=sops, constraints=constraints,
+                  withheld=withheld)
 
 
 # --- serialization -----------------------------------------------------------------------

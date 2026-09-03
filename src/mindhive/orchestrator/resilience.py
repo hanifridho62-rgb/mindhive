@@ -420,7 +420,7 @@ class RepairLoop:
 
     def __init__(self, breaker=None, max_attempts=DEFAULT_MAX_ATTEMPTS,
                  fall_back=None, key_for=None, project=None, reflector=None,
-                 rollback=None):
+                 rollback=None, bus=None):
         self.breaker = breaker if breaker is not None else ToolCircuitBreaker()
         self.max_attempts = max(1, int(max_attempts))
         self.fall_back = fall_back if fall_back is not None else default_fall_back
@@ -441,6 +441,20 @@ class RepairLoop:
         # Successes credited back to the breaker, so a mission report can say a
         # target RECOVERED rather than only that it once failed.
         self.recoveries: list = []
+        # WB7's observation seam. Duck-typed `emit(kind, **fields)` and nothing
+        # else — this module does not import the board it feeds.
+        self.bus = bus
+        self.observer_drops = 0
+
+    def _emit(self, kind, **fields) -> None:
+        """Publish one state change; never let a display fail a repair."""
+        bus = self.bus
+        if bus is None:
+            return
+        try:
+            bus.emit(kind, **fields)
+        except Exception:                               # noqa: BLE001
+            self.observer_drops += 1
 
     def observe(self, entry) -> RepairDecision:
         """Decide what happens to one failed *entry*. Appends no side effects
@@ -458,6 +472,12 @@ class RepairLoop:
             # would spend an agent's tokens on every retry the breaker refuses.
             if len(self.breaker.opened) > before:
                 self._reflect(key, signature)
+                # On the transition only, for the same reason the reflection is:
+                # an alert repeated on every refused retry is a footer that
+                # scrolls the other alerts away.
+                self._emit("circuit_opened", key=str(key), state=state,
+                           reason=("repeated failure"
+                                   + (f" ({signature})" if signature else "")))
             decision = RepairDecision(
                 requeued=False, attempts=attempts, state=state,
                 reason=(f"the breaker for {key} is open after a repeated "
@@ -568,8 +588,28 @@ class RepairLoop:
             except AttributeError:
                 pass
         self._roll_back(lane)
+        self._emit("fallback_triggered",
+                   # NOT `... or -1`: lane 0 is falsy, and that idiom
+                   # turned every fall-back on the first lane into a
+                   # phantom `Lane--1` row that no lane ever cleared.
+                   lane=_lane_id(lane),
+                   task_id=str(getattr(entry, "task_id", "") or ""),
+                   attempt=int(getattr(entry, "attempts", 0) or 0),
+                   # The distinction the board renders: a retry that carries the
+                   # last failure's defused stderr is self-correction; one that
+                   # does not is just another go.
+                   injected=bool(decision.prompt_suffix),
+                   reason=str(getattr(entry, "reason", "") or ""))
         await lane.push(entry)
         return True
+
+
+def _lane_id(lane) -> int:
+    """*lane*'s id, or -1. Total, because it feeds a display."""
+    try:
+        return int(getattr(lane, "lane_id", -1))
+    except (TypeError, ValueError):
+        return -1
 
 
 def _signature_for(entry) -> str:

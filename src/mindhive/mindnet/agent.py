@@ -293,6 +293,16 @@ def _record_brief(task_id, built, ctx=None) -> None:
     that visible; `Stats.gated` is what keeps "switched off" from being reported
     as "found none", which are different problems with different fixes.
 
+    `failures` and `dropped` are the two that were missing, and they close the
+    same class of gap one layer deeper. A context in which every source RAISED
+    reported the identical row to a healthy one that matched nothing, and a brief
+    whose every line was eaten by the defuser reported success while under
+    attack. Counts answered "did the briefing arrive"; they could not answer "did
+    it arrive because everything worked" (TODOS 25).
+
+    Every key here is ADDITIVE. The ledger is append-only and hash-chained, so a
+    key that changes meaning is wrong permanently for every row already written.
+
     Total, and quiet on failure. A telemetry write that can take down prompt
     composition would trade the feature for the measurement of it."""
     stats = getattr(built, "stats", None)
@@ -308,7 +318,10 @@ def _record_brief(task_id, built, ctx=None) -> None:
             {"task_id": str(task_id), "chars": len(built.text or ""),
              "skills": stats.skills, "sops": stats.sops,
              "constraints": stats.constraints, "symbols": stats.symbols,
-             "gated": list(stats.gated), "empty_reason": stats.empty_reason},
+             "gated": list(stats.gated), "empty_reason": stats.empty_reason,
+             "failures": list(getattr(stats, "failures", ()) or ()),
+             "dropped": int(getattr(stats, "dropped", 0) or 0),
+             "authored": int(getattr(stats, "authored", 0) or 0)},
             tags=["mindnet", "brief", "auto"], project=project)
     except Exception:                                  # noqa: BLE001
         pass

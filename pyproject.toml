@@ -27,6 +27,12 @@ browser = ["playwright>=1.40"]
 # major cannot land silently on the one platform this repo runs on.
 pg = ["psycopg[binary]>=3.3,<4", "psycopg_pool>=3.2"]
 mcp = ["mcp>=1.2"]
+# WB7's live terminal board (`hive lintester --board`). A THIRD extra for the
+# same reason `pg` and `mcp` are two: it fails on its own and wants its own
+# message. Runtime `dependencies` stays empty, so the board degrades to a
+# one-line-per-event log without it rather than failing the mission — which is
+# also the path CI takes, because `dev` does not pull this in.
+tui = ["rich>=13"]
 
 [project.scripts]
 hive = "mindhive.__main__:main"

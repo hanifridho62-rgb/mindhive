@@ -1842,3 +1842,79 @@ def test_a_hostile_phase_cannot_forge_a_row_in_the_listing_used_to_audit_it(
     # the assertions above while telling the operator less than before.
     assert any("brainstorm" in ln for ln in rows), (
         f"the real phase was destroyed along with the forgery: {rows!r}")
+
+
+# --- TODOS 25/26: the operator surface for failures, drops and withholdings ---
+
+def test_brief_json_always_carries_the_three_new_keys(capsys):
+    """Unconditionally, unlike the human line. A machine reader must not have to
+    tell "absent" from "zero"."""
+    _orc_graph()
+    capsys.readouterr()
+
+    assert _cli("mindnet", "brief", "a", "--json") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "failures" in data, "the context-level failures list is missing"
+    for key in ("failures", "dropped", "authored"):
+        assert key in data["tasks"]["a"], f"the json does not carry {key}"
+
+
+def test_brief_does_not_print_a_permanent_zero_for_the_exception_counts(capsys):
+    """`dropped=0  withheld=0` on every healthy line would train the operator to
+    skim past exactly the segment that matters on the day it is not zero — the
+    same argument `briefcli`'s docstring makes about an empty fence."""
+    _orc_graph()
+    capsys.readouterr()
+
+    _cli("mindnet", "brief", "a")
+    out = capsys.readouterr().out
+    assert "dropped=" not in out
+    assert "withheld=" not in out
+    assert "failed=" not in out
+
+
+def test_brief_names_a_broken_source_rather_than_reporting_it_as_empty(
+        capsys, monkeypatch):
+    """The operator's actual question when every brief is empty is whether the
+    sidecar threw, and before this the answer was on no surface at all."""
+    from mindhive.mindnet import sidecar as sc_mod
+
+    def _blow_up(*_a, **_k):
+        raise RuntimeError("sidecar unreadable")
+
+    _orc_graph()
+    monkeypatch.setattr(sc_mod, "read", _blow_up)
+    capsys.readouterr()
+
+    _cli("mindnet", "brief", "a")
+    assert "failed=sidecar" in capsys.readouterr().out
+
+
+def test_brief_reports_a_defused_line_rather_than_reporting_success(
+        capsys, monkeypatch):
+    """The run under active attack. It used to print the identical line to a
+    quiet one."""
+    from mindhive.mindnet import advice as adv_mod
+    from mindhive.mindnet import brief as br_mod
+
+    _orc_graph()
+    monkeypatch.setattr(
+        adv_mod, "resolve",
+        lambda *a, **k: adv_mod.Advice(skills=(br_mod.FENCE_CLOSE,)))
+    capsys.readouterr()
+
+    _cli("mindnet", "brief", "a")
+    assert "dropped=1" in capsys.readouterr().out
+
+
+def test_brief_reports_a_withheld_agent_authored_row(capsys, monkeypatch):
+    """Exclusion is the control; this line is what keeps it from being silent."""
+    from mindhive.mindnet import advice as adv_mod
+
+    _orc_graph()
+    monkeypatch.setattr(adv_mod, "resolve",
+                        lambda *a, **k: adv_mod.Advice(withheld=2))
+    capsys.readouterr()
+
+    _cli("mindnet", "brief", "a")
+    assert "withheld=2" in capsys.readouterr().out

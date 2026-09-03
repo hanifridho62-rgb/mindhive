@@ -194,6 +194,13 @@ def make_handler(token: str):
         GZIP_MIN_BYTES = 1400
 
         def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            # The publish point. A route guarded by `_one_at_a_time` drops its
+            # lock HERE, before the first byte, so no client can hold a finished
+            # answer while the endpoint that produced it is still refusing
+            # callers. See that decorator for the failure this ordering fixes.
+            release = getattr(self, "_release_before_send", None)
+            if release is not None:
+                release()
             data = body.encode("utf-8") if isinstance(body, str) else body
             accepts = "gzip" in (self.headers.get("Accept-Encoding") or "")
             self.send_response(code)

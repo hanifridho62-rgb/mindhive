@@ -109,7 +109,8 @@ DETERMINISTIC_TYPES = {
     # the server).
     "mindnet_activity",
     # One row per task briefed for an orchestrated agent. Payload
-    # {task_id, chars, skills, sops, constraints, symbols, gated, empty_reason}.
+    # {task_id, chars, skills, sops, constraints, symbols, gated, empty_reason,
+    #  failures, dropped, authored}.
     #
     # This exists because the feature it measures can fail INVISIBLY. `advice`
     # answers EMPTY for a task whose words overlap nothing, and the symbol slice
@@ -119,6 +120,28 @@ DETERMINISTIC_TYPES = {
     # success. The counts are the only thing that can contradict that, and
     # `gated` is what keeps "switched off" from being reported as "matched
     # nothing", which are different problems with different fixes.
+    #
+    # The last three are ADDITIVE, appended without moving any key above them,
+    # because this is an append-only hash-chained ledger and a key whose meaning
+    # changes is recorded wrong permanently for every row already written:
+    #
+    #   `failures`  which sources RAISED while the wave context resolved
+    #               (events / plugins / sidecar / symbols). `gated` says
+    #               "switched off"; this says "broken". Four `except` branches
+    #               used to swallow silently, so a context in which everything
+    #               failed produced the identical row to a healthy one that
+    #               matched nothing.
+    #   `dropped`   how many non-empty lines the defuser emptied — the ONLY
+    #               observable signal that an injection attempt reached the
+    #               composer. The three counts above are the resolver's ROW
+    #               counts, so five hostile lines used to record `skills=3
+    #               chars=0` and nothing else.
+    #   `authored`  how many rows were withheld because an orchestration session
+    #               wrote them. A spawned child holds `hive` on PATH and its own
+    #               `MINDHIVE_SESSION`, so an injected wave-1 agent could write
+    #               one SOP row that briefed every later agent. Withholding it
+    #               without recording the count would be the same silence one
+    #               step further on.
     #
     # Deterministic, for the same reason as `mindnet_activity`: this is
     # machine-generated telemetry carrying no human intent, and semantic

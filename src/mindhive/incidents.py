@@ -16,6 +16,17 @@ from contextlib import contextmanager
 # string, and a module shadowed by a loop variable is a trap, not a shortcut.
 from . import events, paths, signature as sig_mod
 
+# The record's Markdown format - parsing and rendering - lives in
+# `incidentfile`; see that module's docstring for why the seam is there and not
+# at the write lock. Re-imported under the same names on purpose: reflect,
+# resolve, advice and eleven test files reach these through `incidents`, none of
+# them monkeypatches one, and they are functions plus a single int constant, so
+# there is no mutable state a second module's globals could hold stale.
+from .incidentfile import (MAX_SESSION_IDS, _auto_field,  # noqa: F401
+                           _auto_rule, _frontmatter, _human_text, _id_list,
+                           _raw_excerpt, _render, _replace_section,
+                           _split_sections, derive_active)
+
 THRESHOLD = 2                       # recurrence gate N (D2)
 DECAY_DAYS = 14                     # candidate staleness horizon (KTD4 decay)
 _FLAG_PREFIX = "judgment:flag:"     # explicit human self-flags (hive flag)
@@ -429,97 +440,6 @@ def _collect(project, evs=None):
     return acc
 
 
-_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-_RULE_LINE = re.compile(r"Prevention rule:\s*(.+)", re.IGNORECASE)
-
-
-def _split_sections(text: str) -> dict:
-    """Map '## Name' headers to their body text."""
-    out, cur, buf = {}, None, []
-    for line in text.splitlines():
-        if line.startswith("## "):
-            if cur is not None:
-                out[cur] = "\n".join(buf).strip()
-            cur, buf = line[3:].strip(), []
-        elif cur is not None:
-            buf.append(line)
-    if cur is not None:
-        out[cur] = "\n".join(buf).strip()
-    return out
-
-
-def _replace_section(text: str, name: str, new_body: str) -> str:
-    """Return text with the '## name' section body replaced by new_body."""
-    lines = text.splitlines()
-    out, i, replaced = [], 0, False
-    while i < len(lines):
-        out.append(lines[i])
-        if lines[i].strip() == f"## {name}":
-            out.append(new_body)
-            i += 1
-            while i < len(lines) and not lines[i].startswith("## "):
-                i += 1                       # skip old body
-            replaced = True
-            continue
-        i += 1
-    if not replaced:                          # append the section if missing
-        out += [f"## {name}", new_body]
-    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
-
-
-def _human_text(section: str) -> str:
-    return _COMMENT.sub("", section or "").strip()
-
-
-def _auto_rule(section: str) -> str:
-    m = _RULE_LINE.search(section or "")
-    return m.group(1).strip() if m else ""
-
-
-def derive_active(auto_section: str, human_section: str):
-    """(active_rule_text, rule_source) — Human overrides Auto (D10)."""
-    human = _human_text(human_section)
-    if human:
-        return human, "human"
-    auto = _auto_rule(auto_section)
-    if auto:
-        return auto, "auto"
-    return "", "none"
-
-
-def _render(signature, rec, status, auto_body, human_body, active, source, flag="") -> str:
-    actions = "\n".join(f"- `{a}`" for a in rec["actions"][:5]) or "- (unknown)"
-    sessions = ", ".join(rec["sessions"][:5]) + (
-        f" (+{len(rec['sessions']) - 5})" if len(rec["sessions"]) > 5 else "")
-    active_body = f"> {active}" if active else "> (none yet)"
-    return f"""---
-signature: {signature}
-status: {status}
-occurrences: {rec['occurrences']}
-rule_source: {source}
-flag: {flag}
-sessions: {len(rec['sessions'])}
----
-
-# Incident: {signature}
-
-## Raw Signal
-- Error excerpt: `{rec['excerpt'][:300].replace('`', "'")}`
-- Failing actions:
-{actions}
-- Sample sessions: {sessions or '(none)'}
-
-## Auto Evaluation
-{auto_body}
-
-## Human Evaluation
-{human_body}
-
-## Active Prevention Rule
-{active_body}
-"""
-
-
 def project(project=None, threshold=THRESHOLD, evs=None) -> dict:
     """(Re)write an incident record per signature, preserving the Auto and Human
     Evaluation sections and re-deriving the Active rule. Returns {records: n}.
@@ -748,41 +668,12 @@ def demote(signature, project=None) -> dict:
     return {"demoted": True}
 
 
-_FM_KEYS = ("signature", "status", "occurrences", "rule_source", "flag", "sessions")
-
-
-def _frontmatter(text: str) -> dict:
-    """Parse an incident record's frontmatter fields from its text."""
-    out = {}
-    for line in text.splitlines():
-        m = re.match(r"^(\w+):\s*(.*)$", line)
-        if m and m.group(1) in _FM_KEYS:
-            v = m.group(2)
-            out[m.group(1)] = int(v) if v.isdigit() else v
-        if line.startswith("# Incident:"):
-            break
-    return out
-
-
 def load(signature, project=None) -> dict:
     """Read back a record's frontmatter as a dict (for tests/inspection)."""
     p = _incident_dir(project) / f"{_safe_name(signature)}.md"
     if not p.exists():
         return {}
     return _frontmatter(p.read_text(encoding="utf-8"))
-
-
-def _auto_field(section: str, name: str) -> str:
-    """One labelled value from an Auto Evaluation body ('- Name: value').
-    Line-wise by format contract: a multi-line value keeps its first line."""
-    m = re.search(rf"{name}:\s*(.+)", section or "", re.IGNORECASE)
-    return m.group(1).strip() if m else ""
-
-
-def _raw_excerpt(section: str) -> str:
-    """The error excerpt line from a Raw Signal body, backtick quoting removed."""
-    m = re.search(r"Error excerpt:\s*(.+)", section or "")
-    return m.group(1).strip().strip("`") if m else ""
 
 
 _LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted",
@@ -963,6 +854,13 @@ def summaries(project=None, include_expired=False) -> list:
             # innerHTML unescaped or break the occurrences sort (int vs str).
             "occurrences": _as_int(fm.get("occurrences")),
             "sessions": _as_int(fm.get("sessions")),
+            # The ids behind that count, bounded by `MAX_SESSION_IDS`. EMPTY for
+            # every record written before this key existed, which is the honest
+            # answer — authorship was not captured then, and a consumer must not
+            # read "no ids" as "no human wrote this". `sessions` above is the
+            # true count, so a reader can tell a complete list from a truncated
+            # or absent one by comparing lengths.
+            "session_ids": _id_list(fm.get("session_ids")),
             "rule_source": source,
             "flag": fm.get("flag", ""),
             "excerpt": _raw_excerpt(secs.get("Raw Signal", "")),
