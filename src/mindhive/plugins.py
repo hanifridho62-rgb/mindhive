@@ -583,7 +583,14 @@ def _skill_calls(evs) -> list[dict]:
     (chronological — read_all is already ordered): ``skill_used`` (passive hook
     capture), ``invoke_result`` (ok), and ``tool_failed`` with a ``skill:*``
     signature (fail). Explicit records tagged ``agent-assessed`` keep that
-    provenance (KTD5 — self-grades are never presented as measured)."""
+    provenance (KTD5 — self-grades are never presented as measured).
+
+    ``observed`` says whether an OUTCOME was witnessed. A slash-command
+    capture (harvest, ``outcome_observed: False``) records that the command
+    was typed and the body expanded; no tool ran, so no response was ever
+    read and nothing can ever mark it failed. It is a real call, but treating
+    it as a success is what would let typed commands manufacture a completion
+    rate. Every other source did read a result, so they default to True."""
     calls = []
     for e in evs:
         p = e.payload if isinstance(e.payload, dict) else {}
@@ -592,6 +599,7 @@ def _skill_calls(evs) -> list[dict]:
             if not name:
                 continue
             calls.append({"name": name, "ts": e.ts, "ok": bool(p.get("ok", True)),
+                          "observed": bool(p.get("outcome_observed", True)),
                           "session": e.session_id, "explicit": False,
                           "provenance": "passive", "source": "skill_used"})
         elif e.type == "invoke_result":
@@ -599,7 +607,7 @@ def _skill_calls(evs) -> list[dict]:
             if not name:
                 continue
             prov = "agent-assessed" if "agent-assessed" in (e.tags or []) else "invoke"
-            calls.append({"name": name, "ts": e.ts, "ok": True,
+            calls.append({"name": name, "ts": e.ts, "ok": True, "observed": True,
                           "session": e.session_id, "explicit": True,
                           "provenance": prov, "source": "invoke_result"})
         elif e.type == "tool_failed":
@@ -608,6 +616,7 @@ def _skill_calls(evs) -> list[dict]:
                 continue
             prov = "agent-assessed" if "agent-assessed" in (e.tags or []) else "invoke"
             calls.append({"name": sig[len("skill:"):], "ts": e.ts, "ok": False,
+                          "observed": True,
                           "session": e.session_id, "explicit": True,
                           "provenance": prov, "source": "tool_failed"})
     return calls
@@ -657,40 +666,51 @@ def _dedup_calls(calls: list[dict]) -> list[dict]:
 
 def skill_stats(project=None, evs=None) -> dict:
     """Per-skill telemetry counters from the ledger, keyed by skill name:
-    ``{calls, ok, fail, completion_rate, last_outcome, last_used, streak,
-    fail_streak, provenance, sources}``.
+    ``{calls, ok, fail, unobserved, completion_rate, last_outcome, last_used,
+    streak, fail_streak, provenance, sources}``.
 
     The rate is a COMPLETION rate (ran without a tool error), never a success
-    rate (KTD5); it is None when a skill has zero calls. ``provenance`` breaks
-    calls down by capture path (``passive`` hook capture / ``invoke`` channel /
-    ``agent-assessed`` `skills record` write-throughs); ``streak`` is the
-    trailing run of failure-free calls (the completion record the recommend
-    tie-break reads). Pass evs to reuse an events.read_all() result."""
+    rate (KTD5). It is computed over the calls whose OUTCOME was observed, and
+    is None when none was — a skill invoked only by slash command has calls but
+    no evidence any of them completed, and reporting 3/3 there is exactly how a
+    typed command would promote itself to "measured" in the briefing.
+    ``unobserved`` counts those calls; they move ``calls`` and ``last_used``
+    but not ``ok``/``fail``/``last_outcome``, and they do not extend ``streak``
+    — the trailing run of failure-free calls that the recommend tie-break reads
+    as a completion record. ``provenance`` breaks calls down by capture path
+    (``passive`` hook capture / ``invoke`` channel / ``agent-assessed``
+    `skills record` write-throughs). Pass evs to reuse an events.read_all()
+    result."""
     if evs is None:
         evs = ev_mod.read_all(project)
     out: dict[str, dict] = {}
     for c in _dedup_calls(_skill_calls(evs)):
         s = out.setdefault(c["name"], {
-            "calls": 0, "ok": 0, "fail": 0, "completion_rate": None,
+            "calls": 0, "ok": 0, "fail": 0, "unobserved": 0,
+            "completion_rate": None,
             "last_outcome": None, "last_used": None, "streak": 0,
             "fail_streak": 0, "provenance": {}, "sources": []})
         s["calls"] += 1
-        if c["ok"]:
+        if not c.get("observed", True):
+            s["unobserved"] += 1          # a call, but no outcome to record
+        elif c["ok"]:
             s["ok"] += 1
             s["streak"] += 1
             s["fail_streak"] = 0
+            s["last_outcome"] = "ok"
         else:
             s["fail"] += 1
             s["streak"] = 0
             s["fail_streak"] += 1
-        s["last_outcome"] = "ok" if c["ok"] else "fail"
+            s["last_outcome"] = "fail"
         s["last_used"] = c["ts"]
         s["provenance"][c["provenance"]] = s["provenance"].get(c["provenance"], 0) + 1
         if c["source"] not in s["sources"]:
             s["sources"].append(c["source"])
     for s in out.values():
-        if s["calls"]:
-            s["completion_rate"] = s["ok"] / s["calls"]
+        observed = s["calls"] - s["unobserved"]
+        if observed:
+            s["completion_rate"] = s["ok"] / observed
         s["sources"].sort()
     return out
 

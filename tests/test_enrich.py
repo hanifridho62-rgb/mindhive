@@ -325,3 +325,68 @@ def test_cli_preview_prints_composed_prompt(capsys, monkeypatch):
     obj = json.loads(capsys.readouterr().out)
     assert obj["enabled"] is True and "enriched_prompt" in obj
     assert obj["sop"] and obj["questions"]
+
+
+# --------------------------------------------------------------------------
+# Typed slash commands must not carry a skill over the measured bar here
+# either. This module re-derives `measured` from the stats row, so fixing
+# recommend.score_skill alone would leave this producer of the operator-facing
+# directive promoting a skill nobody graded.
+# --------------------------------------------------------------------------
+
+def _thin_stats(name, calls, unobserved, ok):
+    """skill_stats for a skill whose calls were mostly typed slash commands:
+    the rate is over the observed ones, `calls` counts every invocation."""
+    seen = calls - unobserved
+    return {name: {"calls": calls, "ok": ok, "fail": 0,
+                   "unobserved": unobserved,
+                   "completion_rate": (ok / seen) if seen else None,
+                   "last_outcome": "ok" if ok else None,
+                   "streak": ok, "fail_streak": 0}}
+
+
+def test_a_thinly_graded_skill_is_not_promoted_by_its_typed_calls():
+    """55 invocations, 2 of them graded, and both completed — so the rate is a
+    truthful 1.0. Only the DENOMINATOR of the measured bar decides this one:
+    against raw `calls` it is 55 >= 3 and prints as proven; against observed
+    calls it is 2, and two observations are not a measurement.
+
+    Kills 'MEASURED_MIN_CALLS against st["calls"]' in enrich."""
+    stats = _thin_stats("dash-helper", 55, 53, 2)
+    out = enrich.skill_suggestions("add dashboard poll retry handling",
+                                   skills=_SKILLS, stats=stats)
+    [s] = [e for e in out if e["skill"] == "dash-helper"]
+    assert s["provenance"] == "estimated"
+    assert s["directive"] == "try"
+
+
+def test_a_typed_only_skill_is_not_suggested_as_measured():
+    """The rate path rather than the gate: with nothing observed at all,
+    `skill_stats` leaves completion_rate None and no call count can read as
+    proven. Held upstream (test_unobserved_calls_count_as_calls_but_not_as
+    _completions); asserted here because this is where the operator sees it."""
+    stats = _thin_stats("dash-helper", 4, 4, 0)
+    out = enrich.skill_suggestions("add dashboard poll retry handling",
+                                   skills=_SKILLS, stats=stats)
+    [s] = [e for e in out if e["skill"] == "dash-helper"]
+    assert s["provenance"] == "estimated"
+    assert s["directive"] == "try"
+
+
+def test_the_suggested_fraction_uses_the_observed_denominator():
+    """'measured 3/10 completion' reads as a 30% rate for a skill that
+    completed all three runs anybody watched."""
+    stats = _thin_stats("dash-helper", 10, 7, 3)
+    out = enrich.skill_suggestions("add dashboard poll retry handling",
+                                   skills=_SKILLS, stats=stats)
+    [s] = [e for e in out if e["skill"] == "dash-helper"]
+    assert s["provenance"] == "measured" and s["directive"] == "must"
+    assert (s["ok"], s["calls"]) == (3, 3)
+
+
+def test_a_fully_observed_skill_is_still_measured_here():
+    """CANARY: the gate must count observed calls, not refuse to count."""
+    stats = _stats({"dash-helper": (3, 3)})
+    out = enrich.skill_suggestions("add dashboard poll retry handling",
+                                   skills=_SKILLS, stats=stats)
+    assert out[0]["provenance"] == "measured" and out[0]["directive"] == "must"

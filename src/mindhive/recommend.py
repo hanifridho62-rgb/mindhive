@@ -115,13 +115,33 @@ def active_skill_rules(incidents) -> dict:
     return out
 
 
+def observed_calls(st) -> int:
+    """Calls in a `plugins.skill_stats` row whose OUTCOME was witnessed.
+
+    ``calls`` alone is not evidence about completion: a slash-command
+    invocation fires no tool, so no response is ever read and nothing can
+    mark it failed. Those calls are counted in ``calls`` and in
+    ``unobserved``, and this is the number every "measured" gate and every
+    rendered ``ok/N completion`` fraction has to use. MEASURED_MIN_CALLS
+    against raw ``calls`` would let a skill reach 'measured' — and, above the
+    auto gate, run automatically — on commands that were merely typed."""
+    st = st or {}
+    return max(0, int(st.get("calls") or 0) - int(st.get("unobserved") or 0))
+
+
 def outcome_category(st) -> str | None:
     """Improvements-style outcome category for a skill's recorded history:
     ``failure`` (last call failed), ``supervision-needed`` (history contains
     agent-assessed write-throughs — an agent had to intervene and grade),
     ``no-intervention-needed`` (a solid failure-free streak of clean runs),
-    ``success`` (last call ok, record still thin). None when never called."""
+    ``success`` (last call ok, record still thin). None when never called, and
+    None when nothing was ever OBSERVED — a skill whose whole record is
+    slash-command captures has calls but no witnessed outcome, and the
+    ``success`` branch below would otherwise read "last call ok" off a row that
+    never had a result to be ok."""
     if not st or not st.get("calls"):
+        return None
+    if int(st.get("calls") or 0) <= int(st.get("unobserved") or 0):
         return None
     if st.get("last_outcome") == "fail":
         return "failure"
@@ -164,10 +184,19 @@ def need_match(description, needs) -> float:
 
 
 def _reason(measured: bool, st: dict, calls: int, nm: float, penalty: float) -> str:
+    # `calls` here is the OBSERVED count, so the fraction is a real rate. Using
+    # raw calls would print "2/55 completion" for a skill whose rate is 1.0
+    # because 53 of those calls were typed slash commands nobody graded.
     if measured:
         base = f"measured {st.get('ok', 0)}/{calls} completion"
     elif calls:
         base = f"only {calls} call(s) recorded — breadth-estimated"
+    elif int((st or {}).get("calls") or 0):
+        # Called, but never graded — a slash-only record. Saying "never
+        # called" here is the mirror of the inflation this gate removes: the
+        # skill really did run, the runs just prove nothing about completion.
+        base = (f"{int(st['calls'])} call(s) recorded, none with an observed "
+                "outcome — breadth-estimated")
     else:
         base = "never called — breadth-estimated"
     if nm > 0:
@@ -218,8 +247,13 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
     desc = skill.get("description", "")
     st = (stats or {}).get(name) or {}
     calls = int(st.get("calls") or 0)
+    # The gate counts calls whose outcome was OBSERVED. Against raw `calls` a
+    # skill reached 'measured' — and above AUTO_MIN_RATE ran automatically —
+    # on typed slash commands: 55 calls of which 2 were ever graded still
+    # cleared a 3-call bar. See `observed_calls`.
+    observed = observed_calls(st)
     rate = st.get("completion_rate")
-    measured = calls >= MEASURED_MIN_CALLS and rate is not None
+    measured = observed >= MEASURED_MIN_CALLS and rate is not None
     nm = need_match(desc, needs)
     prior = breadth_prior(desc)
     penalty = OPEN_INCIDENT_PENALTY * (open_incidents or {}).get(name, 0)
@@ -239,6 +273,7 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
         "score": round(score, 4),
         "completion_rate": rate,
         "calls": calls,
+        "observed": observed,        # calls whose outcome was witnessed
         "streak": int(st.get("streak") or 0),
         "need_match": nm,
         "breadth_prior": None if measured else prior,
@@ -247,7 +282,7 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
         "execution_mode": "auto" if auto else "suggest",
         "outcome_category": outcome_category(st),
         "fail_streak": int(st.get("fail_streak") or 0),
-        "reason": _reason(measured, st, calls, nm, penalty),
+        "reason": _reason(measured, st, observed, nm, penalty),
     }
 
 

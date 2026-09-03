@@ -304,7 +304,10 @@ def skill_suggestions(text, skills=None, stats=None, exclude=(),
         if nm <= 0:
             continue
         st = (stats or {}).get(name) or {}
-        calls = int(st.get("calls") or 0)
+        # Calls whose outcome was OBSERVED, per recommend.observed_calls: a
+        # typed slash command is a call but grades nothing, so it must not
+        # carry a skill over the measured bar or into the rendered fraction.
+        calls = recommend.observed_calls(st)
         rate = st.get("completion_rate")
         measured = calls >= recommend.MEASURED_MIN_CALLS and rate is not None
         # recommend-engine order, expressed ascending: measured first, higher

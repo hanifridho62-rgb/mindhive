@@ -224,10 +224,28 @@ def _write_transcript(dirpath, sid, lines):
                                           encoding="utf-8")
 
 
-SLASH = ("<command-message>circle</command-message>"
+def _row(text, *, uuid, parent=None, meta=False):
+    o = {"type": "user", "uuid": uuid, "parentUuid": parent,
+         "message": {"content": text}}
+    if meta:
+        o["isMeta"] = True
+    return json.dumps(o)
+
+
+# A slash-command skill invocation as the transcript actually records it: the
+# typed command and the harness-injected skill body are SEPARATE user rows,
+# linked by body.parentUuid == command.uuid, the body flagged isMeta.
+# This fixture used to be ONE message carrying both signals — a shape that
+# occurs in no real transcript (measured 2026-09-03 over 25 transcripts: 30
+# command rows, 64 body rows, 0 rows carrying both). That fabricated fixture
+# is what let harvest._skill_from_command sit dead while looking covered.
+SLASH_ROWS = [
+    _row("<command-message>circle</command-message>"
          "<command-name>/agent-teams:parallel-debugging</command-name>"
-         "<command-args>go</command-args>\n"
-         "Base directory for this skill: C:\\x\\y\n\n# Parallel Debugging")
+         "<command-args>go</command-args>", uuid="u1", parent="u0"),
+    _row("Base directory for this skill: C:\\x\\y\n\n# Parallel Debugging",
+         uuid="u2", parent="u1", meta=True),
+]
 
 
 def test_harvest_captures_skill_tool_use(tmp_path):
@@ -244,7 +262,7 @@ def test_harvest_captures_skill_tool_use(tmp_path):
 
 def test_harvest_captures_slash_command_skill_invocation(tmp_path):
     tdir = tmp_path / "tx"
-    _write_transcript(tdir, "s1", [_usermsg(SLASH)])
+    _write_transcript(tdir, "s1", SLASH_ROWS)
     harvest.harvest(tdir, "test")
     used = [e for e in events.read_all("test") if e.type == "skill_used"]
     assert len(used) == 1
@@ -276,7 +294,7 @@ def test_harvest_skill_dedups_against_hook_capture(tmp_path):
 
 def test_backfill_skills_is_idempotent_and_respects_existing(tmp_path):
     tdir = tmp_path / "tx"
-    _write_transcript(tdir, "s1", [_usermsg(SLASH)])
+    _write_transcript(tdir, "s1", SLASH_ROWS)
     _write_transcript(tdir, "s2",
                       [_tooluse("Skill", {"skill": "superpowers:brainstorming"})])
     # s2's invocation was already hook-captured -> backfill must skip it
