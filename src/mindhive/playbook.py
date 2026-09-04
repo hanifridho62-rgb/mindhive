@@ -450,7 +450,10 @@ def _skills_for(need, skills, stats, open_incidents=(), skill_rules=None,
         if nm <= 0:
             continue
         st = (stats or {}).get(name) or {}
-        calls = int(st.get("calls") or 0)
+        # Calls whose outcome was OBSERVED, per recommend.observed_calls: a
+        # typed slash command grades nothing, so it must not carry a skill
+        # over the measured bar or into the rendered fraction.
+        calls = recommend.observed_calls(st)
         rate = st.get("completion_rate")
         measured = calls >= recommend.MEASURED_MIN_CALLS and rate is not None
         # An open incident denies MUST wording even for a measured winner — R7, the

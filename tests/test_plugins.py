@@ -853,3 +853,77 @@ def test_skill_stats_fail_streak_tracks_trailing_failures():
                     ts="2026-07-07T10:09:00Z", session_id="sess9", project="test")
     st = plugins.skill_stats(project="test")["s"]
     assert st["fail_streak"] == 0 and st["streak"] == 1
+
+
+# --------------------------------------------------------------------------
+# Calls with NO observed outcome (slash-command skill captures). A slash
+# invocation fires no Skill tool, so it produces neither an invoke_result nor
+# a tool_failed and nothing can ever mark it failed. It is a real CALL but
+# not evidence of COMPLETION, and the rate here is documented as a completion
+# rate (KTD5: a weaker signal is never presented as measured).
+# --------------------------------------------------------------------------
+
+def _used_unobserved(name, ts, session="sess"):
+    """A slash-command capture: recorded, but with no outcome witnessed."""
+    events.append_event("skill_used",
+                        {"name": name, "ok": True, "text": "",
+                         "outcome_observed": False},
+                        session_id=session, ts=ts, project="test")
+
+
+def test_unobserved_calls_count_as_calls_but_not_as_completions():
+    """Kills 'a slash capture is a recorded success'. Three typed slash
+    commands must not read as 3/3 completion -- that is what promotes a skill
+    to 'measured' and then to auto execution mode."""
+    for h in (10, 11, 12):
+        _used_unobserved("s", f"2026-07-01T{h}:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 3
+    assert st["unobserved"] == 3
+    assert st["ok"] == 0 and st["fail"] == 0
+    assert st["completion_rate"] is None       # nothing was actually observed
+    assert st["last_outcome"] is None
+
+
+def test_unobserved_calls_do_not_extend_the_completion_streak():
+    """``streak`` is the trailing run of failure-free calls that
+    recommend.outcome_category reads to declare 'no-intervention-needed'.
+    An unwitnessed call is not evidence of a clean run.
+
+    Kills 'count an unobserved call toward the streak'."""
+    _invoked_ok("s", "2026-07-01T10:00:00Z")
+    for h in (12, 13, 14):
+        _used_unobserved("s", f"2026-07-01T{h}:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["ok"] == 1 and st["unobserved"] == 3
+    assert st["streak"] == 1                   # the one real ok, not 4
+
+
+def test_an_observed_outcome_still_sets_the_rate_alongside_unobserved_calls():
+    """The rate is over calls whose outcome WAS observed, so a real result is
+    not diluted by typed-only invocations."""
+    _used_unobserved("s", "2026-07-01T10:00:00Z")
+    _invoked_ok("s", "2026-07-01T13:00:00Z")   # far outside DEDUP_WINDOW_SECS
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 2 and st["ok"] == 1 and st["unobserved"] == 1
+    assert st["completion_rate"] == 1.0
+    assert st["last_outcome"] == "ok"
+
+
+def test_a_failure_after_unobserved_calls_still_registers():
+    _used_unobserved("s", "2026-07-01T10:00:00Z")
+    _failed("s", "2026-07-01T13:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 2 and st["fail"] == 1 and st["unobserved"] == 1
+    assert st["completion_rate"] == 0.0
+    assert st["last_outcome"] == "fail"
+
+
+def test_an_ordinary_passive_capture_is_still_observed():
+    """CANARY: only rows that explicitly say outcome_observed=False are
+    excluded. A hook capture, which DID read a tool response, still counts --
+    otherwise the change above would silently blank every rate in the store."""
+    _used("s", "2026-07-01T10:00:00Z")
+    st = plugins.skill_stats(project="test")["s"]
+    assert st["calls"] == 1 and st["ok"] == 1 and st["unobserved"] == 0
+    assert st["completion_rate"] == 1.0

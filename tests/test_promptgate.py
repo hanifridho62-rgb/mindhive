@@ -653,3 +653,65 @@ def test_a_missing_always_key_is_tolerated():
     vague = promptgate.hook_context(json.dumps({"prompt": "fix it"}),
                                     project="test")
     assert "MUST USE: planner" in vague["hookSpecificOutput"]["additionalContext"]
+
+
+# --------------------------------------------------------------------------
+# The measured bar counts calls whose outcome was OBSERVED. A slash-command
+# invocation is a real call that grades nothing, so it must not promote a
+# skill to a MUST directive in the trained manifest.
+# --------------------------------------------------------------------------
+
+def _thin_stats(name, calls, unobserved, ok):
+    seen = calls - unobserved
+    return {name: {"calls": calls, "ok": ok, "fail": 0,
+                   "unobserved": unobserved,
+                   "completion_rate": (ok / seen) if seen else None,
+                   "last_outcome": "ok" if ok else None,
+                   "streak": ok, "fail_streak": 0}}
+
+
+def test_a_thinly_graded_skill_does_not_train_into_a_must_directive():
+    """55 invocations, 2 of them graded, and both completed — so the rate is a
+    truthful 1.0. Only the DENOMINATOR of the measured bar decides this one:
+    against raw `calls` it is 55 >= 3 and trains a MUST; against observed
+    calls it is 2, and two observations are not a measurement.
+
+    Kills 'MEASURED_MIN_CALLS against st["calls"]' in promptgate."""
+    man = promptgate.train(_SKILLS, _thin_stats("planner", 55, 53, 2), evs=[])
+    rules = man.get("rules") or {}
+    planner = [r for r in rules.values() if r.get("skill") == "planner"]
+    assert planner, "planner did not train at all -- fixture no longer matches"
+    assert all(r["provenance"] == "estimated" for r in planner)
+    assert all(r["directive"] == "try" for r in planner)
+
+
+def test_a_typed_only_skill_does_not_train_into_a_must_directive():
+    """The rate path rather than the gate: with nothing observed at all,
+    `skill_stats` leaves completion_rate None and no call count can train a
+    MUST. Held upstream (test_unobserved_calls_count_as_calls_but_not_as
+    _completions); asserted here because this manifest is what reaches the
+    operator's prompt."""
+    man = promptgate.train(_SKILLS, _thin_stats("planner", 5, 5, 0), evs=[])
+    rules = man.get("rules") or {}
+    planner = [r for r in rules.values() if r.get("skill") == "planner"]
+    assert planner, "planner did not train at all -- fixture no longer matches"
+    assert all(r["provenance"] == "estimated" for r in planner)
+    assert all(r["directive"] == "try" for r in planner)
+
+
+def test_the_trained_fraction_uses_the_observed_denominator():
+    man = promptgate.train(_SKILLS, _thin_stats("planner", 12, 9, 3), evs=[])
+    planner = [r for r in (man.get("rules") or {}).values()
+               if r.get("skill") == "planner"]
+    assert planner
+    for r in planner:
+        assert r["provenance"] == "measured" and r["directive"] == "must"
+        assert (r["ok"], r["calls"]) == (3, 3)
+
+
+def test_a_fully_observed_skill_still_trains_as_must():
+    """CANARY: the gate must count observed calls, not refuse to count."""
+    man = promptgate.train(_SKILLS, _stats({"planner": (3, 3)}), evs=[])
+    planner = [r for r in (man.get("rules") or {}).values()
+               if r.get("skill") == "planner"]
+    assert planner and all(r["directive"] == "must" for r in planner)

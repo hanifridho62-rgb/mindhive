@@ -71,7 +71,7 @@ def _clean_prompt(text: str) -> str:
 
 def _is_injected_prompt(text: str) -> bool:
     """Skill bodies arrive as user-role messages but aren't prompts the user typed."""
-    return text.lstrip()[:40].lower().startswith("base directory for this skill:")
+    return text.lstrip()[:40].lower().startswith(_SKILL_BODY_MARK)
 
 
 def _is_injected(o, text: str) -> bool:
@@ -106,7 +106,15 @@ def _skill_from_tool_use(inp: dict) -> dict | None:
     """skill_used payload for a Skill tool_use block, or None. Same field
     fallbacks as the live hook (tool_input.skill / .name / .skill_name),
     including the optional capped ``args`` ask, so both capture paths agree
-    on the payload shape."""
+    on the payload shape.
+
+    This reads the CALL, which says nothing about how it went. ``ok`` here is
+    only the no-error-seen default `hookcapture._response_ok` also starts
+    from; the real outcome comes from `_tool_result_ok` once the call is
+    joined to its tool_result, and `outcome_observed` records whether that
+    join happened. Stamping ``ok: True`` and stopping — which this function
+    used to do — made every invocation a recorded success, so harvest could
+    not tell a completed skill from a failed one."""
     for key in ("skill", "name", "skill_name"):
         v = (inp or {}).get(key)
         if isinstance(v, str) and v.strip():
@@ -119,20 +127,118 @@ def _skill_from_tool_use(inp: dict) -> dict | None:
     return None
 
 
-def _skill_from_command(text: str) -> dict | None:
-    """skill_used payload when a user message is a SLASH-COMMAND skill
-    invocation: it carries a <command-name> tag AND an injected skill body
-    ('Base directory for this skill:'). Slash invocations never fire the
-    Skill tool, so without this the dominant real-world invocation path
-    recorded nothing and every slash-invoked skill stayed 'never called'."""
-    low = (text or "").lower()
-    if _SKILL_BODY_MARK not in low:
+def _tool_result_ok(block: dict, row: dict) -> bool:
+    """Whether a joined Skill ``tool_result`` reports a clean run.
+
+    Both signals are read because each covers what the other misses,
+    measured across all 86 transcripts (2026-09-03):
+
+    - ``is_error`` on the result block is the failure marker — TRUE on 502
+      results corpus-wide, so it is real and used, though absent on all 151
+      Skill results in this sample (no Skill call has failed here yet).
+    - the row-level ``toolUseResult`` is what Skill results actually carry:
+      a dict with ``success`` on 151/151. Where ``is_error`` is true it is a
+      plain error STRING instead (502/502), never a dict — so the two can
+      never contradict each other, and a missing ``success`` is not evidence
+      of failure.
+
+    Same shape as `hookcapture._response_ok`: false only on an explicit
+    error marker, never on absence."""
+    if block.get("is_error") or block.get("isError"):
+        return False
+    tur = row.get("toolUseResult")
+    if isinstance(tur, dict) and tur.get("success") is False:
+        return False
+    return True
+
+
+def _flush_pending_skills(pending) -> list:
+    """Skill calls left unmatched at end of file: the tool_result is not in
+    the transcript, so no outcome was ever recorded to read.
+
+    They are still emitted. Dropping them would trade a wrong outcome for a
+    missing invocation, and 'never called' is the bug this capture path
+    exists to fix. Insertion order is call order, so the items come out in
+    the order the skills ran."""
+    out = []
+    if not isinstance(pending, dict):
+        return out
+    for held in pending.values():
+        payload = dict(held["value"])
+        payload["outcome_observed"] = False
+        out.append({"kind": "skill_used", "value": payload, "ts": held["ts"]})
+    pending.clear()
+    return out
+
+
+def _skill_from_command(obj, prev) -> dict | None:
+    """skill_used payload for a SLASH-COMMAND skill invocation, or None.
+    Slash invocations never fire the Skill tool, so without this the dominant
+    real-world invocation path records nothing and every slash-invoked skill
+    stays 'never called'.
+
+    The invocation spans TWO adjacent user rows, never one: the operator's
+    message carries <command-name>, and the harness answers it with an
+    injected ``isMeta`` body row whose ``parentUuid`` is the command row's
+    ``uuid``. ``obj`` is that body row, ``prev`` the line before it. An
+    earlier version demanded both signals inside a SINGLE message and so
+    never fired at all — measured over 25 real transcripts (2026-09-03):
+    30 command rows, 64 body rows, 0 rows carrying both.
+
+    Every clause below is load-bearing against a shape seen in that sample:
+
+    - body is ``isMeta`` — a built-in command (/model) answers with an
+      ordinary row and injects no skill, so it must not be counted as one.
+    - ``parentUuid`` links the pair — adjacency alone would join rows from
+      different branches of the conversation tree.
+    - the parent carries <command-name> — 43 of the 64 body rows answer a
+      Skill TOOL call instead, and `_skill_from_tool_use` already records
+      those; minting here too would double-count them.
+    - the parent is a ``user`` row — a defensive guard, since the parent of a
+      Skill-tool body is an ``attachment``/``assistant`` row. Measured over
+      every transcript (86 files) it rejects nothing the <command-name>
+      clause had not already rejected, so it is belt-and-braces, not load
+      bearing.
+
+    Note what is deliberately NOT required:
+
+    - the body need not open with ``_SKILL_BODY_MARK`` — real skill bodies
+      exist that do not (measured: one, full-stack-feature, a 31KB body).
+    - the COMMAND row may itself be ``isMeta``. An earlier version of this
+      function rejected those on the theory that a machine-written command
+      row is the harness announcing a Skill-tool load, already recorded
+      elsewhere. That was false: across all 86 transcripts the clause
+      rejected exactly 5 rows, every one of them ``workflow-authoring``,
+      and ``workflow-authoring`` appears as a Skill tool_use ZERO times —
+      so it recorded nothing and the clause left a genuinely-invoked skill
+      reading 'never called', which is the bug this function exists to fix.
+    """
+    if not isinstance(obj, dict) or not isinstance(prev, dict):
         return None
-    m = _CMD_NAME_RE.search(text or "")
+    if not obj.get("isMeta"):
+        return None
+    parent = obj.get("parentUuid")
+    if not parent or parent != prev.get("uuid"):
+        return None
+    if prev.get("type") != "user":
+        return None
+    m = _CMD_NAME_RE.search(_user_text((prev.get("message") or {}).get("content")))
     if not m:
         return None
     out = _split_skill_name(m.group(1))
-    out.update({"ok": True, "text": "harvested slash-command invocation"})
+    out.update({"ok": True, "text": "harvested slash-command invocation",
+                # This row proves the command was typed and the harness
+                # expanded the body. It proves NOTHING about the outcome: no
+                # tool ran, so no response was ever read and nothing can ever
+                # mark it failed. Without this flag `ok: True` would read as a
+                # recorded success and plugins.skill_stats would report a
+                # COMPLETION rate built out of typed commands.
+                "outcome_observed": False,
+                # Per-invocation identity. skill_used otherwise dedups on the
+                # skill name alone, which would collapse two real slash
+                # invocations of one skill in a session into one event — see
+                # _event_key.
+                "row": obj.get("uuid")})
     return out
 
 
@@ -169,7 +275,24 @@ def _user_text(content) -> str:
     return ""
 
 
-def _items_from_obj(o) -> list:
+def _items_from_obj(o, prev=None, pending=None) -> list:
+    """Parse one transcript row into capture items.
+
+    Two arguments exist because two kinds of skill invocation span more than
+    one row, in opposite directions:
+
+    - ``prev`` is the row immediately before this one, for the SLASH join,
+      where the body row points back at the command row (see
+      `_skill_from_command`).
+    - ``pending`` is a caller-owned dict of in-flight Skill TOOL calls, keyed
+      by tool_use id. A Skill call is held there and emitted only when its
+      ``tool_result`` arrives — which is 1 to 5+ rows later and reachable
+      only by id, so no fixed-size lookahead would do. The caller must flush
+      what is left with `_flush_pending_skills` at end of file. Pass None to
+      opt out of the join, in which case a call is emitted immediately and
+      declares no observed outcome, because none was read.
+
+    Every other item is derived from ``o`` alone."""
     items = []
     t = o.get("type")
     msg = o.get("message") or {}
@@ -203,13 +326,44 @@ def _items_from_obj(o) -> list:
                 elif name == "Skill":
                     skill = _skill_from_tool_use(inp)
                     if skill:
-                        items.append({"kind": "skill_used", "value": skill})
+                        tid = b.get("id")
+                        if isinstance(pending, dict) and tid:
+                            # Hold it: the outcome lives in the tool_result,
+                            # and emitting here is what made every call a
+                            # recorded success. Stamped at the CALL row so
+                            # `last_used` says when the skill ran, not when
+                            # its output landed (measured gap: median 6.6s,
+                            # max 76.7s).
+                            pending[tid] = {"value": skill,
+                                            "ts": o.get("timestamp")}
+                        else:
+                            # No id, or a caller that opted out of the join —
+                            # nothing can reach the result, so say so rather
+                            # than claiming the call went well.
+                            skill["outcome_observed"] = False
+                            items.append({"kind": "skill_used", "value": skill})
         # Capture Claude's prose response too, so the OUTPUT enters the hive
         # alongside the prompt. Tool-only turns have no text and are skipped.
         resp = _user_text(content).strip()
         if resp:
             items.append({"kind": "assistant_response", "value": _cap_words(resp)})
     elif t == "user":
+        # Close out any Skill call this row answers. Every real Skill result
+        # is carried by a `user` row (151/151), keyed `tool_use_id`.
+        content = msg.get("content")
+        if isinstance(pending, dict) and pending and isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                    continue
+                tid = b.get("tool_use_id") or b.get("toolUseId")
+                held = pending.pop(tid, None) if tid else None
+                if held is None:
+                    continue           # someone else's result, or already closed
+                payload = dict(held["value"])
+                payload["ok"] = _tool_result_ok(b, o)
+                payload["outcome_observed"] = True
+                items.append({"kind": "skill_used", "value": payload,
+                              "ts": held["ts"]})
         text = _user_text(msg.get("content")).strip()
         low = text.lower()
         injected = _is_injected(o, text)
@@ -240,13 +394,20 @@ def _items_from_obj(o) -> list:
                 # so the ledger keeps every memory verbatim and complete.
                 items.append({"kind": "memo", "value": _cap_words(val), "memo_type": mtype})
         # Capture the typed prompt itself so EVERY prompt enters the hive — not
-        # only marker-bearing ones. Skip injected skill bodies (not user-typed).
+        # only marker-bearing ones. Skip harness-injected rows — `_is_injected`
+        # reads the ``isMeta`` envelope first and falls back to the body mark.
+        # The envelope half is load-bearing here because `_skill_from_command`
+        # accepts bodies that do NOT carry the mark: without it the very row
+        # just recognised as a machine-written skill body is also filed as
+        # something the operator typed, and oversee.skill_trails then shows the
+        # body's own text as the ask that led to the skill.
         if text and not injected:
             prompt = _clean_prompt(text)
             if prompt:
                 items.append({"kind": "user_prompt", "value": _cap_words(prompt)})
-        # Slash-command skill invocations live in user messages, not tool_use.
-        skill = _skill_from_command(text)
+        # Slash-command skill invocations live in user messages, not tool_use
+        # — and span this row plus the one before it.
+        skill = _skill_from_command(o, prev)
         if skill:
             items.append({"kind": "skill_used", "value": skill})
     return items
@@ -258,6 +419,8 @@ def iter_transcript_events(path) -> list:
         lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
     except Exception:
         return out
+    prev = None
+    pending: dict = {}
     for line in lines:
         line = line.strip()
         if not line:
@@ -266,7 +429,9 @@ def iter_transcript_events(path) -> list:
             o = json.loads(line)
         except Exception:
             continue
-        out.extend(_items_from_obj(o))
+        out.extend(_items_from_obj(o, prev, pending))
+        prev = o
+    out.extend(_flush_pending_skills(pending))
     return out
 
 
@@ -286,10 +451,20 @@ def _hook_captured_sessions(project) -> set:
 def _event_key(session_id, etype, payload) -> tuple:
     """Dedup identity for one event. skill_used keys on the SKILL NAME — its
     text field differs between the live hook (response excerpt) and harvest
-    (fixed marker), so a text key would double-count the same invocation."""
+    (fixed marker), so a text key would double-count the same invocation.
+
+    A slash capture additionally carries ``row``, the transcript uuid of the
+    body row it was read from: unique per invocation and stable across
+    re-reads. Keying on it keeps a re-harvest idempotent while letting one
+    session hold several real invocations of the same skill, which the
+    name-only key silently discarded. The Skill-TOOL path has no such id and
+    keeps the name-only key on purpose — there the risk runs the other way,
+    since the live hook and harvest observe the SAME tool_use and must
+    collapse to one event."""
     p = payload if isinstance(payload, dict) else {}
-    field = p.get("name") if etype == "skill_used" else p.get("text")
-    return (session_id, etype, field)
+    if etype == "skill_used":
+        return (session_id, etype, p.get("name"), p.get("row"))
+    return (session_id, etype, p.get("text"))
 
 
 def _existing_event_keys(project) -> set:
@@ -358,7 +533,12 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
     With ``skip_captured=True`` any event the live hooks already recorded is
     deduped at the event level, so harvest is safe to run alongside the hooks
     without double-counting — while still backfilling events in a captured
-    session that the hooks missed (e.g. after a mid-session hook crash)."""
+    session that the hooks missed (e.g. after a mid-session hook crash).
+
+    ``unclosed_skill_calls`` counts Skill invocations whose ``tool_result``
+    was not in the transcript, so their outcome could not be read; they are
+    recorded with ``outcome_observed: False``. It is reported rather than
+    swallowed because a silent zero and a silent hundred look identical."""
     d = Path(transcript_dir)
     state = _load_state(project)
     captured = _hook_captured_sessions(project) if skip_captured else set()
@@ -369,6 +549,7 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
     new_events = 0
     files = 0
     skipped = 0
+    unclosed = 0
     if d.exists():
         for f in sorted(d.glob("*.jsonl")):
             files += 1
@@ -382,6 +563,34 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
             sid = f.stem
             is_captured = sid in captured
             wrote = 0
+            # Seed with the row BEFORE the cursor. A slash-command skill
+            # invocation spans two rows and a harvest tick can land between
+            # them; without the seed that pair is split and never joined.
+            # Walk BACK to the nearest parseable row rather than looking at
+            # one line, so the seed means the same thing as the in-loop
+            # `prev` — which also survives blank/unparseable lines via the
+            # `continue` paths below. Looking at exactly one line would make
+            # the capture depend on where the tick happened to land, the very
+            # thing the seed removes.
+            prev = None
+            for back in range(cursor - 1, -1, -1):
+                raw = all_lines[back].strip()
+                if not raw:
+                    continue
+                try:
+                    prev = json.loads(raw)
+                except Exception:
+                    continue
+                break
+            # In-flight Skill tool calls, keyed by tool_use id (see
+            # `_items_from_obj`). Deliberately NOT seeded from before the
+            # cursor: a tick landing inside the call/result window cannot see
+            # a result the file does not hold yet, and the call was already
+            # emitted-as-unobserved on that earlier tick. Seeding would mint a
+            # SECOND event for the same call, since `_event_key` cannot tell
+            # the two apart. So the outcome of a call split by a tick stays
+            # unread — the invocation is never lost, only its result.
+            pending: dict = {}
             for line in all_lines[cursor:]:
                 line = line.strip()
                 if not line:
@@ -393,7 +602,9 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                 # Preserve the real time the action happened (from the transcript
                 # line), falling back to `now` only when the line has no timestamp.
                 line_ts = _normalize_ts(o.get("timestamp")) or now
-                for item in _items_from_obj(o):
+                items = _items_from_obj(o, prev, pending)
+                prev = o
+                for item in items:
                     mapped = _event_for_item(item)
                     if mapped is None:
                         continue
@@ -405,29 +616,50 @@ def harvest(transcript_dir, project, now=None, skip_captured=False) -> dict:
                         if key in seen_keys:
                             continue
                         seen_keys.add(key)
+                    # A joined Skill call is stamped at its CALL row, which is
+                    # an earlier line than the one being read.
+                    ts = _normalize_ts(item.get("ts")) or line_ts
                     events.append_event(etype, payload, session_id=sid,
-                                        tags=tags, ts=line_ts, project=project)
+                                        tags=tags, ts=ts, project=project)
                     new_events += 1
                     wrote += 1
+            for item in _flush_pending_skills(pending):
+                mapped = _event_for_item(item)
+                if mapped is None:
+                    continue
+                etype, payload, tags = mapped
+                if is_captured:
+                    key = _event_key(sid, etype, payload)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                events.append_event(etype, payload, session_id=sid, tags=tags,
+                                    ts=_normalize_ts(item.get("ts")) or now,
+                                    project=project)
+                new_events += 1
+                wrote += 1
+                unclosed += 1
             state[f.name] = len(all_lines)
             if is_captured and wrote == 0:
                 skipped += 1
     _save_state(project, state)
-    return {"processed_files": files, "new_events": new_events, "skipped_captured": skipped}
+    return {"processed_files": files, "new_events": new_events,
+            "skipped_captured": skipped, "unclosed_skill_calls": unclosed}
 
 
 def backfill_skills(transcript_dir, project, now=None) -> dict:
     """One-shot skill_used backfill over WHOLE transcripts, ignoring the
     harvest cursor — skill invocations before this capture path existed live
-    behind cursors the incremental harvest will never revisit. Idempotent: a
-    (session, skill-name) pair that already has ANY skill_used event (hook or
-    harvest) is skipped entirely, so re-runs and hook overlap never double
-    count. Returns {"new_skill_used": n, "files": m}."""
+    behind cursors the incremental harvest will never revisit. Idempotent on
+    `_event_key`, the same identity the incremental harvest dedups on, so
+    re-runs and hook overlap never double count while genuine repeat slash
+    invocations of one skill in a session still each get an event.
+    Returns {"new_skill_used": n, "files": m}."""
     seen: set = set()
     for ev in events.read_all(project):
         if ev.type == "skill_used" and isinstance(ev.payload, dict) \
                 and ev.payload.get("name"):
-            seen.add((ev.session_id, ev.payload["name"]))
+            seen.add(_event_key(ev.session_id, "skill_used", ev.payload))
     d = Path(transcript_dir)
     new = files = 0
     if d.exists():
@@ -438,6 +670,9 @@ def backfill_skills(transcript_dir, project, now=None) -> dict:
                 lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
             except Exception:
                 continue
+            prev = None
+            pending: dict = {}
+            emit = []
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -447,18 +682,26 @@ def backfill_skills(transcript_dir, project, now=None) -> dict:
                 except Exception:
                     continue
                 line_ts = _normalize_ts(o.get("timestamp")) or now
-                for item in _items_from_obj(o):
-                    if item["kind"] != "skill_used":
-                        continue
-                    payload = dict(item["value"])
-                    key = (sid, payload.get("name"))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    events.append_event("skill_used", payload, session_id=sid,
-                                        tags=["harvest", "auto", "skill"],
-                                        ts=line_ts, project=project)
-                    new += 1
+                for item in _items_from_obj(o, prev, pending):
+                    emit.append((item, line_ts))
+                prev = o
+            # Whole-file pass, so an unmatched call really has no result in
+            # the transcript rather than one this tick could not see yet.
+            for item in _flush_pending_skills(pending):
+                emit.append((item, now))
+            for item, line_ts in emit:
+                if item["kind"] != "skill_used":
+                    continue
+                payload = dict(item["value"])
+                key = _event_key(sid, "skill_used", payload)
+                if key in seen:
+                    continue
+                seen.add(key)
+                events.append_event("skill_used", payload, session_id=sid,
+                                    tags=["harvest", "auto", "skill"],
+                                    ts=_normalize_ts(item.get("ts")) or line_ts,
+                                    project=project)
+                new += 1
     return {"new_skill_used": new, "files": files}
 
 
@@ -516,10 +759,19 @@ def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
     ``known_only`` (default) bounds the blast radius to namespaces the user
     already tracks, so incidental sessions (e.g. run from the home folder) never
     spawn surprise projects. Returns a per-project summary plus any skipped
-    namespaces."""
+    namespaces.
+
+    ``unclosed_skill_calls`` (total, and per project) is carried up from
+    `harvest`. This is the only harvest path that runs by itself — autosync
+    and the dashboard sweep both come through here — so a count that stopped
+    at `harvest` would be a count nobody ever reads. `processed_files` and
+    `skipped_captured` are dropped as before: neither is a signal anyone
+    acts on, while an unclosed call says an invocation went on the record
+    with no outcome, so any rate built from it is thinner than it looks."""
     with _harvest_lock() as got:
         if not got:               # another harvester is running — skip this tick
-            return {"projects": {}, "total_new": 0, "skipped_unknown": [], "locked": True}
+            return {"projects": {}, "total_new": 0, "skipped_unknown": [],
+                    "unclosed_skill_calls": 0, "locked": True}
         return _catch_up_unlocked(now=now, skip_captured=skip_captured, known_only=known_only)
 
 
@@ -532,6 +784,7 @@ def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
     per_project: dict = {}
     skipped_unknown: set = set()
     total_new = 0
+    total_unclosed = 0
     if root.exists():
         for d in sorted(root.iterdir()):
             if not d.is_dir():
@@ -543,6 +796,9 @@ def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
                 skipped_unknown.add(proj)
                 continue
             r = harvest(d, proj, now=now, skip_captured=skip_captured)
+            # Counted for every dir, not only the ones that make the
+            # per-project summary, so the total cannot silently undercount.
+            total_unclosed += r["unclosed_skill_calls"]
             # Also capture tool FAILURES and advance the incident lifecycle, so
             # the Learning Loop self-feeds from the same automatic sweep instead
             # of requiring a manual `hive failures capture`.
@@ -568,10 +824,13 @@ def _catch_up_unlocked(now=None, skip_captured=True, known_only=True) -> dict:
                     pass
             if r["new_events"] or fr.get("new_failures"):
                 acc = per_project.setdefault(
-                    proj, {"new_events": 0, "new_failures": 0, "dirs": 0})
+                    proj, {"new_events": 0, "new_failures": 0, "dirs": 0,
+                           "unclosed_skill_calls": 0})
                 acc["new_events"] += r["new_events"]
+                acc["unclosed_skill_calls"] += r["unclosed_skill_calls"]
                 acc["new_failures"] += fr.get("new_failures", 0)
                 acc["dirs"] += 1
                 total_new += r["new_events"]
     return {"projects": per_project, "total_new": total_new,
+            "unclosed_skill_calls": total_unclosed,
             "skipped_unknown": sorted(skipped_unknown)}

@@ -349,3 +349,152 @@ def test_brief_line_handles_delimiter_in_description():
     assert line.count("(estimated)") == 1
     assert line.endswith("Use · intended use: nested markers stay literal")
     assert line.startswith("meta — never called")
+
+
+# --------------------------------------------------------------------------
+# Skills whose only record is slash-command captures. Those calls have no
+# observed outcome, so plugins.skill_stats leaves completion_rate None. This
+# is where that matters: `measured` gates the "MUST USE <name> - measured N/N
+# completion. Proven skill" line that projector injects into MEMORY.md.
+# --------------------------------------------------------------------------
+
+def _unobserved_stat(calls):
+    """What skill_stats reports for a skill invoked only by slash command."""
+    return {"calls": calls, "ok": 0, "fail": 0, "unobserved": calls,
+            "completion_rate": None, "last_outcome": None,
+            "last_used": "2026-07-01T10:00:00Z", "streak": 0, "fail_streak": 0,
+            "provenance": {"passive": calls}, "sources": ["skill_used"]}
+
+
+def test_a_slash_only_skill_is_never_promoted_to_measured():
+    """Kills 'calls alone make a skill measured'. Typing a slash command three
+    times must not read as a proven skill: nothing observed whether any of
+    those runs completed."""
+    out = recommend.score_skill(_skill("a", "d"), {"a": _unobserved_stat(5)})
+    assert out["completion_rate"] is None
+    assert out["provenance"] == "estimated"
+    assert out["execution_mode"] == "suggest"
+
+
+def test_a_slash_only_skill_has_no_outcome_category():
+    """outcome_category returned 'success' for these -- 'last call ok, record
+    still thin' -- when no call had a recorded outcome at all.
+
+    Kills 'treat an unwitnessed call as a success'."""
+    assert recommend.outcome_category(_unobserved_stat(4)) is None
+
+
+def test_a_slash_only_skill_is_not_no_intervention_needed():
+    """The streak path is the other route to a proven-looking verdict, and the
+    guard has to close it too.
+
+    Note the fixture: ``streak`` carries a full clean run, which
+    `plugins.skill_stats` does NOT emit for an unobserved-only skill (it stops
+    unobserved calls extending the streak -- see
+    test_unobserved_calls_do_not_extend_the_completion_streak, the test that
+    actually holds that line). So this is the SECOND line of defence, pinned
+    on the input a regression in that upstream counter would produce. An
+    earlier version of this test used streak=0 and passed no matter what
+    `outcome_category` did -- it asserted on a field the fixture had pinned
+    shut, and mutating the guard away left it green."""
+    st = _unobserved_stat(9)
+    st["streak"] = recommend.MEASURED_MIN_CALLS
+    assert recommend.outcome_category(st) is None
+
+
+def test_an_observed_record_still_reaches_measured_and_auto():
+    """CANARY: the gate above must not blank out genuinely measured skills."""
+    out = recommend.score_skill(_skill("a", "d"), {"a": _fstat(5, 5)})
+    assert out["provenance"] == "measured"
+    assert out["execution_mode"] == "auto"
+    assert recommend.outcome_category(_fstat(5, 5)) == "no-intervention-needed"
+
+
+# --------------------------------------------------------------------------
+# The measured GATE counts observed calls, not raw calls. This is the second
+# half of the same finding as the rate itself: a slash-only record was kept
+# out of `completion_rate`, but MEASURED_MIN_CALLS still read `calls`, so a
+# skill typed 55 times and graded twice cleared a three-call bar and — above
+# AUTO_MIN_RATE — reached execution_mode 'auto'.
+# --------------------------------------------------------------------------
+
+def _partly_observed(calls, unobserved, ok):
+    """What skill_stats reports for a skill with both kinds of call: the rate
+    is over the observed ones, `calls` counts every invocation."""
+    return {"calls": calls, "ok": ok, "fail": 0, "unobserved": unobserved,
+            "completion_rate": ok / (calls - unobserved),
+            "last_outcome": "ok", "last_used": "2026-07-01T10:00:00Z",
+            "streak": ok, "fail_streak": 0,
+            "provenance": {"passive": unobserved, "invoke": ok},
+            "sources": ["invoke_result", "skill_used"]}
+
+
+def test_observed_calls_subtracts_the_unwitnessed_ones():
+    assert recommend.observed_calls(_partly_observed(55, 53, 2)) == 2
+    # A stat from before this field existed: every call counted as observed.
+    assert recommend.observed_calls({"calls": 4}) == 4
+    assert recommend.observed_calls({}) == 0
+    assert recommend.observed_calls(None) == 0
+    # Never negative, whatever a malformed row claims.
+    assert recommend.observed_calls({"calls": 2, "unobserved": 9}) == 0
+
+
+def test_the_measured_gate_counts_observed_calls_not_typed_ones():
+    """55 calls, 2 of them graded, rate 1.0. Against raw `calls` this is
+    'measured' and, at rate 1.0 >= AUTO_MIN_RATE, runs AUTOMATICALLY.
+
+    Kills 'MEASURED_MIN_CALLS against st["calls"]'."""
+    st = _partly_observed(55, 53, 2)
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert out["completion_rate"] == 1.0        # the rate itself is honest
+    assert out["observed"] == 2
+    assert out["provenance"] == "estimated"     # ...but 2 observations is thin
+    assert out["execution_mode"] == "suggest"
+
+
+def test_enough_observed_calls_still_reach_measured(report=None):
+    """CANARY: the gate must count observed calls, not refuse to count."""
+    st = _partly_observed(30, 27, 3)
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert out["observed"] == 3
+    assert out["provenance"] == "measured"
+    assert out["execution_mode"] == "auto"
+
+
+def test_the_measured_reason_names_the_observed_denominator():
+    """This string is what the projector injects into MEMORY.md as the proof
+    behind 'MUST USE'. ok/calls would read '4/10 completion' -- a 40% rate --
+    for a skill that completed every one of the 4 runs anybody watched.
+
+    Kills 'render ok/calls as the completion fraction'."""
+    st = _partly_observed(10, 6, 4)
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert "measured 4/4 completion" in out["reason"], out["reason"]
+    assert "4/10" not in out["reason"]
+
+
+def test_a_fully_observed_record_reads_exactly_as_before():
+    """CANARY: with nothing unobserved the fraction is unchanged."""
+    out = recommend.score_skill(_skill("a", "d"), {"a": _fstat(5, 5)})
+    assert "measured 5/5 completion" in out["reason"]
+    assert out["observed"] == 5
+
+
+def test_a_typed_only_record_is_not_described_as_never_called():
+    """Zero observed calls is not zero calls. Surfaced by a real run:
+    `plan-devex-review`, invoked 16 times by slash command, read back as
+    'never called — breadth-estimated' once the observed count became the
+    denominator. That is the mirror of the inflation the gate removes.
+
+    Kills 'observed == 0 means the skill never ran'."""
+    st = _unobserved_stat(16)
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert "never called" not in out["reason"], out["reason"]
+    assert "16 call(s) recorded" in out["reason"]
+    assert "none with an observed outcome" in out["reason"]
+
+
+def test_a_genuinely_uncalled_skill_still_says_never_called():
+    """CANARY for the branch above: it must not swallow the real zero."""
+    out = recommend.score_skill(_skill("a", "d"), {})
+    assert "never called" in out["reason"]

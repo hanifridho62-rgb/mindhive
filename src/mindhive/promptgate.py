@@ -287,7 +287,10 @@ def _pick_skill(need: str, skills, stats, open_incidents=None,
         if nm <= 0:
             continue
         st = (stats or {}).get(name) or {}
-        calls = int(st.get("calls") or 0)
+        # Calls whose outcome was OBSERVED, per recommend.observed_calls: a
+        # typed slash command grades nothing, so it must not carry a skill
+        # over the measured bar or into the rendered fraction.
+        calls = recommend.observed_calls(st)
         rate = st.get("completion_rate")
         fail_streak = int(st.get("fail_streak") or 0)
         if rules.get(name) and fail_streak >= recommend.DISCONTINUE_STREAK:
