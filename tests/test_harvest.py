@@ -1352,3 +1352,84 @@ def test_a_locked_catch_up_still_carries_the_count(tmp_path, monkeypatch):
     res = harvest.catch_up(known_only=False)
     assert res["locked"] is True
     assert res["unclosed_skill_calls"] == 0
+# --- injected non-user-authored bodies must not mint memos (harvest defect) ---
+#
+# Claude Code delivers skill bodies, workflow references and other injected
+# documents as user-ROLE messages. The envelope distinguishes them: an injected
+# body carries `isMeta: True`; a really-typed prompt instead carries `origin`,
+# `permissionMode` and `promptSource` and has no `isMeta`. The prefix guard
+# `_is_injected_prompt` only recognises bodies that OPEN with "Base directory
+# for this skill:", so a reference document that merely CONTAINS the word
+# "Caveat:" mid-body slipped through and was mined for a memo. This shape is
+# taken from the real transcript message that minted the junk caveat.
+
+_INJECTED_REFERENCE = (
+    "# Workflow authoring reference\n"
+    "\n"
+    "A workflow structures work across many agents.\n"
+    "\n"
+    "Caveat: interactively-authenticated MCP servers may be absent in "
+    "headless runs.\n"
+    "\n"
+    "Use phases to sequence the lanes.\n"
+)
+
+
+def _user(text, **envelope):
+    o = {"type": "user", "message": {"content": text}}
+    o.update(envelope)
+    return o
+
+
+def _kinds(items):
+    return [i["kind"] for i in items]
+
+
+def test_isMeta_injected_body_yields_no_memo():
+    items = harvest._items_from_obj(_user(_INJECTED_REFERENCE, isMeta=True))
+
+    assert "memo" not in _kinds(items)
+
+
+def test_same_text_typed_by_the_user_still_yields_a_memo():
+    """CANARY for the test above: the fixture text really is memo-bearing, so
+    the silence there comes from the envelope check and not from a fixture
+    that could never have tripped the extractor in the first place."""
+    items = harvest._items_from_obj(
+        _user(_INJECTED_REFERENCE, origin="terminal", promptSource="user"))
+
+    [memo] = [i for i in items if i["kind"] == "memo"]
+    assert memo["memo_type"] == "caveat"
+    assert memo["value"].startswith("interactively-authenticated MCP servers")
+
+
+def test_isMeta_injected_body_yields_no_user_prompt():
+    """The prefix guard already skipped bodies opening with the skill marker;
+    this body has no such marker, so only the envelope can reject it."""
+    items = harvest._items_from_obj(_user(_INJECTED_REFERENCE, isMeta=True))
+
+    assert "user_prompt" not in _kinds(items)
+
+
+def test_isMeta_does_not_suppress_slash_command_skill_capture():
+    """Kills the plausible over-broad fix (an early return for every isMeta
+    message). skill_used is a structural fact about the session, not an
+    assertion attributed to the user, so the envelope must not gate it: a
+    slash invocation injects its skill body as an isMeta message, and that
+    body is the only place the invocation is recorded.
+
+    Written against the TWO-row shape the format really uses (see the slash
+    block above), and against a body carrying no skill marker at all, so the
+    envelope is the only thing that can classify it. An earlier version of
+    this test pinned the same contract on a SINGLE message holding both the
+    <command-name> tag and the body marker, a pair that occurs zero times in
+    4127 real user rows because `_skill_from_command` demanded it and so
+    fired on nothing. The contract survived the fix; the fixture did not."""
+    cmd = json.loads(_row(_cmd_text("workflow-authoring"), uuid="c1"))
+    body = json.loads(_body_row(_INJECTED_REFERENCE, uuid="b1", parent="c1"))
+
+    items = harvest._items_from_obj(body, cmd)
+
+    [skill] = [i for i in items if i["kind"] == "skill_used"]
+    assert skill["value"]["name"] == "workflow-authoring"
+    assert "memo" not in _kinds(items)

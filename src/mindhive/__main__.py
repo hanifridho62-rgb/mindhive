@@ -2913,29 +2913,37 @@ def cmd_failures_capture(args) -> int | None:
     return None
 
 
-def cmd_failures_list(args) -> int | None:
-    from . import incidents as incidents_mod
-    acc = incidents_mod._collect(args.project)
+def _print_incident_lines(project, empty_msg) -> None:
+    """One `<n>x  [status] <signature>` line per incident, occurrence-ordered.
+
+    Status is the PROJECTED status, not a re-derivation from the occurrence
+    count. Counting alone cannot see the lifecycle: an expired, demoted or
+    promoted incident still has every occurrence it ever had, so the old
+    `occurrences >= threshold -> "active"` shortcut printed `47x [active]` for
+    a bucket the record itself already called `expired` — which is exactly how
+    a retired signature goes on looking alive from the CLI.
+    """
+    from . import incidents as inc
+    acc = inc._collect(project)
     if not acc:
-        print("(no failures captured yet)")
-        return None
+        print(empty_msg)
+        return
+    projected = {s.get("signature"): s.get("status") or ""
+                 for s in inc.summaries(project, include_expired=True)}
     for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
-        status = ("active" if rec["occurrences"] >= incidents_mod._threshold_for(signature)
-                  else "candidate")
+        status = projected.get(signature) or (
+            "active" if rec["occurrences"] >= inc._threshold_for(signature)
+            else "candidate")
         print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
+
+
+def cmd_failures_list(args) -> int | None:
+    _print_incident_lines(args.project, "(no failures captured yet)")
     return None
 
 
 def cmd_rules_list(args) -> int | None:
-    from . import incidents as inc
-    acc = inc._collect(args.project)
-    if not acc:
-        print("(no incidents yet)")
-        return None
-    for signature, rec in sorted(acc.items(), key=lambda kv: -kv[1]["occurrences"]):
-        status = ("active" if rec["occurrences"] >= inc._threshold_for(signature)
-                  else "candidate")
-        print(f"{rec['occurrences']:>3}x  [{status:9}] {signature}")
+    _print_incident_lines(args.project, "(no incidents yet)")
     return None
 
 

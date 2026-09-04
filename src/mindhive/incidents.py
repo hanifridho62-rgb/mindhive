@@ -12,7 +12,20 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from . import events, paths
+# `sig_mod`, not `sig`: auto_promote() binds a local `sig` for the signature
+# string, and a module shadowed by a loop variable is a trap, not a shortcut.
+from . import events, paths, signature as sig_mod
+
+# The record's Markdown format - parsing and rendering - lives in
+# `incidentfile`; see that module's docstring for why the seam is there and not
+# at the write lock. Re-imported under the same names on purpose: reflect,
+# resolve, advice and eleven test files reach these through `incidents`, none of
+# them monkeypatches one, and they are functions plus a single int constant, so
+# there is no mutable state a second module's globals could hold stale.
+from .incidentfile import (MAX_SESSION_IDS, _auto_field,  # noqa: F401
+                           _auto_rule, _frontmatter, _human_text, _id_list,
+                           _raw_excerpt, _render, _replace_section,
+                           _split_sections, derive_active)
 
 THRESHOLD = 2                       # recurrence gate N (D2)
 DECAY_DAYS = 14                     # candidate staleness horizon (KTD4 decay)
@@ -234,6 +247,14 @@ def leaks(project=None, signature=None, by_sig=None, life=None) -> int:
     act = _activation_ts(project, signature, life=life)
     if not act:
         return 0
+    # A rule_expired wipes the slate the same way a reroute does. Failures from
+    # before a signature decayed — or was retired as a classifier artifact —
+    # are not leaks against the rule that re-entered afterwards; counting them
+    # would grade a re-climbing incident on history it has already paid for,
+    # and no recurrence could ever clear it.
+    exp = _latest_expiry_ts(project, signature, life=life)
+    if exp and exp > act:
+        act = exp
     r_ts, r_sess = _latest_reroute(project, signature, life=life)
     anchor, skip = (r_ts, r_sess) if (r_ts and r_ts > act) else (act, None)
     if by_sig is None:
@@ -275,6 +296,57 @@ def _status_and_flag(project, signature, rec, threshold, source,
     return "active", flag
 
 
+def reclassified(project=None, evs=None, by_sig=None, life=None) -> dict:
+    """``raw:`` buckets whose OWN stored excerpts no longer classify to them.
+
+    A signature is frozen into its tool_failed event at capture time, so fixing
+    signature.py splits only FUTURE failures — the old bucket keeps every
+    occurrence and every leak it ever had. Those counts can only rise, so the
+    incident is red forever: it can never be resolved (no new failure can reach
+    it) and it never stops injecting its prevention rule. raw:37c59e9cae was
+    exactly that — 45 occurrences, all 45 re-classifying into named families
+    once the classifier learned to read the line that ends a traceback.
+
+    Replaying the CURRENT classifier over the excerpts the bucket itself stored
+    is what tells a stale bucket from a live one. Returns ``signature ->
+    {"into": {new_sig: n}, "retirable": bool}`` for each ``raw:`` bucket where
+    NO live excerpt still classifies to it. ``retirable`` is true only when
+    every one of them now lands in a NAMED family: a bucket still holding text
+    nothing can diagnose keeps its red card for a human, because retiring it
+    would drop the evidence rather than re-file it. Named families are never
+    candidates — ``pymodule:tools`` means the same thing whatever this module
+    learns next, and signatures minted elsewhere (``judgment:*``,
+    ``workspace:*``) were never this classifier's to re-read.
+    """
+    if evs is None:
+        evs = events.read_all(project)
+    if life is None:
+        life = _lifecycle_index(evs)
+    if by_sig is None:
+        by_sig = _failures_by_sig(project, evs=evs)
+    out = {}
+    for signature, sig_evs in by_sig.items():
+        if sig_mod.is_diagnostic(signature):
+            continue
+        live = _live_failures(project, signature, sig_evs, life=life)
+        texts = [str(e.payload.get("text") or "") if isinstance(e.payload, dict)
+                 else "" for e in live]
+        if not texts or not all(t.strip() for t in texts):
+            continue          # nothing to replay, or an excerpt we never stored
+        into = {}
+        for t in texts:
+            s = sig_mod.signature(t)
+            into[s] = into.get(s, 0) + 1
+        if signature in into:
+            continue                      # still reachable — a live bucket
+        out[signature] = {
+            "into": into,
+            "retirable": all(sig_mod.is_diagnostic(s) for s in into),
+            "last_ts": live[-1].ts,
+        }
+    return out
+
+
 def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
     """Emit a one-time rule_activated event (stamped at the threshold-crossing
     failure's ts) for any signature that has reached its recurrence threshold
@@ -284,13 +356,43 @@ def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
     judgment:flag:* incidents, which never expire. Idempotent: an expiry zeroes
     the live count, so re-running appends nothing new. Pass evs to reuse an
     events.read_all() result (one ledger pass total instead of several per
-    signature)."""
-    activated = expired = 0
+    signature).
+
+    Retirement rides the same rule_expired lifecycle: a ``raw:`` bucket the
+    current classifier can no longer mint (see reclassified) expires with
+    ``reason: reclassified``, which drops it out of injection and off the red
+    list while leaving its record on disk. Nothing is lost: should that error
+    recur under the current classifier the signature climbs candidate→active
+    again on its post-expiry occurrences alone, and leaks() re-anchors at the
+    expiry so the re-entered rule is not graded on the retired bucket's
+    history. What it does NOT do is mint a second rule_activated — a signature
+    activated before it was retired keeps that first activation, so its very
+    first post-expiry recurrence already reads as a leak. Retirement is a
+    lifecycle reset for accounting, not a fresh identity."""
+    activated = expired = retired = 0
     now_secs = _ts_secs(now) if now else time.time()
     if evs is None:
         evs = events.read_all(project)
     life = _lifecycle_index(evs)
-    for signature, sig_evs in _failures_by_sig(project, evs=evs).items():
+    by_sig = _failures_by_sig(project, evs=evs)
+    stale = {s: info for s, info in
+             reclassified(project, evs=evs, by_sig=by_sig, life=life).items()
+             if info["retirable"]}
+    for signature in sorted(stale):
+        # Stamped at the bucket's LAST failure, not at wall-clock now: a
+        # failure that already happened but has not been harvested yet would
+        # otherwise land in the dead zone between the two and never be counted.
+        # It also keeps the operation deterministic, which is what lets the
+        # tests assert the ts instead of a clock reading.
+        events.append_event(
+            "rule_expired",
+            {"signature": signature, "reason": "reclassified",
+             "into": stale[signature]["into"]},
+            tags=["lifecycle"], ts=stale[signature]["last_ts"], project=project)
+        retired += 1
+    for signature, sig_evs in by_sig.items():
+        if signature in stale:
+            continue                      # just retired; do not also activate it
         live = _live_failures(project, signature, sig_evs, life=life)
         thr = _threshold_for(signature, threshold)
         if len(live) >= thr and not _has_lifecycle(
@@ -306,7 +408,7 @@ def audit(project=None, threshold=THRESHOLD, now=None, evs=None) -> dict:
                 events.append_event("rule_expired", {"signature": signature},
                                     tags=["lifecycle"], project=project)
                 expired += 1
-    return {"activated": activated, "expired": expired}
+    return {"activated": activated, "expired": expired, "retired": retired}
 
 
 def _safe_name(signature: str) -> str:
@@ -336,97 +438,6 @@ def _collect(project, evs=None):
             rec["sessions"].append(ev.session_id)
         rec["excerpt"] = rec["excerpt"] or p.get("text", "")
     return acc
-
-
-_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-_RULE_LINE = re.compile(r"Prevention rule:\s*(.+)", re.IGNORECASE)
-
-
-def _split_sections(text: str) -> dict:
-    """Map '## Name' headers to their body text."""
-    out, cur, buf = {}, None, []
-    for line in text.splitlines():
-        if line.startswith("## "):
-            if cur is not None:
-                out[cur] = "\n".join(buf).strip()
-            cur, buf = line[3:].strip(), []
-        elif cur is not None:
-            buf.append(line)
-    if cur is not None:
-        out[cur] = "\n".join(buf).strip()
-    return out
-
-
-def _replace_section(text: str, name: str, new_body: str) -> str:
-    """Return text with the '## name' section body replaced by new_body."""
-    lines = text.splitlines()
-    out, i, replaced = [], 0, False
-    while i < len(lines):
-        out.append(lines[i])
-        if lines[i].strip() == f"## {name}":
-            out.append(new_body)
-            i += 1
-            while i < len(lines) and not lines[i].startswith("## "):
-                i += 1                       # skip old body
-            replaced = True
-            continue
-        i += 1
-    if not replaced:                          # append the section if missing
-        out += [f"## {name}", new_body]
-    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
-
-
-def _human_text(section: str) -> str:
-    return _COMMENT.sub("", section or "").strip()
-
-
-def _auto_rule(section: str) -> str:
-    m = _RULE_LINE.search(section or "")
-    return m.group(1).strip() if m else ""
-
-
-def derive_active(auto_section: str, human_section: str):
-    """(active_rule_text, rule_source) — Human overrides Auto (D10)."""
-    human = _human_text(human_section)
-    if human:
-        return human, "human"
-    auto = _auto_rule(auto_section)
-    if auto:
-        return auto, "auto"
-    return "", "none"
-
-
-def _render(signature, rec, status, auto_body, human_body, active, source, flag="") -> str:
-    actions = "\n".join(f"- `{a}`" for a in rec["actions"][:5]) or "- (unknown)"
-    sessions = ", ".join(rec["sessions"][:5]) + (
-        f" (+{len(rec['sessions']) - 5})" if len(rec["sessions"]) > 5 else "")
-    active_body = f"> {active}" if active else "> (none yet)"
-    return f"""---
-signature: {signature}
-status: {status}
-occurrences: {rec['occurrences']}
-rule_source: {source}
-flag: {flag}
-sessions: {len(rec['sessions'])}
----
-
-# Incident: {signature}
-
-## Raw Signal
-- Error excerpt: `{rec['excerpt'][:300].replace('`', "'")}`
-- Failing actions:
-{actions}
-- Sample sessions: {sessions or '(none)'}
-
-## Auto Evaluation
-{auto_body}
-
-## Human Evaluation
-{human_body}
-
-## Active Prevention Rule
-{active_body}
-"""
 
 
 def project(project=None, threshold=THRESHOLD, evs=None) -> dict:
@@ -657,41 +668,12 @@ def demote(signature, project=None) -> dict:
     return {"demoted": True}
 
 
-_FM_KEYS = ("signature", "status", "occurrences", "rule_source", "flag", "sessions")
-
-
-def _frontmatter(text: str) -> dict:
-    """Parse an incident record's frontmatter fields from its text."""
-    out = {}
-    for line in text.splitlines():
-        m = re.match(r"^(\w+):\s*(.*)$", line)
-        if m and m.group(1) in _FM_KEYS:
-            v = m.group(2)
-            out[m.group(1)] = int(v) if v.isdigit() else v
-        if line.startswith("# Incident:"):
-            break
-    return out
-
-
 def load(signature, project=None) -> dict:
     """Read back a record's frontmatter as a dict (for tests/inspection)."""
     p = _incident_dir(project) / f"{_safe_name(signature)}.md"
     if not p.exists():
         return {}
     return _frontmatter(p.read_text(encoding="utf-8"))
-
-
-def _auto_field(section: str, name: str) -> str:
-    """One labelled value from an Auto Evaluation body ('- Name: value').
-    Line-wise by format contract: a multi-line value keeps its first line."""
-    m = re.search(rf"{name}:\s*(.+)", section or "", re.IGNORECASE)
-    return m.group(1).strip() if m else ""
-
-
-def _raw_excerpt(section: str) -> str:
-    """The error excerpt line from a Raw Signal body, backtick quoting removed."""
-    m = re.search(r"Error excerpt:\s*(.+)", section or "")
-    return m.group(1).strip().strip("`") if m else ""
 
 
 _LIFECYCLE_TYPES = {"rule_activated", "rule_promoted", "rule_demoted",
@@ -718,6 +700,7 @@ def signal_stats(project=None, evs=None) -> dict:
         evs = events.read_all(project)
     fails = {}                          # sig -> [(ts, session_id), ...] in ts order
     act_ts = {}                         # sig -> first rule_activated ts
+    exp_ts = {}                         # sig -> latest rule_expired ts
     reroutes = {}                       # sig -> {n, ts, sess} (latest reroute)
     demoted = set()                     # sigs with an explicit rule_demoted event
     sess_last = {}                      # session_id -> latest activity ts
@@ -740,9 +723,18 @@ def signal_stats(project=None, evs=None) -> dict:
                 rr["ts"], rr["sess"] = ev.ts, ev.session_id
         elif ev.type == "rule_demoted":
             demoted.add(s)
+        elif ev.type == "rule_expired":
+            if ev.ts and ev.ts > exp_ts.get(s, ""):
+                exp_ts[s] = ev.ts
     out = {}
     for s, hits in fails.items():
         act = act_ts.get(s)
+        # Same re-anchor as leaks(): an expiry (decay, or retirement of a
+        # bucket the classifier can no longer mint) starts the accounting over,
+        # so the Improvements view and the record agree about what leaked.
+        ex = exp_ts.get(s)
+        if act and ex and ex > act:
+            act = ex
         rr = reroutes.get(s) or {}
         if act and rr.get("ts") and rr["ts"] > act:
             anchor, anchor_sess = rr["ts"], rr.get("sess")
@@ -862,6 +854,13 @@ def summaries(project=None, include_expired=False) -> list:
             # innerHTML unescaped or break the occurrences sort (int vs str).
             "occurrences": _as_int(fm.get("occurrences")),
             "sessions": _as_int(fm.get("sessions")),
+            # The ids behind that count, bounded by `MAX_SESSION_IDS`. EMPTY for
+            # every record written before this key existed, which is the honest
+            # answer — authorship was not captured then, and a consumer must not
+            # read "no ids" as "no human wrote this". `sessions` above is the
+            # true count, so a reader can tell a complete list from a truncated
+            # or absent one by comparing lengths.
+            "session_ids": _id_list(fm.get("session_ids")),
             "rule_source": source,
             "flag": fm.get("flag", ""),
             "excerpt": _raw_excerpt(secs.get("Raw Signal", "")),

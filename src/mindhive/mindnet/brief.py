@@ -156,6 +156,18 @@ class WaveContext:
     # "nobody turned this on" is the exact shape in which a feature no-ops while
     # every run still reports success.
     gated: tuple = ()
+    # Which sources RAISED. A sibling of `gated`, deliberately not a widening of
+    # it: "switched off" and "broken" are different problems with different
+    # fixes, and folding them into one tuple would make `("symbols",)` ambiguous
+    # between an operator who never set `MINDHIVE_SYMBOLS` and an indexer that
+    # threw — which is the exact confusion `gated` was introduced to end.
+    #
+    # Every `except` in `wave_context` and `_symbol_slice` appends its own name
+    # here. Before this field they appended nothing, so a context in which all
+    # four sources failed was byte-for-byte indistinguishable from a healthy one
+    # that legitimately matched nothing: same zero counts, same empty `gated`,
+    # same "every source resolved empty" reason (TODOS 25).
+    failures: tuple = ()
     # Which wave this context belongs to, so a brief's artifact can be filed under
     # the same wave-scoped key as the transcript it explains. ``None`` outside a
     # wave — `hive mindnet brief` resolves a context to READ, and there is no wave
@@ -182,6 +194,24 @@ class Stats(NamedTuple):
     symbols: int = 0
     gated: tuple = ()
     empty_reason: str = ""
+    # Sources that RAISED while this brief's context was resolved. Carried from
+    # `WaveContext.failures`; see the field comment there for why this is not
+    # folded into `gated`.
+    failures: tuple = ()
+    # How many non-empty lines the defuser emptied. The one observable signal
+    # that an injection attempt reached the composer: `_section` filters falsy
+    # results and the three counts above are the RESOLVER's row counts, so five
+    # hostile lines used to render as `skills=3 chars=0` and nothing else.
+    #
+    # New fields go at the END. These land on the append-only ledger through
+    # `agent._record_brief`, so the payload is additive by construction and no
+    # existing key changes name or meaning.
+    dropped: int = 0
+    # How many RELEVANT rows `advice` withheld because a spawned orchestration
+    # agent wrote them. Exclusion is the control; this count is what keeps it
+    # from being silent, which `gated`'s own precedent in this module forbids
+    # (TODOS 26).
+    authored: int = 0
 
 
 class Brief(NamedTuple):
@@ -263,6 +293,12 @@ def current():
 BRIEF_EVENT_TYPES = ("skill_used", "invoke_result", "tool_failed", "next_step",
                      "sop", "mindnet_task")
 
+# The sources `wave_context` can lose, named. Fixed and small ON PURPOSE: it is
+# the set of `except` branches that exist, so a new swallowed exception has to
+# add a name here before it can be reported — which is the point. A branch that
+# catches without appending is the bug this whole field exists to make loud.
+FAILURE_SOURCES = ("events", "plugins", "sidecar", "symbols")
+
 
 def wave_context(project=None, evs=None, root=None, wave=None,
                  symbols=None) -> WaveContext:
@@ -288,22 +324,31 @@ def wave_context(project=None, evs=None, root=None, wave=None,
         # same string `build()` uses for the same reason: a source that was
         # switched OFF and a source that ran and found nothing are different
         # problems with different fixes, and an empty tuple says neither.
-        return WaveContext(project=project, wave=wave, gated=("brief",))
+        # `failures=()` explicitly, not by omission: the off switch is not a
+        # fault, and a reader comparing the two tuples has to be able to tell
+        # "nobody turned it on" from "it broke".
+        return WaveContext(project=project, wave=wave, gated=("brief",),
+                           failures=())
     rows: tuple = ()
     reco = None
     records: dict = {}
     tasks: dict = {}
+    # Appended to by each `except` below, in source order, once each — so the
+    # tuple is stable and needs no sort or dedupe to be reproducible.
+    failed: list = []
     try:
         from .. import events as ev_mod
         rows = (tuple(evs) if evs is not None
                 else tuple(ev_mod.read_types(BRIEF_EVENT_TYPES, project)))
     except Exception:                                  # noqa: BLE001
         rows = ()
+        failed.append("events")
     try:
         from .. import plugins as plugins_mod
         reco = plugins_mod.recommend_for(project, evs=list(rows))
     except Exception:                                  # noqa: BLE001
         reco = None
+        failed.append("plugins")
     try:
         from . import sidecar as sc_mod
         # `fresh` is deliberately NOT branched on. A stale sidecar is still exact
@@ -315,14 +360,22 @@ def wave_context(project=None, evs=None, root=None, wave=None,
         tasks = dict(getattr(side, "tasks", {}) or {})
     except Exception:                                  # noqa: BLE001
         records, tasks = {}, {}
-    slice_text, gated = _symbol_slice(project, root, symbols)
+        failed.append("sidecar")
+    slice_text, gated, sym_failed = _symbol_slice(project, root, symbols)
+    failed += list(sym_failed)
     return WaveContext(evs=rows, reco=reco, records=records, tasks=tasks,
                        project=project, symbols=slice_text, gated=gated,
-                       wave=wave)
+                       failures=tuple(failed), wave=wave)
 
 
 def _symbol_slice(project=None, root=None, want=None):
-    """``(text, gated)`` for the repository's symbol index.
+    """``(text, gated, failures)`` for the repository's symbol index.
+
+    A TRIPLE rather than the pair this used to answer, and the third element is
+    the one that was missing: the `except` below returned ``("", ())`` — no
+    text, and an EMPTY `gated` — so the one branch here that most needs
+    reporting reported nothing at all. A symbols failure was neither gated nor
+    failed. It was invisible (TODOS 25).
 
     ``gated`` names the sources that are switched OFF rather than empty, and it
     exists because those two look identical downstream. `symbols.enabled()` reads
@@ -368,20 +421,25 @@ def _symbol_slice(project=None, root=None, want=None):
     try:
         from .. import symbols as sym_mod
         if want is False:
-            return "", ("symbols",)
+            return "", ("symbols",), ()
         if want is not True and not sym_mod.enabled():
-            return "", ("symbols",)
+            return "", ("symbols",), ()
         if root is None:
-            return "", ("symbols",)
+            return "", ("symbols",), ()
         budget = getattr(sym_mod, "BUDGET_TOKENS", SYMBOL_BUDGET_FALLBACK)
         text, _reason = sym_mod.cached_text(root=root, budget=budget,
                                             project=project)
-        return (text or ""), ()
+        return (text or ""), (), ()
     except Exception:                                  # noqa: BLE001
-        # A miss, not a failure — the same contract `symbols.cached_text` holds
-        # for its own cache. The brief is worth less without it and worth nothing
-        # if resolving it can take down a wave.
-        return "", ()
+        # Still not fatal — the brief is worth less without the slice and worth
+        # nothing if resolving it can take down a wave, so this stays swallowed.
+        #
+        # But it is no longer SILENT. It used to answer `("", ())`, which reads
+        # downstream as "the slice ran and had nothing to say" — the same answer
+        # a healthy index of an empty tree gives. `failures` is what tells those
+        # apart, and `gated` stays empty here because nobody switched anything
+        # off: it broke.
+        return "", (), ("symbols",)
 
 
 # --- rendering ----------------------------------------------------------------
@@ -609,6 +667,41 @@ def _defused(value, width=MAX_LINE_CHARS) -> str:
     strips `[mindnet]`, and `_FENCE_RE` removes the fence banners case- and
     spacing-insensitively. Running any of them once, up front, is what made the
     two earlier versions of this function defeatable."""
+    return _defuse_counted(value, width)[0]
+
+
+def _defuse_counted(value, width=MAX_LINE_CHARS):
+    """``(text, dropped)`` — `_defused`'s implementation, plus whether it ate the
+    line.
+
+    Split out rather than widening `_defused`, which has four callers and is the
+    most security-critical function in this module: changing its arity edits
+    every one of them and every test that pins them. One implementation, two
+    entry points, so the counted and uncounted paths cannot disagree about what
+    they defused — the same shape `payoff._score` took for the same reason.
+
+    **``dropped`` is a property of the INPUT, not of the reason.** True when a
+    non-empty input produced an empty output, whatever emptied it: the
+    exhaustion drop, a whole line stripped as a forged banner, a marker
+    collapsing to nothing. False when the input was empty or whitespace to begin
+    with — counting those would make `dropped` rise whenever a resolver returns a
+    blank row, which is noise where the whole point is signal.
+
+    Why it exists: `_section` filters falsy results, `safe_block` drops lines,
+    and `Stats` counts the resolver's ROWS rather than the rendered ones. So five
+    hostile lines that defuse to nothing rendered as `skills=3 chars=0` plus
+    "every source resolved empty for this task" — the one observable signal that
+    an injection attempt reached the composer was discarded, and the feature
+    could be under active attack with every run reporting success (TODOS 25).
+
+    ``had_input`` uses `safe_text`'s OWN coercion rather than a second opinion
+    about what counts as empty; `str(value or "")` blanks every falsy value. The
+    `except` answers True because `safe_text` answers ``"?"`` there — a non-empty
+    rendering, which survives, so nothing was dropped."""
+    try:
+        had_input = bool(" ".join(str(value or "").split()))
+    except (ValueError, TypeError):
+        had_input = True
     text = _visible(inj_mod.safe_text(value, width))
     settled = False
     for _ in range(_DEFUSE_PASSES):
@@ -618,8 +711,9 @@ def _defused(value, width=MAX_LINE_CHARS) -> str:
             break
         text = cleaned
     if not settled or _strip_fences(text) != text:
-        return ""
-    return text.strip()
+        return "", had_input
+    out = text.strip()
+    return out, (had_input and not out)
 
 
 def safe_phase(value) -> str:
@@ -656,42 +750,78 @@ def safe_block(value) -> str:
 
     Blank lines are kept (paragraphs are meaning); lines that defuse to nothing
     are dropped, which is what an emptied-out hostile line should look like."""
+    return block_counted(value)[0]
+
+
+def block_counted(value):
+    """``(text, dropped)`` — `safe_block`'s implementation, plus the drop count.
+
+    A counting sibling rather than a widened `safe_block`, because that one has
+    callers outside this module (`agent.prompt_for`, `decompose`,
+    `resilience.defused_stderr`) and none of them wants a pair. Same trade
+    `_defuse_counted` makes one level down; see its docstring for what `dropped`
+    means and what it deliberately does not count."""
     try:
         raw = str(value or "")
     except (ValueError, TypeError):
-        return ""
+        return "", False
     out = []
+    dropped = 0
     for line in raw.splitlines():
         if not line.strip():
             out.append("")
             continue
-        cleaned = _defused(line)
+        cleaned, gone = _defuse_counted(line)
+        dropped += 1 if gone else 0
         if cleaned:
             out.append(cleaned)
     # No leading/trailing blank runs, and never more than one blank in a row —
     # a description of pure whitespace must not render as a wall of gap.
     text = "\n".join(out)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    return re.sub(r"\n{3,}", "\n\n", text).strip(), dropped
 
 
-def _section(title, lines) -> list:
-    """*title* and its lines, or ``[]`` when every line defused to nothing.
+def _section(title, lines):
+    """``(rendered, dropped)`` — *title* and its lines, or ``[]`` when every line
+    defused to nothing, plus how many lines that was.
 
     A heading with no bullets under it reads as a resolver that broke, which is
-    the opposite of what an emptied-out hostile line should look like."""
-    rendered = [f"  - {t}" for t in (_defused(ln) for ln in lines) if t]
-    return [f"{title}:", *rendered] if rendered else []
+    the opposite of what an emptied-out hostile line should look like. The count
+    is what tells those two apart from OUTSIDE: an empty section and a section
+    whose every row was hostile render identically, and only one of them is an
+    attack (TODOS 25).
+
+    Widened rather than given a sibling — unlike `safe_block` this is private
+    with exactly one caller, `render`."""
+    dropped = 0
+    rendered = []
+    for ln in lines:
+        text, gone = _defuse_counted(ln)
+        dropped += 1 if gone else 0
+        if text:
+            rendered.append(f"  - {text}")
+    return ([f"{title}:", *rendered] if rendered else []), dropped
 
 
 def render(advice, phase=None, symbols="") -> str:
-    """The fenced block, or ``""`` when there is nothing to say.
+    """The fenced block, or ``""`` when there is nothing to say."""
+    return render_counted(advice, phase=phase, symbols=symbols)[0]
+
+
+def render_counted(advice, phase=None, symbols=""):
+    """``(text, dropped)`` — the fenced block and how many lines defusing ate.
 
     Sections come out in a fixed order so two runs of the same task read the same
-    way — an irreproducible brief is one nobody can diff."""
+    way — an irreproducible brief is one nobody can diff.
+
+    `render` stays a plain string for its existing callers; this is where the
+    count comes from, the same split `_defused` / `_defuse_counted` takes."""
     body: list = []
+    dropped = 0
     for key in ("skills", "sops", "constraints"):
-        section = _section(SECTION_TITLES[key],
-                           tuple(getattr(advice, key, ()) or ()))
+        section, gone = _section(SECTION_TITLES[key],
+                                 tuple(getattr(advice, key, ()) or ()))
+        dropped += gone
         if section:
             if body:
                 body.append("")
@@ -700,7 +830,12 @@ def render(advice, phase=None, symbols="") -> str:
     # line structure, and `_defused` reaches `inject.safe_text`, which collapses
     # ALL whitespace — so the 4,000-character map arrived as one run-on line,
     # costing the tokens and delivering none of the map (red team, 2026-08-29).
-    sym = safe_block(symbols)[:MAX_SYMBOL_CHARS] if symbols else ""
+    if symbols:
+        sym_text, sym_dropped = block_counted(symbols)
+        sym = sym_text[:MAX_SYMBOL_CHARS]
+        dropped += sym_dropped
+    else:
+        sym = ""
     if sym:
         if body:
             body.append("")
@@ -708,11 +843,15 @@ def render(advice, phase=None, symbols="") -> str:
     if not body:
         # No empty fence. See the module docstring: a banner around nothing
         # trains the reader to skip the banner.
-        return ""
+        #
+        # The count still rides out: a brief that is empty BECAUSE every line was
+        # dropped is the case this whole counter exists for, and returning it
+        # with a zero here would throw the finding away at the last step.
+        return "", dropped
     head = [FENCE_OPEN, FENCE_PREAMBLE, ""]
     if phase:
         head += [f"This task is currently at phase: {safe_phase(phase)}", ""]
-    return "\n".join(head + body + ["", FENCE_CLOSE])
+    return "\n".join(head + body + ["", FENCE_CLOSE]), dropped
 
 
 def build(task, ctx=None) -> Brief:
@@ -736,20 +875,63 @@ def build(task, ctx=None) -> Brief:
         return Brief("", Stats(empty_reason="no wave context was published — a "
                                             "standalone caller resolves nothing "
                                             "rather than reading the ledger"))
+    # Read BEFORE the resolve, so the advice-raised branch below reports the
+    # context's failures too: a resolver that threw on top of a broken sidecar
+    # is two findings, and dropping one of them because the other fired later is
+    # how the more actionable of the pair goes missing.
+    failed = tuple(getattr(ctx, "failures", ()) or ())
     try:
         from . import advice as adv_mod
         resolved = adv_mod.resolve(task, evs=list(getattr(ctx, "evs", ()) or ()),
                                    project=getattr(ctx, "project", None),
                                    reco=getattr(ctx, "reco", None))
     except Exception as exc:                           # noqa: BLE001
-        return Brief("", Stats(empty_reason=f"advice raised "
+        return Brief("", Stats(failures=failed,
+                               empty_reason=f"advice raised "
                                             f"{type(exc).__name__}: {exc}"))
     sym = str(getattr(ctx, "symbols", "") or "")
-    text = render(resolved, phase=phase_for(ctx, task), symbols=sym)
+    text, dropped = render_counted(resolved, phase=phase_for(ctx, task),
+                                   symbols=sym)
     stats = Stats(skills=len(resolved.skills), sops=len(resolved.sops),
                   constraints=len(resolved.constraints),
                   symbols=1 if sym else 0,
                   gated=tuple(getattr(ctx, "gated", ()) or ()),
-                  empty_reason=("" if text else
-                                "every source resolved empty for this task"))
+                  failures=failed, dropped=dropped,
+                  authored=int(getattr(resolved, "withheld", 0) or 0),
+                  empty_reason=_empty_reason(text, failed, dropped))
     return Brief(text, stats)
+
+
+def _empty_reason(text, failures, dropped) -> str:
+    """Why *text* is empty, or ``""`` when it is not.
+
+    The single reason this replaces — "every source resolved empty for this
+    task" — was a claim, and it was FALSE in the two cases that matter most. A
+    context whose sources raised did not resolve empty; it broke. A brief whose
+    every line was eaten by the defuser did not resolve empty either; it was
+    attacked, or it is carrying data that reads like an attack. Both used to
+    print the sentence describing the third case, which is the benign one
+    (TODOS 25).
+
+    Ordered by what an operator would act on first. A failed source is a broken
+    machine and outranks everything; a dropped line is a security finding and
+    outranks a quiet day."""
+    if text:
+        return ""
+    if failures:
+        # Count the sources, do not assert about them. "no source survived" is
+        # only true when they ALL failed, and the single most likely failure is
+        # `symbols` alone — off by default, and its cache is recorded as flaky
+        # on Windows. Telling an operator whose ledger, plugins and sidecar all
+        # worked that nothing survived points the investigation away from the
+        # one source named two words later. This function exists because the
+        # sentence it replaced was false in the cases that matter; a
+        # replacement false in the commonest one is the same defect rewritten.
+        head = ("no source survived" if len(failures) >= len(FAILURE_SOURCES)
+                else f"{len(failures)} of {len(FAILURE_SOURCES)} sources failed")
+        return (head + ": " + ", ".join(failures) +
+                " raised while the wave context was resolved")
+    if dropped:
+        return (f"{dropped} line(s) were emptied by the defuser, so nothing "
+                f"was left to render — the resolver DID match")
+    return "every source resolved empty for this task"

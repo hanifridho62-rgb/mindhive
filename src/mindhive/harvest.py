@@ -74,6 +74,20 @@ def _is_injected_prompt(text: str) -> bool:
     return text.lstrip()[:40].lower().startswith(_SKILL_BODY_MARK)
 
 
+def _is_injected(o, text: str) -> bool:
+    """True when this user-ROLE message was not authored by the user.
+
+    Claude Code delivers skill bodies, workflow references and other injected
+    documents as user-role messages, and stamps them ``isMeta: True``; a really
+    typed prompt carries ``origin``/``permissionMode``/``promptSource`` instead
+    and has no ``isMeta``. The envelope is the reliable signal, the text prefix
+    is not: only SOME injected bodies open with the skill marker. A reference
+    document that merely CONTAINS 'Caveat:' mid-body passed the prefix guard
+    and was mined for a memo, minting junk caveats from text the user never
+    wrote. The prefix check stays as a fallback for rows without the field."""
+    return bool((o or {}).get("isMeta")) or _is_injected_prompt(text)
+
+
 _CMD_NAME_RE = re.compile(r"<command-name>\s*/?([^<\s]+)\s*</command-name>")
 _SKILL_BODY_MARK = "base directory for this skill:"
 
@@ -352,6 +366,7 @@ def _items_from_obj(o, prev=None, pending=None) -> list:
                               "ts": held["ts"]})
         text = _user_text(msg.get("content")).strip()
         low = text.lower()
+        injected = _is_injected(o, text)
         # Pick the marker that appears FIRST in the text (smallest position),
         # not whichever happens to come first in _MARKERS.
         best = None  # (position, marker)
@@ -359,7 +374,12 @@ def _items_from_obj(o, prev=None, pending=None) -> list:
             i = low.find(m)
             if i != -1 and (best is None or i < best[0]):
                 best = (i, m)
-        if best is not None:
+        # A memo is an assertion ATTRIBUTED to the user, so only user-authored
+        # text may mint one. skill_used below is deliberately left ungated: it
+        # is a structural fact about the session, and a slash invocation is
+        # recorded ONLY on the injected body it arrives with, so gating it
+        # would lose the capture entirely.
+        if best is not None and not injected:
             pos, m = best
             val = text[pos + len(m):].strip()
             if val:
@@ -374,14 +394,14 @@ def _items_from_obj(o, prev=None, pending=None) -> list:
                 # so the ledger keeps every memory verbatim and complete.
                 items.append({"kind": "memo", "value": _cap_words(val), "memo_type": mtype})
         # Capture the typed prompt itself so EVERY prompt enters the hive — not
-        # only marker-bearing ones. Skip harness-injected rows: ``isMeta`` says
-        # so structurally, and the body-mark check still covers rows written
-        # without that flag. The flag is needed because `_skill_from_command`
-        # accepts bodies that do NOT carry the mark — without it the very row
+        # only marker-bearing ones. Skip harness-injected rows — `_is_injected`
+        # reads the ``isMeta`` envelope first and falls back to the body mark.
+        # The envelope half is load-bearing here because `_skill_from_command`
+        # accepts bodies that do NOT carry the mark: without it the very row
         # just recognised as a machine-written skill body is also filed as
         # something the operator typed, and oversee.skill_trails then shows the
         # body's own text as the ask that led to the skill.
-        if text and not o.get("isMeta") and not _is_injected_prompt(text):
+        if text and not injected:
             prompt = _clean_prompt(text)
             if prompt:
                 items.append({"kind": "user_prompt", "value": _cap_words(prompt)})

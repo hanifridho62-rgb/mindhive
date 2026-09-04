@@ -24,6 +24,7 @@ unnecessary and a violation.
 from __future__ import annotations
 
 import json
+import sys
 
 
 def cmd_lintester(args) -> int | None:
@@ -44,6 +45,11 @@ def cmd_lintester(args) -> int | None:
         return 2
 
     started = bool(args.execute)
+    bus, observer, why, board = _observer(args, started)
+    if why:
+        # stderr, not stdout: `--json` is a machine surface and a friendly
+        # note printed into it is a parse error at the other end.
+        print(f"lintester: {why}", file=sys.stderr)
     mission = LintesterOrchestrator(
         root=args.root, project=args.project,
         lanes=args.lanes if args.lanes is not None else None,
@@ -59,9 +65,11 @@ def cmd_lintester(args) -> int | None:
         # tests: the seam worked, the breaker opened, and no anomaly was ever
         # recorded, resolved or remembered on a real run.
         reflector=_reflector(),
+        bus=bus, observer=observer,
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
 
+    _close_board(bus, board)
     report = mission.as_dict()
     scored = _payoff(mission) if getattr(args, "payoff", False) else None
     if scored is not None:
@@ -75,6 +83,75 @@ def cmd_lintester(args) -> int | None:
     if scored is not None:
         _print_payoff(scored)
     return 0 if mission.outcome in ("ok", "dry-run") else 1
+
+
+def _close_board(bus, board) -> None:
+    """Render the board one last time, after the mission has returned.
+
+    The live view is torn down with the lane phase, but the mission is not
+    finished there: it merges the worktrees and decides its outcome AFTER,
+    and publishes both — onto a bus whose only subscriber has already gone.
+    Those events sit in the bus's backlog, and this is what collects them.
+
+    Which makes the closing frame the one that persists. `Live` leaves
+    nothing behind when it exits; a summary the operator can still read after
+    the mission ends is worth more than the frame that scrolled past."""
+    if bus is None or board is None:
+        return
+    from . import dashboard as dash_mod
+
+    try:
+        for event in bus.drain():
+            board.apply(event)
+        print(dash_mod.render_plain(board, dash_mod.icons_for(sys.stdout)))
+        # The bus counts what it could not deliver and what it did not
+        # recognise, and until now nothing ever read either back: the process
+        # exited holding both. Printed only when non-zero — a permanent `0`
+        # trains the operator to skim the one line that matters on the day it
+        # is not zero, which is the argument `hive mindnet brief` already makes
+        # for `failed=` / `dropped=` / `withheld=`.
+        if bus.dropped or bus.unknown:
+            print(f"  board: {bus.dropped} event(s) dropped"
+                  + (f", unrecognised {', '.join(bus.unknown)}"
+                     if bus.unknown else ""))
+    except Exception as exc:                            # noqa: BLE001
+        # The same bargain the board keeps everywhere else: a display is
+        # derived state, and losing it must never cost the report that
+        # follows it.
+        print(f"lintester: the closing board could not be drawn — {exc}",
+              file=sys.stderr)
+
+
+def _observer(args, started):
+    """``(bus, observer, why, board)`` for this invocation.
+
+    *why* is a sentence for the operator when the board was ASKED for and
+    is not going to appear. Silence there would be the worse failure: a
+    flag that does nothing and says nothing teaches the operator that the
+    feature is broken rather than that this run did not qualify.
+
+    Two runs do not qualify. A dry run publishes a handful of phase lines
+    and stops, so a full-screen live board would seize the terminal for a
+    tenth of a second and take the plan's own report down with it. And
+    `--json` owns stdout, which is where the board writes."""
+    if not bool(getattr(args, "board", False)):
+        return None, None, "", None
+    if getattr(args, "json", False):
+        return None, None, ("the board is off — it writes to stdout, which "
+                            "the JSON report owns"), None
+    if not started:
+        return None, None, ("the board is off — a plan publishes a few phase "
+                            "lines and stops; add the flag that starts work "
+                            "to watch lanes run"), None
+    from . import dashboard as dash_mod
+
+    bus = dash_mod.EventBus()
+    # The board is built HERE rather than left to `attach`, because this
+    # function's caller needs it after the mission returns — see `_close_board`.
+    board = dash_mod.Board()
+    available, reason = dash_mod.rich_available()
+    return (bus, (lambda: dash_mod.attach(bus, board=board)),
+            ("" if available else reason), board)
 
 
 def _reflector():
@@ -185,6 +262,8 @@ def register(subparsers) -> None:
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")
+    p.add_argument("--board", action="store_true",
+                   help="watch the lanes live in the terminal (WB7). Needs a run that starts work; install the tui extra for the full board")
     p.add_argument("--calibration", action="store_true",
                    help="print what past runs measured — the weight against "
                         "the wall time it predicted — and start no mission")

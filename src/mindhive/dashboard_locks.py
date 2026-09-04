@@ -107,9 +107,40 @@ def _one_at_a_time(lock, busy):
         def guarded(self, *a):
             if not lock.acquire(blocking=False):
                 return self._json({"ok": False, "error": busy}, 200)
+            # RELEASE BEFORE THE ANSWER IS PUBLISHED, not after. The `finally`
+            # below used to be the only release, and it runs AFTER the handler
+            # has already written its response: `wbufsize` is 0 on
+            # BaseHTTPRequestHandler, so `wfile` is an unbuffered
+            # `_SocketWriter` and those bytes are on the wire inside `fn`. A
+            # caller holding a complete response could therefore call again and
+            # be refused by the endpoint its OWN previous call had not finished
+            # releasing -- and the refusal body has no payload keys, so the
+            # second call looked like a scan that had been skipped for
+            # freshness. That is what turned
+            # test_plugins_autoscan_is_stale_gated red with `KeyError:
+            # 'scanned'` on CI run 33693887912, and reproduced off-CI at 8/400
+            # with request #2 sent down a pre-connected socket.
+            #
+            # `_send` calls this hook before its first write (see
+            # `dashboard.py`), which is safe for every route guarded here
+            # because in all four the send IS the last act -- the work is
+            # already done by the time a byte moves. The `finally` stays for the
+            # paths that never send: a handler that raises still releases.
+            held = [True]
+            outer = getattr(self, "_release_before_send", None)
+
+            def release_once():
+                if held:
+                    held.clear()
+                    lock.release()
+                if outer is not None:      # a nested guard releases both
+                    outer()
+
+            self._release_before_send = release_once
             try:
                 return fn(self, *a)
             finally:
-                lock.release()
+                self._release_before_send = outer
+                release_once()
         return guarded
     return decorate
