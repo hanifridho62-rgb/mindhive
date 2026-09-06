@@ -585,9 +585,28 @@ class LintesterOrchestrator:
         task = entry.task
         try:
             from ..mindnet import agent as ag_mod
-            res = ag_mod.run(f"{MISSION_PREFIX}-{task.task_id}", task.prompt,
+            # ONE string for the run_key and the child's `MINDHIVE_SESSION`,
+            # and both matter for a different reason.
+            #
+            # The session overlay is the identity the whole authorship control
+            # rests on. Without it the child inherits the OPERATOR's session, so
+            # (a) it appends to the operator's ledger segment -- concurrent
+            # agents sharing a segment is exactly what tore the seven rows
+            # `events._append_lock` was written for -- and (b) every `hive log`
+            # / `hive sop` row it writes is attributed to a human, which is what
+            # lets an injected agent put a MANDATORY SOP in front of the
+            # operator. `mindnet.orchestrator` has always set this
+            # (`orchestrator.py:520`); this spawner never did.
+            #
+            # `MISSION_PREFIX` is in `advice.ORCHESTRATION_PREFIXES`, asserted
+            # against the imported constant by
+            # `test_the_lintester_mission_prefix_is_covered`. An identity no
+            # consumer recognises would be no identity at all.
+            run_key = f"{MISSION_PREFIX}-{task.task_id}"
+            res = ag_mod.run(run_key, task.prompt,
                              root=(lane.worktree_path or self.root),
-                             project=self.project, timeout_s=self.timeout_s)
+                             project=self.project, timeout_s=self.timeout_s,
+                             env={"MINDHIVE_SESSION": run_key})
         except Exception as exc:                        # noqa: BLE001
             return _RunOutcome(ok=False,
                                reason=f"{type(exc).__name__}: {exc}",

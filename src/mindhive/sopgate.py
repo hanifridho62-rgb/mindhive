@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 
 from . import injectors, outcomes, sop
+from .mindnet import advice as advice_mod
 from .promptgate import PROMPT_SCAN_CAP
 
 # Marker so an injected SOP block is greppable in a transcript and tellable
@@ -104,10 +105,44 @@ def _safe_title(value) -> str:
     return " ".join(str(value or "").split())[:120]
 
 
+def is_agent_authored(row) -> bool:
+    """Whether a sidecar row was written by a spawned orchestration agent.
+
+    The authorship partition for the MANDATORY tier, and the reason it exists is
+    the amplification, not the row: `hive sop add --mandatory` writes a procedure
+    that this module then puts inside the directive fence of the operator's next
+    prompt, every prompt, labelled as standing procedure. Every spawned child has
+    `hive` on PATH and is instructed to log, so a prompt-injected agent that
+    reaches that command is one composition step away from steering its own
+    operator. `advice.resolve_sops` already refuses to compose such a row into a
+    spawned agent's brief; until this, the operator's own prompt had no such
+    check — the higher-trust surface was the unguarded one.
+
+    Delegates to `advice.is_orchestration_session` rather than re-deriving the
+    family: two copies of the allowlist would agree until a new spawner appeared,
+    and the copy here is the one nobody would think to update.
+
+    Total and fail-open, like everything else on this path: a junk row, an
+    unreadable id, or a raising predicate answers False. Absent authorship is
+    unknown authorship, not agent authorship — dropping every SOP written before
+    session stamping would delete the tier to close a second-order hole. What
+    this closes is the case where the author IS recorded and IS an agent."""
+    if not isinstance(row, dict):
+        return False
+    try:
+        return bool(advice_mod.is_orchestration_session(row.get("session_id")))
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def plan(rows) -> list[dict]:
     """Per-SOP delivery decision for one prompt — the ONE place the budget is
-    spent. Junk rows and rows missing an id or a body are dropped here, so
-    everything downstream sees only deliverable records.
+    spent. Junk rows, rows missing an id or a body, and rows an orchestration
+    agent wrote are dropped here, so everything downstream sees only deliverable
+    records.
+
+    The authorship drop happens BEFORE the budget is spent, so a withheld row
+    cannot push a human-authored procedure over the budget into a pointer.
 
     Extracted from `render` rather than re-derived by `probe`, and that is the
     whole point of it existing: a probe carrying its own copy of the fit rule can
@@ -121,6 +156,8 @@ def plan(rows) -> list[dict]:
     for r in rows or []:
         if not isinstance(r, dict):
             continue                    # a junk row must not sink the block
+        if is_agent_authored(r):
+            continue                    # never inside the mandatory fence
         sop_id = _safe_title(r.get("sop_id"))
         title = _safe_title(r.get("title"))
         text = str(r.get("text") or "").strip()
@@ -213,6 +250,18 @@ def probe(rows=None, project=None) -> dict:
         block = render(rows)
     except Exception:                                       # noqa: BLE001
         delivered, block = [], ""
+    # Counted from the SAME rows `plan` was given, and counted here rather than
+    # returned by `plan` because `plan`'s list is what `render` renders: a
+    # withheld row is not a delivery decision, it is the absence of one. A row
+    # with no id or no body is junk on either side of the partition and is not
+    # counted as withheld — that would report a malformed row as an attack.
+    try:
+        withheld = [r for r in (rows or [])
+                    if isinstance(r, dict) and is_agent_authored(r)
+                    and _safe_title(r.get("sop_id"))
+                    and str(r.get("text") or "").strip()]
+    except Exception:                                       # noqa: BLE001
+        withheld = []
     bodies = [r for r in delivered if r["delivered"] == "body"]
     pointers = [r for r in delivered if r["delivered"] == "pointer"]
     if not delivered:
@@ -227,6 +276,8 @@ def probe(rows=None, project=None) -> dict:
         "budget": PROMPT_BUDGET,
         "verdict": verdict,
         "mandatory": len(delivered),
+        # Exclusion is the control; this is what keeps it from being silent.
+        "withheld": len(withheld),
         "bodies": len(bodies),
         "pointers": len(pointers),
         "body_chars": sum(r["chars"] for r in bodies),

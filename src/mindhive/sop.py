@@ -343,9 +343,21 @@ def global_sidecar_path():
 
 
 def _project_rows(project, evs) -> list:
+    """The mandatory slice for one project, as sidecar rows.
+
+    `session_id` rides along because the sidecar is the ONLY thing `sopgate`
+    reads, and `sopgate` composes MANDATORY procedure text into the operator's
+    prompt on every turn — the highest-trust surface in the system. Dropping the
+    author here is what left that surface with no authorship concept at all:
+    `advice.resolve_sops` could partition agent-written rows out of a spawned
+    agent's brief because it folds the ledger and sees `ev.session_id`, while
+    the operator's own prompt could not, because this projection had already
+    thrown it away. `""` for rows folded from events written before session
+    stamping — absent authorship stays unknown authorship (R8)."""
     name = project or paths.detect_project()
     return [{"project": name, "sop_id": r["sop_id"], "title": r["title"],
-             "text": r["text"], "version": r["version"]}
+             "text": r["text"], "version": r["version"],
+             "session_id": str(r.get("session_id") or "")}
             for r in mandatory(evs)]
 
 
