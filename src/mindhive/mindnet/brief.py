@@ -73,7 +73,7 @@ from . import inject as inj_mod
 # `_defuse_counted` reads it from `fence`'s globals, so a test patching a
 # `brief._DEFUSE_PASSES` would be patching a name nothing reads.
 from .fence import (MAX_LINE_CHARS, PHASE_CHARS, _defuse_counted,
-                    _defused, _strip_fences, _strip_terminal_rules,
+                    _defused, _strip_bracketed_rules, _strip_fences,
                     _visible, block_counted, safe_block, safe_line,
                     safe_phase)
 
