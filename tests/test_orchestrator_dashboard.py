@@ -1140,7 +1140,7 @@ def _args(**kwargs):
 def test_the_flag_is_off_by_default_and_costs_nothing():
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, why, board = cli_mod._observer(_args(), False)
+    bus, observer, why, board, _stream = cli_mod._observer(_args(), False)
     assert (bus, observer, why, board) == (None, None, "", None)
 
 
@@ -1149,24 +1149,68 @@ def test_the_board_refuses_a_plan_and_says_why():
     feature is broken rather than that this run did not qualify."""
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, why, board = cli_mod._observer(_args(board=True), False)
+    bus, observer, why, board, _stream = cli_mod._observer(
+        _args(board=True), False)
     assert bus is None and observer is None and board is None
     assert "plan" in why and why
 
 
-def test_the_board_refuses_to_share_stdout_with_the_json_report():
+def test_the_board_moves_to_stderr_rather_than_losing_to_the_json_report():
+    """**This measurement CHANGED, deliberately.** It used to assert the board
+    was switched OFF whenever `--json` was set, with "stdout" in the reason.
+
+    The reason was true and the conclusion was not: `Dashboard` has always taken
+    `stream=` and `console=`, so the two features never actually conflicted --
+    only stdout being hardcoded made them look like they did. The requirement is
+    that the JSON report owns stdout WHOLE, and moving the board to stderr meets
+    it exactly, while a long run stops being unwatchable the moment a machine
+    reads its output."""
+    import sys
+
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, why, board = cli_mod._observer(
+    bus, observer, why, board, stream = cli_mod._observer(
         _args(board=True, json=True), True)
-    assert bus is None and observer is None and board is None
-    assert "stdout" in why
+    assert bus is not None and board is not None and callable(observer)
+    assert stream is sys.stderr, "the board would have written into the report"
+    assert why == "" or "rich" in why, why
+
+
+def test_the_board_keeps_stdout_when_no_json_report_wants_it():
+    """The canary. A fix that simply moved the board to stderr always would
+    pass the test above and quietly relocate every ordinary run's display."""
+    import sys
+
+    from mindhive.orchestrator import cli as cli_mod
+
+    _bus, _observer_fn, _why, _board, stream = cli_mod._observer(
+        _args(board=True), True)
+    assert stream is sys.stdout
+
+
+def test_the_json_run_puts_its_closing_board_on_stderr_too():
+    """The closing frame follows the live one. Printing this summary to stdout
+    would put a human paragraph into the machine surface -- which is the very
+    thing the old exclusivity existed to prevent, reintroduced one function
+    later."""
+    import io
+
+    from mindhive.orchestrator import cli as cli_mod
+
+    bus = dash.EventBus()
+    board = dash.Board()
+    bus.emit("mission_started", mission_id="m-1", intent="do the thing",
+             units=1, lanes=1)
+    sink = io.StringIO()
+    cli_mod._close_board(bus, board, sink)
+    assert "LINTESTER BRAIN" in sink.getvalue()
 
 
 def test_a_started_run_gets_a_real_bus_and_a_real_observer():
     from mindhive.orchestrator import cli as cli_mod
 
-    bus, observer, _why, board = cli_mod._observer(_args(board=True), True)
+    bus, observer, _why, board, _stream = cli_mod._observer(
+        _args(board=True), True)
     assert isinstance(bus, dash.EventBus)
     assert isinstance(board, dash.Board)
     assert callable(observer)
@@ -1349,3 +1393,280 @@ def test_the_mission_binds_the_bus_to_the_loop_it_actually_runs_on():
 
     asyncio.run(drive())
     assert bus._loop is seen["loop"]
+# --- the bus's two recorded corners ---------------------------------------------
+# Both re-verified in docs/residual-review-findings/ and both latent: no caller
+# in `src/` reuses a bus across two loops today, and no kind drifts today. They
+# are fixed anyway because "latent" is a statement about the callers, and the
+# next caller is the one that finds out.
+
+def test_a_bus_reused_across_two_loops_rebinds_to_the_live_one():
+    """THE DEFECT. `subscribe` bound only when `self._loop` was None, so a bus
+    that had already served one `asyncio.run` kept that loop after it closed.
+    Every later publish then took the `call_soon_threadsafe` path on a dead
+    loop, raised, and was counted as dropped."""
+    bus = dash.EventBus()
+
+    async def _first():
+        bus.subscribe()
+        return asyncio.get_running_loop()
+
+    first_loop = asyncio.run(_first())
+    assert first_loop.is_closed(), "the first loop outlived its asyncio.run"
+
+    async def _second():
+        queue = bus.subscribe()
+        bus.emit("task_started", lane=1, task_id="t-1")
+        await asyncio.sleep(0)
+        return asyncio.get_running_loop(), queue
+
+    second_loop, queue = asyncio.run(_second())
+    assert bus._loop is not first_loop, "the bus kept the closed loop"
+    assert bus._loop is second_loop
+    assert bus.dropped == 0, "a publish was lost to the dead loop"
+    assert queue.qsize() >= 1, "the live subscriber received nothing"
+
+
+def test_a_bus_used_inside_one_loop_does_not_rebind_needlessly():
+    """THE CANARY. Re-binding on every `subscribe` would be indistinguishable
+    from this test passing, so it pins the other half: inside ONE loop the
+    remembered loop is the running one and nothing changes."""
+    async def _once():
+        bus = dash.EventBus()
+        bus.subscribe()
+        first = bus._loop
+        bus.subscribe()
+        return first, bus._loop, asyncio.get_running_loop()
+
+    first, second, running = asyncio.run(_once())
+    assert first is second is running
+
+
+def test_an_explicit_bind_from_a_producer_thread_survives_subscribe():
+    """`bind` stays public for a caller that builds the bus before the loop
+    exists. With no loop running, `subscribe` must not throw that answer away
+    -- only a CLOSED loop is replaced."""
+    loop = asyncio.new_event_loop()
+    try:
+        bus = dash.EventBus()
+        bus.bind(loop)
+        bus.subscribe()                       # no running loop on this thread
+        assert bus._loop is loop
+    finally:
+        loop.close()
+    bus.subscribe()
+    assert bus._loop is None, "the closed loop was kept"
+
+
+def test_one_kind_drifting_forever_cannot_grow_the_drift_record():
+    """THE DEFECT, P3. `unknown` was rebuilt as a longer tuple per complaint --
+    unbounded, and O(n^2) in copying -- so a single misspelled kind emitted per
+    event filled it with thousands of copies of one string."""
+    bus = dash.EventBus(capacity=1)          # the record is full after one
+    for _ in range(500):
+        bus.emit("task_startd", lane=1)
+    assert bus.unknown == ("kind:task_startd",), bus.unknown
+    # `capacity=1` is what makes this discriminating rather than decorative: a
+    # `_note_unknown` that did not recognise the repeat would find the record
+    # already full and count 499 overflows for a kind it had already recorded.
+    assert bus.unknown_dropped == 0, "a repeat was counted as an overflow"
+
+
+def test_more_distinct_complaints_than_the_bound_are_counted_not_kept():
+    """The bound itself, and the counted overflow. `dropped` makes the same
+    bargain for the queue: bounded, never silent."""
+    bus = dash.EventBus(capacity=3)
+    for i in range(10):
+        bus.emit(f"task_start{i}", lane=1)
+    assert len(bus.unknown) == 3, bus.unknown
+    assert bus.unknown_dropped == 7
+    assert bus.unknown[0] == "kind:task_start0", "first-seen order was lost"
+
+
+def test_a_clean_run_records_no_drift_and_no_overflow():
+    """The canary for both counters. A record that is never empty reports drift
+    on every run and is therefore worth nothing."""
+    bus = dash.EventBus(capacity=3)
+    for i in range(10):
+        bus.emit("task_started", lane=i, task_id=f"t-{i}")
+    assert bus.unknown == ()
+    assert bus.unknown_dropped == 0
+# --- the fold, the two renderers, and the state nothing drew ---------------------
+# Four more findings from docs/residual-review-findings/, fixed together because
+# they are one complaint in four places: state this board folds and then does
+# not tell anybody about.
+
+def test_an_unreadable_elapsed_time_does_not_half_apply_the_event():
+    """THE DEFECT. `_finished` moved the counters and THEN did an inline
+    `float(event.elapsed_ms)`. A field that would not convert raised after the
+    mutation, `apply`'s guard caught it, and one event was counted as a
+    completed unit AND as an event that could not be read -- the header then
+    disagreed with itself about the same event."""
+    board = dash.Board()
+    event = dash.make_event("task_finished", lane=0, task_id="t-1",
+                            state="validated", elapsed_ms="not a number")[0]
+
+    assert board.apply(event) is True
+    assert board.completed == 1
+    assert board.ignored == 0, "the event was counted twice, in two ways"
+    assert board.applied == 1
+    assert board.lane(0).note == "validated", "an unreadable time cost the state"
+
+
+def test_a_readable_elapsed_time_is_still_rendered():
+    """THE CANARY. A `_float` that always answered its default would pass the
+    test above and silently delete the timing from every row."""
+    board = dash.Board()
+    event = dash.make_event("task_finished", lane=0, task_id="t-1",
+                            state="validated", elapsed_ms=1234)[0]
+    board.apply(event)
+    assert board.lane(0).note == "validated in 1234 ms"
+
+
+def test_a_drifted_kind_reaches_the_footer_instead_of_vanishing():
+    """THE DEFECT. `Note` is what an unrecognised kind becomes -- the one event
+    carrying information about a producer and this board disagreeing about the
+    string seam -- and it was the one event whose text was dropped, folded into
+    `ignored` beside genuinely unreadable input."""
+    board = dash.Board()
+    event, complaint = dash.make_event("task_startd", lane=1)
+
+    assert complaint, "make_event stopped complaining; this test proves nothing"
+    assert board.apply(event) is True
+    assert board.ignored == 0
+    assert board.applied == 1
+    assert any("task_startd" in alert.text for alert in board.alerts), board.alerts
+    assert "task_startd" in dash.render_plain(board)
+
+
+def test_genuinely_unreadable_input_is_still_ignored():
+    """THE CANARY, and the reason `ignored` is still worth printing. A fold that
+    applied everything would pass the test above and make the header's count a
+    permanent zero."""
+    board = dash.Board()
+    assert board.apply(object()) is False
+    assert board.ignored == 1
+    assert board.applied == 0
+
+
+def test_an_empty_note_carries_nothing_and_is_ignored():
+    """A `Note` with no text has no drift to report, so it is not an alert. The
+    branch is about the TEXT reaching the footer, not about the class."""
+    board = dash.Board()
+    assert board.apply(dash.Note(text="")) is False
+    assert board.ignored == 1
+    assert not board.alerts
+
+
+def test_both_renderers_report_the_unreadable_count():
+    """`Board`'s own docstring promises "`ignored` counts it and the header
+    prints it". Only `render_plain` kept that promise, so the operator most
+    likely to be watching -- the one with a terminal -- was the one not told."""
+    rich_ok, _why = dash.rich_available()
+    if not rich_ok:
+        pytest.skip("rich is not installed on this machine")
+    board = dash.Board()
+    board.apply(object())
+    assert board.counters()["ignored"] == 1
+
+    from rich.console import Console
+
+    buf = io.StringIO()
+    Console(file=buf, width=120, no_color=True).print(dash._header_panel(board))
+    live = buf.getvalue()
+    assert "could not be read" in live, live
+    assert "could not be read" in dash.render_plain(board)
+
+
+def test_a_clean_board_says_nothing_about_unreadable_events():
+    """The canary for both renderers. A permanent notice is not a notice."""
+    rich_ok, _why = dash.rich_available()
+    if not rich_ok:
+        pytest.skip("rich is not installed on this machine")
+    from rich.console import Console
+
+    board = dash.Board()
+    buf = io.StringIO()
+    Console(file=buf, width=120, no_color=True).print(dash._header_panel(board))
+    assert "could not be read" not in buf.getvalue()
+    assert "could not be read" not in dash.render_plain(board)
+
+
+def test_a_frozen_live_board_says_so_when_it_exits():
+    """THE DEFECT. The live path `return`ed saying nothing, so a board frozen by
+    repeated repaint failure exited looking exactly like one that simply had
+    nothing more to show -- while `render_errors` held the count nothing read."""
+    bus = dash.EventBus()
+    sink = io.StringIO()
+
+    async def drive():
+        board = dash.Dashboard(bus, plain=False, stream=sink,
+                               refresh_per_second=50)
+        # `_run_live` succeeds; the REPAINTS are what fail, which is the shape
+        # the finding names -- a board that came up and then froze.
+        async def _live():
+            board._layout = object()
+            board._paint(live=object())
+            board._paint(live=object())
+        board._run_live = _live
+        board._queue = asyncio.Queue()
+        board._stop = asyncio.Event()
+        board._stop.set()
+        await board._run()
+        return board
+
+    board = asyncio.run(drive())
+    out = sink.getvalue()
+    assert board.render_errors == 2, board.render_errors
+    assert "repaint(s) failed" in out, out
+    assert "LINTESTER BRAIN" in out, "the closing snapshot was not written"
+
+
+def test_a_healthy_live_run_does_not_dump_a_plain_board_over_it():
+    """THE CANARY. Reporting unconditionally would put a full text board over
+    every successful run's restored terminal, which is the noise that teaches an
+    operator to skim the line that matters."""
+    bus = dash.EventBus()
+    sink = io.StringIO()
+
+    async def drive():
+        board = dash.Dashboard(bus, plain=False, stream=sink)
+
+        async def _live():
+            return None
+
+        board._run_live = _live
+        board._queue = asyncio.Queue()
+        board._stop = asyncio.Event()
+        board._stop.set()
+        await board._run()
+        return board
+
+    board = asyncio.run(drive())
+    assert board.render_errors == 0
+    assert sink.getvalue() == "", sink.getvalue()
+
+
+def test_the_closing_frame_draws_the_steals_and_the_worktrees():
+    """THE DEFECT. `steal_log` and `LaneView.worktree` were folded, bounded, and
+    drawn by nothing at all. Drawn in the PLAIN renderer, which is the frame
+    `_close_board` prints after the mission returns and therefore the one that
+    persists -- `Live` leaves nothing behind when it exits."""
+    board = dash.Board()
+    board.apply(dash.make_event("lane_opened", lane=0,
+                                worktree="/tmp/wt-0")[0])
+    board.apply(dash.make_event("work_stolen", lane=1, victim=0,
+                                task_id="t-9", target="src/auth.py")[0])
+    out = dash.render_plain(board)
+    assert "WORKTREES" in out and "/tmp/wt-0" in out, out
+    assert "STEALS" in out and "src/auth.py" in out, out
+    assert dash.steal_caption(1, 0, "src/auth.py") in out
+
+
+def test_a_board_with_neither_draws_neither_heading():
+    """The canary. Two permanent empty headings on every closing frame would be
+    worse than not drawing the state at all."""
+    board = dash.Board()
+    board.apply(dash.make_event("mission_started", mission_id="m-1",
+                                intent="do it", units=1, lanes=1)[0])
+    out = dash.render_plain(board)
+    assert "WORKTREES" not in out and "STEALS" not in out, out

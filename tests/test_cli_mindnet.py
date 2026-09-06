@@ -100,6 +100,23 @@ def _ok(*argv) -> None:
     assert _cli(*argv) == 0, f"expected `hive {' '.join(argv)}` to succeed"
 
 
+def _run_capturing_stderr(*argv) -> str:
+    """`hive <argv>`'s stderr. `_cli` prints through the real streams, so the
+    capture is done here rather than by a fixture every caller would share."""
+    return _run_capturing_both(*argv)[1]
+
+
+def _run_capturing_both(*argv) -> tuple:
+    """``(stdout, stderr)`` for one `hive` invocation."""
+    import contextlib
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        _cli(*argv)
+    return out.getvalue(), err.getvalue()
+
+
 def _doc(root, rel, body="evidence\n") -> Path:
     p = root / rel
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1918,3 +1935,58 @@ def test_brief_reports_a_withheld_agent_authored_row(capsys, monkeypatch):
 
     _cli("mindnet", "brief", "a")
     assert "withheld=2" in capsys.readouterr().out
+# --- the two-orchestrators signpost --------------------------------------------
+# There are two orchestrators now and an operator who does not know that keeps
+# using whichever they found first, which is the whole content of "Lintester is
+# additive, not a replacement". The notice is the discoverable half of severing
+# the manual interface -- and it deliberately does NOT claim a replacement,
+# because the two take different inputs and pointing a declared graph at
+# `hive lintester` would send it to a command that cannot read it.
+
+def test_a_dry_run_names_the_other_orchestrator():
+    """The signpost, asserted by EQUALITY against the module constant rather
+    than by substring. A substring assertion is what let two sites word one fact
+    differently until CI caught them -- `resilience.NO_LIMITS_REASON` carries the
+    same argument."""
+    import mindhive.__main__ as main_mod
+
+    _orc_graph()
+    err = _run_capturing_stderr("mindnet", "orchestrate")
+    assert main_mod.MINDNET_ORCHESTRATE_SIGNPOST in err
+    assert err.strip().endswith(
+        main_mod.MINDNET_ORCHESTRATE_SIGNPOST.split(". ")[-1].strip())
+
+
+def test_the_signpost_never_reaches_stdout():
+    """stdout is the report, and with `--json` it is a machine surface. A
+    friendly paragraph printed into it is a parse error at the other end -- the
+    same rule `cli._observer` follows for the board."""
+    _orc_graph()
+    out, err = _run_capturing_both("mindnet", "orchestrate")
+    assert "two orchestrators" in err
+    assert "two orchestrators" not in out
+    assert "mindnet orchestrate:" in out, out
+
+
+def test_the_signpost_is_absent_from_a_json_run():
+    """`--json` is asked for by a program, and a program has already chosen its
+    orchestrator. Printing advice at it every run is the noise that teaches an
+    operator to pipe stderr to /dev/null, which is where the notices that matter
+    then go too."""
+    import json as _json
+
+    _orc_graph()
+    out, err = _run_capturing_both("mindnet", "orchestrate", "--json")
+    assert "two orchestrators" not in err, err
+    assert _json.loads(out)["outcome"], "the JSON report itself broke"
+
+
+def test_the_signpost_is_absent_from_an_execute_run():
+    """THE CANARY for the dry-run gate. A notice printed on every run would pass
+    the first test above just as well, and an operator who has typed `--execute`
+    has made the choice the notice exists to inform."""
+    _orc_graph()
+    out, err = _run_capturing_both(
+        "mindnet", "orchestrate", "--execute", "--via-script")
+    assert "two orchestrators" not in err, err
+    assert "mindnet orchestrate:" in out, out

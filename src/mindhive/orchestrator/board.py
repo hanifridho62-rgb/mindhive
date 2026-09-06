@@ -191,6 +191,26 @@ def make_event(kind, **fields) -> tuple:
 DEFAULT_CAPACITY = 512
 
 
+def _running_loop():
+    """The loop running on THIS thread, or ``None``. Never raises."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _closed(loop) -> bool:
+    """Whether *loop* is a closed event loop.
+
+    Total on purpose: a test may bind a stub with no `is_closed`, and a bus
+    that promises no publish can raise into a mission is not the place to make
+    an exception for that."""
+    try:
+        return bool(loop.is_closed())
+    except Exception:                       # pragma: no cover - stub loops only
+        return False
+
+
 def _elsewhere(loop) -> bool:
     """Is this call happening off *loop*'s own thread?
 
@@ -215,7 +235,13 @@ class EventBus:
         self.capacity = max(1, int(capacity))
         self.published = 0
         self.dropped = 0
-        self.unknown: tuple = ()
+        # A DICT, not a tuple: distinct complaints in first-seen order, each
+        # carrying how often it recurred. `self.unknown = self.unknown + (c,)`
+        # rebuilt the whole tuple per complaint -- O(n^2) copying, unbounded, in
+        # the one class that bounds everything else, and a single drifting kind
+        # emitted per event filled it with the same string thousands of times.
+        self._unknown: dict = {}
+        self.unknown_dropped = 0
         self._subs: list = []
         self._held: collections.deque = collections.deque()
         self._loop = None
@@ -247,8 +273,42 @@ class EventBus:
     def subscribers(self) -> int:
         return len(self._subs)
 
+    @property
+    def unknown(self) -> tuple:
+        """The distinct drift complaints, first-seen order. Reading surface
+        unchanged: every caller and every test compares it as a tuple."""
+        return tuple(self._unknown)
+
+    def _note_unknown(self, complaint) -> None:
+        """Record one drift complaint, bounded by `capacity`.
+
+        Distinct rather than one entry per event, because the record answers
+        "which kinds and fields have drifted", and the hundredth copy of one
+        string answers it no better than the first. `unknown_dropped` counts the
+        NEW complaints refused once the record is full -- the same
+        counted-not-hidden bargain `dropped` makes for the queue."""
+        if complaint in self._unknown:
+            self._unknown[complaint] += 1
+            return
+        if len(self._unknown) >= self.capacity:
+            self.unknown_dropped += 1
+            return
+        self._unknown[complaint] = 1
+
     def subscribe(self):
-        if self._loop is None:
+        # RE-BIND, not bind-once. A bus reused across two `asyncio.run` calls
+        # kept the FIRST, now-closed loop; every later publish then failed
+        # `call_soon_threadsafe` and was counted as dropped -- counted, so never
+        # silent, but lost. The queue this method returns belongs to whoever
+        # awaits it, which is the loop running now, so the running loop is the
+        # right answer whenever there is one. With no loop running, an explicit
+        # `bind(loop)` from a producer thread is preserved unless that loop has
+        # been closed.
+        running = _running_loop()
+        if running is not None:
+            if running is not self._loop:
+                self.bind(running)
+        elif self._loop is None or _closed(self._loop):
             self.bind()
         queue: asyncio.Queue = asyncio.Queue(maxsize=self.capacity)
         self._subs.append(queue)
@@ -276,7 +336,7 @@ class EventBus:
         """The producers' whole surface. Answers the event it published."""
         event, complaint = make_event(kind, **fields)
         if complaint:
-            self.unknown = self.unknown + (complaint,)
+            self._note_unknown(complaint)
         self.publish(event)
         return event
 
@@ -391,6 +451,21 @@ def icons_for(stream=None) -> dict:
 def _int(value, default=0) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value, default=0.0) -> float:
+    """A float from an untrusted field. Never raises.
+
+    Beside `_text` and `_int` rather than inline at the one call site, because
+    the inline `float(event.elapsed_ms)` in `_finished` is what made `apply`
+    HALF-apply: the counters had already been moved when it raised, the
+    exception then reached `apply`'s guard, and one event was counted both as a
+    failure and as unreadable. Every other field on that path goes through a
+    coercer for exactly this reason; this one did not."""
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -555,6 +630,23 @@ class Board:
                 view.status = IDLE
                 view.task_id = ""
                 view.target = ""
+        elif isinstance(event, Note):
+            # DRIFT, not damage. `Note` is what an unrecognised kind becomes, so
+            # this is the one event that carries information about a producer and
+            # this board disagreeing about the string seam -- and it was the one
+            # event whose text was thrown away, folded into `ignored` beside
+            # genuinely unreadable input. An operator watching a board that has
+            # quietly stopped showing a lane needs to be told the kind drifted,
+            # not that "1 event could not be read".
+            #
+            # It counts as APPLIED because it was: the footer says what it said.
+            # `ignored` keeps its meaning -- input this fold could not read at
+            # all -- which is what makes the header's count worth printing.
+            text = _text(event.text)
+            if not text:
+                self.ignored += 1
+                return False
+            self._alert(NOTE, -1, text)
         else:
             self.ignored += 1
             return False
@@ -604,8 +696,8 @@ class Board:
         view.target = ""
         view.load = 0
         view.stolen_from = -1
-        view.note = state + (f" in {float(event.elapsed_ms):.0f} ms"
-                             if event.elapsed_ms else "")
+        elapsed = _float(event.elapsed_ms)
+        view.note = state + (f" in {elapsed:.0f} ms" if elapsed else "")
 
     def _stolen(self, event) -> None:
         view = self.lane(event.lane)
@@ -647,7 +739,13 @@ class Board:
 
         Deliberately narrow: the directive asks for CRITICAL warnings only, and
         a footer that also carried ordinary progress would be a second event log
-        nobody reads — which is the same as no footer at all."""
+        nobody reads — which is the same as no footer at all.
+
+        THREE producers, not two: a breaker opening, a unit being re-queued, and
+        a `Note`. The third was added on the same argument rather than against
+        it — an event kind this board does not recognise means the display has
+        gone silently wrong about something, which is exactly the class the
+        footer exists for."""
         self.alerts.append(Alert(kind=kind, lane=_int(lane, -1),
                                  text=_text(text)))
 

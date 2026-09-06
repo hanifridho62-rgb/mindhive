@@ -68,9 +68,16 @@ def test_the_registration_stays_within_the_ratchet():
     match = re.search(r'"__main__\.py":\s*(\d+)', cap_src)
     assert match, "the ratchet entry moved or was renamed"
 
-    text = (REPO / "src" / "mindhive" / "__main__.py").read_text(
-        encoding="utf-8")
-    assert review_mod._line_count(text) <= int(match.group(1))
+    # `review._line_count` takes a PATH, not the text. Handing it the whole
+    # file body made it raise OSError internally and answer 0, so this half of
+    # the ratchet asserted `0 <= 4237` and could never fail -- it was green on
+    # a file of any length. Found when the other half went red for real.
+    path = REPO / "src" / "mindhive" / "__main__.py"
+    text = path.read_text(encoding="utf-8")
+    cap = int(match.group(1))
+    counted = review_mod._line_count(str(path))
+    assert counted > 0, "the cap check went vacuous again"
+    assert counted <= cap, f"__main__.py is {counted} lines, cap {cap}"
 
     block = [ln for ln in text.splitlines() if "lintester" in ln]
     assert len(block) <= 4, (

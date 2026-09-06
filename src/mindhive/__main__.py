@@ -2158,6 +2158,17 @@ def cmd_mindnet_depend(args) -> int | None:
     return None
 
 
+# Printed by `cmd_mindnet_orchestrate` on a dry run. A module constant so the
+# test can assert equality rather than a substring — the same argument
+# `resilience.NO_LIMITS_REASON` records, and for the same reason: a substring
+# assertion is what let two sites word one fact differently until CI caught them.
+MINDNET_ORCHESTRATE_SIGNPOST = (
+    "note: there are two orchestrators. This one walks the mindnet task graph "
+    "you declared; `hive lintester \"<intent>\"` decomposes one sentence into "
+    "its own mission and lanes. Neither reads the other's input, so pick by "
+    "what you have.")
+
+
 def cmd_mindnet_orchestrate(args) -> int | None:
     """Walk the task graph in waves, running every unblocked task concurrently.
 
@@ -2171,7 +2182,23 @@ def cmd_mindnet_orchestrate(args) -> int | None:
 
     Exit 1 on `stalled`, `capped` and `awaiting-validation` — work remains and a
     zero exit would let a wrapping CI step pass while the graph is stuck, gave
-    up, or holds agent output nothing has verified. See DATA_MODEL.md §4.6."""
+    up, or holds agent output nothing has verified. See DATA_MODEL.md §4.6.
+
+    **The Lintester signpost, and what it deliberately does not say.** There are
+    two orchestrators now, and an operator who does not know that will keep
+    using whichever one they found first. So a dry run names the other and says
+    what it takes — the wording itself is `MINDNET_ORCHESTRATE_SIGNPOST`, so
+    this paragraph does not carry a second copy of the command name. The
+    registration ratchet counts every mention in this file, and prose that
+    repeats the wiring is still a line that can drift from it. It does
+    NOT say "deprecated" and does not point users away: the two take
+    DIFFERENT inputs — this one walks a task graph somebody declared, the
+    other decomposes one intent sentence — so neither is a drop-in for the
+    other, and a notice claiming otherwise would send an operator with a
+    declared graph to a command that cannot read it.
+
+    On the dry run only, and on stderr. Every run prints it and `--json` would
+    stop parsing."""
     from dataclasses import asdict
     from .mindnet import agent as ag_mod
     from .mindnet import executor as x_mod
@@ -2275,6 +2302,8 @@ def cmd_mindnet_orchestrate(args) -> int | None:
         verb = "would run" if not args.execute else "ran"
         print(f"mindnet orchestrate: {out.outcome} — {len(out.waves)} wave(s), "
               f"{verb} {sum(len(w.tasks) for w in out.waves)} task(s)")
+        if not args.execute:
+            print(MINDNET_ORCHESTRATE_SIGNPOST, file=sys.stderr)
         for w in out.waves:
             line = f"  wave {w.index + 1}: " + ", ".join(w.tasks)
             if args.execute:

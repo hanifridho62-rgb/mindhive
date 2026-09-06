@@ -2049,3 +2049,221 @@ def test_a_genuinely_concurrent_caller_is_still_refused(lock_watching_server):
 
     assert status == 200
     assert body == {"ok": False, "error": "a plugin scan is already running"}
+
+
+# --- the two corners the early release never exercised ------------------------
+#
+# Moving the release into `_send` (f2d029b) was measured and mutation-proofed,
+# but two paths through `release_once` were only ever REASONED about. Neither is
+# a known defect. They are here so that "verified" means the same thing for them
+# as for the rest of this file: the argument was that each `outer()` is itself
+# idempotent and that an error path never reaches the publish point, and an
+# argument is not a test.
+
+def _settles(pred, seconds=5.0):
+    """Whether `pred()` becomes true within `seconds`.
+
+    THE WRONG-INSTANT TRAP, in its general form. An HTTP client is released by
+    the RESPONSE BYTES: `BaseHTTPRequestHandler` writes unbuffered, so the
+    bytes are on the wire from inside the handler, and everything the handler
+    does afterwards -- a SECOND `_send`, the guard decorator's `finally` -- is
+    still in flight on the server thread when the client's next line runs.
+
+    Measured twice in the full suite, both times green in isolation:
+    C2 failed at `assert not True` on a lock that was freed a moment later,
+    and C1 failed at `{'entered': 2, 'sends': 1}` -- whose own fixture repr,
+    printed by pytest after the test had finished, already read `sends: 2`.
+    That repr is the proof: nothing was broken, the assertion was early.
+
+    Bounded, so it hides no real defect. A handler that genuinely never sends
+    twice, or never releases its lock, still exhausts the deadline and fails.
+    """
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
+def _free_within(lock, seconds=5.0):
+    """Whether `lock` is free, waiting up to `seconds` for it to become so.
+
+    The client is released by the RESPONSE BYTES, not by the handler finishing.
+    `urllib` raises `HTTPError` the moment it reads the status line, while the
+    decorator's `finally` -- the thing that actually frees the lock -- runs
+    afterwards on the server thread. So `assert not lock.locked()` placed
+    straight after the request races the very code it is checking: green in
+    isolation, and MEASURED red in the full suite under load
+    (`the outer lock leaked on the error path ... assert not True`).
+
+    A bounded wait keeps the property rather than weakening it. The claim is
+    'the lock is free once the request is over', and a real leak never frees
+    it -- so a leak still exhausts the deadline and still fails. What the wait
+    removes is only the assumption that 'the client has the bytes' and 'the
+    handler has returned' are the same instant. They are not.
+    """
+    return _settles(lambda: not lock.locked(), seconds)
+
+
+_PROBE_OUTER = threading.Lock()
+_PROBE_INNER = threading.Lock()
+
+
+@pytest.fixture
+def corner_server():
+    """A real dashboard carrying two extra GET routes, each guarded by NESTED
+    `_one_at_a_time` decorators so the `outer()` chain is live.
+
+    Nested rather than single, because the corner is specifically that
+    `release_once` guards ITS OWN lock with `held` while calling `outer()`
+    unconditionally — with one decorator there is no `outer` and the corner
+    cannot be reached at all. Yields (base, token, seen)."""
+    from mindhive.dashboard_locks import _one_at_a_time
+
+    token = "test-token-123"
+    base_handler = dashboard.make_handler(token)
+    seen = {"entered": 0, "sends": 0, "hangups": 0, "lock_errors": 0,
+            "held_at_error": None}
+
+    class Corners(base_handler):
+        @_one_at_a_time(_PROBE_OUTER, "outer busy")
+        @_one_at_a_time(_PROBE_INNER, "inner busy")
+        def _twice(self):
+            self._send(200, json.dumps({"ok": True, "n": 1}))
+            self._send(200, json.dumps({"ok": True, "n": 2}))
+
+        @_one_at_a_time(_PROBE_OUTER, "outer busy")
+        @_one_at_a_time(_PROBE_INNER, "inner busy")
+        def _errors(self):
+            self.send_error(503, "deliberate")
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            # Counted on BOTH sides of the call, and the failures are counted BY
+            # KIND. `entered` proves the route really sent twice; a release chain
+            # that raises is invisible to `entered` alone, because the client
+            # already holds response #1 and the request still looks fine from
+            # outside -- a test counting only entries passes against the very
+            # defect it exists to catch.
+            #
+            # But "did the call return" is not enough either, and the full suite
+            # proved it: the SECOND write goes to a socket whose client has read
+            # response #1 and gone, so under load it fails with an OSError that
+            # has nothing to do with locks (`{'entered': 2, 'sends': 1}` --
+            # exactly the shape the lock defect produces). `RuntimeError` is the
+            # one `threading.Lock.release()` raises on an unheld lock, so the two
+            # are separated here rather than guessed at from a count.
+            seen["entered"] += 1
+            try:
+                out = super()._send(code, body, ctype)
+            except RuntimeError:
+                seen["lock_errors"] += 1
+                raise
+            except OSError:
+                seen["hangups"] += 1        # the client went away; not a lock
+                return None
+            seen["sends"] += 1
+            return out
+
+        def send_error(self, code, message=None, explain=None):
+            seen["held_at_error"] = (_PROBE_OUTER.locked(),
+                                     _PROBE_INNER.locked())
+            return super().send_error(code, message, explain)
+
+        def do_GET(self):
+            if self.path.startswith("/probe/twice"):
+                return self._twice()
+            if self.path.startswith("/probe/error"):
+                return self._errors()
+            return super().do_GET()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Corners)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", token, seen
+    finally:
+        server.shutdown()
+        for lk in (_PROBE_OUTER, _PROBE_INNER):
+            if lk.locked():
+                lk.release()
+
+
+def test_a_handler_that_sends_twice_does_not_double_release_its_locks(
+        corner_server):
+    """C1. `release_once` clears `held` so the second release of its OWN lock is
+    a no-op, but the chained `outer()` sits OUTSIDE that guard and therefore runs
+    on every `_send`. Safe only if each `outer` is itself idempotent.
+
+    `threading.Lock.release()` on an unheld lock raises `RuntimeError`, so a
+    non-idempotent chain would surface as an exception escaping the handler --
+    which is exactly what this asserts cannot happen, with both locks free
+    afterwards and neither left in a state that refuses the next caller.
+
+    The assertion is on the KIND of failure, not on a count of successes. The
+    client has already read response #1 by the time the second write happens, so
+    that write can legitimately fail with an OSError under load -- measured, in
+    the full suite -- and a test that could not tell that apart from a raising
+    release chain would be red for the environment and green for the defect on
+    different days."""
+    base, token, seen = corner_server
+    assert not _PROBE_OUTER.locked() and not _PROBE_INNER.locked()
+
+    status, body = _get(base, "/probe/twice", token)
+
+    # `_get` came back on response #1's BYTES; the second `_send` is still in
+    # flight on the server thread. Reading the counters here is the same
+    # wrong-instant mistake C2 made -- see `_settles`. `lock_errors` is in the
+    # sum so the mutation case settles at once instead of waiting the deadline
+    # out: a raising release chain accounts for its send too, just not as a
+    # success, and the assertion below is what then goes red.
+    _settles(lambda: seen["entered"] == 2 and seen["sends"]
+             + seen["hangups"] + seen["lock_errors"] == 2)
+
+    assert status == 200 and body["n"] == 1
+    # The canary: without this the test passes just as well against a route that
+    # only ever sent once, which is not the corner under test.
+    assert seen["entered"] == 2, f"the route did not send twice: {seen}"
+    # And the corner itself. Removing `release_once`'s idempotence guard makes
+    # the chained `outer()` release an unheld lock, and `threading.Lock.release()`
+    # raises `RuntimeError` there -- which shows up here and nowhere else, while
+    # every other assertion in this test still holds.
+    assert seen["lock_errors"] == 0, f"the release chain raised: {seen}"
+    assert seen["sends"] + seen["hangups"] == 2, (
+        f"a send neither completed nor lost its client: {seen}")
+    assert _free_within(_PROBE_OUTER), "the outer lock was left held"
+    assert _free_within(_PROBE_INNER), "the inner lock was left held"
+
+    # And the endpoint still answers -- a double release that raised would have
+    # left the guard wedged rather than merely noisy.
+    assert _get(base, "/probe/twice", token)[0] == 200
+
+
+def test_a_guarded_handler_answering_via_send_error_still_frees_its_locks(
+        corner_server):
+    """C2. `send_error` never reaches the publish point, so `_release_before_send`
+    is never called and the lock is held until the decorator's `finally`.
+
+    Both halves are asserted, because only the pair says what the code does: the
+    lock IS still held while the error is written (this path deliberately does
+    NOT get the early release -- an error carries no payload a caller would
+    immediately re-request), and it IS free once the request is over, so nothing
+    leaks.
+
+    'Once the request is over' is why the second half waits: see `_free_within`.
+    The error response reaches the client BEFORE the decorator's `finally` runs,
+    so the un-waited form was checking the release against the wrong instant."""
+    base, token, seen = corner_server
+
+    try:
+        _get(base, "/probe/error", token)
+    except urllib.error.HTTPError as e:
+        assert e.code == 503
+    else:
+        pytest.fail("the probe route did not answer with an error")
+
+    assert seen["held_at_error"] == (True, True), (
+        "an error answer took the early release; the publish-point hook is "
+        "supposed to be unreachable on this path")
+    assert _free_within(_PROBE_OUTER), "the outer lock leaked on the error path"
+    assert _free_within(_PROBE_INNER), "the inner lock leaked on the error path"
+    assert _get(base, "/probe/twice", token)[0] == 200
