@@ -24,6 +24,7 @@ is a prompt-injection channel, not a feature.
 import asyncio
 import json
 import sys
+import time
 
 import pytest
 
@@ -819,3 +820,105 @@ def test_the_two_kernels_are_separately_askable():
     assert r.limits_available()[0] is (posix_ok or jobs_ok)
     if r.limits_available()[0]:
         assert r.limits_available()[1] == "", "an available fence has no reason"
+# --- the cap, against a child that leaves a grandchild ------------------------
+# Every other child in this file is a SINGLE process, which is why 60 tests and
+# zero skips were green over a measured 5x overrun. `proc.kill()` is
+# TerminateProcess on the child alone; a grandchild holding the inherited pipe
+# write-ends keeps them open, and the post-kill drain used to wait on it with no
+# timeout -- while the job close that would have taken the tree sat in
+# `run_sandboxed`'s `finally`, downstream of exactly that wait.
+#
+# Measured before the fix, timeout_s=4:
+#   fenced    20.14s  result=timeout  enforcement=kernel        reason=killed at the 4s cap
+#   unfenced  20.12s  result=timeout  enforcement=timeout-only  reason=killed at the 4s cap
+# Five times the cap, reported as enforced at the cap, and the fenced arm
+# indistinguishable from the unfenced control.
+
+_SPAWNS_A_GRANDCHILD = (
+    "import subprocess, sys, time\n"
+    # The grandchild INHERITS this process's stdout/stderr write ends, which is
+    # the whole mechanism: killing the child does not close them.
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+    "print('up', flush=True)\n"
+    "time.sleep(30)\n")
+
+
+def _grandchild_argv(tmp_path):
+    child = tmp_path / "spawner.py"
+    child.write_text(_SPAWNS_A_GRANDCHILD, encoding="utf-8")
+    return [sys.executable, str(child)]
+
+
+def test_the_cap_holds_when_the_child_leaves_a_live_grandchild(tmp_path):
+    """THE REGRESSION. A cap is a bound on wall clock or it is decoration.
+
+    30s of grandchild against a 4s cap: the run must come back in well under the
+    grandchild's own lifetime, whether or not a job object was available. Without
+    a job the drain grace is what bounds it, so the ceiling asserted here is the
+    cap plus that grace plus slack -- still less than a third of the 30s the
+    unfixed code waited out.
+
+    `Guard.run` calls `run_sandboxed` synchronously on a lane thread, so this
+    wait is the orchestrator's only liveness bound; an unbounded one here pins a
+    lane for as long as a hung grandchild feels like living."""
+    started = time.monotonic()
+    got = r.run_sandboxed(_grandchild_argv(tmp_path), timeout_s=4)
+    elapsed = time.monotonic() - started
+
+    assert got.result == "timeout"
+    ceiling = 4 + r._DRAIN_GRACE_S + 5
+    assert elapsed < ceiling, (
+        f"the cap did not bound the run: {elapsed:.1f}s against a 4s cap "
+        f"(the grandchild sleeps 30s, so this is waiting on IT)")
+
+
+def test_a_cap_that_could_not_take_the_tree_says_so(tmp_path):
+    """The honesty half, and the reason this is a separate test.
+
+    The defect was not only the overrun. The unfixed run reported
+    `enforcement=kernel` and `reason='killed at the 4s cap'` on a run that had
+    just blown that cap by 5x -- a report that is worse than the delay, because
+    it is what a reader trusts instead of the duration.
+
+    When the drain grace expires, something the kill did not reach is still
+    holding the pipes. `duration_s` shows the overrun and the reason must account
+    for it rather than claiming a clean kill."""
+    got = r.run_sandboxed(_grandchild_argv(tmp_path), timeout_s=4)
+
+    assert got.result == "timeout"
+    if got.duration_s > 4 + r._DRAIN_GRACE_S - 0.5:
+        # The tree outlived the kill: no job here, or one that refused.
+        assert "outlived it" in got.reason, (
+            "a run that blew its cap reported a clean kill: " + got.reason)
+    else:
+        # The tree was taken at the cap. Then the plain reason is the true one,
+        # and it must NOT carry the abandonment clause.
+        assert "outlived it" not in got.reason, (
+            "the run met its cap but reported an overrun it did not have: "
+            + got.reason)
+
+
+@_JOBS_ONLY
+def test_the_job_takes_the_grandchild_at_the_cap(tmp_path):
+    """The Windows half, and the canary for the two tests above.
+
+    Both of those pass on a run bounded only by the drain grace, so neither one
+    shows that `TerminateJobObject` does anything. This asserts the fenced arm is
+    strictly better than the grace: the tree is gone AT the cap, so the drain
+    returns at once and the reason carries no abandonment clause.
+
+    That difference is the entire content of `KILL_ON_JOB_CLOSE`'s promise, which
+    the mechanism could not keep while the close sat downstream of the wait it
+    was supposed to interrupt."""
+    limits = r.Limits(memory_bytes=512 * 1024 * 1024)
+    started = time.monotonic()
+    got = r.run_sandboxed(_grandchild_argv(tmp_path), limits=limits, timeout_s=4)
+    elapsed = time.monotonic() - started
+
+    assert got.result == "timeout"
+    assert got.enforcement == "kernel", got.reason
+    assert elapsed < 4 + r._DRAIN_GRACE_S - 0.5, (
+        f"the drain still waited on the grandchild: {elapsed:.1f}s -- the job "
+        "was closed rather than terminated, or terminated too late")
+    assert "outlived it" not in got.reason, (
+        "the job did not take the tree: " + got.reason)

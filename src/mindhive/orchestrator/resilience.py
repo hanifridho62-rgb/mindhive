@@ -60,10 +60,11 @@ from typing import NamedTuple
 from .. import paths
 
 # Imported into THIS module's globals on purpose. `run_sandboxed` and
-# `_run_in_job` call these unqualified, so a test that patches
+# `_run_capped` call these unqualified, so a test that patches
 # `resilience._job_for` or `resilience._assign` still patches what runs --
 # which a `jobs._job_for(...)` call site would silently have stopped doing.
-from .jobs import _assign, _close_job, _job_for, _jobs_available
+from .jobs import (_assign, _close_job, _job_for, _jobs_available,
+                   _terminate_job)
 
 # --- sandbox -------------------------------------------------------------------
 
@@ -157,24 +158,66 @@ def _rlimits_available() -> tuple:
     return True, ""
 
 
-def _run_in_job(argv, job, fence, *, cwd, env, timeout, stdin_text,
-                creationflags):
-    """`subprocess.run`'s contract, with the job assignment in the middle.
+# How long the post-kill drain may wait for the child's pipes to close before
+# the run gives up on its output. It only bites when the kill did NOT take the
+# tree -- a downgraded run, or POSIX, where `proc.kill()` is child-only too --
+# because with the job terminated the write ends are already gone and the drain
+# returns at once. Small on purpose: this wait is the orchestrator's only
+# liveness bound, and before it existed one hung grandchild pinned a lane
+# thread for as long as it felt like living.
+_DRAIN_GRACE_S = 5.0
+
+
+def _run_capped(argv, job, fence, *, cwd, env, timeout, stdin_text,
+                creationflags, **kwargs):
+    """`subprocess.run`'s contract, with the job assignment in the middle and a
+    post-kill drain that cannot outlive the cap.
 
     Answers a real `CompletedProcess` and raises the same `TimeoutExpired` the
     caller already handles, so `run_sandboxed`'s result-building is untouched.
     *fence* is filled in before any wait, so the caller can read the assignment's
-    outcome even on the timeout path."""
+    outcome even on the timeout path.
+
+    Used for the UNFENCED run too (*job* is then ``None``), which is why it is no
+    longer named for the job. `subprocess.run` carries the same unbounded
+    post-kill `communicate()` inside it, so leaving the no-limits path on it left
+    exactly the defect this function was changed to fix -- measured, after the
+    first cut of the fix: the fenced arm came back at 4.03s against a 4s cap and
+    the unfenced control still took 20.11s. Two paths, one of them fixed, is how
+    that survived being called done.
+    """
     proc = subprocess.Popen(
         argv, cwd=cwd, env=env, shell=False,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, creationflags=creationflags)
-    fence["assigned"], fence["why"] = _assign(job, proc)
+        text=True, creationflags=creationflags, **kwargs)
+    if job is not None:
+        fence["assigned"], fence["why"] = _assign(job, proc)
     try:
         out, err = proc.communicate(input=stdin_text, timeout=timeout)
     except subprocess.TimeoutExpired:
+        # ORDER IS THE WHOLE FIX. `proc.kill()` is TerminateProcess on the
+        # CHILD; a grandchild that inherited the pipe write-ends keeps them
+        # open, so the drain below used to block on the grandchild -- with no
+        # timeout -- and the job close that would have taken the tree sits in
+        # `run_sandboxed`'s `finally`, downstream of exactly that wait. Measured
+        # at 20.1s against a 4s cap while reporting `enforcement=kernel` and
+        # "killed at the 4s cap", and indistinguishable from an unfenced run.
         proc.kill()
-        out, err = proc.communicate()
+        _terminate_job(job)              # the tree, before anything waits on it
+        try:
+            out, err = proc.communicate(timeout=_DRAIN_GRACE_S)
+            fence["drained"] = True
+        except subprocess.TimeoutExpired:
+            # Reached when the tree outlived the kill anyway: no job (a
+            # downgraded run, or POSIX, where `proc.kill()` is equally
+            # child-only), or a job that refused to terminate. Give up on the
+            # output rather than the cap -- an unbounded wait here is the
+            # orchestrator's only liveness bound, since `Guard.run` calls this
+            # synchronously on a lane thread. The reader threads are daemons and
+            # die with the process; `fence["drained"]` is False so the caller
+            # reports a cap it could not fully enforce instead of claiming it did.
+            fence["drained"] = False
+            out, err = "", ""
         raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
@@ -271,23 +314,29 @@ def run_sandboxed(argv, limits=None, timeout_s=DEFAULT_TIMEOUT_S, cwd=None,
 
     started = time.monotonic()
     try:
-        if job is not None:
-            proc = _run_in_job(argv, job, fence,
-                               cwd=str(cwd) if cwd else None, env=env,
-                               timeout=timeout_s, stdin_text=stdin_text,
-                               creationflags=paths.NO_WINDOW)
-        else:
-            proc = subprocess.run(
-                argv, cwd=str(cwd) if cwd else None, env=env, shell=False,
-                capture_output=True, text=True, timeout=timeout_s,
-                input=stdin_text, creationflags=paths.NO_WINDOW, **kwargs)
+        # ONE path, fenced or not. The branch that used to sit here sent the
+        # no-limits run through `subprocess.run`, whose own post-kill drain is
+        # unbounded, so the cap held on one arm and not the other.
+        proc = _run_capped(argv, job, fence,
+                           cwd=str(cwd) if cwd else None, env=env,
+                           timeout=timeout_s, stdin_text=stdin_text,
+                           creationflags=paths.NO_WINDOW, **kwargs)
     except subprocess.TimeoutExpired as exc:
         enforcement, downgrade = _fenced()
         # The cap is why this run ENDED; a downgrade is why it was not fenced
         # while it ran. Both, or a timeout on an unfenced run reads as though
         # only the clock was ever asked for.
+        # A cap the run did not actually respect must not report that it did.
+        # `drained` is False only when the pipes were still held after the kill,
+        # which means something the kill did not reach is still alive -- and the
+        # duration will show the overrun, so the reason has to account for it.
+        held = fence.get("drained") is False
         return SandboxResult(result="timeout", enforcement=enforcement,
                              reason=(f"killed at the {timeout_s}s cap"
+                                     + ("; its pipes were still held "
+                                        f"{_DRAIN_GRACE_S}s later, so a process "
+                                        "it spawned outlived it and the output "
+                                        "was abandoned" if held else "")
                                      + (f"; {downgrade}"
                                         if downgrade and enforcement
                                         == TIMEOUT_ONLY and limits is not None

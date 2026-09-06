@@ -47,7 +47,7 @@ _HUNDRED_NS_PER_S = 10_000_000
 
 
 def _kernel32():
-    """`kernel32` with the three entry points bound, or ``None`` off Windows.
+    """`kernel32` with the entry points this module uses, or ``None`` off Windows.
 
     Signatures are declared rather than left to ctypes' defaults: a HANDLE is
     pointer-sized and the implicit `c_int` return truncates it on 64-bit, which
@@ -63,6 +63,8 @@ def _kernel32():
     lib.SetInformationJobObject.restype = ctypes.c_int
     lib.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.AssignProcessToJobObject.restype = ctypes.c_int
+    lib.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.TerminateJobObject.restype = ctypes.c_int
     lib.CloseHandle.argtypes = [ctypes.c_void_p]
     lib.CloseHandle.restype = ctypes.c_int
     return lib
@@ -195,9 +197,41 @@ def _assign(job, proc) -> tuple:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _terminate_job(job, exit_code=1) -> bool:
+    """Kill everything in *job* NOW, leaving the handle open. Never raises.
+
+    KILL_ON_JOB_CLOSE takes the tree too, but only when the handle closes, and
+    the close is the LAST thing `run_sandboxed` does. On the timeout path that
+    is far too late: `proc.kill()` is TerminateProcess on the child alone, a
+    grandchild holding the inherited pipe write-ends keeps them open, and the
+    post-kill drain then waits on that grandchild -- so the mechanism could not
+    run until the thing it exists to interrupt had already finished by itself.
+    Measured at 20.1s against a 4s cap, identical to an unfenced control.
+
+    Separate from `_close_job` rather than an early call to it, because *job* is
+    a raw HANDLE: closing it twice is worse than the bug it would fix, since the
+    value can be reused by another open in between and the second close would
+    take an unrelated handle. This kills; the single existing close still closes.
+
+    Returns whether the kill was actually made, so a caller can report a tree it
+    could NOT take rather than assume it did.
+    """
+    try:
+        lib = _kernel32()
+        if lib is None or job is None:
+            return False
+        return bool(lib.TerminateJobObject(job, exit_code))
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 def _close_job(job) -> None:
     """Close a job handle. Never raises — a failed cleanup must not turn a
-    finished run into an exception."""
+    finished run into an exception.
+
+    Called exactly once per handle, from `run_sandboxed`'s `finally`. Anything
+    that needs the tree dead EARLIER wants `_terminate_job`, which leaves this
+    close the only one."""
     try:
         _kernel32().CloseHandle(job)
     except Exception:                                   # noqa: BLE001
