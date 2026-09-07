@@ -1,0 +1,12 @@
+# Shell shims must keep LF endings whatever `core.autocrlf` says.
+#
+# This repo is developed on Windows with `core.autocrlf=true` and carried no
+# .gitattributes, so a `.sh` file committed here would be checked out with CRLF
+# — and `#!/bin/sh` followed by a carriage return is not a shebang, it is
+# `bad interpreter: /bin/sh^M`. The POSIX hook shims under hooks/ would have
+# been born broken on every Linux checkout, including the ubuntu CI legs.
+#
+# Scoped to *.sh deliberately. A blanket `* text=auto eol=lf` would renormalise
+# every file in the repository in one commit, which is a different change than
+# the one being made here.
+*.sh text eol=lf
