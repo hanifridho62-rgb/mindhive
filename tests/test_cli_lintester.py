@@ -249,3 +249,79 @@ def test_the_reflector_reaches_the_repair_loop_that_calls_it(monkeypatch):
     assert got["reflector"] is marker, (
         f"the repair loop was built with {got.get('reflector')!r}, so the "
         f"orchestrator's reflector never reaches the code that calls it")
+
+
+# --- the machine, not the mission (environment preflight) ---------------------
+
+def _mission(**kw):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    base = dict(intent="x", mission_id="lm-1", outcome="environment",
+                reason="the Claude CLI on this machine is not logged in",
+                environment="auth", left=("t-2",), dry_run=False)
+    base.update(kw)
+    return lint_mod.Mission(**base)
+
+
+def test_a_run_that_starts_work_is_refused_when_the_machine_cannot_start_a_child(
+        capsys, monkeypatch):
+    """Refused BEFORE a lane is made, with the fix named on stderr."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    started = []
+    monkeypatch.setattr(lint_cli, "_preflight",
+                        lambda: ("auth", "claude auth status: loggedIn=false "
+                                         "(authMethod=none)"))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        started.append(intent))
+    assert _cli("lintester", "make the writer retry", "--execute") == 3
+    assert started == [], "a mission was started on a machine that refused"
+    captured = capsys.readouterr()
+    assert "before any lane was made" in captured.err
+    assert "log in" in captured.err
+    assert captured.out == ""
+
+
+def test_the_json_surface_carries_the_environment_refusal(capsys, monkeypatch):
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("cli-missing", "no `claude` executable on PATH"))
+    assert _cli("lintester", "make the writer retry", "--execute", "--json") == 3
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["outcome"] == "environment"
+    assert payload["environment"] == "cli-missing"
+    assert "install" in payload["reason"]
+    assert "before any lane was made" in captured.err
+
+
+def test_a_dry_run_never_probes_the_machine(monkeypatch):
+    """The probe spawns a process; a plan spawns nothing, and must not start."""
+    probed = []
+    monkeypatch.setattr(lint_cli, "_preflight",
+                        lambda: probed.append(1) or ("auth", "x"))
+    assert _cli("lintester", "make the writer retry") == 0
+    assert probed == []
+
+
+def test_an_environment_outcome_exits_with_its_own_status_and_names_what_was_left(
+        capsys, monkeypatch):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        _mission())
+    assert _cli("lintester", "x", "--execute") == lint_cli.ENVIRONMENT_STATUS
+    out = capsys.readouterr().out
+    assert "environment: auth" in out
+    assert "never started: t-2" in out
+    assert "lm-1: environment" in out
+
+
+def test_the_environment_status_is_distinct_from_a_partial_run():
+    assert lint_cli._status("ok") == 0
+    assert lint_cli._status("dry-run") == 0
+    assert lint_cli._status("partial") == 1
+    assert lint_cli._status("refused") == 1
+    assert lint_cli._status("environment") == lint_cli.ENVIRONMENT_STATUS
+    assert lint_cli.ENVIRONMENT_STATUS not in (0, 1)

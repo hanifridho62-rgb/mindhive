@@ -45,6 +45,14 @@ def cmd_lintester(args) -> int | None:
         return 2
 
     started = bool(args.execute)
+    if started:
+        # Asked BEFORE a lane is made and before the board is built: a machine
+        # whose CLI is not logged in can start no child, and every lane it
+        # opened would only be torn down again to say so. The run path halts
+        # on the same fact if this probe is inconclusive -- see `environment`.
+        kind, detail = _preflight()
+        if kind:
+            return _refuse_environment(args, kind, detail)
     bus, observer, why, board, board_stream = _observer(args, started)
     if why:
         # stderr, not stdout: `--json` is a machine surface and a friendly
@@ -77,12 +85,50 @@ def cmd_lintester(args) -> int | None:
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
-        return 0 if mission.outcome in ("ok", "dry-run") else 1
+        return _status(mission.outcome)
 
     _print(mission)
     if scored is not None:
         _print_payoff(scored)
-    return 0 if mission.outcome in ("ok", "dry-run") else 1
+    return _status(mission.outcome)
+
+
+# The machine refused, not the mission: the same status the preflight answers,
+# and distinct from `1` so a wrapper can tell "some units failed" from "nothing
+# could start here" without parsing the report.
+ENVIRONMENT_STATUS = 3
+
+
+def _status(outcome) -> int:
+    if outcome in ("ok", "dry-run"):
+        return 0
+    return ENVIRONMENT_STATUS if outcome == "environment" else 1
+
+
+def _preflight():
+    """`environment.preflight`, behind a seam a test can replace."""
+    from . import environment as env_mod
+
+    return env_mod.preflight()
+
+
+def _refuse_environment(args, kind, detail) -> int:
+    """Say what is wrong with the machine and name the fix, then stop.
+
+    The sentence goes to stderr whether or not `--json` was asked for, and the
+    JSON surface gets a report of the same shape a mission would print, so a
+    caller parsing stdout sees an `environment` outcome rather than nothing."""
+    from . import environment as env_mod
+
+    reason = env_mod.describe(kind, detail)
+    print(f"lintester: refused before any lane was made -- {reason}",
+          file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"outcome": "environment", "environment": kind,
+                          "reason": reason, "dry_run": False,
+                          "tasks": [], "lanes": [], "left": []},
+                         indent=2, sort_keys=True))
+    return ENVIRONMENT_STATUS
 
 
 def _close_board(bus, board, stream=None) -> None:
@@ -267,6 +313,10 @@ def _print(mission) -> None:
         print(f"  kept: {line}")
     for line in mission.rollbacks:
         print(f"  rollback: {line}")
+    if mission.environment:
+        print(f"  environment: {mission.environment}")
+    if mission.left:
+        print(f"  never started: {', '.join(mission.left)}")
     verdict = str((mission.calibration or {}).get("verdict") or "")
     if verdict:
         print(f"  weight against measured time: {verdict}")

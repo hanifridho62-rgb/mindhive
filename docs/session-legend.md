@@ -110,6 +110,25 @@ Units are MN-numbered; the number in each docstring is the address.
 | `autodeclare.py` | MN-18 — decide whether a prompt should mint a task at all. |
 | `telemetry.py`, `ui_cats.py`, `ui_sessions.py` | MN-1 U10 / MN-5 U8 / MN-19 — the faculty activity feed (`mindnet_activity`) and the two cat boards. **MN-10 is a different slice**: the pr-green completion gate in `orchestrator.py` (DATA_MODEL.md §4.9). |
 
+### `orchestrator/` — the lintester mission pipeline (WB1–WB7)
+
+One intent in, one `Mission` out — `hive lintester`. Every module delegates to
+the incumbent named in `orchestrator/__init__.py`; none forks one. A dry run is
+the default, and `--execute` is the only difference between looking and doing.
+
+| Module | Owns |
+|---|---|
+| `lintester.py` | WB1 — `LintesterOrchestrator.execute_mission`: intent → units → weighted lanes → briefs → scheduler → merge-back. `Mission` is the report; `AgentTask` is the closed per-child view. |
+| `metrics.py` | WB2 — the structural spine: `ComplexityVisitor` (AST), `git log --numstat` churn, `calculate_workload_weight`. |
+| `queue.py` | WB3 — the asyncio work-stealing scheduler: LIFO local, FIFO steal, JSON checkpoint sidecar, `halt` / `left`. |
+| `worktree.py` | WB4 — `.worktrees/lane-N` acquisition, rollback and merge-back, over `mindnet.worktree`. |
+| `resilience.py` | WB5 — the sandbox (`run_sandboxed`), `ToolCircuitBreaker`, `RepairLoop` (fall-back + defused stderr injection), `reflect_on_open`. |
+| `environment.py` | Environment failure vs task failure: `environment_failure` (the classifier), `preflight` (`claude auth status`), and the brake `RepairLoop` pulls so a machine that cannot start a child halts the mission instead of retrying every unit. |
+| `payoff.py` | Static waves against weighted lanes, and the weight scored against measured wall time (`calibrate`, `hive lintester --calibration`). |
+| `jobs.py` | Windows Job Objects — the sandbox's kernel fence where `resource` is absent. |
+| `board.py`, `dashboard.py` | WB7 — the event bus and the terminal board (`--board`). |
+| `cli.py` | `hive lintester`. Exit 0 ok / dry run, 1 partial or refused, 3 the machine (not the mission) refused. |
+
 ### `rotation/` — smart-zone session rotation
 
 Interactive sessions only, and **opt-in**: inert unless `MINDHIVE_ROTATION` is

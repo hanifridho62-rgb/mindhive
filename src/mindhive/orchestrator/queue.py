@@ -269,6 +269,13 @@ class WorkStealingScheduler:
         self.steals = 0
         self._inflight = 0
         self._interrupted = False
+        # Set by `halt`, and distinct from an interrupt on purpose. An interrupt
+        # is the operator's: it propagates as an exception and writes a
+        # checkpoint on the way out. A halt is the mission's own decision that
+        # dispatching more would only repeat a failure the machine has already
+        # reported, so the loops wind down normally and `run` answers what it
+        # has. `left()` names what was never started.
+        self.halted = ""
         # Entries currently executing, per lane. The checkpoint needs them: an
         # entry that `take()` has dispatched is in no lane's deque any more, so a
         # checkpoint built from the deques alone LOSES exactly the unit that was
@@ -331,8 +338,28 @@ class WorkStealingScheduler:
                 return await lane.take()
         return None
 
+    def halt(self, reason) -> None:
+        """Stop taking new work. Idempotent; the first reason is the one kept.
+
+        In-flight units are NOT cancelled. A child that is running is a child
+        that could run, and killing it would turn a halt into damage -- the
+        opposite of the point, which is that nothing else gets hurt."""
+        if not self.halted:
+            self.halted = str(reason or "").strip() or "halted"
+
+    def left(self) -> list:
+        """Entries still queued on any lane -- what a halt left unstarted.
+
+        Empty after a run that drained every lane. Read after `run`, and only
+        then: while lanes are working the answer is stale by the time it is
+        returned, for the same reason `WorkerLane.depth` takes no lock."""
+        out = []
+        for lane in self.lanes:
+            out.extend(e for e in tuple(lane._deque) if e.state == QUEUED)
+        return out
+
     async def _work(self, lane):
-        while not self._interrupted:
+        while not self._interrupted and not self.halted:
             entry = await lane.take()
             if entry is None:
                 entry = await self._steal_for(lane)

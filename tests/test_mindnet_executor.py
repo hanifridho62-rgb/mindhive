@@ -882,3 +882,79 @@ def test_the_module_adds_no_dependency():
                             "time", "dataclasses", "pathlib", "typing"} \
                 or s.startswith("from .") or s.startswith("from ..") \
                 or head == "mindhive", s
+
+
+# --- the Windows Store interpreter stub ---------------------------------------
+# `paths.resolve_interpreter`: a bare `python` that PATH would hand to the
+# Store's App Execution Alias never runs a line -- it prints an install prompt
+# and exits 49, which is not ENOENT -- so the executor swaps it for the
+# interpreter running this process and writes the swap into the artifact.
+
+WINDOWS_APPS = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe"
+
+
+def test_a_bare_python_that_path_hands_to_the_store_alias_is_swapped():
+    argv, note = paths.resolve_interpreter(("python", "x.py"),
+                                           which=lambda n: WINDOWS_APPS,
+                                           executable="/venv/bin/python")
+    assert argv == ("/venv/bin/python", "x.py")
+    assert "App Execution Alias" in note
+    assert "/venv/bin/python" in note
+
+
+def test_a_bare_python_that_resolves_to_nothing_is_swapped_too():
+    argv, note = paths.resolve_interpreter(["python3", "-c", "pass"],
+                                           which=lambda n: None,
+                                           executable="/venv/bin/python")
+    assert argv == ("/venv/bin/python", "-c", "pass")
+    assert "nothing on PATH" in note
+
+
+def test_a_real_interpreter_on_path_is_left_alone():
+    argv, note = paths.resolve_interpreter(("python", "x.py"),
+                                           which=lambda n: "/usr/bin/python",
+                                           executable="/venv/bin/python")
+    assert argv == ("python", "x.py")
+    assert note == ""
+
+
+@pytest.mark.parametrize("head", [r"C:\py\python.exe", "/usr/bin/python3",
+                                  "pytest", "git"])
+def test_a_path_or_another_program_is_never_touched(head):
+    """A path is the author's explicit choice; a non-interpreter is not the
+    alias problem at all, even when `which` finds nothing."""
+    argv, note = paths.resolve_interpreter((head, "x"), which=lambda n: None,
+                                           executable="/venv/bin/python")
+    assert argv == (head, "x")
+    assert note == ""
+
+
+def test_resolution_is_total_on_an_empty_argv_and_a_raising_which():
+    assert paths.resolve_interpreter(()) == ((), "")
+    argv, note = paths.resolve_interpreter(
+        ("python", "x"), which=lambda n: (_ for _ in ()).throw(OSError("x")),
+        executable="/venv/bin/python")
+    assert argv == ("/venv/bin/python", "x") and "nothing on PATH" in note
+
+
+def test_the_executor_runs_this_interpreter_for_a_bare_python_and_records_the_swap(
+        tmp_path, monkeypatch):
+    import shutil
+
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which",
+                        lambda name, *a, **k: (WINDOWS_APPS
+                                               if name in ("python", "python3")
+                                               else real_which(name, *a, **k)))
+    marker = _marker(tmp_path)
+    script = " ".join(["python", str(MOCK), "--marker", str(marker),
+                       "--mode", "ok"])
+    run = x_mod.execute("mn-stub-1", script, root=tmp_path, timeout_s=30)
+    assert run.result == "ok", run.reason
+    assert run.executed is True
+    assert _ran(marker) == 1, "the mock never ran -- the alias was not swapped"
+    assert run.argv[0] == sys.executable
+    assert run.artifact is not None
+    text = Path(run.artifact).read_text(encoding="utf-8")
+    assert "note:" in text and "App Execution Alias" in text
+    assert f"argv:   {list(run.argv)}" in text, "the header shows the requested argv, not the one that ran"

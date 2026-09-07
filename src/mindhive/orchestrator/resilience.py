@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .. import paths
+from . import environment as env_mod
 
 # Imported into THIS module's globals on purpose. `run_sandboxed` and
 # `_run_capped` call these unqualified, so a test that patches
@@ -532,6 +533,10 @@ class RepairDecision:
     prompt_suffix: str = ""
     attempts: int = 0
     state: str = ""
+    # Non-empty when the failure was the MACHINE's, not the task's -- one of
+    # `environment.KINDS`. Such an entry is neither re-queued nor counted
+    # against its breaker, because a retry could only repeat it.
+    environment: str = ""
 
 
 def _stderr_of(entry) -> str:
@@ -576,7 +581,7 @@ class RepairLoop:
 
     def __init__(self, breaker=None, max_attempts=DEFAULT_MAX_ATTEMPTS,
                  fall_back=None, key_for=None, project=None, reflector=None,
-                 rollback=None, bus=None):
+                 rollback=None, bus=None, halt=None):
         self.breaker = breaker if breaker is not None else ToolCircuitBreaker()
         self.max_attempts = max(1, int(max_attempts))
         self.fall_back = fall_back if fall_back is not None else default_fall_back
@@ -601,6 +606,14 @@ class RepairLoop:
         # else — this module does not import the board it feeds.
         self.bus = bus
         self.observer_drops = 0
+        # The brake. Called ONCE, with a reason, the first time a failure turns
+        # out to be the machine's rather than a task's -- see `_environment`.
+        # `lintester` points it at `WorkStealingScheduler.halt`; a loop built
+        # without one still refuses to repair such an entry, it just cannot
+        # stop the lanes beside it from dispatching the next.
+        self.halt = halt
+        self.halted = ""
+        self.environment: list = []
 
     def _emit(self, kind, **fields) -> None:
         """Publish one state change; never let a display fail a repair."""
@@ -615,6 +628,9 @@ class RepairLoop:
     def observe(self, entry) -> RepairDecision:
         """Decide what happens to one failed *entry*. Appends no side effects
         beyond the fall-back and the reflection it explicitly performs."""
+        kind = env_mod.environment_failure(entry)
+        if kind:
+            return self._environment(entry, kind)
         key = self.key_for(entry)
         signature = _signature_for(entry)
         before = len(self.breaker.opened)
@@ -666,6 +682,38 @@ class RepairLoop:
                                   prompt_suffix=suffix,
                                   reason="re-queued with the failure quoted")
         self.decisions.append(decision)
+        return decision
+
+    def _environment(self, entry, kind) -> RepairDecision:
+        """The short-circuit for a failure that was never the task's.
+
+        Nothing the loop normally does applies. A fall-back would move the task
+        back a phase it never left; the stderr injection would quote the
+        machine's complaint into a prompt as if the child had said it; a
+        rollback would discard work no child did; a breaker record would open a
+        per-task breaker for a fault the task does not own, and then spend a
+        reflection on it. The one action that helps -- stop dispatching -- is
+        the one this loop cannot take alone, so it is delegated to `halt`, once.
+
+        Recorded before it is acted on, the way `_roll_back` records a refusal:
+        a halt that could not be delivered is a different fact from one that
+        was, and `environment` carries both."""
+        attempts = int(getattr(entry, "attempts", 0) or 0)
+        reason = env_mod.describe(kind, str(getattr(entry, "reason", "") or ""))
+        decision = RepairDecision(requeued=False, attempts=attempts,
+                                  environment=kind, reason=reason)
+        self.decisions.append(decision)
+        row = {"key": self.key_for(entry), "kind": kind, "reason": reason,
+               "task_id": str(getattr(entry, "task_id", "") or "")}
+        self.environment.append(row)
+        if not self.halted:
+            self.halted = reason
+            self._emit("note", text=f"halted: {reason}")
+            if self.halt is not None:
+                try:
+                    self.halt(reason)
+                except Exception as exc:                # noqa: BLE001
+                    row["halt_error"] = f"{type(exc).__name__}: {exc}"
         return decision
 
     def succeeded(self, entry, lane=None) -> str:

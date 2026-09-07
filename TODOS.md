@@ -717,6 +717,17 @@ tests pin the two properties that make the race impossible rather than reproduci
 
 ## 23. Nobody has measured whether briefing a sub-agent actually helps
 
+> **2026-09-07.** Still open, and the gap is now named precisely. No `--execute` run has
+> ever completed on this machine because the CLI is not logged in: `claude auth status --json`
+> answers `{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}` at exit 1.
+> Before this date such a run would not have refused — `lintester._run_child` folded the
+> CLI's `refused` into `fail`, and the repair loop, breaker, rollback and calibration all ran
+> on N phantom failures while every lane kept dispatching. `orchestrator/environment.py` now
+> brakes the mission on the first machine-level refusal (outcome `environment`, exit 3) and
+> `hive lintester --execute` refuses at the front door with the fix named. The measurement
+> this item needs is one owner action away: `claude auth login` (or `/login` inside `claude`),
+> then `hive mindnet ab --execute --record`.
+
 Branch 1 of the Lintester work builds a per-task briefing composer and the telemetry to prove the
 brief *arrives*. It does not, and cannot, prove the brief **helps** — that needs an A/B over real
 runs, and the CEO plan states explicitly that Branch 2 (the rolling frontier, the `hive lintester`
@@ -785,7 +796,13 @@ The off switch is `MINDHIVE_BRIEF=0` (`brief.ENV_SWITCH`), and `hive mindnet bri
 exactly what a child would receive with it either way, which is the per-task inspection surface
 the A/B needs.
 
-## 24. The mindhive-orchestrator skill Claude actually loads is two minor versions old
+## 24. ~~The mindhive-orchestrator skill Claude actually loads is two minor versions old~~ — CLOSED 2026-09-07
+
+> **Closed 2026-09-07.** `~/.claude/plugins/cache/mindhive-dev/mindhive/` now holds only
+> `0.5.0`, matching `.claude-plugin/plugin.json`; the `0.3.0` copy is gone. It was closed by
+> refreshing the global plugin install (`claude plugin update mindhive@mindhive-dev`), not by
+> editing the repo — the ledger decision "Closed TODOS 24 by REFRESHING the global plugin
+> install" records it. The text below describes the machine as it was.
 
 `.claude-plugin/plugin.json` declares `0.5.0`. The copy Claude Code actually loads is
 `~/.claude/plugins/cache/mindhive-dev/mindhive/0.3.0/skills/mindhive-orchestrator/SKILL.md`.
@@ -968,6 +985,15 @@ from the same review are recorded here rather than fixed, because each is outsid
 
 ## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
 
+> **2026-09-07.** Still open; the missing sample is blocked by the same fact as item 23 —
+> the CLI on this machine is not logged in (`claude auth status --json` →
+> `{"loggedIn": false, "authMethod": "none"}`). Two things changed so that the FIRST real
+> sample will be a real one: `lintester._calibrate` now skips any unit whose child never
+> started (before, a refused child's few milliseconds would have been recorded as a
+> measurement of its weight), and the mission halts on a machine-level refusal instead of
+> spending `max_attempts` per unit on it. Owner action: `claude auth login`, then
+> `hive lintester "<intent>" --execute`; the sample lands in `hive lintester --calibration`.
+
 `src/mindhive/orchestrator/` shipped on 2026-09-01 and closes all 22 open items from
 the PRD conformance sweep: `LintesterOrchestrator.execute_mission`, an `ast.NodeVisitor`
 cyclomatic metric, `git log --numstat` churn, an asyncio work-stealing scheduler with a
@@ -1102,6 +1128,13 @@ state is a record of the worst the mission ever saw rather than of where it stan
 ---
 
 ## 29. The terminal board is built and exercised; what no test can prove is that it reads well
+
+> **2026-09-07.** Still open, blocked by the same login as items 23 and 27. One more
+> event now reaches the board that has never been rendered against a real run: the
+> `note` alert (`halted: the Claude CLI on this machine is not logged in …`) that
+> `RepairLoop` publishes when the mission brakes on a machine-level refusal. When the
+> first real `--board --execute` run happens, check that this alert reads as "the machine,
+> not the mission" and does not scroll the lane rows away.
 
 `src/mindhive/orchestrator/dashboard.py` shipped on 2026-09-01: an `asyncio.Queue` publish/subscribe
 bus, ten frozen Event State objects, a pure `Board` fold, a `rich` `Live` layout split into the
