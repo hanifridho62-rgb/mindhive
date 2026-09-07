@@ -126,7 +126,7 @@ argparse wiring only so this rebases cleanly.
 
 ---
 
-## 6. Hooks are Windows-only
+## 6. ~~Hooks are Windows-only~~ — DONE 2026-09-07
 
 **What:** POSIX equivalents alongside `hooks/*.ps1`, if MIND HIVE is ever to run elsewhere.
 
@@ -139,6 +139,24 @@ layer, so all of them are Windows-only today.
 building around it. Naming it was the decision; building it is this TODO.
 
 **Depends on:** an actual second machine or platform to justify the work.
+
+> **2026-09-07.** Nine `.sh` shims plus `hooks/lib.sh`, one per `.ps1`, and
+> `tests/test_hook_shims.py` (173 tests) holding them to the contract. The test that matters most
+> is the parity pair: every `.ps1` must have a `.sh` sibling and the reverse, and the two must
+> dispatch to the same `mindhive hook` stage, so the families cannot drift apart silently. The
+> rest is shaped around what a hook must NOT do — exit non-zero, print on a decision channel,
+> block on a read, leak a child's stderr — under inputs designed to break it: no payload, garbage
+> payload, no interpreter, an interpreter that is really the Windows Store redirector.
+>
+> Two things the port surfaced that the `.ps1` family shares, recorded as items 30 and 31 rather
+> than fixed here: the live hooks are not edited from a feature branch. And one thing that would
+> have shipped broken without a test: with `core.autocrlf=true` and no `.gitattributes`, every
+> Linux checkout — the ubuntu CI legs included — would have received the shims with CRLF and
+> `bad interpreter: /bin/sh^M`. The new `.gitattributes` holds one line, `*.sh text eol=lf`,
+> scoped that narrowly so it renormalises nothing else.
+>
+> The "second machine" this depended on has still not been used: every run so far is Git Bash
+> `sh` on this Windows box. The ubuntu CI legs are the first real POSIX execution.
 
 ---
 
@@ -1176,3 +1194,59 @@ render path with no guard, so a single drifted field killed the mission the boar
 
 **Cons of leaving it:** none of the above blocks anything. The gaps are the same one gap item 27
 names — no mission has ever been executed for real — wearing a second hat.
+
+---
+
+## 30. The nine live `.ps1` hooks hard-code one machine's interpreter, and trust the payload's session id
+
+**What:** `hooks/*.ps1` — all nine — open with
+`$py = "C:\Users\hanif\mindhive\.venv\Scripts\python.exe"`, and `session_start.ps1` /
+`session_end.ps1` take `session_id` straight out of `ConvertFrom-Json` into `$env:MINDHIVE_SESSION`.
+
+**Why it matters:** the path is correct on exactly one machine, for one username, for one
+checkout; a clone anywhere else registers nine hooks that silently do nothing. The session id
+names a ledger segment (`<events>/<session_id>.jsonl`, see item 31), and a payload whose
+`session_id` is a nested object reaches the child as the string `@{a=1}`.
+
+**How the POSIX side handles both, so the fix is already designed:** `hooks/lib.sh`
+`mindhive_python` resolves in a fixed order — `$MINDHIVE_PYTHON` if executable, the nearest
+`.venv` above the hook, then PATH with the WindowsApps redirector refused — and
+`mindhive_session_id` whitelists the id to `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`, mapping
+anything else to `unknown`. `tests/test_hook_shims.py` pins both. The `.ps1` port is `Resolve-MindHivePython`
+from the `windows-powershell-patterns` skill plus a `-match` on the same regex.
+
+**Why not fixed on 2026-09-07:** these are the LIVE hooks, registered in `~/.claude/settings.json`
+and firing in every session on this machine. A feature branch is the wrong place to edit them —
+the edit takes effect the moment the branch is checked out, before any review. Do it as its own
+change, from master, with the harness verification loop (`claude-harness-verification`) run
+before and after.
+
+---
+
+## 31. `events.append_event` names the segment file from an unchecked session id
+
+**What:** `src/mindhive/events.py` `append_event` does
+`seg = d / f"{session_id}.jsonl"` with `session_id` taken from the argument or
+`MINDHIVE_SESSION`, unchecked. A value with a path separator writes outside `events/`; a value
+with characters Windows refuses (`:`, `*`, `?`, `"`, `<`, `>`, `|`) raises `OSError` from inside
+the append lock.
+
+**Where the value comes from today:** the hooks, which read it from Claude Code's payload; the
+CLI's `--session`; and `hive session run`. Claude Code's ids are UUIDs, so nothing real trips it,
+and the POSIX shims now refuse anything but `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` before it
+reaches the environment. The `.ps1` hooks do not (item 30), and nothing stops a caller passing
+`--session ../../x`.
+
+**The shim whitelist does not cover every path.** `post_tool_use` and `post_tool_use_failure`
+hand the RAW payload to `mindhive hook <stage>`, and it is the Python stage handler that reads
+`session_id` out of it and calls `append_event`. Those two stages never go through
+`mindhive_session_id`, so the shim-side check is bypassed for exactly the hook that fires on
+every tool call. That is one more reason the fix belongs in `append_event` and nowhere else.
+
+**Fix:** validate in `append_event` itself, the one place every writer goes through — the same
+whitelist, raising `ValueError` on a miss so a bad id is a loud failure at the call site rather
+than a file in the wrong directory. The reader side (`read_all`, `corrupt_rows`) globs
+`*.jsonl` and needs no change. One test per rejected shape, one for a UUID accepted verbatim.
+
+**Why not in the hooks PR:** it is a change to the ledger's write path, with its own blast
+radius and its own review; the hooks change is additive and touches no `src/`. Keep them apart.
