@@ -89,6 +89,11 @@ REMINDER = "MIND HIVE: before compaction, fold this session"
 sh_missing = pytest.mark.skipif(shutil.which("sh") is None,
                                 reason="no POSIX sh on this machine")
 
+# `subprocess` resolves a bare program name through the PATH of the env it is
+# GIVEN (`os.get_exec_path(env)`), so a test that hands a shim a private PATH
+# would lose `sh` itself on POSIX. Resolve it once, through the real PATH.
+SH = shutil.which("sh") or "sh"
+
 
 # --- helpers -------------------------------------------------------------------
 
@@ -105,6 +110,35 @@ def _coreutils_dir() -> str:
     return str(Path(found).parent) if found else "/usr/bin"
 
 
+def _path_without_python(tmp_path) -> str:
+    """A PATH holding the three binaries the shims exec -- `cat`, `dirname`,
+    `tr` -- and no python at all.
+
+    `_coreutils_dir()` alone is not that on Linux: `cat` lives in /usr/bin and
+    so does python3, so every "no interpreter" scenario built on it found the
+    system interpreter and proved nothing. Measured on Ubuntu 24.04 (dash):
+    the directory-in-MINDHIVE_PYTHON test answered `/usr/bin/python3`, rc=0,
+    while the same test passed on Windows only because Git's `usr/bin` ships
+    no python. So on POSIX the tools are linked into a private directory; on
+    Windows Git's `usr/bin` is used as before, and the test names the reason
+    if that directory ever grows an interpreter."""
+    if os.name == "nt":
+        tools = _coreutils_dir()
+        for name in ("python", "python3"):
+            if shutil.which(name, path=tools):
+                pytest.skip(f"{tools} carries {name}; cannot build a "
+                            "python-free PATH here")
+        return tools
+    tools = tmp_path / "tools-without-python"
+    tools.mkdir()
+    for name in ("cat", "dirname", "tr"):
+        found = shutil.which(name)
+        if found is None:
+            pytest.skip(f"no `{name}` on this machine")
+        (tools / name).symlink_to(found)
+    return str(tools)
+
+
 def run_shim(name, payload=PAYLOAD, env=None, stdin=True, timeout=60):
     """Run one shim under `sh` and answer its `CompletedProcess`.
 
@@ -118,7 +152,7 @@ def run_shim(name, payload=PAYLOAD, env=None, stdin=True, timeout=60):
     child.pop("MINDHIVE_ROTATION", None)
     child.update(env or {})
     return subprocess.run(
-        ["sh", str(HOOKS / f"{name}.sh")],
+        [SH, str(HOOKS / f"{name}.sh")],
         input=(payload if stdin else ""), text=True, shell=False,
         capture_output=True, timeout=timeout, cwd=str(REPO), env=child)
 
@@ -130,7 +164,7 @@ def probe(script, env=None):
     for key in ("MINDHIVE_PYTHON", "MINDHIVE_HOOK_WALK_LIMIT", "MINDHIVE_HEADLESS"):
         child.pop(key, None)
     child.update(env or {})
-    return subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+    return subprocess.run([SH, "-c", script], capture_output=True, text=True,
                           shell=False, cwd=str(REPO), env=child, timeout=30)
 
 
@@ -289,14 +323,14 @@ def test_a_shim_carries_no_bashism_this_suite_knows_about(name):
 @sh_missing
 @pytest.mark.parametrize("name", sorted(STAGE))
 def test_a_shim_parses(name):
-    got = subprocess.run(["sh", "-n", str(HOOKS / f"{name}.sh")],
+    got = subprocess.run([SH, "-n", str(HOOKS / f"{name}.sh")],
                          capture_output=True, text=True, shell=False)
     assert got.returncode == 0, got.stderr
 
 
 @sh_missing
 def test_the_library_parses():
-    got = subprocess.run(["sh", "-n", str(HOOKS / "lib.sh")],
+    got = subprocess.run([SH, "-n", str(HOOKS / "lib.sh")],
                          capture_output=True, text=True, shell=False)
     assert got.returncode == 0, got.stderr
 
@@ -360,12 +394,13 @@ def test_a_shim_survives_an_interpreter_that_fails(name, fake_python):
 def test_a_shim_with_no_interpreter_is_a_silent_no_op(name, tmp_path):
     """The resolver finding nothing must degrade to doing nothing.
 
-    PATH keeps the coreutils directory because the shims genuinely use `cat`
-    and `dirname`; emptying it would break the shim before the code under test
-    ran, and prove nothing."""
+    PATH keeps the binaries the shims genuinely exec (`cat`, `dirname`,
+    `tr`) because emptying it would break the shim before the code under test
+    ran -- and it must hold no python, or on Linux the shim finds
+    /usr/bin/python3 and the scenario under test never happens."""
     env = {"MINDHIVE_PYTHON": str(tmp_path / "absent"),
            "MINDHIVE_HOOK_WALK_LIMIT": "0",
-           "PATH": _coreutils_dir()}
+           "PATH": _path_without_python(tmp_path)}
     got = run_shim(name, env=env)
     assert got.returncode == 0
     if name != "pre_compact":
@@ -395,7 +430,7 @@ def run_file(path, payload=PAYLOAD, env=None, timeout=60):
     for key in ("MINDHIVE_HEADLESS", "MINDHIVE_ROTATION"):
         child.pop(key, None)
     child.update(env or {})
-    return subprocess.run(["sh", str(path)], input=payload, text=True, shell=False,
+    return subprocess.run([SH, str(path)], input=payload, text=True, shell=False,
                           capture_output=True, timeout=timeout, cwd=str(REPO),
                           env=child)
 
@@ -492,7 +527,7 @@ def test_a_directory_in_mindhive_python_is_not_an_interpreter(tmp_path):
               f'. "{(HOOKS / "lib.sh").as_posix()}"; mindhive_python; echo "rc=$?"')
     got = probe(script, env={"MINDHIVE_PYTHON": str(tmp_path),
                              "MINDHIVE_HOOK_WALK_LIMIT": "0",
-                             "PATH": _coreutils_dir()})
+                             "PATH": _path_without_python(tmp_path)})
     assert got.stdout.strip() == "rc=1", got.stdout
 
 
@@ -507,7 +542,7 @@ def test_the_resolver_walks_from_the_physical_cwd_when_nothing_is_set(tmp_path):
     child = dict(os.environ)
     for key in ("MINDHIVE_PYTHON", "MINDHIVE_HOOK_WALK_LIMIT", "MINDHIVE_HOOK_DIR"):
         child.pop(key, None)
-    got = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+    got = subprocess.run([SH, "-c", script], capture_output=True, text=True,
                          shell=False, cwd=str(deep), env=child, timeout=30)
     assert got.returncode == 0, got.stderr
     # `pwd -P` spells the drive its own way (`/c/...` under Git Bash), so the
@@ -535,7 +570,7 @@ def test_the_venv_is_found_through_a_symlinked_hooks_dir(tmp_path):
         pytest.skip("cannot create a directory symlink here")
     got = run_file(link / "post_tool_use.sh",
                    env={"MINDHIVE_PYTHON": str(tmp_path / "absent"),
-                        "PATH": _coreutils_dir()})
+                        "PATH": _path_without_python(tmp_path)})
     assert got.returncode == 0, got.stderr
     assert log.exists() and "hook post_tool_use" in log.read_text(encoding="utf-8"), (
         "the resolver never reached the venv beside the real hooks dir")
@@ -559,7 +594,7 @@ def test_a_path_python_under_windowsapps_is_refused(tmp_path):
         stub.chmod(0o755)
     env = {"MINDHIVE_PYTHON": str(tmp_path / "absent"),
            "MINDHIVE_HOOK_WALK_LIMIT": "0",
-           "PATH": f"{alias}{os.pathsep}{_coreutils_dir()}"}
+           "PATH": f"{alias}{os.pathsep}{_path_without_python(tmp_path)}"}
     got = run_shim("post_tool_use", env=env)
     assert got.returncode == 0
     assert "Microsoft Store" not in got.stdout, (
