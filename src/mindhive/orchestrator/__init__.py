@@ -40,6 +40,7 @@ identifier and never quoted.
 """
 from __future__ import annotations
 
+from .environment import environment_failure, preflight
 from .lintester import AgentTask, LintesterOrchestrator, Mission, run_mission
 from .metrics import ComplexityVisitor, Weight, calculate_workload_weight
 from .payoff import (Calibration, Payoff, Sample, Schedule, calibrate,
@@ -60,7 +61,7 @@ __all__ = [
     "QUEUED", "QueueEntry", "RUNNING", "RepairLoop", "Sample", "SandboxResult",
     "Schedule", "TaskStarted", "ToolCircuitBreaker", "VALIDATED", "Weight",
     "WorkStealingScheduler", "WorkStolen", "WorkerLane", "attach",
-    "calculate_workload_weight", "calibrate", "lane_path_for", "render_plain",
-    "rollback", "run_mission", "run_sandboxed", "simulate_lanes",
-    "simulate_waves",
+    "calculate_workload_weight", "calibrate", "environment_failure",
+    "lane_path_for", "preflight", "render_plain", "rollback", "run_mission",
+    "run_sandboxed", "simulate_lanes", "simulate_waves",
 ]

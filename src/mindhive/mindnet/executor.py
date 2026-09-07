@@ -415,8 +415,14 @@ def execute(run_key, script, root=None, timeout_s=DEFAULT_TIMEOUT_S,
                     "against the worktree root, so there is nothing to run it "
                     "in"))
 
+    # A bare `python` that PATH would hand to the Windows Store redirector is
+    # swapped for the interpreter running this process, and the swap is written
+    # into the artifact: the header's contract is what was actually run.
+    argv, note = paths.resolve_interpreter(argv)
     rl = runlog.RunLog(key, project=project, max_bytes=max_bytes)
     rl.append(_header(script, argv, root, timeout_s))
+    if note:
+        rl.append(f"note:   {note}\n")
     start = _clock()
     timed_out = False
     try:

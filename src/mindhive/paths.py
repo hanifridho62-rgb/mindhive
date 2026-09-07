@@ -1,6 +1,8 @@
 # src/mindhive/paths.py
 import itertools
 import os
+import shutil
+import sys
 import time
 import re
 import subprocess
@@ -311,3 +313,56 @@ def is_freshly_minted(project: str | None = None) -> bool:
     if name in known_projects():
         return False
     return not (store_home() / name).exists()
+
+
+# --- interpreter resolution ------------------------------------------------------
+
+# The bare names an agent-authored validation script is likely to start with.
+# Only these are ever swapped; `pytest`, `git`, or a path are left alone.
+INTERPRETER_ALIASES = ("python", "python3")
+
+# Where Windows keeps its App Execution Aliases. A `python.exe` found here is
+# either the Store's redirector -- which exits 49 with an install prompt and
+# never runs a line -- or a Store-installed Python. Either way, the interpreter
+# running THIS process is the one that has mindhive on it.
+_ALIAS_DIR = "windowsapps"
+
+
+def resolve_interpreter(argv, which=None, executable=None) -> tuple:
+    """``(argv, note)``: *argv* with a bare `python`/`python3` head swapped for
+    this interpreter when the bare name would resolve to nothing on PATH or to
+    a Windows App Execution Alias. *note* is ``""`` when nothing changed.
+
+    The failure this exists for is not ENOENT. On a machine with the aliases
+    on (the Windows default), `python` spawns cleanly, prints "Python was not
+    found; run without arguments to install from the Microsoft Store", and
+    exits 49 -- so a validation command fails for a reason that has nothing to
+    do with the code under test, and `mindnet.executor` would record that as
+    python-verified evidence. `tests/test_mindnet_executor.py` pins both the
+    swap and the two shapes that must be left alone.
+
+    *which* and *executable* are seams for the suite; the defaults are
+    `shutil.which` and `sys.executable`."""
+    argv = tuple(argv or ())
+    if not argv:
+        return argv, ""
+    head = str(argv[0])
+    if head != os.path.basename(head):
+        return argv, ""                                 # a path: the author chose it
+    name = head.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name not in INTERPRETER_ALIASES:
+        return argv, ""
+    exe = str(executable or sys.executable or "")
+    if not exe:
+        return argv, ""
+    try:
+        found = (which or shutil.which)(head)
+    except Exception:                                   # noqa: BLE001
+        found = None
+    if found and _ALIAS_DIR not in str(found).replace("\\", "/").lower():
+        return argv, ""
+    why = (f"`{head}` resolves to nothing on PATH" if not found
+           else f"`{head}` resolves to a Windows App Execution Alias ({found})")
+    return (exe,) + argv[1:], f"{why}; using {exe}"

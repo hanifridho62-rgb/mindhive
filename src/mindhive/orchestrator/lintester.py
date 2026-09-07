@@ -44,6 +44,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+from . import environment as env_mod
 from . import metrics as metrics_mod
 from . import payoff as payoff_mod
 from . import queue as queue_mod
@@ -103,6 +104,12 @@ class _RunOutcome(NamedTuple):
     reason: str = ""
     stderr: str = ""
     result: str = "fail"
+    # Whether a child process was created at all. `False` is what separates a
+    # task that failed from a machine that could not start one, and
+    # `environment.environment_failure` reads it -- so it must survive the
+    # normalisation rather than be folded into `result`.
+    executed: bool = True
+    exit_code: object = None
 
 
 @dataclass(frozen=True)
@@ -156,9 +163,14 @@ class AgentTask:
 class Mission:
     """What one `execute_mission` did, in full.
 
-    `outcome` is one of `ok`, `partial`, `refused`, `dry-run`. `enforcement` is
-    `resilience`'s answer about the sandbox, carried up so a report can say
-    plainly whether the children were fenced by the kernel or only by a clock."""
+    `outcome` is one of `ok`, `partial`, `refused`, `dry-run`, `environment`.
+    `enforcement` is `resilience`'s answer about the sandbox, carried up so a
+    report can say plainly whether the children were fenced by the kernel or
+    only by a clock.
+
+    `environment` is the kind behind an `environment` outcome -- the machine
+    could not start a child, and `reason` names the fix -- and `left` is every
+    unit the halt left unstarted. Neither is a failure of the unit named."""
 
     intent: str = ""
     mission_id: str = ""
@@ -189,11 +201,14 @@ class Mission:
     # `payoff.calibrate`. Empty on a dry run: nothing ran, so nothing was timed,
     # and a zeroed report would read as a measurement that came back flat.
     calibration: dict = field(default_factory=dict)
+    environment: str = ""
+    left: tuple = ()
 
     def as_dict(self) -> dict:
         return {
             "intent": self.intent, "mission": self.mission_id,
             "outcome": self.outcome, "reason": self.reason,
+            "environment": self.environment, "left": list(self.left),
             "dry_run": bool(self.dry_run),
             "decomposition": self.decomposition,
             "enforcement": self.enforcement,
@@ -615,7 +630,25 @@ class LintesterOrchestrator:
             ran = bool(ag_mod.ran(res))
         except Exception:                               # noqa: BLE001
             ran = False
-        return _RunOutcome(ok=ran, result="ok" if ran else "fail",
+        # A result that says no child was started keeps saying so. This used to
+        # fold `refused` into `fail`, and the repair loop then did everything a
+        # failure deserves to a machine that had merely said "Not logged in" --
+        # see `environment.py`'s first paragraph.
+        kind = str(getattr(res, "result", "") or "")
+        try:
+            started = bool(res.executed)
+        except AttributeError:
+            started = ran
+        # `ran` says a child was created, not that it succeeded: a child that
+        # exited 1 or was killed at the cap also ran. Treating `ran` as `ok`
+        # reported both as validated.
+        ok = ran and kind not in ("fail", "timeout")
+        if ok:
+            kind = "ok"
+        elif kind not in env_mod.NEVER_RAN and kind != "timeout":
+            kind = "fail"
+        return _RunOutcome(ok=ok, result=kind, executed=started,
+                           exit_code=getattr(res, "exit_code", None),
                            reason=str(getattr(res, "reason", "") or ""),
                            stderr=str(getattr(res, "stderr", "") or ""))
 
@@ -639,6 +672,16 @@ class LintesterOrchestrator:
         written or by a correlation that cannot be computed."""
         durations = {}
         for entry in entries or ():
+            # A unit whose child never started spent its time on the machine's
+            # refusal, not on the work the weight predicts. Recording it would
+            # put a near-zero sample beside real ones and score the weight
+            # against a run that did not happen.
+            try:
+                started = entry.result.executed
+            except AttributeError:
+                started = True
+            if started is False:
+                continue
             tid = str(getattr(entry, "task_id", "") or "")
             # FLOAT milliseconds. `QueueEntry` measures in nanoseconds so that a
             # unit faster than a millisecond is still a measurement; coercing to
@@ -799,6 +842,12 @@ class LintesterOrchestrator:
             # Both halves of the breaker, not just the failing one. `repair`
             # alone made it failure-only: it could open and never close.
             on_success=repair.succeeded, bus=self.bus)
+        # The brake, wired after both ends exist. The first entry whose failure
+        # is the machine's -- not logged in, quota gone, no CLI -- stops every
+        # lane from taking the next unit, because the next unit would only say
+        # the same thing. `mindnet.orchestrator` has braked on this for its
+        # waves since MN-8; the lanes had nothing.
+        repair.halt = scheduler.halt
         self._emit("brain_phase", phase="Running Lanes",
                    detail=f"{len(lanes)} lane(s)")
 
@@ -843,18 +892,25 @@ class LintesterOrchestrator:
         released = wt_mod.release_lanes(self.root, trees)
         done = tuple(e.task_id for e in completed)
         bad = tuple(f"{e.task_id}: {e.reason}" for e in failed)
-        outcome = "ok" if not bad else "partial"
+        halted = str(scheduler.halted or "")
+        left = tuple(e.task_id for e in scheduler.left())
+        env_kind = str((repair.environment or [{}])[0].get("kind", "") or "")
+        if halted:
+            outcome = "environment"
+            reason = halted + (f"; {len(left)} unit(s) never started"
+                               if left else "")
+        else:
+            outcome = "ok" if not bad else "partial"
+            reason = "" if not bad else f"{len(bad)} of {len(tasks)} unit(s) failed"
         cal = self._calibrate(mission_id,
                               {tid: u[4] for tid, u in by_id.items()},
                               list(completed) + list(failed))
         self._emit("mission_finished", mission_id=mission_id, outcome=outcome,
                    completed=len(done), failed=len(bad),
-                   steals=int(scheduler.steals),
-                   reason=("" if not bad
-                           else f"{len(bad)} of {len(tasks)} unit(s) failed"))
+                   steals=int(scheduler.steals), reason=reason)
         return Mission(
-            intent=text, mission_id=mission_id, outcome=outcome,
-            reason="" if not bad else f"{len(bad)} of {len(tasks)} unit(s) failed",
+            intent=text, mission_id=mission_id, outcome=outcome, reason=reason,
+            environment=env_kind if halted else "", left=left,
             tasks=tuple(tasks), lanes=tuple(lanes_out), completed=done,
             failed=bad, kept=tuple(r.reason for r in released if r.kept),
             enforcement=enforcement, enforcement_reason=why,
