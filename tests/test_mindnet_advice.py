@@ -642,16 +642,33 @@ def test_a_record_with_no_recorded_ids_is_kept(quiet, monkeypatch):
     assert any("KEEP-THIS" in r for r in rows)
 
 
-def test_a_truncated_id_list_fails_open(quiet, monkeypatch):
+def test_a_truncated_all_agent_id_list_fails_closed(quiet, monkeypatch):
     """`incidents.MAX_SESSION_IDS` bounds the stored list while `sessions` keeps
-    the TRUE count, so a shorter list means there are contributors this row
-    cannot see. Withholding on a partial view would drop a record a human also
-    hit but whose id fell off the end."""
+    the TRUE count, so `sessions > len(session_ids)` means this row has writers
+    it cannot show.
+
+    This used to answer "compose it", which turned "too many authors to list"
+    into "trusted" — and an attacker who can write rows can also make the list
+    overflow. Every id this row CAN show is an orchestration session, so it is
+    withheld whatever `sessions` claims. The positive half is the next test."""
     monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
         _agent_summary("pyexc:Widget", ["mn9-t1", "mn9-t2"], sessions=9,
+                       root_cause="DROP-THIS widget handling failure")])
+    rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert withheld == 1, "a truncated all-agent row was composed"
+    assert not any("DROP-THIS" in r for r in rows)
+
+
+def test_a_truncated_list_showing_a_human_contributor_is_kept(quiet, monkeypatch):
+    """The positive half, and the case the old fail-open bullet protected: a
+    failure a human ALSO hit is not agent-manufactured. Truncation is identical
+    to the test above — only the visible authorship differs — so this pins that
+    the control reads the ids rather than the `sessions` count."""
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _agent_summary("pyexc:Widget", ["mn9-t1", "hanif-laptop"], sessions=9,
                        root_cause="KEEP-THIS widget handling failure")])
     rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
-    assert withheld == 0, "withheld on a view that could not see every writer"
+    assert withheld == 0, "withheld a row a human is recorded as hitting"
     assert any("KEEP-THIS" in r for r in rows)
 
 
@@ -659,3 +676,119 @@ def test_the_incident_predicate_is_total_over_junk():
     for row in (None, "", 0, [], {}, {"session_ids": "not-a-list"},
                 {"session_ids": ["mn9-a"], "sessions": "many"}):
         assert adv.agent_authored_incident(row) in (True, False)
+# --- the cap counts RENDERED rows, not candidates --------------------------------
+# Recorded as P2 in docs/residual-review-findings/: a row that cannot render --
+# a SOP with no body, a skill with no name, an incident with no recorded reason
+# -- still spent one of the cap's slots, because all three resolvers ranked to
+# the cap first and skipped the blanks afterwards. A red-team run measured
+# `resolve_sops` rendering 0 of 4 legitimate matching SOPs that way: the same
+# denial of service partition-before-ranking closes for agent-authored rows,
+# reopened by a row that is merely empty. `_ranked_rendered` is the shared seam.
+
+def test_a_sop_whose_body_defuses_to_nothing_does_not_spend_a_slot(quiet):
+    """THE DEFECT. Two SOPs whose bodies survive the fold but render EMPTY rank
+    ahead of two real ones on an identical keyword match (the index tie-break
+    keeps the incoming order), so under the old code the cap was spent before
+    either keeper was reached and the brief rendered nothing at all.
+
+    The body is `[mindnet]` and that choice is load-bearing, not decorative. A
+    genuinely empty body never reaches this resolver -- `sop.current` drops it
+    during the fold, measured -- so a fixture using `""` passes whatever the
+    resolver does and proves nothing. `[mindnet]` is the marker
+    `inject.safe_text` strips, so the row is real to the registry and empty at
+    render: the shape an injected SOP actually has."""
+    evs = [
+        _sop_ev_from("s-blank1", "widget handling", "[mindnet]", "manual",
+                     ts="2026-07-27T00:00:00Z"),
+        _sop_ev_from("s-blank2", "widget handling", "[mindnet]", "manual",
+                     ts="2026-07-27T00:00:01Z"),
+        _sop_ev_from("s-a", "widget handling", "FIRST-KEEPER widget handling",
+                     "manual", ts="2026-07-27T00:00:02Z"),
+        _sop_ev_from("s-b", "widget handling", "SECOND-KEEPER widget handling",
+                     "manual", ts="2026-07-27T00:00:03Z"),
+    ]
+    rows, withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert withheld == 0, "no agent wrote any of these"
+    joined = " ".join(rows)
+    assert "FIRST-KEEPER" in joined and "SECOND-KEEPER" in joined, rows
+    assert len(rows) == adv.MAX_SOPS
+
+
+def test_the_sop_cap_still_holds_when_every_row_renders(quiet):
+    """THE CANARY. A fix that simply stopped capping would pass the test above
+    and hand the whole registry to the agent, which is the budget half of the
+    same attack. Three renderable rows, two slots, still two."""
+    evs = [_sop_ev_from(f"s-{i}", "widget handling",
+                        f"KEEPER-{i} widget handling", "manual",
+                        ts=f"2026-07-27T00:00:0{i}Z") for i in range(3)]
+    rows, _withheld = adv.resolve_sops(adv.keywords("widget handling"), evs)
+    assert len(rows) == adv.MAX_SOPS == 2
+
+
+def test_the_ranking_order_is_unchanged_by_skipping_the_blanks(quiet):
+    """The seam re-ranks over ALL rows rather than over the cap, so this pins
+    that the surviving rows arrive in the SAME order as before -- a resolver
+    that reshuffled itself between two rebuilds of identical data would defeat
+    `_ranked`'s own tie-break."""
+    evs = [_sop_ev_from("s-weak", "widget handling", "TWO-WORD widget handling",
+                        "manual", ts="2026-07-27T00:00:00Z"),
+           _sop_ev_from("s-strong", "widget handling failures",
+                        "THREE-WORD widget handling failures", "manual",
+                        ts="2026-07-27T00:00:01Z")]
+    rows, _withheld = adv.resolve_sops(
+        adv.keywords("widget handling failures"), evs)
+    assert len(rows) == 2, "the weaker match was filtered out, not ranked"
+    assert "THREE-WORD" in rows[0], "the better match lost its place"
+    assert "TWO-WORD" in rows[1]
+
+
+def test_a_reasonless_incident_does_not_spend_a_constraint_slot(quiet,
+                                                                monkeypatch):
+    """The same defect in `resolve_constraints`. `excerpt` is the one field the
+    failing agent controls and the one field never rendered, so a summary the
+    reflection pass has not reached yet renders empty -- and used to take a slot
+    from one that had."""
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _summary("pyexc:A", excerpt="widget handling blew up"),
+        _summary("pyexc:B", excerpt="widget handling blew up again"),
+        _summary("pyexc:C", root_cause="widget handling raced the lock"),
+        _summary("pyexc:D", lesson="widget handling needs the guard"),
+    ])
+    rows, withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert withheld == 0
+    joined = " ".join(rows)
+    assert "raced the lock" in joined and "needs the guard" in joined, rows
+    assert len(rows) == adv.MAX_CONSTRAINTS
+
+
+def test_the_constraint_cap_still_holds_when_every_row_renders(quiet,
+                                                               monkeypatch):
+    """The canary for the constraint half."""
+    monkeypatch.setattr(inc_mod, "summaries", lambda *a, **k: [
+        _summary(f"pyexc:{c}", root_cause=f"widget handling failed {c}")
+        for c in "ABC"])
+    rows, _withheld = adv.resolve_constraints(adv.keywords("widget handling"))
+    assert len(rows) == adv.MAX_CONSTRAINTS == 2
+
+
+def test_a_nameless_skill_does_not_spend_a_slot(quiet):
+    """The third source. A recommendation with no name renders nothing, and
+    `resolve_skills` has no `withheld` counter, so before this the only trace
+    was a short list that read exactly like a thin catalog."""
+    quiet.setattr(plugins_mod, "recommend_for", lambda *a, **k: _reco(
+        _rec("", "widget handling helper"),
+        _rec("keeper-one", "widget handling helper"),
+        _rec("keeper-two", "widget handling helper"),
+        _rec("keeper-three", "widget handling helper")))
+    rows = adv.resolve_skills(adv.keywords("widget handling"), [])
+    assert len(rows) == adv.MAX_SKILLS == 3
+    assert all(r.strip() for r in rows)
+    assert "keeper-one" in " ".join(rows)
+
+
+def test_the_skill_cap_still_holds_when_every_row_renders(quiet):
+    """The canary for the skills half."""
+    quiet.setattr(plugins_mod, "recommend_for", lambda *a, **k: _reco(
+        *[_rec(f"keeper-{i}", "widget handling helper") for i in range(5)]))
+    rows = adv.resolve_skills(adv.keywords("widget handling"), [])
+    assert len(rows) == adv.MAX_SKILLS == 3

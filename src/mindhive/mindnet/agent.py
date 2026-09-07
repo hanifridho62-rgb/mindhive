@@ -321,7 +321,15 @@ def _record_brief(task_id, built, ctx=None) -> None:
              "gated": list(stats.gated), "empty_reason": stats.empty_reason,
              "failures": list(getattr(stats, "failures", ()) or ()),
              "dropped": int(getattr(stats, "dropped", 0) or 0),
-             "authored": int(getattr(stats, "authored", 0) or 0)},
+             "defused": int(getattr(stats, "defused", 0) or 0),
+             "authored": int(getattr(stats, "authored", 0) or 0),
+             # PER-SOURCE, so an attempt is observable after the fact rather
+             # than merely blocked: `authored` alone says something was
+             # withheld, not which surface it was aimed at.
+             "authored_by": {
+                 "sops": int(getattr(stats, "authored_sops", 0) or 0),
+                 "constraints": int(
+                     getattr(stats, "authored_constraints", 0) or 0)}},
             tags=["mindnet", "brief", "auto"], project=project)
     except Exception:                                  # noqa: BLE001
         pass

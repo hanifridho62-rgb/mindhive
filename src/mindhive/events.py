@@ -671,6 +671,24 @@ def corrupt_rows(project=None) -> list[dict]:
     dashboard can show corruption instead of it passing silently. Returns [] for
     a clean store. Each row: ``{segment, line, reason, preview}``.
 
+    **The seven historical rows stay reported, permanently. Decided 2026-09-05.**
+    They are orphan tails from the pre-lock append race (`_append_lock` above
+    names the measurement; `tests/test_events_append_race.py` reproduces both of
+    the reasons they show and proves they are ONE defect, not two). Three
+    options were on the table and two were rejected:
+
+    - **Repair them.** Impossible by contract: the ledger is append-only and
+      hash-chained, and hand-editing a segment breaks chain parity and shows up
+      in the Postgres mirror as divergence. A correction is a new event.
+    - **Quarantine them** behind an audited `corrupt_quarantined` event so
+      `verify` could stop naming them. Rejected: it converts a visible scar into
+      a config, and the next real corruption would land in a report that has
+      already been taught to stay quiet about this class.
+    - **Keep reporting them.** Chosen. Seven rows is a fixed, non-growing set
+      whose cause is fixed, so the count is a REGRESSION DETECTOR: if it ever
+      moves, an unserialised writer exists again. A permanently honest scar is
+      worth more than a clean-looking report.
+
     `line` is ZERO-BASED, so `sed -n 40p` finds the row this reports as 39. That
     is off by one from every editor and every other line-numbering tool, and it
     cost real time during an investigation, but it is not a typo to fix here:

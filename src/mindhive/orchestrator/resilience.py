@@ -16,6 +16,21 @@ launder an unfenced run as a fenced one. So `run_sandboxed` carries an
 caller records which it got. The timeout cap is the cross-platform floor and
 holds either way.
 
+**Windows now has a kernel too.** For a year that field read `timeout-only` on
+the machine this project is developed on, and `RLIMIT_AS` / `RLIMIT_CPU` never
+ran here at all — the fence existed on POSIX and CI and nowhere the work
+actually happened. Windows has had the equivalent since NT: a **Job Object**
+with `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (which is `RLIMIT_AS`) and
+`JOB_OBJECT_LIMIT_PROCESS_TIME` (which is `RLIMIT_CPU`), reached through
+`ctypes` so `dependencies = []` stays true. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+is set with them, which buys something POSIX rlimits do not: closing the handle
+takes the child's whole process TREE with it, so a runner that spawns its own
+children cannot outlive the fence.
+
+The honesty rule is unchanged and is what makes the addition safe. A job that
+cannot be created, or cannot be assigned, DOWNGRADES the run to `timeout-only`
+and names why — it never reports `kernel` on the strength of having tried.
+
 ## The breaker is the incumbent's, keyed
 
 `loop/safeguards.py` already owns a CLOSED / OPEN / HALF_OPEN machine with
@@ -43,6 +58,13 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .. import paths
+
+# Imported into THIS module's globals on purpose. `run_sandboxed` and
+# `_run_capped` call these unqualified, so a test that patches
+# `resilience._job_for` or `resilience._assign` still patches what runs --
+# which a `jobs._job_for(...)` call site would silently have stopped doing.
+from .jobs import (_assign, _close_job, _job_for, _jobs_available,
+                   _terminate_job)
 
 # --- sandbox -------------------------------------------------------------------
 
@@ -102,14 +124,102 @@ def limits_available() -> tuple:
 
     Split out and public so a caller can report the degradation BEFORE spending a
     run finding out, and so the Windows leg of the suite can assert on the reason
-    text rather than being skipped."""
+    text rather than being skipped.
+
+    TWO kernels, asked in order: POSIX `resource`, then Windows Job Objects. It
+    used to ask only the first and answer False everywhere else, which made this
+    project's own development machine — and half its CI matrix — permanently
+    unfenced while the code read as though a platform gap were being reported
+    honestly. It was being reported honestly; it just did not have to be true.
+
+    The two halves stay separately askable (`_rlimits_available`,
+    `_jobs_available`) and that is not tidiness: `_preexec_for` asked THIS
+    function and then did `import resource`, so the moment this one started
+    answering True on Windows the POSIX path began importing a module that is
+    not there. A composite answer is the wrong question for a caller that needs
+    one specific mechanism."""
+    posix_ok, posix_why = _rlimits_available()
+    if posix_ok:
+        return True, ""
+    jobs_ok, jobs_why = _jobs_available()
+    if jobs_ok:
+        return True, ""
+    return False, (f"neither the stdlib `resource` module ({posix_why}) nor "
+                   f"Windows job objects ({jobs_why}) are usable here; the "
+                   f"timeout cap is the only ceiling in force")
+
+
+def _rlimits_available() -> tuple:
+    """``(available, why)`` for POSIX `setrlimit`. Never raises."""
     try:
         import resource                                 # noqa: F401
     except ImportError as exc:
-        return False, (f"the stdlib `resource` module is unavailable on this "
-                       f"platform ({type(exc).__name__}: {exc}); the timeout cap "
-                       f"is the only ceiling in force")
+        return False, f"{type(exc).__name__}: {exc}"
     return True, ""
+
+
+# How long the post-kill drain may wait for the child's pipes to close before
+# the run gives up on its output. It only bites when the kill did NOT take the
+# tree -- a downgraded run, or POSIX, where `proc.kill()` is child-only too --
+# because with the job terminated the write ends are already gone and the drain
+# returns at once. Small on purpose: this wait is the orchestrator's only
+# liveness bound, and before it existed one hung grandchild pinned a lane
+# thread for as long as it felt like living.
+_DRAIN_GRACE_S = 5.0
+
+
+def _run_capped(argv, job, fence, *, cwd, env, timeout, stdin_text,
+                creationflags, **kwargs):
+    """`subprocess.run`'s contract, with the job assignment in the middle and a
+    post-kill drain that cannot outlive the cap.
+
+    Answers a real `CompletedProcess` and raises the same `TimeoutExpired` the
+    caller already handles, so `run_sandboxed`'s result-building is untouched.
+    *fence* is filled in before any wait, so the caller can read the assignment's
+    outcome even on the timeout path.
+
+    Used for the UNFENCED run too (*job* is then ``None``), which is why it is no
+    longer named for the job. `subprocess.run` carries the same unbounded
+    post-kill `communicate()` inside it, so leaving the no-limits path on it left
+    exactly the defect this function was changed to fix -- measured, after the
+    first cut of the fix: the fenced arm came back at 4.03s against a 4s cap and
+    the unfenced control still took 20.11s. Two paths, one of them fixed, is how
+    that survived being called done.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, shell=False,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, creationflags=creationflags, **kwargs)
+    if job is not None:
+        fence["assigned"], fence["why"] = _assign(job, proc)
+    try:
+        out, err = proc.communicate(input=stdin_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # ORDER IS THE WHOLE FIX. `proc.kill()` is TerminateProcess on the
+        # CHILD; a grandchild that inherited the pipe write-ends keeps them
+        # open, so the drain below used to block on the grandchild -- with no
+        # timeout -- and the job close that would have taken the tree sits in
+        # `run_sandboxed`'s `finally`, downstream of exactly that wait. Measured
+        # at 20.1s against a 4s cap while reporting `enforcement=kernel` and
+        # "killed at the 4s cap", and indistinguishable from an unfenced run.
+        proc.kill()
+        _terminate_job(job)              # the tree, before anything waits on it
+        try:
+            out, err = proc.communicate(timeout=_DRAIN_GRACE_S)
+            fence["drained"] = True
+        except subprocess.TimeoutExpired:
+            # Reached when the tree outlived the kill anyway: no job (a
+            # downgraded run, or POSIX, where `proc.kill()` is equally
+            # child-only), or a job that refused to terminate. Give up on the
+            # output rather than the cap -- an unbounded wait here is the
+            # orchestrator's only liveness bound, since `Guard.run` calls this
+            # synchronously on a lane thread. The reader threads are daemons and
+            # die with the process; `fence["drained"]` is False so the caller
+            # reports a cap it could not fully enforce instead of claiming it did.
+            fence["drained"] = False
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def fencing(limits) -> tuple:
@@ -151,7 +261,10 @@ def _preexec_for(limits):
     hazard can have. An async runner avoids it entirely."""
     if limits is None or limits.empty:
         return None
-    available, _why = limits_available()
+    # `_rlimits_available`, NOT `limits_available`: this function needs the
+    # POSIX mechanism specifically, and the composite answer is True on Windows
+    # now that job objects count.
+    available, _why = _rlimits_available()
     if not available:
         return None
     import resource
@@ -184,22 +297,65 @@ def run_sandboxed(argv, limits=None, timeout_s=DEFAULT_TIMEOUT_S, cwd=None,
     preexec = _preexec_for(limits)
     if preexec is not None:
         kwargs["preexec_fn"] = preexec
+    job, job_why = _job_for(limits)
+    fence: dict = {}
+
+    def _fenced() -> tuple:
+        """The enforcement to REPORT, after the platform has had its say.
+
+        A job that could not be created or could not be assigned means this run
+        was clock-fenced and nothing more, and saying `kernel` anyway is exactly
+        the laundering this module's docstring forbids."""
+        if job_why:
+            return TIMEOUT_ONLY, job_why
+        if job is not None and not fence.get("assigned", True):
+            return TIMEOUT_ONLY, fence.get("why") or "the job was not assigned"
+        return enforcement, reason
+
     started = time.monotonic()
     try:
-        proc = subprocess.run(
-            argv, cwd=str(cwd) if cwd else None, env=env, shell=False,
-            capture_output=True, text=True, timeout=timeout_s,
-            input=stdin_text, creationflags=paths.NO_WINDOW, **kwargs)
+        # ONE path, fenced or not. The branch that used to sit here sent the
+        # no-limits run through `subprocess.run`, whose own post-kill drain is
+        # unbounded, so the cap held on one arm and not the other.
+        proc = _run_capped(argv, job, fence,
+                           cwd=str(cwd) if cwd else None, env=env,
+                           timeout=timeout_s, stdin_text=stdin_text,
+                           creationflags=paths.NO_WINDOW, **kwargs)
     except subprocess.TimeoutExpired as exc:
+        enforcement, downgrade = _fenced()
+        # The cap is why this run ENDED; a downgrade is why it was not fenced
+        # while it ran. Both, or a timeout on an unfenced run reads as though
+        # only the clock was ever asked for.
+        # A cap the run did not actually respect must not report that it did.
+        # `drained` is False only when the pipes were still held after the kill,
+        # which means something the kill did not reach is still alive -- and the
+        # duration will show the overrun, so the reason has to account for it.
+        held = fence.get("drained") is False
         return SandboxResult(result="timeout", enforcement=enforcement,
-                             reason=f"killed at the {timeout_s}s cap",
+                             reason=(f"killed at the {timeout_s}s cap"
+                                     + ("; its pipes were still held "
+                                        f"{_DRAIN_GRACE_S}s later, so a process "
+                                        "it spawned outlived it and the output "
+                                        "was abandoned" if held else "")
+                                     + (f"; {downgrade}"
+                                        if downgrade and enforcement
+                                        == TIMEOUT_ONLY and limits is not None
+                                        and not limits.empty else "")),
                              stdout=_text(getattr(exc, "stdout", "")),
                              stderr=_text(getattr(exc, "stderr", "")),
                              duration_s=time.monotonic() - started)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        enforcement, _why = _fenced()
         return SandboxResult(result="spawn-failed", enforcement=enforcement,
                              reason=f"{type(exc).__name__}: {exc}",
                              duration_s=time.monotonic() - started)
+    finally:
+        # KILL_ON_JOB_CLOSE is set, so this is also the cleanup that takes any
+        # grandchild the runner spawned with it. Reached only after the child
+        # has been waited on, so it never kills a live run.
+        if job is not None:
+            _close_job(job)
+    enforcement, reason = _fenced()
     code = int(proc.returncode)
     return SandboxResult(result="ok" if code == 0 else "fail", exit_code=code,
                          stdout=proc.stdout or "", stderr=proc.stderr or "",

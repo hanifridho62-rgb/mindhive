@@ -125,12 +125,30 @@ improvements, history, task-graph, compatibility, pr-green; status ∈ active,
 idle; `task_id`/`phase` are decoration and are dropped when malformed rather
 than losing the event),
 `mindnet_brief` (`{task_id, chars, skills, sops, constraints, symbols, gated,
-empty_reason}` — one row per briefing composed for a spawned agent,
+empty_reason, failures, dropped, defused, authored, authored_by}` — one row per briefing
+composed for a spawned agent,
 `mindnet/agent.py:_record_brief` via `mindnet/brief.py`: the counts per advice
 source, plus `gated` (a list) naming any source that was switched OFF rather
 than empty — `symbols=0` and `gated=["symbols"]` need opposite fixes, so they
 are separate fields, and `docs/runbook-empty-brief.md` turns on that
-distinction. `chars` sizes the brief without carrying it. The brief's TEXT is
+distinction. `failures` (a list) names the sources that RAISED, and `dropped`
+counts the lines the fence-defuser ate — a brief can be empty for three
+different reasons and `empty_reason` says which. `defused` is the strictly wider
+count of lines the defuser CHANGED at all, and it exists because `dropped` alone
+reported a run under attack as clean twice over: a forged banner padded past
+`_BANNER_GAP` used to survive into the fenced block verbatim AND count as zero,
+so both the line and its absence of a counter said nothing happened. `defused`
+≥ `dropped` by construction, and a line that was merely disarmed is exactly the
+gap between them. `authored` counts the RELEVANT
+rows `advice` withheld because a spawned orchestration agent wrote them
+(exclusion is the control; the count is what keeps it from being silent), and
+`authored_by` (`{sops, constraints}`) splits that total by the source it was
+aimed at, because the two are not the same size of hole — a withheld SOP would
+have been rendered body-verbatim, while an incident's attacker-controlled field
+is never rendered at all. Every field after `empty_reason` was appended, never
+renamed: this payload lands on an append-only ledger, so the shape is additive
+by construction and an older row simply lacks the newer keys. `chars` sizes the
+brief without carrying it. The brief's TEXT is
 deliberately NOT in the payload; it goes to the run log under
 `<task_id>-brief`, because `hive verify` re-hashes the whole ledger and
 kilobytes per task would be paid on every integrity check),

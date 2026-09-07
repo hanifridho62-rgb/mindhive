@@ -129,11 +129,18 @@ def _rows(task_id=None, project=None):
 def _describe(stats) -> str:
     """One line of counts, with the gated sources named rather than shown as 0.
 
-    `failures`, `dropped` and `authored` print ONLY when non-zero, unlike the
-    four counts above. They are exceptions rather than measurements — a
-    permanent `dropped=0  authored=0` on every line would train the operator to
+    `failures`, `defused`, `dropped` and `authored` print ONLY when non-zero,
+    unlike the four counts above. They are exceptions rather than measurements —
+    a permanent `dropped=0  authored=0` on every line would train the operator to
     skim past exactly the segment that matters on the day it is not zero, which
     is the same argument the module docstring makes about an empty fence.
+
+    `defused` is here because leaving it out reproduced the very symptom it was
+    added to end. It counts a line the defuser CHANGED without emptying, which
+    is the padded-banner case: `dropped` stays 0, so a brief under active attack
+    printed a line byte-identical to a clean one and only a ledger query showed
+    otherwise — `clean twice over`, the phrase the fence module uses for it. A
+    counter that reaches the payload and not the operator has not been shipped.
 
     The `--json` branch carries them unconditionally, because a machine reader
     wants the key present rather than having to tell "absent" from "zero"."""
@@ -144,6 +151,9 @@ def _describe(stats) -> str:
     failures = tuple(getattr(stats, "failures", ()) or ())
     if failures:
         parts.append("failed=" + ",".join(failures))
+    defused = int(getattr(stats, "defused", 0) or 0)
+    if defused:
+        parts.append(f"defused={defused}")
     dropped = int(getattr(stats, "dropped", 0) or 0)
     if dropped:
         parts.append(f"dropped={dropped}")
@@ -192,6 +202,7 @@ def cmd_brief(args) -> int | None:
                 "constraints": b.stats.constraints, "symbols": b.stats.symbols,
                 "gated": list(b.stats.gated),
                 "failures": list(getattr(b.stats, "failures", ()) or ()),
+                "defused": int(getattr(b.stats, "defused", 0) or 0),
                 "dropped": int(getattr(b.stats, "dropped", 0) or 0),
                 "authored": int(getattr(b.stats, "authored", 0) or 0),
                 "empty_reason": b.stats.empty_reason,

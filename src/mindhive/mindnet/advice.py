@@ -148,7 +148,14 @@ MIN_OVERLAP = 2
 # through them. One hardcoded string would go stale the first time a new spawner
 # appeared, so `test_the_orchestrators_own_prefix_is_covered` asserts against the
 # imported constant rather than a copy of it.
-ORCHESTRATION_PREFIXES = ("mn9-", "mn7-", "mn11-", "mn-")
+#
+# `lm-` is `orchestrator.lintester.MISSION_PREFIX`, and it was added the day
+# that spawner was found passing no `env=` at all: its children inherited the
+# operator's `MINDHIVE_SESSION`, so their rows were attributed to a human, and
+# even once the overlay was added the run_key prefix was outside this family.
+# Both halves are needed — an identity nothing recognises is no identity.
+# `test_the_lintester_mission_prefix_is_covered` pins it the same way.
+ORCHESTRATION_PREFIXES = ("mn9-", "mn7-", "mn11-", "mn-", "lm-")
 
 
 def is_orchestration_session(session_id) -> bool:
@@ -182,6 +189,15 @@ class Advice(NamedTuple):
     # travels `resolve` -> `brief.build` -> `Stats.authored` and no further, so a
     # rehydrated `Advice` correctly reports 0.
     withheld: int = 0
+    # The same number, SPLIT BY SOURCE. One total says an attempt happened; it
+    # does not say where, and the two sources are not the same size of hole --
+    # `resolve_sops` withholds rows whose BODY would have been rendered
+    # verbatim, `resolve_constraints` withholds rows whose attacker-controlled
+    # field (`excerpt`) is never rendered at all. An operator triaging a
+    # non-zero count needs to know which one moved. Appended last, same
+    # `to_dict` exclusion and same reason as `withheld` above.
+    withheld_sops: int = 0
+    withheld_constraints: int = 0
 
 
 EMPTY = Advice()
@@ -282,6 +298,39 @@ def _ranked(rows, task_kw, text_of, limit):
     return [row for _n, _i, row in scored[:limit]]
 
 
+def _ranked_rendered(rows, task_kw, text_of, limit, render):
+    """The *limit* best-matching rows that ACTUALLY RENDER, most relevant first.
+
+    **The cap counts rendered items, not candidates**, and that distinction is
+    the whole reason this function exists. All three resolvers used to rank to
+    `limit` first and then skip the rows whose render came back empty -- a SOP
+    with no body, a skill with no name, an incident with no recorded reason --
+    so an unrenderable row spent a slot and produced nothing. A red-team run
+    measured `resolve_sops` rendering 0 of 4 legitimate matching SOPs that way:
+    the same denial of service that partitioning-before-ranking closes for
+    agent-authored rows, reopened by a row that is merely blank.
+
+    Ranking is done over ALL of *rows* and the walk stops at *limit* renders, so
+    the ORDER is identical to what the old code produced -- only the rows that
+    contributed nothing are no longer counted. The extra cost is ranking rows
+    the old code would have discarded; `_ranked` is one pass plus a sort over
+    what a registry holds, which is small and already bounded by the caller.
+
+    *render* answers `""` for a row that cannot be shown. It is never called on
+    a row that did not match, so a renderer with a side effect (none has one)
+    would not see more rows than before -- only the ones it now reaches later in
+    the ranking."""
+    out = []
+    for row in _ranked(rows, task_kw, text_of, len(rows)):
+        item = render(row)
+        if not item:
+            continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return tuple(out)
+
+
 # --- the three sources ---------------------------------------------------------------
 
 def resolve_skills(task_kw, evs, project=None, reco=None) -> tuple:
@@ -302,18 +351,17 @@ def resolve_skills(task_kw, evs, project=None, reco=None) -> tuple:
         reco = plugins_mod.recommend_for(project, evs=evs)
     rows = [r for r in (reco or {}).get("recommendations") or []
             if isinstance(r, dict)]
-    picks = _ranked(rows, task_kw,
-                    lambda r: f"{r.get('name', '')} {r.get('description', '')}",
-                    MAX_SKILLS)
-    out = []
-    for r in picks:
+    def _render(r):
         name = safe_text(r.get("name"), 60)
         desc = safe_text(r.get("description"), MAX_ITEM_CHARS)
         if not name:
-            continue
-        out.append(safe_text(f"{name} — {desc}" if desc else name,
-                             MAX_ITEM_CHARS))
-    return tuple(out)
+            return ""
+        return safe_text(f"{name} — {desc}" if desc else name, MAX_ITEM_CHARS)
+
+    return _ranked_rendered(
+        rows, task_kw,
+        lambda r: f"{r.get('name', '')} {r.get('description', '')}",
+        MAX_SKILLS, _render)
 
 
 def _sop_text(r) -> str:
@@ -357,16 +405,16 @@ def resolve_sops(task_kw, evs):
     # capping it at MAX_SOPS would under-report a store with several relevant
     # injected rows — which is precisely the case worth seeing.
     withheld = len(_ranked(agent, task_kw, _sop_text, len(agent))) if agent else 0
-    picks = _ranked(kept, task_kw, _sop_text, MAX_SOPS)
-    out = []
-    for r in picks:
-        sid = safe_text(r.get("sop_id"), 64)
-        title = safe_text(r.get("title"), 80)
+
+    def _render(r):
         body = safe_text(r.get("text"), MAX_ITEM_CHARS)
         if not body:
-            continue
-        out.append(safe_text(f"[{sid}] {title}: {body}", MAX_ITEM_CHARS))
-    return tuple(out), withheld
+            return ""
+        sid = safe_text(r.get("sop_id"), 64)
+        title = safe_text(r.get("title"), 80)
+        return safe_text(f"[{sid}] {title}: {body}", MAX_ITEM_CHARS)
+
+    return _ranked_rendered(kept, task_kw, _sop_text, MAX_SOPS, _render), withheld
 
 
 def _constraint_text(r) -> str:
@@ -378,17 +426,24 @@ def _constraint_text(r) -> str:
 def agent_authored_incident(row) -> bool:
     """Whether an incident summary was produced ONLY by orchestration sessions.
 
-    Three ways to answer False, and all three are the fail-open case (R8):
+    Two ways to answer False, both the fail-open case (R8):
 
     - **No ids recorded.** Every record written before `session_ids` existed.
       Absent authorship is unknown authorship, not agent authorship.
-    - **The list is truncated.** `incidents.MAX_SESSION_IDS` bounds what the
-      frontmatter carries while `sessions` keeps the true count, so a shorter
-      list means there are contributors this row cannot see. Withholding on a
-      partial view would drop a record a human also hit.
     - **Any contributor is not an orchestration session.** A failure a human ALSO
       hit is not agent-manufactured, and the lesson distilled from it is worth
       exactly as much as it was before an agent happened to hit it too.
+
+    **Truncation now fails CLOSED, and that is a deliberate reversal.**
+    `incidents.MAX_SESSION_IDS` bounds what the frontmatter carries while
+    `sessions` keeps the true count, so a longer `sessions` means contributors
+    this row cannot show. The old reading — "a partial view might hide a human,
+    so compose it" — turned "too many authors to list" into "trusted", and an
+    attacker who can write rows can also make the list overflow. A row whose
+    every VISIBLE contributor is an orchestration session is withheld whatever
+    `sessions` says; one visible human contributor still composes it, so the
+    case the old bullet protected (a failure a human also hit) is protected by
+    the human's own id rather than by the absence of information.
 
     Worth stating plainly what this does and does not close, because the shape
     invites overclaiming: the incident path is materially HARDER to exploit than
@@ -402,12 +457,9 @@ def agent_authored_incident(row) -> bool:
     ids = [str(s) for s in (row.get("session_ids") or [])]
     if not ids:
         return False
-    try:
-        total = int(row.get("sessions") or 0)
-    except (ValueError, TypeError):
-        total = 0
-    if total > len(ids):
-        return False
+    # `sessions` is deliberately NOT consulted. It used to gate this return and
+    # a larger value answered False; see the docstring on why that inverted the
+    # control it was meant to soften.
     return all(is_orchestration_session(s) for s in ids)
 
 
@@ -427,16 +479,17 @@ def resolve_constraints(task_kw, project=None):
     agent = [r for r in rows if agent_authored_incident(r)]
     withheld = (len(_ranked(agent, task_kw, _constraint_text, len(agent)))
                 if agent else 0)
-    picks = _ranked(kept, task_kw, _constraint_text, MAX_CONSTRAINTS)
-    out = []
-    for r in picks:
+
+    def _render(r):
         reason = safe_text(r.get("root_cause") or r.get("lesson")
                            or r.get("active_rule"), MAX_REASON_CHARS)
         if not reason:
-            continue
-        out.append(safe_text(CONSTRAINT_TEMPLATE.format(reason=reason),
-                             MAX_ITEM_CHARS))
-    return tuple(out), withheld
+            return ""
+        return safe_text(CONSTRAINT_TEMPLATE.format(reason=reason),
+                         MAX_ITEM_CHARS)
+
+    return (_ranked_rendered(kept, task_kw, _constraint_text, MAX_CONSTRAINTS,
+                             _render), withheld)
 
 
 # --- the entry point -------------------------------------------------------------------
@@ -464,7 +517,10 @@ def resolve(task, evs=None, project=None, reco=None) -> Advice:
             evs = ev_mod.read_all(project)
         except Exception:
             evs = []
-    withheld = 0
+    # Each source's own count is initialised BEFORE its try, so a source that
+    # raises reports 0 withheld rather than leaking the previous source's
+    # number or raising a NameError inside an except handler.
+    withheld = sop_withheld = con_withheld = 0
     try:
         skills = resolve_skills(kw, evs, project, reco=reco)
     except Exception:
@@ -473,12 +529,12 @@ def resolve(task, evs=None, project=None, reco=None) -> Advice:
         sops, sop_withheld = resolve_sops(kw, evs)
         withheld += sop_withheld
     except Exception:
-        sops = ()
+        sops, sop_withheld = (), 0
     try:
         constraints, con_withheld = resolve_constraints(kw, project)
         withheld += con_withheld
     except Exception:
-        constraints = ()
+        constraints, con_withheld = (), 0
     # MN-17 note, deliberately NOT an emitter. Announcing the `sop` / `improvements`
     # cats from here was the obvious placement and it was wrong: `resolve` runs during a
     # sidecar REBUILD, so writing telemetry events made the rebuild mutate the ledger and
@@ -486,7 +542,8 @@ def resolve(task, evs=None, project=None, reco=None) -> Advice:
     # advice` caught it immediately. The faculties are announced from the hook instead,
     # where advice is CONSULTED rather than computed. See `inject.engaged_faculties`.
     return Advice(skills=skills, sops=sops, constraints=constraints,
-                  withheld=withheld)
+                  withheld=withheld, withheld_sops=sop_withheld,
+                  withheld_constraints=con_withheld)
 
 
 # --- serialization -----------------------------------------------------------------------

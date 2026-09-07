@@ -110,13 +110,39 @@ def render_plain(board, icons=None, width=110) -> str:
     if not board.rows():
         rows.append("(no lane has reported yet)")
 
+    # `steal_log` and `LaneView.worktree` were folded, bounded, and drawn by
+    # NOTHING. Recorded as "either draw them or delete them, and say which";
+    # this is the which. They are drawn HERE, in the plain renderer, and
+    # deliberately not in the live one:
+    #
+    #   - The live view has a fixed-height layout and shows a steal WHILE it
+    #     happens, as the lane's own STEALING status and note. The log's value
+    #     is afterwards, and `Live` leaves nothing behind when it exits.
+    #   - `_close_board` prints this renderer after the mission returns, so the
+    #     plain frame is the one that persists and the one an operator reads.
+    #
+    # Both blocks are omitted entirely when empty: a permanent "(none)" is the
+    # noise that teaches an operator to skim.
+    extra: list = []
+    worktrees = [view for view in board.rows() if view.worktree]
+    if worktrees:
+        extra.append("")
+        extra.append("WORKTREES")
+        for view in worktrees:
+            extra.append(f"  {view.name:<10}{view.worktree}")
+    if board.steal_log:
+        extra.append("")
+        extra.append("STEALS")
+        for caption in board.steal_log:
+            extra.append(f"  {caption}")
+
     foot = ["", "ALERTS"]
     for alert in board.alerts:
         foot.append(f"  ! {alert.text}")
     if not board.alerts:
         foot.append("  (none — no breaker has opened and nothing has been "
                     "re-queued)")
-    return "\n".join(head + rows + foot)
+    return "\n".join(head + rows + extra + foot)
 
 
 # --- rich rendering ------------------------------------------------------------
@@ -150,6 +176,13 @@ def _header_panel(board):
                 f"done {counts['completed']}  failed {counts['failed']}  "
                 f"retried {counts['retried']}  steals {counts['steals']}",
                 style="dim")
+    # The same line `render_plain` draws, in the same words. `Board`'s own
+    # docstring promises "`ignored` counts it and the header prints it", and
+    # only the plain renderer kept that promise -- so the operator most likely
+    # to be watching, the one with a terminal, was the one not told.
+    if counts["ignored"]:
+        body.append(f"\n{counts['ignored']} event(s) could not be read",
+                    style="yellow")
     if board.intent:
         body.append(f"\n{board.intent[:120]}", style="italic dim")
     return Panel(body, title=f"Lintester Brain — {board.mission_id or '...'}",
@@ -315,7 +348,6 @@ class Dashboard:
         if not self.plain:
             try:
                 await self._run_live()
-                return
             except Exception as exc:                    # noqa: BLE001
                 # The live board could not be BUILT (or could not be torn
                 # down). `_paint` already counts a failed repaint, but the
@@ -332,6 +364,25 @@ class Dashboard:
                 self.plain = True
                 self.degraded = (f"the live board failed and this run fell back "
                                  f"to a log — {self.last_render_error}")
+            else:
+                # The live path used to `return` here and say nothing, so a
+                # board frozen by repeated repaint failure exited looking like a
+                # board that simply had nothing more to show. `_paint` counted
+                # every one of those failures into `render_errors` and nothing
+                # ever read it back.
+                #
+                # Reported only when non-zero, and AFTER `Live` has restored the
+                # terminal so the snapshot is not painted over. A healthy run
+                # still ends with the frame it drew: dumping a plain board over
+                # every successful run would be the noise that trains an
+                # operator to skim the line that matters.
+                if self.render_errors:
+                    self._say(f"[board] {self.render_errors} repaint(s) failed "
+                              f"and the frame above is stale — "
+                              f"{self.last_render_error}")
+                    self._tolerate(
+                        lambda: self._say(render_plain(self.board, self.icons)))
+                return
         self._say(f"[board] {self.degraded}")
         await self._pump(None)
         self._tolerate(lambda: self._say(render_plain(self.board, self.icons)))

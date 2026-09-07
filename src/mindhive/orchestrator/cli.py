@@ -45,7 +45,7 @@ def cmd_lintester(args) -> int | None:
         return 2
 
     started = bool(args.execute)
-    bus, observer, why, board = _observer(args, started)
+    bus, observer, why, board, board_stream = _observer(args, started)
     if why:
         # stderr, not stdout: `--json` is a machine surface and a friendly
         # note printed into it is a parse error at the other end.
@@ -69,7 +69,7 @@ def cmd_lintester(args) -> int | None:
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
 
-    _close_board(bus, board)
+    _close_board(bus, board, board_stream)
     report = mission.as_dict()
     scored = _payoff(mission) if getattr(args, "payoff", False) else None
     if scored is not None:
@@ -85,7 +85,7 @@ def cmd_lintester(args) -> int | None:
     return 0 if mission.outcome in ("ok", "dry-run") else 1
 
 
-def _close_board(bus, board) -> None:
+def _close_board(bus, board, stream=None) -> None:
     """Render the board one last time, after the mission has returned.
 
     The live view is torn down with the lane phase, but the mission is not
@@ -100,20 +100,27 @@ def _close_board(bus, board) -> None:
         return
     from . import dashboard as dash_mod
 
+    # The closing frame follows the live one. With `--json` the board ran on
+    # stderr, and printing its summary to stdout would put a human paragraph
+    # into the machine surface -- a parse error at the other end, which is the
+    # whole reason the two were held apart in the first place.
+    out = stream if stream is not None else sys.stdout
     try:
         for event in bus.drain():
             board.apply(event)
-        print(dash_mod.render_plain(board, dash_mod.icons_for(sys.stdout)))
+        print(dash_mod.render_plain(board, dash_mod.icons_for(out)), file=out)
         # The bus counts what it could not deliver and what it did not
         # recognise, and until now nothing ever read either back: the process
         # exited holding both. Printed only when non-zero — a permanent `0`
         # trains the operator to skim the one line that matters on the day it
         # is not zero, which is the argument `hive mindnet brief` already makes
         # for `failed=` / `dropped=` / `withheld=`.
-        if bus.dropped or bus.unknown:
+        if bus.dropped or bus.unknown or bus.unknown_dropped:
             print(f"  board: {bus.dropped} event(s) dropped"
                   + (f", unrecognised {', '.join(bus.unknown)}"
-                     if bus.unknown else ""))
+                     if bus.unknown else "")
+                  + (f" (+{bus.unknown_dropped} more kind(s) not recorded)"
+                     if bus.unknown_dropped else ""), file=out)
     except Exception as exc:                            # noqa: BLE001
         # The same bargain the board keeps everywhere else: a display is
         # derived state, and losing it must never cost the report that
@@ -135,23 +142,46 @@ def _observer(args, started):
     tenth of a second and take the plan's own report down with it. And
     `--json` owns stdout, which is where the board writes."""
     if not bool(getattr(args, "board", False)):
-        return None, None, "", None
-    if getattr(args, "json", False):
-        return None, None, ("the board is off — it writes to stdout, which "
-                            "the JSON report owns"), None
+        return None, None, "", None, None
+    # `--json` no longer switches the board OFF. It only moves it: `Dashboard`
+    # already takes `stream=` and `console=`, so the exclusivity was never about
+    # the two features conflicting, only about stdout being hardcoded. The JSON
+    # report keeps stdout whole -- which is the requirement -- and the operator
+    # watching a long run still gets lanes, on stderr.
+    to_stderr = bool(getattr(args, "json", False))
     if not started:
         return None, None, ("the board is off — a plan publishes a few phase "
                             "lines and stops; add the flag that starts work "
-                            "to watch lanes run"), None
+                            "to watch lanes run"), None, None
     from . import dashboard as dash_mod
 
     bus = dash_mod.EventBus()
+    stream = sys.stderr if to_stderr else sys.stdout
     # The board is built HERE rather than left to `attach`, because this
     # function's caller needs it after the mission returns — see `_close_board`.
     board = dash_mod.Board()
     available, reason = dash_mod.rich_available()
-    return (bus, (lambda: dash_mod.attach(bus, board=board)),
-            ("" if available else reason), board)
+    return (bus,
+            (lambda: dash_mod.attach(bus, board=board, stream=stream,
+                                     console=_console_for(stream))),
+            ("" if available else reason), board, stream)
+
+
+def _console_for(stream):
+    """A `rich` console bound to *stream*, or ``None`` to let `Live` choose.
+
+    ``None`` for stdout keeps the existing behaviour exactly -- `Live` builds
+    its own console and this function changes nothing for the common case. Only
+    the stderr run needs a console told where to write, and it is built here so
+    a machine with no `rich` still reaches the plain path instead of an
+    ImportError from the front door."""
+    if stream is sys.stdout:
+        return None
+    try:
+        from rich.console import Console
+    except ImportError:                                 # pragma: no cover - no rich
+        return None
+    return Console(file=stream)
 
 
 def _reflector():
