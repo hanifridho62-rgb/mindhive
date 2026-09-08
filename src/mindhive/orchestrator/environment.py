@@ -109,6 +109,13 @@ _CLI_HINTS = ("claude` cli is not installed", "claude` cli is not on path",
 # operator to log in, which is the one thing that was already true.
 _ACCOUNT_HINTS = ("subscription access", "invalid api key", "api key instead")
 
+# Said by `agent._classify` when the envelope's own turn count shows the child
+# had worked before the refusal landed. Matched as a phrase because that is how
+# this module already reads every other fact off an agent's reason -- see the
+# hint tuples above. Read ONLY by `describe`, so a miss costs a less specific
+# sentence and can never change which missions halt.
+_PARTIAL_HINTS = ("may hold partial work",)
+
 # How much of the CLI's own sentence the account branch quotes back. Bounded
 # because `agent._classify` wraps the message in a sentence of its own, and an
 # unbounded quote would put a paragraph in the middle of one line of advice.
@@ -218,6 +225,15 @@ def describe(kind, reason="") -> str:
                 "could start; log in (`claude auth login`, or /login inside "
                 "claude) and re-run -- the mission does not retry this")
     if kind == USAGE:
+        # "no child could start" is false whenever a child ran first and the
+        # limit landed mid-flight. On 2026-09-08 this sentence said exactly that
+        # for a mission whose two lanes held 146 and 7 lines of uncommitted
+        # edits, sending the operator away from work sitting on disk.
+        if _any(_PARTIAL_HINTS, " ".join(detail.split()).lower()):
+            return ("the account's usage limit is exhausted; a child had "
+                    "already started, so a lane may hold partial work worth "
+                    "looking at before it is discarded -- wait for the window "
+                    "to reset and re-run -- the mission does not retry this")
         return ("the account's usage limit is exhausted, so no child could "
                 "start; wait for the window to reset and re-run -- the mission "
                 "does not retry this")

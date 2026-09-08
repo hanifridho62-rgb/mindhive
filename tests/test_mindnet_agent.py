@@ -783,3 +783,75 @@ def test_a_reply_within_the_bound_carries_the_same_text_both_ways(monkeypatch,
     _spawn(monkeypatch, stdout=_envelope(result="short answer"))
     out = ag.run("k", "p", root=tmp_path, project="test")
     assert out.text == out.excerpt == "short answer"
+
+
+# --- a limit reached AFTER the child did real work ----------------------------
+
+def _err_envelope(turns=0, status=429,
+                  msg="You've hit your session limit · resets 9pm"):
+    """An is_error envelope that also says how many turns the child took."""
+    return json.dumps({"result": msg, "is_error": True,
+                       "api_error_status": status, "num_turns": turns})
+
+
+def test_a_limit_hit_before_any_turn_still_says_nothing_was_attempted(monkeypatch,
+                                                                     tmp_path):
+    """The case the current sentence was written for, kept exactly as it was.
+
+    A 401 or a 429 that lands before the model works really does leave the tree
+    untouched, and saying so is what stops an operator hunting for output that
+    does not exist."""
+    _spawn(monkeypatch, exit_code=1, stdout=_err_envelope(turns=0))
+    out = ag.run("k", "p", root=tmp_path, project="test")
+    assert out.executed is False
+    assert "nothing was attempted" in out.reason
+    assert out.turns == 0
+
+
+def test_a_limit_hit_after_real_turns_does_not_claim_the_tree_is_untouched(
+        monkeypatch, tmp_path):
+    """Observed on 2026-09-08, mission lm-84c06ad6 run 2.
+
+    Two children were reported `[usage] ... nothing was attempted, so the task
+    is left untouched`. Both had really run -- 22 and 12 turns over 333805 ms
+    and 396685 ms -- and both left uncommitted edits in their lanes, 146 lines
+    and 7. The report sent the operator away from work that was sitting on
+    disk."""
+    _spawn(monkeypatch, exit_code=1, stdout=_err_envelope(turns=22))
+    out = ag.run("k", "p", root=tmp_path, project="test")
+    assert out.turns == 22
+    assert "nothing was attempted" not in out.reason
+    assert "left untouched" not in out.reason
+    assert "partial" in out.reason, out.reason
+
+
+def test_a_limit_hit_after_real_turns_is_still_not_marked_as_started(monkeypatch,
+                                                                    tmp_path):
+    """The constraint that makes this fix narrow, pinned so nobody widens it.
+
+    `executed` is what `orchestrator.environment` reads to decide whether a
+    failure belongs to the MACHINE or to the task: `environment_failure`
+    answers "" the moment it is True, which routes the entry to the repair loop.
+    Flipping it here would stop the mission braking on an exhausted account and
+    spend `max_attempts` per unit against a limit that resets in hours -- the
+    phantom-failure storm that module exists to prevent. The honest sentence is
+    worth having; it is not worth that."""
+    _spawn(monkeypatch, exit_code=1, stdout=_err_envelope(turns=22))
+    out = ag.run("k", "p", root=tmp_path, project="test")
+    assert out.executed is False
+    assert out.reason.startswith(ag.USAGE_MARK)
+
+
+def test_the_mission_still_brakes_on_a_limit_that_arrived_late(monkeypatch,
+                                                              tmp_path):
+    """The same constraint, checked through the module that actually depends on
+    it rather than through the flag it reads."""
+    from mindhive.orchestrator import environment as env_mod
+
+    _spawn(monkeypatch, exit_code=1, stdout=_err_envelope(turns=22))
+    out = ag.run("k", "p", root=tmp_path, project="test")
+
+    class _Entry:
+        result = out
+
+    assert env_mod.environment_failure(_Entry()) == env_mod.USAGE

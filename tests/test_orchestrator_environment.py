@@ -602,3 +602,45 @@ def test_a_mission_whose_children_all_run_is_unaffected(repo):
     assert got.outcome == "ok", got.reason
     assert got.environment == "" and got.left == ()
     assert got.as_dict()["left"] == []
+
+
+# --- a limit that arrived late, at mission level ------------------------------
+
+LATE_LIMIT = ("[usage] the agent could not run to completion: 429: You've hit "
+              "your session limit · resets 9pm (Asia/Jakarta) — it had "
+              "already taken 22 turn(s), so its tree may hold partial work "
+              "worth looking at")
+
+EARLY_LIMIT = ("[usage] the agent could not run: 429: You've hit your session "
+               "limit — nothing was attempted, so the task is left "
+               "untouched")
+
+
+def test_a_late_limit_does_not_tell_the_operator_no_child_started():
+    """The mission-level half of the same false claim.
+
+    `agent` now says honestly that a child which took real turns may have left
+    partial work, but the sentence the operator READS is this one -- it is what
+    the board prints in its alert panel and what `Mission.reason` carries. On
+    2026-09-08 it said "no child could start" for a run whose two lanes held
+    146 and 7 lines of uncommitted edits. TODOS item 29 asked for exactly this
+    to be checked against a real run."""
+    text = env.describe(env.USAGE, LATE_LIMIT)
+    assert "no child could start" not in text
+    assert "partial" in text or "lane" in text
+    assert "wait for the window to reset" in text
+
+
+def test_an_early_limit_still_says_no_child_could_start():
+    """The discriminating half. When the limit really did land before any work,
+    the old sentence is the true one and must survive."""
+    text = env.describe(env.USAGE, EARLY_LIMIT)
+    assert "no child could start" in text
+    assert "partial" not in text
+
+
+def test_a_usage_halt_with_no_detail_keeps_the_original_sentence():
+    """Nothing to go on means no new claim: the caller that passes no reason at
+    all gets what it always got."""
+    text = env.describe(env.USAGE)
+    assert "no child could start" in text
