@@ -20,6 +20,7 @@ the PRD actually asks for:
 """
 import asyncio
 import dataclasses
+import json
 import subprocess
 
 import pytest
@@ -869,3 +870,146 @@ def test_a_unit_naming_no_file_is_still_briefed(tmp_path):
 
     assert got.tasks[0].brief_text
     assert "this unit owns" not in got.tasks[0].brief_text
+
+
+# --- the real agent decomposer (the AGENT branch) -----------------------------
+
+_AGENT_REPLY = json.dumps({"subtasks": [
+    {"title": "build", "description": "wire the writer"},
+    {"title": "test", "description": "cover the writer"}]})
+
+
+def _agent_stub(monkeypatch, text=_AGENT_REPLY, executed=True, reason=""):
+    """Stand in for `mindnet.agent.run` — the seam `decompose.run` spawns
+    through — so the REAL decomposer runs end to end (prompt, parse, validate,
+    `tasks.check_graph`) with only the model call replaced. An injected
+    `decomposer=` would skip every one of those, which is how the branch below
+    went untested."""
+    from mindhive.mindnet import agent as ag_mod
+    from mindhive.mindnet import executor as x_mod
+
+    def fake(run_key, prompt, **_kw):
+        fake.calls.append((run_key, prompt))
+        return x_mod.RunResult(result="ran-unverified", executed=executed,
+                               exit_code=0 if executed else None,
+                               excerpt=text, reason=reason)
+    fake.calls = []
+    monkeypatch.setattr(ag_mod, "run", fake)
+    return fake
+
+
+def test_a_real_mission_takes_the_agents_split_not_the_root_alone(
+        repo, monkeypatch):
+    """The AGENT branch, driven for real. Every other test in this file either
+    injects a decomposer or takes the dry-run preview, and the branch a live
+    `hive lintester --execute` actually runs was never exercised: it built its
+    graph root as an `AgentTask`, `tasks.check_graph` read `parent_id` off it,
+    and the blanket `except` turned that AttributeError into `root-only`.
+    Every real mission collapsed to one unit on one lane, silently."""
+    stub = _agent_stub(monkeypatch)
+    orch = lint.LintesterOrchestrator(root=repo, project="test", lanes=2)
+    intent = "retry the writer and cover it"
+    root_id, title = orch._name(intent)
+
+    units, source, why = orch._subtasks(root_id, title, intent, dry_run=False)
+
+    assert source == lint.AGENT, why
+    assert why == ""
+    assert sorted(u[1] for u in units) == ["build", "test"]
+    assert len(stub.calls) == 1 and intent in stub.calls[0][1], (
+        "the real decomposer was not the one asked")
+
+
+def test_the_agents_split_reaches_the_lanes_and_the_report(repo, monkeypatch):
+    _agent_stub(monkeypatch)
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2,
+        runner=lambda e, ln: True).execute_mission(
+            "retry the writer and cover it", dry_run=False)
+
+    assert got.outcome == "ok", got.reason
+    assert got.decomposition == lint.AGENT
+    assert got.decomposition_reason == ""
+    assert len(got.tasks) == 2 and len(got.completed) == 2
+    assert sorted(t.title for t in got.tasks) == ["build", "test"]
+
+
+def test_an_agent_that_never_ran_is_recorded_not_read_as_atomic(
+        repo, monkeypatch):
+    """`decompose.run` answers an auth failure as a REASON rather than an
+    empty list — its docstring says so — and the orchestrator threw that
+    reason away, so "Not logged in" and "already atomic" printed the same
+    `root-only` line."""
+    _agent_stub(monkeypatch, executed=False, reason="Not logged in")
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test",
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    assert got.decomposition == lint.ROOT_ONLY
+    assert "Not logged in" in got.decomposition_reason
+    assert len(got.tasks) == 1
+
+
+def test_an_empty_answer_is_recorded_as_the_agents_own_answer(
+        repo, monkeypatch):
+    """The one legitimate `root-only` on the agent path, and it still has to
+    say so: an operator reading the report must be able to tell "the agent
+    said atomic" from "the agent was never asked"."""
+    _agent_stub(monkeypatch, text='{"subtasks": []}')
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test",
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    assert got.decomposition == lint.ROOT_ONLY
+    assert "no subtasks" in got.decomposition_reason
+    assert len(got.tasks) == 1
+
+
+def test_a_decomposer_that_raises_is_recorded_not_swallowed(repo, monkeypatch):
+    """The exact shape that hid the bug above. An exception escaping
+    `decompose.run` is a wiring fault — the runner's own failures are already
+    folded into `Decomposition.reason` inside it — and a wiring fault reported
+    as a bare `root-only` is indistinguishable from an atomic task."""
+    from mindhive.mindnet import decompose as dec_mod
+
+    def boom(*_a, **_k):
+        raise AttributeError("'AgentTask' object has no attribute 'parent_id'")
+    monkeypatch.setattr(dec_mod, "run", boom)
+
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test",
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    assert got.decomposition == lint.ROOT_ONLY
+    assert "AttributeError" in got.decomposition_reason
+    assert "parent_id" in got.decomposition_reason
+    assert len(got.tasks) == 1
+
+
+def test_an_injected_decomposer_that_raises_is_recorded(repo):
+    def bad(*_a):
+        raise RuntimeError("decomposer died")
+
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", decomposer=bad).execute_mission("do it")
+
+    assert got.outcome == "refused"
+    assert got.decomposition == lint.INJECTED
+    assert "decomposer died" in got.decomposition_reason
+
+
+def test_the_decomposition_reason_reaches_the_operator(repo, monkeypatch,
+                                                       capsys):
+    """Same contract as `test_the_split_source_reaches_the_operator`: the
+    reason a split is not what was asked for has to be legible in BOTH the
+    machine report and the printed one."""
+    from mindhive.orchestrator import cli as cli_mod
+
+    _agent_stub(monkeypatch, executed=False, reason="Not logged in")
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test",
+        runner=lambda e, ln: True).execute_mission("do it", dry_run=False)
+
+    assert got.as_dict()["decomposition_reason"] == got.decomposition_reason
+    cli_mod._print(got)
+    assert "Not logged in" in capsys.readouterr().out

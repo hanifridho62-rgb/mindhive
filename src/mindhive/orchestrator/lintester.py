@@ -193,6 +193,9 @@ class Mission:
     open_keys: tuple = ()
     dry_run: bool = True
     decomposition: str = ROOT_ONLY
+    # Why `decomposition` is not what was asked for; empty when it is. See
+    # `LintesterOrchestrator._subtasks`.
+    decomposition_reason: str = ""
     # What each lane's checkout was rolled back to before a retry, and what was
     # refused. Empty on a dry run, which starts no lane and therefore discards
     # nothing.
@@ -211,6 +214,7 @@ class Mission:
             "environment": self.environment, "left": list(self.left),
             "dry_run": bool(self.dry_run),
             "decomposition": self.decomposition,
+            "decomposition_reason": self.decomposition_reason,
             "enforcement": self.enforcement,
             "enforcement_reason": self.enforcement_reason,
             "steals": int(self.steals),
@@ -389,7 +393,8 @@ class LintesterOrchestrator:
     # ---- decomposition ------------------------------------------------------
 
     def _subtasks(self, root_id, title, intent, dry_run) -> tuple:
-        """``([(task_id, title, description, files)], source)`` for the units.
+        """``([(task_id, title, description, files)], source, reason)`` for the
+        units.
 
         *files* is `None` on every row but the preview's — see `_unit`.
 
@@ -397,34 +402,66 @@ class LintesterOrchestrator:
         inferred because the four origins are not interchangeable: an injected
         decomposer, the real `decompose.run` agent, the local preview below, or
         no split at all. `Mission.decomposition` carries it out to the operator
-        so a preview can never be read as the agent's answer."""
+        so a preview can never be read as the agent's answer.
+
+        *reason* says WHY the split is not what was asked for, and is empty when
+        it is. It exists because `root-only` on the agent path is four different
+        facts — the agent answered an empty list, the agent never ran, every
+        proposal was refused, or the decomposer itself raised — and a report
+        that prints the same word for all four sent an operator hunting an
+        "already atomic" intent when the real story was a wiring bug. The
+        `except` below still catches, so a decomposer fault degrades the
+        mission to one unit rather than killing it; it no longer catches
+        SILENTLY."""
         if self.decomposer is not None:
             try:
                 out = [_unit(u) for u
                        in (self.decomposer(root_id, title, intent) or ())]
-            except Exception:                           # noqa: BLE001
+                why = ""
+            except Exception as exc:                    # noqa: BLE001
                 out = []
-            return out[:MAX_TASKS], INJECTED
+                why = (f"the injected decomposer raised "
+                       f"{type(exc).__name__}: {exc}")
+            return out[:MAX_TASKS], INJECTED, why
         if dry_run:
             units = preview_units(root_id, title, intent,
                                   self._files_for(intent), self.root)
             if units:
-                return units[:MAX_TASKS], PREVIEW
-            return [(root_id, title, intent, None)], ROOT_ONLY
+                return units[:MAX_TASKS], PREVIEW, ""
+            return [(root_id, title, intent, None)], ROOT_ONLY, ""
         try:
             from ..mindnet import decompose as dec_mod
-            graph = {root_id: AgentTask(task_id=root_id, title=title,
-                                        description=intent)}
+            from ..mindnet import tasks as t_mod
+            # A `tasks.Task`, NOT an `AgentTask`. `decompose.validate` probes
+            # the graph with `tasks.check_graph`, whose contract is a dict of
+            # `Task`s — it reads `parent_id` and `dependencies` off every
+            # value. `AgentTask` deliberately carries neither (information
+            # hiding: a child must not see the graph), so the conversion
+            # belongs HERE, at the one seam where the orchestrator's narrow
+            # unit meets the graph's wide node, and not on `AgentTask`.
+            graph = {root_id: t_mod.Task(task_id=root_id, title=title,
+                                         description=intent)}
             got = dec_mod.run(root_id, graph, project=self.project,
                               root=self.root)
             proposals = list(getattr(got, "usable", ()) or ())
-        except Exception:                               # noqa: BLE001
+            why = _clean(getattr(got, "reason", ""))
+            if not proposals and not why:
+                offered = list(getattr(got, "proposals", ()) or ())
+                if offered:
+                    first = _clean(getattr(offered[0], "reason", ""))
+                    why = (f"the agent proposed {len(offered)} subtask(s) and "
+                           f"none was usable" + (f": {first}" if first else ""))
+                else:
+                    why = ("the agent proposed no subtasks — the intent reads "
+                           "as already atomic")
+        except Exception as exc:                        # noqa: BLE001
             proposals = []
+            why = f"decomposition raised {type(exc).__name__}: {exc}"
         if not proposals:
-            return [(root_id, title, intent, None)], ROOT_ONLY
+            return [(root_id, title, intent, None)], ROOT_ONLY, why
         return [(str(p.task_id), str(p.title),
                  str(getattr(p, "description", "") or p.title), None)
-                for p in proposals][:MAX_TASKS], AGENT
+                for p in proposals][:MAX_TASKS], AGENT, ""
 
     # ---- weighting and lane packing -----------------------------------------
 
@@ -731,11 +768,12 @@ class LintesterOrchestrator:
         # mission is a header that is missing exactly when it is wanted.
         self._emit("mission_started", mission_id=mission_id, intent=text)
         self._emit("brain_phase", phase="Decomposing Intent", detail=title)
-        subtasks, split = self._subtasks(root_id, title, text, dry_run)
+        subtasks, split, split_why = self._subtasks(root_id, title, text,
+                                                    dry_run)
         if not subtasks:
             return Mission(intent=text, mission_id=mission_id, outcome="refused",
                            enforcement=enforcement, enforcement_reason=why,
-                           decomposition=split,
+                           decomposition=split, decomposition_reason=split_why,
                            reason=("the graph is empty — decomposition produced "
                                    "no unit and the intent yielded none"))
 
@@ -804,7 +842,8 @@ class LintesterOrchestrator:
                                    "flag to fan agents at these lanes"),
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            enforcement=enforcement, enforcement_reason=why,
-                           decomposition=split, dry_run=True)
+                           decomposition=split, decomposition_reason=split_why,
+                           dry_run=True)
 
         runnable = [(lid, ents, tree) for lid, ents, tree in lane_entries
                     if getattr(tree, "ok", False) and ents]
@@ -818,7 +857,8 @@ class LintesterOrchestrator:
                                    "reason"),
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            enforcement=enforcement, enforcement_reason=why,
-                           decomposition=split, dry_run=False)
+                           decomposition=split, decomposition_reason=split_why,
+                           dry_run=False)
 
         breaker = res_mod.ToolCircuitBreaker()
         repair = res_mod.RepairLoop(breaker=breaker,
@@ -885,7 +925,8 @@ class LintesterOrchestrator:
                            tasks=tuple(tasks), lanes=tuple(lanes_out),
                            kept=tuple(r.reason for r in released if r.kept),
                            enforcement=enforcement, enforcement_reason=why,
-                           decomposition=split, dry_run=False)
+                           decomposition=split, decomposition_reason=split_why,
+                           dry_run=False)
 
         self._emit("brain_phase", phase="Merging Worktrees",
                    detail=f"{len(trees)} lane(s)")
@@ -920,7 +961,8 @@ class LintesterOrchestrator:
             open_keys=tuple(breaker.open_keys()),
             rollbacks=tuple(str(r) for r in repair.rollbacks),
             calibration=cal.as_dict(),
-            decomposition=split, dry_run=False)
+            decomposition=split, decomposition_reason=split_why,
+            dry_run=False)
 
 
 def run_mission(intent, root=None, project=None, lanes=DEFAULT_LANES,

@@ -294,6 +294,8 @@ def _print(mission) -> None:
              else ""))
     print(f"  {len(mission.tasks)} unit(s) across {len(mission.lanes)} lane(s)"
           f", split: {mission.decomposition}")
+    if mission.decomposition_reason:
+        print(f"      because: {mission.decomposition_reason}")
     for lane in mission.lanes:
         where = lane.get("worktree") or "(not isolated)"
         print(f"  lane {lane.get('lane')}: {len(lane.get('tasks', []))} unit(s) "
