@@ -74,6 +74,18 @@ ROOT_ONLY = "root-only"
 
 DEFAULT_TIMEOUT_S = 900
 
+# The posture every child is spawned with; `""` or None omits the flag and
+# leaves the CLI's own default. Probed 2026-09-08 on claude 2.1.198: a headless
+# child spawned with NO --permission-mode had its Write DECLINED (listed under
+# `permission_denials`, file never created, exit 0, no error flag) and
+# `_run_child` scored it ok anyway, since a clean envelope classifies as
+# `ran-unverified`. A real fan-out would have timed N children that could not
+# touch the tree and called every one a success -- the phantom measurement
+# `environment.py` exists to stop, one layer in. `autoresume.PERMISSION_MODE`
+# and `loop.config` choose the same value; `workspace.send`'s wider
+# bypassPermissions needs a --disallowedTools fence this seam cannot pass.
+DEFAULT_PERMISSION_MODE = "acceptEdits"
+
 MUST_USE_LEAD = ("Skills the record says work here. Use them via the Skill tool "
                  "before the first edit:")
 
@@ -333,6 +345,8 @@ class LintesterOrchestrator:
     project: object = None
     lanes: int = DEFAULT_LANES
     timeout_s: int = DEFAULT_TIMEOUT_S
+    # See `DEFAULT_PERMISSION_MODE`; injectable like every collaborator here.
+    permission_mode: str = DEFAULT_PERMISSION_MODE
     limits: res_mod.Limits = field(default_factory=res_mod.Limits)
     max_attempts: int = res_mod.DEFAULT_MAX_ATTEMPTS
     decomposer: object = None
@@ -633,7 +647,7 @@ class LintesterOrchestrator:
     # ---- running ------------------------------------------------------------
 
     def _run_child(self, entry, lane):
-        """Default runner: one real sub-agent, in its lane's checkout."""
+        """Default runner: one sub-agent, in the lane checkout it may edit."""
         task = entry.task
         try:
             from ..mindnet import agent as ag_mod
@@ -655,10 +669,14 @@ class LintesterOrchestrator:
             # `test_the_lintester_mission_prefix_is_covered`. An identity no
             # consumer recognises would be no identity at all.
             run_key = f"{MISSION_PREFIX}-{task.task_id}"
+            # The posture (see `DEFAULT_PERMISSION_MODE`) is bounded by the
+            # directory below it: that IS the lane checkout, so an approved
+            # edit reaches no sibling lane and not the main tree.
             res = ag_mod.run(run_key, task.prompt,
                              root=(lane.worktree_path or self.root),
                              project=self.project, timeout_s=self.timeout_s,
-                             env={"MINDHIVE_SESSION": run_key})
+                             env={"MINDHIVE_SESSION": run_key},
+                             permission_mode=(self.permission_mode or None))
         except Exception as exc:                        # noqa: BLE001
             return _RunOutcome(ok=False,
                                reason=f"{type(exc).__name__}: {exc}",

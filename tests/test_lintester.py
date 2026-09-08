@@ -26,6 +26,7 @@ import subprocess
 import pytest
 
 from mindhive.orchestrator import lintester as lint
+from mindhive.orchestrator import queue as q
 
 
 # --- fixtures -----------------------------------------------------------------
@@ -398,6 +399,116 @@ def test_a_repair_block_is_appended_not_substituted():
 def test_an_empty_repair_block_leaves_the_task_alone():
     task = lint.AgentTask(task_id="t1", description="original")
     assert task.with_repair("   ") is task
+
+
+# --- the posture a child is spawned with --------------------------------------
+# Probed on this machine on 2026-09-08 with claude 2.1.198: a headless
+# `claude --output-format json -p` child spawned with NO --permission-mode had
+# its Write DECLINED -- the tool call listed under `permission_denials`, the
+# file never created, exit 0, is_error false. `_run_child` scored that child
+# `ok`, because a clean envelope classifies as `ran-unverified`. So a mission
+# fanned at a repository would have measured N children that could not touch
+# the tree and called every one of them a success -- the same shape of phantom
+# measurement `environment.py` was written to stop, one layer further in.
+
+
+def _child_spy(monkeypatch, started=True):
+    """Stand in for `mindnet.agent.run` and RECORD what `_run_child` asked for.
+
+    A recorder rather than a bare stub: the property under test is an argument
+    at the spawn seam, and an assertion on the mission's outcome cannot see it
+    -- a child with no posture still exits 0 and still reports `ok`."""
+    from mindhive.mindnet import agent as ag_mod
+    from mindhive.mindnet import executor as x_mod
+
+    seen = []
+
+    def fake(run_key, prompt, **kw):
+        seen.append(dict(kw, run_key=run_key))
+        return x_mod.RunResult(result="ran-unverified", executed=started,
+                               exit_code=0, run_key=run_key)
+
+    monkeypatch.setattr(ag_mod, "run", fake)
+    return seen
+
+
+def _one_child(orch):
+    entry = q.QueueEntry(task=lint.AgentTask(task_id="t1", title="t",
+                                             description="d"))
+    return orch._run_child(entry, q.WorkerLane(0))
+
+
+def test_the_default_runner_lets_its_child_edit_its_lane(monkeypatch):
+    seen = _child_spy(monkeypatch)
+
+    out = _one_child(lint.LintesterOrchestrator(project="test"))
+
+    assert lint.DEFAULT_PERMISSION_MODE == "acceptEdits"
+    assert seen[0]["permission_mode"] == lint.DEFAULT_PERMISSION_MODE
+    assert out.ok is True
+
+
+@pytest.mark.parametrize("off", ["", None])
+def test_an_explicit_empty_posture_sends_no_flag(monkeypatch, off):
+    """Both spellings of "no posture" collapse to the ONE value the spawn seam
+    reads as "omit the flag" — `claude_cli.run_headless` appends it only when
+    the value is truthy, so an empty string reaching it would be indistinguishable
+    from None there but not here."""
+    seen = _child_spy(monkeypatch)
+
+    _one_child(lint.LintesterOrchestrator(project="test", permission_mode=off))
+
+    assert seen[0]["permission_mode"] is None
+
+
+def test_every_child_of_a_real_mission_gets_the_posture(monkeypatch):
+    seen = _child_spy(monkeypatch)
+    monkeypatch.setattr(lint.wt_mod, "acquire_lanes",
+                        lambda root, n, mid="": [
+                            lint.wt_mod.LaneWorktree(lane_id=i, ok=True,
+                                                     path=f"lane-{i}")
+                            for i in range(n)])
+    monkeypatch.setattr(lint.wt_mod, "release_lanes", lambda root, trees: [])
+
+    got = lint.LintesterOrchestrator(
+        project="test", lanes=2, decomposer=_two_units,
+        max_attempts=1).execute_mission("do it", dry_run=False)
+
+    assert got.outcome == "ok", got.reason
+    assert len(seen) == 2
+    assert all(c["permission_mode"] == "acceptEdits" for c in seen), seen
+    # The working directory IS a lane checkout, and that is what bounds the
+    # posture: an in-directory edit approval reaches that lane and nothing
+    # above it. NOT one lane per unit -- a unit stolen by an idle sibling runs
+    # in the THIEF's checkout, which is `WorkStealingScheduler` working, not
+    # failing -- so the property pinned here is that no child was ever handed
+    # the mission root instead of a lane.
+    assert seen and all(c["root"] in {"lane-0", "lane-1"} for c in seen), seen
+
+
+def test_run_mission_forwards_the_permission_mode(monkeypatch):
+    seen = _child_spy(monkeypatch)
+    monkeypatch.setattr(lint.wt_mod, "acquire_lanes",
+                        lambda root, n, mid="": [
+                            lint.wt_mod.LaneWorktree(lane_id=i, ok=True,
+                                                     path=f"lane-{i}")
+                            for i in range(n)])
+    monkeypatch.setattr(lint.wt_mod, "release_lanes", lambda root, trees: [])
+
+    lint.run_mission("do it", project="test", decomposer=_two_units,
+                     max_attempts=1, dry_run=False, permission_mode="")
+
+    assert seen and all(c["permission_mode"] is None for c in seen), seen
+
+
+def test_a_dry_run_grants_no_posture_because_it_spawns_nothing(monkeypatch):
+    seen = _child_spy(monkeypatch)
+
+    lint.LintesterOrchestrator(
+        project="test", decomposer=_two_units).execute_mission("do it",
+                                                               dry_run=True)
+
+    assert seen == []
 
 
 # --- review fixes: the paths a description must not be able to reach -----------
