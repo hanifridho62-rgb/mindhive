@@ -318,6 +318,42 @@ def test_an_environment_outcome_exits_with_its_own_status_and_names_what_was_lef
     assert "lm-1: environment" in out
 
 
+def test_a_run_that_starts_work_gets_the_root_its_help_promised(
+        monkeypatch, tmp_path):
+    """`--root` documents "default: cwd" and passed None instead, which is not
+    a softer default -- it is a crash. `worktree.lane_path_for` builds
+    ``Path(root)`` OUTSIDE the guard that turns a git fault into a reason, so a
+    real `--execute` with no `--root` raised TypeError after decomposing the
+    intent and weighing every unit: the whole plan, thrown away at the first
+    lane. Reproduced on this checkout on 2026-09-08."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = []
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        seen.append(self.root) or _mission())
+    monkeypatch.chdir(tmp_path)
+
+    _cli("lintester", "x", "--execute")
+
+    assert seen == [str(tmp_path)]
+
+
+def test_an_explicit_root_is_still_the_one_used(monkeypatch, tmp_path):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = []
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        seen.append(self.root) or _mission())
+
+    _cli("lintester", "x", "--execute", "--root", str(tmp_path))
+
+    assert seen == [str(tmp_path)]
+
+
 def test_the_environment_status_is_distinct_from_a_partial_run():
     assert lint_cli._status("ok") == 0
     assert lint_cli._status("dry-run") == 0

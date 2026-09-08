@@ -24,6 +24,7 @@ unnecessary and a violation.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 
@@ -59,7 +60,14 @@ def cmd_lintester(args) -> int | None:
         # note printed into it is a parse error at the other end.
         print(f"lintester: {why}", file=sys.stderr)
     mission = LintesterOrchestrator(
-        root=args.root, project=args.project,
+        # The flag's help has always said "default: cwd" and the parser has
+        # always passed None, which is not a softer default but a crash:
+        # `worktree.lane_path_for` builds its lane path OUTSIDE the guard that
+        # turns a git fault into a reason, so ``Path(None)`` raised TypeError
+        # after the intent had been decomposed and every unit weighed. Resolved
+        # here rather than in the parser so a caller that passes root=None into
+        # the library keeps whatever behaviour the library gives it.
+        root=args.root or os.getcwd(), project=args.project,
         lanes=args.lanes if args.lanes is not None else None,
         # The unattended half of the reflect/resolve loop, wired HERE and not in
         # `RepairLoop`. `reflect_on_open` runs the same `resolve.resolve_batch`
