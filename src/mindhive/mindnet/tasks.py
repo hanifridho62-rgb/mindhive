@@ -512,7 +512,20 @@ def cross_graph_conflict(tasks):
 
 def check_graph(tasks) -> list:
     """Every structural violation as a human-readable reason string; ``[]`` for
-    a sound graph. Total — never raises, whatever the folded data looks like."""
+    a sound graph.
+
+    Total over the SHAPE of a folded graph — cycles, dangling parents,
+    over-depth, over-count, dependency floods all come back as reasons, never
+    as exceptions. It is NOT a type check: the contract is a dict of `Task`s,
+    the shape `fold` produces, and a value of any other type is a caller bug.
+    That bug is reported as a `TypeError` naming the offender rather than left
+    to surface as an `AttributeError` from inside `_all_depths` — the latter
+    once hid behind an orchestrator's blanket `except` and was reported as
+    "already atomic"."""
+    for tid, t in tasks.items():
+        if not isinstance(t, Task):
+            raise TypeError(f"check_graph expects a dict of Task; '{tid}' is a "
+                            f"{type(t).__name__}")
     out: list = []
     if len(tasks) > MAX_NODES:
         out.append(f"too many nodes: {len(tasks)} exceeds MAX_NODES "
