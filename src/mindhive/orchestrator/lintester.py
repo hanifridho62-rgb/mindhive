@@ -74,16 +74,12 @@ ROOT_ONLY = "root-only"
 
 DEFAULT_TIMEOUT_S = 900
 
-# The posture every child is spawned with; `""` or None omits the flag and
-# leaves the CLI's own default. Probed 2026-09-08 on claude 2.1.198: a headless
-# child spawned with NO --permission-mode had its Write DECLINED (listed under
-# `permission_denials`, file never created, exit 0, no error flag) and
-# `_run_child` scored it ok anyway, since a clean envelope classifies as
-# `ran-unverified`. A real fan-out would have timed N children that could not
-# touch the tree and called every one a success -- the phantom measurement
-# `environment.py` exists to stop, one layer in. `autoresume.PERMISSION_MODE`
-# and `loop.config` choose the same value; `workspace.send`'s wider
-# bypassPermissions needs a --disallowedTools fence this seam cannot pass.
+# The posture every child is spawned with; `""` or None omits the flag. Probed
+# 2026-09-08 on claude 2.1.198: a child spawned with NO --permission-mode had its
+# Write declined, exited 0 clean, and `_run_child` scored it ok -- a fan-out would
+# have timed N children that could not touch the tree. `autoresume` and
+# `loop.config` pick the same value; bypassPermissions would need a
+# --disallowedTools fence this seam cannot pass.
 DEFAULT_PERMISSION_MODE = "acceptEdits"
 
 MUST_USE_LEAD = ("Skills the record says work here. Use them via the Skill tool "
@@ -670,8 +666,8 @@ class LintesterOrchestrator:
             # consumer recognises would be no identity at all.
             run_key = f"{MISSION_PREFIX}-{task.task_id}"
             # The posture (see `DEFAULT_PERMISSION_MODE`) is bounded by the
-            # directory below it: that IS the lane checkout, so an approved
-            # edit reaches no sibling lane and not the main tree.
+            # directory below it, which IS the lane checkout: an approved edit
+            # reaches no sibling lane and not the main tree.
             res = ag_mod.run(run_key, task.prompt,
                              root=(lane.worktree_path or self.root),
                              project=self.project, timeout_s=self.timeout_s,
