@@ -224,6 +224,46 @@ silent about it:
 
 Plan: `docs/plans/2026-09-01-001-feat-lintester-orchestrator-full-prd-plan.md`.
 
+### DECIDED by the owner, 2026-09-08
+
+A conformance audit of the shipped package found four mechanisms that were
+label-only: "validated" meant exit 0; "Merging Worktrees" only released lanes;
+the sandbox had no production caller; and two more front doors were neither
+primary nor retired. The owner decided all four; each lands as its own PR, in
+order, and this section grows one bullet per landing.
+
+- **The per-unit gate (`orchestrator/gate.py`).** Decided: *targeted tests per
+  unit, then one full suite at the end.* Before, `lintester._run_child` called a
+  unit validated when the child's exit code was 0 and nothing ever ran against
+  the lane; the PRD's `hive selftest` gate did not exist on that path. Now
+  `gate.SuiteGate.check` runs, IN the lane, the tests that mention the modules
+  the child changed (`mindnet.worktree.changed_files`, narrowed by
+  `gate.tests_mentioning`; the child's own new test files are always
+  targeted), and `gated` turns a red run into the unit's failure — the task's,
+  not the machine's, so the repair loop retries it with the pytest tail as the
+  first real stderr it has ever received. A change no test mentions is a
+  **recorded vacuous pass** (`scope: none`): the alternative, failing closed,
+  was rejected because it would refuse every unit that adds a module nobody
+  tests yet, and the closing full suite is the mission-level judge anyway.
+  **A targeted run is not a ledger verification** — `verify.run_and_record`
+  grew `record=False` because `replenish._passing_verification_ts` clears the
+  "changed, unverified" gap on ANY exit-0 `verification` row and a two-file
+  pass must not masquerade as the tree verified; only the closing full suite
+  records, stamped `scope: full` with the mission id. Gate time is subtracted
+  from the calibration sample so the weight keeps predicting the child, not
+  the tests. Transitional: the full suite runs once per lane tree that
+  validated a unit, because until the merge-back lands each lane is the only
+  place its work exists. Library default `validator=None` keeps the exit-code
+  path; `hive lintester --execute` wires the gate, `--no-gate` opts out and
+  its help text says what that costs.
+- **The merge-back.** Decided, not yet landed: the orchestrator commits on the
+  child's behalf and merges lanes probe-first into an integration branch made
+  from the lanes' base; the main checkout's HEAD never moves.
+- **The sandbox on the child path.** Decided, not yet landed: the fence goes
+  onto the real child spawn and the report says what was observed.
+- **The two other doors.** Decided, not yet landed: soft-deprecate both, code
+  kept, a notice and a toggle, reversible.
+
 ---
 
 ## Trust boundary (accepted risk)

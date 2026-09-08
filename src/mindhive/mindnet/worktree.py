@@ -309,3 +309,37 @@ def _retire(root, path, branch="", base="") -> Retired:
                        reason=f"could not remove {target}: "
                               f"{err or 'git worktree remove failed'}")
     return Retired(removed=True, kept=False, reason="")
+
+
+def changed_files(path):
+    """Repo-relative POSIX paths of every file the checkout at *path* has
+    changed against its `HEAD` — modified, added, deleted, renamed — plus every
+    untracked file that is not ignored. ``()`` for a clean tree; ``None`` when
+    git could not say.
+
+    Two commands rather than one `status --porcelain`, because `_git` strips
+    its output and the first status line's leading column is whitespace:
+    ``" M seed.txt"`` comes back as ``"M seed.txt"`` and no column parser
+    survives that. `diff --name-only HEAD` and `ls-files --others
+    --exclude-standard` print one bare path per line and nothing to parse.
+    `core.quotepath=false` keeps a non-ASCII name as itself rather than as
+    octal escapes.
+
+    Under the lock like everything else here: the per-unit gate asks this from
+    the scheduler's executor threads while another lane may be mid-`add`.
+    Total."""
+    with _GIT_LOCK:
+        ok, tracked, _err = _git(path, "-c", "core.quotepath=false", "diff",
+                                 "--name-only", "HEAD")
+        if not ok:
+            return None
+        ok, untracked, _err = _git(path, "-c", "core.quotepath=false",
+                                   "ls-files", "--others", "--exclude-standard")
+        if not ok:
+            return None
+    out = []
+    for line in (tracked + "\n" + untracked).splitlines():
+        rel = line.strip().replace("\\", "/")
+        if rel:
+            out.append(rel)
+    return tuple(dict.fromkeys(out))

@@ -1012,6 +1012,13 @@ from the same review are recorded here rather than fixed, because each is outsid
 > spending `max_attempts` per unit on it. Owner action: `claude auth login`, then
 > `hive lintester "<intent>" --execute`; the sample lands in `hive lintester --calibration`.
 
+> **2026-09-08.** The per-unit test gate (item 32) runs pytest inside the unit's
+> `elapsed_ns` window, so `_calibrate` now subtracts each unit's gate rows
+> (`GateResult.duration_s`, summed over attempts) from its sample before the weight is
+> scored. The first real sample will measure the child, not the child plus its tests;
+> `tests/test_orchestrator_gate.py::test_gate_time_is_excluded_from_the_weight_calibration`
+> pins it.
+
 `src/mindhive/orchestrator/` shipped on 2026-09-01 and closes all 22 open items from
 the PRD conformance sweep: `LintesterOrchestrator.execute_mission`, an `ast.NodeVisitor`
 cyclomatic metric, `git log --numstat` churn, an asyncio work-stealing scheduler with a
@@ -1154,6 +1161,12 @@ state is a record of the worst the mission ever saw rather than of where it stan
 > first real `--board --execute` run happens, check that this alert reads as "the machine,
 > not the mission" and does not scroll the lane rows away.
 
+> **2026-09-08.** Two more lines reach the board unrendered against a real run: the gate's
+> `gate <task>: ok|red, N test file(s)` detail under `Running Lanes` (item 32), and the new
+> `Running Suite` phase, once per lane, between the lanes and the teardown. On the first real
+> `--board --execute` run, check that a red gate line reads as the unit's failure and that
+> the suite phase does not look like a hang while pytest runs for a minute.
+
 `src/mindhive/orchestrator/dashboard.py` shipped on 2026-09-01: an `asyncio.Queue` publish/subscribe
 bus, ten frozen Event State objects, a pure `Board` fold, a `rich` `Live` layout split into the
 directive's three areas — Lintester Brain / Worker Lanes / Circuit Breaker & Alerts — and a
@@ -1283,3 +1296,45 @@ than a file in the wrong directory. The reader side (`read_all`, `corrupt_rows`)
 
 **Why not in the hooks PR:** it is a change to the ledger's write path, with its own blast
 radius and its own review; the hooks change is additive and touches no `src/`. Keep them apart.
+
+---
+
+## 32. "Validated" now means the lane's tests passed; four things about the gate are still honest gaps
+
+`src/mindhive/orchestrator/gate.py` landed on 2026-09-08 (owner decision: targeted tests per
+unit, one full suite at the end — `docs/designs/lintester-orchestrator.md`, "DECIDED by the
+owner, 2026-09-08"). Before it, `lintester._run_child` called a unit validated on the child's
+exit code and no test ever ran against the lane. Now `SuiteGate.check` runs, in the lane, the
+tests that mention the modules the child changed; `gated` turns a red run into the unit's
+failure with the pytest tail as its stderr; `SuiteGate.full` runs the whole suite once per
+lane that validated anything; a red suite makes the mission `partial`. Targeted runs pass
+`record=False` to `verify.run_and_record` and never become a ledger `verification`; the full
+run records one stamped `scope: full` with the mission id. `hive lintester --execute` wires
+the gate; `--no-gate` opts out and its help text says what that costs.
+
+**What is honestly still open.**
+
+* **A change no test mentions is a recorded vacuous pass.** `scope: none` in the gate row,
+  `reason` saying so, and the closing full suite as the only judge. The fail-closed
+  alternative was rejected on purpose — it would refuse every unit that adds a module nobody
+  tests yet — but the consequence is real: a child can add an untested module, pass its gate,
+  and be validated on the strength of a suite that never imports it. The report shows the
+  `none` row; nothing yet counts them or warns when every gate in a mission was vacuous.
+* **No real child has ever been gated.** The same missing sample as items 27 and 29: every
+  gate in the suite ran against a fake runner that wrote the files itself. What a real
+  `claude -p` child changes, and whether `tests_mentioning`'s import-pattern narrowing picks
+  the right files for it, is unmeasured until `claude auth login` and the first
+  `hive lintester "<intent>" --execute`.
+* **The full suite runs once per lane, not once.** Until the merge-back lands (the next PR),
+  each lane's tree is the only place its validated work exists, so each is judged where it
+  stands — N lanes, N suite runs, and two lanes that each pass alone can still conflict.
+  The merge-back replaces this loop with one run on the integration tree.
+* **The cap kills the child only.** `verify._stream`'s timer calls `proc.kill()`, which on
+  Windows ends the pytest process and not the grandchildren it spawned (a `subprocess` under
+  test, a hung fixture). A gate killed at its cap answers `124` and the mission continues;
+  what the orphan does afterwards is not tracked. The sandbox PR's Job Object fence is the
+  fix, and it is deliberately not duplicated here.
+
+**Cons of leaving it:** the first bullet is the one that can mislead — a mission of vacuous
+passes reads as validated. The other three are the same "no real sample" gap and the same
+"no merge-back yet" gap the neighbouring items already carry.

@@ -38,18 +38,38 @@ excerpt plus the artifact path.
 on the `UserPromptSubmit` path may produce one. A gate that could spawn a
 multi-minute subprocess on a keystroke is a denial of service on the user's own
 session.
+
+**A targeted run is not a verification.** `orchestrator/gate.py` runs a
+unit's own test files in its lane through `run_and_record(record=False)`: a
+real subprocess, a real exit code, no event. `replenish` clears the "code
+changed, nothing verified since" gap on any exit-0 `verification` and `premise`
+reads the last one's counts, so a two-file pass recorded as one would answer
+for the whole tree. Only the closing full suite appends, and *extra* lets it
+say `scope: full` — under the stamp, never over it.
 """
 from __future__ import annotations
 
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from . import events as ev_mod
 from . import runlog
 
 VERIFIED_BY = "python"
+
+# What a run killed at its cap answers. The code `claude_cli.run_headless`
+# answers for a child that outlived its timeout, so a killed suite and a killed
+# child read alike wherever both are reported.
+TIMEOUT_EXIT = 124
+
+# The payload keys this module writes itself. `extra` may add to a payload; it
+# may not stand in for any of these, or the stamp would be forgeable through
+# the back door `validate_payload` closes at the front.
+_OWN_KEYS = frozenset(("text", "argv", "exit_code", "counts", "excerpt",
+                       "verified_by", "artifact", "error"))
 
 # Keywords pytest reports counts against. `errors?` covers both spellings.
 _COUNT_RE = re.compile(r"\b(\d{1,7})\s+(passed|failed|errors?|skipped|xfailed|"
@@ -129,13 +149,19 @@ def validate_stored(payload) -> None:
             f"{VERIFIED_BY!r} — nothing else may record a mechanical run")
 
 
-def _stream(argv, echo: bool, emit=None, env=None):
+def _stream(argv, echo: bool, emit=None, env=None, cwd=None, timeout_s=None):
     """Run *argv* and return ``(exit_code, output, error)``.
 
     *env* replaces the child's environment wholesale when given, and ``None``
     means inherit. The caller builds it — `selftest` points `PYTHONPATH` at the
     checkout under test — because this function knows nothing about which
     source tree the command is meant to import.
+
+    *cwd* is where the command runs; ``None`` means here. *timeout_s* arms a
+    kill: past it the child is killed, the loop drains what it wrote, and the
+    run answers `TIMEOUT_EXIT` with the cap named in *error*. Known limit:
+    `Popen.kill` reaches the child alone, so a grandchild that inherited the
+    pipe can hold the read open past the cap. Recorded here, not hidden.
 
     Line-streamed rather than captured wholesale so a four-minute suite still
     prints as it goes; the buffer is what becomes the artifact. argv list only
@@ -151,12 +177,37 @@ def _stream(argv, echo: bool, emit=None, env=None):
             encoding="utf-8",
             errors="replace",
             env=env,
+            cwd=str(cwd) if cwd else None,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, ValueError) as e:
         # A missing program is a real, recordable outcome — not a crash for the
         # caller to handle. 127 is the shell convention for "not found".
         return 127, "", f"{type(e).__name__}: {e}"
+    killed: list = []
+    timer = None
+    if timeout_s:
+        def _kill():
+            killed.append(1)
+            try:
+                proc.kill()
+            except OSError:                     # pragma: no cover - already gone
+                pass
+        timer = threading.Timer(float(timeout_s), _kill)
+        timer.daemon = True
+        timer.start()
+    try:
+        code = _drain(proc, chunks, kept, emit, echo)
+    finally:
+        if timer is not None:
+            timer.cancel()
+    if killed:
+        return TIMEOUT_EXIT, "".join(chunks), f"killed at the {timeout_s}s cap"
+    return code, "".join(chunks), ""
+
+
+def _drain(proc, chunks, kept, emit, echo) -> int:
+    """Read *proc* to the end into *chunks* and answer its exit code."""
     with proc:
         if proc.stdout is not None:
             for line in proc.stdout:
@@ -190,22 +241,36 @@ def _stream(argv, echo: bool, emit=None, env=None):
                     # costs a syscall per line on a command that is about to
                     # spend minutes in a subprocess.
                     sys.stdout.flush()
-        code = proc.wait()
-    return code, "".join(chunks), ""
+        return proc.wait()
 
 
 def run_and_record(argv=None, project=None, root=None, echo: bool = True,
-                   emit=None, env=None) -> dict:
+                   emit=None, env=None, cwd=None, timeout_s=None,
+                   record: bool = True, extra=None) -> dict:
     """Run a test command, record the result, return
-    ``{exit_code, counts, error, artifact, excerpt}``.
+    ``{exit_code, counts, error, artifact, excerpt, tail}``.
 
     The returned dict is a convenience for the caller; the EVENT is the
     artifact. Never raises for a failing or missing command — a failure is a
-    result to record, not an exception to hide."""
+    result to record, not an exception to hide.
+
+    ``record=False`` skips the event and nothing else: the subprocess, the
+    exit code and the artifact are as real as ever, and the caller holds the
+    dict. It exists for the per-unit gate — see the module docstring for why a
+    targeted run must not read as a tree verification. *extra* is merged UNDER
+    the payload's own keys, so a caller can label a run (`scope`,
+    `mission_id`, `tree`) and cannot forge its stamp, its exit code or its
+    command."""
     cmd = list(argv) if argv else default_argv(root)
-    code, output, error = _stream(cmd, echo, emit, env=env)
+    code, output, error = _stream(cmd, echo, emit, env=env, cwd=cwd,
+                                  timeout_s=timeout_s)
     counts = parse_summary(output)
-    excerpt = output.strip()[:runlog.EXCERPT_CHARS]
+    text = output.strip()
+    excerpt = text[:runlog.EXCERPT_CHARS]
+    # The END of the output, for a caller that wants the diagnosis rather than
+    # the collection banner: pytest's failures and its summary are its last
+    # lines, and `excerpt` — the event's bounded quote — is its first.
+    tail = text[-runlog.EXCERPT_CHARS:]
 
     artifact = None
     try:
@@ -218,26 +283,29 @@ def run_and_record(argv=None, project=None, root=None, echo: bool = True,
                + (f" — {counts.get('passed', 0)} passed, "
                   f"{counts.get('failed', 0)} failed" if counts
                   else " — counts not parseable"))
-    payload = {
+    payload = ({str(k): v for k, v in extra.items() if str(k) not in _OWN_KEYS}
+               if isinstance(extra, dict) else {})
+    payload.update({
         "text": summary,
         "argv": [str(c) for c in cmd],
         "exit_code": int(code),
         "counts": counts,
         "excerpt": excerpt,
         "verified_by": VERIFIED_BY,
-    }
+    })
     if artifact:
         payload["artifact"] = artifact
     if error:
         payload["error"] = error
     validate_stored(payload)
-    try:
-        ev_mod.append_event("verification", payload, tags=["verify", "auto"],
-                            project=project)
-    except Exception:                                   # noqa: BLE001
-        pass          # a down ledger must not turn a real run into a crash
+    if record:
+        try:
+            ev_mod.append_event("verification", payload,
+                                tags=["verify", "auto"], project=project)
+        except Exception:                               # noqa: BLE001
+            pass      # a down ledger must not turn a real run into a crash
     return {"exit_code": int(code), "counts": counts, "error": error,
-            "artifact": artifact, "excerpt": excerpt}
+            "artifact": artifact, "excerpt": excerpt, "tail": tail}
 
 
 def last_run(evs) -> dict | None:
