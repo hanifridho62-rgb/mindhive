@@ -238,6 +238,21 @@ def test_dangling_dependency_is_reported_not_crashed():
     assert t_mod.dependency_cycle(g) is None
 
 
+def test_check_graph_names_a_value_that_is_not_a_task():
+    """`check_graph` is total over the SHAPE of a folded graph — cycles,
+    dangling parents, over-depth, over-count all come back as reasons — not
+    over the type of what is in it. A value that is not a `Task` is a caller
+    bug, and it surfaces as a `TypeError` naming the offender rather than an
+    `AttributeError` from inside `_all_depths`, which is what an orchestrator
+    once caught, swallowed, and reported as "already atomic"."""
+    class Impostor:
+        task_id = "x"
+        title = "not a Task"
+
+    with pytest.raises(TypeError, match=r"'x'.*Impostor"):
+        t_mod.check_graph({"x": Impostor()})
+
+
 # --- readiness ----------------------------------------------------------------
 
 def test_ready_requires_pending_and_completed_dependencies():
