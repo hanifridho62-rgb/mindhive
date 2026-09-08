@@ -25,6 +25,7 @@ delegates to the incumbent that already owns its work:
     integrate.py   -> mindnet.worktree, which owns every git call the
                       merge-back makes, and changelog.record for its entries
     mission.py     -> nothing; the report is a frozen record
+    agenttask.py   -> nothing; the closed per-child surface, in and out
 
 Nothing here forks a shipped module, re-implements its state machine, or
 bypasses it. A second git-worktree driver or a second breaker would be the

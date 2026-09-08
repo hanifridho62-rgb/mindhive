@@ -118,7 +118,8 @@ the default, and `--execute` is the only difference between looking and doing.
 
 | Module | Owns |
 |---|---|
-| `lintester.py` | WB1 — `LintesterOrchestrator.execute_mission`: intent → units → weighted lanes → briefs → scheduler → per-unit gate → merge-back → closing suite → teardown. `AgentTask` is the closed per-child view. |
+| `lintester.py` | WB1 — `LintesterOrchestrator.execute_mission`: intent → units → weighted lanes → briefs → scheduler → per-unit gate → merge-back → closing suite → teardown. |
+| `agenttask.py` | The closed per-child surface, carved out of `lintester.py` at the size cap: `AgentTask` (frozen — everything one child is told, and nothing else) in, `_RunOutcome` back. Nothing here spawns anything. |
 | `mission.py` | The report: the `Mission` frozen record and the four decomposition constants, carved out of `lintester.py` at the size cap. `as_dict` is the `--json` shape. |
 | `integrate.py` | The merge-back: `commit_lane` commits a validated unit on its lane branch on the child's behalf (children may not commit), `integrate_lanes` merges the lanes probe-first into `lint/<mission>/integration` made from their base. A conflicting lane is kept with its branch for a person; the main checkout never moves; the branch survives its worktree. |
 | `preview.py` | The dry run's decomposer: `preview_units` groups the files the intent names into one `local-preview` unit per directory. Carved out of `lintester.py` at the size cap. |
