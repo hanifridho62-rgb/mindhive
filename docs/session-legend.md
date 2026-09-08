@@ -105,7 +105,7 @@ Units are MN-numbered; the number in each docstring is the address.
 | `orchestrator.py` | MN-7 — the parallel orchestrator that walks the graph in waves. |
 | `agent.py` | MN-8 — what a spawned agent actually runs for a task. |
 | `worktree.py` | MN-9 — one isolated checkout per orchestrated task. |
-| `decompose.py` | MN-11 — a task proposing its own subtasks. |
+| `decompose.py` | MN-11 — a task proposing its own subtasks. Takes a `spawn`, because on the lintester path this is the mission's first fenced child. |
 | `executor.py` | MN-1 U6 — the validation executor (holds the denylist, DATA_MODEL.md §4.2). |
 | `autodeclare.py` | MN-18 — decide whether a prompt should mint a task at all. |
 | `telemetry.py`, `ui_cats.py`, `ui_sessions.py` | MN-1 U10 / MN-5 U8 / MN-19 — the faculty activity feed (`mindnet_activity`) and the two cat boards. **MN-10 is a different slice**: the pr-green completion gate in `orchestrator.py` (DATA_MODEL.md §4.9). |
@@ -120,6 +120,7 @@ the default, and `--execute` is the only difference between looking and doing.
 |---|---|
 | `lintester.py` | WB1 — `LintesterOrchestrator.execute_mission`: intent → units → weighted lanes → briefs → scheduler → per-unit gate → merge-back → closing suite → teardown. |
 | `agenttask.py` | The closed per-child surface, carved out of `lintester.py` at the size cap: `AgentTask` (frozen — everything one child is told, and nothing else) in, `_RunOutcome` back. Nothing here spawns anything. |
+| `fence.py` | The ceiling a real child runs under: `Fence.spawn` has `subprocess.run`'s call shape and `resilience._run_capped`'s enforcement, and is handed down through `claude_cli.run_headless(spawn=)`. Its verdict starts at `resilience.fencing`'s prediction and only ever gets worse, so the mission can never report a ceiling no child actually had. |
 | `mission.py` | The report: the `Mission` frozen record and the four decomposition constants, carved out of `lintester.py` at the size cap. `as_dict` is the `--json` shape. |
 | `integrate.py` | The merge-back: `commit_lane` commits a validated unit on its lane branch on the child's behalf (children may not commit), `integrate_lanes` merges the lanes probe-first into `lint/<mission>/integration` made from their base. A conflicting lane is kept with its branch for a person; the main checkout never moves; the branch survives its worktree. |
 | `preview.py` | The dry run's decomposer: `preview_units` groups the files the intent names into one `local-preview` unit per directory. Carved out of `lintester.py` at the size cap. |

@@ -209,11 +209,19 @@ silent about it:
   the guard. The `orchestrator.py:29-35` rejection of asyncio for the WAVE
   RUNNER stands untouched — that runner is still a thread pool, and the new
   event loop reaches blocking children through `run_in_executor`.
-- **The `setrlimit` sandbox.** Overridden and POSIX-guarded. `import resource`
-  still fails on this machine, so `run_sandboxed` reports `enforcement` as
-  `kernel` or `timeout-only` with a reason, and the Windows leg of the suite
-  ASSERTS the degradation rather than skipping. A sandbox that reported success
-  while enforcing nothing would be worse than none.
+- **The `setrlimit` sandbox.** Overridden, and no longer POSIX-only. `import
+  resource` still fails here (`_rlimits_available()` answers
+  `ModuleNotFoundError: No module named 'resource'`, measured 2026-09-09), so
+  Windows is fenced by a job object instead — `orchestrator/jobs.py`, with
+  `KILL_ON_JOB_CLOSE` so the tree goes with the handle. On this machine
+  `limits_available()` is now `(True, "")` and `fencing(Limits(memory_bytes=…))`
+  answers `kernel`; the earlier note here, that the Windows leg asserts the
+  degradation, described the state before job objects landed. What has not
+  changed is why the field exists: `run_sandboxed` reports `kernel` or
+  `timeout-only` WITH a reason, both legs assert an equality rather than
+  truthiness, and a sandbox that reported success while enforcing nothing would
+  be worse than none — which is precisely the bug the child-path fence above
+  was written to end.
 - **`pybreaker` / any runtime dependency.** NOT overridden. `pyproject.toml:6`
   is still `dependencies = []`; the breaker is the one already in
   `loop/safeguards.py`, and everything new is stdlib.
@@ -287,8 +295,63 @@ order, and this section grows one bullet per landing.
   merged lane was kept as "uncommitted changes". It is a fixed list, not
   "anything ignored" — `dist/out.bin` under an ignore rule is still a build
   the operator asked for, and a test pins that.
-- **The sandbox on the child path.** Decided, not yet landed: the fence goes
-  onto the real child spawn and the report says what was observed.
+- **The sandbox on the child path.** Landed 2026-09-09 as
+  `orchestrator/fence.py`. What it fixes is a false report, not a missing
+  feature: `LintesterOrchestrator` had carried a `limits` field and printed an
+  `enforcement` on every `Mission` since `run_sandboxed` landed, and **nothing
+  was ever fenced** — `execute_mission` asked `resilience.fencing(self.limits)`,
+  which answers what the PLATFORM can do, while `_run_child` went
+  `mindnet.agent.run` -> `claude_cli.run_headless` -> a bare `subprocess.run`
+  with no job object, no rlimit, and no `_terminate_job`, so a timed-out
+  `claude` also left its grandchildren alive. A mission asking for a ceiling
+  reported `kernel` over a completely unfenced child, which is exactly the
+  laundering `resilience`'s own module docstring forbids.
+  `run_sandboxed` could not simply be called: it owns a whole run and answers a
+  `SandboxResult`, while the child's argv belongs to `claude_cli.run_headless`
+  (the `.CMD` shim, the prompt-via-stdin rule, the `MINDHIVE_HEADLESS`
+  recursion guard, `--resume`) and the caller needs a `CompletedProcess` plus
+  the raised `TimeoutExpired` it maps to exit 124. So **the fence is inverted**:
+  `run_headless` grew a `spawn=` seam (appended last, default resolved at CALL
+  time so the module attribute every test patches still wins), `mindnet/agent.py`
+  forwards it on every hop of a rotation chain, and `Fence.spawn` is a
+  `subprocess.run`-shaped callable composing exactly what `run_sandboxed`
+  composes — `_preexec_for`, `_job_for`, `_run_capped`, `_close_job` — and
+  nothing else. **The prediction may only get worse:** `Fence.enforcement`
+  starts at `fencing`'s answer and every spawn can only downgrade it, never
+  upgrade it, because a clean run proves only that THAT child was held and one
+  child that escaped is enough to make `kernel` false for the mission; the first
+  downgrade's reason is kept, since it names the cause rather than the latest
+  symptom. `execute_mission` rebinds the verdict as soon as `_subtasks` returns
+  and again once the lanes have run; only the empty-intent refusal still carries
+  the prediction, and it is the one return where nothing has been spawned.
+  `hive lintester --memory-mb` / `--cpu-seconds` are the front door; the library
+  still takes a `Limits`, and zero on both is `Limits.empty`, for which no fence
+  is built at all so the default run makes byte for byte the call it always
+  made. One trap is pinned by a canary: `jobs._job_for` answers `(None, "")` on
+  POSIX — deliberately not a downgrade, because `_preexec_for`'s `setrlimit`
+  closure is what fences there — so a fence that built a job and forgot the
+  `preexec_fn` would have reported `kernel` on Linux over a child holding no
+  ceiling at all, this same defect one layer up.
+  **Two more instances of that same defect were found by adversarial review of
+  the diff, before it was committed, and both are fixed here.** The
+  decomposition agent — the FIRST `claude` of every real mission — went through
+  `mindnet.decompose.run`, which had no `spawn` parameter at all, so a mission
+  could hold all four lanes to the ceiling and still report `kernel` over an
+  unfenced child; `decompose.run` now takes `spawn` and forwards it only when it
+  is not None, leaving every pre-fence caller and injected runner on the call it
+  always made. And `_spawn`'s lazy `Fence` build was an unguarded check-then-set
+  reached from the scheduler's worker threads: `Fence()` costs ~3 ms because
+  `fencing` probes `import resource` and calls kernel32 through ctypes, both of
+  which release the GIL, and four lanes released together built more than one
+  fence in 200 of 200 measured rounds — every fence but the last orphaned, and
+  an orphaned fence's downgrade is a downgrade nothing reports. It is built
+  under a lock now, and `Fence`'s own counters and verdict under a second one,
+  because `_downgrade` is a check-then-act that two lanes could both pass.
+  **What the verdict does NOT cover** is the breaker's reflection: `RepairLoop`
+  calls the injected reflector, which reaches `run_headless` through
+  `resolve.py` and `reflect.py` with no `spawn=`. That leg is conditional and
+  crosses three modules `hive rules resolve` also uses, so it is stated in
+  `fence.py`'s docstring and open as TODOS #34 rather than half-fixed here.
 - **The two other doors.** Decided, not yet landed: soft-deprecate both, code
   kept, a notice and a toggle, reversible.
 

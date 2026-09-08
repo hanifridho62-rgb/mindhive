@@ -78,6 +78,11 @@ def cmd_lintester(args) -> int | None:
         # validated work reaches no branch has produced nothing a person can
         # pick up. `--no-gate` keeps it on, and its help says what that costs.
         merge_back=started,
+        # The ceiling, off unless asked for. Zero on both is `Limits.empty`,
+        # which `fence.py` never wraps a spawn for at all -- so the default run
+        # makes exactly the call it always made. `hive lintester` is the one
+        # place a person types a number for this; the library takes a `Limits`.
+        limits=_limits(args),
         bus=bus, observer=observer,
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
@@ -381,6 +386,21 @@ def _print(mission) -> None:
         print(f"  weight against measured time: {verdict}")
 
 
+def _limits(args):
+    """The per-child ceiling the flags asked for.
+
+    Megabytes at the front door because that is the unit an operator thinks in;
+    `resilience.Limits` takes bytes because that is what `setrlimit` and
+    `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.ProcessMemoryLimit` take. Negative is
+    clamped to zero rather than refused: zero already means "no ceiling for this
+    resource", so a typo costs the fence, not the mission."""
+    from .resilience import Limits
+
+    mb = max(0, int(getattr(args, "memory_mb", 0) or 0))
+    cpu = max(0, int(getattr(args, "cpu_seconds", 0) or 0))
+    return Limits(memory_bytes=mb * 1024 * 1024, cpu_seconds=cpu)
+
+
 def register(subparsers) -> None:
     """Wire `lintester` onto ``__main__``'s top-level subparser set."""
     p = subparsers.add_parser(
@@ -403,6 +423,15 @@ def register(subparsers) -> None:
                         "suite; a unit is then validated on its child's exit "
                         "code alone, and the merge-back commits and merges "
                         "that unverified work")
+    p.add_argument("--memory-mb", type=int, default=0,
+                   help="per-child memory ceiling in MB (0: none). Held by a "
+                        "Windows job object or a POSIX rlimit; the report's "
+                        "`fencing:` line says which, and says so honestly when "
+                        "the machine could not hold it")
+    p.add_argument("--cpu-seconds", type=int, default=0,
+                   help="per-child CPU-time ceiling in seconds (0: none). "
+                        "Distinct from the wall-clock timeout, which always "
+                        "applies")
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")

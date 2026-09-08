@@ -367,7 +367,7 @@ def _iteration_prompt(base_prompt, iteration, rotated) -> str:
 def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
         env=None, model=None, permission_mode=None,
         context_cfg=None, max_iterations=DEFAULT_MAX_ITERATIONS,
-        guard=None, now_fn=time.monotonic) -> x_mod.RunResult:
+        guard=None, now_fn=time.monotonic, spawn=None) -> x_mod.RunResult:
     """Spawn a headless agent for *prompt*; answer an `executor.RunResult`.
 
     ## One shot, or a chain
@@ -406,7 +406,18 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     because `events.append_event` appends to ``<session_id>.jsonl`` without a lock
     and two agents sharing a segment interleave into corrupt JSONL.
     `claude_cli._child_env` forces `MINDHIVE_HEADLESS` on after the overlay, so
-    passing one can never defeat the recursion guard."""
+    passing one can never defeat the recursion guard.
+
+    *spawn* is forwarded to `claude_cli.run_headless` untouched and is the only
+    way a caller can put a real memory or CPU ceiling on the child: the
+    lintester passes `orchestrator.fence.Fence.spawn` when its mission asked for
+    one. This module deliberately learns nothing about what a ceiling is — it
+    would need `ctypes` and a platform matrix to do so, and both already live in
+    `orchestrator/jobs.py`. `None` is every existing caller, and it is
+    `run_headless` that then resolves `subprocess.run`, so the default path is
+    the call this function has always made. It is forwarded on EVERY hop of a
+    context-rotation chain, because a chain that fenced only its first child
+    would report a ceiling the later ones never had."""
     key = str(run_key)
     header = (f"agent run: {key}\n"
               f"cwd:       {root}\n"
@@ -466,7 +477,8 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
                 # truncating each hop compounds the loss across a chain.
                 step_prompt, model=model, timeout_s=max(1, round(remaining)),
                 permission_mode=permission_mode, env=env,
-                cwd=str(root) if root else None, session_id=session_id)
+                cwd=str(root) if root else None, session_id=session_id,
+                spawn=spawn)
         except Exception as exc:                        # noqa: BLE001
             return _spawn_raised(exc, key, header, transcript, root, project)
 

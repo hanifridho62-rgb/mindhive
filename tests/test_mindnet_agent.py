@@ -50,10 +50,10 @@ def _spawn(monkeypatch, exit_code=0, stdout=None):
     seen = {}
 
     def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None,
-             env=None, session_id=None):
+             env=None, session_id=None, spawn=None):
         seen.update(prompt=prompt, model=model, timeout_s=timeout_s,
                     permission_mode=permission_mode, cwd=cwd, env=env,
-                    session_id=session_id)
+                    session_id=session_id, spawn=spawn)
         return {"exit": exit_code,
                 "stdout": _envelope() if stdout is None else stdout}
 
@@ -71,9 +71,10 @@ def _spawn_seq(monkeypatch, replies):
     remaining = list(replies)
 
     def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None,
-             env=None, session_id=None):
+             env=None, session_id=None, spawn=None):
         calls.append({"prompt": prompt, "session_id": session_id,
-                      "timeout_s": timeout_s, "model": model})
+                      "timeout_s": timeout_s, "model": model,
+                      "spawn": spawn})
         return remaining.pop(0) if remaining else {
             "exit": 0, "stdout": _envelope(), "usage": None, "session_id": None}
 
@@ -754,3 +755,37 @@ def test_language_entries_are_defused_one_by_one_not_after_the_join():
     assert ", ," not in line and "to: ," not in line, (
         f"an entry that defused to nothing left a dangling separator: {line!r}")
     assert br_mod.FENCE_CLOSE not in p
+
+
+# --- the fence seam (PR-4) -----------------------------------------------------
+#
+# This module deliberately learns nothing about resource ceilings. It carries
+# `spawn` from the orchestrator to `claude_cli.run_headless` and does not look
+# inside it — the ctypes and the platform matrix live in `orchestrator/jobs.py`,
+# and a second copy here is how the two would begin to disagree.
+
+def test_no_spawn_is_the_default_every_existing_caller_gets(monkeypatch):
+    seen = _spawn(monkeypatch)
+    ag.run("k", "p")
+    assert seen["spawn"] is None
+
+
+def test_an_injected_spawn_reaches_run_headless(monkeypatch):
+    sentinel = object()
+    seen = _spawn(monkeypatch)
+    ag.run("k", "p", spawn=sentinel)
+    assert seen["spawn"] is sentinel
+
+
+def test_every_hop_of_a_rotation_chain_is_fenced(monkeypatch):
+    """A chain that fenced only its first child would let the mission report a
+    ceiling the later hops never had — and the later hops are the long ones, by
+    construction: rotation happens because the context filled up."""
+    sentinel = object()
+    calls = _spawn_seq(monkeypatch, [
+        _reply(occupancy=900_000, session="s1"),
+        _reply(occupancy=10, session="s2", done=True),
+    ])
+    ag.run("k", "p", context_cfg=_cfg(), max_iterations=3, spawn=sentinel)
+    assert len(calls) >= 2, "the chain did not rotate; this test proved nothing"
+    assert all(c["spawn"] is sentinel for c in calls)
