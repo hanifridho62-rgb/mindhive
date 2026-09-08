@@ -12,8 +12,10 @@ every step of it is a shipped module doing the job it already owned:
       -> orchestrator.worktree.acquire_lanes   .worktrees/lane-N, one per lane
       -> brief.wave_context / brief.build      each task's OWN material
       -> queue.WorkStealingScheduler           LIFO local, FIFO steal
-      -> resilience.Guard / RepairLoop         fenced, broken, repaired
-      -> worktree.release_lanes                merge-back and teardown
+      -> gate.SuiteGate.check                  each unit judged by its own tests
+      -> resilience.RepairLoop                 broken, rolled back, repaired
+      -> gate.SuiteGate.full                   the whole suite, per lane tree
+      -> worktree.release_lanes                teardown; a lane holding work is kept
 
 ## Information Hiding is enforced by the shape, not by a promise
 
@@ -35,6 +37,16 @@ module raises at a caller: a lane whose worktree could not be created, a child
 that died, a ledger that would not accept a row — each is recorded and the other
 lanes keep going. `mindnet/orchestrator.py`'s `Orchestration` makes the same
 bargain, for the same reason.
+
+## Validated means the lane's tests passed
+
+With a `validator` (`gate.SuiteGate`) wired, a unit is validated only when its
+child exited cleanly AND the tests that mention what it changed pass in its
+lane; one full suite then runs per lane that validated anything, and a red
+suite makes the outcome `partial`. The library default `None` is the exit-code
+path every runner-fake test was written against; `cli.py` wires the gate on
+every run that starts work. A red gate is the unit's failure, never the
+machine's -- `gate.py` says why that distinction is load-bearing.
 """
 from __future__ import annotations
 
@@ -45,6 +57,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from . import environment as env_mod
+from . import gate as gate_mod
 from . import metrics as metrics_mod
 from . import payoff as payoff_mod
 from . import queue as queue_mod
@@ -205,6 +218,11 @@ class Mission:
     calibration: dict = field(default_factory=dict)
     environment: str = ""
     left: tuple = ()
+    # The per-unit gate rows and the closing full-suite rows, as dicts
+    # (`gate.GateResult.as_dict`). Empty when no validator was wired, and on a
+    # dry run, which judges nothing.
+    gates: tuple = ()
+    suites: tuple = ()
 
     def as_dict(self) -> dict:
         return {
@@ -231,6 +249,8 @@ class Mission:
             "open_keys": list(self.open_keys),
             "rollbacks": list(self.rollbacks),
             "calibration": dict(self.calibration),
+            "gates": [dict(g) for g in self.gates],
+            "suites": [dict(s) for s in self.suites],
         }
 
 
@@ -258,6 +278,10 @@ class LintesterOrchestrator:
     decomposer: object = None
     runner: object = None
     reflector: object = None
+    # The per-unit test gate: anything with `check(lane_path, task, attempt)`
+    # and `full(cwd, mission_id=)` answering a `gate.GateResult`; `None` is
+    # the exit-code path (see "Validated means" above).
+    validator: object = None
     evs: object = None
     # WB7's observation seam. `bus` is anything with `emit(kind, **fields)`;
     # `observer` is an async context manager FACTORY the caller supplies, run
@@ -274,6 +298,10 @@ class LintesterOrchestrator:
     # actually owns a file. `init=False` because it is a cache, not a
     # collaborator: nothing outside this object should be able to hand it one.
     _smap: object = field(default=None, init=False, repr=False, compare=False)
+    # What the gate answered, one dict per run, appended from the scheduler's
+    # executor threads (`list.append` is atomic) and folded into `Mission`.
+    _gates: list = field(default_factory=list, init=False, repr=False,
+                         compare=False)
 
     # ---- naming -------------------------------------------------------------
 
@@ -298,6 +326,19 @@ class LintesterOrchestrator:
             self.observer_drops += 1
             if not self.observer_error:
                 self.observer_error = f"{type(exc).__name__}: {exc}"
+
+    def _gate_note(self, detail) -> None:
+        """One board line per gate run, under the lane phase. The phase
+        literal stays in THIS file, where the declared-phase scan looks."""
+        self._emit("brain_phase", phase="Running Lanes", detail=str(detail))
+
+    def _root(self):
+        """The main checkout for every lane call. `None` means the working
+        directory, as it does for `_files_for` -- but git needs a real path,
+        and `Path(None)` was a `TypeError` on a run with `--root` unset."""
+        from pathlib import Path
+
+        return self.root if self.root else Path.cwd()
 
     def _name(self, intent) -> tuple:
         """``(task_id, title)`` for the root task, from the incumbent deriver."""
@@ -615,7 +656,7 @@ class LintesterOrchestrator:
         A method rather than a lambda because it carries the root the guard in
         `worktree.rollback` checks the lane path against, and that guard is the
         only thing standing between a repair and the main checkout."""
-        return wt_mod.rollback(self.root, getattr(lane, "worktree", None))
+        return wt_mod.rollback(self._root(), getattr(lane, "worktree", None))
 
     def _calibrate(self, mission_id, weights, entries):
         """Score the weights against what the units really cost, and keep it.
@@ -628,6 +669,13 @@ class LintesterOrchestrator:
         Total: a mission that ran is not failed by a store that cannot be
         written or by a correlation that cannot be computed."""
         durations = {}
+        # Gate time is the SUITE's, not the child's: the weight predicts how
+        # long a child runs, so the pytest run beside it comes off the sample.
+        gate_ms: dict = {}
+        for row in self._gates:
+            tid = str(row.get("task_id", "") or "")
+            gate_ms[tid] = (gate_ms.get(tid, 0.0)
+                            + float(row.get("duration_s", 0.0) or 0.0) * 1000.0)
         for entry in entries or ():
             # A unit whose child never started spent its time on the machine's
             # refusal, not on the work the weight predicts. Recording it would
@@ -645,6 +693,7 @@ class LintesterOrchestrator:
             # `int` here would floor it back to zero, and the `> 0` guard below
             # would then drop it as a unit that never ran.
             ms = float(getattr(entry, "elapsed_ms", 0.0) or 0.0)
+            ms = max(0.0, ms - gate_ms.get(tid, 0.0))
             if tid and ms > 0:
                 durations[tid] = durations.get(tid, 0.0) + ms
         try:
@@ -659,6 +708,25 @@ class LintesterOrchestrator:
         except Exception:                               # noqa: BLE001
             pass
         return cal
+
+    def _full_suites(self, mission_id, trees, completed) -> tuple:
+        """The whole suite, once per lane that validated a unit, before the
+        teardown. Transitional: the merge-back replaces this loop with one run
+        on the integration tree; until then each lane's tree is the only place
+        its validated work exists, so each is judged where it stands."""
+        if self.validator is None:
+            return ()
+        done = {int(getattr(e, "lane_id", -1)) for e in completed or ()}
+        rows = []
+        for tree in trees or ():
+            lane_id = int(getattr(tree, "lane_id", -1))
+            if not getattr(tree, "ok", False) or lane_id not in done:
+                continue
+            self._emit("brain_phase", phase="Running Suite",
+                       detail=f"lane {lane_id}: {tree.path}")
+            rows.append(gate_mod.full_row(self.validator, tree.path, lane_id,
+                                          mission_id))
+        return tuple(rows)
 
     # ---- the entry point ----------------------------------------------------
 
@@ -683,6 +751,8 @@ class LintesterOrchestrator:
 
         mission_id = self._mission_id(text)
         root_id, title = self._name(text)
+        # In place, not rebound: `gated` below holds this list by reference.
+        del self._gates[:]
         # Announced BEFORE the shape is known, and announced again below once
         # it is. A header that stays blank through the slowest phase of the
         # mission is a header that is missing exactly when it is wanted.
@@ -722,7 +792,7 @@ class LintesterOrchestrator:
                    detail=f"{len(plan)} lane(s)")
         trees = ([wt_mod.LaneWorktree(lane_id=ln["lane"], ok=True)
                   for ln in plan] if dry_run
-                 else wt_mod.acquire_lanes(self.root, len(plan), mission_id))
+                 else wt_mod.acquire_lanes(self._root(), len(plan), mission_id))
         ctx = self._context()
         self._emit("brain_phase", phase="Composing Briefs",
                    detail=f"{len(units)} unit(s)")
@@ -771,7 +841,7 @@ class LintesterOrchestrator:
             self._emit("mission_finished", mission_id=mission_id,
                        outcome="refused",
                        reason="no lane could be isolated")
-            wt_mod.release_lanes(self.root, trees)
+            wt_mod.release_lanes(self._root(), trees)
             return Mission(intent=text, mission_id=mission_id, outcome="refused",
                            reason=("no lane could be isolated — see each lane's "
                                    "reason"),
@@ -796,8 +866,14 @@ class LintesterOrchestrator:
                                     bus=self.bus)
         lanes = [queue_mod.WorkerLane(lid, ents, worktree=tree)
                  for lid, ents, tree in runnable]
+        runner = self.runner or self._run_child
+        if self.validator is not None:
+            # The gate sits BETWEEN the child and the scheduler's verdict: the
+            # one place `validated` is earned by a test run, not an exit code.
+            runner = gate_mod.gated(runner, gate=self.validator,
+                                    record=self._gates, emit=self._gate_note)
         scheduler = queue_mod.WorkStealingScheduler(
-            lanes, self.runner or self._run_child, repair=repair,
+            lanes, runner, repair=repair,
             mission_id=mission_id, checkpoint_dir=checkpoint_dir,
             # Both halves of the breaker, not just the failing one. `repair`
             # alone made it failure-only: it could open and never close.
@@ -832,7 +908,7 @@ class LintesterOrchestrator:
         try:
             completed, failed = asyncio.run(_drive())
         except KeyboardInterrupt:
-            released = wt_mod.release_lanes(self.root, trees)
+            released = wt_mod.release_lanes(self._root(), trees)
             # The reason must not promise a sidecar nobody asked for. With no
             # `checkpoint_dir` the scheduler's writer is a no-op, and telling the
             # operator "the checkpoint holds what was left" would send them to
@@ -848,9 +924,11 @@ class LintesterOrchestrator:
                            decomposition=split, decomposition_reason=split_why,
                            dry_run=False)
 
+        # BEFORE the teardown: the suite is judged where the work still is.
+        suites = self._full_suites(mission_id, trees, completed)
         self._emit("brain_phase", phase="Merging Worktrees",
                    detail=f"{len(trees)} lane(s)")
-        released = wt_mod.release_lanes(self.root, trees)
+        released = wt_mod.release_lanes(self._root(), trees)
         done = tuple(e.task_id for e in completed)
         bad = tuple(f"{e.task_id}: {e.reason}" for e in failed)
         halted = str(scheduler.halted or "")
@@ -861,8 +939,16 @@ class LintesterOrchestrator:
             reason = halted + (f"; {len(left)} unit(s) never started"
                                if left else "")
         else:
-            outcome = "ok" if not bad else "partial"
-            reason = "" if not bad else f"{len(bad)} of {len(tasks)} unit(s) failed"
+            # A red full suite is a mission-level fact -- the units passed
+            # their own tests, the tree they left does not pass its suite --
+            # reported as `partial` naming the lane, never as a unit's failure.
+            red = [s for s in suites if not s.get("ok")]
+            outcome = "ok" if not (bad or red) else "partial"
+            parts = [f"{len(bad)} of {len(tasks)} unit(s) failed"] if bad else []
+            parts += [f"the full suite is red in lane {s.get('lane_id')} "
+                      f"({s.get('reason') or 'no reason recorded'})"
+                      for s in red]
+            reason = "; ".join(parts)
         cal = self._calibrate(mission_id,
                               {tid: u[4] for tid, u in by_id.items()},
                               list(completed) + list(failed))
@@ -881,6 +967,7 @@ class LintesterOrchestrator:
             open_keys=tuple(breaker.open_keys()),
             rollbacks=tuple(str(r) for r in repair.rollbacks),
             calibration=cal.as_dict(),
+            gates=tuple(dict(g) for g in self._gates), suites=suites,
             decomposition=split, decomposition_reason=split_why,
             dry_run=False)
 

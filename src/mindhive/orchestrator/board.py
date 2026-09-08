@@ -415,6 +415,10 @@ PHASE_PACKING = "Packing Lanes"
 PHASE_ISOLATING = "Isolating Worktrees"
 PHASE_BRIEFING = "Composing Briefs"
 PHASE_RUNNING = "Running Lanes"
+# The closing full suite, once per lane tree, after the lanes and before the
+# teardown. Its own phase rather than a line under `Running Lanes`: it is the
+# mission-level claim, and it is where a long mission spends its last minutes.
+PHASE_SUITE = "Running Suite"
 PHASE_MERGING = "Merging Worktrees"
 PHASE_DONE = "Mission Complete"
 
@@ -427,7 +431,7 @@ PHASE_DONE = "Mission Complete"
 # board's own two, set by `Board` rather than published.
 BRAIN_PHASES = (PHASE_IDLE, PHASE_DECOMPOSING, PHASE_PARSING, PHASE_WEIGHING,
                 PHASE_PACKING, PHASE_ISOLATING, PHASE_BRIEFING, PHASE_RUNNING,
-                PHASE_MERGING, PHASE_DONE)
+                PHASE_SUITE, PHASE_MERGING, PHASE_DONE)
 
 # Five, and the number is chosen by the footer's HEIGHT rather than by
 # taste: `build_layout` gives the alert pane a fixed size, and a ring that

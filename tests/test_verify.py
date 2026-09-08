@@ -197,3 +197,72 @@ def test_last_run_returns_the_most_recent_record():
 def test_last_run_is_none_on_an_empty_store():
     assert verify.last_run(ev_mod.read_all()) is None
     assert verify.last_run(None) is None
+
+
+# --- the seams the per-unit gate needs ----------------------------------------
+
+def _rows():
+    return [e for e in ev_mod.read_all() if e.type == "verification"]
+
+
+def test_a_run_past_its_cap_is_killed_and_answers_124():
+    """`orchestrator/gate.py` runs a child's tests under a cap; a hung suite
+    must not hang the mission. 124 is `claude_cli`'s own timeout code, so a
+    killed suite and a killed child read alike."""
+    import time
+
+    started = time.monotonic()
+    rec = verify.run_and_record(_argv("import time; time.sleep(30)"),
+                                echo=False, timeout_s=1, record=False)
+    assert time.monotonic() - started < 20, "the cap did not fire"
+    assert rec["exit_code"] == verify.TIMEOUT_EXIT == 124
+    assert "cap" in rec["error"]
+
+
+def test_cwd_is_where_the_command_runs(tmp_path):
+    from pathlib import Path
+
+    rec = verify.run_and_record(_argv("import os; print(os.getcwd())"),
+                                echo=False, cwd=tmp_path, record=False)
+    assert rec["exit_code"] == 0
+    assert Path(rec["excerpt"].strip()).resolve() == tmp_path.resolve()
+
+
+def test_record_false_runs_for_real_and_appends_nothing():
+    """The targeted gate's contract: a real exit code, no `verification`
+    event — `replenish` would read one as the whole tree verified."""
+    rec = verify.run_and_record(_argv("print('2 passed in 0.1s')"),
+                                echo=False, record=False)
+    assert rec["exit_code"] == 0 and rec["counts"]["passed"] == 2
+    assert _rows() == []
+
+
+def test_extra_labels_the_payload_and_cannot_forge_its_stamp():
+    verify.run_and_record(_argv("print('1 passed in 0.1s')"), echo=False,
+                          extra={"scope": "full", "tree": "/x",
+                                 "verified_by": "human", "exit_code": 7,
+                                 "argv": ["forged"]})
+    payload = _rows()[0].payload
+    assert payload["scope"] == "full" and payload["tree"] == "/x"
+    assert payload["verified_by"] == "python"
+    assert payload["exit_code"] == 0
+    assert payload["argv"][-1] != "forged"
+
+
+def test_the_tail_is_the_end_of_the_output_and_the_excerpt_its_head():
+    rec = verify.run_and_record(
+        _argv("print('x' * 5000); print('the last line')"), echo=False,
+        record=False)
+    assert rec["excerpt"].startswith("xxx")
+    assert "the last line" not in rec["excerpt"]
+    assert rec["tail"].endswith("the last line")
+
+
+def test_the_defaults_leave_the_recorded_shape_unchanged():
+    """Every caller before the gate passed none of the new arguments, and
+    what they record must not grow a key by accident."""
+    rec = verify.run_and_record(_argv("print('4 passed in 0.1s')"), echo=False)
+    assert {"exit_code", "counts", "error", "artifact", "excerpt"} <= set(rec)
+    payload = _rows()[0].payload
+    assert payload["counts"]["passed"] == 4
+    assert "scope" not in payload and "tail" not in payload

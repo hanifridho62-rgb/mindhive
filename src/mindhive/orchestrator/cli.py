@@ -73,6 +73,7 @@ def cmd_lintester(args) -> int | None:
         # tests: the seam worked, the breaker opened, and no anomaly was ever
         # recorded, resolved or remembered on a real run.
         reflector=_reflector(),
+        validator=_validator(args, started),
         bus=bus, observer=observer,
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
@@ -240,6 +241,21 @@ def _reflector():
     return res_mod.reflect_on_open
 
 
+def _validator(args, started):
+    """The per-unit test gate a run that starts work gets, or ``None``.
+
+    ``None`` for a plan — nothing runs, nothing to judge — and for a run that
+    opted out. The opt-out is a flag and its help text says what it costs:
+    without the gate a unit is validated on its child's exit code alone, which
+    is the claim the gate exists to stop making. The gate's root is the
+    mission's, so its lane guard and the lanes agree on where the checkout is."""
+    if not started or bool(getattr(args, "no_gate", False)):
+        return None
+    from . import gate as gate_mod
+
+    return gate_mod.SuiteGate(root=args.root, project=args.project)
+
+
 def _payoff(mission):
     """Score THIS mission's own units under both scheduling policies.
 
@@ -315,6 +331,17 @@ def _print(mission) -> None:
         print(f"  kept: {line}")
     for line in mission.rollbacks:
         print(f"  rollback: {line}")
+    for row in mission.gates:
+        print(f"  gate {row.get('task_id')} (attempt {row.get('attempt')}): "
+              f"{'ok' if row.get('ok') else 'RED'} [{row.get('scope')}] "
+              f"{len(row.get('targets') or ())} test file(s)"
+              + (f" — {row['reason']}" if row.get("reason") else ""))
+    for row in mission.suites:
+        counts = row.get("counts") or {}
+        print(f"  suite lane {row.get('lane_id')}: "
+              f"{'ok' if row.get('ok') else 'RED'}"
+              + (f" — {row['reason']}" if row.get("reason") else
+                 f" — {counts.get('passed', 0)} passed"))
     if mission.environment:
         print(f"  environment: {mission.environment}")
     if mission.left:
@@ -341,6 +368,10 @@ def register(subparsers) -> None:
                    help="emit the mission report as JSON")
     p.add_argument("--execute", action="store_true",
                    help="actually start sub-agents (default: plan only)")
+    p.add_argument("--no-gate", action="store_true",
+                   help="skip the per-unit test gate and the closing full "
+                        "suite; a unit is then validated on its child's exit "
+                        "code alone")
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")

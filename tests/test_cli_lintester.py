@@ -325,3 +325,71 @@ def test_the_environment_status_is_distinct_from_a_partial_run():
     assert lint_cli._status("refused") == 1
     assert lint_cli._status("environment") == lint_cli.ENVIRONMENT_STATUS
     assert lint_cli.ENVIRONMENT_STATUS not in (0, 1)
+
+
+# --- the per-unit test gate ---------------------------------------------------
+
+def _wired(monkeypatch, *argv):
+    """The constructor kwargs `hive lintester` wires, with the mission itself
+    replaced: a real run needs a lane and a child."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = {}
+    real = lint_mod.LintesterOrchestrator
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+            super().__init__(*a, **kw)
+
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    assert _cli("lintester", "make the writer retry", *argv) == 0
+    return seen
+
+
+def test_a_run_that_starts_work_wires_the_test_gate(monkeypatch):
+    """Without this a unit is validated on its child's exit code alone — the
+    claim `orchestrator/gate.py` exists to stop the pipeline making."""
+    from mindhive.orchestrator import gate as gate_mod
+
+    seen = _wired(monkeypatch, "--execute", "--root", ".", "--project", "test")
+    gate = seen.get("validator")
+    assert isinstance(gate, gate_mod.SuiteGate), (
+        f"the command wired {gate!r}; a unit would be validated on its "
+        f"child's exit code alone")
+    assert str(gate.root) == "." and gate.project == "test"
+
+
+def test_no_gate_leaves_the_validator_unset(monkeypatch):
+    seen = _wired(monkeypatch, "--execute", "--no-gate")
+    assert seen.get("validator") is None
+
+
+def test_a_dry_run_wires_no_gate(monkeypatch):
+    seen = _wired(monkeypatch)
+    assert seen.get("validator") is None
+
+
+def test_the_plain_report_names_the_gate_and_suite_rows(capsys, monkeypatch):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(
+        lint_mod.LintesterOrchestrator, "execute_mission",
+        lambda self, intent, dry_run=True, checkpoint_dir=None: _mission(
+            outcome="partial", environment="", left=(),
+            reason="the full suite is red in lane 0",
+            gates=({"task_id": "t-1", "ok": False, "scope": "targeted",
+                    "targets": ["tests/test_x.py"], "attempt": 1,
+                    "reason": "targeted tests: exit 1, 1 failed"},),
+            suites=({"lane_id": 0, "ok": False, "scope": "full",
+                     "counts": {"failed": 3},
+                     "reason": "full tests: exit 1, 3 failed"},)))
+    assert _cli("lintester", "x", "--execute") == 1
+    out = capsys.readouterr().out
+    assert "gate t-1" in out and "RED" in out and "1 failed" in out
+    assert "suite lane 0" in out and "3 failed" in out

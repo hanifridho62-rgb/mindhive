@@ -323,6 +323,30 @@ def test_state_without_a_base_cannot_report_ahead(repo):
     assert wt.state(p)[1] == 0
 
 
+def test_changed_files_lists_tracked_changes_and_untracked_files(repo):
+    """The per-unit gate's question: what did the child touch? Modified,
+    staged-new and brand-new files all count; ignored ones do not, because a
+    `.pytest_cache/` is not a change."""
+    assert wt.changed_files(repo) == (), "canary: a clean tree answers empty"
+    (repo / "seed.txt").write_text("changed\n", encoding="utf-8")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "new.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "staged.py").write_text("y = 2\n", encoding="utf-8")
+    _git(repo, "add", "staged.py")
+    (repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "junk.py").write_text("z = 3\n", encoding="utf-8")
+
+    got = wt.changed_files(repo)
+
+    assert set(got) == {"seed.txt", "staged.py", "sub/new.py", ".gitignore"}
+    assert all("\\" not in p for p in got), got
+
+
+def test_changed_files_is_none_where_git_cannot_answer(tmp_path):
+    assert wt.changed_files(tmp_path / "nowhere") is None
+
+
 # --- the P0 a reviewer verified live in a throwaway repo ----------------------
 
 def test_add_refuses_to_reset_a_branch_that_holds_commits(repo):

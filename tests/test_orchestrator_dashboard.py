@@ -984,6 +984,34 @@ def test_the_header_survives_a_real_execute_mission(repo):
     assert board.mission_id in text
 
 
+def test_a_gated_execute_mission_publishes_no_unknown_event(repo):
+    """The gate publishes through the same seam — one line per unit under the
+    lane phase, one `Running Suite` phase per lane — and every one of them has
+    to be a kind and a field set the board recognises."""
+    from mindhive.orchestrator import gate as gate_mod
+
+    def fake_suite(argv, **kw):
+        return {"exit_code": 0, "counts": {"passed": 1}, "error": "",
+                "artifact": None, "excerpt": "1 passed", "tail": "1 passed"}
+
+    bus = dash.EventBus()
+    board = dash.Board()
+    mission = lint_mod.LintesterOrchestrator(
+        root=repo, project="wb7-gate", lanes=2, decomposer=_two_units,
+        runner=lambda e, ln: True, bus=bus,
+        validator=gate_mod.SuiteGate(root=repo, project="wb7-gate",
+                                     runner=fake_suite),
+    ).execute_mission("make the ledger writer retry", dry_run=False)
+    for event in bus.drain():
+        board.apply(event)
+
+    assert mission.outcome == "ok", mission.reason
+    assert bus.unknown == (), f"the string seam has drifted: {bus.unknown}"
+    assert len(mission.gates) == 2 and len(mission.suites) == 2
+    assert board.phase == dash.PHASE_DONE
+    assert dash.PHASE_SUITE in dash.BRAIN_PHASES
+
+
 # --- what the producers actually publish -------------------------------------
 
 def test_a_scheduler_with_no_bus_behaves_exactly_as_before():
