@@ -393,3 +393,67 @@ def test_the_plain_report_names_the_gate_and_suite_rows(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "gate t-1" in out and "RED" in out and "1 failed" in out
     assert "suite lane 0" in out and "3 failed" in out
+
+
+# --- the merge-back -----------------------------------------------------------
+
+def test_a_run_that_starts_work_wires_the_merge_back(monkeypatch):
+    """Without this a mission's validated work never reaches a branch: the
+    lanes are torn down (or kept as "uncommitted changes") and that is all."""
+    seen = _wired(monkeypatch, "--execute", "--root", ".", "--project", "test")
+    assert seen.get("merge_back") is True
+
+
+def test_a_dry_run_wires_no_merge_back(monkeypatch):
+    seen = _wired(monkeypatch)
+    assert seen.get("merge_back") is False
+
+
+def test_the_no_gate_help_says_the_merge_back_commits_unverified_work():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    lint_cli.register(parser.add_subparsers(dest="cmd"))
+    text = parser._subparsers._group_actions[0].choices["lintester"].format_help()
+    assert "unverified" in text, text
+
+
+def test_the_plain_report_names_the_commits_and_the_integration_branch(
+        capsys, monkeypatch):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(
+        lint_mod.LintesterOrchestrator, "execute_mission",
+        lambda self, intent, dry_run=True, checkpoint_dir=None: _mission(
+            outcome="partial", environment="", left=(),
+            reason="lane 1 was not merged (conflicts with the integration "
+                   "tree: src/x.py)",
+            commits=({"task_id": "t-1", "lane_id": 0, "ok": True,
+                      "sha": "abc1234def0", "changed": True, "reason": "",
+                      "logged": "logged 1 file(s)"},
+                     {"task_id": "t-2", "lane_id": 1, "ok": False, "sha": "",
+                      "changed": False, "reason": "no identity configured",
+                      "logged": ""}),
+            integration={"ok": False, "branch": "lint/lm-1/integration",
+                         "sha": "fedcba98765", "base": "0000000", "path": "",
+                         "merged": [{"lane_id": 0, "branch": "lint/lm-1/lane-0",
+                                     "merged": True, "sha": "fedcba98765",
+                                     "conflicts": [], "reason": ""}],
+                         "skipped": [{"lane_id": 1, "branch": "lint/lm-1/lane-1",
+                                      "merged": False, "sha": "",
+                                      "conflicts": ["src/x.py"],
+                                      "reason": "conflicts with the integration "
+                                                "tree: src/x.py"}],
+                         "reason": "", "retired": True, "kept": "",
+                         "next": "git switch lint/lm-1/integration"},
+            suites=({"lane_id": -1, "ok": True, "scope": "full",
+                     "counts": {"passed": 7}, "reason": ""},)))
+    assert _cli("lintester", "x", "--execute") == 1
+    out = capsys.readouterr().out
+    assert "commit t-1" in out and "abc1234def" in out
+    assert "commit t-2" in out and "no identity configured" in out
+    assert "integration: lint/lm-1/integration" in out
+    assert "git switch lint/lm-1/integration" in out
+    assert "lane 1" in out and "src/x.py" in out
+    assert "suite integration:" in out and "7 passed" in out

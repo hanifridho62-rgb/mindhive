@@ -78,6 +78,11 @@ class Mission:
     # dry run, which judges nothing.
     gates: tuple = ()
     suites: tuple = ()
+    # The merge-back: one row per lane commit (`integrate.LaneCommit`) and the
+    # `integrate.Integration` report plus what became of its checkout. Empty
+    # when `merge_back` is off, and on a dry run.
+    commits: tuple = ()
+    integration: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -106,4 +111,6 @@ class Mission:
             "calibration": dict(self.calibration),
             "gates": [dict(g) for g in self.gates],
             "suites": [dict(s) for s in self.suites],
+            "commits": [dict(c) for c in self.commits],
+            "integration": dict(self.integration),
         }

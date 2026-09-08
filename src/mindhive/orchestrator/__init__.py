@@ -22,6 +22,9 @@ delegates to the incumbent that already owns its work:
     worktree.py    -> mindnet.worktree.add / retire, which own the git calls
     resilience.py  -> loop.safeguards.CircuitBreaker, mindnet.controller
     lintester.py   -> mindnet.autodeclare / decompose / brief / orchestrator
+    integrate.py   -> mindnet.worktree, which owns every git call the
+                      merge-back makes, and changelog.record for its entries
+    mission.py     -> nothing; the report is a frozen record
 
 Nothing here forks a shipped module, re-implements its state machine, or
 bypasses it. A second git-worktree driver or a second breaker would be the

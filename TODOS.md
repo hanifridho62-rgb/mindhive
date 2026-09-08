@@ -1325,10 +1325,11 @@ the gate; `--no-gate` opts out and its help text says what that costs.
   `claude -p` child changes, and whether `tests_mentioning`'s import-pattern narrowing picks
   the right files for it, is unmeasured until `claude auth login` and the first
   `hive lintester "<intent>" --execute`.
-* **The full suite runs once per lane, not once.** Until the merge-back lands (the next PR),
-  each lane's tree is the only place its validated work exists, so each is judged where it
-  stands — N lanes, N suite runs, and two lanes that each pass alone can still conflict.
-  The merge-back replaces this loop with one run on the integration tree.
+* **~~The full suite runs once per lane, not once.~~** Closed on 2026-09-08 by item 33's
+  merge-back: the closing suite now runs once, on the integration tree, where every merged
+  lane's work sits together — so two lanes that each pass alone are judged as they will
+  actually be picked up. The per-lane loop survives as the fallback for a mission whose work
+  reached no integration checkout (no lane committed anything, or the branch was refused).
 * **The cap kills the child only.** `verify._stream`'s timer calls `proc.kill()`, which on
   Windows ends the pytest process and not the grandchildren it spawned (a `subprocess` under
   test, a hung fixture). A gate killed at its cap answers `124` and the mission continues;
@@ -1338,3 +1339,50 @@ the gate; `--no-gate` opts out and its help text says what that costs.
 **Cons of leaving it:** the first bullet is the one that can mislead — a mission of vacuous
 passes reads as validated. The other three are the same "no real sample" gap and the same
 "no merge-back yet" gap the neighbouring items already carry.
+
+## 33. The merge-back leaves a branch, and four things about it need a person
+
+`src/mindhive/orchestrator/integrate.py` landed on 2026-09-08 (owner decision:
+the orchestrator commits on the child's behalf, probe-first merge into an
+integration branch made from the lanes' base —
+`docs/designs/lintester-orchestrator.md`, "DECIDED by the owner, 2026-09-08").
+Before it, the phase labelled "Merging Worktrees" only called `release_lanes`
+and no validated work ever reached a branch. Now every gated unit is committed
+on its lane branch with a `Lintester-Task:` trailer, the lanes are probed with
+`git merge-tree` and merged into `lint/<mission>/integration`, the closing full
+suite runs once on that tree, and the branch survives its worktree.
+
+**What is honestly still open.**
+
+* **A conflicting lane needs a human, and nothing schedules that human.** The
+  probe keeps it — branch, checkout and all — reports its paths, and makes the
+  mission `partial`. Nothing retries it against the merged tree, nothing opens
+  an incident, and nothing removes it later: the `.worktrees/lane-N` directory
+  sits there until someone resolves it. On a machine that runs many missions
+  that is a slow disk leak whose only alarm is the mission report nobody may
+  read.
+* **The integration branch never reaches `master`, by design and by omission.**
+  It is created from the lanes' base and left for `git switch`; no push, no PR,
+  no rebase. That is the right default — an unreviewed branch of agent commits
+  must not fast-forward anything — but it means the deliverable is exactly as
+  useful as the operator's habit of looking for it. The report prints the
+  `git switch` line and that is the whole handover.
+* **The cache exemption is a fixed list, and a lane may still be kept for
+  litter.** `mindnet.worktree.CACHE_DIRS` names five directories a test run
+  leaves behind; anything else untracked or ignored still counts as work and
+  keeps the lane, which is deliberate (`dist/out.bin` is a build, not litter,
+  and a canary test pins that). A tool that writes somewhere else — a coverage
+  file at the root, a `node_modules` — will keep a merged lane on disk with
+  nothing in it worth keeping.
+* **No real child's work has ever been committed or merged.** The same gap as
+  items 27, 29 and 32: every commit and every merge in the suite came from a
+  runner fake writing files into a real git repository. Whether a real
+  `claude -p` child leaves a tree `commit_all` handles the way these tests
+  say — no submodule, no symlink, no file it did not mean to write — is
+  unmeasured until `claude auth login` and the first
+  `hive lintester "<intent>" --execute`.
+
+**Cons of leaving it:** the first bullet is the one that accumulates — kept
+lanes are the only state this pipeline leaves behind on purpose, and nothing
+sweeps them. The second is a handover gap rather than a defect. The third and
+fourth are the same "no real sample" gap the neighbouring items carry.

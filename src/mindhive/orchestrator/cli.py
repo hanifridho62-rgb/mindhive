@@ -74,6 +74,10 @@ def cmd_lintester(args) -> int | None:
         # recorded, resolved or remembered on a real run.
         reflector=_reflector(),
         validator=_validator(args, started),
+        # The merge-back, on for every run that starts work: a mission whose
+        # validated work reaches no branch has produced nothing a person can
+        # pick up. `--no-gate` keeps it on, and its help says what that costs.
+        merge_back=started,
         bus=bus, observer=observer,
     ).execute_mission(intent, dry_run=not started,
                       checkpoint_dir=args.checkpoint_dir)
@@ -336,9 +340,35 @@ def _print(mission) -> None:
               f"{'ok' if row.get('ok') else 'RED'} [{row.get('scope')}] "
               f"{len(row.get('targets') or ())} test file(s)"
               + (f" — {row['reason']}" if row.get("reason") else ""))
+    for row in mission.commits:
+        if not row.get("ok"):
+            what = f"FAILED — {row.get('reason') or 'no reason recorded'}"
+        elif not row.get("changed"):
+            what = "nothing to commit"
+        else:
+            what = str(row.get("sha") or "")[:10]
+        print(f"  commit {row.get('task_id')} (lane {row.get('lane_id')}): {what}"
+              + (f"; {row['logged']}" if row.get("logged") else ""))
+    integ = mission.integration or {}
+    if integ.get("branch"):
+        print(f"  integration: {integ['branch']} @ "
+              f"{str(integ.get('sha') or '')[:10]} "
+              f"({len(integ.get('merged') or [])} lane(s) merged, "
+              f"{len(integ.get('skipped') or [])} not)")
+        for m in integ.get("skipped") or []:
+            print(f"      lane {m.get('lane_id')} not merged: "
+                  f"{m.get('reason') or 'no reason recorded'}")
+        if integ.get("kept"):
+            print(f"      {integ['kept']}")
+        if integ.get("next"):
+            print(f"      next: {integ['next']}")
+    elif integ:
+        print(f"  integration: {integ.get('reason') or 'nothing merged'}")
     for row in mission.suites:
         counts = row.get("counts") or {}
-        print(f"  suite lane {row.get('lane_id')}: "
+        where = ("integration" if int(row.get("lane_id", -1)) < 0
+                 else f"lane {row.get('lane_id')}")
+        print(f"  suite {where}: "
               f"{'ok' if row.get('ok') else 'RED'}"
               + (f" — {row['reason']}" if row.get("reason") else
                  f" — {counts.get('passed', 0)} passed"))
@@ -371,7 +401,8 @@ def register(subparsers) -> None:
     p.add_argument("--no-gate", action="store_true",
                    help="skip the per-unit test gate and the closing full "
                         "suite; a unit is then validated on its child's exit "
-                        "code alone")
+                        "code alone, and the merge-back commits and merges "
+                        "that unverified work")
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")

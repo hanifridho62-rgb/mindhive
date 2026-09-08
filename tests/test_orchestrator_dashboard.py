@@ -1012,6 +1012,42 @@ def test_a_gated_execute_mission_publishes_no_unknown_event(repo):
     assert dash.PHASE_SUITE in dash.BRAIN_PHASES
 
 
+def test_a_merge_back_execute_mission_publishes_no_unknown_event(repo):
+    """The merge-back publishes through the same seam -- one line per lane
+    under `Merging Worktrees`, the closing suite on the integration tree --
+    and every one of them has to be a kind and a field set the board knows."""
+    import pathlib
+
+    from mindhive.orchestrator import gate as gate_mod
+
+    def fake_suite(argv, **kw):
+        return {"exit_code": 0, "counts": {"passed": 1}, "error": "",
+                "artifact": None, "excerpt": "1 passed", "tail": "1 passed"}
+
+    def child(entry, lane):
+        target = pathlib.Path(lane.worktree_path) / f"{entry.task_id}.txt"
+        target.write_text("done\n", encoding="utf-8")
+        return True
+
+    bus = dash.EventBus()
+    board = dash.Board()
+    mission = lint_mod.LintesterOrchestrator(
+        root=repo, project="wb7-merge", lanes=2, decomposer=_two_units,
+        runner=child, bus=bus, merge_back=True,
+        validator=gate_mod.SuiteGate(root=repo, project="wb7-merge",
+                                     runner=fake_suite),
+    ).execute_mission("make the ledger writer retry", dry_run=False)
+    for event in bus.drain():
+        board.apply(event)
+
+    assert mission.outcome == "ok", mission.reason
+    assert bus.unknown == (), f"the string seam has drifted: {bus.unknown}"
+    assert len(mission.integration.get("merged", [])) == 2
+    assert len(mission.suites) == 1
+    assert board.phase == dash.PHASE_DONE
+    assert "Merging Worktrees" in dash.BRAIN_PHASES
+
+
 # --- what the producers actually publish -------------------------------------
 
 def test_a_scheduler_with_no_bus_behaves_exactly_as_before():
