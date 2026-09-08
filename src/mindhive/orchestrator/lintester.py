@@ -63,9 +63,12 @@ from . import payoff as payoff_mod
 from . import queue as queue_mod
 from . import resilience as res_mod
 from . import worktree as wt_mod
-# The dry run's decomposer and the row shape, carved out at the size cap. Kept
-# reachable from here: `lintester._unit` and `lintester.preview_units` were
-# the names in use, and `preview.py` says why `MAX_TASKS` moved with them.
+# Two carve-outs at the size cap, both kept reachable from here because these
+# were the names in use: the dry run's decomposer (`lintester._unit`,
+# `lintester.preview_units`; `preview.py` says why `MAX_TASKS` moved with
+# them) and the report (`lintester.Mission`, and the four words for where a
+# unit list came from -- `mission.py` carries the comment that explains them).
+from .mission import AGENT, INJECTED, PREVIEW, ROOT_ONLY, Mission  # noqa: F401
 from .preview import MAX_TASKS, _PARA, _slug, _unit, preview_units  # noqa: F401
 
 MISSION_PREFIX = "lm"
@@ -73,16 +76,6 @@ MISSION_PREFIX = "lm"
 # Lane default. Not "one per task": a lane costs a real `git worktree add`, and
 # past four the checkout cost starts to dominate a mission of ordinary size.
 DEFAULT_LANES = 4
-
-# Where a mission's unit list came from. Reported on `Mission.decomposition`,
-# because the four are not the same claim and an operator reading a fan-out plan
-# is entitled to know which one they are looking at: a real split proposed by an
-# agent, a caller's own decomposer, a directory split this module derived from
-# the intent's own file paths, or no split at all.
-INJECTED = "injected"
-AGENT = "agent"
-PREVIEW = "local-preview"
-ROOT_ONLY = "root-only"
 
 DEFAULT_TIMEOUT_S = 900
 
@@ -169,89 +162,6 @@ class AgentTask:
         parts = [f"# {self.title}" if self.title else "", self.description,
                  self.must_use_block, self.brief_text]
         return "\n\n".join(p for p in parts if p).strip()
-
-
-@dataclass(frozen=True)
-class Mission:
-    """What one `execute_mission` did, in full.
-
-    `outcome` is one of `ok`, `partial`, `refused`, `dry-run`, `environment`.
-    `enforcement` is `resilience`'s answer about the sandbox, carried up so a
-    report can say plainly whether the children were fenced by the kernel or
-    only by a clock.
-
-    `environment` is the kind behind an `environment` outcome -- the machine
-    could not start a child, and `reason` names the fix -- and `left` is every
-    unit the halt left unstarted. Neither is a failure of the unit named."""
-
-    intent: str = ""
-    mission_id: str = ""
-    outcome: str = "refused"
-    reason: str = ""
-    tasks: tuple = ()
-    lanes: tuple = ()
-    completed: tuple = ()
-    failed: tuple = ()
-    kept: tuple = ()
-    enforcement: str = res_mod.TIMEOUT_ONLY
-    enforcement_reason: str = ""
-    steals: int = 0
-    reflections: tuple = ()
-    # A target that failed and then passed. Reported separately from
-    # `open_keys` because "it broke once and recovered" and "it is still broken"
-    # are different facts, and a report carrying only the first is the one that
-    # sends an operator hunting a fault that already cleared.
-    recoveries: tuple = ()
-    open_keys: tuple = ()
-    dry_run: bool = True
-    decomposition: str = ROOT_ONLY
-    # Why `decomposition` is not what was asked for; empty when it is. See
-    # `LintesterOrchestrator._subtasks`.
-    decomposition_reason: str = ""
-    # What each lane's checkout was rolled back to before a retry, and what was
-    # refused. Empty on a dry run, which starts no lane and therefore discards
-    # nothing.
-    rollbacks: tuple = ()
-    # The weight scored against the time the units really took — see
-    # `payoff.calibrate`. Empty on a dry run: nothing ran, so nothing was timed,
-    # and a zeroed report would read as a measurement that came back flat.
-    calibration: dict = field(default_factory=dict)
-    environment: str = ""
-    left: tuple = ()
-    # The per-unit gate rows and the closing full-suite rows, as dicts
-    # (`gate.GateResult.as_dict`). Empty when no validator was wired, and on a
-    # dry run, which judges nothing.
-    gates: tuple = ()
-    suites: tuple = ()
-
-    def as_dict(self) -> dict:
-        return {
-            "intent": self.intent, "mission": self.mission_id,
-            "outcome": self.outcome, "reason": self.reason,
-            "environment": self.environment, "left": list(self.left),
-            "dry_run": bool(self.dry_run),
-            "decomposition": self.decomposition,
-            "decomposition_reason": self.decomposition_reason,
-            "enforcement": self.enforcement,
-            "enforcement_reason": self.enforcement_reason,
-            "steals": int(self.steals),
-            "lanes": [{"lane": ln.get("lane"), "tasks": ln.get("tasks", []),
-                       "worktree": ln.get("worktree", ""),
-                       "weight": ln.get("weight", 0)} for ln in self.lanes],
-            "tasks": [{"task_id": t.task_id, "title": t.title,
-                       "weight": t.weight, "lane": t.lane_id,
-                       "skills": list(t.must_use),
-                       "brief_chars": len(t.brief_text)} for t in self.tasks],
-            "completed": list(self.completed), "failed": list(self.failed),
-            "kept": list(self.kept),
-            "reflections": list(self.reflections),
-            "recoveries": list(self.recoveries),
-            "open_keys": list(self.open_keys),
-            "rollbacks": list(self.rollbacks),
-            "calibration": dict(self.calibration),
-            "gates": [dict(g) for g in self.gates],
-            "suites": [dict(s) for s in self.suites],
-        }
 
 
 def _clean(text) -> str:
