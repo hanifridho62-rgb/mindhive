@@ -36,6 +36,16 @@ from mindhive.orchestrator import resilience as r
 # Verbatim from `mindnet.agent._classify` on this machine, 2026-09-07.
 NOT_LOGGED_IN = ("[usage] the agent could not run: Not logged in · Please run "
                  "/login — nothing was attempted, so the task is left untouched")
+# Verbatim from `mindnet.agent._classify` for the answer `claude -p` gave on
+# this machine on 2026-09-03, kept in the store's own reflection-health line.
+# No `[usage]` mark: none of `agent._USAGE_HINTS` matches a 403, so the CLI
+# said it, `_classify` wrapped it, and nothing marked it as a quota fault.
+SUBSCRIPTION_DISABLED = (
+    "the agent could not run: 403: Your organization has disabled Claude "
+    "subscription access for Claude Code · Use an Anthropic API key "
+    "instead, or ask your admin to enable access — nothing was attempted, "
+    "so the task is left untouched")
+
 # Verbatim from the Windows Store redirector, same day, same machine.
 STORE_STUB = ("Python was not found; run without arguments to install from the "
               "Microsoft Store, or disable this shortcut from Settings > Apps > "
@@ -131,6 +141,14 @@ def test_a_refused_child_that_was_not_logged_in_is_an_auth_failure():
     assert got == env.AUTH
 
 
+def test_a_refused_child_whose_org_disabled_the_account_is_an_auth_failure():
+    """The `subscription access` hint has been in `_AUTH_HINTS` since the module
+    was written and nothing ever exercised it. This is the string it was put
+    there for."""
+    got = env.environment_failure(_entry(result=_res(reason=SUBSCRIPTION_DISABLED)))
+    assert got == env.AUTH
+
+
 def test_a_refused_child_over_the_usage_limit_is_a_usage_failure():
     res = _res(reason="[usage] the agent could not run: You have hit your "
                       "weekly limit — nothing was attempted")
@@ -206,6 +224,37 @@ def test_the_classifier_is_total():
 def test_every_kind_is_described_with_its_fix(kind, fix):
     text = env.describe(kind, "detail")
     assert fix in text, text
+
+
+def test_an_account_side_refusal_names_the_account_fix_not_a_login():
+    """The reason this branch exists. `claude auth status` says the CLI IS
+    logged in, the API answers 403, and the advice "log in" sends the operator
+    to re-do the one thing that is already done. The fix belongs to the account
+    or the organisation, and the CLI's own sentence is the evidence for it --
+    which the AUTH branch used to drop on the floor."""
+    text = env.describe(env.AUTH, SUBSCRIPTION_DISABLED)
+    assert "API key" in text
+    assert "403" in text
+    assert "admin" in text
+    assert "disabled Claude subscription access" in text, (
+        "the operator never sees what the CLI actually said")
+    assert "log in" not in text and "claude auth login" not in text
+
+
+def test_a_plain_login_refusal_still_says_log_in():
+    """The other half of the pair. A branch that answered the account sentence
+    for every AUTH failure would be the same defect wearing the other hat."""
+    text = env.describe(env.AUTH, NOT_LOGGED_IN)
+    assert "log in" in text
+    assert "API key" not in text
+
+
+def test_the_preflight_refusal_keeps_the_login_wording():
+    """`preflight` only ever refuses on `loggedIn` false, and its detail says
+    so in its own words -- no hint of the account case, so no account advice."""
+    text = env.describe(env.AUTH,
+                        "claude auth status: loggedIn=false (authMethod=none)")
+    assert "log in" in text and "API key" not in text
 
 
 def test_no_kind_describes_as_nothing():
@@ -305,6 +354,20 @@ def test_the_loop_neither_repairs_nor_records_a_machine_failure():
     kinds = [k for k, _ in bus.events]
     assert kinds == ["note"], kinds
     assert "halted" in bus.events[0][1]["text"]
+
+
+def test_the_halt_reason_carries_the_account_fix():
+    """`describe` is not read directly by an operator: it reaches them through
+    the halt note the board renders. If the sentence changes there and not
+    here, the board still says the wrong thing."""
+    halted = []
+    loop = r.RepairLoop(breaker=_breaker(), halt=halted.append)
+
+    loop.observe(_entry(result=_res(reason=SUBSCRIPTION_DISABLED)))
+
+    assert loop.environment[0]["kind"] == env.AUTH
+    assert "API key" in halted[0]
+    assert "log in" not in halted[0]
 
 
 def test_the_halt_is_delivered_once_however_many_entries_arrive():
@@ -483,6 +546,25 @@ def test_a_mission_the_machine_refuses_halts_and_says_so(repo, monkeypatch):
     assert report["outcome"] == "environment"
     assert report["environment"] == env.AUTH
     assert report["left"] == list(got.left)
+
+
+def test_a_mission_refused_by_the_organisation_setting_says_which_fix(
+        repo, monkeypatch):
+    """The same halt as the not-logged-in mission, reported with the fix that
+    would actually clear it."""
+    monkeypatch.setattr(lint.payoff_mod, "record_samples", lambda s, **kw: None)
+
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=1, decomposer=_two_units,
+        runner=lambda e, ln: _res(reason=SUBSCRIPTION_DISABLED),
+        max_attempts=3).execute_mission("do it", dry_run=False)
+
+    assert got.outcome == "environment", got.reason
+    assert got.environment == env.AUTH
+    assert "API key" in got.reason
+    assert "log in" not in got.reason
+    assert "never started" in got.reason
+    assert got.rollbacks == ()
 
 
 def test_a_mission_whose_children_all_run_is_unaffected(repo):
