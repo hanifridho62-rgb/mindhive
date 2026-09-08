@@ -139,11 +139,24 @@ flowchart TD
     AT --> RS["resilience.run_guarded<br/>breaker + sandbox"]
     RS -->|failure| RL["RepairLoop<br/>fall_back, defused stderr, retry"]
     RL --> AT
-    RS -->|ok| MB["merge back<br/>worktree.retire"]
+    RS -->|ok| MB["merge back<br/>integrate.integrate_lanes"]
     RL -->|breaker open| RR["rules reflect / resolve<br/>then JSON memory"]
     RR --> MB
     MB --> M["Mission report"]
 ```
+
+> **Superseded, 2026-09-08.** `merge back = worktree.retire` above was a scope
+> reduction, and `src/mindhive/orchestrator/integrate.py` replaced it. Retiring
+> a lane deletes its checkout; it never put the work on a branch. The
+> orchestrator now commits each gated unit on its lane branch (children stay
+> forbidden to commit) and merges the lanes into `lint/<mission>/integration`,
+> created from the lanes' base — the main checkout's HEAD is never touched, and
+> the branch survives its worktree as the mission's deliverable. **U15's
+> probe-first discipline is now code**: `mindnet.worktree.merge_probe` runs
+> `git merge-tree --write-tree` in the object database before any merge touches
+> a checkout, so a conflicting lane is reported and kept rather than half-merged.
+> `docs/designs/lintester-orchestrator.md`, "DECIDED by the owner, 2026-09-08",
+> carries the whole decision.
 
 ### Task state, and what makes a task stealable
 

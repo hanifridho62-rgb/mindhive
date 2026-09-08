@@ -251,14 +251,42 @@ order, and this section grows one bullet per landing.
   pass must not masquerade as the tree verified; only the closing full suite
   records, stamped `scope: full` with the mission id. Gate time is subtracted
   from the calibration sample so the weight keeps predicting the child, not
-  the tests. Transitional: the full suite runs once per lane tree that
-  validated a unit, because until the merge-back lands each lane is the only
-  place its work exists. Library default `validator=None` keeps the exit-code
-  path; `hive lintester --execute` wires the gate, `--no-gate` opts out and
-  its help text says what that costs.
-- **The merge-back.** Decided, not yet landed: the orchestrator commits on the
-  child's behalf and merges lanes probe-first into an integration branch made
-  from the lanes' base; the main checkout's HEAD never moves.
+  the tests. The per-lane closing suite it shipped with was transitional and
+  the merge-back replaced it with one run on the integration tree; the loop
+  survives as the fallback for work that never merged. Library default
+  `validator=None` keeps the exit-code path; `hive lintester --execute` wires
+  the gate, `--no-gate` opts out and its help text says what that costs.
+- **The merge-back.** Landed 2026-09-08 as `orchestrator/integrate.py`. The
+  plan doc's `merge back = worktree.retire`
+  (`docs/plans/2026-09-01-001-…-plan.md`, the pipeline diagram) was a scope
+  reduction: retiring a lane deletes its checkout and leaves the work on no
+  branch anyone can pick up. Now, because children are forbidden to commit
+  (`mindnet/agent.py` — an agent that could `git commit` could `git push`),
+  **the orchestrator commits on the child's behalf**, from `gate.gated`'s
+  `after` seam and therefore only past a green gate: one commit per validated
+  unit on its own lane branch, carrying a `Lintester-Task:` trailer and the
+  co-author line, and a `changelog.record` entry for the in-scope files.
+  A commit that fails is an integration fact, never the unit's failure — the
+  gate already proved the work, and routing it through `RepairLoop` would roll
+  the lane back and discard it; the row says so and the lane is kept.
+  Every lane is then **probed before it is merged** (U15's discipline in one
+  call): `git merge-tree --write-tree` answers in the object database only, so
+  a conflicting lane is reported with its paths and kept, branch and tree, for
+  a person, and the lanes after it still merge. A merged lane must prove it
+  landed (`merge-base --is-ancestor` answering exactly `True`) before the row
+  says `merged`. The **integration branch is made from the lanes' base**, not
+  from `HEAD`: `worktree.add` grew a `start_point`, so the branch starts where
+  the lanes started even if the operator moved the main checkout meanwhile.
+  **The main checkout's HEAD never moves** and its tree is never touched; the
+  integration checkout is retired at the end and its branch survives as the
+  deliverable (`git switch lint/<mission>/integration`, which the report
+  prints). The incumbent mn9 policy in `mindnet/orchestrator.py` is unchanged.
+  One rule was added to `worktree.state` for this: `__pycache__/`,
+  `.pytest_cache/` and their siblings (`CACHE_DIRS`) are not work, because the
+  per-unit gate runs pytest in every lane and without the exemption every
+  merged lane was kept as "uncommitted changes". It is a fixed list, not
+  "anything ignored" — `dist/out.bin` under an ignore rule is still a build
+  the operator asked for, and a test pins that.
 - **The sandbox on the child path.** Decided, not yet landed: the fence goes
   onto the real child spawn and the report says what was observed.
 - **The two other doors.** Decided, not yet landed: soft-deprecate both, code

@@ -14,7 +14,9 @@ every step of it is a shipped module doing the job it already owned:
       -> queue.WorkStealingScheduler           LIFO local, FIFO steal
       -> gate.SuiteGate.check                  each unit judged by its own tests
       -> resilience.RepairLoop                 broken, rolled back, repaired
-      -> gate.SuiteGate.full                   the whole suite, per lane tree
+      -> integrate.commit_lane                 each validated unit committed, in its lane
+      -> integrate.integrate_lanes             lanes merged, probe-first, into one branch
+      -> gate.SuiteGate.full                   the whole suite, once, on that branch's tree
       -> worktree.release_lanes                teardown; a lane holding work is kept
 
 ## Information Hiding is enforced by the shape, not by a promise
@@ -42,11 +44,22 @@ bargain, for the same reason.
 
 With a `validator` (`gate.SuiteGate`) wired, a unit is validated only when its
 child exited cleanly AND the tests that mention what it changed pass in its
-lane; one full suite then runs per lane that validated anything, and a red
-suite makes the outcome `partial`. The library default `None` is the exit-code
-path every runner-fake test was written against; `cli.py` wires the gate on
-every run that starts work. A red gate is the unit's failure, never the
-machine's -- `gate.py` says why that distinction is load-bearing.
+lane; one full suite then runs on the integration tree (per lane, for work
+that never merged), and a red suite makes the outcome `partial`. The library
+default `None` is the exit-code path every runner-fake test was written
+against; `cli.py` wires the gate on every run that starts work. A red gate is
+the unit's failure, never the machine's -- `gate.py` says why that distinction
+is load-bearing.
+
+## The branch is the deliverable
+
+With `merge_back` on, every validated unit is committed on its lane's branch
+and the lanes are merged, probe-first, into `lint/<mission>/integration`, made
+from the lanes' base -- `integrate.py` says why the orchestrator commits and
+why a commit failure is never the unit's failure. The main checkout's HEAD
+never moves. Library default off; `cli.py` turns it on for every run that
+starts work, so `--execute --no-gate` commits unverified work, and its help
+says so.
 """
 from __future__ import annotations
 
@@ -58,14 +71,18 @@ from typing import NamedTuple
 
 from . import environment as env_mod
 from . import gate as gate_mod
+from . import integrate as integrate_mod
 from . import metrics as metrics_mod
 from . import payoff as payoff_mod
 from . import queue as queue_mod
 from . import resilience as res_mod
 from . import worktree as wt_mod
-# The dry run's decomposer and the row shape, carved out at the size cap. Kept
-# reachable from here: `lintester._unit` and `lintester.preview_units` were
-# the names in use, and `preview.py` says why `MAX_TASKS` moved with them.
+# Two carve-outs at the size cap, both kept reachable from here because these
+# were the names in use: the dry run's decomposer (`lintester._unit`,
+# `lintester.preview_units`; `preview.py` says why `MAX_TASKS` moved with
+# them) and the report (`lintester.Mission`, and the four words for where a
+# unit list came from -- `mission.py` carries the comment that explains them).
+from .mission import AGENT, INJECTED, PREVIEW, ROOT_ONLY, Mission  # noqa: F401
 from .preview import MAX_TASKS, _PARA, _slug, _unit, preview_units  # noqa: F401
 
 MISSION_PREFIX = "lm"
@@ -73,16 +90,6 @@ MISSION_PREFIX = "lm"
 # Lane default. Not "one per task": a lane costs a real `git worktree add`, and
 # past four the checkout cost starts to dominate a mission of ordinary size.
 DEFAULT_LANES = 4
-
-# Where a mission's unit list came from. Reported on `Mission.decomposition`,
-# because the four are not the same claim and an operator reading a fan-out plan
-# is entitled to know which one they are looking at: a real split proposed by an
-# agent, a caller's own decomposer, a directory split this module derived from
-# the intent's own file paths, or no split at all.
-INJECTED = "injected"
-AGENT = "agent"
-PREVIEW = "local-preview"
-ROOT_ONLY = "root-only"
 
 DEFAULT_TIMEOUT_S = 900
 
@@ -171,89 +178,6 @@ class AgentTask:
         return "\n\n".join(p for p in parts if p).strip()
 
 
-@dataclass(frozen=True)
-class Mission:
-    """What one `execute_mission` did, in full.
-
-    `outcome` is one of `ok`, `partial`, `refused`, `dry-run`, `environment`.
-    `enforcement` is `resilience`'s answer about the sandbox, carried up so a
-    report can say plainly whether the children were fenced by the kernel or
-    only by a clock.
-
-    `environment` is the kind behind an `environment` outcome -- the machine
-    could not start a child, and `reason` names the fix -- and `left` is every
-    unit the halt left unstarted. Neither is a failure of the unit named."""
-
-    intent: str = ""
-    mission_id: str = ""
-    outcome: str = "refused"
-    reason: str = ""
-    tasks: tuple = ()
-    lanes: tuple = ()
-    completed: tuple = ()
-    failed: tuple = ()
-    kept: tuple = ()
-    enforcement: str = res_mod.TIMEOUT_ONLY
-    enforcement_reason: str = ""
-    steals: int = 0
-    reflections: tuple = ()
-    # A target that failed and then passed. Reported separately from
-    # `open_keys` because "it broke once and recovered" and "it is still broken"
-    # are different facts, and a report carrying only the first is the one that
-    # sends an operator hunting a fault that already cleared.
-    recoveries: tuple = ()
-    open_keys: tuple = ()
-    dry_run: bool = True
-    decomposition: str = ROOT_ONLY
-    # Why `decomposition` is not what was asked for; empty when it is. See
-    # `LintesterOrchestrator._subtasks`.
-    decomposition_reason: str = ""
-    # What each lane's checkout was rolled back to before a retry, and what was
-    # refused. Empty on a dry run, which starts no lane and therefore discards
-    # nothing.
-    rollbacks: tuple = ()
-    # The weight scored against the time the units really took — see
-    # `payoff.calibrate`. Empty on a dry run: nothing ran, so nothing was timed,
-    # and a zeroed report would read as a measurement that came back flat.
-    calibration: dict = field(default_factory=dict)
-    environment: str = ""
-    left: tuple = ()
-    # The per-unit gate rows and the closing full-suite rows, as dicts
-    # (`gate.GateResult.as_dict`). Empty when no validator was wired, and on a
-    # dry run, which judges nothing.
-    gates: tuple = ()
-    suites: tuple = ()
-
-    def as_dict(self) -> dict:
-        return {
-            "intent": self.intent, "mission": self.mission_id,
-            "outcome": self.outcome, "reason": self.reason,
-            "environment": self.environment, "left": list(self.left),
-            "dry_run": bool(self.dry_run),
-            "decomposition": self.decomposition,
-            "decomposition_reason": self.decomposition_reason,
-            "enforcement": self.enforcement,
-            "enforcement_reason": self.enforcement_reason,
-            "steals": int(self.steals),
-            "lanes": [{"lane": ln.get("lane"), "tasks": ln.get("tasks", []),
-                       "worktree": ln.get("worktree", ""),
-                       "weight": ln.get("weight", 0)} for ln in self.lanes],
-            "tasks": [{"task_id": t.task_id, "title": t.title,
-                       "weight": t.weight, "lane": t.lane_id,
-                       "skills": list(t.must_use),
-                       "brief_chars": len(t.brief_text)} for t in self.tasks],
-            "completed": list(self.completed), "failed": list(self.failed),
-            "kept": list(self.kept),
-            "reflections": list(self.reflections),
-            "recoveries": list(self.recoveries),
-            "open_keys": list(self.open_keys),
-            "rollbacks": list(self.rollbacks),
-            "calibration": dict(self.calibration),
-            "gates": [dict(g) for g in self.gates],
-            "suites": [dict(s) for s in self.suites],
-        }
-
-
 def _clean(text) -> str:
     try:
         return str(text or "").strip()
@@ -282,6 +206,11 @@ class LintesterOrchestrator:
     # and `full(cwd, mission_id=)` answering a `gate.GateResult`; `None` is
     # the exit-code path (see "Validated means" above).
     validator: object = None
+    # The merge-back (`integrate.py`): each validated unit committed on its
+    # lane branch, the lanes merged probe-first into the integration branch.
+    # Off by default -- every runner-fake test was written against a teardown
+    # that made no branch -- and on for every `cli.py` run that starts work.
+    merge_back: bool = False
     evs: object = None
     # WB7's observation seam. `bus` is anything with `emit(kind, **fields)`;
     # `observer` is an async context manager FACTORY the caller supplies, run
@@ -302,6 +231,9 @@ class LintesterOrchestrator:
     # executor threads (`list.append` is atomic) and folded into `Mission`.
     _gates: list = field(default_factory=list, init=False, repr=False,
                          compare=False)
+    # One row per lane commit the merge-back made (or refused), same shape.
+    _commits: list = field(default_factory=list, init=False, repr=False,
+                           compare=False)
 
     # ---- naming -------------------------------------------------------------
 
@@ -331,6 +263,11 @@ class LintesterOrchestrator:
         """One board line per gate run, under the lane phase. The phase
         literal stays in THIS file, where the declared-phase scan looks."""
         self._emit("brain_phase", phase="Running Lanes", detail=str(detail))
+
+    def _merge_note(self, detail) -> None:
+        """One board line per lane at the merge. `integrate_lanes` speaks
+        through `emit(text)`; the phase literal stays in this file."""
+        self._emit("brain_phase", phase="Merging Worktrees", detail=str(detail))
 
     def _root(self):
         """The main checkout for every lane call. `None` means the working
@@ -711,9 +648,10 @@ class LintesterOrchestrator:
 
     def _full_suites(self, mission_id, trees, completed) -> tuple:
         """The whole suite, once per lane that validated a unit, before the
-        teardown. Transitional: the merge-back replaces this loop with one run
-        on the integration tree; until then each lane's tree is the only place
-        its validated work exists, so each is judged where it stands."""
+        teardown. The fallback: with the merge-back, `_closing_suite` runs it
+        ONCE on the integration tree, and this loop is for the work that never
+        reached one -- there each lane's tree is the only place its validated
+        work exists, so each is judged where it stands."""
         if self.validator is None:
             return ()
         done = {int(getattr(e, "lane_id", -1)) for e in completed or ()}
@@ -727,6 +665,31 @@ class LintesterOrchestrator:
             rows.append(gate_mod.full_row(self.validator, tree.path, lane_id,
                                           mission_id))
         return tuple(rows)
+
+    def _closing_suite(self, mission_id, integration, trees, completed) -> tuple:
+        """The whole suite ONCE, on the integration tree, when one exists;
+        else `_full_suites`, per lane, for the work that never merged."""
+        path = str(getattr(integration, "path", "") or "")
+        if self.validator is None or not path:
+            return self._full_suites(mission_id, trees, completed)
+        self._emit("brain_phase", phase="Running Suite",
+                   detail=f"integration: {path}")
+        return (gate_mod.full_row(self.validator, path,
+                                  integrate_mod.INTEGRATION_LANE, mission_id),)
+
+    def _committer(self, mission_id):
+        """`gated`'s `after`: commit a validated unit's lane on the child's
+        behalf and keep the row. The session id is the child's own run key,
+        so the change-log entry is attributed to the agent, not the operator."""
+        def commit(entry, lane, out):
+            task = entry.task
+            path = (str(getattr(lane, "worktree_path", "") or "")
+                    or str(getattr(task, "worktree_path", "") or ""))
+            row = integrate_mod.commit_lane(
+                self._root(), path, task, mission_id, project=self.project,
+                session_id=f"{MISSION_PREFIX}-{task.task_id}")
+            self._commits.append(row._asdict())
+        return commit
 
     # ---- the entry point ----------------------------------------------------
 
@@ -867,11 +830,14 @@ class LintesterOrchestrator:
         lanes = [queue_mod.WorkerLane(lid, ents, worktree=tree)
                  for lid, ents, tree in runnable]
         runner = self.runner or self._run_child
-        if self.validator is not None:
+        committer = self._committer(mission_id) if self.merge_back else None
+        if self.validator is not None or committer is not None:
             # The gate sits BETWEEN the child and the scheduler's verdict: the
             # one place `validated` is earned by a test run, not an exit code.
+            # The committer hangs after it, so nothing unvalidated is committed.
             runner = gate_mod.gated(runner, gate=self.validator,
-                                    record=self._gates, emit=self._gate_note)
+                                    record=self._gates, emit=self._gate_note,
+                                    after=committer)
         scheduler = queue_mod.WorkStealingScheduler(
             lanes, runner, repair=repair,
             mission_id=mission_id, checkpoint_dir=checkpoint_dir,
@@ -924,11 +890,30 @@ class LintesterOrchestrator:
                            decomposition=split, decomposition_reason=split_why,
                            dry_run=False)
 
-        # BEFORE the teardown: the suite is judged where the work still is.
-        suites = self._full_suites(mission_id, trees, completed)
-        self._emit("brain_phase", phase="Merging Worktrees",
-                   detail=f"{len(trees)} lane(s)")
+        # BEFORE the teardown: the suite is judged where the work still is --
+        # on the integration tree once the lanes have merged, else per lane.
+        integration = None
+        if self.merge_back:
+            self._emit("brain_phase", phase="Merging Worktrees",
+                       detail=f"{len(trees)} lane(s)")
+            integration = integrate_mod.integrate_lanes(
+                self._root(), trees, mission_id, emit=self._merge_note)
+            suites = self._closing_suite(mission_id, integration, trees,
+                                         completed)
+            # A merged lane's base moves to the integration commit, so the
+            # teardown finds nothing ahead and removes it; an unmerged lane
+            # keeps its base and is kept.
+            trees = integrate_mod.merged_trees(trees, integration)
+        else:
+            suites = self._full_suites(mission_id, trees, completed)
+            self._emit("brain_phase", phase="Merging Worktrees",
+                       detail=f"{len(trees)} lane(s)")
         released = wt_mod.release_lanes(self._root(), trees)
+        # The integration checkout goes; its branch is the deliverable.
+        retired = integrate_mod.retire_integration(self._root(), integration)
+        kept = [r.reason for r in released if r.kept]
+        if getattr(retired, "kept", False):
+            kept.append(str(getattr(retired, "reason", "") or ""))
         done = tuple(e.task_id for e in completed)
         bad = tuple(f"{e.task_id}: {e.reason}" for e in failed)
         halted = str(scheduler.halted or "")
@@ -943,10 +928,23 @@ class LintesterOrchestrator:
             # their own tests, the tree they left does not pass its suite --
             # reported as `partial` naming the lane, never as a unit's failure.
             red = [s for s in suites if not s.get("ok")]
-            outcome = "ok" if not (bad or red) else "partial"
+            uncommitted = [c for c in self._commits if not c.get("ok")]
+            unmerged = integration is not None and not integration.ok
+            outcome = ("ok" if not (bad or red or uncommitted or unmerged)
+                       else "partial")
             parts = [f"{len(bad)} of {len(tasks)} unit(s) failed"] if bad else []
-            parts += [f"the full suite is red in lane {s.get('lane_id')} "
-                      f"({s.get('reason') or 'no reason recorded'})"
+            if uncommitted:
+                parts.append(f"{len(uncommitted)} validated unit(s) not "
+                             f"committed ("
+                             + "; ".join(str(c.get("reason") or "no reason")
+                                         for c in uncommitted) + ")")
+            if unmerged:
+                parts.append(f"merge-back: {integration.reason}")
+            parts += ["the full suite is red "
+                      + ("on the integration tree"
+                         if int(s.get("lane_id", -1)) < 0
+                         else f"in lane {s.get('lane_id')}")
+                      + f" ({s.get('reason') or 'no reason recorded'})"
                       for s in red]
             reason = "; ".join(parts)
         cal = self._calibrate(mission_id,
@@ -959,7 +957,7 @@ class LintesterOrchestrator:
             intent=text, mission_id=mission_id, outcome=outcome, reason=reason,
             environment=env_kind if halted else "", left=left,
             tasks=tuple(tasks), lanes=tuple(lanes_out), completed=done,
-            failed=bad, kept=tuple(r.reason for r in released if r.kept),
+            failed=bad, kept=tuple(kept),
             enforcement=enforcement, enforcement_reason=why,
             steals=int(scheduler.steals),
             reflections=tuple(str(r) for r in repair.reflections),
@@ -968,6 +966,8 @@ class LintesterOrchestrator:
             rollbacks=tuple(str(r) for r in repair.rollbacks),
             calibration=cal.as_dict(),
             gates=tuple(dict(g) for g in self._gates), suites=suites,
+            commits=tuple(dict(c) for c in self._commits),
+            integration=integrate_mod.report(integration, retired),
             decomposition=split, decomposition_reason=split_why,
             dry_run=False)
 
