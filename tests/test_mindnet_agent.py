@@ -754,3 +754,32 @@ def test_language_entries_are_defused_one_by_one_not_after_the_join():
     assert ", ," not in line and "to: ," not in line, (
         f"an entry that defused to nothing left a dangling separator: {line!r}")
     assert br_mod.FENCE_CLOSE not in p
+
+
+# --- the full reply, beside the bounded copy ----------------------------------
+
+def test_a_long_reply_is_carried_whole_and_excerpted_separately(monkeypatch,
+                                                                tmp_path):
+    """`excerpt` is a LEDGER bound, and it used to be the only copy kept.
+
+    `decompose.run` parsed it, so an agent whose answer outgrew
+    `runlog.EXCERPT_CHARS` had its json cut mid-string and its whole
+    decomposition thrown away as unparseable — observed on 2026-09-08 in
+    mission `lm-84c06ad6`, where four sound subtasks became one root-only unit.
+    Both fields are asserted here, in one test, because the fix is worthless if
+    it widens what rides the event: the point is that they DIFFER."""
+    body = "x" * (runlog.EXCERPT_CHARS + 500)
+    _spawn(monkeypatch, stdout=_envelope(result=body))
+    out = ag.run("k", "p", root=tmp_path, project="test")
+    assert out.text == body
+    assert len(out.excerpt) == runlog.EXCERPT_CHARS
+    assert out.excerpt == body[:runlog.EXCERPT_CHARS]
+
+
+def test_a_reply_within_the_bound_carries_the_same_text_both_ways(monkeypatch,
+                                                                  tmp_path):
+    """The discriminating pair: below the cut the two fields agree, so a test
+    that only ever saw a short reply could not tell the fix from its absence."""
+    _spawn(monkeypatch, stdout=_envelope(result="short answer"))
+    out = ag.run("k", "p", root=tmp_path, project="test")
+    assert out.text == out.excerpt == "short answer"

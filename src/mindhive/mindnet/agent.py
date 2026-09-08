@@ -503,7 +503,8 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     artifact = _artifact(key, body, project)
     text = claude_cli.result_text(stdout)
     excerpt = (text or stdout)[:runlog.EXCERPT_CHARS]
-    return _classify(code, stdout, timeout_s, key, root, artifact, excerpt)
+    return _classify(code, stdout, timeout_s, key, root, artifact, excerpt,
+                     text=text or "")
 
 
 def _spawn_raised(exc, key, header, transcript, root, project):
@@ -570,7 +571,7 @@ def _says_finished(stdout: str) -> bool:
         return True         # unreadable contract: do not keep spawning
 
 
-def _classify(code, stdout, timeout_s, key, root, artifact, excerpt):
+def _classify(code, stdout, timeout_s, key, root, artifact, excerpt, text=""):
     """The outcome mapping, unchanged from the one-shot era and deliberately
     factored out whole rather than rewritten: the ORDER of these checks is the
     correctness of this module, and it is not the chain's business."""
@@ -578,7 +579,8 @@ def _classify(code, stdout, timeout_s, key, root, artifact, excerpt):
     def result(kind, reason, executed):
         return x_mod.RunResult(
             result=kind, reason=reason, exit_code=code, executed=executed,
-            artifact=artifact, excerpt=excerpt, stdout=stdout[:runlog.EXCERPT_CHARS],
+            artifact=artifact, excerpt=excerpt, text=text,
+            stdout=stdout[:runlog.EXCERPT_CHARS],
             run_key=key, cwd=str(root or ""))
 
     # THE ENVELOPE IS CHECKED BEFORE THE EXIT CODE, and the order is the whole
