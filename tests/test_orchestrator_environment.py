@@ -241,6 +241,33 @@ def test_an_account_side_refusal_names_the_account_fix_not_a_login():
     assert "log in" not in text and "claude auth login" not in text
 
 
+def test_a_long_refusal_is_quoted_back_but_bounded():
+    """`_DETAIL_CHARS` is a real bound and nothing exercised it.
+
+    The account branch quotes the CLI's own sentence because that sentence is
+    the evidence an operator acts on, and bounds it because `agent._classify`
+    has already wrapped the message in one of its own -- an unbounded quote puts
+    a paragraph in the middle of one line of advice. A bound no fixture crosses
+    is a bound nobody has checked, so this feeds one that crosses it."""
+    tail = " and here is a paragraph the operator does not need." * 20
+    text = env.describe(env.AUTH, SUBSCRIPTION_DISABLED + tail)
+    assert "API key" in text                       # still the account branch
+    assert "does not need" not in text, "the quote ran past its bound"
+    assert len(text) < len(SUBSCRIPTION_DISABLED + tail)
+
+
+def test_the_quote_collapses_the_whitespace_it_carries():
+    """The quote is built with `" ".join(detail.split())`, so a CLI message
+    wrapped over several lines arrives as one line of advice rather than
+    breaking the sentence it is embedded in."""
+    wrapped = ("403: Your organization has disabled\n\t"
+               "Claude  subscription   access for Claude Code")
+    text = env.describe(env.AUTH, wrapped)
+    assert "API key" in text
+    assert "\n" not in text and "\t" not in text
+    assert "disabled Claude subscription access" in text
+
+
 def test_a_plain_login_refusal_still_says_log_in():
     """The other half of the pair. A branch that answered the account sentence
     for every AUTH failure would be the same defect wearing the other hat."""

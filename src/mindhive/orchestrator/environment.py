@@ -196,8 +196,15 @@ def describe(kind, reason="") -> str:
     detail = str(reason or "").strip()
     tail = f" ({detail})" if detail and kind not in (AUTH, USAGE) else ""
     if kind == AUTH:
-        if _any(_ACCOUNT_HINTS, detail.lower()):
-            quoted = " ".join(detail.split())[:_DETAIL_CHARS]
+        # Collapsed ONCE, and matched on the same text that is quoted. Matching
+        # the raw string while quoting a normalised one was a real defect: a CLI
+        # sentence wrapped across lines puts a newline inside "subscription
+        # access", the hint misses, and an operator whose organisation disabled
+        # the account is told to log in again -- the exact misdirection this
+        # branch exists to end.
+        flat = " ".join(detail.split())
+        if _any(_ACCOUNT_HINTS, flat.lower()):
+            quoted = flat[:_DETAIL_CHARS]
             # No status code and no claim about the login state are asserted
             # here: the branch also fires on a rejected key, where neither
             # would be true. The CLI's own sentence carries the specifics.
