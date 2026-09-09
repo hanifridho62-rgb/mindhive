@@ -1469,3 +1469,94 @@ waiting on. The rest are bounded, stated properties rather than defects — but
 the per-child ceiling is the one an operator can hurt themselves with, because
 it is the only one where the tool will do exactly what it was told and still
 exhaust the machine.
+
+## 35. Two doors are soft-deprecated; the notice and the toggle are all that changed
+
+The machine grew three front doors. `hive lintester "<intent>"` is the mission
+pipeline and the one new work goes through. `hive mindnet orchestrate` walks a
+task graph somebody declared. The dashboard's **MindSwarm** workspace commands a
+mission from the browser. An operator meeting the project for the first time
+picks whichever they found first, and two of the three are no longer where the
+work is.
+
+The owner's decision on 2026-09-08 was explicit and it was the reversible one:
+**soft-deprecate both — code kept, a notice and a toggle, no removal.** So this
+change is a notice, a tooltip and one environment variable, and nothing else:
+
+* `mindnet.orchestrator.PRIMARY_DOOR_NOTICE` prints to stderr on every non-JSON
+  `hive mindnet orchestrate` run, dry or `--execute`. It says the front door
+  moved and that nothing here is scheduled for removal. It lives in that module
+  rather than `__main__.py` because its text names the other command, and
+  `tests/test_cli_lintester.py` caps how many lines of `__main__.py` may do that
+  — the file sits at exactly 4 of 4, i.e. **zero** headroom, so the notice had
+  to be a constant imported from elsewhere rather than a sentence written here.
+  Two more caps are now close enough to name, and this change is most of the
+  reason they are: `__main__.py` went 4229 → 4235 of 4237, spending six of the
+  eight lines that were left, and `mindnet/orchestrator.py` 978 → 996 of 1000,
+  eighteen of twenty-two. An earlier draft of this bullet said the change
+  "bought its own room back by trimming its comments"; the trimming happened
+  INSIDE that arithmetic, not on top of it, and a review that checked the
+  numbers is the only reason the sentence is not still there. The next change
+  to either file needs a carve-out first.
+* `dashboard.mindswarm_enabled()` reads `MINDHIVE_MINDSWARM`, **default ON**,
+  and hides only the nav row. `/api/workspace/swarm`, `swarm_page.render_swarm`,
+  `showWorkspace` and every line of the page's JS are untouched. The variable is
+  read per request, but that buys an unfrozen value, NOT a live flip: a running
+  dashboard's environment is fixed at launch, so an operator changes this by
+  restarting with the new value. The README, the design doc, the code comment
+  and the in-page note all said "no restart" until a review pointed out that
+  nothing in the process can write `os.environ`.
+
+**What is honestly still open.**
+
+* **Nobody has been asked whether they read either one.** A notice on stderr is
+  a message an operator can pipe to `/dev/null` without noticing, and a tooltip
+  is a message that requires a hover. Neither has a read receipt, and there is
+  no event recording that either was shown. The measure of a soft deprecation is
+  whether traffic actually moves, and this change adds no way to see that. An
+  adversarial review pushed the message onto four more surfaces — `--help`, the
+  README, `docs/DATA_MODEL.md` §4.6, and an HTML comment that survives the
+  hidden row — which widens the net without closing this gap: none of them
+  reports back either.
+* **The notice's placement was wrong once already.** It first printed beside the
+  report, inside the `else:` that runs only after a graph is orchestrated — so
+  the no-tasks early return, which is a newcomer's likeliest first run AND the
+  one whose stdout hands them `hive mindnet declare`, said nothing at all. It
+  is hoisted above every branch now and mutant-verified, but the lesson is that
+  "every run" claimed in a docstring is worth one trace of the actual returns.
+* **The two notices on a dry run are two paragraphs.** `PRIMARY_DOOR_NOTICE`
+  fires on every non-JSON run; `MINDNET_ORCHESTRATE_SIGNPOST` fires on the dry
+  run only and prints after it. They say different things — where development
+  moved, and which input each command takes — and they need different gates,
+  which is why they are two strings and not one. But an operator doing a dry run
+  reads both, and that is more stderr than the command's own report.
+* **`--json` prints neither.** Deliberate: stdout is a machine surface and
+  advice at a program every run is what teaches people to discard stderr. The
+  cost is that a scripted caller is never told the door moved, and a scripted
+  caller is exactly the one whose habits outlive the person who wrote them.
+  Found while hoisting the notice above that branch, and NOT fixed here: on an
+  empty ledger the command returns early and prints its "(no mindnet tasks to
+  orchestrate…)" sentence to **stdout** whatever `--json` says, so
+  `hive mindnet orchestrate --json` on a fresh project emits something no
+  `json.loads` will read. It predates this change, and fixing it means deciding
+  what an empty graph's JSON document should BE — a contract decision, not a
+  soft-deprecation one. `test_the_empty_graph_run_keeps_the_notice_off_a_json_run`
+  says in its docstring that it does not cover this.
+* **The MindSwarm toggle hides one door; nothing hides the CLI one.** There is
+  no `MINDHIVE_MINDNET_ORCHESTRATE=0`, because hiding a subcommand from
+  `--help` is a different mechanism from hiding a nav row and would need the
+  registration ratchet's attention. The asymmetry is real: one door can be put
+  away, the other can only be annotated.
+* **Reversal is untested as a workflow.** `MINDHIVE_MINDSWARM=1` restoring the
+  row is asserted (`tests/test_dashboard_mindswarm_toggle.py`), but no test
+  covers un-deprecating — removing the notice and the tooltip — because that is
+  a diff, not a runtime state. If the decision reverses, the code has to be
+  edited back; the promise is that nothing was deleted, not that a switch exists.
+
+**Cons of leaving it:** the honest one is the first bullet. Soft deprecation
+that nobody measures is indistinguishable from no deprecation at all, and the
+next person to look will have the same three doors and one more year of habit
+behind two of them. The rest are stated properties of a deliberately small
+change — the whole point of the decision was that it be reversible, and every
+one of these gaps is a thing that was NOT done because doing it would have made
+the change harder to undo.

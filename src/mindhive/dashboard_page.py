@@ -106,7 +106,39 @@ PAINT_GUARD_JS = """\
   }"""
 
 
-def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
+# The MindSwarm nav entry, lifted out of the shell so `dashboard.mindswarm_
+# enabled` can leave it out. Default-on, so every `render_page(` caller that
+# predates the parameter renders exactly what it rendered before it existed.
+#
+# The `title=` is where the soft deprecation actually reaches a reader. An
+# operator who works from the dashboard never sees a CLI notice, so a
+# deprecation that lives only in `mindnet/orchestrator.py` is a deprecation
+# they are never told about — and the tooltip says "kept", not "going away",
+# because that is the decision that was made.
+MINDSWARM_NAV_BUTTON = (
+    """<button data-sec="ws-swarm" onclick="showWorkspace('swarm')" """
+    """title="Kept and still supported. New work goes through the mission """
+    """pipeline; start the dashboard with MINDHIVE_MINDSWARM=0 to hide """
+    """this row.">MindSwarm</button>""")
+
+
+# What stands in the row's place when it is hidden. The tooltip naming the
+# variable lives INSIDE the button, so hiding the row also hides the only
+# in-product instruction for bringing it back -- an adversarial review of
+# this change found that, and it is a real wart in a change whose whole
+# premise is reversibility. An HTML comment is not discoverable by eye and
+# does not pretend to be; it is what a reader who opens the page source
+# finds, and docs/session-legend.md carries the durable answer.
+SWARM_HIDDEN_NOTE = (
+    "<!-- MindSwarm nav row hidden by MINDHIVE_MINDSWARM=0. Restart the "
+    "dashboard with that variable unset, or set to 1, to restore this "
+    "row -- this process read its environment at launch and cannot see "
+    "a change made in a shell after it. Nothing was removed: "
+    "/api/workspace/swarm still answers. -->")
+
+
+def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
+                swarm: bool = True) -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -165,7 +197,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     <button data-sec="skills" onclick="showSkillPanel()">Skill &amp; Plugin</button>
     <div class="group">Workspace</div>
     <button data-sec="ws-parallel" onclick="showWorkspace('parallel')">MindParallel</button>
-    <button data-sec="ws-swarm" onclick="showWorkspace('swarm')">MindSwarm</button>
+    <!--__SWARM_NAV__-->
     <button data-sec="ws-research" onclick="showWorkspace('research')">Self-Reliant</button>
     <div class="group">Actions</div>
     <button data-sec="append" onclick="showAppend()">Append memory</button>
@@ -234,6 +266,8 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "") -> str:
     .replace("/*__CAT_CSS__*/", cat_board.CSS) \
     .replace("<!--__CAT_HTML__-->", cat_board.HTML) \
     .replace("/*__CAT_JS__*/", cat_board.script()) \
+    .replace("<!--__SWARM_NAV__-->",
+             MINDSWARM_NAV_BUTTON if swarm else SWARM_HIDDEN_NOTE) \
     .replace("__TOKEN__", json.dumps(token)) \
     .replace("/*__TASKS_CSS__*/", tasks_css) \
     .replace("//__TASKS_JS__", tasks_js)

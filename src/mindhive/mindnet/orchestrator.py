@@ -130,6 +130,24 @@ OUTCOME_AWAITING_VALIDATION = "awaiting-validation"
 OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
             OUTCOME_USAGE, OUTCOME_AWAITING_VALIDATION)
 
+# Printed by `cmd_mindnet_orchestrate` on every non-JSON run, dry or not. It
+# lives HERE because it names the other command and `test_cli_lintester.py` caps
+# how many lines of `__main__.py` may — a notice is not wiring, and the cap is
+# for wiring. SOFT carries the contract: nothing is removed, disabled, or
+# scheduled for either, and this text is all that changed. "Use the other one
+# instead" would be false: the mission pipeline builds its own graph and never
+# folds a declared one. (Not "nothing else READS one" — an earlier wording said
+# that, and `controller`, `briefcli`, `decompose` and `ab` all do.) So it
+# reports where development MOVED and leaves the capability standing.
+# `MINDNET_ORCHESTRATE_SIGNPOST` says which input each takes, after this, on the
+# dry run: two strings because they need two gates, not because it bears saying
+# twice.
+PRIMARY_DOOR_NOTICE = (
+    "notice: `hive mindnet orchestrate` is no longer the front door — new work "
+    "goes through `hive lintester \"<intent>\"`, which owns the mission "
+    "pipeline. Kept and still supported: that pipeline builds its own graph "
+    "and cannot run one you declared. Nothing here is scheduled for removal.")
+
 # The bounded retry for a `git worktree add` that git itself refused. Bounded, and
 # INSIDE the wave: a retry scheduled for "the next wave" can never run, because a
 # failed isolation writes no status row, so `before == after` and this wave is the

@@ -25,6 +25,14 @@ def isolate_store(tmp_path, monkeypatch):
     # Auto-resume scheduling must never register a REAL Windows scheduled
     # task from inside the suite (autoresume._timer_enabled reads this).
     monkeypatch.setenv("MINDHIVE_AUTORESUME_TIMER", "off")
+    # The MindSwarm soft-deprecation toggle is READ FROM THE AMBIENT
+    # ENVIRONMENT by dashboard.mindswarm_enabled(), and README.md tells
+    # operators to export MINDHIVE_MINDSWARM=0. A developer who did that
+    # dropped the served shell to 15 nav buttons, which reds the browser
+    # tier's `assert laid["buttons"] >= 16` with a message about a lost
+    # rail -- a false regression caused by a documented, supported
+    # setting. Pinned ON here; the tests that need it off set it in-body.
+    monkeypatch.setenv("MINDHIVE_MINDSWARM", "1")
     yield
     # The isolation is only as good as the last line of the test. A blanket
     # `monkeypatch.undo()` inside a test body -- reached for to restore one
