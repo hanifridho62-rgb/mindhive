@@ -252,21 +252,32 @@ def validate(graph, parent_id, pairs) -> list:
 
 
 def run(task_id, graph, runner=None, project=None, timeout_s=DEFAULT_TIMEOUT_S,
-        root=None, model=None) -> Decomposition:
+        root=None, model=None, spawn=None) -> Decomposition:
     """Ask an agent for *task_id*'s subtasks and validate the answer.
 
     Appends NOTHING — the caller decides whether to declare. *runner* defaults to
     `agent.run`, the same seam the orchestrator uses, so this inherits the durable
     transcript and the outcome mapping (an auth failure or usage limit comes back as
-    a reason, not as an empty decomposition that reads like "already atomic")."""
+    a reason, not as an empty decomposition that reads like "already atomic").
+
+    *spawn* is forwarded untouched to that seam and exists for one caller: a
+    lintester mission that asked for a resource ceiling. This is the FIRST child
+    of every real mission, so a decomposition running outside the fence is a
+    mission reporting `enforcement=kernel` over a `claude` nothing was holding —
+    the precise laundering `orchestrator/fence.py` was written to end, one call
+    upstream of where it was fixed. It is passed only when it is not None, so an
+    injected *runner* whose signature predates the fence is unaffected: no
+    ceiling means the call the seam has always made."""
     task = (graph or {}).get(task_id)
     if task is None:
         return Decomposition(task_id=task_id,
                              reason=f"no such task '{task_id}'")
     run_agent = runner or ag_mod.run
+    fenced = {"spawn": spawn} if spawn is not None else {}
     try:
         res = run_agent(f"mn11-{task_id}", prompt_for(task), root=root,
-                        project=project, timeout_s=timeout_s, model=model)
+                        project=project, timeout_s=timeout_s, model=model,
+                        **fenced)
     except Exception as exc:                            # noqa: BLE001
         return Decomposition(task_id=task_id,
                              reason=f"the agent could not be run: "

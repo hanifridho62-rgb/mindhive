@@ -226,6 +226,52 @@ def test_a_raising_runner_is_reported_not_propagated():
     assert "OSError" in out.reason
 
 
+# --- the ceiling this child runs under ----------------------------------------
+#
+# This is the FIRST `claude` a real lintester mission spawns, and it reached the
+# agent seam with no `spawn=` while the mission's report said `enforcement:
+# kernel` over it. Fencing the lane children and not this one is the same
+# laundering `orchestrator/fence.py` exists to end, one call upstream.
+
+def test_a_spawn_reaches_the_agent_seam(monkeypatch):
+    seen = {}
+
+    def spy(run_key, prompt, **kw):
+        seen.update(kw)
+        return x_mod.RunResult(result="ran-unverified", executed=True,
+                               exit_code=0, excerpt=_reply(("alpha", "")))
+
+    fence = object()
+    out = dc.run("p", _graph(_task("p")), runner=spy, spawn=fence)
+    assert seen.get("spawn") is fence
+    assert [p.title for p in out.usable] == ["alpha"]
+
+
+def test_no_spawn_means_the_argument_is_absent_not_none(monkeypatch):
+    """The canary, and the compatibility contract in one. Every existing caller
+    of `decompose.run` — and every injected runner in this suite — predates the
+    fence, so a default run must make byte for byte the call it always made: not
+    `spawn=None`, but no such keyword at all."""
+    seen = {}
+
+    def spy(run_key, prompt, **kw):
+        seen.update(kw)
+        seen["keys"] = sorted(kw)
+        return x_mod.RunResult(result="ran-unverified", executed=True,
+                               exit_code=0, excerpt=_reply(("alpha", "")))
+
+    dc.run("p", _graph(_task("p")), runner=spy)
+    assert "spawn" not in seen["keys"], seen["keys"]
+
+
+def test_a_runner_with_no_spawn_parameter_still_works_unfenced():
+    """`_runner` above has the pre-fence signature. It must keep working, or
+    every caller that never asked for a ceiling breaks on the day one did."""
+    out = dc.run("p", _graph(_task("p")),
+                 runner=_runner(_reply(("alpha", ""))))
+    assert [p.title for p in out.usable] == ["alpha"]
+
+
 # --- declare ------------------------------------------------------------------
 
 def test_declare_writes_both_axes_per_subtask():

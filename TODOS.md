@@ -1386,3 +1386,86 @@ suite runs once on that tree, and the branch survives its worktree.
 lanes are the only state this pipeline leaves behind on purpose, and nothing
 sweeps them. The second is a handover gap rather than a defect. The third and
 fourth are the same "no real sample" gap the neighbouring items carry.
+
+## 34. The child fence is real now; what it can and cannot hold is worth stating
+
+`src/mindhive/orchestrator/fence.py` landed on 2026-09-09. Before it, a mission
+that asked for a ceiling printed `enforcement: kernel` while `_run_child` ran a
+completely unfenced `claude` — the field had existed since `run_sandboxed`
+landed and nothing had ever been behind it. `claude_cli.run_headless` now takes
+a `spawn=`, `mindnet/agent.py` forwards it on every hop of a rotation chain,
+`Fence.spawn` composes the same `_preexec_for` / `_job_for` / `_run_capped` /
+`_close_job` that `run_sandboxed` composes, and the reported verdict starts at
+`resilience.fencing`'s prediction and can only get worse from there.
+
+Two of the defects below were found by an adversarial review of the diff before
+it was committed, and both were the SAME defect one layer out: a mission
+reporting `kernel` over a `claude` nothing was holding. The decomposition child
+— the first child of every real mission — reached `agent.run` with no `spawn=`
+at all, and `_spawn`'s lazy `Fence` build was an unlocked check-then-set that
+handed concurrent lanes their own orphaned fences (measured: more than one
+fence in 200 of 200 rounds). Both are fixed; the reflector below is the leg
+that is not.
+
+**What is honestly still open.**
+
+* **The breaker's reflection is NOT fenced, and the report does not say so.**
+  When a breaker opens, `RepairLoop` calls the injected reflector, which on the
+  CLI path is `resilience.reflect_on_open` -> `resolve.resolve_batch` ->
+  `reflect._claude_runner` -> `run_headless` with no `spawn=`. That is a real
+  `claude` child of the mission running with no ceiling while the mission may
+  still print `kernel`. It is conditional — a breaker has to open first, and
+  even then the resolver may find nothing actionable and spawn nothing — where
+  the decomposition leg was unconditional, which is why that one was fixed
+  inside PR-4 and this one is written down instead: threading `spawn` through
+  three modules that `hive rules resolve` also uses is its own change, with its
+  own tests, not a rider on this one. `fence.py`'s docstring states the scope so
+  the code does not overclaim; nothing in `cli.py`'s `fencing: <verdict>` line
+  does, and that is the gap.
+* **No real `claude -p` child has ever been fenced.** The same gap as items 27,
+  29, 32 and 33. Every assertion in `tests/test_orchestrator_fence.py` runs
+  against a patched `_job_for` / `_run_capped`, deliberately — driving the real
+  Windows kernel would make every one of them platform-conditional and leave
+  the POSIX leg proving nothing. The mechanisms themselves ARE measured
+  elsewhere (a 400MB child raising MemoryError under a 64MB job object), but
+  the composition of fence + `run_headless` + a real CLI is unmeasured until
+  `claude auth login` and the first
+  `hive lintester "<intent>" --execute --memory-mb <n>`.
+* **The assignment window is real and stated, not closed.** `jobs._assign`
+  attaches the child immediately after `Popen` returns, because `subprocess`
+  closes the primary thread handle before handing the object back and there is
+  nothing left to resume. A child cannot be scheduled long enough to allocate
+  past a ceiling in those microseconds, but that is an argument, not an
+  enforcement. `setrlimit` has no such window — the kernel applies it before
+  `exec` — so POSIX is strictly tighter here than Windows.
+* **A ceiling is per child, not per mission.** Four lanes with `--memory-mb 512`
+  may hold 2GB between them. Nothing sums the lanes, and nothing refuses a
+  ceiling times a lane count the machine cannot survive. The operator sets one
+  number and multiplies it in their head.
+* **Only the fence's own failures downgrade the verdict.** A job created and
+  assigned is reported as `kernel`, and that is the strongest claim available —
+  but the kernel does not tell us afterwards whether a limit was ever
+  approached, so `kernel` means "held", never "held and it mattered". The
+  cross-check that a ceiling was really applied is the child dying with
+  MemoryError, which is a mission outcome, not a fence field.
+* **`_run_capped`'s drain bound is the liveness floor for a lintester lane.**
+  On a timeout the fence kills the child, terminates the job, and then waits at
+  most `_DRAIN_GRACE_S` for the pipes. If a grandchild still holds them the
+  output is abandoned and `drained` is False — which `run_sandboxed` reports in
+  its timeout reason and `Fence` currently does NOT surface, because
+  `run_headless` maps the whole timeout to exit 124 and discards the exception's
+  payload. So a lane that overran its cap AND left something alive looks
+  identical to one that merely overran.
+
+* **`lintester.py` is at 982 of the 1000-line cap.** Eighteen lines of headroom
+  after the fence wiring. The next feature that touches it needs a carve-out
+  first, and `agenttask.py` / `preview.py` / `mission.py` are the pattern.
+
+**Cons of leaving it:** the reflector bullet is a correctness gap, not a stated
+property — it is the one item here that can still put a false `kernel` in front
+of an operator, and it is the reason this item exists rather than being closed.
+The `claude auth login` bullet is the same owner action four other items are
+waiting on. The rest are bounded, stated properties rather than defects — but
+the per-child ceiling is the one an operator can hurt themselves with, because
+it is the only one where the tool will do exactly what it was told and still
+exhaust the machine.

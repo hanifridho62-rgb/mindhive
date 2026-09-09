@@ -457,3 +457,71 @@ def test_the_plain_report_names_the_commits_and_the_integration_branch(
     assert "git switch lint/lm-1/integration" in out
     assert "lane 1" in out and "src/x.py" in out
     assert "suite integration:" in out and "7 passed" in out
+
+
+# --- the ceiling flags (PR-4) --------------------------------------------------
+#
+# Asserted at the construction seam, the way the reflector above is: a real
+# fenced run needs credentials and a real child, and neither belongs in this
+# suite. What the front door owes is the right `Limits` — the enforcement of it
+# is `tests/test_orchestrator_fence.py`'s job.
+
+def _limits_from(monkeypatch, *argv):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = {}
+    real = lint_mod.LintesterOrchestrator
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    assert _cli(*argv) == 0
+    return seen["limits"]
+
+
+def test_a_run_with_no_ceiling_flags_asks_for_no_ceiling(monkeypatch):
+    """`Limits.empty` is what `LintesterOrchestrator._spawn` reads to decide it
+    should hand the child nothing at all, so this is the property that keeps
+    every default run on exactly the call it always made."""
+    lim = _limits_from(monkeypatch, "lintester", "rotate the ledger segment")
+    assert lim.empty
+    assert (lim.memory_bytes, lim.cpu_seconds) == (0, 0)
+
+
+def test_the_memory_flag_is_megabytes_at_the_door_and_bytes_underneath(
+        monkeypatch):
+    """An operator types MB; `setrlimit` and `ProcessMemoryLimit` take bytes.
+    A flag that passed 512 straight through would set a half-kilobyte ceiling
+    and every child would die instantly."""
+    lim = _limits_from(monkeypatch, "lintester", "x", "--memory-mb", "512")
+    assert lim.memory_bytes == 512 * 1024 * 1024
+    assert lim.cpu_seconds == 0
+    assert not lim.empty
+
+
+def test_the_cpu_flag_is_seconds_and_is_not_the_wall_clock_timeout(monkeypatch):
+    lim = _limits_from(monkeypatch, "lintester", "x", "--cpu-seconds", "30")
+    assert (lim.memory_bytes, lim.cpu_seconds) == (0, 30)
+
+
+def test_both_ceilings_can_be_asked_for_at_once(monkeypatch):
+    lim = _limits_from(monkeypatch, "lintester", "x",
+                       "--memory-mb", "64", "--cpu-seconds", "5")
+    assert (lim.memory_bytes, lim.cpu_seconds) == (64 * 1024 * 1024, 5)
+
+
+def test_a_negative_ceiling_is_clamped_rather_than_refused(monkeypatch):
+    """Zero already means "no ceiling for this resource", so a typo costs the
+    fence, not the mission — and a negative rlimit is not a smaller ceiling, it
+    is an error the child would die on."""
+    lim = _limits_from(monkeypatch, "lintester", "x", "--memory-mb", "-1")
+    assert lim.memory_bytes == 0 and lim.empty
+
+
+def test_a_non_numeric_ceiling_is_a_caller_error_not_a_silent_default():
+    with pytest.raises(SystemExit) as exc:
+        _cli("lintester", "x", "--memory-mb", "lots")
+    assert exc.value.code == 2
