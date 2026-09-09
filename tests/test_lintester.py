@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import json
 import subprocess
+import threading
 
 import pytest
 
@@ -1124,3 +1125,244 @@ def test_the_decomposition_reason_reaches_the_operator(repo, monkeypatch,
     assert got.as_dict()["decomposition_reason"] == got.decomposition_reason
     cli_mod._print(got)
     assert "Not logged in" in capsys.readouterr().out
+
+
+# --- the fence reaches the real child, and the report tells the truth ---------
+#
+# Before PR-4 this orchestrator carried `limits`, asked `resilience.fencing`
+# what the PLATFORM could do, and printed `kernel` — while `_run_child` went
+# `agent.run` -> `claude_cli.run_headless` -> a bare `subprocess.run` with no
+# ceiling of any kind. The two halves below are what closes that: the callable
+# actually reaches the child, and what it OBSERVED replaces the prediction.
+
+def _capture_spawn(monkeypatch, call_it=False):
+    """Stand in for `mindnet.agent.run`, recording the `spawn` it was handed.
+
+    Records the run_key beside it, because a mission's children are not all
+    lane children: the FIRST one is the decomposer, keyed `mn11-`, and it
+    reaches this same seam through `decompose.run`. A recording that could not
+    tell them apart could not tell whether the decomposer was fenced.
+
+    With *call_it*, the stub USES that spawn the way `claude_cli.run_headless`
+    would. Recording it alone would prove the argument travels and nothing about
+    whether a failure inside it ever reaches the report."""
+    from mindhive.mindnet import agent as ag_mod
+    from mindhive.mindnet import executor as x_mod
+
+    def fake(run_key, prompt, **kw):
+        fake.keys.append(str(run_key))
+        fake.spawns.append(kw.get("spawn"))
+        if call_it and kw.get("spawn") is not None:
+            kw["spawn"](["claude", "-p"], input=prompt, timeout=5)
+        return x_mod.RunResult(result="ran-unverified", executed=True,
+                               exit_code=0, excerpt=_AGENT_REPLY)
+    fake.spawns = []
+    fake.keys = []
+    monkeypatch.setattr(ag_mod, "run", fake)
+    return fake
+
+
+def _fence_primitives(monkeypatch, job=("JOB", "")):
+    """Replace what `fence` borrows so no test here builds a real job object."""
+    import subprocess
+
+    from mindhive.orchestrator import fence as fence_mod
+    from mindhive.orchestrator import resilience as res_mod
+
+    monkeypatch.setattr(res_mod, "limits_available", lambda: (True, ""))
+    monkeypatch.setattr(fence_mod, "_job_for", lambda limits: job)
+    monkeypatch.setattr(fence_mod, "_preexec_for", lambda limits: None)
+    monkeypatch.setattr(fence_mod, "_close_job", lambda jb: None)
+    monkeypatch.setattr(
+        fence_mod, "_run_capped",
+        lambda argv, jb, st, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+
+
+def test_no_ceiling_means_no_spawn_argument_at_all():
+    """The default run must make byte for byte the call it always made — a
+    fence that fences nothing is new code on the one path this project cannot
+    exercise end to end without credentials."""
+    orch = lint.LintesterOrchestrator(project="test")
+    assert orch._spawn() is None
+
+
+def test_asking_for_a_ceiling_hands_the_child_a_fenced_spawn():
+    from mindhive.orchestrator import resilience as res_mod
+
+    orch = lint.LintesterOrchestrator(
+        project="test", limits=res_mod.Limits(memory_bytes=1 << 26))
+    spawn = orch._spawn()
+    assert spawn is not None
+    assert spawn.__self__ is orch._fence, "not the mission's own fence"
+
+
+def test_every_lane_shares_one_fence():
+    """The verdict is a claim about every child the mission ran. A per-lane
+    fence could only ever say that one of them was held."""
+    from mindhive.orchestrator import resilience as res_mod
+
+    orch = lint.LintesterOrchestrator(
+        project="test", limits=res_mod.Limits(cpu_seconds=5))
+    assert orch._spawn().__self__ is orch._spawn().__self__
+
+
+def test_lanes_racing_for_the_fence_still_share_exactly_one():
+    """RED against the lazy build as it shipped: `_spawn` was a bare
+    check-then-set, and `Fence()` costs milliseconds because `fencing` probes
+    `import resource` and calls kernel32 through ctypes — both release the GIL.
+    Four lanes released together each built one, the last assignment won, and
+    every other lane held a fence `_fencing()` never reads. An orphaned fence's
+    downgrade is a downgrade nothing reports, which is the defect PR-4 exists
+    to close, one level up.
+
+    The sequential test above cannot see this: it is the same check-then-set
+    the code satisfies. This one releases real threads from a barrier."""
+    from mindhive.orchestrator import resilience as res_mod
+
+    orch = lint.LintesterOrchestrator(
+        project="test", limits=res_mod.Limits(memory_bytes=1 << 26))
+    lanes, got, errors = 8, [], []
+    gate = threading.Barrier(lanes)
+
+    def race():
+        try:
+            gate.wait(timeout=10)
+            got.append(orch._spawn().__self__)
+        except Exception as exc:                        # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=race) for _ in range(lanes)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert not errors, errors
+    assert len(got) == lanes, "a lane never reached _spawn"
+    assert len({id(f) for f in got}) == 1, (
+        f"{len({id(f) for f in got})} fences were built; every one but "
+        f"{id(orch._fence)} is orphaned and its downgrade is unreportable")
+    assert got[0] is orch._fence
+
+
+def test_the_fenced_spawn_reaches_the_real_child(repo, monkeypatch):
+    from mindhive.orchestrator import resilience as res_mod
+
+    _fence_primitives(monkeypatch)
+    stub = _capture_spawn(monkeypatch)
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2,
+        limits=res_mod.Limits(memory_bytes=1 << 26)).execute_mission(
+            "retry the writer and cover it", dry_run=False)
+
+    assert got.outcome == "ok", got.reason
+    assert stub.spawns and all(s is not None for s in stub.spawns), (
+        "a child was spawned with no ceiling while the mission asked for one")
+    # One per unit, plus the decomposition child that produced the units.
+    assert len(stub.spawns) == len(got.tasks) + 1 >= 3
+
+
+def test_the_decomposition_child_is_fenced_too(repo, monkeypatch):
+    """It is the FIRST `claude` of every real mission, and until this it ran
+    with no ceiling while the report said `kernel` over it — the same
+    laundering as an unfenced lane child, one call upstream."""
+    from mindhive.orchestrator import resilience as res_mod
+
+    _fence_primitives(monkeypatch)
+    stub = _capture_spawn(monkeypatch)
+    orch = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2,
+        limits=res_mod.Limits(memory_bytes=1 << 26))
+    orch.execute_mission("retry the writer and cover it", dry_run=False)
+
+    assert stub.keys and stub.keys[0].startswith("mn11-"), stub.keys
+    assert stub.spawns[0] is not None
+    assert stub.spawns[0].__self__ is orch._fence, "not the mission's own fence"
+
+
+def test_a_mission_with_no_ceiling_leaves_the_decomposer_unfenced(
+        repo, monkeypatch):
+    """The canary for the test above: with no ceiling asked for, the
+    decomposition child must make the call it has always made."""
+    stub = _capture_spawn(monkeypatch)
+    lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2).execute_mission(
+            "retry the writer and cover it", dry_run=False)
+
+    assert stub.keys and stub.keys[0].startswith("mn11-"), stub.keys
+    assert stub.spawns[0] is None
+
+
+def test_a_mission_that_asked_for_no_ceiling_hands_its_children_none(
+        repo, monkeypatch):
+    """The canary for the test above: the same drive, no limits, and the
+    argument must be absent — otherwise that test would pass on any wiring."""
+    stub = _capture_spawn(monkeypatch)
+    lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2).execute_mission(
+            "retry the writer and cover it", dry_run=False)
+    assert stub.spawns and all(s is None for s in stub.spawns)
+
+
+def test_a_fence_the_machine_could_not_build_downgrades_the_report(
+        repo, monkeypatch):
+    """The whole point of PR-4. The platform says it CAN fence, so the
+    prediction is `kernel`; the machine then fails to create the job for every
+    child. A report that still said `kernel` would be the laundering
+    `resilience`'s docstring forbids, and it is what shipped before this."""
+    from mindhive.orchestrator import resilience as res_mod
+
+    _fence_primitives(monkeypatch,
+                      job=(None, "CreateJobObject failed (WinError 5)"))
+    _capture_spawn(monkeypatch, call_it=True)
+    got = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2,
+        limits=res_mod.Limits(memory_bytes=1 << 26)).execute_mission(
+            "retry the writer and cover it", dry_run=False)
+
+    assert got.enforcement == res_mod.TIMEOUT_ONLY
+    assert "CreateJobObject failed (WinError 5)" in got.enforcement_reason
+
+
+def test_a_fence_that_held_every_child_still_reports_kernel(repo, monkeypatch):
+    """The canary. With the job created and assigned, the same drive must keep
+    the `kernel` verdict — a `_fencing` that downgraded unconditionally would
+    pass the test above and tell every operator their ceiling failed.
+
+    The verdict alone is NOT enough to assert here, and asserting it alone was
+    a real hole: `_fence_primitives` makes the pre-run prediction `kernel` too,
+    so every early-return `Mission` on this path already carries `KERNEL`/"" and
+    this test passed with `_spawn` stubbed to `None` — the whole of PR-4
+    deleted. So it also pins that a fence EXISTS and that it counted every child
+    that ran. A `kernel` nobody earned is exactly what fence.py forbids."""
+    from mindhive.orchestrator import resilience as res_mod
+
+    _fence_primitives(monkeypatch)
+    stub = _capture_spawn(monkeypatch, call_it=True)
+    orch = lint.LintesterOrchestrator(
+        root=repo, project="test", lanes=2,
+        limits=res_mod.Limits(memory_bytes=1 << 26))
+    got = orch.execute_mission("retry the writer and cover it", dry_run=False)
+
+    assert got.outcome == "ok", got.reason
+    assert got.enforcement == res_mod.KERNEL
+    assert got.enforcement_reason == ""
+    assert orch._fence is not None, "the verdict rode the prediction, not a run"
+    assert orch._fence.runs == len(stub.spawns) == len(got.tasks) + 1
+    assert orch._fence.downgrades == 0
+
+
+def test_a_dry_run_reports_the_prediction_because_nothing_ran():
+    """No child was spawned, so there is nothing observed to report and the
+    platform's answer is the only honest one. `_fencing` must not invent a
+    downgrade out of an empty record."""
+    from mindhive.orchestrator import resilience as res_mod
+
+    orch = lint.LintesterOrchestrator(
+        decomposer=_two_units, project="test",
+        limits=res_mod.Limits(memory_bytes=1 << 30))
+    got = orch.execute_mission("x")
+    assert got.dry_run is True
+    assert orch._fence is None
+    assert (got.enforcement, got.enforcement_reason) == res_mod.fencing(
+        orch.limits)

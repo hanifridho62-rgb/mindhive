@@ -105,7 +105,7 @@ Units are MN-numbered; the number in each docstring is the address.
 | `orchestrator.py` | MN-7 — the parallel orchestrator that walks the graph in waves. |
 | `agent.py` | MN-8 — what a spawned agent actually runs for a task. |
 | `worktree.py` | MN-9 — one isolated checkout per orchestrated task. |
-| `decompose.py` | MN-11 — a task proposing its own subtasks. |
+| `decompose.py` | MN-11 — a task proposing its own subtasks. Takes a `spawn`, because on the lintester path this is the mission's first fenced child. |
 | `executor.py` | MN-1 U6 — the validation executor (holds the denylist, DATA_MODEL.md §4.2). |
 | `autodeclare.py` | MN-18 — decide whether a prompt should mint a task at all. |
 | `telemetry.py`, `ui_cats.py`, `ui_sessions.py` | MN-1 U10 / MN-5 U8 / MN-19 — the faculty activity feed (`mindnet_activity`) and the two cat boards. **MN-10 is a different slice**: the pr-green completion gate in `orchestrator.py` (DATA_MODEL.md §4.9). |
@@ -118,16 +118,22 @@ the default, and `--execute` is the only difference between looking and doing.
 
 | Module | Owns |
 |---|---|
-| `lintester.py` | WB1 — `LintesterOrchestrator.execute_mission`: intent → units → weighted lanes → briefs → scheduler → merge-back. `Mission` is the report; `AgentTask` is the closed per-child view. |
+| `lintester.py` | WB1 — `LintesterOrchestrator.execute_mission`: intent → units → weighted lanes → briefs → scheduler → per-unit gate → merge-back → closing suite → teardown. |
+| `agenttask.py` | The closed per-child surface, carved out of `lintester.py` at the size cap: `AgentTask` (frozen — everything one child is told, and nothing else) in, `_RunOutcome` back. Nothing here spawns anything. |
+| `fence.py` | The ceiling a real child runs under: `Fence.spawn` has `subprocess.run`'s call shape and `resilience._run_capped`'s enforcement, and is handed down through `claude_cli.run_headless(spawn=)`. Its verdict starts at `resilience.fencing`'s prediction and only ever gets worse, so the mission can never report a ceiling no child actually had. |
+| `mission.py` | The report: the `Mission` frozen record and the four decomposition constants, carved out of `lintester.py` at the size cap. `as_dict` is the `--json` shape. |
+| `integrate.py` | The merge-back: `commit_lane` commits a validated unit on its lane branch on the child's behalf (children may not commit), `integrate_lanes` merges the lanes probe-first into `lint/<mission>/integration` made from their base. A conflicting lane is kept with its branch for a person; the main checkout never moves; the branch survives its worktree. |
+| `preview.py` | The dry run's decomposer: `preview_units` groups the files the intent names into one `local-preview` unit per directory. Carved out of `lintester.py` at the size cap. |
+| `gate.py` | The per-unit test gate: `SuiteGate.check` runs the tests that mention what a child changed, in its lane; `SuiteGate.full` runs the whole suite once at the end. `gated` wraps a scheduler runner so a red gate is the unit's failure. Targeted runs never record a ledger `verification`; the full run does, stamped `scope: full`. |
 | `metrics.py` | WB2 — the structural spine: `ComplexityVisitor` (AST), `git log --numstat` churn, `calculate_workload_weight`. |
 | `queue.py` | WB3 — the asyncio work-stealing scheduler: LIFO local, FIFO steal, JSON checkpoint sidecar, `halt` / `left`. |
-| `worktree.py` | WB4 — `.worktrees/lane-N` acquisition, rollback and merge-back, over `mindnet.worktree`. |
+| `worktree.py` | WB4 — `.worktrees/lane-N` acquisition, rollback and teardown (a lane holding work is kept — after the merge-back, a merged lane no longer holds any), over `mindnet.worktree`. |
 | `resilience.py` | WB5 — the sandbox (`run_sandboxed`), `ToolCircuitBreaker`, `RepairLoop` (fall-back + defused stderr injection), `reflect_on_open`. |
 | `environment.py` | Environment failure vs task failure: `environment_failure` (the classifier), `preflight` (`claude auth status`), and the brake `RepairLoop` pulls so a machine that cannot start a child halts the mission instead of retrying every unit. |
 | `payoff.py` | Static waves against weighted lanes, and the weight scored against measured wall time (`calibrate`, `hive lintester --calibration`). |
 | `jobs.py` | Windows Job Objects — the sandbox's kernel fence where `resource` is absent. |
 | `board.py`, `dashboard.py` | WB7 — the event bus and the terminal board (`--board`). |
-| `cli.py` | `hive lintester`. Exit 0 ok / dry run, 1 partial or refused, 3 the machine (not the mission) refused. |
+| `cli.py` | `hive lintester`. Exit 0 ok / dry run, 1 partial or refused, 3 the machine (not the mission) refused. `--execute` wires the gate and the merge-back; `--no-gate` validates on the child's exit code alone, commits and merges that unverified work, and says so. |
 
 ### `rotation/` — smart-zone session rotation
 

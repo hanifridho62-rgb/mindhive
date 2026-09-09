@@ -323,6 +323,30 @@ def test_state_without_a_base_cannot_report_ahead(repo):
     assert wt.state(p)[1] == 0
 
 
+def test_changed_files_lists_tracked_changes_and_untracked_files(repo):
+    """The per-unit gate's question: what did the child touch? Modified,
+    staged-new and brand-new files all count; ignored ones do not, because a
+    `.pytest_cache/` is not a change."""
+    assert wt.changed_files(repo) == (), "canary: a clean tree answers empty"
+    (repo / "seed.txt").write_text("changed\n", encoding="utf-8")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "new.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "staged.py").write_text("y = 2\n", encoding="utf-8")
+    _git(repo, "add", "staged.py")
+    (repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "junk.py").write_text("z = 3\n", encoding="utf-8")
+
+    got = wt.changed_files(repo)
+
+    assert set(got) == {"seed.txt", "staged.py", "sub/new.py", ".gitignore"}
+    assert all("\\" not in p for p in got), got
+
+
+def test_changed_files_is_none_where_git_cannot_answer(tmp_path):
+    assert wt.changed_files(tmp_path / "nowhere") is None
+
+
 # --- the P0 a reviewer verified live in a throwaway repo ----------------------
 
 def test_add_refuses_to_reset_a_branch_that_holds_commits(repo):
@@ -509,3 +533,271 @@ def test_retire_is_serialised_against_add(repo, monkeypatch):
     assert calls, "no git calls were recorded — the instrument is not wired in"
     assert _cross_thread_overlaps(calls) == [], \
         f"add and retire ran against one .git together: {_cross_thread_overlaps(calls)}"
+
+
+# --- the merge-back's primitives (orchestrator/integrate.py's git driver) -------
+
+def _argv(monkeypatch):
+    """Every git argv this module runs, recorded at the primitive."""
+    calls = []
+    real = wt._git_rc
+
+    def rec(root, *args):
+        calls.append(tuple(str(a) for a in args))
+        return real(root, *args)
+
+    monkeypatch.setattr(wt, "_git_rc", rec)
+    return calls
+
+
+def _branch_with_a_commit(repo, name, rel="new.txt"):
+    """*name*, one commit past `main`, with `main` checked out again after."""
+    _git(repo, "checkout", "-q", "-b", name)
+    (repo / rel).write_text(f"{name}\n", encoding="utf-8")
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-qm", name)
+    sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", "main")
+    return sha
+
+
+def _conflict(repo):
+    """`lane` and `main` both rewrite `seed.txt`, differently."""
+    _git(repo, "checkout", "-q", "-b", "lane")
+    (repo / "seed.txt").write_text("lane\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "lane")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "seed.txt").write_text("main\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "main moved")
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_add_without_a_start_point_runs_the_argv_it_always_ran(repo, monkeypatch):
+    """The pin. `start_point` is the merge-back's one addition to `add`;
+    absent, every existing caller sees the same git commands, byte for byte."""
+    calls = _argv(monkeypatch)
+
+    got = wt.add(repo, "t1")
+
+    assert got.ok, got.reason
+    assert ("rev-parse", "HEAD") in calls
+    adds = [c for c in calls if c[:2] == ("worktree", "add")]
+    assert adds == [("worktree", "add", "-B", "mn9/t1", str(Path(got.path)))]
+
+
+def test_add_with_a_start_point_branches_from_it_and_records_it_as_base(
+        repo, monkeypatch):
+    first = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "later.txt").write_text("later\n", encoding="utf-8")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-qm", "later")
+    calls = _argv(monkeypatch)
+
+    got = wt.add(repo, "t1", start_point=first)
+
+    assert got.ok, got.reason
+    assert got.base == first, "base must be the start point, not HEAD"
+    assert _git(got.path, "rev-parse", "HEAD").stdout.strip() == first
+    assert not (Path(got.path) / "later.txt").exists()
+    adds = [c for c in calls if c[:2] == ("worktree", "add")]
+    assert adds == [("worktree", "add", "-B", "mn9/t1", str(Path(got.path)),
+                     first)]
+
+
+def test_add_with_a_start_point_refuses_a_branch_holding_commits_past_it(repo):
+    """The rule that keeps committed work reachable, measured against the
+    start point rather than HEAD."""
+    first = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    held = _branch_with_a_commit(repo, "mn9/t1")
+
+    got = wt.add(repo, "t1", start_point=first)
+
+    assert got.ok is False and got.retryable is False
+    assert "already holds 1 commit" in got.reason
+    assert _git(repo, "rev-parse", "mn9/t1").stdout.strip() == held
+    assert not Path(got.path).exists()
+
+
+def test_add_with_an_unknown_start_point_is_a_settled_refusal(repo):
+    got = wt.add(repo, "t1", start_point="no-such-ref")
+    assert got.ok is False and got.retryable is False
+    assert got.reason
+    assert not Path(got.path).exists()
+
+
+def test_commit_all_on_a_clean_tree_is_a_recorded_no_op(repo):
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    got = wt.commit_all(repo, "nothing here")
+
+    assert got.ok is True and got.changed is False
+    assert got.sha == head
+    assert "nothing to commit" in got.reason
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head
+
+
+def test_commit_all_commits_everything_but_the_caches(repo):
+    """`add -A` with the cache directories excluded: a child's `__pycache__/`
+    is not its work, and a repository without a `.gitignore` -- every lane
+    fixture in this suite -- would otherwise commit bytecode."""
+    (repo / "seed.txt").write_text("changed\n", encoding="utf-8")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "new.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "sub" / "__pycache__").mkdir()
+    (repo / "sub" / "__pycache__" / "new.cpython-312.pyc").write_bytes(b"\x00")
+    (repo / ".pytest_cache" / "v").mkdir(parents=True)
+    (repo / ".pytest_cache" / "v" / "nodeids").write_text("[]", encoding="utf-8")
+
+    got = wt.commit_all(repo, "lint(lm-1) t-1: the work\n\nLintester-Task: t-1")
+
+    assert got.ok is True and got.changed is True, got.reason
+    assert got.sha == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    tree = _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout
+    assert "sub/new.py" in tree and "seed.txt" in tree
+    assert "__pycache__" not in tree and ".pytest_cache" not in tree, tree
+    body = _git(repo, "log", "-1", "--format=%B").stdout
+    assert body.startswith("lint(lm-1) t-1: the work")
+    assert "Lintester-Task: t-1" in body
+    left = [ln.strip() for ln in _git(repo, "status", "--porcelain").stdout
+            .splitlines() if ln.strip()]
+    assert left and all(any(d in ln for d in wt.CACHE_DIRS) for ln in left), left
+
+
+def test_commit_all_with_only_caches_to_commit_is_a_no_op(repo):
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\x00")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    got = wt.commit_all(repo, "caches only")
+
+    assert got.ok is True and got.changed is False
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head
+
+
+def test_commit_all_never_bypasses_a_hook(repo):
+    """A refusing `pre-commit` hook is git's own reason, reported as one. No
+    `--no-verify`, no retry -- the operator's hooks bind the orchestrator's
+    commits exactly as they bind a person's."""
+    import inspect
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho refused-by-hook >&2\nexit 1\n",
+                    encoding="utf-8")
+    hook.chmod(0o755)
+    (repo / "seed.txt").write_text("changed\n", encoding="utf-8")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    got = wt.commit_all(repo, "blocked")
+
+    assert got.ok is False and got.changed is False
+    assert "refused-by-hook" in got.reason, got.reason
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head
+    assert "--no-verify" not in inspect.getsource(wt)
+
+
+def test_merge_probe_lists_the_conflicting_paths_and_writes_no_ref(repo):
+    """`git merge-tree --write-tree` writes objects, never refs: HEAD, the
+    index and the working tree are exactly as they were."""
+    head = _conflict(repo)
+    refs = _git(repo, "for-each-ref").stdout
+
+    probe = wt.merge_probe(repo, "lane")
+
+    assert probe.clean is False
+    assert probe.conflicts == ("seed.txt",)
+    assert probe.tree and len(probe.tree) == 40
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head
+    assert _git(repo, "for-each-ref").stdout == refs
+    assert _git(repo, "status", "--porcelain").stdout.strip() == ""
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+
+
+def test_merge_probe_answers_clean_with_the_tree_it_would_make(repo):
+    _branch_with_a_commit(repo, "lane")
+
+    probe = wt.merge_probe(repo, "lane")
+
+    assert probe.clean is True and probe.conflicts == ()
+    assert _git(repo, "cat-file", "-t", probe.tree).stdout.strip() == "tree"
+
+
+def test_merge_probe_that_cannot_tell_is_not_a_no(repo):
+    probe = wt.merge_probe(repo, "no-such-branch")
+    assert probe.clean is None
+    assert probe.reason
+
+
+def test_merge_into_aborts_a_failed_merge_and_leaves_the_tree_clean(repo):
+    head = _conflict(repo)
+
+    got = wt.merge_into(repo, "lane", "merge lane")
+
+    assert got.ok is False and got.reason
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert _git(repo, "status", "--porcelain").stdout.strip() == ""
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == head
+
+
+def test_merge_into_makes_a_merge_commit_even_when_it_could_fast_forward(repo):
+    lane_sha = _branch_with_a_commit(repo, "lane")
+
+    got = wt.merge_into(repo, "lane", "lint(lm-1): merge lane 0")
+
+    assert got.ok, got.reason
+    assert got.sha == _git(repo, "rev-parse", "HEAD").stdout.strip()
+    parents = _git(repo, "log", "-1", "--format=%P").stdout.split()
+    assert len(parents) == 2, "a fast-forward leaves no merge to read the lane from"
+    assert lane_sha in parents
+    subject = _git(repo, "log", "-1", "--format=%s").stdout.strip()
+    assert subject == "lint(lm-1): merge lane 0"
+
+
+def test_is_ancestor_distinguishes_no_from_unknown(repo):
+    _branch_with_a_commit(repo, "lane")
+    assert wt.is_ancestor(repo, "main", "lane") is True
+    assert wt.is_ancestor(repo, "lane", "main") is False
+    assert wt.is_ancestor(repo, "no-such-ref", "main") is None
+
+
+def test_rev_of_answers_the_commit_or_nothing(repo):
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert wt.rev_of(repo, "main") == head
+    assert wt.rev_of(repo, "no-such-ref") == ""
+
+
+def test_state_does_not_count_test_caches_as_work(repo):
+    """A gated lane's pytest run leaves `__pycache__/` and `.pytest_cache/`
+    behind; before, `state` read them as work and every gated lane was kept
+    after its commits had merged. Both spellings: untracked (a fixture repo
+    has no `.gitignore`) and ignored."""
+    got = wt.add(repo, "t1")
+    p = Path(got.path)
+    (p / ".pytest_cache" / "v").mkdir(parents=True)
+    (p / ".pytest_cache" / "v" / "nodeids").write_text("[]", encoding="utf-8")
+    (p / "src" / "__pycache__").mkdir(parents=True)
+    (p / "src" / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\x00")
+    assert wt.state(p, got.base) == (False, 0)
+
+    (p / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n",
+                                  encoding="utf-8")
+    _git(p, "add", ".gitignore")
+    _git(p, "commit", "-qm", "ignore the caches")
+    assert wt.state(p, got.base) == (False, 1)
+    tip = _git(p, "rev-parse", "HEAD").stdout.strip()
+    assert wt.retire(repo, p, got.branch, tip).removed
+
+
+def test_ignored_output_outside_a_cache_directory_is_still_work(repo):
+    """The canary: the exemption is a fixed list of cache directories, not
+    "anything ignored". `dist/out.bin` under an ignore rule is a build the
+    operator asked for, and `retire` keeps it exactly as before."""
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore dist")
+    got = wt.add(repo, "t1")
+    p = Path(got.path)
+    (p / "dist").mkdir()
+    (p / "dist" / "out.bin").write_bytes(b"\x00")
+
+    assert wt.state(p, got.base) == (True, 0)
+    assert wt.retire(repo, p, got.branch, got.base).kept
+    assert (p / "dist" / "out.bin").exists()

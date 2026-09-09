@@ -1075,6 +1075,13 @@ from the same review are recorded here rather than fixed, because each is outsid
 > spending `max_attempts` per unit on it. Owner action: `claude auth login`, then
 > `hive lintester "<intent>" --execute`; the sample lands in `hive lintester --calibration`.
 
+> **2026-09-08.** The per-unit test gate (item 32) runs pytest inside the unit's
+> `elapsed_ns` window, so `_calibrate` now subtracts each unit's gate rows
+> (`GateResult.duration_s`, summed over attempts) from its sample before the weight is
+> scored. The first real sample will measure the child, not the child plus its tests;
+> `tests/test_orchestrator_gate.py::test_gate_time_is_excluded_from_the_weight_calibration`
+> pins it.
+
 `src/mindhive/orchestrator/` shipped on 2026-09-01 and closes all 22 open items from
 the PRD conformance sweep: `LintesterOrchestrator.execute_mission`, an `ast.NodeVisitor`
 cyclomatic metric, `git log --numstat` churn, an asyncio work-stealing scheduler with a
@@ -1239,6 +1246,12 @@ state is a record of the worst the mission ever saw rather than of where it stan
 > first real `--board --execute` run happens, check that this alert reads as "the machine,
 > not the mission" and does not scroll the lane rows away.
 
+> **2026-09-08.** Two more lines reach the board unrendered against a real run: the gate's
+> `gate <task>: ok|red, N test file(s)` detail under `Running Lanes` (item 32), and the new
+> `Running Suite` phase, once per lane, between the lanes and the teardown. On the first real
+> `--board --execute` run, check that a red gate line reads as the unit's failure and that
+> the suite phase does not look like a hang while pytest runs for a minute.
+
 `src/mindhive/orchestrator/dashboard.py` shipped on 2026-09-01: an `asyncio.Queue` publish/subscribe
 bus, ten frozen Event State objects, a pure `Board` fold, a `rich` `Live` layout split into the
 directive's three areas — Lintester Brain / Worker Lanes / Circuit Breaker & Alerts — and a
@@ -1368,3 +1381,176 @@ than a file in the wrong directory. The reader side (`read_all`, `corrupt_rows`)
 
 **Why not in the hooks PR:** it is a change to the ledger's write path, with its own blast
 radius and its own review; the hooks change is additive and touches no `src/`. Keep them apart.
+
+---
+
+## 32. "Validated" now means the lane's tests passed; four things about the gate are still honest gaps
+
+`src/mindhive/orchestrator/gate.py` landed on 2026-09-08 (owner decision: targeted tests per
+unit, one full suite at the end — `docs/designs/lintester-orchestrator.md`, "DECIDED by the
+owner, 2026-09-08"). Before it, `lintester._run_child` called a unit validated on the child's
+exit code and no test ever ran against the lane. Now `SuiteGate.check` runs, in the lane, the
+tests that mention the modules the child changed; `gated` turns a red run into the unit's
+failure with the pytest tail as its stderr; `SuiteGate.full` runs the whole suite once per
+lane that validated anything; a red suite makes the mission `partial`. Targeted runs pass
+`record=False` to `verify.run_and_record` and never become a ledger `verification`; the full
+run records one stamped `scope: full` with the mission id. `hive lintester --execute` wires
+the gate; `--no-gate` opts out and its help text says what that costs.
+
+**What is honestly still open.**
+
+* **A change no test mentions is a recorded vacuous pass.** `scope: none` in the gate row,
+  `reason` saying so, and the closing full suite as the only judge. The fail-closed
+  alternative was rejected on purpose — it would refuse every unit that adds a module nobody
+  tests yet — but the consequence is real: a child can add an untested module, pass its gate,
+  and be validated on the strength of a suite that never imports it. The report shows the
+  `none` row; nothing yet counts them or warns when every gate in a mission was vacuous.
+* **No real child has ever been gated.** The same missing sample as items 27 and 29: every
+  gate in the suite ran against a fake runner that wrote the files itself. What a real
+  `claude -p` child changes, and whether `tests_mentioning`'s import-pattern narrowing picks
+  the right files for it, is unmeasured until `claude auth login` and the first
+  `hive lintester "<intent>" --execute`.
+* **~~The full suite runs once per lane, not once.~~** Closed on 2026-09-08 by item 33's
+  merge-back: the closing suite now runs once, on the integration tree, where every merged
+  lane's work sits together — so two lanes that each pass alone are judged as they will
+  actually be picked up. The per-lane loop survives as the fallback for a mission whose work
+  reached no integration checkout (no lane committed anything, or the branch was refused).
+* **The cap kills the child only.** `verify._stream`'s timer calls `proc.kill()`, which on
+  Windows ends the pytest process and not the grandchildren it spawned (a `subprocess` under
+  test, a hung fixture). A gate killed at its cap answers `124` and the mission continues;
+  what the orphan does afterwards is not tracked. The sandbox PR's Job Object fence is the
+  fix, and it is deliberately not duplicated here.
+
+**Cons of leaving it:** the first bullet is the one that can mislead — a mission of vacuous
+passes reads as validated. The other three are the same "no real sample" gap and the same
+"no merge-back yet" gap the neighbouring items already carry.
+
+## 33. The merge-back leaves a branch, and four things about it need a person
+
+`src/mindhive/orchestrator/integrate.py` landed on 2026-09-08 (owner decision:
+the orchestrator commits on the child's behalf, probe-first merge into an
+integration branch made from the lanes' base —
+`docs/designs/lintester-orchestrator.md`, "DECIDED by the owner, 2026-09-08").
+Before it, the phase labelled "Merging Worktrees" only called `release_lanes`
+and no validated work ever reached a branch. Now every gated unit is committed
+on its lane branch with a `Lintester-Task:` trailer, the lanes are probed with
+`git merge-tree` and merged into `lint/<mission>/integration`, the closing full
+suite runs once on that tree, and the branch survives its worktree.
+
+**What is honestly still open.**
+
+* **A conflicting lane needs a human, and nothing schedules that human.** The
+  probe keeps it — branch, checkout and all — reports its paths, and makes the
+  mission `partial`. Nothing retries it against the merged tree, nothing opens
+  an incident, and nothing removes it later: the `.worktrees/lane-N` directory
+  sits there until someone resolves it. On a machine that runs many missions
+  that is a slow disk leak whose only alarm is the mission report nobody may
+  read.
+* **The integration branch never reaches `master`, by design and by omission.**
+  It is created from the lanes' base and left for `git switch`; no push, no PR,
+  no rebase. That is the right default — an unreviewed branch of agent commits
+  must not fast-forward anything — but it means the deliverable is exactly as
+  useful as the operator's habit of looking for it. The report prints the
+  `git switch` line and that is the whole handover.
+* **The cache exemption is a fixed list, and a lane may still be kept for
+  litter.** `mindnet.worktree.CACHE_DIRS` names five directories a test run
+  leaves behind; anything else untracked or ignored still counts as work and
+  keeps the lane, which is deliberate (`dist/out.bin` is a build, not litter,
+  and a canary test pins that). A tool that writes somewhere else — a coverage
+  file at the root, a `node_modules` — will keep a merged lane on disk with
+  nothing in it worth keeping.
+* **No real child's work has ever been committed or merged.** The same gap as
+  items 27, 29 and 32: every commit and every merge in the suite came from a
+  runner fake writing files into a real git repository. Whether a real
+  `claude -p` child leaves a tree `commit_all` handles the way these tests
+  say — no submodule, no symlink, no file it did not mean to write — is
+  unmeasured until `claude auth login` and the first
+  `hive lintester "<intent>" --execute`.
+
+**Cons of leaving it:** the first bullet is the one that accumulates — kept
+lanes are the only state this pipeline leaves behind on purpose, and nothing
+sweeps them. The second is a handover gap rather than a defect. The third and
+fourth are the same "no real sample" gap the neighbouring items carry.
+
+## 34. The child fence is real now; what it can and cannot hold is worth stating
+
+`src/mindhive/orchestrator/fence.py` landed on 2026-09-09. Before it, a mission
+that asked for a ceiling printed `enforcement: kernel` while `_run_child` ran a
+completely unfenced `claude` — the field had existed since `run_sandboxed`
+landed and nothing had ever been behind it. `claude_cli.run_headless` now takes
+a `spawn=`, `mindnet/agent.py` forwards it on every hop of a rotation chain,
+`Fence.spawn` composes the same `_preexec_for` / `_job_for` / `_run_capped` /
+`_close_job` that `run_sandboxed` composes, and the reported verdict starts at
+`resilience.fencing`'s prediction and can only get worse from there.
+
+Two of the defects below were found by an adversarial review of the diff before
+it was committed, and both were the SAME defect one layer out: a mission
+reporting `kernel` over a `claude` nothing was holding. The decomposition child
+— the first child of every real mission — reached `agent.run` with no `spawn=`
+at all, and `_spawn`'s lazy `Fence` build was an unlocked check-then-set that
+handed concurrent lanes their own orphaned fences (measured: more than one
+fence in 200 of 200 rounds). Both are fixed; the reflector below is the leg
+that is not.
+
+**What is honestly still open.**
+
+* **The breaker's reflection is NOT fenced, and the report does not say so.**
+  When a breaker opens, `RepairLoop` calls the injected reflector, which on the
+  CLI path is `resilience.reflect_on_open` -> `resolve.resolve_batch` ->
+  `reflect._claude_runner` -> `run_headless` with no `spawn=`. That is a real
+  `claude` child of the mission running with no ceiling while the mission may
+  still print `kernel`. It is conditional — a breaker has to open first, and
+  even then the resolver may find nothing actionable and spawn nothing — where
+  the decomposition leg was unconditional, which is why that one was fixed
+  inside PR-4 and this one is written down instead: threading `spawn` through
+  three modules that `hive rules resolve` also uses is its own change, with its
+  own tests, not a rider on this one. `fence.py`'s docstring states the scope so
+  the code does not overclaim; nothing in `cli.py`'s `fencing: <verdict>` line
+  does, and that is the gap.
+* **No real `claude -p` child has ever been fenced.** The same gap as items 27,
+  29, 32 and 33. Every assertion in `tests/test_orchestrator_fence.py` runs
+  against a patched `_job_for` / `_run_capped`, deliberately — driving the real
+  Windows kernel would make every one of them platform-conditional and leave
+  the POSIX leg proving nothing. The mechanisms themselves ARE measured
+  elsewhere (a 400MB child raising MemoryError under a 64MB job object), but
+  the composition of fence + `run_headless` + a real CLI is unmeasured until
+  `claude auth login` and the first
+  `hive lintester "<intent>" --execute --memory-mb <n>`.
+* **The assignment window is real and stated, not closed.** `jobs._assign`
+  attaches the child immediately after `Popen` returns, because `subprocess`
+  closes the primary thread handle before handing the object back and there is
+  nothing left to resume. A child cannot be scheduled long enough to allocate
+  past a ceiling in those microseconds, but that is an argument, not an
+  enforcement. `setrlimit` has no such window — the kernel applies it before
+  `exec` — so POSIX is strictly tighter here than Windows.
+* **A ceiling is per child, not per mission.** Four lanes with `--memory-mb 512`
+  may hold 2GB between them. Nothing sums the lanes, and nothing refuses a
+  ceiling times a lane count the machine cannot survive. The operator sets one
+  number and multiplies it in their head.
+* **Only the fence's own failures downgrade the verdict.** A job created and
+  assigned is reported as `kernel`, and that is the strongest claim available —
+  but the kernel does not tell us afterwards whether a limit was ever
+  approached, so `kernel` means "held", never "held and it mattered". The
+  cross-check that a ceiling was really applied is the child dying with
+  MemoryError, which is a mission outcome, not a fence field.
+* **`_run_capped`'s drain bound is the liveness floor for a lintester lane.**
+  On a timeout the fence kills the child, terminates the job, and then waits at
+  most `_DRAIN_GRACE_S` for the pipes. If a grandchild still holds them the
+  output is abandoned and `drained` is False — which `run_sandboxed` reports in
+  its timeout reason and `Fence` currently does NOT surface, because
+  `run_headless` maps the whole timeout to exit 124 and discards the exception's
+  payload. So a lane that overran its cap AND left something alive looks
+  identical to one that merely overran.
+
+* **`lintester.py` is at 982 of the 1000-line cap.** Eighteen lines of headroom
+  after the fence wiring. The next feature that touches it needs a carve-out
+  first, and `agenttask.py` / `preview.py` / `mission.py` are the pattern.
+
+**Cons of leaving it:** the reflector bullet is a correctness gap, not a stated
+property — it is the one item here that can still put a false `kernel` in front
+of an operator, and it is the reason this item exists rather than being closed.
+The `claude auth login` bullet is the same owner action four other items are
+waiting on. The rest are bounded, stated properties rather than defects — but
+the per-child ceiling is the one an operator can hurt themselves with, because
+it is the only one where the tool will do exactly what it was told and still
+exhaust the machine.
