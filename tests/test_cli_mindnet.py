@@ -2032,3 +2032,185 @@ def test_the_signpost_is_absent_from_an_execute_run():
         "mindnet", "orchestrate", "--execute", "--via-script")
     assert "two orchestrators" not in err, err
     assert "mindnet orchestrate:" in out, out
+
+
+# --- the soft-deprecation notice -----------------------------------------------
+# PR-5. The owner's recorded decision was "soft-deprecate both doors: code kept,
+# reversible; a notice and a toggle, no removal." This half is the notice, and it
+# is a SECOND string beside the signpost rather than a rewrite of it because the
+# two have different gates: the signpost fires on a dry run only (an operator who
+# typed --execute has already chosen), while the notice fires on every non-JSON
+# run (an operator who runs this daily with --execute is exactly who needs to
+# hear that development moved). One string cannot have both gates.
+#
+# It lives in `mindnet/orchestrator.py`, not `__main__.py`: its text names the
+# other command, and `test_cli_lintester.py` caps how many lines of __main__.py
+# may do that.
+
+def _notice():
+    from mindhive.mindnet import orchestrator as orc_mod
+    return orc_mod.PRIMARY_DOOR_NOTICE
+
+
+def test_a_dry_run_opens_with_the_primary_door_notice():
+    """By EQUALITY against the module constant, for the reason the signpost test
+    states: a substring assertion is what let two sites word one fact
+    differently."""
+    _orc_graph()
+    err = _run_capturing_stderr("mindnet", "orchestrate")
+    assert _notice() in err
+
+
+def test_an_execute_run_prints_the_notice_too():
+    """THE CANARY that separates the notice from the signpost. Copying the
+    signpost's `if not args.execute` gate would pass the dry-run test above just
+    as well, and would then say nothing to the operator who runs this command
+    for real every day -- who is the entire audience for "the front door
+    moved"."""
+    _orc_graph()
+    out, err = _run_capturing_both(
+        "mindnet", "orchestrate", "--execute", "--via-script")
+    assert _notice() in err, err
+    assert "mindnet orchestrate:" in out, out
+
+
+def test_the_notice_never_reaches_stdout():
+    """stdout is the report. Same rule as the signpost, asserted separately
+    because they are printed by different lines."""
+    _orc_graph()
+    out, err = _run_capturing_both("mindnet", "orchestrate")
+    assert _notice() in err
+    assert "front door" not in out, out
+
+
+def test_the_notice_is_absent_from_a_json_run():
+    """`--json` is asked for by a program, which has already chosen its door.
+    Advice printed at it every run is the noise that teaches an operator to send
+    stderr to /dev/null, taking the notices that matter with it."""
+    import json as _json
+
+    _orc_graph()
+    out, err = _run_capturing_both("mindnet", "orchestrate", "--json")
+    assert _notice() not in err, err
+    assert "front door" not in err, err
+    assert _json.loads(out)["outcome"], "the JSON report itself broke"
+
+
+def test_the_notice_comes_first_and_leaves_the_signpost_last():
+    """Ordering, not just presence. `test_a_dry_run_names_the_other_orchestrator`
+    asserts stderr ENDS with the signpost's last sentence, so a notice appended
+    after it would turn that test red -- this one states the requirement where a
+    reader of the printing code will find it, instead of leaving it implied by a
+    failure two hundred lines away."""
+    import mindhive.__main__ as main_mod
+
+    _orc_graph()
+    err = _run_capturing_stderr("mindnet", "orchestrate")
+    assert err.index(_notice()) < err.index(main_mod.MINDNET_ORCHESTRATE_SIGNPOST)
+    assert err.strip().endswith(
+        main_mod.MINDNET_ORCHESTRATE_SIGNPOST.split(". ")[-1].strip())
+
+
+def test_the_notice_is_soft_and_states_no_removal():
+    """The decision was reversible-by-construction, and the wording is the only
+    place a reader meets it. A notice that said "will be removed" would be a
+    promise nobody made; one that said "use the other one instead" would send an
+    operator with a declared task graph to a command that cannot read it."""
+    text = _notice().lower()
+    assert "no longer the front door" in text
+    assert "nothing here is scheduled for removal" in text
+    assert "kept" in text
+    for gone in ("will be removed", "deprecated in favour", "use `hive linte"):
+        assert gone not in text, gone
+    # The signpost owns the two-orchestrators fact; the notice must not carry a
+    # second copy of it, and `test_the_signpost_is_absent_from_an_execute_run`
+    # goes red the moment it does.
+    assert "two orchestrators" not in text
+
+
+def test_the_notice_is_not_wired_from_a_second_copy_in_main():
+    """`__main__.py` prints the constant, it does not re-word it. The ratchet in
+    test_cli_lintester.py caps that file at four lines mentioning the other
+    command; a hand-written notice there would spend the whole remaining
+    budget."""
+    import re
+
+    import mindhive.__main__ as main_mod
+
+    src = Path(main_mod.__file__).read_text(encoding="utf-8")
+    # The PRINT, not the bare symbol: the rewritten docstring names
+    # PRIMARY_DOOR_NOTICE too, so `"PRIMARY_DOOR_NOTICE" in src` stayed green
+    # with the print deleted. Review caught that; this is the wiring itself.
+    assert "print(orc_mod.PRIMARY_DOOR_NOTICE, file=sys.stderr)" in src
+
+    # Implicit concatenation joined before the scan. This guard read the RAW
+    # source for the phrase "no longer the front door", and the same change
+    # that added it put that phrase into the `orchestrate` parser help, wrapped
+    # as `"... kept, but no " "longer the front door)"`. The scan passed only
+    # because the wrap fell between the two words -- so it was one cosmetic
+    # reflow away from a red suite blaming a copy nobody made, and an author
+    # could have evaded it by splitting a real copy the same way. A second
+    # adversarial review found that. Joining the seams removes both.
+    joined = re.sub('"[ ]*"', "", " ".join(src.split()))
+    # And the key comes FROM the constant, so it cannot drift from the thing it
+    # guards, and it is long enough that the sanctioned one-clause help line
+    # cannot match it. The copy that would matter is the notice's own sentence;
+    # the help saying the door is not the front one is not that copy.
+    key = _notice()[:80]
+    assert key not in joined, (
+        "the notice's wording was copied into __main__.py instead of imported")
+
+
+def test_a_graph_with_no_tasks_still_carries_the_notice():
+    """THE regression test for the hole an adversarial review found.
+
+    The notice used to print beside the report, inside the `else:` that runs
+    only after a graph is folded and orchestrated. But `cmd_mindnet_orchestrate`
+    returns EARLY when the ledger holds no tasks, and that run -- an empty
+    project, nothing declared yet -- is a first-time operator's most likely
+    first contact with this command. Worse, its stdout hands them
+    `hive mindnet declare`, pointing further INTO the door being deprecated.
+    So the whole audience the notice exists for was the one audience it missed.
+
+    Discriminating: the notice now prints before any branch, so restoring the
+    old placement turns this red. It also reds `test_a_refused_run...` below,
+    which returns before the `else:` for the same reason -- an earlier draft of
+    this docstring claimed every OTHER notice test would stay green, and only
+    the ones that orchestrate a real graph do. Those are exactly the tests that
+    were passing while this hole was open, which is the whole lesson."""
+    out, err = _run_capturing_both("mindnet", "orchestrate")
+    assert "no mindnet tasks" in out, out
+    assert _notice() in err, err
+
+
+def test_the_empty_graph_run_keeps_the_notice_off_a_json_run():
+    """The canary for the test above. Hoisting the notice out of the `else:`
+    put it upstream of the `--json` branch as well, so the one gate it still
+    has to honour is asserted on the same early-return path.
+
+    NOT a test of the `--json` contract, despite what this test was called
+    first. The early return prints its human sentence to STDOUT whatever
+    `--json` says, so `hive mindnet orchestrate --json` on an empty ledger
+    emits something no `json.loads` will read. That predates this change and
+    fixing it means deciding what an empty graph's JSON document should BE --
+    a contract decision, not a soft-deprecation one. It is recorded as an open
+    gap in TODOS #35 rather than smuggled in here, and the assertion below is
+    narrowed to what it actually proves: stderr."""
+    out, err = _run_capturing_both("mindnet", "orchestrate", "--json")
+    assert _notice() not in err, err
+
+
+def test_a_refused_run_carries_the_notice_too():
+    """`--isolation worktree --via-script` is refused before any orchestration.
+    A refusal is still a run of this command by an operator who has not heard
+    that the door moved, and the hoist makes the contract one sentence: every
+    non-JSON invocation, before anything else."""
+    _orc_graph()
+    err = _run_capturing_stderr(
+        "mindnet", "orchestrate", "--via-script", "--isolation", "worktree")
+    # The refusal FIRST: without this the test passes on a run that quietly
+    # stopped refusing and orchestrated instead, which is the one way it could
+    # go green while proving nothing. Review found it asserting only the
+    # notice.
+    assert "error: --isolation worktree is for agent runs" in err, err
+    assert _notice() in err, err
