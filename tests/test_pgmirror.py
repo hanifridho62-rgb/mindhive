@@ -321,3 +321,70 @@ def test_the_executed_string_scan_can_see_a_real_statement():
     returned nothing would excuse the statement itself just as happily."""
     assert "no such migration" in _executed_strings("pgmirror.py"), \
         "the scan cannot see a string literal that certainly executes"
+
+
+# --- the loader's line index, which needs no server ---------------------------
+#
+# `scan_segments` is pure file reading, so it belongs in this default-tier file
+# rather than the pg tier: the number it produces is stored in Postgres as
+# `seg_line`, part of `UNIQUE (project, segment, seg_line)` on `mindhive.events`
+# and of `event_embeddings`' primary key, and nothing downstream would notice it
+# drifting. `pgmirror.parity` discards the index entirely (it folds Events), and
+# the staleness fingerprint is `st_size` per segment -- a split-semantics change
+# preserves every byte. So the value has to be pinned here or nowhere.
+
+def _three_rows_one_carrying_a_separator(sep="\u2028"):
+    from mindhive import events
+    for i, text in enumerate(["before", "mid" + sep + "dle", "after"]):
+        events.append_event("decision", {"text": text}, session_id="s",
+                            ts="2026-06-20T10:00:0%d" % i + "Z")
+
+
+def test_scan_segments_seg_line_is_the_physical_newline_index():
+    """Three rows, three newlines, so three consecutive indices. Under
+    `splitlines()` the middle row tore in two and `after` was numbered 3 -- a
+    stored join key off by one for every row after any separator-bearing row."""
+    _three_rows_one_carrying_a_separator()
+    triples = pgmirror.scan_segments("test")
+    assert [(seg, ln, ev.payload["text"]) for seg, ln, ev in triples] == [
+        ("s.jsonl", 0, "before"),
+        ("s.jsonl", 1, "mid\u2028dle"),
+        ("s.jsonl", 2, "after"),
+    ]
+
+
+def test_the_mirror_loader_and_the_chain_scan_index_every_row_alike():
+    """The cross-module invariant the four readers and the chain must hold: one
+    row, one index, one meaning. They forked when `chain._scan` moved to
+    `split("\\n")` and the loader stayed on `splitlines()`; both now go through
+    `events._segment_lines`, and this is what says so."""
+    from mindhive import chain, events
+    _three_rows_one_carrying_a_separator()
+    scan_rows, _ = chain._scan("test")
+    assert [(s, i) for s, i, _ in scan_rows] == [
+        (s, i) for s, i, _ in pgmirror.scan_segments("test")]
+    assert len(scan_rows) == len(events.read_all("test")) == 3
+
+
+def test_the_chain_excludes_an_unterminated_tail_the_readers_still_show():
+    """The ONE place the chain and the readers deliberately differ, pinned here so
+    it is not "fixed" in either direction. They split by the same rule and give
+    every shared row the same index -- but a row with no terminating newline is
+    still MUTABLE (the next append concatenates onto it), so the seal must not
+    cover it, while a total read must still show what is on disk. That is a
+    different row SET, not a different splitter."""
+    from mindhive import chain, events, paths
+    events.append_event("decision", {"text": "complete"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")
+    tail = events.canonical_json({"ts": "2026-06-20T10:00:01Z", "type": "decision",
+                                  "session_id": "s", "payload": {"text": "torn"},
+                                  "tags": []})
+    with open(paths.events_dir("test") / "s.jsonl", "a", encoding="utf-8") as f:
+        f.write(tail)                              # parseable, but NO trailing \n
+
+    scan_rows, lines = chain._scan("test")
+    assert [(s, i) for s, i, _ in scan_rows] == [("s.jsonl", 0)]   # tail not sealed
+    assert lines == {"s.jsonl": 1}
+    assert [(s, i, e.payload["text"]) for s, i, e in pgmirror.scan_segments("test")] == [
+        ("s.jsonl", 0, "complete"), ("s.jsonl", 1, "torn")]        # tail visible
+    assert [e.payload["text"] for e in events.read_all("test")] == ["complete", "torn"]

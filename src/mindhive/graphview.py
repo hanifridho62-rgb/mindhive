@@ -856,8 +856,37 @@ def render_html(graph: dict) -> str:
         {"nodes": graph.get("nodes", []), "edges": graph.get("edges", [])},
         ensure_ascii=False, separators=(",", ":"),
     )
-    # Prevent a literal "</script>" in data from closing the inline script tag.
-    graph_json = graph_json.replace("</", "<\\/")
+    # Escape EVERY "<" as \u003c. Two separate hazards, one fix, because
+    # escaping only the first left the second live for as long as this function
+    # has existed:
+    #   * "</script>" ends the element early -- that is what the old
+    #     `replace("</", "<\\/")` guarded, and it is the obvious one;
+    #   * "<!--<script" is NOT obvious, and the exact trigger matters. "<!--"
+    #     alone is harmless: it opens script-data-ESCAPED state, where
+    #     "</script>" still closes the element normally (browser-checked --
+    #     a blob carrying a bare "<!--" renders fine). It is "<script" seen
+    #     WHILE in that state that opens script-data-DOUBLE-escaped state, and
+    #     there "</script>" stops closing -- so the renderer that follows is
+    #     swallowed and the Graph view goes blank with no error. The two pieces
+    #     need not share a memo: "<!--" in one node and "<script" in any later
+    #     node do it between them, which is what makes it reachable from
+    #     ordinary ledger prose about HTML.
+    # \u003c is a legal JSON escape and `JSON.parse` gives back "<", so the
+    # data the renderer sees is unchanged.
+    graph_json = graph_json.replace("<", "\\u003c")
+    # U+2028 and U+2029 are LINE TERMINATORS in JavaScript source but ordinary
+    # characters in JSON, and `ensure_ascii=False` above writes them raw --
+    # ledger memo prose lands in this blob (`graph.py` puts `payload["text"]` on
+    # every event node). They are inert where they land TODAY: the template's
+    # marker sits in a `type="application/json"` data block, which is never
+    # evaluated and is read back with `JSON.parse`. But that is a property of a
+    # template hundreds of lines away, not of this string. And until the reader
+    # fix shipping with this line, a row carrying one could not reach here at
+    # all -- `read_all` split ON it, tore the row and dropped it -- so this is a
+    # newly reachable path, not a long-standing safe one. Escaping keeps the
+    # JSON semantically identical and makes the guarantee local.
+    graph_json = (graph_json.replace("\u2028", "\\u2028")
+                            .replace("\u2029", "\\u2029"))
     return (
         _TEMPLATE
         .replace("__RENDERER_JS__", _RENDERER_JS)   # constant first
