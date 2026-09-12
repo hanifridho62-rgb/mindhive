@@ -99,6 +99,14 @@ DEFAULT_LANES = 4
 
 DEFAULT_TIMEOUT_S = 900
 
+# The posture every child is spawned with; `""` or None omits the flag. Probed
+# 2026-09-08 on claude 2.1.198: a child spawned with NO --permission-mode had its
+# Write declined, exited 0 clean, and `_run_child` scored it ok -- a fan-out would
+# have timed N children that could not touch the tree. `autoresume` and
+# `loop.config` pick the same value; bypassPermissions would need a
+# --disallowedTools fence this seam cannot pass.
+DEFAULT_PERMISSION_MODE = "acceptEdits"
+
 
 @dataclass
 class LintesterOrchestrator:
@@ -112,6 +120,8 @@ class LintesterOrchestrator:
     project: object = None
     lanes: int = DEFAULT_LANES
     timeout_s: int = DEFAULT_TIMEOUT_S
+    # See `DEFAULT_PERMISSION_MODE`; injectable like every collaborator here.
+    permission_mode: str = DEFAULT_PERMISSION_MODE
     limits: res_mod.Limits = field(default_factory=res_mod.Limits)
     max_attempts: int = res_mod.DEFAULT_MAX_ATTEMPTS
     decomposer: object = None
@@ -503,7 +513,7 @@ class LintesterOrchestrator:
         return res_mod.fencing(self.limits)
 
     def _run_child(self, entry, lane):
-        """Default runner: one real sub-agent, in its lane's checkout."""
+        """Default runner: one sub-agent, in the lane checkout it may edit."""
         task = entry.task
         try:
             from ..mindnet import agent as ag_mod
@@ -525,10 +535,14 @@ class LintesterOrchestrator:
             # `test_the_lintester_mission_prefix_is_covered`. An identity no
             # consumer recognises would be no identity at all.
             run_key = f"{MISSION_PREFIX}-{task.task_id}"
+            # The posture (see `DEFAULT_PERMISSION_MODE`) is bounded by the
+            # directory below it, which IS the lane checkout: an approved edit
+            # reaches no sibling lane and not the main tree.
             res = ag_mod.run(run_key, task.prompt,
                              root=(lane.worktree_path or self.root),
                              project=self.project, timeout_s=self.timeout_s,
                              env={"MINDHIVE_SESSION": run_key},
+                             permission_mode=(self.permission_mode or None),
                              spawn=self._spawn())
         except Exception as exc:                        # noqa: BLE001
             return _RunOutcome(ok=False,

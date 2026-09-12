@@ -318,6 +318,49 @@ def test_an_environment_outcome_exits_with_its_own_status_and_names_what_was_lef
     assert "lm-1: environment" in out
 
 
+def test_a_run_that_starts_work_gets_the_root_its_help_promised(
+        monkeypatch, tmp_path):
+    """The front door resolves the cwd its help promises, rather than None.
+
+    WHAT THIS PINS is exactly that one hand-off: the value `cli` hands to
+    `LintesterOrchestrator`. `execute_mission` is replaced wholesale below, so
+    no lane is ever acquired and this test does NOT exercise the crash --
+    saying otherwise would be a fixture that cannot reach the defect it claims.
+
+    WHY IT MATTERS is that crash, which is real: `--root` documented "default:
+    cwd" and the parser passed None, and `worktree.lane_path_for` builds
+    ``Path(root)`` outside the guard that turns a git fault into a reason, so a
+    real `--execute` raised TypeError after decomposing the intent and weighing
+    every unit. Reproduced on this checkout on 2026-09-08. A non-None root at
+    this seam is what stops it, and a non-None root is what is asserted."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = []
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        seen.append(self.root) or _mission())
+    monkeypatch.chdir(tmp_path)
+
+    _cli("lintester", "x", "--execute")
+
+    assert seen == [str(tmp_path)]
+
+
+def test_an_explicit_root_is_still_the_one_used(monkeypatch, tmp_path):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = []
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        seen.append(self.root) or _mission())
+
+    _cli("lintester", "x", "--execute", "--root", str(tmp_path))
+
+    assert seen == [str(tmp_path)]
+
+
 def test_the_environment_status_is_distinct_from_a_partial_run():
     assert lint_cli._status("ok") == 0
     assert lint_cli._status("dry-run") == 0

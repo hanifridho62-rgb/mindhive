@@ -735,6 +735,21 @@ tests pin the two properties that make the race impossible rather than reproduci
 
 ## 23. Nobody has measured whether briefing a sub-agent actually helps
 
+> **2026-09-08. The login blocker is gone, and two real fan-outs have now run.**
+> `claude auth status --json` answers `{"loggedIn": true, "authMethod": "claude.ai",
+> "subscriptionType": "max"}`, so the 2026-09-07 note below is stale in its premise.
+> Mission `lm-84c06ad6` ran twice from this checkout, and both runs are recorded in
+> item 27. What matters here: a real child edited a real lane, which had never
+> happened. Two defects had to be closed first, and neither was known when the note
+> below was written — children were spawned with NO `--permission-mode`, so their
+> edits were declined while `_run_child` still scored them `ok`; and `decompose.run`
+> parsed a string cut at `runlog.EXCERPT_CHARS`, so any decomposition over 2000
+> characters collapsed to one unit.
+>
+> **The A/B this item actually asks for still has not run.** `hive mindnet ab
+> --execute --record` is untouched, and `mindnet/orchestrator.py` spawns its
+> children through the same seam with the same missing posture, so it would measure
+> children that cannot edit. Fix that before believing any A/B number it produces.
 > **2026-09-07.** Still open, and the gap is now named precisely. No `--execute` run has
 > ever completed on this machine because the CLI is not logged in: `claude auth status --json`
 > answers `{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}` at exit 1.
@@ -1003,6 +1018,54 @@ from the same review are recorded here rather than fixed, because each is outsid
 
 ## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
 
+> **2026-09-08. The sample exists. It says the weight ORDERS the work and its
+> SCALE is meaningless.** `hive lintester --calibration` no longer answers zero:
+>
+> ```
+> weight calibration over 2 recorded sample(s): the weight orders the work over 2
+> measured unit(s), rank correlation +1.00; the costliest weight-unit ran 660.0x
+> the cheapest
+>   add-a-retry-...-events:   weight 1547 -> 465485.782 ms (300.896 ms per weight-unit)
+>   add-a-retry-...-events-4: weight 1    -> 198604.146 ms (198604.146 ms per weight-unit)
+> ```
+>
+> Read it carefully, because `+1.00` flatters it: two points are trivially ordered.
+> The number that carries information is the spread. The weights differ by 1547x and
+> the durations by 2.3x, so `calculate_workload_weight` predicts the ORDER and not
+> the MAGNITUDE — and it collapses to 1 for any unit whose description names no repo
+> file, which is what "Cover the retry paths ... with fault injection" and "Record
+> the mandatory change-log entry" both did. That is the open question this item
+> named, answered for the first time with real children.
+>
+> **Two defects were closed to get here, both found by running it.** Children were
+> spawned with no `--permission-mode`: a probe that day showed the Write declined,
+> exit 0, clean envelope, and `_run_child` scoring it `ok` — a fan-out would have
+> timed N children that could not touch the tree. And `decompose.run` parsed
+> `RunResult.excerpt`, cut at `runlog.EXCERPT_CHARS` (2000) so the copy riding a
+> ledger event stays bounded; the agent's 2507-character answer lost its closing
+> brace mid-string, `parse` closed the object on an inner brace, and run 1 degraded
+> to `root-only` reporting `the agent's json did not parse` — blaming the model for
+> well-formed json. A logging bound was deciding the shape of the work.
+>
+> **Why there are two samples and not five.** Run 2 decomposed properly (three units
+> over two lanes, `decomposition: agent`) and then hit a 429 session limit. Two
+> children were reported `[usage] ... nothing was attempted, so the task is left
+> untouched`. That claim is false: those children had run 22 and 12 turns over
+> 333805 ms and 396685 ms and left 146 and 7 lines of uncommitted edits in their
+> lanes. `agent._classify` checks the envelope error before the exit code and maps
+> every `is_error` to never-started — correct for an auth failure at spawn, wrong
+> for a limit reached after real work. `_calibrate` skips `executed=False`, so it
+> discarded exactly the two measurements this item wants. **This is the next thing
+> to fix, and it is not a casual reorder:** `_classify`'s own comment records that
+> ordering being gotten wrong three times, and treating an auth failure as a task
+> failure blocks a subtree permanently.
+>
+> **Corrections to what this item assumed.** A dirty lane is KEPT, never merged —
+> `release_lanes` delegates to `mindnet.worktree.retire`, which removes only clean
+> lanes. All three lanes from the two runs are archived on `archive/lintester-run*`
+> branches, unreviewed and merged into nothing. And `acceptEdits` does not approve
+> Bash: one child logged nine Bash/PowerShell denials trying to run pytest on its
+> own work, so children can edit but cannot verify.
 > **2026-09-07.** Still open; the missing sample is blocked by the same fact as item 23 —
 > the CLI on this machine is not logged in (`claude auth status --json` →
 > `{"loggedIn": false, "authMethod": "none"}`). Two things changed so that the FIRST real
@@ -1154,6 +1217,28 @@ state is a record of the worst the mission ever saw rather than of where it stan
 
 ## 29. The terminal board is built and exercised; what no test can prove is that it reads well
 
+> **2026-09-08. It has now been driven by real children, and it reads well.**
+> Both runs of mission `lm-84c06ad6` used `--board --execute`. The Brain panel, the
+> Worker Lanes table and the Circuit Breaker panel all rendered at terminal width
+> with the lane rows intact, and no `board: N event(s) dropped` line appeared in
+> either run — so the bounded queue was never pressed by a real mission's publish
+> rate at this size (1 and 3 units; four lanes churning is still unmeasured).
+>
+> The `note` alert this entry asked about did fire, in run 2, and it reads as the
+> machine rather than the mission:
+>
+> ```
+> ! halted: the account's usage limit is exhausted, so no child could start;
+> wait for the window to reset and re-run -- the mission does not retry this
+> ```
+>
+> It sits in its own Circuit Breaker & Alerts panel and scrolls nothing away, which
+> is what this entry wanted checked. One caveat on the wording, not the layout: in
+> that run "no child could start" was not true — both children had run for minutes
+> and left edits. See item 27.
+>
+> **Still nobody has watched it live.** Both runs were captured to a file with
+> stderr redirected, not read off a TTY at four frames a second.
 > **2026-09-07.** Still open, blocked by the same login as items 23 and 27. One more
 > event now reaches the board that has never been rendered against a real run: the
 > `note` alert (`halted: the Claude CLI on this machine is not logged in …`) that

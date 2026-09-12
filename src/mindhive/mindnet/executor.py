@@ -185,6 +185,18 @@ class RunResult(NamedTuple):
     executed: bool = False
     artifact: str | None = None     # absolute path, or None when it was lost
     excerpt: str = ""               # the bounded copy that rides the event
+    # What the agent actually said, uncut. `excerpt` is a LEDGER bound and was
+    # for a while the only copy kept, so a caller that had to READ the reply --
+    # `decompose.run` -- parsed a string cut at `runlog.EXCERPT_CHARS`. A reply
+    # longer than that lost its closing brace mid-string and was reported as
+    # unparseable json, which is a claim about the agent that was not true. Held
+    # separately rather than by widening `excerpt`, because every event detail
+    # is cut from that one and none of them should grow.
+    text: str = ""
+    # Turns the child took, from the envelope. Read for ONE reason: a refusal
+    # that arrives after real turns must not tell the operator the tree is
+    # untouched. It deliberately does NOT feed `executed` -- see `agent._classify`.
+    turns: int = 0
     stdout: str = ""
     stderr: str = ""
     argv: tuple = ()

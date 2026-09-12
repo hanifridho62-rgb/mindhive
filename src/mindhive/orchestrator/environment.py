@@ -38,6 +38,12 @@ recognisable cause is left to the repair loop rather than claimed here. The one
 exception is the Windows Store interpreter stub, which DOES create a process --
 the redirector -- and is recognised by its exit code and its message together.
 
+One AUTH failure is not a login at all: on 2026-09-03 this machine answered
+``403: Your organization has disabled Claude subscription access for Claude
+Code`` while `claude auth status` reported it signed in. `describe` answers
+that case with the fix that clears it -- an API key, or the organisation
+setting -- rather than sending the operator to log in again.
+
 `preflight()` asks `claude auth status` the same question before a single lane
 is made, so the common case is refused at the front door with the fix named.
 Inconclusive is NOT a refusal: a CLI without that subcommand, a probe that times
@@ -90,6 +96,30 @@ _STUB_HINTS = ("python was not found", "app execution alias",
                "install from the microsoft store", "windowsapps")
 _CLI_HINTS = ("claude` cli is not installed", "claude` cli is not on path",
               "claude: command not found", "claude: not found")
+
+# Sub-cases of AUTH that a login cannot fix. Read ONLY by `describe`: by the
+# time these are consulted the classifier has already answered AUTH, so a hint
+# here chooses a sentence and can never halt a mission on its own -- which is
+# why this list is allowed to sit beside the deliberately short ones above.
+#
+# Observed on this machine on 2026-09-03: `claude auth status` reported the CLI
+# logged in and `claude -p` answered ``403: Your organization has disabled
+# Claude subscription access for Claude Code - Use an Anthropic API key
+# instead, or ask your admin to enable access``. The AUTH sentence told the
+# operator to log in, which is the one thing that was already true.
+_ACCOUNT_HINTS = ("subscription access", "invalid api key", "api key instead")
+
+# Said by `agent._classify` when the envelope's own turn count shows the child
+# had worked before the refusal landed. Matched as a phrase because that is how
+# this module already reads every other fact off an agent's reason -- see the
+# hint tuples above. Read ONLY by `describe`, so a miss costs a less specific
+# sentence and can never change which missions halt.
+_PARTIAL_HINTS = ("may hold partial work",)
+
+# How much of the CLI's own sentence the account branch quotes back. Bounded
+# because `agent._classify` wraps the message in a sentence of its own, and an
+# unbounded quote would put a paragraph in the middle of one line of advice.
+_DETAIL_CHARS = 240
 
 
 def _text_of(entry) -> str:
@@ -173,10 +203,37 @@ def describe(kind, reason="") -> str:
     detail = str(reason or "").strip()
     tail = f" ({detail})" if detail and kind not in (AUTH, USAGE) else ""
     if kind == AUTH:
+        # Collapsed ONCE, and matched on the same text that is quoted. Matching
+        # the raw string while quoting a normalised one was a real defect: a CLI
+        # sentence wrapped across lines puts a newline inside "subscription
+        # access", the hint misses, and an operator whose organisation disabled
+        # the account is told to log in again -- the exact misdirection this
+        # branch exists to end.
+        flat = " ".join(detail.split())
+        if _any(_ACCOUNT_HINTS, flat.lower()):
+            quoted = flat[:_DETAIL_CHARS]
+            # No status code and no claim about the login state are asserted
+            # here: the branch also fires on a rejected key, where neither
+            # would be true. The CLI's own sentence carries the specifics.
+            return ("the API refused this account, so no child could start; "
+                    "signing in again does not clear that -- supply an "
+                    "Anthropic API key (ANTHROPIC_API_KEY in the environment "
+                    "the mission runs in) or ask the organisation admin to "
+                    "enable Claude Code access, then re-run -- the mission "
+                    f"does not retry this (the CLI said: {quoted})")
         return ("the Claude CLI on this machine is not logged in, so no child "
                 "could start; log in (`claude auth login`, or /login inside "
                 "claude) and re-run -- the mission does not retry this")
     if kind == USAGE:
+        # "no child could start" is false whenever a child ran first and the
+        # limit landed mid-flight. On 2026-09-08 this sentence said exactly that
+        # for a mission whose two lanes held 146 and 7 lines of uncommitted
+        # edits, sending the operator away from work sitting on disk.
+        if _any(_PARTIAL_HINTS, " ".join(detail.split()).lower()):
+            return ("the account's usage limit is exhausted; a child had "
+                    "already started, so a lane may hold partial work worth "
+                    "looking at before it is discarded -- wait for the window "
+                    "to reset and re-run -- the mission does not retry this")
         return ("the account's usage limit is exhausted, so no child could "
                 "start; wait for the window to reset and re-run -- the mission "
                 "does not retry this")

@@ -289,7 +289,15 @@ def run(task_id, graph, runner=None, project=None, timeout_s=DEFAULT_TIMEOUT_S,
                              reason=getattr(res, "reason", "")
                              or "the agent never ran")
 
-    pairs, why = parse(getattr(res, "excerpt", "") or getattr(res, "stdout", ""))
+    # `text` FIRST, and the reason is a measured one: `excerpt` is cut at
+    # `runlog.EXCERPT_CHARS` for the ledger, and on 2026-09-08 mission
+    # `lm-84c06ad6` answered four sound subtasks in 2507 characters. The cut
+    # landed inside a string, `parse` closed the object on an inner brace, and
+    # the mission degraded to root-only blaming the agent's json -- which was
+    # well formed. The fall-backs stay: an injected runner sets only `excerpt`.
+    pairs, why = parse(getattr(res, "text", "")
+                       or getattr(res, "excerpt", "")
+                       or getattr(res, "stdout", ""))
     if why:
         return Decomposition(task_id=task_id, reason=why)
     return Decomposition(task_id=task_id,

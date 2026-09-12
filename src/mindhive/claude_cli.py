@@ -180,6 +180,23 @@ def result_text(stdout: str) -> str:
     return "" if obj is None or obj.get("is_error") else (obj.get("result", "") or "")
 
 
+def turns(stdout: str) -> int:
+    """How many turns the child took, 0 when the envelope does not say.
+
+    Deliberately reads an is_error envelope too, unlike `result_text` and
+    `_envelope_extras`. Those two refuse an error envelope because there is no
+    honest MODEL OUTPUT in one -- but there is an honest turn count, and it is
+    the only evidence that separates a limit hit at the first request from one
+    hit after the child spent twenty turns editing a tree."""
+    obj = _parse(stdout)
+    if obj is None:
+        return 0
+    try:
+        return max(0, int(obj.get("num_turns") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def error_text(stdout: str) -> str:
     """Why an is_error envelope failed, for health reporting: the api status
     plus the CLI's own message (e.g. "429: You've hit your weekly limit …").
