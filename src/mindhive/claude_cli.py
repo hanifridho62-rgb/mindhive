@@ -98,9 +98,10 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
     no interactive approval), and ``cwd`` pins where that work happens.
 
     ``env`` is an overlay on the child's environment — MN-9's orchestrator uses it
-    to give each concurrent agent its own ``MINDHIVE_SESSION``, because
-    `events.append_event` writes to ``<session_id>.jsonl`` with an unlocked append
-    and two agents sharing one segment interleave into corrupt JSONL. See
+    to give each concurrent agent its own ``MINDHIVE_SESSION``, so each agent's
+    rows carry its own id in its own ``<session_id>.jsonl``. That is for
+    attribution: appends are serialised by `events._append_lock`, so a shared
+    segment would not interleave. See
     `_child_env` for the merge rules and why the recursion guard is applied last.
 
     ``spawn`` replaces `subprocess.run` for this one call, and exists so a

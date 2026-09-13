@@ -44,12 +44,19 @@ import json
 import re
 from . import events as ev_mod
 from . import paths
+from . import provenance
 
 ACTIONS = ("add", "update", "delete")
 
 # sop_id is a stable slug: it names the procedure in STATE.md, the CLI, the
 # dashboard, and cross-references — keep it short, kebab-case, permanent.
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+#
+# `\Z`, not `$`. In Python `$` also matches just before a trailing newline, so
+# `ID_RE.match("ops-rule\n")` succeeded: `hive append sop` took that id, and the
+# fold kept it as a SECOND procedure rendering under the same visible name as
+# `ops-rule`. Other modules import this pattern for plan, task and telemetry ids
+# (`tasks`, `phases`, `changelog`, `autoresume`, ...) and had the same hole.
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}\Z")
 
 MIN_TITLE_CHARS = 3
 MAX_TITLE_CHARS = 120
@@ -94,8 +101,10 @@ def validate_payload(payload) -> None:
     if action not in ACTIONS:
         raise ValueError(
             "sop requires an action — one of: " + ", ".join(ACTIONS))
-    sop_id = payload.get("sop_id") or ""
-    if not ID_RE.match(sop_id):
+    sop_id = payload.get("sop_id")
+    # A non-string is refused here rather than handed to `re`, which raised
+    # TypeError past every `except ValueError` on the append surfaces.
+    if not isinstance(sop_id, str) or not ID_RE.match(sop_id):
         raise ValueError(
             "sop requires a kebab-case sop_id (lowercase letters, digits, "
             "hyphens; max 64 chars), e.g. 'memo-hygiene'")
@@ -144,9 +153,10 @@ def fold(evs):
 
     The fold is total — it never raises on historical data. An ``update``
     carrying both title and text upserts (self-heals a missing add); a
-    partial update on an unknown or deleted id is skipped; ``delete`` on an
-    unknown id is a no-op. Re-adding a deleted id revives it, keeping the
-    original created ts and continuing its version count.
+    partial update on an unknown id is skipped, and on a deleted id revives it
+    with the fields it does not replace; ``delete`` on an unknown id is a
+    no-op. Re-adding a deleted id revives it, keeping the original created ts
+    and continuing its version count.
 
     The ``mandatory`` flag follows the same never-lose-data discipline: it is
     written only when the event actually carries the key, so a title-only
@@ -154,15 +164,33 @@ def fold(evs):
     A first ``add`` that omits it defaults to False; an ``add`` that revives a
     deleted id and omits it keeps whatever the id had, because there the key's
     absence means "unchanged" rather than "unset".
+
+    An event whose ``sop_id`` is not a string matching ``ID_RE`` is skipped, as
+    the append surfaces refuse it. Before ``ID_RE`` was anchored with ``\\Z`` an
+    id with a trailing newline was accepted, and folded into a second procedure
+    rendering under the same visible name as the real one.
     """
+    active, deleted, _written = _fold(evs)
+    return active, deleted
+
+
+def _fold(evs):
+    """`fold`, plus the writes it APPLIED: ``(active, deleted, written)``.
+
+    *written* holds ``(sop_id, session_id)`` for every add or update the fold
+    applied to a record, in ledger order -- the history `agent_touched_ids`
+    reads authorship from. A skipped event is not in it (it changed nothing),
+    and neither is a delete (it removes content rather than writing any)."""
     active: dict = {}
     deleted: dict = {}
+    written: list = []
     for ev in evs:
         if ev.type != "sop" or not isinstance(ev.payload, dict):
             continue
         p = ev.payload
         action, sop_id = p.get("action"), p.get("sop_id")
-        if action not in ACTIONS or not sop_id:
+        if (action not in ACTIONS or not isinstance(sop_id, str)
+                or not ID_RE.match(sop_id)):
             continue
         rec = active.get(sop_id) or deleted.get(sop_id)
         if action == "delete":
@@ -183,6 +211,7 @@ def fold(evs):
                 "created": ev.ts, "updated": ev.ts, "version": 1,
                 "session_id": ev.session_id, "tags": list(ev.tags or []),
             }
+            written.append((sop_id, ev.session_id))
             continue
         rec = dict(rec)
         rec.pop("deleted_at", None)
@@ -202,7 +231,8 @@ def fold(evs):
         rec["tags"] = list(ev.tags or [])
         deleted.pop(sop_id, None)
         active[sop_id] = rec
-    return active, deleted
+        written.append((sop_id, ev.session_id))
+    return active, deleted, written
 
 
 def current(evs) -> list:
@@ -337,9 +367,11 @@ def global_sidecar_path():
     ~/.claude/settings.json and fires in all of them. The global file is what
     closes that gap; the per-project one stays as the registry's own view.
 
-    A FILE at the store root, which `paths.list_namespaces` ignores because it
-    only walks directories."""
-    return paths.store_home() / SIDECAR_NAME
+    A FILE at the store root, declared in `paths.STORE_ROOT_FILES` so no
+    namespace can be named after it: a project called `mandatory_sops.json`
+    used to become a directory standing where `sopgate` reads this file on
+    every prompt."""
+    return paths.store_file(SIDECAR_NAME)
 
 
 def _project_rows(project, evs) -> list:
@@ -353,11 +385,33 @@ def _project_rows(project, evs) -> list:
     agent's brief because it folds the ledger and sees `ev.session_id`, while
     the operator's own prompt could not, because this projection had already
     thrown it away. `""` for rows folded from events written before session
-    stamping — absent authorship stays unknown authorship (R8)."""
+    stamping — absent authorship stays unknown authorship (R8).
+
+    `agent_authored` rides along BECAUSE `session_id` alone is the wrong
+    question, and this is the only place that can answer the right one. `fold`
+    overwrites `session_id` on every event, so the folded value names the LAST
+    editor: one human title-only edit on an agent-written procedure made the row
+    read as human, and `sopgate` -- which sees only this file -- then composed
+    that agent's body inside the operator's per-prompt directive fence while
+    `sop.block` was correctly withholding the same row from STATE.md. Nothing
+    reported the disagreement, because `probe()` counted the withheld rows it
+    could see and there were none.
+
+    Computed here, once, from the history `write_sidecar` already holds. That is
+    what keeps `sopgate` off the ledger: its standing constraint is that the
+    prompt path must not fold events, and a boolean in the projection is how an
+    accumulated fact crosses to a surface that may not re-derive it.
+
+    Absent on an older sidecar, deliberately -- `sopgate.is_agent_authored`
+    falls back to the prefix test when the key is missing, so a sidecar written
+    before this change behaves exactly as it did rather than failing shut."""
     name = project or paths.detect_project()
+    tainted = agent_touched_ids(evs)
     return [{"project": name, "sop_id": r["sop_id"], "title": r["title"],
              "text": r["text"], "version": r["version"],
-             "session_id": str(r.get("session_id") or "")}
+             "session_id": str(r.get("session_id") or ""),
+             "agent_authored": bool(is_agent_authored(r)
+                                    or r["sop_id"] in tainted)}
             for r in mandatory(evs)]
 
 
@@ -396,8 +450,11 @@ def write_sidecar(project=None, evs=None) -> dict:
     # KNOWN RACE, accepted rather than fixed — the same one `style._write_modes`
     # documents. Each write is atomic, but the read-modify-write around it is
     # not, so two projects writing simultaneously can drop one slice. Blast
-    # radius is one project's mandatory SOPs missing until its next `hive state`
-    # or `hive project`, both of which rewrite the slice.
+    # radius is one project's mandatory SOPs missing until the slice is next
+    # rewritten: `hive project` always rewrites it, and `hive state` does through
+    # `heal_sidecar`, which compares the slice with the per-project file. That
+    # comparison is what makes the second true -- before it, the heal read a
+    # MISSING slice as current and left it missing.
     paths.write_text_atomic(
         global_sidecar_path(),
         json.dumps({"written_at": data["written_at"], "sops": merged},
@@ -432,6 +489,68 @@ def read_sidecar(project=None) -> dict:
         return {}
 
 
+def _rows_current(rows) -> bool:
+    """Every row a dict carrying a boolean `agent_authored`."""
+    return all(isinstance(r, dict) and isinstance(r.get("agent_authored"), bool)
+               for r in rows)
+
+
+def _slice_key(rows) -> list:
+    """What a slice of sidecar rows DELIVERS, as comparable data: one
+    ``(sop_id, version, agent_authored)`` per row, None for a non-dict row."""
+    return [(r.get("sop_id"), r.get("version"), r.get("agent_authored"))
+            if isinstance(r, dict) else None for r in (rows or [])]
+
+
+def heal_sidecar(project=None) -> bool:
+    """Rebuild the mandatory-SOP sidecars when missing, corrupt or STALE; True
+    when it rebuilt. Total: session start calls it, and printing STATE.md is
+    that command's job.
+
+    `record` writes both files on every change, so this fires only for a store
+    that never had one (fresh clone, new worktree), one that was corrupted, or
+    one an older build wrote -- and each would otherwise fail SILENTLY forever,
+    since `sopgate` deliberately has no ledger fallback. Gated on a parse of the
+    small files rather than on `exists()`, so the 0.36 s `read_all` is paid only
+    when one of them is actually wrong.
+
+    STALE is a row without a boolean `agent_authored`. A sidecar from before the
+    flag carries only the FOLDED `session_id`, and `sopgate` falls back to the
+    prefix test over that -- which is the laundering case the flag closes: one
+    human edit on an agent-written procedure reads as human. Healing only on a
+    missing file left such a store delivering the laundered body until some
+    unrelated `hive sop` write happened to rebuild it.
+
+    MISSING, too, is a slice of the global file that no longer DELIVERS what the
+    per-project file does, compared as `(sop_id, version, agent_authored)` per
+    row. `write_sidecar`'s read-modify-write can drop one project's slice when
+    two projects write at once, and a check of the rows alone passed the empty
+    slice as current -- so the prompt fence went without this project's
+    mandatory procedures until an unrelated write rebuilt them.
+
+    Only THIS namespace's slice of the global file is checked. Rebuilding
+    another namespace's rows means folding its ledger, which session start here
+    must not pay; each namespace heals its own slice at its own session start.
+    Until then another namespace's missing or flag-less slice stays as it is:
+    healed by that namespace's own session start, a `hive sop` write there, or
+    a projector rebuild of it -- and `autosync.run_all` rebuilds only the
+    namespaces with new transcript activity."""
+    try:
+        name = project or paths.detect_project()
+        local = read_sidecar(project)
+        shared = read_global_sidecar()
+        mine = [r for r in (shared.get("sops") or [])
+                if not isinstance(r, dict) or r.get("project") == name]
+        if (local and shared and _rows_current(local["sops"])
+                and _rows_current(mine)
+                and _slice_key(mine) == _slice_key(local["sops"])):
+            return False
+        write_sidecar(project)
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def ledger_body(payload) -> str:
     """Self-describing markdown body for this event's LEDGER entry, so keyword
     recall finds SOPs by id, title, or body text. Used by the projector."""
@@ -443,6 +562,212 @@ def ledger_body(payload) -> str:
         head += f" — {title}"
     text = (payload.get("text") or "").strip()
     return head + ("\n\n" + text if text else "")
+
+
+# --- authorship partition for the composed surfaces --------------------------------
+#
+# `block` and `digest_block` compose SOP TITLES and BODIES into STATE.md and the
+# auto-loaded MEMORY.md digest. That is the highest-trust surface in the system:
+# every session on this machine reads it without being asked, and nothing in it
+# is labelled as coming from anywhere in particular.
+#
+# The amplification is the threat, not the row. Every spawned orchestration child
+# holds `hive` on PATH with its own `MINDHIVE_SESSION`, and `hive sop add` is one
+# command; so a prompt-injected agent in one wave could write a procedure that
+# briefed every later session as standing project history.
+#
+# `advice.resolve_sops` closed this for a spawned agent's brief and `sopgate.plan`
+# closed it for the operator's per-prompt fence. Both cited this same reasoning,
+# and both left THIS path open -- the two guarded surfaces were the narrower ones.
+#
+# One definition of the prefix family, deliberately: `advice.is_orchestration_session`
+# owns it, `sopgate` already delegates there rather than keeping a copy, and this
+# does the same. The import is LAZY because `mindnet.advice` pulls in `mindnet.inject`
+# -> `controller` / `sidecar` / `tasks`, and `sop` is imported by the projector on a
+# path that must not drag that subtree in. Same idiom as `plugins.recommend_for`.
+
+
+def safe_title(value) -> str:
+    """Whitespace-collapsed, length-capped title.
+
+    Titles flow verbatim into agent-steering context, so a newline in one must
+    not be able to forge a second directive line -- or, here specifically, a
+    second `### MANDATORY SOP` heading. `sopgate._safe_title` delegates to this
+    rather than restating it: two spellings of a sanitizer is exactly the drift
+    that makes one of them stop working.
+
+    That argument applies one level up as well, which is why the RULE now lives
+    in `provenance.safe_line` and this is a named, width-bound view of it: five
+    surfaces needed the same collapse, and five copies of it is the same drift
+    at a larger scale. Behaviour is unchanged -- `provenance.TITLE_CHARS` is
+    120 and the cut is still bare."""
+    return provenance.safe_line(value, provenance.TITLE_CHARS)
+
+
+def is_agent_authored(row) -> bool:
+    """Whether an SOP record was written by a spawned orchestration agent.
+
+    Total and FAILS OPEN, matching `advice.is_orchestration_session`'s own
+    contract: a junk row, a missing id, or an import that raises answers False
+    and the row composes. Absent authorship is unknown authorship -- refusing
+    every SOP written before session stamping would delete the feature to close
+    a second-order hole.
+
+    **A MITIGATION, NOT A BOUNDARY. Do not build on this as if it were one.**
+    The predicate is a prefix test over `session_id`, and `session_id` is
+    attacker-supplied: `hive sop add --session <anything>` is a documented flag
+    and `MINDHIVE_SESSION` is a plain environment variable, both reachable by
+    any spawned agent with a shell. An agent that knows this rule can write
+    under a human-looking id and compose normally.
+
+    What the partition removes is the DEFAULT case -- an agent doing what it
+    ordinarily does, inheriting the id its parent gave it, no longer briefs
+    every later session as project history. Closing it properly means stamping
+    authorship somewhere the child cannot reach, which is a change to how the
+    orchestrator spawns children, not to how a renderer composes them."""
+    if not isinstance(row, dict):
+        return False
+    # The predicate itself lives in `provenance`, which every composing surface
+    # now shares; this stays as the ROW-shaped spelling because `partition_authored`
+    # and `sopgate.probe` both hold rows, not ids.
+    return provenance.is_agent_authored(row.get("session_id"))
+
+
+def agent_touched_ids(evs) -> set:
+    """Every ``sop_id`` whose content an orchestration agent has written.
+
+    Accumulated over the history, for `provenance.agent_touched`'s reason:
+    `fold` keeps the LATEST editor's `session_id`, so a single human edit would
+    otherwise launder an agent's procedure onto the auto-loaded surface.
+
+    Counted over the writes the fold APPLIED (`_fold`), not over every event
+    that carries the id. sop ids are chosen by whoever writes, and guessable --
+    the registry's slugs are its own documentation -- so the event-level rule
+    let an agent pre-poison an id it had never written: a `delete` of an id not
+    yet registered, or a title-only `update` the fold skips, changed nothing,
+    and the operator's later `hive sop add` under that id was withheld from
+    every surface as agent-written. A delete is not a write either: it removes
+    content rather than composing any, so an agent deleting the operator's
+    procedure does not taint the operator's re-add of it.
+
+    Writes DO accumulate across a delete. A revival keeps what the reviving
+    event does not replace -- a title-only `update` on a deleted id brings its
+    old body back -- so clearing at a delete would launder in two steps what a
+    human edit cannot launder in one. The cost is the one
+    `test_an_agent_edit_withholds_the_operators_own_sop_and_names_it` already
+    accepts: an id an agent really wrote stays withheld under the operator's
+    later re-add, and the footer names it.
+
+    `roadmap_render` keeps the event-level rule on purpose: its marker LABELS a
+    record rather than withholding it, so over-approximating there costs a
+    banner, not the operator's own procedure. The ids are what the withheld
+    footer names, so the session values are dropped here."""
+    return {sop_id for sop_id, session in _fold(evs or [])[2]
+            if provenance.is_agent_authored(session)}
+
+
+def partition_authored(rows, evs=None):
+    """``(composed, withheld)`` -- the rows a rendering may show, and the count
+    it must not show but must still ADMIT to.
+
+    Returning a count rather than dropping silently is the project's established
+    rule for this exact control (`Advice.withheld`, `sopgate.probe`'s
+    `withheld`): exclusion that leaves no trace is indistinguishable from a
+    registry that was always empty, so an operator could never tell an attack
+    from a quiet week."""
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    # `evs` is optional so the predicate stays callable on rows alone, but every
+    # composing surface passes it -- without the history, authorship collapses
+    # back to "whoever edited last".
+    tainted = agent_touched_ids(evs) if evs is not None else set()
+
+    def _agent(row):
+        return is_agent_authored(row) or (row.get("sop_id") in tainted)
+
+    composed = [r for r in rows if not _agent(r)]
+    withheld = [r for r in rows if _agent(r)]
+    return composed, len(withheld)
+
+
+def withheld_footer(n, ids=None) -> str:
+    """The one line that keeps the partition above from being silent, or "".
+
+    It NAMES the ids when it has them. A bare count tells an operator that
+    something is missing without telling them what, and the availability
+    trade-off this partition accepts -- an agent that writes into a procedure
+    keeps it off the delivery surface, including a procedure the operator
+    wrote -- is only acceptable while the operator can see exactly which one
+    went and go read it."""
+    if not n:
+        return ""
+    named = ""
+    if ids:
+        # `safe_title`, not `str`: the footer is composed into the block, so an
+        # id renders through the same collapse as a title, whatever validated
+        # it upstream.
+        shown = sorted(safe_title(i) for i in ids if i)[:6]
+        if shown:
+            named = " (" + ", ".join("`%s`" % s for s in shown)
+            if len(ids) > len(shown):
+                named += ", and %d more" % (len(ids) - len(shown))
+            named += ")"
+    return (f"_{n} procedure(s){named} withheld from this block: an "
+            f"orchestration agent, not a human, wrote into them. They are still "
+            f"in the ledger and in `hive sop list` -- they are only kept off the "
+            f"surface every session auto-loads. Read one with `hive sop show "
+            f"<id>`._")
+
+
+def preflight_mandatory(evs) -> dict:
+    """The mandatory-SOP half of `hive sop preflight`'s report, PARTITIONED
+    like every other delivery surface.
+
+    `docs/sops/execution-discipline.md` opens with "BEFORE ANY WORK -- run
+    `hive sop preflight` and read the output", so this list is read into every
+    session as standing directives rather than browsed as a registry. It has
+    three duties, and the command once lacked each of them:
+
+    * **the partition** -- an agent's mandatory row that STATE.md withheld was
+      listed here as one of the operator's standing procedures;
+    * **`safe_title` on the id and the title**, in `--json` as in text -- a
+      newline in an agent-written title forged a second `- [id vN] ...` line;
+    * **the admission, with the ids** -- an exclusion that leaves no trace is
+      indistinguishable from a registry that was always empty, and a bare count
+      says something is missing without saying what to go and read.
+
+    Here rather than in `__main__`: it is rendering policy shared with `block`
+    and `digest_block`, and that file is on a size ratchet."""
+    rows = [r for r in (mandatory(evs) or []) if isinstance(r, dict)]
+    composed, withheld = partition_authored(rows, evs)
+    kept = {id(r) for r in composed}
+    return {
+        "mandatory_sops": [{"sop_id": safe_title(r["sop_id"]),
+                            "title": safe_title(r["title"]),
+                            "version": r["version"]} for r in composed],
+        "mandatory_withheld": withheld,
+        "mandatory_withheld_ids": [safe_title(r["sop_id"]) for r in rows
+                                   if id(r) not in kept],
+    }
+
+
+def preflight_mandatory_lines(rep) -> list:
+    """The text rendering of `preflight_mandatory`'s half of *rep*.
+
+    The header counts what is SHOWN, so the admission names what is not.
+    Without it the header read `(0)` on a registry holding procedures, followed
+    by the "add one" hint -- the one reading an operator must never get from
+    this command. The hint now prints only when nothing was withheld either."""
+    must = rep.get("mandatory_sops") or []
+    out = [f"\nMandatory SOPs ({len(must)}):"]
+    out += [f"  - [{r['sop_id']} v{r['version']}] {r['title']}" for r in must]
+    footer = withheld_footer(rep.get("mandatory_withheld") or 0,
+                             rep.get("mandatory_withheld_ids"))
+    if footer:
+        out.append("  " + footer.strip("_"))
+    if not must and not footer:
+        out.append("  (none — add one: hive sop add <id> --title … --file … "
+                   "--mandatory)")
+    return out
 
 
 def block(evs) -> str:
@@ -460,6 +785,10 @@ def block(evs) -> str:
     sops = current(evs)
     if not sops:
         return ""
+    _all_ids = [r.get("sop_id") for r in sops]
+    sops, withheld = partition_authored(sops, evs)
+    _kept = {r.get("sop_id") for r in sops}
+    _gone = [i for i in _all_ids if i not in _kept]
     must = [r for r in sops if r.get("mandatory")]
     rest = [r for r in sops if not r.get("mandatory")]
     out = [
@@ -478,13 +807,14 @@ def block(evs) -> str:
             "",
         ]
         for i, r in enumerate(must, 1):
-            out.append(f"### MANDATORY SOP {i}: {r['title']}  "
+            out.append(f"### MANDATORY SOP {i}: {safe_title(r['title'])}  "
                        f"`[{r['sop_id']} v{r['version']}]`")
             out.append(r["text"])
             out.append("")
     spent = 0
     for i, r in enumerate(rest, 1):
-        out.append(f"## SOP {i}: {r['title']}  `[{r['sop_id']} v{r['version']}]`")
+        out.append(f"## SOP {i}: {safe_title(r['title'])}  "
+                   f"`[{r['sop_id']} v{r['version']}]`")
         if spent + len(r["text"]) <= BLOCK_FULL_BUDGET:
             out.append(r["text"])
             spent += len(r["text"])
@@ -492,6 +822,9 @@ def block(evs) -> str:
             out.append(f"_(body elided for context budget — read it with: "
                        f"`hive sop show {r['sop_id']}`)_")
         out.append("")
+    foot = withheld_footer(withheld, _gone)
+    if foot:
+        out += [foot, ""]
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -526,6 +859,10 @@ def digest_block(evs, injected_ids=()) -> str:
     sops = current(evs)
     if not sops:
         return ""
+    _all_ids = [r.get("sop_id") for r in sops]
+    sops, withheld = partition_authored(sops, evs)
+    _kept = {r.get("sop_id") for r in sops}
+    _gone = [i for i in _all_ids if i not in _kept]
     injected = set(injected_ids or ())
     must = [r for r in sops if r.get("mandatory")]
     rest = [r for r in sops if not r.get("mandatory")]
@@ -542,7 +879,7 @@ def digest_block(evs, injected_ids=()) -> str:
             "",
         ]
         for i, r in enumerate(must, 1):
-            out.append(f"### MANDATORY SOP {i}: {r['title']}  "
+            out.append(f"### MANDATORY SOP {i}: {safe_title(r['title'])}  "
                        f"`[{r['sop_id']} v{r['version']}]`")
             if r["sop_id"] in injected:
                 # Wording constraint, not style: tests/test_sync.py asserts the
@@ -558,10 +895,13 @@ def digest_block(evs, injected_ids=()) -> str:
         out += ["## Scope-matched SOPs — follow when the task falls in scope",
                 ""]
         for r in rest[:DIGEST_ITEM_CAP]:
-            out.append(f"- `{r['sop_id']}` v{r['version']}: {r['title']} "
+            out.append(f"- `{r['sop_id']}` v{r['version']}: {safe_title(r['title'])} "
                        f"— `hive sop show {r['sop_id']}`")
         extra = len(rest) - DIGEST_ITEM_CAP
         if extra > 0:
             out.append(f"- _(+{extra} more active SOP(s) — `hive sop list`)_")
         out.append("")
+    foot = withheld_footer(withheld, _gone)
+    if foot:
+        out += [foot, ""]
     return "\n".join(out).rstrip("\n") + "\n"

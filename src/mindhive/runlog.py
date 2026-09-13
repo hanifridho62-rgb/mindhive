@@ -70,10 +70,31 @@ def runs_dir(project: str | None = None) -> Path:
     return paths.runs_dir(project)
 
 
+# The `ws-` family, defined once here because this module has spelled it since
+# before anything else needed it, and because `_safe` above is exactly the guard
+# a value that becomes a FILE NAME wants — `events.append_event` writes
+# `<session_id>.jsonl`, so the session id is one of those too.
+SESSION_PREFIX = "ws-"
+
+
 def workspace_key(agent_id, n) -> str:
     """One workspace ``send()`` — an Agent may be sent many prompts over its
     life and each is its own run."""
-    return f"ws-{_safe(agent_id)}-{_safe(n)}"
+    return f"{SESSION_PREFIX}{_safe(agent_id)}-{_safe(n)}"
+
+
+def workspace_session(agent_id) -> str:
+    """The `MINDHIVE_SESSION` a board agent's child writes under.
+
+    Per AGENT, not per send: an Agent holds one `proc` at a time so its runs
+    cannot interleave in the segment, and one stream per agent is what the
+    Sessions view reads. `workspace.send` had no overlay at all before this, so
+    a child inherited the OPERATOR's session — it appended into the operator's
+    ledger segment (the concurrent-writer tear `events._append_lock` exists
+    for) and every row it wrote was attributed to a human. Recognised as an
+    agent by `advice.ORCHESTRATION_PREFIXES`, pinned by
+    `test_the_workspace_session_prefix_is_covered`."""
+    return f"{SESSION_PREFIX}{_safe(agent_id)}"
 
 
 def loop_key(run_id, iteration) -> str:

@@ -2,6 +2,7 @@
 import hashlib
 import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
+from . import provenance, state as state_mod
 from . import roadmap
 # `sopgate` reaches only `outcomes` (stdlib), `sop` and `promptgate` (-> `paths`),
 # so this introduces no cycle either. Importing it here also means the
@@ -34,7 +35,14 @@ def build_state(evs, pending=None, health_note="", changelog_pending=None,
             latest_state = ev
         elif ev.type == "decision":
             last_decision = ev
-    s = latest_state.payload if latest_state else {}
+    # `state.validate_payload` now refuses a non-dict payload at both
+    # raw-append surfaces, so this is no longer the only thing standing between
+    # a hostile `hive append state_set` and a raise inside the function that
+    # builds STATE.md. It stays anyway, and not as belt-and-braces: the gate
+    # gates WRITES, and this fold runs over 67k events that predate it. A
+    # renderer on the projection path that raises does not produce an error
+    # message, it produces no STATE.md at all.
+    s = state_mod.fields(latest_state)
     out = ["# STATE", ""]
     # Pending thermo-nuclear review rides at the top so the next session sees it
     # first when session_start injects STATE.md via `hive state`.
@@ -67,21 +75,53 @@ def build_state(evs, pending=None, health_note="", changelog_pending=None,
     if health_note:
         out.append(health_note)
         out.append("")
-    out.append(f"**Active task:** {s.get('task', '(none)')}")
-    out.append(f"**Last verified:** {s.get('verified', '(none)')}")
-    out.append(f"**Next step:** {s.get('next_step', '(none)')}")
+    # Everything from here down is ledger text rendered at the TOP of STATE.md,
+    # which `sync` wraps verbatim into the MEMORY.md that auto-loads in every
+    # session on this machine. It is the highest-trust surface in the system and
+    # it was the last composing one with no provenance control at all:
+    #
+    #  * SANITIZED, because each line below is an f-string. A newline inside
+    #    `task` opens a second line the reader cannot distinguish from a real
+    #    one -- a forged `## heading`, a forged `**Last decision**`, a forged
+    #    bullet under "Open questions". `hive append state_set` takes raw JSON,
+    #    so nothing upstream removes one.
+    #  * MARKED, not withheld, and that is the opposite of `sop.block`'s answer
+    #    to the same question. An SOP list has many rows, so dropping the
+    #    agent-written ones leaves the surface doing its job. There is exactly
+    #    ONE state block: withholding it does not trim the surface, it empties
+    #    it, and an operator who loses the top of STATE.md loses the thing that
+    #    says where the work stands. Naming the author removes the property that
+    #    made it dangerous -- that it read as the operator's own past
+    #    instruction -- without removing the state.
+    state_banner = provenance.agent_banner(
+        "This state block", getattr(latest_state, "session_id", ""))
+    if state_banner:
+        out.append(state_banner)
+        out.append("")
+    out.append(f"**Active task:** "
+               f"{provenance.safe_line(s.get('task')) or '(none)'}")
+    out.append(f"**Last verified:** "
+               f"{provenance.safe_line(s.get('verified')) or '(none)'}")
+    out.append(f"**Next step:** "
+               f"{provenance.safe_line(s.get('next_step')) or '(none)'}")
     out.append("")
     out.append("**Open questions:**")
-    for q in (s.get("open_questions") or ["(none)"]):
+    for q in provenance.safe_bullets(s.get("open_questions")):
         out.append(f"- {q}")
     out.append("")
     out.append("**Deferred:**")
-    for d in (s.get("deferred") or ["(none)"]):
+    for d in provenance.safe_bullets(s.get("deferred")):
         out.append(f"- {d}")
     out.append("")
     if last_decision:
-        out.append(f"**Last decision ({last_decision.ts}):** "
-                   f"{last_decision.payload.get('text', '')}")
+        dp = last_decision.payload if isinstance(last_decision.payload, dict) \
+            else {}
+        # The decision is ONE row among a history of them, so it takes the row
+        # treatment (`AGENT_MARK`) rather than the block treatment above.
+        out.append(f"**Last decision "
+                   f"({provenance.safe_line(last_decision.ts, 40)}):** "
+                   f"{provenance.safe_line(dp.get('text'))}"
+                   f"{provenance.mark_for(getattr(last_decision, 'session_id', ''))}")
     out.append("")
     out.append(f"_events: {len(evs)}_")
     return "\n".join(out) + "\n"

@@ -45,6 +45,7 @@ interpreter so `mindhive_session_id`'s JSON parsing is exercised for real.
 against the actual CLI.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,10 +56,11 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "hooks"
 
-# `lib.sh` is sourced, never invoked, so it is the one POSIX file with no
-# PowerShell sibling. Named here rather than pattern-matched so adding a second
-# un-paired file is a deliberate edit to this list.
-NOT_A_SHIM = {"lib.sh"}
+# `lib.sh` and `lib.ps1` are sourced, never invoked: each is its family's shared
+# library, and the two are siblings of each other rather than of any shim. Named
+# rather than pattern-matched so adding a third un-paired file is a deliberate
+# edit to this list.
+NOT_A_SHIM = {"lib.sh", "lib.ps1"}
 
 # Which stage each shim hands to `mindhive hook`. Four shims call ordinary
 # `hive` commands instead and are listed as None.
@@ -94,12 +96,27 @@ sh_missing = pytest.mark.skipif(shutil.which("sh") is None,
 # would lose `sh` itself on POSIX. Resolve it once, through the real PATH.
 SH = shutil.which("sh") or "sh"
 
+# Windows PowerShell 5.1, for the cross-family parity tests that run one fixture
+# through BOTH libraries. Same rule as `tests/test_hook_shims_ps.py`: `pwsh` (7+)
+# is not a substitute, because the dialect these files obey exists for 5.1.
+POWERSHELL = shutil.which("powershell")
+ps_missing = pytest.mark.skipif(POWERSHELL is None or sys.platform != "win32",
+                                reason="Windows PowerShell 5.1 not available")
+
 
 # --- helpers -------------------------------------------------------------------
 
 def shims() -> list:
     """Every `.sh` in `hooks/` that is a shim, by stem."""
     return sorted(p.stem for p in HOOKS.glob("*.sh")
+                  if p.name not in NOT_A_SHIM)
+
+
+def ps_shims() -> list:
+    """Every `.ps1` in `hooks/` that is a shim, by stem. The PowerShell family
+    grew its own shared library (`lib.ps1`) when the hard-coded interpreter came
+    out of it, so this side needs the same exclusion the POSIX side always had."""
+    return sorted(p.stem for p in HOOKS.glob("*.ps1")
                   if p.name not in NOT_A_SHIM)
 
 
@@ -238,21 +255,301 @@ def test_every_powershell_hook_has_a_posix_sibling():
 
     This is the test that stops the POSIX family from quietly falling behind:
     a tenth `.ps1` added later fails here until its `.sh` exists."""
-    ps1 = {p.stem for p in HOOKS.glob("*.ps1")}
+    ps1 = set(ps_shims())
     sh = set(shims())
     assert ps1 - sh == set(), f"PowerShell hooks with no POSIX sibling: {sorted(ps1 - sh)}"
 
 
 def test_every_posix_shim_has_a_powershell_sibling():
     """The other direction, so the two families cannot diverge either way."""
-    ps1 = {p.stem for p in HOOKS.glob("*.ps1")}
+    ps1 = set(ps_shims())
     sh = set(shims())
     assert sh - ps1 == set(), f"POSIX shims with no PowerShell sibling: {sorted(sh - ps1)}"
 
 
-def test_there_are_nine_shims_and_one_library():
+def test_there_are_nine_shims_and_one_library_per_family():
     assert len(shims()) == 9
+    assert len(ps_shims()) == 9
     assert (HOOKS / "lib.sh").is_file()
+    assert (HOOKS / "lib.ps1").is_file()
+
+
+# The two spellings of a hard-coded interpreter. The first is the Windows one
+# this branch removed (`C:\Users\...\python.exe`). The second is the same defect
+# written for the POSIX family -- `/home/alice/.venv/bin/python3`,
+# `/Users/bob/...`, `/usr/local/bin/python3`, `~/.venv/bin/python`, or Git
+# Bash's `/c/Users/.../python.exe` -- which has neither a drive letter nor a
+# `.exe`, so the first pattern alone could never fail a `.sh` shim.
+#
+# Both shapes end on the same LEAF: `python`, an optional version (`3`,
+# `3.12`), an optional `w`, an optional `.exe`, then the end of the word. The
+# first cut of the Windows shape required `python[a-z]*\.exe`, so it could not
+# see `C:\Python312\python3.exe` (the `3` is not `[a-z]`) or an extensionless
+# `& "C:\Python312\python"`, which PowerShell runs through PATHEXT all the same.
+#
+# The POSIX shape is anchored at the START of a word (line start, whitespace,
+# `=`, a quote, `(`, a backtick, or `;` `|` `&`) so `"$_mh_dir/.venv/bin/python3"`
+# -- a path relative to a variable, which is exactly how `lib.sh` probes the
+# venv -- is not an absolute path and does not match. The leaf must be the
+# interpreter itself, so `/usr/bin/env python3` does not match either, and the
+# end-of-word rule keeps a directory like `/srv/python-tools` out.
+_DRIVE_LETTER_INTERPRETER = re.compile(
+    r"[A-Za-z]:[\\/](?:[^\r\n\"'`;|&<>]*[\\/])?python[0-9.]*w?(?:\.exe)?"
+    r"(?=$|[\s\"'`;|&)<>])", re.IGNORECASE)
+_ABSOLUTE_POSIX_INTERPRETER = re.compile(
+    r"(?:^|[\s=\"'(`;|&])~?/(?:[^\s\"'`;|&()<>]*/)?python[0-9.]*w?(?:\.exe)?"
+    r"(?=$|[\s\"'`;|&)<>])", re.IGNORECASE)
+HARD_CODE_SHAPES = (_DRIVE_LETTER_INTERPRETER, _ABSOLUTE_POSIX_INTERPRETER)
+
+
+def hard_codes_an_interpreter(line: str) -> bool:
+    """True when *line* names an interpreter by an absolute path."""
+    return any(shape.search(line) for shape in HARD_CODE_SHAPES)
+
+
+def hard_code_offenders(files) -> list:
+    """`name:line: text` for every code line in *files* that hard-codes an
+    interpreter. Whole-line comments are skipped: the libraries QUOTE the old
+    line to explain why it is gone."""
+    offenders = []
+    for f in files:
+        if not f.is_file():
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8",
+                                             errors="replace").splitlines(), 1):
+            bare = line.strip()
+            if bare.startswith("#"):
+                continue
+            if hard_codes_an_interpreter(line):
+                offenders.append(f"{f.name}:{i}: {bare[:90]}")
+    return offenders
+
+
+def test_no_shim_hard_codes_an_interpreter_path():
+    """The defect this whole family was rewritten to end.
+
+    An absolute path to one operator's venv is correct on exactly one machine,
+    and the failure it causes elsewhere is SILENT -- the hook runs, finds no
+    interpreter, and every session on that machine loses telemetry and rotation
+    with nothing printed. Asserted over BOTH families and over `circle.ps1`, and
+    written against the shape rather than one username, so a different
+    operator's hard-code fails too.
+
+    Review found the first cut of this could not fail a `.sh` file at all: its
+    one pattern needed a drive letter AND `.exe`, so
+    `py=/home/alice/mindhive/.venv/bin/python3` in a POSIX shim passed. The
+    matcher is proven against synthetic lines in the two tests below rather
+    than by trusting that the pattern reads right."""
+    targets = list(HOOKS.glob("*.ps1")) + list(HOOKS.glob("*.sh"))
+    targets.append(REPO / "circle.ps1")
+    assert len([t for t in targets if t.suffix == ".sh"]) >= 10, (
+        "the scan no longer reads the POSIX family")
+    # `hard_code_offenders` skips a path that is not a file, so a moved
+    # `circle.ps1` would otherwise leave this guard reading nothing, green.
+    assert [t.name for t in targets if not t.is_file()] == [], "a scan target is gone"
+    offenders = hard_code_offenders(targets)
+    assert offenders == [], "hard-coded interpreter path(s): " + "; ".join(offenders)
+
+
+@pytest.mark.parametrize("line", [
+    'py=/home/alice/mindhive/.venv/bin/python3',
+    'py="/Users/bob/src/mindhive/.venv/bin/python"',
+    '/usr/local/bin/python3 -m mindhive hook stop',
+    'printf \'%s\' "$raw" | /opt/venv/bin/python3.12 -m mindhive hook post_tool_use',
+    "exec '/usr/bin/python3' -m mindhive sync",
+    'py=~/.venv/bin/python3',
+    'py=$(printf \'/home/alice/.venv/bin/pythonw\')',
+    'cd /srv/mindhive;/usr/bin/python3 -m mindhive sync',
+    '/usr/bin/python3</dev/null',
+    'py=/c/Users/hanif/mindhive/.venv/Scripts/python.exe',
+    '$py = "C:\\Users\\hanif\\mindhive\\.venv\\Scripts\\python.exe"',
+    "$py = 'D:/tools/py/pythonw.exe'",
+    '$py = "C:\\Python312\\python3.exe"',
+    "& 'C:\\Program Files (x86)\\Python\\python' -m mindhive sync",
+], ids=["posix-home", "posix-macos-quoted", "posix-usr-local", "posix-piped",
+        "posix-exec-single-quoted", "posix-tilde", "posix-subshell",
+        "posix-after-semicolon", "posix-redirected",
+        "gitbash-drive", "windows-original", "windows-forward-slash",
+        "windows-python3-exe", "windows-no-extension"])
+def test_the_hard_code_matcher_catches_both_families(line):
+    """Every spelling of the defect, POSIX first because that is the half the
+    first cut of the guard could not see."""
+    assert hard_codes_an_interpreter(line), f"missed a hard-code: {line!r}"
+
+
+@pytest.mark.parametrize("line", [
+    '        for _mh_candidate in "$_mh_dir/.venv/Scripts/python.exe" \\',
+    '                             "$_mh_dir/.venv/bin/python"; do',
+    '            for _mh_candidate in "$_mh_dir/$_mh_name" "$_mh_dir/$_mh_name.exe"; do',
+    'py=$(mindhive_python) || exit 0',
+    'printf \'%s\' "$raw" | "$py" -m mindhive hook post_tool_use >/dev/null 2>&1',
+    '#!/usr/bin/env python3',
+    "    $leaves = @('Scripts\\python.exe', 'bin\\python3.exe', 'bin\\python.exe')",
+    'see https://docs.python.org/3/using/windows.html',
+    'command -v python3 >/dev/null 2>&1',
+    "    $py = Join-Path $root '.venv\\Scripts\\python.exe'",
+    "Set-Location 'C:\\src\\python-tools'",
+    'cd /srv/python-tools && ls',
+], ids=["lib-scripts-probe", "lib-bin-probe", "lib-path-scan", "shim-resolve",
+        "shim-dispatch", "env-shebang", "ps-leaves", "url", "command-v",
+        "ps-relative-leaf", "windows-pythonic-dir", "posix-pythonic-dir"])
+def test_the_hard_code_matcher_leaves_resolved_paths_alone(line):
+    """CANARY for the test above: a matcher that flagged every line mentioning
+    `python` would pass it and fail the real scan on `lib.sh`'s own venv probe.
+    These are lines the resolver really contains, or near neighbours of them."""
+    assert not hard_codes_an_interpreter(line), f"flagged a resolved path: {line!r}"
+
+
+def test_the_scan_reports_a_posix_hard_code_in_a_shim_file(tmp_path):
+    """The matcher above is only half the guard; this proves the scan the real
+    test runs actually applies it to a `.sh` file, and still skips a comment
+    that quotes the old line -- on a synthetic shim, never a real one."""
+    shim = tmp_path / "session_start.sh"
+    shim.write_text(
+        "#!/bin/sh\n"
+        "# py=/home/alice/mindhive/.venv/bin/python3   (the old way, quoted)\n"
+        "py=/home/alice/mindhive/.venv/bin/python3\n"
+        '"$py" -m mindhive sync\n',
+        encoding="utf-8", newline="\n")
+    clean = tmp_path / "post_tool_use.sh"
+    clean.write_bytes((HOOKS / "post_tool_use.sh").read_bytes())
+    got = hard_code_offenders([shim, clean])
+    assert len(got) == 1, got
+    assert got[0].startswith("session_start.sh:3:"), got
+
+
+# --- shipped instruction text: no one operator's paths -------------------------
+#
+# The plugin ships prose that Claude FOLLOWS: `commands/*.md`, the skills under
+# `skills/`, the procedures under `scripts/`, and the README. Six of those told
+# every installation to run `C:\Users\hanif\mindhive\.venv\Scripts\python.exe`
+# and one registered a hook into that user's `settings.json` -- the one-machine
+# hard-code the shims were rewritten to remove, moved into text another user's
+# Claude acts on. The scan reads every line, headings included (a Markdown `#`
+# is not a comment), and matches the SHAPE of a per-user directory rather than
+# one username. `TODOS.md` and `docs/` quote the old hard-code as history and
+# are deliberately not scanned.
+SHIPPED_TEXT_TREES = ("commands", "skills", "scripts")
+
+# `<drive>:\Users\<name>\` in either slash (doubled backslashes too, as JSON
+# escapes them), Git Bash's `/c/Users/<name>/`, and `/home/<name>/` or macOS's
+# `/Users/<name>/` where they start a path rather than sit inside a URL. A name
+# opening with `<`, `%` or `$` is a placeholder or a variable, not a user.
+_PER_USER_PATH = re.compile(
+    r"[A-Za-z]:[\\/]+Users[\\/]+(?![<%$])[^\\/\s\"'`<>|]+[\\/]"
+    r"|(?<![\w.-])/[A-Za-z]/Users/(?![<%$])[^/\s\"'`<>|]+/"
+    r"|(?<![\w.:/~-])/(?:home|Users)/(?![<%$])[^/\s\"'`<>|]+/",
+    re.IGNORECASE)
+
+
+def names_a_per_user_path(line: str) -> bool:
+    """True when *line* names a directory inside one user's profile."""
+    return _PER_USER_PATH.search(line) is not None
+
+
+def shipped_text_files() -> list:
+    """The README and every Markdown file under `SHIPPED_TEXT_TREES`."""
+    files = [REPO / "README.md"]
+    for tree in SHIPPED_TEXT_TREES:
+        files.extend(sorted((REPO / tree).rglob("*.md")))
+    return files
+
+
+def per_user_path_offenders(files) -> list:
+    """`path:line: text` for EVERY line in *files* that names a per-user path.
+    No line is skipped, unlike `hard_code_offenders`: a Markdown heading starts
+    with `#` and is shipped text all the same."""
+    offenders = []
+    for f in files:
+        try:
+            label = f.relative_to(REPO).as_posix()
+        except ValueError:
+            label = f.name
+        for i, line in enumerate(f.read_text(encoding="utf-8",
+                                             errors="replace").splitlines(), 1):
+            if names_a_per_user_path(line):
+                offenders.append(f"{label}:{i}: {line.strip()[:90]}")
+    return offenders
+
+
+def test_no_shipped_instruction_text_names_one_users_path():
+    """Text Claude follows must not send every installation to one operator's
+    checkout. It is the defect the hook family was rewritten to end, one layer
+    up: on any other machine the path does not exist, and what fails is
+    whatever the model was told to run with it.
+
+    Guarded against reading nothing: every tree must contribute a file, so a
+    renamed directory cannot leave this green by scanning an empty list."""
+    files = shipped_text_files()
+    assert (REPO / "README.md").is_file(), "the README is gone"
+    for tree in SHIPPED_TEXT_TREES:
+        assert any(f.is_relative_to(REPO / tree) for f in files), (
+            f"the scan reads nothing under {tree}/")
+    offenders = per_user_path_offenders(files)
+    assert offenders == [], "per-user path(s) in shipped text: " + "; ".join(offenders)
+
+
+@pytest.mark.parametrize("line", [
+    "`C:\\Users\\hanif\\mindhive\\.venv\\Scripts\\python.exe -m mindhive …`",
+    'hive session install-hook "C:/Users/hanif/.claude/settings.json"',
+    "(or `/plugin marketplace add C:\\Users\\hanif\\mindhive` to install)",
+    '"cwd": "C:\\\\Users\\\\hanif\\\\mindhive"',
+    "c:\\users\\alice\\src\\mindhive",
+    "D:\\Users\\ops\\mindhive\\.venv",
+    "py=/c/Users/hanif/mindhive/.venv/Scripts/python.exe",
+    "cd /home/alice/src/mindhive",
+    "open /Users/bob/mindhive/README.md",
+    "## Installed at /home/carol/mindhive/",
+], ids=["windows-venv", "windows-forward-slash", "windows-plugin-add",
+        "json-escaped", "lower-case", "other-drive", "gitbash-drive",
+        "linux-home", "macos-users", "markdown-heading"])
+def test_the_per_user_path_matcher_catches_every_spelling(line):
+    """Every spelling the scan exists for. The first three are the shapes of
+    lines the shipped text really carried before this test was written."""
+    assert names_a_per_user_path(line), f"missed a per-user path: {line!r}"
+
+
+@pytest.mark.parametrize("line", [
+    "`<checkout>\\.venv\\Scripts\\python.exe -m mindhive …` on Windows,",
+    "`<checkout>/.venv/bin/python -m mindhive …` elsewhere, where `<checkout>` is the",
+    'hive session install-hook "$HOME/.claude/settings.json"     # POSIX',
+    'hive session install-hook "$env:USERPROFILE\\.claude\\settings.json"',
+    'hive session install-hook "%USERPROFILE%\\.claude\\settings.json"',
+    "type %USERPROFILE%\\.mindhive\\<project>\\ROTATION_PENDING",
+    "C:\\Users\\<you>\\mindhive",
+    "delete the `\"Stop\"` block from `~/.claude/settings.json`",
+    "/plugin marketplace add hanifridho62-rgb/Lintester-project",
+    "https://github.com/hanifridho62-rgb/Lintester-project/actions/workflows/ci.yml",
+    "see https://example.com/home/docs/ and https://example.com/Users/list/",
+    "profiles live under C:\\Users\\ on Windows",
+], ids=["checkout-windows", "checkout-posix", "posix-home-var", "ps-userprofile",
+        "cmd-userprofile", "cmd-type", "placeholder-name", "tilde",
+        "marketplace-slug", "github-url", "url-paths", "bare-users-dir"])
+def test_the_per_user_path_matcher_leaves_portable_text_alone(line):
+    """CANARY for the test above: a matcher that flagged every mention of
+    `Users` or `home` would pass it and then fail the real scan on the portable
+    wording that replaced the hard-codes. These are lines the shipped text
+    really contains now, or near neighbours of them."""
+    assert not names_a_per_user_path(line), f"flagged portable text: {line!r}"
+
+
+def test_the_shipped_text_scan_reports_a_planted_per_user_path(tmp_path):
+    """The matcher is half the guard. This proves the scan the real test runs
+    applies it to a Markdown file, reads a `#` heading line instead of skipping
+    it as a comment, and stays silent on the real README beside it."""
+    skill = tmp_path / "skills" / "demo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "# Demo\n"
+        "\n"
+        "Run `<checkout>/.venv/bin/python -m mindhive state`.\n"
+        "## C:\\Users\\alice\\mindhive\\.venv\\Scripts\\python.exe\n",
+        encoding="utf-8", newline="\n")
+    readme = tmp_path / "README.md"
+    readme.write_bytes((REPO / "README.md").read_bytes())
+    got = per_user_path_offenders([skill, readme])
+    assert len(got) == 1, got
+    assert got[0].startswith("SKILL.md:4:"), got
 
 
 def test_the_stage_table_covers_every_shim():
@@ -500,14 +797,31 @@ def _fake_venv(repo, log=None):
     return target
 
 
+# `lib.sh`'s junk filter used to be `''|*[!0-9]*`, so ANY run of digits passed
+# it: twenty nines reached `[ "$n" -lt 99999999999999999999 ]`, which under
+# bash's `sh` prints "integer expression expected" on the hook's stderr and
+# skips the walk (dash prints nothing and the comparison is simply true, so the
+# walk runs to the filesystem root), and ten zeros meant "do not walk" while
+# `lib.ps1`, which bounds the run at nine digits, read them as the default.
+# Measured by review (#25), and per shell since. The filter's
+# `??????????*` now reads a run of ten or more as the default, and the
+# `overlong` and `ten-zeros` rows below are its regression guards.
+
+
 @sh_missing
-@pytest.mark.parametrize("limit", ["abc", "", "8x", " 8", "-1"],
-                         ids=["word", "empty", "suffixed", "padded", "negative"])
+@pytest.mark.parametrize("limit", [
+    "abc", "", "8x", " 8", "-1", "99999999999999999999", "0000000000",
+], ids=["word", "empty", "suffixed", "padded", "negative", "overlong",
+        "ten-zeros"])
 def test_a_non_numeric_walk_limit_is_silently_the_default(limit, tmp_path):
-    """`[ "$n" -lt abc ]` prints "integer expression expected" on stderr and
-    skips the walk. A hook's stderr is what Claude Code shows the user when it
-    decides the hook failed, so both halves matter: no noise, and the venv
-    still found."""
+    """`[ "$n" -lt abc ]` is an error on stderr that also skips the walk --
+    "integer expression expected" under bash's `sh`, "Illegal number" under
+    dash. A hook's stderr is what Claude Code shows the user when it decides
+    the hook failed, so both halves matter: no noise, and the venv still found.
+
+    `overlong` and `ten-zeros` are digit runs the filter used to let THROUGH:
+    the first to that same noise under bash's `sh` (dash says nothing and the
+    comparison is simply true), the second to no walk at all."""
     deep = tmp_path / "repo" / "hooks"
     deep.mkdir(parents=True)
     target = _fake_venv(tmp_path / "repo")
@@ -639,6 +953,482 @@ def test_the_resolver_prefers_the_checkouts_own_venv(tmp_path):
     assert got.returncode == 0, got.stderr
     assert got.stdout.strip() == target.as_posix(), (
         "the walk did not reach the venv above a worktree checkout")
+
+
+def _store_alias_dir(root) -> Path:
+    """A `WindowsApps` directory whose `python` and `python3` behave like the
+    App Execution Alias: they run, print the Store prompt, and exit 49."""
+    alias = root / "WindowsApps"
+    alias.mkdir(parents=True)
+    for name in ("python", "python3"):
+        stub = alias / name
+        stub.write_text("#!/bin/sh\necho 'Python was not found; run without "
+                        "arguments to install from the Microsoft Store'\nexit 49\n",
+                        encoding="utf-8", newline="\n")
+        stub.chmod(0o755)
+    return alias
+
+
+def _interpreter_dir(root, dirname, name="python3", log=None) -> Path:
+    """A PATH directory holding one working 'interpreter' called *name*."""
+    d = root / dirname
+    d.mkdir(parents=True, exist_ok=True)
+    exe = d / name
+    body = "#!/bin/sh\n"
+    if log is not None:
+        body += f"printf 'ran %s\\n' \"$*\" >> '{log.as_posix()}'\n"
+    exe.write_text(body + "exit 0\n", encoding="utf-8", newline="\n")
+    exe.chmod(0o755)
+    return d
+
+
+def resolve_from_path(tmp_path, dirs):
+    """`mindhive_python` with the override unset and the walk switched off, so
+    PATH -- *dirs*, then a python-free tools dir -- is the only thing deciding.
+    Answers (rc, printed) where *printed* is what the resolver wrote.
+
+    PATH is handed over in the platform's own notation. Under Git Bash the
+    MSYS runtime rewrites a Windows-form PATH to POSIX form as `sh` starts
+    (`C:\\...\\Temp` becomes `/tmp`), so the answer is compared by its tail."""
+    script = (f'MINDHIVE_HOOK_DIR="{(tmp_path / "nowhere").as_posix()}"; '
+              'export MINDHIVE_HOOK_DIR; '
+              f'. "{(HOOKS / "lib.sh").as_posix()}"; mindhive_python; echo "rc=$?"')
+    path = os.pathsep.join([str(d) for d in dirs] + [_path_without_python(tmp_path)])
+    got = probe(script, env={"MINDHIVE_HOOK_WALK_LIMIT": "0", "PATH": path})
+    assert got.stderr == "", got.stderr
+    lines = got.stdout.strip().splitlines()
+    assert lines and lines[-1].startswith("rc="), got.stdout
+    return int(lines[-1][3:]), "\n".join(lines[:-1]).strip()
+
+
+def _tail(answer: str) -> str:
+    """A resolved path in one spelling: forward slashes, lower case, no `.exe`.
+    Git Bash's stat() answers `python3` for a file that is `python3.exe`, and
+    PowerShell spells the same file with backslashes."""
+    got = answer.strip().replace("\\", "/").lower()
+    return got[:-4] if got.endswith(".exe") else got
+
+
+@sh_missing
+@pytest.mark.parametrize("name", ["python3", "python"])
+def test_a_store_stub_ahead_of_a_real_interpreter_does_not_shadow_it(tmp_path, name):
+    """The refusal of the Store redirector must be a SKIP, not a STOP.
+
+    On a default Windows profile `%LOCALAPPDATA%/Microsoft/WindowsApps` sits on
+    PATH AHEAD of a per-user Python, and a Windows user running Claude Code
+    through Git Bash inherits that PATH. The first cut took `command -v`'s
+    first hit, refused the stub, and answered nothing -- measured by review:
+    PATH=<stub>:<real> gave rc=1 and nine silent no-op hooks, while `lib.ps1`
+    on the same box skipped the stub and resolved. `name` covers both the
+    interpreter the stub shadows by the same name and the one it shadows by a
+    name the loop reaches second."""
+    alias = _store_alias_dir(tmp_path)
+    real = _interpreter_dir(tmp_path, "realbin", name)
+    rc, printed = resolve_from_path(tmp_path, [alias, real])
+    assert rc == 0, f"a Store stub ahead of {real} left no interpreter"
+    assert _tail(printed).endswith(f"/{tmp_path.name}/realbin/{name}".lower()), printed
+
+
+@sh_missing
+def test_a_store_stub_alone_on_path_still_resolves_to_nothing(tmp_path):
+    """CANARY for the test above. A scan that simply stopped refusing the stub
+    would pass it by answering the stub; this is the case it cannot pass."""
+    alias = _store_alias_dir(tmp_path)
+    rc, printed = resolve_from_path(tmp_path, [alias])
+    assert rc == 1, f"the Store redirector was accepted: {printed!r}"
+    assert printed == ""
+
+
+@sh_missing
+def test_a_real_interpreter_alone_on_path_is_found(tmp_path):
+    """CANARY: the stub-ahead fixture minus the stub. Without it a resolver that
+    ignored PATH entirely would satisfy the stub-alone test."""
+    real = _interpreter_dir(tmp_path, "realbin")
+    rc, printed = resolve_from_path(tmp_path, [real])
+    assert rc == 0
+    assert _tail(printed).endswith(f"/{tmp_path.name}/realbin/python3".lower()), printed
+
+
+@sh_missing
+def test_a_path_dir_holding_only_python3_exe_is_found(tmp_path):
+    """A directory whose only interpreter is `python3.exe` must still be found
+    by the PATH scan that replaced `command -v`, or the fix for the Store stub
+    could cost a Windows user their interpreter.
+
+    On POSIX this pins the explicit `$name.exe` candidate. Under Git Bash it
+    cannot: the runtime answers `[ -f "$dir/python3" ]` (and `command -v
+    python3`) for a lone `python3.exe` -- measured -- so the bare candidate
+    already finds it and dropping `.exe` stays green there. On Windows this is
+    a reachability canary, not a pin."""
+    d = tmp_path / "exeonly"
+    d.mkdir()
+    exe = d / "python3.exe"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+    exe.chmod(0o755)
+    rc, printed = resolve_from_path(tmp_path, [d])
+    assert rc == 0, "a directory holding only python3.exe was not searched"
+    assert _tail(printed).endswith(f"/{tmp_path.name}/exeonly/python3".lower()), printed
+
+
+@sh_missing
+def test_a_path_entry_spelled_like_a_glob_is_read_literally(tmp_path):
+    """`for dir in $PATH` under `IFS=:` GLOBS each element against the
+    filesystem, so an entry `[ab]` answered from a directory named `a` that is
+    not on PATH at all (measured by review). The walk splits with parameter
+    expansion now, which never globs: the interpreter in the literal `[ab]`
+    directory is the answer, and `a`'s -- planted so that the glob has
+    something to match -- is never looked at."""
+    literal = _interpreter_dir(tmp_path, "[ab]")
+    _interpreter_dir(tmp_path, "a")
+    rc, printed = resolve_from_path(tmp_path, [literal])
+    assert rc == 0, "the [ab] entry was not searched"
+    assert _tail(printed).endswith(f"/{tmp_path.name}/[ab]/python3".lower()), printed
+
+
+@sh_missing
+def test_the_path_walk_leaves_the_callers_ifs_alone(tmp_path):
+    """Restoring `IFS` from a saved copy turns an UNSET `IFS` into an EMPTY one,
+    which switches word splitting off for whoever runs `mindhive_python`
+    outside `$(...)` (measured by review: three fields before the call, one
+    after). Every shipped shim uses the subshell form, so the leak had no
+    victim yet; the walk no longer touches `IFS` at all, and `${IFS+set}` is
+    the spelling that tells unset from empty."""
+    real = _interpreter_dir(tmp_path, "realbin")
+    script = (f'. "{(HOOKS / "lib.sh").as_posix()}"; unset IFS; '
+              'mindhive_python >/dev/null; x="a b c"; set -- $x; '
+              'echo "fields=$#"; echo "ifs=${IFS+set}"')
+    got = probe(script, env={"MINDHIVE_HOOK_WALK_LIMIT": "0",
+                             "MINDHIVE_HOOK_DIR": (tmp_path / "nowhere").as_posix(),
+                             "PATH": os.pathsep.join([str(real),
+                                                      _path_without_python(tmp_path)])})
+    assert got.stderr == "", got.stderr
+    assert got.stdout.split() == ["fields=3", "ifs="], got.stdout
+
+
+@sh_missing
+def test_the_shim_runs_the_real_interpreter_behind_a_store_stub(tmp_path):
+    """End to end through a real shim: the interpreter found behind the stub is
+    the one the hook actually runs, not just the one the resolver prints."""
+    log = tmp_path / "ran.log"
+    alias = _store_alias_dir(tmp_path)
+    real = _interpreter_dir(tmp_path, "realbin", log=log)
+    env = {"MINDHIVE_PYTHON": str(tmp_path / "absent"),
+           "MINDHIVE_HOOK_WALK_LIMIT": "0",
+           "PATH": os.pathsep.join([str(alias), str(real),
+                                    _path_without_python(tmp_path)])}
+    got = run_shim("post_tool_use", env=env)
+    assert got.returncode == 0, got.stderr
+    assert "Microsoft Store" not in got.stdout + got.stderr
+    assert log.exists() and "-m mindhive hook post_tool_use" in log.read_text(
+        encoding="utf-8"), "the shim never ran the interpreter behind the stub"
+
+
+# --- cross-family parity: the two libraries ------------------------------------
+#
+# The shim-level parity tests above compare STEMS and STAGE names, and both
+# libraries are in `NOT_A_SHIM`, so until these existed nothing compared what
+# `lib.sh` and `lib.ps1` DO. Review found two contracts that had already
+# drifted behind docstrings claiming parity: `MINDHIVE_HOOK_WALK_LIMIT=0` (sh:
+# do not walk; ps: junk, walk 8) and a Store stub ahead of a real interpreter
+# (ps: skip it; sh: stop). A later parity probe measured three more: the venv
+# leaf order, which extensions PATH may yield, and how `MINDHIVE_PYTHON` may be
+# spelled. Each test below runs ONE fixture tree through both resolvers and
+# asserts they name the same file.
+
+def _cmd_exe_copy(path: Path) -> Path:
+    """A real Windows executable at *path*. Both families accept it -- `lib.ps1`
+    on the PATHEXT extension, Git Bash's `-x` on `.exe` -- and it is a file
+    that could genuinely be run, so a resolver cannot pass by accepting junk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                             "System32", "cmd.exe"), path)
+    return path
+
+
+def _sh_quote(value) -> str:
+    """*value* as one single-quoted POSIX sh word."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def _both_resolve(tmp_path, hook_dirs, sh_path, ps_path, walk_limit, overrides=None):
+    """Resolve once per hook dir through each library under the same settings.
+    Answers `(sh_answers, ps_answers)`, one raw path (or "") per hook dir.
+
+    *overrides*, when given, is one `MINDHIVE_PYTHON` value per hook dir, set
+    inside each probe just before that resolution -- so a whole table of
+    spellings costs one process per family rather than one per row."""
+    def clean(extra):
+        child = dict(os.environ)
+        for key in ("MINDHIVE_PYTHON", "MINDHIVE_HOOK_DIR", "MINDHIVE_HOOK_WALK_LIMIT",
+                    "MINDHIVE_HEADLESS", "MINDHIVE_SESSION", "MINDHIVE_ROTATION"):
+            child.pop(key, None)
+        child.update(extra)
+        return child
+
+    sh_script = f'. "{(HOOKS / "lib.sh").as_posix()}"; '
+    for i, d in enumerate(hook_dirs):
+        if overrides is not None:
+            sh_script += (f"MINDHIVE_PYTHON={_sh_quote(overrides[i])}; "
+                          "export MINDHIVE_PYTHON; ")
+        sh_script += (f'MINDHIVE_HOOK_DIR="{d.as_posix()}"; export MINDHIVE_HOOK_DIR; '
+                      'printf "[%s]\\n" "$(mindhive_python)"; ')
+    sh_got = subprocess.run([SH, "-c", sh_script], capture_output=True, text=True,
+                            shell=False, cwd=str(REPO), timeout=60,
+                            env=clean({"MINDHIVE_HOOK_WALK_LIMIT": walk_limit,
+                                       "PATH": sh_path}))
+
+    ps_script = tmp_path / "parity_probe.ps1"
+    body = '. "%s"\n' % (HOOKS / "lib.ps1")
+    for i, d in enumerate(hook_dirs):
+        if overrides is not None:
+            body += "$env:MINDHIVE_PYTHON = '%s'\n" % str(overrides[i]).replace("'", "''")
+        body += ("$env:MINDHIVE_HOOK_DIR = '%s'\n"
+                 "Write-Output ('[' + (Get-MindhivePython) + ']')\n" % d)
+    ps_script.write_text(body, encoding="ascii")
+    ps_got = subprocess.run([POWERSHELL, "-NoProfile", "-File", str(ps_script)],
+                            capture_output=True, text=True, timeout=120,
+                            env=clean({"MINDHIVE_HOOK_WALK_LIMIT": walk_limit,
+                                       "PATH": ps_path}))
+
+    answers = []
+    for fam, got in (("lib.sh", sh_got), ("lib.ps1", ps_got)):
+        assert got.returncode == 0, f"{fam} probe exited {got.returncode}: {got.stderr}"
+        assert got.stderr.strip() == "", f"{fam} wrote to stderr: {got.stderr!r}"
+        lines = [ln.strip() for ln in got.stdout.splitlines() if ln.strip()]
+        assert len(lines) == len(hook_dirs), f"{fam}: {got.stdout!r}"
+        answers.append([ln[1:-1] for ln in lines])
+    return answers[0], answers[1]
+
+
+def _which_fixture(tmp_path, answer, fixtures) -> str:
+    """The label of the fixture *answer* names, `NONE` for no answer, or
+    `OTHER:<path>` -- so a failure says which file each family picked."""
+    if not answer.strip():
+        return "NONE"
+    got = _tail(answer)
+    for label, path in fixtures.items():
+        rel = path.relative_to(tmp_path).as_posix()
+        if got.endswith(_tail(f"/{tmp_path.name}/{rel}")):
+            return label
+    return f"OTHER:{answer}"
+
+
+@sh_missing
+@ps_missing
+@pytest.mark.parametrize("limit, expected", [
+    ("0", ["NONE", "NONE"]),
+    ("3", ["venv", "NONE"]),
+    ("", ["venv", "venv"]),
+    ("abc", ["venv", "venv"]),
+    ("99999999999999999999", ["venv", "venv"]),
+    ("0000000000", ["venv", "venv"]),
+], ids=["zero", "three", "empty", "word", "overlong", "ten-zeros"])
+def test_both_libraries_read_the_walk_limit_the_same_way(tmp_path, limit, expected):
+    """One contract, asserted across the family boundary rather than described.
+
+    The venv sits two levels above one hook dir and four above the other, so
+    the pair of answers tells `0` (no walk), `3` (reaches only the near one)
+    and the default 8 (reaches both) apart. `lib.ps1` used to read `0` as junk
+    and walk 8 while `lib.sh` honoured it -- measured by review, and pinned as
+    intended by a PowerShell test whose docstring claimed the families agreed.
+
+    `expected` is asserted as well as equality, so two libraries broken the
+    same way cannot pass as parity. Digit runs longer than nine used to diverge
+    (sh: stderr noise for twenty nines, no walk for ten zeros; ps: the default).
+    Both families now read them as the default, and the last two rows hold
+    that."""
+    repo = tmp_path / "repo"
+    venv = _cmd_exe_copy(repo / ".venv" / "Scripts" / "python.exe")
+    near = repo / "a" / "hooks"
+    far = repo / "a" / "b" / "c" / "hooks"
+    near.mkdir(parents=True)
+    far.mkdir(parents=True)
+    sh_answers, ps_answers = _both_resolve(
+        tmp_path, [near, far],
+        sh_path=_path_without_python(tmp_path),
+        ps_path=r"C:\Windows\System32;C:\Windows",
+        walk_limit=limit)
+    fixtures = {"venv": venv}
+    sh_labels = [_which_fixture(tmp_path, a, fixtures) for a in sh_answers]
+    ps_labels = [_which_fixture(tmp_path, a, fixtures) for a in ps_answers]
+    assert sh_labels == ps_labels, (
+        f"MINDHIVE_HOOK_WALK_LIMIT={limit!r}: lib.sh {sh_labels} vs lib.ps1 {ps_labels}")
+    assert sh_labels == expected, f"both libraries agree on the wrong answer: {sh_labels}"
+
+
+@sh_missing
+@ps_missing
+@pytest.mark.parametrize("on_path, expected", [
+    (["stub", "real"], "real"),
+    (["stub"], "NONE"),
+    (["real"], "real"),
+], ids=["stub-ahead", "stub-alone", "real-only"])
+def test_both_libraries_skip_a_store_stub_the_same_way(tmp_path, on_path, expected):
+    """The Store stub AHEAD of a real interpreter, through both resolvers.
+
+    `lib.ps1` walked every `Get-Command -All` match; `lib.sh` took `command -v`'s
+    first and stopped. The same two PATH directories gave the real interpreter
+    on one family and nothing on the other. `stub-alone` and `real-only` are the
+    canaries that keep `stub-ahead` from passing by accepting the stub or by
+    ignoring PATH."""
+    dirs = {"stub": _cmd_exe_copy(tmp_path / "WindowsApps" / "python.exe").parent,
+            "real": _cmd_exe_copy(tmp_path / "realbin" / "python.exe").parent}
+    chosen = [dirs[k] for k in on_path]
+    sh_answers, ps_answers = _both_resolve(
+        tmp_path, [tmp_path / "nowhere"],
+        sh_path=os.pathsep.join([str(d) for d in chosen]
+                                + [_path_without_python(tmp_path)]),
+        ps_path=";".join([str(d) for d in chosen] + [r"C:\Windows\System32"]),
+        walk_limit="1")
+    fixtures = {"stub": dirs["stub"] / "python.exe", "real": dirs["real"] / "python.exe"}
+    sh_label = _which_fixture(tmp_path, sh_answers[0], fixtures)
+    ps_label = _which_fixture(tmp_path, ps_answers[0], fixtures)
+    assert sh_label == ps_label, f"PATH {on_path}: lib.sh {sh_label} vs lib.ps1 {ps_label}"
+    assert sh_label == expected, f"both libraries agree on the wrong answer: {sh_label}"
+
+
+@sh_missing
+@ps_missing
+@pytest.mark.parametrize("layout, expected", [
+    (("Scripts/python.exe", "bin/python.exe"), "Scripts/python.exe"),
+    (("bin/python3.exe", "bin/python.exe"), "bin/python3.exe"),
+    (("bin/python3.exe",), "bin/python3.exe"),
+], ids=["dual-layout", "bin-python3-beside-python", "bin-python3-only"])
+def test_both_libraries_take_the_same_venv_leaf(tmp_path, layout, expected):
+    """One venv, one interpreter: `Scripts/python.exe`, then `bin/python3`, then
+    `bin/python`, in both families.
+
+    The orders used to differ, and a parity probe measured every row here
+    giving two answers: the dual layout resolved `bin/python` in `lib.sh` and
+    `Scripts\\python.exe` in `lib.ps1`; `bin\\python3.exe` beside
+    `bin\\python.exe` resolved `bin/python3` against `bin\\python.exe`; and a
+    lone `bin\\python3.exe` resolved in `lib.sh` while `lib.ps1`, with no leaf
+    for it, fell through.
+
+    A DIFFERENT real interpreter sits on PATH for both families, so a leaf the
+    walk misses shows up as `path` rather than as a silent `NONE`. `expected`
+    is asserted as well as equality, so two libraries broken the same way
+    cannot pass as parity."""
+    repo = tmp_path / "repo"
+    fixtures = {leaf: _cmd_exe_copy(repo / ".venv" / leaf) for leaf in layout}
+    fixtures["path"] = _cmd_exe_copy(tmp_path / "realbin" / "python.exe")
+    hooks = repo / "hooks"
+    hooks.mkdir(parents=True)
+    realbin = fixtures["path"].parent
+    sh_answers, ps_answers = _both_resolve(
+        tmp_path, [hooks],
+        sh_path=os.pathsep.join([str(realbin), _path_without_python(tmp_path)]),
+        ps_path=";".join([str(realbin), r"C:\Windows\System32", r"C:\Windows"]),
+        walk_limit="2")
+    sh_label = _which_fixture(tmp_path, sh_answers[0], fixtures)
+    ps_label = _which_fixture(tmp_path, ps_answers[0], fixtures)
+    assert sh_label == ps_label, f"{layout}: lib.sh {sh_label} vs lib.ps1 {ps_label}"
+    assert sh_label == expected, f"both libraries agree on the wrong answer: {sh_label}"
+
+
+@sh_missing
+@ps_missing
+@pytest.mark.parametrize("on_path, expected", [
+    (["wrappers", "exe"], "exe"),
+    (["wrappers"], "NONE"),
+], ids=["wrappers-ahead-of-exe", "wrappers-alone"])
+def test_both_libraries_take_only_an_exe_from_path(tmp_path, on_path, expected):
+    """From PATH an interpreter is `python3`/`python` or its `.exe`, never a
+    `.cmd` or `.bat` wrapper, in both families.
+
+    `lib.ps1` took any PATHEXT match `Get-Command` offered, so a directory
+    holding a `python.cmd` ahead of a real `python.exe` gave it the wrapper --
+    which runs through `cmd.exe` and re-parses its arguments -- while `lib.sh`,
+    asking PATH only for `<name>` and `<name>.exe`, took the `.exe`. A parity
+    probe measured exactly that. `python3.bat` is planted beside `python.cmd`
+    so that either extension, if still accepted, would win the name-major scan.
+
+    `wrappers-alone` is the canary: a `lib.ps1` that merely RANKED a `.exe`
+    above a wrapper would pass `wrappers-ahead-of-exe` and still answer one
+    here."""
+    wrappers = tmp_path / "wrapbin"
+    wrappers.mkdir()
+    (wrappers / "python3.bat").write_bytes(b"@echo off\r\nexit /b 0\r\n")
+    (wrappers / "python.cmd").write_bytes(b"@echo off\r\nexit /b 0\r\n")
+    exe = _cmd_exe_copy(tmp_path / "exebin" / "python.exe")
+    dirs = {"wrappers": wrappers, "exe": exe.parent}
+    chosen = [dirs[k] for k in on_path]
+    sh_answers, ps_answers = _both_resolve(
+        tmp_path, [tmp_path / "nowhere"],
+        sh_path=os.pathsep.join([str(d) for d in chosen]
+                                + [_path_without_python(tmp_path)]),
+        ps_path=";".join([str(d) for d in chosen] + [r"C:\Windows\System32"]),
+        walk_limit="0")
+    fixtures = {"python3.bat": wrappers / "python3.bat",
+                "python.cmd": wrappers / "python.cmd", "exe": exe}
+    sh_label = _which_fixture(tmp_path, sh_answers[0], fixtures)
+    ps_label = _which_fixture(tmp_path, ps_answers[0], fixtures)
+    assert sh_label == ps_label, f"PATH {on_path}: lib.sh {sh_label} vs lib.ps1 {ps_label}"
+    assert sh_label == expected, f"both libraries agree on the wrong answer: {sh_label}"
+
+
+@sh_missing
+@ps_missing
+def test_both_libraries_read_mindhive_python_spellings_the_same_way(tmp_path):
+    """`MINDHIVE_PYTHON` names one file in both families, however a Windows
+    operator spells it.
+
+    Under Git Bash the MSYS runtime does two things for `lib.sh` that `lib.ps1`
+    did not: it reads `/c/...` as drive C, in either letter case, and it
+    retries a name that does not exist with `.exe`. A parity probe measured the
+    gap: an extensionless path and a `/c/` path each gave the override in
+    `lib.sh` and the venv in `lib.ps1`.
+
+    One table, one process per family. The rows that need a word:
+      * `windows` is the CANARY -- the plain spelling resolves in both, so the
+        override tier is live and every other row tests only a spelling.
+      * `dotted-name` is `.../python3.12`, whose `.12` is no extension anyone
+        meant; Git Bash completes it to `python3.12.exe` (measured).
+      * `directory-shadowing-exe` names a DIRECTORY `python` with a
+        `python.exe` beside it. Git Bash does not complete a name that exists
+        (measured), so both families refuse it and walk to the venv, rather
+        than one of them quietly running the file next door."""
+    override = _cmd_exe_copy(tmp_path / "override" / "python.exe")
+    dotted = _cmd_exe_copy(tmp_path / "override" / "python3.12.exe")
+    shadowed = _cmd_exe_copy(tmp_path / "shadowed" / "python.exe")
+    (tmp_path / "shadowed" / "python").mkdir()
+    venv = _cmd_exe_copy(tmp_path / "repo" / ".venv" / "Scripts" / "python.exe")
+    hooks = tmp_path / "repo" / "hooks"
+    hooks.mkdir(parents=True)
+
+    win = str(override)
+    assert win[1:3] == ":\\", f"not a drive-letter path: {win}"
+
+    def posix(value, upper=False):
+        drive = value[0].upper() if upper else value[0].lower()
+        return "/" + drive + "/" + value[3:].replace("\\", "/")
+
+    rows = [
+        # (id, MINDHIVE_PYTHON, the fixture both families must name)
+        ("windows", win, "override"),
+        ("windows-no-exe", win[:-4], "override"),
+        ("posix-drive", posix(win), "override"),
+        ("posix-drive-no-exe", posix(win[:-4]), "override"),
+        ("posix-upper-drive", posix(win, upper=True), "override"),
+        ("dotted-name", str(dotted)[:-4], "dotted"),
+        ("directory-shadowing-exe", str(shadowed)[:-4], "venv"),
+    ]
+    sh_answers, ps_answers = _both_resolve(
+        tmp_path, [hooks] * len(rows),
+        sh_path=_path_without_python(tmp_path),
+        ps_path=r"C:\Windows\System32;C:\Windows",
+        walk_limit="2",
+        overrides=[value for _, value, _ in rows])
+    fixtures = {"override": override, "dotted": dotted,
+                "shadowed-exe": shadowed, "venv": venv}
+    wrong = []
+    for (row, value, expected), sh_answer, ps_answer in zip(rows, sh_answers, ps_answers):
+        sh_label = _which_fixture(tmp_path, sh_answer, fixtures)
+        ps_label = _which_fixture(tmp_path, ps_answer, fixtures)
+        if not sh_label == ps_label == expected:
+            wrong.append(f"{row} ({value}): lib.sh {sh_label}, lib.ps1 {ps_label}, "
+                         f"want {expected}")
+    assert wrong == [], "; ".join(wrong)
 
 
 # --- stdout discipline ---------------------------------------------------------
@@ -813,11 +1603,12 @@ def test_the_session_id_reaches_every_child(name, fake_python):
         "empty", "space", "traversal", "slash", "backslash", "overlong",
         "long-flag", "short-flag", "dash", "leading-dash"])
 def test_an_unusable_session_id_becomes_unknown(payload, fake_python):
-    """`unknown`, never the raw value: the id names a file on disk with no
-    further checks in `events.append_event`, so a nested object would become a
-    segment called `{'a': 1}.jsonl` and a path would walk out of the store.
-    A leading `-` is refused too, so no id can read as an option to the child
-    that receives it after `--session`.
+    """`unknown`, never the raw value: the id names a ledger segment. The
+    Python side would quarantine a hostile one (`events.segment_name` maps it
+    to `unsafe-<sha256[:16]>.jsonl`), but the shim refuses it before any child
+    sees it, so a nested object or a path never reaches an environment or an
+    argv at all. A leading `-` is refused too, so no id can read as an option
+    to the child that receives it after `--session`.
 
     The whitelist can refuse nothing real — Claude Code's ids are UUIDs."""
     got = run_shim("session_end", payload=payload, env=fake_python["env"])

@@ -55,6 +55,8 @@ from __future__ import annotations
 import contextlib
 import copy
 import os
+
+from .. import cliparse
 from dataclasses import dataclass, field
 
 from . import brief as br_mod
@@ -233,7 +235,7 @@ def register(subparsers) -> None:
     p.add_argument("--execute", action="store_true",
                    help="actually run agents. WITHOUT this both arms are a dry "
                         "run and the verdict is inconclusive by construction")
-    p.add_argument("--project", default=None,
+    p.add_argument("--project", type=cliparse.project_arg, default=None,
                    help="the project namespace to read (default: the active one)")
     p.add_argument("--limit", type=int, default=None,
                    help="at most this many tasks per wave")

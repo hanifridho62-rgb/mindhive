@@ -400,9 +400,10 @@ def test_the_timeout_default_is_longer_than_the_validators(monkeypatch):
 
 def test_the_env_overlay_is_threaded_to_the_spawn(monkeypatch):
     """MN-9 made this real: the orchestrator uses it to give each concurrent agent
-    its own MINDHIVE_SESSION, because `events.append_event` appends to
-    `<session_id>.jsonl` without a lock. It was documented as ignored before, which
-    is the shape of a future bug."""
+    its own MINDHIVE_SESSION -- its own segment and its own id; appends to one
+    `<session_id>.jsonl` are serialised by `events._append_lock`, but rows under a
+    shared id cannot be told apart. It was documented as ignored before, which is
+    the shape of a future bug."""
     seen = _spawn(monkeypatch)
     ag.run("k", "p", env={"MINDHIVE_SESSION": "mn9-t1"})
     assert seen["env"] == {"MINDHIVE_SESSION": "mn9-t1"}

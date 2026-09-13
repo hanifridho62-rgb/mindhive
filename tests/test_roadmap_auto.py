@@ -67,8 +67,27 @@ def test_the_moved_layer_owns_no_second_copy_of_the_contract():
 
 def test_the_fold_and_the_projections_did_not_move():
     """The other half of the seam: what STAYED has to have stayed. A reader
-    following `roadmap.fold` must not find it re-exported from somewhere else."""
-    for name in ("fold", "plans", "interrupted", "notice", "record",
+    following `roadmap.fold` must not find it re-exported from somewhere else.
+
+    `notice` was in this list until the SECOND split (`roadmap_render`) and was
+    removed then, deliberately and with an argument, because the list had been
+    a snapshot rather than a rule. Two things say so. The name and docstring
+    claim the boundary is "the writers, not the fold" -- but `record` is a
+    writer and is still listed, so the tuple cannot have been derived from that
+    sentence; it was whatever happened to remain in roadmap.py in August. And
+    `notice` is neither a fold nor a projection over the registry: it takes the
+    output of `interrupted()` -- a projection someone else computed -- and
+    formats markdown, alongside `review.notice`, `changelog.notice` and
+    `sopgate.notice`, which `projector.build_state` calls side by side.
+
+    What actually protects callers is `test_the_reexport_is_the_same_object`,
+    not `__module__`: nothing in the tree reads a `__module__` on a roadmap
+    name except this test, while `projector` reaches the renderer as
+    `roadmap.notice`. `tests/test_roadmap_render.py` asserts that identity for
+    all seven moved names. The seven below are the rule this test was reaching
+    for -- the fold, the payload contract, the writer, and every registry
+    projection -- and they stay."""
+    for name in ("fold", "plans", "interrupted", "record",
                  "validate_payload", "by_session", "plan_for_session"):
         fn = getattr(roadmap, name)
         assert getattr(fn, "__module__", "") == "mindhive.roadmap", (

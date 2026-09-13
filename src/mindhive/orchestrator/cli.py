@@ -27,6 +27,8 @@ import json
 import os
 import sys
 
+from .. import cliparse
+
 
 def cmd_lintester(args) -> int | None:
     """Plan (and optionally run) one mission from one intent."""
@@ -419,7 +421,7 @@ def register(subparsers) -> None:
     p.add_argument("--lanes", type=int, default=None,
                    help="parallel lanes (default: one per unit, clamped to [1, n])")
     p.add_argument("--root", default=None, help="repo root (default: cwd)")
-    p.add_argument("--project", default=None, help="target namespace")
+    p.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     p.add_argument("--checkpoint-dir", default=None,
                    help="where per-lane resume sidecars are written")
     p.add_argument("--json", action="store_true",

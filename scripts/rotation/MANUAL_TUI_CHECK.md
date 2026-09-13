@@ -27,10 +27,11 @@ stage — the hook is silent and rotation never fires. That is by design (the sh
 guards for exactly this), but it also means the check below would trivially
 "pass" while testing nothing.
 
-Then register the hook, if it is not already:
+Then register the hook, if it is not already. From `cmd`, the shell the rest of
+this check uses:
 
 ```
-hive session install-hook "C:/Users/hanif/.claude/settings.json"
+hive session install-hook "%USERPROFILE%\.claude\settings.json"
 ```
 
 ## The check

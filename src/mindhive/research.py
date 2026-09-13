@@ -463,7 +463,7 @@ _LB_LOCK = threading.Lock()
 
 def leaderboard_path(run_id: str | None = None) -> Path:
     name = f"research_run_{run_id}.json" if run_id else "research_runs.json"
-    return paths.store_home() / name
+    return paths.store_file(name)
 
 
 def _is_scored(exp: dict) -> bool:

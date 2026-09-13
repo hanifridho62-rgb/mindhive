@@ -43,7 +43,7 @@ from .dashboard_data import (HIVEMIND_LABEL, HIVEMIND_PROJECT, _add_tallies,
                              default_project, event_pairs, injection_status,
                              overview_stats)
 from .dashboard_locks import _VERIFY_LOCK, _one_at_a_time
-from .dashboard_query import qs_int
+from .dashboard_query import is_safe_project, qs_int
 from .dashboard_memo import (_CATS_MEMO, _changelog_cached, _improve_cached,
                              _intended_use_digest, _ledger_fingerprint,
                              _manual_collapsed_cached, _memo_get, _memo_put,
@@ -393,6 +393,12 @@ class GetRoutes:
         if am and not tproj:
             return self._json({"ok": False,
                                "error": "session_project required"}, 400)
+        # Refused by name, like `project=` at the router: this parameter picks
+        # the ledger `events.read_all` folds below, and it was the one project
+        # value on the route that reached the store without the check.
+        if tproj and not is_safe_project(tproj):
+            return self._json({"ok": False,
+                               "error": "invalid session_project"}, 400)
         # One grouped fold serves every card in the namespace (see
         # `_task_cards_cached`). A session the fold never saw answers exactly
         # as the old per-session filter did — `taskview.items([])` — so an

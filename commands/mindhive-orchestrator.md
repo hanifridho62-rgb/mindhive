@@ -22,8 +22,11 @@ The idea to orchestrate: `$ARGUMENTS`
 > allows), run quality passes, and log what it learned back to MindHive. Confirm
 > the idea before it starts building.
 
-Run MindHive commands through the project venv:
-`C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive …`
+Run MindHive commands through the MindHive checkout's own venv interpreter —
+`<checkout>\.venv\Scripts\python.exe -m mindhive …` on Windows,
+`<checkout>/.venv/bin/python -m mindhive …` elsewhere, where `<checkout>` is the
+directory MindHive is cloned into — or through `hive …` / `python -m mindhive …`
+when that venv's interpreter is the one on PATH.
 
 Follow the full procedure in the **`mindhive-orchestrator`** skill. In short:
 

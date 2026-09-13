@@ -129,7 +129,7 @@ def plan_consolidation(evs, limit=DEFAULT_LIMIT) -> list[dict]:
 
 
 def _marker_path():
-    return paths.store_home() / _MARKER
+    return paths.store_file(_MARKER)
 
 
 def _load_marker() -> dict:

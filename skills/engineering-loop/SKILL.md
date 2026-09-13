@@ -30,9 +30,11 @@ straight into the improvement loop.
 > is genuinely done. Like `/circle`, it can hand the keyboard to an unattended
 > headless agent — confirm the goal before launching.
 
-All commands run via the project venv:
-`C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive …` (or just
-`python -m mindhive …` if that interpreter is active).
+All commands run via the MindHive checkout's own venv interpreter —
+`<checkout>\.venv\Scripts\python.exe -m mindhive …` on Windows,
+`<checkout>/.venv/bin/python -m mindhive …` elsewhere, where `<checkout>` is the
+directory MindHive is cloned into (or just `python -m mindhive …` if that
+interpreter is active).
 
 ## Why this is more than lfg
 
