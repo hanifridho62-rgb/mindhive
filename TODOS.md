@@ -1557,6 +1557,27 @@ exhaust the machine.
 
 ## 35. Two doors are soft-deprecated; the notice and the toggle are all that changed
 
+> **2026-09-13.** This item's work was NOT in master for three days after it was
+> called merged, and nothing said so. PR #131 reports `MERGED`, but `gh` records
+> `baseRefName=claude/lintester-fence-b4aff7`: merge commit `cca61d9` landed on
+> the FENCE branch at 2026-09-09T23:15:32Z, forty-eight seconds after PR #129 had
+> already merged that same branch into master (`b5ae0d1`, 23:14:44Z). The doors
+> commit missed the train by three quarters of a minute, and no check anywhere
+> fires on that — from the outside it was a green, merged, closed PR. It surfaced
+> only because a branch tidy asked "is this contained in master?" and got `NO`.
+> Measured three ways before it was believed: neither `99fcfa3` nor `cca61d9` is
+> an ancestor of `origin/master`; `git grep` for the notice's own wording in
+> `origin/master -- src/mindhive` returns nothing; and
+> `tests/test_dashboard_mindswarm_toggle.py`, 254 lines, was absent from master
+> entirely. Second recorded instance of the shape — PR #71 was the first — so the
+> lesson is not "check more carefully", it is that **a merged PR proves its head
+> reached its BASE**, and a stacked PR's base is another branch. Re-landed by
+> merging `99fcfa3` onto `c14e683`: clean, zero conflicts, because PR #130 had
+> touched a disjoint set of files. The counts this item already records still
+> hold on the new base — `__main__.py` 4235 of its 4237 allowance,
+> `mindnet/orchestrator.py` 996 of 1000 — and the full suite on the merged tree
+> is 7255 passed, 3 skipped, 283 deselected, exit 0.
+
 The machine grew three front doors. `hive lintester "<intent>"` is the mission
 pipeline and the one new work goes through. `hive mindnet orchestrate` walks a
 task graph somebody declared. The dashboard's **MindSwarm** workspace commands a
