@@ -1,5 +1,6 @@
 # tests/test_graphview.py
 import json
+import re
 from mindhive import graphview
 
 
@@ -83,6 +84,67 @@ def test_render_html_escapes_script_closing_tag():
         "edges": [],
     })
     assert "</script><script>" not in html
+
+
+def _graph_blob(html):
+    """The graph's JSON payload, found by MATCHING the tag rather than by
+    splitting on an exact literal. Splitting on the literal raises IndexError
+    inside the test body, which reads as a failure of whatever was under test;
+    the `assert` below names the helper as the thing that went stale instead.
+    The pattern tolerates attribute order, extra attributes, either quote style
+    and whitespace inside the tag -- it is anchored on the id, not on the exact
+    spelling of the opening tag."""
+    m = re.search(r"""<script[^>]*\bid=["']graph-data["'][^>]*>(.*?)</script>""",
+                  html, re.S)
+    assert m, "no graph-data block in the rendered page"
+    return m.group(1)
+
+
+def test_render_html_escapes_a_comment_opener():
+    """`</script>` is the obvious way out of a script element; `<!--<script>` is
+    the one that hid, and the exact trigger matters. A bare `<!--` opens
+    script-data-ESCAPED state, where `</script>` still closes normally -- so a
+    fixture carrying only `<!--` proves nothing. It is `<script` seen WHILE in
+    that state that opens script-data-DOUBLE-escaped state, where `</script>`
+    stops closing: the renderer after the blob is swallowed and the Graph view
+    goes blank with no error.
+
+    Both halves are browser-verified, and the fixture below is the SPLIT form on
+    purpose -- `<!--` in one memo and `<script>` in a later one -- because that
+    is the reachable shape: two ordinary memos about HTML, neither odd on its
+    own. Served over http, a page with this pair renders an EMPTY body; the same
+    page with a bare `<!--` reports `renderer=RENDERER RAN`."""
+    html = graphview.render_html({
+        "nodes": [{"id": "a", "type": "event", "label": "e", "text": "look <!-- here"},
+                  {"id": "b", "type": "event", "label": "e", "text": "and <script> back"}],
+        "edges": [],
+    })
+    assert "<!--" not in _graph_blob(html)
+    assert html.count("</script>") == 2        # the two real closers, no more
+    assert "<script" not in _graph_blob(html)  # the half that actually arms it
+    assert [n["text"] for n in json.loads(_graph_blob(html))["nodes"]] == [
+        "look <!-- here", "and <script> back"]  # unchanged once parsed
+
+
+def test_render_html_escapes_the_javascript_line_terminators():
+    """U+2028 and U+2029 are line terminators in JavaScript source but ordinary
+    characters in JSON, and the graph blob is dumped with `ensure_ascii=False`.
+    They are inert in a `type="application/json"` data block read back with
+    `JSON.parse` -- but that is a property of the template, not of the data, and
+    ledger memo prose reaches this blob. Before the reader fix of 2026-09-10 a
+    row carrying one could not get here at all; `read_all` tore it and dropped
+    it. Now it can."""
+    html = graphview.render_html({
+        "nodes": [{"id": "x", "type": "event", "label": "e",
+                   "text": "before\u2028after\u2029end"}],
+        "edges": [],
+    })
+    assert "\u2028" not in html
+    assert "\u2029" not in html
+    assert "\\u2028" in html and "\\u2029" in html
+    # still valid JSON, and still the same string once parsed
+    assert json.loads(_graph_blob(html))["nodes"][0]["text"] == (
+        "before\u2028after\u2029end")
 
 
 def test_render_html_has_color_legend():

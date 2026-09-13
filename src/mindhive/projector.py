@@ -386,5 +386,5 @@ def _project(project=None, evs=None, suggestions=None) -> dict:
     # projection the dashboard parses while `hive project` is rewriting it.
     paths.write_text_atomic(pdir / "index.json",
                             events.canonical_json(build_index(entries)))
-    chain.write_chain(project, evs=evs)  # reuse the events we already read
+    chain.write_chain(project)   # scans segments itself; makes no read_all call
     return {"events": len(evs), "ledger": len(entries), "pruned": pruned}

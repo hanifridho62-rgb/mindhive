@@ -209,11 +209,19 @@ silent about it:
   the guard. The `orchestrator.py:29-35` rejection of asyncio for the WAVE
   RUNNER stands untouched — that runner is still a thread pool, and the new
   event loop reaches blocking children through `run_in_executor`.
-- **The `setrlimit` sandbox.** Overridden and POSIX-guarded. `import resource`
-  still fails on this machine, so `run_sandboxed` reports `enforcement` as
-  `kernel` or `timeout-only` with a reason, and the Windows leg of the suite
-  ASSERTS the degradation rather than skipping. A sandbox that reported success
-  while enforcing nothing would be worse than none.
+- **The `setrlimit` sandbox.** Overridden, and no longer POSIX-only. `import
+  resource` still fails here (`_rlimits_available()` answers
+  `ModuleNotFoundError: No module named 'resource'`, measured 2026-09-09), so
+  Windows is fenced by a job object instead — `orchestrator/jobs.py`, with
+  `KILL_ON_JOB_CLOSE` so the tree goes with the handle. On this machine
+  `limits_available()` is now `(True, "")` and `fencing(Limits(memory_bytes=…))`
+  answers `kernel`; the earlier note here, that the Windows leg asserts the
+  degradation, described the state before job objects landed. What has not
+  changed is why the field exists: `run_sandboxed` reports `kernel` or
+  `timeout-only` WITH a reason, both legs assert an equality rather than
+  truthiness, and a sandbox that reported success while enforcing nothing would
+  be worse than none — which is precisely the bug the child-path fence above
+  was written to end.
 - **`pybreaker` / any runtime dependency.** NOT overridden. `pyproject.toml:6`
   is still `dependencies = []`; the breaker is the one already in
   `loop/safeguards.py`, and everything new is stdlib.
@@ -251,18 +259,134 @@ order, and this section grows one bullet per landing.
   pass must not masquerade as the tree verified; only the closing full suite
   records, stamped `scope: full` with the mission id. Gate time is subtracted
   from the calibration sample so the weight keeps predicting the child, not
-  the tests. Transitional: the full suite runs once per lane tree that
-  validated a unit, because until the merge-back lands each lane is the only
-  place its work exists. Library default `validator=None` keeps the exit-code
-  path; `hive lintester --execute` wires the gate, `--no-gate` opts out and
-  its help text says what that costs.
-- **The merge-back.** Decided, not yet landed: the orchestrator commits on the
-  child's behalf and merges lanes probe-first into an integration branch made
-  from the lanes' base; the main checkout's HEAD never moves.
-- **The sandbox on the child path.** Decided, not yet landed: the fence goes
-  onto the real child spawn and the report says what was observed.
-- **The two other doors.** Decided, not yet landed: soft-deprecate both, code
-  kept, a notice and a toggle, reversible.
+  the tests. The per-lane closing suite it shipped with was transitional and
+  the merge-back replaced it with one run on the integration tree; the loop
+  survives as the fallback for work that never merged. Library default
+  `validator=None` keeps the exit-code path; `hive lintester --execute` wires
+  the gate, `--no-gate` opts out and its help text says what that costs.
+- **The merge-back.** Landed 2026-09-08 as `orchestrator/integrate.py`. The
+  plan doc's `merge back = worktree.retire`
+  (`docs/plans/2026-09-01-001-…-plan.md`, the pipeline diagram) was a scope
+  reduction: retiring a lane deletes its checkout and leaves the work on no
+  branch anyone can pick up. Now, because children are forbidden to commit
+  (`mindnet/agent.py` — an agent that could `git commit` could `git push`),
+  **the orchestrator commits on the child's behalf**, from `gate.gated`'s
+  `after` seam and therefore only past a green gate: one commit per validated
+  unit on its own lane branch, carrying a `Lintester-Task:` trailer and the
+  co-author line, and a `changelog.record` entry for the in-scope files.
+  A commit that fails is an integration fact, never the unit's failure — the
+  gate already proved the work, and routing it through `RepairLoop` would roll
+  the lane back and discard it; the row says so and the lane is kept.
+  Every lane is then **probed before it is merged** (U15's discipline in one
+  call): `git merge-tree --write-tree` answers in the object database only, so
+  a conflicting lane is reported with its paths and kept, branch and tree, for
+  a person, and the lanes after it still merge. A merged lane must prove it
+  landed (`merge-base --is-ancestor` answering exactly `True`) before the row
+  says `merged`. The **integration branch is made from the lanes' base**, not
+  from `HEAD`: `worktree.add` grew a `start_point`, so the branch starts where
+  the lanes started even if the operator moved the main checkout meanwhile.
+  **The main checkout's HEAD never moves** and its tree is never touched; the
+  integration checkout is retired at the end and its branch survives as the
+  deliverable (`git switch lint/<mission>/integration`, which the report
+  prints). The incumbent mn9 policy in `mindnet/orchestrator.py` is unchanged.
+  One rule was added to `worktree.state` for this: `__pycache__/`,
+  `.pytest_cache/` and their siblings (`CACHE_DIRS`) are not work, because the
+  per-unit gate runs pytest in every lane and without the exemption every
+  merged lane was kept as "uncommitted changes". It is a fixed list, not
+  "anything ignored" — `dist/out.bin` under an ignore rule is still a build
+  the operator asked for, and a test pins that.
+- **The sandbox on the child path.** Landed 2026-09-09 as
+  `orchestrator/fence.py`. What it fixes is a false report, not a missing
+  feature: `LintesterOrchestrator` had carried a `limits` field and printed an
+  `enforcement` on every `Mission` since `run_sandboxed` landed, and **nothing
+  was ever fenced** — `execute_mission` asked `resilience.fencing(self.limits)`,
+  which answers what the PLATFORM can do, while `_run_child` went
+  `mindnet.agent.run` -> `claude_cli.run_headless` -> a bare `subprocess.run`
+  with no job object, no rlimit, and no `_terminate_job`, so a timed-out
+  `claude` also left its grandchildren alive. A mission asking for a ceiling
+  reported `kernel` over a completely unfenced child, which is exactly the
+  laundering `resilience`'s own module docstring forbids.
+  `run_sandboxed` could not simply be called: it owns a whole run and answers a
+  `SandboxResult`, while the child's argv belongs to `claude_cli.run_headless`
+  (the `.CMD` shim, the prompt-via-stdin rule, the `MINDHIVE_HEADLESS`
+  recursion guard, `--resume`) and the caller needs a `CompletedProcess` plus
+  the raised `TimeoutExpired` it maps to exit 124. So **the fence is inverted**:
+  `run_headless` grew a `spawn=` seam (appended last, default resolved at CALL
+  time so the module attribute every test patches still wins), `mindnet/agent.py`
+  forwards it on every hop of a rotation chain, and `Fence.spawn` is a
+  `subprocess.run`-shaped callable composing exactly what `run_sandboxed`
+  composes — `_preexec_for`, `_job_for`, `_run_capped`, `_close_job` — and
+  nothing else. **The prediction may only get worse:** `Fence.enforcement`
+  starts at `fencing`'s answer and every spawn can only downgrade it, never
+  upgrade it, because a clean run proves only that THAT child was held and one
+  child that escaped is enough to make `kernel` false for the mission; the first
+  downgrade's reason is kept, since it names the cause rather than the latest
+  symptom. `execute_mission` rebinds the verdict as soon as `_subtasks` returns
+  and again once the lanes have run; only the empty-intent refusal still carries
+  the prediction, and it is the one return where nothing has been spawned.
+  `hive lintester --memory-mb` / `--cpu-seconds` are the front door; the library
+  still takes a `Limits`, and zero on both is `Limits.empty`, for which no fence
+  is built at all so the default run makes byte for byte the call it always
+  made. One trap is pinned by a canary: `jobs._job_for` answers `(None, "")` on
+  POSIX — deliberately not a downgrade, because `_preexec_for`'s `setrlimit`
+  closure is what fences there — so a fence that built a job and forgot the
+  `preexec_fn` would have reported `kernel` on Linux over a child holding no
+  ceiling at all, this same defect one layer up.
+  **Two more instances of that same defect were found by adversarial review of
+  the diff, before it was committed, and both are fixed here.** The
+  decomposition agent — the FIRST `claude` of every real mission — went through
+  `mindnet.decompose.run`, which had no `spawn` parameter at all, so a mission
+  could hold all four lanes to the ceiling and still report `kernel` over an
+  unfenced child; `decompose.run` now takes `spawn` and forwards it only when it
+  is not None, leaving every pre-fence caller and injected runner on the call it
+  always made. And `_spawn`'s lazy `Fence` build was an unguarded check-then-set
+  reached from the scheduler's worker threads: `Fence()` costs ~3 ms because
+  `fencing` probes `import resource` and calls kernel32 through ctypes, both of
+  which release the GIL, and four lanes released together built more than one
+  fence in 200 of 200 measured rounds — every fence but the last orphaned, and
+  an orphaned fence's downgrade is a downgrade nothing reports. It is built
+  under a lock now, and `Fence`'s own counters and verdict under a second one,
+  because `_downgrade` is a check-then-act that two lanes could both pass.
+  **What the verdict does NOT cover** is the breaker's reflection: `RepairLoop`
+  calls the injected reflector, which reaches `run_headless` through
+  `resolve.py` and `reflect.py` with no `spawn=`. That leg is conditional and
+  crosses three modules `hive rules resolve` also uses, so it is stated in
+  `fence.py`'s docstring and open as TODOS #34 rather than half-fixed here.
+- **The two other doors.** Landed 2026-09-09. Soft-deprecate both, code kept,
+  a notice and a toggle, reversible — and the landing is deliberately no larger
+  than that sentence. `mindnet.orchestrator.PRIMARY_DOOR_NOTICE` goes to stderr
+  on every non-JSON `hive mindnet orchestrate` run, dry or `--execute`: the
+  front door moved, this one is kept because the mission pipeline cannot run a
+  declared graph (other modules read one; none of them runs it), its agent
+  children get no permission mode so an agent wave can end with nothing written
+  (TODOS #35),
+  nothing is scheduled for removal. It is a SECOND string beside
+  `MINDNET_ORCHESTRATE_SIGNPOST` rather than a rewrite of it, because the two
+  need different gates — the signpost fires on a dry run only, since an operator
+  who typed `--execute` has already chosen, while the notice has to reach the
+  operator who runs this daily for real. It lives in the mindnet module and not
+  in `__main__.py` because its text names the other command and the registration
+  ratchet caps that file at four such lines, where it already sits.
+  `dashboard.mindswarm_enabled()` reads `MINDHIVE_MINDSWARM` (default **ON**,
+  off via `0`/`false`/`off`/`no` — `_auto_harvest_loop`'s vocabulary) and hides
+  the nav ROW only. Read per request rather than captured at import, which
+  keeps the value out of a module constant frozen before argv is parsed — it
+  does **not** let an operator flip the variable under a running dashboard,
+  whose environment is fixed at launch, and an earlier draft of this bullet
+  promised that it did. `/api/workspace/swarm`, `swarm_page.render_swarm` and
+  `showWorkspace` are untouched: the route is proven by dialling it against a
+  live server with the row hidden, and `showWorkspace` against the function
+  DEFINITION in `dashboard_js_views.JS`. The first version of that second
+  assertion matched the bare name, which two nav buttons, the hidden-row note
+  and two `dashboard_js_core.py` comments also carry — it passed with the whole
+  JS module blanked, and said in its own docstring that it could not. **What
+  this does NOT do** is measure whether anyone reads either message: a stderr
+  paragraph and a `title=` attribute have no read receipt and emit no event, so
+  there is no way to see traffic move. That, and five smaller stated gaps, are
+  TODOS #35.
+  Corrected in passing: `orchestrator/__init__.py`'s module map claimed
+  `lintester.py -> … / orchestrator`, and no import backs it — the two run loops
+  are siblings that read different inputs, not layers.
 
 ---
 

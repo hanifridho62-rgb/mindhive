@@ -127,6 +127,27 @@ OUTCOME_AWAITING_VALIDATION = "awaiting-validation"
 OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
             OUTCOME_USAGE, OUTCOME_AWAITING_VALIDATION)
 
+# Printed by `cmd_mindnet_orchestrate` on every non-JSON run, dry or not. It
+# lives HERE because it names the other command and `test_cli_lintester.py` caps
+# how many lines of `__main__.py` may — a notice is not wiring, and the cap is
+# for wiring. SOFT carries the contract: nothing is removed, disabled, or
+# scheduled for either. "Use the other one instead" would be false: the mission
+# pipeline never folds a declared graph (`controller`, `briefcli`, `decompose`
+# and `ab` read one; none of them runs it). "Still supported" overpromised: the
+# agent runner gets no `permission_mode`, and a child without one had its Write
+# declined (probe 2026-09-13). Loud, not silent: a clean exit is ran-unverified,
+# so the run ends awaiting validation with exit 1, but the wave wrote nothing.
+# `test_the_notice_matches_the_agent_runners_posture` ties the warning to that
+# code. `MINDNET_ORCHESTRATE_SIGNPOST` says which input each takes, on the dry
+# run: two strings because they need two gates.
+PRIMARY_DOOR_NOTICE = (
+    "notice: `hive mindnet orchestrate` is no longer the front door — new work "
+    "goes through `hive lintester \"<intent>\"`, which owns the mission "
+    "pipeline. Kept, because that pipeline builds its own graph and cannot run "
+    "one you declared — but its agent children are spawned with no permission "
+    "mode, so an agent wave can end with nothing written. Nothing here is "
+    "scheduled for removal.")
+
 # The bounded retry for a `git worktree add` that git itself refused. Bounded, and
 # INSIDE the wave: a retry scheduled for "the next wave" can never run, because a
 # failed isolation writes no status row, so `before == after` and this wave is the

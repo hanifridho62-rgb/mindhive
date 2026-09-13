@@ -295,23 +295,131 @@ every telemetry event is hashed and re-hashed in full by every `hive verify`.
 Volume is therefore a real cost of a high-frequency type (`mindnet_activity`
 being the one to watch); bound it at the emitter.
 
-**The checkpoint seals whole SECONDS, not event counts.** `read_all` orders rows
-by `(ts, segment_name, line_index)` — total and deterministic for a given set of
-files, but **not append-monotonic**: ledger timestamps are second-resolution and
-the tie-break is the segment's filename, so an event appended later with a `ts`
-equal to already-sealed rows can sort *before* them. A checkpoint whose boundary
-sat inside such a group was invalidated by the next arrival in that same second,
-which kept `hive verify` red permanently — and an alarm that is always red
-attests to nothing, because a real tamper cannot be told apart from the standing
-failure. `chain.sealable` therefore ends the stamped prefix at a second boundary.
+**The checkpoint seals PER-SEGMENT LINE COUNTS, and folds in append order.**
+`chain.json` is v2: `{version, count, head, segments}`, where `segments` maps
+each segment filename to the number of COMPLETE (newline-terminated) lines it
+held at seal time. `chain.verify` re-folds exactly those lines, ordered by
+`(segment, line_index)`. Two properties make that safe, and they are the whole
+guarantee: appending to a segment cannot change that segment's earlier lines,
+and a brand-new segment is simply absent from the map. So the checkpoint
+attests to the **entire complete log** — there is no unattested trailing
+window, and a tamper anywhere in it is caught.
 
-Two consequences follow, and both are intended. Events in the newest second are
-**unattested** until a later projection seals them, so `ahead` is the normal
-steady state and a tamper confined to that window is not caught until the next
-projection. A store written entirely within one second seals nothing (count 0,
-the zero digest) — the correct answer rather than a case to special-case around.
-Removing the window entirely needs an append-monotonic order (a sequence number
-or sub-second timestamps), which would re-base every chain head ever computed.
+This replaced a ts-ordered fold, and the reason is that **`ts` is not append
+order and never was**. `events.append_event` takes `ts` as a CALLER parameter:
+`incidents.audit` backdates `rule_expired` / `rule_activated` to the failure's
+own ts on purpose, and `hookcapture` stamps `ts=now` before slow work and
+before it contends for the append lock. Measured on the live store: 8,547 rows
+whose `ts` runs backwards against their physical position. Every one of them
+sorted INSIDE the sealed prefix, so `hive verify` flapped — `ok: true`, then
+`{"ok": false, "reason": "hash_mismatch"}` twenty minutes later with nothing
+tampered, then green again after the next projection. A flickering alarm is
+worse than a permanently red one: it trains the reader to ignore it, and a real
+tamper hides in the noise.
+
+`chain.sealable` — which ended the stamped prefix at a second boundary — was an
+earlier, partial answer to the same defect. It fixed the same-SECOND tie and
+could not fix an earlier-second arrival, because no ts-based boundary can.
+Nothing in `src/` calls it now — `chain._verify_v1` folds `read_all` against the
+stored count directly — and it survives only in `tests/test_chain.py`, where it
+is the honest way to BUILD a v1 checkpoint for the shim's own tests.
+
+**A v1 checkpoint keeps the old behaviour, including the flapping.**
+`_verify_v1` is the ts-ordered check, run so a store the old code anchored is
+VERIFIED rather than falsely alarmed at; it does not repair anything. When this
+landed all 67 `chain.json` files under `~/.mindhive/` were v1, so every
+namespace takes that path until something re-anchors it, and a namespace nothing
+writes to any more never will. One `hive project` against it is the fix.
+
+**`verify` dispatches on the declared `version`, never on the shape of
+`segments`.** Shape-dispatch was the first draft and it was a tamper-evidence
+hole: replacing a v2 file's `segments` map with `[]`, `"x"`, `5` or `null` fell
+through to the v1 shim — which never reads `segments` — and returned `ok: true`
+off the weaker check. Anyone able to write `chain.json` could downgrade the audit
+by deleting one key. So: no `version` and no `segments` → genuine v1, take the
+shim; `version: 2` → the v2 check, and a missing or non-dict `segments` is
+`corrupt_chain_file`; a `segments` key with no `version` is a wrecked v2 file,
+not a legacy one; anything else — a newer version, a string, a bool (`True == 1`
+in Python) — is `unsupported_checkpoint_version`, which is neither a green nor a
+claim that the ledger is wrong.
+
+Two costs, both accepted. Re-anchoring re-bases every chain head ever computed,
+which is a one-time rewrite of `chain.json` and nothing else — no other artifact
+stores a head. And `write_chain` / `verify` now scan the segments themselves,
+because `read_all` discards the segment and line index the checkpoint is defined
+by; measured on the live store that is *not* a regression (4.32s against the old
+path's 4.76s), because canonicalising once and folding twice off a single read
+is cheaper than the fold it replaced.
+
+**A ledger row ends at `\n`, and at nothing else. Every TOTAL reader splits
+through one function, `events._segment_lines`; `chain._scan` is a fifth reader
+that splits inline by the same rule, because it also needs each segment's count
+of COMPLETE lines — a different return shape, not a different rule.** `str.splitlines()` — what `read_all`,
+`read_types`, `corrupt_rows` and `pgmirror.scan_segments` all used until
+2026-09-10 — also breaks on U+0085, U+2028, U+2029, U+000B, U+000C and
+U+001C–U+001E. Exactly **three** of those reach a segment: `canonical_json`
+writes with `ensure_ascii=False`, so U+0085/U+2028/U+2029 land raw, while the
+five below U+0020 are escaped because JSON forbids them unescaped. All three are
+legal inside a JSON string and `json.loads` accepts them, so a row carrying one
+is INTACT on disk and only the reader destroyed it.
+
+What that cost, measured on three events with one U+2028 in the middle one:
+`read_all` returned **two** — the event was invisible to every projection, the
+briefing and the mirror — `corrupt_rows` reported **two** torn rows for the one
+intact event, and every later row in that segment shifted index by one,
+including `seg_line`, which Postgres stores as part of
+`UNIQUE (project, segment, seg_line)` and of `event_embeddings`' primary key.
+Nothing would have caught the drift: `pgmirror.parity` folds Events and discards
+the index, and the staleness fingerprint is `st_size` per segment, which a
+split-semantics change leaves untouched. One stale name survives this on purpose:
+`pgmigrations/001_schema.sql` still describes `seg_line` as "the 0-based index
+from `enumerate(splitlines())`". Everything that comment asserts about the COLUMN
+is still exact — 0-based, blank and malformed lines counted — only the function
+name has moved. It is left alone because `apply_migrations` records a sha256 per
+migration file and refuses any already-applied file whose bytes changed, so
+editing a comment in 001 would take every existing mirror down. The name is
+corrected here instead; do not correct it there. The chain saw it differently again —
+`chain._scan` sealed all three while recording a line count of three — and two
+readers disagreeing about where a row ends is how a hash chain stops meaning
+anything.
+
+Indices are unchanged on any segment carrying none of the three: verified
+**2026-09-09** across all 74 namespaces of the live store, 2495 segments and
+118,875 rows at the moment of the check — identical indices and an identical
+chain head under both splits — so the fix renumbered nothing already stored and
+needed no `hive pg rebuild`. Those totals date the check; they are not a figure
+to re-assert. The store is live and grows by the hour: a re-count two minutes
+later read 119,349 and then 119,575. What the check establishes is a property of
+the two splitters over rows that carry none of the three separators, and that
+property does not expire when the row count moves.
+
+That last point is worth stating as an argument rather than as a measurement,
+because a measurement of a growing store only ever covers the past. An
+independent re-run on 2026-09-13 replayed both splits over 2522 segments and
+120,576 rows and again found zero divergence — and that zero is retroactive, not
+a snapshot: `append_event` is the only writer, it opens the segment in mode
+`"a"`, so no byte already on disk can change. A row that reads identically under
+both splits today read identically under both splits the day it was written.
+`hive pg rebuild` is therefore unnecessary as a matter of what append-only
+means, not merely as a matter of what a scan happened to see. Line endings need no handling either;
+`read_text`'s universal-newline decoding turns CRLF and a lone CR into `\n`
+before any split, which matters because `append_event` opens the segment in text
+mode and Windows therefore writes CRLF.
+
+**`canonical_json` was deliberately NOT changed to escape them.** It is the
+ledger's one serialiser and the bytes the hash chain covers, so it is the
+highest-blast-radius edit available here, and escaping at the writer fixes
+nothing: a row that already carries a raw separator — from a torn write, an
+older writer, a hand-edit — still has to be read correctly. It would also leave
+the readers wrong while making the bug unreachable through the normal writer,
+which is the wrong-but-consistent state `pgmirror.scan_segments`' docstring
+exists to warn about. The one genuine JavaScript hazard — U+2028/U+2029 are line
+terminators in JS source — was closed where it lives instead: `graphview`
+escapes them in the graph blob, which is the only place ledger prose is embedded
+in an HTML document. That blob sits in a `type="application/json"` data block
+read back with `JSON.parse`, so it was already inert; but the reader fix is what
+first made a separator-bearing row able to reach it at all, and the escape makes
+the guarantee local to the string instead of a property of a template far away.
 
 ### 3.1 Merge exemptions (both lists, or it is not exempt)
 
@@ -800,6 +908,21 @@ the legend opened their panel off screen and their task id — the thing you cli
 — could not be read.
 
 ### 4.6 The MN-7 orchestrator: waves over the graph
+
+> **Soft-deprecated as a front door (2026-09-09), not as a mechanism.** New work
+> goes through the lintester mission pipeline; `hive mindnet orchestrate` prints
+> `mindnet.orchestrator.PRIMARY_DOOR_NOTICE` on every non-JSON run and is kept,
+> unchanged: the mission pipeline builds its own graph from an intent and never
+> folds a declared one, so it cannot run what this runs. Everything this
+> section specifies — the wave loop, the outcomes, the exit codes — still holds.
+>
+> **Kept is not "supported" (2026-09-13).** The agent runner's `runner_kwargs`
+> carries no `permission_mode`, and a headless child with none had its Write
+> declined and still exited 0. The loop above stays honest about that — a clean
+> exit is `ran-unverified`, which writes no status row, so the run ends
+> `awaiting-validation` with exit 1 — but an agent wave here can end with nothing
+> written. The notice says so now; giving these children a posture is open in
+> TODOS #35, not done.
 
 `hive mindnet orchestrate` walks the MN-2 graph in **waves**. One wave = the
 current frontier, run concurrently, then persisted.

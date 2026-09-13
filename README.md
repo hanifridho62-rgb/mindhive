@@ -426,6 +426,17 @@ namespaces). Disable with `MINDHIVE_AUTOHARVEST=0`; tune cadence with
 `MINDHIVE_AUTOHARVEST_SECS` (default 180). Trigger it by hand with the **Catch
 up** button, the `POST /api/harvest` endpoint, or `hive harvest --catch-up`.
 
+**MindSwarm is soft-deprecated, and the toggle is one variable.** New work goes
+through the mission pipeline (`hive lintester "<intent>"`), so the Workspace's
+**MindSwarm** row is no longer a front door. Nothing was removed: the page, the
+`/api/workspace/swarm` route and its renderer all still answer, and the row is
+still shown by default. `MINDHIVE_MINDSWARM=0` (or `false`/`off`/`no`) hides
+just that nav row. Set it in the environment the dashboard is **started** with:
+a running process cannot see a variable you export into a shell afterwards, so
+bringing the row back means restarting with it unset, or set to `1`. `hive
+mindnet orchestrate` carries the same notice on stderr — it is kept because the
+mission pipeline builds its own graph and cannot run one you declared.
+
 **The six long operations are jobs, not requests.** Catch up, Embed, Plugins
 scan, Reflect, Resolve red and Self-test answer **`202 Accepted`** with
 `{"ok": true, "job": {"id": …, "state": "running"}}` and do the work on their own

@@ -41,7 +41,7 @@ from pathlib import Path
 
 import pytest
 
-from mindhive import consolidate, dedupe, events, projector
+from mindhive import chain, consolidate, dedupe, events, pgmirror, projector
 from mindhive.mindnet import phases as p_mod
 from mindhive.mindnet import tasks as t_mod
 
@@ -370,3 +370,125 @@ def test_every_structured_semantic_type_has_a_ledger_body(type_name):
     assert f'ev.type == "{type_name}"' in src, (
         f"{type_name} has no branch in projector.build_ledger_entries, so it "
         "projects an empty LEDGER body and same-second events collide")
+
+
+# --- 5. one decision about where a ledger row ends ---------------------------
+#
+# Drift 3, and like the two above it already happened. Four readers each carried
+# their own `str.splitlines()`. Because `canonical_json` writes with
+# `ensure_ascii=False`, a raw U+0085/U+2028/U+2029 in a payload then split an
+# INTACT row in two: `read_all` dropped the event, `corrupt_rows` invented two
+# torn rows, and every later line index in that segment shifted by one --
+# `seg_line`, the mirror's stored natural key, among them. `chain._scan` split
+# correctly and so disagreed with all four: on a three-row segment it sealed one
+# event while recording a count of three, and the two rows that fell out could
+# be rewritten with `hive verify` still green.
+#
+# The fix was to make the split ONE function, `events._segment_parts`. This
+# guard is what keeps it one, and it pins the RULE rather than an example of it.
+# A fixture test cannot do that job: nothing compares the chain's count with the
+# mirror's index at runtime, each is self-consistent on its own, and a forward
+# edit applied to one splitter and not the other leaves the whole suite green
+# while re-opening exactly that hole.
+#
+# SCOPE, narrow on purpose in the spirit of this file: a module is a ledger
+# reader if it asks for the segment directory, i.e. its source mentions
+# `events_dir(`. That is the set that could fork, and it catches a SIXTH reader
+# on the day someone writes one. Modules that split Claude Code TRANSCRIPTS
+# (`harvest`, `failures`, `taskview`, `rotation.occupancy`) are a different file
+# family with a different contract, and are deliberately out of scope.
+
+_SPLIT_OWNER = "_segment_parts"
+_BS = chr(92)      # the planted sources below must carry a LITERAL backslash-n,
+_Q = chr(34)       # not a real newline: ast.parse must see SOURCE, not text
+
+
+def _line_splitters(src_text):
+    """Every `.splitlines()` and every `.split()` on a literal containing a
+    newline escape, as (lineno, what, enclosing def). Parsed with `ast`, so a
+    mention inside a docstring or a comment -- of which these modules have many,
+    explaining this very rule -- is not a hit."""
+    tree = ast.parse(src_text)
+    owner = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for n in ast.walk(fn):
+                owner.setdefault(id(n), fn.name)
+    out = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+            continue
+        what = None
+        if n.func.attr == "splitlines":
+            what = "splitlines()"
+        elif n.func.attr == "split" and n.args:
+            a = n.args[0]
+            if (isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    and chr(10) in a.value):
+                what = "split(%r)" % a.value
+        if what:
+            out.append((n.lineno, what, owner.get(id(n), "<module>")))
+    return out
+
+
+def _ledger_reader_modules():
+    root = Path(events.__file__).parent
+    return sorted(f for f in root.rglob("*.py")
+                  if "events_dir(" in f.read_text(encoding="utf-8")
+                  and f.name != "paths.py")
+
+
+def test_there_are_ledger_reader_modules_to_guard():
+    """Without this, a glob that silently matched nothing would let the guard
+    below pass by looking nowhere."""
+    mods = [f.name for f in _ledger_reader_modules()]
+    assert {"events.py", "chain.py", "pgmirror.py"} <= set(mods), mods
+
+
+def test_only_one_function_decides_where_a_ledger_row_ends():
+    bad = []
+    for f in _ledger_reader_modules():
+        for lineno, what, fn in _line_splitters(f.read_text(encoding="utf-8")):
+            if fn != _SPLIT_OWNER:
+                bad.append("%s:%d %s in %s()" % (f.name, lineno, what, fn))
+    assert not bad, (
+        "a ledger-segment reader splits lines outside events._segment_parts, "
+        "which is how the chain and the mirror last disagreed about seg_line: "
+        + "; ".join(bad))
+
+
+def test_the_split_owner_is_real_and_is_what_the_readers_call():
+    """The rule above goes vacuous if `_segment_parts` stops existing, stops
+    splitting, or stops being what the readers go through."""
+    assert hasattr(events, _SPLIT_OWNER)
+    assert [w for _, w, fn in _line_splitters(
+        Path(events.__file__).read_text(encoding="utf-8"))
+        if fn == _SPLIT_OWNER], "the split owner no longer splits anything"
+    assert "events._segment_parts(" in Path(
+        chain.__file__).read_text(encoding="utf-8"), (
+        "chain._scan no longer calls the shared splitter")
+    assert "_events._segment_lines(" in Path(
+        pgmirror.__file__).read_text(encoding="utf-8"), (
+        "pgmirror.scan_segments no longer goes through the shared generator")
+
+
+@pytest.mark.parametrize("planted", [
+    "def _scan(seg):{nl}    return seg.read_text().splitlines(){nl}",
+    "def _scan(seg):{nl}    return seg.read_text().split({q}{bs}n{q}){nl}",
+    "def helper(t):{nl}    return t.split({q}{bs}r{bs}n{q}){nl}",
+], ids=["splitlines", "split-lf", "split-crlf"])
+def test_the_splitter_scanner_catches_a_planted_reader(planted):
+    """CANARY. A green run above must mean the scanner looked and found
+    nothing, not that it cannot find anything at all."""
+    src = planted.format(nl=chr(10), q=_Q, bs=_BS)
+    hits = _line_splitters(src)
+    assert hits and all(fn != _SPLIT_OWNER for _, _, fn in hits), (src, hits)
+
+
+def test_the_splitter_scanner_ignores_prose_about_splitting():
+    """The modules it scans are full of docstrings naming `splitlines()` --
+    that is the whole subject of the rule. A scanner that flagged those would be
+    deleted within a week."""
+    prose = ("def f():{nl}    {q}{q}{q}Never use splitlines() here, nor "
+             "x.split({q}{bs}n{q}) -- see DATA_MODEL.{q}{q}{q}{nl}    return 1{nl}")
+    assert _line_splitters(prose.format(nl=chr(10), q=_Q, bs=_BS)) == []

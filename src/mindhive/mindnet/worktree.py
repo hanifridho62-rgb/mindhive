@@ -29,6 +29,16 @@ Every function answers a value; none raises. A `git worktree add` that fails mus
 become one task reporting `skipped`, not an exception that takes down a wave —
 MN-7's P0 taught that an environmental failure which writes a status row removes
 the task's whole subtree from the graph permanently.
+
+## The merge-back's primitives live here too
+
+`commit_all`, `merge_probe`, `merge_into`, `is_ancestor` and `rev_of` exist for
+`orchestrator.integrate`, which commits each validated lane on the child's
+behalf and merges the lanes into an integration branch. They are in this module
+because it is the ONLY git driver: the lock, the timeout, `shell=False`, and
+the refusal to force anything that could lose work are decided once, here.
+`add` grew `start_point` for the same caller. `CACHE_DIRS` names what a test
+run leaves behind, which neither `state` nor `commit_all` treats as work.
 """
 from __future__ import annotations
 
@@ -36,6 +46,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from .. import paths
 
@@ -73,6 +84,16 @@ PREFIX = "mn9"
 
 _TIMEOUT_S = 60
 
+# Directories a test run leaves behind and no task ever asks for. `state` does
+# not count them as work and `commit_all` never commits them: without this,
+# every lane the per-unit gate ran pytest in was kept at teardown as
+# "uncommitted changes" after its work had merged, and a lane whose repository
+# ignores nothing would have committed its bytecode. A fixed list on purpose --
+# "anything ignored" would put `dist/` back on the deletable side, which is the
+# exact rule `state`'s docstring exists to keep.
+CACHE_DIRS = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+              ".hypothesis")
+
 
 @dataclass(frozen=True)
 class Isolated:
@@ -106,21 +127,30 @@ class Retired:
     reason: str = ""
 
 
-def _git(root, *args):
-    """Run one git command in *root*. Answers ``(ok, stdout, stderr)``.
+def _git_rc(root, *args):
+    """Run one git command in *root*. Answers ``(exit_code, stdout, stderr)``.
 
-    ``shell=False`` always (U6's standing rule), and `paths.NO_WINDOW` so a
-    console child spawned from the window-less dashboard process does not flash a
-    console window."""
+    The primitive under `_git`, for the callers that read git's exit code as
+    an answer rather than a verdict: `merge-tree` and `merge-base
+    --is-ancestor` say "no" with 1 and "could not tell" with anything else.
+    ``-1`` when the process could not run at all. ``shell=False`` always (U6's
+    standing rule), and `paths.NO_WINDOW` so a console child spawned from the
+    window-less dashboard process does not flash a console window."""
     try:
         proc = subprocess.run(
             ["git", "-C", str(root), *[str(a) for a in args]],
             capture_output=True, text=True, shell=False, timeout=_TIMEOUT_S,
             creationflags=paths.NO_WINDOW)
-        return (proc.returncode == 0, (proc.stdout or "").strip(),
+        return (proc.returncode, (proc.stdout or "").strip(),
                 (proc.stderr or "").strip())
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, "", f"{type(exc).__name__}: {exc}"
+        return -1, "", f"{type(exc).__name__}: {exc}"
+
+
+def _git(root, *args):
+    """Run one git command in *root*. Answers ``(ok, stdout, stderr)``."""
+    rc, out, err = _git_rc(root, *args)
+    return rc == 0, out, err
 
 
 def branch_for(task_id) -> str:
@@ -131,7 +161,7 @@ def path_for(root, task_id) -> Path:
     return Path(root).joinpath(*WORKTREE_DIR) / f"{PREFIX}-{task_id}"
 
 
-def add(root, task_id, path=None, branch=None) -> Isolated:
+def add(root, task_id, path=None, branch=None, start_point=None) -> Isolated:
     """Create an isolated checkout for *task_id*, or answer why not.
 
     Idempotent in the direction that matters: an existing directory is REFUSED
@@ -150,15 +180,23 @@ def add(root, task_id, path=None, branch=None) -> Isolated:
     committed work reachable, and would drift from them the first time one
     changed.
 
+    *start_point* is the merge-back's one addition: the commit the branch is
+    made from and recorded as `base`, instead of `HEAD`. `orchestrator.integrate`
+    makes its integration checkout from the lanes' common base with it, so the
+    branch a person picks up starts where the lanes started even when the main
+    checkout has moved on. Absent, the git commands are the ones this function
+    has always run, byte for byte.
+
     Serialised against every other call into this module — see `_GIT_LOCK`."""
     with _GIT_LOCK:
-        return _add(root, task_id, path, branch)
+        return _add(root, task_id, path, branch, start_point)
 
 
-def _add(root, task_id, path=None, branch=None) -> Isolated:
+def _add(root, task_id, path=None, branch=None, start_point=None) -> Isolated:
     """`add`'s body. Split out only so the lock's extent is one readable line
     rather than an indent wrapping fifty."""
     tid = str(task_id)
+    start = str(start_point) if start_point else "HEAD"
     target = Path(path) if path else path_for(root, tid)
     branch = str(branch) if branch else branch_for(tid)
 
@@ -171,10 +209,10 @@ def _add(root, task_id, path=None, branch=None) -> Isolated:
     # The base is captured BEFORE the worktree exists, because "ahead" is only
     # meaningful relative to where the branch started. Deriving it later is not
     # possible without guessing which branch was the parent.
-    base_ok, base, base_err = _git(root, "rev-parse", "HEAD")
+    base_ok, base, base_err = _git(root, "rev-parse", start)
     if not base_ok:
         return Isolated(task_id=tid, path=str(target), branch=branch, ok=False,
-                        reason=base_err or "cannot resolve HEAD to branch from")
+                        reason=base_err or f"cannot resolve {start} to branch from")
 
     # A leftover branch from an earlier retired run must not make every future run
     # of this task fail — but resetting one that HOLDS COMMITS destroys them.
@@ -187,7 +225,7 @@ def _add(root, task_id, path=None, branch=None) -> Isolated:
     # So: reset only a branch with nothing on it, and refuse otherwise.
     has_branch, _o, _e = _git(root, "rev-parse", "--verify", "--quiet", branch)
     if has_branch:
-        _ok2, count, _e2 = _git(root, "rev-list", "--count", f"HEAD..{branch}")
+        _ok2, count, _e2 = _git(root, "rev-list", "--count", f"{start}..{branch}")
         try:
             unmerged = int((count or "0").strip() or 0)
         except ValueError:
@@ -197,7 +235,7 @@ def _add(root, task_id, path=None, branch=None) -> Isolated:
                 task_id=tid, path=str(target), branch=branch, base=base,
                 ok=False,
                 reason=(f"branch {branch} already holds {unmerged} commit(s) "
-                        f"that {'HEAD'} does not. Resetting it would make them "
+                        f"that {start} does not. Resetting it would make them "
                         f"unreachable — merge or rename it first "
                         f"(`git log {branch}`), then re-run"))
 
@@ -213,7 +251,8 @@ def _add(root, task_id, path=None, branch=None) -> Isolated:
                         reason=f"cannot create {target.parent}: "
                                f"{type(exc).__name__}: {exc}")
 
-    ok, _out, err = _git(root, "worktree", "add", "-B", branch, str(target))
+    ok, _out, err = _git(root, "worktree", "add", "-B", branch, str(target),
+                         *([start] if start_point else []))
     if not ok:
         # The ONLY retryable path. Everything above is a decision this module
         # made deliberately; this is git reporting that it could not do the work,
@@ -224,6 +263,19 @@ def _add(root, task_id, path=None, branch=None) -> Isolated:
                         reason=err or "git worktree add failed")
     return Isolated(task_id=tid, path=str(target), branch=branch, base=base,
                     ok=True)
+
+
+def _is_work(line) -> bool:
+    """Whether one `status --porcelain` line names work. An untracked (`??`)
+    or ignored (`!!`) entry under one of `CACHE_DIRS` does not; everything
+    else does, including a tracked change anywhere."""
+    text = line.strip()
+    if not text:
+        return False
+    if text[:2] not in ("??", "!!"):
+        return True
+    rel = text[2:].strip().strip('"').replace("\\", "/")
+    return not any(part in CACHE_DIRS for part in rel.strip("/").split("/"))
 
 
 def state(path, base="") -> tuple:
@@ -243,12 +295,21 @@ def state(path, base="") -> tuple:
     worktree read as "ahead" and `retire` never removed anything. Without a base
     this answers 0 and the dirty check carries the guard alone.
 
+    The one exemption is `CACHE_DIRS`: an untracked or ignored entry under
+    `__pycache__/`, `.pytest_cache/` and the like is what a test run leaves
+    behind, never a task's output, and counting it kept every gated lane on
+    disk after its work had merged. A tracked change anywhere still counts.
+
     Answers ``(True, 0)`` when it cannot tell at all. Unknown must read as "there
     may be work here", because the only consumer is the decision to delete."""
-    ok, out, _err = _git(path, "status", "--porcelain", "--ignored=matching")
+    # `-uall` lists untracked FILES, not the directories collapsing them: a
+    # lane's only leftovers are `src/__pycache__/*.pyc`, and collapsed to
+    # `?? src/` the cache exemption below could never see them.
+    ok, out, _err = _git(path, "status", "--porcelain", "--ignored=matching",
+                         "-uall")
     if not ok:
         return True, 0
-    dirty = bool(out.strip())
+    dirty = any(_is_work(line) for line in out.splitlines())
     ahead = 0
     if base:
         ok2, out2, _err2 = _git(path, "rev-list", "--count", f"{base}..HEAD")
@@ -343,3 +404,152 @@ def changed_files(path):
         if rel:
             out.append(rel)
     return tuple(dict.fromkeys(out))
+# --- the merge-back's primitives ------------------------------------------------
+#
+# Added for `orchestrator.integrate`, and here rather than there because this
+# module is the only git driver: the lock, the timeout, `shell=False`, and the
+# refusal to force anything that could lose work are decided once, in one
+# file. Each answers a value and never raises.
+
+
+class Committed(NamedTuple):
+    """What `commit_all` did. ``changed=False`` with ``ok=True`` is a recorded
+    no-op: nothing to commit is not a failure."""
+
+    ok: bool = False
+    sha: str = ""
+    changed: bool = False
+    reason: str = ""
+
+
+def commit_all(path, message) -> Committed:
+    """Commit everything in the checkout at *path* -- tracked changes and
+    untracked files alike, except `CACHE_DIRS` -- as one commit with *message*.
+
+    `add -A` with the caches excluded, then `diff --cached --quiet` to learn
+    whether anything was staged at all: a tree whose only additions are
+    bytecode answers ``changed=False`` rather than failing at `commit` with
+    "nothing to commit". Identity, hooks and the operator's config bind this
+    exactly as they bind a person: a refusing hook or a missing identity comes
+    back as git's own reason, and nothing here bypasses either."""
+    excludes = [f":(exclude,glob)**/{d}/**" for d in CACHE_DIRS]
+    with _GIT_LOCK:
+        ok, _out, err = _git(path, "add", "-A", "--", ".", *excludes)
+        if not ok:
+            return Committed(reason=f"git add failed: {err or 'no reason'}")
+        rc, _out, err = _git_rc(path, "diff", "--cached", "--quiet")
+        if rc == 0:
+            ok, sha, _err = _git(path, "rev-parse", "HEAD")
+            return Committed(ok=True, sha=sha if ok else "", changed=False,
+                             reason="nothing to commit")
+        if rc != 1:
+            return Committed(reason=f"git diff --cached failed: "
+                                    f"{err or 'no reason'}")
+        ok, out, err = _git(path, "commit", "-q", "-m", str(message))
+        if not ok:
+            return Committed(reason=f"git commit failed: "
+                                    f"{err or out or 'no reason'}")
+        ok, sha, err = _git(path, "rev-parse", "HEAD")
+    if not ok:
+        return Committed(ok=True, changed=True,
+                         reason=f"committed, but HEAD could not be read: {err}")
+    return Committed(ok=True, sha=sha, changed=True)
+
+
+def _is_oid(text) -> bool:
+    """Whether *text* is an object name git just printed (sha-1 or sha-256)."""
+    return len(text) in (40, 64) and all(c in "0123456789abcdef" for c in text)
+
+
+class Probe(NamedTuple):
+    """What `merge_probe` found. ``clean`` is ``True``, ``False`` or ``None``
+    -- three answers, because "could not tell" must never read as "no"."""
+
+    clean: object = None
+    conflicts: tuple = ()
+    tree: str = ""
+    reason: str = ""
+
+
+def merge_probe(path, branch) -> Probe:
+    """Would merging *branch* into the checkout at *path* conflict? Answered
+    WITHOUT touching HEAD, the index or the working tree.
+
+    `git merge-tree --write-tree` (git 2.38+) performs the merge in the object
+    database only: exit 0 is a clean merge with the tree it would make, exit 1
+    lists the conflicting paths (`--name-only`), anything else is a probe that
+    could not run. The plan's U15 discipline in one call: the answer to "does
+    this conflict" is obtained before anything is mutated."""
+    with _GIT_LOCK:
+        rc, out, err = _git_rc(path, "merge-tree", "--write-tree",
+                               "--name-only", "HEAD", str(branch))
+    if rc == 0:
+        lines = out.splitlines()
+        return Probe(clean=True, tree=(lines[0].strip() if lines else ""))
+    if rc == 1:
+        # The tree, then one conflicted path per line, then a blank line and
+        # git's informational messages.
+        head, _sep, _info = out.partition("\n\n")
+        rows = [ln.strip() for ln in head.splitlines() if ln.strip()]
+        # Exit 1 is ALSO how an unknown ref comes back, with nothing on
+        # stdout. A real conflict always prints the tree it made first, so
+        # that oid is what separates "conflicts" from "could not tell".
+        if not rows or not _is_oid(rows[0]):
+            return Probe(clean=None, reason=(err or out or "git merge-tree "
+                                             "exited 1 without a tree"))
+        conflicts = tuple(dict.fromkeys(rows[1:]))
+        return Probe(clean=False, conflicts=conflicts, tree=rows[0],
+                     reason=(f"{len(conflicts)} conflicting path(s): "
+                             + ", ".join(conflicts)))
+    return Probe(clean=None, reason=err or out or f"git merge-tree exited {rc}")
+
+
+class Merged(NamedTuple):
+    """What `merge_into` did."""
+
+    ok: bool = False
+    sha: str = ""
+    reason: str = ""
+
+
+def merge_into(path, branch, message) -> Merged:
+    """Merge *branch* into the checkout at *path* as a merge commit, or leave
+    the tree exactly as it was.
+
+    `--no-ff` always: a fast-forward would leave no commit that says which lane
+    this was, and the integration branch is read by a person. A merge that
+    fails for any reason -- a conflict the probe should have caught, a hook, a
+    dirty index -- is aborted before it is reported, so the checkout is never
+    left mid-merge for the next lane to trip over."""
+    with _GIT_LOCK:
+        ok, out, err = _git(path, "merge", "--no-ff", "--no-edit", "-m",
+                            str(message), str(branch))
+        if not ok:
+            _git(path, "merge", "--abort")
+            return Merged(reason=err or out or "git merge failed")
+        ok, sha, _err = _git(path, "rev-parse", "HEAD")
+    return Merged(ok=True, sha=sha if ok else "")
+
+
+def is_ancestor(root, ancestor, ref):
+    """Whether *ancestor* is reachable from *ref*: ``True``, ``False``, or
+    ``None`` when git could not answer (an unknown ref, a repository that
+    would not open). `merge-base --is-ancestor` exits 0, 1 or something else
+    for exactly those three, and the third must never be read as the second:
+    this is the merge-back's proof that a lane really landed."""
+    with _GIT_LOCK:
+        rc, _out, _err = _git_rc(root, "merge-base", "--is-ancestor",
+                                 str(ancestor), str(ref))
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
+def rev_of(root, ref) -> str:
+    """The commit *ref* names, or ``""``."""
+    with _GIT_LOCK:
+        ok, out, _err = _git(root, "rev-parse", "--verify", "--quiet",
+                             f"{ref}^{{commit}}")
+    return out.strip() if ok else ""

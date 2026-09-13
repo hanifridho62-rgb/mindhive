@@ -2181,26 +2181,31 @@ def cmd_mindnet_orchestrate(args) -> int | None:
     zero exit would let a wrapping CI step pass while the graph is stuck, gave
     up, or holds agent output nothing has verified. See DATA_MODEL.md §4.6.
 
-    **The Lintester signpost, and what it deliberately does not say.** There are
-    two orchestrators now, and an operator who does not know that will keep
-    using whichever one they found first. So a dry run names the other and says
-    what it takes — the wording itself is `MINDNET_ORCHESTRATE_SIGNPOST`, so
-    this paragraph does not carry a second copy of the command name. The
-    registration ratchet counts every mention in this file, and prose that
-    repeats the wiring is still a line that can drift from it. It does
-    NOT say "deprecated" and does not point users away: the two take
-    DIFFERENT inputs — this one walks a task graph somebody declared, the
-    other decomposes one intent sentence — so neither is a drop-in for the
-    other, and a notice claiming otherwise would send an operator with a
-    declared graph to a command that cannot read it.
+    **Soft-deprecated: what that means, and what it deliberately still does
+    not say.** Every non-JSON run opens with the mindnet orchestrator's own
+    `PRIMARY_DOOR_NOTICE` — new work goes through the mission pipeline, and
+    this command is no longer where the machine is developed. It is NOT
+    removed, disabled, or scheduled for either, and it does not say "use the
+    other one instead": the two take DIFFERENT inputs — this one walks a task
+    graph somebody declared, the other decomposes one intent sentence — so a
+    redirect would send an operator with a declared graph to a command that
+    cannot read it. That fact is what `MINDNET_ORCHESTRATE_SIGNPOST` says,
+    after the notice, on a dry run. The notice's own wording lives in the
+    mindnet module (the signpost's is right above this function) so that this
+    paragraph carries no second copy of the other command's name: the ratchet
+    counts every mention in this file, and prose drifts from wiring.
 
-    On the dry run only, and on stderr. Every run prints it and `--json` would
-    stop parsing."""
+    Notice on every run, signpost on the dry run only, both on stderr — stdout
+    is the report, and under `--json` neither is printed at all."""
     from dataclasses import asdict
     from .mindnet import agent as ag_mod
     from .mindnet import executor as x_mod
     from .mindnet import orchestrator as orc_mod
     from .mindnet import tasks as t_mod
+    # Before ANY branch: the no-tasks return below is a newcomer's likeliest
+    # run and it points them DEEPER into this door, so it must carry the notice.
+    if not args.json:
+        print(orc_mod.PRIMARY_DOOR_NOTICE, file=sys.stderr)
     project = getattr(args, "project", None)
     tasks = t_mod.fold(events.read_all(project))
     if not tasks:
@@ -3810,7 +3815,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # orchestrator, and a second copy in the parser is a place for it to drift.
     mno = mnsub.add_parser("orchestrate", help="walk the graph in waves, "
                            "running every unblocked task concurrently (a DRY "
-                           "RUN unless --execute is given)")
+                           "RUN unless --execute is given; kept, but no "
+                           "longer the front door)")
     mno.add_argument("--execute", action="store_true",
                      help="actually run the tasks. Without this the command "
                           "plans the waves and starts nothing")

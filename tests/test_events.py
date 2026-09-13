@@ -1,4 +1,6 @@
 # tests/test_events.py
+import pytest
+
 from mindhive import events, paths
 
 
@@ -244,3 +246,142 @@ def test_concurrent_appends_never_lose_or_tear_a_row(tmp_path):
         "%d of %d appended rows never reached the ledger — the append raced"
         % (len(missing), len(expected)))
     assert events.corrupt_rows("test") == [], "concurrent appends tore a row"
+
+
+# --- where a ledger row ends --------------------------------------------------
+#
+# The ledger is NEWLINE-delimited JSON, but every reader here used
+# `str.splitlines()` until 2026-09-10. That also breaks on U+0085, U+2028,
+# U+2029 and five C0 controls, and `canonical_json` writes with
+# `ensure_ascii=False`, so three of them reach a segment RAW through the
+# ordinary writer. All three are legal inside a JSON string -- the row on disk
+# was intact and only the reader destroyed it: the event vanished from
+# `read_all` (and so from every projection, the briefing and the mirror),
+# `corrupt_rows` invented two torn rows for it, and every later row's line index
+# shifted by one, including `seg_line`, which Postgres stores as part of a
+# UNIQUE natural key.
+#
+# Most of the tests below are written to FAIL on `splitlines()` and pass on the
+# shared `_segment_lines` splitter. Verified that way rather than asserted:
+# mutating the one `.split("\n")` in `events._segment_parts` -- the single
+# place that decides where a ledger row ends -- back to `.splitlines()` fails
+# 30 cases: 13 of the 18 here, 2 in test_pgmirror.py and 15 in test_chain.py.
+# The chain count is that high because the split is now SHARED, so the seal
+# tests defend the readers' rule too; before the shared seam they would all
+# have stayed green while these went red, which is the drift
+# tests/test_architecture_drift.py now forbids outright. The other 5 here pass
+# either way, deliberately:
+#
+#   * the fixture canary (3 cases) and the canonical_json survey guard the OTHER
+#     way this section could go quiet. If a writer ever started escaping these
+#     characters, every test above would become vacuous while staying green;
+#     these two go red instead.
+#   * the blank-line test pins a property, not the defect. Both splitters agree
+#     about a blank line -- that is the point. It is the one guarantee
+#     `_segment_lines` makes that no exotic character is needed to state.
+
+RAW_SEPARATORS = ["\u2028", "\u2029", "\u0085"]      # and ONLY these three -- see the
+ESCAPED_BY_JSON = ["\u000b", "\u000c", "\u001c", "\u001d", "\u001e"]   # test two below
+
+
+@pytest.mark.parametrize("sep", RAW_SEPARATORS, ids=["LS", "PS", "NEL"])
+def test_the_separator_fixture_is_written_raw_and_fools_splitlines(sep):
+    """CANARY for every test below it. They are only discriminating while the
+    writer actually puts the character on disk unescaped; flip `ensure_ascii` and
+    they all quietly become three-event tests that pass against the defect."""
+    events.append_event("decision", {"text": "mid" + sep + "dle"},
+                        session_id="s", ts="2026-06-20T10:00:00Z")
+    text = (paths.events_dir("test") / "s.jsonl").read_text(encoding="utf-8")
+    assert sep in text                          # raw, not the six-char escape
+    assert len(text.splitlines()) > text.count("\n")
+
+
+def test_only_three_separators_survive_canonical_json():
+    """The other five are below U+0020, which JSON forbids unescaped, so
+    `json.dumps` escapes them whatever `ensure_ascii` says -- they can never
+    arrive as separators. Pinning that keeps the docstrings honest and stops the
+    fixture list above growing on a guess."""
+    for ch in RAW_SEPARATORS:
+        assert ch in events.canonical_json({"t": ch}), repr(ch)
+    for ch in ESCAPED_BY_JSON:
+        assert ch not in events.canonical_json({"t": ch}), repr(ch)
+
+
+@pytest.mark.parametrize("sep", RAW_SEPARATORS, ids=["LS", "PS", "NEL"])
+def test_read_all_returns_a_separator_bearing_row_as_one_event(sep):
+    """The defect in its plainest form: three events written, two read back."""
+    for i, text in enumerate(["before", "mid" + sep + "dle", "after"]):
+        events.append_event("decision", {"text": text}, session_id="s",
+                            ts="2026-06-20T10:00:0%d" % i + "Z")
+    assert [e.payload["text"] for e in events.read_all("test")] == [
+        "before", "mid" + sep + "dle", "after"]
+
+
+@pytest.mark.parametrize("sep", RAW_SEPARATORS, ids=["LS", "PS", "NEL"])
+def test_read_types_sees_the_same_rows_read_all_does(sep):
+    """The `== read_all()` half alone is NOT discriminating -- both readers broke
+    identically, which is why the existing typed-read parity test could not catch
+    this. The count assertion is what makes it one."""
+    for i, text in enumerate(["before", "mid" + sep + "dle", "after"]):
+        events.append_event("decision", {"text": text}, session_id="s",
+                            ts="2026-06-20T10:00:0%d" % i + "Z")
+    typed = events.read_types(["decision"], "test")
+    assert typed == events.read_all("test")
+    assert len(typed) == 3
+
+
+@pytest.mark.parametrize("sep", RAW_SEPARATORS, ids=["LS", "PS", "NEL"])
+def test_a_separator_bearing_row_is_not_reported_as_two_torn_rows(sep):
+    """`corrupt_rows`' count is a documented regression detector -- if it moves,
+    an unserialised writer exists again. A reader that tears intact rows makes it
+    move for a reason that has nothing to do with writers."""
+    events.append_event("decision", {"text": "mid" + sep + "dle"},
+                        session_id="s", ts="2026-06-20T10:00:00Z")
+    assert events.corrupt_rows("test") == []
+
+
+def test_corrupt_rows_line_is_the_physical_newline_index():
+    """The reported `line` must be the newline index a human can find with
+    `sed -n <n+1>p`, and the same number `pgmirror.scan_segments` stores as
+    `seg_line`. With `splitlines()` the intact row above counted as two, so the
+    genuinely broken row on newline-line 1 was reported as line 2."""
+    events.append_event("decision", {"text": "mid\u2028dle"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")                  # line 0
+    with open(paths.events_dir("test") / "s.jsonl", "a", encoding="utf-8") as f:
+        f.write("{not json\n")                                        # line 1
+    assert [(r["segment"], r["line"]) for r in events.corrupt_rows("test")] == [
+        ("s.jsonl", 1)]
+
+
+def test_a_blank_line_still_advances_the_line_index():
+    """The property `_segment_lines` exists to keep, tested without any exotic
+    character: a skipped line is skipped from the OUTPUT, never from the count.
+    `corrupt_rows` reports this number to a human and `pgmirror.scan_segments`
+    stores it as `seg_line`, so numbering only surviving rows would renumber the
+    mirror the first time a segment gained a blank line -- a parity failure with
+    no obvious cause. Every other test here happens to use blank-free fixtures."""
+    events.append_event("decision", {"text": "first"}, session_id="s",
+                        ts="2026-06-20T10:00:00Z")                  # line 0
+    seg = paths.events_dir("test") / "s.jsonl"
+    with open(seg, "a", encoding="utf-8") as f:
+        f.write("\n")                                             # line 1: blank
+        f.write("   \n")                                          # line 2: whitespace
+        f.write("{not json\n")                                    # line 3
+    assert [(r["segment"], r["line"]) for r in events.corrupt_rows("test")] == [
+        ("s.jsonl", 3)]
+    assert [i for i, _ in events._segment_lines(seg)] == [0, 3]
+
+
+@pytest.mark.parametrize("sep", RAW_SEPARATORS, ids=["LS", "PS", "NEL"])
+def test_a_malformed_row_that_also_carries_a_separator_is_reported_once(sep):
+    """The case the "corrupt_rows' count is a regression detector" claim rests
+    on. A genuinely broken row must be reported ONCE however exotic its bytes:
+    under `splitlines()` one bad row carrying a separator became two entries, so
+    the count moved for a reason that had nothing to do with a writer."""
+    d = paths.events_dir("test")
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "s.jsonl", "w", encoding="utf-8") as f:
+        f.write('{"broken": "mid' + sep + 'dle"}\n')
+    bad = events.corrupt_rows("test")
+    assert [(r["segment"], r["line"]) for r in bad] == [("s.jsonl", 0)]
+    assert "missing required field" in bad[0]["reason"]
