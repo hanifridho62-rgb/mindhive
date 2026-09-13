@@ -35,9 +35,11 @@ Either may run a stage, or both may be combined. Every other installed skill is 
 subordinate execution engine this pipeline may drive. None of them host the
 pipeline — the pipeline lives here.
 
-All MindHive commands below run through the project venv:
-`C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive …` (or just
-`hive …` / `python -m mindhive …` if that interpreter is active).
+All MindHive commands below run through the MindHive checkout's own venv
+interpreter — `<checkout>\.venv\Scripts\python.exe -m mindhive …` on Windows,
+`<checkout>/.venv/bin/python -m mindhive …` elsewhere, where `<checkout>` is the
+directory MindHive is cloned into (or just `hive …` / `python -m mindhive …` if
+that interpreter is active).
 
 ## Prime directive: recall before you ask
 

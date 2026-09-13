@@ -1,11 +1,97 @@
 # src/mindhive/events.py
 import contextlib
+import hashlib
 import importlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from . import paths
+
+
+# --- the segment path ------------------------------------------------------------
+#
+# A `session_id` is DATA in the row and a FILENAME on disk, and only the second
+# use is dangerous. `append_event` used to build the segment path by raw
+# concatenation -- `seg = d / f"{session_id}.jsonl"` -- with the id arriving
+# either from `--session` on the CLI or from a hook payload, neither checked. So
+# `--session ../../x` wrote the ledger outside the namespace, and an id carrying
+# a character the Windows kernel refuses (`:` `*` `?` `|`) raised OSError from
+# the middle of the append.
+#
+# The rule is the one `hooks/lib.sh` and `hooks/lib.ps1` already enforce at the
+# shell boundary, restated here because the shells are not the only writer: the
+# CLI, the orchestrators and `events.append_event`'s own callers all reach this
+# directly. Three statements of one rule, and they must agree.
+#
+# Verified before it was written: all 2418 segments in the live store match this
+# pattern exactly, so nothing on disk moves.
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+# The segment-name namespace `segment_name` reserves for itself. A conforming
+# id that starts with it, in any case, is quarantined rather than taken at face
+# value, so the only writer of an `unsafe-*` segment is the quarantine path --
+# which is what makes `unsafe-*` mean "something was refused here" to an
+# operator triaging the directory, instead of "something was refused here, or
+# somebody said so". Re-exported: `paths` owns it, for `paths.namespace_name`.
+QUARANTINE_PREFIX = paths.QUARANTINE_PREFIX
+
+
+def segment_name(session_id, os_name=None) -> str:
+    """The file name for *session_id*'s segment -- always a single, safe path
+    component, never a traversal and never a character the OS refuses.
+
+    A conforming id is its own filename, which is every id the system has ever
+    written. Anything else is QUARANTINED to `unsafe-<sha256[:16]>.jsonl`, and
+    the three properties of that choice are all deliberate:
+
+    * **Not `"unknown"`.** Coercing every hostile id to one name merges distinct
+      writers into one segment, which is a second-order corruption of the thing
+      being protected.
+    * **Not a raise.** This is on the hook path -- `post_tool_use` fires on every
+      tool call -- and a hook that can throw is a hook that breaks the session.
+      The loud rejection belongs at the surface a human typed
+      (`cliparse.session_id_arg`), not here.
+    * **Not a sanitized rewrite** (stripping the bad characters). Two different
+      ids must not be able to collide into one segment by both reducing to the
+      same safe string; a hash cannot collide by accident.
+
+    That last property needed a RESERVATION to be true of anything but
+    accidents. `unsafe-<16 hex>` satisfies `SESSION_ID_RE` on its own -- it
+    starts with a letter and every other character is in the class -- so before
+    the prefix was reserved, a conforming id spelled that way took the
+    conforming branch and landed in the quarantine slot of whichever hostile id
+    hashes to it. Chosen, not collided: the exact merge the bullet above
+    forbids, reachable by typing it. `paths.is_reserved_component` holds the
+    reservation (case-insensitive, because NTFS is) and, on Windows, the names
+    the OS stores as something else: `NUL.jsonl` is a device on some builds.
+
+    **The one honest limit.** Two conforming ids that differ only in case share
+    a segment on a case-insensitive filesystem (`Probe-1` and `probe-1` are one
+    file on NTFS), and nothing stops a writer choosing that. Folding case would
+    close it and would also rename every segment on disk, so the trade is
+    refused and stated instead. The cost is bounded: every row keeps its raw
+    `session_id` and `_append_lock` serialises the writes, so a shared segment
+    mixes two writers' rows without tearing or misattributing either. The
+    guarantees are no traversal, no component the OS aliases, and no conforming
+    id in a quarantine segment under any case spelling -- not "one file per
+    distinct string on every filesystem".
+
+    `Event.session_id` keeps the RAW value. The id is inert as a JSON value --
+    `canonical_json` escapes it -- and it is the only record of who wrote the
+    row, so sanitizing the DATA would close the hole by deleting the evidence.
+    Sanitize the path; keep the fact."""
+    raw = paths.text_of(session_id)
+    if raw is None:
+        # `str`, `repr` and the type name all raised: the one input with nothing
+        # left to tell it apart, and so the one place two values do merge.
+        return QUARANTINE_PREFIX + "unstringifiable.jsonl"
+    name = raw + ".jsonl"
+    if SESSION_ID_RE.fullmatch(raw) and not paths.is_reserved_component(name, os_name):
+        return name
+    return paths.quarantine_name(raw) + ".jsonl"
+
 
 SEMANTIC_TYPES = {
     "decision", "experiment_result", "caveat",
@@ -267,6 +353,19 @@ _PAYLOAD_CONTRACTS = {
     "roadmap": (".roadmap",
                 "hive roadmap set|step|interrupt|resume|complete …"),
     "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
+    # `state_set` has NO subcommand -- there is no `hive state --set`, and
+    # `grep -rn state_set src/mindhive/__main__.py` finds nothing -- so the raw
+    # append below is not one writer among several, it is the ONLY one. That is
+    # also why this row was missing for so long: every other contract was
+    # registered by the module that owned the surface, and this surface owned
+    # no module until `state.py`. What it guards is the top of STATE.md, which
+    # `sync` embeds in the auto-loaded MEMORY.md -- the highest-trust text in
+    # the store. Following `mindnet_task`, the hint names only what ships.
+    "state_set": (".state",
+                  "hive append state_set '{\"task\": \"…\", "
+                  "\"open_questions\": []}' --json — keys: task, verified, "
+                  "next_step, open_questions, deferred; every one optional. "
+                  "There is no subcommand; this raw append is the only writer"),
     # The hint names ONLY what ships. `mindnet_task` has five actions
     # (tasks.ACTIONS) but exactly one CLI producer — `hive mindnet declare`;
     # `status`, `depend`, `reparent` and `evidence` have no subcommand yet and
@@ -505,7 +604,11 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None, proje
                payload=payload, tags=list(tags or []))
     d = paths.events_dir(project)
     d.mkdir(parents=True, exist_ok=True)
-    seg = d / f"{session_id}.jsonl"
+    # Computed BEFORE the lock is taken. `_append_lock` releases in a `finally`,
+    # so a raise inside it never wedged the lock -- but a malformed id should not
+    # be able to raise from inside a critical section at all, and this ordering
+    # means it cannot.
+    seg = d / segment_name(session_id)
     with _append_lock(project):
         with open(seg, "a", encoding="utf-8") as f:
             f.write(canonical_json(to_dict(ev)) + "\n")

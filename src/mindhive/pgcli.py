@@ -27,6 +27,8 @@ one and forgotten in the other.
 """
 import json
 
+from . import cliparse
+
 
 def _parse_args(pairs) -> dict:
     """`["limit=50", "key=task_id"]` -> `{"limit": 50, "key": "task_id"}`.
@@ -273,7 +275,7 @@ def register(subparsers) -> None:
 
     st = sub.add_parser("status", help="is the mirror reachable, fresh, and "
                                        "how many failures has this process seen")
-    st.add_argument("--project", default=None, help="namespace (default: this repo)")
+    st.add_argument("--project", type=cliparse.project_arg, default=None, help="namespace (default: this repo)")
     st.add_argument("--json", action="store_true", help="machine-readable report")
     st.set_defaults(func=cmd_status)
 
@@ -286,14 +288,14 @@ def register(subparsers) -> None:
     rb = sub.add_parser("rebuild", help="reload EVERY segment of one namespace "
                                         "from the file ledger (needs "
                                         "MINDHIVE_PG_DSN_ADMIN)")
-    rb.add_argument("--project", default=None, help="namespace (default: this repo)")
+    rb.add_argument("--project", type=cliparse.project_arg, default=None, help="namespace (default: this repo)")
     rb.set_defaults(func=cmd_rebuild)
 
     rf = sub.add_parser("refresh", help="reload only the segments that changed, "
                                         "then re-verify parity — the cheap way "
                                         "to make a stale mirror current (needs "
                                         "MINDHIVE_PG_DSN_ADMIN)")
-    rf.add_argument("--project", default=None, help="namespace (default: this repo)")
+    rf.add_argument("--project", type=cliparse.project_arg, default=None, help="namespace (default: this repo)")
     rf.set_defaults(func=cmd_refresh)
 
     em = sub.add_parser("embed", help="encode this namespace's semantic events "
@@ -301,7 +303,7 @@ def register(subparsers) -> None:
                                       "tools can search by meaning (needs "
                                       "MINDHIVE_PG_DSN_ADMIN and "
                                       "pip install -e .[vectors])")
-    em.add_argument("--project", default=None, help="namespace (default: this repo)")
+    em.add_argument("--project", type=cliparse.project_arg, default=None, help="namespace (default: this repo)")
     em.add_argument("--model", default=None,
                     help="encoder name; also the row key, so two models can "
                          "coexist instead of overwriting each other "
@@ -319,7 +321,7 @@ def register(subparsers) -> None:
     pa = sub.add_parser("parity", help="compare the file ledger's chain head "
                                        "against the mirror's; non-zero if it "
                                        "cannot be proven")
-    pa.add_argument("--project", default=None, help="namespace (default: this repo)")
+    pa.add_argument("--project", type=cliparse.project_arg, default=None, help="namespace (default: this repo)")
     pa.add_argument("--json", action="store_true", help="machine-readable verdict")
     pa.set_defaults(func=cmd_parity)
 

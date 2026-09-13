@@ -27,7 +27,7 @@ from urllib.parse import quote
 
 import pytest
 
-from mindhive import dashboard, events
+from mindhive import dashboard, events, paths
 
 TOKEN = "test-token-123"
 
@@ -542,12 +542,17 @@ def test_a_foreign_host_never_reaches_the_page_that_carries_the_token(server):
 
 def test_a_project_that_escapes_the_store_is_refused_by_name(server, tmp_path,
                                                              monkeypatch):
-    """`paths.project_dir` is `store_home() / project`, unsanitised, so the
-    `project=` parameter IS a path component and `../x` reads outside the store.
+    """`project=` names a directory under the store, so `../x` is a traversal.
 
-    CANARY by MUTATION, at the module seam: with `is_safe_project` forced to
-    True, the very same request must return the file planted outside the store.
-    A traversal test whose fixture does not actually traverse proves nothing and
+    Two layers stand in front of it, and the test holds both. The router
+    refuses the name (`is_safe_project`); behind it `paths.project_dir`
+    quarantines whatever still reaches a join, so with the router's check gone
+    the read stays inside the store.
+
+    CANARY by MUTATION, at both module seams: with the check forced open the
+    planted file must still be unreachable, and with `paths.namespace_name`
+    made the identity as well, the very same request must return it. A
+    traversal test whose fixture does not actually traverse proves nothing and
     reads exactly like one that does.
     """
     address, token, _handler = server
@@ -566,9 +571,18 @@ def test_a_project_that_escapes_the_store_is_refused_by_name(server, tmp_path,
 
     monkeypatch.setattr(dashboard, "is_safe_project", lambda p: True)
     status, _headers, body = _one_exchange(address, _request_bytes("GET", path))
+    assert b"CANARY-OUTSIDE-THE-STORE" not in body, (
+        "the sink's quarantine did not hold with the router's check removed: "
+        f"got {body[:200]!r}")
+
+    for memo in _module_memos():
+        memo.clear()
+    monkeypatch.setattr(paths, "namespace_name",
+                        lambda project, os_name=None: project)
+    status, _headers, body = _one_exchange(address, _request_bytes("GET", path))
     assert b"CANARY-OUTSIDE-THE-STORE" in body, (
-        "canary: with the guard removed the request read nothing outside the "
-        f"store, so the refusal above is not evidence — got {body[:200]!r}")
+        "canary: with both layers removed the request read nothing outside the "
+        f"store, so the refusals above are not evidence: got {body[:200]!r}")
 
 
 def test_an_unparseable_limit_is_refused_by_name_not_by_traceback(server):
@@ -625,3 +639,49 @@ def test_a_non_numeric_scan_parameter_is_refused_by_name_not_by_traceback(server
         assert json.loads(out.decode("utf-8")) == {"ok": False,
                                                    "error": f"invalid {named}"}
         assert b"literal" not in out and b"convert" not in out, out
+
+
+# --- a project name the sink would store under another name ------------------
+
+@pytest.mark.parametrize("project", ["unsafe-0000000000000000", "LIVE_LOCK",
+                                     "my project"])
+def test_a_project_the_sink_would_rename_is_refused_not_answered(server, project):
+    """DISCRIMINATING. Each of these passed the old shape check and reached
+    `paths.namespace_name`, which stores it under a quarantine slot -- so the
+    route answered 200 with ANOTHER directory's contents (usually none) under
+    the name the caller asked for. Refused by name now, like a traversal.
+
+    CANARY: the same route with a usable project still answers 200."""
+    address, token, _handler = server
+    path = (f"/api/memory?token={token}&project={quote(project, safe='')}"
+            "&limit=5")
+    status, _headers, body = _one_exchange(address, _request_bytes("GET", path))
+    assert status.startswith(b"HTTP/1.1 400"), (project, status)
+    assert json.loads(body.decode("utf-8")) == {"ok": False,
+                                                "error": "invalid project"}
+
+    status, _headers, _body = _one_exchange(address, _request_bytes(
+        "GET", f"/api/memory?token={token}&project=test&limit=5"))
+    assert status.startswith(b"HTTP/1.1 200"), status
+
+
+@pytest.mark.parametrize("session_project", ["../../x",
+                                             "unsafe-0000000000000000"])
+def test_a_task_cards_session_project_is_refused_by_name(server,
+                                                         session_project):
+    """DISCRIMINATING. `session_project` picks the ledger `/api/task` folds, and
+    it was the one project value on that route nothing was asked about: the
+    sink quarantined it, and the route answered 200 from another directory.
+
+    CANARY: a usable `session_project` still answers 200."""
+    address, token, _handler = server
+    path = (f"/api/task?token={token}&session=s1"
+            f"&session_project={quote(session_project, safe='')}")
+    status, _headers, body = _one_exchange(address, _request_bytes("GET", path))
+    assert status.startswith(b"HTTP/1.1 400"), (session_project, status)
+    assert json.loads(body.decode("utf-8")) == {
+        "ok": False, "error": "invalid session_project"}
+
+    status, _headers, _body = _one_exchange(address, _request_bytes(
+        "GET", f"/api/task?token={token}&session=s1&session_project=test"))
+    assert status.startswith(b"HTTP/1.1 200"), status

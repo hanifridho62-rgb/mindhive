@@ -265,21 +265,11 @@ def cmd_state(args) -> int | None:
         mn_auto.refresh_projection(project)
     except Exception:                                       # noqa: BLE001
         pass
-    # Self-heal the mandatory-SOP sidecar. `sop.record` writes it on every
-    # change, so this only fires for a store that never had one (fresh clone,
-    # new worktree) or one that was corrupted — and those are exactly the cases
-    # that would otherwise fail SILENTLY forever, since `sopgate` deliberately
-    # has no ledger fallback and a missing sidecar simply injects nothing.
-    # Gated on a parse of the small sidecar rather than on `exists()`, so a
-    # corrupt file heals too; the 0.36 s `read_all` is only paid when it is
-    # actually broken. Session start is the right place: this is the one
-    # command in that hook that belongs to this repo.
-    try:
-        from . import sop as _sop
-        if not _sop.read_sidecar(project):
-            _sop.write_sidecar(project)
-    except Exception:                                       # noqa: BLE001
-        pass
+    # Self-heal the mandatory-SOP sidecars (missing, corrupt, or written before
+    # `agent_authored`): see `sop.heal_sidecar`, which is total. Session start is
+    # the right place: this is the one command in that hook that is this repo's.
+    from . import sop as _sop
+    _sop.heal_sidecar(project)
     s = paths.project_dir(project) / "STATE.md"
     print(s.read_text(encoding="utf-8") if s.exists()
           else "(no STATE.md — run: hive project)")
@@ -289,19 +279,26 @@ def cmd_state(args) -> int | None:
 def cmd_projects(args) -> int | None:
     """List namespaces on disk, marking each registered (in the autosync
     allow-list) or unregistered — surfacing junk/orphan namespaces without
-    deleting anything."""
-    known = paths.known_projects()
+    deleting anything. Registration is `hygiene.registered`'s answer, the one
+    `hive gc --prune` acts on, so the two cannot disagree."""
+    from . import hygiene
     names = paths.list_namespaces()
+    note = hygiene.unlisted_note(paths.unlisted_namespaces())
     if not names:
         print("(no namespaces on disk yet)")
+        if note:
+            print(note)
         return None
+    reg = hygiene.registered(names)
     for name in names:
-        flag = "registered" if name in known else "unregistered"
+        flag = "registered" if reg[name] else "unregistered"
         print(f"  [{flag:12}] {name}")
-    unregistered = [n for n in names if n not in known]
+    unregistered = [n for n in names if not reg[n]]
     print(f"\n{len(names)} namespace(s): "
           f"{len(names) - len(unregistered)} registered, "
           f"{len(unregistered)} unregistered")
+    if note:
+        print(note)
     return None
 
 
@@ -876,7 +873,13 @@ def cmd_sop_list(args) -> int | None:
     for i, r in enumerate(sops, 1):
         tier = "MANDATORY " if r.get("mandatory") else ""
         n_must += 1 if r.get("mandatory") else 0
-        print(f"  {i}. {tier}[{r['sop_id']} v{r['version']}] {r['title']}  "
+        # `safe_title`, but NOT partitioned: `withheld_footer` sends operators
+        # to this command by name to read exactly the rows the delivery
+        # surfaces withhold, so filtering here would make that instruction a
+        # dead end. Sanitizing is still required -- a newline forges a second
+        # numbered entry in a list whose numbering is the operator's index.
+        print(f"  {i}. {tier}[{sop_mod.safe_title(r['sop_id'])} "
+              f"v{r['version']}] {sop_mod.safe_title(r['title'])}  "
               f"(updated {r['updated']})")
     tail = (f" ({n_must} mandatory — re-asserted on every prompt)"
             if n_must else "")
@@ -984,9 +987,8 @@ def _preflight_report(project=None) -> dict:
         "session": here or "(unset)",
         "verdict": "CONTINUATION" if evidence else "NEW",
         "evidence": evidence,
-        "mandatory_sops": [{"sop_id": r["sop_id"], "title": r["title"],
-                            "version": r["version"]}
-                           for r in sop_mod.mandatory(evs)],
+        # Partitioned, sanitized, and admitting what it withheld, by id.
+        **sop_mod.preflight_mandatory(evs),
         "improvements": {
             "active": sum(1 for r in rules if r["status"] == "active"),
             "candidate": sum(1 for r in rules if r["status"] == "candidate"),
@@ -997,6 +999,7 @@ def _preflight_report(project=None) -> dict:
 
 
 def cmd_sop_preflight(args) -> int | None:
+    from . import sop as sop_mod
     rep = _preflight_report(getattr(args, "project", None))
     if args.json:
         print(json.dumps(rep, indent=2, ensure_ascii=False))
@@ -1011,13 +1014,7 @@ def cmd_sop_preflight(args) -> int | None:
               "`hive briefing`, `hive recall \"<topic>\"`.")
     else:
         print("  - no prior sessions, interrupted plans, or pending markers.")
-    must = rep["mandatory_sops"]
-    print(f"\nMandatory SOPs ({len(must)}):")
-    for r in must:
-        print(f"  - [{r['sop_id']} v{r['version']}] {r['title']}")
-    if not must:
-        print("  (none — add one: hive sop add <id> --title … --file … "
-              "--mandatory)")
+    print("\n".join(sop_mod.preflight_mandatory_lines(rep)))
     imp = rep["improvements"]
     print(f"\nImprovements — prevention rules "
           f"({imp['active']} active / {imp['candidate']} candidate):")
@@ -2725,13 +2722,8 @@ def cmd_skills_trail(args) -> int | None:
     from . import oversee as oversee_mod
     from . import paths
     iu = oversee_mod.intended_use_map()
-    if getattr(args, "all", False):
-        home = paths.store_home()
-        names = ([d.name for d in sorted(home.iterdir())
-                  if d.is_dir() and (d / "events").is_dir()]
-                 if home.exists() else [])
-    else:
-        names = [args.project]
+    names = (paths.event_namespaces() if getattr(args, "all", False)
+             else [args.project])
     trails = {}
     for n in names:
         for sid, entries in oversee_mod.skill_trails(project=n,
@@ -3212,7 +3204,7 @@ def _build_parser() -> argparse.ArgumentParser:
     a.add_argument("type")
     a.add_argument("payload", nargs="?", default=None)
     a.add_argument("--tags", default="")
-    a.add_argument("--session", default=None)
+    a.add_argument("--session", type=cliparse.session_id_arg, default=None)
     a.add_argument("--json", action="store_true", help="parse payload as JSON dict")
     a.add_argument("--stdin", action="store_true", help="read payload from stdin")
     a.set_defaults(func=cmd_append)
@@ -3241,7 +3233,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     se_run = se_sub.add_parser("run", help="run an interactive session under "
                                            "smart-zone rotation")
-    se_run.add_argument("--project", default=None,
+    se_run.add_argument("--project", type=cliparse.project_arg, default=None,
                         help="target namespace explicitly (default: detect from cwd)")
     se_run.add_argument("--max-rotations", type=int,
                         default=rotation_supervisor_defaults()[0],
@@ -3255,21 +3247,21 @@ def _build_parser() -> argparse.ArgumentParser:
     se_install = se_sub.add_parser(
         "install-hook", help="register the Stop hook in a settings.json "
                              "(idempotent; the hook stays inert until "
-                             "MINDHIVE_ROTATION is set, and the shim is "
-                             "PowerShell, so rotation only fires on Windows)")
+                             "MINDHIVE_ROTATION is set; the shim registered "
+                             "matches the platform - stop.ps1 or stop.sh)")
     se_install.add_argument("settings", help="path to the settings.json to edit")
     se_install.add_argument("--command", default=None,
                             help="the hook command to register (default: this "
-                                 "checkout's hooks/stop.ps1). Worth setting from "
-                                 "a worktree, where the default resolves to the "
-                                 "worktree's own copy rather than the main one")
+                                 "checkout's platform-matched stop shim). Worth "
+                                 "setting from a worktree, where the default "
+                                 "resolves to the worktree's own copy)")
     se_install.add_argument("--dry-run", action="store_true",
                             help="report what would change without writing")
     se_install.set_defaults(func=cmd_session_install_hook)
 
     sub.add_parser("project", help="rebuild projections").set_defaults(func=cmd_project)
     st = sub.add_parser("state", help="print STATE.md")
-    st.add_argument("--project", default=None,
+    st.add_argument("--project", type=cliparse.project_arg, default=None,
                     help="target namespace explicitly (default: detect from cwd)")
     st.set_defaults(func=cmd_state)
     sub.add_parser("projects", help="list namespaces (registered vs unregistered)").set_defaults(func=cmd_projects)
@@ -3277,7 +3269,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     cx = sub.add_parser("context",
                         help="measure the auto-loaded context budget (read-only)")
-    cx.add_argument("--project", default=None,
+    cx.add_argument("--project", type=cliparse.project_arg, default=None,
                     help="target namespace explicitly (default: detect from cwd)")
     cx.add_argument("--json", action="store_true", help="machine-readable report")
     cx.add_argument("--budget", type=int, default=None,
@@ -3375,13 +3367,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "contradicts (exits non-zero on any contradiction)")
     prec.add_argument("--file", default=None,
                       help="read the text from PATH (default: stdin)")
-    prec.add_argument("--project", default=None,
+    prec.add_argument("--project", type=cliparse.project_arg, default=None,
                       help="target namespace explicitly (default: detect from cwd)")
     prec.set_defaults(func=cmd_premise_check)
 
     r = sub.add_parser("recall", help="search ledger")
     r.add_argument("query")
-    r.add_argument("--project", default=None,
+    r.add_argument("--project", type=cliparse.project_arg, default=None,
                    help="target namespace explicitly (default: detect from cwd)")
     r.add_argument("--semantic", action="store_true")
     r.add_argument("--limit", type=int, default=10)
@@ -3391,7 +3383,7 @@ def _build_parser() -> argparse.ArgumentParser:
     cons = sub.add_parser("consolidate",
                           help="dreaming pass: merge near-duplicate memories "
                                "into survivors (append-only, bounded)")
-    cons.add_argument("--project", default=None)
+    cons.add_argument("--project", type=cliparse.project_arg, default=None)
     cons.add_argument("--limit", type=int, default=3,
                       help="max duplicate clusters merged per pass")
     cons.add_argument("--cooldown-hours", dest="cooldown_hours", type=float,
@@ -3430,7 +3422,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rv = sub.add_parser("review", help="thermo-nuclear review queue")
     rvsub = rv.add_subparsers(dest="review_cmd", required=True)
     rvq = rvsub.add_parser("queue", help="queue this session's touched source files for review")
-    rvq.add_argument("--session", default=None,
+    rvq.add_argument("--session", type=cliparse.session_id_arg, default=None,
                      help="session id to queue (default: $MINDHIVE_SESSION)")
     rvq.set_defaults(func=cmd_review_queue)
     rvsub.add_parser("clear", help="clear the pending-review marker (after the review runs)").set_defaults(func=cmd_review_clear)
@@ -3445,7 +3437,7 @@ def _build_parser() -> argparse.ArgumentParser:
         lc.add_argument("explanation", help="brief explanation of what changed (mandatory)")
         lc.add_argument("--files", nargs="*", default=None,
                         help="affected files (default: pending marker, then session, then git)")
-        lc.add_argument("--session", default=None,
+        lc.add_argument("--session", type=cliparse.session_id_arg, default=None,
                         help="session id (default: $MINDHIVE_SESSION)")
         # The MindNetwork join key (KTD16). `execution` is the one phase whose
         # evidence is an EVENT rather than a file, and it looks for a
@@ -3458,7 +3450,7 @@ def _build_parser() -> argparse.ArgumentParser:
                              "the join key its `execution` phase looks for")
         lc.set_defaults(func=cmd_log_add, category=_cat)
     lgq = lgsub.add_parser("queue", help="queue this session's unlogged source files (run by session_end)")
-    lgq.add_argument("--session", default=None,
+    lgq.add_argument("--session", type=cliparse.session_id_arg, default=None,
                      help="session id to queue (default: $MINDHIVE_SESSION)")
     lgq.set_defaults(func=cmd_log_queue)
     lgsub.add_parser("show", help="print change-log entries, newest first").set_defaults(func=cmd_log_show)
@@ -3470,7 +3462,7 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(run by session_end)")
     rpsub = rp.add_subparsers(dest="replenish_cmd", required=True)
     rpr = rpsub.add_parser("run", help="run one replenishment round for a session")
-    rpr.add_argument("--session", default=None,
+    rpr.add_argument("--session", type=cliparse.session_id_arg, default=None,
                      help="session id to replenish (default: $MINDHIVE_SESSION)")
     rpr.add_argument("--dry-run", action="store_true",
                      help="decide and print without appending anything")
@@ -3505,7 +3497,7 @@ def _build_parser() -> argparse.ArgumentParser:
     soa.add_argument("--stdin", action="store_true",
                      help="read the body from stdin")
     soa.add_argument("--tags", default="")
-    soa.add_argument("--session", default=None)
+    soa.add_argument("--session", type=cliparse.session_id_arg, default=None)
     # Tri-state on purpose (None = leave the tier alone). A plain store_true
     # would default to False, and every title-only `sop update` would then
     # silently demote a mandatory procedure to an ordinary one.
@@ -3523,7 +3515,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sou.add_argument("--file", default=None)
     sou.add_argument("--stdin", action="store_true")
     sou.add_argument("--tags", default="")
-    sou.add_argument("--session", default=None)
+    sou.add_argument("--session", type=cliparse.session_id_arg, default=None)
     sou.add_argument("--mandatory", dest="mandatory", action="store_true",
                      default=None, help="promote to the mandatory tier")
     sou.add_argument("--no-mandatory", dest="mandatory", action="store_false",
@@ -3532,15 +3524,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sod = sosub.add_parser("delete", help="retire an SOP (append-only tombstone)")
     sod.add_argument("sop_id")
     sod.add_argument("--reason", default=None)
-    sod.add_argument("--session", default=None)
+    sod.add_argument("--session", type=cliparse.session_id_arg, default=None)
     sod.set_defaults(func=cmd_sop_delete)
     sol = sosub.add_parser("list", help="list active SOPs")
-    sol.add_argument("--project", default=None)
+    sol.add_argument("--project", type=cliparse.project_arg, default=None)
     sol.add_argument("--json", action="store_true")
     sol.set_defaults(func=cmd_sop_list)
     sos = sosub.add_parser("show", help="print one SOP in full, with history")
     sos.add_argument("sop_id")
-    sos.add_argument("--project", default=None)
+    sos.add_argument("--project", type=cliparse.project_arg, default=None)
     sos.add_argument("--json", action="store_true")
     sos.set_defaults(func=cmd_sop_show)
     sop_pf = sosub.add_parser(
@@ -3549,14 +3541,14 @@ def _build_parser() -> argparse.ArgumentParser:
              "(with the ledger evidence), which SOPs are mandatory, what the "
              "improvements record already warns about, and what is in the "
              "catalog")
-    sop_pf.add_argument("--project", default=None)
+    sop_pf.add_argument("--project", type=cliparse.project_arg, default=None)
     sop_pf.add_argument("--json", action="store_true")
     sop_pf.set_defaults(func=cmd_sop_preflight)
     sop_inj = sosub.add_parser(
         "injection",
         help="what the per-prompt mandatory-SOP injection actually delivers "
              "right now — bodies verbatim, or degraded to pointers")
-    sop_inj.add_argument("--project", default=None)
+    sop_inj.add_argument("--project", type=cliparse.project_arg, default=None)
     sop_inj.add_argument("--json", action="store_true")
     sop_inj.set_defaults(func=cmd_sop_injection)
 
@@ -3591,7 +3583,7 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="one plan step (repeatable, in order)")
     rms.add_argument("--file", default=None,
                      help="read steps from a file, one per line")
-    rms.add_argument("--session", default=None)
+    rms.add_argument("--session", type=cliparse.session_id_arg, default=None)
     _add_work_link_flags(rms)
     rms.set_defaults(func=cmd_roadmap_set)
     rmp = rmsub.add_parser("step", help="update one step's status")
@@ -3599,7 +3591,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rmp.add_argument("index", type=int, help="0-based step index")
     rmp.add_argument("--status", required=True, choices=_RM_STATUSES)
     rmp.add_argument("--note", default=None)
-    rmp.add_argument("--session", default=None)
+    rmp.add_argument("--session", type=cliparse.session_id_arg, default=None)
     rmp.set_defaults(func=cmd_roadmap_step)
     rmi = rmsub.add_parser("interrupt", help="mark the plan interrupted "
                            "(records the out-of-usage marker; usage-shaped "
@@ -3609,7 +3601,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rmi.add_argument("--cause", required=True,
                      help="why work stopped, e.g. usage_limit")
     rmi.add_argument("--note", default=None)
-    rmi.add_argument("--session", default=None)
+    rmi.add_argument("--session", type=cliparse.session_id_arg, default=None)
     rmi.add_argument("--no-auto-resume", action="store_true",
                      dest="no_auto_resume",
                      help="record the marker only; do not schedule the "
@@ -3617,11 +3609,11 @@ def _build_parser() -> argparse.ArgumentParser:
     rmi.set_defaults(func=cmd_roadmap_interrupt)
     rmr = rmsub.add_parser("resume", help="pick an interrupted plan back up")
     rmr.add_argument("plan_id")
-    rmr.add_argument("--session", default=None)
+    rmr.add_argument("--session", type=cliparse.session_id_arg, default=None)
     rmr.set_defaults(func=cmd_roadmap_resume)
     rmc = rmsub.add_parser("complete", help="mark the plan finished")
     rmc.add_argument("plan_id")
-    rmc.add_argument("--session", default=None)
+    rmc.add_argument("--session", type=cliparse.session_id_arg, default=None)
     _add_work_link_flags(rmc)
     rmc.set_defaults(func=cmd_roadmap_complete)
     rmar = rmsub.add_parser(
@@ -3632,14 +3624,14 @@ def _build_parser() -> argparse.ArgumentParser:
     rmar.add_argument("--reason", required=True,
                       help="what settled the unverifiable step, e.g. "
                            "'PR #103 merged' or 'superseded by the jobs plan'")
-    rmar.add_argument("--session", default=None)
+    rmar.add_argument("--session", type=cliparse.session_id_arg, default=None)
     _add_work_link_flags(rmar)
     rmar.set_defaults(func=cmd_roadmap_archive)
     rmk = rmsub.add_parser(
         "link", help="point a plan at the code it produced (branch, PR, "
                      "commits) without changing its status")
     rmk.add_argument("plan_id")
-    rmk.add_argument("--session", default=None)
+    rmk.add_argument("--session", type=cliparse.session_id_arg, default=None)
     _add_work_link_flags(rmk)
     rmk.set_defaults(func=cmd_roadmap_link)
     rmm = rmsub.add_parser(
@@ -3647,25 +3639,25 @@ def _build_parser() -> argparse.ArgumentParser:
                             "Read-only, and answers 'unknown' with a reason "
                             "rather than guessing")
     rmm.add_argument("plan_id")
-    rmm.add_argument("--project", default=None)
+    rmm.add_argument("--project", type=cliparse.project_arg, default=None)
     rmm.add_argument("--json", action="store_true")
     rmm.set_defaults(func=cmd_roadmap_merge_state)
     rmt = rmsub.add_parser(
         "retire", help="retire every live plan whose work link PROVES the work "
                        "is finished (merged -> complete, closed unmerged -> "
                        "archive); reports every plan it examined")
-    rmt.add_argument("--project", default=None)
+    rmt.add_argument("--project", type=cliparse.project_arg, default=None)
     rmt.add_argument("--json", action="store_true")
-    rmt.add_argument("--session", default=None)
+    rmt.add_argument("--session", type=cliparse.session_id_arg, default=None)
     rmt.set_defaults(func=cmd_roadmap_retire)
     rma = rmsub.add_parser("autoclose", help="close a session's auto-synced "
                            "roadmap (run by the SessionEnd hook): complete "
                            "when all steps are done/skipped, else interrupt")
-    rma.add_argument("--session", default=None,
+    rma.add_argument("--session", type=cliparse.session_id_arg, default=None,
                      help="session id (defaults to MINDHIVE_SESSION)")
     rma.set_defaults(func=cmd_roadmap_autoclose)
     rml = rmsub.add_parser("list", help="list roadmaps")
-    rml.add_argument("--project", default=None)
+    rml.add_argument("--project", type=cliparse.project_arg, default=None)
     rml.add_argument("--json", action="store_true")
     rml.add_argument("--all", action="store_true",
                      help="include retired roadmaps (completed and archived)")
@@ -3673,7 +3665,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rmw = rmsub.add_parser("show", help="print one roadmap in full, "
                            "with history")
     rmw.add_argument("plan_id")
-    rmw.add_argument("--project", default=None)
+    rmw.add_argument("--project", type=cliparse.project_arg, default=None)
     rmw.add_argument("--json", action="store_true")
     rmw.set_defaults(func=cmd_roadmap_show)
 
@@ -3710,16 +3702,16 @@ def _build_parser() -> argparse.ArgumentParser:
                      dest="triviality_bypass",
                      help="ADR-0005's one-line-fix bypass: born at 'execution' "
                           "and gated by the bug audit. FIRST DECLARE ONLY")
-    mnd.add_argument("--project", default=None)
-    mnd.add_argument("--session", default=None)
+    mnd.add_argument("--project", type=cliparse.project_arg, default=None)
+    mnd.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnd.set_defaults(func=cmd_mindnet_declare)
 
     mne = mnsub.add_parser("enter", help="move a task to another phase "
                            "(forward moves are evidence-gated)")
     mne.add_argument("task_id")
     mne.add_argument("phase", help="target phase")
-    mne.add_argument("--project", default=None)
-    mne.add_argument("--session", default=None)
+    mne.add_argument("--project", type=cliparse.project_arg, default=None)
+    mne.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mne.set_defaults(func=cmd_mindnet_enter)
 
     mns = mnsub.add_parser("satisfy", help="record that the task's CURRENT "
@@ -3735,8 +3727,8 @@ def _build_parser() -> argparse.ArgumentParser:
                      dest="agent_reported",
                      help="no Python check ran — record the weaker claim "
                           "honestly instead of stamping 'python'")
-    mns.add_argument("--project", default=None)
-    mns.add_argument("--session", default=None)
+    mns.add_argument("--project", type=cliparse.project_arg, default=None)
+    mns.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mns.set_defaults(func=cmd_mindnet_satisfy)
 
     mnf = mnsub.add_parser("fall-back", help="move a task backward and "
@@ -3747,8 +3739,8 @@ def _build_parser() -> argparse.ArgumentParser:
     mnf.add_argument("--detail", required=True,
                      help="what failed — the one transition that exists to "
                           "record a failure may not record nothing about it")
-    mnf.add_argument("--project", default=None)
-    mnf.add_argument("--session", default=None)
+    mnf.add_argument("--project", type=cliparse.project_arg, default=None)
+    mnf.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnf.set_defaults(func=cmd_mindnet_fall_back)
 
     mnv = mnsub.add_parser("validate", help="run the task's validation script "
@@ -3760,36 +3752,36 @@ def _build_parser() -> argparse.ArgumentParser:
                           "re-check)")
     mnv.add_argument("--timeout", type=int, default=None,
                      help="seconds the run may take (default: 600)")
-    mnv.add_argument("--project", default=None)
-    mnv.add_argument("--session", default=None)
+    mnv.add_argument("--project", type=cliparse.project_arg, default=None)
+    mnv.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnv.set_defaults(func=cmd_mindnet_validate)
 
     mnr = mnsub.add_parser("restat", help="re-check the file evidence behind "
                            "the current phase (a failure marks it stale; it "
                            "never moves the task)")
     mnr.add_argument("task_id")
-    mnr.add_argument("--project", default=None)
-    mnr.add_argument("--session", default=None)
+    mnr.add_argument("--project", type=cliparse.project_arg, default=None)
+    mnr.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnr.set_defaults(func=cmd_mindnet_restat)
 
     mnw = mnsub.add_parser("show", help="one task in full: phase, evidence "
                            "with its verifier tier, refusals, orphans")
     mnw.add_argument("task_id")
-    mnw.add_argument("--project", default=None)
-    mnw.add_argument("--session", default=None)
+    mnw.add_argument("--project", type=cliparse.project_arg, default=None)
+    mnw.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnw.add_argument("--json", action="store_true")
     mnw.set_defaults(func=cmd_mindnet_show)
 
     mnl = mnsub.add_parser("list", help="every task with its phase and status")
     mnl.add_argument("--all", action="store_true",
                      help="include completed and abandoned tasks")
-    mnl.add_argument("--project", default=None)
+    mnl.add_argument("--project", type=cliparse.project_arg, default=None)
     mnl.add_argument("--json", action="store_true")
     mnl.set_defaults(func=cmd_mindnet_list)
 
     mnb = mnsub.add_parser("rebuild", help="re-derive the phase sidecar from "
                            "the ledger (the repair for a stale or corrupt one)")
-    mnb.add_argument("--project", default=None)
+    mnb.add_argument("--project", type=cliparse.project_arg, default=None)
     mnb.set_defaults(func=cmd_mindnet_rebuild)
 
     mndc = mnsub.add_parser("decompose", help="ask an agent what subtasks a task "
@@ -3799,8 +3791,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="actually declare the proposed subtasks")
     mndc.add_argument("--timeout", type=int, default=None,
                       help="seconds the agent may take (default: 300)")
-    mndc.add_argument("--project", default=None)
-    mndc.add_argument("--session", default=None)
+    mndc.add_argument("--project", type=cliparse.project_arg, default=None)
+    mndc.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mndc.add_argument("--json", action="store_true")
     mndc.set_defaults(func=cmd_mindnet_decompose)
 
@@ -3809,8 +3801,8 @@ def _build_parser() -> argparse.ArgumentParser:
                              "orchestrator walks)")
     mndep.add_argument("task_id", help="the task that has to wait")
     mndep.add_argument("on", help="the task_id it waits for")
-    mndep.add_argument("--project", default=None)
-    mndep.add_argument("--session", default=None)
+    mndep.add_argument("--project", type=cliparse.project_arg, default=None)
+    mndep.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mndep.set_defaults(func=cmd_mindnet_depend)
 
     # MN-7's orchestrator. No `choices=` on --limit/--max-waves for the same
@@ -3853,8 +3845,8 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="let agents run concurrently in ONE working tree. They "
                           "will collide on each other's edits and the git index "
                           "— without this, agents run one at a time")
-    mno.add_argument("--project", default=None)
-    mno.add_argument("--session", default=None)
+    mno.add_argument("--project", type=cliparse.project_arg, default=None)
+    mno.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mno.add_argument("--json", action="store_true")
     mno.set_defaults(func=cmd_mindnet_orchestrate)
 
@@ -3876,8 +3868,8 @@ def _build_parser() -> argparse.ArgumentParser:
     mnxg.add_argument("--disable", action="store_true",
                       help="disarm it for this checkout root — recorded, so it "
                            "also out-ranks an armed parent checkout")
-    mnx.add_argument("--project", default=None)
-    mnx.add_argument("--session", default=None)
+    mnx.add_argument("--project", type=cliparse.project_arg, default=None)
+    mnx.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnx.add_argument("--json", action="store_true")
     mnx.set_defaults(func=cmd_mindnet_enforce)
 
@@ -3900,18 +3892,18 @@ def _build_parser() -> argparse.ArgumentParser:
                      "CLI's configured model)")
     ars.add_argument("--cwd", default=None,
                      help="where the resumed work runs (default: here)")
-    ars.add_argument("--project", default=None)
-    ars.add_argument("--session", default=None)
+    ars.add_argument("--project", type=cliparse.project_arg, default=None)
+    ars.add_argument("--session", type=cliparse.session_id_arg, default=None)
     ars.set_defaults(func=cmd_autoresume_schedule)
     arl = arsub.add_parser("list", help="list delivery records")
-    arl.add_argument("--project", default=None)
+    arl.add_argument("--project", type=cliparse.project_arg, default=None)
     arl.add_argument("--json", action="store_true")
     arl.set_defaults(func=cmd_autoresume_list)
     arc = arsub.add_parser("cancel", help="withdraw a pending delivery "
                            "and its OS timer")
     arc.add_argument("plan_id")
-    arc.add_argument("--project", default=None)
-    arc.add_argument("--session", default=None)
+    arc.add_argument("--project", type=cliparse.project_arg, default=None)
+    arc.add_argument("--session", type=cliparse.session_id_arg, default=None)
     arc.set_defaults(func=cmd_autoresume_cancel)
     arf = arsub.add_parser("fire", help="deliver the marker now (what the "
                            "OS timer runs at the due time)")
@@ -3919,14 +3911,14 @@ def _build_parser() -> argparse.ArgumentParser:
     arf.add_argument("--timeout", type=int, default=None,
                      help="seconds the delivered session may run "
                      "(default: 3600)")
-    arf.add_argument("--project", default=None)
-    arf.add_argument("--session", default=None)
+    arf.add_argument("--project", type=cliparse.project_arg, default=None)
+    arf.add_argument("--session", type=cliparse.session_id_arg, default=None)
     arf.set_defaults(func=cmd_autoresume_fire)
     arw = arsub.add_parser("wait", help="portable fallback: block until "
                            "each pending delivery is due, then fire it")
     arw.add_argument("--poll", type=float, default=60.0,
                      help="max seconds between due checks (default: 60)")
-    arw.add_argument("--project", default=None)
+    arw.add_argument("--project", type=cliparse.project_arg, default=None)
     arw.set_defaults(func=cmd_autoresume_wait)
 
     # --- graph build / graph related ---
@@ -3976,12 +3968,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ski = sksub.add_parser("invoke", help="call a skill via headless claude and record the outcome")
     ski.add_argument("name", help="skill name (as shown by `skills list`)")
     ski.add_argument("--plugin", default=None, help="owning plugin, when disambiguation is needed")
-    ski.add_argument("--project", default=None, help="target namespace")
+    ski.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     ski.set_defaults(func=cmd_skills_invoke)
     sksub.add_parser("status", help="green/red last-call outcome per skill").set_defaults(func=cmd_skills_status)
     sks = sksub.add_parser("stats", help="per-skill completion-rate telemetry from the ledger")
     sks.add_argument("--json", action="store_true", help="emit the raw stats JSON")
-    sks.add_argument("--project", default=None, help="target namespace")
+    sks.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     sks.set_defaults(func=cmd_skills_stats)
     skr = sksub.add_parser("record",
                            help="record a skill outcome (agent-assessed write-through)")
@@ -3991,7 +3983,7 @@ def _build_parser() -> argparse.ArgumentParser:
     outcome.add_argument("--fail", action="store_true", help="the skill failed")
     skr.add_argument("--note", default="", help="one-line context for the outcome")
     skr.add_argument("--plugin", default=None, help="owning plugin, if known")
-    skr.add_argument("--project", default=None, help="target namespace")
+    skr.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     skr.set_defaults(func=cmd_skills_record)
     skc = sksub.add_parser("recommend",
                            help="deterministic most-needed-skills ranking from measured data")
@@ -3999,16 +3991,16 @@ def _build_parser() -> argparse.ArgumentParser:
     skc.add_argument("--top", type=int, default=None, help="limit to the top N entries")
     skc.add_argument("--brief", action="store_true",
                      help="<= 3 one-line suggestions (fast; for the session hook)")
-    skc.add_argument("--project", default=None, help="target namespace")
+    skc.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     skc.set_defaults(func=cmd_skills_recommend)
     skt = sksub.add_parser("trail",
                            help="per-session skill trail (which skills, when, why) "
                                 "from the ledger — survives the live Oversee board")
-    skt.add_argument("--session", default=None, help="one session id (default: all)")
+    skt.add_argument("--session", type=cliparse.session_id_arg, default=None, help="one session id (default: all)")
     skt.add_argument("--all", action="store_true",
                      help="merge every namespace (HIVE MIND), not just this project")
     skt.add_argument("--json", action="store_true", help="emit the raw trail JSON")
-    skt.add_argument("--project", default=None, help="target namespace")
+    skt.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     skt.set_defaults(func=cmd_skills_trail)
 
     # --- clusters --- self-registering, the trade `bench` and `briefcli` make.
@@ -4039,7 +4031,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hv = sub.add_parser("harvest", help="capture events from Claude Code transcripts")
     hv.add_argument("--transcripts", default=None,
                     help="transcript DIRECTORY (omit with --catch-up)")
-    hv.add_argument("--project", default=None,
+    hv.add_argument("--project", type=cliparse.project_arg, default=None,
                     help="target namespace (omit with --catch-up — it auto-detects per session)")
     hv.add_argument("--catch-up", dest="catch_up", action="store_true",
                     help="scan ALL Claude transcript dirs and backfill sessions the hooks missed")
@@ -4054,7 +4046,7 @@ def _build_parser() -> argparse.ArgumentParser:
     asp.set_defaults(func=cmd_autosync_run)   # `autosync` with no subcommand -> run_all
     asub = asp.add_subparsers(dest="autosync_cmd", required=False)
     areg = asub.add_parser("register", help="register a project for autosync")
-    areg.add_argument("--project", required=True)
+    areg.add_argument("--project", type=cliparse.project_arg, required=True)
     areg.add_argument("--transcripts", required=True)
     areg.add_argument("--folder", required=True)
     areg.set_defaults(func=cmd_autosync_register)
@@ -4077,7 +4069,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fg.add_argument("text", help="one line: what was misjudged")
     fg.add_argument("--category", default=None,
                     help="optional category tag (e.g. git, scope, permissions)")
-    fg.add_argument("--project", default=None, help="target namespace")
+    fg.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     fg.set_defaults(func=cmd_flag)
 
     # --- failures (Learning Loop capture stage) ---
@@ -4085,30 +4077,30 @@ def _build_parser() -> argparse.ArgumentParser:
     fsub = fp.add_subparsers(dest="failures_cmd", required=True)
     fc = fsub.add_parser("capture", help="scan a transcript dir, store tool_failed events")
     fc.add_argument("--transcripts", required=True, help="transcript DIRECTORY")
-    fc.add_argument("--project", default=None, help="target namespace")
+    fc.add_argument("--project", type=cliparse.project_arg, default=None, help="target namespace")
     fc.set_defaults(func=cmd_failures_capture)
     fl = fsub.add_parser("list", help="list incident signatures by occurrence")
-    fl.add_argument("--project", default=None)
+    fl.add_argument("--project", type=cliparse.project_arg, default=None)
     fl.set_defaults(func=cmd_failures_list)
 
     # --- rules (Learning Loop reflection stage) ---
     rp = sub.add_parser("rules", help="reflect on incidents; manage prevention rules")
     rsub = rp.add_subparsers(dest="rules_cmd", required=True)
     rl = rsub.add_parser("list", help="list incidents by occurrence")
-    rl.add_argument("--project", default=None)
+    rl.add_argument("--project", type=cliparse.project_arg, default=None)
     rl.set_defaults(func=cmd_rules_list)
     rsm = rsub.add_parser("summaries",
                           help="structured lesson records (dashboard parity; --json for raw)")
-    rsm.add_argument("--project", default=None)
+    rsm.add_argument("--project", type=cliparse.project_arg, default=None)
     rsm.add_argument("--json", action="store_true", help="emit the raw list as JSON")
     rsm.set_defaults(func=cmd_rules_summaries)
     rsh = rsub.add_parser("show", help="print one incident record")
     rsh.add_argument("signature")
-    rsh.add_argument("--project", default=None)
+    rsh.add_argument("--project", type=cliparse.project_arg, default=None)
     rsh.set_defaults(func=cmd_rules_show)
     rr = rsub.add_parser("reflect",
                          help="bounded reflection pass over active un-reflected incidents")
-    rr.add_argument("--project", default=None)
+    rr.add_argument("--project", type=cliparse.project_arg, default=None)
     rr.add_argument("--limit", type=int, default=3,
                     help="max incidents to reflect this batch (default: 3)")
     rr.add_argument("--cooldown-hours", type=float, default=6.0, dest="cooldown_hours",
@@ -4122,32 +4114,32 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="actively resolve red (unresolved) rules: reflect "
                                "missing ones, reroute leaking ones to the best "
                                "alternative route")
-    rrs.add_argument("--project", default=None)
+    rrs.add_argument("--project", type=cliparse.project_arg, default=None)
     rrs.add_argument("--limit", type=int, default=3,
                      help="max red incidents to resolve this pass (default: 3)")
     rrs.add_argument("--list", action="store_true",
                      help="print the red set as JSON without resolving anything")
     rrs.set_defaults(func=cmd_rules_resolve)
     ra = rsub.add_parser("audit", help="stamp activations for newly-recurring signatures")
-    ra.add_argument("--project", default=None)
+    ra.add_argument("--project", type=cliparse.project_arg, default=None)
     ra.set_defaults(func=cmd_rules_audit)
     ri = rsub.add_parser("inject", help="print the active prevention-rules block")
-    ri.add_argument("--project", default=None)
+    ri.add_argument("--project", type=cliparse.project_arg, default=None)
     ri.set_defaults(func=cmd_rules_inject)
     rpr = rsub.add_parser("promote", help="promote a rule into canonical SOUL.md")
     rpr.add_argument("signature")
-    rpr.add_argument("--project", default=None)
+    rpr.add_argument("--project", type=cliparse.project_arg, default=None)
     rpr.set_defaults(func=cmd_rules_promote)
     rdm = rsub.add_parser("demote", help="manually demote a rule")
     rdm.add_argument("signature")
-    rdm.add_argument("--project", default=None)
+    rdm.add_argument("--project", type=cliparse.project_arg, default=None)
     rdm.set_defaults(func=cmd_rules_demote)
     rc = rsub.add_parser("reconcile", help="record human edits as rule_revised events")
-    rc.add_argument("--project", default=None)
+    rc.add_argument("--project", type=cliparse.project_arg, default=None)
     rc.set_defaults(func=cmd_rules_reconcile)
     ren = rsub.add_parser("enforce",
                           help="manage the PreToolUse enforcement manifest (nudge->enforce ladder)")
-    ren.add_argument("--project", default=None)
+    ren.add_argument("--project", type=cliparse.project_arg, default=None)
     ren.add_argument("--suggest", action="store_true",
                      help="add disabled stubs for ruled signatures recurring past the threshold")
     ren.add_argument("--enable", metavar="SIG", default=None,
@@ -4163,21 +4155,21 @@ def _build_parser() -> argparse.ArgumentParser:
     tgt = tgsub.add_parser("train",
                            help="derive trigger rules from the inventory + ledger "
                                 "and store rules/triggers.json")
-    tgt.add_argument("--project", default=None)
+    tgt.add_argument("--project", type=cliparse.project_arg, default=None)
     tgt.add_argument("--max-age-hours", type=float, default=0.0,
                      dest="max_age_hours",
                      help="stale-gate: skip when the manifest is younger than "
                           "this (0 = always retrain)")
     tgt.set_defaults(func=cmd_triggers_train)
     tgl = tgsub.add_parser("list", help="print the trained trigger rules")
-    tgl.add_argument("--project", default=None)
+    tgl.add_argument("--project", type=cliparse.project_arg, default=None)
     tgl.add_argument("--json", action="store_true", help="emit the raw manifest")
     tgl.set_defaults(func=cmd_triggers_list)
     tgc = tgsub.add_parser("check",
                            help="assess one prompt offline and show what the "
                                 "gate would inject")
     tgc.add_argument("prompt")
-    tgc.add_argument("--project", default=None)
+    tgc.add_argument("--project", type=cliparse.project_arg, default=None)
     tgc.set_defaults(func=cmd_triggers_check)
 
     # --- enrich (Oversee prompt enrichment: default-on toggle + preview) ---
@@ -4189,13 +4181,13 @@ def _build_parser() -> argparse.ArgumentParser:
                          ("on", "enable prompt enrichment"),
                          ("off", "disable prompt enrichment")):
         sp = ensub.add_parser(_name, help=_help)
-        sp.add_argument("--project", default=None)
+        sp.add_argument("--project", type=cliparse.project_arg, default=None)
         sp.set_defaults(func=cmd_enrich)
     env = ensub.add_parser("preview",
                            help="enrich one draft prompt: questions, source "
                                 "candidates, skills, SOP check, composed text")
     env.add_argument("prompt")
-    env.add_argument("--project", default=None)
+    env.add_argument("--project", type=cliparse.project_arg, default=None)
     env.add_argument("--json", action="store_true",
                      help="emit the full enrichment result as JSON")
     env.set_defaults(func=cmd_enrich)

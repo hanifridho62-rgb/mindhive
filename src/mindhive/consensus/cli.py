@@ -38,6 +38,7 @@ THE EXIT-CODE CONTRACT, and why each code is what it is:
 import json
 
 from .. import events as events_mod
+from .. import cliparse
 from . import (contribute, event_ref, fold_and_record, latest_record, trace)
 
 
@@ -180,8 +181,8 @@ def register(subparsers) -> None:
                               help="optional 0..1 multiplier the contributor "
                                    "states. It scales the weight, so it is "
                                    "bounded")
-    contribute_p.add_argument("--session", default=None)
-    contribute_p.add_argument("--project", default=None)
+    contribute_p.add_argument("--session", type=cliparse.session_id_arg, default=None)
+    contribute_p.add_argument("--project", type=cliparse.project_arg, default=None)
     contribute_p.set_defaults(func=cmd_contribute)
 
     fold_p = sub.add_parser("fold",
@@ -192,8 +193,8 @@ def register(subparsers) -> None:
     fold_p.add_argument("--end", default=None,
                         help="ISO timestamp, inclusive (default: latest input)")
     fold_p.add_argument("--json", action="store_true")
-    fold_p.add_argument("--session", default=None)
-    fold_p.add_argument("--project", default=None)
+    fold_p.add_argument("--session", type=cliparse.session_id_arg, default=None)
+    fold_p.add_argument("--project", type=cliparse.project_arg, default=None)
     fold_p.set_defaults(func=cmd_fold)
 
     trace_p = sub.add_parser("trace",
@@ -202,5 +203,5 @@ def register(subparsers) -> None:
                                   "input cannot be resolved")
     trace_p.add_argument("--frame", required=True)
     trace_p.add_argument("--json", action="store_true")
-    trace_p.add_argument("--project", default=None)
+    trace_p.add_argument("--project", type=cliparse.project_arg, default=None)
     trace_p.set_defaults(func=cmd_trace)

@@ -20,8 +20,23 @@
 # feature not working yet is fine; announcing that per-turn is not.
 if ($env:MINDHIVE_HEADLESS -eq "1") { exit 0 }   # headless child: no recursion
 $ErrorActionPreference = "SilentlyContinue"
-$py = "C:\Users\hanif\mindhive\.venv\Scripts\python.exe"
-if (-not (Test-Path $py)) { exit 0 }
+# Resolve the interpreter through the shared library instead of hard-coding one
+# operator's venv. Every step is fail-open and the failure is SILENCE: a hook
+# registered in ~/.claude/settings.json fires in every session on the machine,
+# so a library that is missing, unparseable, or finds no interpreter must leave
+# the session exactly as it found it. `lib.ps1` explains the resolution order.
+# The child's stderr is discarded for the same reason. The old shim named ONE
+# venv and could assume `mindhive` was installed in it; tier 3 can resolve a
+# bare `python` off PATH that has no `mindhive` at all, and a hook that prints
+# `No module named mindhive` on every fire is not the silent no-op this
+# contract promises. Safe here specifically because success is never judged by
+# `$?` -- these shims exit 0 unconditionally.
+$lib = Join-Path $PSScriptRoot "lib.ps1"
+if (-not (Test-Path -LiteralPath $lib -PathType Leaf)) { exit 0 }
+try { . $lib } catch { exit 0 }
+if (-not (Get-Command Get-MindhivePython -ErrorAction SilentlyContinue)) { exit 0 }
+$py = Get-MindhivePython
+if (-not $py) { exit 0 }
 try {
     if ([Console]::IsInputRedirected) {
         $raw = [Console]::In.ReadToEnd()

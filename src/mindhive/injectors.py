@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import events, paths
+from . import cliparse
 
 # D4's three states. `sopgate`'s finer `pointers_only` is deliberately NOT a
 # fourth member — it survives inside `reason`, so there is one legend for a
@@ -848,7 +849,7 @@ def register(subparsers) -> None:
     sh.add_argument("--turn", default="last",
                     help="'last' (the current turn, with its composed text) or "
                          "an index into the recent ring, 0 = newest")
-    sh.add_argument("--project", default=None,
+    sh.add_argument("--project", type=cliparse.project_arg, default=None,
                     help="namespace (default: this repo)")
     sh.add_argument("--json", action="store_true",
                     help="machine-readable report on stdout, even when empty")

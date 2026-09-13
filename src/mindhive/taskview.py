@@ -15,11 +15,19 @@ import re
 import time
 from pathlib import Path
 
+from . import events as ev_mod
+
 ACTIVE_WINDOW_SECS = 600      # newest event younger than this -> "ongoing"
 ITEM_CAP = 100                # locked: detail history shows the last 100 rows
 DIFF_CAP_LINES = 400
 OUTPUT_CAP_CHARS = 10_000
-_SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# `events` owns the rule; this used to recompile it, which made a FOURTH
+# statement of a whitelist the anti-drift test enumerates three of -- and the
+# copy had already drifted. It was anchored with `$`, which Python matches
+# immediately BEFORE a trailing newline, so `"abc\n"` passed the guard whose
+# own docstring promises path traversal is rejected. `events` uses `fullmatch`,
+# which has no such behaviour; importing the pattern is how the fourth
+# statement stops being a statement.
 _NOTE_TYPES = ("caveat", "decision", "experiment_result",
                "next_step", "open_question")
 
@@ -112,7 +120,8 @@ def transcripts_root() -> Path:
 def find_transcript(session_id, root=None):
     """Locate ``<root>/<any dir>/<session_id>.jsonl``. The id becomes a
     filename, so anything but a strict token is rejected (path traversal)."""
-    if not isinstance(session_id, str) or not _SID_RE.match(session_id):
+    if not isinstance(session_id, str) \
+            or not ev_mod.SESSION_ID_RE.fullmatch(session_id):
         return None
     root = Path(root) if root else transcripts_root()
     if not root.exists():

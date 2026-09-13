@@ -186,10 +186,102 @@ the truth about what happens next: it promises a queued successor only when a
 supervisor is actually waiting, and otherwise says plainly that nothing is queued
 and names the command that would queue one.
 
-**Rotation is Windows-only today** — every hook shim in `hooks/` is PowerShell
-(nine `.ps1`, no POSIX equivalent), so `hive session install-hook` on macOS or
-Linux registers a valid entry for a command that cannot run. It reports that as a
-`platform_warning` rather than leaving you to discover it as an absence.
+**Rotation runs on both families.** `hooks/` ships nine PowerShell shims and
+nine POSIX siblings, and `hive session install-hook` registers the one matching
+the platform — `powershell -NoProfile -ExecutionPolicy Bypass -File
+"hooks/stop.ps1"` on Windows, `sh "hooks/stop.sh"` elsewhere. The path is
+quoted because an unquoted one breaks on any checkout under a directory with a
+space in its name, and for the Stop stage that break is printed at the end of
+every agent turn. `-ExecutionPolicy Bypass` is there because a Windows client's
+default policy is `Restricted`, under which `powershell -File` refuses every
+script with a SecurityError and exits 1 — on every hook fire, before the shim's
+fail-open code runs; the flag applies to that one process and changes no
+machine setting. A Stop entry registered before the flag existed still names
+the shim, so `install-hook` reports it as already registered: on a machine
+where the policy was never set, re-spell that entry by hand to the form above.
+It emits a `platform_warning` only when the shim your platform needs is
+actually missing from the checkout, rather than whenever you are not on
+Windows.
+
+## Installing the hooks on a new machine
+The hooks are portable: nothing in `hooks/` names a user, a checkout, or a venv.
+Each shim resolves its interpreter at run time through `hooks/lib.sh` (POSIX) or
+`hooks/lib.ps1` (PowerShell), in this order:
+
+1. **`MINDHIVE_PYTHON`**, when it points at a real file. The operator override —
+   set this if your interpreter is somewhere unusual. On Windows both libraries
+   read it the same way whether it is spelled `C:\...\python.exe`, in Git Bash's
+   `/c/.../python.exe` form, or without the `.exe`.
+2. **The nearest `.venv` above the shim**, probing `Scripts/python.exe`, then
+   `bin/python3`, then `bin/python` — one order in both libraries, so one tree
+   gets one answer. In a plain checkout `mindhive` is installed editable in that
+   venv, so it is the interpreter that imports the checkout the hook belongs to.
+   A git worktree is the exception: a checkout under
+   `<repo>/.claude/worktrees/<name>` with no `.venv` of its own walks up to
+   `<repo>/.venv`, whose editable install imports `<repo>/src` — so that
+   worktree's hooks run the **main checkout's** code, not the worktree's branch.
+   To run a worktree's own code, give it its own `.venv` (`pip install -e .`
+   inside the worktree); the walk finds the nearer one first. The walk climbs at
+   most `MINDHIVE_HOOK_WALK_LIMIT` directories (default 8; `0` turns it off).
+3. **`python3`, then `python` from PATH**, as a last resort — except a hit under
+   Windows `WindowsApps`, which is the Microsoft Store redirector. That one is
+   refused on purpose: it spawns cleanly, prints an install prompt and exits 49,
+   so accepting it would give every hook an interpreter that never runs a line.
+   The refusal is a SKIP, not a stop — on a default Windows profile that
+   directory sits on PATH *ahead* of a per-user Python install, so the search
+   goes on to the next match rather than concluding there is no interpreter.
+   Both libraries walk every PATH entry themselves to make that true; a
+   first-hit-only lookup answers "no interpreter" on a machine that has one,
+   and `Get-Command`, which `lib.ps1` used to lean on, does not strip the
+   quotes a PATH entry may legally carry, so an interpreter in
+   `"C:\Program Files\Py"` was found by one family and not the other. On
+   Windows only a `.exe` counts from PATH: a `python.cmd` or `python.bat`
+   wrapper runs through `cmd.exe`, which re-parses its arguments, so both
+   libraries pass over it. One asymmetry is deliberate: under Git Bash
+   `lib.sh` also accepts an extensionless `#!` script, which that shell can
+   exec and PowerShell cannot, so `lib.ps1` passes such a file over.
+
+If none of those resolve, every shim exits 0 and prints nothing — with one
+documented exception: `pre_compact` still prints its human reminder, because
+that text is the whole point of the hook and needs no interpreter to compose.
+The silence is deliberate — these hooks fire in every session on the machine, so
+a hook that can fail loudly is worse than one that occasionally does nothing.
+
+So the whole setup is:
+
+```
+git clone <repo> && cd mindhive
+python -m venv .venv
+.venv/Scripts/pip install -e .      # or .venv/bin/pip on POSIX
+hive session install-hook "$HOME/.claude/settings.json"     # POSIX
+```
+
+On Windows PowerShell the last line is:
+
+```
+hive session install-hook "$env:USERPROFILE\.claude\settings.json"
+```
+
+Spelled out rather than `~`, because nothing expands it: the CLI hands the
+string to `pathlib.Path`, which treats `~` as a literal directory name, so the
+`~` form reports `missing` against a path that does not exist and registers
+nothing. The shell is what expands `$HOME`; `pathlib` never sees the tilde.
+
+Registering the Stop hook does **not** activate rotation: the shim stays inert
+unless `MINDHIVE_ROTATION` is set, and only `hive session run` sets it, for the
+children it spawns.
+
+`hooks/` holds nine shims, but they are not nine hooks to register. `autosync`
+is not a Claude Code hook at all — it is the scheduler wrapper (Task Scheduler
+on Windows, cron on POSIX) — and `post_tool_use_failure` is built but not
+registered today (`docs/prds/2026-07-21-002-rust-tool-interception-prd.md`
+lists it as "built, unregistered"). That leaves six — `SessionStart`,
+`PreToolUse`, `UserPromptSubmit`, `PostToolUse`, `PreCompact`, `SessionEnd` —
+to register by pointing `~/.claude/settings.json` at the shim for your
+platform, e.g.
+`powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>/hooks/session_start.ps1"`
+or `sh "<repo>/hooks/session_start.sh"` — plus `Stop`, which `install-hook`
+writes for you.
 
 ## Install the `/circle` plugin (global)
 This repo is a self-contained Claude Code plugin marketplace. To get `/circle` in **every** project:
@@ -199,7 +291,7 @@ This repo is a self-contained Claude Code plugin marketplace. To get `/circle` i
 /plugin install mindhive@mindhive-dev
 ```
 
-(or `/plugin marketplace add C:\Users\hanif\mindhive` to install from the local checkout). Then start a new session and type `/circle`. `hive loop` itself still needs the `mindhive` package importable (the plugin shells out to `python -m mindhive loop`) and the `claude` CLI on PATH.
+(or `/plugin marketplace add <path-to-your-checkout>` to install from a local clone). Then start a new session and type `/circle`. `hive loop` itself still needs the `mindhive` package importable (the plugin shells out to `python -m mindhive loop`) and the `claude` CLI on PATH.
 
 ## Event types
 Semantic (you/Claude emit): decision, experiment_result, caveat, next_step,

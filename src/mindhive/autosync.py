@@ -6,7 +6,7 @@ from . import paths, harvest, projector, graph, sync
 
 
 def _registry_path():
-    return paths.store_home() / "autosync.json"
+    return paths.store_file("autosync.json")
 
 
 def load_registry() -> list:

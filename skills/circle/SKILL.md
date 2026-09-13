@@ -27,9 +27,11 @@ brainstorm→plan→review→learn stages attach to it here.
 > its own (default `permission_mode = "acceptEdits"`). Treat it like handing the
 > keyboard to an unattended agent. Confirm the goal before launching.
 
-All commands below run via the project venv:
-`C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive …` (or just
-`python -m mindhive …` if that interpreter is active).
+All commands below run via the MindHive checkout's own venv interpreter —
+`<checkout>\.venv\Scripts\python.exe -m mindhive …` on Windows,
+`<checkout>/.venv/bin/python -m mindhive …` elsewhere, where `<checkout>` is the
+directory MindHive is cloned into (or just `python -m mindhive …` if that
+interpreter is active).
 
 ## Steps
 

@@ -999,6 +999,11 @@ from the same review are recorded here rather than fixed, because each is outsid
   the incident path renders only fields written by the reflection pass holds for what is RENDERED
   into a brief; it does not hold for what reaches the reflector.
 
+*Update 2026-09-13:* the first two are closed. `sopgate.plan` partitions agent-authored mandatory
+rows out of the operator's fence, reading an accumulated `agent_authored` flag the sidecar carries;
+`lintester._run_child` stamps each child's `MINDHIVE_SESSION` with its run key. The third is
+unchanged: `reflect.build_prompt` still interpolates the error excerpt.
+
 ---
 
 ## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
@@ -1267,6 +1272,13 @@ the edit takes effect the moment the branch is checked out, before any review. D
 change, from master, with the harness verification loop (`claude-harness-verification`) run
 before and after.
 
+**Status 2026-09-13 -- fixed on branch `claude/hardcoded-paths-powershell-hooks-3a7e21`, not
+merged.** The `.ps1` family dot-sources `hooks/lib.ps1`, whose `Get-MindhivePython` and
+`Get-MindhiveSessionId` port `lib.sh`'s resolution order and whitelist; `tests/test_hook_shims_ps.py`
+pins them. The paragraph above still governs landing it: the registered hooks run from the main
+checkout, so the change takes effect when this branch is checked out there, and the harness
+verification loop belongs before and after that moment.
+
 ---
 
 ## 31. `events.append_event` names the segment file from an unchecked session id
@@ -1296,6 +1308,16 @@ than a file in the wrong directory. The reader side (`read_all`, `corrupt_rows`)
 
 **Why not in the hooks PR:** it is a change to the ledger's write path, with its own blast
 radius and its own review; the hooks change is additive and touches no `src/`. Keep them apart.
+
+**Status 2026-09-13 -- fixed on branch `claude/hardcoded-paths-powershell-hooks-3a7e21`, not
+merged, and NOT with the `ValueError` proposed above.** `events.segment_name` maps an id outside the
+whitelist -- or one with the reserved `unsafe-` prefix, or a Windows device name -- to
+`unsafe-<sha256[:16]>.jsonl`, computed before `_append_lock` is taken; the event keeps the raw id.
+Raising was rejected because `append_event` runs inside every hook stage, the two that bypass the
+shim included, and an exception there is an outage in every session. The loud refusal sits where a
+human types the value: `cliparse.session_id_arg`, wired to every `--session`. The same split closed
+the directory half of the path (`paths.namespace_name` and `cliparse.project_arg`), and the round-5
+review extended it to the store root's own file names (`paths.STORE_ROOT_FILES`, DATA_MODEL.md §1.1).
 
 ---
 

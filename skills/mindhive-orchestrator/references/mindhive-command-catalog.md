@@ -9,7 +9,7 @@ Function-Call Syntax section lists the handful you use most.
 
 1. `python -m mindhive <command>` (preferred)
 2. `hive <command>` (when the console script is on `PATH`)
-3. `C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive <command>` (explicit venv fallback on this machine)
+3. `<checkout>\.venv\Scripts\python.exe -m mindhive <command>` on Windows, `<checkout>/.venv/bin/python -m mindhive <command>` elsewhere (explicit fallback through the venv of the checkout MindHive is cloned into)
 
 If none resolve, MindHive is unavailable on this surface — run ULT-IDEA in
 stateless mode (see [compatibility.md](compatibility.md)).

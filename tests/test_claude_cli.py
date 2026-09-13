@@ -115,10 +115,11 @@ def test_error_text_empty_on_success_or_garbage():
 
 # --- MN-9: the child-environment overlay -------------------------------------
 #
-# The orchestrator needs each concurrent agent to get its own MINDHIVE_SESSION:
-# `events.append_event` writes to `<session_id>.jsonl` with an unlocked append, so
-# two agents sharing one segment interleave into corrupt JSONL — and the ledger is
-# the source of truth for the whole system.
+# The orchestrator needs each concurrent agent to get its own MINDHIVE_SESSION.
+# `events.append_event` once wrote to `<session_id>.jsonl` with an unlocked append,
+# so agents sharing one segment interleaved into corrupt JSONL; `_append_lock`
+# serialises appends now, and the distinct session is what gives each agent its
+# own segment and its own id.
 
 def _capture_env(monkeypatch):
     """Run the spawn against a fake subprocess, returning the child's env."""

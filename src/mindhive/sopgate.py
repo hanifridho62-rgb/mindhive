@@ -101,8 +101,13 @@ def _safe_title(value) -> str:
 
     Titles come from the registry and flow verbatim into agent-steering
     context, so a newline in one must not be able to forge a second directive
-    line. Same hardening, and the same reason, as `promptgate._safe_text`."""
-    return " ".join(str(value or "").split())[:120]
+    line. Same hardening, and the same reason, as `promptgate._safe_text`.
+
+    DELEGATES to `sop.safe_title` rather than restating the rule. `sop.block`
+    and `sop.digest_block` now need the identical sanitizer for the STATE.md and
+    MEMORY.md renderings, and a second spelling of it is precisely the drift this
+    module's own `is_agent_authored` docstring refuses for the prefix family."""
+    return sop.safe_title(value)
 
 
 def is_agent_authored(row) -> bool:
@@ -126,9 +131,29 @@ def is_agent_authored(row) -> bool:
     unreadable id, or a raising predicate answers False. Absent authorship is
     unknown authorship, not agent authorship — dropping every SOP written before
     session stamping would delete the tier to close a second-order hole. What
-    this closes is the case where the author IS recorded and IS an agent."""
+    this closes is the case where the author IS recorded and IS an agent.
+
+    **`agent_authored` first, `session_id` only as the fallback.** The row's
+    `session_id` is the FOLDED one, which names the last editor, so testing it
+    alone let a single human title-only edit launder an agent-written mandatory
+    procedure into this fence -- on every prompt, while `sop.block` withheld the
+    same row from STATE.md and no surface admitted the disagreement. The
+    accumulated answer cannot be computed here (this path must not fold the
+    ledger; see `plan`), so `sop._project_rows` computes it once and writes it
+    into the projection. The fallback is what keeps a sidecar written by an
+    older build behaving exactly as it did rather than failing shut.
+
+    **The flag can only ADD a withholding, never lift one.** `True` wins over a
+    human-looking `session_id` -- the laundering case. Anything else, `False`
+    included, falls through to the prefix test. `_project_rows` ORs that prefix
+    into the flag, so a sidecar this build wrote never holds `False` on an
+    agent-prefixed row; a hand-edited one can, and trusting `False` there would
+    compose a row the prefix test withholds, on the one path that cannot fold
+    the ledger to find out."""
     if not isinstance(row, dict):
         return False
+    if row.get("agent_authored") is True:
+        return True
     try:
         return bool(advice_mod.is_orchestration_session(row.get("session_id")))
     except Exception:                                       # noqa: BLE001
@@ -278,6 +303,11 @@ def probe(rows=None, project=None) -> dict:
         "mandatory": len(delivered),
         # Exclusion is the control; this is what keeps it from being silent.
         "withheld": len(withheld),
+        # NAMED, for `sop.withheld_footer`'s reason: a bare count tells an
+        # operator that something is missing without telling them what, and the
+        # only action available to them ("go read it") needs the id. Capped
+        # because this rides a projection line; the count above is not.
+        "withheld_ids": [_safe_title(r.get("sop_id")) for r in withheld][:6],
         "bodies": len(bodies),
         "pointers": len(pointers),
         "body_chars": sum(r["chars"] for r in bodies),
@@ -294,7 +324,9 @@ _PROBE_VERDICTS = {
     "silent": "nothing is injected — no mandatory SOP in the global sidecar",
     "pointers_only": "NO body fits — every prompt gets titles and a pointer",
     "partial": "some bodies fit, the rest degraded to pointers",
-    "verbatim": "every mandatory body rides in full",
+    # "delivered", not "mandatory": a withheld procedure IS mandatory and is
+    # not in this count. See `verdict_sentence`.
+    "verbatim": "every delivered mandatory body rides in full",
 }
 
 
@@ -310,17 +342,41 @@ def verdict_sentence(measured) -> str:
     verdict = str(measured.get("verdict") or "silent")
     budget = measured.get("budget", PROMPT_BUDGET)
     mandatory = measured.get("mandatory", 0)
+    # What was WITHHELD is said first, whatever the verdict, because every
+    # sentence below describes only what was delivered. The `silent` case
+    # already had this reasoning attached to it -- "the sentence below would
+    # actively mislead: the promise was made and then not kept" -- and it was
+    # applied to the one verdict that reaches the fallthrough. It applies
+    # unchanged to `verbatim`: a tier with one delivered and one withheld
+    # procedure headlined "every mandatory body rides in full", which a reader
+    # who scans the headline takes as completeness. The exclusion was named on
+    # the next line; the summary line contradicted it.
+    held = measured.get("withheld") or 0
+    kept = (f" ({held} further procedure(s) WITHHELD — a spawned agent, not a "
+            f"human, wrote them)") if held else ""
     if verdict == "pointers_only":
         return (f"no body fits the {budget}-char prompt budget — every prompt "
                 f"gets {mandatory} title(s) and `hive sop show` instead of the "
-                f"procedure (largest is {measured.get('largest_chars', 0)} chars)")
+                f"procedure (largest is {measured.get('largest_chars', 0)} "
+                f"chars)" + kept)
     if verdict == "partial":
         return (f"{measured.get('bodies', 0)} of {mandatory} mandatory bodies "
                 f"fit the {budget}-char budget; the other "
-                f"{measured.get('pointers', 0)} degraded to pointers")
+                f"{measured.get('pointers', 0)} degraded to pointers" + kept)
     if verdict == "verbatim":
-        return (f"every mandatory body rides in full — {mandatory} SOP(s), "
-                f"{measured.get('body_chars', 0)} of {budget} chars spent")
+        return (f"every DELIVERED mandatory body rides in full — "
+                f"{mandatory} SOP(s), {measured.get('body_chars', 0)} of "
+                f"{budget} chars spent" + kept)
+    if held:
+        # `silent` WITH withheld rows is a different state from `silent`
+        # without them, and the sentence below would actively mislead: the
+        # promise was made and then not kept. Rendered before the fallthrough
+        # rather than appended to it, because the two halves of that sentence
+        # are what would be false.
+        return (f"nothing is injected because all "
+                f"{measured.get('withheld')} mandatory procedure(s) were "
+                f"WITHHELD — a spawned agent, not a human, wrote them; the "
+                f"tier is not broken, it is refusing")
     return ("no mandatory SOP in the global sidecar — nothing is injected, and "
             "nothing was promised")
 
@@ -356,7 +412,14 @@ def notice(result=None) -> str:
     if not isinstance(result, dict):
         return ""
     verdict = str(result.get("verdict") or "")
-    if verdict not in NOTICE_VERDICTS:
+    withheld = result.get("withheld") or 0
+    # `verbatim` is normally not worth a line (see NOTICE_VERDICTS). It is worth
+    # one when something was WITHHELD, because then the delivery being healthy
+    # is precisely what hides the exclusion: every promised body that is still
+    # there arrives in full, and the one that was dropped leaves no trace on any
+    # surface a session reads. "Never exclude silently" outranks "do not spend a
+    # line on a healthy tier".
+    if verdict not in NOTICE_VERDICTS and not withheld:
         return ""
     lines = [f"{SOP_MARK} **SOP injection: {verdict}** — {verdict_sentence(result)}"]
     for row in result.get("sops") or []:
@@ -365,6 +428,16 @@ def notice(result=None) -> str:
         lines.append(f"- `{row.get('sop_id')}` ({row.get('title')}) arrived as a "
                      f"POINTER, not its body — {row.get('chars', 0):,} chars. "
                      f"Read it before acting: `hive sop show {row.get('sop_id')}`")
+    if withheld:
+        named = ", ".join(f"`{i}`" for i in (result.get("withheld_ids") or []) if i)
+        more = " (and more)" if withheld > len(result.get("withheld_ids") or []) \
+            else ""
+        lines.append(f"- **{withheld} mandatory procedure(s) WITHHELD** from "
+                     f"every prompt: a spawned orchestration agent, not a "
+                     f"human, wrote them"
+                     + (f" — {named}{more}" if named else "")
+                     + ". They are still in the ledger and in `hive sop list`; "
+                       "read one with `hive sop show <id>`.")
     lines.append("_This verdict is **global**, not this namespace: the per-prompt "
                  "pass reads the global mandatory-SOP sidecar, so it describes "
                  "every session on this machine. Measured at the last projection "
@@ -383,7 +456,20 @@ def render_probe(result: dict) -> str:
         mark = "body" if row.get("delivered") == "body" else "POINTER"
         lines.append(f"  {mark:<7} {row.get('chars', 0):>6,} chars  "
                      f"{row.get('sop_id')}  ({row.get('title')})")
-    lines.append(f"  bodies {result.get('bodies', 0)}/{result.get('mandatory', 0)} · "
+    if result.get("withheld"):
+        ids = ", ".join(str(i) for i in (result.get("withheld_ids") or []) if i)
+        lines.append(f"  WITHHELD {result.get('withheld')} mandatory "
+                     f"procedure(s) — written by a spawned agent, not a human"
+                     + (f": {ids}" if ids else ""))
+    # `mandatory` counts what `plan()` returned, and `plan()` has already
+    # dropped the withheld rows -- so a tier with one delivered and one
+    # withheld procedure read `bodies 1/1`, which is the completeness claim the
+    # line above had just contradicted. The denominator is the REGISTRY's
+    # count, and the shortfall is named beside it.
+    _held = result.get("withheld") or 0
+    _registered = (result.get("mandatory", 0) or 0) + _held
+    lines.append(f"  bodies {result.get('bodies', 0)}/{_registered}"
+                 + (f" ({_held} withheld)" if _held else "") + " · "
                  f"body chars {result.get('body_chars', 0):,}/"
                  f"{result.get('budget', 0):,} · "
                  f"largest {result.get('largest_chars', 0):,} · "

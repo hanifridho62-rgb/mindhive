@@ -49,13 +49,58 @@ rebuildable in the strongest sense — deleting the whole database loses nothing
 Nothing in MindHive reads it unless an operator opts in, and nothing writes
 history to it ever.
 
+### 1.1 Names the store does not take at face value
+
+A project names a DIRECTORY under the store and a session id names a FILE inside
+`events/`, so both are path components. Each passes through one sink that cannot
+throw, because every hook and projection read reaches it: `paths.namespace_name`
+for a project, `events.segment_name` for a session.
+
+| Value | On disk | Why |
+|---|---|---|
+| a `PROJECT_RE` / `SESSION_ID_RE` slug | itself | the normal case |
+| anything else: a separator, `..`, a drive letter, a space, non-ASCII | `unsafe-<sha256[:16]>` | a traversal, or a name the filesystem would store as something else |
+| a name starting with `unsafe-`, in any case | quarantined as well | otherwise a caller could address another value's slot |
+| on Windows, a device name before the first dot (`CON`, `NUL.txt`, `COM1`, ...), or a component ending in a dot | quarantined | Win32 opens the device, or strips the dot so `abc.` is `abc`; a segment ends in `.jsonl`, so only a project can end in a dot |
+| a project named after one of the store root's own FILES (`paths.STORE_ROOT_FILES`, `research_run_*`), in any case, on every platform | quarantined | the directory would stand where the store keeps that file: a `LIVE_LOCK` directory reads as a held lock, an `autosync.json` directory empties the registry |
+
+Only the PATH is sanitised: the event keeps the raw value. Where a human types the
+value the refusal is loud instead. `cliparse.session_id_arg` and
+`cliparse.project_arg` accept exactly what the sink keeps, and the dashboard's
+`is_safe_project` asks the sink the same question, so an HTTP `project=` or
+`session_project=` the sink would rename is a 400 rather than a 200 from another
+directory.
+
+A root file is reached only through `paths.store_file`, which refuses a name not
+declared in `STORE_ROOT_FILES`; `tests/test_store_root_files.py` fails on any join
+onto `store_home()` outside `store_file` and `project_dir`.
+
+**Enumerators return canonical names only.** `paths.list_namespaces` (what
+`hive gc` and `hive projects` walk) and `paths.event_namespaces` (harvest, the
+dashboard's project list, `hive skills trail --all`) return a directory only
+when `namespace_name(name) == name`. A
+quarantine slot, a hand-made `My Project`, or a Windows `abc.` twin created
+through an extended-length path is UNLISTED: never listed, read or pruned by
+name, and reported by `hive gc` and `hive projects` (`paths.unlisted_namespaces`).
+`hygiene` counts a directory as registered by its name, its normalized name, or
+its identity (`st_dev`, `st_ino`) against a registered namespace's directory, and
+refuses to prune through a symlink or a junction.
+
+The one stated limit: two conforming names that differ only in case are one file
+or one directory on a case-insensitive filesystem (`Probe-1` and `probe-1` on
+NTFS). Folding case would close it and would also rename existing segments and
+namespaces, so the trade is refused and stated instead. The cost is bounded:
+every row keeps its raw value, and appends into one namespace are serialised by
+one lock held in its directory, so writers that share a segment mix their rows
+without tearing or misattributing either.
+
 ## 2. The event record (the one true schema)
 
 Every row in every `events/*.jsonl` segment:
 
 ```json
 {"ts": "2026-07-16T17:10:21Z",        // UTC, second resolution, ISO-8601 Z
- "session_id": "2c3835ba-…",          // segment name == session_id
+ "session_id": "2c3835ba-…",          // segment name == session_id (or its quarantine slot, §1.1)
  "type": "decision",                  // MUST be in events.VALID_TYPES
  "payload": {"text": "…"},            // object; contract varies by type (§3)
  "tags": ["memo"]}                    // lowercase kebab-case strings
@@ -1023,11 +1068,14 @@ in `.git/info/exclude`, which is local and does not travel, so on any other clon
 an agent's worktree appeared as untracked changes in the parent — and this
 project's own change-log detection reads `git status`.
 
-Each agent gets `MINDHIVE_SESSION=mn9-<task_id>`, because `events.append_event`
-appends to `<session_id>.jsonl` through an **unlocked** `open(..., "a")`.
-Concurrent agents sharing a session interleave mid-line into JSONL the fold cannot
-read, and the ledger is the source of truth for everything. The per-session
-segmentation was already the design; nothing was passing a distinct session down.
+Each agent gets `MINDHIVE_SESSION=mn9-<task_id>`. When this shipped,
+`events.append_event` appended through an unlocked `open(..., "a")`, and agents
+sharing a session interleaved mid-line into JSONL the fold could not read. Appends
+are serialised by `events._append_lock` now, so a distinct session is no longer
+what keeps the ledger readable; it is what gives each agent its own segment and
+its own id, which is what `provenance.is_agent_authored` inspects. The
+per-session segmentation was already the design; nothing was passing a distinct
+session down.
 `claude_cli.run_headless` gained an `env` overlay for this, and it applies
 `MINDHIVE_HEADLESS` **after** the overlay so no caller can defeat the recursion
 guard (the failure mode of that is an unbounded spawn loop).
@@ -1592,12 +1640,14 @@ says plainly that nothing is queued, names the artifact path it wrote, and names
 nothing: with `MINDHIVE_ROTATION` unset the hook is silent whatever the marker
 says (`tests/test_rotation_hook.py`).
 
-**Rotation is Windows-only today.** Every shim in `hooks/` is PowerShell — nine
-`.ps1` files, no POSIX equivalent — so `hive session install-hook` on
-macOS/Linux writes a perfectly valid settings.json entry for a command that
-cannot run, and the session then never rotates with nothing said. `install`
-returns a `platform_warning` on any successful result from a non-`nt`
-`os.name`, so the limit is reported rather than discovered as an absence.
+**Rotation runs on both shim families.** `hive session install-hook` registers
+`hooks/stop.ps1` through `powershell` on Windows and `hooks/stop.sh` through `sh`
+everywhere else (`rotation/install.py:default_command`, chosen by `os.name`).
+`install` returns a `platform_warning` on a successful result only when the shim
+for this platform is MISSING from the checkout: it asks the filesystem rather
+than comparing `os.name` to a constant, so a registration that cannot fire is
+reported rather than discovered as an absence, and the warning stays true when a
+platform gains or loses a shim.
 
 ### 4.15 The work link, and retiring a card on evidence
 

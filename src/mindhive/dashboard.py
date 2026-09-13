@@ -64,7 +64,7 @@ from .dashboard_memo import (_CATS_MEMO, _IMPROVE_MEMO, _MEMO_MAX,  # noqa: F401
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
 DEFAULT_PORT = 54461
 def _token_path():
-    return paths.store_home() / "dashboard.token"
+    return paths.store_file("dashboard.token")
 
 
 def load_or_create_token() -> str:
