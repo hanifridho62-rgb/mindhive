@@ -864,6 +864,21 @@ the legend opened their panel off screen and their task id — the thing you cli
 
 ### 4.6 The MN-7 orchestrator: waves over the graph
 
+> **Soft-deprecated as a front door (2026-09-09), not as a mechanism.** New work
+> goes through the lintester mission pipeline; `hive mindnet orchestrate` prints
+> `mindnet.orchestrator.PRIMARY_DOOR_NOTICE` on every non-JSON run and is kept,
+> unchanged: the mission pipeline builds its own graph from an intent and never
+> folds a declared one, so it cannot run what this runs. Everything this
+> section specifies — the wave loop, the outcomes, the exit codes — still holds.
+>
+> **Kept is not "supported" (2026-09-13).** The agent runner's `runner_kwargs`
+> carries no `permission_mode`, and a headless child with none had its Write
+> declined and still exited 0. The loop above stays honest about that — a clean
+> exit is `ran-unverified`, which writes no status row, so the run ends
+> `awaiting-validation` with exit 1 — but an agent wave here can end with nothing
+> written. The notice says so now; giving these children a posture is open in
+> TODOS #35, not done.
+
 `hive mindnet orchestrate` walks the MN-2 graph in **waves**. One wave = the
 current frontier, run concurrently, then persisted.
 

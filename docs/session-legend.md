@@ -102,7 +102,7 @@ Units are MN-numbered; the number in each docstring is the address.
 | `enforcer.py` | MN-4 — the teeth; where the spine refuses instead of describing. |
 | `inject.py` | MN-1 U9 — phase-aware injection into the prompt context. |
 | `optin.py` | MN-6 — the blast-radius gate. Enforcement is **opt-in, per checkout**. |
-| `orchestrator.py` | MN-7 — the parallel orchestrator that walks the graph in waves. |
+| `orchestrator.py` | MN-7 — the parallel orchestrator that walks the graph in waves. **Soft-deprecated as a front door** (2026-09-09): `PRIMARY_DOOR_NOTICE` goes to stderr on every non-JSON run, dry or `--execute`. Kept, not removed — the mission pipeline builds its own graph and never folds a declared one, and `hive mindnet ab` runs through this module too. (An earlier version of this row said nothing else *reads* a declared graph; `controller`, `briefcli`, `decompose` and `ab` all do.) |
 | `agent.py` | MN-8 — what a spawned agent actually runs for a task. |
 | `worktree.py` | MN-9 — one isolated checkout per orchestrated task. |
 | `decompose.py` | MN-11 — a task proposing its own subtasks. Takes a `spawn`, because on the lintester path this is the mission's first fenced child. |
@@ -258,7 +258,7 @@ job, and the dashboard section (see
 | `dashboard_js_skills.py` | The Skill & Plugin panel. |
 | `dashboard_js_actions.py` | The six long clicks as polled jobs, the cat board's poll, and the boot sequence. Concatenated **last**, and it has to be: `setInterval(pollCats, …)` and the boot IIFE are the only statements on the page that execute at parse time rather than declaring a function. |
 | `workspace.py` + `workspace_page.py` | MindParallel — the fleet of headless `claude` subprocess agents. |
-| `swarm_page.py` | MindSwarm — the mission view. |
+| `swarm_page.py` | MindSwarm — the mission view. **Soft-deprecated as a front door** (2026-09-09): `MINDHIVE_MINDSWARM=0` hides the nav row (default ON, read per request — but a running dashboard's environment is fixed at launch, so changing it means restarting). The route, this renderer and `showWorkspace` are untouched. |
 | `research.py` + `research_page.py` | Self-Reliant autoresearch. |
 | `oversee.py`, `taskview.py`, `cat_board.py` | Oversee projection, the Sessions notification center, the faculty cat board fragment. |
 | `theme.py` | The colour palette, as `:root` custom properties — one Python source of truth for four documents. `PALETTE_CSS` goes into the shell (injected at the `/*__PALETTE__*/` marker, and `taskview.CARDS_CSS` renders into that same document, so it is written against these tokens too); `STATUS_CSS` — the three colours every document agrees on — goes into the `workspace`/`swarm`/`research` iframe pages, which are separate DOCUMENTS and cannot inherit a parent's `:root`. **`cat_board` is deliberately outside it**: it renders into two documents with different palettes, and its colours become SVG `fill=` presentation attributes, which do not substitute `var()`. `tests/test_dashboard_theme.py` holds the rules (no colour written twice, no token value left as a literal, every document defines exactly the tokens it uses). |
