@@ -133,7 +133,7 @@ def test_the_tooltip_says_kept_not_going_away():
     """The dashboard operator never sees the CLI notice, so this attribute is
     the only place the deprecation reaches them. It carries the promise that is
     true for ITS door -- MindSwarm children do get a posture (`workspace.py`
-    passes bypassPermissions behind a --disallowedTools fence), so "kept and
+    spawns them under bypassPermissions, with no deny list), so "kept and
     still supported" holds here although the CLI notice no longer says it --
     and never a harsher one."""
     # On the SERVED page, not on the constant: a tooltip spliced out of the

@@ -1572,10 +1572,11 @@ exhaust the machine.
 > entirely. Second recorded instance of the shape — PR #71 was the first — so the
 > lesson is not "check more carefully", it is that **a merged PR proves its head
 > reached its BASE**, and a stacked PR's base is another branch. Re-landed by
-> merging `99fcfa3` onto `c14e683`: clean, zero conflicts, because PR #130 had
-> touched a disjoint set of files. The counts this item already records still
+> merging `99fcfa3` onto `c14e683`: clean, zero conflicts; PR #130's one shared
+> file was this one, `TODOS.md`, edited in different sections, and it
+> auto-merged. The counts this item already records still
 > hold on the new base — `__main__.py` 4235 of its 4237 allowance,
-> `mindnet/orchestrator.py` 996 of 1000 — and the full suite on the merged tree
+> `mindnet/orchestrator.py` 996 of 1000 (999 after the correction below) — and the full suite on the merged tree
 > is 7255 passed, 3 skipped, 283 deselected, exit 0 — re-measured on a tree
 > nothing else was touching, after the first run turned out to share its tree
 > with review agents that were mutation-testing tracked files.
@@ -1596,9 +1597,14 @@ exhaust the machine.
 > `test_no_permission_mode_is_granted_by_default` pins `agent.run` granting none
 > on purpose ("Authority is the operator's to grant"), so a grant belongs at this
 > door's `runner_kwargs`, not in `agent.run`; and `__main__.py` has two lines of
-> allowance left. MindSwarm is unaffected — `workspace.py` passes
-> `bypassPermissions` behind a `--disallowedTools` fence, so the dashboard
-> tooltip's promise stands.
+> allowance left. MindSwarm is not affected by this gap: `workspace.py` spawns
+> its children with `--permission-mode bypassPermissions`, so they can edit and
+> the dashboard tooltip's "still supported" stands. That posture has NO
+> `--disallowedTools` fence — `Manager.send` adds one only when a caller passes a
+> deny list, and MindSwarm's `spawn` and `command` never do. An earlier line here
+> said otherwise; the PR-body fact-check caught it. Full suite at `289a23d`
+> (this worktree, clean tree before and after): 7256 passed, 3 skipped, 283
+> deselected, exit 0.
 
 The machine grew three front doors. `hive lintester "<intent>"` is the mission
 pipeline and the one new work goes through. `hive mindnet orchestrate` walks a
