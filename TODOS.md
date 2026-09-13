@@ -735,6 +735,21 @@ tests pin the two properties that make the race impossible rather than reproduci
 
 ## 23. Nobody has measured whether briefing a sub-agent actually helps
 
+> **2026-09-08. The login blocker is gone, and two real fan-outs have now run.**
+> `claude auth status --json` answers `{"loggedIn": true, "authMethod": "claude.ai",
+> "subscriptionType": "max"}`, so the 2026-09-07 note below is stale in its premise.
+> Mission `lm-84c06ad6` ran twice from this checkout, and both runs are recorded in
+> item 27. What matters here: a real child edited a real lane, which had never
+> happened. Two defects had to be closed first, and neither was known when the note
+> below was written — children were spawned with NO `--permission-mode`, so their
+> edits were declined while `_run_child` still scored them `ok`; and `decompose.run`
+> parsed a string cut at `runlog.EXCERPT_CHARS`, so any decomposition over 2000
+> characters collapsed to one unit.
+>
+> **The A/B this item actually asks for still has not run.** `hive mindnet ab
+> --execute --record` is untouched, and `mindnet/orchestrator.py` spawns its
+> children through the same seam with the same missing posture, so it would measure
+> children that cannot edit. Fix that before believing any A/B number it produces.
 > **2026-09-07.** Still open, and the gap is now named precisely. No `--execute` run has
 > ever completed on this machine because the CLI is not logged in: `claude auth status --json`
 > answers `{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}` at exit 1.
@@ -1003,6 +1018,54 @@ from the same review are recorded here rather than fixed, because each is outsid
 
 ## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
 
+> **2026-09-08. The sample exists. It says the weight ORDERS the work and its
+> SCALE is meaningless.** `hive lintester --calibration` no longer answers zero:
+>
+> ```
+> weight calibration over 2 recorded sample(s): the weight orders the work over 2
+> measured unit(s), rank correlation +1.00; the costliest weight-unit ran 660.0x
+> the cheapest
+>   add-a-retry-...-events:   weight 1547 -> 465485.782 ms (300.896 ms per weight-unit)
+>   add-a-retry-...-events-4: weight 1    -> 198604.146 ms (198604.146 ms per weight-unit)
+> ```
+>
+> Read it carefully, because `+1.00` flatters it: two points are trivially ordered.
+> The number that carries information is the spread. The weights differ by 1547x and
+> the durations by 2.3x, so `calculate_workload_weight` predicts the ORDER and not
+> the MAGNITUDE — and it collapses to 1 for any unit whose description names no repo
+> file, which is what "Cover the retry paths ... with fault injection" and "Record
+> the mandatory change-log entry" both did. That is the open question this item
+> named, answered for the first time with real children.
+>
+> **Two defects were closed to get here, both found by running it.** Children were
+> spawned with no `--permission-mode`: a probe that day showed the Write declined,
+> exit 0, clean envelope, and `_run_child` scoring it `ok` — a fan-out would have
+> timed N children that could not touch the tree. And `decompose.run` parsed
+> `RunResult.excerpt`, cut at `runlog.EXCERPT_CHARS` (2000) so the copy riding a
+> ledger event stays bounded; the agent's 2507-character answer lost its closing
+> brace mid-string, `parse` closed the object on an inner brace, and run 1 degraded
+> to `root-only` reporting `the agent's json did not parse` — blaming the model for
+> well-formed json. A logging bound was deciding the shape of the work.
+>
+> **Why there are two samples and not five.** Run 2 decomposed properly (three units
+> over two lanes, `decomposition: agent`) and then hit a 429 session limit. Two
+> children were reported `[usage] ... nothing was attempted, so the task is left
+> untouched`. That claim is false: those children had run 22 and 12 turns over
+> 333805 ms and 396685 ms and left 146 and 7 lines of uncommitted edits in their
+> lanes. `agent._classify` checks the envelope error before the exit code and maps
+> every `is_error` to never-started — correct for an auth failure at spawn, wrong
+> for a limit reached after real work. `_calibrate` skips `executed=False`, so it
+> discarded exactly the two measurements this item wants. **This is the next thing
+> to fix, and it is not a casual reorder:** `_classify`'s own comment records that
+> ordering being gotten wrong three times, and treating an auth failure as a task
+> failure blocks a subtree permanently.
+>
+> **Corrections to what this item assumed.** A dirty lane is KEPT, never merged —
+> `release_lanes` delegates to `mindnet.worktree.retire`, which removes only clean
+> lanes. All three lanes from the two runs are archived on `archive/lintester-run*`
+> branches, unreviewed and merged into nothing. And `acceptEdits` does not approve
+> Bash: one child logged nine Bash/PowerShell denials trying to run pytest on its
+> own work, so children can edit but cannot verify.
 > **2026-09-07.** Still open; the missing sample is blocked by the same fact as item 23 —
 > the CLI on this machine is not logged in (`claude auth status --json` →
 > `{"loggedIn": false, "authMethod": "none"}`). Two things changed so that the FIRST real
@@ -1154,6 +1217,28 @@ state is a record of the worst the mission ever saw rather than of where it stan
 
 ## 29. The terminal board is built and exercised; what no test can prove is that it reads well
 
+> **2026-09-08. It has now been driven by real children, and it reads well.**
+> Both runs of mission `lm-84c06ad6` used `--board --execute`. The Brain panel, the
+> Worker Lanes table and the Circuit Breaker panel all rendered at terminal width
+> with the lane rows intact, and no `board: N event(s) dropped` line appeared in
+> either run — so the bounded queue was never pressed by a real mission's publish
+> rate at this size (1 and 3 units; four lanes churning is still unmeasured).
+>
+> The `note` alert this entry asked about did fire, in run 2, and it reads as the
+> machine rather than the mission:
+>
+> ```
+> ! halted: the account's usage limit is exhausted, so no child could start;
+> wait for the window to reset and re-run -- the mission does not retry this
+> ```
+>
+> It sits in its own Circuit Breaker & Alerts panel and scrolls nothing away, which
+> is what this entry wanted checked. One caveat on the wording, not the layout: in
+> that run "no child could start" was not true — both children had run for minutes
+> and left edits. See item 27.
+>
+> **Still nobody has watched it live.** Both runs were captured to a file with
+> stderr redirected, not read off a TTY at four frames a second.
 > **2026-09-07.** Still open, blocked by the same login as items 23 and 27. One more
 > event now reaches the board that has never been rendered against a real run: the
 > `note` alert (`halted: the Claude CLI on this machine is not logged in …`) that
@@ -1386,3 +1471,86 @@ suite runs once on that tree, and the branch survives its worktree.
 lanes are the only state this pipeline leaves behind on purpose, and nothing
 sweeps them. The second is a handover gap rather than a defect. The third and
 fourth are the same "no real sample" gap the neighbouring items carry.
+
+## 34. The child fence is real now; what it can and cannot hold is worth stating
+
+`src/mindhive/orchestrator/fence.py` landed on 2026-09-09. Before it, a mission
+that asked for a ceiling printed `enforcement: kernel` while `_run_child` ran a
+completely unfenced `claude` — the field had existed since `run_sandboxed`
+landed and nothing had ever been behind it. `claude_cli.run_headless` now takes
+a `spawn=`, `mindnet/agent.py` forwards it on every hop of a rotation chain,
+`Fence.spawn` composes the same `_preexec_for` / `_job_for` / `_run_capped` /
+`_close_job` that `run_sandboxed` composes, and the reported verdict starts at
+`resilience.fencing`'s prediction and can only get worse from there.
+
+Two of the defects below were found by an adversarial review of the diff before
+it was committed, and both were the SAME defect one layer out: a mission
+reporting `kernel` over a `claude` nothing was holding. The decomposition child
+— the first child of every real mission — reached `agent.run` with no `spawn=`
+at all, and `_spawn`'s lazy `Fence` build was an unlocked check-then-set that
+handed concurrent lanes their own orphaned fences (measured: more than one
+fence in 200 of 200 rounds). Both are fixed; the reflector below is the leg
+that is not.
+
+**What is honestly still open.**
+
+* **The breaker's reflection is NOT fenced, and the report does not say so.**
+  When a breaker opens, `RepairLoop` calls the injected reflector, which on the
+  CLI path is `resilience.reflect_on_open` -> `resolve.resolve_batch` ->
+  `reflect._claude_runner` -> `run_headless` with no `spawn=`. That is a real
+  `claude` child of the mission running with no ceiling while the mission may
+  still print `kernel`. It is conditional — a breaker has to open first, and
+  even then the resolver may find nothing actionable and spawn nothing — where
+  the decomposition leg was unconditional, which is why that one was fixed
+  inside PR-4 and this one is written down instead: threading `spawn` through
+  three modules that `hive rules resolve` also uses is its own change, with its
+  own tests, not a rider on this one. `fence.py`'s docstring states the scope so
+  the code does not overclaim; nothing in `cli.py`'s `fencing: <verdict>` line
+  does, and that is the gap.
+* **No real `claude -p` child has ever been fenced.** The same gap as items 27,
+  29, 32 and 33. Every assertion in `tests/test_orchestrator_fence.py` runs
+  against a patched `_job_for` / `_run_capped`, deliberately — driving the real
+  Windows kernel would make every one of them platform-conditional and leave
+  the POSIX leg proving nothing. The mechanisms themselves ARE measured
+  elsewhere (a 400MB child raising MemoryError under a 64MB job object), but
+  the composition of fence + `run_headless` + a real CLI is unmeasured until
+  `claude auth login` and the first
+  `hive lintester "<intent>" --execute --memory-mb <n>`.
+* **The assignment window is real and stated, not closed.** `jobs._assign`
+  attaches the child immediately after `Popen` returns, because `subprocess`
+  closes the primary thread handle before handing the object back and there is
+  nothing left to resume. A child cannot be scheduled long enough to allocate
+  past a ceiling in those microseconds, but that is an argument, not an
+  enforcement. `setrlimit` has no such window — the kernel applies it before
+  `exec` — so POSIX is strictly tighter here than Windows.
+* **A ceiling is per child, not per mission.** Four lanes with `--memory-mb 512`
+  may hold 2GB between them. Nothing sums the lanes, and nothing refuses a
+  ceiling times a lane count the machine cannot survive. The operator sets one
+  number and multiplies it in their head.
+* **Only the fence's own failures downgrade the verdict.** A job created and
+  assigned is reported as `kernel`, and that is the strongest claim available —
+  but the kernel does not tell us afterwards whether a limit was ever
+  approached, so `kernel` means "held", never "held and it mattered". The
+  cross-check that a ceiling was really applied is the child dying with
+  MemoryError, which is a mission outcome, not a fence field.
+* **`_run_capped`'s drain bound is the liveness floor for a lintester lane.**
+  On a timeout the fence kills the child, terminates the job, and then waits at
+  most `_DRAIN_GRACE_S` for the pipes. If a grandchild still holds them the
+  output is abandoned and `drained` is False — which `run_sandboxed` reports in
+  its timeout reason and `Fence` currently does NOT surface, because
+  `run_headless` maps the whole timeout to exit 124 and discards the exception's
+  payload. So a lane that overran its cap AND left something alive looks
+  identical to one that merely overran.
+
+* **`lintester.py` is at 982 of the 1000-line cap.** Eighteen lines of headroom
+  after the fence wiring. The next feature that touches it needs a carve-out
+  first, and `agenttask.py` / `preview.py` / `mission.py` are the pattern.
+
+**Cons of leaving it:** the reflector bullet is a correctness gap, not a stated
+property — it is the one item here that can still put a false `kernel` in front
+of an operator, and it is the reason this item exists rather than being closed.
+The `claude auth login` bullet is the same owner action four other items are
+waiting on. The rest are bounded, stated properties rather than defects — but
+the per-child ceiling is the one an operator can hurt themselves with, because
+it is the only one where the tool will do exactly what it was told and still
+exhaust the machine.

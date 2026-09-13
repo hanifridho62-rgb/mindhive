@@ -318,6 +318,49 @@ def test_an_environment_outcome_exits_with_its_own_status_and_names_what_was_lef
     assert "lm-1: environment" in out
 
 
+def test_a_run_that_starts_work_gets_the_root_its_help_promised(
+        monkeypatch, tmp_path):
+    """The front door resolves the cwd its help promises, rather than None.
+
+    WHAT THIS PINS is exactly that one hand-off: the value `cli` hands to
+    `LintesterOrchestrator`. `execute_mission` is replaced wholesale below, so
+    no lane is ever acquired and this test does NOT exercise the crash --
+    saying otherwise would be a fixture that cannot reach the defect it claims.
+
+    WHY IT MATTERS is that crash, which is real: `--root` documented "default:
+    cwd" and the parser passed None, and `worktree.lane_path_for` builds
+    ``Path(root)`` outside the guard that turns a git fault into a reason, so a
+    real `--execute` raised TypeError after decomposing the intent and weighing
+    every unit. Reproduced on this checkout on 2026-09-08. A non-None root at
+    this seam is what stops it, and a non-None root is what is asserted."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = []
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        seen.append(self.root) or _mission())
+    monkeypatch.chdir(tmp_path)
+
+    _cli("lintester", "x", "--execute")
+
+    assert seen == [str(tmp_path)]
+
+
+def test_an_explicit_root_is_still_the_one_used(monkeypatch, tmp_path):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = []
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(lint_mod.LintesterOrchestrator, "execute_mission",
+                        lambda self, intent, dry_run=True, checkpoint_dir=None:
+                        seen.append(self.root) or _mission())
+
+    _cli("lintester", "x", "--execute", "--root", str(tmp_path))
+
+    assert seen == [str(tmp_path)]
+
+
 def test_the_environment_status_is_distinct_from_a_partial_run():
     assert lint_cli._status("ok") == 0
     assert lint_cli._status("dry-run") == 0
@@ -457,3 +500,71 @@ def test_the_plain_report_names_the_commits_and_the_integration_branch(
     assert "git switch lint/lm-1/integration" in out
     assert "lane 1" in out and "src/x.py" in out
     assert "suite integration:" in out and "7 passed" in out
+
+
+# --- the ceiling flags (PR-4) --------------------------------------------------
+#
+# Asserted at the construction seam, the way the reflector above is: a real
+# fenced run needs credentials and a real child, and neither belongs in this
+# suite. What the front door owes is the right `Limits` — the enforcement of it
+# is `tests/test_orchestrator_fence.py`'s job.
+
+def _limits_from(monkeypatch, *argv):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    seen = {}
+    real = lint_mod.LintesterOrchestrator
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    assert _cli(*argv) == 0
+    return seen["limits"]
+
+
+def test_a_run_with_no_ceiling_flags_asks_for_no_ceiling(monkeypatch):
+    """`Limits.empty` is what `LintesterOrchestrator._spawn` reads to decide it
+    should hand the child nothing at all, so this is the property that keeps
+    every default run on exactly the call it always made."""
+    lim = _limits_from(monkeypatch, "lintester", "rotate the ledger segment")
+    assert lim.empty
+    assert (lim.memory_bytes, lim.cpu_seconds) == (0, 0)
+
+
+def test_the_memory_flag_is_megabytes_at_the_door_and_bytes_underneath(
+        monkeypatch):
+    """An operator types MB; `setrlimit` and `ProcessMemoryLimit` take bytes.
+    A flag that passed 512 straight through would set a half-kilobyte ceiling
+    and every child would die instantly."""
+    lim = _limits_from(monkeypatch, "lintester", "x", "--memory-mb", "512")
+    assert lim.memory_bytes == 512 * 1024 * 1024
+    assert lim.cpu_seconds == 0
+    assert not lim.empty
+
+
+def test_the_cpu_flag_is_seconds_and_is_not_the_wall_clock_timeout(monkeypatch):
+    lim = _limits_from(monkeypatch, "lintester", "x", "--cpu-seconds", "30")
+    assert (lim.memory_bytes, lim.cpu_seconds) == (0, 30)
+
+
+def test_both_ceilings_can_be_asked_for_at_once(monkeypatch):
+    lim = _limits_from(monkeypatch, "lintester", "x",
+                       "--memory-mb", "64", "--cpu-seconds", "5")
+    assert (lim.memory_bytes, lim.cpu_seconds) == (64 * 1024 * 1024, 5)
+
+
+def test_a_negative_ceiling_is_clamped_rather_than_refused(monkeypatch):
+    """Zero already means "no ceiling for this resource", so a typo costs the
+    fence, not the mission — and a negative rlimit is not a smaller ceiling, it
+    is an error the child would die on."""
+    lim = _limits_from(monkeypatch, "lintester", "x", "--memory-mb", "-1")
+    assert lim.memory_bytes == 0 and lim.empty
+
+
+def test_a_non_numeric_ceiling_is_a_caller_error_not_a_silent_default():
+    with pytest.raises(SystemExit) as exc:
+        _cli("lintester", "x", "--memory-mb", "lots")
+    assert exc.value.code == 2

@@ -281,3 +281,107 @@ def test_spawn_failures_still_carry_the_new_keys(monkeypatch):
     monkeypatch.setattr(claude_cli.subprocess, "run", timed_out)
     out = claude_cli.run_headless("x")
     assert out["exit"] == 124 and out["usage"] is None
+
+
+# --- the spawn seam (PR-4: a real ceiling around the child) -------------------
+#
+# `run_headless` must stay a bare `subprocess.run` for every caller that does
+# not ask for a fence, and must hand the WHOLE call to one that does. The
+# default is resolved at call time, not bound as a parameter default: every
+# patch in this file targets the module attribute, and an import-time default
+# would have frozen the real function where no patch could reach it.
+
+def test_no_spawn_argument_still_goes_through_subprocess_run(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        claude_cli.subprocess, "run",
+        lambda argv, **kw: captured.update(argv=argv, kw=kw) or _Proc())
+    assert claude_cli.run_headless("do x")["exit"] == 0
+    assert captured["argv"][0] and captured["kw"]["input"] == "do x"
+
+
+def test_an_injected_spawn_replaces_subprocess_run_entirely(monkeypatch):
+    """Not "as well as": a fenced run that also fired the unfenced one would
+    spawn two `claude` children and bill for both."""
+    seen = {}
+
+    def _boom(*a, **kw):                        # the real one must not be used
+        raise AssertionError("subprocess.run was called despite a spawn=")
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", _boom)
+    out = claude_cli.run_headless(
+        "do x", spawn=lambda argv, **kw: seen.update(argv=argv, kw=kw) or _Proc())
+    assert out["exit"] == 0
+    assert out["stdout"] == '{"is_error": false, "result": "hi"}'
+    assert seen["argv"][-1] == "-p"
+
+
+def test_a_falsy_spawn_object_is_still_the_spawn(monkeypatch):
+    """Absence is `is None`, never falsiness. A `spawn` is a callable OBJECT as
+    often as a function, and an object is free to define `__bool__` — `or` would
+    hand that caller the unfenced `subprocess.run` while it believed it had a
+    ceiling, which is the one outcome this parameter exists to prevent."""
+    class Spawn:
+        called = False
+
+        def __bool__(self):
+            return False
+
+        def __call__(self, argv, **kw):
+            Spawn.called = True
+            return _Proc()
+
+    def _boom(*a, **kw):
+        raise AssertionError("subprocess.run was called despite a spawn=")
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", _boom)
+    out = claude_cli.run_headless("do x", spawn=Spawn())
+    assert Spawn.called is True
+    assert out["exit"] == 0
+
+
+def test_the_spawn_receives_the_same_call_subprocess_run_would_have(monkeypatch):
+    """The discriminating one. A seam that dropped `input` would put a 20k
+    prompt nowhere; one that dropped `env` would lose the recursion guard AND
+    the per-agent MINDHIVE_SESSION, which is what keeps two concurrent children
+    from interleaving into one corrupt ledger segment."""
+    plain, fenced = {}, {}
+    monkeypatch.setattr(
+        claude_cli.subprocess, "run",
+        lambda argv, **kw: plain.update(argv=argv, kw=kw) or _Proc())
+    claude_cli.run_headless("p", cwd="C:/w", env={"MN9": "1"}, timeout_s=7)
+    claude_cli.run_headless(
+        "p", cwd="C:/w", env={"MN9": "1"}, timeout_s=7,
+        spawn=lambda argv, **kw: fenced.update(argv=argv, kw=kw) or _Proc())
+    assert fenced["argv"] == plain["argv"]
+    assert fenced["kw"] == plain["kw"]
+    assert fenced["kw"]["env"]["MINDHIVE_HEADLESS"] == "1"
+
+
+def test_a_spawn_that_cannot_find_the_cli_still_maps_to_127(monkeypatch):
+    def _missing(argv, **kw):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", lambda *a, **kw: _Proc())
+    assert claude_cli.run_headless("x", spawn=_missing)["exit"] == 127
+
+
+def test_a_spawn_that_hits_its_cap_still_maps_to_124(monkeypatch):
+    """`fence.Fence.spawn` raises the same `TimeoutExpired` `_run_capped` does,
+    so nothing downstream needs a branch for whether the run was fenced."""
+    import subprocess as sp
+
+    def _capped(argv, **kw):
+        raise sp.TimeoutExpired(cmd="claude", timeout=1)
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", lambda *a, **kw: _Proc())
+    assert claude_cli.run_headless("x", spawn=_capped)["exit"] == 124
+
+
+def test_spawn_is_the_last_parameter_so_no_caller_collides_with_it():
+    """Appended, never inserted: `agent.run` and `reflect.py` pass everything by
+    keyword, but a parameter added mid-signature is how a positional call site
+    starts silently binding the wrong argument."""
+    import inspect
+    names = list(inspect.signature(claude_cli.run_headless).parameters)
+    assert names[-1] == "spawn"

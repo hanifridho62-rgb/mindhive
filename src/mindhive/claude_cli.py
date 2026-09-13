@@ -70,7 +70,7 @@ def _envelope_extras(stdout: str) -> dict:
 def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
                  permission_mode: str | None = None,
                  cwd: str | None = None, env: dict | None = None,
-                 session_id: str | None = None) -> dict:
+                 session_id: str | None = None, spawn=None) -> dict:
     """One-shot `claude --output-format json -p` with the prompt fed via stdin.
 
     Returns ``{"exit": int, "stdout": str, "usage": dict|None,
@@ -103,6 +103,26 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
     and two agents sharing one segment interleave into corrupt JSONL. See
     `_child_env` for the merge rules and why the recursion guard is applied last.
 
+    ``spawn`` replaces `subprocess.run` for this one call, and exists so a
+    caller can put a real resource ceiling around the child without this module
+    learning what a ceiling is. `orchestrator.fence.Fence.spawn` is the only
+    implementation: it holds the child in a Windows job object (or POSIX
+    rlimits) and, on a timeout, kills the whole tree rather than the child
+    alone. Before it, a lintester mission could report `enforcement=kernel`
+    while this line ran a completely unfenced `claude`.
+
+    The default resolves `subprocess.run` HERE, at call time, rather than
+    binding it as a parameter default at import time. That is not a style
+    choice: a dozen tests in `tests/test_claude_cli.py` and elsewhere patch the
+    module attribute (`claude_cli.subprocess.run`, which is `subprocess.run`),
+    and an import-time default would have frozen the real function into the
+    signature where no patch could reach it — the whole suite would keep
+    passing while proving nothing.
+
+    Anything with `subprocess.run`'s call shape works; the exceptions below are
+    caught from it exactly as they are from the stdlib, so a fenced spawn maps
+    its own faults to the same 127/124 every caller already handles.
+
     The prompt must never ride in argv: on Windows the CLI resolves to a .CMD
     shim that cmd.exe hosts, and cmd.exe rejects command lines past ~8k chars
     ("The command line is too long."), killing long composed prompts. stdin has
@@ -122,9 +142,14 @@ def run_headless(prompt: str, model: str | None = MODEL, timeout_s: int = 180,
     # `_child_env` forces it on AFTER any caller overlay, so it cannot be unset.
     child_env = _child_env(env)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                              env=child_env, input=prompt, cwd=cwd or None,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # `is None`, not `or`: every other seam in this chain tests absence that
+        # way, and a callable object that defines a falsy `__bool__` would be
+        # silently discarded by `or` — the caller having asked for a ceiling and
+        # got none, which is the one outcome this parameter exists to prevent.
+        run = subprocess.run if spawn is None else spawn
+        proc = run(argv, capture_output=True, text=True, timeout=timeout_s,
+                   env=child_env, input=prompt, cwd=cwd or None,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = proc.stdout or ""
         return {"exit": proc.returncode, "stdout": out, **_envelope_extras(out)}
     except FileNotFoundError:
@@ -153,6 +178,23 @@ def result_text(stdout: str) -> str:
     """The model's result text, or "" when the envelope is missing or is_error."""
     obj = _parse(stdout)
     return "" if obj is None or obj.get("is_error") else (obj.get("result", "") or "")
+
+
+def turns(stdout: str) -> int:
+    """How many turns the child took, 0 when the envelope does not say.
+
+    Deliberately reads an is_error envelope too, unlike `result_text` and
+    `_envelope_extras`. Those two refuse an error envelope because there is no
+    honest MODEL OUTPUT in one -- but there is an honest turn count, and it is
+    the only evidence that separates a limit hit at the first request from one
+    hit after the child spent twenty turns editing a tree."""
+    obj = _parse(stdout)
+    if obj is None:
+        return 0
+    try:
+        return max(0, int(obj.get("num_turns") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def error_text(stdout: str) -> str:

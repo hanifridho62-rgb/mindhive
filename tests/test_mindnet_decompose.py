@@ -41,11 +41,16 @@ def _reply(*pairs):
     return "Here is the breakdown.\n\n```json\n" + body + "\n```\nDone."
 
 
-def _runner(text, executed=True, result="ran-unverified"):
+def _runner(text, executed=True, result="ran-unverified", full=""):
+    """*text* is the bounded copy that rides the event; *full* is what the agent
+    actually said. A real `agent.run` sets both, and they differ exactly when the
+    reply outgrows `runlog.EXCERPT_CHARS`; an injected runner sets only the
+    first, so *full* defaults to empty and the fall-back stays exercised."""
     def fake(run_key, prompt, **kw):
         fake.prompt = prompt
         return x_mod.RunResult(result=result, executed=executed, exit_code=0,
-                               excerpt=text, reason="" if executed else "no run")
+                               excerpt=text, text=full,
+                               reason="" if executed else "no run")
     return fake
 
 
@@ -226,6 +231,52 @@ def test_a_raising_runner_is_reported_not_propagated():
     assert "OSError" in out.reason
 
 
+# --- the ceiling this child runs under ----------------------------------------
+#
+# This is the FIRST `claude` a real lintester mission spawns, and it reached the
+# agent seam with no `spawn=` while the mission's report said `enforcement:
+# kernel` over it. Fencing the lane children and not this one is the same
+# laundering `orchestrator/fence.py` exists to end, one call upstream.
+
+def test_a_spawn_reaches_the_agent_seam(monkeypatch):
+    seen = {}
+
+    def spy(run_key, prompt, **kw):
+        seen.update(kw)
+        return x_mod.RunResult(result="ran-unverified", executed=True,
+                               exit_code=0, excerpt=_reply(("alpha", "")))
+
+    fence = object()
+    out = dc.run("p", _graph(_task("p")), runner=spy, spawn=fence)
+    assert seen.get("spawn") is fence
+    assert [p.title for p in out.usable] == ["alpha"]
+
+
+def test_no_spawn_means_the_argument_is_absent_not_none(monkeypatch):
+    """The canary, and the compatibility contract in one. Every existing caller
+    of `decompose.run` — and every injected runner in this suite — predates the
+    fence, so a default run must make byte for byte the call it always made: not
+    `spawn=None`, but no such keyword at all."""
+    seen = {}
+
+    def spy(run_key, prompt, **kw):
+        seen.update(kw)
+        seen["keys"] = sorted(kw)
+        return x_mod.RunResult(result="ran-unverified", executed=True,
+                               exit_code=0, excerpt=_reply(("alpha", "")))
+
+    dc.run("p", _graph(_task("p")), runner=spy)
+    assert "spawn" not in seen["keys"], seen["keys"]
+
+
+def test_a_runner_with_no_spawn_parameter_still_works_unfenced():
+    """`_runner` above has the pre-fence signature. It must keep working, or
+    every caller that never asked for a ceiling breaks on the day one did."""
+    out = dc.run("p", _graph(_task("p")),
+                 runner=_runner(_reply(("alpha", ""))))
+    assert [p.title for p in out.usable] == ["alpha"]
+
+
 # --- declare ------------------------------------------------------------------
 
 def test_declare_writes_both_axes_per_subtask():
@@ -348,3 +399,64 @@ def test_the_decomposition_prompt_defuses_through_the_same_helpers():
     assert {"safe_line", "safe_block"} <= called, (
         "`prompt_for` does not call brief.safe_line and brief.safe_block; "
         f"it calls {sorted(called)}")
+
+
+# --- a reply the ledger excerpt was too small to hold -------------------------
+
+def _long_reply(n=6):
+    """A sound reply longer than `runlog.EXCERPT_CHARS`, like a real one.
+
+    Padded through the DESCRIPTIONS rather than by appending prose after the
+    object, because the bug only bites when the cut lands INSIDE the json."""
+    pad = ("retry only the transient write error and re-raise everything else, "
+           "then say so in the operator-facing surface; ") * 6
+    return _reply(*[(f"unit {i}", f"{pad}{i}") for i in range(n)])
+
+
+def test_a_reply_longer_than_the_event_excerpt_still_decomposes():
+    """The defect the first real fan-out hit, mission `lm-84c06ad6`, 2026-09-08.
+
+    `agent.run` cuts the reply at `runlog.EXCERPT_CHARS` to build the bounded
+    copy that rides the ledger event, and `run` used to parse THAT. The agent
+    answered four sound subtasks in 2507 characters; the cut at 2000 landed
+    mid-string, so `parse` walked from the first `{` to the last `}` still
+    standing — an inner one — and reported `Expecting ',' delimiter`. The
+    mission degraded to `root-only`, ran ONE unit where four were proposed, and
+    recorded one calibration sample, which `payoff` can only answer "one
+    measured unit cannot show whether the weight orders anything" to.
+
+    So a logging bound was deciding the shape of the work. Nothing said so: the
+    reason blamed the agent's json, and the json was well-formed."""
+    from mindhive import runlog
+
+    text = _long_reply()
+    assert len(text) > runlog.EXCERPT_CHARS, "fixture must exceed the cut"
+    out = dc.run("p", _graph(_task("p")),
+                 runner=_runner(text[:runlog.EXCERPT_CHARS], full=text))
+    assert not out.reason, out.reason
+    assert [p.title for p in out.usable] == [f"unit {i}" for i in range(6)]
+
+
+def test_the_truncated_copy_alone_is_what_used_to_fail():
+    """The discriminating half: without the full text the cut really does break.
+
+    A regression test whose fixture does not reproduce the defect proves
+    nothing, so this pins that the excerpt on its own is unparseable — the
+    reason the test above needs the run to carry more than the event does."""
+    from mindhive import runlog
+
+    text = _long_reply()
+    pairs, why = dc.parse(text[:runlog.EXCERPT_CHARS])
+    assert pairs == [] and "did not parse" in why
+
+
+def test_a_runner_that_carries_no_full_text_still_uses_the_excerpt():
+    """Back-compatibility, and the reason every other test here still holds.
+
+    An injected runner — the mindnet CLI's, and every double above — sets only
+    `excerpt`. Reading the new field must not turn those into empty
+    decompositions, which is the failure mode this whole module is built to
+    refuse."""
+    out = dc.run("p", _graph(_task("p")),
+                 runner=_runner(_reply(("alpha", ""), ("beta", ""))))
+    assert [p.title for p in out.usable] == ["alpha", "beta"]

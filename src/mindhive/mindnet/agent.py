@@ -367,7 +367,7 @@ def _iteration_prompt(base_prompt, iteration, rotated) -> str:
 def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
         env=None, model=None, permission_mode=None,
         context_cfg=None, max_iterations=DEFAULT_MAX_ITERATIONS,
-        guard=None, now_fn=time.monotonic) -> x_mod.RunResult:
+        guard=None, now_fn=time.monotonic, spawn=None) -> x_mod.RunResult:
     """Spawn a headless agent for *prompt*; answer an `executor.RunResult`.
 
     ## One shot, or a chain
@@ -406,7 +406,18 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     because `events.append_event` appends to ``<session_id>.jsonl`` without a lock
     and two agents sharing a segment interleave into corrupt JSONL.
     `claude_cli._child_env` forces `MINDHIVE_HEADLESS` on after the overlay, so
-    passing one can never defeat the recursion guard."""
+    passing one can never defeat the recursion guard.
+
+    *spawn* is forwarded to `claude_cli.run_headless` untouched and is the only
+    way a caller can put a real memory or CPU ceiling on the child: the
+    lintester passes `orchestrator.fence.Fence.spawn` when its mission asked for
+    one. This module deliberately learns nothing about what a ceiling is — it
+    would need `ctypes` and a platform matrix to do so, and both already live in
+    `orchestrator/jobs.py`. `None` is every existing caller, and it is
+    `run_headless` that then resolves `subprocess.run`, so the default path is
+    the call this function has always made. It is forwarded on EVERY hop of a
+    context-rotation chain, because a chain that fenced only its first child
+    would report a ceiling the later ones never had."""
     key = str(run_key)
     header = (f"agent run: {key}\n"
               f"cwd:       {root}\n"
@@ -466,7 +477,8 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
                 # truncating each hop compounds the loss across a chain.
                 step_prompt, model=model, timeout_s=max(1, round(remaining)),
                 permission_mode=permission_mode, env=env,
-                cwd=str(root) if root else None, session_id=session_id)
+                cwd=str(root) if root else None, session_id=session_id,
+                spawn=spawn)
         except Exception as exc:                        # noqa: BLE001
             return _spawn_raised(exc, key, header, transcript, root, project)
 
@@ -503,7 +515,8 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
     artifact = _artifact(key, body, project)
     text = claude_cli.result_text(stdout)
     excerpt = (text or stdout)[:runlog.EXCERPT_CHARS]
-    return _classify(code, stdout, timeout_s, key, root, artifact, excerpt)
+    return _classify(code, stdout, timeout_s, key, root, artifact, excerpt,
+                     text=text or "", turns=claude_cli.turns(stdout))
 
 
 def _spawn_raised(exc, key, header, transcript, root, project):
@@ -570,7 +583,8 @@ def _says_finished(stdout: str) -> bool:
         return True         # unreadable contract: do not keep spawning
 
 
-def _classify(code, stdout, timeout_s, key, root, artifact, excerpt):
+def _classify(code, stdout, timeout_s, key, root, artifact, excerpt, text="",
+              turns=0):
     """The outcome mapping, unchanged from the one-shot era and deliberately
     factored out whole rather than rewritten: the ORDER of these checks is the
     correctness of this module, and it is not the chain's business."""
@@ -578,7 +592,8 @@ def _classify(code, stdout, timeout_s, key, root, artifact, excerpt):
     def result(kind, reason, executed):
         return x_mod.RunResult(
             result=kind, reason=reason, exit_code=code, executed=executed,
-            artifact=artifact, excerpt=excerpt, stdout=stdout[:runlog.EXCERPT_CHARS],
+            artifact=artifact, excerpt=excerpt, text=text, turns=turns,
+            stdout=stdout[:runlog.EXCERPT_CHARS],
             run_key=key, cwd=str(root or ""))
 
     # THE ENVELOPE IS CHECKED BEFORE THE EXIT CODE, and the order is the whole
@@ -603,6 +618,24 @@ def _classify(code, stdout, timeout_s, key, root, artifact, excerpt):
         # this: eight tasks against an exhausted weekly limit produce eight
         # identical failures, and the ninth tells nobody anything new.
         mark = (f"{USAGE_MARK} " if any(h in low for h in _USAGE_HINTS) else "")
+        # A limit can land at the FIRST request or after the child has spent
+        # twenty turns editing a tree, and the CLI reports both the same way.
+        # Told apart by the envelope's own turn count, because the sentence
+        # differs in what it asks the operator to do: on 2026-09-08 mission
+        # lm-84c06ad6 reported two children as leaving the task untouched while
+        # their lanes held 146 and 7 lines of uncommitted edits.
+        #
+        # `executed` stays False in BOTH branches, and that is not an oversight.
+        # `orchestrator.environment.environment_failure` answers "" the moment it
+        # is True, routing the entry to the repair loop; flipping it here would
+        # stop the mission braking on an exhausted account and spend
+        # `max_attempts` per unit against a limit that resets in hours. The
+        # honest sentence is worth having. It is not worth that.
+        if turns > 0:
+            return result("refused",
+                          f"{mark}the agent could not run to completion: {err} "
+                          f"— it had already taken {turns} turn(s), so its tree "
+                          f"may hold partial work worth looking at", False)
         return result("refused",
                       f"{mark}the agent could not run: {err} — nothing was "
                       f"attempted, so the task is left untouched", False)
