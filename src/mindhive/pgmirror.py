@@ -266,6 +266,17 @@ def scan_segments(project: str | None = None) -> list:
     -- a divergence that would surface as a parity failure with no obvious
     cause.
 
+    The SPLIT is shared for the same reason, and shared as code rather than as a
+    convention: `_events._segment_lines` is where the four TOTAL readers agree
+    where a row ends (`chain._scan` is a fifth reader and splits inline, by the
+    same rule, because it also needs a per-segment COMPLETE-line count). It used to be four copies of `splitlines()`, which also breaks on
+    U+2028 -- a character `canonical_json` writes raw -- so one such row shifted
+    every later `seg_line` in its segment by one. `seg_line` is stored in
+    Postgres as part of `UNIQUE (project, segment, seg_line)` and as part of
+    `event_embeddings`' primary key, and nothing here would have noticed: the
+    staleness fingerprint is `st_size` per segment, and a split-semantics change
+    preserves every byte.
+
     The loader and the gate calling the SAME function is the point: if this fold
     is wrong, parity compares two things that are wrong together and passes.
     Wrong-but-consistent is what the canary tests have to catch, because the
@@ -276,11 +287,7 @@ def scan_segments(project: str | None = None) -> list:
     if not d.exists():
         return rows
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(
-                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
-            line = line.strip()
-            if not line:
-                continue
+        for i, line in _events._segment_lines(seg):
             ev = _events._row_to_event(line)
             if ev is None:
                 continue           # skip a torn row, exactly as read_all does

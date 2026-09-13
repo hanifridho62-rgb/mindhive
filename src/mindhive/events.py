@@ -585,6 +585,85 @@ def _row_to_event(line: str):
     return Event(**known)
 
 
+def _segment_parts(seg):
+    """One segment split into physical lines. **The single decision about where
+    a ledger row ends, and the reason it is a function of its own.**
+
+    Two readers need two different SHAPES over the same split. `_segment_lines`
+    below wants `(index, text)` with blanks skipped; `chain._scan` wants the raw
+    list, because it also needs `len(parts) - 1` -- the count of COMPLETE lines,
+    which is what a segment may be sealed at. A different return shape is not a
+    different rule, so the rule lives here and both build on it.
+
+    It is a function rather than a convention because the two ARE allowed to
+    drift silently. Nothing compares them at runtime: the chain records a count,
+    the mirror records an index, and each is self-consistent. A forward change
+    applied to one and not the other -- stripping a BOM, say -- leaves the whole
+    suite green while the readers surface a row the chain never sealed, and that
+    row can then be rewritten with `hive verify` still reporting `ok: true`.
+    That is the same tamper-evidence hole `splitlines()` opened, re-reachable by
+    an ordinary edit. `tests/test_architecture_drift.py` pins the rule; this
+    function is what makes the rule cheap to keep."""
+    return seg.read_text(encoding="utf-8", errors="replace").split("\n")
+
+
+def _segment_lines(seg):
+    """One segment's rows as ``(line_index, stripped_text)``, blank lines skipped.
+
+    **The split is on \\n and nothing else, and that is the whole reason this
+    function exists.** `str.splitlines()` -- what every reader here used until
+    this landed -- also breaks on U+0085, U+2028, U+2029 and five C0 controls.
+    The ledger is NEWLINE-delimited JSON, so to this format those are ordinary
+    characters INSIDE a row. `canonical_json` writes with `ensure_ascii=False`,
+    and measured against its exact arguments, exactly three of the eight reach a
+    segment raw: U+0085, U+2028 and U+2029. The other five are below U+0020,
+    which JSON forbids unescaped, so `json.dumps` escapes them and they can
+    never arrive as separators. All three that do arrive are legal inside a JSON
+    string and `json.loads` accepts them, so the row on disk is INTACT and only
+    the reader destroyed it.
+
+    What that cost, reproduced on three events with one U+2028 in the middle
+    one: `read_all` returned TWO -- the event vanished from every projection,
+    the briefing and the mirror -- `corrupt_rows` invented two torn rows for the
+    one intact event, and every later row's line index shifted by one, including
+    `seg_line`, which the Postgres mirror stores as part of a UNIQUE natural key.
+
+    `line_index` counts EVERY physical line, blanks and malformed rows included,
+    because `pgmirror.scan_segments` persists it as `seg_line` and
+    `corrupt_rows` reports it to a human. It is zero-based; `corrupt_rows`
+    documents why.
+
+    Every ledger-segment reader shares this one function so they cannot fork
+    again. `chain._scan` is the one exception and splits identically, because it
+    also needs each segment's COMPLETE-line count -- a different return shape,
+    not a different rule.
+
+    Line endings need no handling here: `read_text`'s universal-newline decoding
+    turns CRLF, and a lone CR, into \\n before the split -- which is load
+    bearing, since `append_event` opens the segment in text mode and Windows
+    therefore writes CRLF. The trailing empty string that `split` yields on a
+    newline-terminated file is dropped by the blank skip, so on any segment
+    carrying none of the three characters the indices are byte-identical to
+    `splitlines()`'. Verified 2026-09-09 across all 74 namespaces, then 2495
+    segments and 118,875 rows: the same indices and the same chain head under
+    both splits. Those totals are a live store's and grow by the hour -- they
+    date the check, they are not a figure to re-assert.
+    This change therefore renumbers nothing already stored, and needs no
+    `hive pg rebuild`.
+
+    Cost: none worth the name. `read_all("mindhive")` -- 1283 segments and 69k
+    rows in that namespace, not the whole store's 2518 at that later moment --
+    warm cache, best of four interleaved runs against the same data in one
+    process: 2.157s through this generator against 2.181s through the inline
+    `splitlines()` it replaced. (A first, non-interleaved attempt said 2.09s
+    against 3.38s; that was cold page cache on the first run, not a speedup,
+    which is why the number quoted here is the interleaved one.)"""
+    for i, raw in enumerate(_segment_parts(seg)):
+        line = raw.strip()
+        if line:
+            yield i, line
+
+
 def read_all(project=None) -> list["Event"]:
     pg = _maybe_read_from_pg(project)
     if pg is not None:
@@ -594,11 +673,7 @@ def read_all(project=None) -> list["Event"]:
     if not d.exists():
         return []
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(
-                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
-            line = line.strip()
-            if not line:
-                continue
+        for i, line in _segment_lines(seg):
             ev = _row_to_event(line)
             if ev is None:
                 continue          # skip a malformed/torn row (reads stay total)
@@ -647,11 +722,7 @@ def read_types(types, project=None) -> list["Event"]:
     if not d.exists():
         return []
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(
-                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
-            line = line.strip()
-            if not line:
-                continue
+        for i, line in _segment_lines(seg):
             ev = _row_to_event(line)
             if ev is None:
                 continue          # skip a malformed/torn row (reads stay total)
@@ -701,11 +772,7 @@ def corrupt_rows(project=None) -> list[dict]:
     if not d.exists():
         return out
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in enumerate(
-                seg.read_text(encoding="utf-8", errors="replace").splitlines()):
-            s = line.strip()
-            if not s:
-                continue
+        for i, s in _segment_lines(seg):
             try:
                 obj = json.loads(s)
             except json.JSONDecodeError as e:
