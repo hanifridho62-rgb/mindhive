@@ -23,7 +23,13 @@ delegates to the incumbent that already owns its work:
     resilience.py  -> loop.safeguards.CircuitBreaker, mindnet.controller
     fence.py       -> resilience's own _run_capped / _preexec_for and jobs'
                       _job_for / _close_job; it composes them, adds none
-    lintester.py   -> mindnet.autodeclare / decompose / brief / orchestrator
+    lintester.py   -> mindnet.autodeclare / decompose / tasks / brief /
+                      advice / agent — but NOT mindnet.orchestrator,
+                      which this row claimed and no import backs. The
+                      two run loops are siblings that read different
+                      inputs, not layers; `hive mindnet orchestrate` is
+                      soft-deprecated as the front door and keeps its
+                      own loop (see its PRIMARY_DOOR_NOTICE)
     integrate.py   -> mindnet.worktree, which owns every git call the
                       merge-back makes, and changelog.record for its entries
     mission.py     -> nothing; the report is a frozen record
