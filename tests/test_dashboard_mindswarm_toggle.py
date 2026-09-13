@@ -21,13 +21,14 @@ reach it, and the tests below can flip it against one live server.
 on a throwaway namespace.
 """
 import pathlib
+import re
 import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mindhive import dashboard, dashboard_page
+from mindhive import dashboard, dashboard_page, taskview
 
 SWARM_NAV = 'data-sec="ws-swarm"'
 
@@ -130,16 +131,23 @@ def test_the_swarm_route_still_answers_with_the_row_hidden(swarm_server,
 
 def test_the_tooltip_says_kept_not_going_away():
     """The dashboard operator never sees the CLI notice, so this attribute is
-    the only place the deprecation reaches them -- and it has to carry the same
-    promise the CLI notice makes, not a harsher one."""
+    the only place the deprecation reaches them. It carries the promise that is
+    true for ITS door -- MindSwarm children do get a posture (`workspace.py`
+    passes bypassPermissions behind a --disallowedTools fence), so "kept and
+    still supported" holds here although the CLI notice no longer says it --
+    and never a harsher one."""
     # On the SERVED page, not on the constant: a tooltip spliced out of the
     # shell by a broken replace chain would leave the constant test green. The
     # negative half ran on the constant while the comment above it claimed
     # otherwise -- review caught that. Both halves are on the page now, and the
     # hidden-row note is held to the same promise, since it is the only wording
     # an operator meets once the row is gone.
+    # With the task cards spliced in, as the `/` route renders it: a bare
+    # `render_page("t")` is 12KB short of the served page, so a harsh word in
+    # `taskview`'s CSS or JS reached the operator with this test still green.
     harsh = ("will be removed", "deprecated", "unsupported")
-    served = dashboard_page.render_page("t").lower()
+    served = dashboard_page.render_page("t", tasks_css=taskview.CARDS_CSS,
+                                        tasks_js=taskview.CARDS_JS).lower()
     assert "kept and still supported" in served
     assert "mindhive_mindswarm=0" in served
     for gone in harsh:
@@ -236,7 +244,9 @@ def test_the_off_vocabulary_really_matches_the_flag_it_claims_to_match():
     the single-line copy read alike. `_auto_harvest_loop` exposes no predicate
     to call -- its check is inline in the loop body -- so a behavioural
     comparison would need a refactor this change has no business making.
-    Discriminating: reword either tuple and the count falls to 1.
+    Discriminating: add, drop or reword a word in either tuple and the count
+    falls to 1. WHOLE tuples are matched -- counting the bare member list let a
+    tuple grow a fifth word past its twin and stay green (review, 2026-09-13).
 
     `>= 2`, not `== 2`: a third honest user of the same vocabulary is parity,
     not a failure. The cost this test still carries is that extracting the two
@@ -245,10 +255,10 @@ def test_the_off_vocabulary_really_matches_the_flag_it_claims_to_match():
     red. Whoever does that refactor should delete this test, not appease it."""
     src = pathlib.Path(dashboard.__file__).read_text(encoding="utf-8")
     flat = " ".join(src.split())
-    # The members, not the parenthesised tuple: one site wraps after the open
-    # paren, so flattening leaves it as `( "0", ...` and only the inner list is
-    # common to both spellings.
-    off = '"0", "false", "off", "no"'
-    assert flat.count(off) >= 2, (
+    # The whole tuple, parens included. One site wraps after the open paren, so
+    # flattening leaves it as `( "0", ...` -- hence the optional space.
+    off = re.compile(r'\( ?"0", "false", "off", "no"\)')
+    found = len(off.findall(flat))
+    assert found >= 2, (
         f"expected the autoharvest flag and the mindswarm flag to share one "
-        f"off-vocabulary; found {flat.count(off)} copies of [{off}]")
+        f"off-vocabulary; found {found} whole copies of {off.pattern}")

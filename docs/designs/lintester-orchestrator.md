@@ -356,7 +356,10 @@ order, and this section grows one bullet per landing.
   a notice and a toggle, reversible — and the landing is deliberately no larger
   than that sentence. `mindnet.orchestrator.PRIMARY_DOOR_NOTICE` goes to stderr
   on every non-JSON `hive mindnet orchestrate` run, dry or `--execute`: the
-  front door moved, this one is kept for the declared task graphs only it reads,
+  front door moved, this one is kept because the mission pipeline cannot run a
+  declared graph (other modules read one; none of them runs it), its agent
+  children get no permission mode so an agent wave can end with nothing written
+  (TODOS #35),
   nothing is scheduled for removal. It is a SECOND string beside
   `MINDNET_ORCHESTRATE_SIGNPOST` rather than a rewrite of it, because the two
   need different gates — the signpost fires on a dry run only, since an operator

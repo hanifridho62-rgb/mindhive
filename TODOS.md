@@ -1576,7 +1576,29 @@ exhaust the machine.
 > touched a disjoint set of files. The counts this item already records still
 > hold on the new base — `__main__.py` 4235 of its 4237 allowance,
 > `mindnet/orchestrator.py` 996 of 1000 — and the full suite on the merged tree
-> is 7255 passed, 3 skipped, 283 deselected, exit 0.
+> is 7255 passed, 3 skipped, 283 deselected, exit 0 — re-measured on a tree
+> nothing else was touching, after the first run turned out to share its tree
+> with review agents that were mutation-testing tracked files.
+>
+> **Kept is not "supported" — corrected the same day.** The notice's "Kept and
+> still supported" overpromised for this door's default run, and had since
+> 99fcfa3 was written: `cmd_mindnet_orchestrate` hands the agent runner
+> `runner_kwargs` with no `permission_mode` (identical at 9f2fc75, 99fcfa3 and
+> c14e683 — reviewing the merge found it, the merge did not cause it), and a
+> headless child with none had its Write declined and still exited 0 (probe
+> 2026-09-13, claude 2.1.198; the same prompt under `acceptEdits` wrote the
+> file). It is LOUD, not silent: the review's verifiers drove the real CLI with
+> that reply and got `ran-unverified`, no status row, `awaiting-validation`,
+> exit 1. The notice now says the children get no permission mode, and
+> `test_the_notice_matches_the_agent_runners_posture` fails in either direction
+> when the runner and the wording disagree. Giving these children a posture is
+> NOT done here and stays open: it is a permission change, not a wording fix;
+> `test_no_permission_mode_is_granted_by_default` pins `agent.run` granting none
+> on purpose ("Authority is the operator's to grant"), so a grant belongs at this
+> door's `runner_kwargs`, not in `agent.run`; and `__main__.py` has two lines of
+> allowance left. MindSwarm is unaffected — `workspace.py` passes
+> `bypassPermissions` behind a `--disallowedTools` fence, so the dashboard
+> tooltip's promise stands.
 
 The machine grew three front doors. `hive lintester "<intent>"` is the mission
 pipeline and the one new work goes through. `hive mindnet orchestrate` walks a

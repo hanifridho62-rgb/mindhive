@@ -2214,3 +2214,29 @@ def test_a_refused_run_carries_the_notice_too():
     # notice.
     assert "error: --isolation worktree is for agent runs" in err, err
     assert _notice() in err, err
+
+
+def test_the_notice_matches_the_agent_runners_posture():
+    """The notice and the agent runner must tell the same story, in BOTH directions.
+
+    On 2026-09-13 a headless child with no --permission-mode had its Write
+    declined and still exited 0, while the same prompt under acceptEdits wrote
+    the file. `cmd_mindnet_orchestrate` builds the agent runner's `runner_kwargs`
+    with no `permission_mode`, so an agent wave here can end with nothing
+    written. The loop says so loudly -- ran-unverified, awaiting-validation,
+    exit 1 -- but the re-landed notice still called this door "Kept and still
+    supported". Wording alone cannot be pinned honestly, so the claim is tied to
+    the code: give the runner a posture and the warning must go; drop the warning
+    while the runner still has none and the notice is promising again. Either
+    drift turns this red."""
+    import inspect
+    import re
+
+    src = inspect.getsource(cli_mod.cmd_mindnet_orchestrate)
+    block = re.search(r"runner_kwargs = \{(.*?)\n\s*\}", src, re.S)
+    assert block, "runner_kwargs is no longer built as a dict literal here"
+    has_posture = "permission_mode" in block.group(1)
+    warns = "no permission mode" in _notice()
+    assert warns != has_posture, (
+        f"agent children given a posture={has_posture}, notice warns={warns}")
+    assert "still supported" not in _notice().lower()
