@@ -134,18 +134,48 @@ __RENDERER_JS__
 
 _RENDERER_JS = r"""
 (function () {
+  // EVERY lookup table in this renderer is indexed by a LEDGER-AUTHORED string
+  // -- an event kind, a node type, a node id -- so every one of them is built
+  // WITHOUT a prototype. On a plain `{}`, `t[k]` walks up to Object.prototype
+  // when `k` names one of its members, and the miss comes back TRUTHY: a kind
+  // called "constructor" made `if (seen[k]) return;` skip a legend row that had
+  // never been seen, and `KIND_LABELS[k] || k` label it
+  // `function Object() { [native code] }` instead of falling through to `k`.
+  // Nothing throws and nothing logs -- the row is simply wrong or gone.
+  //
+  // Both halves matter and fixing one alone is worse than fixing neither, since
+  // it turns a missing row into a row with a garbage label. `bare()` is for the
+  // constant tables below; the tables the renderer builds use
+  // `Object.create(null)` directly, which is every `= {}` this file used to
+  // have. ES5 on purpose: this whole renderer is `var` and `function`, so no
+  // `Object.assign`.
+  //
+  // Today this is LATENT, not live, and the two guards are different: `kind` is
+  // `ev.type`, which `append_event` validates against `events.VALID_TYPES` (0 of
+  // 53 collide), and node ids are all PREFIXED by `graph.py` -- `ev:`, `tag:`,
+  // `file:`, `session:`, `topic:`, `plugin:`, `skill:`, `recommendation:` -- so
+  // no id can equal a prototype member. Neither guard is declared anywhere as a
+  // property this renderer may rely on, and the id prefixes in particular are an
+  // accident of how `graph.py` happens to build them. Costing nothing to hold
+  // locally, it is held locally.
+  function bare(o) {
+    var t = Object.create(null);
+    for (var k in o) { if (Object.prototype.hasOwnProperty.call(o, k)) t[k] = o[k]; }
+    return t;
+  }
+
   // Color by event subtype (kind) so meaning is visible at a glance; structural
   // node types (session/file/tag) keep their own distinct hues.
-  var KIND_COLORS = {
+  var KIND_COLORS = bare({
     decision: "#58a6ff", caveat: "#f0883e", experiment_result: "#2ea043",
     open_question: "#bc8cff", next_step: "#39c5cf", state_set: "#d2a8ff",
     file_touched: "#6e7681", command_run: "#6e7681", git_diff: "#6e7681",
     session_start: "#6e7681", session_end: "#6e7681", compaction: "#6e7681"
-  };
-  var TYPE_COLORS = { session: "#e3b341", file: "#768390", tag: "#db61a2",
+  });
+  var TYPE_COLORS = bare({ session: "#e3b341", file: "#768390", tag: "#db61a2",
                       event: "#58a6ff", plugin: "#3fb950", skill: "#a5d6ff",
-                      topic: "#d29922", recommendation: "#f778ba" };
-  var KIND_LABELS = {
+                      topic: "#d29922", recommendation: "#f778ba" });
+  var KIND_LABELS = bare({
     decision: "decision", caveat: "caveat", experiment_result: "experiment",
     open_question: "open question", next_step: "next step", state_set: "state",
     file_touched: "file touched", command_run: "command", git_diff: "git diff",
@@ -153,7 +183,7 @@ _RENDERER_JS = r"""
     compaction: "compaction", session: "session", file: "file", tag: "tag",
     plugin: "plugin", skill: "skill", topic: "topic",
     recommendation: "recommendation"
-  };
+  });
 
   var data = JSON.parse(document.getElementById("graph-data").textContent);
   var svg = document.getElementById("svg");
@@ -272,9 +302,9 @@ _RENDERER_JS = r"""
   // event -> its session; file -> the session of a file it touched; session ->
   // itself; tags (and anything left over) -> their own group. Group anchors are
   // spread on a ring so the clumps land in separate regions of the canvas.
-  var nodeType = {};
+  var nodeType = Object.create(null);
   data.nodes.forEach(function (n) { nodeType[n.id] = n.type; });
-  var group = {};
+  var group = Object.create(null);
   data.edges.forEach(function (e) {
     if (e.rel !== "in_session") return;
     var ev = nodeType[e.src] === "event" ? e.src : e.dst;
@@ -291,12 +321,12 @@ _RENDERER_JS = r"""
   data.nodes.forEach(function (n) {
     if (group[n.id] == null) group[n.id] = n.type === "tag" ? "__tags__" : "__misc__";
   });
-  var groupIds = [], seenG = {};
+  var groupIds = [], seenG = Object.create(null);
   data.nodes.forEach(function (n) {
     var g = group[n.id];
     if (!seenG[g]) { seenG[g] = true; groupIds.push(g); }
   });
-  var G = Math.max(1, groupIds.length), groupIdx = {};
+  var G = Math.max(1, groupIds.length), groupIdx = Object.create(null);
   groupIds.forEach(function (g, i) { groupIdx[g] = i; });
   var RGROUP = 140 + G * 16;
   var anchors = groupIds.map(function (g, i) {
@@ -314,12 +344,12 @@ _RENDERER_JS = r"""
              // neighbours pulse in lockstep — reads like a field of stars).
              px: null, py: null, buzz: 0, phase: ((i * 0.6180339887) % 1) * 6.2831853 };
   });
-  var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
+  var byId = Object.create(null); nodes.forEach(function (n) { byId[n.id] = n; });
   var edges = data.edges
     .filter(function (e) { return byId[e.src] && byId[e.dst]; })
     .map(function (e) { return { s: byId[e.src], t: byId[e.dst], rel: e.rel }; });
 
-  var adj = {};
+  var adj = Object.create(null);
   data.edges.forEach(function (e) {
     (adj[e.src] = adj[e.src] || []).push({ id: e.dst, rel: e.rel });
     (adj[e.dst] = adj[e.dst] || []).push({ id: e.src, rel: e.rel });
@@ -375,7 +405,7 @@ _RENDERER_JS = r"""
   (function buildLegend() {
     var legend = document.getElementById("legend");
     if (!legend) return;
-    var seen = {}, rows = [];
+    var seen = Object.create(null), rows = [];
     nodes.forEach(function (n) {
       var k = nodeKey(n);
       if (seen[k]) return;
@@ -414,7 +444,7 @@ _RENDERER_JS = r"""
   // Obsidian-style sizing: the disc grows with connectivity (sqrt-damped so a
   // mega-hub tag doesn't dwarf the canvas) and stays muted grey (CSS fill);
   // the kind color moves to the ring (stroke) so the legend still reads true.
-  var degree = {};
+  var degree = Object.create(null);
   data.edges.forEach(function (e) {
     degree[e.src] = (degree[e.src] || 0) + 1;
     degree[e.dst] = (degree[e.dst] || 0) + 1;
@@ -529,7 +559,7 @@ _RENDERER_JS = r"""
   function buildArt() {
     var CX = W / 2, CY = H / 2, minDim = Math.min(W, H);
     var Rc = minDim * 0.40, shrink = 0.16, twist = 2.2 * Math.PI;
-    var petalNodes = {};
+    var petalNodes = Object.create(null);
     nodes.forEach(function (n) { (petalNodes[group[n.id]] = petalNodes[group[n.id]] || []).push(n); });
     var petals = groupIds
       .filter(function (g) { return nodeType[g] === "session"; })
@@ -831,10 +861,16 @@ _RENDERER_JS = r"""
     edgeEls.forEach(function (el) { el.classList.remove("dim"); });
   });
 
+  // `'` is escaped too, though no attribute here needs it: `data-id` is the one
+  // attribute that receives esc() output and it is double-quoted. Escaping it
+  // costs a character and removes the trap, so the next single-quoted attribute
+  // someone adds is safe by default instead of safe by an audit nobody reruns.
+  // The map is prototype-less like every other table here -- the regex already
+  // constrains `c` to five characters, so this one is uniformity, not a fix.
+  var ESC = bare({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+                   '"': "&quot;", "'": "&#39;" });
   function esc(s) {
-    return String(s).replace(/[&<>"]/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
-    });
+    return String(s).replace(/[&<>"']/g, function (c) { return ESC[c]; });
   }
 
   if (!nodes.length) {
