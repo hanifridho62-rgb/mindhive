@@ -247,7 +247,7 @@ def _artifact(run_key, text, project=None):
 # survivor is whichever wrote last — silently.
 #
 # UNDERSCORE, and that is the whole guarantee rather than a spelling choice.
-# `-brief` was reachable: `tasks.ID_RE` is `^[a-z0-9][a-z0-9-]{0,63}$`, the
+# `-brief` was reachable: `tasks.ID_RE` is `^[a-z0-9][a-z0-9-]{0,63}\Z`, the
 # product's own `decompose.slugify("Brief", parent_id="t1")` mints the legal id
 # `t1-brief`, and `run_key(0, "t1-brief")` then equalled `_brief_key("t1",
 # wave=0)` exactly. `_` is outside `ID_RE`, so no task id — not one that exists,
@@ -403,8 +403,8 @@ def run(run_key, prompt, root=None, timeout_s=DEFAULT_TIMEOUT_S, project=None,
 
     *env* is a real overlay on the child's environment as of MN-9 — the
     orchestrator uses it to give each concurrent agent its own `MINDHIVE_SESSION`,
-    because `events.append_event` appends to ``<session_id>.jsonl`` without a lock
-    and two agents sharing a segment interleave into corrupt JSONL.
+    so each agent's rows carry its own id in its own ``<session_id>.jsonl``. That
+    is attribution, not integrity: `events._append_lock` serialises appends.
     `claude_cli._child_env` forces `MINDHIVE_HEADLESS` on after the overlay, so
     passing one can never defeat the recursion guard.
 

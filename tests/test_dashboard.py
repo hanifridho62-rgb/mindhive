@@ -1299,6 +1299,39 @@ def test_append_validates_the_other_registry_types_too(dashboard_server):
     assert events.read_all("p") == []
 
 
+def test_append_gates_state_set_at_this_surface_too(dashboard_server):
+    """`state_set` is the payload behind the top of STATE.md, and this endpoint
+    is its SECOND raw-append surface. It also has a hazard the CLI does not:
+    `_post_append` wraps a plain string as a `text` field, so the Append box
+    with the type set to `state_set` produces a payload no renderer can read --
+    and because `state_set` is last-one-wins, that does not add an inert row,
+    it blanks the operator's whole state block."""
+    from mindhive import events
+    base, token = dashboard_server
+    status, obj = _post(base, "/api/append",
+                        {"type": "state_set",
+                         "payload": "I meant to append a decision",
+                         "project": "p"}, token)
+    assert status == 200 and obj["ok"] is False
+    assert "REPLACES" in obj["error"]
+    assert "hive append state_set" in obj["error"]
+    assert events.read_all("p") == []
+
+
+def test_append_still_takes_a_well_formed_state_set(dashboard_server):
+    """CANARY for the test above: a gate that refused every `state_set` would
+    satisfy it and break the endpoint for the payload it exists to accept."""
+    from mindhive import events
+    base, token = dashboard_server
+    payload = {"task": "ship the branch", "open_questions": ["is it green?"]}
+    status, obj = _post(base, "/api/append",
+                        {"type": "state_set", "payload": payload,
+                         "project": "p"}, token)
+    assert status == 200 and obj["ok"] is True
+    evs = events.read_all("p")
+    assert len(evs) == 1 and evs[0].payload == payload
+
+
 def test_append_still_wraps_plain_text_for_free_text_types(dashboard_server):
     """Regression: the {"text": …} path must survive for uncontracted types —
     it is what the dashboard's own Append box sends."""

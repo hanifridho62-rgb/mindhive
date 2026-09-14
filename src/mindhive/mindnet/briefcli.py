@@ -47,6 +47,8 @@ from __future__ import annotations
 import json
 import sys
 
+from .. import cliparse
+
 from . import brief as br_mod
 
 # What `hive mindnet` returns when it refuses. A local copy of `__main__.MN_REFUSED`
@@ -74,9 +76,9 @@ def register(subparsers) -> None:
     # subcommand takes both, and without them `cmd_brief`'s project lookup could
     # only ever answer None — the command was permanently pinned to the default
     # namespace while reading as if it were not (`/review`, 2026-08-29).
-    p.add_argument("--project", default=None,
+    p.add_argument("--project", type=cliparse.project_arg, default=None,
                    help="the project namespace to read (default: the active one)")
-    p.add_argument("--session", default=None,
+    p.add_argument("--session", type=cliparse.session_id_arg, default=None,
                    help="unused by this read-only command; accepted so the "
                         "`mindnet` subcommands take one flag set")
     p.add_argument("--verbose", action="store_true",

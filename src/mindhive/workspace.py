@@ -150,7 +150,7 @@ def _now_iso() -> str:
 # --- profiles: named CLAUDE_CONFIG_DIR overrides (multiple accounts) ------
 
 def _profiles_path():
-    return paths.store_home() / "workspace_profiles.json"
+    return paths.store_file("workspace_profiles.json")
 
 
 def load_profiles() -> list:
@@ -705,6 +705,9 @@ class Manager:
         # ~8k command-line cap when passed as an argv element.
         argv += ["-p"]
         env = _profile_env(a.profile)
+        # Its OWN session, never the operator's: see `runlog.workspace_session`
+        # for both reasons (a private ledger segment, and honest authorship).
+        env["MINDHIVE_SESSION"] = runlog.workspace_session(a.id)
         cwd = _folder_for_project(a.project)
         try:
             a.proc = self._spawn(argv, env, cwd)
@@ -1267,7 +1270,7 @@ BOARD_COLUMNS = ("backlog", "running", "done")
 
 
 def _board_path():
-    return paths.store_home() / "workspace_board.json"
+    return paths.store_file("workspace_board.json")
 
 
 # A read that loses a race with the atomic write retries this many times, this far

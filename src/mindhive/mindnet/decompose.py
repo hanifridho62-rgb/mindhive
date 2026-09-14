@@ -143,7 +143,7 @@ def slugify(title, parent_id="", taken=()) -> str:
 
     Derived here rather than asked for, because an id is this repo's contract and
     not something a model should be guessing: `ID_RE` is
-    ``^[a-z0-9][a-z0-9-]{0,63}$`` and a violation would be refused at the append
+    ``^[a-z0-9][a-z0-9-]{0,63}\\Z`` and a violation would be refused at the append
     surface after the operator had already approved the proposal.
 
     Prefixed with the parent so a subtask reads as belonging to it in `hive mindnet
@@ -273,11 +273,30 @@ def run(task_id, graph, runner=None, project=None, timeout_s=DEFAULT_TIMEOUT_S,
         return Decomposition(task_id=task_id,
                              reason=f"no such task '{task_id}'")
     run_agent = runner or ag_mod.run
+    # `mn11-<task_id>` is BOTH the run key and the child's `MINDHIVE_SESSION`,
+    # and it had to become the second as well as the first.
+    #
+    # `advice.ORCHESTRATION_PREFIXES` lists `mn11-` as a spawner whose rows the
+    # provenance partition must keep off the auto-loaded surfaces. Nothing ever
+    # wrote it: the key named the transcript artifact, no `env` was passed, and
+    # `claude_cli._child_env` starts from `dict(os.environ)` -- so a decomposer
+    # child inherited the session of whoever launched it. Run by a human at
+    # `hive orchestrator lintest`, every row that child appended was stamped
+    # with a HUMAN id, which is the laundering case the prefix family exists to
+    # close, arriving through the one spawner that never announced itself. The
+    # entry in the allowlist read as coverage while matching nothing.
+    #
+    # It also buys what `orchestrator._run_wave` buys with the same line: its
+    # own ledger segment, so a decomposer's rows sit under its own id in their
+    # own `<session_id>.jsonl`. That is attribution, not integrity: appends are
+    # serialised across processes by `events._append_lock`, so a shared segment
+    # would not tear.
+    session = f"mn11-{task_id}"
     fenced = {"spawn": spawn} if spawn is not None else {}
     try:
-        res = run_agent(f"mn11-{task_id}", prompt_for(task), root=root,
+        res = run_agent(session, prompt_for(task), root=root,
                         project=project, timeout_s=timeout_s, model=model,
-                        **fenced)
+                        env={"MINDHIVE_SESSION": session}, **fenced)
     except Exception as exc:                            # noqa: BLE001
         return Decomposition(task_id=task_id,
                              reason=f"the agent could not be run: "

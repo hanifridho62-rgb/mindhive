@@ -11,7 +11,7 @@ from . import events, hookcapture, paths
 
 
 def _harvest_lock_path() -> Path:
-    return paths.store_home() / "harvest.lock"
+    return paths.store_file("harvest.lock")
 
 
 @contextmanager
@@ -739,14 +739,9 @@ def project_for_transcript_dir(d) -> str | None:
 
 def existing_projects() -> list:
     """Store namespaces that already have an events log — i.e. projects the user
-    already tracks in MIND HIVE."""
-    home = paths.store_home()
-    out = []
-    if home.exists():
-        for d in sorted(home.iterdir()):
-            if d.is_dir() and (d / "events").is_dir():
-                out.append(d.name)
-    return out
+    already tracks in MIND HIVE. Canonical names only (`paths.event_namespaces`):
+    a directory no name reaches cannot be harvested into by name either."""
+    return paths.event_namespaces()
 
 
 def catch_up(now=None, skip_captured=True, known_only=True) -> dict:

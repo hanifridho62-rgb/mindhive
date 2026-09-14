@@ -352,8 +352,41 @@ order, and this section grows one bullet per landing.
   `resolve.py` and `reflect.py` with no `spawn=`. That leg is conditional and
   crosses three modules `hive rules resolve` also uses, so it is stated in
   `fence.py`'s docstring and open as TODOS #34 rather than half-fixed here.
-- **The two other doors.** Decided, not yet landed: soft-deprecate both, code
-  kept, a notice and a toggle, reversible.
+- **The two other doors.** Landed 2026-09-09. Soft-deprecate both, code kept,
+  a notice and a toggle, reversible — and the landing is deliberately no larger
+  than that sentence. `mindnet.orchestrator.PRIMARY_DOOR_NOTICE` goes to stderr
+  on every non-JSON `hive mindnet orchestrate` run, dry or `--execute`: the
+  front door moved, this one is kept because the mission pipeline cannot run a
+  declared graph (other modules read one; none of them runs it), its agent
+  children get no permission mode so an agent wave can end with nothing written
+  (TODOS #35),
+  nothing is scheduled for removal. It is a SECOND string beside
+  `MINDNET_ORCHESTRATE_SIGNPOST` rather than a rewrite of it, because the two
+  need different gates — the signpost fires on a dry run only, since an operator
+  who typed `--execute` has already chosen, while the notice has to reach the
+  operator who runs this daily for real. It lives in the mindnet module and not
+  in `__main__.py` because its text names the other command and the registration
+  ratchet caps that file at four such lines, where it already sits.
+  `dashboard.mindswarm_enabled()` reads `MINDHIVE_MINDSWARM` (default **ON**,
+  off via `0`/`false`/`off`/`no` — `_auto_harvest_loop`'s vocabulary) and hides
+  the nav ROW only. Read per request rather than captured at import, which
+  keeps the value out of a module constant frozen before argv is parsed — it
+  does **not** let an operator flip the variable under a running dashboard,
+  whose environment is fixed at launch, and an earlier draft of this bullet
+  promised that it did. `/api/workspace/swarm`, `swarm_page.render_swarm` and
+  `showWorkspace` are untouched: the route is proven by dialling it against a
+  live server with the row hidden, and `showWorkspace` against the function
+  DEFINITION in `dashboard_js_views.JS`. The first version of that second
+  assertion matched the bare name, which two nav buttons, the hidden-row note
+  and two `dashboard_js_core.py` comments also carry — it passed with the whole
+  JS module blanked, and said in its own docstring that it could not. **What
+  this does NOT do** is measure whether anyone reads either message: a stderr
+  paragraph and a `title=` attribute have no read receipt and emit no event, so
+  there is no way to see traffic move. That, and five smaller stated gaps, are
+  TODOS #35.
+  Corrected in passing: `orchestrator/__init__.py`'s module map claimed
+  `lintester.py -> … / orchestrator`, and no import backs it — the two run loops
+  are siblings that read different inputs, not layers.
 
 ---
 

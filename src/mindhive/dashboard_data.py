@@ -42,14 +42,10 @@ def _folder_for_project(proj: str) -> str:
 
 
 def _all_projects() -> list:
-    """Names of every store namespace that has an events log."""
-    home = paths.store_home()
-    names = []
-    if home.exists():
-        for d in sorted(home.iterdir()):
-            if d.is_dir() and (d / "events").is_dir():
-                names.append(d.name)
-    return names
+    """Names of every store namespace that has an events log -- canonical names
+    only (`paths.event_namespaces`), so no entry reads a different directory
+    from the one it names."""
+    return paths.event_namespaces()
 
 
 def _project_stats(name: str) -> dict:

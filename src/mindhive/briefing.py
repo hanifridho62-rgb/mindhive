@@ -1,7 +1,9 @@
 # src/mindhive/briefing.py
 import re
 from pathlib import Path
-from . import events as ev_mod, paths, projector, dedupe, sop as sop_mod
+from . import events as ev_mod, paths, projector, dedupe, provenance
+from . import state as state_mod
+from . import sop as sop_mod
 
 
 SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES  # decision, experiment_result, caveat, next_step, open_question, state_set
@@ -100,6 +102,38 @@ def _payload_text(payload) -> str:
     return str(payload)
 
 
+# The timeline and the two memo sections below render event text a later session
+# reads as project history. A spawned orchestration agent can write any semantic
+# event -- every child holds `hive` on PATH with its own `MINDHIVE_SESSION` -- so
+# without this those rows are indistinguishable from a human's.
+#
+# MARKED, not withheld, and the difference is the point. `sop.partition_authored`
+# withholds, because an SOP is composed as a DIRECTIVE: it says "follow this", so
+# an agent-written one has to be kept off the surface entirely. These sections are
+# an AUDIT view: they say "this happened", and hiding an event from the record of
+# what happened damages the very thing the record is for. Naming the author leaves
+# the history complete and removes the only property that made it dangerous, which
+# is that it read as somebody else's.
+#
+# Re-exported, not redefined: `projector`, `roadmap` and this module all mark
+# with the same token, and a second literal is how two of them end up marking
+# with different ones.
+AGENT_MARK = provenance.AGENT_MARK
+
+
+def _authorship_mark(ev) -> str:
+    """`AGENT_MARK` when a spawned orchestration agent wrote *ev*, else "".
+
+    Total and fails open, matching `advice.is_orchestration_session`: an
+    unreadable id, or an import that raises, marks nothing. Absent authorship is
+    unknown authorship, and labelling every pre-stamping event as agent-written
+    would be a false accusation about most of the ledger. The lazy import that
+    makes that true now lives in `provenance.is_agent_authored`, for the reason
+    `sop.is_agent_authored` states -- `mindnet.advice` drags in the controller
+    subtree, and this module is on the projection path."""
+    return provenance.mark_for(getattr(ev, "session_id", ""))
+
+
 def build_briefing(evs) -> str:
     """Build a Markdown briefing string from a list of Event objects (deterministic)."""
     absorbed = _absorbed_keys(evs)
@@ -115,18 +149,32 @@ def build_briefing(evs) -> str:
     if latest_state is None:
         lines.append("(no state_set yet)")
     else:
-        s = latest_state.payload
-        lines.append(f"**task:** {s.get('task', '(none)')}")
-        lines.append(f"**verified:** {s.get('verified', '(none)')}")
-        lines.append(f"**next_step:** {s.get('next_step', '(none)')}")
-        oqs = s.get("open_questions") or []
+        # Same treatment, and the same reasons, as `projector.build_state`.
+        # This section was the one part of this file still rendering ledger text
+        # unmarked and unsanitized while every section below it is marked, and
+        # that inconsistency was the tell: the timeline, the decisions and the
+        # caveats all got the control when it was added; the block above them,
+        # which is the first thing a reader reads, did not.
+        s = state_mod.fields(latest_state)
+        state_banner = provenance.agent_banner(
+            "This state block", getattr(latest_state, "session_id", ""))
+        if state_banner:
+            lines.append(state_banner)
+            lines.append("")
+        lines.append(f"**task:** "
+                     f"{provenance.safe_line(s.get('task')) or '(none)'}")
+        lines.append(f"**verified:** "
+                     f"{provenance.safe_line(s.get('verified')) or '(none)'}")
+        lines.append(f"**next_step:** "
+                     f"{provenance.safe_line(s.get('next_step')) or '(none)'}")
         lines.append("**open_questions:**")
-        for q in oqs:
-            lines.append(f"- {q}")
-        deferred = s.get("deferred") or []
+        for q in provenance.safe_bullets(s.get("open_questions"), empty=""):
+            if q:
+                lines.append(f"- {q}")
         lines.append("**deferred:**")
-        for d in deferred:
-            lines.append(f"- {d}")
+        for d in provenance.safe_bullets(s.get("deferred"), empty=""):
+            if d:
+                lines.append(f"- {d}")
     lines.append("")
 
     # --- Timeline (deduped, most-recent-first, capped) ---
@@ -135,7 +183,8 @@ def build_briefing(evs) -> str:
     for ev, n in _collapsed_entries(evs, _TIMELINE_TYPES, cap=_TIMELINE_CAP,
                                     absorbed=absorbed):
         hl = headline(_payload_text(ev.payload))
-        lines.append(f"- {ev.ts} [{ev.type}] {hl}{_count_suffix(n)}")
+        lines.append(f"- {ev.ts} [{ev.type}] {hl}{_count_suffix(n)}"
+                     f"{_authorship_mark(ev)}")
     lines.append("")
 
     # --- Key decisions ---
@@ -143,7 +192,8 @@ def build_briefing(evs) -> str:
     lines.append("")
     for ev, n in _collapsed_entries(evs, {"decision"}, cap=_TIMELINE_CAP,
                                     absorbed=absorbed):
-        lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
+        lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}"
+                     f"{_authorship_mark(ev)}")
     lines.append("")
 
     # --- Lessons & caveats ---
@@ -151,17 +201,31 @@ def build_briefing(evs) -> str:
     lines.append("")
     for ev, n in _collapsed_entries(evs, {"caveat"}, cap=_TIMELINE_CAP,
                                     absorbed=absorbed):
-        lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}")
+        lines.append(f"- {headline(_payload_text(ev.payload))}{_count_suffix(n)}"
+                     f"{_authorship_mark(ev)}")
     lines.append("")
 
     # --- Standard operating procedures (titles only — full text rides the
     # STATE.md block and `hive sop show`) ---
-    actives = sop_mod.current(evs)
-    if actives:
+    # Partitioned on authorship for the reason `sop.partition_authored` states:
+    # a spawned orchestration agent can reach `hive sop add`, and this list is
+    # composed into a briefing a later session reads as project history. Titles
+    # are sanitized on the way out so a newline in one cannot forge a second
+    # bullet or a heading.
+    _sop_rows = sop_mod.current(evs)
+    actives, sop_withheld = sop_mod.partition_authored(_sop_rows, evs)
+    _sop_kept = {r.get("sop_id") for r in actives}
+    _sop_gone = [r.get("sop_id") for r in _sop_rows
+                 if r.get("sop_id") not in _sop_kept]
+    if actives or sop_withheld:
         lines.append("## Standard operating procedures (active)")
         lines.append("")
         for r in actives:
-            lines.append(f"- `{r['sop_id']}` v{r['version']}: {r['title']}")
+            lines.append(f"- `{r['sop_id']}` v{r['version']}: "
+                         f"{sop_mod.safe_title(r['title'])}")
+        foot = sop_mod.withheld_footer(sop_withheld, _sop_gone)
+        if foot:
+            lines.append(foot)
         lines.append("")
 
     # --- Activity ---

@@ -10,10 +10,16 @@ back. Nothing in here touches the filesystem or the store.
 The three checks were written after each was reproduced against a live server on
 an ephemeral port; the docstrings say what was observed rather than what was
 feared.
+
+Its one import from this package is `paths`, itself dependency-free, so the leaf
+property holds: `is_safe_project` asks `paths.namespace_name`, a pure function of
+the string, rather than keeping a second copy of its rule.
 """
 from __future__ import annotations
 
 import re
+
+from . import paths
 
 __all__ = ["BadRequest", "qs_int", "body_num", "is_safe_project",
            "host_is_local"]
@@ -75,38 +81,33 @@ def _coerced(raw, default, name, kind):
         raise BadRequest(f"invalid {name}") from None
 
 
-# Separators (either slash), the Windows drive/stream colon, and the wildcards
-# Windows refuses in a filename anyway. `*` is in here rather than special-cased
-# because the HIVE MIND tokens are recognised by `is_all` BEFORE this is asked —
-# a project that reaches a path join is never one of them.
-_UNSAFE_PROJECT = re.compile(r'[\\/:*?"<>|]')
-
-
 def is_safe_project(project) -> bool:
-    """True when *project* can only ever name ONE directory directly under the
-    store home.
+    """True when *project* names, verbatim, the directory a read of it lands on:
+    exactly the names `paths.namespace_name` keeps.
 
-    `paths.project_dir` is `store_home() / (project or detect_project())` with no
-    sanitisation, so the string arriving on the wire IS a path component. A
+    `paths.project_dir` was `store_home() / (project or detect_project())` with no
+    sanitisation, so the string arriving on the wire WAS a path component. A
     request carrying a relative path escaped the store completely: against a live
     server, `GET /api/state?project=<relpath-to-a-temp-dir>` answered 200 with the
-    contents of a file created outside the store home.
+    contents of a file created outside the store home. `paths.namespace_name` now
+    quarantines such a name inside the store, which closes the escape but would
+    answer a hostile request with an empty namespace and a 200; this guard stays
+    so the HTTP surface refuses it out loud, as `cliparse.project_arg` does for
+    the CLI.
 
-    The test is SHAPE, not charset. Every namespace `paths.normalize` mints is
-    `[a-z0-9-]+`, but a directory somebody created by hand is a real namespace
-    too, and refusing it for its spelling would be a second bug wearing the first
-    one's clothes. A value with no separator cannot escape a single join, and
-    that is the whole property being defended.
+    It ASKS THE SINK, for `cliparse.project_arg`'s reason. It used to be a shape
+    test of its own -- no separator, no drive colon, no wildcard, no control
+    character -- and the sink outgrew it: `проект`, `my project` and
+    `unsafe-<16 hex>` passed here, as did `abc.` and `CON` on Windows, while
+    `namespace_name` sent each to a quarantine slot, so each was answered 200
+    with a DIFFERENT directory's contents (usually an empty one) under the name
+    the caller asked for. A store-root file name (`LIVE_LOCK`, `autosync.json`)
+    is refused the same way. The HIVE MIND tokens are recognised by `is_all`
+    before this is asked, so a project reaching a path join is never one of
+    them. A check that asks the function deciding where the read lands cannot
+    fall behind it.
     """
-    if not isinstance(project, str) or not project.strip():
-        return False
-    if any(ord(c) < 32 or ord(c) == 127 for c in project):
-        return False
-    if project in (".", ".."):
-        return False
-    if project.startswith("~"):
-        return False
-    return not _UNSAFE_PROJECT.search(project)
+    return isinstance(project, str) and paths.namespace_name(project) == project
 
 
 # Loopback by NAME. An attacker's domain can resolve to 127.0.0.1; it can never

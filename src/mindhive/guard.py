@@ -3,7 +3,7 @@ from . import paths
 
 
 def live_lock_active() -> bool:
-    return (paths.store_home() / "LIVE_LOCK").exists()
+    return paths.store_file("LIVE_LOCK").exists()
 
 
 def ensure_safe(force: bool = False) -> None:

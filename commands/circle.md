@@ -18,8 +18,11 @@ one execution engine).
 
 Extra flags passed by the user: `$ARGUMENTS`
 
-Run everything through the project venv:
-`C:\Users\hanif\mindhive\.venv\Scripts\python.exe -m mindhive …`
+Run everything through the MindHive checkout's own venv interpreter —
+`<checkout>\.venv\Scripts\python.exe -m mindhive …` on Windows,
+`<checkout>/.venv/bin/python -m mindhive …` elsewhere, where `<checkout>` is the
+directory MindHive is cloned into — or through `python -m mindhive …` when that
+venv's interpreter is the one on PATH.
 
 Steps:
 

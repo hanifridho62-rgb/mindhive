@@ -48,7 +48,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .paths import store_home
+from . import cliparse
+from .paths import store_file
 
 # The four routes the before-profile measured, in its order. A default rather
 # than a fixed list: a renamed route surfaces here as a non-200, but an ADDED
@@ -268,7 +269,7 @@ def resolve_token(explicit="") -> tuple[str, str]:
     env = os.environ.get("MINDHIVE_DASHBOARD_TOKEN")
     if env:
         return env, "MINDHIVE_DASHBOARD_TOKEN"
-    path = store_home() / TOKEN_FILENAME
+    path = store_file(TOKEN_FILENAME)
     try:
         token = path.read_text(encoding="utf-8").strip()
     except Exception:
@@ -407,7 +408,7 @@ def cmd_bench_dashboard(args) -> int | None:
         print("bench: no dashboard token. Every route but / is behind the token "
               "gate, so without one this would time four 403s and call them "
               "fast. Pass --token, set MINDHIVE_DASHBOARD_TOKEN, or start the "
-              f"dashboard once to create {store_home() / TOKEN_FILENAME}.")
+              f"dashboard once to create {store_file(TOKEN_FILENAME)}.")
         return 2
 
     report = run(origin=origin, token=token, label=label,
@@ -459,7 +460,11 @@ def register(subparsers) -> None:
                          "MINDHIVE_DASHBOARD_TOKEN, then "
                          f"<store>/{TOKEN_FILENAME}). Every route but / is "
                          "behind the token gate")
-    bd.add_argument("--project", default="",
+    # `default=None`, not `""`: argparse runs a STRING default through `type=`,
+    # and `project_arg` refuses the empty string, so an omitted `--project`
+    # exited 2 before `cmd_bench_dashboard` ran. `None` is not passed through,
+    # and the handler already reads the value as `str(... or "")`.
+    bd.add_argument("--project", type=cliparse.project_arg, default=None,
                     help="namespace to fold (default: whatever the SERVER "
                          "resolves from its own cwd). Which namespace is "
                          "folded is the largest single determinant of cost")

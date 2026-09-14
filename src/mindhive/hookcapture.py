@@ -178,11 +178,11 @@ def log_hook_error(stage: str, exc) -> None:
     Best-effort: a logging failure must never propagate out of a hook.
     """
     try:
-        home = paths.store_home()
-        home.mkdir(parents=True, exist_ok=True)
+        log = paths.store_file("hooks_errors.log")
+        log.parent.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
         line = f"{ts}\t{stage}\t{type(exc).__name__}: {exc}\n"
-        with open(home / "hooks_errors.log", "a", encoding="utf-8") as f:
+        with open(log, "a", encoding="utf-8") as f:
             f.write(line)
     except Exception:
         pass

@@ -295,7 +295,7 @@ def _live_lock_blocks(project=None) -> bool:
     the namespace matches — a namespace that is merely a substring of a longer
     token does not. Missing/unreadable lock -> False (proceed)."""
     try:
-        text = (paths.store_home() / "LIVE_LOCK").read_text(encoding="utf-8")
+        text = paths.store_file("LIVE_LOCK").read_text(encoding="utf-8")
     except OSError:
         return False
     name = paths.normalize(project or paths.detect_project())

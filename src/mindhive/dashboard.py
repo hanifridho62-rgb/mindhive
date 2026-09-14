@@ -64,7 +64,7 @@ from .dashboard_memo import (_CATS_MEMO, _IMPROVE_MEMO, _MEMO_MAX,  # noqa: F401
 # dashboard URL identical on every launch (http://127.0.0.1:54461/?token=…).
 DEFAULT_PORT = 54461
 def _token_path():
-    return paths.store_home() / "dashboard.token"
+    return paths.store_file("dashboard.token")
 
 
 def load_or_create_token() -> str:
@@ -90,6 +90,38 @@ def load_or_create_token() -> str:
     except Exception:
         pass
     return tok
+
+
+def mindswarm_enabled() -> bool:
+    """Whether the shell serves the MindSwarm nav button. Default ON.
+
+    The soft-deprecation toggle for the Workspace door, and the default is the
+    whole point of the word soft: an operator who has moved to the mission
+    pipeline can stop seeing an entry they no longer use, and one who has not
+    loses nothing by doing nothing. Off via ``MINDHIVE_MINDSWARM=0`` (or
+    ``false`` / ``off`` / ``no``, case-insensitively) — the same vocabulary
+    `_auto_harvest_loop` reads for ``MINDHIVE_AUTOHARVEST``, because a second
+    spelling of "off" in one process is how an operator learns not to trust
+    either.
+
+    The nav BUTTON is the only thing this hides. ``/api/workspace/swarm`` still
+    answers, `swarm_page.render_swarm` still renders it, and `showWorkspace`
+    is still in the shell's JS — a bookmark on
+    ``/api/workspace/swarm?token=…`` keeps working. Hiding a nav row is
+    reversible; deleting a route is not, and the decision recorded for this
+    change was explicitly the reversible one.
+
+    WHAT REVERSIBLE DOES NOT MEAN. This is read per request, but a running
+    dashboard's ``os.environ`` is fixed at launch and nothing here writes it,
+    so an operator who exports the variable into a shell and reloads the page
+    sees no change: the value has to be in the environment the dashboard was
+    STARTED with, and changing it means restarting the process. An adversarial
+    review found this docstring promising the opposite. What the per-request
+    read does buy is that the value is not frozen at import — this module is
+    imported before argv is parsed — so a future flag or an in-process setter
+    can still reach it, and every test here can flip it against one server."""
+    return os.environ.get("MINDHIVE_MINDSWARM", "1").lower() not in (
+        "0", "false", "off", "no")
 
 
 def make_handler(token: str):
@@ -298,10 +330,17 @@ def make_handler(token: str):
                 parsed = urlparse(self.path)
                 route = parsed.path
                 if route == "/":
+                    # `mindswarm_enabled()` is read per request, not once at
+                    # import. That does NOT let an operator flip the variable
+                    # under a running server — this process's environ is fixed
+                    # at launch — it keeps the value out of a module-level
+                    # constant that would freeze before argv is even parsed.
+                    # The operator's step is to restart with the new value.
                     return self._send(200,
                                       render_page(token,
                                                   tasks_css=taskview.CARDS_CSS,
-                                                  tasks_js=taskview.CARDS_JS),
+                                                  tasks_js=taskview.CARDS_JS,
+                                                  swarm=mindswarm_enabled()),
                                       "text/html; charset=utf-8")
                 if not self._check_token():
                     return self._json({"ok": False, "error": "forbidden"}, 403)

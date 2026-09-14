@@ -527,8 +527,9 @@ class LintesterOrchestrator:
             # `events._append_lock` was written for -- and (b) every `hive log`
             # / `hive sop` row it writes is attributed to a human, which is what
             # lets an injected agent put a MANDATORY SOP in front of the
-            # operator. `mindnet.orchestrator` has always set this
-            # (`orchestrator.py:520`); this spawner never did.
+            # operator. `mindnet.orchestrator` stamps every child the same way
+            # (the `MINDHIVE_SESSION` overlay in `_run_wave`'s per-task worker);
+            # this spawner never did.
             #
             # `MISSION_PREFIX` is in `advice.ORCHESTRATION_PREFIXES`, asserted
             # against the imported constant by

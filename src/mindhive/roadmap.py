@@ -62,25 +62,6 @@ MAX_WORK_BRANCH_CHARS = 250
 MAX_WORK_COMMITS = 20
 MAX_WORK_COMMIT_CHARS = 40      # a full sha; abbreviations are shorter
 
-# Notice rendering caps: done steps collapse to a tail, pending to a head, so
-# one interrupted plan costs a bounded slice of the auto-loaded MEMORY.md.
-_NOTICE_DONE_TAIL = 3
-_NOTICE_PENDING_HEAD = 3
-
-# The provenance marker for an injected step, in ONE place. It shipped as three
-# separate string literals and three of the renderers that read the same step
-# dicts never got one — including `autoresume.resume_prompt`, the leg that
-# delivers an interrupted plan back into Claude, so the resumed agent could not
-# tell injected work from the plan it started with. A shared helper is what makes
-# "marked wherever rendered" checkable instead of aspirational.
-NEW_MARKER = "(new) "
-
-
-def new_prefix(step) -> str:
-    """``NEW_MARKER`` when *step* was added by the replenishment injector, else
-    "". Every text renderer of a roadmap step goes through this."""
-    return NEW_MARKER if (step or {}).get("new") else ""
-
 
 # --- the work link ------------------------------------------------------------
 # Three flat keys rather than one nested object, matching the relay fields below:
@@ -718,6 +699,29 @@ from .roadmap_auto import (  # noqa: E402,F401
     sync_from_todos,
     todos_to_steps,
 )
+
+# --- the rendering layer, re-exported -----------------------------------------
+#
+# It lives in `roadmap_render` (this file hit the 1000-line cap a second time,
+# and the anti-injection work that pushed it there landed in exactly these two
+# renderers). Re-exported for the same reason as the block above: every caller
+# reaches them through this module -- `roadmap.notice` in `projector`,
+# `roadmap.ledger_body` in `projector` and `dashboard_get`, `roadmap.new_prefix`
+# in `autoresume` and `__main__`, `roadmap.NEW_MARKER` in `replenish_sinks`.
+# `tests/test_roadmap_render.py` pins each one as the SAME object, because a
+# re-export that rebound the name would satisfy `hasattr` and defeat every
+# monkeypatch through it -- the failure the `dashboard.py` split shipped.
+from .roadmap_render import (  # noqa: E402,F401
+    NEW_MARKER,
+    _NOTICE_DONE_TAIL,
+    _NOTICE_PENDING_HEAD,
+    _step_line,
+    ledger_body,
+    new_prefix,
+    notice,
+)
+
+
 def _tags_for(action, rec, tags):
     """Tags for one `record` write, so a plan cannot lose its provenance.
 
@@ -829,115 +833,6 @@ def record(action, plan_id, prompt=None, title=None, steps=None, index=None,
         "roadmap", payload, session_id=session_id,
         tags=_tags_for(action, rec, tags),
         project=project)
-
-
-def _step_line(s, marker) -> str:
-    note = f" — {s['note']}" if s.get("note") else ""
-    return f"- {marker} {new_prefix(s)}{s['text']}{note}"
-
-
-def notice(evs) -> str:
-    """The "⚠ Interrupted plan" STATE.md block — the out-of-usage marker.
-    Empty string when no plan is interrupted. Deterministic; each plan's step
-    list is capped (done tail + pending head) so the marker preserves the big
-    picture without regressing the auto-loaded context budget."""
-    marks = interrupted(evs)
-    if not marks:
-        return ""
-    try:
-        # Delivery status per plan (autoresume.py). Lazy + guarded: the
-        # delivery telemetry must never break the marker itself.
-        from . import autoresume as _autoresume
-        ar_recs = _autoresume.fold(evs)
-    except Exception:
-        ar_recs = {}
-    out = ["## ⚠ Interrupted plan — creation context preserved", "",
-           "Work below was interrupted before it finished (e.g. Claude usage "
-           "ran out). The original ask and the plan's progress are the "
-           "creation context: pick the work up at the next step instead of "
-           "starting over. Resume: `hive roadmap resume <id>` · finished: "
-           "`hive roadmap complete <id>` · full detail: "
-           "`hive roadmap show <id>` · auto-deliver back into Claude after "
-           "the usage cooldown: `hive autoresume schedule <id>`.", ""]
-    for r in marks:
-        head = r["title"] or r["plan_id"]
-        prog = r["progress"]
-        out.append(f"### {head}  `[{r['plan_id']}]`")
-        out.append(f"- **Interrupted:** {r['interrupted_at']} "
-                   f"(cause: {r['cause']})")
-        out.append(f"- **Asked:** {r['prompt']}")
-        out.append(f"- **Progress:** {prog['done']}/{prog['total']} steps done")
-        ar = ar_recs.get(r["plan_id"])
-        if ar and ar["status"] == "scheduled":
-            out.append(
-                f"- **Auto-resume:** marker re-enters Claude at {ar['due']} "
-                f"(attempt {ar['attempt']}, timer: {ar['timer']}) — deliver "
-                f"now: `hive autoresume fire {r['plan_id']}`")
-        elif ar and ar["status"] == "fired":
-            detail = f" — {ar['detail']}" if ar.get("detail") else ""
-            out.append(f"- **Auto-resume:** delivery {ar['outcome']} @ "
-                       f"{ar['updated']}{detail}")
-        done = [s for s in r["steps"] if s["status"] == "done"]
-        hidden = len(done) - _NOTICE_DONE_TAIL
-        if hidden > 0:
-            out.append(f"- [x] … {hidden} earlier step(s) done")
-        for s in done[-_NOTICE_DONE_TAIL:]:
-            out.append(_step_line(s, "[x]"))
-        nxt = next_step(r)
-        if nxt is not None:
-            out.append(_step_line(nxt, "[→] NEXT:"))
-        pending = [s for s in r["steps"]
-                   if s["status"] == "pending" and s is not nxt]
-        for s in pending[:_NOTICE_PENDING_HEAD]:
-            out.append(_step_line(s, "[ ]"))
-        if len(pending) > _NOTICE_PENDING_HEAD:
-            out.append(f"- [ ] … {len(pending) - _NOTICE_PENDING_HEAD} "
-                       "more step(s)")
-        out.append("")
-    return "\n".join(out).rstrip("\n") + "\n"
-
-
-def ledger_body(payload) -> str:
-    """Self-describing markdown body for this event's LEDGER entry, so
-    keyword recall finds plans by id, prompt, step text, or cause."""
-    action = payload.get("action", "")
-    head = f"[{action}] roadmap {payload.get('plan_id', '')}"
-    title = str(payload.get("title") or "").strip()
-    if title:
-        head += f" — {title}"
-    parts = [head]
-    prompt = str(payload.get("prompt") or "").strip()
-    if prompt:
-        parts.append(f"Asked: {prompt}")
-    steps = payload.get("steps")
-    if isinstance(steps, list) and steps:
-        lines = []
-        for s in steps:
-            if isinstance(s, dict):
-                # The marker rides the LEDGER body too, so keyword recall can
-                # tell injected work from planned work.
-                lines.append(f"- [{s.get('status', 'pending')}] "
-                             f"{new_prefix(s)}"
-                             f"{str(s.get('text') or '').strip()}")
-            else:
-                lines.append(f"- {str(s).strip()}")
-        parts.append("\n".join(lines))
-    if action == "step":
-        parts.append(f"step {payload.get('index')} -> "
-                     f"{payload.get('status', '')}")
-    cause = str(payload.get("cause") or "").strip()
-    if cause:
-        parts.append(f"cause: {cause}")
-    link = describe_work_link(payload)
-    if link:
-        parts.append(f"work: {link}")
-    reason = str(payload.get("reason") or "").strip()
-    if reason:
-        parts.append(f"reason: {reason}")
-    note = str(payload.get("note") or "").strip()
-    if note:
-        parts.append(note)
-    return "\n\n".join(parts)
 
 
 # --- the outcomes-registry probe ----------------------------------------------

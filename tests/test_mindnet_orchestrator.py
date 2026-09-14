@@ -364,17 +364,22 @@ def test_frontier_delegates_to_the_shared_readiness_predicate():
     """Structural, not behavioural. A behavioural test passes just as well
     against a hand-rolled copy of the rule that happens to agree today;
     this asserts the call is actually made, so the two cannot drift."""
-    assert "ready(" in inspect.getsource(orc.frontier), (
+    from mindhive.mindnet import frontier as fr_mod
+    assert "ready(" in inspect.getsource(fr_mod.frontier), (
         "frontier must call tasks.ready — a second readiness rule in the "
         "orchestrator can disagree with can_complete about the same graph")
-    # And the module must not restate the status strings the readiness rule
-    # turns on. A literal here is how the second copy starts.
-    body = inspect.getsource(orc)
-    for literal in ('"pending"', "'pending'", '"completed"', "'completed'",
-                    '"blocked"', "'blocked'"):
-        assert literal not in body, (
-            f"{literal} is a status literal — reference the tasks.STATUS_* "
-            f"constant so this module cannot drift from the legend")
+    # `frontier.py` was carved out of the orchestrator at the line cap; the
+    # loop must still run the very function the tests above pin.
+    assert orc.frontier is fr_mod.frontier
+    # And neither module may restate the status strings the readiness rule
+    # turns on. A literal in either is how the second copy starts.
+    for module in (orc, fr_mod):
+        body = inspect.getsource(module)
+        for literal in ('"pending"', "'pending'", '"completed"', "'completed'",
+                        '"blocked"', "'blocked'"):
+            assert literal not in body, (
+                f"{literal} in {module.__name__} is a status literal — reference "
+                f"the tasks.STATUS_* constant so it cannot drift from the legend")
 
 
 def _hierarchies(n):
@@ -407,10 +412,11 @@ def test_the_container_pass_is_exact_over_every_small_hierarchy():
             out.update(t_mod.ancestors(graph, tid))
         return out
 
+    from mindhive.mindnet import frontier as fr_mod
     checked = 0
     for graph in _hierarchies(3):
         checked += 1
-        assert orc._containers_with_open_work(graph) == by_definition(graph), (
+        assert fr_mod._containers_with_open_work(graph) == by_definition(graph), (
             f"diverged on {[(t.task_id, t.parent_id, t.status) for t in graph.values()]}")
     assert checked > 1000, f"only {checked} graphs — the sweep collapsed"
 
@@ -1063,10 +1069,11 @@ def test_without_isolation_every_task_shares_the_one_root(gitrepo):
 
 
 def test_each_isolated_task_gets_its_own_ledger_segment(gitrepo):
-    """R2, and the reason parallelism could not ship without this unit.
-    `events.append_event` writes to `<session_id>.jsonl` with an UNLOCKED append,
-    so two concurrent agents sharing a session interleave into corrupt JSONL —
-    and the ledger is the source of truth for the entire system."""
+    """R2, and the reason parallelism could not ship without this unit. When it
+    shipped, `events.append_event` wrote with an UNLOCKED append and two agents
+    sharing a session interleaved into corrupt JSONL. `_append_lock` serialises
+    appends now; a distinct session is still what gives each agent its own
+    segment and its own id, which the provenance rules read."""
     fake = FakeRunner()
     orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake, execute=True,
                     root=gitrepo, isolate=True)
@@ -1083,8 +1090,9 @@ def test_a_child_using_the_injected_session_writes_its_own_segment(gitrepo,
     The test above asserts distinct sessions reach the children; this asserts what
     that BUYS — a runner that actually appends under the session it was handed
     produces one segment file per agent. Without it they all append to one
-    `<session>.jsonl` through an unlocked `open(..., "a")`, and concurrent writes
-    interleave mid-line into JSONL the fold cannot read."""
+    `<session>.jsonl`: `events._append_lock` keeps each line whole, but every
+    agent's rows land in one segment under one id, and nothing tells them
+    apart."""
     from mindhive import paths
 
     def appending_runner(run_key, script, **kw):
@@ -1104,12 +1112,94 @@ def test_a_child_using_the_injected_session_writes_its_own_segment(gitrepo,
         f"agents did not get their own segments: {sorted(segments)}")
 
 
-def test_without_isolation_no_session_is_forced(gitrepo):
-    """The canary for R2: the shared-tree path must not silently start
-    re-segmenting the ledger, which would change behaviour for --via-script runs."""
+# --- every child carries its own identity, isolated or not -----------------
+#
+# This block used to hold `test_without_isolation_no_session_is_forced`, which
+# asserted the OPPOSITE of the tests below: "the shared-tree path must not
+# silently start re-segmenting the ledger". That canary pinned a hole. The stamp
+# is not only a segment -- `mn9-` is the identity `advice.ORCHESTRATION_PREFIXES`
+# recognises, and every composing surface withholds or marks what it wrote. With
+# the stamp inside the isolation branch, an `--isolation none` agent wave and
+# every `--via-script` wave (which cannot isolate) inherited the operator's
+# environment, so a child's `hive sop add --mandatory` was attributed to a human
+# and composed into the operator's per-prompt directives unmarked.
+#
+# Nothing that decides EVIDENCE reads a session id, and `events._append_lock`
+# serialises appends across processes, so the segment itself protected nothing
+# a shared one did not. The reasoning is written at the stamp in `_run_wave`.
+
+def test_a_non_isolated_wave_stamps_each_child_with_its_own_session(gitrepo):
+    """DISCRIMINATING: the autouse `_session` fixture sets the PARENT's
+    `MINDHIVE_SESSION` to `s1`, so a child that was not stamped inherits exactly
+    that -- the defect -- and fails here, not for want of any value."""
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake, execute=True,
+                    root=gitrepo)
+    sessions = {tid: kw["env"].get("MINDHIVE_SESSION")
+                for tid, kw in fake.kwargs.items()}
+    assert sessions == {"b": "mn9-b", "c": "mn9-c"}, sessions
+    # Still the shared tree -- the stamp did not quietly turn isolation on.
+    assert {kw["root"] for kw in fake.kwargs.values()} == {gitrepo}
+
+
+def test_a_non_isolated_session_is_recognised_as_an_orchestration_agent(gitrepo):
+    """The other half. An id no provenance consumer recognises is no identity,
+    so the stamped value is asked of the owning predicate and of the one every
+    composing surface calls -- with the parent's own id as the canary, because
+    a predicate answering True for everything passes the first two alone."""
+    from mindhive import provenance
+    from mindhive.mindnet import advice
+
     fake = FakeRunner()
     orc.orchestrate(_graph(_task("b")), runner=fake, execute=True, root=gitrepo)
-    assert "MINDHIVE_SESSION" not in fake.kwargs["b"]["env"]
+    sid = fake.kwargs["b"]["env"]["MINDHIVE_SESSION"]
+    assert advice.is_orchestration_session(sid), sid
+    assert provenance.is_agent_authored(sid), sid
+    assert not advice.is_orchestration_session(SESSION), (
+        "canary: the parent's human session read as an agent")
+
+
+def test_a_via_script_childs_real_process_sees_its_own_session(gitrepo, tmp_path):
+    """END TO END on the path the old canary protected: the real
+    `executor.execute`, a real subprocess, no fake runner. `--via-script` cannot
+    isolate (the CLI refuses the combination), so this is the ONLY way its
+    children ever get an identity, and what reaches the child's `os.environ` IS
+    the behaviour -- a mapping handed to a fake proves only that a dict moved.
+
+    The probe lives outside the repo so the run leaves the checkout clean."""
+    import sys
+
+    marker = tmp_path / "seen.txt"
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os\n"
+        f"open({str(marker)!r}, 'w', encoding='utf-8').write("
+        "os.environ.get('MINDHIVE_SESSION', '<unset>'))\n",
+        encoding="utf-8")
+    task = _task("b", validation_script=" ".join([sys.executable, str(probe)]))
+
+    out = orc.orchestrate(_graph(task), runner=x_mod.execute, execute=True,
+                          root=gitrepo)
+
+    assert marker.is_file(), f"the validation child never ran: {out.reasons}"
+    assert marker.read_text(encoding="utf-8") == "mn9-b", (
+        "the via-script child ran under the operator's session")
+
+
+def test_a_shared_runner_kwargs_env_is_not_written_through(gitrepo):
+    """The stamp COPIES the env. `runner_kwargs` is one dict shared by every
+    worker in the pool, so writing the key through a caller-supplied `env`
+    would race: task b's runner could read task c's id. Asserted on the
+    caller's dict after the run, and on each child's own value."""
+    shared = {"CALLER_VAR": "kept"}
+    fake = FakeRunner()
+    orc.orchestrate(_graph(_task("b"), _task("c")), runner=fake, execute=True,
+                    root=gitrepo, runner_kwargs={"env": shared})
+    assert shared == {"CALLER_VAR": "kept"}, "the caller's env was mutated"
+    for tid in ("b", "c"):
+        env = fake.kwargs[tid]["env"]
+        assert env["MINDHIVE_SESSION"] == f"mn9-{tid}"
+        assert env["CALLER_VAR"] == "kept"
 
 
 def test_the_isolation_env_does_not_clobber_the_arming_decision(gitrepo):

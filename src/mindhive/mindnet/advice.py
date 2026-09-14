@@ -155,7 +155,36 @@ MIN_OVERLAP = 2
 # even once the overlay was added the run_key prefix was outside this family.
 # Both halves are needed — an identity nothing recognises is no identity.
 # `test_the_lintester_mission_prefix_is_covered` pins it the same way.
-ORCHESTRATION_PREFIXES = ("mn9-", "mn7-", "mn11-", "mn-", "lm-")
+#
+# `ws-` and `research-` are the two families found by the audit that closed the
+# rendering surfaces. Neither is an "orchestration" agent in the MN sense, and
+# the name of this tuple is now slightly narrower than what it holds; the
+# question every consumer asks it is "did a spawned agent write this row, rather
+# than a person", and for both of these the answer is yes.
+#
+#   * `ws-` is a `workspace.Agent`. `workspace.send` had NO `MINDHIVE_SESSION`
+#     overlay, so its children inherited the operator's id outright -- the
+#     lintester state exactly. `send` now stamps `ws-<agent id>`, and the two
+#     halves land together for the reason the `lm-` note above gives.
+#     `ui_sessions._NOT_A_CHAT` already treats `ws-` as a session-id family, so
+#     the shape was expected here before anything wrote it.
+#   * `research-` is a Self-Reliant run (`events.SELF_RELIANT_SESSION_PREFIX`,
+#     stamped at research.py:1029). That spawner always stamped; nothing
+#     recognised the stamp.
+#
+# Both are LITERALS here and pinned by a test against the owning module's
+# constant, which is how `lm-` is already handled and is deliberate: importing
+# `workspace` from this module would drag `claude_cli`, `runlog` and
+# `dashboard_query` onto the projection path that `sop` -> `provenance` reaches,
+# for a five-character string. The drift a shared literal risks is what the
+# pinning tests are for.
+#
+# Availability cost, checked rather than assumed: Self-Reliant writes semantic
+# memos only -- no `sop`, no `roadmap`, no `state_set` -- so adding it withholds
+# nothing from a directive surface. What changes is that its decisions now carry
+# the agent mark in the briefing, which is what they always were.
+ORCHESTRATION_PREFIXES = ("mn9-", "mn7-", "mn11-", "mn-", "lm-",
+                          "ws-", "research-")
 
 
 def is_orchestration_session(session_id) -> bool:
@@ -397,10 +426,17 @@ def resolve_sops(task_kw, evs):
     to `Stats.authored`, the `mindnet_brief` payload and `hive mindnet brief`."""
     from .. import sop as sop_mod
     rows = [r for r in sop_mod.current(evs or []) if isinstance(r, dict)]
+    # ANY contributor, not the last editor. The folded `session_id` names
+    # whoever wrote the row MOST RECENTLY, so reading authorship off it alone
+    # let one human edit launder an agent-written procedure straight back into
+    # this brief -- the hole `sop.agent_touched_ids` was written to close on the
+    # STATE.md surface, open here on the surface that feeds the next agent.
+    tainted = sop_mod.agent_touched_ids(evs or [])
     kept, agent = [], []
     for r in rows:
-        (agent if is_orchestration_session(r.get("session_id")) else kept
-         ).append(r)
+        by_agent = (is_orchestration_session(r.get("session_id"))
+                    or r.get("sop_id") in tainted)
+        (agent if by_agent else kept).append(r)
     # Uncapped limit on the withheld side: this is a count, not a render, and
     # capping it at MAX_SOPS would under-report a store with several relevant
     # injected rows — which is precisely the case worth seeing.

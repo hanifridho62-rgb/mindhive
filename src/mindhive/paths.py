@@ -1,4 +1,5 @@
 # src/mindhive/paths.py
+import hashlib
 import itertools
 import os
 import shutil
@@ -252,8 +253,206 @@ def worktree_root(cwd: Path | None = None) -> Path | None:
     return None
 
 
+# The characters a namespace may contain. It names a DIRECTORY under
+# `store_home()`, so the rule is `events.SESSION_ID_RE`'s with one addition:
+# a leading `_`, because `__hivemind__` is a real namespace this code writes.
+# Measured against the live store before it was tightened -- 81 directories,
+# every one of them a match -- so nothing on disk moves.
+PROJECT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+
+# The component-name namespace the quarantine reserves for itself. OWNED here,
+# not in `events`: `events` imports this module and re-exports the constant,
+# while `paths` stays dependency-free so `autosync` can import it. One authority
+# rather than two spellings; `tests/test_events_segment_path.py` pins the
+# re-export.
+QUARANTINE_PREFIX = "unsafe-"
+
+# The names Windows resolves to a DEVICE rather than a file. The stem before the
+# first dot is what counts, and case is ignored. Measured on this repo's
+# Windows 11 dev box: `mkdir NUL/events` raised FileNotFoundError, so
+# `append_event(project="NUL")` threw from inside the append, while
+# `NUL.jsonl` and a bare `AUX` were created as ordinary files. Which members
+# are reserved, and whether an extension frees them, has moved between Windows
+# builds, so the whole family is refused rather than the members one build
+# happens to reserve. Zero of 90 namespaces and 2547 segments in the live store
+# use one, so nothing on disk moves.
+WINDOWS_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + ["com%d" % i for i in range(10)]
+    + ["lpt%d" % i for i in range(10)])
+
+
+def text_of(value):
+    """*value* as the text a path component is named or hashed by, or None.
+
+    `str`, then `repr`, then the type's name. Each fallback is the cheapest fact
+    that still tells two values apart, so an object whose `__str__` raises is
+    not merged with every other such object under one constant -- the merge the
+    quarantine exists to prevent, reached without anybody choosing it. None
+    only when all three raise, the one input with nothing left to name it by.
+    Shared by `namespace_name` and `events.segment_name`, which used to carry
+    two versions of this chain and only one of them was the full one."""
+    try:
+        return value if isinstance(value, str) else str(value)
+    except Exception:                                   # noqa: BLE001
+        pass
+    try:
+        return repr(value)
+    except Exception:                                   # noqa: BLE001
+        pass
+    try:
+        return "unstringifiable:" + type(value).__name__
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def is_reserved_component(name: str, os_name: str | None = None) -> bool:
+    """Whether *name*, a COMPLETE path component that already matched its
+    whitelist, must still not reach the filesystem verbatim.
+
+    Both reasons are the filesystem storing something OTHER than the name it
+    was handed:
+
+    * **The quarantine prefix, in any case.** A conforming `unsafe-<16 hex>`
+      would land in the quarantine slot of whichever hostile value hashes to
+      it: a chosen merge. The test ignores case because NTFS does.
+      `UNSAFE-<hex>.jsonl` IS `unsafe-<hex>.jsonl` there, and the first,
+      case-sensitive reservation left that merge one Shift key away (observed:
+      three spellings appended to one segment). Refused on every platform, so
+      `unsafe-*` means "refused" wherever the store lives.
+    * **On Windows only, a name the OS aliases**: a device stem (see
+      `WINDOWS_DEVICE_NAMES`), or a trailing dot, which Win32 strips, making
+      `abc.` and `abc` one directory. Only on `nt`, deliberately. On POSIX
+      `aux` and `abc.` are ordinary names a store may already hold, and
+      quarantining them there would silently point an existing caller at a
+      different, empty namespace. `namespace_name` refuses `normalize` for
+      exactly that failure.
+
+    *name* is the whole component, suffix included, because that is what the
+    filesystem sees: a session id `abc.` is the segment `abc..jsonl`, which
+    ends in no dot and needs no quarantine. *os_name* is injected so each
+    platform's answer is testable on the other's runner, the way
+    `rotation.install` takes it."""
+    if name[:len(QUARANTINE_PREFIX)].casefold() == QUARANTINE_PREFIX:
+        return True
+    if (os.name if os_name is None else os_name) != "nt":
+        return False
+    return (name.endswith(".")
+            or name.split(".", 1)[0].casefold() in WINDOWS_DEVICE_NAMES)
+
+
+def quarantine_name(raw: str) -> str:
+    """The quarantine component for a refused *raw* value: deterministic, one
+    legal component, and distinct per value (a hash cannot collide by
+    accident, and `is_reserved_component` stops anyone choosing one)."""
+    digest = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return QUARANTINE_PREFIX + digest[:16]
+
+
+# The FILES the store keeps at its own root, beside the namespace directories.
+#
+# A namespace is a directory at that same level, so a project named after one of
+# these stood where the store expects its own file, and neither half failed
+# loudly. `append_event(project="LIVE_LOCK")` minted `LIVE_LOCK/events/`, and
+# `guard.live_lock_active` -- an `exists()` -- read the directory as a held lock:
+# every `hive gc --prune` and `reflect` refused from then on. A project named
+# `autosync.json` made the registry a directory, so `known_projects` read an
+# empty allow-list and `autosync.register` raised.
+#
+# Every root file is reached through `store_file`, which refuses a name not
+# declared here, and `tests/test_store_root_files.py` fails on a join onto
+# `store_home()` that goes around it -- so the next root file is declared by the
+# first run of the suite, not by the next collision.
+STORE_ROOT_FILES = frozenset({
+    "LIVE_LOCK", "autosync.json", "consolidate_marker.json", "dashboard.token",
+    "harvest.lock", "hooks_errors.log", "mandatory_sops.json",
+    "research_runs.json", "workspace_board.json", "workspace_profiles.json",
+})
+# Root files named per research run: `research.leaderboard_path(run_id)` writes
+# `research_run_<run_id>.json`, and companions derived from a leaderboard's name
+# follow it (`_skills.json`, `_learnings.md`, `_prds.json` in the live store).
+# `research_runs_` holds the same place for companions of `research_runs.json`.
+STORE_ROOT_PREFIXES = ("research_run_", "research_runs_")
+_STORE_ROOT_FOLDED = frozenset(n.casefold() for n in STORE_ROOT_FILES)
+_STORE_ROOT_PREFIXES_FOLDED = tuple(p.casefold() for p in STORE_ROOT_PREFIXES)
+# The shape of a declared root file name: one component, no leading dot.
+_ROOT_FILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+
+def is_store_root_name(name) -> bool:
+    """Whether *name*, in any case, is one of the store root's own files.
+
+    Case is ignored because NTFS and APFS ignore it: `Live_Lock` IS `LIVE_LOCK`
+    there. Refused on every platform, so a store that moves between machines
+    means the same thing on each -- `is_reserved_component`'s reasoning for the
+    quarantine prefix."""
+    if not isinstance(name, str):
+        return False
+    folded = name.casefold()
+    return (folded in _STORE_ROOT_FOLDED
+            or folded.startswith(_STORE_ROOT_PREFIXES_FOLDED))
+
+
+def store_file(name: str) -> Path:
+    """The store root's own file *name*: the one sanctioned join of a FILE onto
+    `store_home()`.
+
+    Raises ValueError unless *name* is declared -- in `STORE_ROOT_FILES`, or
+    under one of `STORE_ROOT_PREFIXES` -- spelled exactly, as one component. An
+    undeclared root file is the collision above waiting for a project to be
+    named after it, so it is refused where it is written."""
+    if not (isinstance(name, str) and _ROOT_FILE_RE.fullmatch(name)
+            and (name in STORE_ROOT_FILES
+                 or name.startswith(STORE_ROOT_PREFIXES))):
+        raise ValueError(f"{name!r} is not a store-root file declared in "
+                         "paths.STORE_ROOT_FILES")
+    return store_home() / name
+
+
+def namespace_name(project, os_name: str | None = None) -> str:
+    """*project* as a single path component inside the store, never an escape.
+
+    `project_dir` is one expression with two halves and only one of them was
+    ever guarded: `detect_project` returns `normalize(...)` on every path, so
+    the DETECTED name is a slug by construction -- while the name an operator
+    or a caller passes went to `Path.__truediv__` verbatim. `--project
+    ../../pwned` therefore reopened, on the other half of the same line, the
+    traversal `events.segment_name` closes for `session_id`.
+
+    Deliberately NOT `normalize`, though it is right there and would refuse the
+    traversal too. `normalize` collapses runs of non-alphanumerics, so it is not
+    idempotent over names it did not produce, and re-slugging an existing
+    namespace would silently point a caller at a DIFFERENT, empty store rather
+    than at their data. The quarantine answers the security question without
+    touching any name that already resolves.
+
+    Quarantine, not raise, and not `"unknown"` -- the three reasons are
+    `events.segment_name`'s, and they are the reasons a second copy of that
+    shape is the right answer here rather than a smell: a hostile value that is
+    dangerous only as a path component, on a path that must not throw, where
+    two distinct values must not merge. The loud refusal lives at the surface a
+    human typed (`cliparse.project_arg`).
+
+    A whitelisted name is still quarantined when `is_reserved_component` says
+    the filesystem would store it as something else: the reserved prefix in
+    any case, and on Windows a device name or a trailing dot.
+
+    And when it is one of the store root's own files (`is_store_root_name`), in
+    any case and on every platform: a directory under that name stands where
+    the store keeps the file. Deliberately NOT part of `is_reserved_component`,
+    which `events.segment_name` shares -- a SESSION may be named `LIVE_LOCK`,
+    because its segment lives inside `events/`, nowhere near the root."""
+    raw = text_of(project)
+    if raw is None:
+        return QUARANTINE_PREFIX + "unstringifiable"
+    if (PROJECT_RE.fullmatch(raw) and not is_reserved_component(raw, os_name)
+            and not is_store_root_name(raw)):
+        return raw
+    return quarantine_name(raw)
+
+
 def project_dir(project: str | None = None) -> Path:
-    return store_home() / (project or detect_project())
+    return store_home() / namespace_name(project or detect_project())
 
 
 def events_dir(project: str | None = None) -> Path:
@@ -274,7 +473,7 @@ def known_projects() -> set[str]:
     Used to distinguish a deliberate namespace from one freshly minted by cwd
     detection."""
     import json
-    reg = store_home() / "autosync.json"
+    reg = store_file("autosync.json")
     if not reg.exists():
         return set()
     try:
@@ -285,21 +484,56 @@ def known_projects() -> set[str]:
             if isinstance(e, dict) and e.get("project")}
 
 
+def _namespace_dirs(is_namespace) -> tuple:
+    """``(canonical, unlisted)``: the store-root directories *is_namespace*
+    accepts, sorted, split on whether a caller can reach them BY NAME.
+
+    CANONICAL is a name `namespace_name` hands back unchanged, so a read or a
+    prune addressed to it lands on this directory. Everything else is UNLISTED:
+    a quarantine slot (`unsafe-<hash>`), a directory made by hand under a name
+    the whitelist refuses (`My Project`), or, on Windows, a twin such as `abc.`
+    that only an extended-length path can create and that Win32 resolves to
+    `abc`. Listing those handed callers names whose reads land somewhere else,
+    and `hive gc --prune --orphans` deleted THROUGH the twin: `rmtree` of
+    `abc.` removed the registered `abc` and every event in it."""
+    home = store_home()
+    canonical, unlisted = [], []
+    if not home.exists():
+        return canonical, unlisted
+    for p in sorted(home.iterdir()):
+        if not (p.is_dir() and is_namespace(p)):
+            continue
+        (canonical if namespace_name(p.name) == p.name else unlisted).append(p.name)
+    return canonical, unlisted
+
+
+def _has_projection(p) -> bool:
+    return any((p / marker).exists() for marker in ("STATE.md", "events", "LEDGER"))
+
+
 def list_namespaces() -> list[str]:
     """On-disk namespace directory names under the store home, sorted. A
     namespace is a directory carrying any of the projection artifacts a real
     namespace has (STATE.md / events / LEDGER), which filters out incidental
-    dirs (downloads, dist) that share the store root."""
-    home = store_home()
-    if not home.exists():
-        return []
-    out = []
-    for p in sorted(home.iterdir()):
-        if not p.is_dir():
-            continue
-        if any((p / marker).exists() for marker in ("STATE.md", "events", "LEDGER")):
-            out.append(p.name)
-    return out
+    dirs (downloads, dist) that share the store root.
+
+    Canonical names only: see `_namespace_dirs` for why a directory no name
+    reaches is left out, and `unlisted_namespaces` for where it is reported."""
+    return _namespace_dirs(_has_projection)[0]
+
+
+def unlisted_namespaces() -> list[str]:
+    """The namespace-shaped directories `list_namespaces` leaves out because no
+    name reaches them. `hive gc` and `hive projects` report these; nothing
+    lists, reads or prunes them by name."""
+    return _namespace_dirs(_has_projection)[1]
+
+
+def event_namespaces() -> list[str]:
+    """Canonical namespaces that have an events log: the set `harvest`, the
+    dashboard's project list and `hive skills trail --all` walk, from one
+    helper so the three cannot disagree about which directories are projects."""
+    return _namespace_dirs(lambda p: (p / "events").is_dir())[0]
 
 
 def is_freshly_minted(project: str | None = None) -> bool:
@@ -312,7 +546,9 @@ def is_freshly_minted(project: str | None = None) -> bool:
     name = project or detect_project()
     if name in known_projects():
         return False
-    return not (store_home() / name).exists()
+    # Through `project_dir` itself: a raw join here probed a different path
+    # from the one the read is about to land on.
+    return not project_dir(name).exists()
 
 
 # --- interpreter resolution ------------------------------------------------------

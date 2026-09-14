@@ -460,3 +460,99 @@ def test_a_runner_that_carries_no_full_text_still_uses_the_excerpt():
     out = dc.run("p", _graph(_task("p")),
                  runner=_runner(_reply(("alpha", ""), ("beta", ""))))
     assert [p.title for p in out.usable] == ["alpha", "beta"]
+
+
+# --- the decomposer child's identity ------------------------------------------
+#
+# `mn11-` sat in `advice.ORCHESTRATION_PREFIXES` while nothing ever wrote it as a
+# session id: `run` passed `mn11-<task_id>` as the run KEY only and no `env=`, and
+# `claude_cli._child_env` starts from `dict(os.environ)`. So the decomposer child
+# inherited whoever launched it -- rows it appended were stamped `manual` or the
+# operator's own id, read as human on every provenance surface, and the allowlist
+# entry guarded nothing. `advice.py` records the same two-halves failure for
+# `lm-`: a prefix nothing writes, and a spawner nothing recognises, are each no
+# identity at all.
+
+def _recording_runner(text):
+    def fake(run_key, prompt, **kw):
+        fake.run_key = run_key
+        fake.kwargs = kw
+        return x_mod.RunResult(result="ran-unverified", executed=True,
+                               exit_code=0, excerpt=text, reason="")
+    return fake
+
+
+def test_the_decomposer_child_runs_under_its_own_session():
+    """DISCRIMINATING: the overlay is the exact mapping, not "some env". A
+    runner that received no `env` (the defect) gets `None` here, and one that
+    received the parent's environment wholesale fails the equality."""
+    fake = _recording_runner(_reply(("alpha", "")))
+    dc.run("graph-view", _graph(_task("graph-view")), runner=fake)
+    assert fake.kwargs.get("env") == {"MINDHIVE_SESSION": "mn11-graph-view"}
+    # One string for both, so the transcript artifact and the rows the child
+    # writes can be joined by name.
+    assert fake.run_key == fake.kwargs["env"]["MINDHIVE_SESSION"]
+
+
+def test_the_decomposer_session_is_recognised_as_an_orchestration_agent():
+    """The OTHER half: the stamped id must be one the provenance partition
+    actually recognises, or the overlay is an identity no consumer reads. Asked
+    of both the owning predicate and the surface-facing one every composing
+    surface calls, with a human id as the canary -- a predicate that answered
+    True for everything would pass the first two assertions alone."""
+    from mindhive import provenance
+    from mindhive.mindnet import advice
+
+    fake = _recording_runner(_reply(("alpha", "")))
+    dc.run("p", _graph(_task("p")), runner=fake)
+    sid = fake.kwargs["env"]["MINDHIVE_SESSION"]
+
+    assert advice.is_orchestration_session(sid), sid
+    assert provenance.is_agent_authored(sid), sid
+    assert not advice.is_orchestration_session("s1"), (
+        "canary: the predicate answered True for a human session id")
+    assert not provenance.is_agent_authored("manual")
+
+
+def test_the_default_runner_hands_the_session_to_the_real_spawn(monkeypatch):
+    """END TO END through the REAL `agent.run`, patched only at the seam
+    `tests/test_mindnet_agent.py` patches, `claude_cli.run_headless`.
+
+    The two tests above hand `run` a fake RUNNER that takes `**kw`, so they
+    stay green whatever `agent.run` really accepts: were its `env` parameter
+    renamed or dropped, the `TypeError` would be caught by `run`'s own `except`
+    and come back as a reason no assertion there reads. That is
+    `orchestrator.run_key`'s lesson -- a seam whose contract matched only the
+    test double -- asked of this spawner, on the path production takes
+    (`runner=None`).
+
+    Read where the child reads it: after `claude_cli._child_env` has merged the
+    overlay over a parent environment that carries a HUMAN session, which is
+    exactly what the child inherited before the overlay existed."""
+    import os
+
+    from mindhive import claude_cli
+
+    monkeypatch.setenv("MINDHIVE_SESSION", "operator-human")
+    seen = {}
+
+    def fake(prompt, model=None, timeout_s=180, permission_mode=None, cwd=None,
+             env=None, session_id=None, spawn=None):
+        seen["env"] = env
+        return {"exit": 0,
+                "stdout": json.dumps({"result": _reply(("alpha", "")),
+                                      "is_error": False})}
+
+    monkeypatch.setattr(claude_cli, "run_headless", fake)
+    out = dc.run("graph-view", _graph(_task("graph-view")))
+
+    # The spawn really completed, so the env below is from a call that ran
+    # rather than one `run` swallowed.
+    assert out.reason == "", out.reason
+    assert [p.title for p in out.usable] == ["alpha"]
+    assert seen.get("env") == {"MINDHIVE_SESSION": "mn11-graph-view"}, seen
+    child = claude_cli._child_env(seen["env"])
+    assert child["MINDHIVE_SESSION"] == "mn11-graph-view"
+    # Canary: the parent really had a human id to leak, so the line above is
+    # not true merely because nothing else was set.
+    assert os.environ["MINDHIVE_SESSION"] == "operator-human"
