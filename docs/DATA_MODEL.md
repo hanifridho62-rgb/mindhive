@@ -124,7 +124,11 @@ Every row in every `events/*.jsonl` segment:
   the wall clock steps back, as long as the mark holds the last stamp issued.
   The lock fails open. An append that does not hold it can repeat a stamp, or
   land below one issued or written before it, at any time: its stamp is the
-  bare clock, blind to the mark and taken outside the lock. A locked append
+  bare clock, blind to the mark and taken outside the lock. Only a held lock
+  reads or writes the mark: `_append_lock` yields its descriptor only while
+  held, because a caller handed it past its deadline read the mark, lost the
+  CPU while locked appends raised it, and wrote the stale value back — the
+  mark went down, and the next locked append repeated a stamp. A locked append
   that finds the mark lost (`append.lock` deleted, garbled or unreadable) seeds
   from the clock, and one that finds it stale (an earlier write of it failed)
   stamps from the clock and that stale value; either can then repeat a stamp or
@@ -142,9 +146,21 @@ Every row in every `events/*.jsonl` segment:
   sorted as `-1` such a row would replay FIRST in its second, before the stamped
   row its own file shows it followed. Rows above a segment's first stamp keep
   `-1`, so a ledger written entirely before stamps orders exactly as it did.
+  A skipped torn row does not reset the carry, and `read_types` carries over
+  every row before its type filter. The carry only moves a row LATER, to a
+  stamp issued before the row was written, so a row a locked append wrote
+  after it still sorts after it — unless, at that append, neither the mark it
+  read nor the clock was above the carried stamp: the mark never held it (a
+  bare-clock stamp from a fail-open append, or one whose own mark write
+  failed) or has lost it since, and the clock is behind it (a step back, or
+  one tick of a coarse clock). An equal stamp then ties and breaks on segment
+  name. The carried value orders; it is not part of the row: `chain._scan`
+  seals each row's OWN `seq` into v3 material, and `chain._legacy_order`
+  ignores stamps, as every v1 writer did.
 - **Historical same-second order is not recoverable.** Nothing durable recorded
   it (`chain.json` holds per-segment line counts, `ts` is second-resolution and
-  caller-supplied), so every row written before the stamp keeps exactly the old
+  caller-supplied, the mirror's `global_seq` is load identity), so every row
+  written before the stamp keeps exactly the old
   `(segment, line)` order. Rows appended by pre-fix code — a stale checkout, the
   frozen exe — carry no `seq`; one with no stamped row above it in its own
   segment sorts FIRST within its second whenever it was written, so restart
