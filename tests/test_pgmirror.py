@@ -554,19 +554,40 @@ _STATE_COLUMNS = ("project", "schema_version", "row_count", "file_head",
                   "pg_head", "parity_ok", "ledger_fingerprint")
 
 
+# Matched against `_canonical_sql`'s output: lower case, no space beside
+# `( ) , . =`.
 _UPSERT_SHAPE = re.compile(
-    r"INSERT INTO mindhive\.mirror_state\s*\(([^)]*)\)\s*"
-    r"VALUES\s*\((.*?)\)\s*"
-    r"ON CONFLICT \(project\) DO UPDATE SET\s+(.*)", re.DOTALL)
-_SET_FROM_EXCLUDED = re.compile(r"(\w+)\s*=\s*EXCLUDED\.(\w+)")
-_SET_REBUILT_AT = re.compile(r"rebuilt_at\s*=\s*now\(\)")
+    r"insert into mindhive\.mirror_state\(([^)]*)\)values\((.*?)\)"
+    r"on conflict\(project\)do update set (.*)")
+_SET_FROM_EXCLUDED = re.compile(r"(\w+)=excluded\.(\w+)")
+_SET_REBUILT_AT = re.compile(r"rebuilt_at=now\(\)")
+
+
+def _canonical_sql(sql):
+    """*sql* as Postgres's lexer sees it, so that only a reformat Postgres runs
+    differently can change what the shape check reads.
+
+    A `--` or `/* */` comment is whitespace, taken left to right so a `/*`
+    inside a `--` comment opens nothing. Whitespace collapses, and goes
+    entirely beside `( ) , . = ;`. One trailing `;` is dropped. An unquoted
+    word folds to lower case, but not a placeholder's letter, so `%S` is
+    refused as psycopg refuses it. A double-quoted `\\w+` identifier loses its
+    quotes but keeps its case and stays one token, so `"Parity_OK"` names no
+    column and `"row_"count` is two words. String literals, nested comments
+    and a quoted keyword (`"set"`) are not modelled: no statement the fake
+    reads has any."""
+    s = re.sub(r"/\*.*?\*/|--[^\n]*", " ", sql, flags=re.DOTALL)
+    s = re.sub(r'"(\w+)"|(?<![%\w])\w+',
+               lambda m: f" {m.group(1)} " if m.group(1) else m.group().lower(), s)
+    s = re.sub(r"\s*([(),.=;])\s*", r"\1", " ".join(s.split()))
+    return s[:-1] if s.endswith(";") else s
 
 
 class _FakeMirrorState:
     """`mindhive.mirror_state` as a dict, driven by the statements pgmirror sends.
 
     Not a SQL engine. It answers `_RECORDED_FP_SQL` and models one other shape,
-    read after `--` comments are removed, as Postgres removes them:
+    read through `_canonical_sql`:
     `INSERT INTO mindhive.mirror_state (cols) VALUES (...) ON CONFLICT (project)
     DO UPDATE SET items`, each value `%s` or `now()`, each item exactly
     `col = EXCLUDED.col` for a column the INSERT binds, or `rebuilt_at = now()`.
@@ -578,9 +599,12 @@ class _FakeMirrorState:
 
     It used to collect `col = EXCLUDED.col` matches anywhere in the raw text. A
     `--`-commented item still matched, so every test passed on a `_VERDICT_SQL`
-    that Postgres runs without updating that column. A `Jsonb` parameter is
-    stored as the value it wraps, which is what reading the column back
-    returns."""
+    that Postgres runs without updating that column. The shape check that
+    replaced it stripped only `--` comments and matched literal spacing and
+    case, so `ON CONFLICT(project)`, `excluded.`, `NOW()`, a trailing `;` or a
+    `/* */` line -- all run identically by Postgres -- failed every verdict
+    test. A `Jsonb` parameter is stored as the value it wraps, which is what
+    reading the column back returns."""
 
     def __init__(self, rows=None):
         self.rows = {k: dict(v) for k, v in (rows or {}).items()}
@@ -595,7 +619,7 @@ class _FakeMirrorState:
             row = self.rows.get(params[0])
             return None if row is None else (row["ledger_fingerprint"],
                                              row["schema_version"])
-        shape = _UPSERT_SHAPE.fullmatch(re.sub(r"--[^\n]*", "", sql).strip())
+        shape = _UPSERT_SHAPE.fullmatch(_canonical_sql(sql))
         if not shape:
             pytest.fail(f"a statement this fake does not model: {sql!r}")
         cols = [c.strip() for c in shape.group(1).split(",")]
