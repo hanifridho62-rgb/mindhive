@@ -33,14 +33,28 @@ guarantee:
 So no legitimate write can disturb the sealed prefix, whatever ts it carries,
 and the checkpoint can attest to the ENTIRE complete log rather than holding
 back a trailing window. The alarm is quiet unless history really moved.
+
+**v3 folds the append stamp.** `events.append_event` stamps every row with
+`seq`, and the readers order rows that share a second by it (see
+`events._order_key`). That makes a sealed row's `seq` history like any other
+field: rewrite it and a same-second `update` replays before the `add` it edits,
+in every fold downstream. v2 predates the stamp and cannot see such a rewrite,
+so v3 folds it. A row without a stamp contributes identical material to both
+formats, so a v2 checkpoint still verifies after the upgrade and re-anchoring a
+legacy store moves no head it was ever compared against. A green v2 verdict
+over stamped rows says so with `seq_unsealed` (see `verify`), and a v1
+checkpoint is folded in the seq-blind order its writer used (`_legacy_order`).
 """
 import hashlib
 import json
 from . import paths, events
 
-# Bumped when the on-disk checkpoint shape changes. v1 was `{count, head}` over
-# a ts-ordered prefix; v2 adds `segments` and folds in append order.
-CHECKPOINT_VERSION = 2
+# Bumped when the on-disk checkpoint shape or its fold material changes. v1 was
+# `{count, head}` over a ts-ordered prefix; v2 adds `segments` and folds in
+# append order; v3 keeps v2's shape and also folds each row's `seq` (`_fold`).
+CHECKPOINT_VERSION = 3
+# The formats the per-segment fold verifies. v1 has its own shim.
+_SEGMENT_MAP_VERSIONS = (2, 3)
 
 _ZERO = "0" * 64
 
@@ -74,18 +88,23 @@ def compute_chain(evs, checkpoint=None) -> dict:
 
 def sealable(evs) -> list:
     """LEGACY. Nothing in `src/` calls this any more -- `_verify_v1` does not,
-    despite what an earlier draft of this docstring said; it folds `read_all`
-    against the stored count directly. What keeps the function alive is
+    despite what an earlier draft of this docstring said; it folds
+    `_legacy_order` against the stored count directly. What keeps the function
+    alive is
     `tests/test_chain.py`, where it is the only honest way to BUILD a v1
     checkpoint: a fixture that hand-writes one would be asserting against a
     format guess, while this is the code that actually minted the 67 v1
     checkpoints now on disk. Delete it when the shim goes.
 
     The prefix a ts-ordered checkpoint could attest to: every event strictly
-    before the newest timestamp on record. It exists because `read_all` orders
-    by ``(ts, segment_name, line_index)``, which is total and deterministic but
-    not append-monotonic, so an event arriving with a ts equal to already-sealed
-    rows could sort BEFORE them and invalidate the boundary.
+    before the newest timestamp on record. It exists because pre-`seq`
+    `read_all` ordered by ``(ts, segment_name, line_index)`` -- the order every
+    v1 checkpoint was minted in -- which is total and deterministic but not
+    append-monotonic, so an event arriving with a ts equal to already-sealed
+    rows could sort BEFORE them and invalidate the boundary. `read_all` now
+    puts the append stamp after ts (`events._order_key`), so it no longer
+    produces that order over stamped rows; a v1 fixture has to be built from
+    the seq-blind order, which is what `_verify_v1` folds (`_legacy_order`).
 
     Ending the prefix at a second boundary fixed that for the same-second case
     and ONLY that case. An event stamped an hour ago -- which
@@ -102,8 +121,11 @@ def sealable(evs) -> list:
 
 
 def _scan(project=None):
-    """Every parseable ledger row as ``(segment, line_index, canonical_json)``
-    in APPEND order, plus the number of COMPLETE lines in each segment.
+    """Every parseable row on a COMPLETE line as ``(segment, line_index,
+    canonical_json, seq)`` in APPEND order, plus the number of COMPLETE lines in
+    each segment.
+    `canonical_json` covers the five Event fields; `seq` is the row's append
+    stamp or None, parsed by the same `events._row_parts` the readers use.
 
     Rows come out already ordered: segments are walked in name order and each
     segment's lines in index order, which IS ``(segment, line_index)``. No sort
@@ -168,24 +190,35 @@ def _scan(project=None):
             s = raw.strip()
             if not s:
                 continue
-            ev = events._row_to_event(s)
+            ev, seq = events._row_parts(s)
             if ev is None:
                 continue                  # torn row: reads stay total
-            rows.append((seg.name, i, events.canonical_json(events.to_dict(ev))))
+            rows.append((seg.name, i,
+                         events.canonical_json(events.to_dict(ev)), seq))
     return rows, lines
 
 
-def _fold(rows) -> str:
+def _fold(rows, with_seq=True) -> str:
     """Hash-chain head over pre-canonicalised rows.
 
     Takes the canonical JSON already computed by `_scan` rather than re-deriving
     it, which is what lets `verify` fold twice -- once for the checkpoint prefix
     and once for the whole log -- off a single read. Measured on the live store:
     the scan costs 1.9s and each fold 0.1-0.2s, so the second fold is nearly
-    free where a second scan would not be."""
+    free where a second scan would not be.
+
+    `with_seq` selects the format's material. v3 -- the default, and what
+    `write_chain` writes -- folds a stamped row as its canonical JSON, a
+    newline, then the decimal stamp; v2 folds the canonical JSON alone. A row
+    with no stamp is the canonical JSON under both. Splicing the stamp on
+    rather than re-serialising a dict that holds it keeps the fold free of a
+    second `json.dumps` per row, and the newline cannot be ambiguous:
+    `canonical_json` escapes every control character inside a string, so a raw
+    `\\n` never occurs in its output."""
     prev = _ZERO
-    for _, _, cj in rows:
-        prev = hashlib.sha256((prev + cj).encode("utf-8")).hexdigest()
+    for _, _, cj, seq in rows:
+        material = cj if seq is None or not with_seq else f"{cj}\n{seq}"
+        prev = hashlib.sha256((prev + material).encode("utf-8")).hexdigest()
     return prev
 
 
@@ -237,6 +270,41 @@ def write_chain(project=None) -> dict:
     return c
 
 
+def _legacy_order(project=None) -> list:
+    """Every parseable event in the order EVERY v1 checkpoint was minted in:
+    ``(ts, segment_name, line_index)``, blind to the append stamp.
+
+    That was `read_all`'s order before `seq` existed, and it is still the order a
+    pre-v2 `write_chain` -- code from before c41b469, such as the frozen exe --
+    seals, over stamped rows as well, because that code builds its `Event` from
+    the five known keys and never looks at `seq`.
+    `read_all` no longer produces it: a same-second tie now follows the stamp
+    (`events._order_key`). Folding `read_all` against a v1 head sealed over a
+    stamped same-second pair from two sessions therefore reported untouched
+    history as `hash_mismatch`, and a stale writer still re-sealing v1 kept it
+    red. ``_order_key(ts, None, ...)`` IS the legacy key -- a missing stamp is a
+    constant sentinel, so it orders nothing -- and going through it keeps one
+    definition of the ``segment, line_index`` tail.
+
+    It walks the segments itself rather than calling `read_all` for a second
+    reason: under `MINDHIVE_EVENT_BACKEND=pg` that call answers from the Postgres
+    mirror, and a check of the files has to read the files. The split and the
+    parse are the readers' own (`events._segment_lines`, `events._row_parts`),
+    so the ROWS are exactly the ones `read_all` sees; only their order differs."""
+    d = paths.events_dir(project)
+    if not d.exists():
+        return []
+    keyed = []
+    for seg in sorted(d.glob("*.jsonl"), key=lambda p: p.name):
+        for i, line in events._segment_lines(seg):
+            ev, _ = events._row_parts(line)
+            if ev is None:
+                continue                  # torn row: reads stay total
+            keyed.append((events._order_key(ev.ts, None, seg.name, i), ev))
+    keyed.sort(key=lambda t: t[0])
+    return [ev for _, ev in keyed]
+
+
 def _verify_v1(project, stored) -> dict:
     """The pre-append-order check, kept so a store checkpointed by the old code
     is VERIFIED rather than alarmed at.
@@ -247,19 +315,24 @@ def _verify_v1(project, stored) -> dict:
     checking anything would be a lie. Running the old check is the honest third
     option, and it retires itself -- the first `write_chain` upgrades the file.
 
+    It folds `_legacy_order`, NOT `read_all`. The two agree on a ledger with no
+    stamps, and disagree wherever stamped rows from two segments share a second
+    and their stamps order them differently from their segment names; a v1
+    writer only ever used the first, so only the first reproduces its head.
+
     **What this does NOT do, stated plainly because the first draft of this
     docstring claimed otherwise: it does not stop the flapping.** This IS the
     ts-ordered prefix check, so a backdated append still sorts inside the
     sealed prefix and still returns `hash_mismatch` until the next projection.
-    A v1 checkpoint therefore keeps exactly the old behaviour -- no better, and
-    no worse. Measured when this landed: all 67 `chain.json` files under
+    A v1 checkpoint therefore keeps the old behaviour, over stamped rows too.
+    Measured when this landed: all 67 `chain.json` files under
     `~/.mindhive/` were v1, so every namespace takes this path until it is
     re-anchored, and a namespace nothing writes to any more never will be. The
     fix for a namespace is one `hive project` against it; there is no way to
     re-anchor from inside a read-only verify, and `verify` writing the file it
     audits would be a worse answer than a stale format."""
     try:
-        rows = events.read_all(project)
+        rows = _legacy_order(project)
     except json.JSONDecodeError as e:
         return {"ok": False, "reason": "corrupt_event_log", "detail": str(e)}
     except Exception as e:
@@ -304,6 +377,15 @@ def verify(project=None) -> dict:
     `hive` command depend on that. `ahead` counts rows appended since the
     checkpoint; its presence is the normal steady state, not a warning.
 
+    `seq_unsealed` appears only on a GREEN verdict against a v2 checkpoint, and
+    counts the sealed rows carrying a stamp that v2 did not fold. It is not a
+    failure -- the head matched, and a v2 writer (a process still on pre-v3
+    code) folded exactly what it knew -- but the head would also have matched
+    after a rewrite of those stamps, and a stamp decides same-second read order.
+    The field names that weaker coverage instead of hiding it. One projection on
+    current code (`write_chain`) re-anchors the file to v3, which folds every
+    stamp it seals, and the field goes away. Absent when the count is zero.
+
     **The checkpoint is read BEFORE the segments, and that order is
     load-bearing.** A projection can re-seal at any moment, and it writes
     chain.json only after it has read the segments. Scanning first would let a
@@ -341,27 +423,48 @@ def verify(project=None) -> dict:
             return {"ok": False, "reason": "corrupt_chain_file",
                     "stored": stored,
                     "detail": "checkpoint has `segments` but no `version`"}
-        if ver is None or ver == 1:
+        # Exact `int` only, for the same reason: `1.0 == 1` and `3.0 == 3`, so
+        # a float would otherwise pick a contract the file never declared.
+        if ver is None or (type(ver) is int and ver == 1):
             return _verify_v1(project, stored)  # legacy shim; scans nothing here
-        if ver != CHECKPOINT_VERSION:
+        if type(ver) is not int or ver not in _SEGMENT_MAP_VERSIONS:
             # Written by code this build does not have. Not corrupt -- there is
             # nothing here to say the LEDGER is wrong -- just unverifiable, and
             # saying so is the honest answer. Downgrading to an older check
             # would report a green we did not earn.
             return {"ok": False, "reason": "unsupported_checkpoint_version",
                     "stored": stored, "detail": f"checkpoint version {raw!r}, "
-                    f"this build verifies {CHECKPOINT_VERSION}"}
+                    f"this build verifies 1 to {CHECKPOINT_VERSION}"}
         if not isinstance(stored.get("segments"), dict):
-            # It claims v2 and has no per-segment map: the file is broken, and
-            # the v2 contract is what it broke.
+            # It claims a per-segment format and has no per-segment map: the
+            # file is broken, and that contract is what it broke.
             return {"ok": False, "reason": "corrupt_chain_file",
-                    "stored": stored, "format": 2,
-                    "detail": "v2 checkpoint without a `segments` map"}
+                    "stored": stored, "format": ver,
+                    "detail": f"v{ver} checkpoint without a `segments` map"}
+        count = stored.get("count")
+        if type(count) is not int or count < 0:
+            # `count` is subtracted from the scanned row count below. Unchecked,
+            # a string or null raised TypeError out of a function contracted
+            # never to raise, `1.5` came back `ok: true` with `ahead: -0.5`, and
+            # `True` -- an int subclass, which `type(...) is int` excludes --
+            # passed as 1. Every segment-map `write_chain` emits a non-negative
+            # int, so anything else, a missing key included, is a broken file.
+            # Whether the int is the RIGHT count is checked after the head.
+            return {"ok": False, "reason": "corrupt_chain_file",
+                    "stored": stored, "format": ver,
+                    "detail": f"v{ver} checkpoint `count` is not a "
+                              f"non-negative int: {count!r}"}
+    # The fold material follows the DECLARED format. A v2 file was written by
+    # code that folds no stamps -- including a stale checkout re-sealing rows a
+    # newer writer already stamped -- so folding stamps against it would report
+    # untouched history as a `hash_mismatch`.
+    fmt = CHECKPOINT_VERSION if stored is None else ver
+    with_seq = fmt >= 3
     try:
         rows, lines = _scan(project)
     except Exception as e:
         return {"ok": False, "reason": "read_error", "detail": str(e)}
-    actual = {"count": len(rows), "head": _fold(rows)}
+    actual = {"count": len(rows), "head": _fold(rows, with_seq)}
     if failure is not None:
         return {**failure, "actual": actual}
     limits = stored["segments"]
@@ -371,12 +474,35 @@ def verify(project=None) -> dict:
         # rewrite because it is the same claim -- the checkpoint no longer
         # describes what is on disk -- with `truncated` naming which segments.
         return {"ok": False, "reason": "hash_mismatch", "stored": stored,
-                "actual": actual, "truncated": short, "format": 2}
-    if _fold(_prefix(rows, limits)) != stored["head"]:
+                "actual": actual, "truncated": short, "format": fmt}
+    sealed = _prefix(rows, limits)
+    if _fold(sealed, with_seq) != stored["head"]:
         return {"ok": False, "reason": "hash_mismatch", "stored": stored,
-                "actual": actual, "format": 2}
-    result = {"ok": True, "stored": stored, "actual": actual, "format": 2}
-    ahead = actual["count"] - stored.get("count", 0)
+                "actual": actual, "format": fmt}
+    if stored["count"] != len(sealed):
+        # The head matched, so `sealed` is exactly the rows this file attests
+        # to, and `write_chain` takes `count` and `segments` from one scan: an
+        # honest file has `count == len(sealed)`. The dispatch check admits any
+        # non-negative int, and without this one an int that is not the row
+        # count verified green -- measured over a head sealing three rows, `0`
+        # returned `ahead: 3` and `999` returned `ahead: -996`. It runs AFTER the
+        # head: a rewrite that also drops a sealed row out of the fold changes
+        # both, and it is the `hash_mismatch` it looks like. The dispatch check
+        # still has to run first, because `True == 1` and `1.0 == 1`.
+        return {"ok": False, "reason": "corrupt_chain_file", "stored": stored,
+                "actual": actual, "format": fmt,
+                "detail": f"v{fmt} checkpoint `count` {stored['count']} is not "
+                          f"the {len(sealed)} rows its head seals"}
+    result = {"ok": True, "stored": stored, "actual": actual, "format": fmt}
+    ahead = actual["count"] - stored["count"]     # == len(sealed): checked above
     if ahead:
         result["ahead"] = ahead
+    if fmt == 2:
+        # Green, but this head folded its rows without their stamps, so a
+        # rewrite of a sealed stamp would still match it. Counted over the
+        # SEALED prefix only: a stamped row appended after the checkpoint is
+        # not something the checkpoint claimed to cover.
+        unsealed = sum(1 for r in sealed if r[3] is not None)
+        if unsealed:
+            result["seq_unsealed"] = unsealed
     return result

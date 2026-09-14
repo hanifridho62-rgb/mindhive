@@ -370,3 +370,58 @@ def test_the_natural_key_makes_a_double_load_a_constraint_violation():
     sql = _sql("001_schema.sql")
     assert "CONSTRAINT events_natural_key UNIQUE (project, segment, seg_line)" in sql
     assert "CONSTRAINT events_seg_line_nonneg CHECK (seg_line >= 0)" in sql
+
+
+# --------------------------------------------------------------------------
+# 007 — the append stamp
+# --------------------------------------------------------------------------
+
+APPEND_SEQ = "007_append_seq.sql"
+
+
+def _events_view_select(sql: str) -> list[str]:
+    """The select list of `CREATE OR REPLACE VIEW mindhive_ro.events`, as names."""
+    m = re.search(r"CREATE OR REPLACE VIEW\s+mindhive_ro\.events\b.*?"
+                  r"\bAS\s+SELECT\s+(.*?)\bFROM\b", _code(sql), re.S)
+    assert m, "no CREATE OR REPLACE VIEW mindhive_ro.events statement found"
+    return [c.strip() for c in m.group(1).split(",")]
+
+
+def test_007_only_appends_to_the_events_view():
+    """A CREATE OR REPLACE VIEW must keep every existing column in place: Postgres
+    rejects a replacement that renames, drops, retypes or reorders one, and takes
+    new columns only at the END. So 007's list has to be 003's list with
+    `append_seq` after it. Anything else is an error at migrate time on a real
+    server, and nothing without one would notice first."""
+    before = _events_view_select(_sql("003_roles_and_views.sql"))
+    assert before[:2] == ["global_seq", "ts"], f"parsed {before}"
+    assert _events_view_select(_sql(APPEND_SEQ)) == before + ["append_seq"]
+
+
+def test_007_keeps_the_barrier_the_namespace_predicate_and_only_select():
+    """A replace sets a view's options to exactly those it names, so a 007 that
+    left out `security_barrier = true` would silently REMOVE the barrier; the
+    predicate is the entire namespace scope; and a replace is the easiest place
+    to hand the reader more than SELECT by accident."""
+    sql = _sql(APPEND_SEQ)
+    code = _code(sql)
+    assert ("CREATE OR REPLACE VIEW mindhive_ro.events "
+            "WITH (security_barrier = true)") in code
+    assert "security_invoker" not in code
+    assert "WHERE  project = current_setting('mindhive.project', true)" in code
+    assert "project" not in _events_view_select(sql)
+    grants = re.findall(r"^GRANT\s+(.*?)\s+ON\s+(\S+)\s+TO\s+(\w+)", code, re.M)
+    assert grants == [("SELECT", "mindhive_ro.events", "mindhive_reader")]
+
+
+def test_007_adds_the_column_re_runnably_and_without_inventing_a_value():
+    """`IF NOT EXISTS` because `apply_migrations` may meet a database that already
+    has the column. No NOT NULL and no DEFAULT: every row written before the stamp
+    existed has none, and a default would manufacture an order nothing recorded."""
+    code = _code(_sql(APPEND_SEQ))
+    assert re.search(r"ALTER TABLE mindhive\.events ADD COLUMN IF NOT EXISTS "
+                     r"append_seq BIGINT;", code), \
+        "append_seq is not added as a re-runnable, nullable BIGINT"
+    assert "DEFAULT" not in code.upper() and "NOT NULL" not in code.upper()
+    assert "DROP" not in code.upper(), "007 extends the view; it must not drop it"
+    assert _non_idempotent(code) == []

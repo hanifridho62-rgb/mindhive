@@ -50,9 +50,19 @@ EVIDENCE_KINDS = ("file", "event", "command", "human")
 
 # Who did the checking. Ordered STRONGEST FIRST: `controller.py` resolves two
 # contradicting records for the same (task, phase, epoch) by this order rather
-# than by replay order, because replay order is manipulable (second-resolution
-# `ts` ties break alphabetically by session id, and `ts` itself is
-# caller-supplied). The sequence is load-bearing, not decorative.
+# than by replay order, because replay order is manipulable: `ts` is
+# caller-supplied and sorts first, and a same-second tie follows append order
+# (the `seq` stamp) only while the high-water mark in `append.lock` rules every
+# stamp: an append on either of `events._append_lock`'s fail-open paths can
+# replay ahead of a row written before it, and so can one that finds the mark
+# lost or left stale by a failed write while the clock reads no later than a
+# stamp already issued -- after a step back, or inside one tick of a coarse
+# clock (`events._next_seq`). Where no stamp decides, spelling can: a row with
+# no stamp on or above it in its segment sorts first against any stamped row
+# whatever its session id, but two such rows, or two sharing a stamp, break by
+# segment name — the session id — then line (`events._segment_events`,
+# `events._order_key`).
+# The sequence is load-bearing, not decorative.
 VERIFIERS = ("python", "agent", "human")
 
 ACTIONS = ("declare", "enter", "satisfy", "fall_back")

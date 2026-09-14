@@ -1,4 +1,6 @@
 # tests/test_events.py
+import json
+
 import pytest
 
 from mindhive import events, paths
@@ -89,6 +91,452 @@ def test_append_and_read_orders_by_ts():
                         ts="2026-06-20T09:00:00Z")
     evs = events.read_all()
     assert [e.payload["text"] for e in evs] == ["first", "second"]
+
+
+# --- same-second order across segments ----------------------------------------
+# `ts` is second-resolution and a segment is named after its session, so two
+# rows written inside one second by two sessions used to come back in FILENAME
+# order -- `aaa-editor` before `zzz-writer` whichever was appended first. Every
+# order-sensitive fold (sop, roadmap, mindnet) then replayed an edit before the
+# record it edits. The fixture names sort OPPOSITE to append order on purpose.
+
+SAME_SECOND = "2026-06-20T10:00:00Z"
+
+
+def _texts(evs):
+    return [e.payload.get("text") for e in evs]
+
+
+def _write_row(session_id, text, **extra):
+    """One row exactly as `canonical_json` writes it, bypassing `append_event`.
+    With no `extra` it is a LEGACY row -- the five keys pre-`seq` code wrote."""
+    seg = paths.events_dir() / f"{session_id}.jsonl"
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": SAME_SECOND, "session_id": session_id, "type": "decision",
+           "payload": {"text": text}, "tags": [], **extra}
+    with open(seg, "a", encoding="utf-8") as f:
+        f.write(events.canonical_json(row) + "\n")
+
+
+def _seqs_by_text():
+    out = {}
+    for seg in paths.events_dir().glob("*.jsonl"):
+        for line in seg.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            out[row["payload"]["text"]] = row.get("seq")
+    return out
+
+
+def test_same_second_rows_across_segments_keep_append_order():
+    events.append_event("decision", {"text": "first"}, session_id="zzz-writer",
+                        ts=SAME_SECOND)
+    events.append_event("decision", {"text": "second"}, session_id="aaa-editor",
+                        ts=SAME_SECOND)
+
+    assert _texts(events.read_all()) == ["first", "second"]
+    assert _texts(events.read_types(["decision"])) == ["first", "second"]
+
+
+def test_the_same_second_fixture_really_does_invert_under_a_filename_tie_break():
+    """CANARY for the test above: the segment that was written SECOND sorts
+    FIRST by name, so a reader breaking the tie on filename returns the rows
+    reversed -- the test above passes because the key changed, not because the
+    fixture happens to agree with filename order."""
+    events.append_event("decision", {"text": "first"}, session_id="zzz-writer",
+                        ts=SAME_SECOND)
+    events.append_event("decision", {"text": "second"}, session_id="aaa-editor",
+                        ts=SAME_SECOND)
+
+    names = sorted(p.name for p in paths.events_dir().glob("*.jsonl"))
+    assert names == ["aaa-editor.jsonl", "zzz-writer.jsonl"]
+
+
+def test_ts_still_outranks_append_order():
+    """`seq` only breaks ties inside one second. A backdated row -- which
+    `incidents.audit` writes on purpose -- still sorts by its ts."""
+    events.append_event("decision", {"text": "later"}, session_id="s1",
+                        ts="2026-06-20T10:00:01Z")
+    events.append_event("decision", {"text": "backdated"}, session_id="s2",
+                        ts="2026-06-20T10:00:00Z")
+
+    assert _texts(events.read_all()) == ["backdated", "later"]
+
+
+def test_append_stamps_a_strictly_increasing_seq_across_segments():
+    for text, session in [("a", "zzz"), ("b", "aaa"), ("c", "mmm"), ("d", "aaa")]:
+        events.append_event("decision", {"text": text}, session_id=session,
+                            ts=SAME_SECOND)
+
+    seqs = _seqs_by_text()
+    assert all(type(seqs[t]) is int for t in "abcd")
+    assert seqs["a"] < seqs["b"] < seqs["c"] < seqs["d"]
+
+
+def test_seq_keeps_increasing_when_the_wall_clock_steps_backwards(monkeypatch):
+    """The clock is adjustable (w32time can step it), so the stamp is
+    `max(clock, last + 1)` against a high-water mark kept under the append lock.
+    A stamp taken from the clock alone would fail this: the second reading is
+    a full second EARLIER than the first."""
+    readings = iter([2_000_000_000_000_000, 1_999_999_999_000_000,
+                     1_999_999_999_500_000])                      # microseconds
+    monkeypatch.setattr(events, "_now_us", lambda: next(readings))
+    for text, session in [("a", "zzz"), ("b", "aaa"), ("c", "mmm")]:
+        events.append_event("decision", {"text": text}, session_id=session,
+                            ts=SAME_SECOND)
+
+    seqs = _seqs_by_text()
+    assert seqs["a"] < seqs["b"] < seqs["c"]
+    assert _texts(events.read_all()) == ["a", "b", "c"]
+
+
+def test_seq_rides_the_row_but_not_the_event():
+    """`Event` keeps its five fields, so `to_dict` -- the chain's material for
+    legacy rows and the shape every consumer serialises -- is unchanged."""
+    ev = events.append_event("decision", {"text": "x"}, session_id="s",
+                             ts=SAME_SECOND)
+
+    assert "seq" not in events.to_dict(ev)
+    assert "seq" not in events.to_dict(events.read_all()[0])
+    assert type(_seqs_by_text()["x"]) is int
+
+
+def test_legacy_rows_without_seq_keep_segment_then_line_order():
+    """Nothing on disk records cross-segment append order for rows written
+    before `seq` existed, so their order must not move: no truthful reorder
+    exists, and every fold over the live store must replay exactly what it
+    replayed before stamps arrived."""
+    _write_row("zzz-writer", "z1")
+    _write_row("aaa-editor", "a1")
+    _write_row("zzz-writer", "z2")
+
+    assert _texts(events.read_all()) == ["a1", "z1", "z2"]
+    assert _texts(events.read_types(["decision"])) == ["a1", "z1", "z2"]
+
+
+def test_a_legacy_row_sorts_before_a_sequenced_row_in_the_same_second():
+    """The sentinel is fixed, not inferred: a row with no `seq`, and no stamped
+    row above it in its own segment, carries nothing that records when it was
+    written, so within one second it goes first whatever its segment is called.
+    Under the filename tie-break the `aaa-` segment would have won."""
+    events.append_event("decision", {"text": "sequenced"}, session_id="aaa-new",
+                        ts=SAME_SECOND)
+    _write_row("zzz-old", "legacy")
+
+    assert _texts(events.read_all()) == ["legacy", "sequenced"]
+
+
+@pytest.mark.parametrize("bad", [True, False, "5", 1.5, -1, 2 ** 63, None,
+                                 [1], {"n": 1}])
+def test_a_malformed_seq_is_treated_as_absent_and_never_raises(bad):
+    """Reads stay TOTAL. The malformed row is `aaa-` and the valid one `zzz-`
+    with seq 0: accepting the bad value as a number (True == 1, 1.5, 2**63)
+    would sort `aaa-` LAST, and a str would make the sort itself raise.
+
+    Not every parameter discriminates HERE, and this test does not pretend
+    otherwise. `False` accepted is stamp 0, which ties `zzz-valid` and loses
+    to `aaa-` on segment name; a negative stamp sorts first whether accepted or
+    not. So a `_valid_seq` written with `isinstance` (bool is an int subclass),
+    or without its `0 <=` lower bound, passes this test on those values.
+    `test_an_invalid_seq_sorts_exactly_where_a_legacy_row_would` below is the
+    one that catches both."""
+    _write_row("zzz-valid", "valid", seq=0)
+    _write_row("aaa-bad", "malformed", seq=bad)
+
+    assert _texts(events.read_all()) == ["malformed", "valid"]
+    assert _texts(events.read_types(["decision"])) == ["malformed", "valid"]
+    assert events.corrupt_rows() == []
+
+
+# Every value `_valid_seq` must refuse, written between two LEGACY rows whose
+# segment names bracket it: `aaa-legacy`, `mmm-bad`, `zzz-legacy`, one second.
+# Refused, the bad row is unstamped like its neighbours and segment order puts it
+# in the MIDDLE. Accepted, it leaves the middle in a direction that depends on the
+# value -- above LEGACY_SEQ (True == 1, False == 0, 1.5, 2**63) it sorts LAST,
+# below it (-2, -5, -2**63) it sorts FIRST, and a str, list or dict makes the
+# sort raise. One fixture therefore kills a missing upper bound, a missing lower
+# bound, an `isinstance` check and a float-tolerant one alike, which no fixture
+# with the bad row at either END can do: that one is blind in one direction.
+#
+# -1 is the value ordering cannot see. It IS `LEGACY_SEQ`, so accepted it ties
+# the legacy rows and still lands in the middle. It is not harmless for that:
+# `chain._fold` folds any stamp `_row_parts` returns into the v3 hash material,
+# and `pgmirror.scan_segments` carries it to the mirror. So the test also asks
+# `_row_parts` directly, and that assertion is the only one -1 can fail.
+INVALID_SEQS = [True, False, "5", 1.5, -1, -2, -5, -(2 ** 63), 2 ** 63,
+                2 ** 64, None, [1], {"n": 1}]
+
+
+def _write_sandwich(bad):
+    _write_row("aaa-legacy", "before")
+    _write_row("mmm-bad", "malformed", seq=bad)
+    _write_row("zzz-legacy", "after")
+
+
+@pytest.mark.parametrize("bad", INVALID_SEQS)
+def test_an_invalid_seq_sorts_exactly_where_a_legacy_row_would(bad):
+    """Kills, by name: `_valid_seq` without `0 <= value` (fails on -2, -5,
+    -2**63 by ORDER and on -1 by `_row_parts`); `_valid_seq` using
+    `isinstance(value, int)` (fails on True and False by order -- the case the
+    test above leaves open for False); and one without the `< 2**63` bound
+    (fails on 2**63 and 2**64). The order assertions come first on purpose, so
+    against any of those mutants the failure a value produces says which half
+    caught it. `test_the_sandwich_moves_a_stamp_it_should_have_refused` is the
+    canary that the fixture really can move."""
+    _write_sandwich(bad)
+
+    assert _texts(events.read_all()) == ["before", "malformed", "after"]
+    assert _texts(events.read_types(["decision"])) == ["before", "malformed",
+                                                      "after"]
+
+    [(_, line)] = events._segment_lines(paths.events_dir() / "mmm-bad.jsonl")
+    ev, seq = events._row_parts(line)
+    assert ev is not None and ev.payload["text"] == "malformed"
+    assert seq is None
+    assert events.corrupt_rows() == []
+
+
+@pytest.mark.parametrize("bad, if_accepted", [
+    (True, ["before", "after", "malformed"]),                  # True == 1
+    (False, ["before", "after", "malformed"]),                 # False == 0
+    (1.5, ["before", "after", "malformed"]),
+    (2 ** 63, ["before", "after", "malformed"]),
+    (2 ** 64, ["before", "after", "malformed"]),
+    (-2, ["malformed", "before", "after"]),
+    (-5, ["malformed", "before", "after"]),
+    (-(2 ** 63), ["malformed", "before", "after"]),
+    (-1, ["before", "malformed", "after"]),                    # == LEGACY_SEQ
+    ("5", TypeError),
+    ([1], TypeError),
+    ({"n": 1}, TypeError),
+])
+def test_the_sandwich_moves_a_stamp_it_should_have_refused(bad, if_accepted):
+    """CANARY for the test above: where `_order_key` puts the middle row if its
+    stamp is taken at face value -- what every accepting mutant of `_valid_seq`
+    hands it. Each row here but -1 leaves the middle or raises, so the order
+    assertions above are discriminating and not a fixture that happens to agree
+    with segment order. -1 staying put is pinned too: it is why the test above
+    has to ask `_row_parts`, and if `LEGACY_SEQ` ever moved this row would say
+    the fixture needs another look."""
+    keys = {"before": events._order_key(SAME_SECOND, None, "aaa-legacy.jsonl", 0),
+            "malformed": events._order_key(SAME_SECOND, bad, "mmm-bad.jsonl", 0),
+            "after": events._order_key(SAME_SECOND, None, "zzz-legacy.jsonl", 0)}
+
+    if if_accepted is TypeError:
+        with pytest.raises(TypeError):
+            sorted(keys, key=keys.get)
+    else:
+        assert sorted(keys, key=keys.get) == if_accepted
+
+
+def test_the_high_water_mark_is_read_from_and_written_back_to_append_lock(
+        monkeypatch):
+    """The mark lives in `append.lock`, not in this process. The dashboard and a
+    `hive` command append to one namespace from two processes, and
+    `max(clock, mark + 1)` only survives a clock step between THEM if each reads
+    the mark the other wrote. `test_seq_keeps_increasing_when_the_wall_clock_
+    steps_backwards` runs in one process, so a module-level counter passes it.
+
+    Planting a mark far above the clock, then patching the clock low, is what
+    tells the two apart: only a reader of the file can produce `planted + 1`.
+    The second assertion is the write half. A stamp that honoured the mark but
+    never wrote its own back would leave `planted` on disk, and the next
+    process would repeat the stamp.
+
+    The SECOND step is what kills a reader that reads the file once and then
+    trusts itself -- a cache per lock file, or per process. The first append
+    warms any such cache; the mark is then overwritten on disk, the way another
+    process's append would leave it, and only a `_next_seq` that re-reads the
+    file on every call produces `rewritten + 1`.
+
+    Layout, as `_append_lock` and `_next_seq` keep it: byte 0 is the byte
+    `msvcrt.locking` covers, and the mark is 20 ASCII digits from offset 1. The
+    offsets are spelled out rather than read from `_SEQ_OFFSET`/`_SEQ_WIDTH`, so
+    moving the mark -- which strands the one every existing lock file holds --
+    has to move this test too."""
+    planted = 2 ** 60
+    lock = paths.project_dir() / "append.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_bytes(b"\0" + b"%020d" % planted)
+    monkeypatch.setattr(events, "_now_us", lambda: 1_000)
+
+    events.append_event("decision", {"text": "x"}, session_id="s",
+                        ts=SAME_SECOND)
+
+    assert _seqs_by_text()["x"] == planted + 1
+    assert lock.read_bytes()[1:21] == b"%020d" % (planted + 1)
+
+    rewritten = 2 ** 61
+    with open(lock, "r+b") as f:
+        f.seek(1)
+        f.write(b"%020d" % rewritten)
+
+    events.append_event("decision", {"text": "y"}, session_id="s",
+                        ts=SAME_SECOND)
+
+    assert _seqs_by_text()["y"] == rewritten + 1
+    assert lock.read_bytes()[1:21] == b"%020d" % (rewritten + 1)
+
+
+def test_an_append_that_times_out_on_the_lock_never_touches_the_mark(
+        monkeypatch):
+    """The lock fails open when its deadline passes, and a caller that does
+    not HOLD it must not read or write the high-water mark. Handed the
+    descriptor anyway, such a caller reads the mark, loses the CPU while locked
+    appends raise it, and writes its stale value back: the mark goes DOWN and
+    the next locked append repeats a stamp. So a timed-out append stamps from
+    the bare clock, exactly like one whose lock file could not be opened.
+
+    Planted far above the clock, the mark tells the two apart. A caller given
+    the descriptor stamps `planted + 1` and writes it back; one given None
+    stamps the clock's 1_000 and leaves `planted` on disk. The lock is held
+    here by a real second descriptor -- `test_the_append_lock_excludes_a_second_
+    holder` in test_events_append_race.py is what makes that a real wedge."""
+    planted = 2 ** 60
+    lock = paths.project_dir() / "append.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_bytes(b"\0" + b"%020d" % planted)
+    monkeypatch.setattr(events, "_now_us", lambda: 1_000)
+    monkeypatch.setattr(events, "_LOCK_WAIT_S", 0.05)
+
+    with events._append_lock(None) as holder:
+        assert holder is not None, "the wedging holder never took the lock"
+        events.append_event("decision", {"text": "unheld"}, session_id="s",
+                            ts=SAME_SECOND)
+
+    assert _seqs_by_text()["unheld"] == 1_000
+    assert lock.read_bytes()[1:21] == b"%020d" % planted
+
+
+# --- the stamp a row is ORDERED by ----------------------------------------------
+# Line order inside one segment IS append order, so a row was written no earlier
+# than anything above it. `_segment_events` therefore orders a row by its own
+# stamp RAISED to the highest stamp above it in its segment. Each fixture below
+# carries an inline canary: the same rows under the row's OWN stamp -- the key
+# before the carry -- come back in the wrong order.
+
+def _texts_under_each_rows_own_stamp():
+    rows = []
+    for seg in paths.events_dir().glob("*.jsonl"):
+        for i, line in events._segment_lines(seg):
+            ev, seq = events._row_parts(line)
+            rows.append((events._order_key(ev.ts, seq, seg.name, i), ev))
+    return _texts(ev for _, ev in sorted(rows, key=lambda t: t[0]))
+
+
+def test_an_unstamped_row_below_a_stamped_one_in_its_segment_keeps_line_order():
+    """A pre-`seq` process -- the dashboard nobody restarted -- appends an
+    `update` to `manual.jsonl` a moment after a `hive` command stamped the `add`
+    there. Sorted as `LEGACY_SEQ` the update would replay FIRST: the lost edit
+    again, inside one file, which even the filename tie-break never did."""
+    events.append_event("decision", {"text": "add"}, session_id="manual",
+                        ts=SAME_SECOND)
+    _write_row("manual", "update")
+
+    assert _texts(events.read_all()) == ["add", "update"]
+    assert _texts(events.read_types(["decision"])) == ["add", "update"]
+    assert _texts_under_each_rows_own_stamp() == ["update", "add"]
+
+
+def test_a_late_unstamped_row_sorts_after_what_its_own_segment_shows_it_followed():
+    """Across segments too: `other` then `stamped` were appended under the lock,
+    and the unstamped row sits below `stamped` in its segment, so it was written
+    after both. The sentinel would put it first."""
+    events.append_event("decision", {"text": "other"}, session_id="aaa-new",
+                        ts=SAME_SECOND)
+    events.append_event("decision", {"text": "stamped"}, session_id="zzz-mixed",
+                        ts=SAME_SECOND)
+    _write_row("zzz-mixed", "unstamped")
+
+    assert _texts(events.read_all()) == ["other", "stamped", "unstamped"]
+    assert _texts(events.read_types(["decision"])) == ["other", "stamped",
+                                                      "unstamped"]
+    assert _texts_under_each_rows_own_stamp() == ["unstamped", "other",
+                                                  "stamped"]
+
+
+def test_a_stamp_below_one_above_it_in_its_segment_still_keeps_line_order():
+    """Only an append the mark did not rule can write a stamp below an earlier
+    one: one that did not hold the lock (the bare clock), or one that found the
+    mark lost or stale while the clock read no later than a stamp already
+    issued. `low` is below `high` in its file, so it was
+    written after it -- and after `between`, whose stamp is below `high`'s."""
+    _write_row("mmm-seg", "high", seq=500)
+    _write_row("mmm-seg", "low", seq=100)
+    _write_row("aaa-other", "between", seq=300)
+
+    assert _texts(events.read_all()) == ["between", "high", "low"]
+    assert _texts_under_each_rows_own_stamp() == ["low", "between", "high"]
+
+
+def test_the_carry_runs_down_a_segment_and_never_up_it():
+    """Rows ABOVE a segment's first stamp keep sorting as legacy rows, so a
+    ledger written before stamps existed orders exactly as it always did. A
+    carry taken from the whole segment -- its max stamp -- would move
+    `z-legacy` after `a-stamped`, which was appended later."""
+    _write_row("zzz-seg", "z-legacy")
+    _write_row("aaa-seg", "a-stamped", seq=50)
+    _write_row("zzz-seg", "z-stamped", seq=100)
+
+    assert _texts(events.read_all()) == ["z-legacy", "a-stamped", "z-stamped"]
+    whole_segment_max = sorted(
+        [("z-legacy", (SAME_SECOND, 100, "zzz-seg.jsonl", 0)),
+         ("a-stamped", (SAME_SECOND, 50, "aaa-seg.jsonl", 0)),
+         ("z-stamped", (SAME_SECOND, 100, "zzz-seg.jsonl", 1))],
+        key=lambda t: t[1])
+    assert [t for t, _ in whole_segment_max] == ["a-stamped", "z-legacy",
+                                                "z-stamped"]
+
+
+def test_read_types_carries_the_stamp_over_rows_it_filters_out():
+    """The stamp an unstamped `decision` sorts by can sit on a row of ANOTHER
+    type above it. `read_types` must carry over every row and filter after;
+    filtering first would drop the `caveat` that holds the stamp and put `late`
+    before `other`, which was appended before that caveat."""
+    events.append_event("decision", {"text": "other"}, session_id="aaa-new",
+                        ts=SAME_SECOND)
+    events.append_event("caveat", {"text": "holds-the-stamp"},
+                        session_id="zzz-mixed", ts=SAME_SECOND)
+    _write_row("zzz-mixed", "late")
+
+    assert _texts(events.read_types(["decision"])) == ["other", "late"]
+    assert [e for e in events.read_all() if e.type == "decision"] == \
+        events.read_types(["decision"])
+
+
+def test_a_torn_row_between_two_rows_does_not_reset_the_carry():
+    """A torn fragment -- a crashed writer's half line -- is skipped, but it
+    changes nothing about when the rows around it were written: `update` is
+    still below `add` in the file, so it was appended after it. A carry that
+    restarted at the torn row would sort `update` as `LEGACY_SEQ` and replay it
+    first -- the lost edit, brought back by one bad line."""
+    events.append_event("decision", {"text": "add"}, session_id="manual",
+                        ts=SAME_SECOND)
+    seg = paths.events_dir() / "manual.jsonl"
+    with open(seg, "a", encoding="utf-8") as f:
+        f.write('{"ts": "2026-06-20T10:00:00Z", "session_id": "man\n')
+    _write_row("manual", "update")
+
+    assert [i for i, _ in events._segment_lines(seg)] == [0, 1, 2]
+    assert [i for i, _, _ in events._segment_events(seg)] == [0, 2]
+    assert _texts(events.read_all()) == ["add", "update"]
+    assert _texts(events.read_types(["decision"])) == ["add", "update"]
+    carry_restarted_at_the_torn_row = sorted(
+        [("add", (SAME_SECOND, _seqs_by_text_skipping_torn()["add"],
+                  "manual.jsonl", 0)),
+         ("update", (SAME_SECOND, events.LEGACY_SEQ, "manual.jsonl", 2))],
+        key=lambda t: t[1])
+    assert [t for t, _ in carry_restarted_at_the_torn_row] == ["update", "add"]
+
+
+def _seqs_by_text_skipping_torn():
+    out = {}
+    for seg in paths.events_dir().glob("*.jsonl"):
+        for _, line in events._segment_lines(seg):
+            ev, seq = events._row_parts(line)
+            if ev is not None:
+                out[ev.payload["text"]] = seq
+    return out
+
 
 def test_segments_are_per_session():
     events.append_event("caveat", {"text": "x"}, session_id="abc",

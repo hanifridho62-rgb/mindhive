@@ -85,9 +85,9 @@ MAX_SCORE_TERMS = 12
 
 # The one refusal that carries NO new information: the fingerprint is spent, so
 # the ledger already holds the row that spent it. Recording it again would add a
-# byte-identical row per round forever — and `chain.compute_chain` hashes every
-# event with no type filter, so the cost lands on `hive verify` for the life of
-# the store.
+# byte-identical row per round forever — and the hash chain hashes every
+# complete row with no type filter (`chain._scan` then `chain._fold`), so the
+# cost lands on `hive verify` for the life of the store.
 DUPLICATE_REASON = "already proposed — this fingerprint is spent"
 
 

@@ -675,8 +675,8 @@ def test_one_participant_under_two_spellings_gets_one_share():
 
 
 def test_latest_record_is_last_wins_not_max_on_the_timestamp():
-    """The docstring's rule, which had no test: last-wins over
-    `read_all`'s (ts, segment, line) order rather than a max() on `ts`, so two
+    """The docstring's rule, which had no test: last-wins over `read_all`'s
+    (ts, seq, segment, line) order rather than a max() on `ts`, so two
     records folded inside the SAME second resolve here the way they resolve
     everywhere else that reads this ledger. The existing test uses one record
     per frame, so ordering never arose in it."""

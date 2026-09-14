@@ -113,12 +113,33 @@ def cmd_status(args) -> int:
     return 0 if report["available"] else 1
 
 
+def _driver_error(exc) -> bool:
+    """True when `exc` is a psycopg error, decided WITHOUT importing psycopg.
+
+    Read off `sys.modules`: an exception can only be a psycopg error if psycopg
+    was already imported to raise it, and importing it here would make every
+    `hive` command pay for the driver, which
+    `tests/test_pgcli.py::test_importing_the_cli_module_costs_no_driver`
+    forbids."""
+    import sys
+    driver = sys.modules.get("psycopg")
+    return driver is not None and isinstance(exc, driver.Error)
+
+
 def _admin(fn, *a, **kw) -> int:
     """Run an admin operation, printing the refusal rather than a traceback.
 
     Both refusals an operator meets today — no owner DSN, and the server-touching
     half being unbuilt — are configuration facts, not crashes, and a stack trace
     for a configuration fact buries the one sentence that would fix it.
+
+    A DRIVER error prints the same way, as `error: <Type>: <message>`. Between
+    pulling a change that adds a column and running `hive pg migrate`, a
+    loader's SQL can name a column the table lacks, and psycopg raises
+    `UndefinedColumn` — a `ProgrammingError`, not a `RuntimeError` — so the
+    operator got a traceback whose last line was the only useful one. The catch
+    widens to `psycopg.Error` and no further: any other exception is a bug in
+    this code, and still raises.
 
     When the result carries a `verified` verdict, the EXIT CODE follows it. Same
     rule `cmd_parity` states: a loader that reports success while its own
@@ -129,6 +150,11 @@ def _admin(fn, *a, **kw) -> int:
         result = fn(*a, **kw)
     except (RuntimeError, NotImplementedError) as e:
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        if not _driver_error(e):
+            raise
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))
     verified = result.get("verified") if isinstance(result, dict) else None
@@ -156,10 +182,18 @@ def _loaded_and_verified(load, project):
     The library functions stay pure loaders on purpose: `pgmirror.rebuild` is
     composed by `refresh` and called by tests that want the load alone. This
     coupling belongs at the operator surface, where "reload it" always means
-    "and leave it in a state something can report on"."""
+    "and leave it in a state something can report on".
+
+    **The load's fingerprint is handed to `parity`, and only that hand-off lets
+    the row claim anything about the load.** `parity` records a schema version
+    and a `ledger_fingerprint` only when it is told which load it follows;
+    without one it updates the verdict columns alone (see
+    `pgmirror._record_state`). A bare `hive pg parity` therefore proves the rows
+    and cannot clear the version gate that forces a full reload."""
     from . import pgmirror
     out = load(project)
-    out["verified"] = pgmirror.parity(project or out.get("project"))
+    out["verified"] = pgmirror.parity(project or out.get("project"),
+                                      loaded_fingerprint=out.get("fingerprint"))
     return out
 
 

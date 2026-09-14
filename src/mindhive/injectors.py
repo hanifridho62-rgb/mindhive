@@ -42,10 +42,10 @@ not an oversight, and it is deferred with that reason attached.
 ## Storage: the sidecar is "now", the ledger is "changed"
 
 One row per turn against a 41,470-event ledger is 73,000 rows a year at 200
-prompts a day — 1.76x the entire store, and `chain.compute_chain` folds
-`read_all()` with no type filter, so every one of them is re-hashed by every
-`hive verify`, forever. Content dedup does not help: it removes bytes, and the
-cost is driven by rows.
+prompts a day — 1.76x the entire store, and the hash chain hashes every
+complete row with no type filter (`chain._scan` then `chain._fold`), so every
+one of them is re-hashed by every `hive verify`, forever. Content dedup does
+not help: it removes bytes, and the cost is driven by rows.
 
 So a row is appended only when the turn's SIGNATURE changes — its composed text
 or any pass's verdict. A run of identical turns writes nothing, and the row that

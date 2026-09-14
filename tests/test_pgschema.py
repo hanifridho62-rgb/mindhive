@@ -11,8 +11,9 @@ others at runtime:
   diagnose why; if it omits one, the column may as well not exist.
 * `COLUMNS` — the same contract as data, for anything that wants to reason about
   the columns rather than print them.
-* the `CREATE OR REPLACE VIEW mindhive_ro.events` statement in
-  `pgmigrations/003_roles_and_views.sql` — what the database actually exposes.
+* the newest `CREATE OR REPLACE VIEW mindhive_ro.events` statement — first
+  `pgmigrations/003_roles_and_views.sql`, now `007_append_seq.sql`, which
+  re-issues it with `append_seq` on the end — what the database actually exposes.
 
 The drift these tests exist to catch has a specific shape: a DDL edit that a
 prose edit does not follow, or the reverse. Both files are hand-edited, neither
@@ -115,6 +116,13 @@ def _ddl(name: str) -> str:
 # registry rather than restated, so a table added to `pgschema.TABLES` is
 # automatically covered by the drift tests below.
 DOCUMENTED = [(t.name, t.ddl) for t in pgschema.TABLES]
+
+# The migration that last DEFINED the events view. The two canaries below compare
+# against this rather than a fixed filename: left pointing at 003 after 007
+# appended a column, the documented list and the view list would already differ
+# before anything was planted, and each canary would pass with its mutation
+# deleted.
+EVENTS_DDL = dict(DOCUMENTED)["mindhive_ro.events"]
 # --------------------------------------------------------------------------
 # the extractors themselves (canaries first — the rest ride on them)
 # --------------------------------------------------------------------------
@@ -124,7 +132,7 @@ def test_the_migration_files_this_module_documents_exist():
     silently reduce every comparison below to `[] == []`."""
     missing = [n for n in ("001_schema.sql", "002_indexes.sql",
                           "003_roles_and_views.sql",
-                          "006_event_embeddings.sql")
+                          "006_event_embeddings.sql", "007_append_seq.sql")
                if not (MIGRATIONS / n).is_file()]
     assert missing == [], f"missing migration file(s): {missing}"
 
@@ -133,7 +141,7 @@ def test_the_doc_column_parser_finds_the_real_block():
     """CANARY. Every agreement assertion below is over `_doc_columns`, and a
     parser that matched nothing would satisfy all of them."""
     cols = _doc_columns(pgschema.SCHEMA_DOC, "mindhive_ro.events")
-    assert len(cols) == 9, f"expected 9 documented columns, parsed {cols}"
+    assert len(cols) == 10, f"expected 10 documented columns, parsed {cols}"
     assert ("global_seq", "bigint") in cols
     assert ("ts", "text") in cols
 
@@ -188,6 +196,15 @@ def test_the_view_column_parser_finds_the_real_select_list():
     assert "global_seq" in cols and "seg_line" in cols
 
 
+def test_the_events_view_is_read_from_its_newest_definition():
+    """CANARY for `EVENTS_DDL`. 007 re-issues the view with `append_seq` on the
+    end; a registry still naming 003 would compare the doc against a list one
+    column short, and the drift guard would report drift that is not there."""
+    assert EVENTS_DDL == "007_append_seq.sql"
+    newest = _view_columns(_ddl(EVENTS_DDL))
+    assert newest == _view_columns(_ddl("003_roles_and_views.sql")) + ["append_seq"]
+
+
 def test_the_view_column_parser_reduces_an_alias_to_its_alias():
     """CANARY for the one expression in any of these views.
     `octet_length(embedding) AS embedding_bytes` exposes `embedding_bytes`, and
@@ -231,7 +248,7 @@ def test_a_schema_doc_naming_a_hidden_column_is_caught():
         "  global_seq  bigint",
         "  project     text        The namespace.\n  global_seq  bigint")
     doc = [name for name, _ in _doc_columns(mutant, "mindhive_ro.events")]
-    view = _view_columns(_ddl("003_roles_and_views.sql"))
+    view = _view_columns(_ddl(EVENTS_DDL))
     assert sorted(doc) != sorted(view), \
         "a SCHEMA_DOC advertising the hidden `project` column was not detected"
 
@@ -243,7 +260,7 @@ def test_a_column_added_to_the_registry_and_not_to_the_ddl_is_caught():
     planted = pgschema.EVENTS_COLUMNS + (
         pgschema.Column("invented", "text", "Not in any view.", "n/a" * 10),)
     doc = [c.name for c in planted]
-    view = _view_columns(_ddl("003_roles_and_views.sql"))
+    view = _view_columns(_ddl(EVENTS_DDL))
     assert sorted(doc) != sorted(view), \
         "a column added to the registry with no DDL behind it was not detected"
 
@@ -354,6 +371,29 @@ def test_every_column_carries_a_reason_for_its_type():
     thin = [(t.name, c.name) for t in pgschema.TABLES for c in t.columns
             if len(c.why.strip()) < 20]
     assert thin == [], f"columns with no real reason recorded: {thin}"
+
+
+def _bare_stamp_orderings(text):
+    """Every `append_seq` ordered on without its COALESCE, as `segment` follows."""
+    return re.findall(r"\bappend_seq(?:\s+DESC)?\s*,\s*segment", text)
+
+
+def test_no_schema_prose_orders_on_a_bare_append_seq():
+    """Postgres sorts NULLs LAST ascending, and the ledger puts a row with no
+    stamp on or above it in its segment FIRST in its second
+    (`events._order_key`'s -1). The events notes say so and
+    call the bare form WRONG -- while global_seq's `why` stated the contract as
+    `(ts_key, append_seq, segment, seg_line)`, the exact form a reader copies
+    into an ORDER BY. Scanned over the module source, so a comment counts too."""
+    src = Path(pgschema.__file__).read_text(encoding="utf-8")
+    assert _bare_stamp_orderings(src) == []
+
+
+def test_the_bare_stamp_scan_sees_the_form_it_forbids():
+    """CANARY: a pattern that matched nothing would pass the test above."""
+    assert _bare_stamp_orderings("(ts_key, append_seq, segment, seg_line)")
+    assert _bare_stamp_orderings("ts DESC, append_seq DESC, segment DESC")
+    assert not _bare_stamp_orderings("ts, COALESCE(append_seq, -1), segment")
 
 
 def test_ts_is_documented_as_text_not_a_timestamp():

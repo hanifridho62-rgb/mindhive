@@ -295,9 +295,16 @@ def fold_window(evs, frame_id, start=None, end=None) -> "dict | None":
 def latest_record(evs, frame_id) -> "dict | None":
     """The newest `consensus_record` payload for *frame_id*, or None.
 
-    Last-wins over `read_all`'s `(ts, segment, line)` order rather than a max()
-    on the timestamp: two records folded inside the same second must resolve the
-    same way here as everywhere else that reads this ledger.
+    Last-wins over `read_all`'s `(ts, seq, segment, line)` order
+    (`events._order_key`) rather than a max() on the timestamp: two records
+    folded inside the same second must resolve the same way here as everywhere
+    else that reads this ledger. For stamped rows that is the later append while
+    the high-water mark in `append.lock` rules every stamp; an append on either
+    of `events._append_lock`'s fail-open paths can replay ahead of a record
+    written before it, and so can one that finds the mark lost or left stale by
+    a failed write while the clock reads no later than a stamp already issued
+    -- after a step back, or inside one tick of a coarse clock
+    (`events._next_seq`).
     """
     found = None
     for ev in evs or []:

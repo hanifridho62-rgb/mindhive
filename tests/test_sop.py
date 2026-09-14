@@ -88,6 +88,26 @@ def test_fold_is_total_on_junk_history():
     assert sop.current(evs) == []
 
 
+def test_a_same_second_update_from_an_earlier_sorting_session_still_applies():
+    """Two sessions, one second: the add lands in `zzz-writer.jsonl`, the
+    update in `aaa-editor.jsonl`. Under the old `(ts, segment, line)` read
+    order the update came back FIRST, found no record, and was skipped as a
+    partial update on an unknown id -- the edit lost with no error anywhere."""
+    t = "2026-07-01T10:00:00Z"
+    _add(session="zzz-writer", ts=t)
+    revised = "Revised within the same second. " + BODY
+    events.append_event("sop", {"action": "update", "sop_id": "edit-discipline",
+                                "text": revised},
+                        session_id="aaa-editor", ts=t, tags=["sop"])
+
+    for evs in (events.read_all(), events.read_types(["sop"])):
+        rec = sop.get(evs, "edit-discipline")
+        assert rec is not None
+        assert rec["text"] == revised
+        assert rec["version"] == 2
+        assert rec["session_id"] == "aaa-editor"
+
+
 def test_current_orders_by_created_then_id():
     _add("b-proc", title="B proc", ts="2026-07-02T10:00:00Z")
     _add("a-proc", title="A proc", ts="2026-07-01T10:00:00Z")

@@ -39,15 +39,28 @@ look correct and do nothing:
 
 ## Every append in this file lands in ONE session — deliberately
 
-`events.read_all` sorts by ``(ts, segment_name, line)``, the segment name is the
-session id, and `events.now_iso` is second-resolution. Two appends inside the
-same second are therefore ordered ALPHABETICALLY BY SESSION ID: setup written
-under ``"s1"`` and command events written under the default ``"manual"`` would
-replay commands-before-setup and orphan them, failing for a reason that has
-nothing to do with the code under test. The autouse fixture below pins
+`events.read_all` sorts by ``(ts, seq, segment, line)`` (`events._order_key`),
+the segment name is the session id, and `events.now_iso` is second-resolution.
+While the high-water mark in `append.lock` rules every stamp, the append stamp
+``seq`` settles a same-second tie in append order whatever the session, so setup
+written under ``"s1"`` and command events written under the default ``"manual"``
+would replay in the order they were written. The pin stays anyway, because
+across segments the stamp is not the only word: two rows with no stamp on or
+above them in their segments, or two sharing a stamp, still break on the segment
+name, where ``"manual"`` sorts before ``"s1"``; one such unstamped row sorts
+first against any stamped row; an append on either of `events._append_lock`'s
+fail-open paths can replay ahead of a row written before it; and so can one
+that finds the mark lost (`append.lock` deleted, garbled or unreadable) or left
+stale by a failed write while the clock reads no later than a stamp already
+issued — a step back, or one tick of a coarse clock (`events._next_seq`).
+Each can replay commands before their setup and orphan them, failing for a
+reason that has nothing to do with the code under test. The autouse fixture
+below pins
 ``MINDHIVE_SESSION`` so every writer — the CLI, `telemetry.emit`,
 `executor.validate`, `controller.restat`, and the direct appends here — shares
-one segment and one line order.
+one segment, where same-second rows replay in line order whatever they carry:
+`events._segment_events` raises each row's stamp to the highest above it, so
+the ordering stamp never falls down a segment.
 """
 import argparse
 import json

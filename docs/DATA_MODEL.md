@@ -58,14 +58,54 @@ Every row in every `events/*.jsonl` segment:
  "session_id": "2c3835ba-…",          // segment name == session_id
  "type": "decision",                  // MUST be in events.VALID_TYPES
  "payload": {"text": "…"},            // object; contract varies by type (§3)
- "tags": ["memo"]}                    // lowercase kebab-case strings
+ "tags": ["memo"],                    // lowercase kebab-case strings
+ "seq": 1789291821004211}             // append stamp (µs); absent on older rows
 ```
 
 - Serialization is `events.canonical_json` (sorted keys, tight separators,
   UTF-8) — byte-stable so the hash chain is meaningful.
-- Global order = sort by `(ts, segment_name, line_number)`; two events may
-  share a second, so precise identity is `(ts, type, text-fingerprint)`
-  (`dedupe.text_fingerprint`).
+- Global order = sort by `(ts, seq, segment_name, line_number)`, where `seq` is
+  the row's **ordering stamp** — its own valid `seq` raised to the highest one
+  above it in its segment (`events._segment_events`) — and a row with none sorts
+  as `-1` (`events._order_key`; valid means an `int`, not a `bool`,
+  `0 <= seq < 2**63`). `ts` stays the primary key, so a backdated row still
+  sorts by its `ts`; `seq` only settles a tie inside one second, where the
+  segment filename is **not** append order — a same-second `sop` update from
+  session `aaa-…` used to replay before the add `zzz-…` wrote first, and
+  `sop.fold` lost the edit.
+- `seq` is written by `append_event` inside the append lock:
+  `max(now in µs, high-water + 1)`, the high-water mark kept in `append.lock`
+  past the locked byte, so across locked appends it rises strictly even when
+  the wall clock steps back, as long as the mark holds the last stamp issued.
+  The lock fails open. An append that does not hold it can repeat a stamp, or
+  land below one issued or written before it, at any time: its stamp is the
+  bare clock, blind to the mark and taken outside the lock. A locked append
+  that finds the mark lost (`append.lock` deleted, garbled or unreadable) seeds
+  from the clock, and one that finds it stale (an earlier write of it failed)
+  stamps from the clock and that stale value; either can then repeat a stamp or
+  fall below an earlier one while the clock reads no later than a stamp already
+  issued — after a step back, or inside one tick of a coarse clock
+  (`time.time()` on Windows before Python 3.13 reads GetSystemTimeAsFileTime,
+  measured here ticking about once a millisecond, and appends inside one tick
+  run the mark ahead of it). So `seq` is a tie-break and not a unique key —
+  segment and line still follow it. It rides the ROW; the `Event`
+  dataclass keeps its five fields and never carries it.
+- **The carry is what keeps mixed writers in file order.** Line order inside a
+  segment is append order, so a row was written no earlier than anything above
+  it. A process still on pre-fix code — the dashboard nobody restarted, sharing
+  `manual.jsonl` with a `hive` command that stamps — writes unstamped rows, and
+  sorted as `-1` such a row would replay FIRST in its second, before the stamped
+  row its own file shows it followed. Rows above a segment's first stamp keep
+  `-1`, so a ledger written entirely before stamps orders exactly as it did.
+- **Historical same-second order is not recoverable.** Nothing durable recorded
+  it (`chain.json` holds per-segment line counts, `ts` is second-resolution and
+  caller-supplied), so every row written before the stamp keeps exactly the old
+  `(segment, line)` order. Rows appended by pre-fix code — a stale checkout, the
+  frozen exe — carry no `seq`; one with no stamped row above it in its own
+  segment sorts FIRST within its second whenever it was written, so restart
+  long-lived writers after upgrading.
+- Two events may share a second, so precise identity is `(ts, type,
+  text-fingerprint)` (`dedupe.text_fingerprint`).
 - `append_event` rejects unknown types. Reads never validate payload shape —
   **folds and projections must stay total** (skip junk, never raise).
 
@@ -244,14 +284,19 @@ speaking for. Job output is capped in memory and read by byte offset
 
 **"Deterministic" means off the SEMANTIC layer, not off the hash chain.** A
 type registered in `DETERMINISTIC_TYPES` gets no LEDGER file, no Memory-view
-row, no recall corpus entry and no consolidation pass — but
-`chain.compute_chain` folds `events.read_all()` with **no type filter**, so
-every telemetry event is hashed and re-hashed in full by every `hive verify`.
+row, no recall corpus entry and no consolidation pass — but the chain hashes
+rows with **no type filter**: `chain._scan` reads every parseable row on a
+complete (newline-terminated) line and `chain._fold` hashes them for a v2/v3
+checkpoint (at every `write_chain`, and again by `verify`), and the v1 shim
+folds every parseable row of `chain._legacy_order`, an unterminated final line
+included, through `chain.compute_chain`. So every complete telemetry row is
+hashed at projection time and hashed again in full by every `hive verify`.
 Volume is therefore a real cost of a high-frequency type (`mindnet_activity`
 being the one to watch); bound it at the emitter.
 
 **The checkpoint seals PER-SEGMENT LINE COUNTS, and folds in append order.**
-`chain.json` is v2: `{version, count, head, segments}`, where `segments` maps
+`chain.json` is v3 (v2 before the append stamp, same shape):
+`{version, count, head, segments}`, where `segments` maps
 each segment filename to the number of COMPLETE (newline-terminated) lines it
 held at seal time. `chain.verify` re-folds exactly those lines, ordered by
 `(segment, line_index)`. Two properties make that safe, and they are the whole
@@ -275,13 +320,23 @@ tamper hides in the noise.
 `chain.sealable` — which ended the stamped prefix at a second boundary — was an
 earlier, partial answer to the same defect. It fixed the same-SECOND tie and
 could not fix an earlier-second arrival, because no ts-based boundary can.
-Nothing in `src/` calls it now — `chain._verify_v1` folds `read_all` against the
-stored count directly — and it survives only in `tests/test_chain.py`, where it
-is the honest way to BUILD a v1 checkpoint for the shim's own tests.
+Nothing in `src/` calls it now — `chain._verify_v1` folds the legacy order
+against the stored count directly — and it survives only in
+`tests/test_chain.py`, where it is the honest way to BUILD a v1 checkpoint for
+the shim's own tests.
 
 **A v1 checkpoint keeps the old behaviour, including the flapping.**
 `_verify_v1` is the ts-ordered check, run so a store the old code anchored is
-VERIFIED rather than falsely alarmed at; it does not repair anything. When this
+VERIFIED rather than falsely alarmed at; it does not repair anything. It folds
+the **seq-blind legacy order** `(ts, segment_name, line_index)`
+(`chain._legacy_order`), not `read_all`'s `(ts, seq, segment_name, line_index)`.
+Every v1 writer used the legacy order — including a pre-`seq` process, such as a
+long-lived dashboard on older code, that is still sealing rows a newer writer
+has already stamped — and folding the stamp-aware order against that head
+reported untouched history as `hash_mismatch` whenever a stamped same-second
+pair from two sessions sorted differently by filename. The shim reads the
+segment files through the readers' own split and parse, never the Postgres
+mirror. When this
 landed all 67 `chain.json` files under `~/.mindhive/` were v1, so every
 namespace takes that path until something re-anchors it, and a namespace nothing
 writes to any more never will. One `hive project` against it is the fix.
@@ -292,11 +347,40 @@ hole: replacing a v2 file's `segments` map with `[]`, `"x"`, `5` or `null` fell
 through to the v1 shim — which never reads `segments` — and returned `ok: true`
 off the weaker check. Anyone able to write `chain.json` could downgrade the audit
 by deleting one key. So: no `version` and no `segments` → genuine v1, take the
-shim; `version: 2` → the v2 check, and a missing or non-dict `segments` is
-`corrupt_chain_file`; a `segments` key with no `version` is a wrecked v2 file,
-not a legacy one; anything else — a newer version, a string, a bool (`True == 1`
-in Python) — is `unsupported_checkpoint_version`, which is neither a green nor a
-claim that the ledger is wrong.
+shim; `version: 2` or `3` → the segment-map check, and a missing or non-dict
+`segments` is `corrupt_chain_file`; a `segments` key with no `version` is a
+wrecked v2 file, not a legacy one; anything else — a newer version, a string, a
+float, a bool (`True == 1` in Python) — is `unsupported_checkpoint_version`,
+which is neither a green nor a claim that the ledger is wrong.
+
+**v3 folds the append stamp into the hash; v2 does not.** A row carrying a valid
+`seq` contributes `canonical_json(event) + "\n" + str(seq)` to a v3 fold; a row
+without one contributes its canonical JSON alone. So an unstamped ledger hashes
+byte-identically under both formats, and an existing v2 checkpoint still
+verifies after stamped rows arrive — it folds them without the stamp, because
+the code that wrote it knew none. v3 exists because `seq` now DECIDES
+same-second read order: were it outside the hash, rewriting the stamp in a
+sealed row could swap a `sop` add and its update with `hive verify` still green.
+The splice is unambiguous because `canonical_json` never emits a raw newline
+(JSON escapes control characters inside strings). `write_chain` writes v3.
+
+A v2 checkpoint over stamped rows stays green, and says what it does not cover.
+A process still on pre-v3 code seals rows a newer writer already stamped, and
+its head folds them without the stamp — correct for what it knew, but a rewrite
+of those stamps would verify too. So a green verdict against a v2 checkpoint
+whose sealed prefix holds stamped rows carries a non-fatal `seq_unsealed`: the
+count of those rows (absent when there are none, and never present under v3).
+One projection on current code (`write_chain`) re-anchors the file to v3 and the
+field goes away. Separately, a v2/v3 checkpoint whose `count` is not a
+non-negative `int` — a string, `null`, a float, a bool, a negative, or no
+`count` at all — is `corrupt_chain_file`, and so is an `int` count that is not
+the number of rows the matching head seals. `write_chain` takes `count` and
+`segments` from one scan, so once the head matches the sealed prefix holds
+exactly `count` rows. Unchecked, `verify` subtracted `count` from the scanned
+count and raised `TypeError` or returned a nonsense `ahead`: over a head sealing
+three rows, `999` verified green with `ahead: -996` and `0` with `ahead: 3`. The
+count is compared only after the head matches, so a rewrite that also drops a
+sealed row out of the fold still reports `hash_mismatch`.
 
 Two costs, both accepted. Re-anchoring re-bases every chain head ever computed,
 which is a one-time rewrite of `chain.json` and nothing else — no other artifact
@@ -1869,13 +1953,15 @@ reader must not "simplify":
 #### The ordering contract, and the invariant it corrects
 
 ```sql
-ORDER BY COALESCE(ts, ''), segment, seg_line     -- pgstore.READ_ALL_SQL
+ORDER BY COALESCE(ts, ''), COALESCE(append_seq, -1), segment, seg_line
+                                                  -- pgstore.READ_ALL_SQL
 ```
 
 ADR 0006 claimed `ORDER BY ts, session_id, id` reproduces file order, because the
 segment is `<session_id>.jsonl`. **It does not, and the counter-example is in the
-live store.** `events.read_all` sorts on `(ev.ts or "", seg.name, line_index)` —
-the *filename*. Where one session id is a proper prefix of another, the separator
+live store.** `events.read_all` breaks any tie the ordering stamp leaves —
+between rows with no stamp on or above them in their segments, or rows sharing
+one — on `(seg.name, line_index)`: the *filename*. Where one session id is a proper prefix of another, the separator
 that follows decides: `-` is `0x2D`, `.` is `0x2E`, so `-` sorts below `.` and the
 two orders invert. The store already holds `verify.jsonl` and
 `verify-e2e-001.jsonl`:
@@ -1890,6 +1976,72 @@ parity gate built on that invariant would have failed against its own store, and
 the failure would have read as data corruption rather than a sort key.
 `COALESCE` carries the second half of the correction: Python sorts a NULL `ts`
 **first** (`ev.ts or ""`), Postgres sorts NULLs **last** by default.
+
+**`append_seq` (migration 007) corrects what the filename key itself got wrong.**
+Inside one second the filename is not append order either: `zzz-writer` adds a
+`sop`, `aaa-editor` updates it a moment later, and every reader — the file
+readers, this mirror, and so both sides of the parity gate — replayed the update
+first. The gate could not see it, because both sides were wrong together.
+`append_seq` is §2's ordering stamp — the row's own `seq` carried down its
+segment (`events._segment_events`) — loaded as NULL when a row has none, and
+`COALESCE(append_seq, -1)` is exactly `events._order_key`'s sentinel: bare
+`append_seq` sorts NULLs last and would put every row loaded as NULL after the
+stamped rows of its second. `pgtools`' newest-first statements reverse the
+stamp, segment and seg_line keys, and so does `pgsearch`'s vector scan, whose
+rows carry no stamp of their own: it LEFT JOINs `mindhive_ro.events` on
+`(segment, seg_line)`, which 001's `events_natural_key` unique index covers, so
+a vector matches at most one row; a vector with no event row sorts as `-1` and
+is counted as orphaned. On `ts` the two differ: `pgsearch` sorts
+`v.ts DESC NULLS LAST`, putting a NULL `ts` last as reversing the file order
+does, while `pgtools`' bare `ts DESC` sorts it FIRST, as the newest row.
+
+007 appends the column to `mindhive_ro.events` with `CREATE OR REPLACE VIEW`.
+That is legal only because the column goes at the END of the select list —
+001's and 003's "needs DROP VIEW" warning is about renaming, removing,
+retyping or reordering — and replacing in place keeps the view's owner (004)
+and grant (003). It also moves `pgschema.SCHEMA_VERSION` to 2: a mirror loaded
+before 007 holds NULL in `append_seq` for every row, so `mirror_health` reports
+it stale and refuses it — `parity_ok` False however the stored verdict reads,
+with a `refusal_reason` and a `repair` of `hive pg migrate` then
+`hive pg refresh` — and `pgmirror.recorded_fingerprint` answers None for it,
+which makes `refresh_changed` reload every segment instead of only the ones
+whose bytes moved.
+
+**Only a load records `schema_version` and `ledger_fingerprint`.** `parity`
+writes the two only when a load hands it `loaded_fingerprint`, the snapshot
+`refresh` took BEFORE its scan (`refresh_changed` does, and so does
+`hive pg rebuild` through `pgcli._loaded_and_verified`). A bare `hive pg parity`
+updates the verdict columns and leaves both as the last load wrote them, so it
+cannot clear the version gate: stamping the version on a verdict let the next
+`refresh_changed` reload only the segments that had moved while every other
+segment kept rows the old loader wrote. A namespace whose first row comes from
+such a verdict records `pgschema.UNLOADED_SCHEMA_VERSION` (0) and a JSON null
+fingerprint — both columns are NOT NULL — and `mirror_health` refuses it with
+`hive pg refresh` as the repair.
+
+**UPGRADE ORDER: run `hive pg migrate` before `hive pg refresh`,
+`hive pg rebuild`, or the next scheduled `autosync`.** Until 007 is applied,
+`refresh` and `rebuild` raise a `RuntimeError` naming the pending file before
+any DELETE or COPY (the CLI prints it as one `error:` line, and a driver error
+such as `UndefinedColumn` gets the same one-line treatment), and the AI tools
+answer `parity_failed` with the migrate-then-refresh refusal instead of running
+statements that name `append_seq`. After pulling, restart every long-lived
+process, because each keeps the code it imported at start. The writers — the
+dashboard and any `hive session run` supervisor — so no process still running
+pre-007 code appends unstamped rows after stamped ones exist: such a row in a
+segment with no stamp above it to carry sorts first in its second, ahead of
+stamped rows written before it. And the long-lived READER, the MCP server
+(`hive pg mcp`, or `python -m mindhive.mcp_server`): until it restarts it keeps
+the old `pgschema.SCHEMA_VERSION` (1), the three-key ordering SQL and the
+`pgschema.TOOL_DESCRIPTIONS` that teach it, so after `hive pg migrate` and
+`hive pg refresh` it still returns same-second ties in filename order, calls the
+version-2 mirror merely stale while serving its stored `parity_ok`, and names
+`hive pg refresh` as the repair for a refresh that has already run.
+
+**Not yet run against a server:** this landed while none was reachable. The
+default tier checks it as text and through fakes; `tests/test_pg_live.py` holds
+the same-second fixtures (the ordered read and the vector scan's ceiling), their
+mutation canaries, and the standalone-parity test for the next `-m pg` run.
 
 #### The index 002 created, and why 005 drops it
 
@@ -2159,11 +2311,13 @@ unmatchable rather than merely unused (005).
 6. **The Postgres mirror never becomes the source, and never re-derives the
    order.** The file ledger is the sole writer; `MINDHIVE_EVENT_BACKEND` stays
    `file` and nothing in `src/` may set it. The mirror's ordering contract is
-   `(COALESCE(ts,''), segment, seg_line)` — the segment **filename**, never
-   `session_id` (they disagree, live, on `verify` vs `verify-e2e-001`), and
-   `COALESCE` because Python sorts a NULL `ts` first where Postgres sorts it
-   last. Both halves are what chain-head parity rests on, so a "simplification"
-   of either reads as data corruption rather than as a sort key (§4.18).
+   `(COALESCE(ts,''), COALESCE(append_seq,-1), segment, seg_line)` — the append
+   stamp before the segment (a same-second tie otherwise replays in filename
+   order, not write order), the segment **filename**, never `session_id` (they
+   disagree, live, on `verify` vs `verify-e2e-001`), and `COALESCE` because
+   Python sorts a NULL `ts` and a missing stamp first where Postgres sorts NULLs
+   last. Every part is what chain-head parity rests on, so a "simplification"
+   of any reads as data corruption rather than as a sort key (§4.18).
 
 7. **A payload number's SPELLING is not part of its identity — except at zero.**
    The mirror's `JSONB` column stores numbers as `numeric`, which has no

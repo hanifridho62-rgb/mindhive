@@ -59,6 +59,7 @@ _MIGRATION_PACKAGE = "mindhive.pgmigrations"
 from . import pgschema as _pgschema           # noqa: E402  — stdlib-only module
 
 SCHEMA_VERSION = _pgschema.SCHEMA_VERSION
+UNLOADED_SCHEMA_VERSION = _pgschema.UNLOADED_SCHEMA_VERSION
 
 
 def admin_dsn() -> str | None:
@@ -248,7 +249,20 @@ def sync_type_registry(dsn: str | None = None) -> dict:
 # --- the file fold the loader and the gate SHARE -----------------------------
 
 def scan_segments(project: str | None = None) -> list:
-    """The file ledger as `(segment, seg_line, Event)` triples, in ledger order.
+    """The file ledger as `(segment, seg_line, Event, seq)` rows, in ledger order.
+
+    `seq` is the row's ORDERING stamp, as `events._segment_events` yields it:
+    its own append stamp (`events.append_event` writes it) raised to the highest
+    stamp above it in its segment, or None while its segment has shown none -- a
+    row written before stamps existed, or one whose malformed stamp has no valid
+    one above it. The order is `events._order_key` over that value -- the SAME
+    row stream and key `read_all` sorts by -- and the loader stores it as
+    `append_seq`, which `pgstore.READ_ALL_SQL` orders on in the same position.
+    Without it two same-second rows from different sessions come back in
+    filename order on both sides, and parity agrees with itself about the wrong
+    order. Stored as the row's OWN stamp instead, an unstamped row below a
+    stamped one in its segment would load as NULL and sort first in the mirror
+    while the file readers put it second.
 
     A deliberate re-implementation of `events.read_all`'s fold rather than a
     call to it, for two reasons that both bite:
@@ -287,12 +301,10 @@ def scan_segments(project: str | None = None) -> list:
     if not d.exists():
         return rows
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in _events._segment_lines(seg):
-            ev = _events._row_to_event(line)
-            if ev is None:
-                continue           # skip a torn row, exactly as read_all does
-            rows.append((seg.name, i, ev))
-    rows.sort(key=lambda t: ((t[2].ts or ""), t[0], t[1]))
+        # torn rows skipped and the stamp carried, exactly as read_all does
+        for i, ev, seq in _events._segment_events(seg):
+            rows.append((seg.name, i, ev, seq))
+    rows.sort(key=lambda t: _events._order_key(t[2].ts, t[3], t[0], t[1]))
     return rows
 
 
@@ -319,9 +331,14 @@ def _ts_utc(ts):
 
 _COPY_SQL = """
 COPY mindhive.events (project, segment, seg_line, ts, ts_utc,
-                      session_id, event_type, payload, tags)
+                      session_id, event_type, payload, tags, append_seq)
 FROM STDIN
 """
+# `append_seq` is the ORDERING stamp `scan_segments` carries (the row's own, or
+# the highest above it in its segment), and NULL for a row with none, never a
+# coerced -1: the sentinel belongs to the ORDER BY (`COALESCE(append_seq, -1)`),
+# and storing it would make "no stamp" and "a stamp" indistinguishable to anyone
+# querying the column.
 # `global_seq` is omitted deliberately -- identity, and row identity only, never
 # ordering authority -- and so is `ts_key`, which is GENERATED ALWAYS and so
 # would be an error to name here rather than an optimisation to omit.
@@ -337,7 +354,18 @@ _DELETE_SEGS_SQL = ("DELETE FROM mindhive.events "
 # `TRUNCATE` would do, arriving through a narrower door.
 
 
-def refresh(project: str | None = None, segments=None) -> dict:
+def _pending_migrations(cur) -> list:
+    """Migrations on disk that `schema_migrations` does not record, in order.
+
+    Names only. A recorded file whose bytes changed is `apply_migrations`'
+    refusal to make, not the loader's: the loader's one question is whether
+    every column it is about to name can exist yet."""
+    applied = _applied(cur)
+    return [n for n in migration_files() if n not in applied]
+
+
+def refresh(project: str | None = None, segments=None,
+            fingerprint: dict | None = None) -> dict:
     """Reload the named segments of one namespace. `None` means every segment.
 
     `DELETE` then `COPY ... FROM STDIN`, in ONE transaction, so MVCC hands every
@@ -357,32 +385,60 @@ def refresh(project: str | None = None, segments=None) -> dict:
 
     **Per-segment reload cannot reorder anything.** Global order is not a stored
     property of the mirror: `pgstore.READ_ALL_SQL` re-establishes it at read time
-    with `ORDER BY COALESCE(ts,''), segment, seg_line`, and `global_seq` is row
+    with `ORDER BY COALESCE(ts,''), COALESCE(append_seq,-1), segment, seg_line`,
+    and every one of those is a value the row carries. `global_seq` is row
     identity only (see `_COPY_SQL`). Rows re-inserted for one segment therefore
     get new `global_seq` values and the fold sees the same sequence as before.
 
     An empty `segments` list is a real answer -- nothing changed -- and returns
-    without opening a connection at all."""
+    without opening a connection at all.
+
+    **A pending migration is refused before anything is deleted.** The load is
+    written for the newest schema -- `_COPY_SQL` names `append_seq`, which
+    exists only once 007 has run -- and against an older one it used to DELETE
+    and then fail at the COPY with a driver `UndefinedColumn`: rolled back, so
+    nothing was lost, but the operator read a traceback that never said to
+    migrate. So the first statements on the connection compare
+    `migration_files()` with `schema_migrations`, and any file the database has
+    not applied raises a `RuntimeError` naming it and `hive pg migrate`, rolled
+    back before a single write.
+
+    **The returned `fingerprint` is taken BEFORE the scan**, and it is what
+    `mirror_state` records as loaded (`parity(loaded_fingerprint=...)`). A stat
+    taken after the scan would cover a row appended between the two -- a row the
+    COPY never carried -- and every later `changed_segments` would call its
+    segment unchanged. Taken first, that row makes the segment look changed and
+    the next refresh reloads it: an extra reload is the safe direction.
+    `refresh_changed` passes in the snapshot it diffed against, so one stat
+    serves the diff, the load and the verdict."""
     from . import paths
     name = project or paths.detect_project()
+    snapshot = _fingerprint(name) if fingerprint is None else fingerprint
 
     if segments is not None:
         wanted = sorted(set(segments))
         if not wanted:
             return {"project": name, "rows": 0, "deleted": 0, "segments": [],
-                    "schema_version": SCHEMA_VERSION}
+                    "schema_version": SCHEMA_VERSION, "fingerprint": snapshot}
     else:
         wanted = None
 
-    triples = scan_segments(name)
+    rows = scan_segments(name)
     if wanted is not None:
         keep = set(wanted)
-        triples = [t for t in triples if t[0] in keep]
+        rows = [t for t in rows if t[0] in keep]
 
     conn = _connect_admin()
     from psycopg.types.json import Jsonb
     try:
         with conn.cursor() as cur:
+            pending = _pending_migrations(cur)
+            if pending:
+                raise RuntimeError(
+                    f"the mirror's database has not applied "
+                    f"{', '.join(pending)}; this loader writes the schema those "
+                    f"migrations create, so run `hive pg migrate` first. "
+                    f"Nothing was deleted or loaded.")
             if wanted is None:
                 cur.execute(_DELETE_ALL_SQL, (name,))
             else:
@@ -390,20 +446,21 @@ def refresh(project: str | None = None, segments=None) -> dict:
             deleted = cur.rowcount
             with cur.copy(_COPY_SQL) as cp:
                 cp.set_types(["text", "text", "integer", "text", "timestamptz",
-                              "text", "text", "jsonb", "jsonb"])
-                for seg, line_no, ev in triples:
+                              "text", "text", "jsonb", "jsonb", "bigint"])
+                for seg, line_no, ev, seq in rows:
                     cp.write_row((name, seg, line_no, ev.ts, _ts_utc(ev.ts),
                                   ev.session_id, ev.type,
                                   Jsonb(ev.payload),
-                                  Jsonb(list(ev.tags or []))))
+                                  Jsonb(list(ev.tags or [])), seq))
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return {"project": name, "rows": len(triples), "deleted": deleted,
-            "segments": wanted, "schema_version": SCHEMA_VERSION}
+    return {"project": name, "rows": len(rows), "deleted": deleted,
+            "segments": wanted, "schema_version": SCHEMA_VERSION,
+            "fingerprint": snapshot}
 
 
 def rebuild(project: str | None = None) -> dict:
@@ -436,7 +493,8 @@ def _fingerprint(project: str) -> dict:
     return {"segments": sizes, "bytes": sum(sizes.values())}
 
 
-def changed_segments(project: str, recorded) -> list | None:
+def changed_segments(project: str, recorded,
+                     live: dict | None = None) -> list | None:
     """Segments whose bytes differ from the fingerprint the mirror was built
     from, or `None` meaning "cannot tell -- reload everything".
 
@@ -448,8 +506,12 @@ def changed_segments(project: str, recorded) -> list | None:
 
     A segment present in the recorded map and absent from disk is reported as
     changed: its rows are then deleted and nothing is copied back, which is the
-    right answer for a segment that went away."""
-    live = _fingerprint(project)["segments"]
+    right answer for a segment that went away.
+
+    `live` is a `_fingerprint` the caller already took. `refresh_changed` passes
+    one so the snapshot it diffs is the same one it loads and then records; left
+    out, the stat is taken here."""
+    live = (_fingerprint(project) if live is None else live)["segments"]
     if not isinstance(recorded, dict):
         return None
     was = recorded.get("segments")
@@ -458,8 +520,8 @@ def changed_segments(project: str, recorded) -> list | None:
     return sorted(n for n in set(live) | set(was) if live.get(n) != was.get(n))
 
 
-_RECORDED_FP_SQL = ("SELECT ledger_fingerprint FROM mindhive.mirror_state "
-                    "WHERE project = %s")
+_RECORDED_FP_SQL = ("SELECT ledger_fingerprint, schema_version "
+                    "FROM mindhive.mirror_state WHERE project = %s")
 
 
 def recorded_fingerprint(project: str):
@@ -467,7 +529,14 @@ def recorded_fingerprint(project: str):
 
     None on every failure path -- no admin DSN, no driver, no row, no table yet
     -- because every one of them means the same thing to the only caller:
-    `changed_segments` cannot tell what moved, so reload everything."""
+    `changed_segments` cannot tell what moved, so reload everything.
+
+    None as well when the row was stamped under a different `SCHEMA_VERSION`.
+    A version bump means a loader that fills a column the old one did not
+    (version 2 added `append_seq`), and a per-segment refresh would reload only
+    the segments that moved, leaving every other segment's rows NULL in that
+    column and ordered as legacy rows -- a mirror that disagrees with the file
+    ledger about same-second order while its fingerprint says nothing moved."""
     if not admin_dsn():
         return None
     try:
@@ -490,7 +559,9 @@ def recorded_fingerprint(project: str):
             conn.close()
         except Exception:
             pass
-    return dict(row[0]) if row and row[0] else None
+    if not row or not row[0] or row[1] != SCHEMA_VERSION:
+        return None
+    return dict(row[0])
 
 
 def refresh_changed(project: str | None = None) -> dict:
@@ -504,17 +575,32 @@ def refresh_changed(project: str | None = None) -> dict:
     end and reads both sides in full. It has to: after new rows land, the
     `parity_ok` recorded in `mirror_state` describes rows that no longer exist,
     and a stamp that says "proven" about a superseded snapshot is worse than the
-    seconds the fold costs. Running it is also what re-stamps
-    `ledger_fingerprint` -- without that the same segments would be recomputed as
-    changed on every run and the mirror would report itself stale forever."""
+    seconds the fold costs. Running it after the load is also what re-stamps
+    `ledger_fingerprint`, with the fingerprint the LOAD returned -- without that
+    the same segments would be recomputed as changed on every run and the mirror
+    would report itself stale forever.
+
+    ONE STAT SERVES ALL THREE STEPS. The live fingerprint is taken once, here,
+    and that same dict is what `changed_segments` diffs, what `refresh` returns
+    as loaded, and what `parity` records. Separate stats would each see a
+    different ledger whenever a session appends mid-run: the old shape let
+    `parity` take its own stat after the load's scan, so a row appended in
+    between was recorded as loaded although no COPY carried it, and its segment
+    read as unchanged from then on. One snapshot taken before the scan turns
+    every such row into a segment that differs from the record, which the next
+    run reloads."""
     from . import paths
     name = project or paths.detect_project()
-    segs = changed_segments(name, recorded_fingerprint(name))
-    out = refresh(name, segments=segs)
-    out["verified"] = parity(name)
+    live = _fingerprint(name)
+    segs = changed_segments(name, recorded_fingerprint(name), live=live)
+    out = refresh(name, segments=segs, fingerprint=live)
+    out["verified"] = parity(name, loaded_fingerprint=out["fingerprint"])
     return out
 
 
+# The LOAD's upsert: every column, including the two only a load may claim.
+# `_record_state` uses it only when `parity` was handed the fingerprint of the
+# load it follows.
 _STATE_SQL = """
 INSERT INTO mindhive.mirror_state
     (project, schema_version, row_count, file_head, pg_head, parity_ok,
@@ -530,15 +616,57 @@ ON CONFLICT (project) DO UPDATE SET
     rebuilt_at         = now()
 """
 
+# The VERDICT's upsert: what one parity run proves and nothing it does not. An
+# existing row keeps the `schema_version` and `ledger_fingerprint` its last load
+# recorded. The INSERT half still names both, because both columns are NOT NULL
+# (migration 001): a first row with no load behind it carries
+# `UNLOADED_SCHEMA_VERSION` and a JSON null, which fails every version check
+# that reads it.
+_VERDICT_SQL = """
+INSERT INTO mindhive.mirror_state
+    (project, schema_version, row_count, file_head, pg_head, parity_ok,
+     ledger_fingerprint, rebuilt_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+ON CONFLICT (project) DO UPDATE SET
+    row_count  = EXCLUDED.row_count,
+    file_head  = EXCLUDED.file_head,
+    pg_head    = EXCLUDED.pg_head,
+    parity_ok  = EXCLUDED.parity_ok,
+    rebuilt_at = now()
+"""
 
-def _record_state(name, rows, file_head, pg_head, ok) -> bool:
+
+def _record_state(name, rows, file_head, pg_head, ok,
+                  loaded_fingerprint=None) -> bool:
     """Stamp the verdict where a READER can see it. Best-effort by design.
 
     Writing needs the owner DSN, and `parity` must still answer for a session
     holding only the reader credential -- so a failure here degrades the
-    verdict's visibility, never the verdict itself."""
+    verdict's visibility, never the verdict itself.
+
+    **Only a load may record `schema_version` and `ledger_fingerprint`.** This
+    used to upsert `SCHEMA_VERSION` and a fingerprint it took itself on EVERY
+    verdict. A bare `hive pg parity` run after a merge that bumped the version,
+    before any reload, therefore stamped the new version over rows the old
+    loader wrote: `recorded_fingerprint` accepted the row, the next
+    `refresh_changed` reloaded only the segments that had moved, and every
+    other segment kept rows the new loader never wrote under a row claiming it
+    had. The fingerprint carried the same defect in time rather than in
+    version: taken at verdict time, it covered rows appended after the load's
+    scan, which no COPY carried.
+
+    So both columns come only from `loaded_fingerprint` -- the snapshot a load
+    returned, which `refresh_changed` and `pgcli._loaded_and_verified` pass
+    through `parity` -- together with `SCHEMA_VERSION`, because that load ran
+    this loader past its pending-migration check. Without one, `_VERDICT_SQL`
+    updates the verdict columns and leaves both alone; a namespace with no row
+    yet gets `UNLOADED_SCHEMA_VERSION` and a JSON null."""
     if not admin_dsn():
         return False
+    if loaded_fingerprint is None:
+        sql, version, fp = _VERDICT_SQL, UNLOADED_SCHEMA_VERSION, None
+    else:
+        sql, version, fp = _STATE_SQL, SCHEMA_VERSION, loaded_fingerprint
     try:
         from psycopg.types.json import Jsonb
         conn = _connect_admin()
@@ -546,9 +674,8 @@ def _record_state(name, rows, file_head, pg_head, ok) -> bool:
         return False
     try:
         with conn.cursor() as cur:
-            cur.execute(_STATE_SQL, (name, SCHEMA_VERSION, rows,
-                                     file_head or "", pg_head or "", ok,
-                                     Jsonb(_fingerprint(name))))
+            cur.execute(sql, (name, version, rows, file_head or "",
+                              pg_head or "", ok, Jsonb(fp)))
         conn.commit()
         return True
     except Exception:
@@ -564,8 +691,16 @@ def _record_state(name, rows, file_head, pg_head, ok) -> bool:
             pass
 
 
-def parity(project: str | None = None) -> dict:
+def parity(project: str | None = None,
+           loaded_fingerprint: dict | None = None) -> dict:
     """Compare the file ledger's chain head against the mirror's.
+
+    `loaded_fingerprint` is the `fingerprint` a load just returned, and passing
+    it is the only way this records a schema version and a `ledger_fingerprint`
+    (see `_record_state`). Left out -- `hive pg parity` on its own, or any
+    re-check -- the verdict columns are recorded and the load columns stay as
+    the last load wrote them, so a verdict cannot clear the version gate that
+    forces a full reload.
 
     ANSWERS rather than raises, including when it could not look: "I could not
     check" is a verdict a gate must be able to give, and an exception here would
@@ -654,7 +789,8 @@ def parity(project: str | None = None) -> dict:
                "project": name, "rows": rows, "file_rows": len(file_evs),
                "file_head": fold["head"], "pg_head": pg_head,
                "reason": reason}
-    verdict["recorded"] = _record_state(name, rows, fold["head"], pg_head, ok)
+    verdict["recorded"] = _record_state(name, rows, fold["head"], pg_head, ok,
+                                        loaded_fingerprint)
     return verdict
 
 
@@ -737,7 +873,7 @@ def embed_events(project: str | None = None, *, model: str | None = None,
     model_name = model or vectors.EMBEDDING_MODEL
 
     wanted = set(types) if types else set(vectors._semantic_types())
-    eligible = [(seg, ln, ev) for seg, ln, ev in scan_segments(name)
+    eligible = [(seg, ln, ev) for seg, ln, ev, _ in scan_segments(name)
                 if ev.type in wanted]
     live = {(seg, ln): vectors.event_id(ev) for seg, ln, ev in eligible}
 

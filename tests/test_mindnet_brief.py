@@ -965,7 +965,7 @@ def test_the_typed_read_is_exactly_the_filter_of_the_full_read():
     """The ordering invariant, at the `events` layer.
 
     `read_types` filters BEFORE the sort. That cannot reorder survivors — the
-    `(ts, segment, line)` key is unique per row — but the folds downstream are
+    `(ts, seq, segment, line)` key is unique per row — but the folds downstream are
     order-sensitive (`sop.fold` is sequential, `tasks.fold` drops a lifecycle
     event whose declare has not been folded yet), so a future refactor that
     filtered after a differently-keyed sort would break them silently."""

@@ -523,6 +523,88 @@ def test_the_stale_notice_reaches_a_real_tool_envelope(monkeypatch):
         f"the remedy did not survive envelope assembly: {notice!r}"
 
 
+# --------------------------------------------------------------------------
+# D2: a mirror loaded under another schema version -- migrate, then refresh
+# --------------------------------------------------------------------------
+#
+# Between pulling 007 and running `hive pg migrate`, the recorded row says
+# version 1. The refusal blamed a chain-head mismatch nobody had measured, and
+# the stale notice named only `hive pg refresh`, which cannot load a column the
+# table does not have yet.
+
+class _HealthConn:
+    """A reader connection whose one `mirror_state` row is `row`."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def cursor(self):
+        row = self.row
+
+        class _Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=None):
+                pass
+
+            def fetchone(self):
+                return row
+
+        return _Cursor()
+
+    def close(self):
+        pass
+
+
+def test_a_schema_mismatch_refusal_names_migrate_not_a_hash_mismatch(
+        monkeypatch):
+    """Through the real `pgstore.mirror_health` and a real tool, so the two
+    modules are proven to agree on the field, not each on its own reading."""
+    fp = pgstore._ledger_fingerprint("test")
+    row = (pgschema.SCHEMA_VERSION - 1, 3, "f" * 64, "f" * 64, True, fp, None)
+    monkeypatch.setattr(pgstore, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(pgstore, "connect",
+                        lambda role="reader": _HealthConn(row))
+    monkeypatch.setattr(pgtools, "_session", lambda *a: pytest.fail(
+        "a refused call reached the database"))
+
+    env = _call("get_recent_events", session_id="s1")
+
+    assert env["error"]["code"] == "parity_failed"
+    detail, remedy = env["error"]["detail"], env["error"]["remedy"]
+    assert "chain head" not in detail, \
+        f"the refusal blamed a hash comparison nobody made: {detail!r}"
+    for text in (detail, remedy):
+        assert text.index("hive pg migrate") < text.index("hive pg refresh"), text
+
+
+def test_an_ordinary_parity_refusal_still_reports_the_chain_mismatch():
+    """CANARY. A `_parity_refusal` that always used the migrate text passes the
+    test above and misdirects every real divergence."""
+    err = pgtools._parity_refusal("get_recent_events", "test",
+                                  {"parity_ok": False},
+                                  pgtools._clock())["error"]
+    assert "chain head does not match" in err["detail"]
+    assert "hive pg migrate" not in err["detail"] + err["remedy"]
+
+
+def test_a_schema_mismatch_stale_notice_names_migrate_before_refresh():
+    text = " ".join(pgtools._stale_notice(
+        {"stale": True, "stale_reason": "loaded under schema version 1",
+         "repair": ["hive pg migrate", "hive pg refresh"]}))
+    assert text.index("hive pg migrate") < text.index("hive pg refresh"), text
+    assert "read-only at the role level" in text
+
+
+def test_an_ordinary_stale_notice_does_not_send_the_operator_to_migrate():
+    """CANARY for the notice above: one that always named migrate passes it."""
+    assert "hive pg migrate" not in _stale_text()
+
+
 def _fake_session(rows, columns=("global_seq", "ts", "ts_utc", "session_id",
                                  "event_type", "payload", "tags")):
     import contextlib
@@ -788,13 +870,15 @@ def test_recent_events_orders_on_segment_not_session_id():
     (pgtools.SEARCH_KEY_SQL, "SEARCH_KEY_SQL"),
     (pgtools.SEARCH_VALUE_SQL, "SEARCH_VALUE_SQL"),
 ])
-def test_the_row_queries_reverse_all_three_ledger_order_keys(sql, label):
+def test_the_row_queries_reverse_all_four_ledger_order_keys(sql, label):
     """"Recent" means latest in LEDGER order, not latest ts_utc: timestamps are
     second-resolution, so several events routinely share one `ts` and sorting
-    on `ts` alone hands back an arbitrary permutation of them. DESC on all
-    three keys is the exact reverse of `events.read_all()`."""
+    on `ts` alone hands back an arbitrary permutation of them. DESC on all four
+    keys -- ts, the append stamp, segment, seg_line -- reverses
+    `events.read_all()` for every row with a `ts`. A NULL `ts` is the exception:
+    `read_all` replays it first, and a bare `ts DESC` also sorts it FIRST."""
     order = sql.split("ORDER", 1)[1]
-    assert order.count("DESC") == 3, f"{label}: {order!r}"
+    assert order.count("DESC") == 4, f"{label}: {order!r}"
 
 
 @pytest.mark.parametrize("sql,label", [
@@ -1050,6 +1134,23 @@ def test_newest_means_ledger_order_not_clock_order():
     for sql in (pgtools.LATEST_SQL, pgtools.BY_TYPE_SQL,
                 pgtools.CURRENT_STATE_SQL):
         assert "segment DESC" in sql and "seg_line DESC" in sql, sql
+
+
+def test_newest_breaks_a_same_second_tie_on_the_append_stamp():
+    """Within one second the segment filename is not write order, so "the newest
+    `sop` event" across sessions was whichever filename sorted last. Every
+    newest-first statement reverses the FULL ledger key, stamp included, through
+    the same COALESCE as the parity read -- bare `append_seq DESC` would put
+    rows with no stamp on or above them in their segment FIRST, the opposite
+    end from the ledger."""
+    stamped = "ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC"
+    for sql in (pgtools.RECENT_SQL, pgtools.SEARCH_VALUE_SQL,
+                pgtools.SEARCH_KEY_SQL, pgtools.LATEST_SQL, pgtools.BY_TYPE_SQL,
+                pgtools.BY_TYPE_SESSION_SQL, pgtools.CURRENT_STATE_SQL,
+                pgtools.CURRENT_STATE_ONE_SQL):
+        assert stamped in sql, sql
+    assert "ORDER BY ts, COALESCE(append_seq, -1), segment, seg_line" in \
+        pgtools.SUMMARY_SQL
 
 
 def test_the_latest_event_tool_refuses_an_empty_session_id():

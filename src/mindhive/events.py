@@ -92,10 +92,15 @@ DETERMINISTIC_TYPES = {
     # no LEDGER markdown file per event (projector.LEDGER_TYPES), no Memory
     # view row, no keyword-recall corpus entry, no consolidation pass.
     #
-    # What it does NOT buy: staying off the hash chain. `chain.compute_chain`
-    # folds `events.read_all()` with NO type filter, so every activity event is
-    # hashed at append-projection time and re-hashed in full by every `hive
-    # verify`. The chain is over the whole ledger, not over the semantic subset.
+    # What it does NOT buy: staying off the hash chain. The chain hashes rows
+    # with NO type filter: `chain._scan` reads every parseable row on a complete
+    # (newline-terminated) line and `chain._fold` hashes them for a v2/v3
+    # checkpoint, and the v1 shim folds every parseable row of
+    # `chain._legacy_order`, an unterminated final line included, through
+    # `chain.compute_chain`. So every complete activity row is hashed at
+    # projection time (`chain.write_chain`) and re-hashed in full by every
+    # `hive verify`. The chain is over the whole ledger, not over the semantic
+    # subset.
     # The volume consequence is MN-5's to carry: the cat board is the only
     # consumer, `telemetry.busy` already emits at most one active/idle PAIR per
     # transition rather than per frame, and if MN-5's rendering ever tempts a
@@ -229,9 +234,9 @@ DETERMINISTIC_TYPES = {
     # What the six UserPromptSubmit injectors actually delivered this turn (see
     # injectors.py). One row per CHANGED turn, never one per prompt: at 200
     # prompts a day, one-row-per-turn is 73,000 rows a year against a
-    # 41,470-event store — 1.76x the whole ledger — and `chain.compute_chain`
-    # folds `read_all()` with no type filter, so every one of them is re-hashed
-    # by every `hive verify`, permanently. Content dedup does not help; the cost
+    # 41,470-event store — 1.76x the whole ledger — and the hash chain hashes
+    # every complete row with no type filter (`chain._scan` then `chain._fold`),
+    # so every one of them is re-hashed by every `hive verify`, permanently. Content dedup does not help; the cost
     # is driven by rows, not bytes. A run of identical turns writes nothing and
     # the row that closes it carries `unchanged_turns`, so the history stays
     # exactly reconstructible.
@@ -460,6 +465,15 @@ def _append_lock(project):
     Fails OPEN in both directions -- if the lock cannot be created, and if the
     deadline passes. A process that writes unserialised has a bad day; a process
     that refuses to record the caller's event has lost it forever.
+
+    Yields the lock file's descriptor only while the lock is HELD, and None in
+    both fail-open cases. `_next_seq` keeps the append sequence's high-water
+    mark in this same file, past the byte the lock covers, so stamping a row
+    costs no second open -- and a caller that does not hold the lock must not
+    touch that mark. Handed the descriptor after its deadline, such a caller
+    read the mark, lost the CPU while locked appends raised it, and wrote its
+    stale value back: the mark went DOWN, and the next locked append repeated a
+    stamp an earlier one already carried.
     """
     fd, held = None, False
     try:
@@ -467,7 +481,7 @@ def _append_lock(project):
         lock.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o666)
     except OSError:
-        yield
+        yield None
         return
     try:
         deadline = time.monotonic() + _LOCK_WAIT_S
@@ -483,7 +497,7 @@ def _append_lock(project):
                 if time.monotonic() > deadline:
                     break
                 time.sleep(0.001)
-        yield
+        yield fd if held else None
     finally:
         if held:
             try:
@@ -497,6 +511,104 @@ def _append_lock(project):
         os.close(fd)
 
 
+# --- the append sequence -------------------------------------------------------
+# `ts` is second-resolution AND caller-supplied, and a segment is named after its
+# session, so nothing on a row used to say which of two same-second rows in two
+# segments was written first. Readers broke that tie on the segment FILENAME:
+# an `update` from session `aaa-…` replayed before the `add` from `zzz-…` it
+# edits, and `sop.fold` skipped it as a partial update on an unknown id -- the
+# edit lost, with no error anywhere. Every order-sensitive fold had the defect.
+#
+# So every row written from here on carries `seq`: a per-namespace stamp taken
+# INSIDE `_append_lock`, which serialises appends across processes and threads,
+# so wherever the high-water mark ruled the stamp -- the append held the lock
+# and read a mark holding the last stamp issued -- `seq` order is the order rows
+# actually reached the disk (`_next_seq` names the exceptions). Rows written before
+# it existed carry nothing that records cross-segment order -- not the chain
+# checkpoint (per-segment line counts), not `ts`, not the mirror's `global_seq`
+# (load identity) -- so their order is NOT reconstructed, and cannot be: they
+# keep the `(ts, segment, line)` order they always had. See `_order_key`.
+#
+# `seq` rides the ROW, never `Event`. `to_dict` therefore keeps its five keys for
+# every consumer, and a legacy row hashes identically under every checkpoint
+# format (`chain._scan`).
+
+# Where the high-water mark lives in `append.lock`: just past the single byte
+# `msvcrt.locking` covers, fixed-width so a shorter number never leaves a stale
+# digit behind.
+_SEQ_OFFSET = 1
+_SEQ_WIDTH = 20
+# The mirror stores `seq` as BIGINT; anything outside it is not a stamp.
+_SEQ_LIMIT = 2 ** 63
+# What a row with no stamp to order by sorts as. Below every real stamp. A row is
+# ordered by the highest stamp at or above it in its own segment
+# (`_segment_events`), so only a row with no valid `seq` AND no stamped row above
+# it sorts as this -- every row written before stamps existed, and a pre-`seq`
+# writer's rows in a segment no stamping process has touched: FIRST within its
+# second, WHENEVER it was written. That is the true append order only if no
+# pre-`seq` process appended after the first stamped row existed: a long-lived
+# writer that imported the old `append_event` (the dashboard, a supervisor, the
+# frozen exe) keeps writing unstamped rows, and one landing in such a segment, in
+# a second that already holds a stamped row elsewhere, replays BEFORE it --
+# nothing on the row can say otherwise. Restart such writers after upgrading.
+# `pgstore.READ_ALL_SQL` coalesces to exactly this value.
+LEGACY_SEQ = -1
+
+
+def _now_us() -> int:
+    """Wall clock in microseconds -- the seed of a stamp, and the seam tests
+    patch to step the clock. Microseconds keep a stamp below 2**53, so it
+    survives a JavaScript reader intact until the year 2255."""
+    return time.time_ns() // 1000
+
+
+def _next_seq(fd) -> int:
+    """The next append stamp: ``max(clock, high-water mark + 1)``.
+
+    Call it only while holding `_append_lock` on *fd*. The clock alone is not
+    enough. It is ADJUSTABLE, and a step backwards inside one second would order
+    that second's rows by the step. It can also be COARSE: this venv's is
+    GetSystemTimePreciseAsFileTime at 100ns, which `time.time()` reads from
+    Python 3.13 on, but CI also runs 3.11 and 3.12, which read
+    GetSystemTimeAsFileTime -- measured here ticking about once a millisecond --
+    so appends inside one tick read one value and the mark carries them ahead of
+    it. The high-water mark keeps locked appends' stamps strictly increasing
+    whatever the clock does, for as long as it holds the last stamp issued; if
+    `append.lock` is deleted, the next stamp seeds from the clock (see the
+    exceptions below).
+
+    Fails OPEN, like the lock: an unreadable or garbled mark falls back to the
+    clock, and an unwritable one is not written. A stamp is never a reason to
+    refuse an append. Both of the lock's fail-open paths hand this None, so an
+    append that does not hold the lock stamps from the bare clock and never
+    reads or writes the mark.
+
+    A stamp can repeat, or fall below one issued before it, only where the mark
+    did not rule it: an append that did not hold the lock, or one that, after
+    the clock stepped back, found the mark lost -- `append.lock` deleted,
+    garbled or unreadable -- or stale, because an earlier append's write of it
+    failed. `_segment_events` and `_order_key` still order such a row
+    deterministically."""
+    now = _now_us()
+    if fd is None:
+        return now
+    last = 0
+    try:
+        os.lseek(fd, _SEQ_OFFSET, os.SEEK_SET)
+        raw = os.read(fd, _SEQ_WIDTH)
+        if len(raw) == _SEQ_WIDTH and raw.isdigit():
+            last = int(raw)
+    except OSError:
+        pass
+    seq = now if last + 1 >= _SEQ_LIMIT else max(now, last + 1)
+    try:
+        os.lseek(fd, _SEQ_OFFSET, os.SEEK_SET)
+        os.write(fd, b"%020d" % seq)
+    except OSError:
+        pass
+    return seq
+
+
 def append_event(event_type, payload, session_id=None, tags=None, ts=None, project=None) -> "Event":
     if event_type not in VALID_TYPES:
         raise ValueError(f"unknown event type: {event_type}")
@@ -506,9 +618,11 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None, proje
     d = paths.events_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     seg = d / f"{session_id}.jsonl"
-    with _append_lock(project):
+    with _append_lock(project) as fd:
+        row = to_dict(ev)
+        row["seq"] = _next_seq(fd)
         with open(seg, "a", encoding="utf-8") as f:
-            f.write(canonical_json(to_dict(ev)) + "\n")
+            f.write(canonical_json(row) + "\n")
     return ev
 
 
@@ -575,14 +689,72 @@ def _row_to_event(line: str):
     `hive verify` (any dropped row also changes the hash-chain head, so verify()
     still reports a mismatch — tamper-evidence lives there, not in crashing
     readers)."""
+    return _row_parts(line)[0]
+
+
+def _valid_seq(value):
+    """*value* as an append stamp, or None. Only a real ``int`` in BIGINT range
+    counts: a bool is an int subclass (`True` would read as stamp 1), a float
+    compares against ints and would silently reorder, and a str would make the
+    sort itself raise. Absent and malformed are the same answer -- a LEGACY row
+    -- because reads stay total."""
+    if type(value) is int and 0 <= value < _SEQ_LIMIT:
+        return value
+    return None
+
+
+def _row_parts(line: str):
+    """One ledger line as ``(Event, seq)``, or ``(None, None)`` when the row is
+    malformed (see `_row_to_event`). `seq` is None for a row written before the
+    append sequence existed, and for one whose stamp is not a valid one.
+
+    One `json.loads` serves both halves, which is why this exists rather than a
+    second parse beside `_row_to_event`: every total reader and `chain._scan`
+    already pay for exactly one."""
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
-        return None
+        return None, None
     if not isinstance(obj, dict) or any(k not in obj for k in _REQUIRED_FIELDS):
-        return None
+        return None, None
     known = {k: obj[k] for k in Event.__dataclass_fields__ if k in obj}
-    return Event(**known)
+    return Event(**known), _valid_seq(obj.get("seq"))
+
+
+def _order_key(ts, seq, segment, line_index):
+    """THE ledger read order: ``(ts, seq, segment, line_index)``.
+
+    `ts` first, because it is the event's own time and a backdated row
+    (`incidents.audit`) is meant to sort by it. `seq` breaks ties inside one
+    second in true append order -- the defect this key exists to fix.
+
+    *seq* is the ORDERING stamp `_segment_events` yields, not necessarily the
+    row's own: its own stamp raised to the highest one above it in its segment.
+    None -- no stamp on the row and none above it -- sorts as `LEGACY_SEQ`:
+    FIRST within its second, whenever it was written. A second holding only such
+    rows therefore orders exactly as `(ts, segment, line_index)` always did. A
+    second holding both puts them first, which is the true append order only if
+    no pre-`seq` process appended after the first stamped row existed -- nothing
+    on such a row records when it was written, so long-lived writers such as the
+    dashboard must be restarted after upgrading. The carry covers the commonest
+    shape of that mistake, an unrestarted writer appending to a segment a
+    stamping process also writes; it cannot cover a segment only the old writer
+    uses.
+
+    This is NOT the order a v1 checkpoint was minted in. Every v1 writer sorted
+    seq-blind, over stamped rows too, so `chain._verify_v1` folds
+    ``_order_key(ts, None, segment, line_index)`` -- the legacy order -- and
+    not this key; folding this one against such a head would report untouched
+    history as tampered.
+
+    `segment, line_index` stay last. They are unique per row, so the key is
+    total, and they settle every tie a stamp leaves: rows carrying one stamp
+    down a segment (line order, which is append order there), and a stamp
+    repeated where the high-water mark did not rule it (`_next_seq`).
+    `read_all`, `read_types`
+    and `pgmirror.scan_segments` all sort `_segment_events` on this function;
+    `pgstore.READ_ALL_SQL` spells the same key in SQL."""
+    return (ts or "", LEGACY_SEQ if seq is None else seq, segment, line_index)
 
 
 def _segment_parts(seg):
@@ -664,7 +836,62 @@ def _segment_lines(seg):
             yield i, line
 
 
+def _segment_events(seg):
+    """One segment's parseable rows as ``(line_index, Event, order_seq)``, in
+    line order, malformed and torn rows skipped (reads stay total). The row
+    stream every ORDERED reader sorts: `read_all`, `read_types` and
+    `pgmirror.scan_segments`.
+
+    `order_seq` is the row's own stamp RAISED to the highest stamp above it in
+    this segment, or None while no row so far has carried one. Line order inside
+    a segment IS append order -- appends to it are serialised by `_append_lock`
+    and land at its end -- so a row was written no earlier than anything above
+    it, and the highest stamp above it is a lower bound on when it was written.
+    Two rows it settles that their own stamps get wrong:
+
+    * an UNSTAMPED row below a stamped one. A long-lived process still on
+      pre-`seq` code (the dashboard nobody restarted) appends to `manual.jsonl`
+      beside a `hive` command that stamps; sorted as `LEGACY_SEQ`, its `update`
+      replayed before the `add` above it -- the lost edit again, inside ONE file,
+      which even the filename tie-break never did.
+    * a stamp BELOW one above it, which only an append the mark did not rule can
+      write: one that did not hold the lock, or one that found the mark lost
+      or stale while the clock read no later than a stamp already issued
+      (`_next_seq`).
+
+    A malformed or torn row between two rows does not reset the carry: it is
+    skipped, and the rows below it were still appended after the rows above.
+
+    Across segments the carry only ever moves a row LATER, and only to a stamp
+    issued before the row was written. A row a locked append wrote after it
+    carries a higher stamp, so it still sorts after it -- unless, at that
+    append, the mark it read was below the carried stamp and the clock was not
+    above it: the stamp it issued is then no higher, and an equal one ties and
+    breaks on segment name. The mark is below it only where it never held that
+    stamp or no longer does: a stamp taken from the bare clock ahead of the
+    mark, one whose own write of the mark failed, or a mark lost since
+    (`append.lock` deleted, garbled or unreadable); the clock is not above it
+    after a step back, or inside one tick of a coarse clock (`_next_seq`).
+    Rows above a segment's first stamp keep None, so a ledger
+    written entirely before stamps orders exactly as it always did.
+
+    The carried value is an ORDERING decision, not part of the row:
+    `chain._scan` folds each row's OWN stamp into v3 material, and
+    `chain._legacy_order` ignores stamps altogether, because every v1 writer
+    did."""
+    carried = None
+    for i, line in _segment_lines(seg):
+        ev, seq = _row_parts(line)
+        if ev is None:
+            continue
+        if seq is not None and (carried is None or seq > carried):
+            carried = seq
+        yield i, ev, carried
+
+
 def read_all(project=None) -> list["Event"]:
+    """Every parseable event in the namespace, in `_order_key` order over
+    `_segment_events`."""
     pg = _maybe_read_from_pg(project)
     if pg is not None:
         return pg
@@ -673,13 +900,10 @@ def read_all(project=None) -> list["Event"]:
     if not d.exists():
         return []
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in _segment_lines(seg):
-            ev = _row_to_event(line)
-            if ev is None:
-                continue          # skip a malformed/torn row (reads stay total)
-            rows.append((ev.ts or "", seg.name, i, ev))
-    rows.sort(key=lambda t: (t[0], t[1], t[2]))
-    return [r[3] for r in rows]
+        for i, ev, seq in _segment_events(seg):
+            rows.append((_order_key(ev.ts, seq, seg.name, i), ev))
+    rows.sort(key=lambda t: t[0])
+    return [r[1] for r in rows]
 
 
 def read_types(types, project=None) -> list["Event"]:
@@ -706,13 +930,16 @@ def read_types(types, project=None) -> list["Event"]:
     here silently forks the two readers:
       * `_maybe_read_from_pg` first, so `MINDHIVE_EVENT_BACKEND=pg` does not make
         one reader answer from the mirror and the other from the file store;
-      * `_row_to_event`, so a torn or malformed row is skipped identically and
-        reads stay total;
-      * the `(ts, segment name, line index)` sort key. Filtering BEFORE the sort
-        cannot reorder the survivors — the key is unique per row, so there are no
-        ties to break differently — which is what lets the order-sensitive folds
-        downstream (`sop.fold`, `tasks.fold`, the skill-call pairing) see exactly
-        what a full read would have shown them."""
+      * `_segment_events`, so a torn or malformed row is skipped identically,
+        reads stay total, and each row is ordered by the same carried stamp.
+        The carry runs over EVERY row, before the type filter: a row of another
+        type can hold the stamp a survivor below it sorts by;
+      * `_order_key`, the `(ts, seq, segment name, line index)` sort key.
+        Filtering BEFORE the sort cannot reorder the survivors — the key is
+        unique per row, so there are no ties to break differently — which is
+        what lets the order-sensitive folds downstream (`sop.fold`,
+        `tasks.fold`, the skill-call pairing) see exactly what a full read would
+        have shown them."""
     want = frozenset(str(t) for t in types)
     pg = _maybe_read_from_pg(project)
     if pg is not None:
@@ -722,15 +949,12 @@ def read_types(types, project=None) -> list["Event"]:
     if not d.exists():
         return []
     for seg in sorted(d.glob("*.jsonl")):
-        for i, line in _segment_lines(seg):
-            ev = _row_to_event(line)
-            if ev is None:
-                continue          # skip a malformed/torn row (reads stay total)
+        for i, ev, seq in _segment_events(seg):
             if ev.type not in want:
-                continue
-            rows.append((ev.ts or "", seg.name, i, ev))
-    rows.sort(key=lambda t: (t[0], t[1], t[2]))
-    return [r[3] for r in rows]
+                continue          # filtered AFTER the carry, never before it
+            rows.append((_order_key(ev.ts, seq, seg.name, i), ev))
+    rows.sort(key=lambda t: t[0])
+    return [r[1] for r in rows]
 
 
 def corrupt_rows(project=None) -> list[dict]:

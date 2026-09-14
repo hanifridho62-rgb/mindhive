@@ -26,6 +26,7 @@ NOT repaired here. See `events.corrupt_rows` on why they stay reported.
 """
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -213,6 +214,7 @@ def test_the_append_lock_excludes_a_second_holder():
 _CHILD = """
 import os, sys
 from mindhive import events
+print(events.__file__)
 for i in range(int(sys.argv[2])):
     events.append_event("command_run", {"cmd": "c", "who": sys.argv[1], "i": i},
                         session_id="shared", project="test")
@@ -224,16 +226,22 @@ def test_concurrent_processes_appending_one_segment_lose_no_rows(tmp_path):
     several `hive` invocations shared one `MINDHIVE_SESSION` and therefore one
     segment.
 
-    `PYTHONPATH` is set from the imported module's own location rather than from
-    the cwd. The venv installs `mindhive` editable against the MAIN checkout, so
-    a child launched from a worktree imports master unless told otherwise -- and
-    a child running master's code would be testing the wrong tree while looking
-    identical."""
-    src = str(__import__("pathlib").Path(events.__file__).resolve().parents[2])
+    `PYTHONPATH` leads with the imported package's own ``src`` (``parents[1]``
+    of ``src/mindhive/events.py``), not the cwd. The venv installs `mindhive`
+    editable against the MAIN checkout, so a child launched from a worktree
+    imports master unless told otherwise -- and a child running master's code
+    would be testing the wrong tree while looking identical. ``parents[2]`` is
+    the checkout ROOT, which holds no importable `mindhive`, so it did exactly
+    that. Asserted, not assumed: each child prints the `events` it imported.
+    The parent's own `PYTHONPATH` follows ``src``, so a hook the parent was
+    started with (coverage, a mutation harness) reaches every child too; ``src``
+    leading still decides which tree a child imports."""
+    src = str(pathlib.Path(events.__file__).resolve().parents[1])
     script = tmp_path / "child.py"
     script.write_text(_CHILD, encoding="utf-8")
 
-    env = dict(os.environ, PYTHONPATH=src,
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+                   p for p in (src, os.environ.get("PYTHONPATH")) if p),
                MINDHIVE_HOME=os.environ["MINDHIVE_HOME"],
                MINDHIVE_PROJECT="test", MINDHIVE_AUTORESUME_TIMER="off")
     procs = [subprocess.Popen([sys.executable, str(script), f"p{i}", "40"],
@@ -243,6 +251,10 @@ def test_concurrent_processes_appending_one_segment_lose_no_rows(tmp_path):
     for p in procs:
         out, err = p.communicate(timeout=180)
         assert p.returncode == 0, err.decode("utf-8", "replace")[-2000:]
+        imported = out.decode("utf-8", "replace").strip().splitlines()[-1]
+        assert pathlib.Path(imported).resolve() == \
+            pathlib.Path(events.__file__).resolve(), (
+                f"the child imported {imported}, not this checkout's events")
 
     seg = paths.events_dir("test") / "shared.jsonl"
     lines = [ln for ln in seg.read_text(encoding="utf-8").splitlines()

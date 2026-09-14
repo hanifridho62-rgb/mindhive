@@ -20,10 +20,22 @@ specced, and each is written here as the REFUSAL it must now produce:
 2. **The fall-back ratchet** (KTD4). Without an epoch watermark `fall_back` is a
    no-op loop: the old satisfactions survive and two forward moves return the
    task to the phase that just failed, free.
-3. **Authority beats replay order** (KTD3). `events.now_iso` is
-   second-resolution and `read_all` breaks a same-second tie by SEGMENT NAME,
-   i.e. alphabetically by session id. A verdict that depended on order would be
-   forgeable by spelling a session id with an earlier letter.
+3. **Authority beats replay order** (KTD3). `read_all` sorts by
+   ``(ts, seq, segment, line)`` (`events._order_key`). `ts` is caller-supplied
+   and second-resolution, so a backdated row replays early and ordinary rows tie
+   constantly; the append stamp `seq` settles a tie in APPEND order while the
+   high-water mark in `append.lock` rules every stamp (a fail-open append, or
+   one that finds the mark lost or left stale while the clock reads no later
+   than a stamp already issued, can replay ahead of a row written before it —
+   `events._next_seq`). Where no
+   stamp settles it, `events._segment_events` and `events._order_key` decide:
+   an unstamped row below a stamped one in its segment takes the highest stamp
+   above it; a row with no stamp on or above it sorts FIRST in its second
+   whatever its spelling; and only two such rows, or two sharing a stamp, still
+   break by SEGMENT NAME, i.e. alphabetically by session id. A verdict that
+   depended on order would be forgeable by writing last in a second,
+   backdating, or — on those last rows — spelling a session id with an earlier
+   letter.
 4. **The `pending` regression guard** (KTD12). `pending` is the dataclass
    default for every declared task, so dropping it from the workable set makes
    the machine unusable — nothing could ever take its first step.
@@ -48,9 +60,15 @@ nothing forever. `_declare` below writes both on purpose;
 `test_a_task_declared_only_on_the_graph_axis_orphans_its_phase_events` pins the
 requirement so it cannot be discovered the hard way.
 """
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
-from mindhive import events
+from mindhive import events, paths
 from mindhive.mindnet import controller as c_mod
 from mindhive.mindnet import phases as ph_mod
 from mindhive.mindnet import tasks as t_mod
@@ -439,37 +457,68 @@ def test_a_settled_task_may_still_record_that_it_fell_over():
 
 
 # --- EXPLOIT 3: authority beats replay order (KTD3) -----------------------------
-# `read_all` sorts by ``(ts, segment_name, line)`` and a segment is named
-# ``<session_id>.jsonl``, so a same-second tie between two sessions resolves BY
-# SPELLING. These four cases pin the verdict to the authority instead.
+# `read_all` sorts by `events._order_key`, ``(ts, seq, segment, line)``. `seq` is
+# the append stamp, so a same-second tie between two sessions resolves in APPEND
+# order: whoever writes last in a second replays last, while the high-water mark
+# in `append.lock` rules every stamp. A fail-open append, or one that finds the
+# mark lost or left stale while the clock reads no later than a stamp already
+# issued, can replay ahead of a row written before it (`events._next_seq`); the
+# cross-session re-stat test builds exactly
+# that order on purpose. Before `seq` existed the
+# tie fell to the segment name, ``<session_id>.jsonl`` — i.e. to SPELLING — and
+# it still does between two rows with no stamp on or above them in their
+# segments, or two sharing a stamp; one such unstamped row sorts first against a
+# stamped one whatever its spelling (`events._segment_events`). Either way replay
+# order is something a writer chooses; these four cases pin the verdict to the
+# authority instead.
 
 SAME_TS = "2026-07-25T12:00:00Z"
+NEXT_TS = "2026-07-25T12:00:01Z"       # a second tie, one second later
 DECLARE_TS = "2026-07-25T11:00:00Z"    # strictly before, so the setup replays first
-EARLY_SESSION = "aaa-session"          # sorts first
-LATE_SESSION = "zzz-session"           # sorts last
+EARLY_SESSION = "aaa-session"          # its segment name sorts first
+LATE_SESSION = "zzz-session"           # its segment name sorts last
 
 
-def test_the_ledger_really_does_order_same_second_rows_by_session_spelling():
-    """Proves the exploit is real and not a strawman. If this ever stops
-    holding, the four tests below have stopped discriminating."""
-    _phase_ev({"action": "enter", "task_id": TASK, "phase": "plan",
-               "verified_by": "python"}, ts=SAME_TS, session=LATE_SESSION)
-    _phase_ev({"action": "enter", "task_id": TASK, "phase": "prd",
-               "verified_by": "python"}, ts=SAME_TS, session=EARLY_SESSION)
+def test_the_ledger_orders_same_second_rows_by_append_order_not_session_spelling():
+    """Proves `python_first` below really moves replay order. If this ever stops
+    holding, the four tests below have stopped discriminating: both of their
+    append orders would replay the same way.
+
+    Pinned in BOTH directions, one second each, so no fixed rule over spellings
+    can pass: at SAME_TS ``zzz`` writes first and must replay first (the
+    segment-name tie-break this replaced says ``aaa``); at NEXT_TS ``aaa`` writes
+    first and must replay first (a key that sorted stamps or segment names
+    DESCENDING says ``zzz``)."""
+    for ts, first, second in ((SAME_TS, LATE_SESSION, EARLY_SESSION),
+                              (NEXT_TS, EARLY_SESSION, LATE_SESSION)):
+        _phase_ev({"action": "enter", "task_id": TASK, "phase": "plan",
+                   "verified_by": "python"}, ts=ts, session=first)
+        _phase_ev({"action": "enter", "task_id": TASK, "phase": "prd",
+                   "verified_by": "python"}, ts=ts, session=second)
     evs = [e for e in events.read_all() if e.type == "mindnet_phase"]
-    assert [e.session_id for e in evs] == [EARLY_SESSION, LATE_SESSION], (
-        "same-second rows no longer resolve alphabetically by session id")
+    assert [(e.ts, e.session_id) for e in evs] == [
+        (SAME_TS, LATE_SESSION), (SAME_TS, EARLY_SESSION),
+        (NEXT_TS, EARLY_SESSION), (NEXT_TS, LATE_SESSION),
+    ], "same-second rows no longer replay in append order"
 
 
 @pytest.mark.parametrize("python_first", [True, False])
 @pytest.mark.parametrize("python_session,agent_session", [
-    (LATE_SESSION, EARLY_SESSION),     # python resolves LAST in replay order
-    (EARLY_SESSION, LATE_SESSION),     # python resolves FIRST in replay order
+    (LATE_SESSION, EARLY_SESSION),     # python's segment name sorts last
+    (EARLY_SESSION, LATE_SESSION),     # python's segment name sorts first
 ])
 def test_a_python_fail_is_never_overridden_by_an_agent_ok(
         python_first, python_session, agent_session):
     """All four combinations: both append orders x both session-id spellings.
     A python `fail` is the verdict whichever way the ledger happens to sort.
+
+    `python_first` is the axis that moves replay order: these rows are stamped,
+    so inside SAME_TS they replay in append order (the canary above). The
+    spelling axis no longer changes the order of anything this test writes. It
+    stays because it costs two cases and it still decides between two rows with
+    no stamp on or above them in their segments, or two sharing a stamp
+    (`events._order_key`) — a verdict that flipped with it would be the same
+    forgery through the older door.
 
     The declare is pinned STRICTLY EARLIER than the contradicting pair. Both
     contradicting records must be ACCEPTED for KTD3 to have anything to resolve,
@@ -1085,10 +1134,12 @@ def test_unsound_tasks_is_empty_for_a_sound_graph():
 # branch are injectable, so these tests never shell out to git.
 
 BRANCH = "claude/mindnetwork-system-init-30cb2a"
-# Ordering is pinned, not left to the clock. `now_iso` is second-resolution and
-# `read_all` breaks a tie by SEGMENT NAME, while `restat` writes to the `manual`
-# segment — so an unpinned setup races its own re-stat. Same-second setup rows
-# share one segment and stay line-ordered; the re-stat lands strictly later.
+# Ordering is pinned, not left to the clock. `read_all` sorts on `ts` first, so a
+# walk stamped by `now_iso` (today) would sort AFTER a re-stat pinned at
+# RESTAT_TS and replay the finding ahead of the transition it answers. Setup rows
+# share SETUP_TS and replay in append order (`seq`); RESTAT_TS lands strictly
+# later, so an ordinary re-stat replays after the whole walk on `ts` alone. The
+# two idempotence tests further down build the OPPOSITE order on purpose.
 SETUP_TS = "2026-07-25T10:00:00Z"
 RESTAT_TS = "2026-07-25T11:00:00Z"
 
@@ -1210,61 +1261,181 @@ def test_two_consecutive_restats_append_exactly_one_event(tmp_path):
     assert len(_phase_events()) == before + 1
 
 
+# The two idempotence tests below need a re-stat whose own write replays BEFORE
+# the `enter` it answers — the one order in which the fold does not carry that
+# write back, and so the one order that separates the raw-row existence guard
+# from a fold-based one. Each builds the order explicitly and asserts it.
+BACKDATED_TS = "2026-07-25T09:59:59Z"          # one second before SETUP_TS
+# Two readings of the append clock, the later taken FIRST: the walk is stamped
+# at the later one, the re-stat half a second earlier.
+CLOCK_AT_WALK_US = 2_000_000_000_500_000
+CLOCK_AT_RESTAT_US = 2_000_000_000_000_000
+
+
+def _replays_before_its_enter(restat_event, phase, task_id=TASK):
+    """CANARY for the two idempotence tests: does `read_all` replay
+    *restat_event* ahead of the `enter` that put *task_id* in *phase*?
+
+    Nothing else in those tests notices that order going away. Under the order
+    a re-stat normally gets, the fold carries its write back and a fold-based
+    guard passes them too — which is how both rotted once already: they leaned
+    on the segment-name tie-break, `seq` retired it for rows whose stamps
+    differ, and they went on passing while guarding nothing."""
+    evs = _phase_events()
+    enters = [i for i, e in enumerate(evs)
+              if e.payload.get("action") == "enter"
+              and e.payload.get("task_id") == task_id
+              and e.payload.get("phase") == phase]
+    assert len(enters) == 1, f"expected exactly one enter into {phase}: {enters}"
+    return evs.index(restat_event) < enters[0]
+
+
 def test_a_restat_whose_own_event_the_fold_rejects_appends_without_end(tmp_path):
-    """KNOWN FAILING — a real, unbounded-growth defect, reported not fixed.
+    """The runaway `_restat_fail_recorded` exists to stop, pinned on an order
+    that still produces it.
 
-    `restat`'s idempotence guard is `sat.ref in sat.failed_refs`, i.e. it asks
-    the FOLD whether the failure it just wrote is already recorded. The guard is
-    therefore only as good as the fold's acceptance of `restat`'s own write, and
-    it fails OPEN: whenever that write is not folded back, every call appends
-    again, forever.
+    `restat`'s idempotence guard used to be `sat.ref in sat.failed_refs`: it asked
+    the FOLD whether the failure it had just written was already recorded. That
+    guard is only as good as the fold's acceptance of `restat`'s own write, and
+    it fails OPEN — whenever the write is not folded back, every call appends
+    again, forever, and `hive mindnet show` calls `restat`.
 
-    This is reachable today. `restat` appends with `session_id=None` (segment
-    ``manual.jsonl``) and `ts=now_iso()`, which is second-resolution, while
-    `read_all` sorts by ``(ts, segment_name, line)``. So a re-stat landing in the
-    same wall-clock second as the evidence it is re-checking, from any session
-    whose id sorts after ``manual`` (``s1``, ``session-*``, ``run-*`` — most of
-    them), replays BEFORE the `enter` that put the task in that phase. Its own
-    `fail` becomes an orphan of its own task, `failed_refs` stays empty, and:
-    the phase is never marked stale, `can_advance` keeps letting the task
-    through, and the ledger grows by one event per `hive mindnet show`.
+    The write is not folded back when it replays BEFORE the `enter` that put the
+    task in the phase: it becomes an orphan of its own task, `failed_refs` stays
+    empty, the phase is never marked stale, and `can_advance` keeps letting the
+    task through. `read_all` sorts on ``ts`` FIRST, so a re-stat whose ``ts`` is
+    earlier than the walk's does exactly that. `restat` accepts a caller-supplied
+    ``ts``, and `now_iso` reads a wall clock that can be stepped back across a
+    second boundary; the append stamp cannot rescue either, because ``seq`` only
+    orders rows INSIDE one second. Here the re-stat is backdated by one second.
 
-    The `ts` root cause is deferred by the plan (Scope Boundaries), but the
-    FAIL-OPEN GUARD is not: an append gate that only holds when an unrelated
-    ordering assumption holds is the defect this pins."""
+    This test used to reach that order through a same-second tie broken by
+    segment name (``manual`` sorts before ``s1``). `seq` put that re-stat after
+    the walk, the fold carried it back, and a fold-based guard passed — so the
+    order is now built from ``ts`` and asserted before the count."""
     root = _worktree(tmp_path)
     _walk_with_file_evidence("prd", root, ts=SETUP_TS)
     _EVIDENCE_FILE(root, "prd").unlink()
     before = len(_phase_events())
-    for _ in range(4):
-        c_mod.restat(TASK, root=root, branch=BRANCH, ts=SETUP_TS)
+    results = [c_mod.restat(TASK, root=root, branch=BRANCH, ts=BACKDATED_TS)
+               for _ in range(4)]
+
+    first = results[0]
+    assert first.event is not None, first.reason
+    assert _replays_before_its_enter(first.event, "prd"), (
+        "the backdated re-stat no longer replays ahead of its enter — this test "
+        "has stopped exercising the order the guard fails open on")
+    state, tasks, records = _state()
+    sat = records[TASK].satisfaction("prd", 0)
+    assert sat.ref not in sat.failed_refs, (
+        "the fold carried the re-stat back, so a fold-based guard would pass too")
     assert len(_phase_events()) == before + 1, (
         "restat appended once per call — its idempotence guard failed open")
 
 
-def test_a_restat_from_another_session_still_appends_exactly_once(tmp_path):
-    """The durability case the guard exists for, and the one a process-local or
-    same-session fix would miss.
+# `restat` in a NEW interpreter. stdout is the only channel back, so the child
+# prints exactly what the parent asserts, plus which `controller` it imported.
+_RESTAT_CHILD = """
+import json, sys
+from pathlib import Path
+from mindhive.mindnet import controller
+r = controller.restat(sys.argv[1], root=Path(sys.argv[2]), branch=sys.argv[3],
+                      ts=sys.argv[4], session_id=sys.argv[5])
+print(json.dumps({"controller": controller.__file__, "status": r.status,
+                  "appended": r.event is not None}))
+"""
+
+
+def _restat_in_a_fresh_process(task_id, root, branch, ts, session_id):
+    """`controller.restat` run by a fresh interpreter against this test's store,
+    as ``{"controller", "status", "appended"}``.
+
+    `PYTHONPATH` leads with the imported package's own ``src`` (``parents[2]``
+    of ``src/mindhive/mindnet/controller.py``): the venv installs `mindhive`
+    editable against the MAIN checkout, so a child launched from a worktree
+    would import master and test the wrong tree while looking identical —
+    asserted, not assumed. The parent's own `PYTHONPATH` follows it, so a hook the parent was
+    started with (coverage, a mutation harness) reaches the child too.
+    `MINDHIVE_HOME` / `MINDHIVE_PROJECT` arrive through the environment the
+    autouse fixture set."""
+    src = str(Path(c_mod.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        p for p in (src, os.environ.get("PYTHONPATH")) if p))
+    r = subprocess.run(
+        [sys.executable, "-c", _RESTAT_CHILD, task_id, str(root), branch, ts,
+         session_id],
+        env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert Path(out["controller"]).resolve() == Path(c_mod.__file__).resolve(), (
+        f"the child imported {out['controller']}, not this checkout's controller")
+    return out
+
+
+def test_a_restat_from_another_session_still_appends_exactly_once(
+        tmp_path, monkeypatch):
+    """The durability case the guard exists for: a re-stat from another session,
+    and from another PROCESS, finds the finding already on the ledger.
 
     `restat` runs from a DIFFERENT session than the one that advanced the task,
-    in the same second, with a session id that sorts EARLIER — so its own write
-    replays ahead of the `enter` it answers and the fold will not carry it back.
-    The guard must hold anyway, because it asks the raw ledger rather than the
-    folded record or the previous call's return value."""
+    in the SAME second, and its own write replays ahead of the `enter` it answers,
+    so the fold will not carry it back. The guard must hold anyway, because it
+    asks the raw ledger rather than the folded record or the previous call's
+    return value. The second call runs in this process and fails a fold-based
+    guard. The third runs in a fresh interpreter and fails a process-local one:
+    a memo of "already appended here" passes the second call, because the first
+    call filled it.
+
+    Inside one second the order is the append stamp's, so this order is built
+    from stamps that run BACKWARDS: the wall clock steps back half a second
+    between the walk and the re-stat, and the high-water mark that would have
+    kept stamps rising is gone — `append.lock` deleted, so `_next_seq` finds no
+    mark and seeds from the clock. An append on either of `_append_lock`'s
+    fail-open paths (the file cannot be opened, or the wait times out) reaches
+    the bare clock too: the lock yields None and `_next_seq` neither reads nor
+    writes the mark. The re-stat is the first row of its own segment, so no
+    stamp above it carries it later (`events._segment_events`). The session is
+    spelled to sort AFTER ``s1`` on purpose: were the two stamps equal, the
+    segment-name tie-break would replay this re-stat after the walk, so spelling
+    cannot be what puts it first. That tie-break is what this test used to lean
+    on (``aaa-other-session``); once `seq` retired it for rows whose stamps
+    differ, the test passed against a fold-based guard, so the order is now
+    asserted before the count."""
     root = _worktree(tmp_path)
+    monkeypatch.setattr(events, "_now_us", lambda: CLOCK_AT_WALK_US)
     _walk_with_file_evidence("prd", root, ts=SETUP_TS)      # session "s1"
     _EVIDENCE_FILE(root, "prd").unlink()
     before = len(_phase_events())
-    other = "aaa-other-session"                             # sorts before "s1"
+
+    monkeypatch.setattr(events, "_now_us", lambda: CLOCK_AT_RESTAT_US)
+    (paths.project_dir() / "append.lock").unlink()
+    other = "zzz-other-session"                             # sorts AFTER "s1"
     first = c_mod.restat(TASK, root=root, branch=BRANCH, ts=SETUP_TS,
                          session_id=other)
     second = c_mod.restat(TASK, root=root, branch=BRANCH, ts=SETUP_TS,
                           session_id=other)
+    third = _restat_in_a_fresh_process(TASK, root, BRANCH, SETUP_TS, other)
+
     assert first.event is not None, "the first re-stat recorded nothing"
     assert first.event.session_id == other, (
         "restat did not honour the caller's session — the segment is the "
         "store's join key")
+    assert _replays_before_its_enter(first.event, "prd"), (
+        "the re-stat no longer replays ahead of its same-second enter — this "
+        "test has stopped exercising the order the guard exists for")
+    state, tasks, records = _state()
+    sat = records[TASK].satisfaction("prd", 0)
+    assert sat.ref not in sat.failed_refs, (
+        "the fold carried the re-stat back, so a fold-based guard would pass too")
     assert second.event is None, "the cross-session re-stat appended twice"
+    # CANARY for the negative below: `stale` means the child saw this store's
+    # record and the missing file and reached the guard. Pointed at any other
+    # store it answers `unknown` and appends nothing for that reason instead.
+    assert third["status"] == "stale", (
+        f"the fresh process never reached the guard: {third}")
+    assert not third["appended"], (
+        "a re-stat in a fresh process appended again — the guard remembered the "
+        "finding in process memory, not on the ledger")
     assert len(_phase_events()) == before + 1
 
 

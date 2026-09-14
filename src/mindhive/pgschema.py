@@ -91,8 +91,9 @@ EVENTS_COLUMNS = (
     Column("global_seq", "bigint",
            "Row identity ONLY. Do NOT order by it.",
            "BIGINT identity for row identity only. The ordering contract is "
-           "(ts_key, segment, seg_line) and must not depend on this column, so "
-           "it is a primary key and not an ordering authority."),
+           "(ts_key, COALESCE(append_seq, -1), segment, seg_line) and must "
+           "not depend on this column, so it is a primary key and not an "
+           "ordering authority."),
     Column("ts", "text",
            "ISO-8601 UTC, e.g. '2026-08-16T23:15:14Z'. TEXT, not a timestamp, "
            "because it is the byte-exact string a hash chain covers. Second "
@@ -137,7 +138,7 @@ EVENTS_COLUMNS = (
            "and a column default would silently merge the two cases."),
     Column("segment", "text",
            "Source file name, always '<session_id>.jsonl'.",
-           "TEXT holding the source FILE NAME verbatim. It is the second sort "
+           "TEXT holding the source FILE NAME verbatim. It is the third sort "
            "key of events.read_all — the filename, not the session_id field — "
            "and storing it makes file order derivable from the row rather than "
            "assumed from insert order."),
@@ -146,6 +147,24 @@ EVENTS_COLUMNS = (
            "INTEGER, not BIGINT: the 0-based line index inside one segment, "
            "counting blank and malformed lines because that is what the file "
            "order counts. 2^31 lines in one session is not a reachable state."),
+    Column("append_seq", "bigint",
+           "Ordering stamp: the highest append stamp on this row or above it "
+           "in its segment. It can repeat, and it follows write order only "
+           "where the high-water mark ruled every stamp involved. NULL when "
+           "neither this row nor any row above it in its segment carries a "
+           "valid stamp, which includes every row written before stamps "
+           "existed. It breaks ties WITHIN one second: order by "
+           "COALESCE(append_seq, -1), never by bare append_seq, and never "
+           "instead of ts.",
+           "BIGINT, nullable, never coerced: events.append_event writes it "
+           "under the append lock and the loader keeps only 0 <= seq < 2^63. "
+           "It is the ORDERING stamp: the row's own, raised to the highest one "
+           "above it in its segment (events._segment_events), so a row an "
+           "unrestarted pre-stamp writer appended below a stamped one still "
+           "follows it. NULL means no stamp to order by, and no truthful value "
+           "exists for a legacy row; the -1 sentinel lives in the ORDER BY, "
+           "where it reproduces events._order_key exactly. Appended LAST so 007 "
+           "could extend the view with CREATE OR REPLACE."),
 )
 
 # Kept under its old name because it is the events view's contract specifically,
@@ -213,17 +232,19 @@ EMBEDDINGS_COLUMNS = (
 
 TABLES = (
     Table(
-        "mindhive_ro.events", "003_roles_and_views.sql",
+        "mindhive_ro.events", "007_append_seq.sql",
         "a read-only view, ALREADY SCOPED to one project namespace. Never "
         "write a `project` predicate; there is no such column here, and never "
         "schema-qualify: just `FROM events`.",
         EVENTS_COLUMNS,
-        ("LEDGER ORDER IS (ts, segment, seg_line) -- order by those three, in "
-         "that order. Never by global_seq, and never by ts alone: timestamps "
-         "are second-resolution, so ORDER BY ts returns an arbitrary "
-         "permutation within each second. Reverse all three for newest-first. "
-         "Ordering by session_id instead of segment is WRONG and is not the "
-         "same thing.",),
+        ("LEDGER ORDER IS (ts, COALESCE(append_seq, -1), segment, seg_line) -- "
+         "order by those four, in that order. Never by global_seq, and never "
+         "by ts alone: timestamps are second-resolution, so ORDER BY ts "
+         "returns an arbitrary permutation within each second. Reverse all "
+         "four for newest-first. Bare append_seq is WRONG: Postgres sorts its "
+         "NULLs last, and the ledger puts a row whose append_seq is NULL "
+         "first. Ordering by "
+         "session_id instead of segment is WRONG and is not the same thing.",),
     ),
     Table(
         "mindhive_ro.event_types", "003_roles_and_views.sql",
@@ -368,7 +389,7 @@ The most recent events in one MindHive session, newest first, in true ledger ord
 
 {SCHEMA_DOC}
 
-"Recent" means **latest in ledger order — `(ts, segment, seg_line)` reversed — not latest by clock alone**. That distinction is real: timestamps are second-resolution, so several events routinely share one `ts` and sorting by time alone would hand you an arbitrary permutation of them.
+"Recent" means **latest in ledger order — `(ts, COALESCE(append_seq, -1), segment, seg_line)` reversed — not latest by clock alone**. That distinction is real: timestamps are second-resolution, so several events routinely share one `ts` and sorting by time alone would hand you an arbitrary permutation of them.
 
 `session_id` is exact-match, not a pattern. If you do not know one, get them with `query_database`: `SELECT session_id, min(ts) AS first, max(ts) AS last, count(*) FROM events GROUP BY 1 ORDER BY 3 DESC LIMIT 20`.
 
@@ -412,7 +433,7 @@ The single newest event of one MindHive session. Use this to answer "where did s
 
 {SCHEMA_DOC}
 
-Newest means **latest in ledger order — `(ts, segment, seg_line)` reversed — not latest by clock alone**, because timestamps are second-resolution and several events routinely share one `ts`.
+Newest means **latest in ledger order — `(ts, COALESCE(append_seq, -1), segment, seg_line)` reversed — not latest by clock alone**, because timestamps are second-resolution and several events routinely share one `ts`.
 
 This is the cheapest question in the tool set: one indexed lookup, one row. Reach for it before `get_recent_events` whenever you only need the tip. If the row's `event_type` is `session_end` the session closed cleanly; anything else means it stopped mid-flight or is still running.
 
@@ -652,7 +673,25 @@ TOOL_SCHEMAS = {
 # would put the owner connection one attribute lookup from the AI read path.
 # `tests/test_pgmirror.py` enforces that direction as an allowlist, and this is
 # the module both sides are already allowed to import.
-SCHEMA_VERSION = 1
+#
+# 2 — 007_append_seq.sql added `append_seq`, which only this loader fills. A
+# mirror stamped 1 holds NULL there for every row, so `pgstore.mirror_health`
+# reports it stale and refuses on it until it is reloaded (its recorded parity
+# verdict was proven under the filename tie-break), and
+# `pgmirror.recorded_fingerprint` treats it as unknown, forcing a full reload.
+SCHEMA_VERSION = 2
+
+# The `schema_version` of a `mirror_state` row that no LOAD has stamped.
+# `pgmirror.parity` writes the verdict columns on every run, but the version and
+# `ledger_fingerprint` are claims about a load -- which loader filled the rows,
+# which ledger bytes it read -- and a parity run sees neither, so it leaves both
+# as the last load stamped them. With no row yet, both columns are NOT NULL
+# (001_schema.sql), so that first row needs values that claim nothing: this
+# version, which no loader records because the count started at 1, and a JSON
+# `null` fingerprint. `recorded_fingerprint` answers None for it, so the next
+# refresh reloads every segment, and `pgstore.mirror_health` refuses on it with
+# `hive pg refresh` as the repair.
+UNLOADED_SCHEMA_VERSION = 0
 
 EVENT_TYPE_CLASSES = {
     # semantic — human meaning, rides the LEDGER, the Memory view and recall
@@ -674,7 +713,8 @@ EVENT_TYPE_CLASSES = {
     "sop":                 "semantic",
     "state_set":           "semantic",
     # deterministic — machine telemetry. Hashed like everything else (the chain
-    # folds read_all with no type filter), but off the semantic layer.
+    # hashes every complete row with no type filter, `chain._scan` then
+    # `chain._fold`), but off the semantic layer.
     "assistant_response":  "deterministic",
     "autoresume":          "deterministic",
     "command_run":         "deterministic",

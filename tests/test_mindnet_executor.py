@@ -86,12 +86,22 @@ def _declare(task_id=TASK, script="", **kw):
 
     Every append here deliberately uses the DEFAULT session, the same one
     `executor.validate` writes under. `events.read_all` sorts by
-    ``(ts, segment_name, line)``, so setup events in a segment that sorts after
-    the executor's would replay AFTER the satisfy they are a precondition for —
-    the satisfy would orphan, the fold would show nothing, and the test would
-    fail for a reason that has nothing to do with U6. That is `controller.py`'s
-    documented H17, deferred repo-wide; it is not this unit's to fix, but a test
-    that straddles two segments is testing the tie-break, not the executor."""
+    ``(ts, seq, segment, line)``. The append stamp ``seq`` puts same-second rows
+    in append order while the high-water mark in `append.lock` rules every
+    stamp, but not always across segments: two rows with no stamp on or above
+    them in their segments, or two sharing a stamp, fall back to the segment
+    name; an append on either of `events._append_lock`'s fail-open paths can
+    replay ahead of a row written before it; and so can one that finds the mark
+    lost or left stale by a failed write while the clock reads no later than a
+    stamp already issued (`events._next_seq`). Any of these can replay setup
+    events from another
+    segment AFTER the satisfy they are a precondition for — the satisfy would
+    orphan, the fold would show nothing, and the test would fail for a reason
+    that has nothing to do with U6. That tie-break is H17 in the MN-1 plan
+    (``docs/plans/2026-07-25-001-feat-mn1-phase-spine-plan.md``), which ``seq``
+    settles only for rows whose stamps differ; it is not this unit's to fix, and
+    a test that straddles two segments is testing the tie-break, not the
+    executor."""
     payload = {"action": "declare", "task_id": task_id, "title": f"task {task_id}"}
     if script:
         payload["validation_script"] = script

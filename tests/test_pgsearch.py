@@ -19,6 +19,7 @@ NumPy rides in with `sentence-transformers`, which is an optional extra, so
 every test that needs it is skipped rather than failed on a base install --
 the same rule the rest of the semantic layer follows.
 """
+import re
 import struct
 
 import pytest
@@ -410,6 +411,62 @@ def test_the_notice_is_prose_and_not_one_character_per_word(monkeypatch):
     assert " ".join("hive") not in env["notice"], \
         "the notice was spread one character at a time"
     assert "hive pg embed" in env["notice"]
+
+
+# --------------------------------------------------------------------------
+# the scan order, checked as text (the pg tier runs it against a server)
+# --------------------------------------------------------------------------
+
+_STAMPED_ORDER = ("ORDER BY v.ts DESC NULLS LAST, COALESCE(e.append_seq, -1) "
+                  "DESC, v.segment DESC, v.seg_line DESC")
+_STAMP_JOIN = ("LEFT JOIN mindhive_ro.events e "
+               "ON e.segment = v.segment AND e.seg_line = v.seg_line")
+_VIEW_COLUMNS = ("segment", "seg_line", "model", "ts", "ts_utc", "session_id",
+                 "event_type", "event_id", "dim", "norm", "embedding",
+                 "global_seq", "payload", "tags", "append_seq")
+
+
+def _flat(sql):
+    return " ".join(sql.split())
+
+
+def _bare_columns(sql):
+    """View column names the statement uses without a `v.` / `e.` qualifier."""
+    body = sql.replace("mindhive_ro.event_vectors", " ").replace(
+        "mindhive_ro.events", " ")
+    body = re.sub(r"\b[ve]\.\w+", " ", body)
+    return sorted(c for c in _VIEW_COLUMNS if re.search(rf"\b{c}\b", body))
+
+
+@pytest.mark.parametrize("name", ["VECTORS_SQL", "VECTORS_TYPED_SQL"])
+def test_the_vector_scan_breaks_a_same_second_tie_on_the_append_stamp(name):
+    """The scan is newest-first so the ceiling drops the OLDEST vectors. Within
+    one second the segment filename is not write order, so at the 20,000
+    boundary a vector written later in `aaa-...` was dropped for an older one in
+    `zzz-...`. `mindhive_ro.event_vectors` carries no stamp, so the scan joins
+    the events view for it, through the same COALESCE as every other
+    newest-first statement.
+
+    LEFT, not INNER: an inner join silently drops a vector whose event moved,
+    and `_shape` exists to count exactly those as orphans."""
+    sql = _flat(getattr(pgsearch, name))
+    assert _STAMPED_ORDER in sql, sql
+    assert _STAMP_JOIN in sql, sql
+
+
+@pytest.mark.parametrize("name", ["VECTORS_SQL", "VECTORS_TYPED_SQL"])
+def test_every_column_in_the_joined_scan_names_its_view(name):
+    """Both views expose `segment`, `seg_line`, `ts`, `session_id` and
+    `event_type`, so an unqualified one is `42702 ambiguous column` -- an error
+    only a server raises, which this tier would otherwise ship."""
+    assert _bare_columns(getattr(pgsearch, name)) == []
+
+
+def test_the_bare_column_scan_sees_an_unqualified_name():
+    """CANARY: a scan that found nothing would pass the test above forever."""
+    assert _bare_columns(
+        "SELECT v.segment FROM mindhive_ro.event_vectors v "
+        "ORDER BY ts DESC, segment DESC") == ["segment", "ts"]
 
 
 # --------------------------------------------------------------------------

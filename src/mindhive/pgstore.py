@@ -389,7 +389,7 @@ PROJECT_SCOPE_SQL = "SELECT set_config('mindhive.project', %s, true)"
 # TIMESTAMPTZ round trip would hand it a different value than the file reader
 # would and silently end parity.
 #
-# THREE things about the ORDER BY, and the design document gets one of them
+# FOUR things about the ORDER BY, and the design document gets one of them
 # wrong:
 #
 # 1. `segment`, never `session_id`. '-' (0x2D) sorts below '.' (0x2E), so
@@ -408,10 +408,22 @@ PROJECT_SCOPE_SQL = "SELECT set_config('mindhive.project', %s, true)"
 #    ascending order by default. A NULL `ts` is explicitly legal (the ledger
 #    checks key presence only), so the two would disagree on a row shape the
 #    schema deliberately admits.
+# 4. `COALESCE(append_seq, -1)` BEFORE `segment`. Within one second the filename
+#    is not append order: a `sop` update from session `aaa-…` sorted before the
+#    add session `zzz-…` had written first, so every fold replaying history lost
+#    the edit — on BOTH sides of the gate, which is why parity never noticed.
+#    `append_seq` is the ORDERING stamp `pgmirror.scan_segments` loads -- the
+#    row's own `seq` raised to the highest one above it in its segment
+#    (`events._segment_events`), NULL when there is none -- and -1 is exactly
+#    what `events._order_key` gives a None one. Bare `append_seq` would sort
+#    NULLs LAST and put every row loaded as NULL after the stamped rows of its
+#    second: point 3's trap, one column over.
 #
-# VERIFIED against PostgreSQL 17.11: this statement is what `pgmirror.parity`
-# reads, and it folded 37,435 real events to the same chain head as the file
-# ledger. Point 1 is covered by a constructed fixture rather than by that run —
+# VERIFIED against PostgreSQL 17.11, BEFORE point 4 existed: this statement is
+# what `pgmirror.parity` reads, and it folded 37,435 real events to the same
+# chain head as the file ledger. Point 4 landed with no server reachable, so it
+# is proven only against text and fakes until `tests/test_pg_live.py`'s
+# same-second fixture runs. Point 1 is covered by a constructed fixture rather than by that run —
 # the real ledger has 868 timestamps shared across segments and NOT ONE of them
 # inverts under session_id ordering, so parity on real data passes with the sort
 # key mutated. `tests/test_pg_live.py` builds the `verify.jsonl` /
@@ -425,7 +437,7 @@ PROJECT_SCOPE_SQL = "SELECT set_config('mindhive.project', %s, true)"
 READ_ALL_SQL = """
 SELECT ts, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
-ORDER BY COALESCE(ts, ''), segment, seg_line
+ORDER BY COALESCE(ts, ''), COALESCE(append_seq, -1), segment, seg_line
 """
 
 
@@ -496,10 +508,12 @@ def mirror_health(project: str | None = None) -> dict:
     the model cannot tell "fresh" from "not implemented" from "the check failed"
     — and ambiguity resolves toward the optimistic reading every time.
 
-    `parity_ok` is False whenever the mirror cannot be reached, has never been
-    built, was built by a different schema version, or was built from a ledger
-    that has since changed: an unproven mirror is not a proven one, and this is
-    the one field a caller is told to refuse on.
+    `parity_ok` is the verdict the last parity run recorded, forced False
+    whenever the mirror cannot be reached, has never been built, or was stamped
+    by a different schema version: an unproven mirror is not a proven one, and
+    this is the one field a caller is told to refuse on. Ledger growth since the
+    build is not one of those cases: it sets `stale` and leaves `parity_ok` as
+    recorded (the two are never ANDed; see the comment above the return).
 
     STALENESS IS CHECKED WITHOUT RE-RUNNING PARITY. The recorded row carries the
     `ledger_fingerprint` (segment count and total bytes) the rebuild saw; this
@@ -549,10 +563,11 @@ def mirror_health(project: str | None = None) -> dict:
 
     version, rows, file_head, pg_head, parity_ok, fingerprint, rebuilt_at = row
 
-    stale_reason = None
+    stale_reason = refusal_reason = repair = None
     if version != _schema_version():
-        stale_reason = (f"the mirror was built by schema version {version}, "
-                        f"this reader expects {_schema_version()}")
+        # Not served, however the stored verdict reads: see `_version_mismatch`.
+        stale_reason, refusal_reason, repair = _version_mismatch(version)
+        parity_ok = False
     else:
         now = _ledger_fingerprint(name)
         if fingerprint and now != dict(fingerprint):
@@ -574,10 +589,72 @@ def mirror_health(project: str | None = None) -> dict:
     return {"available": True, "reason": None,
             "parity_ok": bool(parity_ok),
             "stale": stale, "stale_reason": stale_reason,
+            "refusal_reason": refusal_reason, "repair": repair,
             "rows": rows, "schema_version": version,
             "file_head": file_head, "pg_head": pg_head,
             "rebuilt_at": rebuilt_at.isoformat() if rebuilt_at else None,
             "breaker": _BREAKER.state()}
+
+
+# The owner credential is described, never named: this module may not contain
+# that variable's name at all (tests/test_pgstore.py asserts it over the
+# source), and `pgtools`' remedy line names it for the operator.
+_NOT_YOURS = ("You cannot run {it} yourself — {need} the owner credential, "
+              "and the reader role this tool connects with is read-only at the "
+              "role level.")
+
+
+def _version_mismatch(version) -> tuple:
+    """`(stale_reason, refusal_reason, repair)` for a mirror whose recorded
+    `schema_version` is not the one this reader expects.
+
+    The recorded `parity_ok` is not served in this case, however it reads. It
+    was proven by whatever wrote the row, under that writer's ordering contract:
+    version 1 broke same-second ties on the segment filename, so its True says
+    nothing about the order this reader returns rows in. No chain comparison
+    failed, though, so `refusal_reason` is what `pgtools._parity_refusal` shows
+    instead of its chain-head sentence, and `repair` lists the operator's
+    commands in the order they must run.
+
+    Two shapes, with different repairs:
+
+    * `pgschema.UNLOADED_SCHEMA_VERSION` -- `pgmirror.parity` wrote the row with
+      no load behind it, so nothing records which loader filled the rows. No
+      pending migration explains that (parity cannot read a mirror 007 has not
+      reached), and a refresh, which reloads every segment and records itself,
+      is the whole repair.
+    * any other version -- a loader that is not this reader's. After a pull the
+      likeliest cause is that `hive pg migrate` has not run, and a refresh alone
+      then refuses (`pgmirror.refresh` checks for pending migrations). So
+      migrate, THEN refresh."""
+    from . import pgschema
+    expected = pgschema.SCHEMA_VERSION
+    if version == pgschema.UNLOADED_SCHEMA_VERSION:
+        return (
+            "no load has been recorded for this mirror: its state row was "
+            "written by a parity check alone, which proves the rows agree with "
+            "the ledger but not which loader wrote them or from which bytes; "
+            "the OPERATOR runs `hive pg refresh`, which reloads every segment "
+            "and records the load",
+            "the mirror's recorded state has no load behind it (a parity check "
+            "wrote it alone), so this reader cannot tell which loader filled "
+            "the rows it would answer from. To repair: the OPERATOR runs "
+            "`hive pg refresh`, which reloads every segment and records the "
+            "load. " + _NOT_YOURS.format(it="it", need="it needs"),
+            ["hive pg refresh"])
+    return (
+        f"the mirror was loaded under schema version {version}, and this "
+        f"reader expects {expected}: migrations may be pending, so the OPERATOR "
+        f"runs `hive pg migrate`, then `hive pg refresh`, which reloads every "
+        f"segment",
+        f"the mirror was loaded under schema version {version} and this reader "
+        f"expects {expected}, so the parity verdict it recorded was proven "
+        f"under a different ordering contract and cannot vouch for the order "
+        f"this tool would return rows in. To repair: the OPERATOR runs "
+        f"`hive pg migrate` (migrations may be pending), then "
+        f"`hive pg refresh`, which reloads every segment. "
+        + _NOT_YOURS.format(it="either", need="both need"),
+        ["hive pg migrate", "hive pg refresh"])
 
 
 def _schema_version() -> int:

@@ -57,13 +57,35 @@ rule, one home: both callers route the phase-axis half through
 
 3. **Contradictions resolve by AUTHORITY, not replay order** (KTD3):
    ``python > agent > human``, and a `fail` at the deciding authority is never
-   overridden by an `ok`. Replay order is manipulable two independent ways in
-   this codebase — `events.now_iso` is second-resolution and `read_all` breaks a
-   same-second tie ALPHABETICALLY BY SESSION ID (`events.py:129`, `:229-230`),
-   and `append_event` takes a caller-supplied ``ts`` with no monotonicity check
-   at all, backdating being already in production use (`harvest.py:386`). A
-   verdict that depended on order would be forgeable by spelling a session id
-   with an earlier letter. This one is order-INDEPENDENT by construction.
+   overridden by an `ok`. Replay order is something a writer controls in this
+   codebase. `read_all` sorts on `events._order_key`, ``(ts, seq, segment,
+   line)``, and `append_event` takes a caller-supplied ``ts`` with no
+   monotonicity check at all, backdating being already in production use
+   (`harvest.harvest` and `harvest.backfill_skills` append at the transcript's
+   own timestamps), so a backdated row replays ahead of every second it skips.
+   `events.now_iso` is second-resolution, so ordinary rows tie on ``ts``
+   constantly; the append stamp ``seq`` settles that tie in APPEND order, so
+   whoever writes last in a second replays last — while the high-water mark in
+   `append.lock` rules every stamp. A stamp it does not rule can replay ahead of
+   a row written before it (`events._next_seq`): an append on either of
+   `events._append_lock`'s fail-open paths stamps from the bare clock, blind to
+   the mark (below it whenever the mark has run ahead of the clock) and outside
+   the lock, so another append can stamp and write between that stamp and its
+   write; and while the clock reads no later than stamps already issued (it
+   stepped back, or appends inside one tick of a coarse clock ran the mark
+   ahead of it), an append that finds the mark lost (`append.lock` deleted,
+   garbled or unreadable) seeds from the clock, and one that reads a mark a
+   failed write left stale can repeat a stamp or land below one. Where no stamp
+   settles it,
+   `events._segment_events` and `events._order_key` do: an unstamped row below
+   a stamped one in its own segment is ordered by the highest stamp above it; a
+   row with no stamp on or above it sorts FIRST in its second whatever its
+   session id; and two such rows, or two sharing a stamp, break on the segment
+   name, then line — alphabetically by session id, as every same-second tie did
+   before ``seq`` existed. A verdict that depended on order would be forgeable
+   by timing an append, backdating one, or (for those last rows) spelling a
+   session id with an earlier letter. This one is order-INDEPENDENT by
+   construction.
 
 ## Purity
 
@@ -881,10 +903,28 @@ def _restat_fail_recorded(evs, task_id, phase, epoch, ref) -> bool:
     EXISTENCE over the raw rows, deliberately — not `Satisfaction.failed_refs`.
     Asking the FOLD whether the failure `restat` just wrote is on record made the
     guard only as good as the fold's acceptance of that write, and it failed
-    OPEN. `now_iso` is second-resolution and `read_all` breaks a tie by segment
-    name, so a re-stat landing in the same second as the evidence it re-checks
-    can replay BEFORE the `enter` that put the task in that phase, orphan itself,
-    and leave ``failed_refs`` empty — after which EVERY call appended again.
+    OPEN. A re-stat whose row replays BEFORE the `enter` that put the task in
+    that phase orphans itself and leaves ``failed_refs`` empty — after which
+    EVERY call appended again. Before the append stamp existed that took nothing
+    more than a same-second tie, which `read_all` broke by segment name. It is
+    still reachable. `read_all` sorts on ``ts`` first (`events._order_key`), so
+    a caller-supplied ``ts``, or a wall clock stepped back past a second
+    boundary, puts the re-stat ahead of the transition. Inside one second the
+    stamp keeps the re-stat after the `enter` it re-checks while the high-water
+    mark in `append.lock` rules both stamps. A re-stat stamps only after it has
+    read that `enter`, so a stamp the mark does not rule lands below the
+    enter's, or repeats it, only from a clock that reads no later than stamps
+    already issued (it stepped back, it has not yet ticked past the enter's
+    stamp on a coarse clock, or a garbled mark ran them ahead): on either of
+    `events._append_lock`'s fail-open paths (the file cannot be opened, or the
+    wait times out) the re-stat stamps from the bare clock without reading or
+    writing the mark; with the mark lost (`append.lock` deleted, garbled or
+    unreadable) it seeds from the clock; and reading a mark that a failed write
+    left stale, it can land below the enter's stamp or repeat it, a repeat
+    breaking on segment name. A re-stat written by a process still running
+    pre-`seq` code carries
+    no stamp, and with no stamped row above it in its segment sorts FIRST in
+    its second (`events.LEGACY_SEQ`).
     `hive mindnet show` calls `restat`, so that grew the hash chain once per
     look. An existence test is order-INDEPENDENT by construction and survives
     across processes, because it reads the ledger rather than a fold or a
@@ -992,8 +1032,14 @@ def restat(task_id, root=None, branch=None, evs=None, tasks=None, project=None,
         note = f"already recorded at epoch {rec.epoch}; nothing appended"
         if sat.ref not in sat.failed_refs:
             # On the ledger, but the PROJECTION does not carry it — the finding
-            # replayed ahead of the transition it answers (second-resolution
-            # `ts`, segment-name tie-break). Reporting a bare `stale` here would
+            # replayed ahead of the transition it answers: a backdated or
+            # clock-stepped `ts`; a stamp the high-water mark did not rule (a
+            # fail-open append, a lost mark, a mark a failed write left stale)
+            # that landed below the transition's or repeated it, a repeat
+            # breaking on segment name; or no stamp at all, from a writer still
+            # running pre-`seq` code, which sorts first in its second unless a
+            # stamped row above it in its segment carries it (see
+            # `_restat_fail_recorded`). Reporting a bare `stale` here would
             # claim a gate that `can_advance` is not actually applying, so the
             # divergence is named instead of papered over. Appending again would
             # not fix it and is what this guard exists to stop.

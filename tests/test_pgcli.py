@@ -131,7 +131,7 @@ def test_status_lists_the_migration_inventory(capsys):
         "001_schema.sql", "002_indexes.sql", "003_roles_and_views.sql",
         "004_mirror_state_view_and_ownership.sql",
         "005_drop_unmatchable_order_index.sql",
-        "006_event_embeddings.sql"]
+        "006_event_embeddings.sql", "007_append_seq.sql"]
 
 
 def test_status_without_json_prints_readable_lines(capsys):
@@ -180,6 +180,58 @@ def test_no_admin_command_prints_a_traceback(capsys):
     for cmd in ("migrate", "rebuild"):
         _run("pg", cmd)
         assert "Traceback" not in capsys.readouterr().err, cmd
+
+
+def test_a_driver_error_prints_one_line_instead_of_a_traceback(monkeypatch,
+                                                                capsys):
+    """Between pulling a change that adds a column and running `hive pg
+    migrate`, the loader's SQL names a column the table lacks and psycopg raises
+    `UndefinedColumn` -- a `ProgrammingError` under `psycopg.Error`, not a
+    `RuntimeError`. `_admin` caught only the latter, so `hive pg refresh` ended
+    in a traceback whose last line was the only useful one."""
+    psycopg = pytest.importorskip("psycopg")
+    from mindhive import pgmirror
+
+    def undefined_column(project=None):
+        raise psycopg.errors.UndefinedColumn(
+            'column "append_seq" of relation "events" does not exist')
+
+    monkeypatch.setattr(pgmirror, "refresh_changed", undefined_column)
+    rc = _run("pg", "refresh")
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert 'error: UndefinedColumn: column "append_seq"' in err, err
+    assert "Traceback" not in err
+
+
+def test_a_bug_that_is_not_a_driver_error_still_raises():
+    """CANARY for the test above. Catching `Exception` passes it as well, and
+    turns every real defect in a loader into one quiet line and exit 1."""
+    def bug():
+        return {}["missing"]
+
+    with pytest.raises(KeyError):
+        pgcli._admin(bug)
+
+
+def test_a_cli_load_hands_its_own_fingerprint_to_the_verdict(monkeypatch):
+    """`parity` records the schema version and the fingerprint only when it is
+    told which load it follows. `hive pg rebuild` is that case; dropping the
+    hand-off would leave a freshly rebuilt mirror stamped as never loaded, and
+    refused by every tool until a refresh."""
+    from mindhive import pgmirror
+    loaded = {"segments": {"s.jsonl": 7}, "bytes": 7}
+    seen = {}
+
+    def verify(project=None, loaded_fingerprint=None):
+        seen.update(project=project, loaded=loaded_fingerprint)
+        return {"ok": True}
+
+    monkeypatch.setattr(pgmirror, "parity", verify)
+    out = pgcli._loaded_and_verified(
+        lambda project: {"project": "p", "rows": 1, "fingerprint": loaded}, None)
+    assert seen == {"project": "p", "loaded": loaded}
+    assert out["verified"] == {"ok": True}
 
 
 # --------------------------------------------------------------------------

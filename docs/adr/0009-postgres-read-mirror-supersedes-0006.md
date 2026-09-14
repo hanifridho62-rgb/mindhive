@@ -108,6 +108,15 @@ reusing code from a repository this one does not ship with.
   **segment filename**, never `session_id`, and `COALESCE` so NULL timestamps
   land where Python puts them. This is the correction of 0006's invariant, and
   it is written into the SQL, the tool descriptions, and two tests.
+
+  > Amended by migration 007 (`007_append_seq.sql`): the contract is now
+  > `(COALESCE(ts,''), COALESCE(append_seq,-1), segment, seg_line)`. The
+  > argument above about chain heads still holds for the parity gate:
+  > `pgmirror.parity` folds `chain.compute_chain` over both sides in that order,
+  > which is why 007 changed `pgstore.READ_ALL_SQL` together with the file
+  > readers. (Separately, and before 007, the `chain.json` checkpoint moved to
+  > an append-order fold, `chain._scan`, in c41b469.) See DATA_MODEL.md, "The
+  > ordering contract, and the invariant it corrects".
 - A **synchronous** driver (`psycopg` 3), behind an optional extra. No async, no
   bridge, no loop-safety rule to remember.
 - **Phase B is withdrawn.** There is no plan to make Postgres the writer. If one

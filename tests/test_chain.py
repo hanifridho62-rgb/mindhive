@@ -56,6 +56,47 @@ def _put_checkpoint(obj):
         events.canonical_json(obj), encoding="utf-8")
 
 
+_EVENT_KEYS = ("ts", "session_id", "type", "payload", "tags")
+
+
+def _pre_seq_order():
+    """Every row in the order EVERY v1 writer folded: pre-`seq` `read_all`'s
+    ``(ts, segment_name, line_index)``, blind to the append stamp.
+
+    Built from the raw segment bytes, not through `events` or `chain`, because
+    whether the v1 shim reproduces this order is exactly what the tests below
+    ask. An oracle derived from the shim's own helpers would agree with the shim
+    by construction, and a test of that shape passes against any order."""
+    rows = []
+    for seg in _segments():
+        for i, line in enumerate(seg.read_text(encoding="utf-8").split("\n")):
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            ev = events.Event(**{k: obj[k] for k in _EVENT_KEYS})
+            rows.append(((obj["ts"], seg.name, i), ev))
+    rows.sort(key=lambda t: t[0])
+    return [ev for _, ev in rows]
+
+
+def _mint_v1():
+    """chain.json exactly as the pre-append-order `write_chain` wrote it:
+    `compute_chain(sealable(read_all()))` over that code's read order, stored as
+    a bare ``{count, head}``. That code is still what the main checkout runs, so
+    it keeps minting this over rows a newer writer has already stamped."""
+    v1 = chain.compute_chain(chain.sealable(_pre_seq_order()))
+    _put_checkpoint({"count": v1["count"], "head": v1["head"]})
+    return v1
+
+
+def _v2_head():
+    """The head a v2 writer -- one that knows no stamp -- seals over the whole
+    ledger, for fixtures whose rows sit in one segment: there `read_all`'s order
+    IS append order, and `compute_chain` folds the five Event fields, which is
+    v2's material."""
+    return chain.compute_chain(events.read_all())["head"]
+
+
 # --- the core contract --------------------------------------------------------
 
 def test_verify_ok_after_write():
@@ -91,12 +132,22 @@ def test_appended_garbage_keeps_verify_ok_but_shows_in_corrupt_rows():
     assert "unparseable json" in bad[0]["reason"]
 
 
-def test_verify_detects_delete_by_corruption():
+@pytest.mark.parametrize("ver", [2, 3])
+def test_verify_detects_delete_by_corruption(ver):
     # Deleting a sealed event by corrupting its line is caught: the row stops
-    # parsing, so it leaves the fold and the recomputed head moves.
+    # parsing, so it leaves the fold and the recomputed head moves. It also
+    # leaves the sealed prefix, so the stored `count` stops matching -- and the
+    # verdict must still be the `hash_mismatch` it is, under BOTH segment-map
+    # formats, because `verify` compares `count` only after the head. The v2
+    # file is the v3 one with a stamp-blind head; the first verdict is the
+    # canary that the hand-built head really verifies.
     _add("one")
     _add("two", ts="2026-06-20T11:00:00Z")
-    chain.write_chain()
+    stored = chain.write_chain()
+    if ver == 2:
+        _put_checkpoint({**stored, "version": 2, "head": _v2_head()})
+    before = chain.verify()
+    assert before["ok"] is True and before["format"] == ver, before
     seg = _segments()[0]
     seg.write_text(
         seg.read_text(encoding="utf-8").replace('"text":"one"', "GARBAGE"),
@@ -104,6 +155,7 @@ def test_verify_detects_delete_by_corruption():
     result = chain.verify()
     assert result["ok"] is False
     assert result["reason"] == "hash_mismatch"
+    assert result["format"] == ver
 
 
 @pytest.mark.parametrize("body", ['{not json', '[]', '"a string"', '{"count": 1}'])
@@ -407,20 +459,22 @@ def test_a_segment_limit_that_is_not_a_line_count_is_refused(bogus):
 
 # --- the checkpoint's own format ----------------------------------------------
 
+@pytest.mark.parametrize("ver", [2, 3])
 @pytest.mark.parametrize("broken", [[], "x", 5, None])
-def test_a_v2_checkpoint_with_a_wrecked_segments_map_is_refused(broken):
+def test_a_v2_checkpoint_with_a_wrecked_segments_map_is_refused(broken, ver):
     """Dispatch keys on `version`, never on the shape of `segments`. Under
     shape-dispatch all four of these fell through to the v1 shim -- which does
     not read `segments` at all -- and returned ok=True/format=1: a silent
     downgrade to the weaker ts-ordered check, available to anyone who could
-    replace one key in the file the check depends on."""
+    replace one key in the file the check depends on. Both segment-map formats
+    carry the same contract."""
     _add("a")
     stored = chain.write_chain()
-    _put_checkpoint({**stored, "segments": broken})
+    _put_checkpoint({**stored, "version": ver, "segments": broken})
     result = chain.verify()
     assert result["ok"] is False
     assert result["reason"] == "corrupt_chain_file"
-    assert result.get("format") == 2
+    assert result.get("format") == ver
 
 
 def test_a_v2_checkpoint_with_its_version_deleted_is_refused():
@@ -437,7 +491,7 @@ def test_a_v2_checkpoint_with_its_version_deleted_is_refused():
     assert result["reason"] == "corrupt_chain_file"
 
 
-@pytest.mark.parametrize("ver", [3, "2", 1.5, True])
+@pytest.mark.parametrize("ver", [4, "3", "2", 1.5, 3.0, True])
 def test_a_checkpoint_from_an_unknown_format_is_unverifiable_not_green(ver):
     """A version this build does not know is not evidence the ledger is wrong,
     so it is not `corrupt_chain_file`; it is also not a licence to fall back to
@@ -460,6 +514,240 @@ def test_a_genuine_v1_checkpoint_still_reaches_the_shim():
     assert chain.verify()["format"] == 1
 
 
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("ver", [2, 3])
+@pytest.mark.parametrize("bogus", ["x", None, 1.5, 1.0, True, -1, _ABSENT, 0, 999],
+                         ids=["str", "null", "float", "integral-float", "bool",
+                              "negative", "missing", "zero", "too-many"])
+def test_a_checkpoint_count_that_is_not_a_row_count_is_refused(bogus, ver):
+    """`count` is the one checkpoint field nothing validated. `verify` subtracts
+    it from the scanned row count, so `"x"` and `null` raised TypeError out of a
+    function contracted never to raise -- the dashboard overview poll and
+    `hive verify` turned that into a traceback -- while `1.5` returned `ok: true`
+    with `ahead: -0.5`, `True` passed as the count 1, and `-1` passed with a
+    phantom `ahead`. Every segment-map writer emits a non-negative int, so a
+    file carrying anything else (or nothing) was not written by `write_chain`,
+    which is what `corrupt_chain_file` says.
+
+    `0` and `999` ARE non-negative ints, and a type check alone let them
+    through: measured over a head sealing three rows, `0` returned `ok: true,
+    ahead: 3` and `999` returned `ok: true, ahead: -996`. `write_chain` takes
+    `count` and `segments` from one scan, so once the head matches the sealed
+    prefix holds exactly `count` rows; here it holds one. Both values are
+    needed: `0` kills a check that refuses only a count above the prefix, `999`
+    one that refuses only a count below it.
+
+    `1.0` is the case only the dispatch type check can refuse. The fixture seals
+    one row and `1.0 == 1`, so the equality check after the head passes it --
+    measured with the dispatch check widened to admit floats, it verified `ok:
+    true` -- while `1.5` that later check refuses on its own. `True` is the same
+    shape for `bool`.
+
+    The head is valid for the declared format in both parametrisations, so the
+    COUNT is the only thing wrong with the file: a v2 head folded without
+    stamps, a v3 head as `write_chain` sealed it."""
+    _add("a")
+    stored = chain.write_chain()
+    checkpoint = {**stored, "version": ver,
+                  "head": stored["head"] if ver == 3 else _v2_head()}
+    if bogus is _ABSENT:
+        del checkpoint["count"]
+    else:
+        checkpoint["count"] = bogus
+    _put_checkpoint(checkpoint)
+
+    result = chain.verify()
+    assert result["ok"] is False, result
+    assert result["reason"] == "corrupt_chain_file"
+    assert result["format"] == ver
+
+
+@pytest.mark.parametrize("ver", [2, 3])
+def test_a_count_naming_the_scanned_rows_rather_than_the_sealed_ones_is_refused(ver):
+    """`count` is compared with the SEALED prefix, not with the rows on disk.
+    Every case above seals the whole ledger, where the two numbers are equal, so
+    a check admitting anything between them -- ``len(sealed) <= count <=
+    scanned`` -- passes all of those. Here one row is appended after the seal
+    and `count` is set to the scanned total: measured under that range check,
+    the file verified `ok: true` with no `ahead`, hiding the appended row.
+
+    The first verdict is the canary. The honest count must verify with `ahead:
+    1`, so the refusal is about the count, not about the appended row or the
+    hand-built v2 head -- which is taken BEFORE the append, because `_v2_head`
+    folds the whole ledger."""
+    _add("a")
+    stored = chain.write_chain()
+    checkpoint = {**stored, "version": ver,
+                  "head": stored["head"] if ver == 3 else _v2_head()}
+    _add("b")
+    _put_checkpoint(checkpoint)
+    honest = chain.verify()
+    assert honest["ok"] is True and honest["format"] == ver, honest
+    assert honest["ahead"] == 1
+
+    _put_checkpoint({**checkpoint, "count": honest["actual"]["count"]})
+    result = chain.verify()
+    assert result["ok"] is False, result
+    assert result["reason"] == "corrupt_chain_file"
+    assert result["format"] == ver
+    assert "ahead" not in result
+
+
+def test_an_exact_int_count_still_verifies_zero_included():
+    """CANARY for the refusal above: the untouched checkpoint's int count must
+    still verify, or the refusal is proving only that `verify` refuses
+    everything. Zero is here on purpose -- an empty ledger seals `count: 0`, and
+    a falsy test (`not count`) would refuse it as readily as `null`."""
+    stored = chain.write_chain()
+    assert stored["count"] == 0
+    assert chain.verify()["ok"] is True
+
+    _add("a")
+    stored = chain.write_chain()
+    assert type(stored["count"]) is int and stored["count"] == 1
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert "ahead" not in result
+
+
+# --- the append sequence ------------------------------------------------------
+# `seq` decides the read order of rows that share a second, so a sealed row's
+# seq is history like any other field: rewriting it can replay a same-second
+# edit before the record it edits, and every fold downstream would believe it.
+# Checkpoint v3 folds `seq`; v2 was written before it existed and does not.
+
+def _rewrite_seq(session_id, new_seq):
+    seg = _seg(session_id)
+    rows = [json.loads(line) for line in seg.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["seq"] = new_seq
+    seg.write_text("".join(events.canonical_json(r) + "\n" for r in rows),
+                   encoding="utf-8")
+
+
+def _legacy(text, session_id="s", ts="2026-06-20T10:00:00Z"):
+    """A row as pre-`seq` code wrote it: the five Event keys and nothing else."""
+    seg = _seg(session_id)
+    seg.parent.mkdir(parents=True, exist_ok=True)
+    with open(seg, "a", encoding="utf-8") as f:
+        f.write(events.canonical_json(
+            {"ts": ts, "session_id": session_id, "type": "decision",
+             "payload": {"text": text}, "tags": []}) + "\n")
+
+
+def test_write_chain_writes_a_v3_checkpoint():
+    _add("a")
+    stored = chain.write_chain()
+    assert stored["version"] == chain.CHECKPOINT_VERSION == 3
+    assert chain.verify()["format"] == 3
+
+
+def test_rewriting_seq_in_a_sealed_row_is_caught():
+    _add("add", session_id="zzz-writer")
+    _add("edit", session_id="aaa-editor")
+    chain.write_chain()
+
+    _rewrite_seq("zzz-writer", 2 ** 62)
+
+    # The tamper is real: the add now replays AFTER the edit.
+    assert [e.payload["text"] for e in events.read_all()] == ["edit", "add"]
+    result = chain.verify()
+    assert result["ok"] is False
+    assert result["reason"] == "hash_mismatch"
+
+
+def test_a_v2_checkpoint_still_verifies_once_rows_carry_seq():
+    """A store sealed by pre-`seq` code is VERIFIED after the upgrade, not
+    alarmed at: v2 folds the five Event fields, so its head is exactly the
+    event-list chain over the one segment in append order."""
+    _add("a")
+    _add("b")
+    head = chain.compute_chain(events.read_all())["head"]
+    _put_checkpoint({"version": 2, "count": 2, "head": head,
+                     "segments": {"s.jsonl": 2}})
+
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert result["format"] == 2
+
+
+def test_legacy_rows_hash_identically_under_v2_and_v3():
+    """What makes the v3 bump free for history: a row without `seq` contributes
+    the same material to both folds, so re-anchoring a legacy store to v3 does
+    not move any head it could already be compared against."""
+    _legacy("one")
+    _legacy("two")
+    stored = chain.write_chain()
+    assert stored["version"] == 3
+    assert stored["head"] == chain.compute_chain(events.read_all())["head"]
+
+
+def test_a_v3_head_differs_from_a_v2_head_once_rows_carry_seq():
+    """CANARY for the two tests above: if `seq` were silently left out of the v3
+    material, v3 would equal v2 and the tamper test would be the only thing
+    standing -- this names that failure directly."""
+    _add("a")
+    stored = chain.write_chain()
+    assert stored["head"] != chain.compute_chain(events.read_all())["head"]
+
+
+# A v2 checkpoint over stamped rows is GREEN and does not cover their stamps: a
+# process still on pre-v3 code re-sealed rows a newer writer had stamped. That
+# is correct -- it folded what it knew -- but a `seq` rewrite inside that prefix
+# would verify too, so the verdict says how many sealed rows it left uncovered.
+
+def test_a_v2_checkpoint_counts_the_sealed_stamps_it_does_not_cover():
+    """Three sealed rows, two of them stamped, and a stamped row appended after
+    the seal. `seq_unsealed` is 2. That number kills three wrong counts at
+    once: every sealed row (3), every stamped row on disk (3), and every row
+    the scan saw (4)."""
+    _legacy("old")
+    _add("a")
+    _add("b")
+    _put_checkpoint({"version": 2, "count": 3, "head": _v2_head(),
+                     "segments": {"s.jsonl": 3}})
+    _add("after the seal")
+
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert result["format"] == 2
+    assert result["ahead"] == 1
+    assert result["seq_unsealed"] == 2
+
+
+def test_a_v2_checkpoint_over_legacy_rows_reports_no_unsealed_stamp():
+    """Nothing sealed carries a stamp, so nothing is uncovered and the field is
+    ABSENT -- not zero, matching how `ahead` is reported. The stamped row
+    appended after the seal is outside the prefix and must not count; the
+    sibling test above is the canary proving the field can appear at all."""
+    _legacy("one")
+    _legacy("two")
+    _put_checkpoint({"version": 2, "count": 2, "head": _v2_head(),
+                     "segments": {"s.jsonl": 2}})
+    _add("stamped after the seal")
+
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert result["format"] == 2
+    assert result["ahead"] == 1
+    assert "seq_unsealed" not in result
+
+
+def test_a_v3_checkpoint_never_reports_unsealed_stamps():
+    """v3 folds every stamp it seals, so the field is a v2-only warning. Kills
+    an implementation that counts stamped prefix rows whatever the format."""
+    _add("a")
+    _add("b")
+    chain.write_chain()
+
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert result["format"] == 3
+    assert "seq_unsealed" not in result
+
+
 # --- migration ----------------------------------------------------------------
 
 def test_a_v1_checkpoint_is_still_verified_rather_than_alarming():
@@ -468,13 +756,130 @@ def test_a_v1_checkpoint_is_still_verified_rather_than_alarming():
     old ts-prefix check still runs, so nothing reports a false tamper."""
     _add("a", ts="2026-06-20T10:00:00Z")
     _add("b", ts="2026-06-20T10:00:01Z")
-    v1 = chain.compute_chain(chain.sealable(events.read_all()))
-    (paths.project_dir() / "chain.json").write_text(
-        json.dumps({"count": v1["count"], "head": v1["head"]}), encoding="utf-8")
+    _mint_v1()
 
     result = chain.verify()
     assert result["ok"] is True
     assert result["format"] == 1
+
+
+def _stamped_rows_whose_orders_all_disagree():
+    """An earlier-second row, then a same-second add/edit pair across two
+    sessions appended writer first, then a later-second row. Every wrong order
+    a fold could use differs from the one v1 was minted in over the three rows a
+    v1 checkpoint seals (`sealable` holds back the newest second):
+
+    * seq-blind legacy ``(ts, segment, line)``, which v1 was minted in:
+      ``[early, edit, add]``
+    * `read_all`'s ``(ts, seq, segment, line)``: ``[early, add, edit]``
+    * the legacy key with its tail swapped, ``(ts, line, segment)``:
+      ``[early, add, edit]``
+    * the v2/v3 append walk ``(segment, line)``: ``[early, edit, later]``
+
+    so a shim folding any wrong one misses the stored head. `early` is what arms
+    the swapped tail: it pushes `edit` to line 1 of aaa-editor while `add` is
+    line 0 of zzz-writer. With both tie rows at line 0 the line index tied too,
+    the segment name decided under either tail, and that mutant verified green."""
+    _add("early", session_id="aaa-editor", ts="2026-06-20T09:59:59Z")
+    _add("add", session_id="zzz-writer", ts="2026-06-20T10:00:00Z")
+    _add("edit", session_id="aaa-editor", ts="2026-06-20T10:00:00Z")
+    _add("later", session_id="aaa-editor", ts="2026-06-20T10:00:01Z")
+
+
+def test_a_v1_checkpoint_sealed_over_stamped_rows_still_verifies():
+    """The main checkout still runs pre-`seq` code, and its `write_chain` mints
+    v1 over whatever rows are on disk -- stamped ones included, folded in the
+    seq-blind order. When `_verify_v1` folded `read_all`, whose same-second tie
+    now follows `seq`, this untouched store came back `hash_mismatch`, and it
+    stayed red until current code re-anchored it; the stale process's next
+    projection turned it red again. Kills: a shim folding `read_all`, one
+    folding the segment walk, and one sorting on the legacy key with its tail
+    swapped, ``events._order_key(ev.ts, None, line_index, segment)``."""
+    _stamped_rows_whose_orders_all_disagree()
+    v1 = _mint_v1()
+    assert v1["count"] == 3
+
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert result["format"] == 1
+    assert result["ahead"] == 1
+
+
+def test_the_stamped_fixture_really_orders_three_ways():
+    """CANARY for the test above. If the stamp stopped reordering the pair, the
+    pair's session names stopped inverting it, or the pair fell back onto one
+    line index, a wrong order would agree with the legacy one over the sealed
+    three rows and the test above would pass against that defect. The swapped
+    tail is built from the raw bytes for the reason `_pre_seq_order` is."""
+    _stamped_rows_whose_orders_all_disagree()
+    raw = [(json.loads(line), seg.name, i) for seg in _segments()
+           for i, line in enumerate(seg.read_text(encoding="utf-8").splitlines())]
+    walk = [obj["payload"]["text"] for obj, _, _ in raw]
+    swapped = [obj["payload"]["text"] for obj, _, _ in
+               sorted(raw, key=lambda t: (t[0]["ts"], t[2], t[1]))]
+
+    legacy = [e.payload["text"] for e in _pre_seq_order()]
+    assert legacy[:3] == ["early", "edit", "add"]
+    assert [e.payload["text"] for e in events.read_all()][:3] == [
+        "early", "add", "edit"]
+    assert swapped[:3] == ["early", "add", "edit"]
+    assert walk[:3] == ["early", "edit", "later"]
+
+
+def test_a_v1_checkpoint_over_stamped_rows_still_catches_a_tamper():
+    """CANARY that the legacy-order fold still checks something: rewrite the
+    sealed `edit` row and the same checkpoint must go red."""
+    _stamped_rows_whose_orders_all_disagree()
+    _mint_v1()
+    seg = _seg("aaa-editor")
+    seg.write_text(seg.read_text(encoding="utf-8").replace('"edit"', '"forged"'),
+                   encoding="utf-8")
+
+    result = chain.verify()
+    assert result["ok"] is False
+    assert result["reason"] == "hash_mismatch"
+    assert result["format"] == 1
+
+
+def test_the_v1_shim_reads_the_segments_not_read_all(monkeypatch):
+    """`read_all` is not a file read under every configuration: with
+    `MINDHIVE_EVENT_BACKEND=pg` it answers from the Postgres mirror, which also
+    orders by the stamp. The shim must fold the segments it was asked about in
+    the order v1 was minted in, so it has no business calling it. Before this
+    fix the refusal below surfaced as `read_error`."""
+    _add("a", ts="2026-06-20T10:00:00Z")
+    _add("b", ts="2026-06-20T10:00:01Z")
+    _mint_v1()
+
+    def refuse(project=None):
+        raise AssertionError("the v1 shim called events.read_all")
+
+    monkeypatch.setattr(events, "read_all", refuse)
+    result = chain.verify()
+    assert result["ok"] is True, result
+    assert result["format"] == 1
+
+
+@pytest.mark.parametrize("exc, reason", [
+    (json.JSONDecodeError("bad", "{", 0), "corrupt_event_log"),
+    (OSError("segment unreadable"), "read_error"),
+])
+def test_the_v1_shim_maps_a_failed_read_to_a_verdict(monkeypatch, exc, reason):
+    """PRESERVATION pin, green before and after the legacy-order rewrite: the
+    shim's read failures stay verdicts with the reasons they always had, never
+    a raise. `_segment_lines` is the seam because every segment reader --
+    `read_all` then, the shim's own walk now -- goes through it."""
+    _add("a")
+    _mint_v1()
+
+    def explode(seg):
+        raise exc
+
+    monkeypatch.setattr(events, "_segment_lines", explode)
+    result = chain.verify()
+    assert result["ok"] is False
+    assert result["reason"] == reason
+    assert result["detail"] == str(exc)
 
 
 def test_a_v1_checkpoint_still_catches_a_tamper():
@@ -482,9 +887,7 @@ def test_a_v1_checkpoint_still_catches_a_tamper():
     everything through."""
     _add("alpha", ts="2026-06-20T10:00:00Z")
     _add("closer", ts="2026-06-20T10:00:01Z")
-    v1 = chain.compute_chain(chain.sealable(events.read_all()))
-    (paths.project_dir() / "chain.json").write_text(
-        json.dumps({"count": v1["count"], "head": v1["head"]}), encoding="utf-8")
+    _mint_v1()
     seg = _segments()[0]
     seg.write_text(seg.read_text(encoding="utf-8").replace('"alpha"', '"beta"'),
                    encoding="utf-8")

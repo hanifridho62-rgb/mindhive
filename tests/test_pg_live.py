@@ -85,6 +85,36 @@ def write_segment(store, session_id, rows):
     return path
 
 
+def write_stamped_segment(store, session_id, rows):
+    """`write_segment` with an append stamp. `rows` are (ts, text, seq) triples.
+
+    Written by hand rather than through `append_event` so the fixture chooses
+    the stamps: the tests below need a tie whose stamp order is the REVERSE of
+    its filename order, and that must not depend on the wall clock."""
+    path = store["events"] / f"{session_id}.jsonl"
+    path.write_text("".join(
+        json.dumps({"ts": ts, "session_id": session_id, "type": "decision",
+                    "payload": {"text": text}, "tags": [], "seq": seq}) + "\n"
+        for ts, text, seq in rows), encoding="utf-8")
+    return path
+
+
+def load_and_verify(name):
+    """A full load and the verdict that follows it, run the way `hive pg rebuild`
+    runs them: `pgcli._loaded_and_verified(pgmirror.rebuild, name)`.
+
+    Not `rebuild` followed by a bare `parity`. Only a load may record a schema
+    version and a `ledger_fingerprint`: a verdict with no load behind it writes
+    the verdict columns alone, and on a namespace with no row yet it stamps
+    `UNLOADED_SCHEMA_VERSION`, which every reader refuses. So every test below
+    that relies on the recorded fingerprint (the incremental path) or on a
+    served verdict (the tool surface) has to hand the load's own snapshot to
+    `parity` -- and the CLI's pairing is the one path that does, so the tests
+    use it rather than re-deriving it."""
+    from mindhive import pgcli, pgmirror
+    return pgcli._loaded_and_verified(pgmirror.rebuild, name)
+
+
 @pytest.fixture(scope="module")
 def migrated():
     """Schema applied once for the module. Idempotent, so a re-run is free."""
@@ -348,6 +378,51 @@ def test_the_gate_bites_when_the_read_order_is_mutated(migrated, store,
     assert "diverges" in v["reason"]
 
 
+def _stamped_same_second_pair(store):
+    """`zzz-writer` stamped first, `aaa-editor` second, inside one second: the
+    stamp order is the REVERSE of the filename order."""
+    same_ts = "2026-01-01T00:00:00Z"
+    write_stamped_segment(store, "zzz-writer", [(same_ts, "first", 100)])
+    write_stamped_segment(store, "aaa-editor", [(same_ts, "second", 200)])
+
+
+@needs_server
+def test_a_same_second_tie_follows_the_append_stamp_not_the_filename(migrated,
+                                                                     store):
+    """The defect 007 closes, end to end: the file reader, the loaded rows and the
+    parity read all agree on stamp order. The canary below is what rules out the
+    other way to pass -- both sides still sharing the filename key."""
+    from mindhive import events, pgmirror
+    _stamped_same_second_pair(store)
+    assert [e.payload["text"] for e in events.read_all(store["name"])] == [
+        "first", "second"]
+
+    pgmirror.rebuild(store["name"])
+    assert pgmirror.parity(store["name"])["ok"] is True
+    assert _texts_in_read_order(store["name"]) == ["first", "second"]
+
+
+@needs_server
+def test_the_gate_bites_when_the_stamp_is_dropped_from_the_read_order(
+        migrated, store, monkeypatch):
+    """CANARY for the test above. With `append_seq` taken back out of
+    READ_ALL_SQL the mirror reads the pair in filename order, and parity must
+    FAIL on order alone."""
+    from mindhive import pgmirror, pgstore
+    _stamped_same_second_pair(store)
+    pgmirror.rebuild(store["name"])
+    assert pgmirror.parity(store["name"])["ok"] is True, "the fixture is broken"
+
+    mutant = pgstore.READ_ALL_SQL.replace("COALESCE(append_seq, -1), ", "")
+    assert mutant != pgstore.READ_ALL_SQL, "the mutation matched nothing"
+    monkeypatch.setattr(pgstore, "READ_ALL_SQL", mutant)
+    v = pgmirror.parity(store["name"])
+    assert v["ok"] is False, "a read order without the stamp was not detected"
+    assert v["rows"] == v["file_rows"] == 2, (
+        "this must fail on ORDER, not on a row count difference")
+    assert "diverges" in v["reason"]
+
+
 @needs_server
 def test_a_mirror_that_is_merely_behind_is_a_proven_prefix_not_a_failure(
         migrated, store):
@@ -498,10 +573,9 @@ def test_mirror_health_reports_a_namespace_that_was_never_built(migrated,
 def test_mirror_health_reads_the_verdict_a_parity_run_recorded(migrated, store):
     """Needs migration 004: 003 revoked schema `mindhive` from the reader, which
     left the verdict table unreadable by the role that refuses on it."""
-    from mindhive import pgmirror, pgstore
+    from mindhive import pgstore
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "m")])
-    pgmirror.rebuild(store["name"])
-    assert pgmirror.parity(store["name"])["recorded"] is True
+    assert load_and_verify(store["name"])["verified"]["recorded"] is True
 
     pgstore.reset_state()
     h = pgstore.mirror_health(store["name"])
@@ -511,14 +585,53 @@ def test_mirror_health_reads_the_verdict_a_parity_run_recorded(migrated, store):
 
 
 @needs_server
+def test_a_parity_run_with_no_load_behind_it_records_no_load(migrated, store):
+    """Only a LOAD may stamp `schema_version` and `ledger_fingerprint`, asked of
+    the real `mirror_state` table rather than the fake `tests/test_pgmirror.py`
+    pins it with (the column list, the NOT NULL constraints and the JSON null
+    are the server's to accept).
+
+    The window this closes: `parity` used to upsert `SCHEMA_VERSION` and a
+    fingerprint it took itself. Run between a merge that bumps the version and
+    the full reload that version demands, that stamp cleared the gate
+    `recorded_fingerprint` enforces, and the next `refresh_changed` reloaded
+    only the segments that had moved, leaving every other segment's rows as the
+    old loader wrote them under a row claiming the new contract.
+
+    KILLS: a `_record_state` that writes `SCHEMA_VERSION` or a live fingerprint
+    on a verdict that was handed no `loaded_fingerprint`."""
+    from mindhive import pgmirror, pgstore
+    write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "m")])
+    _forget(store["name"])            # a re-run must not inherit a loaded row
+    pgmirror.rebuild(store["name"])
+    assert pgmirror.parity(store["name"])["recorded"] is True
+
+    assert pgmirror.recorded_fingerprint(store["name"]) is None, (
+        "a verdict with no load behind it recorded a fingerprint the gate "
+        "accepts")
+    pgstore.reset_state()
+    h = pgstore.mirror_health(store["name"])
+    assert h["parity_ok"] is False
+    assert h["repair"] == ["hive pg refresh"]
+
+    # CANARY: the same namespace through the load-and-verify path DOES record,
+    # so the None above is the contract rather than a table the admin role
+    # cannot read or a statement that never ran.
+    load_and_verify(store["name"])
+    assert pgmirror.recorded_fingerprint(store["name"]) == (
+        pgmirror._fingerprint(store["name"]))
+    pgstore.reset_state()
+    assert pgstore.mirror_health(store["name"])["parity_ok"] is True
+
+
+@needs_server
 def test_growth_since_the_rebuild_is_reported_as_stale_not_as_parity_failure(
         migrated, store):
     """The distinction the AI tools live or die on: a stale mirror still answers
     (with a notice), a diverged one refuses."""
-    from mindhive import pgmirror, pgstore
+    from mindhive import pgstore
     seg = write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "m")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
 
     seg.write_text(seg.read_text(encoding="utf-8") + json.dumps(
         {"ts": "2026-01-01T00:00:05Z", "session_id": "alpha",
@@ -538,11 +651,10 @@ def test_growth_since_the_rebuild_is_reported_as_stale_not_as_parity_failure(
 
 @needs_server
 def test_every_registered_tool_answers_against_a_real_server(migrated, store):
-    from mindhive import pgmirror, pgstore, pgtools
+    from mindhive import pgstore, pgtools
     write_segment(store, "alpha", [("2026-01-01T00:00:0%dZ" % i, f"m{i}")
                                    for i in range(5)])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgstore.reset_state()
 
     calls = {
@@ -577,11 +689,10 @@ def test_every_registered_tool_answers_against_a_real_server(migrated, store):
 
 @needs_server
 def test_paging_returns_disjoint_pages(migrated, store):
-    from mindhive import pgmirror, pgstore, pgtools
+    from mindhive import pgstore, pgtools
     write_segment(store, "alpha", [("2026-01-01T00:%02d:00Z" % i, f"m{i}")
                                    for i in range(10)])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgstore.reset_state()
 
     first = pgtools.get_recent_events("alpha", limit=4, offset=0)
@@ -598,10 +709,9 @@ def test_a_second_statement_cannot_ride_in_on_query_database(migrated, store):
     A fake cannot answer this: whether a second statement executes depends on
     which libpq entry point psycopg chooses, and that depends on whether the
     parameter sequence is truthy."""
-    from mindhive import pgmirror, pgstore, pgtools
+    from mindhive import pgstore, pgtools
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "m")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgstore.reset_state()
 
     out = pgtools.query_database(
@@ -618,11 +728,10 @@ def test_a_second_statement_cannot_ride_in_on_query_database(migrated, store):
 def test_the_helper_tools_page_at_twenty_by_default(migrated, store):
     """The user-facing bound. 20, not 200: the context window is the resource
     being protected, and a tool that CAN return hundreds of rows will."""
-    from mindhive import pgmirror, pgstore, pgtools
+    from mindhive import pgstore, pgtools
     write_segment(store, "alpha", [("2026-01-01T%02d:00:00Z" % (i % 24), f"m{i}")
                                    for i in range(40)])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgstore.reset_state()
 
     assert pgtools.DEFAULT_LIMIT == 20
@@ -635,10 +744,9 @@ def test_the_helper_tools_page_at_twenty_by_default(migrated, store):
 
 @needs_server
 def test_an_unregistered_event_type_teaches_the_vocabulary(migrated, store):
-    from mindhive import pgmirror, pgstore, pgtools
+    from mindhive import pgstore, pgtools
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "m")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgstore.reset_state()
 
     out = pgtools.search_events_by_type("code_changes")   # the plural typo
@@ -652,11 +760,10 @@ def test_the_session_summary_splits_semantic_from_deterministic(migrated,
                                                                 store):
     """`counts_by_class` was promised in the tool description and computed
     nowhere; every caller got null until the CTE was written."""
-    from mindhive import pgmirror, pgstore, pgtools
+    from mindhive import pgstore, pgtools
     write_segment(store, "alpha", [("2026-01-01T00:00:0%dZ" % i, f"m{i}")
                                    for i in range(3)])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgstore.reset_state()
 
     summary = pgtools.get_session_summary("alpha")["summary"]
@@ -749,7 +856,8 @@ def _texts_in_read_order(project) -> list:
         with conn.cursor() as cur:
             cur.execute("SELECT payload->>'text' FROM mindhive.events "
                         "WHERE project = %s "
-                        "ORDER BY COALESCE(ts,''), segment, seg_line", (project,))
+                        "ORDER BY COALESCE(ts,''), COALESCE(append_seq,-1), "
+                        "segment, seg_line", (project,))
             return [r[0] for r in cur.fetchall()]
     finally:
         conn.close()
@@ -762,11 +870,12 @@ def test_appending_one_event_and_refreshing_leaves_parity_ok(migrated, store):
     do while achieving it."""
     from mindhive import pgmirror
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "a1")])
-    pgmirror.rebuild(store["name"])
-    # `parity` is what STAMPS `mirror_state`, including the fingerprint the
-    # incremental path reads. A rebuild alone leaves the mirror reporting
-    # "never built", which is why `hive pg rebuild` now runs both.
-    assert pgmirror.parity(store["name"])["ok"] is True
+    # Only a LOAD stamps `mirror_state`'s version and the fingerprint the
+    # incremental path reads, and only by handing its own snapshot to `parity`.
+    # A rebuild alone leaves the mirror reporting "never built", and a bare
+    # `parity` records a verdict with no load behind it -- which is why
+    # `hive pg rebuild` runs the pair `load_and_verify` runs.
+    assert load_and_verify(store["name"])["verified"]["ok"] is True
 
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "a1"),
                                    ("2026-01-01T00:00:01Z", "a2")])
@@ -789,8 +898,7 @@ def test_an_untouched_segments_rows_are_not_rewritten(migrated, store):
     from mindhive import pgmirror
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "a1")])
     write_segment(store, "beta", [("2026-01-02T00:00:00Z", "b1")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])          # stamps the fingerprint
+    load_and_verify(store["name"])          # stamps the fingerprint
     before = _seqs(store["name"], "beta.jsonl")
     assert before, "the fixture never loaded beta"
 
@@ -819,8 +927,7 @@ def test_a_segment_whose_earlier_lines_changed_converges(migrated, store):
     from mindhive import pgmirror
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "old"),
                                    ("2026-01-01T00:00:01Z", "keep")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])          # stamps the fingerprint
+    load_and_verify(store["name"])          # stamps the fingerprint
 
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "rewritten"),
                                    ("2026-01-01T00:00:01Z", "keep")])
@@ -853,8 +960,7 @@ def test_a_same_length_in_place_edit_is_invisible_to_the_fingerprint(migrated,
     change or every namespace reports itself permanently stale."""
     from mindhive import pgmirror
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "old")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
 
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "new")])   # same size
     assert pgmirror.changed_segments(
@@ -878,8 +984,7 @@ def test_a_legacy_fingerprint_forces_a_full_refresh(migrated, store):
     exact failure this whole change exists to fix — silently."""
     from mindhive import pgmirror
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "a1")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])          # stamps the fingerprint
+    load_and_verify(store["name"])          # stamps the fingerprint
 
     legacy = {"segments": 1, "bytes": 123}
     assert pgmirror.changed_segments(store["name"], legacy) is None, \
@@ -947,8 +1052,7 @@ def test_refreshing_one_namespace_leaves_another_alone(migrated, tmp_path,
         # THE SAME segment name in both namespaces — that collision is the point.
         write_segment({"events": home / name / "events"}, "alpha",
                       [("2026-01-01T00:00:00Z", text)])
-        pgmirror.rebuild(name)
-        pgmirror.parity(name)               # stamps the fingerprint
+        load_and_verify(name)               # stamps the fingerprint
 
     monkeypatch.setenv("MINDHIVE_PROJECT", names[0])
     write_segment({"events": home / names[0] / "events"}, "alpha",
@@ -968,8 +1072,7 @@ def test_an_empty_change_set_costs_no_connection(migrated, store, monkeypatch):
     that explodes, which is the only way to prove a connection was not made."""
     from mindhive import pgmirror
     write_segment(store, "alpha", [("2026-01-01T00:00:00Z", "a1")])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])          # stamps the fingerprint
+    load_and_verify(store["name"])          # stamps the fingerprint
     assert pgmirror.changed_segments(
         store["name"], pgmirror.recorded_fingerprint(store["name"])) == [], \
         "a rebuild left the recorded fingerprint disagreeing with the disk"
@@ -1313,8 +1416,7 @@ def test_the_semantic_tool_finds_a_memo_over_the_real_server(migrated, store,
         ("2026-01-01T00:00:00Z", "decision", "aaaa"),
         ("2026-01-01T00:00:01Z", "caveat", "zzzzzzzzzzzz"),
     ])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgmirror.embed_events(store["name"])
 
     env = pgtools.call("search_events_by_meaning",
@@ -1337,8 +1439,7 @@ def test_a_type_filter_narrows_the_search_before_ranking(migrated, store,
         ("2026-01-01T00:00:00Z", "decision", "aaaa"),
         ("2026-01-01T00:00:01Z", "caveat", "aaaa but a caveat"),
     ])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgmirror.embed_events(store["name"])
 
     env = pgtools.call("search_events_by_meaning",
@@ -1351,17 +1452,62 @@ def test_a_type_filter_narrows_the_search_before_ranking(migrated, store,
 
 @needs_server
 @needs_vectors
+def test_the_vector_ceiling_keeps_the_later_append_of_a_same_second_tie(
+        migrated, store, empty_index, fake_encoder, monkeypatch):
+    """`pgsearch.VECTORS_SQL` keeps the NEWEST `VECTOR_SCAN_CEILING` vectors, and
+    newest has to mean what the ledger means by it. Inside one second that is
+    the append stamp, not the filename: `zzz-writer` appends first (seq 100)
+    and `aaa-editor` a moment later (seq 200), so the later event sits in the
+    SMALLER filename and a `segment DESC` tie-break keeps the earlier one.
+
+    The same fixture shape as the ordering tests above, asked through the
+    vector scan: with the ceiling at 1 exactly one vector survives the LIMIT,
+    and it must be the later append. The statement is read at call time, so the
+    ceiling and the canary's statement are both patched on the module.
+
+    KILLS: the scan that ordered `ts DESC, segment DESC, seg_line DESC` and never
+    joined `mindhive_ro.events` for the stamp. The CANARY restores that ORDER BY
+    and shows the same fixture then keeps the earlier row, so the first
+    assertion is armed on this data rather than passing on a lucky filename."""
+    from mindhive import pgmirror, pgsearch, pgtools
+    ts = "2026-01-01T00:00:00Z"
+    write_stamped_segment(store, "zzz-writer", [(ts, "first", 100)])
+    write_stamped_segment(store, "aaa-editor", [(ts, "second", 200)])
+    load_and_verify(store["name"])
+    pgmirror.embed_events(store["name"])
+    monkeypatch.setattr(pgsearch, "VECTOR_SCAN_CEILING", 1)
+
+    def kept():
+        env = pgtools.call("search_events_by_meaning",
+                           {"query": "anything", "limit": 1,
+                            "project": store["name"]})
+        assert env["ok"] is True, env.get("error")
+        assert env["summary"]["vectors_compared"] == 1
+        return [r["payload"]["text"] for r in env["rows"]]
+
+    assert kept() == ["second"], \
+        "the vector ceiling kept the earlier append of a same-second tie"
+
+    stamp = "COALESCE(e.append_seq, -1) DESC, "
+    assert stamp in pgsearch.VECTORS_SQL, "the canary no longer edits the scan"
+    monkeypatch.setattr(pgsearch, "VECTORS_SQL",
+                        pgsearch.VECTORS_SQL.replace(stamp, ""))
+    assert kept() == ["first"], \
+        "CANARY unarmed: without the stamp the scan still kept the later append"
+
+
+@needs_server
+@needs_vectors
 def test_searching_a_namespace_with_no_index_names_the_command(migrated, store,
                                                                empty_index,
                                                                fake_encoder):
     """Not an error and not an empty ledger — and the difference is what the
     model has to be told, because the same events are still reachable by type."""
-    from mindhive import pgmirror, pgtools
+    from mindhive import pgtools
     write_typed_segment(store, "alpha", [
         ("2026-01-01T00:00:00Z", "decision", "present but unindexed"),
     ])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
 
     env = pgtools.call("search_events_by_meaning",
                        {"query": "anything", "project": store["name"]})
@@ -1392,8 +1538,7 @@ def test_the_real_encoder_ranks_a_paraphrase_above_an_unrelated_memo(migrated,
         ("2026-01-01T00:00:01Z", "decision",
          "the office coffee machine is broken and nobody has called anyone"),
     ])
-    pgmirror.rebuild(store["name"])
-    pgmirror.parity(store["name"])
+    load_and_verify(store["name"])
     pgmirror.embed_events(store["name"])
 
     env = pgtools.call(

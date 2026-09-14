@@ -467,9 +467,16 @@ def test_the_split_owner_is_real_and_is_what_the_readers_call():
     assert "events._segment_parts(" in Path(
         chain.__file__).read_text(encoding="utf-8"), (
         "chain._scan no longer calls the shared splitter")
-    assert "_events._segment_lines(" in Path(
+    # `scan_segments` reads through `_segment_events`, the ordered row stream it
+    # shares with `read_all` and `read_types`, and that stream reads through
+    # `_segment_lines`. Both links are asserted: either one dropped forks the
+    # mirror's split, or its order, from the file readers'.
+    assert "_events._segment_events(" in Path(
         pgmirror.__file__).read_text(encoding="utf-8"), (
         "pgmirror.scan_segments no longer goes through the shared generator")
+    import inspect
+    assert "_segment_lines(" in inspect.getsource(events._segment_events), (
+        "events._segment_events no longer goes through the shared splitter")
 
 
 @pytest.mark.parametrize("planted", [

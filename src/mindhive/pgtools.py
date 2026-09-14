@@ -127,15 +127,34 @@ def _parity_refusal(tool, project, fresh, started):
     (everything after `rebuilt_at`), so it answers with a stamp. Parity failure
     is unbounded: rows may be missing, duplicated or misordered and you cannot
     say which, so an agent answering from it is confidently wrong with no way to
-    know."""
+    know.
+
+    A mirror loaded under another schema version refuses as well
+    (`pgstore.mirror_health` reports `parity_ok` False for it), but no chain
+    comparison failed there, and the chain-head sentence would send an operator
+    hunting for a divergence that does not exist. So when the freshness stamp
+    carries `refusal_reason`, that is the detail, and its `repair` commands, in
+    order, are the remedy."""
     if fresh.get("parity_ok") is not False:
         return None
+    steps = fresh.get("repair")
     return error_envelope(
         tool, "parity_failed",
-        "the mirror's chain head does not match the file ledger's, so rows may "
-        "be missing, duplicated or misordered and this tool cannot say which",
+        fresh.get("refusal_reason") or (
+            "the mirror's chain head does not match the file ledger's, so rows "
+            "may be missing, duplicated or misordered and this tool cannot say "
+            "which"),
         project=project, retryable=False, elapsed_ms=_ms(started),
+        remedy=(f"an operator runs {_commands(steps)} (they need "
+                f"MINDHIVE_PG_DSN_ADMIN), then re-checks `hive pg status`"
+                if steps else None),
         freshness=fresh)
+
+
+def _commands(steps) -> str:
+    """`["hive pg migrate", "hive pg refresh"]` -> the two, backticked, joined
+    by ", then " -- the order is the instruction."""
+    return ", then ".join(f"`{s}`" for s in steps)
 
 
 def _stale_notice(fresh):
@@ -154,15 +173,29 @@ def _stale_notice(fresh):
     so the repair is not merely unavailable to the model, it is structurally
     impossible for it. Without that clause the honest response to the notice is
     to retry; with it, the honest response is to hand the command to the
-    operator and answer with what the mirror does hold."""
+    operator and answer with what the mirror does hold.
+
+    The COMMAND is `hive pg refresh` unless the freshness stamp says otherwise.
+    A mirror loaded under another schema version carries `repair` (see
+    `pgstore._version_mismatch`), because a refresh alone cannot load a column a
+    pending migration has not added yet: then the notice names those commands,
+    in order, instead."""
+    if not fresh.get("stale"):
+        return None
     reason = fresh.get("stale_reason") or "the mirror has not been rebuilt lately"
+    steps = fresh.get("repair")
+    if not steps:
+        how = ("runs `hive pg refresh`, which reloads only the segments that "
+               "changed. You cannot run it yourself — it needs")
+    elif len(steps) == 1:
+        how = f"runs {_commands(steps)}. You cannot run it yourself — it needs"
+    else:
+        how = (f"runs {_commands(steps)}, in that order. You cannot run them "
+               f"yourself — they need")
     return [f"the mirror is stale ({reason}); rows are still real but anything "
             f"newer than the last rebuild is absent. To repair: the OPERATOR "
-            f"runs `hive pg refresh`, which reloads only the segments that "
-            f"changed. You cannot run it yourself — it needs "
-            f"MINDHIVE_PG_DSN_ADMIN, and the reader role this tool connects "
-            f"with is read-only at the role level."] \
-        if fresh.get("stale") else None
+            f"{how} MINDHIVE_PG_DSN_ADMIN, and the reader role this tool "
+            f"connects with is read-only at the role level."]
 
 
 # --- the connection seam ------------------------------------------------------
@@ -323,7 +356,7 @@ RECENT_SQL = """
 SELECT global_seq, ts, ts_utc, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
 WHERE  session_id = %s
-ORDER  BY ts DESC, segment DESC, seg_line DESC
+ORDER  BY ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s OFFSET %s
 """
 
@@ -331,9 +364,10 @@ LIMIT  %s OFFSET %s
 def get_recent_events(session_id, *, limit=None, offset=0, project=None) -> dict:
     """The newest events of one session, in TRUE ledger order.
 
-    "Recent" is `(ts, segment, seg_line)` reversed, not `ts` alone: timestamps
-    are second-resolution, so several events routinely share one `ts` and
-    sorting by time alone hands back an arbitrary permutation of them."""
+    "Recent" is `(ts, COALESCE(append_seq, -1), segment, seg_line)` reversed,
+    not `ts` alone: timestamps are second-resolution, so several events
+    routinely share one `ts` and sorting by time alone hands back an arbitrary
+    permutation of them."""
     started = _clock()
     try:
         name = project or _project()
@@ -369,7 +403,7 @@ SEARCH_VALUE_SQL = """
 SELECT global_seq, ts, ts_utc, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
 WHERE  payload @> jsonb_build_object(%s::text, %s::jsonb)
-ORDER  BY ts DESC, segment DESC, seg_line DESC
+ORDER  BY ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s OFFSET %s
 """
 
@@ -377,7 +411,7 @@ SEARCH_KEY_SQL = """
 SELECT global_seq, ts, ts_utc, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
 WHERE  payload ? %s
-ORDER  BY ts DESC, segment DESC, seg_line DESC
+ORDER  BY ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s OFFSET %s
 """
 
@@ -551,7 +585,8 @@ WITH s AS (
       FROM (SELECT * FROM s
              WHERE event_type IN ('decision','caveat','experiment_result',
                                   'next_step','open_question')
-             ORDER BY ts, segment, seg_line LIMIT 25) m
+             ORDER BY ts, COALESCE(append_seq, -1), segment, seg_line
+             LIMIT 25) m
 ), changes AS (
     SELECT jsonb_agg(jsonb_build_object('ts', ts, 'category', payload->>'category',
                                         'text', left(payload->>'text', 200),
@@ -604,7 +639,7 @@ LATEST_SQL = """
 SELECT global_seq, ts, ts_utc, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
 WHERE  session_id = %s
-ORDER  BY ts DESC, segment DESC, seg_line DESC
+ORDER  BY ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  1
 """
 
@@ -617,8 +652,9 @@ def get_latest_event(session_id, *, project=None) -> dict:
     whose name says so is a tool a model reaches for correctly. It also cannot
     be talked into returning more, which `limit` can.
 
-    Newest is `(ts, segment, seg_line)` reversed, not `ts` alone -- timestamps
-    are second-resolution and several events routinely share one."""
+    Newest is `(ts, COALESCE(append_seq, -1), segment, seg_line)` reversed, not
+    `ts` alone -- timestamps are second-resolution and several events routinely
+    share one."""
     started = _clock()
     try:
         name = project or _project()
@@ -643,7 +679,7 @@ BY_TYPE_SQL = """
 SELECT global_seq, ts, ts_utc, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
 WHERE  event_type = %s
-ORDER  BY ts DESC, segment DESC, seg_line DESC
+ORDER  BY ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s OFFSET %s
 """
 
@@ -651,7 +687,7 @@ BY_TYPE_SESSION_SQL = """
 SELECT global_seq, ts, ts_utc, session_id, event_type, payload, tags
 FROM   mindhive_ro.events
 WHERE  event_type = %s AND session_id = %s
-ORDER  BY ts DESC, segment DESC, seg_line DESC
+ORDER  BY ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s OFFSET %s
 """
 
@@ -734,7 +770,7 @@ CURRENT_STATE_SQL = """
 SELECT DISTINCT ON (event_type)
        event_type, global_seq, ts, ts_utc, session_id, payload, tags
 FROM   mindhive_ro.events
-ORDER  BY event_type, ts DESC, segment DESC, seg_line DESC
+ORDER  BY event_type, ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s
 """
 
@@ -743,7 +779,7 @@ SELECT DISTINCT ON (event_type)
        event_type, global_seq, ts, ts_utc, session_id, payload, tags
 FROM   mindhive_ro.events
 WHERE  event_type = %s
-ORDER  BY event_type, ts DESC, segment DESC, seg_line DESC
+ORDER  BY event_type, ts DESC, COALESCE(append_seq, -1) DESC, segment DESC, seg_line DESC
 LIMIT  %s
 """
 

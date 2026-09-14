@@ -48,19 +48,51 @@ LIMIT_CEILING = 50
 # The scan is ordered NEWEST FIRST, so when the ceiling binds it drops the
 # OLDEST vectors rather than an arbitrary set. That is a bias, not a neutral
 # sample, and `notice` says so in the response.
+#
+# "Newest" is ledger order reversed -- `(ts, COALESCE(append_seq, -1), segment,
+# seg_line)`, the key every newest-first statement in `pgtools` uses. Without
+# the stamp a same-second tie fell to the segment filename, which is not write
+# order, so at the ceiling a vector written later in `aaa-...` was dropped for
+# an older one in `zzz-...`. `mindhive_ro.event_vectors` carries no stamp (the
+# embeddings loader copies none), and the reader role cannot reach schema
+# `mindhive`, so the scan takes it from `mindhive_ro.events`, which it can read.
+#
+# The join, as far as it has been checked:
+#
+# * INDEX. The key is `(segment, seg_line)` inside one namespace, which is the
+#   mirror's natural key: 001_schema.sql's `events_natural_key UNIQUE (project,
+#   segment, seg_line)` is enforced by a unique btree on exactly those columns,
+#   and both views take `project` from the same `current_setting` predicate. So
+#   an index covering the join exists. Whether the planner probes it through the
+#   two `security_barrier` views, or hashes the namespace's rows instead, has
+#   NOT been EXPLAINed: this landed with no server reachable. What 005 measured
+#   -- the barrier keeps ordered index access out of reach -- is about the ORDER
+#   BY, which sorts above the join either way.
+# * CARDINALITY. That key is UNIQUE, so the join cannot duplicate a vector.
+# * LEFT, not INNER. A vector whose event is no longer at its position keeps its
+#   row, sorts as unstamped (-1), and reaches `_shape`, which counts it as an
+#   orphan; an inner join would drop it before anything could say so. (A
+#   position now holding a DIFFERENT event lends that event's stamp; `hive pg
+#   embed` replaces such a vector, because it compares content hashes.)
+# * QUALIFIED. Both views expose `segment`, `seg_line`, `ts`, `session_id` and
+#   `event_type`, so an unqualified one is an ambiguous-column error.
 VECTORS_SQL = """
-SELECT segment, seg_line, dim, embedding
-FROM   mindhive_ro.event_vectors
-WHERE  model = %s
-ORDER  BY ts DESC NULLS LAST, segment DESC, seg_line DESC
+SELECT v.segment, v.seg_line, v.dim, v.embedding
+FROM   mindhive_ro.event_vectors v
+LEFT   JOIN mindhive_ro.events e
+       ON e.segment = v.segment AND e.seg_line = v.seg_line
+WHERE  v.model = %s
+ORDER  BY v.ts DESC NULLS LAST, COALESCE(e.append_seq, -1) DESC, v.segment DESC, v.seg_line DESC
 LIMIT  %s
 """
 
 VECTORS_TYPED_SQL = """
-SELECT segment, seg_line, dim, embedding
-FROM   mindhive_ro.event_vectors
-WHERE  model = %s AND event_type = %s
-ORDER  BY ts DESC NULLS LAST, segment DESC, seg_line DESC
+SELECT v.segment, v.seg_line, v.dim, v.embedding
+FROM   mindhive_ro.event_vectors v
+LEFT   JOIN mindhive_ro.events e
+       ON e.segment = v.segment AND e.seg_line = v.seg_line
+WHERE  v.model = %s AND v.event_type = %s
+ORDER  BY v.ts DESC NULLS LAST, COALESCE(e.append_seq, -1) DESC, v.segment DESC, v.seg_line DESC
 LIMIT  %s
 """
 

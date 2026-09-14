@@ -431,6 +431,98 @@ def test_health_is_answerable_with_the_backend_down():
 
 
 # --------------------------------------------------------------------------
+# a mirror stamped under another schema version refuses, and names migrate
+# --------------------------------------------------------------------------
+
+class _HealthConn:
+    """A reader connection whose one `mirror_state` row is `row`."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def cursor(self):
+        row = self.row
+
+        class _Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=None):
+                pass
+
+            def fetchone(self):
+                return row
+
+        return _Cursor()
+
+    def close(self):
+        pass
+
+
+_LIVE = object()
+
+
+def _health(monkeypatch, version, fingerprint=_LIVE):
+    """`mirror_health` over a row recording `parity_ok=True` and, by default,
+    the ledger's current fingerprint -- so the version is the only thing off."""
+    if fingerprint is _LIVE:
+        fingerprint = pgstore._ledger_fingerprint("test")
+    row = (version, 3, "f" * 64, "f" * 64, True, fingerprint, None)
+    monkeypatch.setattr(pgstore, "unavailable_reason", lambda: None)
+    monkeypatch.setattr(pgstore, "connect",
+                        lambda role="reader": _HealthConn(row))
+    return pgstore.mirror_health("test")
+
+
+def test_a_mirror_loaded_under_an_older_schema_refuses_and_names_migrate(
+        monkeypatch):
+    """The stored `parity_ok` was proven under the ordering contract of the
+    version that stamped it. Version 1 folded same-second ties by filename, so
+    its True says nothing about the order this reader returns rows in. And the
+    likeliest reason a version-1 row outlives pulling 007 is that migrate has
+    not run -- so the repair is `hive pg migrate`, THEN `hive pg refresh`.
+
+    Kills the `mirror_health` that returned the stored verdict unchanged and
+    named no migration."""
+    h = _health(monkeypatch, pgstore._schema_version() - 1)
+
+    assert h["parity_ok"] is False, \
+        "a verdict proven under another ordering contract was served as proof"
+    assert h["stale"] is True
+    assert h["repair"] == ["hive pg migrate", "hive pg refresh"]
+    for text in (h["stale_reason"], h["refusal_reason"]):
+        assert text.index("hive pg migrate") < text.index("hive pg refresh"), text
+
+
+def test_a_mirror_loaded_under_this_schema_keeps_its_recorded_verdict(
+        monkeypatch):
+    """CANARY. A `mirror_health` that refused every mirror passes the test above
+    and switches every tool off for good."""
+    h = _health(monkeypatch, pgstore._schema_version())
+
+    assert (h["parity_ok"], h["stale"]) == (True, False)
+    assert h["refusal_reason"] is None and h["repair"] is None
+
+
+def test_a_state_row_no_load_ever_stamped_refuses_until_a_refresh(monkeypatch):
+    """`pgmirror.parity` with no load behind it writes a first state row as
+    `UNLOADED_SCHEMA_VERSION` with a JSON null fingerprint. No pending migration
+    explains that row -- parity cannot read a pre-007 mirror at all -- so the
+    repair is a refresh alone, and the message must not describe a loader
+    'version 0' that never existed."""
+    from mindhive import pgschema
+    h = _health(monkeypatch, pgschema.UNLOADED_SCHEMA_VERSION, fingerprint=None)
+
+    assert (h["parity_ok"], h["stale"]) == (False, True)
+    assert h["repair"] == ["hive pg refresh"]
+    assert "hive pg refresh" in h["refusal_reason"]
+    assert "version 0" not in h["stale_reason"]
+
+
+# --------------------------------------------------------------------------
 # the read SQL, checked as text (there is no server to run it against)
 # --------------------------------------------------------------------------
 
@@ -456,6 +548,23 @@ def test_the_read_query_sorts_a_null_timestamp_where_python_does():
     order = pgstore.READ_ALL_SQL.split("ORDER BY", 1)[1]
     assert "COALESCE(ts, '')" in order, \
         "a bare ORDER BY ts puts NULL rows at the opposite end from Python"
+
+
+def test_the_read_query_breaks_a_same_second_tie_on_the_append_stamp():
+    """`ts` is second-resolution and the segment filename is not write order, so
+    a same-second `sop` update from session `aaa-…` read back before the add
+    `zzz-…` had written first, and the fold lost the edit. The stamp goes after
+    `ts` and BEFORE `segment`, and through the SAME sentinel `events._order_key`
+    uses: bare `append_seq` sorts NULLs last, where Python puts every row with
+    no stamp on or above it in its segment first."""
+    from mindhive import events, pgschema
+    order = pgstore.READ_ALL_SQL.split("ORDER BY", 1)[1]
+    stamp = f"COALESCE(append_seq, {events.LEGACY_SEQ})"
+    assert stamp in order, "the stamp is missing, or its sentinel is not Python's"
+    assert order.index("COALESCE(ts, '')") < order.index(stamp) \
+        < order.index("segment") < order.index("seg_line")
+    assert "append_seq" in [c.name for c in pgschema.EVENTS_COLUMNS], \
+        "the reader's view has no append_seq to order on"
 
 
 def test_the_read_query_uses_the_window_the_reader_actually_has():
