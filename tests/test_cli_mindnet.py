@@ -1672,13 +1672,15 @@ def test_decompose_is_on_the_frozen_subcommand_surface():
 # --- `hive mindnet brief` — the briefing's inspection surface ------------------
 #
 # A subcommand rather than an `orchestrate --preview-brief` flag, because
-# `__main__.py` had six lines of ratchet headroom and a flag does not fit in six.
+# `__main__.py` (the parser module then; `commands/parsers/mindnet.py` since the
+# P9 split) had six lines of ratchet headroom and a flag does not fit in six.
 # It registers itself, the trade `bench` and `pgcli` already took.
 
 def test_brief_is_on_the_subcommand_surface():
     """The registration itself. `briefcli.register(mnsub)` is two lines in
-    `__main__.py`, and two lines are easy to lose in a merge — at which point the
-    command silently stops existing."""
+    `commands/parsers/mindnet.py` (`__main__.py` before the P9 split), and two
+    lines are easy to lose in a merge — at which point the command silently
+    stops existing."""
     assert "brief" in _subparser_action(_subparser("mindnet")).choices
 
 
@@ -2043,9 +2045,9 @@ def test_the_signpost_is_absent_from_an_execute_run():
 # run (an operator who runs this daily with --execute is exactly who needs to
 # hear that development moved). One string cannot have both gates.
 #
-# It lives in `mindnet/orchestrator.py`, not `__main__.py`: its text names the
-# other command, and `test_cli_lintester.py` caps how many lines of __main__.py
-# may do that.
+# It lives in `mindnet/orchestrator.py`, not in the handler or parser module:
+# its text names the other command, and `test_cli_lintester.py` caps how many
+# lines of the wiring may do that.
 
 def _notice():
     from mindhive.mindnet import orchestrator as orc_mod
@@ -2129,15 +2131,30 @@ def test_the_notice_is_soft_and_states_no_removal():
 
 
 def test_the_notice_is_not_wired_from_a_second_copy_in_main():
-    """`__main__.py` prints the constant, it does not re-word it. The ratchet in
-    test_cli_lintester.py caps that file at four lines mentioning the other
-    command; a hand-written notice there would spend the whole remaining
-    budget."""
+    """The handler prints the constant, it does not re-word it. The ratchet in
+    test_cli_lintester.py caps the wiring -- the parser package, the `__main__`
+    shim and the handler module together -- at four lines mentioning the other
+    command; a hand-written notice would spend the whole budget.
+
+    Pre-split this scanned ONE file, `__main__.py`, which held BOTH
+    `cmd_mindnet_orchestrate` and the `orchestrate` parser help (the wrap the
+    comment below describes lived in that help). Since the P9 split those are
+    two files -- `commands/mindnet_orchestrate.py` and
+    `commands/parsers/mindnet.py` -- so the scan follows both functions to
+    their files and reads the union: a copy pasted into the parser module is
+    the same leak as one in the handler, and a scan of the handler alone let
+    it through (a review pasted the notice into the parser module and this
+    test stayed green)."""
+    import inspect
     import re
 
     import mindhive.__main__ as main_mod
+    from mindhive.commands.parsers import mindnet as mindnet_parsers
 
-    src = Path(main_mod.__file__).read_text(encoding="utf-8")
+    handler_file = Path(inspect.getsourcefile(main_mod.cmd_mindnet_orchestrate))
+    parser_file = Path(inspect.getsourcefile(mindnet_parsers.add_mindnet))
+    assert handler_file != parser_file, "handler and parser share a file again"
+    src = handler_file.read_text(encoding="utf-8")
     # The PRINT, not the bare symbol: the rewritten docstring names
     # PRIMARY_DOOR_NOTICE too, so `"PRIMARY_DOOR_NOTICE" in src` stayed green
     # with the print deleted. Review caught that; this is the wiring itself.
@@ -2151,14 +2168,16 @@ def test_the_notice_is_not_wired_from_a_second_copy_in_main():
     # reflow away from a red suite blaming a copy nobody made, and an author
     # could have evaded it by splitting a real copy the same way. A second
     # adversarial review found that. Joining the seams removes both.
-    joined = re.sub('"[ ]*"', "", " ".join(src.split()))
     # And the key comes FROM the constant, so it cannot drift from the thing it
     # guards, and it is long enough that the sanctioned one-clause help line
     # cannot match it. The copy that would matter is the notice's own sentence;
     # the help saying the door is not the front one is not that copy.
     key = _notice()[:80]
-    assert key not in joined, (
-        "the notice's wording was copied into __main__.py instead of imported")
+    for scanned in (handler_file, parser_file):
+        joined = re.sub('"[ ]*"', "", " ".join(
+            scanned.read_text(encoding="utf-8").split()))
+        assert key not in joined, (
+            f"the notice's wording was copied into {scanned.name} instead of imported")
 
 
 def test_a_graph_with_no_tasks_still_carries_the_notice():

@@ -436,9 +436,10 @@ def _restamp_sidecar(snapshot, project) -> None:
     MindNetwork gates until the next `hive mindnet rebuild`, and re-running the
     very command that was just refused succeeded.
 
-    `__main__.py` already states the rule this broke — "No ledger append.
-    `sidecar._staleness` counts every event, so a row written here without also
-    rewriting the sidecar would read STALE" — and every other writer in the repo
+    `commands/mindnet_orchestrate.py` (`__main__.py` before the P9 split)
+    already states the rule this broke — "No ledger append. `sidecar._staleness`
+    counts every event, so a row written here without also rewriting the
+    sidecar would read STALE" — and every other writer in the repo
     obeys it by rebuilding. A rebuild is not available here: it costs a full
     `events.read_all` (~264 ms) on the hook that fires for every tool call.
 

@@ -79,7 +79,13 @@ branch touches README first. The full restructure is this TODO.
 
 ---
 
-## 5. Split `__main__.py` (4141 lines, and now holding a raised ceiling)
+## 5. ~~Split `__main__.py` (4141 lines, and now holding a raised ceiling)~~ — DONE 2026-09-14
+
+> **The text below describes the file as it was.** The ceiling ended at 4,237 (raised four
+> times, not once) and the file at 4,227 lines when the split landed; `bench` had by then been
+> joined by `pgcli`, `consensus`, `inject`, `clusters`, `lintester`, `briefcli` and `ab` as
+> self-registering groups, and the surface had grown to 46 top-level subcommands. What was
+> actually done is the **Done** paragraph at the end.
 
 **What:** Split `src/mindhive/__main__.py` into per-domain modules, leaving only argparse wiring.
 
@@ -123,6 +129,25 @@ entry point at `mindhive.__main__:main`; that must survive.
 [the 2026-08-10 plan](docs/plans/2026-08-10-001-fix-feedback-loop-five-surfaces-plan.md) landing
 first, or the merge conflicts are painful. PR-5 deliberately keeps its `__main__.py` hunks to
 argparse wiring only so this rebases cleanly.
+
+**Done, 2026-09-14 (blueprint P9).** `src/mindhive/__main__.py` is a shim under 90 lines: it
+star-imports every handler module's `__all__` from `src/mindhive/commands/` and takes
+`_build_parser` from `src/mindhive/commands/parsers/`, so each `cmd_*` on `mindhive.__main__`
+is the SAME OBJECT as the one in its domain module and every `from mindhive import __main__
+as cli_mod` in the tests still resolves. The handlers went to thirteen modules (`ledger`,
+`context_ops`, `maintenance`, `registry_sop`, `registry_roadmap`, `registry_rules`,
+`dashboard`, `skills`, `mindnet_tasks`, `mindnet_satisfy`, `mindnet_view`,
+`mindnet_orchestrate`, `orchestration`) and the argparse tree to six (`parsers/ledger`,
+`maintenance`, `registry`, `mindnet`, `dashboard`, `orchestration`), each at or under 500
+lines. Bodies were moved by AST line range — byte-identical apart from the extra dot on
+relative imports — and the 159 parser help texts were diffed byte-for-byte against the
+pre-split tree. `tests/test_commands_reexport.py` pins the surface snapshot, the top-level
+registration order, the identity re-export, the dispatch table, the < 90 / <= 500 line caps
+and a cold `-W error` import. The `__main__.py` entry in `tests/test_file_size_cap.py` is
+**deleted**, not lowered — the outcome that list exists to force — and the three tests that
+scanned `__main__.py` as text (`test_cli_lintester`, `test_cli_mindnet`, `test_pgcli`) now
+follow the function to its file with `inspect.getsourcefile`. `pyproject.toml`'s
+`mindhive.__main__:main` entry point is unchanged.
 
 ---
 
@@ -411,6 +436,15 @@ tests must be re-run against today's master, which has moved a long way since 20
 head reached its **base**. It says nothing about master. Any audit that trusts the merged flag
 instead of `git merge-base --is-ancestor <sha> origin/master` will report this feature as
 shipped.
+
+> **2026-09-14.** `src/mindhive/__main__.py` is no longer an append-style registry: since
+> blueprint P9 it is a shim, and the handlers and argparse wiring live in
+> `src/mindhive/commands/<domain>.py` and `src/mindhive/commands/parsers/<domain>.py`. The
+> `__main__.py` conflict above no longer merges by taking both sides — the branch's
+> `cmd_fabricate*` bodies and `fabricate` subparser must be re-homed into those two packages
+> (handler module listed in `commands.HANDLER_MODULES` and star-imported by the shim; the
+> `SURFACE` and `LEAF_HANDLERS` snapshots in `tests/test_commands_reexport.py` extended with
+> `fabricate`).
 
 **Depends on:** nothing. It is independent of every other item here.
 

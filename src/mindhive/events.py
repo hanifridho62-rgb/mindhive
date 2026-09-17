@@ -8,6 +8,11 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from . import paths
+# Bound by identity under this module's name: `append_event` calls the private
+# spelling, so a test (or the watcher) can swap it here without reaching into
+# `embedqueue`. That module imports `paths` only -- no cycle.
+from .embedqueue import count_newlines as _count_newlines
+from .embedqueue import emit_pending_embed_marker as _emit_pending_embed_marker
 
 
 # --- the segment path ------------------------------------------------------------
@@ -28,6 +33,11 @@ from . import paths
 # Verified before it was written: all 2418 segments in the live store match this
 # pattern exactly, so nothing on disk moves.
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# The ANCHORED twin (PDF §8.1), for the validators, which state "the whole id"
+# in the pattern itself. Beside the shared rule, not instead of it: the hooks
+# copy the unanchored spelling. Always applied with `fullmatch` anyway --
+# Python's `$` matches before a trailing newline, the hole `taskview` once had.
+SESSION_ID_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # The segment-name namespace `segment_name` reserves for itself. A conforming
 # id that starts with it, in any case, is quarantined rather than taken at face
@@ -91,6 +101,36 @@ def segment_name(session_id, os_name=None) -> str:
     if SESSION_ID_RE.fullmatch(raw) and not paths.is_reserved_component(name, os_name):
         return name
     return paths.quarantine_name(raw) + ".jsonl"
+
+
+def validate_session_id(session_id) -> str:
+    """*session_id* VERBATIM, or ``ValueError`` -- the loud half of Bug 2.
+
+    `segment_name` is the quiet half: it quarantines, because it sits on the
+    hook path where a raise breaks the session. This is for the surfaces that
+    can afford to refuse -- `cliparse.session_id_arg` and
+    `append_event(strict_session=True)` -- and it accepts exactly what the sink
+    keeps at its STRICTEST platform: the anchored whitelist AND
+    `segment_name(x, os_name="nt") == x + ".jsonl"`. Asked at `nt` on every
+    runner because a store moves between machines: a `CON` accepted on Linux
+    is a device the day the store is opened on Windows, and the reserved
+    `unsafe-` prefix is refused everywhere already. `fullmatch`, never `match`.
+
+    No `.strip()`, no `"unknown"` for `None`: a validator that hands back a
+    value the caller did not pass is a second sanitiser competing with the
+    sink. `append_event` resolves `None` to the environment BEFORE calling.
+    Pure -- it touches no filesystem, which is what lets a strict append
+    refuse before the events directory or the lock exists. The value is
+    rendered with `!r` so a control character in it cannot break the message
+    (or a `re.search` over it) with a raw newline."""
+    if (isinstance(session_id, str) and SESSION_ID_REGEX.fullmatch(session_id)
+            and segment_name(session_id, os_name="nt") == session_id + ".jsonl"):
+        return session_id
+    raise ValueError(
+        f"Format session_id {session_id!r} tidak valid: wajib alfanumerik "
+        "diawali huruf/angka, panjang 1-128 karakter, hanya boleh memuat tanda "
+        "titik, garis bawah, atau strip, tidak boleh berawalan 'unsafe-' (huruf "
+        "besar/kecil), dan bukan nama device Windows (CON, NUL, COM1, ...)")
 
 
 SEMANTIC_TYPES = {
@@ -354,7 +394,7 @@ _PAYLOAD_CONTRACTS = {
                 "hive roadmap set|step|interrupt|resume|complete …"),
     "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
     # `state_set` has NO subcommand -- there is no `hive state --set`, and
-    # `grep -rn state_set src/mindhive/__main__.py` finds nothing -- so the raw
+    # `grep -rn state_set src/mindhive/commands/` finds nothing -- so the raw
     # append below is not one writer among several, it is the ONLY one. That is
     # also why this row was missing for so long: every other contract was
     # registered by the module that owned the surface, and this surface owned
@@ -501,6 +541,51 @@ def canonical_json(obj) -> str:
                       ensure_ascii=False, allow_nan=False)
 
 
+# --- the hash chain's primitives, exported ------------------------------------
+# `chain.py` has always folded the ledger into a SHA-256 chain, but the fold
+# lived inline in `chain.compute_chain` and `chain._fold` with nothing exporting
+# the formula. The background watcher builds an `EventRecord` per physical row
+# and stores `prev_hash` / `chain_hash` in vector metadata; a formula re-derived
+# there by hand could drift from `chain.py` by one `.encode()` argument, and the
+# two digests for one row would disagree without anything noticing. So the
+# primitive lives here. `chain._ZERO` is not rewritten to import this constant
+# -- `chain.py` is untouched -- and `tests/test_events_chain_helpers.py` pins
+# the two equal and the fold identical in both of `chain.py`'s coordinates.
+GENESIS_PREV_HASH = "0" * 64
+
+
+def compute_chain_hash(prev_hash: str, canonical: str) -> str:
+    """One chain step, byte for byte what `chain.compute_chain` and
+    `chain._fold` run: SHA-256 over the UTF-8 bytes of `prev_hash + canonical`,
+    where *canonical* is the str `canonical_json(to_dict(ev))` returns. NOT
+    the PDF's `bytes` parameter with an ASCII-encoded prefix -- a second scheme
+    would make the watcher's digest and the checkpoint's two different numbers
+    for one row (plan decision AMBIG 3)."""
+    return hashlib.sha256((prev_hash + canonical).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    """One physical row as a READER sees it, with its chain coordinates.
+
+    A runtime wrapper, never the row (AMBIG 3): the segment keeps exactly
+    `Event`'s five keys, because every checkpoint on disk was folded over
+    those bytes and a `prev_hash` written into the row would move every head
+    on the first append. Readers build this from a row -- `event_id` is
+    `f"{session_id}:{seg_line}"` with `seg_line` the 1-BASED physical line --
+    and it is frozen so a record handed to a vector store cannot be edited
+    after its `chain_hash` was computed over it."""
+    event_id: str
+    session_id: str
+    seg_line: int
+    timestamp: str
+    event_type: str
+    payload: dict
+    tags: list
+    prev_hash: str
+    chain_hash: str
+
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
@@ -596,10 +681,17 @@ def _append_lock(project):
         os.close(fd)
 
 
-def append_event(event_type, payload, session_id=None, tags=None, ts=None, project=None) -> "Event":
+def append_event(event_type, payload, session_id=None, tags=None, ts=None,
+                 project=None, *, strict_session=False) -> "Event":
     if event_type not in VALID_TYPES:
         raise ValueError(f"unknown event type: {event_type}")
     session_id = session_id or os.environ.get("MINDHIVE_SESSION") or "manual"
+    # Bug 2's loud half, keyword-only and off by default: the hook path keeps
+    # the quarantine below (fail-open), and a surface that can afford to refuse
+    # asks by name. Validated on the RESOLVED id, before the directory and the
+    # lock exist, so a refusal leaves nothing behind -- not even `events/`.
+    if strict_session:
+        validate_session_id(session_id)
     ev = Event(ts=ts or now_iso(), session_id=session_id, type=event_type,
                payload=payload, tags=list(tags or []))
     d = paths.events_dir(project)
@@ -607,11 +699,25 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None, proje
     # Computed BEFORE the lock is taken. `_append_lock` releases in a `finally`,
     # so a raise inside it never wedged the lock -- but a malformed id should not
     # be able to raise from inside a critical section at all, and this ordering
-    # means it cannot.
+    # means it cannot. The strict check above sits earlier still, for the same
+    # reason plus one: it must not be the thing that mints the directory.
     seg = d / segment_name(session_id)
     with _append_lock(project):
+        # 1-based line of the row, counted BEFORE the write, only for rows the
+        # watcher wants; an unreadable segment skips the MARKER, never the row.
+        try:
+            seg_line = _count_newlines(seg) + 1 if event_type in SEMANTIC_TYPES else None
+        except OSError:
+            seg_line = None
         with open(seg, "a", encoding="utf-8") as f:
             f.write(canonical_json(to_dict(ev)) + "\n")
+        if seg_line is not None:
+            # A secondary projection behind the primary record: a marker that
+            # cannot be read or published must never lose or delay the row.
+            try:
+                _emit_pending_embed_marker(project, session_id, seg.name, seg_line)
+            except Exception:                               # noqa: BLE001
+                pass
     return ev
 
 

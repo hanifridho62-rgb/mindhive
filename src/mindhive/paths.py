@@ -459,6 +459,22 @@ def events_dir(project: str | None = None) -> Path:
     return project_dir(project) / "events"
 
 
+def state_dir(project: str | None = None) -> Path:
+    """The namespace's directory for sidecars that are neither the ledger nor
+    a projection of it -- the pending-embed queue first -- made on demand.
+
+    Through `project_dir`, never a join of its own, so a hostile project lands
+    inside the quarantined namespace like everything else in the store (and
+    `tests/test_store_root_files.py`'s root-join guard has nothing new to
+    allow). It mkdirs, unlike `events_dir`, because every caller is about to
+    write; call it only then. `is_freshly_minted` probes `project_dir()` for
+    existence, and a probe that minted the namespace on the way would answer
+    "not fresh" to the very read it exists to warn about."""
+    d = project_dir(project) / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def runs_dir(project: str | None = None) -> Path:
     """Per-run output artifacts (runlog.py). Evidence, not a projection: unlike
     events/ these are not rebuildable, and losing one degrades every consumer to

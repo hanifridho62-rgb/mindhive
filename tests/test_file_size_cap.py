@@ -40,7 +40,8 @@ cannot drift from the lens that scores against them.
 
 `replenish._python_modules` is deliberately non-recursive and skips `__`-prefixed
 names, so the lens can see neither `__main__.py` nor `mindnet/controller.py` —
-both of which are over the cap. This test walks the whole tree, which is why its
+the latter still over the cap, the former four times over it until the split
+recorded above `ALLOWED`. This test walks the whole tree, which is why its
 allowlist is longer than anything the lens has ever proposed.
 """
 from pathlib import Path
@@ -154,8 +155,17 @@ CAP = replenish.LINE_THRESHOLD
 # monkeypatch hazard was answered rather than hoped away: `pgtools` re-exports
 # every moved name and `tests/test_pgshape.py` asserts each is the same OBJECT,
 # and the names the tests actually patch never moved at all.
+#
+# `__main__.py` is NOT on this list any more either. The split every paragraph
+# above kept naming as the real fix happened on 2026-09-14 (blueprint P9): the
+# handlers moved to `src/mindhive/commands/<domain>.py`, the argparse tree to
+# `src/mindhive/commands/parsers/`, and `__main__.py` became a shim that
+# re-exports every handler BY IDENTITY -- the same answer to the monkeypatch
+# hazard that `pgtools` gave. `tests/test_commands_reexport.py` holds the shim
+# under 90 lines and every `commands/**/*.py` at or under 500, a ratchet that
+# turns the other way, so the entry is DELETED rather than lowered, exactly as
+# `pgtools.py`'s was.
 ALLOWED = {
-    "__main__.py": 4237,          # the CLI surface; every command's argparse wiring
     "replenish.py": 2781,         # the suggestion lenses; a split is already deferred
     "workspace.py": 1462,         # MindParallel orchestration
     "research.py": 1353,          # Self-Reliant research runs

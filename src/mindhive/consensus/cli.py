@@ -1,13 +1,16 @@
 # src/mindhive/consensus/cli.py
 """The `hive consensus` group: its parser and its handlers, in one file.
 
-WHY THIS IS NOT IN `__main__.py`. That module is nearly four times the 1000-line
-cap and is on `tests/test_file_size_cap.py`'s allowlist at a recorded length —
-which is a ratchet, not a licence, so a new group adding a hundred lines there is
-a test failure and deserves to be. `pgcli.register` (after `bench`) made
-self-registration the convention for a multi-subcommand group: two lines in
-`__main__.py` — one import, one `register(sub)` call — and every flag sits beside
-the handler that reads it.
+WHY THIS IS NOT IN THE PARSER MODULE. When this was written that module was
+`__main__.py`, nearly four times the 1000-line cap and on
+`tests/test_file_size_cap.py`'s allowlist at a recorded length — a ratchet, not
+a licence, so a new group adding a hundred lines there was a test failure and
+deserved to be. Since the P9 split the wiring is `commands/parsers/`, capped at
+500 lines per module by `tests/test_commands_reexport.py`, and the argument
+holds unchanged. `pgcli.register` (after `bench`) made self-registration the
+convention for a multi-subcommand group: two lines in the parser module — one
+import, one `register(sub)` call — and every flag sits beside the handler that
+reads it.
 
 WHY THE HANDLERS SIT BESIDE THE PARSER RATHER THAN BESIDE THE FOLD. The fold in
 `__init__.py` takes events and returns data — no printing, no exit codes, no
@@ -146,7 +149,8 @@ def cmd_trace(args) -> int | None:
 
 
 def register(subparsers) -> None:
-    """Wire the `consensus` group onto ``__main__``'s subparser set.
+    """Wire the `consensus` group onto the root subparser set built by
+    `commands.parsers._build_parser`.
 
     Three verbs and not one per aggregation shape: `fold` reads the frame's own
     data to decide numeric-vs-categorical, so an operator never has to know which

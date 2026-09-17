@@ -11,8 +11,9 @@ between looking and doing must be an explicit flag — not a default anybody can
 flip by editing one line.
 
 `test_the_registration_stays_within_the_ratchet` guards the reason this command
-lives in its own module at all: `src/mindhive/__main__.py` is under a
-shrink-only cap in `tests/test_file_size_cap.py`, and the self-registering
+lives in its own module at all: the parser module -- `src/mindhive/__main__.py`
+until the P9 split, `src/mindhive/commands/parsers/__init__.py` since -- is
+under a line cap (`tests/test_commands_reexport.py`), and the self-registering
 pattern is what keeps a new command from eating it.
 """
 import argparse
@@ -55,7 +56,11 @@ def test_the_parser_carries_the_positional_intent():
 
 
 def test_the_registration_stays_within_the_ratchet():
-    """The whole reason `cli.py` exists rather than 90 more lines in `__main__`."""
+    """The whole reason `cli.py` exists rather than 90 more lines in the parser
+    module. That module was `__main__.py` when this was written; the P9 split
+    moved `_build_parser` to `mindhive.commands.parsers`, so the scan follows
+    the function to whichever file owns it instead of naming one."""
+    import inspect
     import re
 
     from mindhive import review as review_mod
@@ -63,25 +68,41 @@ def test_the_registration_stays_within_the_ratchet():
     # The cap is read out of the one file that owns it rather than copied here.
     # A copy is a second authority, and the two drift the first time somebody
     # lowers the real one.
-    cap_src = (REPO / "tests" / "test_file_size_cap.py").read_text(
+    cap_src = (REPO / "tests" / "test_commands_reexport.py").read_text(
         encoding="utf-8")
-    match = re.search(r'"__main__\.py":\s*(\d+)', cap_src)
-    assert match, "the ratchet entry moved or was renamed"
+    match = re.search(r"^MODULE_CAP\s*=\s*(\d+)", cap_src, re.MULTILINE)
+    assert match, "the commands-module cap moved or was renamed"
 
     # `review._line_count` takes a PATH, not the text. Handing it the whole
     # file body made it raise OSError internally and answer 0, so this half of
     # the ratchet asserted `0 <= 4237` and could never fail -- it was green on
     # a file of any length. Found when the other half went red for real.
-    path = REPO / "src" / "mindhive" / "__main__.py"
-    text = path.read_text(encoding="utf-8")
+    path = Path(inspect.getsourcefile(cli_mod._build_parser))
     cap = int(match.group(1))
     counted = review_mod._line_count(str(path))
     assert counted > 0, "the cap check went vacuous again"
-    assert counted <= cap, f"__main__.py is {counted} lines, cap {cap}"
+    assert counted <= cap, f"{path.name} is {counted} lines, cap {cap}"
 
-    block = [ln for ln in text.splitlines() if "lintester" in ln]
-    assert len(block) <= 4, (
-        f"the command's wiring is leaking back into __main__.py: {block}")
+    # The whole wiring, SUMMED: every module of the parser package, the shim,
+    # and the module that owns `cmd_mindnet_orchestrate` (whose signpost names
+    # this command once, as it did in `__main__.py`). Pre-split the four lines
+    # sat in ONE file against a cap of four -- zero headroom. Capping each file
+    # at four after the split handed the same leak several budgets (a review
+    # planted five in the handler module and four in a sibling parser module
+    # and stayed green), so the cap is on the sum, and it is still four.
+    shim = REPO / "src" / "mindhive" / "__main__.py"
+    handler = Path(inspect.getsourcefile(cli_mod.cmd_mindnet_orchestrate))
+    scanned = sorted({shim, handler, *path.parent.glob("*.py")})
+    assert path in scanned and len(scanned) >= 4, scanned
+    block = {}
+    for f in scanned:
+        hits = [ln for ln in f.read_text(encoding="utf-8").splitlines()
+                if "lintester" in ln]
+        if hits:
+            block[f.name] = hits
+    total = sum(len(v) for v in block.values())
+    assert total <= 4, (
+        f"the command's wiring is leaking back into the parser tree: {block}")
 
 
 def test_the_help_text_names_the_start_flag_without_minting_a_synonym():

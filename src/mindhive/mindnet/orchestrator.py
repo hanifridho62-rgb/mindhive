@@ -120,8 +120,9 @@ OUTCOME_USAGE = "usage-halted"
 # It IS on the CLI's exit-1 side, with `stalled` and `capped`. The distinction it
 # draws is diagnostic, not a promotion to success: the agents ran, but nothing is
 # verified until `hive mindnet validate` says so, and a wrapping CI step that
-# passed here would be reporting unverified work as done. See `__main__.py`'s
-# `cmd_mindnet_orchestrate` and `test_orchestrate_exits_non_zero_when_the_wave_
+# passed here would be reporting unverified work as done. See
+# `commands/mindnet_orchestrate.py`'s `cmd_mindnet_orchestrate` and
+# `test_orchestrate_exits_non_zero_when_the_wave_
 # only_awaits_validation`.
 OUTCOME_AWAITING_VALIDATION = "awaiting-validation"
 OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
@@ -129,8 +130,9 @@ OUTCOMES = (OUTCOME_SETTLED, OUTCOME_STALLED, OUTCOME_CAPPED, OUTCOME_DRY_RUN,
 
 # Printed by `cmd_mindnet_orchestrate` on every non-JSON run, dry or not. It
 # lives HERE because it names the other command and `test_cli_lintester.py` caps
-# how many lines of `__main__.py` may — a notice is not wiring, and the cap is
-# for wiring. SOFT carries the contract: nothing is removed, disabled, or
+# how many lines of the wiring (`commands/parsers/`, the shim, and the handler
+# module) may — a notice is not wiring, and the cap is for wiring. SOFT carries
+# the contract: nothing is removed, disabled, or
 # scheduled for either. "Use the other one instead" would be false: the mission
 # pipeline never folds a declared graph (`controller`, `briefcli`, `decompose`
 # and `ab` read one; none of them runs it). "Still supported" overpromised: the

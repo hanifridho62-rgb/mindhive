@@ -2,8 +2,9 @@
 # advertised but did not have.
 """Two places promised this command before it existed:
 
-  * `__main__.py` prints the hint "(hive skills list / hive plugins list)" —
-    the first half works, the second exited 2.
+  * the CLI (`__main__.py` then, `commands/registry_sop.py` now) prints the
+    hint "(hive skills list / hive plugins list)" — the first half works, the
+    second exited 2.
   * the MANDATORY SOP resident in MEMORY.md, re-injected on every prompt, carries
     "hive plugins list still does not run".
 

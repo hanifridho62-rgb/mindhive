@@ -3,23 +3,28 @@
 
 ## Why a subcommand and not a flag
 
-The obvious shape was `hive mindnet orchestrate --preview-brief`. It does not
-fit: `__main__.py` sits AT its shrink-only ratchet (`tests/test_file_size_cap.py`),
-and an argparse flag plus its branch does not fit in what that leaves. That file's
-own comment says the fix is splitting it and that "raising a ceiling is not it" —
-twice. Deliberately stated without the arithmetic: an earlier version of this
+The obvious shape was `hive mindnet orchestrate --preview-brief`. It did not
+fit: `__main__.py` sat AT its shrink-only ratchet (`tests/test_file_size_cap.py`)
+when this was written, and an argparse flag plus its branch did not fit in what
+that left. That file's own comment said the fix was splitting it and that
+"raising a ceiling is not it" — twice. (It was split, on 2026-09-14, blueprint
+P9: the wiring is now `commands/parsers/mindnet.py`, held at or under 500 lines
+by `tests/test_commands_reexport.py`.) Deliberately stated without the
+arithmetic: an earlier version of this
 paragraph quoted a line count that the same change then invalidated, and a reader
 budgeting against a stale number overspends.
 
-The same file records the way out, also twice: `bench.register` and
-`pgcli.register` put ~200 lines of behaviour in a module and cost `__main__.py`
-three. This is the third, and it registers on the `mindnet` subparser rather than
+The same file recorded the way out, also twice: `bench.register` and
+`pgcli.register` put ~200 lines of behaviour in a module and cost the parser
+module three lines. This is the third, and it registers on the `mindnet`
+subparser rather than
 the top level, which is the only new thing about it.
 
 One consequence worth writing down, because it looks like a typo otherwise: the
-registration comment in `__main__.py` names `bench` but deliberately does NOT
-name the other sibling. `test_the_registration_is_two_lines_in_main` counts raw
-source lines in `__main__.py` carrying that module's name, so a comment
+registration comment in `commands/parsers/__init__.py` names `bench` but
+deliberately does NOT name the other sibling.
+`test_the_registration_is_two_lines_in_main` counts raw source lines in
+`commands/parsers/__init__.py` carrying that module's name, so a comment
 mentioning it is indistinguishable from a third line of registration and turns a
 correct guard red. The guard is right to be that literal — it exists to catch an
 argparse block being inlined back in — so the comment moved instead.
@@ -51,9 +56,10 @@ from .. import cliparse
 
 from . import brief as br_mod
 
-# What `hive mindnet` returns when it refuses. A local copy of `__main__.MN_REFUSED`
-# rather than an import, because `__main__` imports THIS module to register the
-# subcommand and the reverse import closes the cycle.
+# What `hive mindnet` returns when it refuses. A local copy of
+# `commands.mindnet_tasks.MN_REFUSED` (re-exported as `__main__.MN_REFUSED`)
+# rather than an import, because the parser package imports THIS module to
+# register the subcommand and the reverse import closes the cycle.
 # `tests/test_cli_mindnet.py::test_brief_refuses_a_missing_task_the_way_its_siblings_do`
 # pins the two equal, so the copy cannot drift. (The name cited here until
 # 2026-08-30 — `test_briefcli_refuses_like_its_siblings` — greps to nothing; a
@@ -64,9 +70,10 @@ REFUSED = 2
 def register(subparsers) -> None:
     """Wire `brief` onto the `mindnet` subparser set.
 
-    Two lines in `__main__.py` — an import and one call — instead of the ~40 an
-    inline parser would cost against a ratchet with no headroom left. Same trade
-    `bench.register` and `pgcli.register` took; see the module docstring."""
+    Two lines in the parser module (`commands/parsers/mindnet.py`) — an import
+    and one call — instead of the ~40 an inline parser would cost against a
+    ratchet with no headroom left. Same trade `bench.register` and
+    `pgcli.register` took; see the module docstring."""
     p = subparsers.add_parser(
         "brief", help="show what a spawned agent would be told about a task "
                       "(reads only; starts nothing)")

@@ -2195,8 +2195,8 @@ LENSES["caveat"] = caveat
 # against the real repo — and the real repo is 4000 tests wide.
 
 # The thermo-nuclear threshold. Not a new opinion: `docs/session-legend.md`
-# already records `__main__.py` sitting past this line as a standing caveat, and
-# the review skill checks against the same number.
+# recorded the pre-split `__main__.py` sitting past this line as a standing
+# caveat, and the review skill checks against the same number.
 LINE_THRESHOLD = 1000
 
 # How many lines past the threshold make one step of magnitude. It does double

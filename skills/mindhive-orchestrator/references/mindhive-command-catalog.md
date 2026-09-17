@@ -1,7 +1,8 @@
 # MindHive Command Catalog
 
 The full `hive` / `python -m mindhive` command surface that the orchestrator draws
-on. Every command below is a real subcommand in `src/mindhive/__main__.py`. Reach
+on. Every command below is a real subcommand wired in `src/mindhive/commands/parsers/`
+(the `hive` entry point `src/mindhive/__main__.py` is a shim over that package). Reach
 for a command only when the phase calls for it — the [SKILL.md](../SKILL.md)
 Function-Call Syntax section lists the handful you use most.
 

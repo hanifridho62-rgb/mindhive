@@ -1,13 +1,14 @@
 # src/mindhive/clusterscli.py
 """`hive clusters` — the parallel-orchestration layer the skill pipeline reads.
 
-## Why this lives outside `__main__.py`
+## Why this lives outside the parser module
 
 Third module to take the self-registering trade, after `bench.register` and
-`briefcli.register`, and for the reason those two record: `__main__.py` sits at a
-shrink-only ratchet (`tests/test_file_size_cap.py`) with no headroom, and the
-argparse wiring plus three `cmd_*` bodies is ~55 lines of it. Here it costs that
-file three.
+`briefcli.register`, and for the reason those two record: `__main__.py` sat at a
+shrink-only ratchet (`tests/test_file_size_cap.py`) with no headroom when this
+was written, and the argparse wiring plus three `cmd_*` bodies is ~55 lines.
+Since the P9 split the wiring is `commands/parsers/__init__.py`, capped at 500
+lines by `tests/test_commands_reexport.py`; here the group costs that file three.
 
 Nothing about the command changed — same `hive clusters build|plan|show`, same
 flags, same output. `/mindhive-orchestrator` reads `hive clusters plan`'s lane
@@ -61,7 +62,8 @@ def cmd_clusters_plan(args) -> int | None:
 
 
 def register(subparsers) -> None:
-    """Wire the `clusters` group onto ``__main__``'s subparser set."""
+    """Wire the `clusters` group onto the root subparser set built by
+    `commands.parsers._build_parser`."""
     # --- clusters: parallel-orchestration layer for /mindhive-orchestrator ---
     cl = subparsers.add_parser("clusters",
                         help="cluster the repo, classify file complexity, plan parallel lanes")

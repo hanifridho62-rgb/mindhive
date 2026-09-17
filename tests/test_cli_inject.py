@@ -232,7 +232,8 @@ def test_the_human_table_is_pure_ascii():
 
 def test_the_group_is_registered_on_the_real_parser():
     """`injectors.register(sub)` — the fourth module to take the convention that
-    keeps `__main__.py` at one line per group instead of ten."""
+    keeps the parser module (`__main__.py` then, `commands/parsers/__init__.py`
+    since the P9 split) at one line per group instead of ten."""
     parser = cli_mod._build_parser()
     sub = next(a for a in parser._actions if hasattr(a, "choices") and a.choices)
     assert "inject" in sub.choices

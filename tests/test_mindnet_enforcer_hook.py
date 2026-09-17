@@ -717,10 +717,11 @@ def test_the_new_cat_takes_its_canonical_slot_rather_than_arrival_order(spine):
 # open with `if not sc.fresh: return None, None` — ALLOW. Re-running the refused
 # command succeeded, and the phase block went dormant with it.
 #
-# The repo already states the rule this broke, at `__main__.py`: "No ledger
-# append. `sidecar._staleness` counts every event, so a row written here without
-# also rewriting the sidecar would read STALE." The audit was the first ledger
-# writer on the hook path itself.
+# The repo already states the rule this broke, at `cmd_mindnet_orchestrate`
+# (`commands/mindnet_orchestrate.py`; `__main__.py` before the P9 split): "No
+# ledger append. `sidecar._staleness` counts every event, so a row written here
+# without also rewriting the sidecar would read STALE." The audit was the first
+# ledger writer on the hook path itself.
 #
 # These tests use the REAL `sidecar.read`, deliberately: the `spine` fixture
 # monkeypatches it with a closure returning a fixed `fresh=True` sidecar, so no

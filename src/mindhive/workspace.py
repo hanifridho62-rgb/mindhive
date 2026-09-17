@@ -87,7 +87,7 @@ SWARM_FACULTY = "task-graph"
 #
 # Re-asserting is explicitly sanctioned: `telemetry.emit`'s docstring notes that
 # "the fold is idempotent under repeats, so a duplicate `active` is harmless".
-# It also repairs the shared-faculty case — `orchestrator` and `__main__` write
+# It also repairs the shared-faculty case — `orchestrator` and `mindnet_tasks` write
 # `task-graph` too, and a `busy` block closing mid-mission would otherwise
 # extinguish this cat permanently, since an edge that already fired cannot fire
 # again.

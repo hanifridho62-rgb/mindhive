@@ -36,6 +36,11 @@ the git main-repo directory name, normalized to a kebab-case slug
 | `pending_review.json`, `pending_changelog.json` | Sidecar gates: files awaiting thermo-review / a mandatory change-log entry. | `review`, `changelog` | self-healing |
 | `chroma/`                 | Optional vector index for `--semantic` recall. | `vectors.embed` | yes |
 | `orchestrator_memory.json` | Projection: the resolution set a lintester mission's breaker triggered, folded from `incidents.summaries`. The ledger stays the source of truth; delete this and `orchestrator.resilience.remember` rebuilds it byte-identically. | `orchestrator.resilience.remember` | yes |
+| `state/pending_embed.json` | Sidecar queue of semantic rows awaiting vector embedding: `{"entries": [{session_id, segment, seg_line, queued_at}]}`. `segment` is the basename actually written (`events.segment_name`, so a quarantined id names its `unsafe-*` slot); `seg_line` is the **1-based** physical line the row starts on. | `events._emit_pending_embed_marker` (`embedqueue`), inside the append lock after every `SEMANTIC_TYPES` append, fail-open; consumed and truncated by the background watcher only | yes — disposable: deleting it loses nothing, `hive embed` re-indexes from the ledger |
+
+`state/` (`paths.state_dir`, made on demand) is the namespace's directory for
+sidecars of that kind: neither the ledger nor a projection of it, written by
+the append path or a daemon, and never something a reader must consult.
 
 The auto-loaded memory file lives OUTSIDE the store:
 `~/.claude/projects/<encoded-folder>/memory/MEMORY.md`, composed by
@@ -66,10 +71,12 @@ for a project, `events.segment_name` for a session.
 
 Only the PATH is sanitised: the event keeps the raw value. Where a human types the
 value the refusal is loud instead. `cliparse.session_id_arg` and
-`cliparse.project_arg` accept exactly what the sink keeps, and the dashboard's
-`is_safe_project` asks the sink the same question, so an HTTP `project=` or
-`session_project=` the sink would rename is a 400 rather than a 200 from another
-directory.
+`cliparse.project_arg` accept only what the sink keeps on EVERY platform — the
+session validator asks `events.segment_name` at its strictest (`os_name="nt"`),
+so a Windows device name is refused on Linux too, because a store moves between
+machines — and the dashboard's `is_safe_project` asks the sink the same question,
+so an HTTP `project=` or `session_project=` the sink would rename is a 400 rather
+than a 200 from another directory.
 
 A root file is reached only through `paths.store_file`, which refuses a name not
 declared in `STORE_ROOT_FILES`; `tests/test_store_root_files.py` fails on any join
@@ -113,6 +120,39 @@ Every row in every `events/*.jsonl` segment:
   (`dedupe.text_fingerprint`).
 - `append_event` rejects unknown types. Reads never validate payload shape —
   **folds and projections must stay total** (skip junk, never raise).
+
+**Two session-id surfaces, one rule.** `append_event(..., strict_session=False)`
+— the default, and the hook path — quarantines a hostile id through
+`events.segment_name` and never raises (§1.1): `post_tool_use` fires on every
+tool call, and a hook that can throw is a hook that breaks the session.
+`strict_session=True` and `cliparse.session_id_arg` refuse instead, through
+`events.validate_session_id`: the anchored `SESSION_ID_REGEX` (applied with
+`fullmatch`, because `$` matches before a trailing newline) AND sink identity at
+the strictest platform, `segment_name(x, os_name="nt") == x + ".jsonl"`. The
+refusal is a `ValueError` whose message starts `Format session_id '…' tidak
+valid:`; the CLI wraps it as `invalid session id '…': …` and exits 2. A strict
+append validates the RESOLVED id before `events/` is made and before the append
+lock is taken, so a refusal writes nothing — not even the directory.
+
+**The physical row is unchanged; the chain coordinates live on a wrapper.** No
+row carries `prev_hash`, `chain_hash`, `seg_line` or `event_id` — every
+checkpoint on disk was folded over exactly the five keys above, and one extra
+key would move every head on the next append. `events.EventRecord` is a frozen
+RUNTIME wrapper that readers build from a row and nothing stores: `event_id` is
+`<session_id>:<seg_line>`, `prev_hash` is the head before the row and
+`chain_hash` the head after it. `events.compute_chain_hash(prev, canonical)` is
+`sha256((prev + canonical).encode("utf-8"))` over the str `canonical_json`
+returns — the same fold `chain.py` runs, not a second scheme — and
+`events.GENESIS_PREV_HASH` (64 zeros) equals `chain._ZERO`.
+
+**Two `seg_line`s, one off by one — deliberately.** The pending-embed marker's
+`seg_line` (§1, `state/pending_embed.json`) is **1-based**: the count of `\n`
+bytes in the segment before the write, plus one, so it names the physical line
+a human would `sed -n` for. The Postgres mirror's `seg_line` column
+(`pgmirror.scan_segments`, `events._segment_lines`, `corrupt_rows`) is
+**zero-based**, because it is a stored join key that must not be renumbered. A
+reader that consumes the marker and then joins against the mirror subtracts one;
+neither number is going to change to meet the other.
 
 ## 3. Event taxonomy and payload contracts
 
@@ -1648,7 +1688,7 @@ healthy digest is a notice every reader learns to skip. It enters at
 the STATE.md rebuild and the digest `sync` embeds in `MEMORY.md`; the latter is the
 file a session loads without being asked, and is the reason the notice is composed
 there rather than in `cmd_state`, which does not build STATE.md at all — it prints
-the file (`__main__.py:282-284`).
+the file (`commands/context_ops.py::cmd_state`).
 
 Three properties of that block are stated inside it rather than left to a reader:
 
@@ -2244,7 +2284,8 @@ unmatchable rather than merely unused (005).
    `DETERMINISTIC_TYPES` (telemetry), with a comment saying why it exists.
 2. Define its payload contract in a dedicated module (pattern:
    `changelog.py`, `sop.py`) with a `validate_payload` enforced in
-   `__main__.cmd_append` — the store stays type-agnostic; the contract lives
+   `commands.ledger.cmd_append` (re-exported as `__main__.cmd_append`) — the
+   store stays type-agnostic; the contract lives
    at the append surfaces.
 3. Decide merge semantics: an audit/registry type must be named in **both**
    `consolidate.NEVER_CONSOLIDATE` and `dedupe.NEVER_COLLAPSE` (§3.1).

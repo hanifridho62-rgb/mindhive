@@ -2,9 +2,10 @@
 """`hive lintester "<intent>"` — the PRD's single user-facing instruction.
 
 Self-registering, the trade `bench`, `briefcli`, `clusterscli` and `ab` all
-make: `src/mindhive/__main__.py` sits under a shrink-only ratchet
-(`tests/test_file_size_cap.py`), so the argparse wiring and the command body
-live here and that file pays two lines.
+make: the parser module (`src/mindhive/__main__.py` under a shrink-only ratchet
+when this was written, `commands/parsers/__init__.py` since the P9 split, capped
+at 500 lines by `tests/test_commands_reexport.py`) pays two lines, and the
+argparse wiring and the command body live here.
 
 Two things about this module are deliberate and easy to undo by accident.
 
@@ -412,7 +413,8 @@ def _limits(args):
 
 
 def register(subparsers) -> None:
-    """Wire `lintester` onto ``__main__``'s top-level subparser set."""
+    """Wire `lintester` onto the root subparser set built by
+    `commands.parsers._build_parser`."""
     p = subparsers.add_parser(
         "lintester",
         help="one intent -> weighted lanes, isolated worktrees, briefed agents")

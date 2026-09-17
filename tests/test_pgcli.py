@@ -49,7 +49,7 @@ def _run(*argv):
 # --------------------------------------------------------------------------
 
 def test_the_group_is_registered_on_the_real_parser():
-    """`pgcli.register(sub)` is two lines in `__main__.py` instead of ~180.
+    """`pgcli.register(sub)` is two lines in the parser module instead of ~180.
     `bench.register`'s docstring said that if a second module ever registered
     this way the deviation becomes the convention — this is that second
     module."""
@@ -277,10 +277,13 @@ def test_importing_the_cli_module_costs_no_driver():
 
 def test_the_registration_is_two_lines_in_main():
     """The whole point of the `register(sub)` convention, and the reason the
-    `__main__.py` ratchet moves by 2 instead of ~180. Asserted so a later edit
-    that inlines the argparse block here shows up as a failure rather than as a
-    quiet ceiling raise."""
-    src = (SRC / "__main__.py").read_text(encoding="utf-8")
+    parser module grows by 2 lines instead of ~180. That module was
+    `__main__.py` (and its ratchet) when this was written; the P9 split moved
+    `_build_parser` to `commands/parsers/__init__.py`, so the scan follows the
+    function to its file. Asserted so a later edit that inlines the argparse
+    block shows up as a failure rather than as a quiet ceiling raise."""
+    import inspect
+    src = Path(inspect.getsourcefile(cli._build_parser)).read_text(encoding="utf-8")
     tree = ast.parse(src)
     build = next(n for n in ast.walk(tree)
                  if isinstance(n, ast.FunctionDef) and n.name == "_build_parser")

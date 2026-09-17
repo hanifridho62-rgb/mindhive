@@ -735,8 +735,10 @@ def preflight_mandatory(evs) -> dict:
       indistinguishable from a registry that was always empty, and a bare count
       says something is missing without saying what to go and read.
 
-    Here rather than in `__main__`: it is rendering policy shared with `block`
-    and `digest_block`, and that file is on a size ratchet."""
+    Here rather than beside the handler that prints it
+    (`commands/registry_sop.py`; `__main__.py` before the P9 split): it is
+    rendering policy shared with `block` and `digest_block`, and the handler
+    modules are on a size cap."""
     rows = [r for r in (mandatory(evs) or []) if isinstance(r, dict)]
     composed, withheld = partition_authored(rows, evs)
     kept = {id(r) for r in composed}

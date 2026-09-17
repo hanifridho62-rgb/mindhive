@@ -377,12 +377,13 @@ def render(report) -> str:
 
 
 # --- the CLI ------------------------------------------------------------------
-# `register` lives here rather than inline in __main__.py, which is where every
-# other group is wired (`context`, `repo`, `packs`, `mindnet`). The deviation is
-# deliberate and its only reason is size: __main__.py is past 4100 lines. Note
-# for accuracy — the tech-debt lens does NOT flag that file, because
-# `replenish._python_modules` skips `__`-prefixed names; the argument is the
-# measured line count, not a tool's verdict.
+# `register` lives here rather than inline in the parser module (`__main__.py`
+# until the P9 split on 2026-09-14, `commands/parsers/__init__.py` since), which
+# is where every other group is wired (`context`, `repo`, `packs`, `mindnet`).
+# The deviation was deliberate and its only reason was size: __main__.py was
+# past 4100 lines. Note for accuracy — the tech-debt lens did NOT flag that
+# file, because `replenish._python_modules` skips `__`-prefixed names; the
+# argument was the measured line count, not a tool's verdict.
 
 def cmd_bench_dashboard(args) -> int | None:
     """Time the dashboard's endpoints. Read-only; writes no ledger event.
@@ -423,19 +424,22 @@ def cmd_bench_dashboard(args) -> int | None:
 
 
 def register(subparsers) -> None:
-    """Wire the `bench` group onto ``__main__``'s subparser set.
+    """Wire the `bench` group onto the root subparser set built by
+    `commands.parsers._build_parser`.
 
     A new top-level group rather than `hive dashboard bench`: `dashboard` is a
     leaf parser taking only `--port` and `--no-browser`, and
     `python -m mindhive dashboard` has to keep working as a bare invocation —
     that is the mechanism the project instructions protect.
 
-    **This is the only command in the tree that registers itself.** Every other
-    group — including the multi-subcommand ones — builds its parser inline in
-    `__main__.py`, which is how that file reached 4115 lines. The deviation is
+    **This was the only command in the tree that registered itself** when it
+    was written. Every other group — including the multi-subcommand ones —
+    built its parser inline in `__main__.py`, which is how that file reached
+    4115 lines (seven more groups have since taken the same trade, and the P9
+    split moved the wiring itself to `commands/parsers/`). The deviation is
     deliberate and it is named here rather than left for the next reader to
-    notice: `__main__.py` gets two lines (an import and this call) instead of
-    forty, and the flags stay beside the code that reads them, so a new flag
+    notice: the parser module gets two lines (an import and this call) instead
+    of forty, and the flags stay beside the code that reads them, so a new flag
     cannot be added to one and forgotten in the other. Following the local
     convention would have been the more consistent choice and the worse one; if
     a second module ever registers this way, this comment stops being a
