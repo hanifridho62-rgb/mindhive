@@ -62,7 +62,7 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - **Session auto-sync** — interactive sessions declare and update their roadmap automatically: the PostToolUse hook mirrors each TodoWrite into a `roadmap set` for the session's id (statuses mapped completed→done, in_progress→active), and `hive roadmap autoclose --session <id>` (run by the SessionEnd hook) completes a finished plan or interrupts an unfinished one so its context rides STATE.md into the next session. Auto-synced plans carry the `auto` tag; human-declared plans are never touched
 - `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
-- `hive verify` — check the hash chain
+- `hive verify [--json] [--strict]` — check the hash chain (`--json`: sorted one-line JSON for scripts; `--strict`: exit 1 when the chain is broken or a corrupt row exists — the default always exits 0 and reports on stdout)
 - `hive embed [--force]` — build the on-demand vector index
 - `hive selftest` — run the test suite
 - `hive loop init` — scaffold `.hive-loop/` (PROMPT.md, fix_plan.md, AGENT.md, loop.toml) and check the `claude` CLI

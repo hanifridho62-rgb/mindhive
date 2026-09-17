@@ -16,7 +16,8 @@ from ..mindnet_view import (cmd_mindnet_decompose,
                             cmd_mindnet_rebuild,
                             cmd_mindnet_show)
 
-__all__ = ["add_mindnet"]
+__all__ = ["add_mindnet",
+    "register_parsers"]
 
 
 
@@ -226,3 +227,9 @@ def add_mindnet(sub) -> None:
     mnx.add_argument("--session", type=cliparse.session_id_arg, default=None)
     mnx.add_argument("--json", action="store_true")
     mnx.set_defaults(func=cmd_mindnet_enforce)
+
+
+def register_parsers(sub) -> None:
+    """`base.CommandModule` (blueprint P9b): mount this domain's commands,
+    in the relative order `_build_parser` gives them."""
+    add_mindnet(sub)

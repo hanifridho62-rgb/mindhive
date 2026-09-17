@@ -43,7 +43,8 @@ from ..registry_sop import (cmd_sop_add,
                             cmd_sop_update)
 
 __all__ = ["add_sop", "add_roadmap", "add_autoresume", "add_rules",
-    "add_triggers"]
+    "add_triggers",
+    "register_parsers"]
 
 
 
@@ -381,3 +382,13 @@ def add_triggers(sub) -> None:
     tgc.add_argument("prompt")
     tgc.add_argument("--project", type=cliparse.project_arg, default=None)
     tgc.set_defaults(func=cmd_triggers_check)
+
+
+def register_parsers(sub) -> None:
+    """`base.CommandModule` (blueprint P9b): mount this domain's commands,
+    in the relative order `_build_parser` gives them."""
+    add_sop(sub)
+    add_roadmap(sub)
+    add_autoresume(sub)
+    add_rules(sub)
+    add_triggers(sub)

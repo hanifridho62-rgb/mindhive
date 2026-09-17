@@ -27,7 +27,8 @@ from ..skills import (cmd_plugins_autoscan,
                       cmd_skills_trail)
 
 __all__ = ["add_replenish", "add_graph", "add_plugins", "add_skills",
-    "add_sync", "add_dashboard", "add_harvest", "add_autosync"]
+    "add_sync", "add_dashboard", "add_harvest", "add_autosync",
+    "register_parsers"]
 
 
 
@@ -204,3 +205,16 @@ def add_autosync(sub) -> None:
     areg.add_argument("--transcripts", required=True)
     areg.add_argument("--folder", required=True)
     areg.set_defaults(func=cmd_autosync_register)
+
+
+def register_parsers(sub) -> None:
+    """`base.CommandModule` (blueprint P9b): mount this domain's commands,
+    in the relative order `_build_parser` gives them."""
+    add_replenish(sub)
+    add_graph(sub)
+    add_plugins(sub)
+    add_skills(sub)
+    add_sync(sub)
+    add_dashboard(sub)
+    add_harvest(sub)
+    add_autosync(sub)

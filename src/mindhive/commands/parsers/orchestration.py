@@ -4,7 +4,8 @@ add `worksession` and `watcher` here; `ci` registers itself.
 """
 from ..orchestration import cmd_loop
 
-__all__ = ["add_loop"]
+__all__ = ["add_loop",
+    "register_parsers"]
 
 
 
@@ -22,3 +23,9 @@ def add_loop(sub) -> None:
                     help="don't auto-open the web dashboard for this run "
                          "(also disabled by MINDHIVE_LOOP_DASHBOARD=0)")
     lp.set_defaults(func=cmd_loop)
+
+
+def register_parsers(sub) -> None:
+    """`base.CommandModule` (blueprint P9b): mount this domain's commands,
+    in the relative order `_build_parser` gives them."""
+    add_loop(sub)

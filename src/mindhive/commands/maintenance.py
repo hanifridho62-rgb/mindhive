@@ -1,35 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Store-hygiene and verification handlers: `verify`, `recall`, `gc`,
-`export`, `embed`, `selftest`, the thermo-nuclear `review` queue,
-`consolidate`, `flag`, `enrich` and the `failures` incident group.
+"""Store-hygiene handlers: `recall`, `gc`, `export`, `embed`, the
+thermo-nuclear `review` queue, `consolidate`, `flag`, `enrich` and the
+`failures` incident group. `verify` and `selftest` live in
+`verification.py` since blueprint P9b (MEB CLI-02).
 """
 import json
 import os
 import sys
 from .. import (events,
-                chain,
                 paths,
                 recall as recall_mod,
-                export as export_mod,
-                selftest as selftest_mod)
+                export as export_mod)
 
-__all__ = ["cmd_verify", "cmd_recall", "cmd_gc", "cmd_export", "cmd_embed",
-    "cmd_selftest", "cmd_review_queue", "cmd_review_clear", "cmd_review_show",
+__all__ = ["cmd_recall", "cmd_gc", "cmd_export", "cmd_embed",
+    "cmd_review_queue", "cmd_review_clear", "cmd_review_show",
     "cmd_flag", "cmd_consolidate", "cmd_failures_capture",
     "_print_incident_lines", "cmd_failures_list", "cmd_enrich"]
 
-
-def cmd_verify(args) -> int | None:
-    # Chain integrity is the tamper-evidence check; corrupt_rows is the loud,
-    # explicit surfacing of any torn/malformed rows that read_all() skips to stay
-    # total. Reporting both here is where "fail loud" now lives — instead of
-    # crashing every reader on a single bad line.
-    result = chain.verify()
-    bad = events.corrupt_rows()
-    if bad:
-        result = {**result, "corrupt_rows": bad}
-    print(json.dumps(result))
-    return None
 
 def cmd_recall(args) -> int | None:
     project = getattr(args, "project", None)
@@ -98,11 +85,6 @@ def cmd_embed(args) -> int | None:
            "events": vectors.embed_events(force=args.force)}
     print(json.dumps(out))
     return None
-
-def cmd_selftest(args) -> int | None:
-    # The exit code IS the command's contract; `run` returns the whole result
-    # because the dashboard's job reports the counts too.
-    return selftest_mod.run()["exit_code"]
 
 def cmd_review_queue(args) -> int | None:
     from .. import review as review_mod

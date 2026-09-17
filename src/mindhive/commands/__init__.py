@@ -8,6 +8,11 @@ mindhive.commands.<module>.cmd_x` and tests that monkeypatch or
 Every module here is held under the blueprint's 500-line target by
 `tests/test_commands_reexport.py`; a domain that outgrows it is split,
 never allow-listed.
+
+`base.py` is the contract module (blueprint P9b, MEB CLI-01: the
+`CommandModule` Protocol, `COMMAND_DISPATCH`, `register_handler`) and is NOT
+in `HANDLER_MODULES`: it exports no handler and `__main__` does not
+star-import it.
 """
 import importlib
 
@@ -24,6 +29,7 @@ HANDLER_MODULES = (
     "mindnet_satisfy",
     "mindnet_view",
     "mindnet_orchestrate",
+    "verification",
     "orchestration",
 )
 PARSER_MODULES = (

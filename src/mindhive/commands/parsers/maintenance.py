@@ -17,19 +17,25 @@ from ..maintenance import (cmd_consolidate,
                            cmd_recall,
                            cmd_review_clear,
                            cmd_review_queue,
-                           cmd_review_show,
-                           cmd_selftest,
-                           cmd_verify)
+                           cmd_review_show)
+from ..verification import cmd_selftest, cmd_verify
 
 __all__ = ["add_verify", "add_selftest", "add_premise", "add_recall",
     "add_consolidate", "add_gc", "add_export", "add_embed", "add_briefing",
-    "add_review", "add_log", "add_flag", "add_failures", "add_enrich"]
+    "add_review", "add_log", "add_flag", "add_failures", "add_enrich",
+    "register_parsers"]
 
 
 
 def add_verify(sub) -> None:
-    """Register `hive verify`."""
-    sub.add_parser("verify", help="verify hash chain").set_defaults(func=cmd_verify)
+    """Register `hive verify` (`--json`, `--strict`: blueprint P9b)."""
+    p = sub.add_parser("verify", help="verify hash chain")
+    p.add_argument("--json", action="store_true",
+                   help="sorted one-line JSON (keys sorted, no spaces), for scripts and diffs")
+    p.add_argument("--strict", action="store_true",
+                   help="exit 1 when the chain is not ok or a corrupt row exists "
+                        "(the default reports on stdout and always exits 0)")
+    p.set_defaults(func=cmd_verify)
 
 
 def add_selftest(sub) -> None:
@@ -212,3 +218,22 @@ def add_enrich(sub) -> None:
     env.add_argument("--json", action="store_true",
                      help="emit the full enrichment result as JSON")
     env.set_defaults(func=cmd_enrich)
+
+
+def register_parsers(sub) -> None:
+    """`base.CommandModule` (blueprint P9b): mount this domain's commands,
+    in the relative order `_build_parser` gives them."""
+    add_verify(sub)
+    add_selftest(sub)
+    add_premise(sub)
+    add_recall(sub)
+    add_consolidate(sub)
+    add_gc(sub)
+    add_export(sub)
+    add_embed(sub)
+    add_briefing(sub)
+    add_review(sub)
+    add_log(sub)
+    add_flag(sub)
+    add_failures(sub)
+    add_enrich(sub)

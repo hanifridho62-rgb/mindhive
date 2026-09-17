@@ -24,7 +24,8 @@ from ..ledger import (cmd_append,
 
 __all__ = ["add_append", "add_symbols", "add_hook", "add_session",
     "add_project", "add_state", "add_projects", "add_directives",
-    "add_context", "add_repo", "add_packs"]
+    "add_context", "add_repo", "add_packs",
+    "register_parsers"]
 
 
 
@@ -201,3 +202,19 @@ def add_packs(sub) -> None:
                      help="machine-readable report")
     pkr.add_argument("--pack", default=None, help="limit output to one pack")
     pkr.set_defaults(func=cmd_packs_report)
+
+
+def register_parsers(sub) -> None:
+    """`base.CommandModule` (blueprint P9b): mount this domain's commands,
+    in the relative order `_build_parser` gives them."""
+    add_append(sub)
+    add_symbols(sub)
+    add_hook(sub)
+    add_session(sub)
+    add_project(sub)
+    add_state(sub)
+    add_projects(sub)
+    add_directives(sub)
+    add_context(sub)
+    add_repo(sub)
+    add_packs(sub)

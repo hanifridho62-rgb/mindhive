@@ -29,6 +29,7 @@ from .commands.mindnet_tasks import *  # noqa: F401,F403
 from .commands.mindnet_satisfy import *  # noqa: F401,F403
 from .commands.mindnet_view import *  # noqa: F401,F403
 from .commands.mindnet_orchestrate import *  # noqa: F401,F403
+from .commands.verification import *  # noqa: F401,F403
 from .commands.orchestration import *  # noqa: F401,F403
 from .commands.parsers import _build_parser, _closest_command  # noqa: F401
 
