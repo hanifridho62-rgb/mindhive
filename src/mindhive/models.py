@@ -34,6 +34,19 @@ Derived conveniences, NOT stated in BAB 3 and kept for their callers:
 `prioritised_risks`, and `classify_priority`'s impact -> band rule (inferred
 from the sixteen rows). A verbatim audit should read them as such.
 
+**MEB section 2** (blueprint P1a', the MASTER ENGINEERING BLUEPRINT's own
+audit) follows BAB 3 in the same style: the baseline / mitigated Poisson rates
+`λ0 = 0.05` / `λ1 = 0.008` with `R(t) = e^(-λt)`, the `e^4.2` gain and the
+seven-row sensitivity table; the INTEGRATION breaker's DTMC (QUARANTINED
+entered from OPEN, `failure_threshold = 3`, `cooldown 300 s`) with its
+closed-form stationary distribution and the availability / downtime
+arithmetic -- the document's printed vectors are kept as data and their
+divergence from its stated parameters is pinned, not papered over; the CLT
+overflow probability under the 160 000-token safe budget; the eight-row
+operational risk matrix; the birthday bound on SHA-256 collisions; and the
+HNSW parameters with the per-vector memory estimate. Names the MEB shares
+with BAB 3 (`stationary_distribution`, `availability`) are the same objects.
+
 This module is a LEAF: it imports nothing from `mindhive` at module level.
 `spearman_rho` reuses `orchestrator.payoff._ranks` (ties share the average of
 the places they cover -- the reason that helper exists) but imports it at
@@ -549,6 +562,332 @@ def prioritised_risks() -> list[RiskRow]:
     return sorted(RISK_MATRIX, key=lambda r: (r.priority, -r.score, r.id))
 
 
+# =====================================================================================
+# MEB section 2 (blueprint P1a'): the MASTER ENGINEERING BLUEPRINT's own audit, as
+# pure functions beside BAB 3. Where the MEB re-states a BAB 3 formula under another
+# name the name is bound to the SAME object (`stationary_distribution`,
+# `availability`); where it states a different model (the integration breaker's
+# matrix, the promotion thresholds in `core.recommend`) both live side by side
+# (plan decisions K1, K2, K5).
+# =====================================================================================
+
+# --- MEB 2.1 baseline vs. mitigated Poisson reliability ----------------------------
+
+LAMBDA_BASELINE = 0.05
+"""MEB 2.1 B: failures per atomic action before the blueprint, `λ0`."""
+LAMBDA_MITIGATED = 0.008
+"""MEB 2.1 B: failures per action with process-group isolation, jittered lock
+backoff, `terminate_process_tree` and worktree isolation, `λ1`."""
+SESSION_ACTIONS = 100
+"""MEB 2.1 B: the standard development session, `t = 100` atomic actions."""
+
+
+def poisson_reliability(lam: float, t: float) -> float:
+    """`R(t) = P(N(t) = 0) = e^(-λt)` (MEB 2.1 A): the probability that `t`
+    consecutive actions complete without one interrupting failure.
+    `λ0 = 0.05, t = 100` -> 0.006738 (0.6738 %); `λ1 = 0.008` -> 0.4493."""
+    _check_rate(lam, t)
+    return math.exp(-lam * t)
+
+
+def reliability_gain(lam_baseline: float, lam_mitigated: float, t: float) -> float:
+    """`Gain = R1(t) / R0(t) = e^((λ0 - λ1)·t)` (MEB 2.1 C): `e^4.2 ≈ 66.686`
+    for the two rates above at `t = 100`."""
+    _check_rate(lam_baseline, t)
+    _check_rate(lam_mitigated, t)
+    return math.exp((lam_baseline - lam_mitigated) * t)
+
+
+def session_failure_reduction(lam_baseline: float, lam_mitigated: float, t: float) -> float:
+    """The last column of MEB 2.1 D, "Reduksi Probabilitas Kegagalan Sesi": the
+    relative change of the session FAILURE probability `F(t) = 1 - R(t)`,
+    `(F1 - F0) / F0` -- negative when mitigation helps (-44.56 % at `t = 100`).
+    Undefined when the baseline cannot fail (`λ0 = 0` or `t = 0`)."""
+    f0 = 1.0 - poisson_reliability(lam_baseline, t)
+    f1 = 1.0 - poisson_reliability(lam_mitigated, t)
+    if f0 <= 0.0:
+        raise ValueError(
+            f"reduksi kegagalan tidak terdefinisi tanpa kegagalan baseline: λ0={lam_baseline!r}, t={t!r}")
+    return (f1 - f0) / f0
+
+
+class ReliabilityRow(NamedTuple):
+    actions: int
+    baseline_pct: float
+    mitigated_pct: float
+    gain: float
+    failure_reduction_pct: float
+
+
+RELIABILITY_SENSITIVITY = (
+    ReliabilityRow(10, 60.65, 92.31, 1.52, -80.45),
+    ReliabilityRow(25, 28.65, 81.87, 2.86, -74.60),
+    ReliabilityRow(50, 8.21, 67.03, 8.17, -64.08),
+    ReliabilityRow(75, 2.35, 54.88, 23.33, -53.79),
+    ReliabilityRow(100, 0.67, 44.93, 66.69, -44.56),
+    ReliabilityRow(150, 0.055, 30.12, 544.57, -30.08),
+    ReliabilityRow(200, 0.0045, 20.19, 4447.07, -20.18),
+)
+"""MEB 2.1 D verbatim, to the document's own rounding (percent columns). The
+tests recompute every cell from `LAMBDA_BASELINE` / `LAMBDA_MITIGATED`; four
+cells differ from the recomputation by 0.01 in the last printed digit
+(rounding of already-rounded intermediates), which is why the pin tolerates
+0.02 and not less."""
+
+
+# --- MEB 2.2 the integration breaker's four-state DTMC ------------------------------
+
+INTEGRATION_BREAKER_PARAMS = {"failure_threshold": 3, "cooldown_period_s": 300.0}
+"""MEB 2.2 A: `failure_threshold = 3` consecutive failures trip CLOSED -> OPEN,
+and `cooldown_period = 300 s` elapses before OPEN -> HALF_OPEN admits one probe.
+`orchestrator/breaker.IntegrationBreaker` (P1f) runs on these; the TOOL
+breaker keeps BAB 3's `BREAKER_PARAMS` (decision K1)."""
+
+
+def integration_breaker_matrix(p_f: float, p_s: float, p_rec: float, p_q: float,
+                               p_reset: float) -> list[list[float]]:
+    """MEB 2.2 B verbatim, rows and columns in `BREAKER_STATES` order:
+
+        CLOSED       [1 - p_f,   0,      p_f,               0          ]
+        HALF_OPEN    [p_s,       0,      1 - p_s,           0          ]
+        OPEN         [0,         p_rec,  1 - p_rec - p_q,   p_q        ]
+        QUARANTINED  [p_reset,   0,      0,                 1 - p_reset]
+
+    It differs from BAB 3's `breaker_transition_matrix` in where QUARANTINED is
+    entered from: here from OPEN with `p_q` (repeated trips inside the window),
+    there from HALF_OPEN (a probe past `max_attempts`). Both are kept; the
+    integration breaker of P1f steps the MEB table."""
+    for name, p in (("p_f", p_f), ("p_s", p_s), ("p_rec", p_rec), ("p_q", p_q),
+                    ("p_reset", p_reset)):
+        _check_prob(name, p)
+    if p_rec + p_q > 1.0 + 1e-12:
+        raise ValueError(f"p_rec + p_q harus <= 1 agar baris OPEN berjumlah 1: {p_rec + p_q!r}")
+    return [
+        [1.0 - p_f, 0.0, p_f, 0.0],
+        [p_s, 0.0, 1.0 - p_s, 0.0],
+        [0.0, p_rec, 1.0 - p_rec - p_q, p_q],
+        [p_reset, 0.0, 0.0, 1.0 - p_reset],
+    ]
+
+
+def integration_breaker_stationary(p_f: float, p_s: float, p_rec: float, p_q: float,
+                                   p_reset: float) -> list[float]:
+    """MEB 2.2 C in closed form, every state as a multiple of `π0`:
+
+        π2 = p_f / (p_s·p_rec + p_q) · π0
+        π1 = p_rec · π2
+        π3 = (p_q / p_reset) · π2
+
+    then normalised to `Σπ = 1`. It needs `p_s·p_rec + p_q > 0` and
+    `p_reset > 0` (otherwise the chain is reducible and the closed form divides
+    by zero); the tests pin it against `stationary_distribution` of the matrix."""
+    integration_breaker_matrix(p_f, p_s, p_rec, p_q, p_reset)     # the same validation
+    denom = p_s * p_rec + p_q
+    if denom <= 0.0 or p_reset <= 0.0:
+        raise ValueError(
+            "bentuk tertutup butuh p_s·p_rec + p_q > 0 dan p_reset > 0 (rantai tereduksi)")
+    r2 = p_f / denom
+    r1 = p_rec * r2
+    r3 = (p_q / p_reset) * r2
+    total = 1.0 + r1 + r2 + r3
+    return [1.0 / total, r1 / total, r2 / total, r3 / total]
+
+
+stationary_distribution = steady_state
+"""MEB 2.2 C's name for BAB 3's solver of `π·P = π, Σπ = 1`: the same object."""
+
+availability = lane_availability
+"""MEB 2.2 D's `A = π0 + π1`: the same object as BAB 3's `lane_availability`."""
+
+
+def downtime(pi: list[float]) -> float:
+    """`U = π2 + π3 = 1 - A` (MEB 2.2 D), over a validated distribution."""
+    return 1.0 - availability(pi)
+
+
+def downtime_reduction(u_base: float, u_opt: float) -> float:
+    """`(U_base - U_opt) / U_base` (MEB 2.2 D): the printed `(23.88 % - 1.97 %) /
+    23.88 % = 91.75 %`."""
+    _check_prob("U_base", u_base)
+    _check_prob("U_opt", u_opt)
+    if u_base <= 0.0:
+        raise ValueError("reduksi downtime tidak terdefinisi untuk U_base = 0")
+    return (u_base - u_opt) / u_base
+
+
+MEB_BREAKER_CALIBRATION = {
+    "baseline": {"params": (0.12, 0.50, 0.30, 0.10, 0.05),
+                 "printed_pi": (0.7164, 0.0448, 0.1493, 0.0896),
+                 "printed_availability": 0.7612, "printed_downtime": 0.2388},
+    "mitigated": {"params": (0.02, 0.85, 0.50, 0.02, 0.20),
+                  "printed_pi": (0.9714, 0.0089, 0.0179, 0.0018),
+                  "printed_availability": 0.9803, "printed_downtime": 0.0197},
+    "printed_downtime_reduction": 0.9175,
+}
+"""MEB 2.2 D as PRINTED, kept as data because the printed vectors are NOT the
+stationary distribution of the printed parameters under the MEB's own matrix
+(the CLOSED balance `p_f·π0 = p_s·π1 + p_reset·π3` fails: 0.12·0.7164 = 0.0860
+against 0.5·0.0448 + 0.05·0.0896 = 0.0269). The stated parameters give
+π = (38.70 %, 5.57 %, 18.58 %, 37.15 %), A = 44.27 % and, mitigated,
+π = (93.29 %, 2.10 %, 4.19 %, 0.42 %), A = 95.39 %; the printed baseline
+vector is reproduced exactly by `(p_f, p_q) = (0.0375, 0.03)` with the other
+three parameters unchanged. The downtime reduction the two printed vectors
+imply (91.75 %) and the one the stated parameters give (91.72 %) agree to
+0.03 pp. `tests/test_models.py` pins all of this; nothing here bends the
+formula towards the print."""
+
+
+# --- MEB 2.5 context depletion and the CLT overflow probability ---------------------
+
+CONTEXT_WINDOW_TOKENS = 200_000
+"""MEB 2.5: the hard window (Claude's 200k); the same number as BAB 3's
+`CONTEXT_LIMIT_TOKENS`, pinned equal."""
+SAFE_CONTEXT_BUDGET_TOKENS = 160_000
+"""MEB 2.5: `b`, the safe ceiling -- 20 % head-room under the window. The
+Oversee usage bar draws its "safe" line here (decision K5)."""
+OVERFLOW_TRIGGER_P = 0.05
+"""MEB 2.5: `P(Overflow) > 0.05` triggers the adaptive tail and the secondary
+archive to ChromaDB."""
+
+
+def safe_turns_remaining(current: int, per_turn: int,
+                         budget: int = SAFE_CONTEXT_BUDGET_TOKENS) -> int:
+    """`D(c, b, μ) = ⌊(b - c) / μ⌋` (MEB 2.5): whole turns left under the safe
+    budget -- BAB 3's `context_depletion` with `b` as the limit."""
+    return context_depletion(current, budget, per_turn)
+
+
+def normal_cdf(z: float) -> float:
+    """`Φ(z)`, the standard normal CDF, through `math.erf`."""
+    _check_finite("z", z)
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def overflow_probability(current: int, budget: int, turns: int, mean_per_turn: float,
+                         sigma_per_turn: float) -> float:
+    """`P(Overflow) ≈ 1 - Φ((b - c - kμ) / (σ√k))` (MEB 2.5), the CLT estimate
+    that `k` more turns of mean `μ` and standard deviation `σ` tokens exceed
+    the head-room `b - c`. A degenerate `σ = 0` is the step: 1 when `kμ`
+    exceeds the head-room, else 0. Example: c = 140 000, b = 160 000, k = 5,
+    μ = 3 000, σ = 800 -> z = 2.795, P ≈ 0.0026."""
+    for name, v in (("current", current), ("budget", budget), ("turns", turns)):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f"{name} harus bilangan bulat: {v!r}")
+    if current < 0 or budget <= 0 or turns < 1:
+        raise ValueError(
+            f"butuh current >= 0, budget > 0, turns >= 1: {current!r}, {budget!r}, {turns!r}")
+    _check_finite("μ", mean_per_turn)
+    _check_finite("σ", sigma_per_turn)
+    if mean_per_turn < 0 or sigma_per_turn < 0:
+        raise ValueError(f"μ dan σ tidak boleh negatif: {mean_per_turn!r}, {sigma_per_turn!r}")
+    headroom = budget - current - turns * mean_per_turn
+    if sigma_per_turn == 0.0:
+        return 1.0 if headroom < 0 else 0.0
+    return 1.0 - normal_cdf(headroom / (sigma_per_turn * math.sqrt(turns)))
+
+
+def should_trigger_adaptive_tail(p_overflow: float) -> bool:
+    """MEB 2.5: strictly above `OVERFLOW_TRIGGER_P`."""
+    _check_prob("P(Overflow)", p_overflow)
+    return p_overflow > OVERFLOW_TRIGGER_P
+
+
+# --- MEB 2.6 the operational risk matrix ---------------------------------------------
+
+class OperationalRisk(NamedTuple):
+    mode: str
+    probability: float
+    probability_label: str
+    impact: int
+    impact_label: str
+    score: float
+    mitigation: str
+
+
+def _op(mode, p, p_label, impact, i_label, mitigation) -> OperationalRisk:
+    return OperationalRisk(mode, p, p_label, impact, i_label, risk_score(p, impact), mitigation)
+
+
+OPERATIONAL_RISK_MATRIX = (
+    _op("NTFS File Lock Collision (PermissionError pada open)", 0.60, "Medium-High",
+        4, "High - Data Loss",
+        "Spin-wait jittered backoff pada os.open di core/locks.py & vectors.py."),
+    _op("Path Traversal Injection (Windows Reserved Names)", 0.15, "Low",
+        5, "Critical - System Breach",
+        "Sanitasi ketat validate_session_id & pemblokiran nama CON, PRN, AUX, NUL."),
+    _op("Silent Memory Tail Truncation", 0.55, "Medium",
+        3, "Medium - Context Loss",
+        "Plafon aman 24.500 bita LF di adaptivetail.py dan retensi 3-tier ke ChromaDB."),
+    _op("Flaky Test Assertion Manipulation (Agent Cheat)", 0.70, "High",
+        4, "High - False Quality",
+        "Immutable Test Gates (penguncian read-only pada berkas uji selama implementasi)."),
+    _op("Git Worktree Merge Conflict Contention", 0.40, "Medium",
+        3, "Medium - Latency",
+        "AST File Ownership Clustering & Dual-hook Gateway Interceptor."),
+    _op("API Rate Limit & Token Runaway", 0.65, "High",
+        4, "High - Cost Explosion",
+        "IntegrationBreaker 4-status terpersistensi & pembatasan kuota per lane."),
+    _op("Bytecode Sharing Violation (WinError 32 di NTFS)", 0.50, "Medium",
+        3, "Medium - Flaky Build",
+        "Penegakan PYTHONDONTWRITEBYTECODE=1 pada seluruh runner subprocess."),
+    _op("Circular Import Deadlock saat Dekomposisi CLI", 0.35, "Low-Medium",
+        4, "High - Startup Failure",
+        "Aliran dependensi satu arah (Core → Handlers → Parsers → Main)."),
+)
+"""MEB 2.6 verbatim, eight rows in the document's order; `score` is
+`risk_score(P, I)` and the tests pin the printed 2.40 / 0.75 / 1.65 / 2.80 /
+1.20 / 2.60 / 1.50 / 1.40."""
+
+
+def prioritised_operational_risks() -> list[OperationalRisk]:
+    """The eight rows by descending score, ties by mode: the treatment order
+    (Flaky Test 2.80 first, Path Traversal 0.75 last). Derived convenience --
+    the MEB prints the rows unsorted."""
+    return sorted(OPERATIONAL_RISK_MATRIX, key=lambda r: (-r.score, r.mode))
+
+
+# --- MEB 7.3 the hash chain's collision resistance -------------------------------------
+
+HASH_BITS = 256
+"""SHA-256's output space, `n = 256` bits (MEB 7.3)."""
+
+
+def hash_collision_probability(n: int, bits: int = HASH_BITS) -> float:
+    """`P_collision ≈ 1 - e^(-N(N-1) / 2^(bits+1)) ≈ N² / 2^(bits+1)` (MEB 7.3,
+    the birthday bound), computed in the exact-exponent form through
+    `math.expm1` so the astronomically small values keep their digits:
+    `N = 10^9` -> 4.318e-60. Zero or one record cannot collide."""
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError(f"jumlah catatan N harus bilangan bulat >= 0: {n!r}")
+    if isinstance(bits, bool) or not isinstance(bits, int) or bits < 1:
+        raise ValueError(f"lebar hash harus bilangan bulat >= 1: {bits!r}")
+    if n < 2:
+        return 0.0
+    return -math.expm1(-(n * (n - 1)) / 2.0 ** (bits + 1))
+
+
+# --- MEB 8 HNSW parameters and memory ---------------------------------------------------
+
+HNSW_PARAMS = {"space": "cosine", "M": 16, "ef_construction": 100, "ef_search": 32}
+"""MEB 8.1: the collection's fixed HNSW parameters; `vectors.HNSW_METADATA`
+(P1h) is pinned to these."""
+EMBEDDING_DIM = 384
+"""MEB 8.2: `all-MiniLM-L6-v2`'s dimension."""
+HNSW_NODE_OVERHEAD_BYTES = 208
+"""MEB 8.3: node structure and metadata pointers per vector."""
+
+
+def estimate_hnsw_memory_bytes(n: int, dim: int = EMBEDDING_DIM, m: int = HNSW_PARAMS["M"],
+                               overhead: int = HNSW_NODE_OVERHEAD_BYTES) -> int:
+    """`Mem = N · [(d × 4) + (M × 2 × 8) + Overhead]` (MEB 8.3): 1 536 + 256 +
+    208 = 2 000 bytes a vector, so 50 000 vectors are 100 000 000 bytes
+    (95.37 MiB)."""
+    for name, v in (("N", n), ("dim", dim), ("M", m), ("overhead", overhead)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f"{name} harus bilangan bulat >= 0: {v!r}")
+    return n * (dim * 4 + m * 2 * 8 + overhead)
+
+
 __all__ = [
     "ACTIONS_PER_UNIT", "LAMBDA_UNENFORCED_RANGE", "LAMBDA_TARGET",
     "poisson_pmf", "poisson_failure_probability", "exponential_pdf",
@@ -566,4 +905,15 @@ __all__ = [
     "STREAK_DISCONTINUE", "bayesian_laplace_rate", "laplace_qualifies",
     "streak_penalty", "should_discontinue",
     "RiskRow", "risk_score", "classify_priority", "RISK_MATRIX", "prioritised_risks",
+    # MEB section 2 (P1a')
+    "LAMBDA_BASELINE", "LAMBDA_MITIGATED", "SESSION_ACTIONS", "poisson_reliability",
+    "reliability_gain", "session_failure_reduction", "ReliabilityRow", "RELIABILITY_SENSITIVITY",
+    "INTEGRATION_BREAKER_PARAMS", "integration_breaker_matrix", "integration_breaker_stationary",
+    "stationary_distribution", "availability", "downtime", "downtime_reduction",
+    "MEB_BREAKER_CALIBRATION",
+    "CONTEXT_WINDOW_TOKENS", "SAFE_CONTEXT_BUDGET_TOKENS", "OVERFLOW_TRIGGER_P",
+    "safe_turns_remaining", "normal_cdf", "overflow_probability", "should_trigger_adaptive_tail",
+    "OperationalRisk", "OPERATIONAL_RISK_MATRIX", "prioritised_operational_risks",
+    "HASH_BITS", "hash_collision_probability",
+    "HNSW_PARAMS", "EMBEDDING_DIM", "HNSW_NODE_OVERHEAD_BYTES", "estimate_hnsw_memory_bytes",
 ]

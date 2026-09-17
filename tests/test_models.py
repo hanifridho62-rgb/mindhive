@@ -600,3 +600,275 @@ def test_importing_models_does_not_import_the_orchestrator_package():
         capture_output=True, text=True, env=env, cwd=str(REPO))
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == ["False", "False"]
+
+
+# =====================================================================================
+# MEB section 2 (blueprint P1a'): the MASTER ENGINEERING BLUEPRINT's audit numbers
+# =====================================================================================
+
+# --- MEB 2.1 Poisson baseline vs. mitigated -----------------------------------------
+
+def test_meb_rates_mtbf_and_the_two_session_reliabilities():
+    assert (models.LAMBDA_BASELINE, models.LAMBDA_MITIGATED, models.SESSION_ACTIONS) == (0.05, 0.008, 100)
+    assert models.mtbf_from_rate(models.LAMBDA_BASELINE) == pytest.approx(20.0)
+    assert models.mtbf_from_rate(models.LAMBDA_MITIGATED) == pytest.approx(125.0)
+    r0 = models.poisson_reliability(models.LAMBDA_BASELINE, 100)
+    r1 = models.poisson_reliability(models.LAMBDA_MITIGATED, 100)
+    assert r0 == pytest.approx(0.006737947, abs=1e-9)          # 0.6738 %
+    assert r1 == pytest.approx(0.449328964, abs=1e-9)          # 44.9329 %
+    assert r0 * 100 == pytest.approx(0.6738, abs=1e-4)
+    assert r1 * 100 == pytest.approx(44.9329, abs=1e-4)
+    # R(t) is the k = 0 Poisson term, not a second formula
+    assert r0 == pytest.approx(models.poisson_pmf(models.LAMBDA_BASELINE, 100, 0))
+    assert models.poisson_reliability(0.0, 100) == 1.0 and models.poisson_reliability(0.05, 0) == 1.0
+
+
+def test_meb_reliability_gain_is_e_to_the_four_point_two():
+    gain = models.reliability_gain(0.05, 0.008, 100)
+    assert gain == pytest.approx(math.exp(4.2))
+    assert gain == pytest.approx(66.686, abs=1e-3)
+    assert gain == pytest.approx(models.poisson_reliability(0.008, 100)
+                                 / models.poisson_reliability(0.05, 100))
+    assert models.reliability_gain(0.05, 0.05, 100) == 1.0
+
+
+def test_meb_session_failure_reduction_is_the_relative_change_of_one_minus_r():
+    red = models.session_failure_reduction(0.05, 0.008, 100)
+    f0, f1 = 1 - math.exp(-5.0), 1 - math.exp(-0.8)
+    assert red == pytest.approx((f1 - f0) / f0)
+    assert red * 100 == pytest.approx(-44.56, abs=0.01)
+    with pytest.raises(ValueError):
+        models.session_failure_reduction(0.0, 0.008, 100)      # no baseline failure to reduce
+    with pytest.raises(ValueError):
+        models.session_failure_reduction(0.05, 0.008, 0)
+
+
+@pytest.mark.parametrize("row", models.RELIABILITY_SENSITIVITY, ids=lambda r: f"t={r.actions}")
+def test_meb_sensitivity_table_recomputes_from_the_two_rates(row):
+    """Every printed cell within 0.02 of the recomputation (the MEB rounds its
+    intermediates: -80.45 printed against -80.457 recomputed at t = 10)."""
+    r0 = models.poisson_reliability(models.LAMBDA_BASELINE, row.actions) * 100
+    r1 = models.poisson_reliability(models.LAMBDA_MITIGATED, row.actions) * 100
+    assert r0 == pytest.approx(row.baseline_pct, abs=0.02)
+    assert r1 == pytest.approx(row.mitigated_pct, abs=0.02)
+    if row.baseline_pct < 0.1:                                  # 0.055 % and 0.0045 %: relative too
+        assert r0 == pytest.approx(row.baseline_pct, rel=0.02)
+    gain = models.reliability_gain(models.LAMBDA_BASELINE, models.LAMBDA_MITIGATED, row.actions)
+    assert gain == pytest.approx(row.gain, rel=1e-3, abs=0.006)   # two printed decimals
+    red = models.session_failure_reduction(models.LAMBDA_BASELINE, models.LAMBDA_MITIGATED,
+                                           row.actions) * 100
+    assert red == pytest.approx(row.failure_reduction_pct, abs=0.02)
+
+
+def test_meb_sensitivity_table_is_the_documents_seven_rows_verbatim():
+    assert [r.actions for r in models.RELIABILITY_SENSITIVITY] == [10, 25, 50, 75, 100, 150, 200]
+    assert models.RELIABILITY_SENSITIVITY[4] == (100, 0.67, 44.93, 66.69, -44.56)
+    assert models.RELIABILITY_SENSITIVITY[-1] == (200, 0.0045, 20.19, 4447.07, -20.18)
+
+
+# --- MEB 2.2 the integration breaker's DTMC -----------------------------------------
+
+def test_meb_integration_breaker_matrix_rows_are_the_documents():
+    p_f, p_s, p_rec, p_q, p_reset = 0.12, 0.50, 0.30, 0.10, 0.05
+    m = models.integration_breaker_matrix(p_f, p_s, p_rec, p_q, p_reset)
+    assert m == [[1 - p_f, 0.0, p_f, 0.0],
+                 [p_s, 0.0, 1 - p_s, 0.0],
+                 [0.0, p_rec, 1 - p_rec - p_q, p_q],
+                 [p_reset, 0.0, 0.0, 1 - p_reset]]
+    assert all(sum(row) == pytest.approx(1.0) for row in m)
+    # QUARANTINED is entered from OPEN here (MEB) and from HALF_OPEN in BAB 3
+    bab3 = models.breaker_transition_matrix(p_f, p_rec, p_s, p_q, p_reset)
+    assert m[2][3] == p_q and bab3[2][3] == 0.0
+    assert m[1][3] == 0.0 and bab3[1][3] == p_q
+    assert models.INTEGRATION_BREAKER_PARAMS == {"failure_threshold": 3, "cooldown_period_s": 300.0}
+    assert models.BREAKER_PARAMS["cooldown_s"] == 10.0            # the TOOL breaker keeps BAB 3's
+    with pytest.raises(ValueError):
+        models.integration_breaker_matrix(0.1, 0.5, 0.7, 0.4, 0.1)   # p_rec + p_q > 1
+    with pytest.raises(ValueError):
+        models.integration_breaker_matrix(1.2, 0.5, 0.3, 0.1, 0.1)
+
+
+@pytest.mark.parametrize("params", [
+    (0.12, 0.50, 0.30, 0.10, 0.05), (0.02, 0.85, 0.50, 0.02, 0.20),
+    (0.5, 0.5, 0.5, 0.25, 0.5), (0.01, 0.99, 0.9, 0.05, 0.01), (1.0, 0.0, 0.1, 0.9, 1.0)])
+def test_meb_closed_form_stationary_agrees_with_the_solver(params):
+    closed = models.integration_breaker_stationary(*params)
+    solved = models.stationary_distribution(models.integration_breaker_matrix(*params))
+    assert closed == pytest.approx(solved, abs=1e-9)
+    assert sum(closed) == pytest.approx(1.0)
+    # π·P = π for the closed form too
+    m = models.integration_breaker_matrix(*params)
+    again = [sum(closed[i] * m[i][j] for i in range(4)) for j in range(4)]
+    assert again == pytest.approx(closed, abs=1e-12)
+
+
+def test_meb_names_are_bab3s_objects_where_the_formula_is_the_same():
+    assert models.stationary_distribution is models.steady_state
+    assert models.availability is models.lane_availability
+    pi = [0.7, 0.1, 0.15, 0.05]
+    assert models.downtime(pi) == pytest.approx(0.2)
+    assert models.availability(pi) + models.downtime(pi) == pytest.approx(1.0)
+    with pytest.raises(ValueError):
+        models.integration_breaker_stationary(0.1, 0.0, 0.5, 0.0, 0.1)   # p_s·p_rec + p_q == 0
+    with pytest.raises(ValueError):
+        models.integration_breaker_stationary(0.1, 0.5, 0.5, 0.1, 0.0)   # absorbing QUARANTINED
+
+
+def test_meb_calibration_what_the_stated_parameters_actually_give():
+    """The MEB's stated parameters, through the MEB's own matrix. These are
+    the numbers, not the ones the document prints (next test)."""
+    base = models.MEB_BREAKER_CALIBRATION["baseline"]
+    mit = models.MEB_BREAKER_CALIBRATION["mitigated"]
+    pi_b = models.integration_breaker_stationary(*base["params"])
+    pi_m = models.integration_breaker_stationary(*mit["params"])
+    assert [round(p * 100, 2) for p in pi_b] == [38.70, 5.57, 18.58, 37.15]
+    assert [round(p * 100, 2) for p in pi_m] == [93.29, 2.10, 4.19, 0.42]
+    assert models.availability(pi_b) * 100 == pytest.approx(44.27, abs=0.01)
+    assert models.availability(pi_m) * 100 == pytest.approx(95.39, abs=0.01)
+    red = models.downtime_reduction(models.downtime(pi_b), models.downtime(pi_m))
+    assert red * 100 == pytest.approx(91.72, abs=0.01)
+
+
+def test_meb_calibration_the_printed_vectors_come_from_other_parameters():
+    """Documented divergence (plan K1): the printed π vectors are not the
+    stationary distribution of the printed parameters -- the CLOSED balance
+    fails by a factor of three -- and the printed baseline vector IS the
+    stationary distribution at (p_f, p_q) = (0.0375, 0.03)."""
+    base = models.MEB_BREAKER_CALIBRATION["baseline"]
+    mit = models.MEB_BREAKER_CALIBRATION["mitigated"]
+    p_f, p_s, p_rec, p_q, p_reset = base["params"]
+    pi = base["printed_pi"]
+    assert p_f * pi[0] == pytest.approx(0.0860, abs=1e-4)
+    assert p_s * pi[1] + p_reset * pi[3] == pytest.approx(0.0269, abs=1e-4)      # != 0.0860
+    computed = models.integration_breaker_stationary(*base["params"])
+    assert abs(computed[0] - pi[0]) > 0.30                       # 38.70 % against 71.64 %
+    fitted = models.integration_breaker_stationary(0.0375, p_s, p_rec, 0.03, p_reset)
+    assert [round(p, 4) for p in fitted] == list(pi)             # reproduced exactly
+    assert sum(pi[:2]) == pytest.approx(base["printed_availability"], abs=1e-4)
+    assert sum(mit["printed_pi"][:2]) == pytest.approx(mit["printed_availability"], abs=1e-4)
+    # the printed reduction follows from the printed downtimes, and agrees with
+    # the stated parameters' reduction to 0.03 pp
+    printed = models.downtime_reduction(base["printed_downtime"], mit["printed_downtime"])
+    assert printed == pytest.approx(models.MEB_BREAKER_CALIBRATION["printed_downtime_reduction"], abs=5e-5)
+    assert printed * 100 == pytest.approx(91.75, abs=0.01)
+    with pytest.raises(ValueError):
+        models.downtime_reduction(0.0, 0.0)
+
+
+# --- MEB 2.5 context depletion and CLT overflow ---------------------------------------
+
+def test_meb_context_budget_constants_and_safe_turns():
+    assert models.CONTEXT_WINDOW_TOKENS == models.CONTEXT_LIMIT_TOKENS == 200_000
+    assert models.SAFE_CONTEXT_BUDGET_TOKENS == 160_000 == 0.8 * models.CONTEXT_WINDOW_TOKENS
+    assert models.OVERFLOW_TRIGGER_P == 0.05
+    assert models.safe_turns_remaining(140_000, 3_000) == 6                  # ⌊20 000 / 3 000⌋
+    assert models.safe_turns_remaining(140_000, 3_000, budget=200_000) == 20
+    assert models.safe_turns_remaining(170_000, 3_000) == 0
+    assert models.safe_turns_remaining(140_000, 3_000) == models.context_depletion(140_000, 160_000, 3_000)
+
+
+def test_meb_overflow_probability_worked_example_and_shape():
+    p = models.overflow_probability(140_000, 160_000, 5, 3_000, 800)
+    z = (160_000 - 140_000 - 5 * 3_000) / (800 * math.sqrt(5))
+    assert z == pytest.approx(2.7951, abs=1e-4)
+    assert p == pytest.approx(1 - models.normal_cdf(z))
+    assert p == pytest.approx(0.0026, abs=1e-4)
+    assert not models.should_trigger_adaptive_tail(p)
+    # more turns, more risk; a mean that already exceeds the head-room is past 1/2
+    assert models.overflow_probability(140_000, 160_000, 6, 3_000, 800) > p
+    assert models.overflow_probability(140_000, 160_000, 7, 3_000, 800) > 0.5
+    assert models.should_trigger_adaptive_tail(models.overflow_probability(140_000, 160_000, 7, 3_000, 800))
+    assert models.should_trigger_adaptive_tail(0.05) is False and models.should_trigger_adaptive_tail(0.0501)
+    # σ = 0: the step
+    assert models.overflow_probability(140_000, 160_000, 6, 3_000, 0) == 0.0
+    assert models.overflow_probability(140_000, 160_000, 7, 3_000, 0) == 1.0
+    assert models.normal_cdf(0.0) == 0.5
+    assert models.normal_cdf(1.96) == pytest.approx(0.975, abs=1e-3)
+    assert models.normal_cdf(-1.0) + models.normal_cdf(1.0) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("bad", [
+    (-1, 160_000, 5, 3_000, 800), (140_000, 0, 5, 3_000, 800), (140_000, 160_000, 0, 3_000, 800),
+    (140_000, 160_000, 5, -1.0, 800), (140_000, 160_000, 5, 3_000, -1.0),
+    (140_000, 160_000, 5, float("nan"), 800), (140_000.0, 160_000, 5, 3_000, 800),
+    (140_000, 160_000, True, 3_000, 800)])
+def test_meb_overflow_probability_validates(bad):
+    with pytest.raises(ValueError):
+        models.overflow_probability(*bad)
+
+
+# --- MEB 2.6 the operational risk matrix ----------------------------------------------
+
+def test_meb_operational_risk_matrix_scores_and_order():
+    rows = models.OPERATIONAL_RISK_MATRIX
+    assert len(rows) == 8
+    assert [r.score for r in rows] == [2.40, 0.75, 1.65, 2.80, 1.20, 2.60, 1.50, 1.40]
+    for r in rows:
+        assert r.score == models.risk_score(r.probability, r.impact)
+        assert 1 <= r.impact <= 5 and 0 < r.probability < 1
+    assert [r.mode for r in rows][:2] == ["NTFS File Lock Collision (PermissionError pada open)",
+                                         "Path Traversal Injection (Windows Reserved Names)"]
+    assert rows[3] == ("Flaky Test Assertion Manipulation (Agent Cheat)", 0.70, "High", 4,
+                       "High - False Quality", 2.80,
+                       "Immutable Test Gates (penguncian read-only pada berkas uji selama implementasi).")
+    assert rows[6].mitigation == "Penegakan PYTHONDONTWRITEBYTECODE=1 pada seluruh runner subprocess."
+    ordered = models.prioritised_operational_risks()
+    assert [r.score for r in ordered] == [2.80, 2.60, 2.40, 1.65, 1.50, 1.40, 1.20, 0.75]
+    assert ordered[0].mode.startswith("Flaky Test") and ordered[-1].mode.startswith("Path Traversal")
+    assert sorted(models.OPERATIONAL_RISK_MATRIX, key=lambda r: r.mode) != list(ordered)
+
+
+# --- MEB 7.3 the birthday bound --------------------------------------------------------
+
+def test_meb_hash_collision_probability_is_the_birthday_bound():
+    p = models.hash_collision_probability(10 ** 9)
+    assert p == pytest.approx(4.318e-60, rel=1e-3)
+    assert p == pytest.approx((10 ** 9) ** 2 / 2 ** 257, rel=1e-6)          # the ≈ N²/2^257 form
+    assert models.HASH_BITS == 256
+    assert models.hash_collision_probability(0) == 0.0 == models.hash_collision_probability(1)
+    assert models.hash_collision_probability(10 ** 12) > p
+    # a 64-bit space at 2^32 records: N(N-1)/2^65 ≈ 0.5 -> 1 - e^-0.5
+    assert models.hash_collision_probability(2 ** 32, bits=64) == pytest.approx(1 - math.exp(-0.5), rel=1e-6)
+    for bad in ((-1,), (1.5,), (True,), (10, 0)):
+        with pytest.raises(ValueError):
+            models.hash_collision_probability(*bad)
+
+
+# --- MEB 8 HNSW ----------------------------------------------------------------------
+
+def test_meb_hnsw_parameters_and_memory_estimate():
+    assert models.HNSW_PARAMS == {"space": "cosine", "M": 16, "ef_construction": 100, "ef_search": 32}
+    assert (models.EMBEDDING_DIM, models.HNSW_NODE_OVERHEAD_BYTES) == (384, 208)
+    assert models.estimate_hnsw_memory_bytes(1) == 1_536 + 256 + 208 == 2_000
+    assert models.estimate_hnsw_memory_bytes(50_000) == 100_000_000
+    assert models.estimate_hnsw_memory_bytes(50_000) / 2 ** 20 == pytest.approx(95.37, abs=0.01)
+    assert models.estimate_hnsw_memory_bytes(0) == 0
+    assert models.estimate_hnsw_memory_bytes(10, dim=3, m=1, overhead=0) == 10 * (12 + 16)
+    with pytest.raises(ValueError):
+        models.estimate_hnsw_memory_bytes(-1)
+    with pytest.raises(ValueError):
+        models.estimate_hnsw_memory_bytes(1.0)
+
+
+def test_meb_additions_are_exported_and_the_module_stays_a_leaf():
+    for name in ("LAMBDA_BASELINE", "LAMBDA_MITIGATED", "SESSION_ACTIONS", "poisson_reliability",
+                 "reliability_gain", "session_failure_reduction", "ReliabilityRow",
+                 "RELIABILITY_SENSITIVITY", "INTEGRATION_BREAKER_PARAMS", "integration_breaker_matrix",
+                 "integration_breaker_stationary", "stationary_distribution", "availability",
+                 "downtime", "downtime_reduction", "MEB_BREAKER_CALIBRATION", "CONTEXT_WINDOW_TOKENS",
+                 "SAFE_CONTEXT_BUDGET_TOKENS", "OVERFLOW_TRIGGER_P", "safe_turns_remaining",
+                 "normal_cdf", "overflow_probability", "should_trigger_adaptive_tail",
+                 "OperationalRisk", "OPERATIONAL_RISK_MATRIX", "prioritised_operational_risks",
+                 "HASH_BITS", "hash_collision_probability", "HNSW_PARAMS", "EMBEDDING_DIM",
+                 "HNSW_NODE_OVERHEAD_BYTES", "estimate_hnsw_memory_bytes"):
+        assert name in models.__all__, name
+    assert len(models.__all__) == len(set(models.__all__))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-W", "error", "-c",
+         "import sys, mindhive.models; print(sorted(m for m in sys.modules if m.startswith('mindhive')))"],
+        capture_output=True, text=True, env=env, cwd=str(REPO))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "['mindhive', 'mindhive.models']"
