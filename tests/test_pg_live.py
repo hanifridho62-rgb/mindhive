@@ -233,7 +233,10 @@ def test_adversarial_number_shapes_survive_the_jsonb_round_trip(migrated, store)
 
 
 @needs_server
-@pytest.mark.parametrize("shape", ["large_exponent", "signed_zero"])
+# `signed_zero` left this list when `canonical_json` began normalising `-0.0`
+# at the writer (RFC 8785, MEB SEC-02): the ledger no longer holds one, so
+# there is nothing for the mirror to differ over.
+@pytest.mark.parametrize("shape", ["large_exponent"])
 def test_a_payload_the_mirror_cannot_hold_verbatim_is_never_green(migrated,
                                                                  store,
                                                                  shape):

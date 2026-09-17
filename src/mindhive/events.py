@@ -1,8 +1,7 @@
 # src/mindhive/events.py
 import contextlib
-import hashlib
-import importlib
 import json
+import math
 import os
 import re
 import time
@@ -46,6 +45,17 @@ SESSION_ID_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # operator triaging the directory, instead of "something was refused here, or
 # somebody said so". Re-exported: `paths` owns it, for `paths.namespace_name`.
 QUARANTINE_PREFIX = paths.QUARANTINE_PREFIX
+
+# MEB SEC-01, verbatim: the Windows device stems, upper-case, checked by
+# `validate_session_id` BEFORE it asks the sink. `paths.WINDOWS_DEVICE_NAMES`
+# (lower-case, `com0`/`lpt0` included) stays the sink's own list, and the
+# sink is still asked afterwards -- so a stem this set lacks is refused all
+# the same, under the fourth message instead of the third.
+WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
 
 
 def segment_name(session_id, os_name=None) -> str:
@@ -103,6 +113,18 @@ def segment_name(session_id, os_name=None) -> str:
     return paths.quarantine_name(raw) + ".jsonl"
 
 
+def _quote(value) -> str:
+    """MEB's `'{session_id}'` rendering of a refused value, with every
+    control and non-ASCII character escaped: a raw newline in the value
+    would break the message and the `re.search` the tests run over it.
+    `paths.text_of`, not `str`, so a value whose `__str__` raises is still
+    named rather than crashing the refusal."""
+    text = paths.text_of(value)
+    if text is None:
+        text = "unstringifiable:" + type(value).__name__
+    return "'" + text.encode("unicode_escape").decode("ascii") + "'"
+
+
 def validate_session_id(session_id) -> str:
     """*session_id* VERBATIM, or ``ValueError`` -- the loud half of Bug 2.
 
@@ -121,16 +143,31 @@ def validate_session_id(session_id) -> str:
     sink. `append_event` resolves `None` to the environment BEFORE calling.
     Pure -- it touches no filesystem, which is what lets a strict append
     refuse before the events directory or the lock exists. The value is
-    rendered with `!r` so a control character in it cannot break the message
-    (or a `re.search` over it) with a raw newline."""
-    if (isinstance(session_id, str) and SESSION_ID_REGEX.fullmatch(session_id)
-            and segment_name(session_id, os_name="nt") == session_id + ".jsonl"):
-        return session_id
-    raise ValueError(
-        f"Format session_id {session_id!r} tidak valid: wajib alfanumerik "
-        "diawali huruf/angka, panjang 1-128 karakter, hanya boleh memuat tanda "
-        "titik, garis bawah, atau strip, tidak boleh berawalan 'unsafe-' (huruf "
-        "besar/kecil), dan bukan nama device Windows (CON, NUL, COM1, ...)")
+    rendered by `_quote` -- MEB's `'{session_id}'` form with every control
+    character escaped -- so a raw newline cannot break the message (or a
+    `re.search` over it).
+
+    Four refusals, in MEB SEC-01's order and wording: the type, the
+    whitelist, the Windows device stem (`WINDOWS_RESERVED_NAMES`), then the
+    sink's own verdict at `nt` -- which is what catches the reserved
+    `unsafe-` prefix in any case and the `com0`/`lpt0` stems the MEB set
+    lacks. Each message names exactly one rule, so the operator reads the one they
+    broke."""
+    if not isinstance(session_id, str):
+        raise ValueError(
+            f"Format session_id {_quote(session_id)} tidak valid: tipe data harus string.")
+    if not SESSION_ID_REGEX.fullmatch(session_id):
+        raise ValueError(
+            f"Format session_id {_quote(session_id)} tidak valid: karakter tidak diizinkan.")
+    if session_id.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        raise ValueError(
+            f"Format session_id {_quote(session_id)} tidak valid: "
+            "nama perangkat khusus Windows ditolak.")
+    if segment_name(session_id, os_name="nt") != session_id + ".jsonl":
+        raise ValueError(
+            f"Format session_id {_quote(session_id)} tidak valid: "
+            "inkonsistensi nama segmen fisik.")
+    return session_id
 
 
 SEMANTIC_TYPES = {
@@ -378,115 +415,10 @@ VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 MEMORY_VIEW_TYPES = SEMANTIC_TYPES | {"user_prompt", "assistant_response"}
 
 # --- registry payload contracts ----------------------------------------------
-# DATA_MODEL.md §6.2: the store stays type-agnostic (append_event does NOT call
-# this — every internal writer already builds a valid payload), and each type's
-# contract lives in its owning module, enforced at the surfaces that accept an
-# arbitrary type+payload from the user. There are TWO such surfaces — `hive
-# append` and the dashboard's POST /api/append — so the dispatch lives here,
-# beside the type registry, instead of being copied into both. Copying is how
-# they drifted: the CLI enforced four contracts and the endpoint enforced none.
-#
-# event type -> (contract module, corrective hint carried in the rejection)
-_PAYLOAD_CONTRACTS = {
-    "code_change": (".changelog", 'hive log <category> "..."'),
-    "sop": (".sop", "hive sop add|update|delete …"),
-    "roadmap": (".roadmap",
-                "hive roadmap set|step|interrupt|resume|complete …"),
-    "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
-    # `state_set` has NO subcommand -- there is no `hive state --set`, and
-    # `grep -rn state_set src/mindhive/commands/` finds nothing -- so the raw
-    # append below is not one writer among several, it is the ONLY one. That is
-    # also why this row was missing for so long: every other contract was
-    # registered by the module that owned the surface, and this surface owned
-    # no module until `state.py`. What it guards is the top of STATE.md, which
-    # `sync` embeds in the auto-loaded MEMORY.md -- the highest-trust text in
-    # the store. Following `mindnet_task`, the hint names only what ships.
-    "state_set": (".state",
-                  "hive append state_set '{\"task\": \"…\", "
-                  "\"open_questions\": []}' --json — keys: task, verified, "
-                  "next_step, open_questions, deferred; every one optional. "
-                  "There is no subcommand; this raw append is the only writer"),
-    # The hint names ONLY what ships. `mindnet_task` has five actions
-    # (tasks.ACTIONS) but exactly one CLI producer — `hive mindnet declare`;
-    # `status`, `depend`, `reparent` and `evidence` have no subcommand yet and
-    # are reachable only through this same raw-append surface. Advertising them
-    # as commands sent an operator whose append was just rejected off to run
-    # four things that do not exist, which is a worse failure than the original
-    # rejection. When a subcommand lands, add it here in the same change-set.
-    "mindnet_task": (".mindnet.tasks",
-                     "hive mindnet declare … — the status/depend/reparent/"
-                     "evidence actions have no subcommand yet; append them as "
-                     "raw JSON with a valid `action` field"),
-    # mindnet_phase points at the APPEND-SURFACE half of a two-validator
-    # contract: phases.validate_payload refuses any payload carrying
-    # `verified_by`, so this surface cannot self-attest a machine verification
-    # nothing performed. The writer's shape (which REQUIRES verified_by) is
-    # phases.validate_stored, called by the CLI just before append_event —
-    # registering that one here instead would invert the honesty rule.
-    "mindnet_phase": (".mindnet.phases",
-                      "hive mindnet declare|enter|satisfy|fall-back …"),
-    # Same two-validator split as mindnet_phase, and for the same reason:
-    # `verify.validate_payload` refuses any payload carrying `verified_by`, so
-    # this surface cannot stamp a mechanical run that never happened. The
-    # writer's shape (`verify.validate_stored`, which REQUIRES the stamp) is
-    # applied inside `run_and_record` just before append_event. Registering
-    # that one here would let a hand-written append forge the evidence the
-    # premise gate reads.
-    "verification": (".verify", "hive selftest — it records the run"),
-    # The replenishment audit row. Registered because the round's own state is
-    # folded back out of these events: a hand-appended row with a bogus
-    # `outcome` or a missing `fingerprint` would silently corrupt the dedup set
-    # and the dry-round counter, and the damage would only show up as work that
-    # stopped being proposed.
-    "work_injected": (".replenish", "hive replenish run --session <id>"),
-    # All three job types share ONE contract, because this surface sees only the
-    # payload and the three rows are paired by the two fields it enforces
-    # (`job_id`, `kind`). The per-type requirement — a `job_finished` MUST carry
-    # an outcome, or a finished job reads as running forever — is the writer's
-    # half, `jobs.validate_stored`, the same two-validator split `verification`
-    # and `mindnet_phase` use above. The hint names no command because there is
-    # none: these rows are written by the dashboard as it runs the work, and a
-    # hand-appended one is almost certainly a mistake.
-    "job_started": (".jobs", "the dashboard writes these as it runs a job"),
-    "job_finished": (".jobs", "the dashboard writes these as it runs a job"),
-    "job_abandoned": (".jobs", "written only by the boot seal, jobs.seal_orphans"),
-    # Participatory consensus. Two types, two submodules — the same split
-    # `mindnet_task` / `mindnet_phase` use, because this table calls one
-    # `validate_payload` per module and cannot pass the type down.
-    #
-    # Both are gated rather than left free-text because the round's own meaning
-    # is folded back out of them. A contribution with no `subject` breaks the
-    # per-subject weight normalisation for everyone else in the frame, and a
-    # `consensus_record` whose inputs carry no weight or reason is exactly the
-    # untraceable conclusion the PRD names as a failure condition — permanent,
-    # since this store is append-only, and authoritative-looking forever after.
-    "contribution": (".consensus.contributions",
-                     "hive consensus contribute --frame F --kind K "
-                     "--subject S --value V"),
-    "consensus_record": (".consensus.records",
-                         "hive consensus fold --frame F — the fold is the only "
-                         "writer, so a hand-appended record is almost "
-                         "certainly a mistake"),
-}
-
-
-def validate_typed_payload(event_type, payload) -> None:
-    """Enforce *event_type*'s registry contract at an arbitrary-payload append
-    surface. Raises ``ValueError`` whose message already carries the corrective
-    hint, so both surfaces report the same thing. A type with no registered
-    contract — every free-text memo and every telemetry type — is accepted
-    unchanged, which keeps this a gate on the registry, not on the store."""
-    contract = _PAYLOAD_CONTRACTS.get(event_type)
-    if contract is None:
-        return
-    module_name, hint = contract
-    # Deferred import: keeps `hive` startup cheap and the import side effects
-    # of five modules scoped to the one append that actually needs them.
-    mod = importlib.import_module(module_name, __package__)
-    try:
-        mod.validate_payload(payload)
-    except ValueError as e:
-        raise ValueError(f"{e} (use: {hint})") from e
+# Carved out to `contracts.py` (blueprint P0b) and re-exported BY IDENTITY:
+# `events._PAYLOAD_CONTRACTS is contracts._PAYLOAD_CONTRACTS`, so the two
+# append surfaces, the owning modules and the tests keep this spelling.
+from .contracts import _PAYLOAD_CONTRACTS, validate_typed_payload  # noqa: E402,F401
 
 
 # --- provenance: which outputs came from a Self-Reliant run ------------------
@@ -524,8 +456,67 @@ def to_dict(ev: "Event") -> dict:
     return asdict(ev)
 
 
+# RFC 8785 (JCS) alignment, MEB SEC-02. The three properties `canonical_json`
+# always had -- sorted keys, no whitespace, `allow_nan=False` -- are JCS's;
+# the two it lacked are added as one copy-on-write pass over the payload:
+# `-0.0` becomes `0.0` (JCS has no negative zero, and neither has the
+# mirror's `numeric`, which is why `-0.0` was the one float the mirror could
+# never hold verbatim), and nesting is capped so a hostile payload cannot
+# drive `json.dumps` into a RecursionError from inside the append lock.
+# BYTE-IDENTICAL for every payload without a `-0.0` and within the cap --
+# `tests/test_events_canonical.py` proves it over a corpus -- so no stored
+# chain head moves. Key order stays code-point order, which is JCS's UTF-16
+# order for the BMP; the astral-plane divergence is recorded here, not
+# fixed, because fixing it would move every head.
+MAX_NESTING_DEPTH = 100
+
+
+def _normalise(obj, depth=0):
+    """*obj* with every `-0.0` replaced by `0.0`, or *obj* ITSELF when nothing
+    changed: containers are copied only on the path to a change, so the
+    ordinary payload costs one walk and no allocation, and the caller's
+    object is never mutated. *depth* counts the containers entered; the
+    (`MAX_NESTING_DEPTH` + 1)-th raises `ValueError`."""
+    # Scalar-first: `str`, `None` and `int` (bool included) are most of the
+    # leaves and never change, so they leave before the float and container
+    # tests. Measured on the live 78,273-row `mindhive` ledger this ordering
+    # cut the walk from 0.200 s to 0.132 s.
+    if isinstance(obj, str) or obj is None or isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return 0.0 if obj == 0.0 and math.copysign(1.0, obj) < 0 else obj
+    if isinstance(obj, dict):
+        if depth >= MAX_NESTING_DEPTH:
+            raise ValueError(
+                f"kedalaman bersarang payload melebihi MAX_NESTING_DEPTH={MAX_NESTING_DEPTH}")
+        out = None
+        for key, value in obj.items():
+            new = _normalise(value, depth + 1)
+            if new is not value:
+                if out is None:
+                    out = dict(obj)
+                out[key] = new
+        return obj if out is None else out
+    if isinstance(obj, (list, tuple)):
+        if depth >= MAX_NESTING_DEPTH:
+            raise ValueError(
+                f"kedalaman bersarang payload melebihi MAX_NESTING_DEPTH={MAX_NESTING_DEPTH}")
+        out = None
+        for i, value in enumerate(obj):
+            new = _normalise(value, depth + 1)
+            if new is not value:
+                if out is None:
+                    out = list(obj)
+                out[i] = new
+        return obj if out is None else out
+    return obj
+
+
 def canonical_json(obj) -> str:
     """The ledger's one serialiser, and the bytes the hash chain covers.
+
+    RFC 8785-aligned (MEB SEC-02): sorted keys, no whitespace, no NaN, and --
+    through `_normalise` -- no `-0.0` and no nesting past `MAX_NESTING_DEPTH`.
 
     `allow_nan=False` because the default emits BARE `NaN` / `Infinity`
     tokens, which are not JSON. Measured: a contribution carrying
@@ -537,53 +528,15 @@ def canonical_json(obj) -> str:
 
     Refusing at the writer is the only place this can be caught for every
     event type at once, so it is refused here and not in one contract."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+    return json.dumps(_normalise(obj), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
 
 
 # --- the hash chain's primitives, exported ------------------------------------
-# `chain.py` has always folded the ledger into a SHA-256 chain, but the fold
-# lived inline in `chain.compute_chain` and `chain._fold` with nothing exporting
-# the formula. The background watcher builds an `EventRecord` per physical row
-# and stores `prev_hash` / `chain_hash` in vector metadata; a formula re-derived
-# there by hand could drift from `chain.py` by one `.encode()` argument, and the
-# two digests for one row would disagree without anything noticing. So the
-# primitive lives here. `chain._ZERO` is not rewritten to import this constant
-# -- `chain.py` is untouched -- and `tests/test_events_chain_helpers.py` pins
-# the two equal and the fold identical in both of `chain.py`'s coordinates.
-GENESIS_PREV_HASH = "0" * 64
-
-
-def compute_chain_hash(prev_hash: str, canonical: str) -> str:
-    """One chain step, byte for byte what `chain.compute_chain` and
-    `chain._fold` run: SHA-256 over the UTF-8 bytes of `prev_hash + canonical`,
-    where *canonical* is the str `canonical_json(to_dict(ev))` returns. NOT
-    the PDF's `bytes` parameter with an ASCII-encoded prefix -- a second scheme
-    would make the watcher's digest and the checkpoint's two different numbers
-    for one row (plan decision AMBIG 3)."""
-    return hashlib.sha256((prev_hash + canonical).encode("utf-8")).hexdigest()
-
-
-@dataclass(frozen=True)
-class EventRecord:
-    """One physical row as a READER sees it, with its chain coordinates.
-
-    A runtime wrapper, never the row (AMBIG 3): the segment keeps exactly
-    `Event`'s five keys, because every checkpoint on disk was folded over
-    those bytes and a `prev_hash` written into the row would move every head
-    on the first append. Readers build this from a row -- `event_id` is
-    `f"{session_id}:{seg_line}"` with `seg_line` the 1-BASED physical line --
-    and it is frozen so a record handed to a vector store cannot be edited
-    after its `chain_hash` was computed over it."""
-    event_id: str
-    session_id: str
-    seg_line: int
-    timestamp: str
-    event_type: str
-    payload: dict
-    tags: list
-    prev_hash: str
-    chain_hash: str
+# Defined in `core.models` (blueprint P0b, K6) and re-exported BY IDENTITY:
+# `events.EventRecord is core.models.EventRecord`. `chain.py` is untouched
+# and `tests/test_events_chain_helpers.py` still pins the fold identical.
+from .core.models import EventRecord, GENESIS_PREV_HASH, compute_chain_hash  # noqa: E402,F401
 
 
 def now_iso() -> str:
@@ -682,7 +635,11 @@ def _append_lock(project):
 
 
 def append_event(event_type, payload, session_id=None, tags=None, ts=None,
-                 project=None, *, strict_session=False) -> "Event":
+                 project=None, *, strict_session=False, fsync=False) -> "Event":
+    # `fsync`: the storage SPI's durable append (MEB STO-01) -- flush and
+    # `os.fsync` before the lock is released. Off by default: the hook path
+    # must not pay a disk flush per event, and the row is durable enough
+    # once the OS holds it for every reader this process will ever have.
     if event_type not in VALID_TYPES:
         raise ValueError(f"unknown event type: {event_type}")
     session_id = session_id or os.environ.get("MINDHIVE_SESSION") or "manual"
@@ -711,6 +668,9 @@ def append_event(event_type, payload, session_id=None, tags=None, ts=None,
             seg_line = None
         with open(seg, "a", encoding="utf-8") as f:
             f.write(canonical_json(to_dict(ev)) + "\n")
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
         if seg_line is not None:
             # A secondary projection behind the primary record: a marker that
             # cannot be read or published must never lose or delay the row.
