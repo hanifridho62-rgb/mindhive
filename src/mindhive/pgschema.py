@@ -665,6 +665,9 @@ EVENT_TYPE_CLASSES = {
     "contribution":        "semantic",
     "decision":            "semantic",
     "experiment_result":   "semantic",
+    # Work sessions (blueprint P1b): a step and an initiative are both memos a
+    # reader searches by meaning.
+    "initiative_declared": "semantic",
     "learning":            "semantic",
     "mindnet_phase":       "semantic",
     "mindnet_task":        "semantic",
@@ -673,6 +676,7 @@ EVENT_TYPE_CLASSES = {
     "roadmap":             "semantic",
     "sop":                 "semantic",
     "state_set":           "semantic",
+    "work_session":        "semantic",
     # deterministic — machine telemetry. Hashed like everything else (the chain
     # folds read_all with no type filter), but off the semantic layer.
     "assistant_response":  "deterministic",

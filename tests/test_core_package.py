@@ -56,6 +56,22 @@ def test_the_core_package_init_imports_nothing():
     assert not [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
 
 
+def test_work_session_step_is_served_lazily_by_the_package():
+    """K6: `WorkSessionStep` stays defined in `worksessions.py` (section 8.4) and
+    the package serves it through PEP 562 `__getattr__`, so importing the
+    package still loads nothing -- the name resolves on first access only."""
+    import mindhive.core as core_pkg
+    from mindhive import worksessions
+    assert core_pkg.WorkSessionStep is worksessions.WorkSessionStep
+    with pytest.raises(AttributeError, match="has no attribute 'Nope'"):
+        core_pkg.Nope
+    loaded = _child("import sys, mindhive.core as c; "
+                    "before = 'mindhive.worksessions' in sys.modules; "
+                    "c.WorkSessionStep; "
+                    "print(before, 'mindhive.worksessions' in sys.modules)")
+    assert loaded == "False True"
+
+
 def test_events_imports_only_core_models_from_the_core_package():
     """`events` must never pull `core.locks` or `core.dreaming` onto the hook
     path; the one allowed edge is the re-export of the three primitives."""

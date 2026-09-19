@@ -10,7 +10,11 @@ SEMANTIC_TYPES = ev_mod.SEMANTIC_TYPES  # decision, experiment_result, caveat, n
 # roadmap events carry structured payloads (no "text") and their delivery is
 # the STATE.md interrupted-plan notice + Oversee — a timeline line would be a
 # blank headline eating the cap.
-_TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set", "roadmap"}
+# Work-session rows (blueprint P1b) carry tags, not text, and a migration writes
+# one per roadmap step: as timeline lines they would be blank headlines flooding
+# the cap. `hive worksession list` and Oversee are where they are read.
+_TIMELINE_TYPES = SEMANTIC_TYPES - {"state_set", "roadmap", "work_session",
+                                    "initiative_declared"}
 
 # Cap on how many distinct (post-dedup) entries each list section emits. The
 # briefing is wrapped verbatim into the native MEMORY.md that auto-loads every

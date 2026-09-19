@@ -35,6 +35,119 @@ def test_active_session_appears_with_prompt_title_and_online():
     assert stale[0]["online"] is False                # idle > online window
 
 
+def _ws_step(phase, action, minute, sid="sess-abc", status="pending"):
+    from mindhive import worksessions as ws
+    ts = f"2026-07-08T10:{minute:02d}:00Z"
+    tag = ws.make_work_session_tag(phase, action, ts=ts)
+    _ev("work_session", {"action": "step_append", "session_id": sid,
+                         "step_id": f"st-{minute}", "phase": phase, "ws_tag": tag,
+                         "initiative_tag": "[USER_SPEC: x]",
+                         "usage_tag": "[USAGE: 0/100000 | 0.0%]", "status": status,
+                         "timestamp": ts}, minute, sid=sid)
+    return tag
+
+
+def test_card_carries_the_work_session_phase_and_its_recent_tags():
+    _ev("user_prompt", {"text": "build it"}, 0)
+    tags = [_ws_step(p, f"step {i}", i + 1)
+            for i, p in enumerate(("brainstorm", "plan", "PRD", "kanban", "execution"))]
+    _ev("work_session", {"action": "step_status", "session_id": "sess-abc",
+                         "step_id": "st-5", "status": "completed",
+                         "timestamp": "2026-07-08T10:07:00Z"}, 7)
+    (card,) = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:08:00Z"))
+    assert card["phase"] == "execution"            # nothing active: the last step
+    assert card["ws_tags"] == tags[-4:]            # the head tag + three before it
+    assert card["initiatives"] == []
+    # Bookkeeping rows are not activity: the card's clock is the prompt's.
+    assert card["last_event_ts"] == "2026-07-08T10:00:00Z"
+
+
+def test_the_card_head_is_the_active_step_not_the_last_appended():
+    _ev("user_prompt", {"text": "build it"}, 0)
+    tags = [_ws_step("plan", "one", 1), _ws_step("execution", "two", 2),
+            _ws_step("quality assessment", "three", 3)]
+    _ev("work_session", {"action": "step_status", "session_id": "sess-abc",
+                         "step_id": "st-1", "status": "completed",
+                         "timestamp": "2026-07-08T10:04:00Z"}, 4)
+    _ev("work_session", {"action": "step_status", "session_id": "sess-abc",
+                         "step_id": "st-2", "status": "active",
+                         "timestamp": "2026-07-08T10:05:00Z"}, 5)
+    (card,) = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:06:00Z"))
+    assert card["phase"] == "execution"
+    assert card["ws_tags"] == tags[:2]             # the trail ends at the active step
+
+
+def test_off_axis_or_malformed_work_session_rows_leave_the_card_quiet():
+    _ev("user_prompt", {"text": "x"}, 0)
+    _ev("work_session", {"action": "step_append", "phase": "implementation",
+                         "ws_tag": "[WS: implementation | x | t]"}, 1)
+    _ev("work_session", {"action": "step_append", "phase": "plan", "ws_tag": 3}, 2)
+    _ev("work_session", "free text", 3)
+    _ev("initiative_declared", "free text", 4)
+    (card,) = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:05:00Z"))
+    assert (card["phase"], card["ws_tags"], card["initiatives"]) == ("", [], [])
+
+
+def test_a_session_without_work_session_rows_still_carries_the_keys():
+    _ev("user_prompt", {"text": "x"}, 0)
+    (card,) = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:01:00Z"))
+    assert (card["phase"], card["ws_tags"], card["initiatives"]) == ("", [], [])
+
+
+def test_work_session_rows_alone_open_no_card():
+    _ws_step("plan", "copied from a roadmap", 1, sid="ws-demo")
+    _ev("initiative_declared", {"reason": "r", "ref": "", "tag": "[INITIATIVE: r]"}, 2,
+        sid="ws-demo")
+    assert oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z")) == []
+
+
+def test_work_session_rows_never_resurrect_an_aged_out_or_dismissed_session():
+    events.append_event("user_prompt", {"text": "old task"}, session_id="old-sess",
+                        ts="2026-07-08T01:00:00Z", project="test")
+    _ev("user_prompt", {"text": "some work"}, 1)
+    events.append_event("loop_run_dismissed", {"run_id": "sess-abc", "cause": "manual"},
+                        ts="2026-07-08T10:05:00Z", project="test")
+    _ws_step("plan", "migrated", 20, sid="old-sess")      # `hive worksession migrate`
+    _ws_step("plan", "migrated", 21)
+    _ev("initiative_declared", {"reason": "r", "ref": "", "tag": "[INITIATIVE: r]"}, 22)
+    assert oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:23:00Z")) == []
+
+
+def test_initiatives_ride_the_card_oldest_first_and_capped():
+    _ev("user_prompt", {"text": "x"}, 0)
+    for i in range(10):
+        _ev("initiative_declared", {"reason": f"r{i}", "ref": "i:1" if i == 9 else "",
+                                    "tag": f"[INITIATIVE: r{i}]"}, 1, second=i)
+    (card,) = oversee.interactive_sessions(
+        "test", now_fn=lambda: _epoch("2026-07-08T10:02:00Z"))
+    assert [i["reason"] for i in card["initiatives"]] == [f"r{i}" for i in range(2, 10)]
+    assert card["initiatives"][-1] == {"reason": "r9", "ref": "i:1",
+                                       "tag": "[INITIATIVE: r9]",
+                                       "ts": "2026-07-08T10:01:09Z", "step_id": ""}
+    assert card["last_event_ts"] == "2026-07-08T10:00:00Z"
+
+
+def test_an_initiative_step_written_through_the_api_gets_its_badge():
+    from mindhive import worksessions as ws
+    _ev("user_prompt", {"text": "x"}, 0)
+    step = ws.create_work_session_step("quality assessment", "TDD_GREEN", True,
+                                       initiative_reason="autonomous extra")
+    ws.record_work_session_step("sess-abc", step, project="test")
+    now = events.read_all("test")[-1].ts
+    (card,) = oversee.interactive_sessions("test", now_fn=lambda: _epoch(now) + 60,
+                                           active_seconds=10 ** 9)
+    (init,) = card["initiatives"]
+    assert (init["reason"], init["step_id"], init["tag"]) == \
+        ("autonomous extra", step.step_id, "[INITIATIVE: autonomous extra]")
+    assert card["phase"] == "quality assessment"
+
+
 def test_ended_session_is_removed_automatically():
     _ev("session_start", {}, 0)
     _ev("user_prompt", {"text": "quick fix"}, 1)

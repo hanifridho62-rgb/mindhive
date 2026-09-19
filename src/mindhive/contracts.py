@@ -105,6 +105,15 @@ _PAYLOAD_CONTRACTS = {
                          "hive consensus fold --frame F — the fold is the only "
                          "writer, so a hand-appended record is almost "
                          "certainly a mistake"),
+    # Blueprint P1b: one module per type, as `consensus` does -- this table
+    # cannot pass the type down, and one module telling two types apart by
+    # payload shape let each type accept the other's rows.
+    "work_session": (".worksessions",
+                     "hive worksession record --phase <phase> --action <key|text> "
+                     "[--initiative --reason … --ref …] | hive worksession status "
+                     "--session S --step-id ID --status <status>"),
+    "initiative_declared": (".initiatives",
+                            "hive worksession initiative --reason … [--ref …]"),
 }
 
 

@@ -156,7 +156,9 @@ SURFACE = {'append': {},
            'reconcile': {},
            'enforce': {}},
  'triggers': {'train': {}, 'list': {}, 'check': {}},
- 'enrich': {'status': {}, 'on': {}, 'off': {}, 'preview': {}}}
+ 'enrich': {'status': {}, 'on': {}, 'off': {}, 'preview': {}},
+ 'worksession': {'record': {}, 'status': {}, 'initiative': {}, 'list': {},
+                 'migrate': {}}}
 
 # The handler NAME every parser bound BEFORE the split (the `__func__` entries
 # of the same 2026-09-14 snapshot). Self-registering groups included: this is
@@ -295,7 +297,12 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'triggers check': 'cmd_triggers_check',
  'triggers list': 'cmd_triggers_list',
  'triggers train': 'cmd_triggers_train',
- 'verify': 'cmd_verify'}
+ 'verify': 'cmd_verify',
+ 'worksession initiative': 'cmd_worksession',
+ 'worksession list': 'cmd_worksession',
+ 'worksession migrate': 'cmd_worksession',
+ 'worksession record': 'cmd_worksession',
+ 'worksession status': 'cmd_worksession'}
 
 
 def _sub(parser):

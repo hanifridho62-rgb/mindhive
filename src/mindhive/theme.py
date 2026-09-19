@@ -104,6 +104,11 @@ PALETTE = {
         "cat-replacement": ("#4ad9c8", "replacement"),
         "cat-other": ("#888", "a category this build does not know"),
     },
+    # The MEB palette (blueprint K12), token by token: each lands with the first
+    # rule that draws it, because a declared-but-unused token fails the audit.
+    "blueprint": {
+        "accent": ("#3182ce", "the context-usage fill and initiative flags (MEB accent)"),
+    },
 }
 
 # The groups every document needs, whether or not it is the shell.

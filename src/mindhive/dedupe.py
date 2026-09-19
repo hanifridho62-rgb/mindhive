@@ -37,13 +37,16 @@ DEFAULT_THRESHOLD = 0.85
 #
 # Two reasons a type lands here, and both matter:
 #
-#   * AUDIT ROWS — `code_change` and `learning`. Two similarly-worded change-log
-#     entries are two genuinely distinct changes, and two Self-Reliant PRDs
-#     about the same goal read alike while prescribing different builds.
-#     Collapsing either hides a real record behind a near-twin.
-#   * REPLAYED REGISTRIES — `sop`, `roadmap`, `mindnet_task`, `mindnet_phase`.
-#     Their folds replay EVERY lifecycle event, so an add and its later update
-#     are two steps of one record's history, not a duplicate pair.
+#   * AUDIT ROWS — `code_change`, `learning` and `initiative_declared`. Two
+#     similarly-worded change-log entries are two genuinely distinct changes,
+#     two Self-Reliant PRDs about the same goal read alike while prescribing
+#     different builds, and two initiatives worded alike are two autonomous
+#     decisions BAB 5.3.2 promises the reader will see. Collapsing any of them
+#     hides a real record behind a near-twin.
+#   * REPLAYED REGISTRIES — `sop`, `roadmap`, `mindnet_task`, `mindnet_phase`,
+#     `work_session`. Their folds replay EVERY lifecycle event, so an add and
+#     its later update are two steps of one record's history, not a duplicate
+#     pair.
 #
 # `state_set` is here for a third reason: it is "last one wins" state, carries
 # no `text` at all, and is excluded from the LEDGER entirely — collapsing two of
@@ -53,7 +56,8 @@ DEFAULT_THRESHOLD = 0.85
 # never matched anything. Listing it explicitly costs nothing and closes the
 # last gap in the two-list agreement.
 NEVER_COLLAPSE = ("code_change", "learning", "state_set", "sop", "roadmap",
-                  "mindnet_task", "mindnet_phase")
+                  "mindnet_task", "mindnet_phase", "work_session",
+                  "initiative_declared")
 
 
 def text_fingerprint(text) -> str:

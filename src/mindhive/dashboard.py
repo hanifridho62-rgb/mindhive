@@ -24,6 +24,10 @@ from .dashboard_query import (BadRequest, body_num,  # noqa: F401
 # job module the background harvest loop reaches through.
 from . import dashboard_jobs as jobs_mod
 from .dashboard_get import GetRoutes
+# The v1.1 GET routes (blueprint P1b onward): a second mixin, mounted first by
+# `make_handler`. Its memo is re-exported so the module-level `*_MEMO` sweep
+# (tests/test_dashboard_locks.py) empties it with the rest.
+from .dashboard_get_v1 import _WORKSESSIONS_MEMO, GetRoutesV1  # noqa: F401
 from .dashboard_post import PostRoutes
 # Re-exported, not re-implemented. Callers read these off THIS module and
 # must get the same OBJECTS the handlers use: `tests/test_dashboard_locks`
@@ -125,12 +129,18 @@ def mindswarm_enabled() -> bool:
 
 
 def make_handler(token: str):
-    class DashboardHandler(GetRoutes, PostRoutes, BaseHTTPRequestHandler):
+    class DashboardHandler(GetRoutesV1, GetRoutes, PostRoutes, BaseHTTPRequestHandler):
         # The token, as a class attribute rather than a closure cell. Two
         # GET handlers render an iframe page with it and now live in
         # `dashboard_get`, which cannot see this function's locals; nothing
         # else in either route module ever needed it.
         _token = token
+
+        # This class's OWN GET table: the base routes, then the v1.1 ones
+        # (`dashboard_get_v1`; `dashboard_get.py` stands at the 1000-line cap).
+        # A fresh dict per minted class, so a route planted on one handler
+        # cannot leak into the next. The two tables are disjoint (pinned).
+        _GET_ROUTES = {**GetRoutes._GET_ROUTES, **GetRoutesV1._GET_ROUTES_V1}
 
         # HTTP/1.1, so the browser reuses one connection for the whole page
         # instead of a TCP handshake per request — this panel issues dozens of

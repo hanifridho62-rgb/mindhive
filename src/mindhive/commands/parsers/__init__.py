@@ -87,6 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
     registry_p.add_rules(sub)
     registry_p.add_triggers(sub)
     maintenance_p.add_enrich(sub)
+    orchestration_p.add_worksession(sub)     # blueprint P1b
 
     return p
 

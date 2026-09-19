@@ -4,6 +4,8 @@ import threading
 from . import paths, events, chain, review, changelog, incidents, reflect, sop
 from . import provenance, state as state_mod
 from . import roadmap
+# Reaches only `events` at import; the tag grammar lives with its contract.
+from . import initiatives, worksessions
 # `sopgate` reaches only `outcomes` (stdlib), `sop` and `promptgate` (-> `paths`),
 # so this introduces no cycle either. Importing it here also means the
 # `sop-injection` surface is registered by anything that can rebuild a
@@ -269,6 +271,10 @@ def build_ledger_entries(evs):
             body = mn_tasks.ledger_body(ev.payload)
         elif ev.type == "mindnet_phase" and isinstance(ev.payload, dict):
             body = mn_phases.ledger_body(ev.payload)
+        elif ev.type == "work_session" and isinstance(ev.payload, dict):
+            body = worksessions.ledger_body(ev.payload)
+        elif ev.type == "initiative_declared" and isinstance(ev.payload, dict):
+            body = initiatives.ledger_body(ev.payload)
         fname = f"{_ts_compact(ev.ts)}-{ev.type}-{_short(ev.ts + ev.type + body)}.md"
         content = (f"---\nts: {ev.ts}\ntype: {ev.type}\n"
                    f"tags: {','.join(ev.tags)}\nsession: {ev.session_id}\n---\n\n{body}\n")

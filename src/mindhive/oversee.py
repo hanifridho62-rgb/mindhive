@@ -24,18 +24,28 @@ tool events within ONLINE_WINDOW_SECONDS."""
 import time
 
 from . import events as ev_mod
+from . import initiatives as initiatives_mod
+from . import worksessions
 from .briefing import headline
 from .loop.state import _ts_epoch
 
 ONLINE_WINDOW_SECONDS = 180.0        # tool events this fresh = Claude is working
 ACTIVE_WINDOW_SECONDS = 6 * 3600.0   # idle longer than this = session aged out
 _DONE_CAP = 8                        # per detail group, keep the card readable
+_WS_TAG_CAP = 4                      # the active [WS] tag + the three before it
+
+# Work-session rows (blueprint P1b) are bookkeeping ABOUT a session, not
+# activity OF one: they attach to a card real telemetry already opened, and
+# never open a card or bump its liveness -- `hive worksession migrate` copies
+# old roadmap plans, and counting those rows put every past plan owner back on
+# the board as "online". One set with the Sessions view (`events.BOOKKEEPING_TYPES`).
+_WS_TYPES = ev_mod.BOOKKEEPING_TYPES
 
 # telemetry that counts as "the session is doing something"
 _ACTIVITY_TYPES = {
     "session_start", "file_touched", "command_run", "user_prompt",
     "assistant_response", "compaction", "skill_used",
-} | ev_mod.SEMANTIC_TYPES
+} | (ev_mod.SEMANTIC_TYPES - _WS_TYPES)
 
 
 def _text(payload) -> str:
@@ -239,6 +249,7 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
     sessions: dict[str, dict] = {}
     order: list[str] = []
     dismissed: dict[str, str] = {}
+    ws_rows: dict[str, list] = {}
     for e in evs:
         if e.type == "loop_run_dismissed":
             rid = (e.payload or {}).get("run_id")
@@ -247,6 +258,9 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
             continue
         sid = e.session_id
         if not sid or sid == "manual" or e.type.startswith("loop_"):
+            continue
+        if e.type in _WS_TYPES:
+            ws_rows.setdefault(sid, []).append(e)
             continue
         s = sessions.get(sid)
         if s is None:
@@ -269,6 +283,10 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 # (filled by the per-event pass below — same idiom as
                 # dashboard_get._get_sessions)
                 "origin": None,
+                # Work sessions (blueprint P1b, BAB 5.5): the ACTIVE step's
+                # phase, the [WS] tags up to and including it, and the
+                # session's initiatives. Present, and empty, on every card.
+                "phase": "", "ws_tags": [], "initiatives": [],
             }
             order.append(sid)
         if not s["origin"]:              # any event may carry the tag
@@ -339,6 +357,17 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
         s["done"] = s["done"][-_DONE_CAP:] + [f"touched {p}" for p in files[-_DONE_CAP:]]
         s["planned"] = s["planned"][-_DONE_CAP:]
         s["blockers"] = s["blockers"][-_DONE_CAP:]
+        # The same fold `hive worksession list` and /api/worksessions read, so
+        # the card head is the step `fold` calls active, never merely the last
+        # one appended, and the three surfaces cannot disagree.
+        rows = ws_rows.get(sid, [])
+        w = worksessions.fold(rows).get(sid)
+        if w is not None and w.steps:
+            head = w.active_step_index
+            s["phase"] = w.steps[head].phase_tag
+            s["ws_tags"] = [st.technical_action for st in w.steps[:head + 1]][-_WS_TAG_CAP:]
+        s["initiatives"] = [{k: v for k, v in i.items() if k != "session_id"}
+                            for i in initiatives_mod.initiatives(rows)][-_DONE_CAP:]
         sk = trails.get(sid, [])
         s["skills_total"] = len(sk)
         s["skills"] = sk[-_DONE_CAP:]

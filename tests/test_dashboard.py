@@ -770,6 +770,9 @@ _MOTION_GUARDS = {
     ".mn-cat.dim svg:hover": ".mn-cat-sprite",
     ".mn-sess.working .mn-cat-sprite:hover": ".mn-cat-sprite",
     ".mn-inj.verbatim .mn-cat-sprite:hover": ".mn-cat-sprite",
+    # dashboard_css.py, blueprint P1b: the work-session phase pill pulses its
+    # blip while the session is online, and stops like every other pulse.
+    ".pill.wsphase .blip": ".pill.wsphase .blip",
     # taskview.py
     ".tstat.ongoing": ".tstat.ongoing",
 }

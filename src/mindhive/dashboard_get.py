@@ -27,7 +27,7 @@ defined on a different class."""
 import time
 from urllib.parse import urlparse
 
-from . import chain, dedupe, events, jobs, paths, taskview
+from . import chain, dashboard_get_v1, dedupe, events, jobs, paths, taskview
 from . import export as export_mod
 from . import graph as graph_mod
 from . import graphview
@@ -177,7 +177,7 @@ class GetRoutes:
                 # same self-describing body the LEDGER projection uses so
                 # the Memory view never shows a blank plan row.
                 return roadmap_mod.ledger_body(e.payload)
-            return e.payload.get("text", "")
+            return e.payload.get("text", "") or dashboard_get_v1.memory_text(e)
         # Collapse near-duplicate memories by meaning (same type + project),
         # keeping the newest; display-time only, ledger untouched.
         # similar_count rides along for the UI hint.
@@ -290,6 +290,8 @@ class GetRoutes:
                     s["origin"] = events.origin_of(e.session_id, e.tags)
                 if e.type in events.MEMORY_VIEW_TYPES:
                     s["memory"] += 1
+                if e.type in events.BOOKKEEPING_TYPES and s["events"] > 1:
+                    continue           # never re-dates a session (as on Oversee)
                 if e.ts and e.ts < s["first_ts"]:
                     s["first_ts"] = e.ts
                 if e.ts and e.ts > s["last_ts"]:

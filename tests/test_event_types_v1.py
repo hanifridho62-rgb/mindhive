@@ -34,12 +34,15 @@ kind: `project_dir(project) / "state"`, made on demand, joined THROUGH
 `project_dir` so a hostile project name lands inside the quarantined namespace
 like everything else in the store.
 
-Deliberately NOT here yet: the six v1.x event types (`work_session`,
-`initiative_declared`, `interceptor_signal`, `vector_sync_started`,
+Two of the six v1.x event types are registered: `work_session` and
+`initiative_declared` landed with their owners, `worksessions.py` and
+`initiatives.py` (blueprint P1b), and their registration assertions close this
+file. Deliberately NOT
+here yet: the other four (`interceptor_signal`, `vector_sync_started`,
 `vector_sync_completed`, `merge_conflict_detected`) and their registration
 assertions -- membership in `VALID_TYPES`, the SEMANTIC / DETERMINISTIC split,
 their `_PAYLOAD_CONTRACTS` rows and `ledger_body`. Each is registered by the
-phase that lands its owning module (worksessions; orchestrator/interceptor and
+phase that lands its owning module (orchestrator/interceptor and
 mindnet/worktree; watcher), following docs/DATA_MODEL.md section 6, and the
 assertions are appended to this file in that same change-set. Registering a
 type before its owner module exists is not merely untidy: a
@@ -534,3 +537,52 @@ def test_an_existing_marker_is_read_through_read_text_retry(monkeypatch):
     _decision("two")
     assert _marker() in reads
     assert [e["seg_line"] for e in _entries()] == [1, 2]
+
+
+# --- the two v1.x types blueprint P1b registers (DATA_MODEL.md section 6) -----------
+
+P1B_TYPES = ("work_session", "initiative_declared")
+OWNERS = {"work_session": ".worksessions", "initiative_declared": ".initiatives"}
+STILL_UNREGISTERED = ("interceptor_signal", "vector_sync_started",
+                      "vector_sync_completed", "merge_conflict_detected")
+
+
+@pytest.mark.parametrize("etype", P1B_TYPES)
+def test_p1b_types_are_registered_semantic_exempt_and_contracted(etype):
+    from mindhive import consolidate, contracts, dedupe, pgschema
+    assert etype in events.VALID_TYPES and etype in events.SEMANTIC_TYPES
+    assert etype not in events.DETERMINISTIC_TYPES
+    assert pgschema.EVENT_TYPE_CLASSES[etype] == "semantic"
+    assert etype in consolidate.NEVER_CONSOLIDATE and etype in dedupe.NEVER_COLLAPSE
+    module, hint = contracts._PAYLOAD_CONTRACTS[etype]
+    assert module == OWNERS[etype] and hint.startswith("hive worksession ")
+    with pytest.raises(ValueError, match=r"\(use: hive worksession "):
+        contracts.validate_typed_payload(etype, {})
+
+
+@pytest.mark.parametrize("etype", STILL_UNREGISTERED)
+def test_the_other_four_v1_types_are_still_unregistered(etype):
+    from mindhive import contracts
+    assert etype not in events.VALID_TYPES
+    assert etype not in contracts._PAYLOAD_CONTRACTS
+
+
+def test_p1b_appends_queue_one_marker_entry_per_row():
+    from mindhive import initiatives, worksessions as ws
+    step = ws.create_work_session_step("execution", "TDD_RED", False)
+    ws.record_work_session_step("ws-marker", step)
+    initiatives.declare_initiative("ws-marker", "flaky lock")
+    entries = [e for e in _entries() if e["session_id"] == "ws-marker"]
+    assert [e["seg_line"] for e in entries] == [1, 2]
+    assert {e["segment"] for e in entries} == {events.segment_name("ws-marker")}
+
+
+def test_p1b_types_render_ledger_bodies_carrying_their_tags():
+    from mindhive import initiatives, projector, worksessions as ws
+    step = ws.create_work_session_step("PRD", "AST_PARSE", True, initiative_reason="audit")
+    ws.record_work_session_step("ws-ledger", step)
+    tag = initiatives.declare_initiative("ws-ledger", "audit", "finding:3")
+    bodies = {ev.type: content
+              for _f, content, ev in projector.build_ledger_entries(events.read_all())}
+    assert "PRD" in bodies["work_session"] and step.technical_action in bodies["work_session"]
+    assert tag in bodies["initiative_declared"]

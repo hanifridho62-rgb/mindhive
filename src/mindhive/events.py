@@ -218,6 +218,12 @@ SEMANTIC_TYPES = {
     # population would put the demographic into the schema.
     "contribution",
     "consensus_record",
+    # Work sessions (blueprint P1b, BAB 5): a `work_session` row (owner
+    # `worksessions.py`) is one step on the ten-stage axis or a status move;
+    # `initiative_declared` (owner `initiatives.py`) records an autonomous
+    # initiative that is not one step (BAB 5.3.2).
+    "work_session",
+    "initiative_declared",
 }
 DETERMINISTIC_TYPES = {
     "file_touched", "command_run", "git_diff",
@@ -406,6 +412,12 @@ DETERMINISTIC_TYPES = {
     "context_injected",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
+
+# Work-session rows (blueprint P1b): semantic, but bookkeeping ABOUT a session,
+# never activity OF one -- no liveness surface (the Oversee board, the Sessions
+# view) lets them open or re-date a session, since `hive worksession migrate`
+# writes them by the hundred under old plans' owners.
+BOOKKEEPING_TYPES = frozenset({"work_session", "initiative_declared"})
 
 # Types surfaced in the dashboard "Memory" view: the curated semantic memos PLUS
 # the raw conversation log (every prompt and every response). user_prompt and

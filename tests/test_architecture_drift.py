@@ -360,7 +360,8 @@ def test_no_phase_name_synonym_in_the_normative_docs(doc):
 # the projected markdown) AND filename-colliding, because the entry name hashes
 # `ts + type + body`. Two same-second events then write the same file.
 
-_TEXTLESS_SEMANTIC_TYPES = ("sop", "roadmap", "mindnet_task", "mindnet_phase")
+_TEXTLESS_SEMANTIC_TYPES = ("sop", "roadmap", "mindnet_task", "mindnet_phase",
+                            "work_session", "initiative_declared")
 
 
 @pytest.mark.parametrize("type_name", _TEXTLESS_SEMANTIC_TYPES)

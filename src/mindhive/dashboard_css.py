@@ -423,6 +423,21 @@ CSS = """\
   .pill.triclaude { color:var(--link); border-color:#2c4a75; font-weight:700; }
   .pill.tridism { color:var(--faint); }
   .pill.sr { color:#c9a6ff; border-color:#5b3f8a; background:#191227; }
+  /* Work sessions (blueprint P1b, BAB 5.5). The phase pill's blip pulses only
+     while the session is online; an initiative badge is never styled like an
+     ordinary pill, because an autonomous step has to read as one at a glance.
+     The usage bar fills with the MEB accent and ticks the safe budget. */
+  .pill.wsphase { color:var(--link); }
+  .pill.wsphase .blip { animation: pulse 1.6s infinite; color:var(--ok); }
+  .pill.wstag { color:var(--muted); display:inline-block; max-width:44ch;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
+  .pill.wsinit { color:#5ad1e6; border-color:#8b6fe0; background:#13182a; }
+  .wsflag { color:var(--accent); }
+  .usagebar { position:relative; display:inline-block; width:140px; height:6px;
+    vertical-align:middle; background:var(--sunken); border:1px solid var(--line);
+    border-radius:3px; overflow:hidden; }
+  .usagefill { display:block; height:100%; background:var(--accent); }
+  .usagesafe { position:absolute; top:0; bottom:0; width:2px; background:var(--warn); }
   /* A READING COLUMN, not the width of the window. Measured on the real store
      at 1440px: a change-log row ran 1176 px wide and its prose came to 152
      characters per line, which is a shade under twice the widest line anybody
@@ -649,7 +664,7 @@ CSS = """\
      page declares itself. Each of these animations is switched on by a rule at
      least as specific, and a media query adds no specificity — hence !important. */
   @media (prefers-reduced-motion: reduce) {
-    header .dot.busy, header #live .blip, .ovspin, .rmnode.rmactive,
+    header .dot.busy, header #live .blip, .pill.wsphase .blip, .ovspin, .rmnode.rmactive,
     .skel .bar, .skel .tile, .skel .line, .skel .pane,
     .cards.enter .card, .cards .big.bump,
     .types .pill b.bump, section.panel.swap { animation:none !important; }

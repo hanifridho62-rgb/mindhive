@@ -42,7 +42,8 @@ from . import dedupe, events as ev_mod, guard, paths, projector
 # merge — so `tests/test_architecture_drift.py` asserts the agreement instead of
 # one importing the other and making the guard vacuous.
 NEVER_CONSOLIDATE = ("code_change", "learning", "state_set", "sop", "roadmap",
-                     "mindnet_task", "mindnet_phase")
+                     "mindnet_task", "mindnet_phase", "work_session",
+                     "initiative_declared")
 CONSOLIDATE_TYPES = ev_mod.SEMANTIC_TYPES - set(NEVER_CONSOLIDATE)
 DEFAULT_LIMIT = 3            # clusters merged per pass
 DEFAULT_COOLDOWN_HOURS = 6.0
