@@ -990,3 +990,162 @@ def test_the_cli_reports_the_hook_origin(capsys):
     out = capsys.readouterr().out
     assert "hook" in out
     assert "sopgate" in out
+
+
+
+# --------------------------------------------------------------------------
+# a truncation the composer managed (blueprint P1c)
+# --------------------------------------------------------------------------
+# The adaptive tail closes the digest with a rollover notice. When that notice
+# arrives before the loader's cut, the session is told what was left out and
+# where it went, and `--check` warns instead of failing; a notice past the cut,
+# or none, is the old unmanaged truncation and still fails.
+
+from mindhive import adaptivetail  # noqa: E402
+
+
+def _bytes_digest(tmp_path, notice_at=None) -> Path:
+    """~27 KB over 161 lines: truncated by BYTES (lines stay under 195), with the
+    rollover notice before filler line *notice_at* (None: no notice)."""
+    lines = ["# Current State", ""]
+    for i in range(150):
+        if i == notice_at:
+            lines += adaptivetail.rollover_notice(12, vectors_available=True).strip("\n").split("\n")
+        if i % 30 == 0:
+            lines.append(f"## Part {i // 30}")
+        if i == 136:                     # starts between the safe cut and the loader cut
+            lines.append("## Tail")
+        lines.append(f"{i:03d} " + "y" * 176)
+    return _write(tmp_path / "MEMORY.md", "\n".join(lines) + "\n")
+
+
+def test_memory_pressure_reports_a_managed_truncation(tmp_path):
+    p = context.memory_pressure(_bytes_digest(tmp_path, notice_at=5))
+    assert p["truncated"] and p["cut"] == "bytes" and p["lines"] < 195
+    assert p["managed"] and p["rollover_count"] == 12 and p["rollover_bytes"] > 100
+    assert p["dropped"] == [] and p["over_safe"] and p["safe_dropped"] == ["Tail"]
+
+
+def test_a_notice_past_the_cut_does_not_manage_the_truncation(tmp_path):
+    p = context.memory_pressure(_bytes_digest(tmp_path, notice_at=145))
+    assert p["truncated"] and not p["managed"] and p["rollover_count"] == 12
+
+
+def test_a_digest_without_a_notice_is_unmanaged(tmp_path):
+    p = context.memory_pressure(_bytes_digest(tmp_path))
+    assert p["truncated"] and not p["managed"]
+    assert (p["rollover_count"], p["rollover_bytes"]) == (0, 0)
+
+
+def test_a_notice_in_a_digest_that_fits_is_managed_and_quiet(tmp_path):
+    text = "## Key decisions\n\n- x\n" + adaptivetail.rollover_notice(3, vectors_available=True)
+    p = context.memory_pressure(_write(tmp_path / "MEMORY.md", text))
+    assert p["managed"] and not p["truncated"] and not p["over_safe"]
+
+
+def test_a_notice_quoted_inside_the_state_fence_manages_nothing(tmp_path):
+    """A mandatory SOP body rides the fenced state block raw. A notice line
+    quoted there is not the composer's: the truncation below it is unmanaged."""
+    quoted = adaptivetail.rollover_notice(12, vectors_available=True).strip("\n").split("\n")[0]
+    lines = ["## Current State", "```", quoted, "```"] + [f"{i:03d} filler" for i in range(250)]
+    lines.insert(230, "## Key decisions")
+    path = _write(tmp_path / "MEMORY.md", "\n".join(lines) + "\n")
+    p = context.memory_pressure(path)
+    assert p["truncated"] and p["dropped"] == ["Key decisions"]
+    assert not p["managed"] and p["rollover_count"] == 0
+    seg = context.Segment(name="MEMORY.md", origin="hive", path=str(path),
+                          nbytes=path.stat().st_size, tokens=100, kind="artifact")
+    assert [f.rule for f in context.findings([seg], project="test")
+            if f.rule.startswith("memory_")] == ["memory_truncated"]
+
+
+def test_memory_pressure_never_raises_on_an_absurd_rollover_count(tmp_path):
+    text = ("## Key decisions\n\n- a\n... " + "9" * 5000 + " keputusan dan pelajaran "
+            "dialihkan ke basis data vektor sekunder (ChromaDB).\n")
+    p = context.memory_pressure(_write(tmp_path / "MEMORY.md", text))
+    assert p["readable"] and not p["managed"] and p["rollover_count"] == 0
+
+
+def test_unreadable_pressure_carries_the_new_keys_too(tmp_path):
+    p = context.memory_pressure(tmp_path / "nope.md", budget=200)
+    assert (p["managed"], p["rollover_count"], p["rollover_bytes"], p["over_safe"],
+            p["safe_dropped"]) == (False, 0, 0, False, [])
+
+
+def test_the_safe_budget_is_inclusive(tmp_path):
+    at_limit = _write(tmp_path / "a.md", "a" * 24_499 + "\n")          # 24 500 bytes
+    assert not context.memory_pressure(at_limit)["over_safe"]
+    past = _write(tmp_path / "b.md", "a" * 24_500 + "\n")
+    assert context.memory_pressure(past)["over_safe"]
+    lines = _write(tmp_path / "c.md", "l\n" * 196)
+    p = context.memory_pressure(lines)
+    assert p["over_safe"] and not p["truncated"]
+
+
+def test_findings_name_the_managed_and_the_safe_budget_cases(tmp_path):
+    managed = _bytes_digest(tmp_path, notice_at=5)
+    seg = context.Segment(name="MEMORY.md", origin="hive", path=str(managed),
+                          nbytes=managed.stat().st_size, tokens=100, kind="artifact")
+    (f,) = [f for f in context.findings([seg], project="test") if f.subject == "MEMORY.md"
+            and f.rule.startswith("memory_")]
+    assert (f.rule, f.severity) == ("memory_rollover_truncated", "medium")
+    assert "12 item(s)" in f.message
+
+
+def test_unmanaged_truncation_exits_1(tmp_path, monkeypatch, capsys):
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _bytes_digest(tmp_path, notice_at=145))
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 1
+    err = capsys.readouterr().err
+    assert "TRUNCATED" in err and "WARNING" not in err
+
+
+def test_managed_rollover_warns_but_passes(tmp_path, monkeypatch, capsys):
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _bytes_digest(tmp_path, notice_at=5))
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    err = capsys.readouterr().err
+    assert "TRUNCATED" not in err
+    assert "WARNING" in err and "rollover notice (12 item(s)" in err
+
+
+def test_a_managed_truncation_still_needs_a_token_budget(tmp_path, monkeypatch, capsys):
+    """Warned, not excused: with no token budget the gate still cannot run."""
+    from mindhive import __main__ as cli_mod
+    _point_memory_at(monkeypatch, _bytes_digest(tmp_path, notice_at=5))
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 2
+
+
+def test_a_digest_past_the_safe_budget_only_warns(tmp_path, monkeypatch, capsys):
+    from mindhive import __main__ as cli_mod
+    text = "## Key decisions\n" + ("z" * 163 + "\n") * 150            # 24 617 bytes
+    _point_memory_at(monkeypatch, _write(tmp_path / "MEMORY.md", text))
+    context.save_budget(1_000_000, project="test")
+    assert cli_mod.main(["context", "--origin", "hive", "--check"]) == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "safe budget of 24,500 bytes / 195 lines" in err
+
+
+def test_managed_means_the_notices_first_line_ends_before_the_cut(tmp_path):
+    """The definition, at its edge. The fixtures above put the notice far before
+    the cut or far past it; the rule is that the "... N" line arrives WHOLE.
+    Half of it is not a notice the session can read, and the pointer line under
+    it is not what makes the truncation managed."""
+    notice = adaptivetail.rollover_notice(12, vectors_available=True)
+    first = notice.strip("\n").split("\n")[0]
+    width = len(first.encode("utf-8"))
+
+    def pressure(inside):
+        """*inside* bytes of the notice arrive before the 25 000-byte cut."""
+        text = ("x" * (25_000 - inside - 1) + "\n" + notice.lstrip("\n")
+                + "## Key decisions\n- a\n" * 30)
+        return context.memory_pressure(_write(tmp_path / "MEMORY.md", text))
+
+    p = pressure(width - 1)                 # the cut falls inside the "... N" line
+    assert p["truncated"] and p["cut"] == "bytes" and p["rollover_count"] == 12
+    assert not p["managed"]
+    p = pressure(width)                     # that line arrives whole; its pointer does not
+    assert p["truncated"] and p["cut"] == "bytes" and p["managed"]
+    assert not pressure(1)["managed"] and pressure(width + 40)["managed"]

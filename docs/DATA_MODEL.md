@@ -1623,14 +1623,20 @@ both used to degrade with nothing said.
 
 ```json
 {"budget": 51000, "memory_lines": 200, "memory_bytes": 25000,
+ "adaptive_tail": {"enabled": false, "lessons": 10, "decisions": 5},
  "set_at": "2026-08-13T00:00:00Z"}
 ```
 
 Config, not a projection: it is not rebuildable from the ledger, exactly like
 `rules/enforce.json`. `budget` is the namespace's estimated-token ceiling for the
 auto-loaded surface; `memory_lines` and `memory_bytes` are the two cuts the native
-loader applies to `MEMORY.md`. Writes **merge over all three**: these are set at
-three different moments, and setting one must never discard another. A missing,
+loader applies to `MEMORY.md`; `adaptive_tail` is the digest's adaptive-tail opt-in
+and its two item caps (`hive context --set-adaptive-tail`, blueprint P1c; a missing
+or corrupt value reads as off, with the digest's own caps of 10 and 5). Writes
+**merge over every key**: these are set at different moments, and setting one must
+never discard another (`save_budget` carries `adaptive_tail` forward,
+`adaptivetail.save_adaptive_tail` keeps the budgets). A command that exits 2 has
+written none of them. A missing,
 corrupt or non-positive value reads as unset (token budget) or as
 `context.MEMORY_LINE_BUDGET` / `context.MEMORY_BYTE_BUDGET` — a bad value must not
 silence a real measurement.
@@ -1640,8 +1646,9 @@ Those numbers bound different failures, which is why they are separate:
 | | Bounds | Past it |
 |---|---|---|
 | `budget` | **cost** — tokens spent before work starts | reported; `hive context --check` exits 1 |
-| `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set |
+| `memory_lines` | **loss** — the loader reads only the first N lines | the digest's *tail sections* never arrive; `--check` exits 1 even with no token budget set — unless the truncation is MANAGED (the digest's rollover notice, outside any code fence, has its first line before the cut, so the session is told what moved to the semantic index), which prints `WARNING:` and keeps the exit code (2 with no token budget) |
 | `memory_bytes` | **loss** — and the cut that actually bit | same, and it is the one to check first: measured live at 404a7c0, the delivered digest stopped at LF byte ~24,900 |
+| composer safe budget (24,500 bytes / 195 lines, `adaptivetail.MAX_LOADER_*`) | **margin** — what the adaptive tail sizes the digest to: 500 bytes / 5 lines under the loader cut, and the same margin under a lower `memory_bytes` / `memory_lines` | the loader still reads the file whole; `--check` prints `WARNING:` (`memory_over_safe_budget`) and keeps the exit code |
 
 The loss case is the subtler one, and it has bitten twice for two different
 reasons. First: `sync` caps ITEM COUNTS (`LESSONS_CAP`, `DECISIONS_CAP`) and no

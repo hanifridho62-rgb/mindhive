@@ -57,7 +57,12 @@ import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from . import outcomes, paths
+from . import adaptivetail, outcomes, paths
+# The composer's adaptive-tail opt-in rides this module's sidecar, so it is
+# reachable here too (blueprint P1c). `adaptivetail` imports only `paths` and
+# `core.dreaming` at load, so this adds no cycle.
+from .adaptivetail import (load_adaptive_tail, parse_adaptive_tail_spec,  # noqa: F401
+                           save_adaptive_tail)
 
 # Average characters per token for English prose and markdown. Real tokenizers
 # land near this for ordinary text; dense punctuation or CJK diverge. Used only
@@ -197,20 +202,21 @@ def save_budget(budget: int, project=None, memory_lines: int | None = None,
     the token budget must not silently discard a line or byte budget the
     operator set earlier. `load_*` cannot answer "was it stored?" — they return
     the default for absent and for corrupt alike — so the raw file is what
-    decides what carries forward."""
+    decides what carries forward. The adaptive-tail opt-in
+    (`adaptivetail.save_adaptive_tail`) lives in the same file and is carried
+    forward untouched."""
     import time
     data = {"budget": int(budget),
             "set_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"}
     given = {"memory_lines": memory_lines, "memory_bytes": memory_bytes}
-    missing = [k for k, v in given.items() if v is None]
-    prior = {}
-    if missing:
-        try:
-            raw = json.loads((paths.project_dir(project) / BUDGET_FILE)
-                             .read_text(encoding="utf-8"))
-            prior = raw if isinstance(raw, dict) else {}
-        except Exception:
-            prior = {}
+    try:
+        raw = json.loads((paths.project_dir(project) / BUDGET_FILE)
+                         .read_text(encoding="utf-8"))
+        prior = raw if isinstance(raw, dict) else {}
+    except Exception:
+        prior = {}
+    if isinstance(prior.get(adaptivetail.ADAPTIVE_TAIL_KEY), dict):
+        data[adaptivetail.ADAPTIVE_TAIL_KEY] = prior[adaptivetail.ADAPTIVE_TAIL_KEY]
     for key, value in given.items():
         if value is not None:
             data[key] = int(value)
@@ -281,7 +287,8 @@ def memory_pressure(path, budget: int | None = None, project=None,
     """Does the native MEMORY.md fit the loader, and what is lost if not?
 
     Returns ``{lines, budget, over, bytes, byte_budget, over_bytes, cut,
-    truncated, dropped, readable, path}``.
+    truncated, dropped, readable, path, managed, rollover_count, rollover_bytes,
+    over_safe, safe_dropped}``.
 
     TWO cuts, because the loader enforces two and this module used to model only
     one. ``over`` is the line overflow, ``over_bytes`` the byte overflow on
@@ -300,6 +307,14 @@ def memory_pressure(path, budget: int | None = None, project=None,
     ``errors="replace"``, so a corrupt digest is measured in the same frame the
     loader sees rather than refusing to be measured at all.)
 
+    ``managed`` says the digest carries the composer's rollover notice
+    (`adaptivetail.find_rollover`) and, when truncated, that the notice's first
+    line arrives before the cut: the session is told what was left out and where
+    it went, and the loader cuts only what follows the notice. ``over_safe``
+    compares against the COMPOSER's safe budget (`adaptivetail.MAX_LOADER_BYTES`
+    / `MAX_LOADER_LINES`, a margin under the loader's own) and ``safe_dropped``
+    names the sections past that safe cut.
+
     Never raises: an unreadable or absent file reports ``readable: False`` and
     zero pressure, because "we could not measure" must not read as "it is
     fine" — which is why ``truncated`` is False there and ``readable`` is the
@@ -312,25 +327,48 @@ def memory_pressure(path, budget: int | None = None, project=None,
         return {"lines": 0, "budget": budget, "over": 0,
                 "bytes": 0, "byte_budget": byte_budget, "over_bytes": 0,
                 "cut": None, "truncated": False, "dropped": [],
-                "readable": False, "path": str(path or "")}
+                "readable": False, "path": str(path or ""), "managed": False,
+                "rollover_count": 0, "rollover_bytes": 0, "over_safe": False,
+                "safe_dropped": []}
     lines = text.splitlines()
     nbytes = len(text.encode("utf-8"))
     over = max(0, len(lines) - budget)
     over_bytes = max(0, nbytes - byte_budget)
 
-    cuts = []
-    if over:
-        cuts.append((_char_offset_of_line(text, budget), "lines"))
-    if over_bytes:
-        cuts.append((_char_offset_of_byte(text, byte_budget), "bytes"))
-    cut_at, cut = min(cuts) if cuts else (None, None)
-    dropped = ([m.group(1) for m in _MEMORY_SECTION_RE.finditer(text)
-                if m.start() >= cut_at] if cut_at is not None else [])
+    cut_at, cut = _first_cut(text, len(lines), nbytes, budget, byte_budget)
+    safe_at, _ = _first_cut(text, len(lines), nbytes, adaptivetail.MAX_LOADER_LINES,
+                            adaptivetail.MAX_LOADER_BYTES)
+    rollover = adaptivetail.find_rollover(text)
 
     return {"lines": len(lines), "budget": budget, "over": over,
             "bytes": nbytes, "byte_budget": byte_budget,
             "over_bytes": over_bytes, "cut": cut, "truncated": cut is not None,
-            "dropped": dropped, "readable": True, "path": str(path)}
+            "dropped": _sections_past(text, cut_at), "readable": True,
+            "path": str(path),
+            "managed": rollover is not None and (cut_at is None
+                                                 or rollover["line_end"] <= cut_at),
+            "rollover_count": rollover["count"] if rollover else 0,
+            "rollover_bytes": rollover["bytes"] if rollover else 0,
+            "over_safe": safe_at is not None,
+            "safe_dropped": _sections_past(text, safe_at)}
+
+
+def _first_cut(text: str, nlines: int, nbytes: int, line_budget: int,
+               byte_budget: int) -> tuple:
+    """``(offset, "lines" | "bytes")`` of whichever budget *text* passes first,
+    or ``(None, None)`` when it fits both."""
+    cuts = []
+    if nlines > line_budget:
+        cuts.append((_char_offset_of_line(text, line_budget), "lines"))
+    if nbytes > byte_budget:
+        cuts.append((_char_offset_of_byte(text, byte_budget), "bytes"))
+    return min(cuts) if cuts else (None, None)
+
+
+def _sections_past(text: str, at) -> list:
+    """The digest's section headings that begin at or after offset *at*."""
+    return ([m.group(1) for m in _MEMORY_SECTION_RE.finditer(text) if m.start() >= at]
+            if at is not None else [])
 
 
 def pressure_headline(pressure: dict) -> str:
@@ -736,22 +774,48 @@ def _finding_memory_truncated(segments, project=None) -> list[Finding]:
     LOSS. An oversized artifact is paid for and delivered; a truncated one is
     paid for and half-delivered, and the half that vanishes is the tail, where
     `sync` writes the lessons and decisions. High severity for that reason: the
-    other findings suggest trimming, this one reports something already gone."""
+    other findings suggest trimming, this one reports something already gone.
+
+    Two softer cases get rules of their own, which `hive context --check` warns
+    on without failing (blueprint P1c): a truncation the composer MANAGED -- its
+    rollover notice arrives before the cut, so the session is told what was left
+    out and where it went -- and a digest past the composer's safe budget that
+    the loader still reads whole."""
     out = []
     for s in segments:
         if s.name != "MEMORY.md" or not s.path:
             continue
         pressure = memory_pressure(s.path, project=project)
-        if not pressure["readable"] or not pressure["truncated"]:
+        if not pressure["readable"]:
             continue
         knob = "memory_bytes" if pressure["cut"] == "bytes" else "memory_lines"
-        out.append(Finding(
-            rule="memory_truncated", severity="high", subject=s.name,
-            message=(f"{pressure_headline(pressure)}. The loader reads part of "
-                     f"the file, so these never reach a session: "
-                     f"{pressure_lost(pressure)}. Trim the digest or raise "
-                     f"`{knob}` in {BUDGET_FILE} deliberately."),
-        ))
+        if pressure["truncated"] and not pressure["managed"]:
+            out.append(Finding(
+                rule="memory_truncated", severity="high", subject=s.name,
+                message=(f"{pressure_headline(pressure)}. The loader reads part of "
+                         f"the file, so these never reach a session: "
+                         f"{pressure_lost(pressure)}. Trim the digest or raise "
+                         f"`{knob}` in {BUDGET_FILE} deliberately."),
+            ))
+        elif pressure["truncated"]:
+            out.append(Finding(
+                rule="memory_rollover_truncated", severity="medium", subject=s.name,
+                message=(f"{pressure_headline(pressure)}, but its rollover notice "
+                         f"({pressure['rollover_count']} item(s) to the semantic "
+                         f"index, {pressure['rollover_bytes']:,} bytes) arrives "
+                         f"before the cut; past it: {pressure_lost(pressure)}."),
+            ))
+        elif pressure["over_safe"]:
+            past = ", ".join(pressure["safe_dropped"]) or "the tail of the file"
+            out.append(Finding(
+                rule="memory_over_safe_budget", severity="low", subject=s.name,
+                message=(f"MEMORY.md is {pressure['bytes']:,} bytes and "
+                         f"{pressure['lines']} lines, past the composer's safe "
+                         f"budget of {adaptivetail.MAX_LOADER_BYTES:,} bytes / "
+                         f"{adaptivetail.MAX_LOADER_LINES} lines (the loader still "
+                         f"reads it whole). Past the safe cut: {past}; rollover "
+                         f"notice: {pressure['rollover_bytes']:,} bytes."),
+            ))
     return out
 
 

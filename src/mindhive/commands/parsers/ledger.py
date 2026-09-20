@@ -28,6 +28,17 @@ __all__ = ["add_append", "add_symbols", "add_hook", "add_session",
     "register_parsers"]
 
 
+def _adaptive_tail_spec(text):
+    """argparse type for --set-adaptive-tail: the parsed settings, or a usage
+    error naming the bad part. Lazy: only this flag needs `adaptivetail`."""
+    import argparse
+    from ...adaptivetail import parse_adaptive_tail_spec
+    try:
+        return parse_adaptive_tail_spec(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 
 def add_append(sub) -> None:
     """Register `hive append`."""
@@ -148,10 +159,23 @@ def add_context(sub) -> None:
                          "LF-normalised content — not the on-disk size). "
                          "Raising it is a decision that the loader will read "
                          "only part of the file")
+    cx.add_argument("--set-adaptive-tail", type=_adaptive_tail_spec, default=None,
+                    dest="set_adaptive_tail", metavar="SPEC",
+                    help="persist this namespace's adaptive MEMORY.md tail as "
+                         "lessons=N,decisions=N,enabled=0|1 (any subset). "
+                         "Enabled, `hive sync` fills lessons and decisions newest "
+                         "first inside the composer's safe budget (24,500 bytes / "
+                         "195 lines, or the same margin under a lower "
+                         "--set-memory-lines/--set-memory-bytes cut), never cuts a "
+                         "pinned lesson, and counts what "
+                         "it leaves out in a rollover notice pointing at "
+                         "`hive recall --semantic`")
     cx.add_argument("--check", action="store_true",
                     help="exit 1 when the measured total exceeds the budget, or "
-                         "when MEMORY.md is past its line OR byte budget (the "
-                         "loader then drops the digest's tail sections)")
+                         "when MEMORY.md is past its line OR byte budget with no "
+                         "rollover notice before the cut (the loader then drops "
+                         "the digest's tail sections); a managed truncation, or a "
+                         "digest past the composer's safe budget, only warns")
     cx.add_argument("--top", type=int, default=None,
                     help="show only the N heaviest contributors")
     cx.add_argument("--origin", choices=["hive", "claude", "hook", "all"],

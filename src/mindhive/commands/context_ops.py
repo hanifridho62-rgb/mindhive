@@ -93,19 +93,24 @@ def cmd_directives(args) -> int | None:
 
 def cmd_context(args) -> int | None:
     """Report what auto-loads into every session — ranked by estimated token
-    cost, with trim suggestions. Reporting never mutates anything; the one
-    write path is --set-budget, which persists the namespace's token budget.
-    --check turns the report into a gate: exit 1 when over the budget (the
-    hook adoption flows and scripts rely on), exit 2 when asked to check with
-    no budget configured at all."""
+    cost, with trim suggestions. Reporting never mutates anything; the write
+    paths are --set-budget (and the memory budgets beside it), which persists
+    the namespace's token budget, and --set-adaptive-tail, which persists the
+    digest's adaptive-tail opt-in. --check turns the report into a gate: exit 1
+    when over the budget (the hook adoption flows and scripts rely on) or when
+    MEMORY.md is truncated with no rollover notice arriving before the cut,
+    exit 2 when asked to check with no budget configured at all. A managed
+    truncation, or a digest past the composer's safe budget, is a WARNING."""
     from .. import context as context_mod
     project = getattr(args, "project", None)
     origin = getattr(args, "origin", "all")
 
     set_memory_lines = getattr(args, "set_memory_lines", None)
     set_memory_bytes = getattr(args, "set_memory_bytes", None)
-    if (getattr(args, "set_budget", None) is not None
-            or set_memory_lines is not None or set_memory_bytes is not None):
+    adaptive = getattr(args, "set_adaptive_tail", None)
+    writes_budget = (getattr(args, "set_budget", None) is not None
+                     or set_memory_lines is not None or set_memory_bytes is not None)
+    if writes_budget:
         # One sidecar, one write. A memory override alone must not drop the
         # token budget already stored there, so the current value is read back
         # and rewritten when only a memory budget is being changed. The
@@ -119,6 +124,14 @@ def cmd_context(args) -> int | None:
             print(f"error: {flag} needs a token budget too — pass "
                   "--set-budget N (the sidecar holds both)", file=sys.stderr)
             return 2
+    if adaptive is not None:
+        # After the refusal above, never before it: a command that exits 2 has
+        # stored nothing, the adaptive-tail opt-in included.
+        node = context_mod.save_adaptive_tail(project, **adaptive)
+        print(f"adaptive tail {'enabled' if node['enabled'] else 'disabled'}: "
+              f"lessons cap {node['lessons']}, decisions cap {node['decisions']} "
+              f"(stored in {context_mod.BUDGET_FILE}; `hive sync` applies it)")
+    if writes_budget:
         data = context_mod.save_budget(budget_value, project=project,
                                        memory_lines=set_memory_lines,
                                        memory_bytes=set_memory_bytes)
@@ -128,6 +141,7 @@ def cmd_context(args) -> int | None:
               + (f", MEMORY.md byte budget {data['memory_bytes']}"
                  if "memory_bytes" in data else "")
               + f" (stored in {context_mod.BUDGET_FILE})")
+    if adaptive is not None or writes_budget:
         return None
 
     segments = []
@@ -162,6 +176,11 @@ def cmd_context(args) -> int | None:
         truncated = [f for f in found if f.rule == "memory_truncated"]
         for f in truncated:
             print(f"TRUNCATED: {f.message}", file=sys.stderr)
+        # Warned, never failed (blueprint P1c): the rollover notice tells the
+        # session what was left out, or the loader still reads the whole file.
+        for f in found:
+            if f.rule in ("memory_rollover_truncated", "memory_over_safe_budget"):
+                print(f"WARNING: {f.message}", file=sys.stderr)
         if budget is None:
             if truncated:
                 return 1

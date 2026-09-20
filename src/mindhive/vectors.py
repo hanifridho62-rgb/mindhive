@@ -7,6 +7,21 @@ _log = logging.getLogger("mindhive.vectors")
 _MODEL = None
 
 
+def has_vectors_support() -> bool:
+    """True when both packages the semantic layer needs are installed.
+
+    Asks `importlib.util.find_spec` and imports neither: `chromadb` and
+    `sentence_transformers` take seconds to import, and the answer is wanted on
+    the digest path (`adaptivetail.rollover_notice`), which must stay cheap.
+    Total: a spec lookup that raises reads as unavailable."""
+    import importlib.util
+    try:
+        return all(importlib.util.find_spec(name) is not None
+                   for name in ("chromadb", "sentence_transformers"))
+    except Exception:
+        return False
+
+
 def _require_deps():
     try:
         import chromadb  # noqa: F401
