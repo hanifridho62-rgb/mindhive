@@ -187,8 +187,9 @@ def _run_capped(argv, job, fence, *, cwd, env, timeout, stdin_text,
     the unfenced control still took 20.11s. Two paths, one of them fixed, is how
     that survived being called done.
     """
+    from .. import advice as authorship     # P1d: no SOP process token in a sandbox
     proc = subprocess.Popen(
-        argv, cwd=cwd, env=env, shell=False,
+        argv, cwd=cwd, env=authorship.scrub_agent_env(env), shell=False,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, creationflags=creationflags, **kwargs)
     if job is not None:

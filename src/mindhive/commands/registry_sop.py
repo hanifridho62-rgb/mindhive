@@ -9,7 +9,8 @@ import os
 import sys
 from .. import events, paths
 
-__all__ = ["_sop_body", "_cmd_sop_write", "cmd_sop_add", "cmd_sop_update",
+__all__ = ["_sop_body", "_cmd_sop_write", "_authorship",
+    "cmd_sop_add", "cmd_sop_update",
     "cmd_sop_delete", "cmd_sop_list", "cmd_sop_show", "_preflight_report",
     "cmd_sop_preflight", "cmd_sop_injection"]
 
@@ -31,11 +32,26 @@ def _sop_body(args) -> str | None:
     return args.text
 
 def _cmd_sop_write(args, action) -> int | None:
+    from .. import advice as authorship
     from .. import sop as sop_mod
     sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    # The authorship gate (blueprint P1d, PDF BAB 2.3). Asked BEFORE the body is
+    # read, so a refused write costs nothing and leaves nothing behind -- no
+    # event, no sidecar refresh. `--session` cannot answer it in a process that
+    # sees the host secret: the token is environment, and `advice.scrub_agent_env`
+    # keeps it out of every agent this package spawns. (A process that blanks
+    # the secret for its own command is the limit `advice` documents.) Exit 2,
+    # never a raise.
+    refusal = authorship.sop_write_refusal(sid, action)
+    if refusal:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
     try:
         text = (args.reason if action == "delete" else _sop_body(args))
-        tags = [t for t in (getattr(args, "tags", "") or "").split(",") if t]
+        # `write_tags`, not a bare split: a caller's own `sop-validated` is a
+        # claim nobody checked, and the real stamp is this process's to give.
+        tags = authorship.write_tags(
+            (getattr(args, "tags", "") or "").split(","))
         ev = sop_mod.record(action, args.sop_id,
                             title=getattr(args, "title", None), text=text,
                             tags=tags, session_id=sid,
@@ -55,9 +71,19 @@ def cmd_sop_update(args) -> int | None:
 def cmd_sop_delete(args) -> int | None:
     return _cmd_sop_write(args, "delete")
 
+def _authorship(sop_mod, evs, rec) -> str:
+    """The provenance the prompt fence labels this row with
+    (`advice.classify_author`), counting ANY contributor and not only the last
+    editor -- one human edit must not relabel an agent's procedure."""
+    from .. import advice as authorship
+    if rec.get("sop_id") in sop_mod.agent_touched_ids(evs):
+        return authorship.UNTRUSTED_AGENT
+    return authorship.classify_author(rec)
+
 def cmd_sop_list(args) -> int | None:
-    from .. import sop as sop_mod
-    sops = sop_mod.current(events.read_all(getattr(args, "project", None)))
+    from .. import provenance, sop as sop_mod
+    evs = events.read_all(getattr(args, "project", None))
+    sops = sop_mod.current(evs)
     if args.json:
         print(json.dumps(sops, indent=2, ensure_ascii=False))
         return None
@@ -65,10 +91,15 @@ def cmd_sop_list(args) -> int | None:
         print('(no active SOPs — add one: hive sop add <id> --title "…" '
               '--file <body.md>)')
         return None
-    n_must = 0
+    n_must = n_agent = 0
+    tainted = sop_mod.agent_touched_ids(evs)
     for i, r in enumerate(sops, 1):
         tier = "MANDATORY " if r.get("mandatory") else ""
-        n_must += 1 if r.get("mandatory") else 0
+        # Listed AND said to be withheld: the prompt fence sends every session
+        # here by count alone, so this is where a reader learns which rows.
+        agent = sop_mod.is_agent_authored(r) or r.get("sop_id") in tainted
+        n_agent += 1 if agent else 0
+        n_must += 1 if r.get("mandatory") and not agent else 0
         # `safe_title`, but NOT partitioned: `withheld_footer` sends operators
         # to this command by name to read exactly the rows the delivery
         # surfaces withhold, so filtering here would make that instruction a
@@ -76,9 +107,14 @@ def cmd_sop_list(args) -> int | None:
         # numbered entry in a list whose numbering is the operator's index.
         print(f"  {i}. {tier}[{sop_mod.safe_title(r['sop_id'])} "
               f"v{r['version']}] {sop_mod.safe_title(r['title'])}  "
-              f"(updated {r['updated']})")
-    tail = (f" ({n_must} mandatory — re-asserted on every prompt)"
-            if n_must else "")
+              f"(updated {r['updated']})"
+              + (provenance.AGENT_MARK if agent else ""))
+    notes = ([f"{n_must} mandatory — re-asserted on every prompt"]
+             if n_must else [])
+    if n_agent:
+        notes.append(f"{n_agent} agent-written — withheld from every "
+                     "directive surface")
+    tail = f" ({'; '.join(notes)})" if notes else ""
     print(f"\n{len(sops)} active SOP(s){tail}")
     return None
 
@@ -97,8 +133,12 @@ def cmd_sop_show(args) -> int | None:
     if rec is None:
         print(f"SOP {args.sop_id}: deleted (history below)")
     else:
-        print(f"SOP {rec['sop_id']} v{rec['version']} — {rec['title']}")
-        print(f"created {rec['created']}  updated {rec['updated']}\n")
+        print(f"SOP {rec['sop_id']} v{rec['version']} — "
+              f"{sop_mod.safe_title(rec['title'])}")
+        print(f"created {rec['created']}  updated {rec['updated']}")
+        # The body below is the stored text, verbatim: this line is what says
+        # whose it is, since a pointer row sends a session here to read it.
+        print(f"authorship: {_authorship(sop_mod, evs, rec)}\n")
         print(rec["text"])
     print("\nhistory (newest first):")
     for e in hist:

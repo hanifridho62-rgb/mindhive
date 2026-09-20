@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 
+from . import advice as authorship
 from . import injectors, outcomes, sop
 from .mindnet import advice as advice_mod
 from .promptgate import PROMPT_SCAN_CAP
@@ -176,24 +177,50 @@ def plan(rows) -> list[dict]:
     renders this list and `probe` counts it, so the two cannot disagree.
 
     Each record: `sop_id`, `title`, `chars`, `delivered` ("body" | "pointer"),
-    and `text` (the body itself, for `render`; `probe` drops it)."""
+    `author_type` (`advice.classify_author`: the provenance `render` labels the
+    body with) and `text` (the body itself, for `render`; `probe` drops it).
+    `chars` and the budget count the BODY alone -- the label is this module's
+    overhead, not the procedure's, and charging it would turn a body that fits
+    into a pointer."""
     out, spent = [], 0
-    for r in rows or []:
+    for r in (rows if isinstance(rows, (list, tuple)) else ()):
         if not isinstance(r, dict):
             continue                    # a junk row must not sink the block
         if is_agent_authored(r):
             continue                    # never inside the mandatory fence
         sop_id = _safe_title(r.get("sop_id"))
+        # `_safe_title` is `sop.safe_title`, which defangs a label-shaped
+        # bracket AFTER the collapse -- an opener the title never closes
+        # included, or `render`'s own "`[sop_id]`" would close it for it.
         title = _safe_title(r.get("title"))
-        text = str(r.get("text") or "").strip()
+        try:
+            text = str(r.get("text") or "").strip()
+        except Exception:                                   # noqa: BLE001
+            continue                    # `str` refuses a huge int: a junk row
         if not sop_id or not text:
             continue
         fits = spent + len(text) <= PROMPT_BUDGET
         if fits:
             spent += len(text)
         out.append({"sop_id": sop_id, "title": title, "chars": len(text),
-                    "delivered": "body" if fits else "pointer", "text": text})
+                    "delivered": "body" if fits else "pointer",
+                    "author_type": authorship.classify_author(r), "text": text})
     return out
+
+
+def _withheld_rows(rows) -> list:
+    """The agent-authored rows `plan` dropped. Counted from the SAME rows `plan`
+    was given rather than returned by it, because `plan`'s list is what `render`
+    renders: a withheld row is not a delivery decision, it is the absence of
+    one. A row with no id or no body is junk on either side of the partition
+    and is not counted -- that would report a malformed row as an attack."""
+    try:
+        return [r for r in (rows or [])
+                if isinstance(r, dict) and is_agent_authored(r)
+                and _safe_title(r.get("sop_id"))
+                and str(r.get("text") or "").strip()]
+    except Exception:                                       # noqa: BLE001
+        return []
 
 
 def render(rows) -> str:
@@ -209,7 +236,11 @@ def render(rows) -> str:
     for row in delivered:
         lines.append(f"— {row['title']} `[{row['sop_id']}]`")
         if row["delivered"] == "body":
-            lines.append(row["text"])
+            # Labelled with where it came from (blueprint P1d, PDF 10.13.3). A
+            # body that carries a label-shaped bracket of its own is defanged
+            # there; every other body still rides byte for byte.
+            lines.append(authorship.format_sop_directive(
+                {"author_type": row["author_type"], "content": row["text"]}))
         else:
             lines.append(f"  (body over the per-prompt budget — read it now: "
                          f"`hive sop show {row['sop_id']}`)")
@@ -221,6 +252,12 @@ def render(rows) -> str:
         # here, rather than letting a list of titles read as the procedure.
         lines.append("  None of the bodies fit this prompt's budget — read "
                      "them before acting.")
+    # Reached only with something delivered: a fence holding nothing but
+    # withheld rows stays SILENT, or an agent could put a line on every prompt
+    # of an operator who registered nothing. A count and no agent-chosen byte.
+    summary = authorship.withheld_summary(len(_withheld_rows(rows)))
+    if summary:
+        lines.append(summary)
     return "\n".join([_HEADER] + lines)
 
 
@@ -275,18 +312,7 @@ def probe(rows=None, project=None) -> dict:
         block = render(rows)
     except Exception:                                       # noqa: BLE001
         delivered, block = [], ""
-    # Counted from the SAME rows `plan` was given, and counted here rather than
-    # returned by `plan` because `plan`'s list is what `render` renders: a
-    # withheld row is not a delivery decision, it is the absence of one. A row
-    # with no id or no body is junk on either side of the partition and is not
-    # counted as withheld — that would report a malformed row as an attack.
-    try:
-        withheld = [r for r in (rows or [])
-                    if isinstance(r, dict) and is_agent_authored(r)
-                    and _safe_title(r.get("sop_id"))
-                    and str(r.get("text") or "").strip()]
-    except Exception:                                       # noqa: BLE001
-        withheld = []
+    withheld = _withheld_rows(rows)
     bodies = [r for r in delivered if r["delivered"] == "body"]
     pointers = [r for r in delivered if r["delivered"] == "pointer"]
     if not delivered:

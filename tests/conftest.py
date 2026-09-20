@@ -33,6 +33,17 @@ def isolate_store(tmp_path, monkeypatch):
     # rail -- a false regression caused by a documented, supported
     # setting. Pinned ON here; the tests that need it off set it in-body.
     monkeypatch.setenv("MINDHIVE_MINDSWARM", "1")
+    # The SOP authorship gate (`mindhive.advice`, blueprint P1d) reads three
+    # AMBIENT variables, and two supported setups make them hostile to a green
+    # suite: a host that configured `MINDHIVE_ORCHESTRATION_SECRET` refuses
+    # every `hive sop add` a test makes unless the token matches, and a suite run
+    # by an orchestration agent inherits `MINDHIVE_SESSION=lm-...`, which the
+    # fallback rule refuses by design. Cleared here for the MINDSWARM reason
+    # above -- a documented setting must not read as a regression; the tests
+    # that need one set it in-body.
+    for ambient in ("MINDHIVE_ORCHESTRATION_SECRET", "MINDHIVE_PROCESS_TOKEN",
+                    "MINDHIVE_SESSION"):
+        monkeypatch.delenv(ambient, raising=False)
     yield
     # The isolation is only as good as the last line of the test. A blanket
     # `monkeypatch.undo()` inside a test body -- reached for to restore one

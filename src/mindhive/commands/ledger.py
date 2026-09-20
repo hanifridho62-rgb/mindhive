@@ -17,6 +17,19 @@ __all__ = ["cmd_append", "cmd_hook", "rotation_supervisor_defaults",
 
 
 def cmd_append(args) -> int | None:
+    sop_write = args.type == "sop"
+    if sop_write:
+        # One registry, one authorship gate, whichever door is used (blueprint
+        # P1d): `hive sop add` refusing an agent means nothing while `hive
+        # append sop` beside it does not. Every other type is untouched. Asked
+        # BEFORE the payload is read or parsed, as `hive sop add` asks before it
+        # reads a body: a refused writer gets the refusal, not a JSON error.
+        from .. import advice as authorship
+        refusal = authorship.sop_write_refusal(
+            args.session or os.environ.get("MINDHIVE_SESSION"), "append")
+        if refusal:
+            print(f"error: {refusal}", file=sys.stderr)
+            return 2
     if args.stdin:
         raw = sys.stdin.read()
     elif args.payload is not None:
@@ -38,6 +51,8 @@ def cmd_append(args) -> int | None:
         print(f"error: {e}", file=sys.stderr)
         return 2
     tags = [t for t in args.tags.split(",") if t]
+    if sop_write:
+        tags = authorship.write_tags(tags)
     ev = events.append_event(args.type, payload, session_id=args.session, tags=tags)
     print(f"appended {ev.type} @ {ev.ts}")
     return None

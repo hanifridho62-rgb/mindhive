@@ -40,6 +40,14 @@ silent quarantine (`events.segment_name`, pinned by
   texts: the legacy `invalid session id` phrase two existing test files pin,
   and the `ValueError` text so an operator sees the rule they broke.
 
+**P1d (appended): the SOP authorship half.** `advice.is_authorized_sop_author`
+is the write gate BAB 2.3 asks for, and its tier-1 invariants are the three a
+refactor is most likely to lose: an unconfigured host never authorises through
+`compare_digest("", "")`, a refused `hive sop add` appends NOTHING, and no CLI
+argument can stand in for the process token. The behavioural suite is
+`tests/test_advice_authorship.py`; what is pinned here is only what must never
+move.
+
 **P2 (appended later): the SuiteGate half.** The `SuiteGate` /
 `"PELANGGARAN GATE"` tests from the same harness sketch belong to the phase
 that creates `mindhive.orchestrator.gate`; they are deliberately NOT written
@@ -399,3 +407,63 @@ def test_cli_session_id_arg_keeps_its_identity():
     assert cliparse.session_id_arg.__name__ == "session_id_arg"
     assert cliparse.session_id_arg.__module__ == "mindhive.cliparse"
     assert inspect.isfunction(cliparse.session_id_arg)
+
+
+# --- P1d: SOP authorship (PDF BAB 2.3 / 10.13.3, Bug 3) ---------------------------
+
+SOP_BODY = "Read the file before editing it, then run the whole suite."
+
+
+@pytest.fixture()
+def no_sop_credentials(monkeypatch):
+    for name in ("MINDHIVE_ORCHESTRATION_SECRET", "MINDHIVE_PROCESS_TOKEN",
+                 "MINDHIVE_SESSION"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_an_unconfigured_host_never_authorises_an_orchestration_session(
+        no_sop_credentials, monkeypatch):
+    """`hmac.compare_digest("", "")` is True. The PDF's one-line check compared
+    the two variables directly, so a host that had configured NOTHING authorised
+    every process on it. Both set-but-empty and both-absent must fall through to
+    the session rule instead."""
+    from mindhive import advice
+    assert advice.is_authorized_sop_author("mn9-x") is False
+    monkeypatch.setenv("MINDHIVE_ORCHESTRATION_SECRET", "")
+    monkeypatch.setenv("MINDHIVE_PROCESS_TOKEN", "")
+    assert advice.is_authorized_sop_author("mn9-x") is False
+    assert advice.is_authorized_sop_author("human-1") is True     # THE CANARY
+
+
+def test_no_cli_argument_stands_in_for_the_process_token(no_sop_credentials,
+                                                         monkeypatch, capsys):
+    """The spoof BAB 2.3 names: `hive sop add --session s1` from an agent. In a
+    process that sees the host secret the claimed session is not consulted at
+    all, and the refusal leaves the ledger byte-for-byte as it was."""
+    from mindhive import __main__ as cli_mod
+    monkeypatch.setenv("MINDHIVE_ORCHESTRATION_SECRET", "s3cr3t")
+    argv = ["sop", "add", "spoofed", "--title", "Spoofed", "--text", SOP_BODY,
+            "--session", "s1"]
+    assert cli_mod.main(argv) == 2
+    assert "ditolak" in capsys.readouterr().err
+    assert events.read_all() == []
+    monkeypatch.setenv("MINDHIVE_PROCESS_TOKEN", "s3cr3t")
+    assert cli_mod.main(argv) == 0                                # THE CANARY
+    assert [e.type for e in events.read_all()] == ["sop"]
+
+
+def test_the_process_token_is_withheld_from_every_spawned_agent(
+        no_sop_credentials, monkeypatch):
+    """The token is only process-bound while no spawner hands it down. The two
+    spawners with an `env=` overlay scrub it AFTER that overlay, so neither
+    inheritance nor an explicit `env=` can deliver it. The other agent spawners
+    (board, loop, sandbox, suite, trainer) and the table that classifies EVERY
+    module that spawns a process are pinned in `tests/test_advice_authorship.py`."""
+    from mindhive import claude_cli
+    from mindhive.mindnet import executor
+    monkeypatch.setenv("MINDHIVE_PROCESS_TOKEN", "s3cr3t")
+    overlay = {"MINDHIVE_PROCESS_TOKEN": "s3cr3t", "KEEP": "1"}
+    for spawner in (executor._child_env, claude_cli._child_env):
+        assert "MINDHIVE_PROCESS_TOKEN" not in spawner(None)
+        child = spawner(dict(overlay))
+        assert "MINDHIVE_PROCESS_TOKEN" not in child and child["KEEP"] == "1"

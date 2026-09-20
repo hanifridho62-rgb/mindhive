@@ -166,6 +166,9 @@ def _stream(argv, echo: bool, emit=None, env=None, cwd=None, timeout_s=None):
     Line-streamed rather than captured wholesale so a four-minute suite still
     prints as it goes; the buffer is what becomes the artifact. argv list only
     — `shell=True` appears nowhere in this module and a test pins that."""
+    # What runs here is a test suite, and in a lane the tests are an agent's:
+    # it gets an agent's environment, without the SOP process token (P1d).
+    from . import advice as authorship
     chunks: list[str] = []
     kept = 0
     try:
@@ -176,7 +179,7 @@ def _stream(argv, echo: bool, emit=None, env=None, cwd=None, timeout_s=None):
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env,
+            env=authorship.scrub_agent_env(env),
             cwd=str(cwd) if cwd else None,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

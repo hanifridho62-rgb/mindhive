@@ -377,16 +377,23 @@ def _child_env(extra):
     A value of ``None`` REMOVES the variable, so a caller can hand a child a
     clean slate for one setting instead of only overwriting it. Anything that is
     not a mapping is ignored: this module maps every fault to a typed result, and
-    a bad argument must not be the one thing that escapes as a crash."""
+    a bad argument must not be the one thing that escapes as a crash.
+
+    **The SOP process token is withheld LAST** (blueprint P1d,
+    `advice.scrub_agent_env`), after the overlay, so no caller can hand it to a
+    child. With no token in the parent that is the identity -- ``None`` still
+    means "inherit unchanged" -- so every pre-P1d caller spawns exactly as it
+    did."""
+    from .. import advice as authorship
     if not isinstance(extra, dict) or not extra:
-        return None
+        return authorship.scrub_agent_env(None)
     merged = dict(os.environ)
     for key, value in extra.items():
         if value is None:
             merged.pop(str(key), None)
         else:
             merged[str(key)] = str(value)
-    return merged
+    return authorship.scrub_agent_env(merged)
 
 
 def execute(run_key, script, root=None, timeout_s=DEFAULT_TIMEOUT_S,

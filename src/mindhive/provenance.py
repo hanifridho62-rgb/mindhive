@@ -33,6 +33,13 @@ a projection) and strip a DIFFERENT marker (`[mindnet]`). Folding them in would
 be a second change with a much larger blast radius than the one this module was
 written for. `inject.safe_text` is the model `safe_line` below follows.
 
+A third question joined them with the provenance labels (blueprint P1d): **can
+this string pass for a label?** `advice.format_sop_directive` prefixes a
+delivered procedure with where it came from, so a title or a body carrying a
+label-shaped bracket of its own forges that attribution. `defang_labels` and
+`defang_title` answer it HERE, not in `advice`, because `sop.safe_title` needs
+the answer and `sop` must not import the authorship module.
+
 Leaf module by construction: nothing in `mindhive` is imported at module level,
 so `projector`, `roadmap`, `briefing`, `sop` and `sopgate` can all reach it
 without a cycle, and importing it costs nothing on the projection path.
@@ -258,3 +265,56 @@ def agent_banner(what: str, session_id=None) -> str:
     LATEST editor, so it accumulates authorship itself -- the hole
     `sop.agent_touched_ids` exists to close -- and calls `banner` directly."""
     return banner(what, session_id) if is_agent_authored(session_id) else ""
+
+
+# --- 3. can this string pass for a provenance label? -------------------------------
+
+# A label-shaped bracket inside a TITLE or a BODY. Covers the three keywords as
+# whole words, in any case, with any separator or none (the fence's own header
+# spells it with an em dash, so that forgery read as native), inside ASCII,
+# fullwidth or CJK brackets, on one line, up to 60 characters. Does NOT cover a
+# homoglyph or a zero-width character inside the keyword, or a label split
+# across lines: normalising those would rewrite text the mandatory tier promises
+# to carry verbatim. Like the labels themselves, this attributes; it does not
+# prove. Bounded and linear -- it runs on the per-prompt path.
+_OPEN = "\\[\uff3b\u3010\u3014\u3016\u27e6"
+_CLOSE = "\\]\uff3d\u3011\u3015\u3017\u27e7"
+_FORGED_LABEL = re.compile(
+    "[" + _OPEN + r"](\s*(?:MANDATORY\s+SOP|SYSTEM\s+SOP|ADVISORY\s+TIP)\b"
+    "[^" + _CLOSE + r"\n]{0,60})[" + _CLOSE + "]",
+    re.IGNORECASE)
+# An opener that NOTHING closes, up to the end of a one-line field. A renderer
+# writes a title and then text of its own -- `sopgate.render` its "`[sop_id]`" --
+# so a title that opens a label and never closes it is closed by the renderer.
+# The lookahead is capped at the width such a field is cut to, which keeps this
+# linear whatever it is handed.
+_FORGED_OPENER = re.compile(
+    "[" + _OPEN + r"](?=\s*(?:MANDATORY\s+SOP|SYSTEM\s+SOP|ADVISORY\s+TIP)\b"
+    "[^" + _CLOSE + r"\n]{0," + str(TITLE_CHARS) + r"}$)",
+    re.IGNORECASE)
+
+
+def defang_labels(text) -> str:
+    """*text* with every label-shaped bracket turned into parentheses, so a
+    title or a body cannot carry a provenance label in the spellings
+    `_FORGED_LABEL` covers (its comment lists what it does not). A text with no
+    such bracket comes back unchanged -- the verbatim promise of the mandatory
+    tier holds for every procedure that is not trying to forge one. Run by
+    every surface that composes a BODY (`advice.format_sop_directive`,
+    `sop.block`, `sop.digest_block`, `mindnet.advice.resolve_sops`);
+    `hive sop show` prints the stored body, under an `authorship:` line.
+    Total, for `safe_line`'s reason: `str` refuses an int past
+    ``sys.get_int_max_str_digits()``, and that reads as no text."""
+    try:
+        raw = str(text or "")
+    except Exception:                                       # noqa: BLE001
+        return ""
+    return _FORGED_LABEL.sub(lambda m: "(" + m.group(1) + ")", raw)
+
+
+def defang_title(text) -> str:
+    """`defang_labels` for a ONE-LINE field a renderer follows with text of its
+    own: an opener the field never closes loses its bracket too. `sop.safe_title`
+    runs it, after the collapse and the cut, so every surface that shows a title
+    is covered at once. Bracket for parenthesis: the length never changes."""
+    return _FORGED_OPENER.sub("(", defang_labels(text))

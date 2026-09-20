@@ -68,6 +68,7 @@ import re
 from typing import NamedTuple
 
 from .. import events as ev_mod
+from .. import provenance
 from .inject import safe_text
 
 # Bounds. The per-item cap is what makes the injector's total budget
@@ -448,7 +449,10 @@ def resolve_sops(task_kw, evs):
             return ""
         sid = safe_text(r.get("sop_id"), 64)
         title = safe_text(r.get("title"), 80)
-        return safe_text(f"[{sid}] {title}: {body}", MAX_ITEM_CHARS)
+        # The composed LINE, not its fields: a brief carries no provenance
+        # label, so a label-shaped bracket would be the only one the agent sees.
+        return provenance.defang_labels(
+            safe_text(f"[{sid}] {title}: {body}", MAX_ITEM_CHARS))
 
     return _ranked_rendered(kept, task_kw, _sop_text, MAX_SOPS, _render), withheld
 

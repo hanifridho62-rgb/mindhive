@@ -708,6 +708,8 @@ class Manager:
         # Its OWN session, never the operator's: see `runlog.workspace_session`
         # for both reasons (a private ledger segment, and honest authorship).
         env["MINDHIVE_SESSION"] = runlog.workspace_session(a.id)
+        from . import advice as authorship  # P1d: the SOP process token never
+        env = authorship.scrub_agent_env(env)   # reaches a board agent; withheld LAST
         cwd = _folder_for_project(a.project)
         try:
             a.proc = self._spawn(argv, env, cwd)
