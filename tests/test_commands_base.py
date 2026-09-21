@@ -223,7 +223,10 @@ def test_build_parser_still_names_every_add_call_itself():
     from mindhive.commands import parsers
     src = inspect.getsource(parsers._build_parser)
     assert "register_parsers" not in src
-    assert src.count("maintenance_p.add_") == 14
+    # 15 since blueprint P1h: `add_watcher`, appended at the TAIL of the
+    # assembly so the pinned surface order is unchanged for everything above
+    # it. The number is the point -- a loop would read as one call.
+    assert src.count("maintenance_p.add_") == 15
 
 
 # --- verification.py --------------------------------------------------------------
@@ -236,7 +239,12 @@ def test_verify_and_selftest_live_in_verification_and_left_maintenance():
     for n in ("cmd_verify", "cmd_selftest"):
         assert n not in maintenance.__all__, n
         assert not hasattr(maintenance, n), n
-    assert verification.__all__ == ["cmd_verify", "cmd_selftest", "cmd_verify_chain"]
+    # The three watcher handlers joined at P1h for the reason the module
+    # docstring gives: `verify`, `selftest` and `watcher status|recover` all
+    # answer "is the store consistent with itself".
+    assert verification.__all__ == ["cmd_verify", "cmd_selftest",
+                                    "cmd_verify_chain", "cmd_watcher_run",
+                                    "cmd_watcher_status", "cmd_watcher_recover"]
     mods = list(commands.HANDLER_MODULES)
     assert mods.index("verification") == mods.index("orchestration") - 1
     assert "base" not in mods

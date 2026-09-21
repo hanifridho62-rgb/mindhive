@@ -388,11 +388,15 @@ class _FakeClient:
 
 def test_a_collection_is_asked_for_cosine_space(monkeypatch):
     """chroma defaults to squared L2; all-MiniLM-L6-v2 is a cosine model. The
-    mismatch is what made `1 - distance` come back NEGATIVE."""
+    mismatch is what made `1 - distance` come back NEGATIVE.
+
+    The space now travels with M and the ef parameters (blueprint P1h, K20);
+    `tests/test_vectors_v1.py` is where the rest of the set is pinned."""
     client = _FakeClient("cosine")
     monkeypatch.setattr(vectors, "_client", lambda project: client)
     vectors._open(None, "events")
-    assert client.created == [("events", {"hnsw:space": "cosine"})]
+    assert client.created == [("events", dict(vectors.HNSW_METADATA))]
+    assert client.created[0][1]["hnsw:space"] == "cosine"
     assert client.deleted == []
 
 
@@ -410,4 +414,4 @@ def test_a_wrong_space_collection_is_rebuilt_only_where_it_will_be_refilled(
 
     col = vectors._open(None, "events", refill=True)
     assert client.deleted == ["events"]
-    assert col.metadata == {"hnsw:space": "cosine"}
+    assert col.metadata["hnsw:space"] == "cosine"

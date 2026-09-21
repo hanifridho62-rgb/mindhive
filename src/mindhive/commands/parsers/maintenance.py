@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """argparse wiring for store hygiene and verification: `verify`,
 `selftest`, `premise`, `recall`, `consolidate`, `gc`, `export`, `embed`,
-`briefing`, `review`, `log`, `flag`, `failures`, `enrich`.
+`briefing`, `review`, `log`, `flag`, `failures`, `enrich`, `watcher`.
 """
 from ... import cliparse
 from ..context_ops import cmd_briefing, cmd_premise_check
@@ -18,12 +18,13 @@ from ..maintenance import (cmd_consolidate,
                            cmd_review_clear,
                            cmd_review_queue,
                            cmd_review_show)
-from ..verification import cmd_selftest, cmd_verify
+from ..verification import (cmd_selftest, cmd_verify, cmd_watcher_recover,
+                            cmd_watcher_run, cmd_watcher_status)
 
 __all__ = ["add_verify", "add_selftest", "add_premise", "add_recall",
     "add_consolidate", "add_gc", "add_export", "add_embed", "add_briefing",
     "add_review", "add_log", "add_flag", "add_failures", "add_enrich",
-    "register_parsers"]
+    "add_watcher", "register_parsers"]
 
 
 
@@ -119,7 +120,42 @@ def add_embed(sub) -> None:
     """Register `hive embed`."""
     em = sub.add_parser("embed", help="build vector index (on-demand)")
     em.add_argument("--force", action="store_true")
+    em.add_argument("--rebuild", action="store_true",
+                    help="drop both collections first, so an index built under "
+                         "older HNSW tuning is rebuilt with the current one")
     em.set_defaults(func=cmd_embed)
+
+
+def add_watcher(sub) -> None:
+    """Register `hive watcher run|status|recover` (blueprint P1h, BAB 4.4)."""
+    wp = sub.add_parser("watcher",
+                        help="the pending-embed queue: drain it, read it, "
+                             "recover claims a crash abandoned (BAB 4.4)")
+    ws = wp.add_subparsers(dest="watcher_cmd", required=True)
+
+    run = ws.add_parser("run", help="drain the queue; loops until Ctrl+C "
+                                    "unless --once")
+    run.add_argument("--once", action="store_true",
+                     help="one cycle and exit, for a scheduled task or a hook")
+    _watcher_common(run)
+    run.set_defaults(func=cmd_watcher_run)
+
+    st = ws.add_parser("status", help="how many rows are queued and how many "
+                                      "markers are claimed")
+    _watcher_common(st)
+    st.set_defaults(func=cmd_watcher_status)
+
+    rec = ws.add_parser("recover", help="return abandoned claims to the queue")
+    rec.add_argument("--stale", type=float, default=None,
+                     help="seconds before a claim counts as abandoned "
+                          "(default 600)")
+    _watcher_common(rec)
+    rec.set_defaults(func=cmd_watcher_recover)
+
+
+def _watcher_common(p) -> None:
+    p.add_argument("--project", type=cliparse.project_arg, default=None)
+    p.add_argument("--json", action="store_true")
 
 
 def add_briefing(sub) -> None:
@@ -237,3 +273,4 @@ def register_parsers(sub) -> None:
     add_flag(sub)
     add_failures(sub)
     add_enrich(sub)
+    add_watcher(sub)

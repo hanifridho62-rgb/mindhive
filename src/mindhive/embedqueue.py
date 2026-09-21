@@ -108,3 +108,29 @@ def emit_pending_embed_marker(project, session_id, segment, seg_line) -> None:
         "segment": segment,
     })
     paths.write_text_atomic(marker_file, json.dumps(queue, indent=2))
+
+
+def requeue_entries(project, entries) -> int:
+    """Put *entries* BACK at the head of the queue, keeping whatever is
+    already there. Returns how many were added.
+
+    The watcher's startup recovery is the only caller (`watcher.
+    recover_stale_markers`): a claim abandoned by a killed process holds
+    entries that were removed from this file when it was claimed, and appends
+    that landed while it held them are in this file now. Merged, therefore,
+    and never written over -- an overwrite in either direction loses rows
+    that nothing else records. At the HEAD because they are the older work:
+    the queue is drained in order and the rows that waited through a crash
+    should not wait through the next batch as well.
+
+    Entries keep their ORIGINAL `queued_at`. Re-stamping them would erase the
+    evidence of how long the work has actually been outstanding, which is the
+    one thing an operator reading this file wants to know."""
+    entries = [e for e in entries if isinstance(e, dict)]
+    if not entries:
+        return 0
+    marker_file = paths.state_dir(project) / MARKER_NAME
+    queue = _load_queue(marker_file)
+    queue["entries"] = list(entries) + queue["entries"]
+    paths.write_text_atomic(marker_file, json.dumps(queue, indent=2))
+    return len(entries)

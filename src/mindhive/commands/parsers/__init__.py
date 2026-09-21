@@ -94,6 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # this comment: a ratchet counts the lines that mention it here.)
     from ...ci import cli as ci_cli
     ci_cli.register(sub)
+    maintenance_p.add_watcher(sub)           # blueprint P1h
 
     return p
 

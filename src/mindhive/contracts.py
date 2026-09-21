@@ -24,6 +24,11 @@ import importlib
 # beside the type registry, instead of being copied into both. Copying is how
 # they drifted: the CLI enforced four contracts and the endpoint enforced none.
 #
+#: Both vector-sync types share it; spelled once so the two rows cannot drift.
+_SYNC_HINT = ("written by the embedding watcher as it drains a claim "
+              "(`hive watcher run`, or the thread `hive dashboard` owns); "
+              "there is no command that appends one by hand")
+
 # event type -> (contract module, corrective hint carried in the rejection)
 _PAYLOAD_CONTRACTS = {
     "code_change": (".changelog", 'hive log <category> "..."'),
@@ -126,6 +131,12 @@ _PAYLOAD_CONTRACTS = {
     "merge_conflict_detected": (".mindnet.worktree",
                                 "written by mindnet.worktree.merge_probe as it "
                                 "answers; there is no command"),
+    # Blueprint P1h. One module for BOTH types, which is safe here and was not
+    # for the P1b pair: these two carry the SAME payload -- `{marker, count,
+    # duration_s}` -- so the validator has nothing to tell apart. They differ
+    # by NAME, which is the whole point of having two.
+    "vector_sync_started": (".watcher", _SYNC_HINT),
+    "vector_sync_completed": (".watcher", _SYNC_HINT),
 }
 
 

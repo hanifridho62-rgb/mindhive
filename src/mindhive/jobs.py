@@ -53,11 +53,48 @@ from __future__ import annotations
 
 import collections
 import os
+import re
 import threading
 import time
 import uuid
 
 from . import events, outcomes
+
+#: The frame the vector watcher overwrites one terminal line with (PDF 4.6,
+#: blueprint P1h). Spelled HERE, in the module that has to recognise it, and
+#: imported by `watcher` -- one string in the parser rather than two that can
+#: drift apart while both tests stay green.
+PROGRESS_PREFIX = "[MINDHIVE VEC-SYNC]"
+_PROGRESS_BYTES = PROGRESS_PREFIX.encode("utf-8")
+_PROGRESS_FRACTION = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+def progress_pct(text):
+    """The percentage a progress frame states, or None.
+
+    Read from the FRACTION rather than from the printed percentage: the
+    fraction is what the watcher counts, and a reader that parsed `(30.0%)`
+    would be parsing a rounding of it. `0/0` is not 0 % -- there is no work,
+    which is not the same as work that has not started."""
+    if not text or PROGRESS_PREFIX not in text:
+        return None
+    tail = text[text.rindex(PROGRESS_PREFIX) + len(PROGRESS_PREFIX):]
+    found = _PROGRESS_FRACTION.search(tail)
+    if found is None:
+        return None
+    done, total = int(found.group(1)), int(found.group(2))
+    if total <= 0:
+        return None
+    return round(done / total * 100.0, 1)
+
+
+def _collapse_lines(data: bytes) -> bytes:
+    """Every COMPLETE line in *data*, reduced to what a terminal would show:
+    the segment after its last carriage return."""
+    lines = data.split(b"\n")[:-1]
+    if not lines:
+        return b""
+    return b"\n".join(line.rsplit(b"\r", 1)[-1] for line in lines) + b"\n"
 
 
 # Per-job output cap. Selftest is the honest worst case — a full pytest run over
@@ -93,6 +130,8 @@ class OutputRing:
         self._chunks: "collections.deque[bytes]" = collections.deque()
         self._retained = 0        # bytes currently held
         self._dropped = 0         # bytes discarded off the front, ever
+        self._pending = b""       # the unterminated frame, not yet committed
+        self._progress_pct = None
         self._lock = threading.Lock()
 
     @property
@@ -100,17 +139,71 @@ class OutputRing:
         with self._lock:
             return self._dropped + self._retained
 
+    @property
+    def progress_pct(self):
+        with self._lock:
+            return self._progress_pct
+
     def write(self, text) -> None:
+        """Add *text*, collapsing carriage-return runs to what a terminal
+        would show.
+
+        tqdm and the vector watcher overwrite ONE line with `\r`. Delivered
+        raw, the browser stacks every superseded frame -- the PDF's "hundreds
+        of empty log lines" -- because the page APPENDS what each poll
+        returns. So a frame that is still being overwritten is held OUT of the
+        offset stream until its line is terminated: an offset handed to a
+        reader is a place it has already passed, and no collapse may take
+        bytes back. The frame is not lost; `progress_pct` carries it while it
+        is live, and `close` publishes the last one.
+
+        Text with no carriage return, arriving with no frame held, takes the
+        original path byte for byte -- including a partial line, which still
+        streams immediately."""
         chunk = str(text).encode("utf-8", "replace")
         if not chunk:
             return
         with self._lock:
-            self._chunks.append(chunk)
-            self._retained += len(chunk)
-            while self._retained > self._capacity and self._chunks:
-                oldest = self._chunks.popleft()
-                self._retained -= len(oldest)
-                self._dropped += len(oldest)
+            if b"\r" not in chunk and not self._pending:
+                if _PROGRESS_BYTES in chunk:
+                    self._note_progress(chunk.rsplit(b"\n", 2)[0])
+                self._commit(chunk)
+                return
+            self._pending += chunk
+            cut = self._pending.rfind(b"\n")
+            if cut >= 0:
+                head, self._pending = (self._pending[:cut + 1],
+                                       self._pending[cut + 1:])
+                head = _collapse_lines(head)
+                self._note_progress(head)
+                self._commit(head)
+            self._pending = self._pending.rsplit(b"\r", 1)[-1]
+            self._note_progress(self._pending)
+
+    def close(self) -> None:
+        """Publish the frame still being overwritten, if any. Idempotent: the
+        boot seal closes jobs it never ran."""
+        with self._lock:
+            if self._pending:
+                self._commit(self._pending + b"\n")
+                self._pending = b""
+
+    def _note_progress(self, data: bytes) -> None:
+        if _PROGRESS_BYTES not in data:
+            return
+        pct = progress_pct(data.decode("utf-8", "replace"))
+        if pct is not None:
+            self._progress_pct = pct
+
+    def _commit(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._chunks.append(chunk)
+        self._retained += len(chunk)
+        while self._retained > self._capacity and self._chunks:
+            oldest = self._chunks.popleft()
+            self._retained -= len(oldest)
+            self._dropped += len(oldest)
 
     def read(self, offset=0):
         """Return ``(text, next_offset, dropped_before)`` for everything written
@@ -181,6 +274,9 @@ class Job:
             "output": text,
             "offset": next_offset,
             "dropped": dropped,
+            # The live frame, which is deliberately NOT in `output`: the page
+            # renders it as a bar rather than appending it as a line.
+            "progress_pct": self.output.progress_pct,
         }
         if report is not None:
             body["outcome"] = report.outcome
@@ -346,6 +442,10 @@ def finish(job, report) -> None:
     observes FINISHED can rely on the row already being there.
     """
     job.finished_at = time.time()       # only this job's own thread writes it
+    # The last progress frame is still held out of the offset stream; publish
+    # it before anything can read the job as finished, or a run's final line
+    # would be a line nobody ever sees.
+    job.output.close()
     _record(job, "job_finished", {
         "outcome": report.outcome,
         "summary": report.summary,

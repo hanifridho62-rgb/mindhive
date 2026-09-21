@@ -645,6 +645,23 @@ def serve(port: int | None = None, open_browser: bool = True,
                   flush=True)
     except Exception as e:                      # noqa: BLE001 — see comment
         print(f"job seal skipped: {type(e).__name__}: {e}", flush=True)
+    # The vector half of the same boot sweep (blueprint P1h, PDF 4.5). A claim
+    # left by a process that died mid-embed names rows nothing else records as
+    # unindexed; returning them to the queue here, before the watcher starts,
+    # is what stops a power cut costing an operator their semantic index.
+    # Best-effort for the same reason the seal is: an unreadable sidecar must
+    # not stop the dashboard from serving.
+    watcher = None
+    try:
+        from . import watcher as watcher_mod
+        recovered = watcher_mod.recover_stale_markers(default_project())
+        if recovered:
+            print(f"recovered {recovered} embedding marker(s) abandoned by a "
+                  f"previous run", flush=True)
+        watcher = watcher_mod.BackgroundEmbeddingWatcher(default_project())
+        watcher.start()
+    except Exception as e:                      # noqa: BLE001 — see comment
+        print(f"embedding watcher skipped: {type(e).__name__}: {e}", flush=True)
     stop_event = threading.Event()
     threading.Thread(target=_auto_harvest_loop, args=(stop_event,), daemon=True).start()
     try:
@@ -653,4 +670,6 @@ def serve(port: int | None = None, open_browser: bool = True,
         pass
     finally:
         stop_event.set()
+        if watcher is not None:
+            watcher.stop()
         server.shutdown()

@@ -495,3 +495,125 @@ def test_job_rows_stay_out_of_the_semantic_layer():
     for etype in ("job_started", "job_finished", "job_abandoned"):
         assert etype not in events.SEMANTIC_TYPES
         assert etype not in events.MEMORY_VIEW_TYPES
+
+
+# --- carriage returns and the progress bar (blueprint P1h, PDF 4.6) ----------
+
+def test_plain_output_is_untouched_by_the_carriage_return_path():
+    """The fast path has to stay the fast path: a job that never emits `\r`
+    must behave exactly as it did before P1h, partial lines included."""
+    ring = jobs.OutputRing()
+    ring.write("half a line")
+    assert ring.read() == ("half a line", 11, 0)
+    ring.write(" and the rest\n")
+    assert ring.read(11) == (" and the rest\n", 25, 0)
+
+
+def test_a_carriage_return_run_collapses_to_its_last_segment():
+    """tqdm and the vector watcher overwrite ONE terminal line. Delivered
+    raw, the browser stacks every superseded frame -- the PDF's "hundreds of
+    empty log lines" -- because the page appends what each poll returns."""
+    ring = jobs.OutputRing()
+    for i in (1, 2, 3):
+        ring.write(f"\r{jobs.PROGRESS_PREFIX} Menanam: {i}/3 "
+                   f"({round(i / 3 * 100, 1)}%)")
+    ring.write("\n")
+    text, _off, _drop = ring.read()
+    assert text == f"{jobs.PROGRESS_PREFIX} Menanam: 3/3 (100.0%)\n"
+
+
+def test_an_unterminated_progress_frame_is_held_back_not_streamed():
+    """Only the SURVIVING frame may enter the offset stream: a byte handed
+    to a reader cannot be taken back, and the reader appends what it gets."""
+    ring = jobs.OutputRing()
+    ring.write("\rworking 1/3")
+    assert ring.read() == ("", 0, 0)
+    ring.write("\rworking 3/3\n")
+    assert ring.read() == ("working 3/3\n", 12, 0)
+
+
+def test_lines_before_a_carriage_return_run_survive_it():
+    ring = jobs.OutputRing()
+    ring.write("collecting ...\n")
+    ring.write("\rworking 1/2")
+    ring.write("\rworking 2/2\n")
+    ring.write("done\n")
+    assert ring.read()[0] == "collecting ...\nworking 2/2\ndone\n"
+
+
+def test_a_mixed_chunk_splits_into_lines_and_a_frame():
+    ring = jobs.OutputRing()
+    ring.write("first\n\rframe a\rframe b\nsecond\n\rtail")
+    assert ring.read()[0] == "first\nframe b\nsecond\n"
+    ring.close()
+    assert ring.read()[0] == "first\nframe b\nsecond\ntail\n"
+
+
+def test_closing_a_ring_publishes_the_last_held_frame():
+    ring = jobs.OutputRing()
+    ring.write("\rworking 3/3")
+    assert ring.read()[0] == ""
+    ring.close()
+    assert ring.read()[0] == "working 3/3\n"
+    ring.close()
+    assert ring.read()[0] == "working 3/3\n", "close is not idempotent"
+
+
+def test_the_offset_never_moves_backwards_across_a_collapse():
+    """A reader's offset is its place in everything ever written; a ring that
+    retracted bytes would hand it an offset it had already passed."""
+    ring = jobs.OutputRing()
+    seen = 0
+    for i in range(1, 6):
+        ring.write(f"\rworking {i}/5")
+        _t, off, _d = ring.read(seen)
+        assert off >= seen
+        seen = off
+    ring.write("\n")
+    _t, off, _d = ring.read(seen)
+    assert off > seen
+
+
+def test_progress_pct_reads_the_fraction_the_watcher_prints():
+    assert jobs.progress_pct(
+        f"{jobs.PROGRESS_PREFIX} Menanam: 3/10 (30.0%)") == 30.0
+    assert jobs.progress_pct(
+        f"{jobs.PROGRESS_PREFIX} Menanam: 10/10 (100.0%)") == 100.0
+
+
+def test_progress_pct_ignores_a_line_that_is_not_a_sync_frame():
+    assert jobs.progress_pct("3/10 (30.0%)") is None
+    assert jobs.progress_pct("collecting ... 12 items") is None
+    assert jobs.progress_pct("") is None
+
+
+def test_progress_pct_of_an_empty_queue_is_not_a_division_by_zero():
+    assert jobs.progress_pct(f"{jobs.PROGRESS_PREFIX} Menanam: 0/0 (0%)") is None
+
+
+def test_a_polled_job_carries_the_percentage_while_it_runs():
+    job = jobs.Job("j1", "embed", "Embedding", "test")
+    assert job.snapshot()["progress_pct"] is None
+    job.output.write(f"\r{jobs.PROGRESS_PREFIX} Menanam: 3/10 (30.0%)")
+    assert job.snapshot()["progress_pct"] == 30.0
+    job.output.write(f"\r{jobs.PROGRESS_PREFIX} Menanam: 10/10 (100.0%)")
+    assert job.snapshot()["progress_pct"] == 100.0
+
+
+def test_a_job_that_prints_no_progress_reports_none():
+    job = jobs.Job("j2", "selftest", "Testing", "test")
+    job.output.write("collecting ...\n")
+    assert job.snapshot()["progress_pct"] is None
+
+
+def test_a_capped_ring_still_collapses():
+    """The CR path must not smuggle bytes past the cap: the ring is what keeps
+    a job's memory bounded."""
+    ring = jobs.OutputRing(capacity=64)
+    for i in range(200):
+        ring.write(f"\rworking {i}/200")
+    ring.write("\n")
+    text, _off, dropped = ring.read()
+    assert "working 199/200" in text
+    assert dropped == 0
+    assert len(text.encode("utf-8")) <= 64

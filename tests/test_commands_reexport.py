@@ -163,7 +163,8 @@ SURFACE = {'append': {},
  # so the breaker verbs shipped WITH the state rather than waiting for P1g.
  # P1g added the gate itself: `run`, `status` and `hook-install`.
  'ci': {'run': {}, 'status': {}, 'hook-install': {},
-        'breaker': {'status': {}, 'reset': {}}}}
+        'breaker': {'status': {}, 'reset': {}}},
+ 'watcher': {'run': {}, 'status': {}, 'recover': {}}}
 
 # The handler NAME every parser bound BEFORE the split (the `__func__` entries
 # of the same 2026-09-14 snapshot). Self-registering groups included: this is
@@ -312,7 +313,10 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'ci breaker status': 'cmd_ci_breaker_status',
  'ci hook-install': 'cmd_ci_hook_install',
  'ci run': 'cmd_ci_run',
- 'ci status': 'cmd_ci_status'}
+ 'ci status': 'cmd_ci_status',
+ 'watcher recover': 'cmd_watcher_recover',
+ 'watcher run': 'cmd_watcher_run',
+ 'watcher status': 'cmd_watcher_status'}
 
 
 def _sub(parser):

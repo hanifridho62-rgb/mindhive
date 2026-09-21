@@ -34,25 +34,24 @@ kind: `project_dir(project) / "state"`, made on demand, joined THROUGH
 `project_dir` so a hostile project name lands inside the quarantined namespace
 like everything else in the store.
 
-Two of the six v1.x event types are registered: `work_session` and
-`initiative_declared` landed with their owners, `worksessions.py` and
-`initiatives.py` (blueprint P1b), and their registration assertions close this
-file. Deliberately NOT
-here yet: the two the watcher owns (`vector_sync_started`,
-`vector_sync_completed`) and their registration
-assertions -- membership in `VALID_TYPES`, the SEMANTIC / DETERMINISTIC split,
-their `_PAYLOAD_CONTRACTS` rows and `ledger_body`. Each is registered by the
-phase that lands its owning module (orchestrator/interceptor and
-mindnet/worktree; watcher), following docs/DATA_MODEL.md section 6, and the
-assertions are appended to this file in that same change-set. Registering a
-type before its owner module exists is not merely untidy: a
-`_PAYLOAD_CONTRACTS` row names the owner by module path and
-`events.validate_typed_payload` imports it, so `hive append <type>` would die
-with `ModuleNotFoundError` instead of the contract's `ValueError`, and
-`projector.build_ledger_entries` would render an empty body until
+All six v1.x event types are now registered, each by the phase that landed
+its owning module: `work_session` and `initiative_declared` with
+`worksessions.py` and `initiatives.py` (blueprint P1b), `interceptor_signal`
+and `merge_conflict_detected` with `orchestrator/interceptor.py` and
+`mindnet/worktree.py` (P1f), and `vector_sync_started` /
+`vector_sync_completed` with `watcher.py` (P1h). Their registration
+assertions close this file.
+
+Arriving together is the rule and not a preference. A `_PAYLOAD_CONTRACTS`
+row names its owner by MODULE PATH and `events.validate_typed_payload`
+imports it, so a type registered before its module exists makes `hive append
+<type>` die with `ModuleNotFoundError` instead of the contract's `ValueError`;
+a SEMANTIC type registered early renders an empty LEDGER body until
 `ledger_body` lands. The exemption-parity guards in
 `tests/test_architecture_drift.py` are satisfied either way as long as the
-`NEVER_CONSOLIDATE` / `NEVER_COLLAPSE` entries land together with the type.
+`NEVER_CONSOLIDATE` / `NEVER_COLLAPSE` entries land together with the type --
+which the two watcher types need not do, being deterministic: consolidation
+and display dedupe only ever see the semantic half.
 """
 import json
 import re
@@ -545,9 +544,9 @@ P1B_TYPES = ("work_session", "initiative_declared")
 OWNERS = {"work_session": ".worksessions", "initiative_declared": ".initiatives"}
 # Blueprint P1f registered `interceptor_signal` (orchestrator/interceptor.py)
 # and `merge_conflict_detected` (mindnet/worktree.py) together with their owner
-# modules, the way this file's docstring says each type must arrive. The two
-# left belong to the watcher, which P1h lands.
-STILL_UNREGISTERED = ("vector_sync_started", "vector_sync_completed")
+# modules, the way this file's docstring says each type must arrive. P1h did
+# the same for the watcher's pair, below.
+P1H_TYPES = ("vector_sync_started", "vector_sync_completed")
 
 
 @pytest.mark.parametrize("etype", P1B_TYPES)
@@ -563,11 +562,55 @@ def test_p1b_types_are_registered_semantic_exempt_and_contracted(etype):
         contracts.validate_typed_payload(etype, {})
 
 
-@pytest.mark.parametrize("etype", STILL_UNREGISTERED)
-def test_the_other_two_v1_types_are_still_unregistered(etype):
+@pytest.mark.parametrize("etype", P1H_TYPES)
+def test_p1h_types_are_registered_deterministic_and_contracted(etype):
+    from mindhive import contracts, pgschema
+    assert etype in events.VALID_TYPES and etype in events.DETERMINISTIC_TYPES
+    assert pgschema.EVENT_TYPE_CLASSES[etype] == "deterministic"
+    module, hint = contracts._PAYLOAD_CONTRACTS[etype]
+    assert module == ".watcher" and "hive watcher run" in hint
+    with pytest.raises(ValueError, match=r"needs marker, count, duration_s"):
+        contracts.validate_typed_payload(etype, {})
+
+
+@pytest.mark.parametrize("etype", P1H_TYPES)
+def test_a_sync_row_never_queues_its_own_embedding(etype):
+    """The watcher indexes SEMANTIC rows. A semantic sync row would queue an
+    embed of itself, whose completion row would queue another one, and the
+    queue would never be empty again."""
+    assert etype not in events.SEMANTIC_TYPES
+    assert etype not in events.MEMORY_VIEW_TYPES
+    events.append_event(etype, {"marker": "processing_embed_1.json",
+                                "count": 1, "duration_s": 0.5},
+                        session_id="sync-marker")
+    assert not _marker().exists()
+
+
+@pytest.mark.parametrize("bad, why", [
+    ({"count": 1, "duration_s": 0.0}, r"needs marker, count, duration_s"),
+    ({"marker": "nope.json", "count": 1, "duration_s": 0.0},
+     r"must name a processing_embed_\*\.json claim"),
+    ({"marker": "processing_embed_1.json", "count": -1, "duration_s": 0.0},
+     r"whole number of rows"),
+    ({"marker": "processing_embed_1.json", "count": True, "duration_s": 0.0},
+     r"whole number of rows"),
+    ({"marker": "processing_embed_1.json", "count": 1, "duration_s": -0.5},
+     r"non-negative number of seconds"),
+])
+def test_a_hand_appended_sync_row_is_refused_with_its_hint(bad, why):
     from mindhive import contracts
-    assert etype not in events.VALID_TYPES
-    assert etype not in contracts._PAYLOAD_CONTRACTS
+    with pytest.raises(ValueError, match=why):
+        contracts.validate_typed_payload("vector_sync_completed", bad)
+    with pytest.raises(ValueError, match=r"there is no command"):
+        contracts.validate_typed_payload("vector_sync_completed", bad)
+
+
+def test_a_well_formed_sync_row_passes_the_contract():
+    from mindhive import contracts
+    assert contracts.validate_typed_payload(
+        "vector_sync_started",
+        {"marker": "processing_embed_17.json", "count": 3,
+         "duration_s": 1.25}) is None
 
 
 def test_p1b_appends_queue_one_marker_entry_per_row():

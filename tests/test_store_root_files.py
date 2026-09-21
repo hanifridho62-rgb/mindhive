@@ -33,6 +33,9 @@ import pytest
 
 from mindhive import (autosync, cliparse, consolidate, dashboard, events, guard,
                       harvest, hookcapture, paths, research, sop, workspace)
+# `tests/` is a package (`tests/__init__.py`), so the suite's own conftest has
+# an importable name and its helpers can be exercised directly.
+from tests import conftest
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "mindhive"
 
@@ -281,3 +284,55 @@ def test_canary_the_guard_sees_every_spelling_of_a_root_join(source):
         "alias-in-another-scope"])
 def test_canary_the_guard_stays_silent_on_sanctioned_uses(source):
     assert _root_joins(source) == []
+
+
+# --------------------------------------------------------------------------
+# The REPO root's turn: `tests/conftest.py::repo_root_stays_clean`
+# --------------------------------------------------------------------------
+#
+# Everything above guards the STORE root. The checkout has the same problem
+# from the other direction -- pytest's working directory IS the checkout, so
+# a relative path under test, or a subprocess spawned without `cwd=`, writes
+# straight into someone's working copy. The session fixture watches for it;
+# these canaries are what keep the watching honest, because a snapshot
+# comparison that always returned the empty set would pass forever.
+
+def test_canary_the_repo_root_guard_sees_a_new_file_and_a_new_directory(tmp_path):
+    (tmp_path / "already-here.txt").write_text("x", encoding="utf-8")
+    before = conftest.repo_root_entries(tmp_path)
+    (tmp_path / "b.bin").write_bytes(b"\x00\x01main")
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "in.txt").write_text("x\n", encoding="utf-8")
+    new = sorted(conftest.repo_root_entries(tmp_path) - before)
+    # `d/in.txt` is NOT listed separately: the check is top-level names, and a
+    # stray nested file always arrives inside a new top-level directory.
+    assert new == ["b.bin", "d"]
+
+
+def test_canary_the_repo_root_guard_ignores_the_tooling_churn(tmp_path):
+    """A default run writes `.pytest_cache`; `-p no:cacheprovider` does not.
+    A guard that disagreed with itself between those two spellings would be
+    noise, and noise is what gets a guard deleted."""
+    before = conftest.repo_root_entries(tmp_path)
+    for name in ("__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"):
+        (tmp_path / name).mkdir()
+    (tmp_path / ".coverage.host.12345").write_text("", encoding="utf-8")
+    assert conftest.repo_root_entries(tmp_path) == before
+
+
+def test_canary_the_repo_root_guard_survives_a_root_that_is_not_there(tmp_path):
+    """It must never be the thing that fails a run."""
+    assert conftest.repo_root_entries(tmp_path / "nope") == set()
+
+
+def test_the_repo_root_guard_is_autouse_for_the_whole_session():
+    """Scope is the design decision, not an accident: per-test would name the
+    offending test but pay one listing per test to find a thing that has
+    happened once."""
+    # pytest 9 wraps a fixture in a FixtureFunctionDefinition and hangs the
+    # marker off `_fixture_function_marker`; `_pytestfixturefunction` was the
+    # pytest 8 spelling and is gone.
+    marker = conftest.repo_root_stays_clean._fixture_function_marker
+    assert marker.scope == "session"
+    assert marker.autouse is True
+    assert conftest.REPO_ROOT == Path(__file__).resolve().parents[1]

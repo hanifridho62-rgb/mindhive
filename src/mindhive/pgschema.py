@@ -699,6 +699,8 @@ EVENT_TYPE_CLASSES = {
     "loop_run_start":      "deterministic",
     "memory_consolidated": "deterministic",
     "merge_conflict_detected": "deterministic",
+    "vector_sync_started":  "deterministic",
+    "vector_sync_completed": "deterministic",
     "mindnet_activity":    "deterministic",
     "mindnet_brief":       "deterministic",
     "plugin_catalog":      "deterministic",

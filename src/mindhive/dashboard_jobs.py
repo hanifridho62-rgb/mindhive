@@ -72,10 +72,17 @@ def _job_harvest(project, request, emit) -> outcomes.Report:
 
 
 def _job_embed(project, request, emit) -> outcomes.Report:
+    """Index BOTH collections, exactly as `hive embed` does.
+
+    The button used to run the FILE pass alone, so an operator who never
+    touched the CLI had a semantic layer that silently half-worked: the
+    Memory view could find the file a decision lived in and `hive recall
+    --semantic` could not find the decision (blueprint P1h)."""
     from . import vectors
     force = bool(request.get("force", False))
+    rebuild = bool(request.get("rebuild", False))
     try:
-        res = vectors.embed(project, force=force)
+        res = vectors.embed(project, force=force, rebuild=rebuild)
     except RuntimeError as e:
         # The semantic layer is optional by invariant (DATA_MODEL §5), so absent
         # extras are a DEGRADED store rather than a broken dashboard — reporting
@@ -91,12 +98,16 @@ def _job_embed(project, request, emit) -> outcomes.Report:
         if isinstance(e.__cause__, ImportError):
             return outcomes.Report(outcomes.DEGRADED, str(e))
         raise
+    evres = vectors.embed_events(project, force=force, rebuild=rebuild)
+    out = {"files": res, "events": evres}
     embedded = int(res.get("embedded") or 0)
-    if not embedded:
+    indexed = int(evres.get("embedded") or 0)
+    if not embedded and not indexed:
         return outcomes.Report(outcomes.NOTHING_TO_DO,
-                               "no LEDGER entries to embed yet", res)
+                               "no LEDGER entries to embed yet", out)
     return outcomes.Report(outcomes.DID_WORK,
-                           f"embedded {embedded} LEDGER entr(ies)", res)
+                           f"embedded {embedded} LEDGER entr(ies) and "
+                           f"{indexed} event(s)", out)
 
 
 def _job_plugins_scan(project, request, emit) -> outcomes.Report:

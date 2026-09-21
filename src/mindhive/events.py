@@ -422,6 +422,11 @@ DETERMINISTIC_TYPES = {
     # a LEDGER markdown file, a Memory-view row and a recall-corpus entry on
     # disk for every prompt anyone ever types.
     "context_injected",
+    # The two ends of one background embedding run (blueprint P1h, PDF 4.4).
+    # Deterministic for the reason `job_started` gives, and for one more: the
+    # watcher indexes SEMANTIC rows, so a semantic sync row would queue its
+    # own embedding and the watcher would never reach an empty queue.
+    "vector_sync_started", "vector_sync_completed",
 }
 VALID_TYPES = SEMANTIC_TYPES | DETERMINISTIC_TYPES
 

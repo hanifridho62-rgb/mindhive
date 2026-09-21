@@ -13,15 +13,23 @@ spaces), a shape a script can diff across two runs or hand to `jq`.
 which no spelling of `hive verify` could say before. `cmd_verify_chain` is
 `verify --json --strict` as one function, for `ci/` (P1g) and the migration
 engine (P1i) to call without composing flags.
+
+`hive watcher` joined them at P1h, and belongs here for the same reason
+`verify` does: all four answer "is the store consistent with itself", and the
+watcher's two maintenance verbs -- `status` and `recover` -- are read and
+repair operations on a sidecar, not vector work. `watcher` is imported inside
+the handlers so that `hive --help` never pays for it.
 """
 import argparse
 import json
+import sys
 
 from .. import (events,
                 chain,
                 selftest as selftest_mod)
 
-__all__ = ["cmd_verify", "cmd_selftest", "cmd_verify_chain"]
+__all__ = ["cmd_verify", "cmd_selftest", "cmd_verify_chain",
+           "cmd_watcher_run", "cmd_watcher_status", "cmd_watcher_recover"]
 
 
 def cmd_verify(args) -> int | None:
@@ -55,3 +63,61 @@ def cmd_verify_chain(args) -> int | None:
     is accepted for a caller that has no namespace to hand over."""
     carried = vars(args) if args is not None else {}
     return cmd_verify(argparse.Namespace(**{**carried, "json": True, "strict": True}))
+
+
+def cmd_watcher_run(args) -> int | None:
+    """`hive watcher run [--once]`: drain the pending-embed queue.
+
+    With `--once` it claims the queue, embeds what it names, and returns --
+    the shape a scheduled task or a hook wants. Without it the loop runs in
+    the foreground until Ctrl+C, which is how someone watches the thing work
+    rather than trusting that it did."""
+    from .. import watcher
+    project = getattr(args, "project", None)
+    if not getattr(args, "once", False):
+        return watcher.run_forever(project) or None
+    report = watcher.run_once(project, out=None if getattr(args, "json", False)
+                              else sys.stdout)
+    if getattr(args, "json", False):
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"embedded {report['count']} queued row(s) "
+              f"in {report['duration_s']}s")
+    return None
+
+
+def cmd_watcher_status(args) -> int | None:
+    """`hive watcher status`: how much is queued and how much is claimed.
+
+    Exit 0 whatever it finds. A backlog is not an error -- the watcher runs
+    with the dashboard, and a machine where the dashboard has been closed all
+    week has a large, entirely correct backlog."""
+    from .. import watcher
+    report = watcher.status(getattr(args, "project", None))
+    if getattr(args, "json", False):
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"pending {report['pending']} row(s), "
+              f"processing {report['processing']} marker(s)")
+        for name in report["markers"]:
+            print(f"  {name}")
+    return None
+
+
+def cmd_watcher_recover(args) -> int | None:
+    """`hive watcher recover`: return abandoned claims to the queue.
+
+    The same pass the dashboard runs at boot, reachable by hand for the case
+    it exists to answer -- a machine that lost power mid-embed and whose
+    operator wants the rows back before opening the dashboard."""
+    from .. import watcher
+    stale = getattr(args, "stale", None)
+    cleared = watcher.recover_stale_markers(
+        getattr(args, "project", None),
+        watcher.STALE_MARKER_S if stale is None else float(stale))
+    if getattr(args, "json", False):
+        print(json.dumps({"recovered": cleared}, sort_keys=True,
+                         separators=(",", ":")))
+    else:
+        print(f"recovered {cleared} abandoned marker(s)")
+    return None

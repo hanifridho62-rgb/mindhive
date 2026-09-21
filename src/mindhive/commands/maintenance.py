@@ -79,10 +79,16 @@ def cmd_embed(args) -> int | None:
     covers this topic" against "which memo said this" -- and an operator who ran
     `hive embed` and got only one of them has a semantic layer that silently
     half-works. The event pass is incremental, so the second run costs a scan
-    rather than 37k encodes."""
+    rather than 37k encodes.
+
+    `--rebuild` (blueprint P1h) drops both collections first. It is the only
+    way to re-tune an EXISTING index: chroma ignores the metadata argument for
+    a collection that already exists, so a collection built under an older
+    `HNSW_METADATA` keeps those parameters until something deletes it."""
     from .. import vectors
-    out = {"files": vectors.embed(force=args.force),
-           "events": vectors.embed_events(force=args.force)}
+    rebuild = bool(getattr(args, "rebuild", False))
+    out = {"files": vectors.embed(force=args.force, rebuild=rebuild),
+           "events": vectors.embed_events(force=args.force, rebuild=rebuild)}
     print(json.dumps(out))
     return None
 

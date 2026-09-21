@@ -143,8 +143,13 @@ JOBS = [
     Op("/api/harvest", ("mindhive.dashboard_jobs", "run_catch_up"),
        {"projects": {"test": {"new": 2}}, "total_new": 2},
        {}, ({"projects": {}, "total_new": 0}, NOTHING)),
+    # `reach` stubs the EVENT pass (blueprint P1h): the job indexes both
+    # collections now, and letting the real one run would load a 90 MB model
+    # inside a lock test.
     Op("/api/embed", ("mindhive.vectors", "embed"), {"embedded": 3},
-       {}, ({"embedded": 0}, NOTHING)),
+       {("mindhive.vectors", "embed_events"): lambda *a, **k: {
+           "scanned": 0, "eligible": 0, "embedded": 0, "skipped": 0}},
+       ({"embedded": 0}, NOTHING)),
     Op("/api/plugins/scan", ("mindhive.plugins", "scan_and_store"),
        {"counts": {"plugins_total": 4, "skills_total": 9}},
        {}, ({"counts": {"plugins_total": 0, "skills_total": 0}}, NOTHING)),
@@ -371,6 +376,10 @@ def test_an_operation_with_nothing_to_do_says_so(dashboard_server, monkeypatch,
     _stub_incident_projection(monkeypatch)
     empty_result, expected = op.empty
     if empty_result is not None:
+        # `reach` only where the work itself is stubbed. Applying it to the
+        # reflect op — whose empty case is "no eligible incident" — would
+        # hand it one and then let the REAL reflection run.
+        _apply(monkeypatch, op.reach)
         mod, attr = op.work
         monkeypatch.setattr(importlib.import_module(mod), attr,
                             lambda *_a, **_kw: empty_result)
