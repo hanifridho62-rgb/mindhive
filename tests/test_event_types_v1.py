@@ -38,8 +38,8 @@ Two of the six v1.x event types are registered: `work_session` and
 `initiative_declared` landed with their owners, `worksessions.py` and
 `initiatives.py` (blueprint P1b), and their registration assertions close this
 file. Deliberately NOT
-here yet: the other four (`interceptor_signal`, `vector_sync_started`,
-`vector_sync_completed`, `merge_conflict_detected`) and their registration
+here yet: the two the watcher owns (`vector_sync_started`,
+`vector_sync_completed`) and their registration
 assertions -- membership in `VALID_TYPES`, the SEMANTIC / DETERMINISTIC split,
 their `_PAYLOAD_CONTRACTS` rows and `ledger_body`. Each is registered by the
 phase that lands its owning module (orchestrator/interceptor and
@@ -543,8 +543,11 @@ def test_an_existing_marker_is_read_through_read_text_retry(monkeypatch):
 
 P1B_TYPES = ("work_session", "initiative_declared")
 OWNERS = {"work_session": ".worksessions", "initiative_declared": ".initiatives"}
-STILL_UNREGISTERED = ("interceptor_signal", "vector_sync_started",
-                      "vector_sync_completed", "merge_conflict_detected")
+# Blueprint P1f registered `interceptor_signal` (orchestrator/interceptor.py)
+# and `merge_conflict_detected` (mindnet/worktree.py) together with their owner
+# modules, the way this file's docstring says each type must arrive. The two
+# left belong to the watcher, which P1h lands.
+STILL_UNREGISTERED = ("vector_sync_started", "vector_sync_completed")
 
 
 @pytest.mark.parametrize("etype", P1B_TYPES)
@@ -561,7 +564,7 @@ def test_p1b_types_are_registered_semantic_exempt_and_contracted(etype):
 
 
 @pytest.mark.parametrize("etype", STILL_UNREGISTERED)
-def test_the_other_four_v1_types_are_still_unregistered(etype):
+def test_the_other_two_v1_types_are_still_unregistered(etype):
     from mindhive import contracts
     assert etype not in events.VALID_TYPES
     assert etype not in contracts._PAYLOAD_CONTRACTS

@@ -37,6 +37,19 @@ ends the worktree is retired and the BRANCH survives: `git switch
 lint/<mission>/integration` is the operator's next step, and the report names
 it. Nothing is created when no lane committed anything.
 
+## The circuit
+
+Merging is guarded by `breaker.IntegrationBreaker`. Three consecutive
+integrations that did not fully land open it, and while it is open this module
+refuses BEFORE `add` makes a checkout: no integration worktree, no merge, every
+candidate reported in `skipped` with the reason, and a line naming the branch a
+person would switch to. The lanes are untouched, so a refused mission is
+`partial` -- work that ran and did not land -- not a crash. `lintester.py` is
+zero-edit and passes no breaker, so one is built here for the namespace the
+MISSION's own checkout belongs to: running uncircuited by default would make
+the control decorative, and keying it on the process's cwd would let one
+repository's bad day stop another's mission.
+
 ## One git driver
 
 Every git command here goes through `mindnet.worktree`. This module spawns
@@ -55,6 +68,7 @@ from typing import NamedTuple
 
 from ..mindnet import worktree as mn_wt
 from . import worktree as wt_mod
+from .breaker import IntegrationBreaker
 
 INTEGRATION_NAME = "integration"
 COMMIT_TRAILER = "Lintester-Task"
@@ -214,6 +228,70 @@ def _say(emit, text) -> None:
         pass
 
 
+def _project_of(root):
+    """The namespace *root* belongs to, or ``None`` to let `paths` decide.
+
+    A *root* that is not a directory answers ``None``: inventing a namespace
+    from a string that names nothing is worse than falling back to the default
+    one, because the circuit would then be keyed on a name no other process
+    would ever compute."""
+    try:
+        from .. import paths
+        path = Path(str(root or ""))
+        return paths.detect_project(path) if path.is_dir() else None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _breaker_of(breaker, root=None):
+    """The circuit this run merges under. `integrate_lanes` has no `project`
+    parameter -- its caller is zero-edit -- so with none passed it builds one
+    itself rather than merging uncircuited.
+
+    Keyed on the MISSION's checkout, not on the process's cwd.
+    `detect_project(None)` reads `Path.cwd()`, which is wherever `hive
+    lintester` happened to be invoked from: two missions in two checkouts would
+    then share one circuit, and a mission that kept failing to merge could stop
+    an unrelated one. An explicit `MINDHIVE_PROJECT` still wins, inside
+    `detect_project`, exactly as it does everywhere else in the store."""
+    if breaker is not None:
+        return breaker
+    try:
+        return IntegrationBreaker(project=_project_of(root))
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _breaker_refusal(breaker):
+    """The verdict when the circuit refuses, and ``None`` when it does not.
+
+    Total on purpose: a breaker that cannot read its own state must not stop
+    the merge. The circuit exists to prevent an outage, not to become one."""
+    if breaker is None:
+        return None
+    try:
+        verdict = breaker.check()
+    except Exception:                                   # noqa: BLE001
+        return None
+    return None if getattr(verdict, "allowed", True) else verdict
+
+
+def _breaker_feed(breaker, ok, reason) -> None:
+    """The outcome the circuit counts: an integration where every candidate
+    landed is a success, one where any lane did not is a failure. A run that
+    merged nothing because no lane committed is neither, and never reaches
+    here. Total, for the same reason as `_breaker_refusal`."""
+    if breaker is None:
+        return
+    try:
+        if ok:
+            breaker.record_success()
+        else:
+            breaker.record_failure(str(reason or "the integration did not land"))
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def _merge_one(root, path, branch, lane_id, lane_branch, mission_id) -> LaneMerge:
     """One lane: probe, merge, prove -- under the incumbent's lock for the
     whole of it, so no other lane's `add` or `prune` interleaves. The lock is
@@ -244,13 +322,19 @@ def _merge_one(root, path, branch, lane_id, lane_branch, mission_id) -> LaneMerg
     return LaneMerge(lane_id, lane_branch, merged=True, sha=got.sha)
 
 
-def integrate_lanes(root, trees, mission_id, emit=None) -> Integration:
+def integrate_lanes(root, trees, mission_id, emit=None, *,
+                    breaker=None) -> Integration:
     """Merge every lane that committed anything into the integration branch.
 
     *trees* are the mission's `LaneWorktree`s; only the ones that were
     acquired (`ok`) count, and only those whose branch is ahead of the common
     base are candidates. ``emit(text)`` gets one line per lane. Total: every
-    outcome is a row in the answer, and a refusal names its reason."""
+    outcome is a row in the answer, and a refusal names its reason.
+
+    *breaker* is the `IntegrationBreaker` the merge runs under; with none the
+    default project's own is used. An open or quarantined circuit refuses
+    before any checkout is made."""
+    breaker = _breaker_of(breaker, root)
     lanes = [t for t in trees or ()
              if getattr(t, "ok", False) and getattr(t, "path", "")]
     bases = {str(getattr(t, "base", "") or "") for t in lanes} - {""}
@@ -276,6 +360,20 @@ def integrate_lanes(root, trees, mission_id, emit=None) -> Integration:
 
     branch = integration_branch_for(mission_id)
     target = integration_path_for(root, mission_id)
+    refused = _breaker_refusal(breaker)
+    if refused is not None:
+        reason = (f"the integration breaker is {refused.state}: "
+                  f"{refused.reason}")
+        skipped = tuple(LaneMerge(int(getattr(t, "lane_id", -1)),
+                                  str(getattr(t, "branch", "") or ""),
+                                  reason="the integration breaker refused: "
+                                         + str(refused.reason or refused.state))
+                        for t in candidates)
+        _say(emit, f"integration: refused -- {reason}")
+        _say(emit, "integration: nothing was merged and every lane is kept; "
+                   f"look at them with git switch {branch}")
+        return Integration(ok=False, branch=branch, base=base,
+                           skipped=skipped, reason=reason)
     try:
         iso = mn_wt.add(root, INTEGRATION_NAME, path=target, branch=branch,
                         start_point=base)
@@ -289,6 +387,7 @@ def integrate_lanes(root, trees, mission_id, emit=None) -> Integration:
                                   reason="no integration checkout: " + reason)
                         for t in candidates)
         _say(emit, f"integration: refused -- {reason}")
+        _breaker_feed(breaker, False, reason)
         return Integration(ok=False, branch=branch, base=base,
                            skipped=skipped, reason=reason)
 
@@ -304,6 +403,7 @@ def integrate_lanes(root, trees, mission_id, emit=None) -> Integration:
     sha = mn_wt.rev_of(root, branch)
     reason = "; ".join(f"lane {m.lane_id} was not merged ({m.reason})"
                        for m in skipped)
+    _breaker_feed(breaker, not skipped, reason)
     return Integration(ok=not skipped, branch=branch, sha=sha, base=base,
                        path=path, merged=tuple(merged), skipped=tuple(skipped),
                        reason=reason)

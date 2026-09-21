@@ -158,7 +158,10 @@ SURFACE = {'append': {},
  'triggers': {'train': {}, 'list': {}, 'check': {}},
  'enrich': {'status': {}, 'on': {}, 'off': {}, 'preview': {}},
  'worksession': {'record': {}, 'status': {}, 'initiative': {}, 'list': {},
-                 'migrate': {}}}
+                 'migrate': {}},
+ # blueprint P1f: QUARANTINED is reachable and `manual_reset` is its only exit,
+ # so the group ships WITH the state rather than in P1g with the CI runner.
+ 'ci': {'breaker': {'status': {}, 'reset': {}}}}
 
 # The handler NAME every parser bound BEFORE the split (the `__func__` entries
 # of the same 2026-09-14 snapshot). Self-registering groups included: this is
@@ -302,7 +305,9 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'worksession list': 'cmd_worksession',
  'worksession migrate': 'cmd_worksession',
  'worksession record': 'cmd_worksession',
- 'worksession status': 'cmd_worksession'}
+ 'worksession status': 'cmd_worksession',
+ 'ci breaker reset': 'cmd_ci_breaker_reset',
+ 'ci breaker status': 'cmd_ci_breaker_status'}
 
 
 def _sub(parser):

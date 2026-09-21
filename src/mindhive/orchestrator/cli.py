@@ -62,7 +62,8 @@ def cmd_lintester(args) -> int | None:
         # stderr, not stdout: `--json` is a machine surface and a friendly
         # note printed into it is a parse error at the other end.
         print(f"lintester: {why}", file=sys.stderr)
-    mission = LintesterOrchestrator(
+    ledger = _ledger(args)
+    orch = LintesterOrchestrator(
         # The flag's help has always said "default: cwd" and the parser has
         # always passed None, which is not a softer default but a crash:
         # `worktree.lane_path_for` builds its lane path OUTSIDE the guard that
@@ -95,11 +96,25 @@ def cmd_lintester(args) -> int | None:
         # place a person types a number for this; the library takes a `Limits`.
         limits=_limits(args),
         bus=bus, observer=observer,
-    ).execute_mission(intent, dry_run=not started,
-                      checkpoint_dir=args.checkpoint_dir)
+    )
+    # The lane budget, wired HERE and nowhere else (K21). `lintester.py` is
+    # zero-edit, so the guard goes on through the `runner` field the
+    # orchestrator already injects: `_run_child` is what it would have used, so
+    # wrapping it changes nothing for a run with no ceiling -- `guard` returns
+    # the runner unchanged when there is no quota, exactly as `_limits`/`_spawn`
+    # leave an unfenced run alone. Before the gate rather than after it: the
+    # gate is wrapped around whatever `runner` holds, so the order on a real
+    # unit is gate -> quota -> child, and a refusal costs no child at all.
+    if ledger is not None:
+        orch.runner = ledger.guard(orch._run_child)
+    mission = orch.execute_mission(intent, dry_run=not started,
+                                   checkpoint_dir=args.checkpoint_dir)
 
     _close_board(bus, board, board_stream)
+    _record_quota(ledger, args.project)
     report = mission.as_dict()
+    if ledger is not None:
+        report["lane_quota"] = _quota_report(ledger)
     scored = _payoff(mission) if getattr(args, "payoff", False) else None
     if scored is not None:
         report["payoff"] = scored.as_dict()
@@ -109,6 +124,7 @@ def cmd_lintester(args) -> int | None:
         return _status(mission.outcome)
 
     _print(mission)
+    _print_quota(ledger)
     if scored is not None:
         _print_payoff(scored)
     return _status(mission.outcome)
@@ -412,6 +428,97 @@ def _limits(args):
     return Limits(memory_bytes=mb * 1024 * 1024, cpu_seconds=cpu)
 
 
+def _quota(args):
+    """The per-lane ceiling the flags asked for, or ``None`` for no ceiling.
+
+    ``None`` rather than an empty `LaneQuota` so the enforcement is off by
+    construction, not by a branch someone can forget: `LaneLedger.guard`
+    returns the runner it was handed and the report prints nothing. Negative is
+    clamped to zero, the same choice `_limits` makes -- a typo costs the
+    budget, not the mission. Zero is a REAL ceiling, and the strictest one: a
+    lane may then spend nothing that is measured."""
+    from .breaker import LaneQuota
+
+    tokens = getattr(args, "max_lane_tokens", None)
+    cost = getattr(args, "max_lane_cost", None)
+    if tokens is None and cost is None:
+        return None
+    return LaneQuota(max_tokens=None if tokens is None else max(0, int(tokens)),
+                     max_cost_usd=None if cost is None else max(0.0, float(cost)))
+
+
+def _ledger(args):
+    """The `LaneLedger` this run enforces with, or ``None``."""
+    quota = _quota(args)
+    if quota is None:
+        return None
+    from .breaker import LaneLedger
+
+    return LaneLedger(quota)
+
+
+def _quota_report(ledger) -> dict:
+    """The `--json` shape for the lane budget. `measured` is the load-bearing
+    key: with it False the totals are UNMEASURED, not zero (see `quota.py`)."""
+    quota = ledger.quota
+    return {
+        "max_tokens": quota.max_tokens,
+        "max_cost_usd": quota.max_cost_usd,
+        "measured": ledger.measured(),
+        "lanes": {str(lane): {"tokens": use.tokens, "cost_usd": use.cost_usd}
+                  for lane, use in sorted(ledger.totals().items())},
+        "refused": [{"lane_id": lane, "task_id": task, "reason": why}
+                    for lane, task, why in ledger.refusals()],
+    }
+
+
+def _print_quota(ledger) -> None:
+    """The lane budget, for a run that asked for one."""
+    if ledger is None:
+        return
+    quota = ledger.quota
+    ceiling = ", ".join(
+        part for part in (
+            f"{quota.max_tokens} token(s)" if quota.max_tokens is not None else "",
+            f"${quota.max_cost_usd:g}" if quota.max_cost_usd is not None else "")
+        if part)
+    print(f"  lane quota: {ceiling}")
+    if not ledger.measured():
+        # Said plainly rather than printed as a confident zero: this runner
+        # reports no spend, so nothing was refused and nothing could have been.
+        print("      usage: unavailable — this runner reports no token or cost "
+              "figure, so no lane was measured against the ceiling")
+        return
+    for lane, use in sorted(ledger.totals().items()):
+        print(f"      lane {lane}: {use.tokens} token(s), ${use.cost_usd:g}")
+    for lane, task, why in ledger.refusals():
+        print(f"      refused {task or '(unnamed unit)'} on lane {lane}: {why}")
+
+
+def _record_quota(ledger, project=None) -> None:
+    """One anomaly per lane the budget refused, so `hive rules` sees it.
+
+    `record_anomaly` is the existing `tool_failed` door the tool breaker
+    already writes through -- a parallel record only this package could read
+    would be the worse choice. Total: it swallows its own failures, and a run
+    that refused nothing writes nothing."""
+    if ledger is None:
+        return
+    lanes: dict = {}
+    for lane, task, why in ledger.refusals():
+        lanes.setdefault(lane, [why, []])[1].append(task or "(unnamed unit)")
+    if not lanes:
+        return
+    from . import resilience as res_mod
+
+    for lane, (why, tasks) in sorted(lanes.items()):
+        res_mod.record_anomaly(
+            f"lane-{lane}", "lane_quota_exceeded",
+            detail=f"lane {lane} took no further unit: {why} "
+                   f"({len(tasks)} unit(s) refused: {', '.join(tasks)})",
+            project=project)
+
+
 def register(subparsers) -> None:
     """Wire `lintester` onto the root subparser set built by
     `commands.parsers._build_parser`."""
@@ -444,6 +551,13 @@ def register(subparsers) -> None:
                    help="per-child CPU-time ceiling in seconds (0: none). "
                         "Distinct from the wall-clock timeout, which always "
                         "applies")
+    p.add_argument("--max-lane-tokens", type=int, default=None,
+                   help="ceiling on the tokens ONE lane may spend (MEB K21); "
+                        "omitted means no ceiling")
+    p.add_argument("--max-lane-cost", type=float, default=None,
+                   help="ceiling in USD on what ONE lane may spend; omitted "
+                        "means no ceiling. Both ceilings need a runner that "
+                        "reports usage — the report says so when none did")
     p.add_argument("--payoff", action="store_true",
                    help="also score this unit set under both scheduling "
                         "policies (TODOS 27b)")

@@ -114,6 +114,18 @@ _PAYLOAD_CONTRACTS = {
                      "--session S --step-id ID --status <status>"),
     "initiative_declared": (".initiatives",
                             "hive worksession initiative --reason … [--ref …]"),
+    # Blueprint P1f. Both are written by a hook or by the merge probe, never by
+    # a person, so the hint names no command: following the `mindnet_task`
+    # rule that a hint names ONLY what ships, saying "there is no command" is
+    # more use than sending an operator whose append was just rejected off to
+    # run something that does not exist.
+    "interceptor_signal": (".orchestrator.interceptor",
+                           "written by the pre/post tool-use hooks; there is "
+                           "no command, so a hand-appended signal is almost "
+                           "certainly a mistake"),
+    "merge_conflict_detected": (".mindnet.worktree",
+                                "written by mindnet.worktree.merge_probe as it "
+                                "answers; there is no command"),
 }
 
 

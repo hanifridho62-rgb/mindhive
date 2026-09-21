@@ -13,7 +13,8 @@ from .. import events, projector, paths
 __all__ = ["cmd_append", "cmd_hook", "rotation_supervisor_defaults",
     "cmd_session_run", "cmd_session_install_hook", "cmd_project",
     "cmd_projects", "cmd_log_add", "cmd_log_queue", "cmd_log_show",
-    "cmd_log_pending", "_hook_payload", "_hook_prompt", "_hook_session"]
+    "cmd_log_pending", "_hook_payload", "_hook_prompt", "_hook_session",
+    "_observe_gateway"]
 
 
 def cmd_append(args) -> int | None:
@@ -57,6 +58,23 @@ def cmd_append(args) -> int | None:
     print(f"appended {ev.type} @ {ev.ts}")
     return None
 
+def _observe_gateway(raw, stage) -> None:
+    """The git-gateway interceptor (blueprint P1f), wired in BESIDE the work
+    each stage already does and adding not one byte to stdout -- which is the
+    hook protocol itself. Total: an interceptor that raised would fail a hook
+    meant to be invisible, so every failure is swallowed here as well as
+    inside the interceptor."""
+    try:
+        from ..orchestrator import interceptor as itc
+        gateway = itc.GatewayInterceptor()
+        if stage == "pre_tool_use":
+            gateway.observe_intent(raw)
+        else:
+            gateway.observe_result(raw, failed=stage.endswith("_failure"))
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def cmd_hook(args) -> int | None:
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if args.stage == "post_tool_use":
@@ -72,11 +90,13 @@ def cmd_hook(args) -> int | None:
         # never-raising, because this runs on every single tool call and stdout
         # above is the hook's contract.
         promptgate.beat_faculties(session_id=_hook_session(raw))
+        _observe_gateway(raw, "post_tool_use")
     elif args.stage == "post_tool_use_failure":
         # Structured live failure capture: one tool_failed event with a
         # machine-readable {tool, category, retryable} payload per failure.
         from .. import hookcapture
         print(json.dumps(hookcapture.record_post_tool_use_failure(raw)))
+        _observe_gateway(raw, "post_tool_use_failure")
     elif args.stage == "pre_tool_use":
         # Deny the ineffective tool form for enabled-enforcement signatures.
         # Print ONLY on a deny (stdout is the hook's decision channel); an allow
@@ -85,6 +105,7 @@ def cmd_hook(args) -> int | None:
         decision = enforce.hook_decision(raw)
         if decision:
             print(json.dumps(decision))
+        _observe_gateway(raw, "pre_tool_use")
     elif args.stage == "stop":
         # Smart-zone rotation: measure this session's real context occupancy and,
         # when it is past the boundary, leave the ROTATION_PENDING artifact for

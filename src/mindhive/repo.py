@@ -187,8 +187,14 @@ def _probe_pr(pr, runner, root, timeout_s) -> dict:
     if not github_remote(runner, root, timeout_s):
         return _answer(UNKNOWN, reason=NO_GITHUB_REMOTE,
                        detail="no github.com remote in this checkout")
+    # `mergedBy` and `author` are free here -- one `gh pr view` either way --
+    # and are what `orchestrator/interceptor.py` needs to name the actor. The
+    # ANSWER below is unchanged: this probe still reports only the state, its
+    # evidence line and its reason, so `roadmap.retire_landed` reads exactly
+    # what it read before.
     rc, out, err = runner([gh, "pr", "view", str(pr), "--json",
-                           "state,mergedAt,url"], root, timeout_s)
+                           "state,mergedAt,url,mergedBy,author"],
+                          root, timeout_s)
     if rc != 0:
         return _answer(UNKNOWN, reason=PROBE_FAILED,
                        detail=_first_line(err) or f"gh pr view exited {rc}")

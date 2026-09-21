@@ -169,7 +169,7 @@ LANE_AVAILABILITY_TARGET = 0.992
 BREAKER_EVENTS = (
     "success", "failure", "failure_threshold", "cooldown_elapsed",
     "probe_ok", "probe_fail", "probe_fail_max_attempts",
-    "manual_reset", "rule_resolved",
+    "manual_reset", "rule_resolved", "trip_repeat",
 )
 
 # The non-zero, non-diagonal entries of the matrix, as (state, event) -> state.
@@ -181,6 +181,13 @@ BREAKER_TRANSITIONS = {
     (HALF_OPEN, "probe_ok"): CLOSED,                        # p_s   (on_success)
     (HALF_OPEN, "probe_fail"): OPEN,                        # 1 - p_s - p_q
     (HALF_OPEN, "probe_fail_max_attempts"): QUARANTINED,    # p_q   (max_attempts)
+    # MEB 2.2 B's `p_q`, which BAB 3's matrix does not have: the integration
+    # breaker reaches QUARANTINED from OPEN, on a trip REPEATED inside its
+    # window (`orchestrator/breaker.IntegrationBreaker.MAX_TRIPS_IN_WINDOW`).
+    # BAB 3's own p_q edge (HALF_OPEN on a probe past `max_attempts`, the tool
+    # breaker's) is kept above: decision K1 keeps both breakers, so the table
+    # carries both ways in, and each runtime steps the row that is its own.
+    (OPEN, "trip_repeat"): QUARANTINED,                     # p_q   (MEB 2.2)
     (QUARANTINED, "manual_reset"): CLOSED,                  # p_rel (operator)
     (QUARANTINED, "rule_resolved"): CLOSED,                 # p_rel (hive rules resolve)
 }

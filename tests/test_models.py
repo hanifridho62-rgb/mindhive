@@ -249,20 +249,25 @@ def test_the_dtmc_parameters_are_the_ones_the_text_names():
 
 
 def test_the_transition_table_lists_exactly_the_matrix_off_diagonal_entries():
-    """Seven `(state, event) -> state` rows: the non-zero, non-diagonal
-    entries of the 4x4 matrix, plus the two operator/rule exits from
-    QUARANTINED that share `p_rel`. And the event vocabulary is closed."""
+    """Eight `(state, event) -> state` rows: the non-zero, non-diagonal
+    entries of BAB 3's 4x4 matrix, plus the two operator/rule exits from
+    QUARANTINED that share `p_rel`, plus MEB 2.2 B's own `p_q` edge
+    (OPEN -> QUARANTINED on a repeated trip) that BAB 3's matrix does not
+    have. Decision K1 keeps BOTH breakers, so the table carries both ways
+    into QUARANTINED and each runtime steps the row that is its own. And the
+    event vocabulary is closed."""
     C, H, O, Q = models.CLOSED, models.HALF_OPEN, models.OPEN, models.QUARANTINED
     assert models.BREAKER_EVENTS == (
         "success", "failure", "failure_threshold", "cooldown_elapsed",
         "probe_ok", "probe_fail", "probe_fail_max_attempts",
-        "manual_reset", "rule_resolved")
+        "manual_reset", "rule_resolved", "trip_repeat")
     assert models.BREAKER_TRANSITIONS == {
         (C, "failure_threshold"): O,
         (O, "cooldown_elapsed"): H,
         (H, "probe_ok"): C,
         (H, "probe_fail"): O,
         (H, "probe_fail_max_attempts"): Q,
+        (O, "trip_repeat"): Q,
         (Q, "manual_reset"): C,
         (Q, "rule_resolved"): C,
     }

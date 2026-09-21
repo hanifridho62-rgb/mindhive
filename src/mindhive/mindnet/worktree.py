@@ -461,6 +461,60 @@ def _is_oid(text) -> bool:
     return len(text) in (40, 64) and all(c in "0123456789abcdef" for c in text)
 
 
+def validate_payload(payload) -> None:
+    """The `merge_conflict_detected` contract (DATA_MODEL.md section 6.2).
+    `branch` names the lane that collided, `conflicts` are the paths it
+    collided on, and `tree` is the object name `git merge-tree` wrote while
+    finding them -- the proof the probe really ran."""
+    if not isinstance(payload, dict):
+        raise ValueError("merge_conflict_detected payload must be an object")
+    for key in ("branch", "tree"):
+        if not isinstance(payload.get(key), str) or not payload.get(key):
+            raise ValueError(f"merge_conflict_detected {key} must be a "
+                             "non-empty string")
+    rows = payload.get("conflicts")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("merge_conflict_detected conflicts must be a "
+                         "non-empty list")
+    if any(not isinstance(row, str) or not row for row in rows):
+        raise ValueError("merge_conflict_detected conflicts must all be "
+                         "non-empty strings")
+
+
+# Payloads this module's OWN validator refused, newest last and capped. Not the
+# ledger's business and never a reason to fail a probe -- but not nothing
+# either: see `_record_conflict`.
+CONTRACT_VIOLATIONS: list = []
+_VIOLATION_CAP = 20
+
+
+def _record_conflict(branch, conflicts, tree) -> None:
+    """Best effort, and deliberately so. Answering "would this conflict" is
+    the job; recording it is the side benefit that makes a repeated collision
+    visible. An unwritable ledger must never turn a probe that ANSWERED into a
+    probe that raised, so a failure to WRITE is swallowed.
+
+    One failure is told apart from the rest. A payload `validate_payload`
+    refuses is not the store failing, it is THIS MODULE failing: the two are
+    opposite kinds of fault, and swallowing the second alongside the first let
+    the contract drift with nothing whatever to show for it. It still must not
+    raise into the probe, so it lands in `CONTRACT_VIOLATIONS` instead."""
+    payload = {"branch": str(branch), "conflicts": list(conflicts),
+               "tree": str(tree)}
+    try:
+        validate_payload(payload)
+    except ValueError as exc:
+        CONTRACT_VIOLATIONS.append(f"merge_conflict_detected: {exc}")
+        del CONTRACT_VIOLATIONS[:-_VIOLATION_CAP]
+        return
+    try:
+        from .. import events as ev_mod
+        ev_mod.append_event("merge_conflict_detected", payload,
+                            tags=["auto", "integration"])
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 class Probe(NamedTuple):
     """What `merge_probe` found. ``clean`` is ``True``, ``False`` or ``None``
     -- three answers, because "could not tell" must never read as "no"."""
@@ -498,6 +552,7 @@ def merge_probe(path, branch) -> Probe:
             return Probe(clean=None, reason=(err or out or "git merge-tree "
                                              "exited 1 without a tree"))
         conflicts = tuple(dict.fromkeys(rows[1:]))
+        _record_conflict(branch, conflicts, rows[0])
         return Probe(clean=False, conflicts=conflicts, tree=rows[0],
                      reason=(f"{len(conflicts)} conflicting path(s): "
                              + ", ".join(conflicts)))

@@ -89,6 +89,12 @@ def _build_parser() -> argparse.ArgumentParser:
     maintenance_p.add_enrich(sub)
     orchestration_p.add_worksession(sub)     # blueprint P1b
 
+    # --- ci --- self-registering, the same one-named-call convention as the
+    # group above; blueprint P1f. (Its module is deliberately not named in
+    # this comment: a ratchet counts the lines that mention it here.)
+    from ...ci import cli as ci_cli
+    ci_cli.register(sub)
+
     return p
 
 def _closest_command(token: str, choices=None) -> str | None:

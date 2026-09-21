@@ -231,6 +231,18 @@ DETERMINISTIC_TYPES = {
     "plugin_catalog", "user_prompt", "assistant_response",
     "loop_run_start", "loop_iteration", "loop_run_end", "loop_run_dismissed",
     "tool_failed", "rule_revised",
+    # The git gateway, blueprint P1f. `interceptor_signal` is one row per
+    # observed merge act, naming WHO landed it (orchestrator/interceptor.py);
+    # `merge_conflict_detected` is one row per lane that `merge_probe` found
+    # colliding (mindnet/worktree.py), which is how "lane 0 has hit the same
+    # file five times" becomes visible at all.
+    #
+    # Deterministic rather than semantic, for the reason `job_started` gives:
+    # machine telemetry carrying no human intent. The PDF lists
+    # `interceptor_signal` in its v1 type table and NOT among the semantic
+    # ones, and semantic membership would put a LEDGER markdown file, a
+    # Memory-view row and a recall-corpus entry on disk per merge.
+    "interceptor_signal", "merge_conflict_detected",
     "rule_activated", "rule_promoted", "rule_demoted", "rule_expired",
     "rule_enforced", "rule_rerouted", "trigger_trained",
     "invoke_requested", "invoke_result", "skill_used",

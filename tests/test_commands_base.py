@@ -205,7 +205,12 @@ def test_the_six_domains_and_the_self_registering_groups_are_the_whole_surface()
         top for top, child in live.choices.items()
         if not any(fn.__module__.startswith("mindhive.commands.")
                    for _, fn in _leaves(child))}
-    assert self_registered == {"bench", "inject", "pg", "consensus", "clusters", "lintester"}
+    # `ci` joined in blueprint P1f: QUARANTINED is reachable and `manual_reset`
+    # is its only exit, so the group had to ship WITH that state rather than in
+    # P1g with the CI runner. Self-registering like the rest -- one named call
+    # in `commands/parsers/__init__.py`, handlers bound beside their flags.
+    assert self_registered == {"bench", "inject", "pg", "consensus", "clusters",
+                               "lintester", "ci"}
     assert domains.isdisjoint(self_registered)
     assert domains | self_registered == set(live.choices)
 
