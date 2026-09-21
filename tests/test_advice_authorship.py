@@ -635,6 +635,7 @@ SPAWNERS = {
     "claude_cli.py": "agent", "mindnet/executor.py": "agent",
     "workspace.py": "agent", "loop/driver.py": "agent", "research.py": "agent",
     "orchestrator/resilience.py": "agent", "verify.py": "agent",
+    "orchestrator/driver.py": "agent",
     "rotation/supervisor.py": "operator",
 }
 
@@ -1455,7 +1456,15 @@ SPAWN_SITES = {
     "clusters.py": (1, 0), "commands/context_ops.py": (1, 0), "context.py": (1, 0),
     "dashboard.py": (1, 0), "loop/driver.py": (1, 1),
     "mindnet/controller.py": (1, 0), "mindnet/executor.py": (1, 2),
-    "mindnet/worktree.py": (1, 0), "orchestrator/environment.py": (1, 0),
+    "mindnet/worktree.py": (1, 0),
+    # two sites, one agent, DOWN from four: the counter walks attributes, so a
+    # `subprocess.Popen` written as a type ANNOTATION counted as a launch. Round
+    # 2 dropped both annotations -- `terminate_process_tree` and `reap` are total
+    # over anything with `poll`/`kill`/`pid`, which is what the stand-ins in
+    # `tests/test_orchestrator_driver.py` are -- so what is left is the real
+    # `Popen` and the real `taskkill`. A lower pin is a STRICTER ratchet.
+    "orchestrator/driver.py": (2, 1),
+    "orchestrator/environment.py": (1, 0),
     "orchestrator/metrics.py": (1, 0), "orchestrator/resilience.py": (1, 1),
     "paths.py": (3, 0), "replenish.py": (1, 0), "repo.py": (1, 0),
     "research.py": (5, 1), "rotation/supervisor.py": (1, 0), "verify.py": (1, 1),

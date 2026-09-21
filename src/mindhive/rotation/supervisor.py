@@ -124,7 +124,11 @@ def _child_env(env=None):
     # line above cannot carry it, because a user who switches rotation on by
     # hand sets that variable too and no one is waiting on them.
     merged[hook.SUPERVISED_ENV] = "1"
-    return merged
+    # Not a rotation switch: the successor session runs Python tools in the
+    # operator's tree and should not litter it with `__pycache__` (MEB risk 7).
+    # A default only -- whatever the operator already set is left alone.
+    from .. import paths
+    return paths.no_bytecode_env(merged)
 
 
 def default_spawn(handoff: str | None, *, cmd: str = "claude", extra=()) -> int:

@@ -1471,11 +1471,27 @@ the gate; `--no-gate` opts out and its help text says what that costs.
   lane's work sits together — so two lanes that each pass alone are judged as they will
   actually be picked up. The per-lane loop survives as the fallback for a mission whose work
   reached no integration checkout (no lane committed anything, or the branch was refused).
-* **The cap kills the child only.** `verify._stream`'s timer calls `proc.kill()`, which on
-  Windows ends the pytest process and not the grandchildren it spawned (a `subprocess` under
-  test, a hung fixture). A gate killed at its cap answers `124` and the mission continues;
-  what the orphan does afterwards is not tracked. The sandbox PR's Job Object fence is the
-  fix, and it is deliberately not duplicated here.
+* **~~The cap kills the child only.~~** Closed by blueprint P1e (Bug 16, MEB ORCH-04).
+  `verify._stream` now starts the run at the head of its own process group
+  (`orchestrator/driver.isolation_kwargs`) and its timer calls
+  `driver.terminate_process_tree`: `taskkill /F /T` on Windows, `SIGKILL` to the group on
+  POSIX. A gate killed at its cap still answers `124`; the grandchildren go with it, measured
+  by `tests/test_orchestrator_driver.py` against a real parent/grandchild pair that writes a
+  heartbeat file. Because a child that heads its own group leaves the console's Ctrl+C group,
+  any other exit from the drain — an interrupt included — ends the tree too.
+
+  Round 2 closed the half the first cut missed, which an adversarial review measured: when the
+  direct child had ALREADY EXITED, the kill returned without killing anything (`taskkill /F /T`
+  cannot walk a dead pid, `os.getpgid` raises ESRCH once `poll()` reaps the leader), so an
+  orphaned grandchild on the inherited pipe held the drain open for its own lifetime — 8.69 s
+  against a 2.0 s cap — while the run still recorded "killed at the 2.0s cap". The child is now
+  HELD at spawn (`driver.hold_tree`: a `KILL_ON_JOB_CLOSE` Job Object on Windows, the recorded
+  group on POSIX, signalled by pid because the group outlives its leader), `reap` runs on a
+  daemon thread so a `pipe.close()` behind a live reader cannot pin the caller, `_stream`
+  abandons the read `DRAIN_GRACE_S` past the cap, and the cap's own error names what the kill
+  reached rather than asserting one it did not make. What is NOT claimed: a descendant that
+  breaks out of both (its own `setsid` on POSIX) still escapes the kill — the abandoned drain
+  and the bounded reap are what keep it from costing the caller anything but a leaked handle.
 
 **Cons of leaving it:** the first bullet is the one that can mislead — a mission of vacuous
 passes reads as validated. The other three are the same "no real sample" gap and the same
@@ -1591,7 +1607,15 @@ that is not.
   MemoryError, which is a mission outcome, not a fence field.
 * **`_run_capped`'s drain bound is the liveness floor for a lintester lane.**
   On a timeout the fence kills the child, terminates the job, and then waits at
-  most `_DRAIN_GRACE_S` for the pipes. If a grandchild still holds them the
+  most `_DRAIN_GRACE_S` for the pipes. Blueprint P1e narrowed the case below
+  without closing it: a child NO assigned job is holding (no ceiling asked for,
+  a downgraded run, a failed assignment) is now killed through
+  `driver.terminate_process_tree`, so on Windows `taskkill /F /T` takes its
+  grandchildren with it. On POSIX that same unheld child shares the
+  orchestrator's process group — deliberately, so the terminal's Ctrl+C still
+  reaches an agent — and the driver will not signal a group this process is in,
+  so it dies alone exactly as before and its grandchild can still hold the
+  pipes. If a grandchild still holds them the
   output is abandoned and `drained` is False — which `run_sandboxed` reports in
   its timeout reason and `Fence` currently does NOT surface, because
   `run_headless` maps the whole timeout to exit 124 and discards the exception's

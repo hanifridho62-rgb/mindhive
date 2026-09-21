@@ -14,6 +14,23 @@ from pathlib import Path
 # split second. CREATE_NO_WINDOW suppresses it. No-op flag (0) elsewhere.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# A Python child that writes `__pycache__` into a lane or a checkout under test
+# leaves litter the merge-back reads as work (MEB operational risk 7). Every
+# environment this package builds for a child carries this variable.
+NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
+
+
+def no_bytecode_env(env=None) -> dict:
+    """A copy of *env* (``None``: this process's) with `NO_BYTECODE_ENV` set to
+    ``"1"`` unless it already carries a value -- the operator's choice wins,
+    even an empty one. The name is matched the way the platform matches it:
+    case-blind on Windows, where a second spelling would be a duplicate key."""
+    merged = dict(os.environ if env is None else env)
+    names = {str(k).upper() for k in merged} if os.name == "nt" else set(merged)
+    if NO_BYTECODE_ENV not in names:
+        merged[NO_BYTECODE_ENV] = "1"
+    return merged
+
 
 def store_home() -> Path:
     return Path(os.environ.get("MINDHIVE_HOME", str(Path.home() / ".mindhive")))

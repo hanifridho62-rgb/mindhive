@@ -447,7 +447,8 @@ def execute(run_key, script, root=None, timeout_s=DEFAULT_TIMEOUT_S,
     try:
         proc = subprocess.run(
             list(argv), shell=False, capture_output=True, text=True,
-            timeout=timeout_s, cwd=str(root), env=_child_env(env),
+            timeout=timeout_s, cwd=str(root),
+            env=paths.no_bytecode_env(_child_env(env)),
             creationflags=paths.NO_WINDOW)
         out, err, code = (_as_text(proc.stdout), _as_text(proc.stderr),
                           proc.returncode)
