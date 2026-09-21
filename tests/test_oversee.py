@@ -578,3 +578,73 @@ def test_a_session_with_no_open_questions_has_an_empty_blockers_list():
     s = oversee.interactive_sessions(
         "test", now_fn=lambda: _epoch("2026-07-08T10:03:00Z"))[0]
     assert s["blockers"] == [] and s["task"] == ""
+
+
+# --- a red CI run turns the session's card red (blueprint P1g) --------------------------
+
+
+def _ci(session, code, pr=7, gate="gate2_suite", scope="ci"):
+    from mindhive import verify
+    events.append_event("verification", {
+        "text": f"hive ci: PR #{pr}", "argv": ["python", "-m", "pytest"],
+        "exit_code": code, "counts": {"passed": 1}, "excerpt": "",
+        "verified_by": verify.VERIFIED_BY, "scope": scope, "gate": gate,
+        "pr_id": pr, "branch": "b", "commit_sha": "", "mode": "offline",
+        "merge_state": "skipped"}, tags=["verify"], session_id=session)
+
+
+def test_a_red_ci_run_marks_the_session_failed():
+    events.append_event("user_prompt", {"text": "land the branch"},
+                        session_id="s-ci")
+    _ci("s-ci", 1)
+    card = oversee.interactive_sessions()[0]
+    assert card["status"] == "failed"
+    assert card["ci"]["exit_code"] == 1
+    assert any("PR #7" in b for b in card["blockers"]), card["blockers"]
+
+
+def test_a_green_ci_run_leaves_the_card_running():
+    events.append_event("user_prompt", {"text": "land the branch"},
+                        session_id="s-ci")
+    _ci("s-ci", 0)
+    card = oversee.interactive_sessions()[0]
+    assert card["status"] == "running"
+    assert card["ci"]["exit_code"] == 0
+    assert card["blockers"] == []
+
+
+def test_a_later_green_run_clears_the_red():
+    """The LAST CI run is the answer. A card stuck red after the fix landed
+    is a card the operator learns to ignore."""
+    events.append_event("user_prompt", {"text": "land it"}, session_id="s-ci")
+    _ci("s-ci", 1)
+    _ci("s-ci", 0)
+    assert oversee.interactive_sessions()[0]["status"] == "running"
+
+
+def test_a_verification_that_is_not_a_ci_run_never_reds_the_card():
+    """A failing `hive selftest` is a red suite, not a red CI gate, and the
+    two are different claims about different runs."""
+    events.append_event("user_prompt", {"text": "work"}, session_id="s-ci")
+    _ci("s-ci", 1, scope="full")
+    card = oversee.interactive_sessions()[0]
+    assert card["status"] == "running"
+    assert card["ci"] is None
+
+
+def test_every_card_carries_the_ci_key_even_with_no_ci_run():
+    events.append_event("user_prompt", {"text": "work"}, session_id="s-ci")
+    card = oversee.interactive_sessions()[0]
+    assert "ci" in card and card["ci"] is None
+
+
+def test_the_status_glyph_reads_failed_before_it_reads_chat():
+    """`ovStatus` answers on `kind === 'chat'` first, so a `failed` branch
+    placed after it would never be reached by an interactive card -- which is
+    the only kind a CI run ever attaches to."""
+    from mindhive import dashboard_js_oversee as js
+    body = js.JS
+    fail_at = body.index("r.status === 'failed'")
+    chat_at = body.index("r.kind === 'chat'")
+    assert fail_at < chat_at, "the failed branch is unreachable behind chat"
+    assert "sbad" in body[fail_at:fail_at + 200]

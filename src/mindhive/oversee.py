@@ -42,6 +42,11 @@ _WS_TAG_CAP = 4                      # the active [WS] tag + the three before it
 _WS_TYPES = ev_mod.BOOKKEEPING_TYPES
 
 # telemetry that counts as "the session is doing something"
+#: What `verification.scope` says for a native CI run (`ci.runner.SCOPE`).
+#: Spelled here rather than imported: `oversee` is on the dashboard's poll
+#: path and must not pull the runner in to read one string.
+_CI_SCOPE = "ci"
+
 _ACTIVITY_TYPES = {
     "session_start", "file_touched", "command_run", "user_prompt",
     "assistant_response", "compaction", "skill_used",
@@ -287,6 +292,11 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 # phase, the [WS] tags up to and including it, and the
                 # session's initiatives. Present, and empty, on every card.
                 "phase": "", "ws_tags": [], "initiatives": [],
+                # The session's last NATIVE CI run (blueprint P1g), or None.
+                # Present and None on every card: the renderer reads `ci` to
+                # decide whether to show the gate at all, and a key that
+                # appears only after a run is one it starts failing on.
+                "ci": None,
             }
             order.append(sid)
         if not s["origin"]:              # any event may carry the tag
@@ -331,6 +341,18 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
                 s["files"].append(p)
         elif e.type == "command_run":
             s["iterations"] += 1          # activity count for the pill
+        elif (e.type == "verification" and isinstance(e.payload, dict)
+                and e.payload.get("scope") == _CI_SCOPE):
+            # The LAST one wins, deliberately: a card still red after the fix
+            # landed is a card the operator learns to ignore. Scope is
+            # checked rather than assumed, because a failing `hive selftest`
+            # is a red SUITE, which is a different claim about a different
+            # run than a red CI gate.
+            s["ci"] = {"exit_code": int(e.payload.get("exit_code") or 0),
+                       "pr_id": int(e.payload.get("pr_id") or 0),
+                       "gate": str(e.payload.get("gate") or ""),
+                       "branch": str(e.payload.get("branch") or ""),
+                       "ts": e.ts}
 
     now = now_fn()
     out = []
@@ -357,6 +379,16 @@ def interactive_sessions(project=None, *, now_fn=time.time, evs=None,
         s["done"] = s["done"][-_DONE_CAP:] + [f"touched {p}" for p in files[-_DONE_CAP:]]
         s["planned"] = s["planned"][-_DONE_CAP:]
         s["blockers"] = s["blockers"][-_DONE_CAP:]
+        ci = s["ci"]
+        if ci and ci["exit_code"] != 0:
+            # `failed` rather than a note on a running card: the gate that
+            # decides whether work lands went red, and a card that still
+            # reads "running" is telling the operator the opposite.
+            s["status"] = "failed"
+            s["blockers"] = ([f"CI \u2717 PR #{ci['pr_id']} "
+                              f"({ci['gate'] or 'unknown gate'} exit "
+                              f"{ci['exit_code']})"]
+                             + s["blockers"])[-_DONE_CAP:]
         # The same fold `hive worksession list` and /api/worksessions read, so
         # the card head is the step `fold` calls active, never merely the last
         # one appended, and the three surfaces cannot disagree.

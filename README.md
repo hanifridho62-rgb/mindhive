@@ -32,6 +32,9 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - `hive rules resolve [--limit N] [--list]` — active resolution over the **red (unresolved) set**: incidents with no rule are reflected; a leaking **auto** rule is replaced with the best distinct alternative route (model-ranked, deterministic-fallback aware, capped at 3 attempts per signature — then flagged `reroute_exhausted` for a human). The `rule_rerouted` event re-anchors leak counting, so a route that holds turns green (resolved) and auto-promotes to SOUL.md. Human rules are never rerouted. `--list` prints the red set without spending tokens
 - `hive flag "<text>" [--category tag]` — self-flag a judgment error (wrong call, not a tool failure); active as a prevention rule from the first occurrence
 - `hive graph export [--out path] [--semantic] [--open]` — write a standalone, offline graph.html
+- `hive ci run [--pr N] [--branch B] [--merge] [--root R] [--project P] [--json]` — the **native CI gate**: four staged gates in a git worktree of its own — the repo's own guards, the suite, the pg tier when `MINDHIVE_PG_DSN_ADMIN` names a server, then the hash chain — stopping at the first red. Exit 0 green, 1 red, 2 it could not start. `--merge` lands a green run: through `gh pr review --approve` + `gh pr merge --squash` when `gh` is logged in, and otherwise offline, which never checks the base out from the ephemeral worktree
+- `hive ci status [--pr N] [--page N] [--project P] [--json]` — the last recorded CI run: which gate decided it, its counts, the commit and the merge state. Exit 0 it was green, 1 red, 2 there has never been one — three different facts, spelled differently
+- `hive ci hook-install [--root R] [--force]` — write `pre-push` (POSIX `sh`, LF-only, executable) so every push runs `hive ci run --branch "$branch"` first. Written to the repository's COMMON hooks dir, so it works from a linked worktree too; refuses to clobber a hook someone else wrote unless `--force`
 - `hive ci breaker status [--project P] [--json]` — what the **integration circuit** is doing, without moving it: state, consecutive failures, trips inside the window, cooldown left, and the record behind it. Exit 1 while OPEN and 2 while QUARANTINED, so a script can gate on it. It deliberately does **not** call the breaker's own `check`, which is a transition: an OPEN circuit whose cooldown has elapsed moves itself to HALF_OPEN as it answers
 - `hive ci breaker reset [--project P] [--json]` — close the circuit by hand and clear its trip history. **The only exit from QUARANTINED**, which three trips inside the window reach and no cooldown leaves; total over every other state, so a reset of an already-closed circuit is a named no-op rather than an error
 - `hive dashboard [--port N] [--no-browser]` — open the web control panel for every feature
@@ -207,6 +210,42 @@ where the policy was never set, re-spell that entry by hand to the form above.
 It emits a `platform_warning` only when the shim your platform needs is
 actually missing from the checkout, rather than whenever you are not on
 Windows.
+
+## CI
+
+The **daily gate is `hive ci run`**, not GitHub Actions. It runs the same four
+gates locally, in a `git worktree add --detach` of its own, so the tree being
+judged is the branch and not whatever the working copy happens to hold:
+
+1. the repo's own guards (file-size cap, docs parity, CLI arg wiring,
+   architecture drift, pg repo gates), filtered by what the branch actually
+   has — pytest answers exit 4 for a path that is not there, and a branch
+   predating one of these files is not broken;
+2. `python -m pytest -q`;
+3. the `pg` tier plus `hive pg parity`, only when `MINDHIVE_PG_DSN_ADMIN`
+   names a server — skipped, and said to be skipped, otherwise;
+4. `chain.verify()`, in-process.
+
+Every gate child runs with `PYTHONPATH` pointing at the worktree's `src`
+first and `PYTHONDONTWRITEBYTECODE=1`, so it imports the tree under test
+rather than the editable install and leaves no `__pycache__` behind in a
+directory that is about to be deleted.
+
+The verdict is appended once as a `verification` carrying `scope: "ci"` and
+the gate that decided it; `hive ci status` reads it back and a red one turns
+the session's Oversee card red. A red run also crosses into `hive incidents`
+through the same bridge a failed tool call uses.
+
+Put it where pushes pass:
+
+```sh
+hive ci hook-install
+```
+
+`.github/workflows/ci.yml` is **`workflow_dispatch` + `push: tags: ["v*"]`**
+only. It is what you reach for deliberately — a release tag, or a run you
+ask for by hand — because it is the only place the OS × Python matrix,
+the Postgres service container and the browser tier actually exist.
 
 ## Installing the hooks on a new machine
 The hooks are portable: nothing in `hooks/` names a user, a checkout, or a venv.

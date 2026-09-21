@@ -640,8 +640,9 @@ SPAWNERS = {
 }
 
 TOOL_SPAWNERS = {
-    "autoresume.py", "changelog.py", "clusters.py", "commands/context_ops.py",
-    "context.py", "dashboard.py", "mindnet/controller.py", "mindnet/worktree.py",
+    "autoresume.py", "changelog.py", "ci/runner.py", "clusters.py",
+    "commands/context_ops.py", "context.py", "dashboard.py",
+    "mindnet/controller.py", "mindnet/worktree.py",
     "orchestrator/environment.py", "orchestrator/metrics.py", "paths.py",
     "replenish.py", "repo.py",
 }
@@ -1452,7 +1453,13 @@ def test_defang_is_linear_on_input_built_to_make_it_backtrack(text):
 # A new site in a listed module changes the first number and fails this test;
 # whoever adds it decides whether what it starts is an agent, and updates the row.
 SPAWN_SITES = {
-    "autoresume.py": (1, 0), "changelog.py": (1, 0), "claude_cli.py": (1, 1),
+    "autoresume.py": (1, 0), "changelog.py": (1, 0),
+    # One site, no agent (blueprint P1g): the native CI runner spawns `git`,
+    # `gh` and `pytest` through a single `_default_runner`, and never the
+    # `claude` CLI -- so it must NOT scrub, and a scrub appearing here would
+    # mean it had started launching agents.
+    "ci/runner.py": (1, 0),
+    "claude_cli.py": (1, 1),
     "clusters.py": (1, 0), "commands/context_ops.py": (1, 0), "context.py": (1, 0),
     "dashboard.py": (1, 0), "loop/driver.py": (1, 1),
     "mindnet/controller.py": (1, 0), "mindnet/executor.py": (1, 2),

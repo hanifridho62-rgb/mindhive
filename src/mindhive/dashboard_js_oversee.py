@@ -41,6 +41,12 @@ JS = """\
   const RM_OPEN = new Set();
   const RM_NODE_OPEN = new Set();
   function ovStatus(r){
+    // BEFORE the chat branch, and that order is load-bearing: a native CI run
+    // (blueprint P1g) only ever attaches to an interactive card, and every
+    // interactive card has kind 'chat' -- so a failed branch placed after it
+    // would be unreachable by the only rows that can reach it.
+    if (r.status === 'failed') return ['\\u2717', 'sbad',
+      r.ci ? ('CI \\u2717 PR #' + r.ci.pr_id) : 'failed'];
     if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
     if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
