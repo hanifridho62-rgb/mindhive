@@ -33,9 +33,22 @@ mcp = ["mcp>=1.2"]
 # one-line-per-event log without it rather than failing the mission — which is
 # also the path CI takes, because `dev` does not pull this in.
 tui = ["rich>=13"]
+# `hive ui --asgi` (blueprint P1k, K11). A FOURTH extra, and the MEB's
+# FastAPI/uvicorn requirement met without spending the stdlib-only runtime:
+# `hive ui` itself serves through the dashboard's own `ThreadingHTTPServer`
+# and needs none of this. `server/asgi.py` is a BRIDGE over the existing
+# handler rather than a second implementation, so the two front ends cannot
+# drift; without the extras it exits 2 naming this line, and the bridge's own
+# tests run with neither package installed.
+ui = ["fastapi>=0.110", "uvicorn>=0.27"]
 
 [project.scripts]
 hive = "mindhive.__main__:main"
+# The MEB's own spelling (`mindhive db migrate`). Same entry point as `hive`,
+# because it is the same CLI -- an alias, not a second surface. It appears on
+# PATH only after the checkout is reinstalled; until then `python -m mindhive`
+# is the spelling that works, and the live dashboard is not restarted for it.
+mindhive = "mindhive.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]

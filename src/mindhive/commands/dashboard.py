@@ -11,8 +11,8 @@ from .. import events, projector
 
 __all__ = ["_UNATTRIBUTABLE_SESSIONS", "cmd_replenish_run",
     "cmd_replenish_explain", "cmd_replenish_status", "cmd_graph_build",
-    "cmd_graph_related", "cmd_graph_export", "cmd_dashboard", "cmd_sync",
-    "cmd_harvest", "cmd_autosync_register", "cmd_autosync_run"]
+    "cmd_graph_related", "cmd_graph_export", "cmd_dashboard", "cmd_ui",
+    "cmd_sync", "cmd_harvest", "cmd_autosync_register", "cmd_autosync_run"]
 
 
 # Session ids that exist but cannot own work: the hook's stdin-parse fallback and
@@ -201,8 +201,52 @@ def cmd_graph_export(args) -> int | None:
     return None
 
 def cmd_dashboard(args) -> int | None:
+    """The 24/7 panel. Starts, and stays up until someone stops it.
+
+    `--idle-cutoff` is the ONLY thing that can change that, and the branch
+    below is written so the default path is byte-for-byte the call it has
+    always been -- no `lifecycle=None` kwarg, so a panel someone expects to
+    find tomorrow cannot acquire a way to shut itself down through a default
+    that later moves. `hive ui` is the same page with the flag always on."""
     from .. import dashboard
-    dashboard.serve(port=args.port, open_browser=not args.no_browser)
+    cutoff = getattr(args, "idle_cutoff", None)
+    if cutoff is None:
+        dashboard.serve(port=args.port, open_browser=not args.no_browser)
+        return None
+    from ..server.lifecycle import HeartbeatMonitor, default_interval_for
+    try:
+        # Derived, not defaulted, for the same reason `serve_ui` derives it:
+        # a monitor refuses an interval that cannot fit inside its cutoff, so
+        # `--idle-cutoff 5` would otherwise be a usage error rather than a
+        # short run. At the blueprint's own numbers it returns 15.0.
+        monitor = HeartbeatMonitor(idle_cutoff_s=cutoff,
+                                   interval_s=default_interval_for(cutoff))
+    except ValueError as e:
+        # A cutoff no interval can fit under — zero or negative. Refuse
+        # before binding, as a sentence rather than a traceback.
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    dashboard.serve(port=args.port, open_browser=not args.no_browser,
+                    lifecycle=monitor)
+    return None
+
+def cmd_ui(args) -> int | None:
+    """The panel as a PAGE: it goes away once the tab does (blueprint P1k).
+
+    The two exceptions caught here both come out of `serve_ui`'s preflight,
+    which runs before anything binds: `HeartbeatMonitor` refuses numbers that
+    cannot work (ValueError), and the ASGI adapter refuses to pretend the
+    extras are installed (RuntimeError, naming the pip line). Printing the
+    exception's own text rather than a sentence of our own is deliberate --
+    it stays accurate whatever raised it, and the extras message already
+    says exactly what to type."""
+    from ..server import app
+    try:
+        app.serve_ui(port=args.port, open_browser=not args.no_browser,
+                     idle_cutoff_s=args.idle_cutoff, asgi=args.asgi)
+    except (ValueError, RuntimeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     return None
 
 def cmd_sync(args) -> int | None:

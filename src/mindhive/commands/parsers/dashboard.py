@@ -13,7 +13,8 @@ from ..dashboard import (cmd_autosync_register,
                          cmd_replenish_explain,
                          cmd_replenish_run,
                          cmd_replenish_status,
-                         cmd_sync)
+                         cmd_sync,
+                         cmd_ui)
 from ..skills import (cmd_plugins_autoscan,
                       cmd_plugins_list,
                       cmd_plugins_recommend,
@@ -27,7 +28,7 @@ from ..skills import (cmd_plugins_autoscan,
                       cmd_skills_trail)
 
 __all__ = ["add_replenish", "add_graph", "add_plugins", "add_skills",
-    "add_sync", "add_dashboard", "add_harvest", "add_autosync",
+    "add_sync", "add_dashboard", "add_harvest", "add_autosync", "add_ui",
     "register_parsers"]
 
 
@@ -174,7 +175,35 @@ def add_dashboard(sub) -> None:
                     help="port (default: fixed 54461 for a stable URL; pass 0 for an ephemeral port)")
     dp.add_argument("--no-browser", dest="no_browser", action="store_true",
                     help="don't auto-open the browser")
+    # blueprint P1k. Default None, not 60: ABSENT is what keeps the 24/7
+    # panel's `serve` call exactly what it was. `hive ui` is this flag with a
+    # number already in it.
+    dp.add_argument("--idle-cutoff", dest="idle_cutoff", type=float,
+                    default=None,
+                    help="also shut down after this many seconds with no "
+                         "open page (default: never)")
     dp.set_defaults(func=cmd_dashboard)
+
+
+def add_ui(sub) -> None:
+    """Register `hive ui`."""
+    # --- ui (blueprint P1k) --- the dashboard as a page rather than a service.
+    up = sub.add_parser("ui",
+                        help="open the control panel and let it shut itself "
+                             "down once you close the tab")
+    up.add_argument("--port", type=int, default=None,
+                    help="port (default: 54461, the dashboard's own — if the "
+                         "24/7 panel is already there, this just opens it)")
+    up.add_argument("--no-browser", dest="no_browser", action="store_true",
+                    help="don't auto-open the browser")
+    up.add_argument("--idle-cutoff", dest="idle_cutoff", type=float,
+                    default=60.0,
+                    help="shut down after this many seconds with no page "
+                         "beating (default: 60)")
+    up.add_argument("--asgi", action="store_true",
+                    help="serve through FastAPI/uvicorn instead of the stdlib "
+                         "server (needs `pip install -e .[ui]`)")
+    up.set_defaults(func=cmd_ui)
 
 
 def add_harvest(sub) -> None:
@@ -218,3 +247,6 @@ def register_parsers(sub) -> None:
     add_dashboard(sub)
     add_harvest(sub)
     add_autosync(sub)
+    add_ui(sub)                              # blueprint P1k — at the tail,
+    # which is where `_build_parser` mounts it too: the order pin compares
+    # this list against the live tree's, not against this file's reading order.

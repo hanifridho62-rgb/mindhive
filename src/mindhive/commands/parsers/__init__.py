@@ -101,6 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # events into the mirror with the hash chain verified.
     from ...storage import cli as db_cli
     db_cli.register(sub)
+    dashboard_p.add_ui(sub)                  # blueprint P1k
 
     return p
 

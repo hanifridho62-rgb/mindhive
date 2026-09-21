@@ -261,6 +261,30 @@ the ROLE level and a write seam anywhere else could only fail at runtime.
 | `storage/migration.py` | `EventReplayMigrationEngine`, `HashChainVerifier`, `MigrationReport`. Replays session by session, commits per `batch` (500) chunk — safe because every insert is `ON CONFLICT DO NOTHING`, so a partial commit is a prefix the next run skips, and an unbounded transaction over a multi-hundred-thousand-row replay is the alternative. A session the destination already holds is skipped by ARITHMETIC (`max(seg_line)`, one SELECT) rather than a per-row probe. The first chain break stops the RUN, not just its session. **What the verifier does not prove, stated plainly in its docstring:** the records it checks came out of a fold that COMPUTES both hashes, so it catches a broken STREAM (reorder, skip, splice) and not an edited ledger — `chain.verify` is that check, and `hive db migrate` runs it first. |
 | `storage/cli.py` | The self-registering `hive db` group (`register(sub)`, two lines in `commands/parsers/__init__.py`). `db migrate [--dsn --project --dry-run --json]` is the DATA half of `hive pg migrate`'s SCHEMA — two verbs so "migrate failed" is never ambiguous. Every import is inside a handler, so `hive --help` never pulls `pgmirror` or psycopg (pinned in a child). Exit codes mean one thing each: 0 verified, 1 the run happened and the chain did not verify (the DATA is wrong), 2 the ENVIRONMENT stopped it (no DSN, no driver, unreachable server, a schema that would not apply). `db status` reports the SAME checkpoint verdict migrate gates on, so the two cannot come apart, and its `chain_ok` is tri-state — `null` means never checkpointed, which is not the same fact as verified. |
 
+### `server/` — the ephemeral UI (`hive ui`, blueprint P1k, MEB §1.4)
+
+The same panel as `hive dashboard`, on the same port, that **goes away when
+the tab does**. The page beats every 15 s, a watchdog thread stops the server
+60 s after the last beat, and that is the whole mechanism: no session table,
+no connection tracking, no "is the socket still open" heuristic — a
+keep-alive connection outlives the tab that opened it, which is precisely why
+the socket cannot answer the question.
+
+Two properties are load-bearing and pinned from both sides. **`hive
+dashboard` is untouched**: no wrapper, no extra thread, no fragment in its
+page, because `serve`'s `lifecycle=` is keyword-only and absent by default.
+And **the live panel is never disturbed**: `hive ui` defaults to 54461, so
+`serve`'s single-instance guard — which answers BEFORE the bind — opens the
+running dashboard's URL instead of binding over it.
+
+| Module | What it is |
+| --- | --- |
+| `server/lifecycle.py` | `HeartbeatMonitor` (thread-safe: request threads write, the watchdog reads) and `watchdog(monitor, server, stop_event, *, shutdown=None)`. `HEARTBEAT_INTERVAL_S = 15.0`, `IDLE_CUTOFF_S = 60.0` — four intervals, so three consecutive missed beats (a GC pause, a throttled tab, a laptop lid) are survivable and a closed tab still dies inside a minute. A fresh monitor is NOT idle: `last_ping` starts at construction, or the first tick would kill the server while the browser was still parsing the HTML. `default_interval_for(cutoff)` derives the beat from the cutoff (`cutoff/4`, capped at 15 s) so `--idle-cutoff 5` is a short run rather than a refused pair; at the default cutoff it returns exactly 15.0. Every seam is injected (`clock`, `sleep`, `shutdown`), because the alternative is a test that sleeps a minute and therefore never runs. |
+| `server/js.py` | `heartbeat_script(interval_ms)` — the page's end, spliced AFTER `dashboard_js_actions.JS` so `u()` and `TOKEN` are in scope. The timer runs in a **Worker**: Chrome throttles a hidden tab's `setInterval` to ~1/min after five minutes, which against a 60 s cutoff is a coin flip every minute. The Worker only TICKS; the fetch stays on the main thread, so the token never enters a second scope. There is deliberately **no `document.hidden` guard** — pausing in a hidden tab shuts the server down under a page the user merely switched away from. `tests/test_server_js_node.py` runs these exact bytes in node and asserts the hidden case behaves like the visible one. |
+| `server/routes.py` | `with_lifecycle(base, monitor)` mints a SUBCLASS of the handler `dashboard.make_handler` already produced, with merged route tables and one extra string (`_extra_js`). `POST /api/heartbeat` records; `GET /api/lifecycle` reports WITHOUT recording, so `curl` in a loop cannot keep a server alive. Subclassing rather than editing `dashboard_get.py`/`dashboard_post.py` is the point: `do_GET`/`do_POST` dispatch through `self._GET_ROUTES`, so the token guard, host guard, gzip and HIVE MIND rules are inherited and cannot drift — and the 24/7 panel never learns the routes. |
+| `server/app.py` | `serve_ui(...)` — argument handling and one call into `dashboard.serve(..., lifecycle=monitor)`. Builds the monitor BEFORE anything binds, so an impossible pair is a usage error the operator reads rather than a server that stops while they watch. |
+| `server/asgi.py` | The optional FastAPI/uvicorn front end (`hive ui --asgi`, extras `[ui]`). A **bridge, not a port**: `call_handler` drives the existing handler class through one request on a fake socket, so both front ends run the same guards because there is only one copy of them. Forces `Connection: close` (the handler speaks HTTP/1.1 and would otherwise answer a second request out of leftover bytes) and drops hop-by-hop headers on the way out. Stdlib-only and tested with neither extra installed; `make_app`/`serve_asgi` have not been executed on this machine. |
+
 ### `consensus/` — participatory consensus (`hive consensus`)
 
 Many framed contributions folded into **one number that can be walked back to

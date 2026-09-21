@@ -165,6 +165,15 @@ def make_handler(token: str):
         # assumes can happen.
         timeout = 30
 
+        # What `hive ui` splices into the page after every built-in
+        # fragment (blueprint P1k). Empty here and overridden by the subclass
+        # `server.routes.with_lifecycle` mints, so `hive dashboard` renders
+        # byte for byte the page it rendered before that feature existed --
+        # and so the wrapper overrides ONE string rather than re-stating the
+        # `render_page` call, whose argument list is the page's contract and
+        # whose `token` is a closure cell of this function.
+        _extra_js = ""
+
         # Whether bytes of a response for the request in flight are already on
         # the wire. Class-level default so it reads correctly even if a failure
         # happens before `handle_one_request` runs.
@@ -327,6 +336,28 @@ def make_handler(token: str):
             self._json({"ok": False, "error": "invalid project"}, 400)
             return None
 
+        def _render_index(self):
+            """The page `/` serves. A METHOD so `hive ui` can wrap this class
+            and add its heartbeat fragment without reimplementing the route --
+            see `server/routes.with_lifecycle`.
+
+            `render_page` is called by NAME through the module globals, not
+            captured into a local: `tests/test_dashboard_browser.py`
+            monkeypatches `dashboard.render_page` to serve a stub page, and a
+            captured reference would make that patch silently ineffective.
+
+            `mindswarm_enabled()` is read per request, not once at import.
+            That does NOT let an operator flip the variable under a running
+            server -- this process's environ is fixed at launch -- it keeps the
+            value out of a module-level constant that would freeze before argv
+            is even parsed. The operator's step is to restart with the new
+            value."""
+            return render_page(token,
+                               tasks_css=taskview.CARDS_CSS,
+                               tasks_js=taskview.CARDS_JS,
+                               swarm=mindswarm_enabled(),
+                               extra_js=self._extra_js)
+
         # --- routing ---
         def do_GET(self):
             # The WHOLE method runs inside the guard, not just route dispatch.
@@ -340,17 +371,7 @@ def make_handler(token: str):
                 parsed = urlparse(self.path)
                 route = parsed.path
                 if route == "/":
-                    # `mindswarm_enabled()` is read per request, not once at
-                    # import. That does NOT let an operator flip the variable
-                    # under a running server — this process's environ is fixed
-                    # at launch — it keeps the value out of a module-level
-                    # constant that would freeze before argv is even parsed.
-                    # The operator's step is to restart with the new value.
-                    return self._send(200,
-                                      render_page(token,
-                                                  tasks_css=taskview.CARDS_CSS,
-                                                  tasks_js=taskview.CARDS_JS,
-                                                  swarm=mindswarm_enabled()),
+                    return self._send(200, self._render_index(),
                                       "text/html; charset=utf-8")
                 if not self._check_token():
                     return self._json({"ok": False, "error": "forbidden"}, 403)
@@ -416,9 +437,14 @@ def make_handler(token: str):
                     # mutating action needs a concrete target. The plugin
                     # handlers substitute the default project for storage when
                     # in all-mode.
+                    # `/api/heartbeat` (blueprint P1k) is global in the same
+                    # sense: it says "someone still has this page open" and
+                    # names no namespace, so refusing it under HIVE MIND would
+                    # shut the UI down under a user who is looking at it.
                     if route not in ("/api/selftest", "/api/harvest",
                                      "/api/plugins/scan", "/api/plugins/autoscan",
-                                     "/api/workspace/auth_verify"):
+                                     "/api/workspace/auth_verify",
+                                     "/api/heartbeat"):
                         return self._json({"ok": False, "error":
                             "HIVE MIND is a unified read-only view across all projects — "
                             "pick a specific project for this action."}, 200)
@@ -588,7 +614,7 @@ def open_panel(port: int | None = None) -> str:
 
 
 def serve(port: int | None = None, open_browser: bool = True,
-          token: str | None = None) -> None:
+          token: str | None = None, *, lifecycle=None) -> None:
     """Start the dashboard on a fixed port with a persisted token so the URL is
     stable across launches, open the browser, and serve until interrupted.
 
@@ -598,6 +624,14 @@ def serve(port: int | None = None, open_browser: bool = True,
 
     A background loop also auto-harvests sessions the live hooks miss, so the
     store self-heals even where hooks never fire (disable: MINDHIVE_AUTOHARVEST=0).
+
+    *lifecycle* is a `server.lifecycle.HeartbeatMonitor` and is how `hive ui`
+    turns this server into an ephemeral one: the handler gains the two
+    lifecycle routes and a watchdog thread stops the server once the page has
+    stopped beating. Keyword-only and defaulted to None, so `hive dashboard`
+    behaves exactly as it did -- no wrapper, no extra thread, no fragment in
+    the page. A panel meant to stay up must not acquire a way to shut itself
+    down as a side effect of this parameter existing.
     """
     if port is None:
         port = DEFAULT_PORT
@@ -614,6 +648,13 @@ def serve(port: int | None = None, open_browser: bool = True,
             webbrowser.open(url)
         return
     handler = make_handler(token)
+    if lifecycle is not None:
+        # Imported HERE, not at module scope: `hive dashboard` must not pay
+        # for a package it will never use, and `server.routes` imports this
+        # module back for `render_page` -- a module-scope import would be a
+        # cycle resolved by luck.
+        from .server.routes import with_lifecycle
+        handler = with_lifecycle(handler, lifecycle)
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as e:
@@ -664,6 +705,14 @@ def serve(port: int | None = None, open_browser: bool = True,
         print(f"embedding watcher skipped: {type(e).__name__}: {e}", flush=True)
     stop_event = threading.Event()
     threading.Thread(target=_auto_harvest_loop, args=(stop_event,), daemon=True).start()
+    if lifecycle is not None:
+        # Shares `stop_event` with the harvest loop, which is what makes
+        # Ctrl+C end this thread at once instead of after one interval -- and
+        # what stops it calling `shutdown()` on a server already shutting
+        # down. Daemon, so an exit never waits on it.
+        from .server.lifecycle import watchdog
+        threading.Thread(target=watchdog, args=(lifecycle, server, stop_event),
+                         name="hive-ui-watchdog", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

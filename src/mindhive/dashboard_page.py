@@ -138,7 +138,13 @@ SWARM_HIDDEN_NOTE = (
 
 
 def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
-                swarm: bool = True) -> str:
+                swarm: bool = True, extra_js: str = "") -> str:
+    """The served page.
+
+    *extra_js* is spliced after every built-in fragment, so `u()`, `TOKEN` and
+    the rest of the page's module scope are already defined when it runs. It
+    defaults to `""` and `hive dashboard` never passes it: the one caller is
+    `hive ui`, whose heartbeat has no business in a panel meant to stay up."""
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -252,6 +258,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
 /*__JS_VIEWS__*/
 /*__JS_SKILLS__*/
 /*__JS_ACTIONS__*/
+/*__EXTRA_JS__*/
 </script>
 </body></html>""" \
     .replace("/*__DASH_CSS__*/", dashboard_css.CSS) \
@@ -270,4 +277,5 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
              MINDSWARM_NAV_BUTTON if swarm else SWARM_HIDDEN_NOTE) \
     .replace("__TOKEN__", json.dumps(token)) \
     .replace("/*__TASKS_CSS__*/", tasks_css) \
-    .replace("//__TASKS_JS__", tasks_js)
+    .replace("//__TASKS_JS__", tasks_js) \
+    .replace("/*__EXTRA_JS__*/", extra_js)

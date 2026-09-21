@@ -167,7 +167,10 @@ SURFACE = {'append': {},
  'watcher': {'run': {}, 'status': {}, 'recover': {}},
  # blueprint P1i: the DATA half of `hive pg migrate`'s SCHEMA. Registered
  # last, so it sits at the tail of this list as well as of `hive --help`.
- 'db': {'migrate': {}, 'status': {}}}
+ 'db': {'migrate': {}, 'status': {}},
+ # blueprint P1k: `hive dashboard`'s page with a heartbeat, on the same port.
+ # Also registered last, so it takes the new tail.
+ 'ui': {}}
 
 # The handler NAME every parser bound BEFORE the split (the `__func__` entries
 # of the same 2026-09-14 snapshot). Self-registering groups included: this is
@@ -321,7 +324,8 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'ci status': 'cmd_ci_status',
  'watcher recover': 'cmd_watcher_recover',
  'watcher run': 'cmd_watcher_run',
- 'watcher status': 'cmd_watcher_status'}
+ 'watcher status': 'cmd_watcher_status',
+ 'ui': 'cmd_ui'}
 
 
 def _sub(parser):
