@@ -131,7 +131,8 @@ def test_status_lists_the_migration_inventory(capsys):
         "001_schema.sql", "002_indexes.sql", "003_roles_and_views.sql",
         "004_mirror_state_view_and_ownership.sql",
         "005_drop_unmatchable_order_index.sql",
-        "006_event_embeddings.sql"]
+        "006_event_embeddings.sql",
+        "007_event_embeddings_hashes.sql"]
 
 
 def test_status_without_json_prints_readable_lines(capsys):

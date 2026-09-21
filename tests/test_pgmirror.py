@@ -140,10 +140,22 @@ def test_nothing_on_the_ai_read_path_imports_the_admin_module():
       somewhere, and the schedule is that somewhere. It is not an AI path: no
       tool, no MCP handler and no dashboard request reaches it, and it gates on
       `MINDHIVE_PG_DSN_ADMIN` before importing anything.
+    * `storage/postgres_driver.py` — the SPI's Postgres adapter. It is the
+      module the migration engine writes THROUGH, and it earns the entry by
+      carrying no statement of its own: `tests/test_pg_repo_gates.py` D4 still
+      finds zero write SQL in it (asserted directly in
+      `tests/test_storage_postgres_driver.py`), so what it gained is the
+      ability to CALL a write, not to spell one.
+    * `storage/pgvector_driver.py` — the same arrangement for vectors, through
+      `pgmirror.upsert_embedding`.
+    * `storage/cli.py` — an OPERATOR entry point, exactly like `pgcli.py`: a
+      human typing `hive db migrate`. Every import is inside a handler, so
+      `hive --help` does not pay for it.
 
     Anything else appearing here is a module that just gained the ability to
     write, which is the whole reason this assertion exists."""
-    allowed = {"pgcli.py", "autosync.py"}
+    allowed = {"pgcli.py", "autosync.py", "storage/postgres_driver.py",
+               "storage/pgvector_driver.py", "storage/cli.py"}
     assert set(_importers_of("pgmirror")) <= allowed, \
         f"unexpected importer(s) of pgmirror: {_importers_of('pgmirror')}"
 
@@ -156,7 +168,10 @@ def test_the_allowed_importers_reach_the_admin_module_lazily():
     owner-DSN module on every one of those import graphs.
 
     Add a module to the allowlist and this test starts guarding it too."""
-    for name in ("pgcli.py", "autosync.py"):
+    for name in ("pgcli.py", "autosync.py", "storage/postgres_driver.py",
+                 "storage/pgvector_driver.py", "storage/cli.py"):
+        if not (SRC / name).exists():
+            continue        # a driver that has not landed yet cannot offend
         assert _imports_are_all_inside_functions(name, "pgmirror"), \
             f"{name} imports pgmirror at module scope — it must be lazy"
 
@@ -206,7 +221,8 @@ def test_the_migrations_are_discoverable_in_application_order():
         "001_schema.sql", "002_indexes.sql", "003_roles_and_views.sql",
         "004_mirror_state_view_and_ownership.sql",
         "005_drop_unmatchable_order_index.sql",
-        "006_event_embeddings.sql"]
+        "006_event_embeddings.sql",
+        "007_event_embeddings_hashes.sql"]
 
 
 def _executable_names(name: str) -> set[str]:
@@ -261,7 +277,7 @@ def test_every_digest_is_distinct():
     """CANARY. A `migration_sha256` that hashed the filename, or the empty
     string, would satisfy the test above for every file."""
     digests = {pgmirror.migration_sha256(n) for n in pgmirror.migration_files()}
-    assert len(digests) == len(pgmirror.migration_files()) == 6
+    assert len(digests) == len(pgmirror.migration_files()) == 7
 
 
 def test_an_unknown_migration_name_is_refused():

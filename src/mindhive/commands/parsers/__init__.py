@@ -96,6 +96,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ci_cli.register(sub)
     maintenance_p.add_watcher(sub)           # blueprint P1h
 
+    # --- db --- self-registering, the same convention; blueprint P1i. The
+    # DATA half of `hive pg migrate`'s SCHEMA: it replays the file ledger's
+    # events into the mirror with the hash chain verified.
+    from ...storage import cli as db_cli
+    db_cli.register(sub)
+
     return p
 
 def _closest_command(token: str, choices=None) -> str | None:

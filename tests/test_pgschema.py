@@ -124,7 +124,8 @@ def test_the_migration_files_this_module_documents_exist():
     silently reduce every comparison below to `[] == []`."""
     missing = [n for n in ("001_schema.sql", "002_indexes.sql",
                           "003_roles_and_views.sql",
-                          "006_event_embeddings.sql")
+                          "006_event_embeddings.sql",
+                          "007_event_embeddings_hashes.sql")
                if not (MIGRATIONS / n).is_file()]
     assert missing == [], f"missing migration file(s): {missing}"
 
@@ -202,6 +203,37 @@ def test_the_view_column_parser_reduces_an_alias_to_its_alias():
 # --------------------------------------------------------------------------
 # R6 — description drift
 # --------------------------------------------------------------------------
+
+def _defining_migrations(view: str) -> list[str]:
+    """Every migration whose text defines *view*, in application order."""
+    return [p.name for p in sorted(MIGRATIONS.glob("*.sql"))
+            if _view_columns(p.read_text(encoding="utf-8"), view)]
+
+
+@pytest.mark.parametrize("view,ddl", DOCUMENTED)
+def test_the_registry_names_the_last_migration_that_defines_each_view(view,
+                                                                     ddl):
+    """THE HOLE UNDER THE DRIFT GUARD, closed.
+
+    The guard below reads the DDL file the registry NAMES. A view is defined
+    once and then re-stated by a later migration whenever a column is appended
+    -- which is legal, and which `CREATE OR REPLACE VIEW` is for -- and at that
+    moment the named file stops being the definition. The guard goes on
+    comparing the map against superseded DDL and stays green while the map
+    rots.
+
+    That is not hypothetical: `007_event_embeddings_hashes.sql` appended
+    `prev_hash`/`chain_hash` to `mindhive_ro.event_embeddings` and nothing
+    noticed until this test was written. Last file wins, and the registry has
+    to say so."""
+    defining = _defining_migrations(view)
+    assert defining, f"no migration under {MIGRATIONS.name} defines {view}"
+    assert ddl == defining[-1], (
+        f"`pgschema.TABLES` says {view} is defined by {ddl}, but "
+        f"{defining[-1]} redefines it. The drift guard reads the named file, "
+        f"so the model's map is now being checked against superseded DDL — "
+        f"point the registry at the last definition. (all: {defining})")
+
 
 @pytest.mark.parametrize("view,ddl", DOCUMENTED)
 def test_schema_doc_and_the_view_ddl_name_the_same_columns(view, ddl):

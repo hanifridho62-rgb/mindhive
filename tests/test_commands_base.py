@@ -210,7 +210,7 @@ def test_the_six_domains_and_the_self_registering_groups_are_the_whole_surface()
     # P1g with the CI runner. Self-registering like the rest -- one named call
     # in `commands/parsers/__init__.py`, handlers bound beside their flags.
     assert self_registered == {"bench", "inject", "pg", "consensus", "clusters",
-                               "lintester", "ci"}
+                               "lintester", "ci", "db"}
     assert domains.isdisjoint(self_registered)
     assert domains | self_registered == set(live.choices)
 

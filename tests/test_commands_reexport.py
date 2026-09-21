@@ -164,7 +164,10 @@ SURFACE = {'append': {},
  # P1g added the gate itself: `run`, `status` and `hook-install`.
  'ci': {'run': {}, 'status': {}, 'hook-install': {},
         'breaker': {'status': {}, 'reset': {}}},
- 'watcher': {'run': {}, 'status': {}, 'recover': {}}}
+ 'watcher': {'run': {}, 'status': {}, 'recover': {}},
+ # blueprint P1i: the DATA half of `hive pg migrate`'s SCHEMA. Registered
+ # last, so it sits at the tail of this list as well as of `hive --help`.
+ 'db': {'migrate': {}, 'status': {}}}
 
 # The handler NAME every parser bound BEFORE the split (the `__func__` entries
 # of the same 2026-09-14 snapshot). Self-registering groups included: this is
@@ -188,6 +191,8 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'consolidate': 'cmd_consolidate',
  'context': 'cmd_context',
  'dashboard': 'cmd_dashboard',
+ 'db migrate': 'cmd_db_migrate',
+ 'db status': 'cmd_db_status',
  'directives': 'cmd_directives',
  'embed': 'cmd_embed',
  'enrich off': 'cmd_enrich',

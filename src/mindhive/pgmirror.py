@@ -337,6 +337,51 @@ _DELETE_SEGS_SQL = ("DELETE FROM mindhive.events "
 # `TRUNCATE` would do, arriving through a narrower door.
 
 
+# --- the single-row write seam (blueprint P1i, MEB MIG-01) -------------------
+#
+# `refresh` reloads a whole segment; the migration engine inserts ONE row at a
+# time and has to know whether that row was already there. Both statements live
+# HERE, and the storage drivers only call them, because `tests/test_pg_repo_
+# gates.py` D4 holds the mirror to one module that can mutate it: a reader that
+# merely HOLDS a write statement is a write path waiting for a connection.
+#
+# `ON CONFLICT ... DO NOTHING` over `events_natural_key` (001_schema.sql), not a
+# SELECT-then-INSERT: the check and the write are then one statement under one
+# snapshot, so two migrations racing on the same segment cannot both see "absent"
+# and both insert. `rowcount` reports which of the two happened, and that is the
+# whole return value -- 1 means this call wrote the row, 0 means it was already
+# correct, and the caller counts them apart without a second round trip.
+_INSERT_EVENT_SQL = (
+    "INSERT INTO mindhive.events "
+    "(project, segment, seg_line, ts, ts_utc, session_id, event_type, "
+    "payload, tags) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb) "
+    "ON CONFLICT (project, segment, seg_line) DO NOTHING")
+
+
+def insert_event_idempotent(cur, project: str, segment: str, seg_line: int,
+                            ev) -> bool:
+    """Write one event at `(project, segment, seg_line)`. True iff it landed.
+
+    *seg_line* is the MIRROR's coordinate, 0-based, the one `scan_segments`
+    produces. `EventRecord.seg_line` is 1-based, and the conversion happens in
+    `storage.postgres_driver` -- once, at the boundary, rather than wherever
+    someone remembers.
+
+    `payload` and `tags` are passed as canonical JSON TEXT with an explicit
+    `::jsonb` cast rather than as `psycopg.types.json.Jsonb`, for two reasons
+    that both matter: the bytes are then the ledger's own canonical bytes, and
+    the call is exercisable with a fake cursor on a machine that has no psycopg
+    at all -- which is how the migration engine is tested."""
+    from . import events as _events
+    cur.execute(_INSERT_EVENT_SQL,
+                (project, segment, int(seg_line), ev.ts, _ts_utc(ev.ts),
+                 ev.session_id, ev.type,
+                 _events.canonical_json(ev.payload),
+                 _events.canonical_json(list(ev.tags or []))))
+    return cur.rowcount == 1
+
+
 def refresh(project: str | None = None, segments=None) -> dict:
     """Reload the named segments of one namespace. `None` means every segment.
 
@@ -691,6 +736,61 @@ _EMB_DELETE_KEYS_SQL = (
     "WHERE project = %s AND model = %s "
     "AND (segment, seg_line) IN "
     "(SELECT s, l FROM unnest(%s::text[], %s::int[]) AS t(s, l))")
+
+
+#: Every column `upsert_embedding` writes, in statement order. The first four
+#: are the primary key (006_event_embeddings.sql); the rest are what a conflict
+#: overwrites, which is why the split is at index 4 and not by hand.
+EMBEDDING_COLUMNS = ("project", "segment", "seg_line", "model",
+                     "ts", "ts_utc", "session_id", "event_type", "event_id",
+                     "dim", "embedding", "norm", "prev_hash", "chain_hash")
+
+
+def _upsert_embedding_sql(vector: bool) -> str:
+    """The upsert, with or without pgvector's shadow column.
+
+    Built rather than spelled twice: the two forms differ by one column and one
+    placeholder, and two 14-column literals kept in step by hand is how a
+    column gets added to one of them only. `embedding_vec` exists only after
+    007 on a cluster that HAS the extension, so the caller decides -- see
+    `storage.pgvector_driver.has_vector_extension`."""
+    cols = list(EMBEDDING_COLUMNS) + (["embedding_vec"] if vector else [])
+    marks = ["%s"] * len(EMBEDDING_COLUMNS) + (["%s::vector"] if vector else [])
+    updates = [f"{c} = EXCLUDED.{c}" for c in cols[4:]]
+    return ("INSERT INTO mindhive.event_embeddings (" + ", ".join(cols) + ") "
+            "VALUES (" + ", ".join(marks) + ") "
+            "ON CONFLICT (project, segment, seg_line, model) DO UPDATE SET "
+            + ", ".join(updates) + ", indexed_at = now()")
+
+
+def upsert_embedding(cur, row, vector_literal=None) -> bool:
+    """Write one vector at its `(project, segment, seg_line, model)` key.
+
+    DO UPDATE, not DO NOTHING, and that is the opposite choice from
+    `insert_event_idempotent` on purpose. An event at a given line is immutable
+    -- the ledger is append-only, so a row already there is already right. A
+    VECTOR at that line is a derived value: the event can be re-encoded by a
+    newer build of the same model, and a `DO NOTHING` would keep the old bytes
+    forever while every count reported success. `indexed_at` moves with it, so
+    "how far behind is the index" keeps meaning something.
+
+    Returns True when the statement affected a row, which for an upsert is
+    always -- the bool is there so callers read the same shape from both
+    helpers, not because a False is expected.
+
+    *vector_literal* is pgvector's `'[0.1,0.2,...]'` text form, or None on a
+    cluster without the extension. It is a separate argument rather than a key
+    in *row* because it is not a property of the embedding -- it is the same
+    numbers in the other of two storage shapes."""
+    missing = [k for k in EMBEDDING_COLUMNS if k not in row]
+    if missing:
+        raise KeyError(f"embedding row is missing {missing}")
+    params = [row[k] for k in EMBEDDING_COLUMNS]
+    if vector_literal is not None:
+        params.append(vector_literal)
+    cur.execute(_upsert_embedding_sql(vector_literal is not None),
+                tuple(params))
+    return cur.rowcount != 0
 
 
 def embed_events(project: str | None = None, *, model: str | None = None,

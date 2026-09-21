@@ -209,6 +209,18 @@ EMBEDDINGS_COLUMNS = (
            "see the note below.",
            "INTEGER, computed by the view; the raw bytea is deliberately "
            "absent from this projection."),
+    Column("prev_hash", "text",
+           "The chain head this event was appended onto, or NULL. You are "
+           "unlikely to want it: it is here so a similarity hit can be turned "
+           "back into a full record without re-reading the segment.",
+           "TEXT, nullable because the two writers know different things — "
+           "the storage SPI folds the segment and has it, `hive pg embed` "
+           "mirrors row by row and does not."),
+    Column("chain_hash", "text",
+           "This event's own chain hash. Present together with prev_hash or "
+           "not at all.",
+           "TEXT, nullable for the same reason as prev_hash; NOT NULL would "
+           "have made the existing loader unable to write a row."),
 )
 
 TABLES = (
@@ -232,7 +244,7 @@ TABLES = (
         EVENT_TYPES_COLUMNS,
     ),
     Table(
-        "mindhive_ro.event_embeddings", "006_event_embeddings.sql",
+        "mindhive_ro.event_embeddings", "007_event_embeddings_hashes.sql",
         "what the semantic index COVERS. Metadata only, one row per indexed "
         "event. Query it to answer \"is this searchable yet\", not to search.",
         EMBEDDINGS_COLUMNS,
