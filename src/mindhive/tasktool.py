@@ -56,6 +56,19 @@ open -- an unserialised write is a bad day, a hook that blocks or raises is
 every session on this machine. Reads never raise either: a corrupt or
 half-written sidecar reads as empty rather than breaking a session.
 
+**The public task lock (blueprint P3, MEB CONC-02 / §4.2, decision K4).**
+`task_lock(project_dir, timeout_s=15.0)` is the opposite contract to
+`_exclusive`: fail-CLOSED, and a `LockTimeoutError` -- this module's subclass
+of `core.locks.LockTimeoutError` -- when the lock cannot be had. It is for a
+caller that would rather hear "no" than run unlocked, a sub-agent manipulating
+the board from outside a hook, and it is the MEB's code verbatim, constants
+included; the comment above it names the two deliberate deviations and the
+properties a caller has to know: its patience under contention is twenty
+attempts (0.3-4 s of jittered sleep), the 15 s deadline mattering only when
+attempts stall, and it serialises `task_lock` callers against each other, not
+against the hook path -- a board write under it goes through `record()`, which
+takes `_exclusive` for itself. `_exclusive` and its budget do not move.
+
 The sidecar is per NAMESPACE while task ids are per session, so one session
 working across two projects accumulates part of its list in each. That is the
 same split the ledger already makes -- events land in the namespace detected at
@@ -65,9 +78,13 @@ whole, since the plan those steps land on is per-namespace too.
 import contextlib
 import json
 import os
+import random
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 from . import paths
+from .core.locks import LockTimeoutError as _CoreLockTimeoutError
 
 # The two tools whose calls this module folds. Named here so the hook and the
 # tests share one list rather than two spellings that can drift apart.
@@ -452,3 +469,110 @@ def record(session_id, tool, inp, response, project=None):
                       "n": _next_seq(state)}
         save(state, project)
         return todos(tasks)
+
+
+# --- CONC-02: the public task lock (blueprint P3, MEB §4.2, decision K4) ------
+#
+# `_exclusive` above is the HOOK path's lock: fail-open, two seconds of patience,
+# never raises, because a hook that blocks is every session on the machine. This
+# one is the opposite contract, for a caller that would rather hear "no" than run
+# unlocked -- a sub-agent manipulating the board from outside a hook. `task_lock`
+# sleeps a uniformly jittered `_LOCK_RETRY_BASE_MS`..`_LOCK_RETRY_MAX_MS` between
+# attempts (SECONDS, whatever the MEB's suffix says: 15-200 ms), reclaims a
+# holder older than `_STALE_LOCK_AGE_SECS`, counts an ACCESS_DENIED answer
+# (Windows DELETE-PENDING) like EEXIST, and raises `LockTimeoutError` once either
+# the `_TASK_LOCK_DENIED_SPINS` attempts or the `_LOCK_TIMEOUT_SECS` deadline are
+# spent. Twenty sleeps of at most 200 ms are 4 s, so under contention it is the
+# attempt cap that gives up (0.3-4 s of patience, about 2 s on average); the
+# deadline fires only when single attempts stall, and the message quotes the
+# deadline rather than the elapsed time because that is the MEB's string. The
+# five constants and the loop are the MEB's code verbatim (§10.1 names
+# `tasktool.py` as their owner) but for two guards, each marked where it stands.
+# Two properties of the verbatim loop stay as written and are recorded here
+# rather than fixed: the stale reclaim is unlink-then-open, so on POSIX a live
+# holder older than 60 s can be reclaimed and two reclaimers can race (Windows
+# refuses both -- an open handle blocks the delete), and an unlink the `finally`
+# cannot complete leaves a fresh-mtime file nobody can take for 60 s; a critical
+# section under this lock therefore stays far under a minute. The lock file is
+# `project_dir / ".tasktool.lock"`, beside the board's own `task_tools.json.lock`
+# -- a DIFFERENT file, so this lock excludes other `task_lock` callers and not
+# the hook path's `record()`, and a board write made under it goes through
+# `record()`, which takes `_exclusive` for itself. The caller hands
+# `paths.project_dir(project)` in -- never `store_home()` -- with the directory
+# already there: the primitive creates the FILE, not the folder, so a missing
+# directory is ENOENT from `os.open`, raised as-is.
+_LOCK_TIMEOUT_SECS = 15.0
+_LOCK_RETRY_BASE_MS = 0.015
+_LOCK_RETRY_MAX_MS = 0.200
+_STALE_LOCK_AGE_SECS = 60.0
+_TASK_LOCK_DENIED_SPINS = 20
+
+
+class LockTimeoutError(_CoreLockTimeoutError):
+    """`task_lock` gave up: the deadline passed or the spin budget ran out.
+
+    A subclass of `core.locks.LockTimeoutError` (itself a `TimeoutError`), so
+    one `except` clause covers a lock from either module."""
+
+
+@contextmanager
+def task_lock(project_dir: Path, timeout_s: float = _LOCK_TIMEOUT_SECS):
+    lock_file = project_dir / ".tasktool.lock"
+    start_time = time.monotonic()
+    spins = 0
+    while True:
+        try:
+            # Periksa stale lock (> 60 detik)
+            if lock_file.exists():
+                try:
+                    mtime = lock_file.stat().st_mtime
+                except FileNotFoundError:
+                    # THE ONE DEVIATION from the MEB text. A holder can let go
+                    # between `exists()` and `stat()`, and the stat then answers
+                    # ENOENT -- which is not in the except tuple below, so the
+                    # verbatim loop crashed its caller on the lock coming FREE.
+                    # Caught in the act by `tests/test_tasktool_lock.py`. It is
+                    # read as a fresh holder: the O_EXCL open just below is the
+                    # real answer, and it takes the lock or counts a spin.
+                    mtime = time.time()
+                if (time.time() - mtime) > _STALE_LOCK_AGE_SECS:
+                    try:
+                        lock_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            # Upaya perolehan kunci atomik
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            try:
+                os.write(fd, f"{os.getpid()}:{time.time()}".encode("utf-8"))
+            except BaseException:
+                # THE SECOND DEVIATION. The open above created the file, and an
+                # error from the write -- ENOSPC, EIO, a Ctrl+C on this CLI
+                # path -- is not in the except tuple below and never reaches
+                # the `finally` further down: the verbatim loop left the fd
+                # open and `.tasktool.lock` behind with a fresh mtime, which on
+                # Windows no contender can unlink for as long as this process
+                # lives (an open handle blocks the delete). Undo the open, then
+                # let the error out unchanged.
+                try:
+                    os.close(fd)
+                    lock_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            break
+        except (FileExistsError, PermissionError):
+            spins += 1
+            if spins > _TASK_LOCK_DENIED_SPINS or (time.monotonic() - start_time) > timeout_s:
+                raise LockTimeoutError(f"Gagal memperoleh task_lock setelah {timeout_s}s (spins={spins}).")
+            jitter = random.uniform(_LOCK_RETRY_BASE_MS, _LOCK_RETRY_MAX_MS)
+            time.sleep(jitter)
+
+    try:
+        yield
+    finally:
+        try:
+            os.close(fd)
+            lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass

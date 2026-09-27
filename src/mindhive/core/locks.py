@@ -14,11 +14,15 @@ byte-range lock (`msvcrt.locking` / `fcntl.flock`) over one file per
 namespace, and it stays that way: measured under twelve-way contention it
 was three times faster than this pattern (0.89 s against 2.68 s), and the
 kernel drops it when the holder dies, so no stale file can wedge a later
-append. This module is for the sidecars that need an `O_EXCL` FILE --
-`tasktool`'s board (P3), the Chroma directory (P1h), the storage driver's
-state file (P1i) -- where the resource has no single file to lock a byte
-of. A caller always gives the path under `paths.project_dir(...)`, never
-under `store_home()` (`tests/test_store_root_files.py`).
+append. This module is for the sidecars that need an `O_EXCL` FILE -- the
+Chroma directory (P1h), the storage driver's state file (P1i), the
+integration breaker's record -- where the resource has no single file to
+lock a byte of. NOT `tasktool`'s board: decision K4 gave its public
+`task_lock` the MEB's own loop verbatim (P3), with a 60 s stale age against
+this module's 30 s, so a `file_lock` pointed at `.tasktool.lock` would
+reclaim a live holder -- one file, one policy. A caller always gives the
+path under `paths.project_dir(...)`, never under `store_home()`
+(`tests/test_store_root_files.py`).
 
 Every OS call goes through the `os` module by name (`os.open`, `os.write`,
 `os.close`, `os.unlink`, `os.stat`), so a test can monkeypatch one to
