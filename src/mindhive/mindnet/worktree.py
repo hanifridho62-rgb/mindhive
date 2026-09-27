@@ -45,9 +45,10 @@ ask the same question before they read or discard.
 
 ## The merge-back's primitives live here too
 
-`commit_all`, `merge_probe`, `merge_into`, `is_ancestor` and `rev_of` exist for
-`orchestrator.integrate`, which commits each validated lane on the child's
-behalf and merges the lanes into an integration branch. They are in this module
+`commit_all`, `merge_probe`, `merge_into`, `is_ancestor`, `rev_of` and
+`commits_since` exist for `orchestrator.integrate`, which commits each validated
+lane on the child's behalf, and merges into an integration branch only the
+lanes whose every commit past the base it stamped. They are in this module
 because it is the ONLY git driver: the lock, the timeout, `shell=False`, and
 the refusal to force anything that could lose work are decided once, here.
 `add` grew `start_point` for the same caller. `CACHE_DIRS` names what a test
@@ -867,3 +868,56 @@ def rev_of(root, ref) -> str:
         ok, out, _err = _git(root, "rev-parse", "--verify", "--quiet",
                              f"{ref}^{{commit}}")
     return out.strip() if ok else ""
+
+
+class LogEntry(NamedTuple):
+    """One commit as `commits_since` reads it: its object name and the values
+    of the one trailer asked for, in the order git prints them -- ``()`` when
+    the message carries none."""
+
+    sha: str = ""
+    trailers: tuple = ()
+
+
+def _is_trailer_key(key) -> bool:
+    """A trailer token as git spells one: letters, digits and dashes, starting
+    with a letter. Anything else is refused before it reaches a format string,
+    where a comma would read as the next option."""
+    return (bool(key) and key.isascii() and key[0].isalpha()
+            and key.replace("-", "").isalnum())
+
+
+def commits_since(root, base, ref, trailer):
+    """Every commit *ref* has that *base* does not (``base..ref``), newest
+    first, each with the values of *trailer* as git's OWN trailer parser reads
+    the message -- `%(trailers:key=...)`: the last paragraph, `Key: value`
+    lines -- so a key mentioned in a body is not one. ``()`` when nothing is
+    ahead; ``None`` when git could not answer (an unknown rev, a repository
+    that would not open) or was not asked: a rev that reads as an option
+    (`--output=x..HEAD` makes `log` WRITE a file), or a key that is not a
+    trailer token. Reads only; total.
+
+    For `orchestrator.integrate`, which delivers a lane only when every commit
+    past the base carries the stamp `commit_lane` puts there. NUL and SOH
+    separate the fields and the records because, unlike the unit separators,
+    Python does not count them as whitespace to strip."""
+    base, ref, key = str(base or ""), str(ref or ""), str(trailer or "")
+    if (not base or not ref or base.startswith("-") or ref.startswith("-")
+            or not _is_trailer_key(key)):
+        return None
+    fmt = f"%H%x00%(trailers:key={key},valueonly,separator=%x00)%x01"
+    with _GIT_LOCK:
+        ok, out, _err = _git(root, "log", f"--format={fmt}", f"{base}..{ref}",
+                             "--")
+    if not ok:
+        return None
+    entries = []
+    for record in out.split("\x01"):
+        sha, *values = record.strip(" \t\r\n").split("\x00")
+        if not sha:
+            continue
+        if not _is_oid(sha):
+            return None
+        entries.append(LogEntry(sha, tuple(v for v in (x.strip(" \t\r\n")
+                                                        for x in values) if v)))
+    return tuple(entries)

@@ -25,6 +25,10 @@ suite runner (the wiring cases) are ever faked, and those tests say so.
   never left mid-merge.
 * The integration branch is made from the lanes' base. The main checkout's
   HEAD never moves and its index is never touched.
+* Only what the gate validated is delivered. `commit_lane` stamps what it
+  commits with the `Lintester-Task` trailer; a lane holding any commit past
+  the base without it -- a child that committed anyway, whatever its gate
+  said -- is held whole, named, and kept for a person. Nothing is deleted.
 """
 import inspect
 import json
@@ -563,3 +567,196 @@ def test_the_library_default_makes_no_branch(repo):
     assert _branches(repo, "lint/*/integration") == []
     assert any("lane-0" in line for line in got.kept), \
         "uncommitted work was not kept"
+
+
+# --- only what the gate validated is delivered -----------------------------------
+
+DOCTORED_TEST = """
+    from pkg import writer
+
+
+    def test_write():
+        assert writer.write(1) == 0
+"""
+
+
+def _commits_in_lane(lane, rel, text, message):
+    """What a disobedient child does: writes *rel* and commits it, in its own
+    lane, against the standing "do NOT commit" rule."""
+    _write(lane.worktree_path, rel, text)
+    _git(lane.worktree_path, "add", "-A")
+    _git(lane.worktree_path, "commit", "-qm", message)
+    return _sha(lane.worktree_path, "HEAD")
+
+
+def _lane_branch(got, lane_id=0):
+    return f"lint/{got.mission_id}/lane-{lane_id}"
+
+
+def test_a_lane_holding_a_commit_the_orchestrator_did_not_make_is_held_not_merged(
+        repo):
+    """THE hole. Children are told not to commit, nothing stops one, and
+    `rollback` keeps commits on purpose -- so `integrate_lanes` merged the
+    lane's TIP, and whatever a child had committed rode in under the next
+    unit's green gate. A lane is merged only when every commit past the base
+    is one `commit_lane` stamped; this one is kept whole, its foreign commit
+    named, and no integration branch is made of it."""
+    foreign = {}
+
+    def runner(entry, lane):
+        if entry.task_id == "t-writer":
+            foreign["sha"] = _commits_in_lane(lane, "src/pkg/writer.py",
+                                              BROKEN_WRITER, "child: my commit")
+        else:
+            _write(lane.worktree_path, "src/pkg/other.py", CHANGED_OTHER)
+        return True
+
+    got = _mission(repo, runner, decomposer=_two_units, lanes=1)
+
+    assert set(got.completed) == {"t-writer", "t-other"}
+    assert got.outcome == "partial", got.reason
+    assert "merge-back" in got.reason and foreign["sha"][:12] in got.reason
+    assert _branches(repo, "lint/*/integration") == []
+    assert list(repo.glob(".worktrees/integration-*")) == []
+    report = got.integration
+    assert report["ok"] is False and report["merged"] == []
+    [row] = report["skipped"]
+    assert row["lane_id"] == 0 and row["merged"] is False
+    assert row["foreign"] == [foreign["sha"]]
+    assert foreign["sha"][:12] in row["reason"]
+    # Nothing was deleted: the lane, its branch, the child's commit and the
+    # stamped one above it are all kept, for a person.
+    assert _ahead(repo, _lane_branch(got)) == 2
+    assert (repo / ".worktrees" / "lane-0").exists()
+    assert any("lane-0" in line for line in got.kept), got.kept
+    assert "OTHER = True" in _git(repo, "show",
+                                  f"{_lane_branch(got)}:src/pkg/other.py").stdout
+    rt = json.loads(json.dumps(got.as_dict()))
+    assert rt["integration"]["skipped"][0]["foreign"] == [foreign["sha"]]
+
+
+def test_a_refused_units_committed_edit_never_reaches_the_integration_branch(
+        repo):
+    """The scenario the hole was found by. Unit 1's child doctors the test its
+    broken work would fail and COMMITS the doctored test; unit 2 on the same
+    lane is honest. Whatever the gate makes of unit 1 -- this repository's
+    gate has judged that differently as K13 landed -- the doctored test must
+    not become the mission's deliverable, and must not be deleted either."""
+    doctored = {}
+
+    def runner(entry, lane):
+        if entry.task_id == "t-writer":
+            doctored["sha"] = _commits_in_lane(lane, "tests/test_writer.py",
+                                               DOCTORED_TEST, "child: doctor")
+            _write(lane.worktree_path, "src/pkg/writer.py", BROKEN_WRITER)
+        else:
+            _write(lane.worktree_path, "src/pkg/other.py", CHANGED_OTHER)
+        return True
+
+    got = _mission(repo, runner, decomposer=_two_units, lanes=1,
+                   validator=gate_mod.SuiteGate(root=repo, project="test"))
+
+    assert got.outcome == "partial", got.reason
+    assert _branches(repo, "lint/*/integration") == []
+    assert got.integration["ok"] is False and got.integration["merged"] == []
+    [row] = got.integration["skipped"]
+    assert row["foreign"] == [doctored["sha"]], row
+    shown = _git(repo, "show", f"{_lane_branch(got)}:tests/test_writer.py").stdout
+    assert "== 0" in shown, "the child's commit is kept on the lane, for a person"
+    assert (repo / ".worktrees" / "lane-0").exists()
+
+
+def test_work_a_child_committed_itself_is_held_even_when_the_gate_passed(repo):
+    """The decision, pinned: a commit the orchestrator did not make is not
+    delivered even when the unit's gate was green. From the branch the merge
+    reads, a child's commit of validated work is indistinguishable from a
+    refused unit's, and `commit_lane` -- which finds nothing left to commit --
+    is the only thing that stamps. The work is not lost: the lane is kept
+    whole and the report names the commit for a person to pick up."""
+    own = {}
+
+    def runner(entry, lane):
+        own["sha"] = _commits_in_lane(lane, "src/pkg/writer.py",
+                                      CHANGED_WRITER, "child: my own commit")
+        return True
+
+    got = _mission(repo, runner,
+                   validator=gate_mod.SuiteGate(root=repo, project="test"))
+
+    assert got.completed == ("t-writer",)
+    [commit] = got.commits
+    assert commit["ok"] is True and commit["changed"] is False
+    assert _branches(repo, "lint/*/integration") == []
+    assert got.integration["ok"] is False
+    assert got.integration["skipped"][0]["foreign"] == [own["sha"]]
+    assert got.outcome == "partial" and own["sha"][:12] in got.reason
+    shown = _git(repo, "show", f"{_lane_branch(got)}:src/pkg/writer.py").stdout
+    assert "CHANGED = True" in shown
+    assert (repo / ".worktrees" / "lane-0").exists()
+
+
+def test_two_units_on_one_lane_both_stamped_still_merge(repo):
+    """The canary for the hold: the rule is "every commit past the base is
+    stamped", not "the tip is". Two honest units on one lane are two stamped
+    commits, and the lane merges as before."""
+    got = _mission(repo, _per_task(TWO_FILES), decomposer=_two_units, lanes=1)
+
+    assert got.outcome == "ok", got.reason
+    integration = _integration(got)
+    assert _ahead(repo, integration) == 3          # two lane commits, one merge
+    assert got.integration["skipped"] == []
+    assert [m["lane_id"] for m in got.integration["merged"]] == [0]
+    shas = _git(repo, "rev-list", f"main..{_lane_branch(got)}").stdout.split()
+    assert len(shas) == 2
+    for sha in shas:
+        body = _git(repo, "log", "-1", "--format=%B", sha).stdout
+        assert f"{integrate_mod.COMMIT_TRAILER}: t-" in body, body
+
+
+def test_a_lane_whose_history_git_could_not_read_is_held_not_merged(
+        repo, monkeypatch):
+    """Unproven is not validated: when git cannot list what is past the base,
+    the lane is kept, never merged on the assumption that it is clean."""
+    monkeypatch.setattr(mn_wt, "commits_since", lambda *a, **k: None)
+
+    got = _mission(repo, _writes({"src/pkg/writer.py": CHANGED_WRITER}))
+
+    assert got.outcome == "partial", got.reason
+    assert _branches(repo, "lint/*/integration") == []
+    [row] = got.integration["skipped"]
+    assert row["foreign"] == [] and "could not" in row["reason"], row
+    assert _ahead(repo, _lane_branch(got)) == 1
+    assert (repo / ".worktrees" / "lane-0").exists()
+
+
+def test_a_held_lane_does_not_hold_the_others(repo):
+    """One lane's foreign commit keeps that lane out; the honest lane still
+    merges, the integration branch is made, and the report carries both."""
+    foreign = {}
+
+    def runner(entry, lane):
+        if entry.task_id == "t-writer":
+            foreign["sha"] = _commits_in_lane(lane, "src/pkg/writer.py",
+                                              CHANGED_WRITER, "child: my commit")
+        else:
+            _write(lane.worktree_path, "src/pkg/other.py", CHANGED_OTHER)
+        return True
+
+    got = _mission(repo, runner, decomposer=_two_units, lanes=2)
+
+    assert got.outcome == "partial", got.reason
+    integration = _integration(got)
+    assert _ahead(repo, integration) == 2          # one lane commit, one merge
+    assert "OTHER = True" in _git(repo, "show",
+                                  f"{integration}:src/pkg/other.py").stdout
+    assert "CHANGED" not in _git(repo, "show",
+                                 f"{integration}:src/pkg/writer.py").stdout
+    report = got.integration
+    assert report["ok"] is False
+    [merged] = report["merged"]
+    [held] = report["skipped"]
+    assert {merged["lane_id"], held["lane_id"]} == {0, 1}
+    assert held["foreign"] == [foreign["sha"]]
+    assert report["next"] == f"git switch {integration}"
+    assert (repo / ".worktrees" / f"lane-{held['lane_id']}").exists()
+    assert not (repo / ".worktrees" / f"lane-{merged['lane_id']}").exists()

@@ -468,6 +468,13 @@ def test_the_switch_command_the_refusal_names_is_the_integration_branch(store, m
     assert any(f"git switch {branch}" in line for line in said)
 
 
+def _stamped(root, base, ref, trailer):
+    """A lane whose one commit past the base is one `commit_lane` stamped, so
+    the provenance check passes and the failure under test is `add`'s."""
+    from mindhive.mindnet import worktree as mn_wt
+    return (mn_wt.LogEntry("a" * 40, ("t-1",)),)
+
+
 def test_a_merge_failure_is_what_feeds_the_breaker(store, monkeypatch):
     """The wiring that matters: a lane that could not be merged records a
     failure, a clean run records a success. Without this the breaker is a
@@ -476,6 +483,7 @@ def test_a_merge_failure_is_what_feeds_the_breaker(store, monkeypatch):
 
     b = brk.IntegrationBreaker(project="p")
     monkeypatch.setattr(integrate.mn_wt, "state", lambda p, base: (False, 2))
+    monkeypatch.setattr(integrate.mn_wt, "commits_since", _stamped)
     monkeypatch.setattr(integrate.mn_wt, "add", lambda *a, **k: integrate.mn_wt.Isolated(
         task_id="integration", path=str(store / "iso"), branch="lint/m/integration",
         ok=False, reason="no checkout"))
@@ -546,6 +554,7 @@ def test_the_default_circuit_does_not_key_on_the_process_cwd(store, monkeypatch)
 
     monkeypatch.delenv("MINDHIVE_PROJECT", raising=False)
     monkeypatch.setattr(integrate.mn_wt, "state", lambda p, base: (False, 1))
+    monkeypatch.setattr(integrate.mn_wt, "commits_since", _stamped)
     other = store / "someone-elses-repo"
     other.mkdir()
     root = store / "mission-repo"

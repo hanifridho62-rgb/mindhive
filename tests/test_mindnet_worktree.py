@@ -1150,3 +1150,75 @@ def test_is_toplevel_asks_git_once(repo, monkeypatch):
     assert wt.is_toplevel(repo) is True
     assert len(ran) == 1, ran
     assert "--show-toplevel" in ran[0] and "--absolute-git-dir" in ran[0]
+
+
+# --- the merge-back's provenance read ---------------------------------------------
+#
+# `orchestrator.integrate` delivers a lane only when every commit past the base
+# is one it stamped. This is the read that tells them apart -- git's own
+# trailer parser answering, not a substring search over messages.
+
+def _commit_with(repo, rel, message):
+    (repo / rel).write_text(f"{rel}\n", encoding="utf-8")
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-qm", message)
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_commits_since_reads_each_commit_with_the_trailer_git_sees(repo):
+    """Newest first, as `git log` prints them, each with the values of the one
+    trailer asked for as `git interpret-trailers` reads a message -- the LAST
+    paragraph, `Key: value` lines -- so the key mentioned in a body is not a
+    trailer, and two trailer lines are two values."""
+    start = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    stamped = _commit_with(repo, "a.txt", "lint(m) t-1: title\n\n"
+                           "Lintester-Task: t-1\n"
+                           "Co-Authored-By: Claude <noreply@anthropic.com>")
+    foreign = _commit_with(repo, "b.txt", "a child's own commit\n\n"
+                           "it mentions Lintester-Task: in the body\n\n"
+                           "and ends with prose")
+    twice = _commit_with(repo, "c.txt", "two\n\nLintester-Task: t-2\n"
+                         "Lintester-Task: t-3\n")
+
+    got = wt.commits_since(repo, start, "HEAD", "Lintester-Task")
+
+    assert got == (wt.LogEntry(twice, ("t-2", "t-3")),
+                   wt.LogEntry(foreign, ()),
+                   wt.LogEntry(stamped, ("t-1",)))
+    assert wt.commits_since(repo, start, start, "Lintester-Task") == ()
+    assert wt.commits_since(repo, twice, start, "Lintester-Task") == ()
+
+
+@pytest.mark.parametrize("base, ref, key", [
+    ("no-such-ref", "HEAD", "Lintester-Task"),
+    ("HEAD", "no-such-ref", "Lintester-Task"),
+    ("", "HEAD", "Lintester-Task"),
+    ("HEAD", "", "Lintester-Task"),
+    ("HEAD", "HEAD", ""),
+    ("HEAD", "HEAD", "Bad Key"),
+    ("HEAD", "HEAD", "key,valueonly"),
+])
+def test_commits_since_is_none_where_git_could_not_or_must_not_answer(
+        repo, base, ref, key):
+    """An unknown rev, and a key that is not a trailer token (git would read
+    the comma as its next format option): ``None``, never ``()`` -- the
+    caller reads ``()`` as "nothing foreign here" and merges."""
+    assert wt.commits_since(repo, base, ref, key) is None
+
+
+def test_commits_since_never_hands_git_an_option_as_a_rev(repo, monkeypatch):
+    """`git log --output=x..HEAD` WRITES a file named for the range. A rev
+    that reads as an option is refused before git is asked anything."""
+    calls = []
+    real = wt._git_rc
+    monkeypatch.setattr(wt, "_git_rc",
+                        lambda root, *a: calls.append(a) or real(root, *a))
+    assert wt.commits_since(repo, "--output=x", "HEAD", "Lintester-Task") is None
+    assert wt.commits_since(repo, "HEAD", "--all", "Lintester-Task") is None
+    assert calls == []
+    assert not list(Path(repo).glob("x*"))
+
+
+def test_commits_since_outside_a_repository_is_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    assert wt.commits_since(tmp_path, "HEAD", "HEAD", "Lintester-Task") is None
