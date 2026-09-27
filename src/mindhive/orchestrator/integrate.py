@@ -9,14 +9,45 @@ Children are forbidden to commit (`mindnet/agent.py`): a headless agent that
 could `git commit` could also `git push`, and the authorship control rests on
 it not being able to. So the work a child leaves in its lane is committed HERE,
 on its behalf, by `commit_lane` -- and `gate.gated` calls it only after the
-child exited cleanly AND its targeted tests passed. A unit the gate refused
-never reaches a branch; the repair loop rolls its lane back instead.
+child exited cleanly AND its targeted tests passed. A unit the gate refused is
+rolled back by the repair loop instead of committed. But `rollback` keeps
+commits on purpose, and nothing STOPS a child from committing, so a refused
+unit's edit can be sitting on the lane branch when the merge comes -- under
+the next unit's green gate. The branch alone does not say what was validated;
+the stamp does.
 
 A commit that fails is an integration fact, never the unit's failure. The gate
 already proved the work; routing a failed `git commit` through the repair loop
 would roll the lane back and DISCARD it. The row says what happened, the lane
 stays on disk (`retire` keeps a dirty tree), and the mission is `partial` for
 that reason.
+
+## Only what the gate validated is delivered
+
+`commit_lane` stamps every commit it makes with the `Lintester-Task` trailer
+(`commit_message`), and `integrate_lanes` merges a lane only when EVERY commit
+past the base on its branch carries it -- read with
+`mindnet.worktree.commits_since`, git's own trailer parser, not a search over
+messages. A lane holding a commit the orchestrator did not make is HELD:
+reported in `skipped` with the foreign shas (`LaneMerge.foreign`), kept
+whole, branch and tree, for a person, and nothing of it merged. Whole, because
+the stamped commits above a foreign one were validated on top of it, and
+delivering them without it is not what the gate saw either. The first version
+of this module merged the lane's TIP, and a doctored test a child had
+committed under a refused unit rode into the deliverable that way.
+
+This holds even when the foreign commit is validated work a disobedient child
+committed itself -- the gate green, `commit_lane` finding nothing left to
+commit. Decided so, and pinned in the tests, because from the branch the merge
+reads that commit is indistinguishable from a refused unit's: the gate's
+verdict is process memory the merge is not handed (`lintester.py` is
+zero-edit), and the branch is the only record it has. The cost is a held lane
+the report names; the alternative was a rule a doctored test satisfies by
+being committed BEFORE an honest unit. A lane git cannot list is held the
+same way: unproven is not validated. Not caught, and said so: a child that
+forges the trailer or rewrites a stamped commit. That is a hostile child, not
+a disobedient one, and telling the two apart from a branch is not something a
+merge policy can do.
 
 ## Probe first, then merge, then prove
 
@@ -35,15 +66,17 @@ started even when the operator has moved `HEAD` since. `add`'s own rule refuses
 to reset a leftover integration branch that holds commits. When the mission
 ends the worktree is retired and the BRANCH survives: `git switch
 lint/<mission>/integration` is the operator's next step, and the report names
-it. Nothing is created when no lane committed anything.
+it. Nothing is created when no lane committed anything, or when every lane
+that did is held.
 
 ## The circuit
 
 Merging is guarded by `breaker.IntegrationBreaker`. Three consecutive
-integrations that did not fully land open it, and while it is open this module
-refuses BEFORE `add` makes a checkout: no integration worktree, no merge, every
-candidate reported in `skipped` with the reason, and a line naming the branch a
-person would switch to. The lanes are untouched, so a refused mission is
+integrations that did not fully land -- a held lane counts as not landed --
+open it, and while it is open this module refuses BEFORE `add` makes a
+checkout: no integration worktree, no merge, every candidate reported in
+`skipped` with the reason, and a line naming the branch a person would switch
+to. The lanes are untouched, so a refused mission is
 `partial` -- work that ran and did not land -- not a crash. `lintester.py` is
 zero-edit and passes no breaker, so one is built here for the namespace the
 MISSION's own checkout belongs to: running uncircuited by default would make
@@ -105,7 +138,9 @@ class LaneCommit(NamedTuple):
 
 
 class LaneMerge(NamedTuple):
-    """One lane's fate at the integration branch."""
+    """One lane's fate at the integration branch. ``foreign`` names the
+    commits past the base that `commit_lane` did not make, when that is what
+    kept the lane out."""
 
     lane_id: int = -1
     branch: str = ""
@@ -113,10 +148,12 @@ class LaneMerge(NamedTuple):
     sha: str = ""
     conflicts: tuple = ()
     reason: str = ""
+    foreign: tuple = ()
 
     def as_dict(self) -> dict:
         row = self._asdict()
         row["conflicts"] = list(self.conflicts)
+        row["foreign"] = list(self.foreign)
         return row
 
 
@@ -152,7 +189,8 @@ class Integration:
 def commit_message(mission_id, task) -> str:
     """The lane commit's message: a subject naming the mission and the unit, a
     trailer a `git log --grep` can find, and the co-author line every commit
-    an agent shaped here carries."""
+    an agent shaped here carries. The trailer is also the merge's proof of
+    provenance: `integrate_lanes` merges no commit past the base without it."""
     task_id = str(getattr(task, "task_id", "") or "")
     title = str(getattr(task, "title", "") or "").strip() or task_id
     return (f"lint({mission_id}) {task_id}: {title}\n\n"
@@ -278,9 +316,10 @@ def _breaker_refusal(breaker):
 
 def _breaker_feed(breaker, ok, reason) -> None:
     """The outcome the circuit counts: an integration where every candidate
-    landed is a success, one where any lane did not is a failure. A run that
-    merged nothing because no lane committed is neither, and never reaches
-    here. Total, for the same reason as `_breaker_refusal`."""
+    landed is a success, one where any lane did not -- a held lane included
+    -- is a failure. A run that merged nothing because no lane committed is
+    neither, and never reaches here. Total, for the same reason as
+    `_breaker_refusal`."""
     if breaker is None:
         return
     try:
@@ -322,14 +361,51 @@ def _merge_one(root, path, branch, lane_id, lane_branch, mission_id) -> LaneMerg
     return LaneMerge(lane_id, lane_branch, merged=True, sha=got.sha)
 
 
+def _unmerged(rows) -> str:
+    """The reason line: one clause per lane that did not land."""
+    return "; ".join(f"lane {m.lane_id} was not merged ({m.reason})"
+                     for m in rows)
+
+
+def _held(root, base, tree):
+    """The row that keeps a lane out of the merge, or ``None`` when every
+    commit past *base* on its branch is one `commit_lane` stamped. A history
+    git could not list holds the lane too: unproven is not validated, and a
+    held lane loses nothing -- it is kept, branch and tree, as it stands."""
+    lane_id = int(getattr(tree, "lane_id", -1))
+    lane_branch = str(getattr(tree, "branch", "") or "")
+    try:
+        entries = mn_wt.commits_since(root, base, lane_branch, COMMIT_TRAILER)
+    except Exception:                                   # noqa: BLE001
+        entries = None
+    if entries is None:
+        return LaneMerge(lane_id, lane_branch,
+                         reason=("git could not list the commits past the "
+                                 "base, so none is known to be validated; "
+                                 "the lane is kept as it is"))
+    foreign = tuple(str(e.sha) for e in entries if not e.trailers)
+    if not foreign:
+        return None
+    return LaneMerge(lane_id, lane_branch, foreign=foreign,
+                     reason=(f"holds {len(foreign)} commit(s) the orchestrator "
+                             "did not make: "
+                             + ", ".join(sha[:12] for sha in foreign)
+                             + "; kept whole for a person "
+                             f"(git switch {lane_branch})"))
+
+
 def integrate_lanes(root, trees, mission_id, emit=None, *,
                     breaker=None) -> Integration:
     """Merge every lane that committed anything into the integration branch.
 
     *trees* are the mission's `LaneWorktree`s; only the ones that were
     acquired (`ok`) count, and only those whose branch is ahead of the common
-    base are candidates. ``emit(text)`` gets one line per lane. Total: every
-    outcome is a row in the answer, and a refusal names its reason.
+    base are candidates. A candidate is merged only when every commit past the
+    base on its branch carries `commit_lane`'s stamp (`_held`); one holding a
+    commit the orchestrator did not make is kept as it is and reported in
+    ``skipped`` with the foreign shas. ``emit(text)`` gets one line per lane.
+    Total: every outcome is a row in the answer, and a refusal names its
+    reason.
 
     *breaker* is the `IntegrationBreaker` the merge runs under; with none the
     default project's own is used. An open or quarantined circuit refuses
@@ -374,6 +450,20 @@ def integrate_lanes(root, trees, mission_id, emit=None, *,
                    f"look at them with git switch {branch}")
         return Integration(ok=False, branch=branch, base=base,
                            skipped=skipped, reason=reason)
+    held, proven = [], []
+    for tree in candidates:
+        row = _held(root, base, tree)
+        if row is None:
+            proven.append(tree)
+            continue
+        held.append(row)
+        _say(emit, f"lane {row.lane_id}: not merged -- {row.reason}")
+    if not proven:
+        reason = _unmerged(held)
+        _say(emit, "integration: nothing was merged; every lane is kept as it is")
+        _breaker_feed(breaker, False, reason)
+        return Integration(ok=False, branch=branch, base=base,
+                           skipped=tuple(held), reason=reason)
     try:
         iso = mn_wt.add(root, INTEGRATION_NAME, path=target, branch=branch,
                         start_point=base)
@@ -383,17 +473,20 @@ def integrate_lanes(root, trees, mission_id, emit=None, *,
                              reason=f"{type(exc).__name__}: {exc}")
     if not iso.ok:
         reason = str(iso.reason or "the integration checkout could not be made")
-        skipped = tuple(LaneMerge(int(t.lane_id), str(t.branch),
-                                  reason="no integration checkout: " + reason)
-                        for t in candidates)
+        skipped = tuple(held) + tuple(
+            LaneMerge(int(t.lane_id), str(t.branch),
+                      reason="no integration checkout: " + reason)
+            for t in proven)
         _say(emit, f"integration: refused -- {reason}")
+        if held:
+            reason += "; " + _unmerged(held)
         _breaker_feed(breaker, False, reason)
         return Integration(ok=False, branch=branch, base=base,
                            skipped=skipped, reason=reason)
 
     path = str(iso.path)
-    merged, skipped = [], []
-    for tree in candidates:
+    merged, skipped = [], list(held)
+    for tree in proven:
         lane_id = int(getattr(tree, "lane_id", -1))
         row = _merge_one(root, path, branch, lane_id,
                          str(getattr(tree, "branch", "") or ""), mission_id)
@@ -401,8 +494,7 @@ def integrate_lanes(root, trees, mission_id, emit=None, *,
         _say(emit, f"lane {lane_id}: "
                    + ("merged" if row.merged else f"not merged -- {row.reason}"))
     sha = mn_wt.rev_of(root, branch)
-    reason = "; ".join(f"lane {m.lane_id} was not merged ({m.reason})"
-                       for m in skipped)
+    reason = _unmerged(skipped)
     _breaker_feed(breaker, not skipped, reason)
     return Integration(ok=not skipped, branch=branch, sha=sha, base=base,
                        path=path, merged=tuple(merged), skipped=tuple(skipped),
