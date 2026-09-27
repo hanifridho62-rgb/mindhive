@@ -2,6 +2,10 @@
 # Pure-function fixtures throughout: skills are {name, plugin, description}
 # dicts, stats mirror plugins.skill_stats output, incidents mirror
 # incidents.summaries records. No store needed.
+import math
+
+import pytest
+
 from mindhive import recommend
 
 
@@ -268,22 +272,38 @@ def test_discontinued_with_active_rule_and_streak():
 
 
 def test_streak_below_threshold_stays_recommended():
+    # Four calls, not five: a two-streak multiplies the MEB score by e^-1, so
+    # at five or more calls ANY two-streak is below 0.50 and the K2 score door
+    # (next section) would discontinue it. Under DISCONTINUE_MIN_CALLS the
+    # rule path's own threshold is the only thing being tested.
     incidents = [{"signature": "skill:x", "status": "active",
                   "active_rule": "rule text"}]
     out = recommend.recommend([_skill("x", "d")],
-                              {"x": _fstat(5, 3, fail_streak=2, last="fail")},
+                              {"x": _fstat(4, 2, fail_streak=2, last="fail")},
                               incidents=incidents, needs=[])
     assert _names(out) == ["x"]
     assert out["discontinued"] == []
+    assert out["recommendations"][0]["promotion"] == "PROBATION"
 
 
-def test_dismissed_rule_does_not_discontinue():
+def test_a_dismissed_rule_never_reaches_the_rule_path_but_the_meb_score_still_judges():
+    """Before P4 a dismissed rule meant no discontinuation at all. The MEB
+    rule (K2) judges the RECORD: 2 of 5 with four trailing failures is
+    DISCONTINUED whatever the incident's status -- by the score door, with
+    the Laplace reason and no rule attached."""
     incidents = [{"signature": "skill:x", "status": "demoted",
                   "active_rule": "rule text"}]
     out = recommend.recommend([_skill("x", "d")],
                               {"x": _fstat(5, 2, fail_streak=4, last="fail")},
                               incidents=incidents, needs=[])
-    assert _names(out) == ["x"]
+    assert _names(out) == []
+    d = out["discontinued"][0]
+    assert d["rule"] is None and d["promotion"] == "DISCONTINUED"
+    assert d["reason"].startswith("discontinued: skor Laplace ")
+    # CANARY: the same dismissed rule over a clean record discontinues nothing.
+    out = recommend.recommend([_skill("x", "d")], {"x": _fstat(5, 5)},
+                              incidents=incidents, needs=[])
+    assert _names(out) == ["x"] and out["discontinued"] == []
 
 
 def test_successful_call_breaks_streak_and_restores():
@@ -294,6 +314,73 @@ def test_successful_call_breaks_streak_and_restores():
                               {"x": _fstat(6, 3, fail_streak=0)},
                               incidents=incidents, needs=[])
     assert _names(out) == ["x"]
+
+
+# --- blueprint P4 (MEB §2.3 C, decision K2): the Laplace promotion ----------
+
+def test_a_scored_entry_carries_the_laplace_score_and_its_promotion():
+    out = recommend.score_skill(_skill("a", "d"), {"a": _fstat(5, 5)})
+    assert out["laplace_rate"] == pytest.approx(6 / 7)
+    assert out["skill_score"] == pytest.approx(6 / 7)
+    assert out["promotion"] == "QUALIFIED" and out["execution_mode"] == "auto"
+    # the keys the projector and the dashboard already read are untouched
+    assert out["completion_rate"] == 1.0 and out["score"] == 1.0
+    assert "measured 5/5 completion" in out["reason"]
+
+
+def test_a_never_called_skill_scores_the_flat_prior_and_stays_on_probation():
+    out = recommend.score_skill(_skill("a", "d"), {})
+    assert out["laplace_rate"] == 0.5 and out["skill_score"] == 0.5
+    assert out["promotion"] == "PROBATION" and out["execution_mode"] == "suggest"
+
+
+def test_a_streak_takes_the_promotion_down_with_the_meb_penalty():
+    out = recommend.score_skill(_skill("a", "d"),
+                                {"a": _fstat(10, 7, fail_streak=1, last="fail")})
+    assert out["skill_score"] == pytest.approx((8 / 12) * math.exp(-0.5))
+    assert out["promotion"] == "DISCONTINUED"      # 0.404 < 0.50 at ten calls
+
+
+def test_auto_mode_is_exactly_the_qualified_status():
+    for st, mode in ((_fstat(4, 4), "auto"), (_fstat(3, 3), "suggest"),
+                     (_fstat(5, 3), "suggest")):
+        out = recommend.score_skill(_skill("a", "d"), {"a": st})
+        assert out["execution_mode"] == mode, (st, out["promotion"])
+        assert (out["promotion"] == "QUALIFIED") == (mode == "auto")
+
+
+def test_bad_bookkeeping_never_raises_out_of_score_skill():
+    st = _fstat(5, 2, fail_streak=4, last="fail")       # a streak longer than the failures
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert out["promotion"] == "DISCONTINUED"
+    st = dict(_fstat(5, 5), ok=9)                        # more successes than calls
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert out["promotion"] == "PROBATION" and out["execution_mode"] == "suggest"
+    assert 0.0 <= out["laplace_rate"] <= 1.0 and 0.0 <= out["skill_score"] <= 1.0
+
+
+def test_the_meb_score_rule_discontinues_without_any_incident():
+    """`recommend()`'s rule path (active rule + streak) stays; the MEB adds a
+    second door: a score below 0.50 after five calls, no incident needed."""
+    out = recommend.recommend([_skill("x", "d")], {"x": _fstat(6, 2, fail_streak=0)},
+                              needs=[])
+    assert _names(out) == []
+    d = out["discontinued"][0]
+    assert d["name"] == "x" and d["rule"] is None and d["promotion"] == "DISCONTINUED"
+    assert d["reason"] == "discontinued: skor Laplace 0.38 di bawah 0.50 setelah 6 panggilan"
+    assert out["coverage"] == {"measured": 1, "total": 1}
+
+
+def test_the_rule_path_keeps_its_reason_when_both_doors_would_open():
+    incidents = [{"signature": "skill:x", "status": "active",
+                  "active_rule": "dry-run first"}]
+    out = recommend.recommend([_skill("x", "d")],
+                              {"x": _fstat(5, 2, fail_streak=3, last="fail")},
+                              incidents=incidents, needs=[])
+    d = out["discontinued"][0]
+    assert d["rule"] == "dry-run first"
+    assert d["reason"].startswith("discontinued: 3 consecutive failures")
+    assert d["promotion"] == "DISCONTINUED"
 
 
 # --------------------------------------------------------------------------
@@ -453,12 +540,19 @@ def test_the_measured_gate_counts_observed_calls_not_typed_ones():
 
 
 def test_enough_observed_calls_still_reach_measured(report=None):
-    """CANARY: the gate must count observed calls, not refuse to count."""
+    """CANARY: the gate must count observed calls, not refuse to count. Three
+    observed calls are MEASURED (the provenance label); the MEB's promotion
+    wants four (`QUALIFIED_MIN_CALLS`, K2), so auto takes one more witnessed
+    call -- two bars, on purpose."""
     st = _partly_observed(30, 27, 3)
     out = recommend.score_skill(_skill("a", "d"), {"a": st})
     assert out["observed"] == 3
     assert out["provenance"] == "measured"
-    assert out["execution_mode"] == "auto"
+    assert out["promotion"] == "PROBATION" and out["execution_mode"] == "suggest"
+    st = _partly_observed(30, 26, 4)
+    out = recommend.score_skill(_skill("a", "d"), {"a": st})
+    assert out["observed"] == 4 and out["provenance"] == "measured"
+    assert out["promotion"] == "QUALIFIED" and out["execution_mode"] == "auto"
 
 
 def test_the_measured_reason_names_the_observed_denominator():

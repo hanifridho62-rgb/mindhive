@@ -350,8 +350,11 @@ def log_linear_estimate(complexity: float, churn: float, alpha: float,
     """`ln(T_est) = α + β1·ln(Complexity) + β2·ln(Churn) + ε`, returned as
     `T_est` -- the bare formula: a non-positive input has no logarithm and
     raises. `floor` is the caller's guard, not the text's: `floor=1.0` clamps
-    both inputs up to 1 so a zero-churn file estimates as `exp(α + β1·ln C)`
-    (what `payoff.compute_calibrated_weight` needs for real repositories)."""
+    both inputs up to 1 so a zero-churn file estimates as `exp(α + β1·ln C)`,
+    the guard a caller weighing a real repository would need. The runtime
+    weight (`payoff.compute_calibrated_weight`, decision K3) is a different
+    formula that takes `ln(1 + x)` and needs no floor; this one stays BAB 3's
+    duration estimate."""
     for name, v in (("complexity", complexity), ("churn", churn), ("alpha", alpha),
                     ("beta_complexity", beta_complexity), ("beta_churn", beta_churn),
                     ("epsilon", epsilon)):

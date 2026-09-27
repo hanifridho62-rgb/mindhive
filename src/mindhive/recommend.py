@@ -35,11 +35,26 @@ Cold-start honesty: the output reports measured coverage
 EXPLORE_NEED_MIN gets a small deterministic exploration bonus plus a
 ``try_to_measure`` flag, so early measured winners cannot permanently entrench
 behind the calls gate while the rest of the inventory sits unmeasured.
+
+Promotion (blueprint P4, MEB §2.3 C, decision K2): every scored entry also
+carries the MEB's Laplace machinery from ``core.recommend`` -- ``laplace_rate``
+``(ok + 1) / (calls + 2)``, ``skill_score`` (that rate times
+``e^(-fail_streak / 2)``) and ``promotion``, one of QUALIFIED / PROBATION /
+DISCONTINUED -- and ``execution_mode`` is ``auto`` exactly when the promotion
+is QUALIFIED: score >= 0.80, at least four OBSERVED calls, no open incident.
+``MEASURED_MIN_CALLS`` (three) stays the bar for the ``measured`` label; the
+promotion's four is a different bar on purpose. ``should_promote_skill`` is
+the adapter, and it is total over the contradictory rows a folded telemetry
+can carry. ``recommend`` has a second discontinuation door beside the
+improvements linkage: a promotion of DISCONTINUED (a three-streak, or a score
+below 0.50 after five calls) with the reason
+``discontinued: skor Laplace <x> di bawah 0.50 setelah <n> panggilan``.
 """
 from __future__ import annotations
 
 import re
 
+from .core import recommend as core_recommend
 from .plugins import TOPIC_KEYWORDS
 
 MEASURED_MIN_CALLS = 3      # calls needed before a rate counts as measured
@@ -163,6 +178,51 @@ def open_skill_incidents(incidents) -> dict:
     return out
 
 
+def _whole(value):
+    """A non-negative integer count out of a telemetry field: 0 for an absent
+    field (`None`), the count for a number or a numeric string, and `None` for
+    a value that is not a count at all -- a bool, NaN, an infinity (which
+    overflows `int()`), a non-numeric string, a negative."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if n >= 0 else None
+
+
+def should_promote_skill(ok, calls, fail_streak, open_incidents=0) -> tuple:
+    """``(auto, status)`` for a skill's counts under the MEB's promotion rule
+    (blueprint P4, decision K2): ``status`` is ``core.recommend``'s QUALIFIED
+    / PROBATION / DISCONTINUED and ``auto`` is ``status == "QUALIFIED"``.
+    *calls* is the OBSERVED count (see ``observed_calls``).
+
+    Total. ``core.recommend`` validates its counts and raises on a
+    contradiction; this path must not, because the row it scores was folded
+    from events by several hands. A reported streak of ``DISCONTINUE_STREAK``
+    is a fact on its own and answers DISCONTINUED whatever the other counts
+    say; any other contradiction -- more successes than calls, a streak longer
+    than the failures -- is the residual status, PROBATION, and never a
+    promotion. An absent field reads as 0; a value that is not a count at all
+    (a bool, NaN, an infinity, a non-numeric string, a negative) makes the row
+    one this cannot read -- PROBATION, never a promotion -- unless the streak
+    alone already says DISCONTINUED. Reading garbage as 0 would promote a row
+    whose streak field happens to be broken."""
+    ok_n, calls_n = _whole(ok), _whole(calls)
+    streak_n, incidents_n = _whole(fail_streak), _whole(open_incidents)
+    if streak_n is not None and streak_n >= core_recommend.DISCONTINUE_STREAK:
+        return False, core_recommend.DISCONTINUED
+    if None in (ok_n, calls_n, streak_n, incidents_n):
+        return False, core_recommend.PROBATION           # not a row this can read
+    if ok_n > calls_n or streak_n > calls_n - ok_n:
+        return False, core_recommend.PROBATION
+    status = core_recommend.promotion_status(ok_n, calls_n, streak_n, incidents_n)
+    return status == core_recommend.QUALIFIED, status
+
+
 def breadth_prior(description) -> float:
     """Breadth fallback for unmeasured skills, reusing plugins.evaluate's topic
     vocabulary on one skill's description: distinct topics hit, capped, scaled
@@ -260,11 +320,21 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
     try_measure = (not measured) and nm >= EXPLORE_NEED_MIN
     score = ((rate if measured else prior) + W_NEED * nm - penalty
              + (EXPLORE_BONUS if try_measure else 0.0))
-    # Learning-gated execution: only a proven skill (measured, high completion
-    # rate, no open incident) may run automatically; everything else — above
-    # all a never-used skill — is suggest-only.
-    auto = (measured and (rate or 0.0) >= AUTO_MIN_RATE
-            and not (open_incidents or {}).get(name, 0))
+    # Learning-gated execution (blueprint P4, decision K2): a skill runs
+    # automatically exactly when the MEB promotes it -- QUALIFIED: a Laplace
+    # score >= 0.80 over at least four OBSERVED calls and no open incident.
+    # Everything else — above all a never-used skill — is suggest-only. The
+    # rate and the score on the entry come from the coherent reading of the
+    # row (successes capped at the observed calls, the streak at the
+    # failures) so they never raise; the promotion comes from the adapter,
+    # which fails closed on a contradiction.
+    ok_n = min(_whole(st.get("ok")) or 0, observed)
+    streak_n = min(_whole(st.get("fail_streak")) or 0, max(0, observed - ok_n))
+    auto, promotion = should_promote_skill(
+        st.get("ok"), observed, st.get("fail_streak"),
+        (open_incidents or {}).get(name, 0))
+    laplace = core_recommend.bayesian_laplace_rate(ok_n, observed)
+    skill_score = core_recommend.skill_score(ok_n, observed, streak_n)
     return {
         "name": name,
         "plugin": skill.get("plugin", ""),
@@ -274,14 +344,17 @@ def score_skill(skill, stats, needs=None, open_incidents=None) -> dict:
         "completion_rate": rate,
         "calls": calls,
         "observed": observed,        # calls whose outcome was witnessed
-        "streak": int(st.get("streak") or 0),
+        "streak": _whole(st.get("streak")) or 0,
         "need_match": nm,
         "breadth_prior": None if measured else prior,
         "incident_penalty": round(penalty, 4),
         "try_to_measure": try_measure,
         "execution_mode": "auto" if auto else "suggest",
         "outcome_category": outcome_category(st),
-        "fail_streak": int(st.get("fail_streak") or 0),
+        "fail_streak": _whole(st.get("fail_streak")) or 0,
+        "laplace_rate": laplace,     # (ok + 1) / (observed + 2), the MEB's E[theta]
+        "skill_score": skill_score,  # that rate times e^(-fail_streak / 2)
+        "promotion": promotion,      # QUALIFIED / PROBATION / DISCONTINUED
         "reason": _reason(measured, st, observed, nm, penalty),
     }
 
@@ -336,7 +409,9 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
     and flags. ``discontinued`` holds skills stopped by the improvements
     linkage — an active ``skill:*`` prevention rule plus a trailing failure
     streak of DISCONTINUE_STREAK — excluded from ranking until the incident
-    resolves or a successful call breaks the streak."""
+    resolves or a successful call breaks the streak; and, since blueprint P4
+    (decision K2), skills the MEB's promotion rule alone discontinues: a
+    ``promotion`` of DISCONTINUED, ``rule`` None, the Laplace reason."""
     open_inc = open_skill_incidents(incidents)
     rules = active_skill_rules(incidents)
     entries = [score_skill(s, stats, needs=needs, open_incidents=open_inc)
@@ -352,8 +427,23 @@ def recommend(skills, stats, incidents=None, needs=None, top=None) -> dict:
             discontinued.append({
                 "name": e["name"], "plugin": e["plugin"],
                 "fail_streak": e["fail_streak"], "rule": rule,
+                "promotion": e["promotion"],
                 "reason": (f"discontinued: {e['fail_streak']} consecutive "
                            f"failures with an active prevention rule"),
+            })
+        elif e["promotion"] == core_recommend.DISCONTINUED:
+            # The MEB's door (K2): the RECORD says stop -- a three-streak, or a
+            # Laplace score under 0.50 after five observed calls -- with no
+            # incident and no rule needed. The score quoted is the one the
+            # rule read, `skill_score`: the Laplace rate times the streak
+            # penalty, which with no streak is the rate itself.
+            discontinued.append({
+                "name": e["name"], "plugin": e["plugin"],
+                "fail_streak": e["fail_streak"], "rule": None,
+                "promotion": e["promotion"],
+                "reason": (f"discontinued: skor Laplace {e['skill_score']:.2f} "
+                           f"di bawah {core_recommend.PROBATION_MIN_SCORE:.2f} "
+                           f"setelah {e['observed']} panggilan"),
             })
         else:
             active.append(e)
