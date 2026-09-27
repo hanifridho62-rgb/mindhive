@@ -438,6 +438,135 @@ def test_a_dry_run_wires_no_gate(monkeypatch):
     assert seen.get("validator") is None
 
 
+# --- P2: the gate's two refusals, and the flags that stand them down ----------
+
+def test_the_gate_defaults_to_fail_closed_on_both_counts(monkeypatch):
+    """The defaults ARE the feature. A gate wired permissive by default would
+    leave every property `tests/test_orchestrator_gate.py` pins reachable only
+    by a caller who asked for it."""
+    gate = _wired(monkeypatch, "--execute")["validator"]
+    assert gate.allow_untested is False
+    assert gate.immutable_tests is True
+    assert gate.allow_test_edits is False
+
+
+def test_allow_untested_reaches_the_gate(monkeypatch):
+    gate = _wired(monkeypatch, "--execute", "--allow-untested")["validator"]
+    assert gate.allow_untested is True
+
+
+def test_allow_test_edits_reaches_the_gate(monkeypatch):
+    gate = _wired(monkeypatch, "--execute", "--allow-test-edits")["validator"]
+    assert gate.allow_test_edits is True
+
+
+def test_no_immutable_tests_reaches_the_gate(monkeypatch):
+    gate = _wired(monkeypatch, "--execute", "--no-immutable-tests")["validator"]
+    assert gate.immutable_tests is False
+
+
+def test_the_lane_lock_is_held_for_the_mission_and_let_go_after(monkeypatch):
+    """`worktree.LOCK_TESTS` is a module flag because `lintester.py` sits
+    between this front door and `acquire_lanes` and is not edited by this
+    blueprint. A flag left set would then apply to whatever ran next in the
+    same process."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+
+    assert _cli("lintester", "x", "--execute") == 0
+    assert during == [True]
+    assert wt_mod.LOCK_TESTS is False, "the policy outlived its mission"
+
+
+def test_a_dry_run_locks_nothing(monkeypatch):
+    """Nothing runs, so there is nothing to lock — and a plan that chmod-ed
+    the operator's own checkout would be a surprise with no upside."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="dry-run", reason="", environment="",
+                            left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    assert _cli("lintester", "x") == 0
+    assert during == [False]
+
+
+def test_allow_test_edits_also_stands_the_chmod_down(monkeypatch):
+    """One flag, both layers. Locking the files a unit was explicitly allowed
+    to edit would make the permission a lie the child has to work around."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    assert _cli("lintester", "x", "--execute", "--allow-test-edits") == 0
+    assert during == [False]
+
+
+def test_the_report_counts_the_units_nothing_judged(capsys, monkeypatch):
+    """A green mission whose units all passed under `--allow-untested` reads
+    exactly like a tested one. The count is what tells them apart."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(
+        lint_mod.LintesterOrchestrator, "execute_mission",
+        lambda self, intent, dry_run=True, checkpoint_dir=None: _mission(
+            outcome="ok", reason="", environment="", left=(),
+            gates=({"task_id": "t-1", "ok": True, "attempt": 0,
+                    "scope": "untested_override", "targets": [],
+                    "reason": "untested override"},
+                   {"task_id": "t-2", "ok": True, "attempt": 0,
+                    "scope": "untested_override", "targets": [],
+                    "reason": "untested override"},
+                   {"task_id": "t-3", "ok": True, "attempt": 0,
+                    "scope": "targeted", "targets": ["tests/test_x.py"],
+                    "reason": ""})))
+    assert _cli("lintester", "x", "--execute") == 0
+    assert "warning: 2 untested override(s)" in capsys.readouterr().out
+
+
+def test_a_report_with_nothing_overridden_says_nothing(capsys, monkeypatch):
+    from mindhive.orchestrator import lintester as lint_mod
+
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(
+        lint_mod.LintesterOrchestrator, "execute_mission",
+        lambda self, intent, dry_run=True, checkpoint_dir=None: _mission(
+            outcome="ok", reason="", environment="", left=(),
+            gates=({"task_id": "t-1", "ok": True, "attempt": 0,
+                    "scope": "targeted", "targets": ["tests/test_x.py"],
+                    "reason": ""},)))
+    assert _cli("lintester", "x", "--execute") == 0
+    assert "untested override" not in capsys.readouterr().out
+
+
 def test_the_plain_report_names_the_gate_and_suite_rows(capsys, monkeypatch):
     from mindhive.orchestrator import lintester as lint_mod
 
@@ -589,3 +718,61 @@ def test_a_non_numeric_ceiling_is_a_caller_error_not_a_silent_default():
     with pytest.raises(SystemExit) as exc:
         _cli("lintester", "x", "--memory-mb", "lots")
     assert exc.value.code == 2
+
+
+# --- P2 round 2, review fixes: the lock's other paths, and what --no-gate says ---
+
+def test_a_mission_that_raises_still_lets_the_lock_go(monkeypatch):
+    """The `finally` in `_tests_locked`, exercised: a mission that raises out
+    of `execute_mission` must not leave `LOCK_TESTS` switched on for whatever
+    runs next in this process."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Boom(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            raise RuntimeError("the mission blew up")
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Boom)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    try:
+        _cli("lintester", "x", "--execute")
+    except RuntimeError:
+        pass
+    assert during == [True]
+    assert wt_mod.LOCK_TESTS is False, "the policy outlived its mission"
+
+
+def test_no_immutable_tests_also_stands_the_chmod_down(monkeypatch):
+    """The third term of `_tests_locked`'s condition: with the check itself
+    switched off there is nothing for the deterrent to deter."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import worktree as wt_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(wt_mod.LOCK_TESTS)
+            return _mission(outcome="ok", reason="", environment="", left=())
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("", ""))
+    monkeypatch.setattr(wt_mod, "LOCK_TESTS", False)
+    assert _cli("lintester", "x", "--execute", "--no-immutable-tests") == 0
+    assert during == [False]
+
+
+def test_the_no_gate_help_says_the_lanes_tests_stay_read_only():
+    """`--no-gate` skips the gate; it does not skip the read-only lock on the
+    lane's tests, which `_tests_locked` decides from `--immutable-tests` and
+    `--allow-test-edits` alone. Help that did not say so would send an
+    operator hunting for why a child in an ungated run cannot edit a test."""
+    parser = _subparser_action(cli_mod._build_parser()).choices["lintester"]
+    helps = {a.dest: str(a.help or "") for a in parser._actions}
+    assert "read-only" in helps["no_gate"], helps["no_gate"]
+    assert "--allow-test-edits" in helps["no_gate"], helps["no_gate"]

@@ -24,6 +24,7 @@ unnecessary and a violation.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -107,8 +108,9 @@ def cmd_lintester(args) -> int | None:
     # unit is gate -> quota -> child, and a refusal costs no child at all.
     if ledger is not None:
         orch.runner = ledger.guard(orch._run_child)
-    mission = orch.execute_mission(intent, dry_run=not started,
-                                   checkpoint_dir=args.checkpoint_dir)
+    with _tests_locked(args, started):
+        mission = orch.execute_mission(intent, dry_run=not started,
+                                       checkpoint_dir=args.checkpoint_dir)
 
     _close_board(bus, board, board_stream)
     _record_quota(ledger, args.project)
@@ -277,6 +279,30 @@ def _reflector():
     return res_mod.reflect_on_open
 
 
+@contextlib.contextmanager
+def _tests_locked(args, started):
+    """Hold `worktree.LOCK_TESTS` for the length of one mission (K13).
+
+    A module flag rather than an argument because `lintester.py` sits between
+    this front door and `acquire_lanes`, and this blueprint does not edit it.
+    Restored in a `finally` so a mission that raises does not leave the policy
+    switched on for whatever runs next in this process.
+
+    It only ever adds the chmod deterrent. The check that decides is
+    `gate.tests_mutated`, which `_validator` carries, and switching this off
+    does not switch that off."""
+    from . import worktree as wt_mod
+
+    want = bool(started) and bool(getattr(args, "immutable_tests", True)) \
+        and not bool(getattr(args, "allow_test_edits", False))
+    before = wt_mod.LOCK_TESTS
+    wt_mod.LOCK_TESTS = want
+    try:
+        yield want
+    finally:
+        wt_mod.LOCK_TESTS = before
+
+
 def _validator(args, started):
     """The per-unit test gate a run that starts work gets, or ``None``.
 
@@ -289,7 +315,11 @@ def _validator(args, started):
         return None
     from . import gate as gate_mod
 
-    return gate_mod.SuiteGate(root=args.root, project=args.project)
+    return gate_mod.SuiteGate(
+        root=args.root, project=args.project,
+        allow_untested=bool(getattr(args, "allow_untested", False)),
+        immutable_tests=bool(getattr(args, "immutable_tests", True)),
+        allow_test_edits=bool(getattr(args, "allow_test_edits", False)))
 
 
 def _payoff(mission):
@@ -336,6 +366,20 @@ def _print_payoff(scored) -> None:
         print("    (not a like-for-like comparison — see the verdict)")
 
 
+def _print_overrides(gates) -> None:
+    """One warning line for the units nothing judged.
+
+    A green mission whose units all passed under `--allow-untested` reads
+    exactly like a green mission that was tested, and the per-unit lines say
+    `untested_override` in a place nobody counts. This is the count."""
+    from . import gate as gate_mod
+
+    n = gate_mod.count_scopes(gates).get(gate_mod.UNTESTED_OVERRIDE, 0)
+    if n:
+        print(f"  warning: {n} untested override(s) — no test judged that "
+              f"work; --allow-untested passed it")
+
+
 def _print(mission) -> None:
     head = f"mission {mission.mission_id}: {mission.outcome}"
     if mission.reason:
@@ -372,6 +416,7 @@ def _print(mission) -> None:
               f"{'ok' if row.get('ok') else 'RED'} [{row.get('scope')}] "
               f"{len(row.get('targets') or ())} test file(s)"
               + (f" — {row['reason']}" if row.get("reason") else ""))
+    _print_overrides(mission.gates)
     for row in mission.commits:
         if not row.get("ok"):
             what = f"FAILED — {row.get('reason') or 'no reason recorded'}"
@@ -541,7 +586,25 @@ def register(subparsers) -> None:
                    help="skip the per-unit test gate and the closing full "
                         "suite; a unit is then validated on its child's exit "
                         "code alone, and the merge-back commits and merges "
-                        "that unverified work")
+                        "that unverified work. The lane's tests stay "
+                        "read-only regardless: only --allow-test-edits or "
+                        "--no-immutable-tests stands that down")
+    p.add_argument("--allow-untested", action="store_true",
+                   help="pass a unit whose change no test could name — a "
+                        "README, a migration, a config file. It does NOT "
+                        "excuse a new module: there the gate names the test "
+                        "file to write, and writing it is the way through")
+    p.add_argument("--allow-test-edits", action="store_true",
+                   help="let a unit modify test files the lane was checked "
+                        "out with. For a unit whose job really is the suite; "
+                        "otherwise a red test has a second cure — change what "
+                        "it demands — and a child under repair will find it")
+    p.add_argument("--immutable-tests", dest="immutable_tests",
+                   action="store_true", default=True,
+                   help="refuse a unit that edited an existing test (default)")
+    p.add_argument("--no-immutable-tests", dest="immutable_tests",
+                   action="store_false",
+                   help="switch that check off for the whole mission")
     p.add_argument("--memory-mb", type=int, default=0,
                    help="per-child memory ceiling in MB (0: none). Held by a "
                         "Windows job object or a POSIX rlimit; the report's "

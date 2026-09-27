@@ -12,7 +12,9 @@ The assertion that matters most is `test_release_keeps_a_lane_that_holds_work`.
 Every other failure here costs a rerun; that one silently deletes an agent's
 output, which is the entire reason for running agents.
 """
+import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -350,3 +352,326 @@ def test_the_incumbent_renaming_its_private_seam_is_reported_not_raised(
     assert not got.ok and not got.changed
     assert "cannot load the worktree driver" in got.reason
     assert "AttributeError" in got.reason
+
+
+# --- K13: the lane's tests are read-only while a child works in it ------------
+
+def _mode(path):
+    import stat
+    return bool(path.stat().st_mode & stat.S_IWRITE)
+
+
+def test_the_lock_clears_the_write_bit_on_the_lanes_tests(tmp_path):
+    lane = tmp_path / "lane"
+    (lane / "tests" / "sub").mkdir(parents=True)
+    keep = lane / "tests" / "test_a.py"
+    deep = lane / "tests" / "sub" / "test_b.py"
+    for target in (keep, deep):
+        target.write_text("x = 1\n", encoding="utf-8")
+
+    assert lw.lock_tests_readonly(lane) == ("tests/sub/test_b.py",
+                                            "tests/test_a.py")
+    assert not _mode(keep) and not _mode(deep)
+    assert lw.unlock_tests(lane)
+    assert _mode(keep) and _mode(deep)
+
+
+def test_the_lock_leaves_the_directory_itself_writable(tmp_path):
+    """Only the files. A read-only `tests/` stops pytest writing
+    `__pycache__` there, which breaks the suite the lane is judged by rather
+    than slowing down the child editing it."""
+    lane = tmp_path / "lane"
+    (lane / "tests").mkdir(parents=True)
+    (lane / "tests" / "test_a.py").write_text("x = 1\n", encoding="utf-8")
+
+    lw.lock_tests_readonly(lane)
+    try:
+        (lane / "tests" / "__pycache__").mkdir()
+    finally:
+        lw.unlock_tests(lane)
+
+
+def test_locking_a_tree_with_no_tests_is_not_an_error(tmp_path):
+    assert lw.lock_tests_readonly(tmp_path / "nowhere") == ()
+    assert lw.unlock_tests(tmp_path / "nowhere") == ()
+
+
+def test_the_lock_is_off_unless_the_front_door_switches_it_on(repo):
+    """`LOCK_TESTS` defaults off: `lintester.py` is the only caller between
+    the CLI and `acquire_lanes` and this blueprint does not edit it, so a
+    default-on flag would apply to every library caller too."""
+    assert lw.LOCK_TESTS is False
+
+
+def test_acquire_lanes_locks_each_new_lane_when_asked(repo, monkeypatch):
+    seen = []
+    monkeypatch.setattr(lw, "lock_tests_readonly", lambda p: seen.append(str(p)))
+    lanes = lw.acquire_lanes(repo, 2, "m-1", lock_tests=True)
+    try:
+        assert all(l.ok for l in lanes), [l.reason for l in lanes]
+        assert seen == [l.path for l in lanes]
+    finally:
+        lw.release_lanes(repo, lanes)
+
+
+def test_acquire_lanes_locks_nothing_by_default(repo, monkeypatch):
+    seen = []
+    monkeypatch.setattr(lw, "lock_tests_readonly", lambda p: seen.append(str(p)))
+    lanes = lw.acquire_lanes(repo, 1, "m-1")
+    try:
+        assert seen == []
+    finally:
+        lw.release_lanes(repo, lanes)
+
+
+def test_release_always_unlocks_whatever_the_policy_was(repo, monkeypatch):
+    """Unconditionally, because a read-only file is one more thing that can
+    make a removal fail on Windows and re-granting a bit that is already
+    granted costs nothing."""
+    seen = []
+    monkeypatch.setattr(lw, "unlock_tests", lambda p: seen.append(str(p)))
+    lanes = lw.acquire_lanes(repo, 1, "m-1")
+    lw.release_lanes(repo, lanes)
+    assert seen == [lanes[0].path]
+
+
+def test_a_locked_lane_can_still_be_torn_down(repo):
+    """The whole point of unlocking on release, asserted against real git and
+    a real read-only file rather than against the call.
+
+    The tests are committed to the REPO before the lane exists, which is both
+    the realistic case — a lane inherits the suite it is judged by — and the
+    only one that can answer this question: `retire` keeps any lane holding
+    work, so a lane that had to create the file itself would be kept for
+    holding it and the read-only bit would never be reached."""
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "tests")
+
+    lanes = lw.acquire_lanes(repo, 1, "m-1", lock_tests=True)
+    assert lanes[0].ok, lanes[0].reason
+    lane = Path(lanes[0].path)
+    assert not _mode(lane / "tests" / "test_a.py"), "the lane was not locked"
+
+    released, = lw.release_lanes(repo, lanes)
+    assert released.removed, released.reason
+    assert not lane.exists()
+
+
+def test_the_lock_covers_exactly_the_judge(tmp_path):
+    """What the gate compares is what the lock protects: one list,
+    `judge.judge_files`. The shared config files are not on it -- a child
+    may bump a dependency there, and only their pytest section is the judge,
+    which no file mode can express."""
+    from mindhive.orchestrator import judge
+
+    lane = tmp_path / "lane"
+    files = {
+        "tests/test_a.py": "x = 1\n",
+        "tests/conftest.py": "import pytest\n",
+        "tests/data/expected.json": "{}\n",
+        "conftest.py": "# the root plugin\n",
+        "pytest.ini": "[pytest]\n",
+        "pyproject.toml": "[project]\nname = 'p'\n",
+        "src/pkg/mod.py": "y = 2\n",
+        "tests/__pycache__/test_a.cpython-314.pyc": "",
+    }
+    for rel, text in files.items():
+        (lane / rel).parent.mkdir(parents=True, exist_ok=True)
+        (lane / rel).write_text(text, encoding="utf-8")
+
+    locked = lw.lock_tests_readonly(lane)
+    try:
+        assert locked == judge.judge_files(lane) == (
+            "conftest.py", "pytest.ini", "tests/conftest.py",
+            "tests/data/expected.json", "tests/test_a.py")
+        for rel in files:
+            assert _mode(lane / rel) is (rel not in locked), rel
+    finally:
+        lw.unlock_tests(lane)
+    assert all(_mode(lane / rel) for rel in files)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="no execute bit to keep on Windows")
+def test_the_lock_moves_only_the_write_bits(tmp_path):
+    """A fixed 0o444 would drop an executable fixture's `x` bit, and git
+    records that bit: the lock itself would then read as a test edit."""
+    import stat
+
+    lane = tmp_path / "lane"
+    (lane / "tests").mkdir(parents=True)
+    script = lane / "tests" / "run.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    os.chmod(script, 0o755)
+
+    lw.lock_tests_readonly(lane)
+    assert stat.S_IMODE(script.stat().st_mode) == 0o555
+    lw.unlock_tests(lane)
+    assert stat.S_IMODE(script.stat().st_mode) == 0o755
+
+
+def test_locking_a_lane_is_not_itself_a_test_edit(repo):
+    """The deterrent must not trip the gate it stands beside. Git sees a mode
+    change as a change, so a lock that moved more than it should would make
+    every locked lane read as a child that edited its tests."""
+    from mindhive.orchestrator import judge
+
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "conftest.py").write_text("# the root plugin\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "tests")
+
+    lanes = lw.acquire_lanes(repo, 1, "m-1", lock_tests=True)
+    try:
+        assert lanes[0].ok, lanes[0].reason
+        lane = Path(lanes[0].path)
+        assert not _mode(lane / "tests" / "test_a.py"), "canary: not locked"
+        assert not _mode(lane / "conftest.py"), "canary: not locked"
+        assert judge.tests_mutated(lane) == ()
+        assert _git(lane, "status", "--porcelain").stdout == ""
+    finally:
+        lw.release_lanes(repo, lanes)
+
+
+def test_the_lock_never_follows_a_symlink(tmp_path):
+    """A symlink's mode is its target's, and the target can be anywhere --
+    outside the lane, in the operator's own checkout."""
+    outside = tmp_path / "outside.py"
+    outside.write_text("x = 1\n", encoding="utf-8")
+    lane = tmp_path / "lane"
+    (lane / "tests").mkdir(parents=True)
+    link = lane / "tests" / "test_link.py"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform or user cannot create a symlink")
+    try:
+        assert "tests/test_link.py" not in lw.lock_tests_readonly(lane)
+        assert _mode(outside), "the lock followed the link out of the lane"
+    finally:
+        lw.unlock_tests(lane)
+
+
+def test_an_empty_path_locks_nothing_rather_than_the_working_directory(
+        tmp_path, monkeypatch):
+    """`Path("")` is `.`. An empty lane path read that way would make the
+    checkout the orchestrator runs FROM read-only."""
+    (tmp_path / "tests").mkdir()
+    mine = tmp_path / "tests" / "test_mine.py"
+    mine.write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for empty in ("", None):
+        assert lw.lock_tests_readonly(empty) == ()
+        assert lw.unlock_tests(empty) == ()
+    assert _mode(mine)
+
+
+# --- P2 round 2: a lane git no longer answers for is not a lane ----------------
+
+def test_a_lane_whose_link_to_its_repository_is_gone_is_refused_not_emptied(
+        repo):
+    """`is_lane_path` is a test of the PATH. With the lane's `.git` file gone,
+    git asked there walks up and answers for the main checkout, from where
+    every file in the lane is untracked -- and `clean -fd` then empties it.
+    The guard behind the path guard is git's own answer about the top level."""
+    lane = _lane(repo)
+    path = Path(lane.path)
+    (path / "half-written.txt").write_text("partial\n", encoding="utf-8")
+    (path / ".git").unlink()
+
+    got = lw.rollback(repo, lane)
+
+    assert not got.ok and not got.changed, got.reason
+    assert "discarding nothing" in got.reason
+    assert (path / "half-written.txt").exists()
+    assert (path / "seed.txt").exists()
+
+
+# --- P2 round 2, review fixes: the guard under the lock, the walk at a link -------
+
+def _link_dir(target, link):
+    """A directory link at *link* naming *target*: a junction on Windows
+    (`_winapi.CreateJunction` needs no privilege), a symlink elsewhere. Skips
+    when the platform refuses either."""
+    try:
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            os.symlink(str(target), str(link), target_is_directory=True)
+    except (OSError, ImportError, AttributeError, NotImplementedError) as exc:
+        pytest.skip(f"cannot link a directory here: {exc}")
+
+
+def test_the_top_level_guard_is_a_seam_taken_inside_the_try(monkeypatch, repo):
+    """`rollback` reaches for `mn_wt.is_toplevel` the way it reaches for
+    `_git` and `_GIT_LOCK`: inside the guard, so a rename on the incumbent's
+    side is reported, not raised out of a repair loop."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    lane = _lane(repo)
+    monkeypatch.delattr(mn_wt, "is_toplevel")
+    got = lw.rollback(repo, lane)
+
+    assert not got.ok and not got.changed
+    assert "cannot load the worktree driver" in got.reason
+    assert "AttributeError" in got.reason
+
+
+def test_the_top_level_guard_holds_the_git_lock_while_it_asks(monkeypatch,
+                                                              repo):
+    """Between "this is a checkout of its own" and `checkout -- .` nothing may
+    change what git answers for the path: a prune on another thread takes the
+    same lock, so the guard is asked under it, not before it. Proven by a
+    second thread that tries the lock while the guard runs and must fail."""
+    import threading
+
+    from mindhive.mindnet import worktree as mn_wt
+
+    real, held = mn_wt.is_toplevel, []
+
+    def spy(path):
+        taken = []
+
+        def probe():
+            ok = mn_wt._GIT_LOCK.acquire(blocking=False)
+            if ok:
+                mn_wt._GIT_LOCK.release()
+            taken.append(ok)
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join()
+        held.append(taken == [False])
+        return real(path)
+
+    lane = _lane(repo)
+    monkeypatch.setattr(mn_wt, "is_toplevel", spy)
+    got = lw.rollback(repo, lane)
+
+    assert got.ok, got.reason
+    assert held == [True], "the guard was asked outside the lock"
+
+
+def test_the_lock_never_follows_a_directory_link(tmp_path):
+    """The symlink case, and the junction: `os.walk` walks straight into one,
+    and the lock would then clear the write bit on files that belong to
+    whatever tree the link names."""
+    lane = tmp_path / "lane"
+    outside = tmp_path / "outside"
+    (lane / "tests").mkdir(parents=True)
+    outside.mkdir()
+    keep = lane / "tests" / "test_a.py"
+    theirs = outside / "test_theirs.py"
+    for target in (keep, theirs):
+        target.write_text("x = 1\n", encoding="utf-8")
+    _link_dir(outside, lane / "tests" / "linked")
+
+    assert lw.lock_tests_readonly(lane) == ("tests/test_a.py",)
+    try:
+        assert not _mode(keep)
+        assert _mode(theirs), "a file behind the link lost its write bit"
+    finally:
+        lw.unlock_tests(lane)

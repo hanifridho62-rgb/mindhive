@@ -253,6 +253,10 @@ order, and this section grows one bullet per landing.
   **recorded vacuous pass** (`scope: none`): the alternative, failing closed,
   was rejected because it would refuse every unit that adds a module nobody
   tests yet, and the closing full suite is the mission-level judge anyway.
+  *Superseded by blueprint P2 (MEB ORCH-01): the vacuous pass is now a
+  refusal, `scope: greenfield_needs_test` — a unit that adds a module no test
+  mentions must bring its own test; see the `gate.py` module docstring
+  section "The vacuous pass is now a refusal".*
   **A targeted run is not a ledger verification** — `verify.run_and_record`
   grew `record=False` because `replenish._passing_verification_ts` clears the
   "changed, unverified" gap on ANY exit-0 `verification` row and a two-file

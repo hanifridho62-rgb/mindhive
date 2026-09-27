@@ -999,8 +999,12 @@ def test_a_gated_execute_mission_publishes_no_unknown_event(repo):
     mission = lint_mod.LintesterOrchestrator(
         root=repo, project="wb7-gate", lanes=2, decomposer=_two_units,
         runner=lambda e, ln: True, bus=bus,
+        # `allow_untested` because the property here is the EVENT SEAM, not the
+        # verdict: this repo is one `seed.txt` and the fake child changes
+        # nothing, so since P2 the gate would refuse every unit and the mission
+        # would end `partial` before the board ever reached PHASE_DONE.
         validator=gate_mod.SuiteGate(root=repo, project="wb7-gate",
-                                     runner=fake_suite),
+                                     runner=fake_suite, allow_untested=True),
     ).execute_mission("make the ledger writer retry", dry_run=False)
     for event in bus.drain():
         board.apply(event)
@@ -1034,8 +1038,10 @@ def test_a_merge_back_execute_mission_publishes_no_unknown_event(repo):
     mission = lint_mod.LintesterOrchestrator(
         root=repo, project="wb7-merge", lanes=2, decomposer=_two_units,
         runner=child, bus=bus, merge_back=True,
+        # `allow_untested`: the child writes `<task_id>.txt`, which no test
+        # could ever mention. See the note in the gated-mission test above.
         validator=gate_mod.SuiteGate(root=repo, project="wb7-merge",
-                                     runner=fake_suite),
+                                     runner=fake_suite, allow_untested=True),
     ).execute_mission("make the ledger writer retry", dry_run=False)
     for event in bus.drain():
         board.apply(event)

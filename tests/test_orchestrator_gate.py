@@ -281,23 +281,170 @@ def test_the_childs_own_new_test_file_is_always_targeted(repo):
     assert got.outcome == "partial"
 
 
-def test_a_change_no_test_mentions_is_a_recorded_vacuous_pass(repo):
-    """Recorded, not hidden: the row says `none` and why. The alternative —
-    failing every unit that adds an untested module — was rejected because it
-    would fail the unit for the SUITE's gap, and the full suite at the end is
-    the mission-level claim anyway."""
+def test_a_new_module_with_no_test_fails_closed_and_names_the_path(repo):
+    """THE reversal (blueprint P2, MEB ORCH-01). This was a recorded VACUOUS
+    PASS: a unit that added an untested module was called validated, with a
+    row saying `none` and a reason explaining that the closing full suite
+    would judge it.
+
+    Two things were wrong with that. The closing suite cannot fail a unit that
+    already merged, so "the full suite is its judge" named a judge with no
+    sentence to pass. And a child learns from the gate's answer: told its
+    untested module passed, the cheapest way to satisfy the gate forever is to
+    write modules no test mentions.
+
+    So it refuses, and the refusal is an INSTRUCTION -- the exact path to
+    create, not "add tests". A prescription a child can act on is what breaks
+    the repair loop that otherwise retries the same unguided fix."""
     got = _mission(repo, _writes({"src/pkg/lonely.py": """
         def lonely():
             return 3
     """}), _gate(repo))
 
     row = got.gates[0]
-    assert row["ok"] is True
-    assert row["scope"] == gate_mod.NONE
+    assert row["ok"] is False
+    assert row["scope"] == gate_mod.GREENFIELD_NEEDS_TEST
     assert row["targets"] == []
-    assert "no test" in row["reason"], row["reason"]
+    assert "MODUL BARU TERDETEKSI" in row["reason"], row["reason"]
+    assert "src/pkg/lonely.py" in row["reason"]
+    assert "'tests/test_lonely.py'" in row["reason"]
+    assert row["tail"] == ("Instruksi: Tulis minimal satu pengujian unit di "
+                           "tests/test_lonely.py.")
+    assert got.outcome != "ok"
+
+
+def test_the_prescribed_path_is_one_the_gate_would_actually_accept(repo):
+    """The instruction has to be true. A child that creates exactly the file
+    the refusal named must then PASS -- otherwise the gate sends children to a
+    path it does not recognise and the loop never terminates."""
+    got = _mission(repo, _writes({
+        "src/pkg/lonely.py": """
+            def lonely():
+                return 3
+        """,
+        "tests/test_lonely.py": """
+            from pkg import lonely
+
+
+            def test_lonely():
+                assert lonely.lonely() == 3
+        """}), _gate(repo))
+
+    row = got.gates[0]
+    assert row["ok"] is True, row["reason"]
+    assert row["scope"] == gate_mod.TARGETED
+    assert [Path(p).name for p in row["targets"]] == ["test_lonely.py"]
+    assert got.outcome == "ok", got.reason
+
+
+def test_a_change_no_module_owns_is_refused_unless_overridden(repo):
+    """The second refusal: files no test could ever mention — a README, a
+    migration, a config. There is no path to prescribe, so this one IS
+    overridable, and the message names the flag that does it."""
+    got = _mission(repo, _writes({"README.md": "# notes\n"}), _gate(repo))
+
+    row = got.gates[0]
+    assert row["ok"] is False
+    assert row["scope"] == gate_mod.NONE
+    assert "PELANGGARAN GATE" in row["reason"], row["reason"]
+    assert "--allow-untested" in row["reason"]
+    assert got.outcome != "ok"
+
+
+def test_the_override_passes_the_unit_and_says_so_in_its_own_scope(repo):
+    """Overridden is not the same fact as tested, so it gets its own scope
+    rather than reusing `none`. An operator reading a report can then count
+    them — see `count_scopes`."""
+    got = _mission(repo, _writes({"README.md": "# notes\n"}),
+                   _gate(repo, allow_untested=True))
+
+    row = got.gates[0]
+    assert row["ok"] is True, row["reason"]
+    assert row["scope"] == gate_mod.UNTESTED_OVERRIDE
+    assert "--allow-untested" in row["reason"] or "override" in row["reason"]
     assert got.completed == ("t-writer",)
     assert got.outcome == "ok", got.reason
+
+
+def test_the_override_does_not_excuse_a_new_untested_module(repo):
+    """`--allow-untested` is for work no test could name. A new module always
+    can be named — the gate just told the child the path — so the override
+    deliberately does not reach it. The way out is to write the file."""
+    got = _mission(repo, _writes({"src/pkg/lonely.py": """
+        def lonely():
+            return 3
+    """}), _gate(repo, allow_untested=True))
+
+    assert got.gates[0]["ok"] is False
+    assert got.gates[0]["scope"] == gate_mod.GREENFIELD_NEEDS_TEST
+
+
+# --- which files count as greenfield -------------------------------------------
+
+def test_the_prescription_is_the_repos_own_short_test_name():
+    assert gate_mod.canonical_test_path("src/pkg/lonely.py") \
+        == "tests/test_lonely.py"
+    assert gate_mod.canonical_test_path("src\\pkg\\lonely.py") \
+        == "tests/test_lonely.py"
+
+
+def test_the_prescribed_name_is_one_the_target_search_recognises():
+    """The two halves of the same promise: `_named_for` is what accepts a
+    test file by NAME, so the name the refusal prescribes has to be in it."""
+    assert Path(gate_mod.canonical_test_path("src/pkg/lonely.py")).name \
+        in gate_mod._named_for("pkg.lonely")
+
+
+def test_a_deleted_module_is_not_greenfield(tmp_path):
+    """A child cannot be told to write a test for a file it removed, and
+    telling it to would be an instruction that can never be satisfied."""
+    _write(tmp_path, "src/pkg/kept.py", "x = 1\n")
+    assert gate_mod.greenfield_files(
+        tmp_path, ["src/pkg/kept.py", "src/pkg/gone.py"]) == ["src/pkg/kept.py"]
+
+
+def test_a_package_marker_is_not_greenfield(tmp_path):
+    """`tests/test___init__.py` is not an instruction anyone should be given,
+    and a package marker is not a module with behaviour to cover."""
+    _write(tmp_path, "src/pkg/__init__.py", "")
+    assert gate_mod.greenfield_files(tmp_path, ["src/pkg/__init__.py"]) == []
+
+
+def test_tests_and_non_python_files_are_not_greenfield(tmp_path):
+    _write(tmp_path, "tests/test_thing.py", "")
+    _write(tmp_path, "docs/notes.md", "")
+    _write(tmp_path, "src/pkg/data.sql", "")
+    assert gate_mod.greenfield_files(
+        tmp_path, ["tests/test_thing.py", "docs/notes.md",
+                   "src/pkg/data.sql"]) == []
+
+
+def test_the_greenfield_list_is_sorted_so_one_message_is_deterministic(tmp_path):
+    """The refusal names ONE file, and `resilience` hashes the reason into the
+    failure signature the breaker counts. A set-ordered pick would make two
+    runs of one failure read as two different failures."""
+    for rel in ("src/pkg/b.py", "src/pkg/a.py", "src/pkg/c.py"):
+        _write(tmp_path, rel, "x = 1\n")
+    order = ["src/pkg/c.py", "src/pkg/a.py", "src/pkg/b.py"]
+    assert gate_mod.greenfield_files(tmp_path, order)[0] == "src/pkg/a.py"
+
+
+# --- counting the scopes for a report ------------------------------------------
+
+def test_count_scopes_totals_the_rows_by_scope():
+    rows = [{"scope": "targeted"}, {"scope": "targeted"},
+            {"scope": "untested_override"}, {"scope": "none"}]
+    assert gate_mod.count_scopes(rows) == {"targeted": 2,
+                                           "untested_override": 1,
+                                           "none": 1}
+
+
+def test_count_scopes_is_total_over_junk():
+    """It runs at report time, after a mission. A malformed row must not be
+    the thing that stops an operator seeing the rest."""
+    assert gate_mod.count_scopes(None) == {}
+    assert gate_mod.count_scopes([None, {}, {"scope": ""}, 7,
+                                  {"scope": "full"}]) == {"full": 1}
 
 
 def test_a_clean_lane_falls_back_to_the_units_own_files(repo):
@@ -369,6 +516,9 @@ def test_a_run_with_no_root_makes_its_lanes_under_the_working_directory(
 
 
 def test_a_hung_gate_is_killed_at_its_cap(repo):
+    # `allow_test_edits` because this child's job IS to edit an existing test
+    # -- a hang has to be written into the file the gate would run. Without it
+    # K13 refuses before pytest starts and the cap never gets to fire.
     started = time.monotonic()
     got = _mission(repo, _writes({"tests/test_writer.py": """
         import time
@@ -376,7 +526,7 @@ def test_a_hung_gate_is_killed_at_its_cap(repo):
 
         def test_write():
             time.sleep(30)
-    """}), _gate(repo, unit_timeout_s=2))
+    """}), _gate(repo, unit_timeout_s=2, allow_test_edits=True))
 
     assert time.monotonic() - started < 25, "the cap did not fire"
     row = got.gates[0]
@@ -610,3 +760,702 @@ def test_tests_mentioning_is_total_on_a_missing_or_junk_tree(tmp_path):
     _write(tests, "test_bad.py", "from a import b\n")
     (tests / "test_bad.py").write_bytes(b"\xff\xfe from a import b")
     assert gate_mod.tests_mentioning(tests, ["a.b"]) == ["test_bad.py"]
+
+
+# --- K13: existing tests are immutable during implementation -------------------
+
+def test_a_child_that_edits_an_existing_test_is_refused(repo):
+    """K13 Immutable Test Gates. A red test has exactly two cures: fix the
+    code, or change what the test demands. The second one is always available
+    and always cheaper, and a child under a repair loop will find it -- so a
+    gate that only runs pytest can be satisfied by deleting the assertion that
+    was failing.
+
+    The baseline is the commit the lane stood at before the unit's FIRST
+    attempt, pinned by `SuiteGate.begin` through `gated`. A snapshot taken
+    when the gate first runs would be taken after the first attempt had
+    already edited the file; the lane's `HEAD` at gate time moves with a
+    child that commits (see the committing-child tests below)."""
+    got = _mission(repo, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "tests/test_writer.py": """
+            def test_writer():
+                assert True
+        """}), _gate(repo))
+
+    row = got.gates[0]
+    assert row["ok"] is False, row["reason"]
+    assert row["scope"] == gate_mod.IMMUTABLE_TESTS_VIOLATED
+    assert "PELANGGARAN GATE" in row["reason"]
+    assert "tests/test_writer.py" in row["reason"]
+    assert "--allow-test-edits" in row["reason"]
+    assert got.outcome != "ok"
+
+
+def test_the_flag_is_what_lets_a_test_edit_through(repo):
+    got = _mission(repo, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "tests/test_writer.py": """
+            from pkg import writer
+
+
+            def test_writer():
+                assert writer.write(1) == 1
+        """}), _gate(repo, allow_test_edits=True))
+
+    assert got.gates[0]["ok"] is True, got.gates[0]["reason"]
+    assert got.gates[0]["scope"] == gate_mod.TARGETED
+    assert got.outcome == "ok", got.reason
+
+
+def test_turning_the_gate_off_entirely_also_lets_it_through(repo):
+    got = _mission(repo, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "tests/test_writer.py": """
+            from pkg import writer
+
+
+            def test_writer():
+                assert writer.write(1) == 1
+        """}), _gate(repo, immutable_tests=False))
+
+    assert got.gates[0]["ok"] is True, got.gates[0]["reason"]
+    assert got.outcome == "ok", got.reason
+
+
+def test_a_brand_new_test_file_is_never_a_violation(repo):
+    """The greenfield flow ENDS in a child creating a test file. If that
+    counted as mutating the suite, the instruction the other half of this gate
+    hands out would be refused the moment it was followed."""
+    got = _mission(repo, _writes({
+        "src/pkg/lonely.py": """
+            def lonely():
+                return 3
+        """,
+        "tests/test_lonely.py": """
+            from pkg import lonely
+
+
+            def test_lonely():
+                assert lonely.lonely() == 3
+        """}), _gate(repo))
+
+    assert got.gates[0]["ok"] is True, got.gates[0]["reason"]
+    assert got.gates[0]["scope"] == gate_mod.TARGETED
+
+
+def test_the_violation_is_checked_before_a_single_test_runs(repo):
+    """Refusing AFTER running the suite would report the doctored suite's
+    green as the unit's result for as long as it took to notice."""
+    ran = []
+
+    def _spy(argv, **kw):                                # pragma: no cover - argv
+        ran.append(list(argv))
+        return {"exit_code": 0, "counts": {"passed": 1}, "tail": "1 passed"}
+
+    got = _mission(repo, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "tests/test_writer.py": "def test_writer():\n    assert True\n"}),
+        _gate(repo, runner=_spy))
+
+    assert got.gates[0]["scope"] == gate_mod.IMMUTABLE_TESTS_VIOLATED
+    assert ran == [], f"the gate ran pytest anyway: {ran}"
+
+
+def test_a_deleted_test_counts_as_mutated_too(repo):
+    """Deleting the file that judges you is the same move as emptying it."""
+    def _delete(entry, lane):
+        (Path(lane.worktree_path) / "tests" / "test_writer.py").unlink()
+        return True
+
+    got = _mission(repo, _delete, _gate(repo))
+    row = got.gates[0]
+    assert row["ok"] is False
+    assert row["scope"] == gate_mod.IMMUTABLE_TESTS_VIOLATED
+    assert "tests/test_writer.py" in row["reason"]
+
+
+# --- K13: the whole judge, not just `test_*.py` ----------------------------------
+
+@pytest.fixture
+def judged(repo):
+    """`repo` plus the rest of what judges a lane: a conftest at the root and
+    one under `tests/`, a data fixture, and a `pyproject.toml` whose pytest
+    section sits beside a `[project]` table -- the section is what makes
+    pytest root itself here instead of walking up out of the lane."""
+    _write(repo, "tests/conftest.py", """
+        import pytest
+
+
+        @pytest.fixture
+        def expected():
+            return 1
+    """)
+    _write(repo, "conftest.py", "# the root plugin every test below loads\n")
+    _write(repo, "tests/data/expected.json", '{"write": 1}\n')
+    _write(repo, "pyproject.toml", """
+        [project]
+        name = "pkg"
+        version = "0.1.0"
+        dependencies = []
+
+        [tool.pytest.ini_options]
+        markers = ["slow: a slow test"]
+    """)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "the rest of the judge")
+    return repo
+
+
+def _refused_for(got, rel):
+    row = got.gates[0]
+    assert row["ok"] is False, row["reason"]
+    assert row["scope"] == gate_mod.IMMUTABLE_TESTS_VIOLATED, row
+    assert rel in row["reason"], row["reason"]
+    assert got.outcome != "ok"
+
+
+def test_editing_a_conftest_under_tests_is_refused(judged):
+    """An autouse fixture in a conftest can make every assertion below it
+    pass without a single test file changing."""
+    got = _mission(judged, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "tests/conftest.py": """
+            import pytest
+
+
+            @pytest.fixture(autouse=True)
+            def _green(monkeypatch):
+                from pkg import writer
+                monkeypatch.setattr(writer, "write", lambda x: 1)
+        """}), _gate(judged))
+    _refused_for(got, "tests/conftest.py")
+
+
+def test_editing_the_root_conftest_is_refused(judged):
+    got = _mission(judged, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "conftest.py": "def pytest_collection_modifyitems(items):\n"
+                       "    items[:] = []\n"}), _gate(judged))
+    _refused_for(got, "conftest.py")
+
+
+def test_editing_a_data_fixture_the_tests_compare_against_is_refused(judged):
+    got = _mission(judged, _writes({
+        "src/pkg/writer.py": GREEN_WRITER,
+        "tests/data/expected.json": '{"write": 0}\n'}), _gate(judged))
+    _refused_for(got, "tests/data/expected.json")
+
+
+def test_the_pytest_section_of_pyproject_is_part_of_the_judge(judged):
+    text = (judged / "pyproject.toml").read_text(encoding="utf-8")
+    got = _mission(judged, _writes({
+        "src/pkg/writer.py": BROKEN_WRITER,
+        "pyproject.toml": text + 'addopts = "--deselect '
+                                 'tests/test_writer.py::test_write"\n'}),
+        _gate(judged))
+    _refused_for(got, "pyproject.toml")
+
+
+def test_the_rest_of_pyproject_is_not(judged):
+    """A dependency bump or a version change is the work, not the judge."""
+    text = (judged / "pyproject.toml").read_text(encoding="utf-8")
+    got = _mission(judged, _writes({
+        # A real change to the module, still green: the fixture's writer IS
+        # `GREEN_WRITER`, and rewriting it unchanged would leave the version
+        # bump as the lane's only change -- which no test names.
+        "src/pkg/writer.py": """
+            RELEASE = "0.2.0"
+
+
+            def write(x):
+                return 1
+        """,
+        "pyproject.toml": text.replace('version = "0.1.0"',
+                                       'version = "0.2.0"')}), _gate(judged))
+    assert got.gates[0]["ok"] is True, got.gates[0]["reason"]
+    assert got.gates[0]["scope"] == gate_mod.TARGETED
+    assert got.outcome == "ok", got.reason
+
+
+def test_a_new_conftest_is_a_judge_change_not_greenfield(repo):
+    """"A new test file is always allowed" is about test MODULES. A new
+    conftest is a plugin for every test below it, and existing is enough."""
+    got = _mission(repo, _writes({
+        "src/pkg/writer.py": BROKEN_WRITER,
+        "tests/conftest.py": """
+            import pytest
+
+
+            @pytest.fixture(autouse=True)
+            def _green(monkeypatch):
+                from pkg import writer
+                monkeypatch.setattr(writer, "write", lambda x: 1)
+        """}), _gate(repo))
+    _refused_for(got, "tests/conftest.py")
+
+
+def test_a_staged_new_test_file_is_not_a_violation(repo):
+    """Staged is how a lane looks after `commit_all` added everything and the
+    commit itself was refused. A new file is new whether or not it is in the
+    index."""
+    def runner(entry, lane):
+        _write(lane.worktree_path, "src/pkg/lonely.py", """
+            def lonely():
+                return 3
+        """)
+        _write(lane.worktree_path, "tests/test_lonely.py", """
+            from pkg import lonely
+
+
+            def test_lonely():
+                assert lonely.lonely() == 3
+        """)
+        _git(lane.worktree_path, "add", "-A")
+        return True
+
+    got = _mission(repo, runner, _gate(repo))
+    assert got.gates[0]["ok"] is True, got.gates[0]["reason"]
+    assert got.gates[0]["scope"] == gate_mod.TARGETED
+
+
+# --- K13: a child that commits cannot move the baseline ---------------------------
+
+def _commits(files):
+    """A child that writes *files* and then COMMITS them in its lane -- which
+    `mindnet/agent.py` tells it not to do, and which nothing prevents."""
+    def runner(entry, lane):
+        for rel, text in files.items():
+            _write(lane.worktree_path, rel, text)
+        _git(lane.worktree_path, "add", "-A")
+        _git(lane.worktree_path, "commit", "-qm", "the child committed")
+        return True
+    return runner
+
+
+def test_a_child_that_commits_its_test_edit_is_still_refused(repo):
+    """With the lane's `HEAD` as the baseline this passed: the commit made
+    `HEAD` agree with the edit, and `diff HEAD` answered that nothing changed."""
+    got = _mission(repo, _commits({
+        "src/pkg/writer.py": BROKEN_WRITER,
+        "tests/test_writer.py": "def test_write():\n    assert True\n"}),
+        _gate(repo))
+    _refused_for(got, "tests/test_writer.py")
+
+
+def test_a_committed_module_with_no_test_is_still_greenfield(repo):
+    """The fail-closed half has the same door: against `HEAD` a committed new
+    module is no change at all, the gate falls back to the unit's own files,
+    and their tests pass it -- the vacuous pass again."""
+    got = _mission(repo, _commits({"src/pkg/lonely.py": """
+        def lonely():
+            return 3
+    """}), _gate(repo))
+    row = got.gates[0]
+    assert row["ok"] is False, row["reason"]
+    assert row["scope"] == gate_mod.GREENFIELD_NEEDS_TEST, row
+    assert "tests/test_lonely.py" in row["reason"]
+
+
+def test_the_baseline_is_the_units_first_attempt_not_the_latest(repo):
+    """Rollback keeps commits. If each attempt pinned its own baseline, the
+    edit a child committed in attempt 1 would BE attempt 2's baseline, and
+    attempt 2 would pass on the doctored test it inherited."""
+    calls = []
+
+    def runner(entry, lane):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return _commits({"tests/test_writer.py":
+                             "def test_write():\n    assert True\n"})(entry, lane)
+        return _writes({"src/pkg/writer.py": GREEN_WRITER})(entry, lane)
+
+    got = _mission(repo, runner, _gate(repo), max_attempts=2)
+    assert len(calls) == 2, "the repair loop did not retry"
+    assert [row["scope"] for row in got.gates] == [
+        gate_mod.IMMUTABLE_TESTS_VIOLATED] * 2, got.gates
+    assert got.outcome != "ok"
+
+
+def test_a_lane_git_cannot_read_is_refused_not_passed(repo, monkeypatch):
+    monkeypatch.setattr(gate_mod, "tests_mutated", lambda *a, **k: None)
+    got = _mission(repo, _writes({"src/pkg/writer.py": GREEN_WRITER}),
+                   _gate(repo))
+    row = got.gates[0]
+    assert row["ok"] is False
+    assert row["scope"] == gate_mod.NONE
+    assert "could not verify" in row["reason"]
+    assert "--allow-test-edits" in row["reason"]
+
+
+@pytest.mark.parametrize("switch", [{"allow_test_edits": True},
+                                    {"immutable_tests": False}])
+def test_either_switch_skips_the_check_git_could_not_answer(repo, monkeypatch,
+                                                           switch):
+    """Both switches bypass the immutability check as a whole, so neither is
+    stopped by a git that cannot answer it."""
+    monkeypatch.setattr(gate_mod, "tests_mutated", lambda *a, **k: None)
+    got = _mission(repo, _writes({"src/pkg/writer.py": GREEN_WRITER}),
+                   _gate(repo, **switch))
+    assert got.gates[0]["ok"] is True, got.gates[0]["reason"]
+    assert got.gates[0]["scope"] == gate_mod.TARGETED
+
+
+# --- the pin itself ---------------------------------------------------------------
+
+def _task(tid="t-pin"):
+    return lint.AgentTask(task_id=tid)
+
+
+def test_begin_pins_the_first_attempt_and_only_the_first(repo):
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-pin")
+    assert lane.ok, lane.reason
+    try:
+        first = gate.begin(lane.path, _task())
+        assert first and first == _git(lane.path, "rev-parse", "HEAD").stdout.strip()
+        assert gate.baseline(lane.path, _task()) == first
+
+        _write(lane.path, "later.txt", "x\n")
+        _git(lane.path, "add", "-A")
+        _git(lane.path, "commit", "-qm", "moved")
+        assert gate.begin(lane.path, _task()) == first, "a later attempt re-pinned"
+        assert gate.baseline(lane.path, _task()) == first
+        assert gate.baseline(lane.path, _task("t-other")) == "HEAD"
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_begin_outside_a_lane_pins_nothing_and_runs_no_git(repo, monkeypatch):
+    from mindhive.mindnet import worktree as mn_wt
+    ran = []
+    monkeypatch.setattr(mn_wt, "rev_of", lambda *a: ran.append(a) or "abc")
+    gate = _gate(repo)
+    assert gate.begin(str(repo), _task()) == ""
+    assert gate.begin("", _task()) == ""
+    assert gate.begin(None, _task()) == ""
+    assert ran == [] and gate.baseline(str(repo), _task()) == "HEAD"
+
+
+def test_a_unit_whose_start_could_not_be_pinned_is_refused(repo, monkeypatch):
+    """`begin` asked git for the lane's commit and got nothing. Falling back to
+    the lane's `HEAD` would reopen the door the pin exists to close -- a child
+    that commits its edit moves `HEAD` -- so the unit is refused. And the
+    failed pin is RECORDED: a later attempt pinning then would pin a commit
+    made after the unit began, absorbing whatever the first attempt committed."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    lane = wt_mod.acquire(repo, 0, "m-nopin")
+    assert lane.ok, lane.reason
+    real, broken = mn_wt.rev_of, {"on": True}
+    monkeypatch.setattr(mn_wt, "rev_of", lambda root, ref: (
+        "" if broken["on"] else real(root, ref)))
+    try:
+        gate = _gate(repo)
+        assert gate.begin(lane.path, _task()) == ""
+        broken["on"] = False
+        assert gate.begin(lane.path, _task()) == "", "a later attempt pinned"
+        assert gate.baseline(lane.path, _task()) == ""
+
+        res = gate.check(lane.path, _task())
+        assert res.ok is False and res.scope == gate_mod.NONE, res
+        assert "could not verify" in res.reason
+        assert "started from" in res.reason
+        assert "--allow-test-edits" in res.reason
+
+        # The switch stands the whole check down, and the gate then judges
+        # the change against HEAD like any caller that never pinned.
+        broken["on"] = True
+        waived = _gate(repo, allow_test_edits=True)
+        assert waived.begin(lane.path, _task()) == ""
+        _write(lane.path, "src/pkg/writer.py", """
+            def write(x):
+                return 1  # unchanged behaviour, changed file
+        """)
+        broken["on"] = False
+        res = waived.check(lane.path, _task())
+        assert res.ok is True and res.scope == gate_mod.TARGETED, res.reason
+    finally:
+        wt_mod.release(repo, lane)
+
+
+class _PinGate(_Gate):
+    def __init__(self, log):
+        super().__init__()
+        self.log = log
+
+    def begin(self, lane_path, task):
+        self.log.append(("begin", str(lane_path)))
+
+    def check(self, lane_path, task, attempt=0):
+        self.log.append(("check", str(lane_path)))
+        return super().check(lane_path, task, attempt)
+
+
+def test_gated_tells_the_gate_before_the_child_runs():
+    log = []
+
+    def runner(entry, lane):
+        log.append(("runner", ""))
+        return True
+
+    lane = q_mod.WorkerLane(
+        0, worktree=wt_mod.LaneWorktree(lane_id=0, path="/lanes/lane-0"))
+    gate_mod.gated(runner, gate=_PinGate(log))(_entry(), lane)
+    assert [step for step, _ in log] == ["begin", "runner", "check"]
+    assert log[0][1] == log[2][1], "begin and check saw different lanes"
+
+
+def test_gated_tells_a_coroutine_runners_gate_first_too():
+    log = []
+
+    async def runner(entry, lane):
+        log.append(("runner", ""))
+        return True
+
+    wrapped = gate_mod.gated(runner, gate=_PinGate(log))
+    asyncio.run(wrapped(_entry(), q_mod.WorkerLane(0)))
+    assert [step for step, _ in log] == ["begin", "runner", "check"]
+
+
+def test_a_begin_that_raises_never_stops_the_child():
+    class _Broken(_Gate):
+        def begin(self, lane_path, task):
+            raise RuntimeError("the pin is broken")
+
+    ran = []
+    gate = _Broken()
+    out = gate_mod.gated(lambda e, ln: ran.append(1) or True, gate=gate)(
+        _entry(), q_mod.WorkerLane(0))
+    assert ran == [1] and out is True and gate.calls
+
+
+# --- P2 round 2: the baseline a lane's next unit inherits -------------------------
+#
+# `begin` pins the lane's HEAD before a unit's first attempt. On a lane that
+# ran an earlier unit, that HEAD may hold what the earlier unit COMMITTED --
+# rollback keeps commits -- and a doctored test committed under a refused unit
+# would then be the next unit's baseline: judged clean, and green. So a lane
+# has a TRUSTED commit, and HEAD becomes the next pin only when nothing of the
+# judge changed between the two (`judge.judge_changes`); otherwise the trusted
+# commit stays the pin, and the committed edit stays the lane's change until
+# it is undone.
+
+def _doctor(lane_path):
+    _write(lane_path, "tests/test_writer.py",
+           "def test_write():\n    assert True\n")
+    _git(lane_path, "add", "-A")
+    _git(lane_path, "commit", "-qm", "the first unit's child doctored a test")
+
+
+def test_a_judge_edit_an_earlier_unit_committed_is_the_next_units_change_too(
+        repo):
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-inherit")
+    assert lane.ok, lane.reason
+    try:
+        first = gate.begin(lane.path, _task("t-a"))
+        _doctor(lane.path)
+        res = gate.check(lane.path, _task("t-a"))
+        assert res.scope == gate_mod.IMMUTABLE_TESTS_VIOLATED, "canary"
+
+        assert gate.begin(lane.path, _task("t-b")) == first, (
+            "the next unit was pinned at the doctored commit")
+        res = gate.check(lane.path, _task("t-b"))
+        assert res.ok is False, res
+        assert res.scope == gate_mod.IMMUTABLE_TESTS_VIOLATED, res
+        assert "tests/test_writer.py" in res.reason
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_validated_work_an_earlier_unit_committed_moves_the_baseline_forward(
+        repo):
+    """The other half: what `commit_lane` commits past a green gate -- source,
+    and the test module the greenfield refusal asked for -- leaves the judge
+    as it was, and the next unit starts from there, not from a stale pin that
+    would make it answer for the earlier unit's work."""
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-advance")
+    assert lane.ok, lane.reason
+    try:
+        first = gate.begin(lane.path, _task("t-a"))
+        _write(lane.path, "src/pkg/lonely.py", "def lonely():\n    return 3\n")
+        _write(lane.path, "tests/test_lonely.py", """
+            from pkg import lonely
+
+
+            def test_lonely():
+                assert lonely.lonely() == 3
+        """)
+        _git(lane.path, "add", "-A")
+        _git(lane.path, "commit", "-qm", "lint(m-advance) t-a: validated work")
+        moved = _git(lane.path, "rev-parse", "HEAD").stdout.strip()
+        assert moved != first
+
+        assert gate.begin(lane.path, _task("t-b")) == moved
+        _write(lane.path, "src/pkg/writer.py", GREEN_WRITER + "\n")
+        res = gate.check(lane.path, _task("t-b"))
+        assert res.ok is True and res.scope == gate_mod.TARGETED, res.reason
+        assert res.targets == ("tests/test_writer.py",), res.targets
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_a_history_git_cannot_compare_pins_nothing(repo, monkeypatch):
+    """Unknown is not clean: when "did the judge change since the trusted
+    commit" has no answer, the unit is refused as one whose start could not
+    be pinned -- not judged from a HEAD the gate cannot vouch for."""
+    from mindhive.orchestrator import judge
+
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-unknown")
+    assert lane.ok, lane.reason
+    try:
+        first = gate.begin(lane.path, _task("t-a"))
+        _write(lane.path, "src/pkg/writer.py", GREEN_WRITER + "\n")
+        _git(lane.path, "add", "-A")
+        _git(lane.path, "commit", "-qm", "moved on")
+        monkeypatch.setattr(judge, "judge_changes", lambda *a, **k: None)
+        assert gate.begin(lane.path, _task("t-b")) == ""
+        res = gate.check(lane.path, _task("t-b"))
+        assert res.ok is False and res.scope == gate_mod.NONE, res
+        assert "could not verify" in res.reason
+        assert gate.begin(lane.path, _task("t-a")) == first, "the first pin moved"
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_the_next_unit_on_a_lane_is_refused_for_the_doctored_test_it_inherited(
+        repo):
+    """End to end: two units, ONE lane. The first unit's child doctors a test
+    and commits it; the gate refuses it, the repair loop rolls back what was
+    uncommitted, and the commit stays. Judged from the lane's HEAD, the
+    second unit would have been green on the doctored suite."""
+    seen = []
+
+    def runner(entry, lane):
+        seen.append(entry.task.task_id)
+        if len(seen) == 1:
+            _write(lane.worktree_path, "src/pkg/writer.py", BROKEN_WRITER)
+            _doctor(lane.worktree_path)
+        return True
+
+    got = _mission(repo, runner, _gate(repo), decomposer=_two_units, lanes=1)
+    assert len(seen) == 2, seen
+    rows = {row["task_id"]: row for row in got.gates}
+    assert set(rows) == set(seen), got.gates
+    for tid in seen:
+        assert rows[tid]["scope"] == gate_mod.IMMUTABLE_TESTS_VIOLATED, rows[tid]
+        assert "tests/test_writer.py" in rows[tid]["reason"]
+    assert got.outcome != "ok"
+
+
+# --- P2 round 2, review fixes: the pin, the pair, and one read of the lane -------
+
+def test_a_lane_whose_first_pin_failed_never_trusts_a_later_head(repo,
+                                                                 monkeypatch):
+    """The first unit on a lane could not be pinned -- git answered nothing --
+    and was refused (above). Its child ran anyway, doctored a test and
+    committed it. The NEXT unit's `begin` then found a lane with no trusted
+    commit and took `HEAD`, the doctored commit, on trust. A lane nothing
+    ever vouched for stays unvouched: every later unit on it is refused too,
+    until the check is stood down."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    lane = wt_mod.acquire(repo, 0, "m-unvouched")
+    assert lane.ok, lane.reason
+    real, broken = mn_wt.rev_of, {"on": True}
+    monkeypatch.setattr(mn_wt, "rev_of", lambda root, ref: (
+        "" if broken["on"] else real(root, ref)))
+    try:
+        gate = _gate(repo)
+        assert gate.begin(lane.path, _task("t-a")) == ""
+        _doctor(lane.path)
+        broken["on"] = False
+        assert gate.begin(lane.path, _task("t-b")) == "", (
+            "the next unit was pinned at a HEAD nothing vouched for")
+        res = gate.check(lane.path, _task("t-b"))
+        assert res.ok is False and res.scope == gate_mod.NONE, res
+        assert "could not verify" in res.reason
+
+        # Stood down, there is nothing to inherit and HEAD is the pin.
+        waived = _gate(repo, allow_test_edits=True)
+        assert waived.begin(lane.path, _task("t-b")) == real(lane.path, "HEAD")
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_a_module_and_a_test_side_twin_committed_together_move_the_baseline(
+        repo):
+    """`test_validated_work_an_earlier_unit_committed_moves_the_baseline_forward`
+    with the pair named ALIKE: `src/twin.py` and a `tests/twin.py` helper. The
+    unit's own check let the pair through (nothing the run imported was
+    replaced), but read with the names the later commit holds, the test-side
+    twin outranked the src-side one and `begin` never trusted the commit --
+    the lane's baseline stopped there for good."""
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-twins")
+    assert lane.ok, lane.reason
+    try:
+        first = gate.begin(lane.path, _task("t-a"))
+        _write(lane.path, "src/twin.py", "def twin():\n    return 4\n")
+        _write(lane.path, "tests/twin.py", "EXPECTED = 4\n")
+        res = gate.check(lane.path, _task("t-a"))
+        assert res.scope != gate_mod.IMMUTABLE_TESTS_VIOLATED, res.reason
+        _git(lane.path, "add", "-A")
+        _git(lane.path, "commit", "-qm", "lint(m-twins) t-a: the pair")
+        moved = _git(lane.path, "rev-parse", "HEAD").stdout.strip()
+        assert moved != first
+
+        assert gate.begin(lane.path, _task("t-b")) == moved
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_the_gate_asks_git_once_per_check_which_files_the_unit_touched(
+        repo, monkeypatch):
+    """`targets` and the greenfield search read ONE list, so a lane that
+    changes underneath the check cannot make the refusal name a file the
+    target search never saw -- and the second spawn was half the gate's git
+    cost on the untested path."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    calls, real = [], mn_wt.changed_files
+    monkeypatch.setattr(mn_wt, "changed_files",
+                        lambda *a, **k: calls.append(a) or real(*a, **k))
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-once")
+    assert lane.ok, lane.reason
+    try:
+        gate.begin(lane.path, _task())
+        _write(lane.path, "src/pkg/lonely.py", "def lonely():\n    return 3\n")
+        res = gate.check(lane.path, _task())
+        assert res.scope == gate_mod.GREENFIELD_NEEDS_TEST, res
+        assert len(calls) == 1, calls
+    finally:
+        wt_mod.release(repo, lane)
+
+
+def test_a_lane_whose_changes_git_cannot_list_is_refused_not_judged_by_its_files(
+        repo, monkeypatch):
+    """`changed_files` answering ``None`` is "git could not say", and it used
+    to fall through to the unit's own files: a stale list that judged a
+    child's real change by the tests of the files it was SENT to edit. The
+    same refusal an unreadable lane gets everywhere else in the gate."""
+    from mindhive.mindnet import worktree as mn_wt
+
+    monkeypatch.setattr(mn_wt, "changed_files", lambda *a, **k: None)
+    gate = _gate(repo)
+    lane = wt_mod.acquire(repo, 0, "m-unlisted")
+    assert lane.ok, lane.reason
+    try:
+        task = lint.AgentTask(task_id="t-writer",
+                              files=(str(repo / "src" / "pkg" / "writer.py"),))
+        gate.begin(lane.path, task)
+        _write(lane.path, "src/pkg/writer.py", GREEN_WRITER + "\n")
+        res = gate.check(lane.path, task)
+        assert res.ok is False and res.scope == gate_mod.NONE, res
+        assert "could not read the lane's changes" in res.reason
+    finally:
+        wt_mod.release(repo, lane)

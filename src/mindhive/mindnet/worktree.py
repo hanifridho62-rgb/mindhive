@@ -30,6 +30,19 @@ become one task reporting `skipped`, not an exception that takes down a wave —
 MN-7's P0 taught that an environmental failure which writes a status row removes
 the task's whole subtree from the graph permanently.
 
+## Names as git holds them, and only at the top level
+
+`changed_files`, `modified_tracked`, `tracked_at` and `changes_between` read
+git with `-z` and split on NUL (`_git_paths`): `core.quotepath=false` still
+C-quotes a DEL, `str.splitlines` breaks a name at LINE SEPARATOR or NEL, and
+`strip` eats a trailing NO-BREAK SPACE, and each came back as a name the gate
+compared against the wrong file. `is_toplevel` tells a checkout from a
+directory inside one, because git asked in a subdirectory answers for the
+tree around it -- and a lane whose `.git` link is gone is that case one level
+up, answering for the MAIN checkout. `commit_all` refuses such a path before
+staging anything, and `orchestrator.judge` and `orchestrator.worktree.rollback`
+ask the same question before they read or discard.
+
 ## The merge-back's primitives live here too
 
 `commit_all`, `merge_probe`, `merge_into`, `is_ancestor` and `rev_of` exist for
@@ -42,6 +55,8 @@ run leaves behind, which neither `state` nor `commit_all` treats as work.
 """
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -127,30 +142,73 @@ class Retired:
     reason: str = ""
 
 
+def _git_bytes(root, *args):
+    """Run one git command in *root*. Answers ``(exit_code, stdout, stderr)``
+    as BYTES. The module's one spawn site: `_git_rc` decodes what it answers,
+    `show_at` returns it as the file content it is.
+
+    ``-1`` when the process could not run at all. ``shell=False`` always (U6's
+    standing rule), and `paths.NO_WINDOW` so a console child spawned from the
+    window-less dashboard process does not flash a console window.
+
+    Bytes, because decoding inside `subprocess.run` is where this went wrong.
+    ``text=True`` decodes the pipe with the locale's codec -- cp1252 on
+    Windows, which leaves five bytes undefined -- and git prints paths as UTF-8
+    under `core.quotepath=false`. One such byte in a file NAME (`ā` is
+    `C4 81`) killed the pipe's reader thread, and `run` then answered an EMPTY
+    stdout with exit 0. No exception ever reached this function; the checkout
+    was simply reported clean."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), *[str(a) for a in args]],
+            capture_output=True, shell=False, timeout=_TIMEOUT_S,
+            creationflags=paths.NO_WINDOW)
+        return proc.returncode, proc.stdout or b"", proc.stderr or b""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, b"", f"{type(exc).__name__}: {exc}".encode("utf-8",
+                                                               "replace")
+
+
+def _decoded(data) -> str:
+    """Git's output as text: UTF-8 with replacement, universal newlines,
+    stripped -- what ``text=True`` gave, without the codec that could fail. A
+    replacement character costs one path a wrong byte; the empty answer the
+    locale codec produced lost every path at once."""
+    text = bytes(data or b"").decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def _git_rc(root, *args):
     """Run one git command in *root*. Answers ``(exit_code, stdout, stderr)``.
 
     The primitive under `_git`, for the callers that read git's exit code as
     an answer rather than a verdict: `merge-tree` and `merge-base
     --is-ancestor` say "no" with 1 and "could not tell" with anything else.
-    ``-1`` when the process could not run at all. ``shell=False`` always (U6's
-    standing rule), and `paths.NO_WINDOW` so a console child spawned from the
-    window-less dashboard process does not flash a console window."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(root), *[str(a) for a in args]],
-            capture_output=True, text=True, shell=False, timeout=_TIMEOUT_S,
-            creationflags=paths.NO_WINDOW)
-        return (proc.returncode, (proc.stdout or "").strip(),
-                (proc.stderr or "").strip())
-    except (OSError, subprocess.SubprocessError) as exc:
-        return -1, "", f"{type(exc).__name__}: {exc}"
+    ``-1`` when the process could not run at all."""
+    rc, out, err = _git_bytes(root, *args)
+    return rc, _decoded(out), _decoded(err)
 
 
 def _git(root, *args):
     """Run one git command in *root*. Answers ``(ok, stdout, stderr)``."""
     rc, out, err = _git_rc(root, *args)
     return rc == 0, out, err
+
+
+def _git_paths(root, *args):
+    """Run one git LISTING in *root* -- a command given `-z` -- and answer the
+    paths it printed, in git's order, or ``None`` when it failed.
+
+    Split on NUL and decoded with replacement, never stripped, never
+    line-split: with `-z` a path is printed verbatim, so a DEL, a LINE
+    SEPARATOR, a NEL or a trailing NO-BREAK SPACE in a name comes back as the
+    name, where the text reading before this C-quoted the first, broke at the
+    next two and ate the last."""
+    rc, out, _err = _git_bytes(root, *args)
+    if rc != 0:
+        return None
+    return [chunk.decode("utf-8", errors="replace")
+            for chunk in out.split(b"\x00") if chunk]
 
 
 def branch_for(task_id) -> str:
@@ -372,38 +430,230 @@ def _retire(root, path, branch="", base="") -> Retired:
     return Retired(removed=True, kept=False, reason="")
 
 
-def changed_files(path):
-    """Repo-relative POSIX paths of every file the checkout at *path* has
-    changed against its `HEAD` — modified, added, deleted, renamed — plus every
-    untracked file that is not ignored. ``()`` for a clean tree; ``None`` when
-    git could not say.
+def _rev(rev):
+    """*rev* as git should receive it, or ``None`` when it cannot be one.
 
-    Two commands rather than one `status --porcelain`, because `_git` strips
-    its output and the first status line's leading column is whitespace:
-    ``" M seed.txt"`` comes back as ``"M seed.txt"`` and no column parser
-    survives that. `diff --name-only HEAD` and `ls-files --others
-    --exclude-standard` print one bare path per line and nothing to parse.
-    `core.quotepath=false` keeps a non-ASCII name as itself rather than as
-    octal escapes.
+    A revision here is an argument, and git reads an argument that starts with
+    ``-`` as an OPTION -- `--output=<file>` makes `diff` write a file. Every rev
+    this module is handed is `HEAD` or came out of `rev-parse`, so refusing the
+    rest costs nothing and shuts the one door that argument position has."""
+    text = str(rev or "").strip()
+    if not text or text.startswith("-"):
+        return None
+    return text
+
+
+def changed_files(path, rev="HEAD"):
+    """Repo-relative POSIX paths of every file the checkout at *path* has
+    changed against *rev* — modified, added, deleted, renamed — plus every
+    untracked file that is not ignored. ``()`` for a clean tree; ``None`` when
+    git could not say, or when *rev* cannot be a revision (`_rev`).
+
+    *rev* is `HEAD` unless a caller pinned an earlier commit, and
+    `orchestrator.gate` does: it pins the commit a unit STARTED from. A child
+    that commits its own work moves `HEAD` past that work, and "changed against
+    `HEAD`" then answers that the unit changed nothing at all.
+
+    Two listings rather than one `status --porcelain`, because a status line's
+    leading column is whitespace and no column parser survives `_decoded`'s
+    strip. `diff --name-only --no-renames` and `ls-files --others
+    --exclude-standard`, both with `-z` (`_git_paths`): one NUL-terminated
+    path each, taken verbatim -- `core.quotepath=false` still C-quoted a DEL,
+    `str.splitlines` broke a name at LINE SEPARATOR or NEL, and `strip` ate a
+    trailing NO-BREAK SPACE, and each came back as a name the gate compared
+    against the wrong file. `--no-renames`, because a moved module changed at
+    BOTH ends and the tests naming the old path have to run too.
 
     Under the lock like everything else here: the per-unit gate asks this from
     the scheduler's executor threads while another lane may be mid-`add`.
     Total."""
+    rev = _rev(rev)
+    if rev is None:
+        return None
     with _GIT_LOCK:
-        ok, tracked, _err = _git(path, "-c", "core.quotepath=false", "diff",
-                                 "--name-only", "HEAD")
-        if not ok:
+        tracked = _git_paths(path, "diff", "--name-only", "-z", "--no-renames",
+                             rev, "--")
+        if tracked is None:
             return None
-        ok, untracked, _err = _git(path, "-c", "core.quotepath=false",
-                                   "ls-files", "--others", "--exclude-standard")
-        if not ok:
+        untracked = _git_paths(path, "ls-files", "-z", "--others",
+                               "--exclude-standard")
+        if untracked is None:
             return None
-    out = []
-    for line in (tracked + "\n" + untracked).splitlines():
-        rel = line.strip().replace("\\", "/")
-        if rel:
-            out.append(rel)
-    return tuple(dict.fromkeys(out))
+    return tuple(dict.fromkeys([*tracked, *untracked]))
+
+
+def modified_tracked(path, rev="HEAD"):
+    """Repo-relative POSIX paths of files that EXISTED at *rev* in the
+    checkout at *path* and have since been modified, deleted or had their type
+    changed -- by a commit made since *rev* or in the working tree, alike.
+    ``None`` when git could not say, so a caller can tell "nothing changed"
+    from "I do not know".
+
+    The distinction `changed_files` cannot make. `orchestrator.gate` refuses a
+    unit that edited a test the lane was checked out WITH, while a test the
+    unit CREATED is the whole point of the greenfield flow.
+
+    That line is drawn by `--diff-filter=DMT`, not by "tracked": a plain
+    `diff HEAD` also lists a new file that has merely been STAGED, and a lane
+    carries staged new files whenever `commit_all` ran `git add -A` and the
+    commit itself was then refused (a hook, no identity, an unusable signing
+    key). The next unit on that lane would be refused for a file an earlier,
+    validated unit created -- and no rollback clears it, because `checkout`
+    and `clean` both leave the index alone. `--no-renames` reports a rename as
+    the delete of the path that existed, which is the one this contract names.
+
+    Read with `-z` (see `changed_files`), under `_GIT_LOCK` like every other
+    invocation in this module. Total."""
+    rev = _rev(rev)
+    if rev is None:
+        return None
+    with _GIT_LOCK:
+        tracked = _git_paths(path, "diff", "--name-only", "-z", "--no-renames",
+                             "--diff-filter=DMT", rev, "--")
+    if tracked is None:
+        return None
+    return tuple(dict.fromkeys(tracked))
+
+
+def show_at(path, rel, rev="HEAD"):
+    """The bytes of *rel* as committed at *rev* in the checkout at *path*, or
+    ``None`` when it was not there or git could not say.
+
+    Bytes, straight from `_git_bytes`, because this returns FILE CONTENT: a
+    decode would alter it and fold its line endings, and the caller compares
+    what pytest will read. `cat-file blob` rather than `show`, because it is
+    the command that promises the stored bytes with no conversion of any kind.
+    Under the lock. Total."""
+    rev = _rev(rev)
+    if rev is None:
+        return None
+    spec = f"{rev}:" + str(rel or "").replace("\\", "/").lstrip("/")
+    with _GIT_LOCK:
+        rc, out, _err = _git_bytes(path, "cat-file", "blob", spec)
+    return out if rc == 0 else None
+
+
+def tracked_at(path, rev="HEAD"):
+    """Every repo-relative POSIX path committed at *rev*, as a frozenset, or
+    ``None`` when git could not say.
+
+    The other half of `modified_tracked`, which names what changed among the
+    files *rev* held: this is how a caller tells a file that is NEW since *rev*
+    from one that was always there. A new `conftest.py` changes what a suite
+    does exactly as much as an edited one. Read with `-z` (see
+    `changed_files`). Total."""
+    rev = _rev(rev)
+    if rev is None:
+        return None
+    with _GIT_LOCK:
+        held = _git_paths(path, "ls-tree", "-r", "-z", "--name-only",
+                          "--full-tree", rev)
+    return None if held is None else frozenset(held)
+
+
+def changes_between(path, base, head):
+    """``((status, path), ...)`` for every file that differs between the
+    commits *base* and *head* in the checkout at *path*, in git's path order:
+    `A`dded, `D`eleted, `M`odified or `T`ype-changed at *head* against *base*.
+    The working tree and the index are no part of the answer -- this is the
+    commit-to-commit question `orchestrator.judge.judge_changes` asks before
+    `SuiteGate.begin` trusts a later commit on a shared lane. `--no-renames`,
+    so a move is the delete of the path that was and the add of the path that
+    is, which is what a judge comparing files by name needs. ``()`` when the
+    two trees are the same; ``None`` when git could not say or either
+    revision cannot be one (`_rev`), decided before git runs. Under the lock.
+    Total."""
+    base, head = _rev(base), _rev(head)
+    if base is None or head is None:
+        return None
+    with _GIT_LOCK:
+        rows = _git_paths(path, "diff", "--name-status", "-z", "--no-renames",
+                          base, head, "--")
+    if rows is None:
+        return None
+    pairs = iter(rows)
+    return tuple((status[:1], rel) for status, rel in zip(pairs, pairs))
+
+
+def is_toplevel(path) -> bool:
+    """Whether *path* is the top level of a checkout git registered -- not a
+    directory inside one, and not a tree that merely carries a `.git` file.
+
+    git asked in a subdirectory answers for the checkout around it: every
+    path relative to a root the caller never named, `add -A -- .` staging one
+    subtree of a tree `commit` then commits whole. A lane whose `.git` link
+    is gone is that case one level up -- git walks out of the lane and
+    answers for the MAIN checkout, from where every file in the lane is
+    untracked and a `clean -fd` empties it. So `rev-parse --show-toplevel`
+    must name *path* itself, and when the admin directory
+    (`--absolute-git-dir`) holds a `gitdir` back-pointer -- a linked
+    worktree's does -- it must point back at *path*, which a COPY of a lane
+    fails: its `.git` file names the original's admin directory, and git
+    would act on the original's records.
+
+    A LINK standing at *path* -- a junction or a symlink -- is refused before
+    git is asked: it passes every test of the path's shape and resolves to
+    whatever it names, another lane or the main checkout, which git then
+    vouches for as a top level of its own; a rollback or a commit through
+    it would act on THAT tree. The lane must be the directory (`is_link`).
+    The back-pointer may be relative (`worktree.useRelativePaths`, git
+    2.48+) and is resolved against the admin directory that holds it.
+
+    Asks git through `_git_bytes` directly, ONCE -- `rev-parse` answers both
+    questions on consecutive lines -- so a caller that fakes `_git` to watch
+    the commands a function issues does not see this one, and the guard that
+    every commit, rollback and gate check runs first costs one spawn. Not
+    cached, on purpose: the guard must see the link vanish. ``False`` for an
+    empty path, a link, one that is not a directory, or anything git cannot
+    answer. Never raises."""
+    text = str(path or "")
+    if not text or is_link(text):
+        return False
+    try:
+        target = Path(text).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if not target.is_dir():
+        return False
+    with _GIT_LOCK:
+        rc, out, _err = _git_bytes(target, "rev-parse", "--show-toplevel",
+                                   "--absolute-git-dir")
+    if rc != 0:
+        return False
+    lines = _decoded(out).splitlines()
+    if len(lines) < 2:
+        return False
+    top, admin = lines[0].strip(), lines[1].strip()
+    try:
+        if (os.path.normcase(str(Path(top).resolve()))
+                != os.path.normcase(str(target))):
+            return False
+        link = Path(admin) / "gitdir"
+        if not link.is_file():
+            return True
+        raw = link.read_text(encoding="utf-8", errors="replace").strip()
+        back = (Path(admin) / raw).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return os.path.normcase(str(back)) == os.path.normcase(str(target / ".git"))
+
+
+def is_link(path) -> bool:
+    """Whether *path* is a symbolic link or a Windows junction. `os.walk`
+    stops at the first (`followlinks=False`) and walks straight into the
+    second, `Path.resolve` follows both, and `Path.is_symlink` sees only the
+    first; the readers that must not cross into another tree -- the judge's
+    walk, `is_toplevel` -- ask this. ``False`` for a path that cannot be
+    stat'ed. Never raises."""
+    try:
+        st = os.lstat(str(path))
+    except (OSError, ValueError):
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return getattr(st, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
 # --- the merge-back's primitives ------------------------------------------------
 #
 # Added for `orchestrator.integrate`, and here rather than there because this
@@ -431,7 +681,16 @@ def commit_all(path, message) -> Committed:
     bytecode answers ``changed=False`` rather than failing at `commit` with
     "nothing to commit". Identity, hooks and the operator's config bind this
     exactly as they bind a person: a refusing hook or a missing identity comes
-    back as git's own reason, and nothing here bypasses either."""
+    back as git's own reason, and nothing here bypasses either.
+
+    Refused before anything is staged when *path* is not a checkout's top
+    level (`is_toplevel`): `add -A -- .` in a subdirectory stages that
+    subtree and `commit` then commits the WHOLE index, whatever else was
+    staged, under a message about one lane's unit -- and a lane whose `.git`
+    link is gone is that call made against the main checkout."""
+    if not is_toplevel(path):
+        return Committed(reason=f"{path} is not a checkout's top level; "
+                                f"nothing staged")
     excludes = [f":(exclude,glob)**/{d}/**" for d in CACHE_DIRS]
     with _GIT_LOCK:
         ok, _out, err = _git(path, "add", "-A", "--", ".", *excludes)

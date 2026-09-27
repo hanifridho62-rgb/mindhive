@@ -48,10 +48,27 @@ argument can stand in for the process token. The behavioural suite is
 `tests/test_advice_authorship.py`; what is pinned here is only what must never
 move.
 
-**P2 (appended later): the SuiteGate half.** The `SuiteGate` /
-`"PELANGGARAN GATE"` tests from the same harness sketch belong to the phase
-that creates `mindhive.orchestrator.gate`; they are deliberately NOT written
-here, and that module is not imported. Do not add them to P0.
+**P2 (appended): the SuiteGate half.** The gate in front of a merge is
+foundation for the same reason the ledger is -- every later phase trusts that
+"validated" meant a test ran. Three properties are pinned here because no
+later phase can repair them:
+
+* a unit whose changed module no test mentions is REFUSED, not passed. The
+  fail-open version of this branch called such a unit validated and said the
+  closing full suite would judge it, which named a judge that runs after the
+  merge;
+* the greenfield refusal carries the exact path to create, and that path is
+  one the gate itself would then accept. An instruction the gate does not
+  recognise is a repair loop, not a fix;
+* a unit may not edit the tests it is judged by (K13) -- the whole judge,
+  `conftest.py` and the pytest configuration as much as `test_*.py` --
+  measured from the commit its lane stood at before its FIRST attempt, which
+  the gate pins ahead of the child. Not the lane's `HEAD`: a child that
+  commits its edit moves `HEAD` with it, and a baseline the judged party can
+  move is no baseline. A lane git cannot read is refused, never passed.
+
+The behavioural suite is `tests/test_orchestrator_gate.py`, which runs real
+git and real pytest; what is pinned here is only what must never move.
 
 ## The canaries
 
@@ -467,3 +484,247 @@ def test_the_process_token_is_withheld_from_every_spawned_agent(
         assert "MINDHIVE_PROCESS_TOKEN" not in spawner(None)
         child = spawner(dict(overlay))
         assert "MINDHIVE_PROCESS_TOKEN" not in child and child["KEEP"] == "1"
+
+
+# --- P2: the gate in front of a merge -----------------------------------------
+
+def _refusals():
+    from mindhive.orchestrator import gate as gate_mod
+    return gate_mod
+
+
+def _joined(func):
+    """A function's source with implicit string concatenation collapsed.
+
+    These messages are read by a child and are pinned as text, but they are
+    also wrapped to fit 79 columns — so the string in the file is four
+    fragments and a search for the sentence finds nothing."""
+    import re
+    return re.sub(r'"\s*\n\s*f?"', "", inspect.getsource(func))
+
+
+def test_no_test_mentions_it_is_a_refusal_not_a_pass():
+    """THE inversion. `check` reaches this branch with an empty target list,
+    and the only two ways out are a prescription or an explicit override."""
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate._untested)
+    assert "ok=False" in src
+    assert ("PELANGGARAN GATE: tidak ada tes yang menyebut modul yang "
+            "diubah; gunakan --allow-untested" in src)
+    assert src.count("ok=True") == 1, (
+        "more than one way out of the untested branch passes the unit")
+
+
+def test_the_prescribed_path_is_one_the_gate_would_accept():
+    """The instruction has to be true on every input, not on the example.
+    `canonical_test_path` names a file and `_named_for` decides whether a file
+    counts -- if those two ever disagree the gate sends children somewhere it
+    does not look."""
+    gate_mod = _refusals()
+    from pathlib import Path as _P
+    for rel in ("src/pkg/lonely.py", "src/a/b/c/deep_module.py",
+                "src\\pkg\\windows.py", "toplevel.py"):
+        prescribed = gate_mod.canonical_test_path(rel)
+        assert prescribed.startswith("tests/")
+        stem = _P(rel.replace("\\", "/")).stem
+        assert _P(prescribed).name in gate_mod._named_for(f"pkg.{stem}")
+
+
+def test_the_refusal_names_the_module_and_the_file_to_write():
+    """Verbatim MEB ORCH-01. A child reads this string and acts on it, so the
+    two substitutions it turns on are pinned as text."""
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate._untested)
+    assert "MODUL BARU TERDETEKSI: Modul '" in src
+    assert "belum memiliki tes pendamping. Anda WAJIB membuat berkas tes pada:" in src
+    assert "Instruksi: Tulis minimal satu pengujian unit di" in src
+
+
+def test_the_override_cannot_reach_the_greenfield_case():
+    """`--allow-untested` is for work no test could name. A new module always
+    can be named -- the gate has just said which file -- so the greenfield
+    branch is decided BEFORE the flag is consulted."""
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate._untested)
+    assert src.index("MODUL BARU TERDETEKSI") < src.index("allow_untested")
+
+
+def test_a_deleted_module_is_never_prescribed_a_test(tmp_path):
+    """An instruction no attempt can satisfy is worse than no instruction."""
+    gate_mod = _refusals()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "kept.py").write_text("x = 1", encoding="utf-8")
+    assert gate_mod.greenfield_files(
+        tmp_path, ["src/kept.py", "src/gone.py"]) == ["src/kept.py"]
+
+
+def test_editing_the_tests_is_refused_and_says_which_flag_allows_it():
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate.check)
+    assert ("PELANGGARAN GATE: berkas uji yang sudah ada diubah selama "
+            "implementasi:" in src)
+    assert "--allow-test-edits" in src
+
+
+def test_the_immutable_check_runs_before_the_suite_does():
+    """Refusing AFTER running would report the doctored suite's green as the
+    unit's result. Asserted on the source order because the behavioural test
+    needs a real lane and this file takes none."""
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate.check)
+    assert src.index("tests_mutated") < src.index("self.targets(")
+
+
+def test_the_immutable_baseline_is_pinned_before_the_child_runs():
+    """The baseline is the commit the lane stood at before the unit's FIRST
+    attempt. A snapshot taken when the gate first runs is taken after that
+    attempt edited the file, and the lane's `HEAD` at gate time is no better:
+    a child told not to commit still can, and committing makes `HEAD` agree
+    with the edit. Every link is pinned because losing any one reopens it --
+    `gated` asks for the pin BEFORE the runner on both paths, `begin` pins the
+    lane's current commit and never overwrites a pin, and `check` compares
+    against the pin, not `HEAD`."""
+    gate_mod = _refusals()
+    gated = _joined(gate_mod.gated)
+    assert ("_begin(entry, lane)\n        return _finish(entry, lane, "
+            "runner(entry, lane))" in gated), "the sync path pins after the child"
+    assert (gated.index("run_in_executor(None, _begin, entry, lane)")
+            < gated.index("out = await runner(entry, lane)")), (
+        "the coroutine path pins after the child")
+    begin = _joined(gate_mod.SuiteGate.begin)
+    assert 'rev_of(lane, "HEAD")' in begin
+    assert "setdefault" in begin, "a later attempt would re-pin"
+    check = _joined(gate_mod.SuiteGate.check)
+    assert "pinned = self.baseline(lane, task)" in check
+    assert "tests_mutated(lane, base=base)" in check
+    # A pin `begin` could not take is refused, not swapped for HEAD.
+    assert (check.index("if not pinned:")
+            < check.index("ok=False", check.index("if not pinned:"))
+            < check.index("tests_mutated(lane, base=base)"))
+
+
+def test_the_judge_is_more_than_the_test_modules():
+    """An autouse fixture in a `conftest.py`, or `addopts = --deselect ...`,
+    turns a red run green without one `test_*.py` changing. A gate watching
+    only those passes the doctored run."""
+    from mindhive.orchestrator import judge
+    for rel in ("tests/conftest.py", "conftest.py", "src/pkg/conftest.py",
+                "pytest.ini", "tests/data/expected.json", "tests/helpers.py",
+                "tests/__init__.py"):
+        assert judge.is_judge_path(rel), rel
+    assert judge.PYTEST_SECTIONS == {"pyproject.toml": "tool.pytest",
+                                     "setup.cfg": "tool:pytest",
+                                     "tox.ini": "pytest"}
+    assert not judge.is_judge_path("pyproject.toml"), (
+        "the WHOLE pyproject judged would refuse a dependency bump")
+    assert not judge.is_judge_path("src/pkg/writer.py")
+
+
+def test_a_new_plugin_file_is_a_change_and_a_new_test_module_is_not():
+    """Writing a test module is exactly what the greenfield refusal tells a
+    child to do. Writing a `conftest.py` changes every run below it just by
+    existing."""
+    from mindhive.orchestrator import judge
+    for rel in ("tests/conftest.py", "conftest.py", "pytest.ini",
+                "tests/pytest.ini", "tests/__init__.py"):
+        assert judge.is_implicit_load(rel), rel
+    for rel in ("tests/test_lonely.py", "tests/helpers.py",
+                "tests/data/expected.json"):
+        assert not judge.is_implicit_load(rel), rel
+
+
+def test_a_lane_git_cannot_read_is_refused_not_passed():
+    """"Nothing I could see changed" is not "nothing changed". `None` is its
+    own refusal, decided BEFORE the test that would read it as clean."""
+    gate_mod = _refusals()
+    check = _joined(gate_mod.SuiteGate.check)
+    unknown = check.index("if mutated is None:")
+    assert unknown < check.index("ok=False", unknown) < check.index("if mutated:")
+    assert "could not verify that the lane's existing tests" in check
+
+
+def test_the_lock_and_the_check_walk_one_list():
+    """What the deterrent protects and what the gate compares cannot drift
+    apart when both are the same walk."""
+    from mindhive.orchestrator import judge
+    from mindhive.orchestrator import worktree as wt_mod
+    assert "judge.judge_files(" in inspect.getsource(wt_mod._chmod_tests)
+    assert "judge_files(lane)" in inspect.getsource(judge.snapshot_tests)
+
+
+def test_the_gate_defaults_to_closed_on_both_counts():
+    """The defaults ARE the invariant: a permissive default leaves every
+    property above reachable only by a caller who asked for it."""
+    gate_mod = _refusals()
+    plain = gate_mod.SuiteGate()
+    assert plain.allow_untested is False
+    assert plain.immutable_tests is True
+    assert plain.allow_test_edits is False
+
+
+def test_a_judge_edit_left_on_a_lane_is_every_later_units_change():
+    """Rollback keeps commits, so the lane a second unit starts on may hold a
+    judge edit the first unit's child committed under a refused unit. A pin
+    taken at that HEAD would judge the second unit clean against a doctored
+    suite. The pin advances only when the judge is the same at both commits."""
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate._pin)
+    assert "judge_changes(lane, trusted, head)" in src
+    assert "return trusted" in src, "a judge edit does not move the pin"
+    assert src.index("if changed:") < src.index("self._trusted[lane_key] = head")
+    assert "self._pin(" in _joined(gate_mod.SuiteGate.begin)
+
+
+def test_the_judge_reads_a_checkout_only_at_its_top_level():
+    """git asked inside a checkout answers for the tree around it, and a lane
+    whose `.git` link is gone is a directory inside the MAIN checkout. Every
+    reader that would act on that answer asks first."""
+    from mindhive.mindnet import worktree as mn_wt
+    from mindhive.orchestrator import judge
+    from mindhive.orchestrator import worktree as wt_mod
+    for func in (judge.tests_mutated, judge.judge_changes, mn_wt.commit_all,
+                 wt_mod.rollback):
+        assert "is_toplevel(" in inspect.getsource(func), func.__name__
+
+
+def test_the_judge_is_named_by_import_as_well_as_by_path():
+    """The interpreter imports `sitecustomize` by NAME and pytest loads every
+    `pytest11` entry point the metadata on its path declares; matching one
+    file name missed every other spelling."""
+    from mindhive.orchestrator import judge
+    assert judge.STARTUP_HOOKS == ("sitecustomize", "usercustomize")
+    for rel in ("src/sitecustomize/__init__.py", "src/usercustomize.pyw",
+                "src/sitecustomize.pyc", "src/x-1.0.dist-info/entry_points.txt",
+                "pytest.toml", ".pytest.toml", "tests/pytest.toml"):
+        assert judge.is_judge_path(rel) and judge.is_implicit_load(rel), rel
+    assert not judge.is_judge_path("src/sitecustomize/__pycache__/x.pyc")
+
+
+# --- P2 round 2, review fixes ---------------------------------------------------
+
+def test_the_rollback_guard_is_asked_under_the_git_lock():
+    """Between "this is a checkout of its own" and `checkout -- .` nothing may
+    change what git answers for the path, so the guard runs under the lock
+    the checkout runs under; and its seam is taken inside the try like the
+    other two, so a rename is reported, not raised."""
+    from mindhive.orchestrator import worktree as wt_mod
+    src = inspect.getsource(wt_mod.rollback)
+    assert src.index("with lock:") < src.index("is_toplevel(")
+    assert src.index("mn_wt.is_toplevel") < src.index("except Exception as exc:")
+
+
+def test_the_gate_reads_the_lanes_changes_once_per_check():
+    """One list for `targets` and the greenfield search, read by `check` and
+    handed down -- a second read could name a file the first never saw."""
+    gate_mod = _refusals()
+    assert _joined(gate_mod.SuiteGate.check).count("self._touched(") == 1
+    assert "self._touched(" not in _joined(gate_mod.SuiteGate._untested)
+
+
+def test_a_lane_nothing_vouched_for_stays_unvouched():
+    """A first pin that failed leaves the lane with no trusted commit, and a
+    later `HEAD` is not taken on trust in its place."""
+    gate_mod = _refusals()
+    src = _joined(gate_mod.SuiteGate._pin)
+    assert "if trusted is None:" in src
+    assert src.index("if trusted is None:") < src.index("judge_changes(")
