@@ -135,12 +135,22 @@ JS = """\
       // Recall sets liveFn = null, and a second search while the first is in
       // flight is the common case here, not an edge one.
       if (!current()) return;
-      if (!hits.length) { showText('No matches for "'+q+'".'); return; }
-      showHTML('<h2 class="h">'+hits.length+' result'+(hits.length>1?'s':'')+'</h2><ul class="hits">'
+      // A failed search answers {ok:false, error} with a 500, and apiGet does
+      // not look at the status: without this a broken index reads as no matches.
+      // Thrown, not painted: run() then paints it with fail() and announces
+      // the search failed, where a hand-painted error sat under "ready".
+      if (!Array.isArray(hits)) throw new Error('Recall failed: '+((hits && hits.error) || 'no answer from the server'));
+      // HIVE MIND: a namespace whose index could not be read answers
+      // {project, error} in place of its hits; the others' hits still stand.
+      const notes = hits.filter(h => h && h.error).map(h => '<div class="err">Could not search '+esc(h.project||'')+': '+esc(h.error)+'</div>').join('');
+      const found = hits.filter(h => !(h && h.error));
+      if (!found.length && !notes) { showText('No matches for "'+q+'".'); return; }
+      showHTML(notes + (!found.length ? '<p>No matches for "'+esc(q)+'" where the search could run.</p>'
+        : '<h2 class="h">'+found.length+' result'+(found.length>1?'s':'')+'</h2><ul class="hits">'
         // The one row in sixteen whose `.file` really is a file: `path` puts the
         // link blue back on it, which the shared rule stopped being.
-        + hits.map(h => '<li><div class="file path">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
-        + '</ul>');
+        + found.map(h => '<li><div class="file path">'+esc(h.file||'')+'</div><div class="snip">'+esc(h.snippet||'')+'</div></li>').join('')
+        + '</ul>'));
     }, 'rows');
   }
 

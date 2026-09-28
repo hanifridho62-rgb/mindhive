@@ -40,12 +40,56 @@ class _FakeCollection:
         return self._query_result
 
 
+class _ReadClient:
+    """What `vectors._reading` yields: a client over a private COPY of the
+    index. It can look a collection up and nothing else, so a read path that
+    tried to create or drop one fails here instead of passing."""
+
+    def __init__(self, cols):
+        self.cols = dict(cols)
+
+    def list_collections(self):
+        import types
+        return [types.SimpleNamespace(name=n) for n in self.cols]
+
+    def get_collection(self, name):
+        return self.cols[name]
+
+
+def _stub_reading(monkeypatch, cols, opened=None):
+    """Replace the read seam. *cols* None is "this namespace has no index";
+    *opened* collects the project of every read that got as far as opening."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _reading(project=None, name=None):
+        if opened is not None:
+            opened.append(project)
+        yield None if cols is None else _ReadClient(cols)
+
+    monkeypatch.setattr(vectors, "_reading", _reading)
+
+
+def _refusing(error):
+    """A read seam that fails before any client exists, raising *error*."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _reading(project=None, name=None):
+        raise error
+        yield                                           # pragma: no cover
+
+    return _reading
+
+
 def _stub_backend(monkeypatch, col):
-    """Replace the real deps/encoder/collection with deterministic stand-ins."""
+    """Replace the real deps/encoder/collection with deterministic stand-ins.
+    Writes go through `_collection`, reads through `_reading`."""
     monkeypatch.setattr(vectors, "_require_deps", lambda: None)
     monkeypatch.setattr(vectors, "_encoder", lambda: (lambda texts: [[0.0] for _ in list(texts)]))
     monkeypatch.setattr(vectors, "_collection",
                         lambda project=None, **kw: col)
+    _stub_reading(monkeypatch, {vectors.LEDGER_COLLECTION: col})
 
 
 # --- dependency check -------------------------------------------------------
@@ -208,6 +252,7 @@ def _stub_events_backend(monkeypatch, col, evs):
     monkeypatch.setattr(vectors, "_events_collection",
                         lambda project=None, **kw: col)
     monkeypatch.setattr(events_mod, "read_all", lambda project=None: list(evs))
+    _stub_reading(monkeypatch, {vectors.EVENT_COLLECTION: col})
 
 
 # --- ids and documents -------------------------------------------------------
@@ -345,21 +390,124 @@ def test_a_type_filter_reaches_the_query(tmp_path, monkeypatch):
     assert col.where == {"type": {"$in": ["decision", "caveat"]}}
 
 
-def test_a_failing_query_returns_no_hits_rather_than_raising(tmp_path,
-                                                             monkeypatch):
+class _Angry(_FakeEventCollection):
+    """A collection whose every read raises, the way a corrupt index does."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.error = error or RuntimeError("Error loading hnsw index")
+
+    def query(self, **kw):
+        raise self.error
+
+    def count(self):
+        raise self.error
+
+
+def test_a_failing_query_is_an_error_not_an_empty_answer(tmp_path,
+                                                         monkeypatch):
+    """The finding: a query exception was caught and turned into `[]`, so a
+    broken index read exactly like "no semantic hits" to every caller."""
     _isolate(tmp_path, monkeypatch)
+    boom = RuntimeError("Error loading hnsw index")
+    _stub_events_backend(monkeypatch, _Angry(boom), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    assert err.value.stage == "query"
+    assert err.value.collection == vectors.EVENT_COLLECTION
+    assert err.value.__cause__ is boom
+    assert "hnsw" in str(err.value) and "hive embed --rebuild" in str(err.value)
 
-    class _Angry(_FakeEventCollection):
-        def query(self, **kw):
-            raise RuntimeError("no")
 
-    _stub_events_backend(monkeypatch, _Angry(), [])
+def test_the_typed_error_is_still_a_runtime_error():
+    """Callers that already catch RuntimeError (LIVE_LOCK, missing extras) keep
+    catching this one; the type is how the ones that care tell it apart."""
+    assert issubclass(vectors.SemanticQueryError, RuntimeError)
+
+
+def test_a_failing_file_level_query_is_an_error_too(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_backend(monkeypatch, _Angry())
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall("x")
+    assert (err.value.stage, err.value.collection) == (
+        "query", vectors.LEDGER_COLLECTION)
+
+
+def test_an_encoder_failure_is_reported_as_one(tmp_path, monkeypatch):
+    """A model that will not load is a different repair from a broken index,
+    so the stage says which."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+
+    def _no_model():
+        raise OSError("all-MiniLM-L6-v2 is not in the local cache")
+
+    monkeypatch.setattr(vectors, "_encoder", _no_model)
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    assert err.value.stage == "encode"
+    assert "model" in str(err.value)
+
+
+def test_an_index_that_cannot_be_opened_is_reported_at_open(tmp_path,
+                                                            monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    monkeypatch.setattr(vectors, "_reading",
+                        _refusing(RuntimeError("file is not a database")))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    assert err.value.stage == "open"
+
+
+def test_a_missing_index_is_empty_and_never_loads_the_model(tmp_path,
+                                                            monkeypatch):
+    """No index is a real "nothing found", not a failure -- and answering it
+    must not cost a 90 MB model load."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    _stub_reading(monkeypatch, None)
+
+    def _never():
+        raise AssertionError("the model was loaded to search no index")
+
+    monkeypatch.setattr(vectors, "_encoder", _never)
     assert vectors.semantic_recall_events("x") == []
+    assert vectors.semantic_recall("x") == []
+    assert vectors.indexed_event_count(strict=True) == 0
+
+
+def test_a_read_never_creates_the_collection_it_asks_for(tmp_path,
+                                                         monkeypatch):
+    """An index that holds the ledger collection but not the events one is
+    answered as empty. `_ReadClient` has no `get_or_create_collection`, so a
+    read path that minted the collection would fail here."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    _stub_reading(monkeypatch, {vectors.LEDGER_COLLECTION: _FakeCollection()})
+    assert vectors.semantic_recall_events("x") == []
+    assert vectors.indexed_event_count(strict=True) == 0
+
+
+def test_live_lock_refuses_an_event_read_before_the_index_is_opened(
+        tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    opened = []
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    _stub_reading(monkeypatch, {}, opened)
+    paths.store_home().mkdir(parents=True, exist_ok=True)
+    (paths.store_home() / "LIVE_LOCK").write_text("x", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="LIVE_LOCK"):
+        vectors.semantic_recall_events("x")
+    with pytest.raises(RuntimeError, match="LIVE_LOCK"):
+        vectors.semantic_recall("x")
+    assert opened == [], "the index was opened while V17 was live"
 
 
 def test_the_index_count_is_zero_rather_than_an_exception(tmp_path, monkeypatch):
-    """It is called to DECIDE whether the semantic path is worth taking, and a
-    check that can fail is a check every caller has to wrap."""
+    """Without the extras there is no semantic layer to count, and that is
+    not a failure of one."""
     _isolate(tmp_path, monkeypatch)
 
     def _boom():
@@ -367,6 +515,260 @@ def test_the_index_count_is_zero_rather_than_an_exception(tmp_path, monkeypatch)
 
     monkeypatch.setattr(vectors, "_require_deps", _boom)
     assert vectors.indexed_event_count() == 0
+    assert vectors.indexed_event_count(strict=True) == 0
+
+
+def test_a_broken_index_count_raises_when_strict_and_is_logged_otherwise(
+        tmp_path, monkeypatch, caplog):
+    """`recall` asks strictly, because it routes on the answer and a 0 that
+    meant "broken" sent it to the other index in silence. A caller that only
+    DISPLAYS the count may take 0 -- but the failure is logged, never lost."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.indexed_event_count(strict=True)
+    assert err.value.stage == "count"
+    with caplog.at_level("WARNING", logger="mindhive.vectors"):
+        assert vectors.indexed_event_count() == 0
+    assert "count" in caplog.text and "hnsw" in caplog.text
+
+
+# --- the error says what to do, and the advice fits the failure ---------------
+#
+# One remedy for every stage told an operator to rebuild an index that a busy
+# writer, a full temp dir or a missing package had made unreadable -- and
+# `--rebuild` itself opens the live index, so on a damaged one it is not a
+# repair at all.
+
+from mindhive import vector_snapshot                  # noqa: E402
+
+
+def _snapshot_failure(tmp_path, monkeypatch, reason):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    monkeypatch.setattr(vectors, "_reading", _refusing(
+        vector_snapshot.SnapshotError(f"could not copy ({reason})",
+                                      reason=reason)))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    assert err.value.stage == "snapshot"
+    return str(err.value)
+
+
+def test_a_busy_writer_is_reported_as_one(tmp_path, monkeypatch):
+    msg = _snapshot_failure(tmp_path, monkeypatch, "busy")
+    assert "retry when" in msg and "--rebuild" not in msg
+
+
+def test_a_temp_dir_that_cannot_hold_a_copy_is_not_called_busy(tmp_path,
+                                                               monkeypatch):
+    msg = _snapshot_failure(tmp_path, monkeypatch, "space")
+    assert "temp" in msg and "retry when" not in msg and "--rebuild" not in msg
+    # ...nor handed the copy advice: freeing space mends neither a read-only
+    # temp directory nor one that cannot take a directory at all.
+    assert "full or not writable" in msg and "free space there" not in msg
+
+
+def test_a_copy_that_failed_says_to_free_space(tmp_path, monkeypatch):
+    msg = _snapshot_failure(tmp_path, monkeypatch, "copy")
+    assert "free space" in msg and "--rebuild" not in msg
+
+
+def test_a_damaged_index_names_the_directory_to_delete(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.indexed_event_count(strict=True)
+    msg = str(err.value)
+    assert str(paths.project_dir() / "chroma") in msg
+    assert "hive embed" in msg and "--rebuild" not in msg
+    assert f"hive embed --project {paths.project_dir().name}" in msg, \
+        "the repair does not say which namespace `hive embed` must run in"
+
+
+def test_a_failed_query_still_offers_the_rebuild_and_then_the_delete(
+        tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    msg = str(err.value)
+    assert "hive embed --rebuild" in msg
+    assert str(paths.project_dir() / "chroma") in msg
+
+
+def test_the_error_names_the_project_and_how_to_select_it(tmp_path,
+                                                          monkeypatch):
+    """`hive embed` repairs whichever namespace it is pointed at, so advice
+    that does not say which one repairs the wrong index as often as not."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x", project="other")
+    msg = str(err.value)
+    assert "'other'" in msg and "hive embed --rebuild --project other" in msg
+    assert str(paths.project_dir("other") / "chroma") in msg
+
+
+def test_the_repair_selects_the_namespace_verbatim(tmp_path, monkeypatch):
+    """The advice used to be `MINDHIVE_PROJECT=<ns>`, and `hive embed` reads
+    that variable through `paths.normalize`: for `my_proj` it embedded
+    `my-proj`, a different namespace, and left the broken index as it was.
+    `--project` takes the name as it is -- or refuses it out loud."""
+    from mindhive.commands.parsers import _build_parser
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.indexed_event_count("my_proj", strict=True)
+    msg = str(err.value)
+    assert "hive embed --project my_proj" in msg
+    assert "MINDHIVE_PROJECT" not in msg
+    assert paths.normalize("my_proj") != "my_proj", "the case no longer bites"
+    assert _build_parser().parse_args(
+        ["embed", "--project", "my_proj"]).project == "my_proj"
+
+
+def test_a_search_for_no_hits_asks_the_index_nothing(tmp_path, monkeypatch):
+    """`hive recall --semantic --limit 0` reached chromadb, which refused the
+    limit, and the refusal came back as a broken index to rebuild and then
+    delete. A limit below 1 is `[]` before anything is opened -- the answer
+    `PgVectorIndex.query` gives a top_k of 0."""
+    _isolate(tmp_path, monkeypatch)
+    opened = []
+    _stub_events_backend(monkeypatch, _Angry(), [])
+    _stub_reading(monkeypatch, {vectors.EVENT_COLLECTION: _Angry(),
+                                vectors.LEDGER_COLLECTION: _Angry()}, opened)
+    for limit in (0, -3):
+        assert vectors.semantic_recall_events("x", limit=limit) == []
+        assert vectors.semantic_recall("x", limit=limit) == []
+    assert opened == [], "a search for no hits opened the index"
+
+
+@pytest.mark.parametrize("cause", [
+    TypeError("Number of requested results 0, cannot be negative, or zero."),
+    OverflowError("out of range integral type conversion attempted")],
+    ids=["type", "overflow"])
+def test_an_argument_chromadb_refused_is_not_answered_with_a_repair(
+        tmp_path, monkeypatch, cause):
+    """chromadb refuses a bad `n_results` before it touches the index. The
+    advice to rebuild, then delete, was advice to destroy a healthy index --
+    and with `chroma/` the watcher's collection, which nothing refills."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(cause), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x", limit=5)
+    msg = str(err.value)
+    assert err.value.stage == "query" and err.value.__cause__ is cause
+    assert "--rebuild" not in msg and "delete" not in msg
+    assert "arguments" in msg and "not at fault" in msg
+
+
+@pytest.mark.parametrize("stage", ["open", "count", "query"])
+def test_a_broken_watcher_collection_is_not_sent_to_hive_embed(
+        tmp_path, monkeypatch, stage):
+    """`hive embed --rebuild` drops and refills `ledger` and `events` and never
+    opens the watcher's `mindhive_<slug>` collection. The advice led with that
+    rebuild and then added that `hive embed` does not rebuild this collection:
+    two instructions, the first a full re-encode that cannot reach the damage.
+    The one repair that does reach it is the delete, and it says what that
+    costs."""
+    _isolate(tmp_path, monkeypatch)
+    name = vectors.collection_name("other")
+    msg = str(vectors.SemanticQueryError(
+        stage, name, RuntimeError("Error loading hnsw index"), "other"))
+    assert "--rebuild" not in msg
+    assert f"delete {paths.project_dir('other') / 'chroma'}" in msg
+    assert "hive embed --project other" in msg
+    assert "watcher" in msg and "appended after" in msg
+    assert msg.count("hive embed") == 2, msg     # the repair, and what it skips
+
+
+def test_a_watcher_collection_note_is_not_added_where_no_repair_is_given(
+        tmp_path, monkeypatch):
+    """A busy writer, a model that would not load or an argument chromadb
+    refused says nothing about the watcher's collection."""
+    _isolate(tmp_path, monkeypatch)
+    name = vectors.collection_name("other")
+    for stage, cause in (("snapshot", vector_snapshot.SnapshotError("busy")),
+                         ("encode", RuntimeError("no model")),
+                         ("query", TypeError("n_results 0"))):
+        msg = str(vectors.SemanticQueryError(stage, name, cause, "other"))
+        assert "delete" not in msg and "--rebuild" not in msg, (stage, msg)
+        assert "watcher's collection" not in msg, (stage, msg)
+
+
+def test_missing_extras_are_a_refusal_not_a_broken_index(tmp_path,
+                                                         monkeypatch):
+    """Without chromadb there is no index to be broken: the read refuses the
+    way every other missing-extras path does, rather than advising the
+    deletion of a healthy index."""
+    import sys
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setitem(sys.modules, "chromadb", None)
+    with pytest.raises(RuntimeError, match="needs extras") as err:
+        with vectors._read_view(None, vectors.EVENT_COLLECTION):
+            pass
+    assert not isinstance(err.value, vectors.SemanticQueryError)
+
+
+def _failed(stage, cause):
+    err = vectors.SemanticQueryError(stage, vectors.EVENT_COLLECTION, cause)
+    err.__cause__ = cause
+    return err
+
+
+def test_the_judge_claims_what_the_chroma_client_failed_at_and_no_more():
+    """A claimed failure keeps its client for good, so the claim is narrow:
+    the stages that ran inside chromadb, minus an argument chromadb refused
+    in Python before touching the index."""
+    inner = RuntimeError("Failed to apply logs to the hnsw segment writer")
+    for stage in ("open", "count", "query"):
+        assert vectors._judge(_failed(stage, inner)), stage
+    for stage in ("encode", "snapshot"):
+        assert not vectors._judge(_failed(stage, inner)), stage
+    assert not vectors._judge(_failed("query", ValueError("n_results < 1")))
+    assert not vectors._judge(inner)
+
+
+def test_an_overflowing_argument_is_not_claimed_as_the_clients_failure():
+    """An `n_results` past 2**32 - 1 raises OverflowError in Python, before
+    the index is touched. Claimed, it poisoned a HEALTHY index: its client
+    kept for good and every later read of it refused for 600 s."""
+    assert not vectors._judge(_failed("query", OverflowError(
+        "out of range integral type conversion attempted")))
+
+
+def test_chromadbs_own_argument_errors_are_not_claimed_either():
+    """chromadb validates a request -- the arguments, the embedding's
+    dimension -- before it reads anything; an internal error is how a
+    damaged index presents, and it stays claimed."""
+    errors = pytest.importorskip("chromadb.errors")
+    for cause in (errors.InvalidArgumentError("n_results must be positive"),
+                  errors.InvalidDimensionException(
+                      "Embedding dimension 3 does not match collection "
+                      "dimensionality 384"),
+                  # `validate_ids`, before anything is read: an id named twice
+                  errors.DuplicateIDError(
+                      "Expected IDs to be unique, found duplicates of: s1:5")):
+        assert not vectors._judge(_failed("query", cause)), type(cause).__name__
+    assert vectors._judge(_failed("query", errors.InternalError(
+        "Error loading hnsw index")))
+
+
+def test_an_index_remembered_as_unreadable_reports_its_failure(tmp_path,
+                                                               monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    first = _failed("count", RuntimeError("Failed to apply logs"))
+    for capped in (False, True):
+        monkeypatch.setattr(vectors, "_reading", _refusing(
+            vector_snapshot.IndexUnreadable("src", "events", first,
+                                            capped=capped)))
+        with pytest.raises(vectors.SemanticQueryError) as err:
+            vectors.indexed_event_count(strict=True)
+        assert err.value.stage == "count"
+        assert "Failed to apply logs" in str(err.value)
+        assert ("restart" in str(err.value)) is capped
 
 
 # --- cosine space ------------------------------------------------------------

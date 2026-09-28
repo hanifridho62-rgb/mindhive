@@ -75,24 +75,36 @@ class FakeCollection:
         return [name for name, _ in self.calls]
 
 
+#: The client `vectors._reading` hands a read: a stand-in for the one chroma
+#: opens on a private copy of the index.
+READ_CLIENT = object()
+
+
 @pytest.fixture
 def col(monkeypatch):
     """A fake collection in place of `vectors._open`, plus the open log.
 
     Each entry records whether the chroma lock file existed AT THE MOMENT the
     collection was opened, which is how the lock is asserted without
-    instrumenting `core.locks`."""
+    instrumenting `core.locks` -- and which client it was opened through:
+    None for the live index a write uses, `READ_CLIENT` for a read's copy."""
+    from contextlib import contextmanager
     fake = FakeCollection()
     fake.opened = []
 
-    def _open(project, name, *, refill=False, rebuild=False):
+    def _open(project, name, *, refill=False, rebuild=False, client=None):
         lock = paths.project_dir(project) / vectors.CHROMA_LOCK_NAME
         fake.opened.append({"project": project, "name": name,
                             "refill": refill, "rebuild": rebuild,
-                            "locked": lock.exists()})
+                            "locked": lock.exists(), "client": client})
         return fake
 
+    @contextmanager
+    def _reading(project=None, name=None):
+        yield READ_CLIENT
+
     monkeypatch.setattr(vectors, "_open", _open)
+    monkeypatch.setattr(vectors, "_reading", _reading)
     return fake
 
 
@@ -249,6 +261,15 @@ def test_a_write_opens_with_refill_and_a_read_does_not(col):
     idx.embed_batch("events", _recs(1))
     idx.query("events", "anything")
     assert [o["refill"] for o in col.opened] == [True, False]
+
+
+def test_a_write_opens_the_live_index_and_a_read_opens_the_copy(col):
+    """A read through the live client writes to the index it reads
+    (DATA_MODEL.md 4.19), so only the write may be handed that client."""
+    idx = _index()
+    idx.embed_batch("events", _recs(1))
+    idx.query("events", "anything")
+    assert [o["client"] for o in col.opened] == [None, READ_CLIENT]
 
 
 # --------------------------------------------------------------------------
@@ -445,9 +466,70 @@ def test_a_thin_hit_is_dropped_rather_than_padded(col):
     assert [r.event_id for r, _ in out] == [second.event_id]
 
 
-def test_a_query_that_raises_answers_empty(col):
-    col.query_error = RuntimeError("no such collection")
+def test_hits_dropped_as_thin_are_said_out_loud(col, caplog):
+    """An `[]` from a populated collection whose hits are all `hive embed`
+    rows is not "no match": the vectors matched, and no record could be
+    rebuilt from them. The answer stays a list; the log says what it is not."""
+    (rec,) = _recs(1)
+    idx = _index()
+    _thin_row(col, rec, idx)
+    col.hits = [(idx.record_id(rec), 0.1)]
+    with caplog.at_level("WARNING", logger="mindhive.storage.local_vector"):
+        assert idx.query("events", "q") == []
+    assert "1 of 1" in caplog.text and "hive embed" in caplog.text
+
+
+def test_a_query_with_no_thin_hit_logs_nothing(col, caplog):
+    (rec,) = _recs(1)
+    idx = _index()
+    idx.embed_batch("events", [rec])
+    col.hits = [(idx.record_id(rec), 0.1)]
+    with caplog.at_level("WARNING", logger="mindhive.storage.local_vector"):
+        assert len(idx.query("events", "q")) == 1
+    assert caplog.text == ""
+
+
+def test_a_query_that_raises_is_an_error_not_an_empty_answer(col):
+    """A broken index and an index with no match must not look alike."""
+    boom = RuntimeError("Error loading hnsw index")
+    col.query_error = boom
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        _index().query("events", "q")
+    assert (err.value.stage, err.value.collection) == ("query", "events")
+    assert err.value.__cause__ is boom
+
+
+def test_a_top_k_below_one_asks_the_index_nothing(col):
+    """`PgVectorIndex.query` answers a top_k of 0 with `[]` before it asks
+    the server; this driver let chromadb refuse it and reported the refusal
+    as a broken index. The two drivers answer alike again."""
+    for top_k in (0, -1):
+        assert _index().query("events", "q", top_k=top_k) == []
+    assert col.calls == [] and col.opened == []
+
+
+def test_a_namespace_with_no_index_answers_empty(col, monkeypatch):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _nothing(project=None, name=None):
+        yield None
+
+    monkeypatch.setattr(vectors, "_reading", _nothing)
     assert _index().query("events", "q") == []
+    assert col.opened == [], "a read opened a collection with no index there"
+
+
+def test_a_query_without_chromadb_is_a_refusal_not_a_broken_index(
+        monkeypatch):
+    """An injected encoder skips the extras check up front, so the missing
+    package is met at the read itself -- where it must still be the extras
+    refusal, not a `SemanticQueryError` advising the deletion of an index."""
+    import sys
+    monkeypatch.setitem(sys.modules, "chromadb", None)
+    with pytest.raises(RuntimeError, match="needs extras") as err:
+        _index().query("events", "q")
+    assert not isinstance(err.value, vectors.SemanticQueryError)
 
 
 def test_a_collection_with_nothing_in_it_answers_empty(col):

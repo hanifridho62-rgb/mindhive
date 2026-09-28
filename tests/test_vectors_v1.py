@@ -396,11 +396,30 @@ def test_a_document_is_capped_at_four_thousand_characters():
 
 # --- batch embedding (PDF 4.3.3, 8.2) ----------------------------------------
 
-def _mgr(monkeypatch, col=None):
+#: The client `vectors._reading` hands a read path in these tests: a stand-in
+#: for the one opened on a private copy of the index.
+_READ_CLIENT = object()
+
+
+def _mgr(monkeypatch, col=None, asked=None):
+    """A manager whose collection is *col*. *asked* collects the `client`
+    each `get_collection` call was given -- `_READ_CLIENT` for a read."""
+    from contextlib import contextmanager
     col = col if col is not None else _Col()
     _stub(monkeypatch)
     mgr = vectors.VectorStoreManager.get_instance(None)
-    monkeypatch.setattr(mgr, "get_collection", lambda slug, **kw: col)
+
+    def _get(slug, **kw):
+        if asked is not None:
+            asked.append(kw.get("client"))
+        return col
+
+    @contextmanager
+    def _reading(project=None, name=None):
+        yield _READ_CLIENT
+
+    monkeypatch.setattr(mgr, "get_collection", _get)
+    monkeypatch.setattr(vectors, "_reading", _reading)
     return mgr, col
 
 
@@ -567,11 +586,153 @@ def test_an_empty_index_answers_with_no_hits(monkeypatch):
     assert mgr.semantic_query("proj", "q") == []
 
 
+def test_a_manager_query_reads_the_copy_and_a_write_the_live_index(
+        monkeypatch):
+    """A read is handed the snapshot's client; the watcher's writes keep the
+    manager's own live one (no `client` given, so `_open` uses `_client`)."""
+    asked = []
+    mgr, _col = _mgr(monkeypatch, asked=asked)
+    mgr.semantic_query("proj", "q")
+    mgr.embed_batch("proj", [_rec()], sleep=lambda _s: None)
+    assert asked == [_READ_CLIENT, None]
+
+
+def test_a_failing_manager_query_is_an_error_not_an_empty_answer(monkeypatch):
+    col = _Col()
+    boom = RuntimeError("Error loading hnsw index")
+
+    def _raise(**_kw):
+        raise boom
+
+    monkeypatch.setattr(col, "query", _raise)
+    mgr, _c = _mgr(monkeypatch, col)
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        mgr.semantic_query("proj", "q")
+    assert err.value.stage == "query"
+    assert err.value.collection == vectors.collection_name("proj")
+    assert err.value.__cause__ is boom
+    # `hive embed --rebuild` drops `ledger` and `events`; the watcher's own
+    # collection is refilled only by new appends, and the advice says so.
+    assert "watcher" in str(err.value)
+
+
+def test_the_watchers_id_probe_reads_the_copy(monkeypatch):
+    """`already_indexed` is a read, so it goes where every read goes: the
+    collection is looked up on the snapshot's client, never on the live
+    index, where `get_or_create_collection` would mint one."""
+    asked = []
+    col = _Col()
+    col.present = {"alpha:1"}
+    mgr, _c = _mgr(monkeypatch, col, asked=asked)
+    assert mgr.already_indexed("proj", ["alpha:1", "alpha:2"]) == {"alpha:1"}
+    assert asked == [_READ_CLIENT]
+
+
+def test_a_failed_id_probe_is_empty_and_says_why(monkeypatch, caplog):
+    """Empty, because over-embedding is idempotent where refusing is loss --
+    but logged as the typed failure, not swallowed."""
+    col = _Col()
+
+    def _raise(**_kw):
+        raise RuntimeError("Error loading hnsw index")
+
+    monkeypatch.setattr(col, "get", _raise)
+    mgr, _c = _mgr(monkeypatch, col)
+    with caplog.at_level("WARNING", logger="mindhive.vectors"):
+        assert mgr.already_indexed("proj", ["alpha:1"]) == set()
+    assert "semantic query failed" in caplog.text and "hnsw" in caplog.text
+
+
+def test_the_id_probe_asks_in_batches_sqlite_can_bind(monkeypatch):
+    """chromadb binds one SQL variable per id, and SQLite refuses a statement
+    with too many: a stale claim of 40k rows made one `get` raise
+    InternalError 'too many SQL variables' -- the class a damaged index
+    raises, so the judge kept a HEALTHY index's client for good and refused
+    its reads for 600 s. The probe asks `ID_PROBE_BATCH` ids at a time."""
+    col = _Col()
+    col.present = {f"alpha:{i}" for i in range(0, 1000, 2)}
+    sizes, real_get = [], col.get
+
+    def _get(ids=None):
+        sizes.append(len(ids))
+        return real_get(ids=ids)
+
+    monkeypatch.setattr(col, "get", _get)
+    mgr, _c = _mgr(monkeypatch, col)
+    ids = [f"alpha:{i}" for i in range(1000)]
+    assert mgr.already_indexed("proj", ids) == col.present
+    assert sum(sizes) == 1000 and max(sizes) == vectors.ID_PROBE_BATCH
+    assert 1 < vectors.ID_PROBE_BATCH <= 999, "SQLite's oldest variable limit"
+
+
+def test_a_repeated_id_is_probed_once(monkeypatch):
+    """A claim recovered twice queues every row twice, and chromadb refuses a
+    `get` naming an id twice -- `DuplicateIDError`, in Python, before the
+    index is read -- which the judge took for damage: a HEALTHY index's
+    client kept for good and its reads refused. Each id is asked once."""
+    col = _Col()
+    col.present = {"s1:4"}
+    asked, real_get = [], col.get
+
+    def _get(ids=None):
+        assert len(set(ids)) == len(ids), f"an id asked twice: {ids}"
+        asked.extend(ids)
+        return real_get(ids=ids)
+
+    monkeypatch.setattr(col, "get", _get)
+    mgr, _c = _mgr(monkeypatch, col)
+    assert mgr.already_indexed(
+        "proj", ["s1:4", "s1:5", "s1:4", "s1:5"]) == {"s1:4"}
+    assert asked == ["s1:4", "s1:5"]
+
+
+def test_a_manager_query_for_no_hits_asks_the_index_nothing(monkeypatch):
+    """A top_k below 1 is `[]`, as `PgVectorIndex.query` answers it -- not a
+    chromadb refusal reported as a broken index."""
+    col = _Col()
+
+    def _raise(**_kw):                                   # pragma: no cover
+        raise AssertionError("a top_k of 0 reached the index")
+
+    monkeypatch.setattr(col, "query", _raise)
+    mgr, _c = _mgr(monkeypatch, col)
+    assert mgr.semantic_query("proj", "q", top_k=0) == []
+
+
+def test_a_read_only_open_looks_up_and_never_creates(monkeypatch):
+    """`_open(..., client=...)` is the read form: a collection the copy does
+    not hold is None, and nothing is created, dropped or re-tuned."""
+    import types
+
+    class _Copy:
+        def __init__(self):
+            self.touched = []
+
+        def list_collections(self):
+            return [types.SimpleNamespace(name="ledger")]
+
+        def get_collection(self, name):
+            self.touched.append(name)
+            return _Col({"hnsw:space": "l2"})
+
+        def get_or_create_collection(self, *a, **k):     # pragma: no cover
+            raise AssertionError("a read created a collection")
+
+        def delete_collection(self, *a, **k):            # pragma: no cover
+            raise AssertionError("a read dropped a collection")
+
+    copy = _Copy()
+    assert vectors._open(None, "events", client=copy) is None
+    got = vectors._open(None, "ledger", refill=True, client=copy)
+    assert got.metadata == {"hnsw:space": "l2"}, "a read re-tuned the index"
+    assert copy.touched == ["ledger"]
+
+
 # --- `hive embed --rebuild` --------------------------------------------------
 
-def _embed_args(force=False, rebuild=False):
+def _embed_args(force=False, rebuild=False, project=None):
     import argparse
-    return argparse.Namespace(force=force, rebuild=rebuild)
+    return argparse.Namespace(force=force, rebuild=rebuild, project=project)
 
 
 def test_hive_embed_rebuild_drops_both_collections(monkeypatch, capsys):
@@ -616,7 +777,59 @@ def test_force_and_rebuild_compose(monkeypatch, capsys):
     assert client.deleted == ["ledger"]
 
 
+def test_hive_embed_under_live_lock_is_a_refusal_with_exit_two(monkeypatch,
+                                                                capsys):
+    """`hive recall --semantic` answers LIVE_LOCK with one line and exit 2;
+    `hive embed` let the RuntimeError out as a traceback."""
+    from mindhive.commands import maintenance as maint
+    _stub(monkeypatch)
+    paths.store_home().mkdir(parents=True, exist_ok=True)
+    (paths.store_home() / "LIVE_LOCK").write_text("x", encoding="utf-8")
+    assert maint.cmd_embed(_embed_args()) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: ") and "LIVE_LOCK" in captured.err
+    assert captured.out == ""
+
+
+def test_hive_embed_without_the_extras_is_a_refusal_with_exit_two(
+        monkeypatch, capsys):
+    from mindhive.commands import maintenance as maint
+
+    def _missing():
+        raise RuntimeError("semantic layer needs extras: pip install -e .[vectors]")
+
+    monkeypatch.setattr(vectors, "_require_deps", _missing)
+    assert maint.cmd_embed(_embed_args()) == 2
+    assert "needs extras" in capsys.readouterr().err
+
+
 def test_the_embed_parser_offers_rebuild():
     from mindhive.commands.parsers import _build_parser
     args = _build_parser().parse_args(["embed", "--rebuild"])
     assert args.rebuild is True and args.force is False
+    assert args.project is None
+
+
+def test_hive_embed_project_embeds_exactly_that_namespace(monkeypatch, capsys):
+    """The repair a failed semantic read prints is `hive embed --project
+    <ns>`: both collections are built for that namespace, whatever the
+    working directory or MINDHIVE_PROJECT would select."""
+    from mindhive.commands import maintenance as maint
+    seen = []
+    monkeypatch.setattr(vectors, "_require_deps", lambda: None)
+    monkeypatch.setattr(vectors, "embed", lambda project=None, force=False,
+                        rebuild=False: seen.append(("files", project, rebuild))
+                        or {"embedded": 0})
+    monkeypatch.setattr(vectors, "embed_events", lambda project=None,
+                        force=False, rebuild=False: seen.append(
+                            ("events", project, rebuild)) or {"embedded": 0})
+    assert maint.cmd_embed(_embed_args(rebuild=True, project="my_proj")) is None
+    capsys.readouterr()
+    assert seen == [("files", "my_proj", True), ("events", "my_proj", True)]
+
+
+def test_the_embed_parser_refuses_a_namespace_no_directory_can_be(capsys):
+    from mindhive.commands.parsers import _build_parser
+    with pytest.raises(SystemExit) as exc:
+        _build_parser().parse_args(["embed", "--project", "../escape"])
+    assert exc.value.code == 2 and "invalid project" in capsys.readouterr().err

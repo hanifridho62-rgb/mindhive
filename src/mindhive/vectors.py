@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+from contextlib import ExitStack, contextmanager
 
 from . import paths, guard
 
@@ -63,14 +64,15 @@ def has_vectors_support() -> bool:
         return False
 
 
+_EXTRAS = "semantic layer needs extras: pip install -e .[vectors]"
+
+
 def _require_deps():
     try:
         import chromadb  # noqa: F401
         import sentence_transformers  # noqa: F401
     except ImportError as e:
-        raise RuntimeError(
-            "semantic layer needs extras: pip install -e .[vectors]"
-        ) from e
+        raise RuntimeError(_EXTRAS) from e
 
 
 def _encoder():
@@ -114,6 +116,11 @@ CHROMA_LOCK_STALE_S = 600.0
 #: typing (PDF 8.2).
 EMBED_BATCH_SIZE = 32
 COOPERATIVE_YIELD_SECS = 0.050
+#: Ids per `get` of the watcher's id probe. chromadb binds one SQL variable
+#: per id and SQLite refuses a statement with too many (999 on old builds):
+#: 40k ids in one `get` raised 'too many SQL variables' as an InternalError --
+#: the class a damaged index raises.
+ID_PROBE_BATCH = 256
 
 
 def _client(project):
@@ -122,7 +129,179 @@ def _client(project):
         path=str(paths.project_dir(project) / "chroma"))
 
 
-def _open(project, name, *, refill=False, rebuild=False):
+# --- the read path -------------------------------------------------------------
+#
+# A read never writes the index it reads (DATA_MODEL.md 4.19). chromadb has no
+# read-only client and a read through a normal one commits to `chroma.sqlite3`
+# and can rewrite the HNSW segment files, so every read below goes through
+# `_reading`, which hands back a client on a private copy (`vector_snapshot`).
+#
+# And a read that FAILED says so. Each step that can break -- taking the copy,
+# opening it, counting, encoding the query, querying -- raises
+# `SemanticQueryError` naming the step, instead of the `[]` or `0` that made a
+# broken index look exactly like one with nothing relevant in it. The message
+# names the namespace and the repair, which depends on what broke: a busy
+# writer is waited out, a full temp dir is freed, an argument chromadb refused
+# is nobody's index to repair, and only damaged files are deleted -- `hive
+# embed --rebuild` opens the same live index to drop it, so on damaged files it
+# is no repair at all, and on the watcher's collection it never reaches them.
+
+class SemanticQueryError(RuntimeError):
+    """A semantic read that failed, as opposed to one that found nothing.
+
+    `stage` is the step that broke -- `snapshot`, `open`, `count`, `encode` or
+    `query` -- and `collection` the collection being read; the original
+    exception is `__cause__`. A `RuntimeError` so that callers which already
+    catch the LIVE_LOCK and missing-extras refusals keep catching it."""
+
+    def __init__(self, stage, collection, cause, project=None, note=None):
+        self.stage = stage
+        self.collection = collection
+        ns, where = _namespace(project)
+        msg = (f"semantic {stage} failed on the {collection!r} index of project "
+               f"{ns!r}: {type(cause).__name__}: {cause} "
+               f"({_remedy(stage, cause, ns, where, collection)})")
+        super().__init__(msg + (f" [{note}]" if note else ""))
+
+
+def _namespace(project):
+    """`(namespace, chroma dir)` for an error message: the name `hive embed
+    --project` takes to repair this index, and what to delete."""
+    try:
+        pdir = paths.project_dir(project)
+        return pdir.name, pdir / "chroma"
+    except Exception:                              # noqa: BLE001 -- a message only
+        return str(project or "?"), "the project's chroma directory"
+
+
+def _remedy(stage, cause, ns, where, collection=None) -> str:
+    if stage == "snapshot":
+        return {"copy": "copying the index into the temp directory failed: "
+                        "free space there, or retry if a writer held a file",
+                "space": "the temp directory cannot hold a copy of the "
+                         "index: it is full or not writable",
+                }.get(getattr(cause, "reason", "busy"),
+                      "a writer is busy; retry when `hive embed` or the "
+                      "watcher has finished")
+    if stage == "encode":
+        return "the embedding model failed to load or run"
+    if _refused_arguments(cause):
+        return ("chromadb refused the read's arguments before touching the "
+                "index; the index is not at fault")
+    # `--project`, not MINDHIVE_PROJECT: `hive embed` reads the variable
+    # through `paths.normalize`, which turns `my_proj` into `my-proj` -- the
+    # advice repaired a different namespace. `--project` takes it verbatim.
+    if str(collection or "").startswith(COLLECTION_PREFIX):
+        # The watcher's collection: `hive embed` never writes it, `--rebuild`
+        # included, so the delete is the only repair that reaches it -- and
+        # nothing brings back the vectors of rows appended before it.
+        return (f"{collection!r} is the watcher's collection, which `hive "
+                f"embed` never writes: delete {where} and run `hive embed "
+                f"--project {ns}` for the ledger and events collections; the "
+                f"watcher's refills only with rows appended after that")
+    if stage == "query":
+        return (f"rebuild it with `hive embed --rebuild --project {ns}`; if "
+                f"that fails too, delete {where} and run `hive embed "
+                f"--project {ns}`")
+    return (f"the index files are damaged: delete {where} and run `hive "
+            f"embed --project {ns}`")
+
+
+#: The stages that ran inside the chroma client.
+_CLIENT_STAGES = ("open", "count", "query")
+
+
+def _refused_arguments(cause) -> bool:
+    """Whether *cause* is chromadb refusing a read's ARGUMENTS -- raised
+    before the index is touched, so it says nothing about the index: a bad
+    `n_results` (ValueError, TypeError; OverflowError past 2**32 - 1), a
+    request its validation refuses, an embedding of the wrong dimension, an
+    id named twice in one request."""
+    if isinstance(cause, (ValueError, TypeError, OverflowError)):
+        return True
+    try:
+        from chromadb.errors import (DuplicateIDError, InvalidArgumentError,
+                                     InvalidDimensionException)
+    except ImportError:
+        return False
+    return isinstance(cause, (DuplicateIDError, InvalidArgumentError,
+                              InvalidDimensionException))
+
+
+def _judge(exc) -> bool:
+    """Whether a failed read was the chroma client failing on its copy -- the
+    client `vector_snapshot` then never closes. Arguments chromadb refused
+    never reached the index, and claiming them poisoned a healthy one."""
+    return (isinstance(exc, SemanticQueryError)
+            and exc.stage in _CLIENT_STAGES
+            and not _refused_arguments(exc.__cause__))
+
+
+def _reading(project, name=None):
+    """A client on a private copy of *project*'s index, or None when it has
+    no index; used as `with _reading(project, name) as client:`. The one place
+    a read path meets chromadb, and so the seam the tests replace. Without
+    chromadb it is the extras refusal, before anything is read."""
+    try:
+        import chromadb  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(_EXTRAS) from e
+    from . import vector_snapshot
+    return vector_snapshot.reading(
+        paths.project_dir(project) / "chroma", vector_snapshot.open_chroma,
+        judge=_judge, name=name)
+
+
+def _existing(client, name):
+    """Collection *name* if the index holds it, else None. Never creates:
+    `get_or_create_collection` on a read would mint an empty collection."""
+    have = {getattr(c, "name", c) for c in client.list_collections()}
+    return client.get_collection(name) if name in have else None
+
+
+@contextmanager
+def _read_view(project, name, open_col=None):
+    """Yield collection *name* from a copy of the index, None when there is
+    none. *open_col(client)* overrides how the collection is looked up. A
+    failure is a `SemanticQueryError` -- missing extras stay the refusal."""
+    from . import vector_snapshot
+    view = _reading(project, name=name)
+    with ExitStack() as stack:
+        try:
+            client = stack.enter_context(view)
+            col = None if client is None else (
+                open_col(client) if open_col is not None
+                else _open(project, name, client=client))
+        except vector_snapshot.IndexUnreadable as e:
+            # Reported as the read that failed, on the collection it failed
+            # on -- past the cap that can be a sibling of the one asked for.
+            first = e.original
+            raise SemanticQueryError(
+                getattr(first, "stage", "open"), e.of,
+                getattr(first, "__cause__", None) or first, project,
+                note=e.why) from e
+        except vector_snapshot.SnapshotError as e:
+            raise SemanticQueryError("snapshot", name, e, project) from e
+        except Exception as e:                     # noqa: BLE001 -- re-raised typed
+            raise SemanticQueryError("open", name, e, project) from e
+        yield col
+
+
+def _embed_query(query, name, project=None):
+    try:
+        return _encoder()([query])
+    except Exception as e:                         # noqa: BLE001 -- re-raised typed
+        raise SemanticQueryError("encode", name, e, project) from e
+
+
+def _ask(col, name, project=None, **kwargs):
+    try:
+        return col.query(**kwargs)
+    except Exception as e:                         # noqa: BLE001 -- re-raised typed
+        raise SemanticQueryError("query", name, e, project) from e
+
+
+def _open(project, name, *, refill=False, rebuild=False, client=None):
     """Get one collection, in cosine space.
 
     chroma ignores the metadata argument when a collection already exists, so a
@@ -131,7 +310,13 @@ def _open(project, name, *, refill=False, rebuild=False):
     `refill`: query paths take whatever is there (wrong scores beat no results),
     embed paths correct it first. *rebuild* is the operator saying "start
     over" -- it drops a collection whose metadata already agrees, which is
-    exactly the case the drift check would pass."""
+    exactly the case the drift check would pass.
+
+    *client* given is the READ form: the collection is looked up on that
+    client and nothing is created, dropped or re-tuned, whatever *refill*
+    says -- None when the index does not hold it."""
+    if client is not None:
+        return _existing(client, name)
     client = _client(project)
     col = client.get_or_create_collection(name, metadata=dict(HNSW_METADATA))
     if refill and (rebuild or hnsw_drift(col)):
@@ -197,8 +382,12 @@ def chroma_lock(project=None, *, timeout_s=None, stale_s=None, **seams):
                            name="chroma_lock", **seams)
 
 
+#: The file-level collection: one vector per LEDGER/*.md projection.
+LEDGER_COLLECTION = "ledger"
+
+
 def _collection(project, *, refill=False, rebuild=False):
-    return _open(project, "ledger", refill=refill, rebuild=rebuild)
+    return _open(project, LEDGER_COLLECTION, refill=refill, rebuild=rebuild)
 
 
 def embed(project=None, force=False, rebuild=False) -> dict:
@@ -230,11 +419,19 @@ def embed(project=None, force=False, rebuild=False) -> dict:
 
 
 def semantic_recall(query, project=None, limit=10, force=False):
+    """Nearest LEDGER files to a query. `[]` when nothing is indexed or the
+    limit asks for no hits; `SemanticQueryError` when the index could not be
+    read."""
     guard.ensure_safe(force=force)
     _require_deps()
-    enc = _encoder()
-    col = _collection(project)
-    res = col.query(query_embeddings=enc([query]), n_results=limit)
+    if limit < 1:          # chromadb refuses it; `PgVectorIndex` answers `[]`
+        return []
+    with _read_view(project, LEDGER_COLLECTION) as col:
+        if col is None:
+            return []
+        res = _ask(col, LEDGER_COLLECTION, project, n_results=limit,
+                   query_embeddings=_embed_query(query, LEDGER_COLLECTION,
+                                                 project))
     docs = res.get("documents", [[]])[0]
     ids = res.get("ids", [[]])[0]
     # Surface the similarity so callers can rank and drop weak matches. chroma
@@ -372,19 +569,22 @@ def semantic_recall_events(query, project=None, limit=10, force=False,
     """Nearest semantic EVENTS to a query, best first.
 
     Each hit carries its type, timestamp and session alongside the score, so a
-    caller can cite the memo rather than merely quote it."""
+    caller can cite the memo rather than merely quote it. `[]` means nothing
+    matched, nothing is indexed or the limit asks for no hits; an index that
+    could not be read raises `SemanticQueryError` instead."""
     guard.ensure_safe(force=force)
     _require_deps()
-    enc = _encoder()
-    col = _events_collection(project)
-    kwargs = {"query_embeddings": enc([query]), "n_results": limit}
-    if types:
-        kwargs["where"] = {"type": {"$in": list(types)}}
-    try:
-        res = col.query(**kwargs)
-    except Exception as e:                         # noqa: BLE001
-        _log.warning("vectors: event query failed: %s", e)
+    if limit < 1:
         return []
+    with _read_view(project, EVENT_COLLECTION) as col:
+        if col is None:
+            return []
+        kwargs = {"query_embeddings": _embed_query(query, EVENT_COLLECTION,
+                                                   project),
+                  "n_results": limit}
+        if types:
+            kwargs["where"] = {"type": {"$in": list(types)}}
+        res = _ask(col, EVENT_COLLECTION, project, **kwargs)
     docs = res.get("documents", [[]])[0]
     ids = res.get("ids", [[]])[0]
     metas = (res.get("metadatas") or [[]])[0] or [{}] * len(docs)
@@ -403,15 +603,31 @@ def semantic_recall_events(query, project=None, limit=10, force=False,
     return out
 
 
-def indexed_event_count(project=None) -> int:
-    """How many events are in the vector index. 0 when the store is absent.
+def indexed_event_count(project=None, *, strict=False) -> int:
+    """How many events are in the vector index; 0 when there is no index or
+    the extras are not installed.
 
-    Never raises: this is called to DECIDE whether the semantic path is worth
-    taking, and a check that can fail is a check every caller has to wrap."""
+    An index that could not be read is NOT 0. With *strict* it raises
+    `SemanticQueryError` -- `recall` routes on this number, and a 0 that meant
+    "broken" sent it to the file index in silence. Without, it logs the
+    failure and answers 0, for callers that only display the count."""
     try:
         _require_deps()
-        return int(_events_collection(project).count())
-    except Exception:                              # noqa: BLE001
+    except RuntimeError:
+        return 0
+    try:
+        with _read_view(project, EVENT_COLLECTION) as col:
+            if col is None:
+                return 0
+            try:
+                return int(col.count())
+            except Exception as e:                 # noqa: BLE001 -- re-raised typed
+                raise SemanticQueryError("count", EVENT_COLLECTION, e,
+                                         project) from e
+    except SemanticQueryError as e:
+        if strict:
+            raise
+        _log.warning("vectors: %s", e)
         return 0
 
 
@@ -549,20 +765,43 @@ class VectorStoreManager:
                 self._client = _client(self.project)
             return self._client
 
-    def get_collection(self, project_slug, *, refill=False, rebuild=False):
+    def get_collection(self, project_slug, *, refill=False, rebuild=False,
+                       client=None):
+        """The collection for *project_slug* on the live index, or -- with
+        *client*, a read's copy -- looked up there without being created."""
         return _open(self.project, collection_name(project_slug),
-                     refill=refill, rebuild=rebuild)
+                     refill=refill, rebuild=rebuild, client=client)
 
     def already_indexed(self, project_slug, ids) -> set:
-        """Which of *ids* the collection already holds. Empty on any failure:
-        this decides whether to RE-embed, and over-embedding is idempotent
-        where refusing to embed is data loss."""
-        ids = list(ids)
+        """Which of *ids* the collection already holds, read from a copy of
+        the index like every other read (DATA_MODEL.md 4.19): through the live
+        `get_or_create_collection` a probe minted an empty collection for a
+        slug never embedded, and wrote to the index every time. Empty on any
+        failure, logged: this decides whether to RE-embed, and over-embedding
+        is idempotent where refusing to embed is data loss."""
+        # Each id once: a claim recovered twice queues its rows twice, and
+        # chromadb refuses a `get` that names an id twice (DuplicateIDError).
+        ids = list(dict.fromkeys(ids))
         if not ids:
             return set()
+        name = collection_name(project_slug)
+
+        def _on(client):
+            return self.get_collection(project_slug, client=client)
+
         try:
-            return set(self.get_collection(project_slug).get(ids=ids
-                                                             ).get("ids") or [])
+            with _read_view(self.project, name, _on) as col:
+                if col is None:
+                    return set()
+                try:
+                    have = set()
+                    for at in range(0, len(ids), ID_PROBE_BATCH):
+                        batch = ids[at:at + ID_PROBE_BATCH]
+                        have.update(col.get(ids=batch).get("ids") or [])
+                    return have
+                except Exception as e:             # noqa: BLE001 -- re-raised typed
+                    raise SemanticQueryError("query", name, e,
+                                             self.project) from e
         except Exception as e:                     # noqa: BLE001
             _log.warning("vectors: id probe failed for %s: %s", project_slug, e)
             return set()
@@ -600,10 +839,19 @@ class VectorStoreManager:
 
     def semantic_query(self, project_slug, query, top_k=5) -> list:
         """Nearest vectors to *query*, best first, each with its
-        back-pointers and a cosine score rounded to four places."""
+        back-pointers and a cosine score rounded to four places. Read from a
+        copy of the index; a failure raises `SemanticQueryError`. A top_k
+        below 1 is `[]`, as `PgVectorIndex.query` answers it."""
         _require_deps()
-        col = self.get_collection(project_slug)
-        res = col.query(query_embeddings=_encoder()([query]), n_results=top_k)
+        if top_k < 1:
+            return []
+        name = collection_name(project_slug)
+        with _read_view(self.project, name, lambda client: self.get_collection(
+                project_slug, client=client)) as col:
+            if col is None:
+                return []
+            res = _ask(col, name, self.project, n_results=top_k,
+                       query_embeddings=_embed_query(query, name, self.project))
         docs = (res.get("documents") or [[]])[0]
         ids = (res.get("ids") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0] or [{}] * len(docs)

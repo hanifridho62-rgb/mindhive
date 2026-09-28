@@ -66,20 +66,33 @@ def _frontmatter_boost_tokens(text: str):
 
 def recall(query, project=None, semantic=False, limit=10, force=False):
     if semantic:
-        from . import vectors
+        from . import guard, vectors
         # EVENT vectors first, files as the fallback. A file-level hit points at
         # LEDGER/decisions.md and shows 200 characters of it; an event-level hit
         # IS the decision, with its timestamp and session. The fallback is not
         # decoration -- the event index is empty until `hive embed` has run
         # once, and returning nothing there would look like "no such memory"
         # rather than "not indexed yet".
-        if vectors.indexed_event_count(project) > 0:
+        #
+        # The fallback is for an EMPTY index, never a broken one: the count is
+        # asked strictly, so a failure raises `vectors.SemanticQueryError`
+        # instead of reading as 0 and routing to the files in silence. The
+        # LIVE_LOCK refusal comes first, before the count opens anything; a
+        # limit below 1 then asks for nothing, so nothing is opened.
+        guard.ensure_safe(force=force)
+        if limit < 1:
+            return []
+        if vectors.indexed_event_count(project, strict=True) > 0:
             hits = vectors.semantic_recall_events(query, project=project,
                                                   limit=limit, force=force)
             if hits:
                 return hits
         return vectors.semantic_recall(query, project=project, limit=limit,
                                        force=force)
+    # As the semantic path answers it: `results[:-3]` was all but the last
+    # three hits, not "no hits".
+    if limit < 1:
+        return []
     ldir = paths.project_dir(project) / "LEDGER"
     if not ldir.exists():
         return []
@@ -128,3 +141,30 @@ def recall(query, project=None, semantic=False, limit=10, force=False):
         # Always keep the single best hit; drop the weak tail below the cut.
         results = [r for i, r in enumerate(results) if i == 0 or r["score"] >= cut]
     return results[:limit]
+
+
+def recall_across(query, projects, *, semantic=False, limit=10, force=False):
+    """`recall` over several namespaces -- the HIVE MIND search -- each hit
+    tagged with its `project`, in namespace order.
+
+    A namespace whose semantic index could not be read answers one
+    `{"project", "error"}` row in place of its hits: one broken index, or a
+    writer busy on one of sixty, must not turn every other namespace's answer
+    into a 500. When no namespace could be read at all, the first failure is
+    raised, as a one-namespace search raises it. A refusal -- LIVE_LOCK,
+    extras missing -- is the same for every namespace and is raised as is."""
+    from .vectors import SemanticQueryError
+    rows, first, read = [], None, 0
+    for n in projects:
+        try:
+            found = recall(query, project=n, semantic=semantic, limit=limit,
+                           force=force)
+        except SemanticQueryError as e:
+            first = first or e
+            rows.append({"project": n, "error": str(e)})
+            continue
+        read += 1
+        rows.extend(dict(h, project=n) for h in found)
+    if first is not None and not read:
+        raise first
+    return rows

@@ -2257,7 +2257,7 @@ nothing is ever written to chroma that did not come from it, and deleting
 named under *Three collections* below). It is optional as a whole: without
 `pip install -e .[vectors]` (chromadb, sentence-transformers) every path below
 answers structurally, naming the extra, and the lexical paths keep working
-(invariant 5).
+(invariant 5). And a read never writes it: see *The read path* below.
 
 **What feeds it.** Only `events.SEMANTIC_TYPES` rows — decisions, experiment
 results, caveats, next steps, open questions, `state_set`, `code_change`,
@@ -2282,13 +2282,13 @@ it; a query path takes whatever is there. `import mindhive.vectors` bounds the
 encoder's threads with `setdefault` (`OMP`/`MKL`/`OPENBLAS`/`VECLIB`/`NUMEXPR` = 2,
 `TOKENIZERS_PARALLELISM=false`), so an exported value still wins.
 
-**Three collections, two writers, and one of them has no reader.**
+**Three collections, two writers, and one of them no search reads.**
 
 | collection | one vector per | id | written by | read by |
 |---|---|---|---|---|
-| `ledger` | `LEDGER/*.md` file | the file name | `hive embed` (`vectors.embed`), delete-before-add | `hive recall --semantic`, as the fallback |
-| `events` | semantic event | `sha256` of the event's canonical JSON, first 32 hex (`vectors.event_id`), so a re-run skips what is present | `hive embed` (`vectors.embed_events`), incremental | `hive recall --semantic`, first |
-| `mindhive_<slug>` (`vectors.collection_name`) | queued semantic row | `"<session_id>:<seg_line>"`, metadata `session_id`, `seg_line`, `chain_hash`, `event_type`, `timestamp`, `provenance` | the embedding watcher (`VectorStoreManager.embed_batch`, batches of 32 with a 50 ms yield, under `chroma.lock`) | **nothing**: `VectorStoreManager.semantic_query` has no caller in `src/` |
+| `ledger` | `LEDGER/*.md` file | the file name | `hive embed` (`vectors.embed`), delete-before-add | `hive recall --semantic`, as the fallback; the semantic graph (`graph.build(semantic=True)`) |
+| `events` | semantic event | `sha256` of the event's canonical JSON, first 32 hex (`vectors.event_id`), so a re-run skips what is present | `hive embed` (`vectors.embed_events`), incremental | `hive recall --semantic` and the dashboard's `/api/recall`, first |
+| `mindhive_<slug>` (`vectors.collection_name`) | queued semantic row | `"<session_id>:<seg_line>"`, metadata `session_id`, `seg_line`, `chain_hash`, `event_type`, `timestamp`, `provenance` | the embedding watcher (`VectorStoreManager.embed_batch`, batches of 32 with a 50 ms yield, under `chroma.lock`) | no search: `VectorStoreManager.semantic_query` has no caller in `src/`; the watcher's own id probe (`VectorStoreManager.already_indexed`) reads it, from a copy, to skip rows already embedded |
 
 **The write paths.**
 
@@ -2306,34 +2306,239 @@ encoder's threads with `setdefault` (`OMP`/`MKL`/`OPENBLAS`/`VECLIB`/`NUMEXPR` =
    It runs as a daemon thread inside `hive dashboard` and `hive ui` (which
    recover stale claims at boot, then start it; poll `MINDHIVE_WATCHER_POLL_S`,
    default 2 s), or by hand as `hive watcher run [--once]`.
-3. `hive embed [--rebuild]` fills `ledger` and `events` straight from the
-   ledger and its projections, independently of the queue. `--rebuild` drops
-   both first. `--force` does not rebuild anything: it only overrides
-   `LIVE_LOCK` (`guard.ensure_safe`).
+3. `hive embed [--project P] [--rebuild]` fills `ledger` and `events`
+   straight from the ledger and its projections, independently of the queue;
+   it never writes the watcher's collection, `--rebuild` included.
+   `--rebuild` drops both first. `--project` names the namespace verbatim,
+   as the repair messages below name it. `--force` does not rebuild
+   anything: it only overrides `LIVE_LOCK` (`guard.ensure_safe`).
 
-**The read path.** `hive recall "<q>" --semantic` (`recall.py`) queries
-`events` when `vectors.indexed_event_count` is above zero and returns those hits
-if there are any; otherwise it falls back to `ledger`. Two consequences worth
-knowing: `vectors.semantic_recall_events` swallows a failed query and returns no
-hits, so a broken event index degrades silently to file-level hits rather than
-raising; and chromadb re-saves its own files whenever a client opens them, even
-for a pure query (measured by P8's bench: one `hive recall --semantic` changed
-the sha256 of `chroma.sqlite3` and two HNSW segment files). That is why
-`hive bench recall-semantic` queries a temporary copy of `chroma/` rather than
-the index itself.
+Writers — `hive embed`, the watcher, `LocalVectorIndex.embed_batch` — open the
+index directly and serialise on `vectors.chroma_lock`.
 
-**Rebuilding it from the ledger.** `hive embed --rebuild`; or stop every process
-holding the index (the dashboard, `hive ui`, `hive watcher run`), delete
-`chroma/`, and run `hive embed`; then `hive watcher recover` and
-`hive watcher run --once` for the queue. The step-by-step form, with how to
-detect the failure and confirm the fix, is scenario 1 of
+**The read path.** Read paths may NOT mutate the index. Every read — `hive
+recall --semantic`, the dashboard's `/api/recall`, `graph.build(semantic=True)`,
+`VectorStoreManager.semantic_query`, the watcher's id probe
+`VectorStoreManager.already_indexed`, `LocalVectorIndex.query` — goes through
+`vectors._read_view`, which queries a private byte copy of the index taken by
+`vector_snapshot.reading`. A reader never takes `chroma_lock` and never
+creates, drops or re-tunes a collection: `_open(..., client=...)` only looks a
+collection up, and an index that does not hold it answers empty. (The id probe
+used to reach the live index through `get_or_create_collection`, so probing a
+slug never embedded minted an empty collection, and every probe wrote.)
+
+**Reads and the index files.** The decision has to be enforced by a copy
+because chromadb 1.5.9 has no read-only client, and a read through an ordinary
+one writes. Measured on a scratch store (and pinned by
+`tests/test_vector_snapshot.py`, whose byte-identity test fails in exactly
+this way when `vectors._reading` is pointed at the live directory): one
+`hive recall decision --semantic` changed the sha256 of `chroma.sqlite3` and
+of the queried collection's `data_level0.bin` and `length.bin`. Only that
+collection's segment moves: re-measured on a two-collection scratch store, a
+read of `events` left every file of the `ledger` segment byte-identical. Two
+mechanisms, both inside chromadb:
+
+- every client open commits an `acquire_write` row to `chroma.sqlite3`,
+  whether or not the caller ever writes;
+- an HNSW segment is persisted only after `hnsw:sync_threshold` (default 1000)
+  rows, so below that every reader re-initialises the segment files and
+  replays the embeddings queue into them.
+
+A reader mutating the index is not a cosmetic problem: it is a write that takes
+no `chroma_lock`, racing the watcher's embed batches on one SQLite file, and
+it turns every audit of "did anything change the index" into noise.
+
+The copy is checked, not locked. `vector_snapshot` fingerprints the source
+(every file's size and mtime, plus SQLite's file change counter, header bytes
+24–27) before and after `copytree`; a copy whose fingerprints disagree is
+discarded and retaken, and after `COPY_ATTEMPTS` (5) the read fails with a
+`snapshot` error naming the busy writer rather than answering from a torn copy.
+An unchanged index is copied once per process and the open client reused; a
+changed one gets a fresh copy, and the old copy is closed and deleted when its
+last reader is done. Measured against the real 9.8 MB index: fingerprint
+1.1 ms, a checked copy 13.5 ms median (19.8 ms worst of five). Under
+contention (a scratch writer adding rows while readers looped) a plain
+`copytree` accepted 1 torn copy in 179 and raised on 12 more; the checked copy
+accepted none in 234, and failed with `snapshot` on 15% of reads only while the
+writer never paused (2 in 609 with 0.3 s between writes).
+
+Copies live in the temp directory as `mindhive-chroma-read-<pid>-*`, and none
+is left behind silently. A delete Windows refuses — a closed client not yet
+letting go of a file; under a busy writer 8 closed 9.4 MB copies were seen
+left on disk — is retried `REMOVE_ATTEMPTS` times, then logged and retried on
+the next fresh copy and at exit. The first fresh copy a process takes also
+deletes every copy whose owning pid is certainly gone (a process killed before
+its `atexit` hook); a running process's copy is never touched.
+
+**A failed read is an error, never an empty answer.** Each step that can break
+raises `vectors.SemanticQueryError` (a `RuntimeError`) whose `stage` names it —
+`snapshot`, `open`, `count`, `encode` or `query` — with the collection name and
+the original exception as `__cause__`. `[]` means only "nothing matched",
+"nothing is indexed", or a limit below 1 — a search for no hits, answered before
+anything is copied or opened, as `PgVectorIndex.query` answers a `top_k` of 0.
+(`LocalVectorIndex.query` has a third meaning, logged as a warning: every hit
+was a row `hive embed` wrote, too thin to rebuild a record from.) The message
+names the project namespace and a remedy chosen by what broke, because the
+repairs differ and one of them does nothing on the wrong damage. A repair that
+runs `hive embed` names the namespace as `--project <ns>`, verbatim: the
+command would read `MINDHIVE_PROJECT` through `paths.normalize`, which turns
+`my_proj` into `my-proj`, and the advice repaired another namespace.
+
+| stage | what broke | remedy the message gives |
+|---|---|---|
+| `snapshot` | `SnapshotError.reason` `busy` | retry when `hive embed` or the watcher has finished |
+| `snapshot` | `copy` | free space in the temp directory, or retry if a writer held a file |
+| `snapshot` | `space` | the temp directory is full or not writable |
+| `encode` | the embedding model | none on the index: the model failed to load or run |
+| `open`, `count`, `query` | an argument chromadb refused before touching the index — `ValueError`, `TypeError`, `OverflowError` (an `n_results` past 2**32 − 1), `InvalidArgumentError`, `InvalidDimensionException`, `DuplicateIDError` (an id named twice in one request) | none: the index is not at fault |
+| `query` | the collection | `hive embed --rebuild --project <ns>`; if that fails too, delete the `chroma/` directory it names and run `hive embed --project <ns>` |
+| `open`, `count` | the index files | delete the `chroma/` directory it names and run `hive embed --project <ns>` — not `--rebuild`, which opens the same damaged files to drop the collections |
+| `open`, `count`, `query` | the watcher's `mindhive_<slug>` collection | delete the `chroma/` directory and run `hive embed --project <ns>` for `ledger` and `events`; the watcher's collection refills only with rows appended after that. `hive embed` never writes it, `--rebuild` included, so no rebuild is offered |
+
+A missing extras install is not a `SemanticQueryError`: it stays the
+`RuntimeError` refusal, raised before anything is copied or opened.
+
+`recall.recall` refuses LIVE_LOCK before it opens anything, answers a limit
+below 1 with `[]` (in both modes: the keyword path's `[:-3]` was all but the
+last three hits), then asks `indexed_event_count(strict=True)`, so a broken
+event index raises instead of reading as 0 and falling back to the file index
+in silence; the non-strict count, for callers that only display it, logs the
+failure and answers 0. `hive recall --limit` refuses a value below 1 as a usage
+error (exit 2). `hive recall --semantic` exits **1** on a `SemanticQueryError`;
+it and `hive embed` exit **2** on a refusal (LIVE_LOCK, extras missing), each
+with `error: …` on stderr. `/api/recall` answers a failure with a 500 and the
+recall view throws it, so `run()` paints `Recall failed: …` and announces the
+search failed — painted by hand, the status chip read "ready" over the error.
+In HIVE MIND view the search goes through `recall.recall_across`: a namespace
+whose index could not be read answers one `{project, error}` row in place of
+its hits, and the view names it beside the other namespaces' hits; only when
+no namespace could be read is the first failure raised, and a refusal is
+raised as is. The watcher's id probe asks each id once, `ID_PROBE_BATCH` (256)
+at a time. Once: a claim recovered twice queues its rows twice, and chromadb
+refuses a `get` that names an id twice with `DuplicateIDError`, raised in
+Python before the index is read — claimed as damage, it poisoned a healthy
+index, and it is now a refused argument (the table above). At a time: chromadb
+binds one SQL variable per id, and 40,000 in one `get` raised "too many SQL
+variables" as an `InternalError`, the class a damaged index raises. It answers
+an empty set on any failure, logged: it only decides what to re-embed, and an
+`add` of an id the collection already holds is a no-op in chromadb 1.5.9
+(measured: no exception, count and stored vector unchanged), so a probe that
+failed costs encodes, never vectors.
+
+A semantic graph build that failed returns the deterministic graph with no
+semantic edges at all: the pairs are added only once every query has answered,
+so a pass that failed half-way keeps none of the links it had found — it kept
+them, under a banner saying there were none. It records a non-empty
+`semantic_error` in the result (the exception's type when its message is empty,
+which would otherwise hide the banner) and logs a warning; the page rendered
+from that result — `hive graph export --semantic`, the dashboard's
+`/api/graph?semantic=1` — shows it as a banner, inserted as text, never markup.
+`graph.json` does not keep the error: a semantic view is always rebuilt, so the
+file is what a later plain viewer is served, and a failure written into it
+would outlive the index that caused it. A semantic build that succeeded does
+write its edges into `graph.json`, where a later plain viewer is served them
+with the rest; that is not settled here.
+
+**A read that fails inside chromadb.** Measured on a scratch index whose
+persisted HNSW `header.bin` was cut to 7 bytes (a whole one is 100): the count
+fails, and then ANY teardown of that client — `close()`, dropping its last
+reference, interpreter exit — corrupts the heap (exit `0xC0000374`). So the
+defence is layered, from cheapest to last resort:
+
+1. `vector_snapshot.check_segments` refuses, before chromadb opens the copy, a
+   persisted segment (one with `index_metadata.pickle`) whose `header.bin` is
+   shorter than `HNSW_HEADER_BYTES`; that surfaces as stage `open`. A
+   never-persisted segment with a short header is harmless and passes.
+2. A failure `vectors._judge` claims as the client's own — stage `open`,
+   `count` or `query`, with a cause other than an argument chromadb refused
+   before touching the index (the row of the table above) — poisons that
+   copy: its client is never closed and never freed (`_immortalise`), and the
+   copy is left for a later process's dead-pid sweep. Claimed, a refused
+   argument poisoned a HEALTHY index: its client kept for good and every later
+   read of it refused.
+3. The failure is remembered per (index, collection) against the bytes it
+   happened on: while they are unchanged, the next read of that collection is
+   refused (`IndexUnreadable`, reported as the original stage and cause) instead
+   of copied and opened again, until `FAILED_RETRY_S` (600 s) pass — a hiccup
+   on an index nobody writes to must not end semantic search for the life of a
+   dashboard. The memo is asked on the way in, again once the copy is taken,
+   and again before the new client is installed: asked only on the way in,
+   every reader that overlapped one failure — copied before it, installed
+   after — went on to open, read and fail on the same bytes, and kept one more
+   client. A reader refused after its copy opens nothing; one refused at
+   install has read nothing, and its client is closed and its copy deleted.
+   Measured on copies with a cut or a garbage `header.bin`, a cut
+   `data_level0.bin` or `link_lists.bin`: a client that never read closed
+   cleanly in each of 5 runs, where one whose count had failed on the cut
+   header corrupted the heap as it closed (`0xC0000374`). The re-checks never
+   drop a memo the copy does not match: a copy taken before a writer came by
+   is older than a failure on what the writer left, and those bytes may still
+   be the source's.
+4. Every poisoned client is held until the process ends, so once
+   `POISON_LIMIT` (16) are held, no collection of a source that has failed is
+   read again until the process restarts, and the message says so, naming the
+   collection that failed. Per source, not per (index, collection): capped per
+   collection, each sibling of a failed collection was copied, opened, failed
+   and kept one more client past the limit. A source that first fails after
+   the limit is reached still keeps one, so the bound is the limit plus one
+   per source.
+
+A failed `PersistentClient` open leaves chromadb's own registry holding the
+half-built system (`SharedSystemClient._identifier_to_system`, measured: one
+entry per failed open, the copy's files still deletable); `open_chroma` pops
+it. On the same damage with fewer rows waiting in the queue — 130 rows at
+`sync_threshold` 100, 35 at 10 — runs of the count with the header check
+stubbed out crashed the process, hung past two minutes, or failed, the outcome
+varying between runs. The check contains all of them: it refuses the copy
+before chromadb reads the segment, and `tests/test_vector_snapshot.py` builds
+both indexes and requires every read to fail as stage `open` with the process
+alive. **Not contained:** damage the header-length check cannot see — a
+`header.bin` of whole length but wrong bytes, a cut `data_level0.bin` or
+`link_lists.bin`. Were chromadb to crash or hang on that, no in-process guard
+would survive it; a read in a child process would, and is not done here.
+
+**Not done here:** the writer side still leaves an index below
+`sync_threshold` unpersisted, so a copy's first open replays the queue.
+Lowering the threshold needs no rebuild — measured on chromadb 1.5.9,
+`collection.modify(configuration={"hnsw": {"sync_threshold": n}})` changes it
+in place, the new value survives a reopen, and the next write past it persists
+the segment — but it cannot go through `HNSW_METADATA`: `modify(metadata=…)`
+with `hnsw:` keys is refused, and a key added there would make `hnsw_drift`
+report every existing collection as drifted and rebuild it. Left as its own
+change.
+
+**The bench reads the same way.** `hive bench recall-semantic`
+(`bench_scenarios`) lists the collections through `vectors._read_view`,
+routes as `recall.recall` routes and times the same functions, so its queries
+run on the reader's private copy: one copy for the whole run while the index
+is unchanged, a fresh one if a writer lands mid-run. The copy's size, the time
+it took and whether it is gone afterwards come from `vector_snapshot.held` and
+`dispose_all`. A broken index makes the semantic row `unavailable` with the
+`SemanticQueryError` message, stage and repair included; a message longer than
+the report keeps both ends. The bench used to copy `chroma/` itself, point
+`MINDHIVE_HOME` at the copy, and empty chromadb's client registry
+(`clear_system_cache`) to delete it. Merged with the read path, that copied
+the copy, and the registry it emptied is the one every client
+`vector_snapshot` holds looks its system up in.
+
+**Rebuilding it from the ledger.** The repair depends on what broke, and the
+error names it (the remedy table above). Damaged files — stage
+`open` or `count` — are deleted: stop every process that writes the index
+(the dashboard and `hive ui`, which run the watcher, and `hive watcher run`),
+delete `chroma/`, and run `hive embed --project <ns>`. Readers need not be
+stopped: they hold only their own copies in the temp directory. `hive embed
+--rebuild --project <ns>` repairs a `query` failure on `ledger` or `events`
+only: it opens the same files to drop the collections. Then `hive watcher
+recover` and `hive watcher run --once` for the queue. The step-by-step form,
+with how to detect the failure and confirm the fix, is scenario 1 of
 `docs/RUNBOOK_RECOVERY.md`.
 
 **Where this differs from the spec (BAB 4).** The spec's one-way diagram runs
 `append_event → pending_embed.json → processing_embed_* → chroma → hive recall
 --semantic`, as one pipeline. In the code it is two:
 
-- The queue-and-watcher half ends in `mindhive_<slug>`, which no command reads.
+- The queue-and-watcher half ends in `mindhive_<slug>`, which no search reads;
+  only the watcher's own id probe does, to skip what it has embedded.
 - What `hive recall --semantic` reads is filled by `hive embed`, on demand.
 
 Two smaller differences:
@@ -2379,7 +2584,10 @@ appended as an event — breaks this projection's contract.
 5. **The semantic layer is optional.** Base install works without
    chromadb/sentence-transformers (`vectors._require_deps`). The Postgres
    mirror joins it under the same rule: `psycopg` and `mcp` are extras, and
-   `import mindhive.events` must not pay for either.
+   `import mindhive.events` must not pay for either. Optional is not silent:
+   once the extras are present, a semantic read that fails raises
+   `vectors.SemanticQueryError` rather than answering empty, and no read path
+   writes the index it reads (§4.19).
 6. **The Postgres mirror never becomes the source, and never re-derives the
    order.** The file ledger is the sole writer; `MINDHIVE_EVENT_BACKEND` stays
    `file` and nothing in `src/` may set it. The mirror's ordering contract is

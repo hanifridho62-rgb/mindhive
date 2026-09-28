@@ -29,6 +29,7 @@ the one detected from the git checkout — `hive projects` lists them).
 | `<ns>/STATE.md`, `<ns>/LEDGER/`, `<ns>/index.json` | projections | `hive project` |
 | `MEMORY.md` (the native memory folder) | the auto-loaded digest | `hive sync` |
 | `<ns>/chroma/` | the vector index (three collections, docs/DATA_MODEL.md §4.19) | `hive embed`, the embedding watcher |
+| `<temp>/mindhive-chroma-read-<pid>-*` | a reader's private copy of `<ns>/chroma/`: every semantic read answers from one, because chromadb writes to any index it opens | nothing: deleted when its reader is done; a copy of a process that is gone is swept by the next copy taken |
 | `<ns>/state/pending_embed.json` | the embed queue `append_event` writes | drained by the watcher |
 | `<ns>/state/processing_embed_<ns-time>.json` | a watcher's claim on the queue | `hive watcher recover` |
 | the Postgres mirror | a one-way copy of the ledger | `hive pg refresh`, `hive pg rebuild`, `hive db migrate` |
@@ -39,46 +40,70 @@ where both spellings are given.
 
 ## Scenario 1 — the chroma index is corrupt or unusable
 
-**How you notice.**
+**How you notice.** A semantic read that fails says so; it never answers empty.
 
-- `hive recall "<query>" --semantic` fails with a SQLite or HNSW error.
-- Or it quietly degrades. `hive recall --semantic` reads the `events` collection
-  first and falls back to the file-level `ledger` collection when that returns
-  nothing — and `vectors.semantic_recall_events` swallows a failed query and
-  returns no hits. A broken event index can therefore look like hits that name
-  `LEDGER/*.md` files instead of events, or like no hits at all. Treat "semantic
-  recall suddenly returns files, or nothing, for a query that used to hit" as
-  this scenario.
-- `hive bench recall-semantic` shows the semantic row `FAILED`, `unavailable`,
-  or `hits 0` where the lexical row still hits.
+- `hive recall "<query>" --semantic` exits 1 with `error: semantic <stage>
+  failed on the '<collection>' index of project '<ns>': <error> (<repair>)`.
+  The stage — `snapshot`, `open`, `count`, `encode` or `query` — is the step
+  that broke, and the parenthesis is the repair for that damage
+  (docs/DATA_MODEL.md §4.19 has the table). Exit 2 is a refusal instead —
+  `LIVE_LOCK`, or the `vectors` extra missing — and not this scenario.
+- The dashboard's recall view paints `Recall failed: ` and the same message. In
+  HIVE MIND view a namespace whose index could not be read shows its error
+  beside the other namespaces' hits.
+- The graph (`hive graph export --semantic`, the dashboard's
+  `/api/graph?semantic=1`) shows a `Semantic links unavailable: …` banner and
+  no semantic edges.
+- `hive bench recall-semantic` shows the semantic row `unavailable` with the
+  same message, or `FAILED` when a timed query raised.
+- In a process that stays up — the dashboard, `hive ui` — the same failure
+  again ends in `[… it is not read again until it changes or 600s pass]`: the
+  failed read is remembered against the bytes it happened on instead of being
+  repeated. `… until the process restarts` means 16 failed reads are already
+  held in that process.
 
-**Commands.**
+`snapshot` (a busy writer, a temp directory that is full or not writable) and
+`encode` (the embedding model) are not damage to the index, and neither is a
+message that says chromadb refused the read's arguments: follow the message,
+and nothing below applies.
 
-1. If the index still opens, drop and refill both collections recall reads:
+**Commands.** Follow the repair the message names. By stage:
 
-       hive embed --rebuild
-
-2. If it does not open, delete the directory and embed from scratch. First stop
-   everything holding it: the dashboard (`hive dashboard`) or `hive ui` (their
-   background watcher thread and chromadb's client cache keep `chroma.sqlite3`
-   open, which on Windows makes the directory undeletable), and any
-   `hive watcher run`. Then:
+1. `open` or `count` — the index files are damaged — or any stage on the
+   watcher's `mindhive_<slug>` collection: delete the directory and embed from
+   scratch. Not `hive embed --rebuild`: it opens the same damaged files to drop
+   the collections. First stop everything that WRITES the index: the dashboard
+   (`hive dashboard`) or `hive ui` (their background watcher thread keeps
+   `chroma.sqlite3` open, which on Windows makes the directory undeletable),
+   and any `hive watcher run`. Readers need not stop: each holds its own copy
+   in the temp directory. Then:
 
        rm -rf "${MINDHIVE_HOME:-$HOME/.mindhive}/<project>/chroma"          # POSIX
        Remove-Item -Recurse -Force "$env:USERPROFILE\.mindhive\<project>\chroma"   # PowerShell, default store root
 
-       hive embed
+       hive embed --project <project>
+
+2. `query` on `ledger` or `events`: drop and refill both collections recall
+   reads, and if that fails too, do step 1:
+
+       hive embed --rebuild --project <project>
 
 3. Return any claim a dead watcher left behind and drain the queue:
 
        hive watcher recover
        hive watcher run --once
 
+Pass `--project` the namespace exactly as the message prints it.
+`MINDHIVE_PROJECT` would be normalised on the way in (`my_proj` becomes
+`my-proj`), and the repair would run on another namespace.
+
 **How you confirm it.** `hive embed` prints how many files and events it indexed.
-`hive recall "<query>" --semantic` returns event-level hits (a type, a timestamp,
-a session) again. `hive bench recall-semantic` measures the semantic row instead
-of reporting it unavailable. `hive watcher status` reads
-`pending 0 row(s), processing 0 marker(s)`.
+`hive recall "<query>" --semantic` exits 0 with event-level hits (a type, a
+timestamp, a session) again. `hive bench recall-semantic` measures the semantic
+row instead of reporting it unavailable. `hive watcher status` reads
+`pending 0 row(s), processing 0 marker(s)`. A dashboard that stayed up reads the
+repaired index once its bytes have changed; one whose error said `until the
+process restarts` needs a restart first.
 
 **What differs from spec §9.4.**
 
@@ -86,8 +111,9 @@ of reporting it unavailable. `hive watcher status` reads
   index is per namespace: `<store>/<project>/chroma/`.
 - The spec runs `hive embed --force --rebuild`. `--force` does not force a
   rebuild: it only overrides `LIVE_LOCK` (`guard.ensure_safe`). `--rebuild` is
-  what drops and refills the collections. After the directory is deleted,
-  neither flag is needed.
+  what drops and refills the collections, and it opens the index to do it, so
+  on damaged files it repairs nothing. After the directory is deleted, neither
+  flag is needed.
 - The spec says the index "recovers 100% in seconds". A rebuild re-encodes every
   semantic event with a local model. On a large ledger that takes minutes, not
   seconds: P8's bench measured the cold model load alone at 8 to 67 s on this
@@ -95,8 +121,9 @@ of reporting it unavailable. `hive watcher status` reads
 - `hive embed` rebuilds the `ledger` and `events` collections, which are what
   `hive recall --semantic` reads. The watcher writes a third collection,
   `mindhive_<slug>`. No command backfills that collection from the ledger, and
-  no command reads it (docs/DATA_MODEL.md §4.19). Deleting `chroma/` loses it,
-  and only rows queued after that point refill it.
+  no search reads it — only the watcher's own id probe does
+  (docs/DATA_MODEL.md §4.19). Deleting `chroma/` loses it, and only rows queued
+  after that point refill it.
 
 ## Scenario 2 — the embed queue is stuck
 
@@ -304,4 +331,4 @@ reads `ok: true`. `hive context --check` exits 0.
 | delete the leftover lock file | `append.lock`'s file stays by design; the others expire on their own |
 | `hive verify --json` names the exact broken line | it names truncated segments and corrupt rows (zero-based `line`), not the first changed line |
 | hash-chain reconciliation through `chain.py` | no such command; `hive project` re-seals over the current disk, which accepts rather than repairs |
-| the rebuilt vector index is what semantic recall uses | `hive recall --semantic` reads the `events` and `ledger` collections `hive embed` writes; the watcher's `mindhive_<slug>` collection has no reader and no backfill |
+| the rebuilt vector index is what semantic recall uses | `hive recall --semantic` reads the `events` and `ledger` collections `hive embed` writes; no search reads the watcher's `mindhive_<slug>` collection (only its own id probe does), and nothing backfills it |

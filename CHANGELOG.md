@@ -134,6 +134,34 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **A failed semantic read no longer looks like "no hits", and a read no
+  longer writes the index** (docs/DATA_MODEL.md §4.19; merged from
+  `claude/semantic-recall-observable`):
+  - `vectors.semantic_recall_events` swallowed a failed query and returned
+    `[]`. Every step that can break now raises `vectors.SemanticQueryError`,
+    naming the stage, the collection, the namespace and a repair chosen by
+    what broke. `hive recall --semantic` exits 1 on it (refusals stay exit
+    2); `/api/recall` answers 500 and the recall view says the search
+    failed; HIVE MIND recall keeps the other namespaces' hits beside a
+    `{project, error}` row; a semantic graph build that fails keeps none of
+    its semantic edges and shows a `semantic_error` banner.
+  - One read changed `chroma.sqlite3`, `data_level0.bin` and `length.bin`:
+    chromadb 1.5.9 has no read-only client. Every read now answers from a
+    fingerprint-checked private copy (`vector_snapshot`), reused while the
+    index is unchanged, never taken under `chroma_lock`, with `LIVE_LOCK`
+    refused before anything is copied. A client whose read failed on a
+    damaged segment is never torn down (measured: that corrupts the heap,
+    `0xC0000374`), the failure is remembered against the bytes it happened
+    on, and a cut HNSW header is refused before chromadb opens the copy.
+  - `hive embed --project`, because the repairs name the namespace
+    verbatim; `hive recall --limit` below 1 is a usage error; the watcher's
+    id probe reads a copy, in batches, asking each id once.
+  - `hive bench recall-semantic` reads through the same path, one copy per
+    run reported through `vector_snapshot.held`. It used to copy the index
+    itself under a redirected `MINDHIVE_HOME` and empty chromadb's client
+    registry (`clear_system_cache`) to delete the copy. A long `unavailable`
+    reason or search error now keeps both ends, so the repair survives the
+    300-character cap.
 - README said the dashboard's auto-harvest polls every 180 seconds by default
   (`MINDHIVE_AUTOHARVEST_SECS`); the code's default is 3 seconds, floor 1
   (blueprint P8, found while building the environment-variable registry).

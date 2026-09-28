@@ -18,12 +18,12 @@ The rules are `bench.py`'s, inherited whole:
 **It measures and never fixes.** `cli-startup` spawns children of THIS
 interpreter and reads their exit codes; `recall-semantic` calls the functions
 behind `hive recall` and `hive recall --semantic` in-process. Nothing here
-embeds, rebuilds, writes an event or creates a collection. `hive recall
---semantic` creates the chroma directory and its collections on demand, so on
-a namespace that was never embedded this command says "unavailable" and leaves
-no `chroma/` behind, rather than measuring an index it just made. And because
-chromadb re-saves its own files whenever a client opens them, the semantic
-queries run against a temporary copy of the index, removed afterwards.
+embeds, rebuilds, writes an event or creates a collection. On a namespace that
+was never embedded this command says "unavailable" and leaves no `chroma/`
+behind, rather than measuring an index it just made. And the semantic queries
+read through the path `hive recall --semantic` reads through, which answers
+from a private copy of the index because chromadb writes to any index it opens
+(DATA_MODEL.md section 4.19); the copy is gone when the command ends.
 
 **A failure is never timed as a success.** A child that crashed on import
 exits in a millisecond, and a search that raised returns in microseconds; both
@@ -55,7 +55,6 @@ import os
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 
 from . import cliparse, paths
 
@@ -389,62 +388,23 @@ def default_lexical(query, project, limit):
     return recall_mod.recall(query, project=project, semantic=False, limit=limit)
 
 
-#: The variable `paths.store_home` reads on every call -- which is what lets
-#: the semantic path be pointed at a copy of the index one call at a time.
-_STORE_HOME_ENV = "MINDHIVE_HOME"
+def _names(client) -> set:
+    """The collections *client*'s index holds. chroma returned Collection
+    objects before 0.6 and names since."""
+    return {str(getattr(c, "name", c)) for c in client.list_collections()}
 
 
-@contextmanager
-def _store_home_at(home):
-    """`paths.store_home()` answers *home* inside the block; afterwards the
-    variable is exactly what it was, unset included. Process-global for the
-    block's length, which a CLI command running nothing concurrently can
-    afford."""
-    previous = os.environ.get(_STORE_HOME_ENV)
-    os.environ[_STORE_HOME_ENV] = str(home)
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(_STORE_HOME_ENV, None)
-        else:
-            os.environ[_STORE_HOME_ENV] = previous
-
-
-def _discard_copy(root) -> bool:
-    """Remove the index copy under *root*; True when it is gone. chromadb
-    caches one client per path and holds its SQLite file open, which on
-    Windows makes the directory undeletable, so that cache is dropped first --
-    only when chromadb was imported at all: importing it to clear it costs
-    seconds."""
-    import gc
-    import shutil
-    chroma_api = sys.modules.get("chromadb.api.client")
-    shared = getattr(chroma_api, "SharedSystemClient", None)
-    if shared is not None:
-        try:
-            shared.clear_system_cache()
-        except Exception:                      # noqa: BLE001 -- the return value says whether it worked
-            pass
-    gc.collect()
-    shutil.rmtree(root, ignore_errors=True)
-    return not os.path.exists(root)
-
-
-def _bind_copy(vectors, project):
-    """``(path, query_fn, names, indexed_events)`` for the index copy the store
-    currently points at: the collections that exist, and the function `hive
-    recall --semantic` would dispatch to over them -- `semantic_recall_events`
-    when the event index holds rows, else the file-level `semantic_recall`.
-    Its own frame, so the client it opens is released when it returns."""
-    client = vectors._client(project)
-    # chroma returned Collection objects before 0.6 and names since.
-    names = {str(getattr(c, "name", c)) for c in client.list_collections()}
-    indexed_events = 0
-    if vectors.EVENT_COLLECTION in names:
-        # `get_collection`, not `_events_collection`: that one goes through
-        # `get_or_create_collection`, and this function creates nothing.
-        indexed_events = int(client.get_collection(vectors.EVENT_COLLECTION).count())
+def _bind(vectors, project):
+    """``(path, query_fn, names, indexed_events)``: the collections the index
+    holds, and the function `hive recall --semantic` dispatches to over them,
+    routed as `recall.recall` routes -- `semantic_recall_events` when the
+    event index holds rows, else the file-level `semantic_recall`. Read the
+    way every semantic read is, from a private copy (`vectors._read_view`);
+    an index that cannot be read is `vectors.SemanticQueryError`, naming the
+    stage that broke and the repair."""
+    with vectors._read_view(project, vectors.EVENT_COLLECTION, _names) as names:
+        names = set(names or ())
+    indexed_events = vectors.indexed_event_count(project, strict=True)
     if indexed_events > 0:
         return "events", vectors.semantic_recall_events, names, indexed_events
     if FILE_COLLECTION in names:
@@ -458,37 +418,34 @@ def _bind_copy(vectors, project):
 def default_semantic_open(project):
     """Open the semantic path for *project*: ``(facts, search)``, where
     ``search(query, limit)`` calls the function `hive recall --semantic`
-    dispatches to, and ``search.close()`` removes the index copy it reads.
-    Raises RuntimeError -- reported as `unavailable: <reason>`, exit 0 --
-    when the path cannot be opened without writing: LIVE_LOCK
-    (`guard.ensure_safe` against the real store, once, here; the bench has no
-    `--force`), the `vectors` extra absent, no `chroma/` directory for the
-    namespace, an index with neither collection, or a model that fails to load.
+    dispatches to, and ``search.close()`` disposes of the index copies the
+    reads took, answering whether they are gone. Raises RuntimeError --
+    reported as `unavailable: <reason>`, exit 0 -- when the path cannot be
+    opened: LIVE_LOCK (`guard.ensure_safe` against the real store, once, here;
+    the bench has no `--force`), the `vectors` extra absent, no `chroma/`
+    directory for the namespace, an index with neither collection, an index
+    the read path cannot read (`vectors.SemanticQueryError`: the stage that
+    broke and the repair), or a model that fails to load.
 
     Everything here -- importing chromadb and sentence-transformers, copying
-    the index, loading the model, opening the SQLite-backed client -- is the
-    `open_ms` figure the caller times around this call: what the first `hive
-    recall --semantic` of a process waits for, and not a query. The copy's own
-    share rides along as `copy_ms` and `copy_bytes`.
+    the index, opening the copy, loading the model -- is the `open_ms` figure
+    the caller times around this call: what the first `hive recall
+    --semantic` of a process waits for, and not a query. The copy's own share
+    rides along as `copy_ms` and `copy_bytes`.
 
-    Never writes to the store, which takes two precautions:
-
-    * `recall.recall(semantic=True)` asks `vectors.indexed_event_count`, whose
-      `get_or_create_collection` CREATES the chroma directory and an empty
-      `events` collection on a namespace that was never embedded. So a
-      namespace without `chroma/` is refused, and the collections are listed
-      before a query function is bound.
-    * chromadb is not read-only even for a query: its client re-saves the
-      SQLite file and the HNSW segment when it opens. Measured on a scratch
-      store: one `hive recall --semantic` against an index nothing was adding
-      to changed the hashes of `chroma.sqlite3`, `data_level0.bin` and
-      `length.bin`. So the namespace's `chroma/` is COPIED into a temporary
-      store, and every open and query runs against the copy through the same
-      `vectors` functions, with `paths.store_home()` pointed at it for the
-      length of each call."""
-    import tempfile
+    Never writes to the store: it reads through the path `hive recall
+    --semantic` reads through (DATA_MODEL.md section 4.19). chromadb writes to
+    any index it opens -- measured on a scratch store, one `hive recall
+    --semantic` against an index nothing was adding to changed the hashes of
+    `chroma.sqlite3`, `data_level0.bin` and `length.bin` -- so every semantic
+    read answers from a private copy of the index (`vector_snapshot`), taken
+    once and reused while the index is unchanged, and the facts about the copy
+    are `vector_snapshot.held`'s. That path creates nothing on a namespace that
+    was never embedded; the missing `chroma/` is refused here anyway, so the
+    reason can name `hive embed`. The bench is a process of its own, so
+    `close()` disposes of every copy the process holds."""
     from pathlib import Path
-    from . import guard, vectors
+    from . import guard, vector_snapshot, vectors
     guard.ensure_safe()
     if not vectors.has_vectors_support():
         raise RuntimeError("the `vectors` extra is not installed (chromadb / "
@@ -500,38 +457,43 @@ def default_semantic_open(project):
         raise RuntimeError(f"no vector index at {chroma_dir}: run `hive embed` "
                            "first (this bench never creates one)")
     vectors._require_deps()
-    scratch = Path(tempfile.mkdtemp(prefix="mindhive-bench-"))
     failure = None
     try:
-        import shutil
-        with _store_home_at(scratch):
-            copy = paths.project_dir(project) / "chroma"
-        start = time.perf_counter()
-        shutil.copytree(chroma_dir, copy)
-        copy_ms = _round_ms((time.perf_counter() - start) * 1000.0)
-        copy_bytes = sum(f.stat().st_size for f in copy.rglob("*") if f.is_file())
-        with _store_home_at(scratch):
-            path, query_fn, names, indexed_events = _bind_copy(vectors, project)
-            vectors._encoder()   # the model load: paid here, not inside the first query
+        path, query_fn, names, indexed_events = _bind(vectors, project)
+        vectors._encoder()   # the model load: paid here, not inside the first query
     except BaseException as e:
         if not isinstance(e, Exception):       # Ctrl-C: clean up and stop
-            _discard_copy(scratch)
+            vector_snapshot.dispose_all()
             raise
         failure = str(e) or e.__class__.__name__
     if failure is not None:
         # Outside the handler, so no traceback still holds a client whose open
-        # SQLite file would keep the copy undeletable on Windows.
-        _discard_copy(scratch)
+        # files would keep its copy undeletable on Windows.
+        vector_snapshot.dispose_all()
         raise RuntimeError(failure)
+    copy = vector_snapshot.held(chroma_dir)
+    # Every copy the reads were answered from: a writer that lands mid-bench
+    # makes the next read take a fresh one.
+    roots = {copy["root"]} if copy else set()
 
     def search(query, limit):
-        with _store_home_at(scratch):
+        try:
             return query_fn(query, project=project, limit=limit)
-    search.close = lambda: _discard_copy(scratch)
+        finally:
+            now = vector_snapshot.held(chroma_dir)
+            if now:
+                roots.add(now["root"])
+
+    def close():
+        vector_snapshot.dispose_all()
+        return not any(Path(root).exists() for root in roots)
+    search.close = close
     facts = {"path": path, "indexed_events": indexed_events,
              "collections": sorted(names), "model": vectors.EMBEDDING_MODEL,
-             "chroma_dir": str(chroma_dir), "copy_dir": str(scratch),
-             "copy_ms": copy_ms, "copy_bytes": copy_bytes}
+             "chroma_dir": str(chroma_dir)}
+    if copy:
+        facts.update(copy_dir=copy["root"], copy_ms=_round_ms(copy["copy_ms"]),
+                     copy_bytes=copy["bytes"])
     return facts, search
 
 
@@ -566,6 +528,17 @@ def _search_row(samples, queries) -> dict:
     }
 
 
+def _clip(text) -> str:
+    """*text* within `MAX_ERROR_CHARS`, keeping both ends: a
+    `vectors.SemanticQueryError` names what failed first and the repair last,
+    and cut to its head a long one lost the repair."""
+    text = str(text)
+    if len(text) <= MAX_ERROR_CHARS:
+        return text
+    keep = (MAX_ERROR_CHARS - len(" ... ")) // 2
+    return f"{text[:keep]} ... {text[-keep:]}"
+
+
 def time_searches(search, queries, reps, clock=None) -> dict:
     """*reps* rounds over *queries*, in order, through ``search(query)``: one
     sample per call, every sample kept. A raise is the sample's state, not
@@ -584,7 +557,7 @@ def time_searches(search, queries, reps, clock=None) -> dict:
                 samples.append({"query": query, "rep": rep,
                                 "ms": _round_ms(elapsed_ms), "state": FAILED,
                                 "hits": None,
-                                "error": (str(e) or e.__class__.__name__)[:MAX_ERROR_CHARS]})
+                                "error": _clip(str(e) or e.__class__.__name__)})
                 continue
             elapsed_ms = (clock() - start) * 1000.0
             samples.append({"query": query, "rep": rep, "ms": _round_ms(elapsed_ms),
@@ -593,7 +566,7 @@ def time_searches(search, queries, reps, clock=None) -> dict:
 
 
 def _unavailable_row(reason) -> dict:
-    return {"state": UNAVAILABLE, "reason": str(reason)[:MAX_ERROR_CHARS],
+    return {"state": UNAVAILABLE, "reason": _clip(reason),
             "open_ms": None, "open": {}, "cold_ms": None, "median_ms": None,
             "min_ms": None, "max_ms": None, "ok": 0, "total": 0,
             "per_query": [], "error": "", "samples": []}
@@ -718,12 +691,15 @@ def render_recall_semantic(report) -> str:
             + (f"  [{detail}]" if detail else "")]
     if "copy_bytes" in facts:
         gone = {True: "removed",
-                False: f"NOT removed -- delete {facts.get('copy_dir')} by hand"}.get(
+                False: f"NOT removed -- the next process to copy the index "
+                       f"sweeps {facts.get('copy_dir')}, or delete it once this "
+                       f"one has exited"}.get(
             facts.get("copy_removed"), "removal not reported")
         out.append(f"  index copy     {facts['copy_bytes']:,} bytes in "
-                   f"{_ms(facts.get('copy_ms'))}, {gone}. chromadb re-saves its "
-                   "files on every open, so the queries ran against a temporary "
-                   "copy and the store's index was not touched")
+                   f"{_ms(facts.get('copy_ms'))}, {gone}. Taken by the read path "
+                   "every semantic read goes through: chromadb writes to any index "
+                   "it opens, so the queries read a private copy and the store's "
+                   "index was not touched")
     out.append(f"  ratio          {ratio}  (lexical warm median / semantic warm "
                f"median; above 1.0 the semantic query answered faster; the spec's "
                f"figure is {claim['ratio']:g}x)")

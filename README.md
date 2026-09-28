@@ -81,7 +81,7 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify [--json] [--strict]` — check the hash chain (`--json`: sorted one-line JSON for scripts; `--strict`: exit 1 when the chain is broken or a corrupt row exists — the default always exits 0 and reports on stdout)
-- `hive embed [--force] [--rebuild]` — build the on-demand vector index (`--rebuild`: drop and refill the chroma collections, which is what picks up a change to the HNSW tuning an existing collection would otherwise keep ignoring)
+- `hive embed [--project P] [--force] [--rebuild]` — build the on-demand vector index (`--rebuild`: drop and refill the `ledger` and `events` chroma collections, which is what picks up a change to the HNSW tuning an existing collection would otherwise keep ignoring; the watcher's own collection is never touched). `--project` names the namespace verbatim — it is what a failed semantic read tells you to run, where `MINDHIVE_PROJECT` would be normalised (`my_proj` → `my-proj`) into another namespace
 - `hive watcher run [--once] [--json]` — drain the pending-embed queue: the rows `append_event` marked for indexing, embedded and the marker cleared. `--once` claims the queue and returns (the shape a scheduled task wants); without it the loop runs in the foreground until Ctrl+C. The same work `hive dashboard` does on a background thread while it is open, so a machine that keeps the dashboard open never needs this
 - `hive watcher status [--json]` — how much is queued and how much is claimed. Always exit 0: a backlog is not an error, it is what a week with the dashboard closed looks like
 - `hive watcher recover [--stale SECONDS] [--json]` — return abandoned claims to the queue (default: older than 600 s). The same pass the dashboard runs at boot, by hand for the machine that lost power mid-embed
@@ -121,7 +121,7 @@ quietly fall behind the CLI again.
 - `hive premise check [--file F]` — check a prompt or handoff document's factual claims against the record: asserted file paths, roadmap ids, and test counts that contradict what is on disk, plus the claims it could not check
 - `hive bench dashboard --url <origin> --label "<condition>" [--token T] [--project P] [--reps N] [--timeout S] [--endpoint PATH ...] [--json]` — time the dashboard's own API endpoints. Read-only: it starts nothing, restarts nothing, and writes no events — not even the token, which it reads but will never create. **Cold/miss and warm/hit are separate rows and nothing is discarded**, because the perf work being measured *is* a fingerprint-keyed memo layer: the first request per endpoint pays the fold and the rest are hits, so averaging them yields a figure that moves with the hit/miss ratio. `--label` is required — the same code answers 6.7x apart between two load conditions, so a number without its condition is not evidence. A non-200 is reported with its status and excluded from every mean (a missing token would otherwise time four fast 403s and read as a healthy server). Also reports serial-total against concurrent-wall for the same set, which is how GIL-serialized folds show up
 - `hive bench cli-startup [--reps N] [--timeout S] [--json]` — median wall-clock of `python -c "import mindhive.__main__"` and `python -m mindhive --help`, each run as a child process of the interpreter that runs `hive`, N children per scenario (default 10, at least 1), each killed after S seconds (default 60) and reported as a timeout. Reports median, min and max ms per scenario, ok/total, the interpreter and Python version, `PYTHONPATH` and `PYTHONDONTWRITEBYTECODE` (children get `1` unless you exported your own value). The MEB's 45 ms claim is printed beside the measured median for comparison; it is **not a gate**. Exit 0 when every child ran, however slow; 1 when any child failed or timed out (a failure is never timed as a success); 2 for `--reps` below 1. Read-only
-- `hive bench recall-semantic [--query Q ...] [--reps N] [--limit K] [--project P] [--json]` — median query time of the lexical ledger scan behind `hive recall` against the chroma path behind `hive recall --semantic`, in-process, on the same queries. `--query` is repeatable and **replaces** the default set of one query per memo kind (`decision`, `caveat`, `next_step`); `--reps` (default 5, at least 1) is rounds over the query set per path; `--limit` (default 10) is hits per query, as `hive recall --limit`; `--project` defaults to the detected project. Per path it reports the cold first sample, then the warm median, min and max over the rest, and hits per query; the semantic open (dependency import, index copy, model load) is timed on its own row, never inside the query times. The ratio is lexical warm median over semantic warm median, printed beside spec §4.7's 14.7x as a claim, not a gate. Without the `vectors` extra, on a namespace never embedded, or under `LIVE_LOCK`, the semantic row reads `unavailable: <reason>` and the exit code stays 0; exit 1 when a search raised; 2 for `--reps` or `--limit` below 1. **Never writes**: queries run against a temporary copy of the index, removed afterwards, because chromadb re-saves its own files whenever it opens them
+- `hive bench recall-semantic [--query Q ...] [--reps N] [--limit K] [--project P] [--json]` — median query time of the lexical ledger scan behind `hive recall` against the chroma path behind `hive recall --semantic`, in-process, on the same queries. `--query` is repeatable and **replaces** the default set of one query per memo kind (`decision`, `caveat`, `next_step`); `--reps` (default 5, at least 1) is rounds over the query set per path; `--limit` (default 10) is hits per query, as `hive recall --limit`; `--project` defaults to the detected project. Per path it reports the cold first sample, then the warm median, min and max over the rest, and hits per query; the semantic open (dependency import, index copy, model load) is timed on its own row, never inside the query times. The ratio is lexical warm median over semantic warm median, printed beside spec §4.7's 14.7x as a claim, not a gate. Without the `vectors` extra, on a namespace never embedded, under `LIVE_LOCK`, or on an index that cannot be read (the reason names the failing stage and the repair), the semantic row reads `unavailable: <reason>` and the exit code stays 0; exit 1 when a search raised; 2 for `--reps` or `--limit` below 1. **Never writes**: it reads through the path `hive recall --semantic` reads through, which answers from a private copy of the index because chromadb writes to any index it opens; one copy serves the whole run, and its size, copy time and removal are reported
 
 #### What composes a prompt's injected context
 
@@ -257,7 +257,7 @@ list of spellings; anything else takes the default.
 | `MINDHIVE_DASHBOARD_TOKEN` | string; unset → the token persisted in `dashboard.token` under the store root, minted once with `secrets.token_urlsafe(16)` | `dashboard.py::load_or_create_token`; `bench.py` reads it and never creates one | overrides the dashboard's URL token |
 | `MINDHIVE_EVENT_BACKEND` | `file` (default), `pg` or `dual` | `events.py::_maybe_read_from_pg`, `dashboard_memo.py`, `adaptivetail.py` | `pg`: `read_all` reads the Postgres mirror, falling back to the files. `pg` or `dual`: the dashboard's memo fingerprints are disabled and the `MEMORY.md` rollover line adds the `hive pg tool search_events_by_type` pointer. Appends never touch Postgres under any value, and `dual` performs no dual-read comparison. Nothing in `src/` sets it (docs/DATA_MODEL.md §5, invariant 6) |
 | `MINDHIVE_HEADLESS` | `1` when set; set by the code, not the operator | set by `claude_cli.py` and `workspace.py` on every headless `claude` child and removed by `rotation/supervisor.py` for its interactive successor; read by every `hooks/*.sh` / `hooks/*.ps1` shim | a hook fired inside a headless child exits at once (no recursion) |
-| `MINDHIVE_HOME` | path; default `~/.mindhive` | `paths.py::store_home`, on every call | the store root: namespaces, `LIVE_LOCK`, `dashboard.token`. `hive bench recall-semantic` points it at a temporary index copy for the length of one measurement and restores it |
+| `MINDHIVE_HOME` | path; default `~/.mindhive` | `paths.py::store_home`, on every call | the store root: namespaces, `LIVE_LOCK`, `dashboard.token` |
 | `MINDHIVE_HOOK_WALK_LIMIT` | integer; default 8, `0` = no walk; a non-number or a value of 10+ digits → 8 | `hooks/lib.sh`, `hooks/lib.ps1` | how many directories a shim climbs looking for a `.venv` |
 | `MINDHIVE_INTERCEPTOR` | default `1`; exactly `0` turns it off | `orchestrator/interceptor.py` | the gateway interceptor that records an `interceptor_signal` on pre/post tool use; it never blocks a call |
 | `MINDHIVE_LOOP_DASHBOARD` | switch; default on. `0`, `false`, `off`, `no` turn it off | `commands/orchestration.py` (`hive loop`) | whether a real `hive loop` run opens the dashboard; `--no-dashboard` does the same per run |
@@ -303,7 +303,12 @@ The step-by-step runbook — scenario, how you notice, the exact commands, and
 how to confirm the fix — is [docs/RUNBOOK_RECOVERY.md](docs/RUNBOOK_RECOVERY.md).
 The short form:
 
-- **Semantic recall broken or empty**: `hive embed --rebuild`, then
+- **Semantic recall fails**: `hive recall --semantic` exits 1 and names the
+  failing stage and the repair. Damaged files (stage `open` or `count`):
+  stop the writers (the dashboard, `hive ui`, `hive watcher run`), delete the
+  `chroma/` directory the message names, and run `hive embed --project <ns>`;
+  a failed `query`: `hive embed --rebuild --project <ns>`. An empty answer
+  means nothing is indexed yet: `hive embed --project <ns>`. Then
   `hive watcher recover` and `hive watcher run --once`; confirm with
   `hive recall "<query>" --semantic`.
 - **A lock left behind by a dead process**: every lock expires on its own
@@ -501,6 +506,17 @@ Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via s
 ## V17 safety
 `embed` and `recall --semantic` refuse to run while `~/.mindhive/LIVE_LOCK`
 exists (V17 is trading). Override with `--force` only when the box is idle.
+For both commands the refusal — and a missing `[vectors]` extras install — is
+`error: …` on stderr and exit 2, as is a `recall --limit` below 1. A semantic
+index that cannot be read is exit 1, never an empty result: the message names
+the failing stage, the project namespace and a remedy that depends on what
+broke — wait out a busy writer, free the temp directory, `hive embed --rebuild
+--project <ns>` after a failed query, or delete the damaged `chroma/` directory
+it names and run `hive embed --project <ns>` (a rebuild opens the same damaged
+files; on the watcher's collection it never reaches them, and that collection
+refills only from rows appended afterwards). An argument chromadb refused is
+reported as such, with no repair: the index is not at fault. A semantic read
+never writes the index: it queries a private copy (docs/DATA_MODEL.md §4.19).
 
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into

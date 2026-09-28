@@ -299,6 +299,109 @@ def test_build_semantic_false_no_error():
     evs = _make_evs()
     g = build(project=None, semantic=False, _evs=evs)
     assert "nodes" in g
+    assert "semantic_error" not in g
+
+
+def test_a_failed_semantic_pass_is_recorded_not_hidden(monkeypatch, caplog):
+    """The semantic edges stay optional -- a failure still yields the
+    deterministic graph -- but a graph that asked for them and silently has
+    none is indistinguishable from one whose memos are just unrelated."""
+    from mindhive import vectors
+    boom = vectors.SemanticQueryError("query", vectors.LEDGER_COLLECTION,
+                                      RuntimeError("Error loading hnsw index"))
+
+    def _raise(*_a, **_k):
+        raise boom
+
+    monkeypatch.setattr(vectors, "semantic_recall", _raise)
+    with caplog.at_level("WARNING", logger="mindhive.graph"):
+        g = build(project=None, semantic=True, _evs=_make_evs())
+    assert "nodes" in g
+    assert not [e for e in g["edges"] if e.get("rel") == "semantic_near"]
+    assert g["semantic_error"] == str(boom)
+    assert "hnsw" in caplog.text
+
+
+def test_a_semantic_failure_is_returned_but_never_persisted(monkeypatch):
+    """The error belongs to the build that asked for semantic edges.
+    graph.json is what every later viewer is served, semantic or not, and a
+    failure written into it would outlive the index that caused it."""
+    from mindhive import vectors
+
+    def _raise(*_a, **_k):
+        raise vectors.SemanticQueryError(
+            "query", vectors.LEDGER_COLLECTION, RuntimeError("hnsw"))
+
+    monkeypatch.setattr(vectors, "semantic_recall", _raise)
+    g = build(project=None, semantic=True, _evs=_make_evs())
+    assert "semantic_error" in g
+    persisted = json.loads((paths.project_dir() / "graph.json").read_text(
+        encoding="utf-8"))
+    assert "semantic_error" not in persisted
+    assert persisted["nodes"] == g["nodes"]
+
+
+def test_a_semantic_pass_that_worked_records_no_error(monkeypatch):
+    from mindhive import vectors
+    monkeypatch.setattr(vectors, "semantic_recall", lambda *a, **k: [])
+    g = build(project=None, semantic=True, _evs=_make_evs())
+    assert "semantic_error" not in g
+
+
+def _near(edges):
+    return [e for e in edges if e.get("rel") == "semantic_near"]
+
+
+def _linking_recall(monkeypatch, fail_from=None, error=None):
+    """`semantic_recall` answering every ledger entry as a hit, so each query
+    links its memo to the others -- and raising from call `fail_from` on."""
+    from mindhive import vectors
+    from mindhive.projector import build_ledger_entries
+    files = [fn for fn, _c, _ev in build_ledger_entries(_make_evs())]
+    calls = []
+
+    def _recall(body, **_k):
+        calls.append(body)
+        if fail_from is not None and len(calls) >= fail_from:
+            raise error or vectors.SemanticQueryError(
+                "query", vectors.LEDGER_COLLECTION, RuntimeError("hnsw"))
+        return [{"file": f} for f in files]
+
+    monkeypatch.setattr(vectors, "semantic_recall", _recall)
+    return calls
+
+
+def test_a_completed_semantic_pass_links_its_memos(monkeypatch):
+    """The control for the test below: this double does produce edges."""
+    _linking_recall(monkeypatch)
+    g = build(project=None, semantic=True, _evs=_make_evs())
+    assert _near(g["edges"]) and "semantic_error" not in g
+
+
+def test_a_semantic_pass_that_fails_midway_keeps_none_of_its_edges(
+        monkeypatch):
+    """The semantic layer is all or nothing. A pass that linked the first memo
+    and then failed handed the viewer -- and graph.json, which every later
+    viewer is served without the error -- a partial layer that reads as the
+    whole of it."""
+    calls = _linking_recall(monkeypatch, fail_from=2)
+    g = build(project=None, semantic=True, _evs=_make_evs())
+    assert len(calls) == 2           # the first query did answer, and link
+    assert g["semantic_error"]
+    assert _near(g["edges"]) == []
+    persisted = json.loads((paths.project_dir() / "graph.json").read_text(
+        encoding="utf-8"))
+    assert _near(persisted["edges"]) == []
+
+
+def test_a_semantic_failure_without_a_message_still_names_itself(monkeypatch):
+    """`str(RuntimeError())` is '' -- and an empty error is falsy, so the page
+    showed no banner over a graph that had lost its semantic edges."""
+    from mindhive import graphview
+    _linking_recall(monkeypatch, fail_from=1, error=RuntimeError())
+    g = build(project=None, semantic=True, _evs=_make_evs())
+    assert g["semantic_error"] == "RuntimeError"
+    assert '"semantic_error":"RuntimeError"' in graphview.render_html(g)
 
 
 def test_related_finds_file_node():

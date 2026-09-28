@@ -21,8 +21,9 @@ twelve files are both real conditions, not failures.
 The one real-process run of `cli-startup` lives in `tests/test_cli_startup.py`
 (MEB K15). The real lexical path is exercised here against a fixture ledger;
 the real semantic open is exercised as far as its refusals, because the harness
-must never create the index it would then measure, and its copy isolation
-through fake `vectors` seams that write on open the way chromadb does.
+must never create the index it would then measure, and its reads through the
+real `vector_snapshot`, with a fake chromadb client that writes on open the way
+chromadb does.
 """
 import json
 import os
@@ -575,19 +576,48 @@ def _byte_snapshot(root):
             for p in sorted(root.rglob("*")) if p.is_file()}
 
 
-def _fake_chroma(monkeypatch, *, encoder=lambda: None):
-    """The `vectors` seams the default semantic open goes through, behaving the
-    way chromadb does: every client open WRITES into the directory it was
-    pointed at, resolved from the store at call time exactly as
-    `vectors._client` resolves it. Returns the list of directories opened."""
-    from mindhive import vectors
+@pytest.fixture
+def snapshots(tmp_path_factory, monkeypatch):
+    """`vector_snapshot` as a fresh process finds it, its copies in a directory
+    of their own -- outside the store, so a byte comparison of the store sees
+    only what the bench did to IT."""
+    from mindhive import vector_snapshot
+    monkeypatch.setattr(vector_snapshot, "SNAPSHOT_DIR",
+                        tmp_path_factory.mktemp("snaps"))
+    monkeypatch.setattr(vector_snapshot, "_CURRENT", {})
+    monkeypatch.setattr(vector_snapshot, "_ORPHANS", set())
+    monkeypatch.setattr(vector_snapshot, "_SWEPT", False)
+    monkeypatch.setattr(vector_snapshot, "_POISONED", [])
+    monkeypatch.setattr(vector_snapshot, "_FAILED", {})
+    yield vector_snapshot
+    vector_snapshot.dispose_all()
+
+
+def _vectors_encoder():
+    return lambda texts: [[0.0, 1.0] for _ in texts]
+
+
+def _fake_chroma(monkeypatch, *, encoder=_vectors_encoder, count=lambda: 4):
+    """The read path the default semantic open goes through, with only chromadb
+    faked: `vectors._reading` hands the REAL `vector_snapshot.reading` a client
+    that WRITES into the directory it is opened on, the way every chromadb
+    open does. `count()` is what the events collection answers -- a raise is
+    a damaged index. Returns the list of directories opened."""
+    from mindhive import vector_snapshot, vectors
     opened = []
 
     class Collection:
-        name = vectors.EVENT_COLLECTION
+        def __init__(self, name):
+            self.name = name
 
         def count(self):
-            return 4
+            return count()
+
+        def query(self, **kwargs):
+            return {"ids": [["e1"]], "documents": [["[decision] we decided"]],
+                    "metadatas": [[{"type": "decision", "ts": TS,
+                                    "session_id": "s1"}]],
+                    "distances": [[0.25]]}
 
     class Client:
         def __init__(self, path):
@@ -595,23 +625,22 @@ def _fake_chroma(monkeypatch, *, encoder=lambda: None):
             (path / "chroma.sqlite3").write_bytes(b"re-saved by chroma")
 
         def list_collections(self):
-            return [Collection()]
+            return [Collection(vectors.EVENT_COLLECTION)]
 
         def get_collection(self, name):
-            return Collection()
+            return Collection(name)
 
-    def client(project):
-        return Client(paths.project_dir(project) / "chroma")
+        def close(self):
+            pass
 
-    def recall_events(query, project=None, limit=10, force=False):
-        client(project)                    # the real one opens the store again
-        return list(HITS)
+    def reading(project, name=None):
+        return vector_snapshot.reading(paths.project_dir(project) / "chroma",
+                                       Client, judge=vectors._judge, name=name)
 
     monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
     monkeypatch.setattr(vectors, "_require_deps", lambda: None)
-    monkeypatch.setattr(vectors, "_client", client)
+    monkeypatch.setattr(vectors, "_reading", reading)
     monkeypatch.setattr(vectors, "_encoder", encoder)
-    monkeypatch.setattr(vectors, "semantic_recall_events", recall_events)
     return opened
 
 
@@ -622,12 +651,15 @@ def _embedded_namespace():
     return real
 
 
-def test_the_semantic_path_queries_a_copy_and_never_rewrites_the_index(monkeypatch):
-    """chromadb re-saves its segment files on every open -- measured on the
-    scratch store: one `hive recall --semantic` changed the hashes of
-    `chroma.sqlite3` and of the HNSW segment of an index nothing was adding
-    to. So the bench opens and queries a temporary COPY of the namespace's
-    `chroma/`, puts the store path back, and removes the copy."""
+def test_the_semantic_path_reads_one_copy_and_never_rewrites_the_index(
+        monkeypatch, snapshots):
+    """chromadb writes to every index it opens -- measured on the scratch
+    store: one `hive recall --semantic` changed the hashes of `chroma.sqlite3`
+    and of the HNSW segment of an index nothing was adding to. The bench reads
+    through the path `hive recall --semantic` reads through, which answers
+    from a private copy (`vector_snapshot`): ONE copy, taken at the open and
+    reused by every query while the index is unchanged, reported with its
+    size, and gone when the bench is done."""
     _embedded_namespace()
     opened = _fake_chroma(monkeypatch)
     home = paths.store_home()
@@ -637,13 +669,16 @@ def test_the_semantic_path_queries_a_copy_and_never_rewrites_the_index(monkeypat
                                     lexical=_lexical(), timestamp=TS)
     sem = report["semantic"]
     assert sem["state"] == bs.OK and (sem["ok"], sem["total"]) == (2, 2), sem
+    assert [q["hits"] for q in sem["per_query"]] == [1]
     assert (sem["open"]["path"], sem["open"]["indexed_events"]) == ("events", 4)
     assert sem["open"]["copy_bytes"] == len(b"index bytes")   # a copy OF the index
+    assert sem["open"]["copy_ms"] >= 0
     assert sem["open"]["copy_removed"] is True
-    assert len(opened) >= 3                       # the open, then one per query
+    assert len(opened) == 1                       # one copy, reused by every query
+    assert sem["open"]["copy_dir"] == str(opened[0].parent)
     assert all(home not in p.parents for p in opened)   # never the store's index
     assert _byte_snapshot(home) == before                # byte for byte
-    assert os.environ.get("MINDHIVE_HOME") == home_env   # the redirect is undone
+    assert os.environ.get("MINDHIVE_HOME") == home_env   # nothing redirected
     assert not any(p.exists() for p in opened)           # the copy is gone
     copy_line = next(ln for ln in bs.render_recall_semantic(report).splitlines()
                      if ln.strip().startswith("index copy"))
@@ -651,7 +686,8 @@ def test_the_semantic_path_queries_a_copy_and_never_rewrites_the_index(monkeypat
     assert "NOT removed" not in copy_line
 
 
-def test_a_semantic_open_that_fails_after_the_copy_still_removes_it(monkeypatch):
+def test_a_semantic_open_that_fails_after_the_copy_still_removes_it(
+        monkeypatch, snapshots):
     def no_model():
         raise RuntimeError("model all-MiniLM-L6-v2 not in the cache")
     _embedded_namespace()
@@ -663,9 +699,51 @@ def test_a_semantic_open_that_fails_after_the_copy_still_removes_it(monkeypatch)
                                     lexical=_lexical(), timestamp=TS)
     assert report["semantic"]["state"] == bs.UNAVAILABLE
     assert "not in the cache" in report["semantic"]["reason"]
-    assert opened and not any(p.exists() for p in opened)
+    assert len(opened) == 1 and not opened[0].exists()
+    assert snapshots.held(paths.project_dir("test") / "chroma") is None
     assert _byte_snapshot(home) == before
     assert os.environ.get("MINDHIVE_HOME") == home_env
+
+
+def test_an_index_the_read_path_cannot_read_names_the_stage_and_the_repair(
+        monkeypatch, snapshots):
+    """A damaged index is not "nothing indexed", and not a reason cut to
+    nothing: the semantic row is unavailable with `vectors.SemanticQueryError`'s
+    message -- the stage that broke and the repair -- the lexical row is still
+    measured, and the store is untouched."""
+    def damaged():
+        raise RuntimeError("Error loading hnsw index")
+    _embedded_namespace()
+    _fake_chroma(monkeypatch, count=damaged)
+    home = paths.store_home()
+    before = _byte_snapshot(home)
+    report = bs.run_recall_semantic(queries=["q"], reps=1, project="test",
+                                    lexical=_lexical(), timestamp=TS)
+    sem = report["semantic"]
+    assert sem["state"] == bs.UNAVAILABLE
+    assert sem["reason"].startswith(
+        "semantic count failed on the 'events' index of project 'test'"), sem
+    assert sem["reason"].endswith("run `hive embed --project test`)"), sem
+    assert (report["lexical"]["ok"], report["lexical"]["total"]) == (1, 1)
+    assert _byte_snapshot(home) == before
+
+
+def test_a_long_reason_or_error_keeps_what_failed_and_the_repair():
+    """`vectors.SemanticQueryError` names what failed first and the repair
+    last. Cut to its first `MAX_ERROR_CHARS`, a long one -- a chromadb error of
+    a hundred and fifty characters is ordinary -- lost the repair."""
+    long = ("semantic query failed on the 'events' index: InternalError: "
+            + "x" * 400 + " (rebuild it with `hive embed --rebuild --project p`)")
+
+    def failing(query):
+        raise RuntimeError(long)
+    for text in (bs._unavailable_row(long)["reason"],
+                 bs.time_searches(failing, ["q"], 1)["error"]):
+        assert len(text) <= bs.MAX_ERROR_CHARS
+        assert text.startswith("semantic query failed on the 'events' index")
+        assert text.endswith("(rebuild it with `hive embed --rebuild --project p`)")
+    short = "no vector index here"
+    assert bs._unavailable_row(short)["reason"] == short
 
 
 def test_the_live_lock_makes_the_semantic_row_unavailable_not_the_run():
