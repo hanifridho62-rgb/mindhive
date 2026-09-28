@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/ui_cats.py
 """MN-5 U8 — the cat board's data provider: telemetry plus the passage of time.
 

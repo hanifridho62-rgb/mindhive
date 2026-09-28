@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/enforce.py
 """Deterministic PreToolUse enforcement — the "enforce" rung of MindHive's
 nudge -> enforce ladder.

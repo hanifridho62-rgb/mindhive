@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/sidecar.py
 """MN-1 U5 — the phase projection's sidecar, and the `rebuild` that mints it.
 

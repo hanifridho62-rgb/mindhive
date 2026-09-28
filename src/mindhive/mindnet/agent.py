@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/agent.py
 """MN-8 — what a spawned agent actually RUNS for a task.
 

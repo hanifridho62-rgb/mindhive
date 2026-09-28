@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The dashboard's long operations, run off the request thread.
 
 Six of the panel's buttons started work that takes longer than a person will

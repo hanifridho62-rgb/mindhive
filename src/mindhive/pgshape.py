@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgshape.py
 """Result shaping for the Postgres tool surface: the caps, the payload
 summariser, and the envelope every tool answers in.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/injectors.py
 """T1-T4 — the injector registry, and the per-turn record of what reached Claude.
 

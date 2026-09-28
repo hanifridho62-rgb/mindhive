@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/consensus/__init__.py
 """Participatory consensus: many framed contributions folded into one number
 that can be walked back to every input that produced it.

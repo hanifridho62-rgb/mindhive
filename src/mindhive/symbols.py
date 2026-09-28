@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/symbols.py
 """T7/T8 — zero-token structural extraction: a ranked symbol index of the tree.
 

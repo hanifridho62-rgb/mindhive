@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/worktree.py
 """MN-9 — one isolated checkout per orchestrated task.
 

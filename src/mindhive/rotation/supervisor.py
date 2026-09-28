@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/rotation/supervisor.py
 """`hive session run` — the outer loop around an interactive Claude Code session.
 

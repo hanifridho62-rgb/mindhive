@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgcli.py
 """The `hive pg` group: status, migrate, rebuild, refresh, embed, parity,
 tool, mcp.

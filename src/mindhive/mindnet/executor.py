@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/executor.py
 """MN-1 U6 — the validation executor: the one place in this codebase where
 Python runs a string an agent authored.

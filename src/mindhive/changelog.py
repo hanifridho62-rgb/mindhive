@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/changelog.py
 """Mandatory code change-log: every change to mindhive's own code gets a
 categorized entry with a brief human-written explanation.

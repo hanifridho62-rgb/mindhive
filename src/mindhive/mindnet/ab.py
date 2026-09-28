@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/ab.py
 """`hive mindnet ab` — run one task graph twice, brief OFF then ON, and compare.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/consensus/cli.py
 """The `hive consensus` group: its parser and its handlers, in one file.
 

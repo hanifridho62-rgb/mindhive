@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/roadmap_render.py
 """How a roadmap record becomes text a human (or a later session) reads.
 

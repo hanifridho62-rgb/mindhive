@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_core.py
 """The page's runtime: element handles, the real-time engine, the render/paint
 choke points, project scoping and the Overview section.

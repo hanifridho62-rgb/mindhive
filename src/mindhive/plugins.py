@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/plugins.py
 """Scan installed Claude Code skill/plugins, keep the ones usable without API
 keys or paying, score them by breadth, and produce a top-5 recommendation.

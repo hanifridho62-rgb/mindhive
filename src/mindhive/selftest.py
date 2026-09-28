@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/selftest.py
 """`hive selftest` — run the suite, and RECORD that it ran.
 

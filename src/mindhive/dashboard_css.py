@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_css.py
 """The dashboard page's own stylesheet.
 

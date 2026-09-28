@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/hygiene.py
 """Store hygiene: report per-namespace size/health, and prune junk safely.
 

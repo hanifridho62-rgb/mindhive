@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_jobs.py
 """The six long dashboard operations, as background jobs (T13), and the harvest
 they share.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/advice.py
 """MN-3 U2 — the advice resolver. The unit that makes injection MECHANICAL.
 

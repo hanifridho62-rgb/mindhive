@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/state.py
 """The `state_set` contract: what the top of STATE.md may contain.
 

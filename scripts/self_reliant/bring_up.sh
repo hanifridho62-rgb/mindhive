@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # scripts/self_reliant/bring_up.sh — one-time WSL bring-up for Self-Reliant (plan U1).
 #
 # Clones karpathy/autoresearch into a WSL sibling directory (never inside the

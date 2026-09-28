@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/agenttask.py
 """`AgentTask` -- everything one child is told, and nothing else -- plus the
 normalised outcome the scheduler reads back.

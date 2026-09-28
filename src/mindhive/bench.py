@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/bench.py
 """Timing the dashboard's own endpoints, so "it got faster" can be a number.
 

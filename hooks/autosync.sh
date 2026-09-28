@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # autosync — the POSIX half of autosync.ps1, for a cron entry rather than a
 # Windows Task Scheduler action. Harvests Claude Code transcripts, rebuilds the
 # projections, and syncs the native MEMORY.md for every registered project.

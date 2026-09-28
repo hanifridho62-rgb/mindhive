@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/inject.py
 """MN-1 U9 — phase-aware injection. The delivery mechanism for the phase spine.
 

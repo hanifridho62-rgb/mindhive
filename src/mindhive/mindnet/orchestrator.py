@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/orchestrator.py
 """MN-7 — the parallel orchestrator: the loop that actually walks the graph.
 

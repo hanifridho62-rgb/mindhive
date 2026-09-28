@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # session_start — inject STATE.md into the new session; stamp session id.
 # Hang-proof (only reads stdin if piped) and never blocks the session.
 if [ "${MINDHIVE_HEADLESS:-}" = "1" ]; then exit 0; fi   # headless reflection session: no recursion, no phantom events

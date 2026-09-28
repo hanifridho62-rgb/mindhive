@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/autoresume.py
 """Auto-resume: deliver the interruption marker straight back into Claude.
 

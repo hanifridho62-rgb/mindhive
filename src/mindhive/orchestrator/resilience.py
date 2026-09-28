@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/resilience.py
 """Sandboxing, per-target breaking, and the loop that repairs a failed run.
 

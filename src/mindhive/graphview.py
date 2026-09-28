@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/graphview.py
 from __future__ import annotations
 import json

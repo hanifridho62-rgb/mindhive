@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/phases.py
 """MN-1 — the per-phase evidence descriptors and the ``mindnet_phase`` contract.
 

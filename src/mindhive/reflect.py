@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/reflect.py
 """Reflection pass: turn one incident into a structured prevention rule.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_actions.py
 """The six long operations as 202-accepted polled jobs (T13), the MN-13 faculty
 cat board's poll, and the boot sequence.

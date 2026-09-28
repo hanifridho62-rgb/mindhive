@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgtools.py
 """The AI tools over the Postgres read mirror: argument validation, one SQL
 statement each, and the dispatch table `pgschema` publishes.

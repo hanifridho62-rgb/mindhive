@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/theme.py
 """The dashboard's colour palette, defined once.
 

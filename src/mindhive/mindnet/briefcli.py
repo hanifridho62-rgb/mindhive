@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/briefcli.py
 """`hive mindnet brief` — see what a spawned agent would actually be told.
 

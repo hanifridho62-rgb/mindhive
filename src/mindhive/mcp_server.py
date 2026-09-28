@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mcp_server.py
 """The MCP adapter over the four MindHive event tools — stdio, and thin.
 

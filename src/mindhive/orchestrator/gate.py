@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/gate.py
 """The per-unit test gate: "validated" means the lane's own tests passed.
 

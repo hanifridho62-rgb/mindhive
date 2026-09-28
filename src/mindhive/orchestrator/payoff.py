@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/payoff.py
 """TODOS 27b — does weighted-lanes-plus-stealing actually beat static waves?
 

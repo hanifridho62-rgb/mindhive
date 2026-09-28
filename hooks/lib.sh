@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # hooks/lib.sh — what every POSIX hook shim needs, and nothing else.
 #
 # Sourced, never executed. `tests/test_hook_shims.py` asserts that every

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/worktree.py
 """Lane-scoped physical isolation: `.worktrees/lane-N`, one per lane, for life.
 

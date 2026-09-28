@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dedupe.py
 """Deterministic, meaning-aware deduplication of memory items.
 

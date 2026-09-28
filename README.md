@@ -591,3 +591,21 @@ To build a double-click binary (Windows, Python 3.12):
 
 The exe runs a small console window showing the (stable) URL; close it to stop
 the server. The window/exe use `build/icon.ico`.
+
+## License
+
+MIND HIVE is licensed under the [Apache License, Version 2.0](LICENSE). Every
+source file in `src/mindhive/`, `hooks/`, `scripts/` and `build/` opens with
+`SPDX-License-Identifier: Apache-2.0`, and `tests/test_license.py` fails on one
+that does not. The one deliberate exception is the Postgres migrations
+(`src/mindhive/pgmigrations/*.sql`): `apply_migrations` pins every applied file
+by its sha256 and refuses to run against a changed one, so they keep their
+bytes.
+
+Third-party code keeps its own license: `skills/caveman/` is vendored from
+JuliusBrussee/caveman under the MIT License
+([skills/caveman/LICENSE](skills/caveman/LICENSE)).
+
+Contributions are accepted under the same terms (Apache-2.0, section 5) — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Notable changes are listed in
+[CHANGELOG.md](CHANGELOG.md).

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # hooks/lib.ps1 — what every PowerShell hook shim needs, and nothing else.
 #
 # Dot-sourced, never executed. The PowerShell half of `hooks/lib.sh`, and it

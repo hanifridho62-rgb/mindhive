@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Adaptive work injection: replenish a surface's plan from what the record proves.
 
 Work in this system ends quietly. An interactive session stops when the human
@@ -50,7 +51,6 @@ would let two different conditions share one identity — which reads as "alread
 proposed" and silences the lens. `kind` carries the readable classification the
 digest gives up, for the lenses that observe more than one kind of condition.
 """
-
 import hashlib
 import re
 from dataclasses import dataclass, field, replace

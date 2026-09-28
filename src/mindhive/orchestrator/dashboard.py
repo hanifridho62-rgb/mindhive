@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/dashboard.py
 """WB7 — the worker-cat board: a terminal view the mission publishes TO.
 

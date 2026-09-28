@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/hookcapture.py
 """Python-side handler for the live Claude Code hooks.
 

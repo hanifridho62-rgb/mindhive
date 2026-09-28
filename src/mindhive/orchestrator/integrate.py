@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/integrate.py
 """The merge-back: each validated unit committed on its lane branch, the lanes
 merged probe-first into `lint/<mission>/integration`, made from the lanes'

@@ -1,4 +1,4 @@
-# src/mindhive/mindnet/controller.py
+# SPDX-License-Identifier: Apache-2.0
 """MN-1 — the phase state machine: where a task is, what cleared each exit
 criterion, and which move the machine will accept next.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/rotation/window.py
 """Model id -> context window, and window -> smart-zone rotation threshold.
 

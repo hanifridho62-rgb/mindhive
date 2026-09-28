@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgschema.py
 """The map the model is given: the Postgres mirror described as data and as
 prose, in one place, so the eight AI tool descriptions cannot disagree with each

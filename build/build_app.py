@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # build/build_app.py
 """Freeze the MIND HIVE Graph desktop app into a single binary.
 

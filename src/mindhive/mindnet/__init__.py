@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/__init__.py
 """MindNetwork — the governing brain over every phase of building code here.
 

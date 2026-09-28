@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/roadmap.py
 """Event-sourced roadmap registry: the ask, the plan, and the progress.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_memo.py
 """The dashboard's caching layer: the bounded LRU memos, the stat-only ledger
 fingerprint, and the gate built on it.

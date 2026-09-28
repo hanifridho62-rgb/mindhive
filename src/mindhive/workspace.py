@@ -1,4 +1,4 @@
-# src/mindhive/workspace.py
+# SPDX-License-Identifier: Apache-2.0
 """Workspace backend: parallel Claude Code agents feeding the Mind Hive ledger.
 
 One Manager owns up to MAX_AGENTS agents. Each agent is a headless `claude`

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_oversee.py
 """The Sessions and Oversee sections: live Claude work — loop runs, interactive
 sessions, roadmap panels — plus the prompt-enrichment panel that rides

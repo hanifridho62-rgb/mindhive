@@ -1,4 +1,4 @@
-# src/mindhive/research.py
+# SPDX-License-Identifier: Apache-2.0
 """Self-Reliant backend — autonomous autoresearch experiments for MindHive.
 
 Phase 1 (this module's first slice) is the deterministic core the autonomous

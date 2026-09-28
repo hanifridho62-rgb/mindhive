@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_data.py
 """The dashboard's data layer: what a project IS, and the folds the panel reads.
 

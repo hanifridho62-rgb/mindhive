@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/resolve.py
 """Active rule resolution: turn red (unresolved) lessons green.
 

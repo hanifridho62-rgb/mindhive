@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # pre_tool_use — the ENFORCE rung of MindHive's nudge->enforce ladder. Reads the
 # PreToolUse payload on stdin and, when an *enabled* enforcement matcher fires,
 # emits a deny decision on stdout so Claude must use the effective method. Every

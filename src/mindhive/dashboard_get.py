@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_get.py
 """Every GET route the dashboard serves, as a mixin on the request handler.
 

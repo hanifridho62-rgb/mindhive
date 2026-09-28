@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/style.py
 """The standing reply-style pass: caveman by default, normal prose when the user
 asks to be taught.

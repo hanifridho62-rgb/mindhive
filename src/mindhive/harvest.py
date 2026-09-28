@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/harvest.py
 # Deterministic, hook-free auto-capture: turn Claude Code session transcripts
 # (~/.claude/projects/<encoded>/<uuid>.jsonl) into MIND HIVE events.

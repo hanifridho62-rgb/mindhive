@@ -502,6 +502,11 @@ That ordering is load-bearing. A new pass goes before `style`, anything that wri
   session on this machine. Keep it fail-open and opt-in (`../CLAUDE.md`).
 - Every change to `src/mindhive/` or `tests/` needs `hive log <category> "…"`
   before the work is done. The suite must be green before "done".
+- Every new source file opens with `# SPDX-License-Identifier: Apache-2.0`
+  (`//` in JavaScript, `/* */` in CSS; after the shebang where there is one),
+  and `tests/test_license.py` fails on one that does not. **Never stamp an
+  applied migration**: `pgmigrations/*.sql` are pinned by sha256, and the
+  same test holds the seven existing digests (blueprint P7).
 
 ---
 

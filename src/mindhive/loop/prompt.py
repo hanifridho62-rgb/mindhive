@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/loop/prompt.py
 
 CONTRACT_INSTRUCTION = """\

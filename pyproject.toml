@@ -2,6 +2,26 @@
 name = "mindhive"
 version = "0.1.0"
 description = "Deterministic event-sourced memory for long-running Claude sessions"
+# Blueprint P7 (spec section 2.14): the license as a PEP 639 SPDX expression,
+# with the file it names. No `License ::` classifier beside it -- setuptools
+# >= 77 rejects the pair outright (InvalidConfigError, reproduced on 81 and
+# 84), and the expression is what replaced the classifier. That is also why the
+# build-system floor below is 77: 68 through 76 read a string `license` as a
+# malformed table and fail the build.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# The versions and platforms the release matrix (.github/workflows/ci.yml)
+# actually runs. 3.13 is inside `requires-python` but no leg has run it, so it
+# is not claimed here.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
 requires-python = ">=3.11"
 dependencies = []
 
@@ -51,7 +71,8 @@ hive = "mindhive.__main__:main"
 mindhive = "mindhive.__main__:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+# 77: the first setuptools that reads a PEP 639 license expression.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

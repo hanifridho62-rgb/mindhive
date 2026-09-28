@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pane.py
 """The one thing the three workspace documents agree on about being LOOKED at.
 

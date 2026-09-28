@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/promptgate.py
 """Deterministic UserPromptSubmit prompt-quality gate.
 

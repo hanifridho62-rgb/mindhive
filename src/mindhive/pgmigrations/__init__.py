@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgmigrations/__init__.py
 """The mirror's DDL, as package data.
 

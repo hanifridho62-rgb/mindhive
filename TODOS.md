@@ -7,7 +7,7 @@ Plan: [docs/plans/2026-08-10-001-fix-feedback-loop-five-surfaces-plan.md](docs/p
 
 ---
 
-## 1. No LICENSE, while README publishes a public install command
+## 1. ~~No LICENSE, while README publishes a public install command~~ — DONE 2026-09-28
 
 **What:** Add a `LICENSE` (and optionally `CONTRIBUTING`, `CHANGELOG`), or remove the public
 install instructions from README.
@@ -24,6 +24,15 @@ decision, not a formality.
 **Depends on:** deciding whether MIND HIVE is meant to be installable by other people at all.
 If not, delete the marketplace instructions instead.
 
+
+> **2026-09-28 (blueprint P7, spec §2.14).** Decided by the approved blueprint,
+> whose header classifies MIND HIVE as Apache License 2.0. `LICENSE` holds the
+> Apache 2.0 text verbatim (pinned by the sha256 of the canonical apache.org
+> file), `CONTRIBUTING.md` and `CHANGELOG.md` sit beside it, every source file
+> opens with `SPDX-License-Identifier: Apache-2.0`, `pyproject.toml` declares
+> `license = "Apache-2.0"` with `license-files` (PEP 639), and README has a
+> License section. `skills/caveman/` stays MIT (vendored); the applied Postgres
+> migrations keep their bytes. `tests/test_license.py` holds all of it.
 ---
 
 ## 2. ~~Dashboard nav mixes navigation and mutation in one column~~ — DONE 2026-09-28

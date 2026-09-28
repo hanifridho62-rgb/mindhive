@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/provenance.py
 """The two questions every composing surface has to ask, in one place.
 

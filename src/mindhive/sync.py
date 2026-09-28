@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/sync.py
 from pathlib import Path
 from . import adaptivetail, context, projector, incidents, events as ev_mod

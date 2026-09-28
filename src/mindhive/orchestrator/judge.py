@@ -1,5 +1,5 @@
-# src/mindhive/orchestrator/judge.py
 # SPDX-License-Identifier: Apache-2.0
+# src/mindhive/orchestrator/judge.py
 """The judge a unit may not edit (blueprint P2, MEB K13 / risk #4).
 
 A red test has two cures -- fix the code, or change what the test demands --

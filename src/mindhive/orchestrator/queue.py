@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/queue.py
 """Lanes, work stealing, and the checkpoint that survives an interrupt.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/board.py
 """WB7 — the half of the board that needs no terminal.
 

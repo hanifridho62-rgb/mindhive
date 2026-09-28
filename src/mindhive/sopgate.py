@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/sopgate.py
 """The per-prompt mandatory-SOP pass: re-assert every MANDATORY SOP on every
 human-typed prompt, verbatim.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/tasktool.py
 """The harness's per-item task tools, folded back into a whole-list snapshot.
 

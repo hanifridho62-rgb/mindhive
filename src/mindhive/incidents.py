@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/incidents.py
 """Project `tool_failed` events into per-signature incident records.
 

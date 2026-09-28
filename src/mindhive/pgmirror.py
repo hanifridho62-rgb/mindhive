@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/pgmirror.py
 """The admin half of the Postgres read mirror: migrations, the loader, parity.
 

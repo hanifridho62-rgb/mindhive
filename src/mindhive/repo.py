@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/repo.py
 """Repository plumbing: what git and ``gh`` can PROVE about a branch or a PR.
 

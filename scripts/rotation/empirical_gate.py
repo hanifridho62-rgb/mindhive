@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Empirical gate for smart-zone session rotation.
 
     py scripts/rotation/empirical_gate.py

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_page.py
 """Presentation layer for the MIND HIVE dashboard: the page's shell.
 

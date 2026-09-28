@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/claude_cli.py
 """Shared headless `claude` invocation — one home for what the invoke channel
 (invoker.py) and the reflection engine (reflect.py) both need: resolving the

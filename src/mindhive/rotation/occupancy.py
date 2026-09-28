@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/rotation/occupancy.py
 """True context occupancy, read out of a Claude Code session transcript.
 

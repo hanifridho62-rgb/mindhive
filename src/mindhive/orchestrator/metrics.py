@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/metrics.py
 """Quantitative workload weighting — how heavy is one file, really?
 

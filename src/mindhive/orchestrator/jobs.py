@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/orchestrator/jobs.py
 """Windows Job Objects: the kernel fence `setrlimit` is on POSIX.
 

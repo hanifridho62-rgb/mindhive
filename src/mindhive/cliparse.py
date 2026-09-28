@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/cliparse.py
 """Argparse behaviour shared by the whole `hive` surface.
 

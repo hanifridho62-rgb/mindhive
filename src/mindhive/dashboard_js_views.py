@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_views.py
 """The thin sections: Log, SOP, State, Briefing, Recall, Graph, Workspace and
 Append. Each is a few lines of controls over `run()` and one fetch, which is

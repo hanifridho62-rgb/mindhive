@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # post_tool_use — capture file_touched / command_run. Hang-proof, never blocks.
 # Parsing now lives in Python (mindhive.hookcapture): it is unit-tested and
 # records any failure to hooks_errors.log instead of dropping it silently, so a

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/clusters.py
 """Cluster database + file-complexity classifier + parallel shard planner.
 

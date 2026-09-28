@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_js_skills.py
 """The Skill & Plugin section: the viewing panel over the skill database (U7) —
 the status strip, the sort/filter controls, the per-skill cards with their

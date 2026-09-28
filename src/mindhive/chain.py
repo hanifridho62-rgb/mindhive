@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/chain.py
 """The ledger's tamper-evidence checkpoint.
 

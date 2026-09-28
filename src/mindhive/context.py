@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/context.py
 """Context-budget analyzer for the always-on session surface.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/dashboard_locks.py
 """The dashboard's concurrency guards: one lock per mutating operation, and the
 decorator that refuses a second concurrent call instead of running it.

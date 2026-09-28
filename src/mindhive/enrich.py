@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/enrich.py
 """Deterministic prompt enrichment for the Oversee section.
 

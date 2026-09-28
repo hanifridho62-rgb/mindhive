@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/decompose.py
 """MN-11 — a task proposes its own subtasks.
 

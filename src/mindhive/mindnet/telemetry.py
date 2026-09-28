@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # src/mindhive/mindnet/telemetry.py
 """MN-1 U10 — the faculty activity feed: which MindNetwork faculty is awake.
 
