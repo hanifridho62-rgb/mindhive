@@ -91,6 +91,10 @@ _TEMPLATE = """<!DOCTYPE html>
   #empty { padding: 40px; color: #8b949e; text-align: center; }
   #hint { position: absolute; bottom: 8px; left: 12px; color: #8b949e;
     font-size: 12px; }
+  #semerr { position: absolute; bottom: 30px; left: 12px; right: 12px;
+    background: rgba(248,81,73,0.12); border: 1px solid #f85149;
+    border-radius: 6px; padding: 6px 10px; color: #ffa198; font-size: 12px;
+    word-break: break-word; max-height: 35%; overflow-y: auto; }
   #legend { position: absolute; top: 10px; left: 10px;
     background: rgba(22,27,34,0.85); border: 1px solid #30363d; border-radius: 8px;
     padding: 8px 10px; font-size: 11px; max-width: 200px; }
@@ -186,6 +190,16 @@ _RENDERER_JS = r"""
   });
 
   var data = JSON.parse(document.getElementById("graph-data").textContent);
+  // A build that asked for semantic links and could not read the index says
+  // why, on the page it built. As TEXT: the message quotes paths and exception
+  // strings, and nothing in it may be parsed as markup.
+  if (data.semantic_error) {
+    var semerr = document.createElement("div");
+    semerr.id = "semerr";
+    semerr.setAttribute("role", "alert");
+    semerr.textContent = "Semantic links unavailable: " + data.semantic_error;
+    document.getElementById("stage").appendChild(semerr);
+  }
   var svg = document.getElementById("svg");
   var panel = document.getElementById("panel");
   var W = svg.clientWidth || 800, H = svg.clientHeight || 600;
@@ -886,12 +900,13 @@ def render_html(graph: dict) -> str:
     """Return a single self-contained HTML document for the given graph dict.
 
     Pure function: no I/O, no network. The graph is inlined as JSON and rendered
-    by an embedded vanilla-JS SVG engine as a seeded "meteor" layout.
+    by an embedded vanilla-JS SVG engine as a seeded "meteor" layout. A
+    `semantic_error` from `graph.build` rides along and is shown as a banner.
     """
-    graph_json = json.dumps(
-        {"nodes": graph.get("nodes", []), "edges": graph.get("edges", [])},
-        ensure_ascii=False, separators=(",", ":"),
-    )
+    blob = {"nodes": graph.get("nodes", []), "edges": graph.get("edges", [])}
+    if graph.get("semantic_error"):
+        blob["semantic_error"] = str(graph["semantic_error"])
+    graph_json = json.dumps(blob, ensure_ascii=False, separators=(",", ":"))
     # Escape EVERY "<" as \u003c. Two separate hazards, one fix, because
     # escaping only the first left the second live for as long as this function
     # has existed:

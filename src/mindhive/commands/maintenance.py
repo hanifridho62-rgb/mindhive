@@ -19,13 +19,28 @@ __all__ = ["cmd_recall", "cmd_gc", "cmd_export", "cmd_embed",
 
 
 def cmd_recall(args) -> int | None:
+    """Exit 1 when the semantic index could not be read, 2 when the search
+    was refused (LIVE_LOCK, extras missing) -- never an empty result for
+    either, which would read as "nothing relevant was ever recorded"."""
     project = getattr(args, "project", None)
     if project is None and paths.is_freshly_minted():
         print(f"warning: no memory for detected project "
               f"'{paths.detect_project()}' — searching an empty namespace. Pass "
               f"--project or see `hive projects`.", file=sys.stderr)
-    for h in recall_mod.recall(args.query, project=project, semantic=args.semantic,
-                               limit=args.limit, force=args.force):
+    from ..vectors import SemanticQueryError
+    try:
+        hits = recall_mod.recall(args.query, project=project,
+                                 semantic=args.semantic, limit=args.limit,
+                                 force=args.force)
+    except SemanticQueryError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        if not args.semantic:
+            raise
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    for h in hits:
         score = h.get("score")
         tag = f" [score {score:g}]" if isinstance(score, (int, float)) else ""
         # Two hit shapes reach here. A FILE hit carries `file`; an EVENT
@@ -84,11 +99,27 @@ def cmd_embed(args) -> int | None:
     `--rebuild` (blueprint P1h) drops both collections first. It is the only
     way to re-tune an EXISTING index: chroma ignores the metadata argument for
     a collection that already exists, so a collection built under an older
-    `HNSW_METADATA` keeps those parameters until something deletes it."""
-    from .. import vectors
+    `HNSW_METADATA` keeps those parameters until something deletes it.
+
+    LIVE_LOCK and missing extras are refusals: one `error:` line and exit 2,
+    as `hive recall --semantic` answers them, never a traceback.
+
+    `--project` names the namespace verbatim: it is what a failed semantic
+    read tells the operator to run, and MINDHIVE_PROJECT would be normalised
+    (`my_proj` -> `my-proj`) into another namespace."""
+    from .. import guard, vectors
+    try:
+        guard.ensure_safe(force=args.force)
+        vectors._require_deps()
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     rebuild = bool(getattr(args, "rebuild", False))
-    out = {"files": vectors.embed(force=args.force, rebuild=rebuild),
-           "events": vectors.embed_events(force=args.force, rebuild=rebuild)}
+    project = getattr(args, "project", None)
+    out = {"files": vectors.embed(project=project, force=args.force,
+                                  rebuild=rebuild),
+           "events": vectors.embed_events(project=project, force=args.force,
+                                          rebuild=rebuild)}
     print(json.dumps(out))
     return None
 

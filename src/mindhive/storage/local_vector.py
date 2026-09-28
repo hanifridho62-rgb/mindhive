@@ -30,6 +30,7 @@ metadata then describes whichever row was written last -- written down here
 rather than discovered later.
 """
 import json
+import logging
 import re
 
 from .. import events, vectors
@@ -38,6 +39,8 @@ from . import records
 from .interface import VectorIndex
 
 __all__ = ["LocalVectorIndex", "LEGAL_COLLECTION", "METADATA_KEYS"]
+
+_log = logging.getLogger(__name__)
 
 #: chroma's own rule: 3-63 characters, alphanumeric at both ends, and only
 #: `[a-z0-9._-]` between. `vectors.collection_name` is the helper that turns
@@ -213,14 +216,30 @@ class LocalVectorIndex(VectorIndex):
         A hit whose metadata is too thin to rebuild a record is DROPPED, not
         padded with empty hashes. It belongs to `hive embed`'s side of the
         shared collection; handing back a record whose `chain_hash` is `""`
-        would be a record-shaped object that attests to nothing."""
+        would be a record-shaped object that attests to nothing.
+
+        Read through `vectors._read_view`, so the query runs on a copy of the
+        index and never writes the live one (DATA_MODEL.md 4.19). An empty
+        list is "no match", "nothing indexed", or -- logged as a warning --
+        "every hit was a thin `hive embed` row"; a failure raises
+        `vectors.SemanticQueryError`, because a failure and an answer must not
+        look alike. A top_k below 1 asks nothing and is `[]`, as
+        `PgVectorIndex` has it."""
         name = self._check(collection_name)
-        encode = self._encode()
-        col = vectors._open(self.project, name)
-        try:
-            res = col.query(query_embeddings=encode([text]), n_results=top_k)
-        except Exception:                                      # noqa: BLE001
+        if top_k < 1:
             return []
+        if self._encoder is None:
+            vectors._require_deps()     # the extras refusal, before any open
+        with vectors._read_view(self.project, name) as col:
+            if col is None:
+                return []
+            try:
+                vec = self._encode()([text])
+            except Exception as e:                             # noqa: BLE001
+                raise vectors.SemanticQueryError("encode", name, e,
+                                                 self.project) from e
+            res = vectors._ask(col, name, self.project, query_embeddings=vec,
+                               n_results=top_k)
         metas = (res.get("metadatas") or [[]])[0] or []
         dist_outer = res.get("distances") or [[]]
         dists = dist_outer[0] if dist_outer else []
@@ -231,4 +250,9 @@ class LocalVectorIndex(VectorIndex):
             distance = dists[i] if i < len(dists) and dists[i] is not None else None
             score = 0.0 if distance is None else round(1.0 - distance, 4)
             out.append((self.from_metadata(meta), score))
+        if len(out) < len(metas):
+            _log.warning("local_vector: %d of %d hits in %r dropped: written "
+                         "by `hive embed`, too thin to rebuild a record from; "
+                         "`embed_batch` upgrades them", len(metas) - len(out),
+                         len(metas), name)
         return out

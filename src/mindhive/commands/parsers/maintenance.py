@@ -3,6 +3,8 @@
 `selftest`, `premise`, `recall`, `consolidate`, `gc`, `export`, `embed`,
 `briefing`, `review`, `log`, `flag`, `failures`, `enrich`, `watcher`.
 """
+import argparse
+
 from ... import cliparse
 from ..context_ops import cmd_briefing, cmd_premise_check
 from ..ledger import cmd_log_add, cmd_log_pending, cmd_log_queue, cmd_log_show
@@ -64,6 +66,20 @@ def add_premise(sub) -> None:
     prec.set_defaults(func=cmd_premise_check)
 
 
+def _limit_arg(text: str) -> int:
+    """argparse type for `hive recall --limit`: a whole number above zero. `0`
+    reads as "no limit" to whoever types it and answered nothing; a negative
+    one cut the keyword answer to all but its last hits."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a whole number, got {text!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {n}")
+    return n
+
+
 def add_recall(sub) -> None:
     """Register `hive recall`."""
     r = sub.add_parser("recall", help="search ledger")
@@ -71,7 +87,7 @@ def add_recall(sub) -> None:
     r.add_argument("--project", type=cliparse.project_arg, default=None,
                    help="target namespace explicitly (default: detect from cwd)")
     r.add_argument("--semantic", action="store_true")
-    r.add_argument("--limit", type=int, default=10)
+    r.add_argument("--limit", type=_limit_arg, default=10)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_recall)
 
@@ -119,6 +135,9 @@ def add_export(sub) -> None:
 def add_embed(sub) -> None:
     """Register `hive embed`."""
     em = sub.add_parser("embed", help="build vector index (on-demand)")
+    em.add_argument("--project", type=cliparse.project_arg, default=None,
+                    help="target namespace explicitly, verbatim (default: "
+                         "detect from cwd / MINDHIVE_PROJECT)")
     em.add_argument("--force", action="store_true")
     em.add_argument("--rebuild", action="store_true",
                     help="drop both collections first, so an index built under "

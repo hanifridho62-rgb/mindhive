@@ -69,7 +69,7 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - `hive consolidate [--limit N] [--cooldown-hours H] [--force]` — one bounded memory-consolidation ("dreaming") pass: merge near-duplicate semantic memories into survivors and drop the absorbed originals from the briefing/MEMORY.md digest. Append-only throughout — the originals stay in the hash chain as the archive; `hive verify` stays green
 - `hive export [--out path]` — write a portable handoff.md (zero API tokens)
 - `hive verify [--json] [--strict]` — check the hash chain (`--json`: sorted one-line JSON for scripts; `--strict`: exit 1 when the chain is broken or a corrupt row exists — the default always exits 0 and reports on stdout)
-- `hive embed [--force] [--rebuild]` — build the on-demand vector index (`--rebuild`: drop and refill the chroma collections, which is what picks up a change to the HNSW tuning an existing collection would otherwise keep ignoring)
+- `hive embed [--project P] [--force] [--rebuild]` — build the on-demand vector index (`--rebuild`: drop and refill the `ledger` and `events` chroma collections, which is what picks up a change to the HNSW tuning an existing collection would otherwise keep ignoring; the watcher's own collection is never touched). `--project` names the namespace verbatim — it is what a failed semantic read tells you to run, where `MINDHIVE_PROJECT` would be normalised (`my_proj` → `my-proj`) into another namespace
 - `hive watcher run [--once] [--json]` — drain the pending-embed queue: the rows `append_event` marked for indexing, embedded and the marker cleared. `--once` claims the queue and returns (the shape a scheduled task wants); without it the loop runs in the foreground until Ctrl+C. The same work `hive dashboard` does on a background thread while it is open, so a machine that keeps the dashboard open never needs this
 - `hive watcher status [--json]` — how much is queued and how much is claimed. Always exit 0: a backlog is not an error, it is what a week with the dashboard closed looks like
 - `hive watcher recover [--stale SECONDS] [--json]` — return abandoned claims to the queue (default: older than 600 s). The same pass the dashboard runs at boot, by hand for the machine that lost power mid-embed
@@ -397,6 +397,17 @@ Inline JSON args are mangled by PowerShell 5.1. To set state from PS, pipe via s
 ## V17 safety
 `embed` and `recall --semantic` refuse to run while `~/.mindhive/LIVE_LOCK`
 exists (V17 is trading). Override with `--force` only when the box is idle.
+For both commands the refusal — and a missing `[vectors]` extras install — is
+`error: …` on stderr and exit 2, as is a `recall --limit` below 1. A semantic
+index that cannot be read is exit 1, never an empty result: the message names
+the failing stage, the project namespace and a remedy that depends on what
+broke — wait out a busy writer, free the temp directory, `hive embed --rebuild
+--project <ns>` after a failed query, or delete the damaged `chroma/` directory
+it names and run `hive embed --project <ns>` (a rebuild opens the same damaged
+files; on the watcher's collection it never reaches them, and that collection
+refills only from rows appended afterwards). An argument chromadb refused is
+reported as such, with no repair: the index is not at fault. A semantic read
+never writes the index: it queries a private copy (docs/DATA_MODEL.md §4.19).
 
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into

@@ -425,14 +425,9 @@ class GetRoutes:
         semantic = (qs.get("semantic") or ["0"])[0] in ("1", "true")
         limit = qs_int(qs, "limit", 10)
         force = (qs.get("force") or ["0"])[0] in ("1", "true")
-        if am:
-            hits = []
-            for n in _all_projects():
-                for h in recall_mod.recall(q, project=n, semantic=semantic, limit=limit, force=force):
-                    h = dict(h)
-                    h["project"] = n
-                    hits.append(h)
-            return self._json(hits)
+        if am:   # a namespace it could not read is a {project, error} row
+            return self._json(recall_mod.recall_across(
+                q, _all_projects(), semantic=semantic, limit=limit, force=force))
         return self._json(list(recall_mod.recall(q, project=proj, semantic=semantic, limit=limit, force=force)))
 
     def _get_graph(self, proj, am, qs):
