@@ -17,6 +17,11 @@ export MINDHIVE_SESSION
 "$py" -m mindhive directives 2>/dev/null
 "$py" -m mindhive state 2>/dev/null
 # Skill suggestions (R9) arrive via the SUGGESTED SKILLS block embedded in STATE.md above — no extra call here.
+# Tell the session when the plugin Claude Code loads has drifted from this
+# checkout (spec Bug 8). It prints only on drift, exits 0 even when the check
+# itself breaks, and syncs only when MINDHIVE_PLUGIN_AUTOSYNC=1. Inline rather
+# than detached like the two below: what it prints is session context.
+"$py" -m mindhive plugins cache-check --hook 2>/dev/null
 # Auto-refresh the plugin/skill catalog in the background — detached and
 # fire-and-forget so it never delays session start. 'autoscan' is stale-gated:
 # it only does real work when the catalog is missing or older than 24h, so on a

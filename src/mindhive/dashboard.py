@@ -55,7 +55,8 @@ from .dashboard_locks import (REFLECT_BATCH_LIMIT,  # noqa: F401
                               _PLUGINS_LOCK, _PROJECT_LOCK, _REFLECT_LOCK,
                               _SELFTEST_LOCK, _SYNC_LOCK, _VERIFY_LOCK,
                               _one_at_a_time)
-from .dashboard_memo import (_CATS_MEMO, _IMPROVE_MEMO, _MEMO_MAX,  # noqa: F401
+from .dashboard_memo import (DASHBOARD_FOLDS_MEMO, _CATS_MEMO,  # noqa: F401
+                             _IMPROVE_MEMO, _MEMO_MAX,
                              _OVERSEE_MEMO, _OVERSEE_MEMO_MAX, _SESSIONS_MEMO,
                              _STATS_MEMO, _STATS_MEMO_MAX, _BoundedMemo,
                              _fingerprinted, _fix_plan_fingerprint,

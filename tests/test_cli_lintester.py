@@ -315,6 +315,37 @@ def test_the_json_surface_carries_the_environment_refusal(capsys, monkeypatch):
     assert "before any lane was made" in captured.err
 
 
+@pytest.mark.parametrize("extra", [(), ("--json",)], ids=["plain", "json"])
+def test_the_refusal_line_opens_with_the_gates_fatal_frame_exactly_once(
+        capsys, monkeypatch, extra):
+    """§10.9.2's frame on the front door's refusal, whichever surface was asked
+    for: a wrapper greps ONE string for "this machine refused" and finds it
+    whether `hive lintester` or the gate said so. Read from `environment`,
+    never retyped -- a copy here would pass while the two drifted apart."""
+    from mindhive.orchestrator import environment as env_mod
+
+    detail = "claude auth status: loggedIn=false (authMethod=none)"
+    monkeypatch.setattr(lint_cli, "_preflight", lambda: ("auth", detail))
+    assert _cli("lintester", "make the writer retry", "--execute", *extra) == 3
+    captured = capsys.readouterr()
+    frame = env_mod.FATAL_REFUSAL_FRAME
+    assert captured.err.count(frame) == 1, captured.err
+    # The frame FIRST, as §10.9.2 writes it and as the gate prints it, so one
+    # anchored pattern (`^\[FATAL PREFLIGHT REFUSAL`) finds both refusals.
+    assert captured.err.startswith(
+        f"{frame}lintester: refused before any lane was made -- "), captured.err
+    assert captured.err.startswith(
+        env_mod.refusal_line("lintester", "refused before any lane was made -- ")
+    ), "the front door built its line apart from the gate's formatter"
+    assert "log in" in captured.err
+    # stdout is untouched: nothing on a plain run, the same report on --json.
+    if extra:
+        reason = json.loads(captured.out)["reason"]
+        assert reason == env_mod.describe("auth", detail), reason
+    else:
+        assert captured.out == ""
+
+
 def test_a_dry_run_never_probes_the_machine(monkeypatch):
     """The probe spawns a process; a plan spawns nothing, and must not start."""
     probed = []

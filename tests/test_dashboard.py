@@ -3226,6 +3226,57 @@ def test_the_clock_face_helper_is_spliced_and_called():
         "fmtHm is defined on the page but nothing calls it")
 
 
+def _rail_markup(page):
+    """The whole `<div id="rail">` element, read to its matching `</div>`: the
+    sections `<nav>` AND the `#actions` group beside it (blueprint Bug 13)."""
+    start = page.index('<div id="rail">')
+    depth = 0
+    for tag in re.finditer(r"<(/?)div\b[^>]*>", page[start:]):
+        depth += -1 if tag.group(1) else 1
+        if depth == 0:
+            return page[start:start + tag.end()]
+    raise AssertionError('the <div id="rail"> never closes')
+
+
+def _rail_buttons(page):
+    """`({data-sec id: handler name}, [handler name of every other button])`
+    for every button in the rail -- both halves, since the commands' half is
+    the only place a section switcher can now sit without a `data-sec`."""
+    owned, actions = {}, []
+    for attrs in re.findall(r"<button([^>]*)>", _rail_markup(page)):
+        sec = re.search(r'data-sec="([^"]+)"', attrs)
+        call = re.search(r'onclick="([^"(]+)', attrs).group(1)
+        if sec:
+            owned[sec.group(1)] = call
+        else:
+            actions.append(call)
+    return owned, actions
+
+
+# A rail shaped like the real one, with a section switcher (`showSops()`, no
+# `data-sec`) put among the commands -- the one place Bug 13 left for one.
+_RAIL_WITH_A_SWITCHER_IN_THE_COMMANDS = (
+    '<div id="rail"><nav aria-label="sections">'
+    '<button class="nav-link" data-sec="log" onclick="showLog()">Log</button>'
+    '</nav><div id="actions" role="group" aria-label="actions">'
+    '<div class="group">Actions</div>'
+    '<button class="nav-action" onclick="doExport()">Export</button>'
+    '<button class="nav-action" onclick="showSops()">SOP</button>'
+    '</div></div><div id="ann"><button onclick="showState()">x</button></div>')
+
+
+def test_the_section_guard_reads_the_commands_half_of_the_rail():
+    """CANARY for the `unowned` check below. Since the split (blueprint Bug
+    13) every button inside `<nav>` carries `data-sec`, so a guard that reads
+    only the nav can never fire: the one place a section switcher can now land
+    without a `data-sec` is `#actions`, and that is where this one is. The
+    button AFTER the rail is outside it and must not be read."""
+    owned, actions = _rail_buttons(_RAIL_WITH_A_SWITCHER_IN_THE_COMMANDS)
+    assert owned == {"log": "showLog"}
+    assert actions == ["doExport", "showSops"]
+    assert [c for c in actions if c.startswith("show")] == ["showSops"]
+
+
 def test_every_nav_button_that_owns_a_section_is_marked_and_nothing_else_is():
     """The rail's active state is a PAIRING across two files, so it is audited
     as one.
@@ -3247,20 +3298,13 @@ def test_every_nav_button_that_owns_a_section_is_marked_and_nothing_else_is():
 
     page = dashboard_page.render_page("tok", tasks_css=taskview.CARDS_CSS,
                                       tasks_js=taskview.CARDS_JS)
-    nav = page[page.index('<nav aria-label="sections">'):page.index("</nav>")]
-    owned, actions = {}, []
-    for attrs in _re.findall(r"<button([^>]*)>", nav):
-        sec = _re.search(r'data-sec="([^"]+)"', attrs)
-        call = _re.search(r'onclick="([^"(]+)', attrs).group(1)
-        if sec:
-            owned[sec.group(1)] = call
-        else:
-            actions.append(call)
+    owned, actions = _rail_buttons(page)
 
     assert page.count("function markSection(") == 1, (
         "markSection is not defined on the page exactly once, so either nothing "
         "marks the rail or two definitions are racing to")
     assert owned, "no nav button declares a data-sec at all"
+    assert actions, "the rail reads as holding no command at all"
 
     unowned = [c for c in actions if c.startswith("show")]
     assert not unowned, (

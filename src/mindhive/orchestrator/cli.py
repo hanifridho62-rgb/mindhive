@@ -30,6 +30,7 @@ import os
 import sys
 
 from .. import cliparse
+from . import environment as env_mod
 
 
 def cmd_lintester(args) -> int | None:
@@ -134,8 +135,9 @@ def cmd_lintester(args) -> int | None:
 
 # The machine refused, not the mission: the same status the preflight answers,
 # and distinct from `1` so a wrapper can tell "some units failed" from "nothing
-# could start here" without parsing the report.
-ENVIRONMENT_STATUS = 3
+# could start here" without parsing the report. Bound to the gate's own name,
+# never retyped: two literals that agree today are two authorities tomorrow.
+ENVIRONMENT_STATUS = env_mod.EXIT_ENVIRONMENT_REFUSAL
 
 
 def _status(outcome) -> int:
@@ -146,8 +148,6 @@ def _status(outcome) -> int:
 
 def _preflight():
     """`environment.preflight`, behind a seam a test can replace."""
-    from . import environment as env_mod
-
     return env_mod.preflight()
 
 
@@ -156,11 +156,14 @@ def _refuse_environment(args, kind, detail) -> int:
 
     The sentence goes to stderr whether or not `--json` was asked for, and the
     JSON surface gets a report of the same shape a mission would print, so a
-    caller parsing stdout sees an `environment` outcome rather than nothing."""
-    from . import environment as env_mod
-
+    caller parsing stdout sees an `environment` outcome rather than nothing.
+    The line is the gate's own `refusal_line`, so it opens with
+    `FATAL_REFUSAL_FRAME` and a wrapper finds this refusal and the gate's by
+    one anchored string. Why this door keeps its own writer rather than
+    calling `enforce_preflight_gate` is in `environment`'s docstring."""
     reason = env_mod.describe(kind, detail)
-    print(f"lintester: refused before any lane was made -- {reason}",
+    print(env_mod.refusal_line("lintester",
+                               f"refused before any lane was made -- {reason}"),
           file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps({"outcome": "environment", "environment": kind,

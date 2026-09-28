@@ -26,7 +26,12 @@ If not, delete the marketplace instructions instead.
 
 ---
 
-## 2. Dashboard nav mixes navigation and mutation in one column
+## 2. ~~Dashboard nav mixes navigation and mutation in one column~~ — DONE 2026-09-28
+
+> **The text below describes the page as it was.** By the time this landed the rail
+> held 26 buttons (the 21 counted below were the 2026-08-10 page) and the honest-zero
+> invariant it waited on had shipped, so it was the presentation change the item asks
+> for. What was actually done is the **Done** paragraph at the end.
 
 **What:** Separate the 21 nav buttons into navigation (sections) and actions (mutations).
 
@@ -42,6 +47,8 @@ three worst action buttons but not the affordance problem underneath.
 
 **Depends on:** the honest-zero invariant landing first (plan §The honest-zero invariant), so
 this becomes a presentation change rather than a behaviour change.
+
+**Done (blueprint P5, spec §2.13 Bug 13):** `dashboard_page.py` renders the rail as `<div id="rail">` with two landmarks: `<nav aria-label="sections">` holding only the sixteen `class="nav-link"` section buttons (every one `data-sec`; `append` moved into the Memory group because it is a section, which changes the Alt+arrow order) and `<div id="actions" role="group" aria-label="actions">` holding the ten `class="nav-action"` commands under their Actions/Heavy headings. `dashboard_css.py` makes `#rail` the sticky scrollport, gives `#actions` its own `--border` separator, and gives the 2px `translate` travel to `nav button` alone (its `transition` adds `translate` to the two colour fades); `#actions button` keeps the background and border fades every `button` carries and answers the pointer with its own `:hover`, which brightens the label instead of moving it. `dashboard_js_core.py` scrolls `railEl`. `tests/test_dashboard_nav_split.py` (23 tests) pins the split, the counts, the ARIA roles and the served page, and rejects a `show*()` handler among the commands (with a canary); `tests/test_dashboard.py`'s older section/`markSection` guard reads the whole `#rail` rather than the `<nav>` alone, since after the split every nav button has a `data-sec` and a nav-only guard could never fire. The browser-tier nav probes still pass.
 
 ---
 
@@ -185,7 +192,14 @@ building around it. Naming it was the decision; building it is this TODO.
 
 ---
 
-## 7. `#6b7488` fails WCAG AA contrast
+## 7. ~~`#6b7488` fails WCAG AA contrast~~ — DONE 2026-09-28
+
+> **The text below describes the palette as it was.** The ratios it quotes were not the
+> WCAG 2.x formula's: `#6b7488` on `#171a23` measures **3.71:1** (not 3.87), `#9aa3b8`
+> 6.87:1 (not 7.17) and `#a4b0c6` 7.95:1 (not 8.2) — `theme.contrast_ratio` computes them
+> now and the tests pin the measured values. T26 (the colour tokens) had landed, so the fix
+> was one token, plus the one other text token that was under AA. What was actually done
+> is the **Done** paragraph at the end.
 
 **What:** Raise `#6b7488` until it clears 4.5:1 on the header background, everywhere it is used.
 
@@ -209,6 +223,8 @@ lightness once, after the colour tokens exist (task T26 in
 line instead of a search-and-replace across 123 literals.
 
 **Depends on / blocked by:** T26 (colour token extraction) landing first.
+
+**Done (blueprint P5, K12, spec §2.12 Bug 12):** `theme.py` sets `dim` to `#9aa3b8` (6.87:1 on `--surface`, 7.22:1 on the new `--bg` `#12151c`) and, because it was the only other text token under AA, brightens `dimmest` from `#555c6e` (2.60:1) to `#798297` (4.51:1 on `--surface`, 4.60:1 on the `--inset` it is drawn on) — the same hue at a higher lightness, still the quietest text token. `text` is `#e2e8f0`; `border`/`success`/`warning`/`danger` join `accent` in the `blueprint` group and `BLUEPRINT_PALETTE` exposes the MEB dict. `tests/test_theme_contrast.py` (48 tests) holds every text token to ≥ 4.5:1 on `--surface` and `--bg` and the signal colours to ≥ 3.0:1, and pins to two places every ratio quoted here and in `theme.py` (6.87, 7.22, 4.51, 4.60, 7.95, and the old grey's 3.71). `--dim` now equals `--muted` (two tokens, one value). Where the MEB tokens land, against the K12 row's list: `--accent` fills the usage bar (and the initiative flag); `--border` edges the initiative pill (`.pill.wsinit`, which carried a literal `#8b6fe0`) and also draws the line between the rail's sections and its commands; `--danger` edges the card of a run a CI check failed (`.hits li.ovci`) and colours its status glyph; `--warning` edges the breaker badge — the status pill that reads `tripped` on a `breaker_open` run (`.pill.ovtrip`) — and colours its glyph. **Not implemented, because the element does not exist:** the `--success` half of the breaker badge. The dashboard never badges a closed or healthy breaker — an Oversee card badges only a tripped one, and the Sessions loop detail prints `breaker_state` as plain table text — so `--success` stays on the one element it had, the completed-run glyph (`.statusDot.sdone`).
 
 ---
 

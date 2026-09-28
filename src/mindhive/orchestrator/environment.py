@@ -51,6 +51,37 @@ out, an unparseable answer -- all fall through to the run path, where the first
 real refusal halts the mission anyway. Fail-closed lives in the run path; the
 preflight is only the cheaper place to say the same thing.
 
+## The gate, blueprint §10.9.2
+
+`check_claude_environment()` and `enforce_preflight_gate()` are the spec's two
+names for that same probe. The first answers ``(ok, message, details)``; the
+second turns a refusal into ONE line on stderr -- `refusal_line`: the
+`FATAL_REFUSAL_FRAME` first, as the spec writes it, then the command's name and
+the fix -- and leaves with `EXIT_ENVIRONMENT_REFUSAL`, the number
+`cli.ENVIRONMENT_STATUS` is bound to.
+
+`hive lintester` does not call the gate. Its refusal also has to print the
+mission-shaped JSON report on `--json` and hand its status back to `main`
+instead of leaving the process, and it names the kind in that report, which
+the gate's ``(ok, message)`` does not carry. It shares everything else: the
+probe (`preflight` -> `_probe`), `refusal_line`, and the status by reference.
+`enforce_preflight_gate` is the spec's entry point for any other caller. Four
+departures from the spec's letter are deliberate:
+
+- Inconclusive passes. The spec's check fails closed on a timeout, a non-zero
+  exit or a body that is not JSON; this one refuses only where `preflight`
+  does, for the reason given above.
+- The body is read whatever the exit code. Signed out, `claude auth status
+  --json` exits 1 AND prints the JSON that says so; a check that tested the
+  code first would never reach the ``loggedIn`` it exists for.
+- The probe waits `PREFLIGHT_TIMEOUT_S`, 15 s, not the spec's 10.0: one probe
+  serves both callers and keeps the one timeout it had, and since a timeout
+  passes, the longer wait costs latency, never a refusal.
+- The fix is named in `describe`'s words, `claude auth login`, where the spec
+  wrote ``claude login``: the CLI's login lives under `auth`. The frame is the
+  contract; the sentence after it -- which opens with the name of the command
+  that refused -- is advice.
+
 ## What it does not do
 
 It does not log in. Credentials are the owner's, and a pipeline that could fix
@@ -62,8 +93,9 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 
-from .. import paths
+from . import driver
 
 # Result strings that mean "no child ran". `mindnet.executor.RunResult` and
 # `mindnet.agent._classify` both answer these with ``executed=False``.
@@ -83,6 +115,16 @@ KINDS = (AUTH, USAGE, CLI_MISSING, INTERPRETER_STUB, SPAWN)
 STUB_EXIT_CODES = (49, 9009)
 
 PREFLIGHT_TIMEOUT_S = 15
+
+# The status a machine that can start no child leaves the process with.
+# `cli.ENVIRONMENT_STATUS` is bound to this name, not to a number of its own,
+# so the front door and the gate cannot drift into two codes for one refusal.
+EXIT_ENVIRONMENT_REFUSAL = 3
+
+# How the one line a refusal writes to stderr opens, verbatim from §10.9.2, so
+# a wrapper greps one fixed string for it. Built from the status it announces
+# so the two cannot disagree; the front door prints it too, by reference.
+FATAL_REFUSAL_FRAME = f"[FATAL PREFLIGHT REFUSAL - EXIT {EXIT_ENVIRONMENT_REFUSAL}]: "
 
 # Lower-cased substrings. Each list is short on purpose: a hint that matches a
 # task's own traceback would turn a real failure into a halted mission, which
@@ -274,24 +316,109 @@ def preflight(which=None, run=None, timeout_s=PREFLIGHT_TIMEOUT_S) -> tuple:
     proceeds, because the run path halts on the first real refusal anyway and
     a preflight that refused on its own uncertainty would block missions on
     machines whose CLI merely lacks the subcommand."""
+    return _probe(which, run, timeout_s)[:2]
+
+
+def _run_bounded(argv, *, timeout, **popen_kw):
+    """`subprocess.run`'s contract for the probe, with `PREFLIGHT_TIMEOUT_S`
+    holding for its whole process TREE -- this module's one process start.
+
+    `subprocess.run` kills only its direct child on a timeout and then, on
+    Windows, drains the pipes with no bound of its own. `claude` is
+    `claude.CMD` on this machine, the CLI a grandchild of cmd.exe holding the
+    inherited pipes, so a 2 s probe came back after 30.12 s (measured;
+    tests/test_orchestrator_environment.py). The same shape as
+    `plugin_cache._run_bounded`, over the same `driver` pieces: its own process
+    group, held, the tree killed on the timeout, the rest of the wait bounded
+    by `driver.reap`. The environment is inherited: `auth status` is the CLI's
+    own probe, not an agent."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, **popen_kw,
+                            **driver.isolation_kwargs())
+    driver.hold_tree(proc)
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except BaseException:               # the timeout, or an interrupt
+            driver.terminate_process_tree(proc)
+            driver.reap(proc, 0.0)
+            raise
+    finally:
+        driver.release_tree(proc)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _probe(which, run, timeout_s) -> tuple:
+    """``(kind, reason, payload)``: `preflight`'s verdict and what it read.
+
+    The one place this module asks for a process (through `_run_bounded`),
+    shared so that `preflight` and `check_claude_environment` cannot reach two
+    verdicts about one answer. *payload* is the ``auth status`` object, or
+    ``None`` where there is none -- no CLI, a probe that raised, a body that is
+    not a JSON object."""
     which = which or shutil.which
-    run = run or subprocess.run
+    run = run or _run_bounded
     try:
         exe = which("claude")
     except Exception:                                   # noqa: BLE001
         exe = None
     if not exe:
-        return CLI_MISSING, "no `claude` executable on PATH"
+        return CLI_MISSING, "no `claude` executable on PATH", None
     try:
         proc = run([str(exe), "auth", "status", "--json"], shell=False,
-                   capture_output=True, text=True, timeout=timeout_s,
-                   creationflags=paths.NO_WINDOW)
+                   text=True, timeout=timeout_s)
     except Exception:                                   # noqa: BLE001
-        return "", ""
+        return "", "", None
     payload = _json_object(getattr(proc, "stdout", ""))
     if payload is None:
-        return "", ""
+        return "", "", None
     if payload.get("loggedIn") is False:
         method = str(payload.get("authMethod") or "none")
-        return AUTH, f"claude auth status: loggedIn=false (authMethod={method})"
-    return "", ""
+        reason = f"claude auth status: loggedIn=false (authMethod={method})"
+        return AUTH, reason, payload
+    return "", "", payload
+
+
+def check_claude_environment(which=None, run=None) -> tuple:
+    """``(ok, message, details)``: can this machine start a child at all?
+
+    `preflight`'s verdict, answered for a caller that wants a sentence either
+    way. *details* is the CLI's ``auth status`` object whenever it printed one,
+    a signed-out answer included, and ``{}`` otherwise. ``ok`` is ``False``
+    exactly where `preflight` refuses, and *message* is then `describe`'s fix;
+    an inconclusive probe passes with a message saying the login was not
+    confirmed, never one claiming that it was."""
+    kind, reason, payload = _probe(which, run, PREFLIGHT_TIMEOUT_S)
+    details = payload if payload is not None else {}
+    if kind:
+        return False, describe(kind, reason), details
+    if details.get("loggedIn") is True:
+        method = str(details.get("authMethod") or "unknown")
+        return True, f"the Claude CLI is logged in (authMethod={method})", details
+    return True, ("the Claude CLI's login could not be confirmed; proceeding, "
+                  "and the run path halts on the first real refusal"), details
+
+
+def refusal_line(argv0, message) -> str:
+    """The one stderr line an environment refusal writes, without its newline:
+    `FATAL_REFUSAL_FRAME` FIRST, as §10.9.2 writes it, so a wrapper can anchor
+    on it (``^\\[FATAL PREFLIGHT REFUSAL``); then *argv0*, the command that
+    refused, and *message*. The gate and `hive lintester` both build their line
+    here, so the two cannot drift into two shapes."""
+    return f"{FATAL_REFUSAL_FRAME}{argv0}: {message}"
+
+
+def enforce_preflight_gate(argv0="hive lintester", exit=sys.exit):
+    """Refuse this process before any lane is made, or hand back the details.
+
+    A refusal writes ONE line to stderr -- `refusal_line`: the frame, *argv0*,
+    the fix -- and calls *exit* with `EXIT_ENVIRONMENT_REFUSAL`. The default
+    does not return; an *exit* that does gets ``None`` back, never a value a
+    caller could read as a pass. A pass prints nothing and answers
+    `check_claude_environment`'s *details*."""
+    ok, message, details = check_claude_environment()
+    if ok:
+        return details
+    print(refusal_line(argv0, message), file=sys.stderr, flush=True)
+    exit(EXIT_ENVIRONMENT_REFUSAL)
+    return None

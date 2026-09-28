@@ -11,18 +11,22 @@ The three checks were written after each was reproduced against a live server on
 an ephemeral port; the docstrings say what was observed rather than what was
 feared.
 
-Its one import from this package is `paths`, itself dependency-free, so the leaf
-property holds: `is_safe_project` asks `paths.namespace_name`, a pure function of
-the string, rather than keeping a second copy of its rule.
+Its imports from this package are `paths` and `pgshape`, both dependency-free,
+so the leaf property holds: `is_safe_project` asks `paths.namespace_name`, a pure
+function of the string, rather than keeping a second copy of its rule, and
+`paged` hands the page itself to `pgshape.paginate_records` for the same reason.
+`select_newest` is the one piece that applies a request's number rather than
+reading it: the `limit` cut, which has to report whether it cut anything so the
+page built on it can say so.
 """
 from __future__ import annotations
 
 import re
 
-from . import paths
+from . import paths, pgshape
 
-__all__ = ["BadRequest", "qs_int", "body_num", "is_safe_project",
-           "host_is_local"]
+__all__ = ["BadRequest", "qs_int", "select_newest", "paged", "body_num",
+           "is_safe_project", "host_is_local"]
 
 
 class BadRequest(ValueError):
@@ -36,7 +40,7 @@ class BadRequest(ValueError):
     """
 
 
-def qs_int(qs, name, default):
+def qs_int(qs, name, default, ceiling=None):
     """One integer query parameter, the *default* when absent, else BadRequest.
 
     `int((qs.get("limit") or ["200"])[0])` was the shape at every call site, and
@@ -46,8 +50,65 @@ def qs_int(qs, name, default):
 
     Same class of defect the Content-Length path was already fixed for, and the
     same answer: refuse it by the name the caller used.
+
+    *ceiling* caps the answer from above, and only from above: a number the
+    caller may not talk its way past (`page_size`). The floor, where there is
+    one, belongs to whoever consumes the number -- `pgshape.paginate_records`
+    for a page -- so it is not kept here as a second copy. None, the default,
+    is no cap, which is what every caller before the page parameters has.
     """
-    return _coerced((qs.get(name) or [None])[0], default, name, int)
+    value = _coerced((qs.get(name) or [None])[0], default, name, int)
+    if ceiling is not None and value is not None and value > ceiling:
+        return ceiling
+    return value
+
+
+def select_newest(rows, limit):
+    """``(kept, limited)``: the newest *limit* of *rows* -- which arrive oldest
+    first -- newest first, and *limit* again when that dropped any row, else
+    None.
+
+    The second half is what `paged` needs to be honest. A route that selects
+    before it pages (/api/memory keeps the newest `limit`, 200 unless named,
+    ahead of a `dedupe.collapse` that is quadratic in what it is handed) would
+    otherwise report the selection's size as `total_items`. Detected, not
+    assumed, as `pgshape` detects its row cap: a *limit* at or above the row
+    count drops nothing and answers None."""
+    kept = list(reversed(rows))[:limit]
+    return kept, (limit if len(kept) < len(rows) else None)
+
+
+def paged(qs, rows, limit=None):
+    """*rows* unchanged, or -- when the request names a `page` or a
+    `page_size` -- one page of them in `pgshape.paginate_records`' envelope.
+
+    ADDITIVE on purpose: without either parameter a list route answers the bare
+    list it always has, byte for byte, so no existing caller sees a change. A
+    blank value is the caller declining to say (`_coerced`'s rule), so `?page=`
+    alone asks for no page. `page_size` is capped here at the envelope's
+    ceiling and clamped by `paginate_records`; a value that will not parse is
+    refused by name, like every other parameter.
+
+    *limit* is `select_newest`'s second answer. When it is not None the rows
+    are a selection that dropped some, so `total_items` counts the selection,
+    not the store -- and the envelope says so with a `limit` key holding the N
+    that was kept, placed just before `items` so the §10.8.2 keys keep their
+    order. Absent, `total_items` is the whole answer. A bare list has no room
+    for the key and never had it, so unpaged answers are unchanged.
+
+    Paging is a cut of the rows the route already holds -- callers hand in the
+    cached fold -- so turning a page reads nothing."""
+    if not any((qs.get(name) or [""])[0] for name in ("page", "page_size")):
+        return rows
+    env = pgshape.paginate_records(
+        rows, qs_int(qs, "page", 1),
+        qs_int(qs, "page_size", pgshape.DEFAULT_PAGE_SIZE,
+               ceiling=pgshape.MAX_PAGE_SIZE_CEILING))
+    if limit is not None:
+        items = env.pop("items")
+        env["limit"] = limit
+        env["items"] = items                 # re-inserted, so last again
+    return env
 
 
 def body_num(body, name, default, kind=int):

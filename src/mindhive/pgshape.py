@@ -8,6 +8,15 @@ an agent can reason correctly from the answer, and it has no opinion about which
 tool called it. `pgsearch` and `pgtools` both go through here, which is the
 point: one envelope shape, learned once.
 
+The same holds for lists that never touch a cursor. `paginate_records` and
+`trim_field_content` are the page and the field cut a route answers in when
+its rows are already folded in memory -- the dashboard's polled lists
+(blueprint §10.8) -- so an agent reading either surface learns one page shape.
+Property 5 binds a page too: `total_items` is `len` of what was paged, so a
+route that SELECTS before it pages (/api/memory keeps the newest `limit`) adds
+a `limit` key whenever that selection dropped rows -- `dashboard_query.paged`
+-- and the total is never mistaken for the store's.
+
 Five properties, each closing a specific way a model gets confidently wrong:
 
 1. **`truncated` is an object, never a boolean, never absent.** Three
@@ -84,6 +93,16 @@ OBJECT_KEY_LIST = 30            # the key names are the map
 # that merely ended.
 SUMMARY_CAPS = {"memos": 25, "code_changes": 25, "verifications": 10,
                 "counts_by_type": 40}
+
+# In-memory pages (`paginate_records`), for rows a route has already folded
+# rather than streamed off a cursor. All three values are the spec's (blueprint
+# §10.8.2): a page is meant to be handed to an agent whole, which is why its
+# ceiling sits well under `MAX_ROWS_CEILING`. A string over `MAX_FIELD_CHARS`
+# is cut with a marker saying how much went, so a reader can tell a shortened
+# value from a short one -- the same reason `truncated` is never silent.
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE_CEILING = 100
+MAX_FIELD_CHARS = 500
 
 # The closed error vocabulary. A model matching on prose is a model that loops,
 # so this is a fixed set and every one of them appears in the tool descriptions
@@ -458,3 +477,61 @@ def _fit_response(shaped, truncated, max_bytes):
         kept.append(row)
         total += size
     return kept, truncated
+
+
+# --- in-memory pages ----------------------------------------------------------
+
+def trim_field_content(val, max_chars=MAX_FIELD_CHARS):
+    """*val* cut to its first *max_chars* characters, with a marker naming how
+    many went, when it is a string longer than that; anything else is handed
+    back as the same object.
+
+    Characters, not UTF-8 bytes: the cap bounds what a reader has to read, and
+    a byte cut can split a character in two. A *max_chars* that is not a
+    non-negative int falls back to the default rather than raising."""
+    if (isinstance(max_chars, bool) or not isinstance(max_chars, int)
+            or max_chars < 0):
+        max_chars = MAX_FIELD_CHARS
+    if isinstance(val, str) and len(val) > max_chars:
+        return (val[:max_chars]
+                + f"... [TRUNCATED: {len(val) - max_chars} chars hidden]")
+    return val
+
+
+def paginate_records(records, page=1, page_size=DEFAULT_PAGE_SIZE):
+    """One page of *records* in the blueprint §10.8.2 envelope:
+    ``{page, page_size, total_items, total_pages, has_next, has_prev, items}``,
+    in that key order.
+
+    ``page_size`` is clamped into ``[1, MAX_PAGE_SIZE_CEILING]`` and ``page``
+    to at least 1. A page past the end answers no items with the true totals,
+    and an empty input has ``total_pages == 0``: the spec's own ceiling
+    division, kept as it answers. Each dict row comes back as a NEW dict with
+    its values put through `trim_field_content` -- the rows handed in are often
+    a cached fold, and trimming them in place would cut the cache itself.
+
+    Total, like everything here. Where §10.8.2's code raises -- ``.items()`` on
+    a row that is not a dict, ``max(1, page)`` on a page that is not a number
+    -- this degrades instead: a row that is not a dict is trimmed as a value,
+    and a page or size that is not an int takes its default. A bool counts as
+    not an int, though ``isinstance(True, int)`` holds: ``True`` is a caller's
+    mistake, not a request for a page of one."""
+    if isinstance(page, bool) or not isinstance(page, int):
+        page = 1
+    if isinstance(page_size, bool) or not isinstance(page_size, int):
+        page_size = DEFAULT_PAGE_SIZE
+    page = max(1, page)
+    size = max(1, min(page_size, MAX_PAGE_SIZE_CEILING))
+    try:
+        records = list(records)
+    except TypeError:
+        records = []
+    total = len(records)
+    total_pages = (total + size - 1) // size
+    start = (page - 1) * size
+    items = [{k: trim_field_content(v) for k, v in row.items()}
+             if isinstance(row, dict) else trim_field_content(row)
+             for row in records[start:start + size]]
+    return {"page": page, "page_size": size, "total_items": total,
+            "total_pages": total_pages, "has_next": page < total_pages,
+            "has_prev": page > 1, "items": items}

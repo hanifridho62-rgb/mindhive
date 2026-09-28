@@ -45,12 +45,15 @@ JS = """\
     // (blueprint P1g) only ever attaches to an interactive card, and every
     // interactive card has kind 'chat' -- so a failed branch placed after it
     // would be unreachable by the only rows that can reach it.
-    if (r.status === 'failed') return ['\\u2717', 'sbad',
+    // The dot wears the K12 signal colour of the outcome (`.statusDot.sci`,
+    // `.sdone`, `.strip` in the sheet); `sbad`/`sok` stay for the plain failure
+    // and the live states.
+    if (r.status === 'failed') return ['\\u2717', r.ci ? 'sci' : 'sbad',
       r.ci ? ('CI \\u2717 PR #' + r.ci.pr_id) : 'failed'];
     if (r.kind === 'chat') return ['\\u25c9', r.online ? 'sok' : 'snone', 'chat session'];
     if (r.status === 'running') return ['\\u25b6', r.online ? 'sok' : 'snone', 'running'];
-    if (r.status === 'completed') return ['\\u2714', 'sok', 'completed'];
-    if (r.status === 'breaker_open') return ['\\u26a1', 'sbad', 'tripped'];
+    if (r.status === 'completed') return ['\\u2714', 'sdone', 'completed'];
+    if (r.status === 'breaker_open') return ['\\u26a1', 'strip', 'tripped'];
     return ['\\u25a0', 'snone', r.status || 'ended'];
   }
   // Provenance pill, shared by ovRow and rmPanel so the two surfaces cannot
@@ -265,7 +268,9 @@ JS = """\
       + '<button class="mini ovdel" data-rid="'+escAttr(r.run_id)
       + '" data-proj="'+escAttr(r.project||'')+'">delete</button>';
     const chat = r.kind === 'chat';
-    const pills = '<span class="pill">'+esc(st[2])+'</span> '
+    // K12's breaker badge: the status pill of a tripped run takes `--warning`.
+    const pills = '<span class="pill'+(st[1] === 'strip' ? ' ovtrip' : '')+'">'
+      + esc(st[2])+'</span> '
       + '<span class="pill">'+(r.iterations||0)+(chat
           ? ' command'+((r.iterations||0)===1?'':'s')
           : ' iteration'+((r.iterations||0)===1?'':'s'))+'</span>'
@@ -308,7 +313,9 @@ JS = """\
     if (RM_OPEN.has(r.run_id)){
       body += rmPanel(r.roadmap || rmFromCard(r), r.run_id);
     }
-    return '<li data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
+    // K12's red CI card: a run a CI check failed is edged in `--danger`.
+    return '<li'+(st[1] === 'sci' ? ' class="ovci"' : '')
+      + ' data-rid="'+escAttr(r.run_id)+'"><div class="file">'+head+'</div>'
       + '<div style="margin:4px 0">'+pills+'</div>'+body+'</li>';
   }
   // --- Prompt enrichment (Oversee): improve a draft prompt before spending a

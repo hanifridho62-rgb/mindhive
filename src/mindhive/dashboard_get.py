@@ -43,16 +43,16 @@ from .dashboard_data import (HIVEMIND_LABEL, HIVEMIND_PROJECT, _add_tallies,
                              default_project, event_pairs, injection_status,
                              overview_stats)
 from .dashboard_locks import _VERIFY_LOCK, _one_at_a_time
-from .dashboard_query import is_safe_project, qs_int
-from .dashboard_memo import (_CATS_MEMO, _changelog_cached, _improve_cached,
-                             _intended_use_digest, _ledger_fingerprint,
-                             _manual_collapsed_cached, _memo_get, _memo_put,
-                             _memory_rows_cached, _oversee_cached,
-                             _recommend_cached, _session_rows_cached,
-                             _sessions_cached, _skill_calls_cached,
-                             _skill_history_cached, _skill_stats_cached,
-                             _sops_cached, _task_cards_cached, _with_liveness,
-                             _with_online)
+from .dashboard_query import is_safe_project, paged, qs_int, select_newest
+from .dashboard_memo import (_CATS_MEMO, _changelog_cached, _hivemind_cached,
+                             _improve_cached, _intended_use_digest,
+                             _ledger_fingerprint, _manual_collapsed_cached,
+                             _memo_get, _memo_put, _memory_rows_cached,
+                             _oversee_cached, _recommend_cached,
+                             _session_rows_cached, _sessions_cached,
+                             _skill_calls_cached, _skill_history_cached,
+                             _skill_stats_cached, _sops_cached,
+                             _task_cards_cached, _with_liveness, _with_online)
 from .research_page import render_research
 from .swarm_page import render_swarm
 from .workspace_page import render_parallel
@@ -144,8 +144,8 @@ class GetRoutes:
         # Gated per project on the ledger fingerprint. The TYPE filter is a pure
         # fold, and it was reading the whole ledger on every 2.5 s tick with the
         # Memory section open — measured warm at 482 ms, the same as cold.
-        # `session` and `limit` cut the cached list afterwards, so they stay out
-        # of the key.
+        # `session`, `limit` and the page cut the cached list afterwards, so
+        # they stay out of the key.
         from . import roadmap as roadmap_mod
         session = (qs.get("session") or [None])[0]
         limit = qs_int(qs, "limit", 200)
@@ -167,7 +167,7 @@ class GetRoutes:
             rows = _memory_rows_cached(proj, lambda: memory_pairs(proj))
         if session:
             rows = [(n, e) for n, e in rows if e.session_id == session]
-        rows = list(reversed(rows))[:limit]      # newest first
+        rows, limited = select_newest(rows, limit)   # newest first
 
         def _text(e):
             if not isinstance(e.payload, dict):
@@ -181,12 +181,12 @@ class GetRoutes:
         # Collapse near-duplicate memories by meaning (same type + project),
         # keeping the newest; display-time only, ledger untouched.
         # similar_count rides along for the UI hint.
-        return self._json(dedupe.collapse([
+        return self._json(paged(qs, dedupe.collapse([
             {"ts": e.ts, "type": e.type, "session": e.session_id, "project": n,
              "text": _text(e), "tags": e.tags,
              "origin": events.origin_of(e.session_id, e.tags)}
             for n, e in rows
-        ]))
+        ]), limit=limited))
 
     def _improvements_fold(self, n):
         """One project's Improvements fold, and every part of it is a pure
@@ -321,8 +321,8 @@ class GetRoutes:
         out = sorted(rows, key=lambda s: s["last_ts"] or "", reverse=True)
         # `status` is a function of the WALL CLOCK, so it is derived per response
         # onto a copy — storing it would freeze a session as active forever.
-        return self._json([dict(s, status=taskview.status_of(s["last_ts"]))
-                           for s in out])
+        return self._json(paged(qs, [
+            dict(s, status=taskview.status_of(s["last_ts"])) for s in out]))
 
     def _get_changelog(self, proj, am, qs):
         # Mandatory code change-log. Shape and ordering delegate to
@@ -490,11 +490,11 @@ class GetRoutes:
         # measured at 378 ms warm for a 28-byte response, all of it `read_all`.
         # HIVE MIND folds a MERGED event list and cannot be composed from
         # per-project folds — "last outcome per skill" across namespaces is not
-        # the merge of each namespace's last outcome — so that path is left
-        # reading, and says so rather than pretending to be covered.
+        # the merge of each namespace's last outcome — so it keeps that fold and
+        # is gated whole, on one stamp of every namespace (`_hivemind_cached`).
         if am:
-            evs = [e for _, e in all_event_pairs()]
-            return self._json(plugins_mod.call_stats(project=proj, evs=evs))
+            return self._json(_hivemind_cached(
+                "/api/skills/status", all_event_pairs, plugins_mod.call_stats))
         return self._json(_skill_calls_cached(
             proj, lambda: plugins_mod.call_stats(project=proj)))
 
@@ -725,9 +725,8 @@ class GetRoutes:
         # Gated for `_get_skills_status`'s reason and by the same measurement:
         # 407 ms warm, identical to cold, on every visit to the section.
         if am:
-            evs = [e for _, e in all_event_pairs()]
-            return self._json({"stats": plugins_mod.skill_stats(project=proj,
-                                                                evs=evs)})
+            return self._json({"stats": _hivemind_cached(
+                "/api/skills/stats", all_event_pairs, plugins_mod.skill_stats)})
         return self._json({"stats": _skill_stats_cached(
             proj, lambda: plugins_mod.skill_stats(project=proj))})
 
@@ -740,7 +739,7 @@ class GetRoutes:
         # section's LIVE function, so this ran every 2.5 s at 641 ms a tick.
         # The stamp covers all three of its inputs (see `_recommend_fingerprint`),
         # not just the ledger. HIVE MIND merges events and incidents across every
-        # namespace and is left reading, like the other skills endpoints.
+        # namespace and is left reading (status/stats gate theirs: `_hivemind_cached`).
         top = (qs.get("top") or [None])[0]
         top = int(top) if top else None
         if am:

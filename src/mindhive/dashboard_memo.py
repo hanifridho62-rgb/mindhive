@@ -21,7 +21,16 @@ count drove its hit rate to exactly zero.
 ``dashboard`` re-exports the memos and the LRU helpers: the dashboard tests empty
 every ``*_MEMO`` between cases by scanning ``vars(dashboard)``, so they have to
 be reachable there, and a re-export is the same OrderedDict object —
-``_BoundedMemo`` subclasses ``OrderedDict``, so that scan still finds them."""
+``_BoundedMemo`` subclasses ``OrderedDict``, so that scan still finds them.
+
+The blueprint's public names (§10.5.1) are thin wrappers over this machinery,
+never a second copy of it: ``BoundedMemo`` IS ``_BoundedMemo``,
+``DASHBOARD_STATS_MEMO`` IS ``_STATS_MEMO``, ``compute_project_fingerprint`` is
+the stat-only stamp under ``_ledger_fingerprint``'s trust rules, and
+``gated_fold`` is the gate keyed by a cache key. ``DASHBOARD_FOLDS_MEMO`` is the
+one new memo — the HIVE MIND skills folds — and ``dashboard`` re-exports it
+like the rest, so the ``vars(dashboard)`` sweeps empty it too
+(``tests/test_dashboard_hivemind_gate.py`` pins the identity)."""
 import collections
 import hashlib
 import json
@@ -88,7 +97,15 @@ class _BoundedMemo(collections.OrderedDict):
     parameter makes every one of them responsible for remembering which memo it
     is writing to. One that forgets restores the exact defect this class was
     added to fix — silently, since a memo that evicts too eagerly still returns
-    correct answers, just never a cheap one."""
+    correct answers, just never a cheap one.
+
+    Published as ``BoundedMemo`` (blueprint §10.5.1) by identity, so every memo
+    here is an instance of the public name, and it deviates from the spec's
+    class twice, on purpose. ``max_entries`` has no default — the spec's is
+    ``= 512``, and the comment on ``__init__`` is why a default is the worse
+    failure. And there is no lock: the spec calls its class "thread-safe" and
+    shows none, and this one relies on the GIL exactly as every memo in this
+    module always has."""
 
     # `max_entries` is deliberately REQUIRED, which means `copy()` raises
     # `TypeError` — `OrderedDict.copy` calls `self.__class__(self)` and passes
@@ -101,6 +118,26 @@ class _BoundedMemo(collections.OrderedDict):
     def __init__(self, max_entries: int):
         super().__init__()
         self.max_entries = max_entries
+
+    def get(self, key, current_fingerprint):
+        """The value stored under *key* when it was stored under
+        *current_fingerprint*, else None: the spec's ``get``, over the same
+        ``(fingerprint, value)`` entries ``_fingerprinted`` keeps, and a read
+        counts as use. It REPLACES ``dict.get`` on every memo here: nothing
+        calls that on one, a one-argument call now raises ``TypeError``, and a
+        second argument is read as a stamp, never as a default."""
+        cached = _memo_get(self, key)
+        if cached is None or cached[0] != current_fingerprint:
+            return None
+        return cached[1]
+
+    def put(self, key, fingerprint, value):
+        """Store *value* under *key*, stamped with *fingerprint*, inside the
+        memo's own bound (``_memo_put``)."""
+        _memo_put(self, key, (fingerprint, value))
+
+
+BoundedMemo = _BoundedMemo
 
 
 def _memo_put(memo: "collections.OrderedDict", key, value) -> None:
@@ -188,6 +225,84 @@ def _fingerprinted(memo: "collections.OrderedDict", proj, compute):
     return value
 
 
+def compute_project_fingerprint(project_dir):
+    """``(segment count, ((name, mtime_ns, size), ...) by name, chain.json
+    mtime_ns)`` for the ledger under *project_dir*, or **None when no stamp can
+    be trusted** — the spec's shape (blueprint §10.5.1) under
+    ``_ledger_fingerprint``'s trust rules.
+
+    Stat-only: ``os.scandir`` hands back the stat data its enumeration already
+    holds and ``os.stat`` reads ``chain.json``'s metadata, so no file is opened.
+    The segments are exactly the ones ``segment_stats`` counts (``*.jsonl``, an
+    entry that vanishes mid-scan skipped), so this stamp and the ledger stamp
+    can never disagree about which segments exist. ``chain.json`` is the term
+    the ledger stamp cannot see: the checkpoint moves with no event appended.
+    A missing one is 0.
+
+    None — never the spec's ``(0, 0)`` — under a ``pg`` backend, for a ledger
+    with no segment, and on any filesystem error. ``(0, 0) == (0, 0)``, so a
+    constant here is a hit forever, and a transient error that looked like an
+    empty ledger would pin its answer for the life of the process. The full
+    reasoning for each case is ``_ledger_fingerprint``'s, spelled the same way
+    so the two cannot disagree."""
+    if os.environ.get("MINDHIVE_EVENT_BACKEND", "file").lower() == "pg":
+        return None
+    segments = []
+    try:
+        with os.scandir(os.path.join(project_dir, "events")) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".jsonl"):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                segments.append((entry.name, st.st_mtime_ns, st.st_size))
+    except (OSError, ValueError):
+        return None
+    if not segments:
+        return None
+    try:
+        chain_mtime = os.stat(os.path.join(project_dir,
+                                           "chain.json")).st_mtime_ns
+    except FileNotFoundError:
+        chain_mtime = 0
+    except (OSError, ValueError):
+        return None
+    segments.sort()
+    return (len(segments), tuple(segments), chain_mtime)
+
+
+def _stamped_fold(memo, cache_key, stamp, fold):
+    """``fold()``, served from *memo* while *stamp* has not moved.
+
+    ``_fingerprinted``'s gate with the key and the stamp supplied, so one
+    implementation serves ``gated_fold`` and the HIVE MIND routes. The CALLER
+    takes *stamp*, BEFORE ``fold`` runs — ``_oversee_cached``'s lesson: taken
+    after, a write landing inside the fold would be in the key and missing
+    from the value, and every later call would serve the stale value as
+    current. None is an untrusted stamp: fold, and store nothing."""
+    if stamp is None:
+        return fold()
+    cached = _memo_get(memo, cache_key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    value = fold()
+    _memo_put(memo, cache_key, (stamp, value))
+    return value
+
+
+def gated_fold(memo, cache_key, project_dir, fold_func):
+    """``fold_func(project_dir)``, recomputed only when the ledger under
+    *project_dir* moved: the spec's name (blueprint §10.5.1) for the gate
+    ``_fingerprinted`` already is, keyed by *cache_key* rather than by project
+    so two routes can share one memo. The stamp is taken before the fold, and
+    an untrusted one folds and stores nothing."""
+    return _stamped_fold(memo, cache_key,
+                         compute_project_fingerprint(project_dir),
+                         lambda: fold_func(project_dir))
+
+
 # Per-project counts for the picker. `default_project()` computes these for
 # EVERY namespace on disk — 60 on this machine — at launch and on every project
 # list, and each one was a full `read_all`. Bounded for the namespace count, not
@@ -195,6 +310,9 @@ def _fingerprinted(memo: "collections.OrderedDict", proj, compute):
 # memo its entire hit rate.
 # {project: (fingerprint, stats dict)}
 _STATS_MEMO = _BoundedMemo(_STATS_MEMO_MAX)
+# The spec's name for it (blueprint §10.5.1), as an identity: a second memo
+# under the public name would be a second 512-slot bound free to drift.
+DASHBOARD_STATS_MEMO = _STATS_MEMO
 
 
 # One memo of the session fold, shared by every poll of /api/mindnet/cats.
@@ -325,6 +443,51 @@ def _skill_calls_cached(proj, compute):
 def _skill_stats_cached(proj, compute):
     """`plugins.skill_stats` for one project, on the same fingerprint."""
     return _fingerprinted(_SKILL_STATS_MEMO, proj, compute)
+
+
+# The HIVE MIND half of the same two routes (blueprint §10.11, step 1.2). It
+# folded EVERY namespace on every request: its fold runs over the MERGED event
+# list, and "last outcome per skill" across namespaces is not the merge of each
+# namespace's last outcome, so it cannot be composed from the memos above — and
+# is not. The fold is untouched; only its SKIP is new, on one stamp covering
+# every namespace. Keyed per route, so the live entry count is two, and 512 is
+# `_STATS_MEMO_MAX`'s backstop rather than a working size.
+DASHBOARD_FOLDS_MEMO = BoundedMemo(512)
+
+
+def _hivemind_fingerprint():
+    """Every namespace's ``compute_project_fingerprint`` beside its name, in
+    sorted namespace order — or None when ANY of them is untrusted.
+
+    The list is ``paths.event_namespaces``, read fresh on every call — the one
+    ``all_event_pairs`` walks — so the stamp covers exactly what the fold
+    reads, and a namespace appearing lengthens it. Each term carries its
+    namespace's name, so the stamp reads as the list it covers. One untrusted
+    namespace makes the whole stamp untrusted: the merge is only as current as
+    its least trustworthy input."""
+    from . import paths
+    stamps = []
+    for name in sorted(paths.event_namespaces()):
+        stamp = compute_project_fingerprint(paths.project_dir(name))
+        if stamp is None:
+            return None
+        stamps.append((name, stamp))
+    return tuple(stamps)
+
+
+def _hivemind_cached(cache_key, pairs, fold):
+    """``fold`` over the merged event list, served from ``DASHBOARD_FOLDS_MEMO``
+    while no namespace has moved.
+
+    *pairs* is ``dashboard_data.all_event_pairs``, handed in because
+    ``dashboard_data`` imports this module, never the reverse. *fold* is one of
+    the ``plugins`` folds, called with the merged list as ``evs`` as the ungated
+    handler called it; the handler also passed its ``project``, which those
+    folds read only when ``evs`` is absent, so leaving it out changes no byte.
+    Stamped before the fold."""
+    return _stamped_fold(DASHBOARD_FOLDS_MEMO, cache_key,
+                         _hivemind_fingerprint(),
+                         lambda: fold(evs=[e for _, e in pairs()]))
 
 
 # Every task card in one namespace, from ONE read.

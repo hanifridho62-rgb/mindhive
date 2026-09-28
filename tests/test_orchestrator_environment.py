@@ -348,6 +348,32 @@ def test_preflight_reads_the_object_out_of_noisy_output():
     assert env.preflight(which=lambda n: "/bin/claude", run=run)[0] == env.AUTH
 
 
+def test_the_probe_timeout_holds_for_the_whole_process_tree(tmp_path):
+    """The real runner, no `run` seam, against a stub shaped like `claude.CMD`
+    on this machine: the CLI a grandchild of cmd.exe, holding the pipes. With
+    `subprocess.run` a 2 s probe came back after 30.12 s -- its timeout killed
+    cmd.exe alone and then waited on the grandchild's pipes."""
+    import time
+
+    from tests.test_plugin_cache import (TREE_SLACK_S, kill_leftover, pid_of,
+                                         process_gone, sleeping_tree_stub)
+
+    stub, pidfile = sleeping_tree_stub(tmp_path)
+    timeout = 2.0
+    started = time.monotonic()
+    got = env.preflight(which=lambda name: str(stub), timeout_s=timeout)
+    elapsed = time.monotonic() - started
+    pid = pid_of(pidfile)
+    try:
+        assert elapsed < timeout + TREE_SLACK_S, (
+            f"a {timeout} s probe came back after {elapsed:.2f} s")
+        assert got == ("", ""), "a timed-out probe is inconclusive, never a refusal"
+        assert pid is not None, "the stub's grandchild never started"
+        assert process_gone(pid), "the grandchild outlived the probe's timeout"
+    finally:
+        kill_leftover(pid)
+
+
 # --- the repair loop's short-circuit ------------------------------------------
 
 def test_the_loop_neither_repairs_nor_records_a_machine_failure():
@@ -644,3 +670,235 @@ def test_a_usage_halt_with_no_detail_keeps_the_original_sentence():
     all gets what it always got."""
     text = env.describe(env.USAGE)
     assert "no child could start" in text
+
+
+# --- the preflight gate, blueprint §10.9.2 ------------------------------------
+#
+# §10.9.2 names two functions: `check_claude_environment() -> (ok, msg,
+# details)` and `enforce_preflight_gate()`, which writes one fatal line and
+# leaves with exit 3. Both stand ON `preflight`'s probe rather than beside it.
+# A second probe would be a second opinion about the same `claude auth status
+# --json`, and two opinions about one fact disagree the first time either one
+# learns something -- so the verdicts below are `preflight`'s, and only the
+# shape of the answer is new.
+
+# The answer §1.4 quotes for a signed-in machine.
+HEALTHY = ('{"loggedIn": true, "authMethod": "claude.ai", '
+           '"subscriptionType": "max"}')
+# What `claude auth status --json` printed on this machine signed out -- at
+# exit 1, which is why the body is read whatever the exit code says. A check
+# that tested the code first would never reach the `loggedIn` it exists for.
+SIGNED_OUT = ('{"loggedIn": false, "authMethod": "none", '
+              '"apiProvider": "firstParty"}')
+# The fatal frame, verbatim from §10.9.2.
+FATAL = "[FATAL PREFLIGHT REFUSAL - EXIT 3]: "
+
+
+def test_the_refusal_exit_code_is_three():
+    assert env.EXIT_ENVIRONMENT_REFUSAL == 3
+
+
+def test_the_fatal_frame_is_the_specs_text_to_the_character():
+    """What a wrapper greps for. The front door prints it by reference
+    (`tests/test_cli_lintester.py`), never as a copy, so this is where its
+    spelling answers to §10.9.2."""
+    assert env.FATAL_REFUSAL_FRAME == FATAL
+
+
+def test_the_check_refuses_a_machine_with_no_cli_and_names_the_binary():
+    run = _run_answering(HEALTHY)
+
+    ok, msg, details = env.check_claude_environment(which=lambda name: None,
+                                                    run=run)
+
+    assert ok is False
+    assert "claude" in msg.lower() and "PATH" in msg, msg
+    assert details == {}
+    assert run.calls == [], "a CLI that is not on PATH was spawned anyway"
+    # The canary: the same fake IS reached once a CLI is on PATH.
+    env.check_claude_environment(which=lambda name: "/bin/claude", run=run)
+    assert len(run.calls) == 1
+
+
+def test_the_check_refuses_a_signed_out_cli_and_hands_back_its_answer():
+    run = _run_answering(SIGNED_OUT, code=1)
+
+    ok, msg, details = env.check_claude_environment(
+        which=lambda name: "/bin/claude", run=run)
+
+    assert ok is False
+    assert "login" in msg, msg
+    assert details == {"loggedIn": False, "authMethod": "none",
+                       "apiProvider": "firstParty"}
+    # `preflight`'s own probe, not a second one: one call, the same argv, no
+    # shell, and `preflight`'s timeout rather than a number of the check's own.
+    assert len(run.calls) == 1
+    argv, kw = run.calls[0]
+    assert argv == ["/bin/claude", "auth", "status", "--json"]
+    assert kw.get("shell") is False
+    assert kw.get("timeout") == env.PREFLIGHT_TIMEOUT_S
+
+
+def test_the_check_passes_a_signed_in_cli_and_hands_back_its_answer():
+    ok, msg, details = env.check_claude_environment(
+        which=lambda name: "/bin/claude", run=_run_answering(HEALTHY))
+
+    assert ok is True
+    assert msg, "a pass with nothing to say"
+    assert details == {"loggedIn": True, "authMethod": "claude.ai",
+                       "subscriptionType": "max"}
+
+
+@pytest.mark.parametrize("run", [
+    _raise_timeout,
+    lambda argv, **kw: SimpleNamespace(stdout="error: unknown command 'auth'"),
+    lambda argv, **kw: SimpleNamespace(stdout=""),
+    lambda argv, **kw: SimpleNamespace(stdout="[1, 2, 3]"),
+])
+def test_an_inconclusive_probe_passes_the_check_without_claiming_a_login(run):
+    """§10.9.2's own check fails CLOSED here: a timeout, a non-zero exit, a body
+    that is not JSON all answer False. `preflight` fails OPEN, on purpose and
+    pinned above (`test_an_inconclusive_probe_proceeds_rather_than_refusing`):
+    the run path halts on the first real refusal, and a gate that refused on
+    its own uncertainty would block every mission on a CLI that merely lacks
+    the subcommand. Built on `preflight`'s probe, the check inherits that
+    verdict -- but not the right to call an unanswered question a confirmed
+    login."""
+    confirmed = env.check_claude_environment(
+        which=lambda n: "/bin/claude", run=_run_answering(HEALTHY))[1]
+
+    ok, msg, details = env.check_claude_environment(
+        which=lambda n: "/bin/claude", run=run)
+
+    assert env.preflight(which=lambda n: "/bin/claude", run=run) == ("", "")
+    assert ok is True
+    assert details == {}
+    assert msg and msg != confirmed, (
+        "an unanswered probe was reported as a confirmed login")
+
+
+def _binding_of(source, name="ENVIRONMENT_STATUS"):
+    """How *name* is bound at the top level of *source*: ``"alias"`` when it
+    names `EXIT_ENVIRONMENT_REFUSAL`, ``"literal"`` when it is a number of its
+    own, ``"other"`` for anything else, ``"missing"`` when it is not bound."""
+    import ast
+
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ImportFrom):
+            if any(a.name == "EXIT_ENVIRONMENT_REFUSAL" and a.asname == name
+                   for a in node.names):
+                return "alias"
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            value = node.value
+            named = (value.attr if isinstance(value, ast.Attribute)
+                     else getattr(value, "id", ""))
+            if named == "EXIT_ENVIRONMENT_REFUSAL":
+                return "alias"
+            return "literal" if isinstance(value, ast.Constant) else "other"
+    return "missing"
+
+
+def test_the_cli_status_is_the_gates_constant_not_a_second_number():
+    """`orchestrator/cli.py` answered 3 for "nothing could start here" before
+    this module had a name for it. Two literals that agree today are two
+    authorities tomorrow, so the CLI's status has to BE the gate's constant.
+
+    `is` alone cannot prove that: CPython caches the small integers, so
+    ``3 is 3`` holds for two independent literals. The binding itself is read
+    instead, with a canary proving the reader can tell the two apart."""
+    from pathlib import Path
+
+    from mindhive.orchestrator import cli as lint_cli
+
+    assert lint_cli.ENVIRONMENT_STATUS == 3
+    assert lint_cli.ENVIRONMENT_STATUS is env.EXIT_ENVIRONMENT_REFUSAL
+    source = Path(lint_cli.__file__).read_text(encoding="utf-8")
+    assert _binding_of(source) == "alias", _binding_of(source)
+    # The canary: the reader sees the old literal as the literal it is.
+    assert _binding_of("ENVIRONMENT_STATUS = 3\n") == "literal"
+
+
+@pytest.fixture
+def no_real_cli(monkeypatch):
+    """The net under every gate test. Each one replaces the check at the module
+    seam or drives it through `which`; a gate that ever bypassed the seam finds
+    no `claude` on PATH here instead of spawning the real one on this machine."""
+    monkeypatch.setattr(env.shutil, "which", lambda name: None)
+
+
+def _check_answering(ok, msg, details):
+    """A stand-in for `check_claude_environment`, patched at the module seam."""
+    def check(which=None, run=None):
+        return ok, msg, details
+
+    return check
+
+
+@pytest.mark.parametrize("kwargs, named", [
+    ({}, "hive lintester"),
+    ({"argv0": "hive probe"}, "hive probe"),
+])
+def test_a_refusing_gate_exits_three_and_says_why_exactly_once(
+        monkeypatch, capsys, no_real_cli, kwargs, named):
+    monkeypatch.setattr(env, "check_claude_environment",
+                        _check_answering(False, "no claude here", {}))
+    exits = []
+
+    got = env.enforce_preflight_gate(exit=exits.append, **kwargs)
+
+    assert exits == [3] and exits == [env.EXIT_ENVIRONMENT_REFUSAL]
+    assert got is None, "a refusal handed back what a caller could read as a pass"
+    out, err = capsys.readouterr()
+    assert out == "", "the refusal went to stdout"
+    # §10.9.2 writes the frame FIRST, so a wrapper can anchor on it
+    # (`^\[FATAL PREFLIGHT REFUSAL`); the command's name follows it.
+    assert err.startswith(FATAL), err
+    assert err == f"{FATAL}{named}: no claude here\n", err
+    assert err.count(FATAL) == 1 and err.count("\n") == 1, (
+        "the refusal is one line, printed once")
+
+
+def test_a_passing_gate_returns_the_details_and_never_exits(
+        monkeypatch, capsys, no_real_cli):
+    details = {"loggedIn": True, "authMethod": "claude.ai",
+               "subscriptionType": "max"}
+    monkeypatch.setattr(env, "check_claude_environment",
+                        _check_answering(True, "ready", details))
+    exits = []
+
+    got = env.enforce_preflight_gate(exit=exits.append)
+
+    assert got == details
+    assert exits == [], "a passing gate called exit"
+    assert capsys.readouterr() == ("", ""), "a passing gate printed"
+    # The canary: the same spy and the same capture DO see a refusal.
+    monkeypatch.setattr(env, "check_claude_environment",
+                        _check_answering(False, "no", {}))
+    env.enforce_preflight_gate(exit=exits.append)
+    assert exits == [3]
+    assert FATAL in capsys.readouterr().err
+
+
+def test_the_default_gate_leaves_the_process_with_status_three(
+        monkeypatch, no_real_cli):
+    monkeypatch.setattr(env, "check_claude_environment",
+                        _check_answering(False, "no claude here", {}))
+
+    with pytest.raises(SystemExit) as exc:
+        env.enforce_preflight_gate()
+
+    assert exc.value.code == 3
+
+
+def test_the_gate_asks_the_real_check_through_the_real_probe(
+        capsys, no_real_cli):
+    """No stand-in for the check here. `which` answering nothing drives the
+    whole chain -- gate, check, `preflight`'s probe -- without spawning."""
+    exits = []
+
+    env.enforce_preflight_gate(exit=exits.append)
+
+    assert exits == [3]
+    err = capsys.readouterr().err
+    assert FATAL in err and "claude" in err.lower(), err

@@ -59,7 +59,7 @@ JS = """\
     const gap = dropped
       ? '[' + dropped + ' earlier bytes dropped \\u2014 the buffer is capped]\\n\\n'
       : '';
-    // The bar is drawn from the NUMBER, never from the tail. A `\r` frame
+    // The bar is drawn from the NUMBER, never from the tail. A `\\r` frame
     // never reaches the byte stream the tail is built from -- the ring holds
     // the live one back and reports it as `progress_pct` (jobs.OutputRing),
     // precisely so a reader does not have to re-parse carriage returns it

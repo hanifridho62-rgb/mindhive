@@ -8,8 +8,9 @@ string.
 
 ## What this file is, after the split
 
-The SHELL only — the ``<head>``, the header, the nav, the panel, and the splice
-chain that assembles everything else into them. The stylesheet and the ~2050
+The SHELL only — the ``<head>``, the header, the rail (the sections ``<nav>``
+and the ``#actions`` group under it), the panel, and the splice chain that
+assembles everything else into them. The stylesheet and the ~2050
 lines of page JS live in sibling modules, one per concern, because this file was
 2396 lines: more than twice the project's 1000-line cap, which this docstring
 used to record as a debt both this file and ``dashboard.py`` carried. Both are
@@ -18,6 +19,13 @@ back.
 
 Spliced in, in the order the browser needs them:
 
+* ``static/dashboard.js`` — FIRST in the script, and from a FILE rather than
+  a module: ``window.MindHive``, the paint-signature helper and the latched
+  poller (blueprint Pillar 4), read once at import through
+  ``importlib.resources`` (``DASHBOARD_JS``) and served on its own at
+  ``/static/dashboard.js`` by ``dashboard_get_v1``. It declares nothing
+  outside its own closure and touches no DOM while loading, which is what
+  lets it go ahead of everything.
 * ``dashboard_css.CSS`` — this page's own stylesheet, including the
   reduced-motion guard for every animation it declares.
 * ``dashboard_js_core.script()`` — element handles, the real-time engine, the
@@ -29,13 +37,17 @@ Spliced in, in the order the browser needs them:
   Recall, Graph, Workspace, Append.
 * ``dashboard_js_skills.JS`` — the Skill & Plugin panel.
 * ``dashboard_js_actions.JS`` — the six long operations as polled jobs, the cat
-  board's poll, and the boot sequence. LAST, and it has to be: those are the only
-  statements on the page that execute at parse time instead of declaring a
-  function.
+  board's poll, and the boot sequence. LAST, and it has to be: apart from the
+  static file's closure, which only hangs a namespace on ``window``, those are
+  the only statements on the page that execute at parse time instead of
+  declaring a function.
 
 The fragments are spliced FIRST in the chain, before ``__TOKEN__`` and the
 ``theme``/``cat_board``/``taskview`` placeholders, because those placeholders
 live inside the fragments' text. Any other order would leave them unreplaced.
+``static/dashboard.js`` is spliced LAST, after every placeholder is gone, so
+it arrives byte for byte: nothing in a file that is also served verbatim is
+ever read as a placeholder.
 
 **The page is ONE ``<script>``.** The JS modules are a division for readers and
 for the cap; they buy no isolation. Every fragment shares one scope, function
@@ -53,6 +65,7 @@ colour palette this document's CSS is written against: the same argument, for th
 152 hex literals that used to be repeats of a value chosen somewhere else. Both
 are themselves pure presentation, so this stays a presentation-only module."""
 import json
+from importlib import resources
 
 from . import cat_board, theme
 from . import dashboard_css
@@ -116,7 +129,7 @@ PAINT_GUARD_JS = """\
 # they are never told about — and the tooltip says "kept", not "going away",
 # because that is the decision that was made.
 MINDSWARM_NAV_BUTTON = (
-    """<button data-sec="ws-swarm" onclick="showWorkspace('swarm')" """
+    """<button class="nav-link" data-sec="ws-swarm" onclick="showWorkspace('swarm')" """
     """title="Kept and still supported. New work goes through the mission """
     """pipeline; start the dashboard with MINDHIVE_MINDSWARM=0 to hide """
     """this row.">MindSwarm</button>""")
@@ -135,6 +148,16 @@ SWARM_HIDDEN_NOTE = (
     "row -- this process read its environment at launch and cannot see "
     "a change made in a shell after it. Nothing was removed: "
     "/api/workspace/swarm still answers. -->")
+
+
+# `static/dashboard.js` (blueprint Pillar 4), read ONCE, at import, and through
+# `importlib.resources` rather than a path beside `__file__`: the frozen build
+# has no source tree to walk -- the rule `pgmirror` set for its migrations, and
+# the reason `build/build_app.py` collects the package's data. The page inlines
+# it at the top of its one script block; `dashboard_get_v1` serves the same
+# string at `/static/dashboard.js`.
+DASHBOARD_JS = (resources.files("mindhive") / "static" / "dashboard.js").read_text(
+    encoding="utf-8")
 
 
 def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
@@ -178,6 +201,11 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
   <!--__CAT_HTML__-->
 </header>
 <main>
+  <!-- The rail: two landmarks in one sticky column. `nav` holds the sixteen
+       buttons that take you somewhere, each with a `data-sec`; `#actions` holds
+       the ten that DO something (blueprint Bug 13). Assistive tech lists
+       "sections" and "actions" as two things, because they are. -->
+  <div id="rail">
   <nav aria-label="sections">
     <!-- ONE indicator that travels, rather than sixteen that light up. The
          active button carries the STATE (`.on` for the eye, `aria-current` for
@@ -186,39 +214,45 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
          section therefore animates one compositor property on one node instead
          of repainting two rows of buttons. -->
     <span id="navdot" aria-hidden="true"></span>
-    <button data-sec="overview" onclick="showOverview()">Overview</button>
+    <button class="nav-link" data-sec="overview" onclick="showOverview()">Overview</button>
     <div class="group">Work</div>
-    <button data-sec="oversee" onclick="showOversee()">Oversee</button>
+    <button class="nav-link" data-sec="oversee" onclick="showOversee()">Oversee</button>
     <div class="group">Memory</div>
-    <button data-sec="memory" onclick="showMemory()">Memory</button>
-    <button data-sec="sessions" onclick="showSessions()">Sessions</button>
-    <button data-sec="improvements" onclick="showImprovements(true)">Improvements</button>
-    <button data-sec="log" onclick="showLog()">Log</button>
-    <button data-sec="sops" onclick="showSops()">SOP</button>
+    <button class="nav-link" data-sec="memory" onclick="showMemory()">Memory</button>
+    <button class="nav-link" data-sec="sessions" onclick="showSessions()">Sessions</button>
+    <button class="nav-link" data-sec="improvements" onclick="showImprovements(true)">Improvements</button>
+    <button class="nav-link" data-sec="log" onclick="showLog()">Log</button>
+    <button class="nav-link" data-sec="sops" onclick="showSops()">SOP</button>
+    <!-- A section, not a command -- it opens a form -- so it lives with the
+         Memory sections it writes to, not with the actions it used to sit
+         beside. -->
+    <button class="nav-link" data-sec="append" onclick="showAppend()">Append memory</button>
     <div class="group">View</div>
-    <button data-sec="state" onclick="showState()">State</button>
-    <button data-sec="briefing" onclick="showBriefing()">Briefing</button>
-    <button data-sec="recall" onclick="showRecall()">Recall</button>
-    <button data-sec="graph" onclick="showGraph()">Graph</button>
-    <button data-sec="skills" onclick="showSkillPanel()">Skill &amp; Plugin</button>
+    <button class="nav-link" data-sec="state" onclick="showState()">State</button>
+    <button class="nav-link" data-sec="briefing" onclick="showBriefing()">Briefing</button>
+    <button class="nav-link" data-sec="recall" onclick="showRecall()">Recall</button>
+    <button class="nav-link" data-sec="graph" onclick="showGraph()">Graph</button>
+    <button class="nav-link" data-sec="skills" onclick="showSkillPanel()">Skill &amp; Plugin</button>
     <div class="group">Workspace</div>
-    <button data-sec="ws-parallel" onclick="showWorkspace('parallel')">MindParallel</button>
+    <button class="nav-link" data-sec="ws-parallel" onclick="showWorkspace('parallel')">MindParallel</button>
     <!--__SWARM_NAV__-->
-    <button data-sec="ws-research" onclick="showWorkspace('research')">Self-Reliant</button>
-    <div class="group">Actions</div>
-    <button data-sec="append" onclick="showAppend()">Append memory</button>
-    <button onclick="doExport()">Export handoff.md</button>
-    <button onclick="doAction('/api/project','Project (rebuild)')">Project</button>
-    <button onclick="doAction('/api/sync','Sync')">Sync</button>
-    <button onclick="runJob('/api/harvest','Catching up')">Catch up</button>
-    <button onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
-    <div class="group">Heavy</div>
-    <button onclick="runEmbed()">Embed</button>
-    <button onclick="confirmJob('/api/plugins/scan','Plugins scan')">Plugins scan</button>
-    <button onclick="runReflect()">Reflect (learn from failures)</button>
-    <button onclick="runResolve()">Resolve red (reroute failed rules)</button>
-    <button onclick="confirmJob('/api/selftest','Self-test')">Self-test</button>
+    <button class="nav-link" data-sec="ws-research" onclick="showWorkspace('research')">Self-Reliant</button>
   </nav>
+  <div id="actions" role="group" aria-label="actions">
+    <div class="group">Actions</div>
+    <button class="nav-action" onclick="doExport()">Export handoff.md</button>
+    <button class="nav-action" onclick="doAction('/api/project','Project (rebuild)')">Project</button>
+    <button class="nav-action" onclick="doAction('/api/sync','Sync')">Sync</button>
+    <button class="nav-action" onclick="runJob('/api/harvest','Catching up')">Catch up</button>
+    <button class="nav-action" onclick="doAction('/api/verify','Verify chain', 'GET')">Verify</button>
+    <div class="group">Heavy</div>
+    <button class="nav-action" onclick="runEmbed()">Embed</button>
+    <button class="nav-action" onclick="confirmJob('/api/plugins/scan','Plugins scan')">Plugins scan</button>
+    <button class="nav-action" onclick="runReflect()">Reflect (learn from failures)</button>
+    <button class="nav-action" onclick="runResolve()">Resolve red (reroute failed rules)</button>
+    <button class="nav-action" onclick="confirmJob('/api/selftest','Self-test')">Self-test</button>
+  </div>
+  </div>
   <!-- The screen-reader channel. Until the nav stopped being disabled during a
        fetch, `disabled` on every nav button WAS the only signal assistive tech
        got that the app was busy — a side effect of a lock, not a statement. It
@@ -252,6 +286,7 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
      whether it is visible. -->
 <button id="totop" aria-label="back to top" title="back to top">&uarr; top</button>
 <script>
+/*__STATIC_JS__*/
 /*__JS_CORE__*/
 /*__JS_IMPROVE__*/
 /*__JS_OVERSEE__*/
@@ -278,4 +313,5 @@ def render_page(token: str, tasks_css: str = "", tasks_js: str = "",
     .replace("__TOKEN__", json.dumps(token)) \
     .replace("/*__TASKS_CSS__*/", tasks_css) \
     .replace("//__TASKS_JS__", tasks_js) \
-    .replace("/*__EXTRA_JS__*/", extra_js)
+    .replace("/*__EXTRA_JS__*/", extra_js) \
+    .replace("/*__STATIC_JS__*/", DASHBOARD_JS)

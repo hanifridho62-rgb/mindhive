@@ -339,6 +339,26 @@ function Get-MindhivePython {
     return $null
 }
 
+# `Resolve-MindHivePython` is the name MEB HOOK-02, spec 10.13.1 and the
+# `windows-powershell-patterns` skill give this resolver. It is a NAME, not a
+# second resolver. Spec 10.13.1's standalone body differs from the one above
+# on every tier -- a bare `Test-Path` that accepts a directory; a five-level
+# walk that starts from `$MyInvocation.MyCommand.Path`, which is `$null`
+# inside a function; `python.exe` alone on PATH; no `-Windowed`; and, when
+# nothing resolves, the bare name `python.exe`, which `&` would look up at
+# call time, Store redirector included -- and two bodies for one contract
+# drift the moment one of them is edited.
+#
+# The switch is declared and passed on by value rather than splatted with
+# `@args`: in 5.1, `@args` re-binds `-Windowed:$false` as the bare, PRESENT
+# switch and hands the `$false` on as a stray positional that
+# `Get-MindhivePython` swallows, so an explicit `$false` answered
+# `pythonw.exe` (measured).
+function Resolve-MindHivePython {
+    param([switch]$Windowed)
+    Get-MindhivePython -Windowed:$Windowed
+}
+
 # The characters a `session_id` may contain. It names a ledger segment:
 # `events.append_event` writes `<events>/<session_id>.jsonl`, so a value with a
 # separator, a `..`, or a drive letter in it is a path, not an id. The Python

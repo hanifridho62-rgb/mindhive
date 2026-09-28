@@ -66,6 +66,12 @@ where = ["src"]
 # these patterns, so a typo'd package name or a `*.psql` cannot satisfy the
 # declaration while shipping nothing.
 [tool.setuptools.package-data]
+# `static/*.js` is the dashboard's own data file, read through
+# `importlib.resources` when `dashboard_page` is imported -- a wheel without it
+# has a dashboard that cannot import its own page.
+# `tests/test_static_dashboard_js.py` globs the pattern against the package
+# directory the way setuptools resolves it.
+"mindhive" = ["static/*.js"]
 "mindhive.pgmigrations" = ["*.sql"]
 
 [tool.pytest.ini_options]

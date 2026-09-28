@@ -27,10 +27,16 @@ file (the synced MEMORY.md) that a ledger fingerprint cannot see move, so they
 are computed on every request -- one directory walk
 (`worksession_usage.memory_path_index`) and one autosync-registry read shared by
 every namespace, and one small file read per namespace that has a digest.
+
+``/static/dashboard.js`` (blueprint P5, Pillar 4) serves
+`dashboard_page.DASHBOARD_JS` -- the same string the page inlines at the top of
+its one script block -- as ``application/javascript``, behind the token check
+every route but ``/`` gets.
 """
 from . import events, initiatives, worksession_usage, worksessions
 from .dashboard_data import _all_projects
 from .dashboard_memo import _OVERSEE_MEMO_MAX, _BoundedMemo, _fingerprinted
+from .dashboard_page import DASHBOARD_JS
 
 # {project: (fingerprint, {"sessions": [...], "initiatives": [...]})} -- bounded
 # for the namespace count, like every memo HIVE MIND fills in one request.
@@ -87,8 +93,13 @@ class GetRoutesV1:
                            "initiatives": found, "usage": usage,
                            "context_budget_tokens": worksessions.CONTEXT_BUDGET_TOKENS})
 
+    def _get_static_dashboard_js(self, proj, am, qs):
+        """`static/dashboard.js`, the same string the page inlines."""
+        return self._send(200, DASHBOARD_JS, "application/javascript; charset=utf-8")
+
     _GET_ROUTES_V1 = {
         "/api/worksessions": _get_worksessions,
+        "/static/dashboard.js": _get_static_dashboard_js,
     }
 
 

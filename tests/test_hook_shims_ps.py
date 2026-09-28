@@ -1367,3 +1367,217 @@ def test_pre_compact_still_reminds_the_human_with_no_interpreter(tmp_path):
                      "PATH": r"C:\Windows\System32;C:\Windows"})
     assert r2.returncode == 0, r2.stderr
     assert REMINDER in r2.stdout, r2.stdout
+
+
+# --- Resolve-MindHivePython: the MEB's name for Get-MindhivePython (Bug 1) -----
+#
+# MEB HOOK-02, spec 10.13.1 and the `windows-powershell-patterns` skill call the
+# resolver `Resolve-MindHivePython`; this library shipped it as
+# `Get-MindhivePython`, and every shim calls that. The binding plan answers with
+# a delegating function, not a second resolver: spec 10.13.1's standalone body
+# disagrees with `Get-MindhivePython` on most of the tiers pinned above (a bare
+# `Test-Path` that accepts a directory, a fixed five-level walk from
+# `$MyInvocation`, `python.exe` handed back when nothing resolves), and two
+# implementations of one contract is the drift this library was written to
+# end. Each test compares the two names on ONE fixture and asserts the file as
+# well, so two functions broken the same way cannot pass as agreement.
+
+def _windowed_venv(tmp_path):
+    """A venv whose `Scripts\\` holds both leaves, so `-Windowed` changes the
+    answer. Answers `(console, windowless, env)`. `MINDHIVE_PYTHON` stays
+    unset: the override wins before the leaf list is even built, so under it
+    `-Windowed` changes nothing and no comparison could see the switch."""
+    repo = tmp_path / "repo"
+    console = fake_exe(repo / ".venv" / "Scripts" / "python.exe")
+    windowless = fake_exe(repo / ".venv" / "Scripts" / "pythonw.exe")
+    hooks = repo / "hooks"
+    hooks.mkdir(parents=True)
+    env = {"MINDHIVE_HOOK_DIR": str(hooks), "MINDHIVE_HOOK_WALK_LIMIT": "2",
+           "PATH": r"C:\Windows\System32;C:\Windows"}
+    return console, windowless, env
+
+
+@windows_only
+def test_resolve_mindhive_python_answers_exactly_what_get_mindhive_python_does(tmp_path):
+    """One probe, four settings, both names, and each row's file asserted too:
+      * `override` -- `MINDHIVE_PYTHON` names a runnable file, which beats the
+        venv the walk would also reach.
+      * `override-is-a-directory` -- spec 10.13.1's bare `Test-Path` takes the
+        directory; both names must refuse it and walk on to the venv.
+      * `venv` -- no override, so the walk answers.
+      * `nothing` -- no override, no venv in reach, no interpreter on PATH:
+        both answer NOTHING. Spec 10.13.1 returns `python.exe` here, a bare
+        name `&` would look up at call time -- the Store redirector included --
+        where `$null` lets every shim's `if (-not $py)` exit 0 in silence."""
+    repo = tmp_path / "repo"
+    venv = fake_exe(repo / ".venv" / "Scripts" / "python.exe")
+    hooks = repo / "hooks"
+    hooks.mkdir(parents=True)
+    override = fake_exe(tmp_path / "custom" / "python.exe")
+    folder = tmp_path / "notaninterpreter"
+    folder.mkdir()
+    isolated = tmp_path / "iso" / "hooks"
+    isolated.mkdir(parents=True)
+    rows = [
+        # (id, MINDHIVE_PYTHON -- None means unset, MINDHIVE_HOOK_DIR, expected)
+        ("override", override, hooks, str(override)),
+        ("override-is-a-directory", folder, hooks, str(venv)),
+        ("venv", None, hooks, str(venv)),
+        ("nothing", tmp_path / "absent.exe", isolated, ""),
+    ]
+    body = []
+    for row, value, hook_dir, _ in rows:
+        if value is None:
+            body.append("Remove-Item Env:MINDHIVE_PYTHON -ErrorAction SilentlyContinue")
+        else:
+            body.append("$env:MINDHIVE_PYTHON = %s" % ps_quote(value))
+        body.append("$env:MINDHIVE_HOOK_DIR = %s" % ps_quote(hook_dir))
+        body.append("Write-Output ('%s|' + (Get-MindhivePython) + '|' + "
+                    "(Resolve-MindHivePython))" % row)
+    r = eval_ps("\n".join(body), tmp_path=tmp_path,
+                env={"MINDHIVE_HOOK_WALK_LIMIT": "2",
+                     "PATH": r"C:\Windows\System32;C:\Windows"})
+    assert r.stderr.strip() == "", r.stderr
+    got = [line.split("|") for line in r.stdout.splitlines() if line.strip()]
+    assert got == [[row, want, want] for row, _, _, want in rows], r.stdout
+
+
+@windows_only
+def test_resolve_mindhive_python_forwards_windowed(tmp_path):
+    """`-Windowed` reaches `Get-MindhivePython`: the windowless interpreter
+    `autosync.ps1` asks for is the same file under either name.
+
+    CANARY in the same probe: `Resolve-DroppingWindowed`, a delegation that
+    forgets its arguments, is asked for `-Windowed` and must answer the CONSOLE
+    leaf. That proves this fixture tells the two leaves apart, so the assertion
+    on `Resolve-MindHivePython -Windowed` is one a dropped switch would fail."""
+    console, windowless, env = _windowed_venv(tmp_path)
+    r = eval_ps("function Resolve-DroppingWindowed { Get-MindhivePython }\n"
+                "Write-Output ('GET|' + (Get-MindhivePython -Windowed))\n"
+                "Write-Output ('RESOLVE|' + (Resolve-MindHivePython -Windowed))\n"
+                "Write-Output ('DROPPED|' + (Resolve-DroppingWindowed -Windowed))",
+                tmp_path=tmp_path, env=env)
+    assert r.stderr.strip() == "", r.stderr
+    assert r.stdout.splitlines() == ["GET|%s" % windowless,
+                                     "RESOLVE|%s" % windowless,
+                                     "DROPPED|%s" % console], r.stdout
+
+
+@windows_only
+def test_resolve_mindhive_python_honours_an_explicit_windowed_false(tmp_path):
+    """`-Windowed:$false` means the console interpreter, exactly as it does for
+    `Get-MindhivePython`; a caller that computes the switch
+    (`-Windowed:$scheduled`) depends on it.
+
+    The plan's one-liner, `function Resolve-MindHivePython { Get-MindhivePython
+    @args }`, answers `pythonw.exe` here on 5.1 (measured while this was
+    written): splatting `$args` re-binds `-Windowed:` as the bare, PRESENT
+    switch and passes the `$false` on as a stray positional, which
+    `Get-MindhivePython` -- no `[CmdletBinding()]` -- collects into its own
+    `$args` without a word. The `$true` and bare rows are the canary: they
+    prove the windowless leaf is reachable, so the console answer on the
+    `$false` row is the switch being honoured, not a leaf the walk never saw."""
+    console, windowless, env = _windowed_venv(tmp_path)
+    r = eval_ps("Write-Output ('FALSE|' + (Resolve-MindHivePython -Windowed:$false))\n"
+                "Write-Output ('TRUE|' + (Resolve-MindHivePython -Windowed:$true))\n"
+                "Write-Output ('BARE|' + (Resolve-MindHivePython -Windowed))",
+                tmp_path=tmp_path, env=env)
+    assert r.stderr.strip() == "", r.stderr
+    assert r.stdout.splitlines() == ["FALSE|%s" % console,
+                                     "TRUE|%s" % windowless,
+                                     "BARE|%s" % windowless], r.stdout
+
+
+@windows_only
+def test_resolve_mindhive_python_is_a_function_the_library_defines(tmp_path):
+    """Dot-sourcing `lib.ps1` defines the name, and as a FUNCTION, the shape
+    the plan specifies: a `Set-Alias` to `Get-MindhivePython` would answer
+    `Alias` here."""
+    r = eval_ps("Write-Output (Get-Command Resolve-MindHivePython).CommandType",
+                tmp_path=tmp_path)
+    assert r.stderr.strip() == "", r.stderr
+    assert r.stdout.strip() == "Function", r.stdout
+
+
+# --- session_start checks the plugin cache (spec Bug 8) -------------------------
+#
+# The `.ps1` half of the same section in `tests/test_hook_shims.py`: Claude Code
+# runs a plugin from its copy under `~/.claude/plugins/cache/`, and
+# `mindhive plugins cache-check --hook` says so -- one line, only on drift --
+# when that copy is not this checkout's. `session_start.ps1` must run it after
+# `state`, forward its line the way it forwards `state`'s, and keep a failure of
+# it off the hook's stderr.
+
+CACHE_CHECK = "-m mindhive plugins cache-check --hook"
+
+
+def session_start_interpreter(tmp_path: Path, log: Path) -> Path:
+    """An 'interpreter' for `session_start`: each call appends its argv to *log*
+    and prints `child stdout: <argv>`, so the hook's stdout shows which calls
+    it forwarded, in order. With `STUB_FAIL` set, the call whose fourth
+    argument equals it prints `child stderr: <argv>` on stderr and exits 3
+    instead. Each redirection LEADS its `echo`, so an argv ending in a digit
+    (`--max-age-hours 24`) cannot be read as a handle number, and no trailing
+    space reaches the log."""
+    stub = tmp_path / "session_start_stub.cmd"
+    stub.write_text(
+        "@echo off\r\n"
+        ">>\"%s\" echo %%*\r\n"
+        "if defined STUB_FAIL if \"%%4\"==\"%%STUB_FAIL%%\" (\r\n"
+        "    >&2 echo child stderr: %%*\r\n"
+        "    exit /b 3\r\n"
+        ")\r\n"
+        "echo child stdout: %%*\r\n" % log,
+        encoding="ascii")
+    return stub
+
+
+def _calls(log: Path) -> list:
+    return (log.read_text(encoding="ascii", errors="replace").splitlines()
+            if log.exists() else [])
+
+
+@windows_only
+def test_session_start_checks_the_plugin_cache_right_after_state(tmp_path):
+    """The check is the very next call after `state`, and its answer reaches
+    the hook's stdout -- the new session's context -- right after the state it
+    qualifies, the way `state`'s own answer does. The stub prints for EVERY
+    call, so the exact stdout also pins what is not forwarded: the `append`
+    bookkeeping and the detached background calls."""
+    dest = _copy_family(tmp_path)
+    log = tmp_path / "argv.log"
+    stub = session_start_interpreter(tmp_path, log)
+    r = run_ps(dest / "session_start.ps1", stdin=PAYLOAD,
+               env={"MINDHIVE_PYTHON": str(stub)})
+    assert r.returncode == 0, r.stderr
+    calls = _calls(log)
+    assert "-m mindhive state" in calls, calls
+    at = calls.index("-m mindhive state")
+    assert calls[at + 1:at + 2] == [CACHE_CHECK], calls
+    assert r.stdout.splitlines() == ["child stdout: -m mindhive directives",
+                                     "child stdout: -m mindhive state",
+                                     "child stdout: " + CACHE_CHECK], r.stdout
+
+
+@windows_only
+def test_a_failing_plugin_cache_check_leaves_session_start_quiet_and_exit_0(tmp_path):
+    """`--hook` is fail-open on the Python side, and the shim does not lean on
+    that: a check that dies loudly -- a line on stderr, exit 3 -- costs the
+    session its one line and nothing else. The hook exits 0, prints nothing on
+    stderr, and forwards exactly what it forwards without the check. The log
+    proves the check RAN, so the quiet is the shim's doing rather than a call
+    that never happened, and the stub run bare proves the failure is loud."""
+    dest = _copy_family(tmp_path)
+    log = tmp_path / "argv.log"
+    stub = session_start_interpreter(tmp_path, log)
+    env = {"MINDHIVE_PYTHON": str(stub), "STUB_FAIL": "cache-check"}
+    r = run_ps(dest / "session_start.ps1", stdin=PAYLOAD, env=env)
+    assert r.returncode == 0, r.stderr
+    assert r.stderr == "", r.stderr
+    assert CACHE_CHECK in _calls(log), _calls(log)
+    assert r.stdout.splitlines() == ["child stdout: -m mindhive directives",
+                                     "child stdout: -m mindhive state"], r.stdout
+    bare = subprocess.run([str(stub)] + CACHE_CHECK.split(), capture_output=True,
+                          text=True, env=clean_env(env), timeout=30)
+    assert (bare.returncode, bare.stdout, bare.stderr) == (
+        3, "", "child stderr: " + CACHE_CHECK + "\n")

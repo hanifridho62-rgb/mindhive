@@ -28,7 +28,16 @@ or all-literals — the reader cannot tell whether the gap is a decision.
 
 `--text-strong` and `--paper` hold the same value today and are still two tokens:
 one is the brightest text in a dark interface, the other is the paper the graph
-iframe draws on. They coincide; they are not the same decision.
+iframe draws on. They coincide; they are not the same decision. `--dim` and
+`--muted` coincide the same way since blueprint K12 lifted the furniture grey
+to AA: the tier survives as a name, so a later retune can part them again
+without touching a rule.
+
+Every text token clears WCAG AA for normal text (4.5:1) on `--surface` and on
+`--bg`, measured by `contrast_ratio` below. `tests/test_theme_contrast.py`
+holds every token to that threshold and pins, to two places, each ratio a
+document quotes (6.87 and 7.22 for `--dim`, 4.51 and 4.60 for `--dimmest`);
+the MEB's flat palette is `BLUEPRINT_PALETTE`, a view of the same values.
 
 The iframe pages (`workspace_page`, `swarm_page`, `research_page`) are separate
 DOCUMENTS, so custom properties do not reach them from the shell — a `:root` in
@@ -43,7 +52,7 @@ same three everywhere, which is exactly the kind of value that drifts. They get
 # CSS keeps them, so the palette reads as an interface description.
 PALETTE = {
     "surfaces": {
-        "bg": ("#11131a", "the page behind everything"),
+        "bg": ("#12151c", "the page behind everything"),
         "surface": ("#171a23", "the header band"),
         "rail": ("#141722", "the nav rail"),
         "sunken": ("#0c0e14", "recessed: inputs, cards, pre#out, list rows"),
@@ -57,13 +66,18 @@ PALETTE = {
         "dot-idle": ("#3a4054", "an indicator that is off (header dot, status dot)"),
     },
     "text": {
-        "text": ("#e6e8ef", "body text"),
+        "text": ("#e2e8f0", "body text"),
         "text-strong": ("#fff", "the brightest text: a count inside a pill"),
         "field-text": ("#dfe6f3", "text the user typed, in an input or textarea"),
         "muted": ("#9aa3b8", "labels and secondary lines"),
         "faint": ("#8a93a6", "present but inactive: dismissed, pending, duplicate"),
-        "dim": ("#6b7488", "furniture: group headings, timestamps"),
-        "dimmest": ("#555c6e", "skipped — the quietest thing still rendered"),
+        # K12: was #6b7488, 3.71:1 on --surface -- under AA for text.
+        "dim": ("#9aa3b8", "furniture: group headings, timestamps"),
+        # K12: was #555c6e, 2.60:1 on --surface and 2.65:1 on the --inset it is
+        # drawn on. The same grey at a higher lightness -- hue and saturation
+        # kept -- the darkest one that clears 4.5:1 on both, and still under
+        # `faint`: a skipped step reads quieter than a pending one beside it.
+        "dimmest": ("#798297", "skipped — the quietest thing still rendered"),
     },
     # The three that every document agrees on — see SHARED_GROUPS.
     "status": {
@@ -108,6 +122,10 @@ PALETTE = {
     # rule that draws it, because a declared-but-unused token fails the audit.
     "blueprint": {
         "accent": ("#3182ce", "the context-usage fill and initiative flags (MEB accent)"),
+        "border": ("#282d3d", "the line between the sections and the commands"),
+        "success": ("#38a169", "a run that completed, on an Oversee card"),
+        "warning": ("#dd6b20", "a tripped circuit breaker, on an Oversee card"),
+        "danger": ("#e53e3e", "a run a CI check failed, on an Oversee card"),
     },
 }
 
@@ -151,3 +169,35 @@ def render(groups=None, indent="  ") -> str:
 # into it), and the status-only block for the iframe documents.
 PALETTE_CSS = render()
 STATUS_CSS = render(SHARED_GROUPS)
+
+# The MEB's flat palette (blueprint K12), verbatim and in its order. A VIEW of
+# `PALETTE`, never a second copy: `tests/test_theme_contrast.py` holds it to
+# the MEB's values and to what `tokens()` resolves.
+BLUEPRINT_PALETTE = {name: tokens()[name] for name in (
+    "bg", "surface", "border", "text", "dim", "accent", "success", "warning", "danger")}
+
+
+def relative_luminance(hex_colour: str) -> float:
+    """WCAG 2.x relative luminance of `#rgb` or `#rrggbb`, 0.0 (black) to
+    1.0 (white). Anything else -- an alpha channel included, which no ratio
+    can answer without a backdrop, and a value that is not a str at all -- is
+    a ValueError."""
+    if not isinstance(hex_colour, str):
+        raise ValueError(f"not a #rgb or #rrggbb colour: {hex_colour!r}")
+    digits = hex_colour[1:] if hex_colour.startswith("#") else ""
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    if len(digits) != 6 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+        raise ValueError(f"not a #rgb or #rrggbb colour: {hex_colour!r}")
+    lin = []
+    for i in (0, 2, 4):
+        c = int(digits[i:i + 2], 16) / 255
+        lin.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG 2.x contrast ratio, lighter over darker: 1.0 to 21.0, whichever
+    colour is named first. AA wants 4.5 for text and 3.0 for other marks."""
+    a, b = relative_luminance(fg), relative_luminance(bg)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)

@@ -50,10 +50,11 @@ from .pgshape import (                                          # noqa: F401
     TIMEOUT_MS_DEFAULT, TIMEOUT_MS_CEILING, WIRE_MAX_BYTES,
     RESPONSE_MAX_BYTES_DEFAULT, RESPONSE_MAX_BYTES_CEILING, RESPONSE_BYTES_ENV,
     PAYLOAD_ROW_BUDGET, STRING_HEAD, TEXT_HEAD, OBJECT_KEY_LIST, SUMMARY_CAPS,
+    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE_CEILING, MAX_FIELD_CHARS,
     ERROR_CODES, _REASON_TO_WIRE, _REMEDIES, _CREDENTIALS,
     response_byte_cap, _jsonable, _size, _descriptor, summarise_payload,
     stream_rows, shape_rows, new_truncated, notice_for, envelope, scrub,
-    error_envelope, _fit_response,
+    error_envelope, _fit_response, paginate_records, trim_field_content,
 )
 
 

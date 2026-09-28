@@ -24,6 +24,14 @@ def main() -> int:
         "--onefile",
         "--name", "MindHive",
         "--paths", str(ROOT / "src"),
+        # PyInstaller follows imports and bundles nothing the code merely
+        # opens. The package READS two kinds of file: `static/dashboard.js`,
+        # which `dashboard_page` inlines at import (a frozen build without it
+        # cannot import its own page), and `pgmigrations/*.sql`, which the
+        # mirror applies (without them it finds zero migrations and reports
+        # success). `--collect-data` ships every data file under the package;
+        # `tests/test_build_app.py` pins the flag.
+        "--collect-data", "mindhive",
     ]
     if ICON.exists():
         args += ["--icon", str(ICON)]
