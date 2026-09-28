@@ -212,10 +212,17 @@ def add_ui(sub) -> None:
                          "24/7 panel is already there, this just opens it)")
     up.add_argument("--no-browser", dest="no_browser", action="store_true",
                     help="don't auto-open the browser")
+    # Default None, not 60.0 (blueprint P8): the handler must be able to tell
+    # an absent flag from `--idle-cutoff 60`, because only the absent flag
+    # lets MINDHIVE_UI_IDLE_CUTOFF_S decide. The number itself stays in
+    # `server.lifecycle`, read there at call time -- not imported here, so
+    # `hive --help` still builds without the server package.
     up.add_argument("--idle-cutoff", dest="idle_cutoff", type=float,
-                    default=60.0,
+                    default=None,
                     help="shut down after this many seconds with no page "
-                         "beating (default: 60)")
+                         "beating (default: 60, or MINDHIVE_UI_IDLE_CUTOFF_S "
+                         "when that is set to a positive number; the flag "
+                         "wins)")
     up.add_argument("--asgi", action="store_true",
                     help="serve through FastAPI/uvicorn instead of the stdlib "
                          "server (needs `pip install -e .[ui]`)")

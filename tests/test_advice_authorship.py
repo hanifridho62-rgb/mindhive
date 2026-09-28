@@ -640,7 +640,11 @@ SPAWNERS = {
 }
 
 TOOL_SPAWNERS = {
-    "autoresume.py", "changelog.py", "ci/runner.py", "clusters.py",
+    "autoresume.py",
+    # blueprint P8 (MEB K15): `hive bench cli-startup` times children of THIS
+    # interpreter importing the CLI -- no session, no model, no agent.
+    "bench_scenarios.py",
+    "changelog.py", "ci/runner.py", "clusters.py",
     "commands/context_ops.py", "context.py", "dashboard.py",
     "mindnet/controller.py", "mindnet/worktree.py",
     "orchestrator/environment.py", "orchestrator/metrics.py", "paths.py",
@@ -1453,7 +1457,14 @@ def test_defang_is_linear_on_input_built_to_make_it_backtrack(text):
 # A new site in a listed module changes the first number and fails this test;
 # whoever adds it decides whether what it starts is an agent, and updates the row.
 SPAWN_SITES = {
-    "autoresume.py": (1, 0), "changelog.py": (1, 0),
+    "autoresume.py": (1, 0),
+    # One site, no agent (blueprint P8, MEB K15): `_default_spawn` runs
+    # `sys.executable -c "import mindhive.__main__"` and `-m mindhive --help`
+    # to time the CLI's own startup. What it starts is this interpreter and
+    # nothing else -- no session, no model -- so it must NOT scrub, and a
+    # scrub appearing here would mean the benchmark had started launching
+    # agents.
+    "bench_scenarios.py": (1, 0), "changelog.py": (1, 0),
     # One site, no agent (blueprint P1g): the native CI runner spawns `git`,
     # `gh` and `pytest` through a single `_default_runner`, and never the
     # `claude` CLI -- so it must NOT scrub, and a scrub appearing here would

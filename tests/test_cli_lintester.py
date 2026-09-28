@@ -18,6 +18,7 @@ pattern is what keeps a new command from eating it.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -807,3 +808,211 @@ def test_the_no_gate_help_says_the_lanes_tests_stay_read_only():
     helps = {a.dest: str(a.help or "") for a in parser._actions}
     assert "read-only" in helps["no_gate"], helps["no_gate"]
     assert "--allow-test-edits" in helps["no_gate"], helps["no_gate"]
+
+
+# --- P8: `--weight-model`, delivered through the environment (blueprint P4/K3) ---
+#
+# `lintester.py` weighs every unit through `metrics.calculate_workload_weight`
+# and names no model, so that call reads `MINDHIVE_WEIGHT_MODEL` at call time.
+# The front door therefore hands the flag over AS that variable for the length
+# of the mission and puts the variable back afterwards; the lanes a mission
+# spawns inherit it. `lintester.py` is not edited by this blueprint (three
+# lines of headroom under the size cap), so the variable is the only door.
+#
+# A REAL dry run weighs only the files a unit's description names by path --
+# `rotate the ledger segment` names none and never reaches the seam (measured
+# on this checkout), which is why the seam tests below name a source file.
+
+WEIGHED_INTENT = "add retry to src/mindhive/events.py"
+
+
+def _model_during(monkeypatch, *argv):
+    """`MINDHIVE_WEIGHT_MODEL` as the mission saw it, with the mission itself
+    replaced: what this pins is the hand-off, not the weighing."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    during = []
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            during.append(os.environ.get(metrics_mod.WEIGHT_MODEL_ENV))
+            return _mission(outcome="dry-run", reason="", environment="",
+                            left=(), dry_run=True)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    assert _cli("lintester", "x", *argv) == 0
+    assert during, "the mission never ran, so nothing was observed"
+    return during[0]
+
+
+def _report(monkeypatch, *argv):
+    """``(stdout, status)`` of a dry run whose mission is replaced, so the
+    report's own lines can be read without weighing anything."""
+    from mindhive.orchestrator import lintester as lint_mod
+
+    class Spy(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            return _mission(outcome="dry-run", reason="", environment="",
+                            left=(), dry_run=True)
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Spy)
+    return _cli("lintester", "x", *argv)
+
+
+def test_the_flag_takes_exactly_the_models_metrics_knows_and_defaults_to_none():
+    """`choices=` is read off the one constant, never retyped, and the default
+    is None -- absent, not `log_linear` -- so an operator's exported
+    `MINDHIVE_WEIGHT_MODEL` still decides when the flag is not typed."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    parser = _subparser_action(cli_mod._build_parser()).choices["lintester"]
+    (action,) = [a for a in parser._actions
+                 if "--weight-model" in a.option_strings]
+    assert tuple(action.choices) == metrics_mod.WEIGHT_MODELS
+    assert action.default is None
+    assert metrics_mod.WEIGHT_MODEL_ENV in str(action.help), action.help
+    with pytest.raises(SystemExit) as exc:
+        _cli("lintester", "x", "--weight-model", "cubic")
+    assert exc.value.code == 2
+
+
+def test_the_flag_sets_the_variable_for_the_mission_and_unsets_it_after(
+        monkeypatch):
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    assert _model_during(monkeypatch, "--weight-model", "linear") == "linear"
+    assert metrics_mod.WEIGHT_MODEL_ENV not in os.environ, (
+        "the variable outlived the mission")
+
+
+def test_the_flag_restores_the_value_the_operator_had_exported(monkeypatch):
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, "linear")
+    assert _model_during(monkeypatch, "--weight-model", "log_linear") \
+        == "log_linear"
+    assert os.environ[metrics_mod.WEIGHT_MODEL_ENV] == "linear"
+
+
+@pytest.mark.parametrize("exported", [None, "linear"], ids=["unset", "exported"])
+def test_no_flag_leaves_the_variable_exactly_as_it_was(monkeypatch, exported):
+    """The default is ABSENCE. A default of `log_linear` written into the
+    environment would silently overrule an operator's own export."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    if exported is None:
+        monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, exported)
+    assert _model_during(monkeypatch) == exported
+    assert os.environ.get(metrics_mod.WEIGHT_MODEL_ENV) == exported
+
+
+def test_a_mission_that_raises_still_puts_the_variable_back(monkeypatch):
+    """The `finally`, exercised: whatever runs next in this process must not
+    inherit a model it never asked for."""
+    from mindhive.orchestrator import lintester as lint_mod
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, "linear")
+
+    class Boom(lint_mod.LintesterOrchestrator):
+        def execute_mission(self, intent, dry_run=True, checkpoint_dir=None):
+            raise RuntimeError("the mission blew up")
+
+    monkeypatch.setattr(lint_mod, "LintesterOrchestrator", Boom)
+    with pytest.raises(RuntimeError):
+        _cli("lintester", "x", "--weight-model", "log_linear")
+    assert os.environ[metrics_mod.WEIGHT_MODEL_ENV] == "linear"
+
+
+@pytest.mark.parametrize("model", ["linear", "log_linear"])
+def test_the_model_reaches_the_metrics_seam_on_a_real_dry_run(monkeypatch,
+                                                              model):
+    """Not the hand-off but the weighing: a real dry-run mission, with
+    `metrics.calculate_workload_weight` wrapped so every `Weight` it answers
+    is recorded. The variable is exported to the OTHER model first, so a
+    flag that merely failed to overrule it shows up as the wrong model; and
+    the canary is that the seam was reached at all."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    other = next(m for m in metrics_mod.WEIGHT_MODELS if m != model)
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, other)
+    seen = []
+    real = metrics_mod.calculate_workload_weight
+
+    def spy(*a, **kw):
+        weight = real(*a, **kw)
+        seen.append(weight.model)
+        return weight
+
+    monkeypatch.setattr(metrics_mod, "calculate_workload_weight", spy)
+    assert _cli("lintester", WEIGHED_INTENT, "--weight-model", model) == 0
+    assert seen, "the dry run weighed no file, so this proves nothing"
+    assert set(seen) == {model}, seen
+
+
+def test_the_two_models_weigh_the_same_unit_differently(monkeypatch, capsys):
+    """The visible effect, in the report itself: `linear` is the three-term
+    sum and `log_linear` a clamped logarithm, so on a real module they cannot
+    agree. A flag the mission never read would print the same weights twice."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    weights = {}
+    for model in metrics_mod.WEIGHT_MODELS:
+        assert _cli("lintester", WEIGHED_INTENT, "--json",
+                    "--weight-model", model) == 0
+        payload = json.loads(capsys.readouterr().out)
+        weights[model] = max(t["weight"] for t in payload["tasks"])
+    assert weights["linear"] > weights["log_linear"], weights
+
+
+def test_the_report_names_the_model_in_effect(monkeypatch, capsys):
+    """The same way the report names its fencing and its lane quota: a key on
+    the JSON surface and a line on the plain one."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    assert _report(monkeypatch, "--json", "--weight-model", "linear") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["weight_model"] == "linear"
+    assert payload["weight_model_reason"] == ""
+    assert _report(monkeypatch, "--weight-model", "linear") == 0
+    assert "weight model: linear" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("exported,expect", [(None, None), ("linear", "linear")],
+                         ids=["unset-default", "exported"])
+def test_without_the_flag_the_report_names_what_really_answered(
+        monkeypatch, capsys, exported, expect):
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    if exported is None:
+        monkeypatch.delenv(metrics_mod.WEIGHT_MODEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, exported)
+    assert _report(monkeypatch, "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["weight_model"] == (expect or metrics_mod.DEFAULT_WEIGHT_MODEL)
+
+
+def test_an_unknown_exported_model_is_reported_rather_than_hidden(monkeypatch,
+                                                                  capsys):
+    """`metrics` falls back to the default on a name it does not know and says
+    so on the `Weight`; the report carries that sentence, because a
+    misconfiguration behind a plausible number is the failure it exists to
+    name."""
+    from mindhive.orchestrator import metrics as metrics_mod
+
+    monkeypatch.setenv(metrics_mod.WEIGHT_MODEL_ENV, "cubic")
+    assert _report(monkeypatch, "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["weight_model"] == metrics_mod.DEFAULT_WEIGHT_MODEL
+    assert "cubic" in payload["weight_model_reason"]
+    assert _report(monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert f"weight model: {metrics_mod.DEFAULT_WEIGHT_MODEL}" in out
+    assert "cubic" in out

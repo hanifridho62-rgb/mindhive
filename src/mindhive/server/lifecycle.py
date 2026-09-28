@@ -26,11 +26,14 @@ which is the failure mode that makes people disable the feature.
 to check a minute-long cutoff -- which is a test nobody runs and therefore a
 guarantee nobody has.
 """
+import math
+import os
 import threading
 import time
 
-__all__ = ["BEATS_PER_CUTOFF", "HEARTBEAT_INTERVAL_S", "IDLE_CUTOFF_S",
-           "HeartbeatMonitor", "default_interval_for", "watchdog"]
+__all__ = ["BEATS_PER_CUTOFF", "HEARTBEAT_INTERVAL_S", "IDLE_CUTOFF_ENV",
+           "IDLE_CUTOFF_S", "HeartbeatMonitor", "default_interval_for",
+           "idle_cutoff_from_env", "watchdog"]
 
 #: How often the page beats, and how often the watchdog looks.
 HEARTBEAT_INTERVAL_S = 15.0
@@ -43,6 +46,49 @@ IDLE_CUTOFF_S = 60.0
 #: The ratio the two numbers above already are (60 / 15), named so that
 #: deriving one from the other cannot drift from the pair it was taken from.
 BEATS_PER_CUTOFF = 4
+
+#: The variable `hive ui` reads for its cutoff when `--idle-cutoff` is not
+#: given (blueprint P8). Named for the verb it governs: see
+#: `idle_cutoff_from_env` for why `hive dashboard` never reads it.
+IDLE_CUTOFF_ENV = "MINDHIVE_UI_IDLE_CUTOFF_S"
+
+
+def idle_cutoff_from_env(environ=None) -> tuple:
+    """``(seconds, note)``: the cutoff `hive ui` runs under when
+    `--idle-cutoff` is not given, read from `IDLE_CUTOFF_ENV` at call time.
+
+    Unset, the pair is ``(IDLE_CUTOFF_S, "")``. A value that is a positive,
+    finite number of seconds is that number. Anything else -- empty, not a
+    number, nan or an infinity, zero, negative -- is ignored: the pair is
+    the default and ONE sentence naming the variable, the value it held and
+    the value used, for the caller to print once on stderr. Never a raise: a
+    typo in a shell profile must not stop `hive ui` from starting, and zero
+    is exactly the number `HeartbeatMonitor` refuses, so letting it through
+    would turn that typo into a refusal at bind time.
+
+    *environ* is the mapping to read (tests hand in a dict). None reads
+    `os.environ` when CALLED, not when this module was imported, so an
+    export made after the first import still counts.
+
+    **`hive dashboard` does not read this variable.** The 24/7 panel's
+    `--idle-cutoff` is an explicit opt-in whose absence keeps `serve` the
+    call it has always been (`commands.dashboard.cmd_dashboard`), and a
+    variable that reached it would give a panel someone expects to find
+    tomorrow a way to shut itself down through a shell profile. So the
+    variable is named for the verb it governs, and `tests/test_server_cli.py`
+    pins that `hive dashboard` ignores it."""
+    env = os.environ if environ is None else environ
+    raw = env.get(IDLE_CUTOFF_ENV)
+    if raw is None:
+        return IDLE_CUTOFF_S, ""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if math.isfinite(seconds) and seconds > 0:
+        return seconds, ""
+    return IDLE_CUTOFF_S, (f"{IDLE_CUTOFF_ENV}={raw!r} is not a positive number of "
+                           f"seconds; using {IDLE_CUTOFF_S:g}")
 
 
 def default_interval_for(idle_cutoff_s: float) -> float:

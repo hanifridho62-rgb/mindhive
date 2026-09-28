@@ -58,6 +58,7 @@ def _ws_common(p) -> None:
 
 def add_worksession(sub) -> None:
     """Register `hive worksession` (blueprint P1b, BAB 5)."""
+    from ... import pgshape
     from ... import worksessions as ws
     wsp = sub.add_parser("worksession", help="work-session steps tagged by phase, "
                          "initiative and context usage (BAB 5)")
@@ -108,6 +109,19 @@ def add_worksession(sub) -> None:
                     help="list initiatives instead (declarations and [INITIATIVE] steps)")
     ls.add_argument("--session", type=cliparse.session_id_arg, default=None,
                     help="list this session's steps, with the ids `status` takes")
+    # Both default to None: without either flag the whole listing prints, as
+    # before; with one, the page comes from `pgshape.paginate_records`, which
+    # also owns the clamping (a value the helper would not take is clamped
+    # there, never refused here).
+    ls.add_argument("--page", type=int, default=None,
+                    help="print one page of the listing, counted from 1 (below 1 "
+                         "reads as 1; past the end prints no rows and names the "
+                         "last page); the footer then says which page this is "
+                         "and how to ask for the next")
+    ls.add_argument("--page-size", dest="page_size", type=int, default=None,
+                    help=f"rows per page: default {pgshape.DEFAULT_PAGE_SIZE}, at most "
+                         f"{pgshape.MAX_PAGE_SIZE_CEILING} (outside that range the value "
+                         "is clamped, never refused); alone, it prints page 1")
     _ws_common(ls)
     ls.set_defaults(func=cmd_worksession)
 

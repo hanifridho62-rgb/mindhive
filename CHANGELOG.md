@@ -17,6 +17,34 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Added
 
+- **Blueprint P8 — the operator surface, two benches, and the documentation
+  that closes the foundation** (spec §1.5, §1.6, §4.7, §9.3, §9.4; MEB K15,
+  §10.1):
+  - `hive lintester --weight-model {log_linear,linear}`: picks the weighing fusion for one mission by carrying it as `MINDHIVE_WEIGHT_MODEL` for the mission's duration (restored afterwards, even on failure; lanes inherit it); the report gains `weight_model` / `weight_model_reason` (JSON) and a `weight model:` line (plain), naming what really weighed.
+  - `hive worksession list --page N --page-size M`: pages the sessions, `--initiatives` and `--session S` listings through `pgshape.paginate_records` — the §10.8.2 envelope under `--json`, a `page X of Y` footer with the exact next-page command in plain text; out-of-range values are clamped by the helper, never refused. Without a flag the output is unchanged.
+  - `MINDHIVE_UI_IDLE_CUTOFF_S`: `hive ui` takes its idle cutoff from the variable when `--idle-cutoff` is absent (`--idle-cutoff` now defaults to None); a value that is not a positive finite number is ignored with one stderr line and the UI still starts; the flag wins; `hive dashboard` does not read it. New `server.lifecycle.IDLE_CUTOFF_ENV` and `idle_cutoff_from_env(environ=None) -> (seconds, note)`.
+  - `hive bench cli-startup` and `hive bench recall-semantic` (MEB K15, spec §4.7) measure CLI startup and lexical-vs-vector recall latency. The published 45 ms and 14.7x figures are printed as claims beside the measurements, never as gates; failed children and raised searches are counted, never timed as successes. Includes `tests/test_cli_startup.py`, which checks that importing the CLI loads no heavy dependency.
+  - README gains an `## Environment variables` registry: one row for each of
+    the 37 `MINDHIVE_*` / `MINDNETWORK_*` variables the code reads, plus the four
+    third-party ones it reads or sets. `tests/test_env_registry.py` holds the
+    registry and the code together in both directions. README also gains the
+    spec install line `pip install -e .[vectors,dev,tui]`, with what each extra
+    buys (checked by `tests/test_pyproject_extras.py`), and a `## Disaster
+    recovery` section.
+  - `docs/RUNBOOK_RECOVERY.md` (spec §9.4) covers chroma corruption, a stuck
+    embed queue, a broken hash chain, stale locks, a diverged Postgres mirror and
+    lost projections. Each has detection, exact commands and verification, plus
+    a table of the mechanisms spec §9.4 names that the code does not have.
+  - `docs/SOP_FIVE_GOLDEN_RULES.md` (spec §9.3) gives the five rules, each with
+    the file and test that enforces it and where nothing does. It also shows how
+    to load them as an optional, non-mandatory SOP with `hive sop add`.
+  - `docs/DATA_MODEL.md` §4.19 covers the Chroma secondary projection: what
+    feeds it, its three collections, the write paths (`hive embed`, the embedding
+    watcher) and the read path (`hive recall --semantic`), rebuilding it from the
+    ledger, and its invariant.
+  - `tests/test_constants_registry.py` reads the MEB's appendix 10.1 — thirteen
+    calibrated constants with owner module, type and value — back against the
+    code in one table.
 - **License and contributor documentation** (blueprint P7, spec §2.14): the
   Apache License 2.0 in `LICENSE`, `CONTRIBUTING.md`, this changelog, an
   `SPDX-License-Identifier: Apache-2.0` line at the top of every source file in
@@ -103,6 +131,12 @@ history and grouped by what each release window introduced. They summarise;
   mandatory SOP tier; work replenishment (`hive replenish`); task-specific
   briefs for spawned agents; the POSIX hook family; the benchmark command
   (`hive bench`); dashboard poll-cost gates and keep-alive.
+
+### Fixed
+
+- README said the dashboard's auto-harvest polls every 180 seconds by default
+  (`MINDHIVE_AUTOHARVEST_SECS`); the code's default is 3 seconds, floor 1
+  (blueprint P8, found while building the environment-variable registry).
 
 ## [0.5.0] — 2026-08-02 (`0214668`)
 

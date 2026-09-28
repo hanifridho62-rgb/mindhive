@@ -42,6 +42,12 @@ def raw_serve(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def no_ambient_cutoff(monkeypatch):
+    """The operator's own shell must not decide what these tests see."""
+    monkeypatch.delenv("MINDHIVE_UI_IDLE_CUTOFF_S", raising=False)
+
+
 # --------------------------------------------------------------------------
 # registration
 # --------------------------------------------------------------------------
@@ -179,6 +185,86 @@ def test_a_short_dashboard_cutoff_derives_its_interval_too(raw_serve):
     (_args, kw), = raw_serve
     assert kw["lifecycle"].idle_cutoff_s == 5.0
     assert kw["lifecycle"].interval_s == 1.25
+
+
+# --------------------------------------------------------------------------
+# MINDHIVE_UI_IDLE_CUTOFF_S (blueprint P8)
+# --------------------------------------------------------------------------
+
+def test_the_flag_defaults_to_none_so_its_absence_can_be_told_apart():
+    """A default of 60.0 on the flag would make `hive ui` and
+    `hive ui --idle-cutoff 60` indistinguishable, and the variable could
+    never be given the first and refused the second."""
+    assert cli._build_parser().parse_args(["ui"]).idle_cutoff is None
+
+
+def test_the_variable_supplies_the_cutoff_when_the_flag_is_absent(
+        served, monkeypatch, capsys):
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", "5")
+    assert _run("ui") == 0
+    assert served[0]["idle_cutoff_s"] == 5.0
+    assert capsys.readouterr().err == ""
+
+
+def test_the_flag_beats_the_variable(served, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", "5")
+    assert _run("ui", "--idle-cutoff", "30") == 0
+    assert served[0]["idle_cutoff_s"] == 30.0
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "nan", "inf", "0", "-5", "5s"])
+def test_a_bad_variable_is_ignored_with_one_line_and_the_ui_still_starts(
+        served, monkeypatch, capsys, raw):
+    """Never a crash, never a refusal: `hive ui` starts under the default and
+    says, once, on stderr, what it ignored and what it used."""
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", raw)
+    assert _run("ui") == 0
+    assert served[0]["idle_cutoff_s"] == 60.0
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and err.endswith("\n")
+    assert "MINDHIVE_UI_IDLE_CUTOFF_S" in err and repr(raw) in err and "60" in err
+    assert "Traceback" not in err
+
+
+def test_a_bad_variable_says_nothing_when_the_flag_decides(served, monkeypatch, capsys):
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", "abc")
+    assert _run("ui", "--idle-cutoff", "30") == 0
+    assert served[0]["idle_cutoff_s"] == 30.0
+    assert capsys.readouterr().err == ""
+
+
+def test_the_variable_is_read_when_ui_runs_not_when_the_module_was_imported(
+        served, monkeypatch):
+    """The modules under test were imported at collection, before this
+    export: a default captured at import time would still answer 60."""
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", "9")
+    assert _run("ui") == 0
+    assert served[0]["idle_cutoff_s"] == 9.0
+
+
+def test_dashboard_does_not_read_the_variable(raw_serve, monkeypatch):
+    """The decision written in `lifecycle.idle_cutoff_from_env`'s docstring:
+    the 24/7 panel's `serve` call stays byte for byte what it was, however
+    the shell is set up. A variable that reached it would give a panel
+    someone expects to find tomorrow a way to shut itself down through a
+    shell profile."""
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", "5")
+    assert _run("dashboard") == 0
+    (args, kw), = raw_serve
+    assert args == () and kw == {"port": None, "open_browser": True}
+
+
+def test_the_dashboards_own_flag_still_works_beside_the_variable(raw_serve, monkeypatch):
+    monkeypatch.setenv("MINDHIVE_UI_IDLE_CUTOFF_S", "5")
+    assert _run("dashboard", "--idle-cutoff", "30") == 0
+    (_args, kw), = raw_serve
+    assert kw["lifecycle"].idle_cutoff_s == 30.0
+
+
+def test_the_ui_help_names_the_variable(capsys):
+    with pytest.raises(SystemExit):
+        _run("ui", "--help")
+    assert "MINDHIVE_UI_IDLE_CUTOFF_S" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------

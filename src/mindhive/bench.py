@@ -446,8 +446,9 @@ def register(subparsers) -> None:
     a second module ever registers this way, this comment stops being a
     deviation and the pattern should be written down as the convention."""
     bn = subparsers.add_parser(
-        "bench", help="time the dashboard's own endpoints (read-only; writes "
-                      "no events)")
+        "bench", help="benchmarks that measure and never fix: the dashboard's "
+                      "endpoints, CLI startup, the recall paths (read-only; "
+                      "writes no events)")
     bnsub = bn.add_subparsers(dest="bench_cmd", required=True)
     bd = bnsub.add_parser(
         "dashboard", help="cold/miss and warm/hit timings for the dashboard "
@@ -486,3 +487,9 @@ def register(subparsers) -> None:
                          + ", ".join(DEFAULT_ENDPOINTS))
     bd.add_argument("--json", action="store_true", help="machine-readable report")
     bd.set_defaults(func=cmd_bench_dashboard)
+    # Blueprint P8 (MEB K15, spec section 4.7): `cli-startup` and
+    # `recall-semantic` live in `bench_scenarios` and register onto this same
+    # group, so `hive bench` stays one call in `commands/parsers/__init__.py`
+    # and each module keeps the flags beside the code that reads them.
+    from . import bench_scenarios
+    bench_scenarios.register(bnsub)

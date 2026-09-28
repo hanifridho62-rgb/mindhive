@@ -110,13 +110,17 @@ def cmd_lintester(args) -> int | None:
     # unit is gate -> quota -> child, and a refusal costs no child at all.
     if ledger is not None:
         orch.runner = ledger.guard(orch._run_child)
-    with _tests_locked(args, started):
+    with _tests_locked(args, started), _weight_model(args) as weighed:
         mission = orch.execute_mission(intent, dry_run=not started,
                                        checkpoint_dir=args.checkpoint_dir)
 
     _close_board(bus, board, board_stream)
     _record_quota(ledger, args.project)
     report = mission.as_dict()
+    # The fusion that weighed this mission's units, named the way the report
+    # names its fencing: a lane plan that looks wrong is diagnosed by asking
+    # which model answered, and the mission itself does not record it.
+    report["weight_model"], report["weight_model_reason"] = weighed
     if ledger is not None:
         report["lane_quota"] = _quota_report(ledger)
     scored = _payoff(mission) if getattr(args, "payoff", False) else None
@@ -128,6 +132,7 @@ def cmd_lintester(args) -> int | None:
         return _status(mission.outcome)
 
     _print(mission)
+    _print_weight_model(weighed)
     _print_quota(ledger)
     if scored is not None:
         _print_payoff(scored)
@@ -307,6 +312,44 @@ def _tests_locked(args, started):
         wt_mod.LOCK_TESTS = before
 
 
+@contextlib.contextmanager
+def _weight_model(args):
+    """Run one mission under `--weight-model`, and put the environment back.
+
+    Yields ``(model, note)``: the fusion that answers
+    `metrics.calculate_workload_weight` for this mission and, when a name
+    could not be honoured, the one sentence `metrics` says about it. Read
+    through `metrics._resolve_model` AFTER the variable is set, so the report
+    names what really weighed rather than what was asked for; reaching that
+    private seam is the trade `orch._run_child` makes above, and a copy of
+    its rule here would be the second authority `metrics` warns against.
+
+    The flag travels AS `MINDHIVE_WEIGHT_MODEL` (blueprint P4, K3) because
+    `lintester.py` weighs without naming a model, that call reads the
+    variable at call time, and `lintester.py` is not edited by this
+    blueprint. A variable rather than a process-local switch also means the
+    lanes a mission spawns inherit the model. Absent, the environment is
+    left exactly alone: an operator's own export still decides. Restored in
+    a `finally` -- unset back to unset -- so a mission that raises does not
+    hand the model to whatever runs next in this process."""
+    from . import metrics as metrics_mod
+
+    key = metrics_mod.WEIGHT_MODEL_ENV
+    model = getattr(args, "weight_model", None)
+    if not model:
+        yield metrics_mod._resolve_model(None)
+        return
+    before = os.environ.get(key)
+    os.environ[key] = model
+    try:
+        yield metrics_mod._resolve_model(None)
+    finally:
+        if before is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = before
+
+
 def _validator(args, started):
     """The per-unit test gate a run that starts work gets, or ``None``.
 
@@ -368,6 +411,13 @@ def _print_payoff(scored) -> None:
           f"across {scored.lanes.workers} lane(s)")
     if not scored.comparable:
         print("    (not a like-for-like comparison — see the verdict)")
+
+
+def _print_weight_model(weighed) -> None:
+    """The fusion that weighed the units, with `metrics`' note when the name
+    asked for was not one it knows."""
+    model, note = weighed
+    print(f"  weight model: {model}" + (f" ({note})" if note else ""))
 
 
 def _print_overrides(gates) -> None:
@@ -609,6 +659,17 @@ def register(subparsers) -> None:
     p.add_argument("--no-immutable-tests", dest="immutable_tests",
                    action="store_false",
                    help="switch that check off for the whole mission")
+    # `choices` read off the one constant, never retyped; the import is lazy
+    # so `hive --help` pays for it only when this parser is built.
+    from . import metrics as metrics_mod
+    p.add_argument("--weight-model", dest="weight_model",
+                   choices=metrics_mod.WEIGHT_MODELS, default=None,
+                   help="the fusion every unit is weighed by (blueprint P4, "
+                        "K3): log_linear is the calibrated default, linear "
+                        "the three-term sum. Travels as MINDHIVE_WEIGHT_MODEL "
+                        "for the length of the mission, so the lanes it "
+                        "starts weigh the same way; omitted, an exported "
+                        "MINDHIVE_WEIGHT_MODEL still applies")
     p.add_argument("--memory-mb", type=int, default=0,
                    help="per-child memory ceiling in MB (0: none). Held by a "
                         "Windows job object or a POSIX rlimit; the report's "

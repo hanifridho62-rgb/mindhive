@@ -165,6 +165,14 @@ scanned `__main__.py` as text (`test_cli_lintester`, `test_cli_mindnet`, `test_p
 follow the function to its file with `inspect.getsourcefile`. `pyproject.toml`'s
 `mindhive.__main__:main` entry point is unchanged.
 
+> **2026-09-28 (blueprint P8 audit): still DONE, re-verified.** On the blueprint branch the split
+> is commit `9576f15` ("P0 tier-1 + P9 commands split + P1a models", 2026-09-17), followed the
+> same day by `4d615df` (P9b: `commands/base.py`, `commands/verification.py` — `verify --json
+> --strict` — and `register_parsers`). `src/mindhive/__main__.py` is **60** lines today. The
+> surface it assembles has grown to **51** top-level commands — `worksession`, `ci`, `watcher`,
+> `db` and `ui` joined in P1 — every one registered from `commands/parsers/`, not the shim.
+> `tests/test_commands_reexport.py` still pins the snapshot, the order and the line caps.
+
 ---
 
 ## 6. ~~Hooks are Windows-only~~ — DONE 2026-09-07
@@ -426,6 +434,10 @@ phase cannot be aggregated. Nothing was lost — the plan document itself carrie
 but the machine-readable half of two planning runs is simply absent, and it will keep being
 absent silently.
 
+> **2026-09-28 (blueprint P8 audit): still open.** Re-checked: `jq` is still not on this
+> machine's PATH (`which jq` in Git Bash walks every entry and finds none). No blueprint phase
+> touched the planning skill's aggregation step, so neither half of **What** has happened.
+
 ---
 
 ## 15. A merged PR whose code never reached master — the whole `fabricate` feature
@@ -486,6 +498,11 @@ branch's 657.
 Kept here rather than deleted because the branch still exists and someone auditing it later will
 ask the same question: **the branch is safe to delete, nothing unique is lost.** That is the
 answer, with the commit that supersedes it named.
+
+> **2026-09-28 (blueprint P8 audit): unchanged.** The branch still exists, locally and as
+> `origin/claude/gifted-mirzakhani-d842b5`, and still resolves to `a5c739d`; no blueprint
+> commit touched it. The verdict stands: superseded by `c3ef3e0`, safe to delete — deleting it
+> is the owner's call, not an audit's.
 
 ---
 
@@ -718,6 +735,17 @@ was 7/7 green on CI. Both were true and neither was evidence: at 8–15% the tes
 Windows matrix included. The whole-session clobber really was fixed; a single lost create was not,
 and a lost create can never be reached again because `_update` refuses an id it has never seen.
 
+> **2026-09-28 (blueprint P8 audit): still fixed, and the MEB's lock now sits beside it.**
+> Blueprint P3 (`c22601d`, 2026-09-27) added `tasktool.task_lock`, the MEB's `task_lock`
+> verbatim (decision K4, CONC-02). It takes `.tasktool.lock`, has a 15 s timeout, steals a lock
+> older than 60 s, and allows 20 denied spins. It catches `(FileExistsError, PermissionError)`
+> as contention, which is this item's delete-pending lesson written into the new primitive. It
+> is a **different file** from the sidecar's `task_tools.json.lock`, which still goes through
+> the `_exclusive` fixed here. Pinned by `tests/test_tasktool.py::test_a_delete_pending_lock_makes_the_waiter_wait_not_barge_in`
+> (this fix) and `tests/test_tasktool_lock.py::test_an_access_denied_answer_is_contention_not_a_crash`
+> (P3). The five `task_lock` constants are pinned against the MEB's appendix 10.1 by
+> `tests/test_constants_registry.py`.
+
 ---
 
 <details><summary>The original entry, kept for the four hypotheses it killed</summary>
@@ -794,6 +822,12 @@ tests pin the two properties that make the race impossible rather than reproduci
 
 ## 23. Nobody has measured whether briefing a sub-agent actually helps
 
+> **2026-09-28 (blueprint P8 audit): still OPEN, nothing measured.** No blueprint phase ran or
+> changed the A/B. The only blueprint commit to touch `mindnet/ab.py` or `mindnet/orchestrator.py`
+> is the P9 split (`9576f15`), and its hunks there are comments re-pointing `__main__.py` at
+> `commands/`. `brief.py` is untouched, so `MINDHIVE_BRIEF` still defaults ON on an unmeasured
+> premise. The remaining work is exactly the 2026-09-08 note's.
+>
 > **2026-09-08. The login blocker is gone, and two real fan-outs have now run.**
 > `claude auth status --json` answers `{"loggedIn": true, "authMethod": "claude.ai",
 > "subscriptionType": "max"}`, so the 2026-09-07 note below is stale in its premise.
@@ -895,6 +929,17 @@ the A/B needs.
 > refreshing the global plugin install (`claude plugin update mindhive@mindhive-dev`), not by
 > editing the repo — the ledger decision "Closed TODOS 24 by REFRESHING the global plugin
 > install" records it. The text below describes the machine as it was.
+>
+> **2026-09-28 (blueprint P8 audit): still CLOSED, and the recurrence is now detectable.**
+> Blueprint P4b (spec §2.8, Bug 8) added `hive plugins cache-check [--json] [--sync] [--hook]`
+> (`src/mindhive/plugin_cache.py`). It compares the copy Claude Code loads with this checkout
+> by version **and** by a content hash of the plugin's components, names the files that
+> differ, and exits 1 on drift. That catches exactly this item's shape, a stale cache under a
+> version compare alone. `--sync` repairs through `claude plugin update`; `--hook` is the
+> session-start form, syncing only with `MINDHIVE_PLUGIN_AUTOSYNC=1`. It is pinned by
+> `tests/test_plugin_cache.py` (27 tests). Caveat: on the blueprint branch both files are still
+> **untracked** (present in this copy's S0 snapshot `5049433`, not in a commit), so the
+> detection lands only with whichever commit takes them.
 
 `.claude-plugin/plugin.json` declares `0.5.0`. The copy Claude Code actually loads is
 `~/.claude/plugins/cache/mindhive-dev/mindhive/0.3.0/skills/mindhive-orchestrator/SKILL.md`.
@@ -977,7 +1022,7 @@ permanently for every row already written. The human line prints `failed=`, `dro
 `withheld=` only when non-zero — a permanent zero trains the operator to skim the one segment that
 matters on the day it is not zero.
 
-## 26. ~~A prompt-injected agent can write the next wave's briefing~~ — CLOSED 2026-09-01
+## 26. A prompt-injected agent can write the next wave's briefing — NARROWED 2026-09-21 (blueprint P1d), NOT CLOSED
 
 `advice.resolve_sops` renders SOP bodies verbatim, and `resolve_constraints` renders incident
 `root_cause`/`lesson` text. Both are ledger- and file-backed. Every spawned child has `hive` on
@@ -1078,10 +1123,50 @@ rows out of the operator's fence, reading an accumulated `agent_authored` flag t
 `lintester._run_child` stamps each child's `MINDHIVE_SESSION` with its run key. The third is
 unchanged: `reflect.build_prompt` still interpolates the error excerpt.
 
+> **2026-09-28 (blueprint P8 audit). The heading said CLOSED; it now says what the record
+> shows.** Blueprint P1d (`99bedec`, 2026-09-21) built the process-bound control the
+> 2026-09-02 correction said a self-reported string could not be. `advice.is_authorized_sop_author`
+> gates every `hive sop add|update|delete` and `hive append sop` before anything is read. With
+> `MINDHIVE_ORCHESTRATION_SECRET` set, only a process whose `MINDHIVE_PROCESS_TOKEN` equals it
+> (`hmac.compare_digest`) may write, and `--session` is not consulted. `scrub_agent_env`
+> withholds the token from every agent spawner, under a site-count ratchet. The dashboard's
+> `POST /api/append` refuses `sop` under a secret. A refusal exits 2 and appends nothing.
+> Every delivered body carries a provenance label (`[MANDATORY SOP - HUMAN VERIFIED]`,
+> `[SYSTEM SOP - SYSTEM VALIDATED]`, `[ADVISORY TIP - UNVERIFIED AGENT]`). Pinned by
+> `tests/test_advice_authorship.py` (for example
+> `test_a_different_token_is_refused_whatever_the_session`,
+> `test_with_no_secret_the_session_rule_decides`) and `tests/test_sop_authorship.py`.
+>
+> **What is left, and why this stays open:**
+>
+> - With **no secret configured** — the default — the session-prefix rule still decides, so
+>   the `--session s1` bypass reproduced above still works on a host that never set one.
+> - The same-user limits README states remain: a process that reads an inherited secret can
+>   mint a token, and one that blanks the secret for its own command is back on the session
+>   rule.
+> - The incident path's reflector: `reflect.build_prompt(signature, error_excerpt, actions)`
+>   (`reflect.py:32-35`) still interpolates the failing agent's excerpt into the prompt.
+
 ---
 
 ## 27. The mission pipeline is built and scored; what is unmeasured is the weight itself
 
+> **2026-09-28 (blueprint P8 audit): still OPEN — the default changed, the measurement did
+> not.** Blueprint P4 (`30a1dee`, 2026-09-28) made the MEB's log-linear fusion the default
+> weight model (decision K3). The new pieces are `payoff.compute_calibrated_weight`,
+> `metrics.DEFAULT_WEIGHT_MODEL = "log_linear"` and `metrics._resolve_model`, and
+> `MINDHIVE_WEIGHT_MODEL=linear` restores the three-term sum. P8 added
+> `hive lintester --weight-model {log_linear,linear}`, which sets that variable for one mission
+> and names the model that really weighed in the report (`weight_model`,
+> `weight_model_reason`). Pinned by `tests/test_orchestrator_metrics.py`,
+> `tests/test_tier2_stability.py` and `tests/test_cli_lintester.py`.
+>
+> None of that is a measurement. The two recorded samples below date from 2026-09-08, before
+> P4, and were weighed by the old sum. So the new default has **no** real sample behind it,
+> and whether log-linear predicts magnitude better than the sum is exactly as unknown as this
+> item says. What closes it is unchanged: more real children, then `hive lintester
+> --calibration` read under each model.
+>
 > **2026-09-08. The sample exists. It says the weight ORDERS the work and its
 > SCALE is meaningless.** `hive lintester --calibration` no longer answers zero:
 >
@@ -1281,6 +1366,15 @@ state is a record of the worst the mission ever saw rather than of where it stan
 
 ## 29. The terminal board is built and exercised; what no test can prove is that it reads well
 
+> **2026-09-28 (blueprint P8 audit): still OPEN.** No blueprint commit touched
+> `orchestrator/dashboard.py` or `orchestrator/board.py`
+> (`git log 9576f15^..HEAD -- src/mindhive/orchestrator/dashboard.py src/mindhive/orchestrator/board.py`
+> is empty), and no run since 2026-09-08 has been read off a live TTY. The gap is unchanged.
+> One new line can now reach the board unrendered against a real run: P2's fail-closed gate
+> (`dee01e3`) names the test file a refused new module must get. P8's README now spells the
+> `tui` extra into the quick-start install line (`pip install -e .[vectors,dev,tui]`), so
+> `--board` gets `rich` by default on a fresh checkout.
+>
 > **2026-09-08. It has now been driven by real children, and it reads well.**
 > Both runs of mission `lm-84c06ad6` used `--board --execute`. The Brain panel, the
 > Worker Lanes table and the Circuit Breaker panel all rendered at terminal width
@@ -1392,7 +1486,21 @@ names — no mission has ever been executed for real — wearing a second hat.
 
 ---
 
-## 30. The nine live `.ps1` hooks hard-code one machine's interpreter, and trust the payload's session id
+## 30. ~~The nine live `.ps1` hooks hard-code one machine's interpreter, and trust the payload's session id~~ — DONE 2026-09-14
+
+> **2026-09-28 (blueprint P8 audit): merged, so DONE.** The fix the 2026-09-13 status below
+> describes as "not merged" reached master in commit `677e0ac` ("portable hook interpreter,
+> path-safe ledger names, agent-written SOPs off the auto-loaded context"). It landed through PR
+> #134 (merge `bac198a`, 2026-09-14, from `claude/path-safety-provenance-3a7e21`), and
+> `git merge-base --is-ancestor 677e0ac origin/master` holds. Verified in the tree:
+>
+> - No `hooks/*.ps1` or `hooks/*.sh` names `C:\Users\hanif` any more.
+> - `hooks/lib.ps1` carries `Get-MindhivePython` (line 228: `MINDHIVE_PYTHON`, the nearest
+>   `.venv`, then PATH with the WindowsApps redirector skipped) and `Get-MindhiveSessionId`
+>   (line 392: the `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z` whitelist, `unknown` otherwise).
+> - `tests/test_hook_shims_ps.py` (54 tests) pins both.
+>
+> README's "Installing the hooks on a new machine" documents the resolution order.
 
 **What:** `hooks/*.ps1` — all nine — open with
 `$py = "C:\Users\hanif\mindhive\.venv\Scripts\python.exe"`, and `session_start.ps1` /
@@ -1425,7 +1533,20 @@ verification loop belongs before and after that moment.
 
 ---
 
-## 31. `events.append_event` names the segment file from an unchecked session id
+## 31. ~~`events.append_event` names the segment file from an unchecked session id~~ — DONE 2026-09-14
+
+> **2026-09-28 (blueprint P8 audit): merged, then hardened, so DONE.**
+>
+> - The quarantine below reached master in the same commit as item 30, `677e0ac` (PR #134,
+>   merge `bac198a`, 2026-09-14). It introduced `events.segment_name` (line 62), which maps an
+>   off-whitelist id, the reserved `unsafe-` prefix or a Windows device name to
+>   `unsafe-<sha256[:16]>.jsonl`, and `cliparse.session_id_arg` (line 78) on every `--session`.
+> - Blueprint P0b (`53989ca`, 2026-09-17, SEC-01/SEC-02) then added
+>   `events.validate_session_id` (line 129) and `append_event(..., strict_session=True)`.
+>   That is the loud refusal this item first proposed, available to a caller that wants it,
+>   while the hook path keeps the fail-safe quarantine.
+> - `tests/test_events_sec.py` (14 tests) pins the P0b half, and
+>   `tests/test_events_segment_path.py` pins the quarantine.
 
 **What:** `src/mindhive/events.py` `append_event` does
 `seg = d / f"{session_id}.jsonl"` with `session_id` taken from the argument or
@@ -1479,6 +1600,19 @@ run records one stamped `scope: full` with the mission id. `hive lintester --exe
 the gate; `--no-gate` opts out and its help text says what that costs.
 
 **What is honestly still open.**
+
+> **2026-09-28 (blueprint P8 audit): the first bullet is CLOSED; the second is still open.**
+> Blueprint P2 (`dee01e3`, 2026-09-27, decision K17) made `SuiteGate` **fail-closed**. A unit
+> whose changed module no test mentions is refused. A new module is refused with the exact file
+> to write (`tests/test_<stem>.py`), so the child gets an instruction rather than a complaint.
+> `--allow-untested` passes a change no test could ever name, and does not excuse a new
+> module. The report counts those overrides (`orchestrator/cli.py`:
+> `warning: N untested override(s) — no test judged that work; --allow-untested passed it`),
+> which is the "nothing yet counts them" half. Pinned by `tests/test_orchestrator_gate.py`:
+> `test_a_new_module_with_no_test_fails_closed_and_names_the_path`,
+> `test_a_change_no_module_owns_is_refused_unless_overridden`,
+> `test_the_override_does_not_excuse_a_new_untested_module`. "No real child has ever been
+> gated" stands unchanged: no blueprint phase ran a real `--execute` mission.
 
 * **A change no test mentions is a recorded vacuous pass.** `scope: none` in the gate row,
   `reason` saying so, and the closing full suite as the only judge. The fail-closed
@@ -1651,6 +1785,22 @@ that is not.
   after the fence wiring. The next feature that touches it needs a carve-out
   first, and `agenttask.py` / `preview.py` / `mission.py` are the pattern.
 
+> **2026-09-28 (blueprint P8 audit): still OPEN; the headline bullet is unchanged, and one
+> count is stale.**
+>
+> - **The reflector is still unfenced.** `reflect._claude_runner` still calls
+>   `claude_cli.run_headless(prompt, timeout_s=timeout_s)` with no `spawn=`, and no
+>   blueprint commit changed `fence.py`, `resolve.py` or `reflect.py`'s runner. The
+>   only blueprint touches in this area are P1e (`b30d0da`: `resilience.py`, the
+>   whole-tree kill, already recorded in the drain bullet above) and P1d (`99bedec`: the
+>   SOP token scrub).
+> - **The cap count is stale.** `lintester.py` is **997** of 1000 today, not 982. It
+>   already stood at 997 at `9576f15^`, the parent of the blueprint's first commit, so the
+>   growth predates the blueprint. Three lines of headroom are left, and the carve-out
+>   advice above is now a precondition rather than a suggestion.
+> - The per-child ceiling, the assignment window, the kernel-verdict semantics and "no
+>   real child has ever been fenced" are unchanged.
+
 **Cons of leaving it:** the reflector bullet is a correctness gap, not a stated
 property — it is the one item here that can still put a false `kernel` in front
 of an operator, and it is the reason this item exists rather than being closed.
@@ -1662,6 +1812,28 @@ exhaust the machine.
 
 ## 35. Two doors are soft-deprecated; the notice and the toggle are all that changed
 
+> **2026-09-28 (blueprint P8 audit): still OPEN; the gaps stand, and the line counts this
+> item quotes are stale.**
+>
+> - `__main__.py` is no longer "4235 of 4237", nor at "4 of 4" on the notice cap. Since
+>   the P9 split (`9576f15`) it is a 60-line shim. The handler lives in
+>   `commands/mindnet_orchestrate.py`, and `test_cli_lintester` follows it there with
+>   `inspect.getsourcefile`.
+> - `mindnet/orchestrator.py` is not "996/999 of 1000". It fell to 885 in `677e0ac` and to
+>   906 in the merge after it (PR #134), before the blueprint began. It is 909 in this copy,
+>   with P7's SPDX line.
+>
+> None of the open bullets moved:
+>
+> - Still no read receipt or event for either notice.
+> - `--json` still prints neither notice.
+> - An empty graph still prints its "(no mindnet tasks to orchestrate …)" sentence to
+>   **stdout** under `--json` (`commands/mindnet_orchestrate.py`, the early return after
+>   `t_mod.fold`).
+> - There is still no CLI-side toggle.
+>
+> P8's README registry now documents `MINDHIVE_MINDSWARM` with its read-at-launch caveat.
+>
 > **2026-09-13.** This item's work was NOT in master for three days after it was
 > called merged, and nothing said so. PR #131 reports `MERGED`, but `gh` records
 > `baseRefName=claude/lintester-fence-b4aff7`: merge commit `cca61d9` landed on

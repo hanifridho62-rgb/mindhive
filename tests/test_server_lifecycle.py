@@ -397,3 +397,73 @@ def test_the_module_imports_without_pulling_in_the_dashboard():
                          text=True)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False"
+
+
+# --------------------------------------------------------------------------
+# MINDHIVE_UI_IDLE_CUTOFF_S (blueprint P8): the cutoff when the flag is absent
+# --------------------------------------------------------------------------
+
+def test_the_variable_is_named_for_the_verb_it_governs_and_is_exported():
+    assert lifecycle.IDLE_CUTOFF_ENV == "MINDHIVE_UI_IDLE_CUTOFF_S"
+    assert "IDLE_CUTOFF_ENV" in lifecycle.__all__
+    assert "idle_cutoff_from_env" in lifecycle.__all__
+
+
+def test_unset_is_the_blueprints_default_with_nothing_to_say():
+    assert lifecycle.idle_cutoff_from_env({}) == (lifecycle.IDLE_CUTOFF_S, "")
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("5", 5.0), ("0.5", 0.5), ("3600", 3600.0), (" 30 ", 30.0), ("1e2", 100.0),
+    ("60", 60.0),
+])
+def test_a_positive_number_of_seconds_is_taken_as_it_is(raw, expected):
+    assert lifecycle.idle_cutoff_from_env(
+        {lifecycle.IDLE_CUTOFF_ENV: raw}) == (expected, "")
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "abc", "nan", "inf", "-inf", "0", "-5",
+                                 "0x10", "5s", "1,5"])
+def test_anything_else_is_ignored_with_one_sentence_naming_all_three(raw):
+    """Empty, not a number, not finite, zero, negative: the default, and ONE
+    line for the caller to print -- the variable, the value it held, the
+    value used -- never a raise. Zero is exactly the number `HeartbeatMonitor`
+    refuses, so letting it through would turn a shell typo into a refusal at
+    bind time."""
+    seconds, note = lifecycle.idle_cutoff_from_env({lifecycle.IDLE_CUTOFF_ENV: raw})
+    assert seconds == lifecycle.IDLE_CUTOFF_S
+    assert lifecycle.IDLE_CUTOFF_ENV in note and repr(raw) in note and "60" in note
+    assert "\n" not in note and note == note.strip()
+
+
+def test_the_environment_is_read_when_called_not_when_imported(monkeypatch):
+    monkeypatch.setenv(lifecycle.IDLE_CUTOFF_ENV, "7")
+    assert lifecycle.idle_cutoff_from_env() == (7.0, "")
+    monkeypatch.delenv(lifecycle.IDLE_CUTOFF_ENV)
+    assert lifecycle.idle_cutoff_from_env() == (lifecycle.IDLE_CUTOFF_S, "")
+
+
+def test_it_never_raises_whatever_a_hand_built_mapping_holds():
+    for odd in (None, 5, 2.5, [], object()):
+        seconds, note = lifecycle.idle_cutoff_from_env({lifecycle.IDLE_CUTOFF_ENV: odd})
+        assert seconds > 0 and isinstance(note, str)
+
+
+@pytest.mark.parametrize("raw", ["0.1", "5", "59", "60", "600", "1e6"])
+def test_every_accepted_value_is_a_pair_the_monitor_takes(raw):
+    """What comes back must never become a `ValueError` three frames down:
+    with the interval derived the way `serve_ui` derives it, every accepted
+    value builds a monitor."""
+    seconds, note = lifecycle.idle_cutoff_from_env({lifecycle.IDLE_CUTOFF_ENV: raw})
+    assert note == ""
+    mon = lifecycle.HeartbeatMonitor(
+        idle_cutoff_s=seconds, interval_s=lifecycle.default_interval_for(seconds))
+    assert 0 < mon.interval_s < mon.idle_cutoff_s
+
+
+def test_the_docstring_records_that_dashboard_does_not_read_it():
+    """The decision the blueprint asked to be written down where the helper
+    lives, so the next reader does not re-decide it: `hive dashboard` keeps
+    its explicit opt-in and never reads the variable."""
+    doc = lifecycle.idle_cutoff_from_env.__doc__
+    assert "hive dashboard" in doc and "does not read" in doc

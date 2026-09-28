@@ -239,11 +239,25 @@ def cmd_ui(args) -> int | None:
     extras are installed (RuntimeError, naming the pip line). Printing the
     exception's own text rather than a sentence of our own is deliberate --
     it stays accurate whatever raised it, and the extras message already
-    says exactly what to type."""
+    says exactly what to type.
+
+    `--idle-cutoff` absent, the cutoff is MINDHIVE_UI_IDLE_CUTOFF_S when that
+    holds a positive number of seconds, else the blueprint's 60 (P8) -- read
+    through `lifecycle.idle_cutoff_from_env`, which also hands back the one
+    sentence to print when the variable held something it could not use.
+    The flag beats the variable, and then the variable is not even read, so
+    a bad value it holds is not reported for a run it did not decide.
+    `hive dashboard` never reads it; the helper's docstring says why."""
     from ..server import app
+    from ..server.lifecycle import idle_cutoff_from_env
+    cutoff = args.idle_cutoff
+    if cutoff is None:
+        cutoff, note = idle_cutoff_from_env()
+        if note:
+            print(f"hive ui: {note}", file=sys.stderr)
     try:
         app.serve_ui(port=args.port, open_browser=not args.no_browser,
-                     idle_cutoff_s=args.idle_cutoff, asgi=args.asgi)
+                     idle_cutoff_s=cutoff, asgi=args.asgi)
     except (ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

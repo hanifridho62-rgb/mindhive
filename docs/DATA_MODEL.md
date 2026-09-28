@@ -34,7 +34,7 @@ the git main-repo directory name, normalized to a kebab-case slug
 | `handoff.md`              | Projection: portable export. | `export` | yes |
 | `harvest_state.json`      | Cursor: which transcript lines were already harvested. | `harvest` | no (cursor) |
 | `pending_review.json`, `pending_changelog.json` | Sidecar gates: files awaiting thermo-review / a mandatory change-log entry. | `review`, `changelog` | self-healing |
-| `chroma/`                 | Optional vector index for `--semantic` recall. | `vectors.embed` | yes |
+| `chroma/`                 | Optional vector index for `--semantic` recall: the `ledger` and `events` collections, plus the embedding watcher's `mindhive_<slug>` (§4.19). | `vectors.embed`, `vectors.embed_events`, `watcher` | yes (§4.19 names the one collection no command backfills) |
 | `orchestrator_memory.json` | Projection: the resolution set a lintester mission's breaker triggered, folded from `incidents.summaries`. The ledger stays the source of truth; delete this and `orchestrator.resilience.remember` rebuilds it byte-identically. | `orchestrator.resilience.remember` | yes |
 | `state/pending_embed.json` | Sidecar queue of semantic rows awaiting vector embedding: `{"entries": [{session_id, segment, seg_line, queued_at}]}`. `segment` is the basename actually written (`events.segment_name`, so a quarantined id names its `unsafe-*` slot); `seg_line` is the **1-based** physical line the row starts on. | `events._emit_pending_embed_marker` (`embedqueue`), inside the append lock after every `SEMANTIC_TYPES` append, fail-open; consumed and truncated by the background watcher only | yes — disposable: deleting it loses nothing, `hive embed` re-indexes from the ledger |
 
@@ -498,7 +498,7 @@ hive append / hive log / hive sop ──▶          │
  (state_set fold,  (1 file per     (hash chain     (dedup + caps)  (tag/entity
   notices, rules,   semantic ev)    over semantic)                  edges)
   SOP block)            │
-        │               └──────────▶ hive recall (keyword) / chroma (semantic)
+        │               └──────────▶ hive recall (keyword) / chroma (semantic, §4.19)
         ▼
     MEMORY.md  (sync.py — auto-loads into every session)
 ```
@@ -2247,6 +2247,116 @@ unmatchable rather than merely unused (005).
 - **The cluster used is a scratch one** (port 5433, loopback, trust auth,
   binaries unpacked into a temp directory). Nothing about a production
   deployment — TLS, real authentication, backups — has been exercised.
+
+### 4.19 The Chroma secondary projection (semantic recall)
+
+The vector index is the store's CQRS read side, and like every other projection
+in §1 it is **disposable**. The ledger is the write side and the only source;
+nothing is ever written to chroma that did not come from it, and deleting
+`chroma/` loses nothing that `hive embed` cannot rebuild (with the one exception
+named under *Three collections* below). It is optional as a whole: without
+`pip install -e .[vectors]` (chromadb, sentence-transformers) every path below
+answers structurally, naming the extra, and the lexical paths keep working
+(invariant 5).
+
+**What feeds it.** Only `events.SEMANTIC_TYPES` rows — decisions, experiment
+results, caveats, next steps, open questions, `state_set`, `code_change`,
+learnings, SOPs, roadmap and MindNetwork task/phase rows. Deterministic telemetry
+is never embedded, which includes the watcher's own `vector_sync_*` rows.
+
+**On disk** (all under `<store>/<project>/`, the namespace directory):
+
+| path | what it is | written by |
+|---|---|---|
+| `chroma/` | a `chromadb.PersistentClient` directory: `chroma.sqlite3` plus one HNSW segment directory per collection | `vectors._client` |
+| `chroma.lock` | the `core.locks.file_lock` every chroma **write** takes (wait 30 s, stale after 600 s; `vectors.CHROMA_LOCK_*`), because two processes writing one SQLite file on NTFS fail as `database is locked` | `vectors.chroma_lock` |
+| `state/pending_embed.json` | the queue (§1) | `append_event`, inside the append lock, fail-open |
+| `state/processing_embed_<time_ns>.json` | one watcher's claim on the queue, taken by atomic rename | `watcher.run_once` |
+
+Every collection is created in cosine space with the tuning in
+`vectors.HNSW_METADATA` (`M=16`, `construction_ef=100`, `search_ef=32`), encoded
+by `all-MiniLM-L6-v2` (384 dimensions) on the local CPU. chroma ignores the
+metadata argument for a collection that already exists, so an embed path that
+finds a collection whose tuning drifted (`vectors.hnsw_drift`) drops and refills
+it; a query path takes whatever is there. `import mindhive.vectors` bounds the
+encoder's threads with `setdefault` (`OMP`/`MKL`/`OPENBLAS`/`VECLIB`/`NUMEXPR` = 2,
+`TOKENIZERS_PARALLELISM=false`), so an exported value still wins.
+
+**Three collections, two writers, and one of them has no reader.**
+
+| collection | one vector per | id | written by | read by |
+|---|---|---|---|---|
+| `ledger` | `LEDGER/*.md` file | the file name | `hive embed` (`vectors.embed`), delete-before-add | `hive recall --semantic`, as the fallback |
+| `events` | semantic event | `sha256` of the event's canonical JSON, first 32 hex (`vectors.event_id`), so a re-run skips what is present | `hive embed` (`vectors.embed_events`), incremental | `hive recall --semantic`, first |
+| `mindhive_<slug>` (`vectors.collection_name`) | queued semantic row | `"<session_id>:<seg_line>"`, metadata `session_id`, `seg_line`, `chain_hash`, `event_type`, `timestamp`, `provenance` | the embedding watcher (`VectorStoreManager.embed_batch`, batches of 32 with a 50 ms yield, under `chroma.lock`) | **nothing**: `VectorStoreManager.semantic_query` has no caller in `src/` |
+
+**The write paths.**
+
+1. `append_event` appends the row, then (still inside the append lock) queues
+   `{session_id, segment, seg_line, queued_at}` in `state/pending_embed.json`
+   (`embedqueue`). A failure to queue is swallowed: the append is what must
+   not be lost.
+2. The embedding watcher (`watcher.py`) claims the queue by renaming it to
+   `processing_embed_<time_ns>.json` (backoff `0.02, 0.04, 0.08, 0.16, 0.32` s),
+   reads each physical record, embeds the batch into `mindhive_<slug>`,
+   appends `vector_sync_started` / `vector_sync_completed`
+   (`{marker, count, duration_s}`), and deletes the claim. A failed embed leaves
+   its claim on disk; `recover_stale_markers` returns a claim older than
+   `STALE_MARKER_S` (600 s) to the queue after reconciling it against the index.
+   It runs as a daemon thread inside `hive dashboard` and `hive ui` (which
+   recover stale claims at boot, then start it; poll `MINDHIVE_WATCHER_POLL_S`,
+   default 2 s), or by hand as `hive watcher run [--once]`.
+3. `hive embed [--rebuild]` fills `ledger` and `events` straight from the
+   ledger and its projections, independently of the queue. `--rebuild` drops
+   both first. `--force` does not rebuild anything: it only overrides
+   `LIVE_LOCK` (`guard.ensure_safe`).
+
+**The read path.** `hive recall "<q>" --semantic` (`recall.py`) queries
+`events` when `vectors.indexed_event_count` is above zero and returns those hits
+if there are any; otherwise it falls back to `ledger`. Two consequences worth
+knowing: `vectors.semantic_recall_events` swallows a failed query and returns no
+hits, so a broken event index degrades silently to file-level hits rather than
+raising; and chromadb re-saves its own files whenever a client opens them, even
+for a pure query (measured by P8's bench: one `hive recall --semantic` changed
+the sha256 of `chroma.sqlite3` and two HNSW segment files). That is why
+`hive bench recall-semantic` queries a temporary copy of `chroma/` rather than
+the index itself.
+
+**Rebuilding it from the ledger.** `hive embed --rebuild`; or stop every process
+holding the index (the dashboard, `hive ui`, `hive watcher run`), delete
+`chroma/`, and run `hive embed`; then `hive watcher recover` and
+`hive watcher run --once` for the queue. The step-by-step form, with how to
+detect the failure and confirm the fix, is scenario 1 of
+`docs/RUNBOOK_RECOVERY.md`.
+
+**Where this differs from the spec (BAB 4).** The spec's one-way diagram runs
+`append_event → pending_embed.json → processing_embed_* → chroma → hive recall
+--semantic`, as one pipeline. In the code it is two:
+
+- The queue-and-watcher half ends in `mindhive_<slug>`, which no command reads.
+- What `hive recall --semantic` reads is filled by `hive embed`, on demand.
+
+Two smaller differences:
+
+- The spec has the watcher writing the marker. The append path writes it; the
+  watcher only consumes it.
+- The spec promises that a deleted index recovers "100%, deterministically,
+  by replaying the ledger". That holds for `ledger` and `events`: rebuilt from
+  the ledger, with deterministic ids. It does not hold for `mindhive_<slug>`:
+  no command backfills it, and after a deletion it refills only as new rows
+  are queued.
+
+Closing that gap means either pointing recall at the watcher's collection or
+pointing the watcher at `events`. That is a code change, not a documentation
+one, and it is not made here.
+
+**The invariant.** The index is never the source of truth, and never consulted
+to decide what the ledger says: a hit is a pointer back to a ledger row (the
+`events` document carries the row's type, timestamp and session; the watcher's
+metadata carries its `chain_hash` so a hit can be verified against the chain).
+Anything that would make a chroma row the only copy of a fact — a write that
+does not start from the ledger, or a correction applied to the index instead of
+appended as an event — breaks this projection's contract.
 
 ## 5. Invariants — do not break these
 

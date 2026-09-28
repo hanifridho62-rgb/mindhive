@@ -9,7 +9,8 @@ import sys
 from .. import events
 
 __all__ = ["cmd_loop", "_ws_session", "_ws_print", "_ws_record", "_ws_status",
-           "_ws_initiative", "_step_doc", "_ws_list_steps", "_ws_list", "_ws_migrate", "_WS_ACTIONS",
+           "_ws_initiative", "_step_doc", "_ws_list_command", "_ws_listing",
+           "_ws_list_steps", "_ws_list", "_ws_migrate", "_WS_ACTIONS",
            "cmd_worksession"]
 
 
@@ -176,24 +177,73 @@ def _step_doc(step) -> dict:
             "status": step.status, "timestamp": step.timestamp}
 
 
+def _ws_list_command(args) -> str:
+    """The `hive worksession list` invocation a paged footer repeats, with the
+    listing's own selectors, so the next-page hint pastes back into the same
+    listing."""
+    cmd = "hive worksession list"
+    if getattr(args, "initiatives", False):
+        cmd += " --initiatives"
+    if getattr(args, "session", None):
+        cmd += f" --session {args.session}"
+    if getattr(args, "project", None):
+        cmd += f" --project {args.project}"
+    return cmd
+
+
+def _ws_listing(args, rows: list, noun: str, tail: str = "") -> tuple:
+    """What a `list` surface prints for *rows*: ``(doc, items, start, footer)``
+    -- the JSON document, the rows to print, the absolute index of the first
+    of them (the active-step marker is an absolute index) and the footer.
+
+    Without ``--page``/``--page-size`` that is the rows themselves, all of
+    them from index 0, under the old count footer: the pre-P8 output, byte for
+    byte. With either flag, *doc* is the `pgshape.paginate_records` envelope
+    (blueprint §10.8.2), *items* its page, and the footer names the page, the
+    totals and the exact command for the next page -- or the last page, when
+    the one asked for is past the end. The flags reach the helper untouched
+    (``None`` for the one not given), so a clamped value -- 0, negative, above
+    the ceiling -- means exactly what the helper says it means: one authority
+    for the page arithmetic. `getattr`, because `tests/test_worksessions.py`
+    builds its Namespace by hand, without the two keys."""
+    page, size = getattr(args, "page", None), getattr(args, "page_size", None)
+    if page is None and size is None:
+        return rows, rows, 0, f"{len(rows)} {noun}(s){tail}"
+    from .. import pgshape
+    env = pgshape.paginate_records(rows, page=page, page_size=size)
+    p, n, size = env["page"], env["total_pages"], env["page_size"]
+    footer = f"page {p} of {n}, {len(env['items'])} of {env['total_items']} {noun}(s){tail}"
+    if env["has_next"]:
+        footer += f"\nnext page: {_ws_list_command(args)} --page {p + 1} --page-size {size}"
+    elif n and p > n:
+        footer += (f"\npast the end: the last page is {_ws_list_command(args)} "
+                   f"--page {n} --page-size {size}")
+    return env, env["items"], (p - 1) * size, footer
+
+
 def _ws_list_steps(args, ws, project: str) -> int:
-    """`list --session S`: one session's steps, with the ids `status` takes."""
+    """`list --session S`: one session's steps, with the ids `status` takes.
+    Paged, the JSON ``steps`` is the envelope, and the plain marker still sits
+    on the session's absolute active index."""
     w = ws.fold(ws.session_events(args.session, args.project), project).get(args.session)
+    docs = [_step_doc(s) for s in w.steps] if w else []
+    doc, items, start, footer = _ws_listing(
+        args, docs, "step", f", session {w.status if w else ''}; move one with: hive "
+        f"worksession status --session {args.session} --step-id <id> --status <status>")
     if args.json:
         _ws_print({"session_id": args.session, "project": project,
                    "status": w.status if w else "",
                    "active_step_index": w.active_step_index if w else 0,
-                   "steps": [_step_doc(s) for s in w.steps] if w else []}, True, "")
+                   "steps": doc}, True, "")
     elif w is None:
         print(f"(no steps in work session '{args.session}' -- hive worksession record "
               f"--session {args.session} --phase <phase> --action <key|text>)")
     else:
-        for i, s in enumerate(w.steps):
+        for i, s in enumerate(items, start):
             mark = "*" if i == w.active_step_index else " "
-            print(f"{mark} {s.step_id}  [{s.status}]  {s.technical_action}  "
-                  f"{s.initiative_tag}  {s.usage_tag}")
-        print(f"\n{len(w.steps)} step(s), session {w.status}; move one with: hive "
-              f"worksession status --session {args.session} --step-id <id> --status <status>")
+            print(f"{mark} {s['step_id']}  [{s['status']}]  {s['ws_tag']}  "
+                  f"{s['initiative_tag']}  {s['usage_tag']}")
+        print(f"\n{footer}")
     return 0
 
 
@@ -208,29 +258,32 @@ def _ws_list(args, ws) -> int | None:
         # [INITIATIVE] steps; it never swaps the listing for the step list.
         rows = [r for r in initiatives.initiatives(evs)
                 if not args.session or r["session_id"] == args.session]
+        doc, items, _start, footer = _ws_listing(args, rows, "initiative")
         if args.json:
-            _ws_print(rows, True, "")
+            _ws_print(doc, True, "")
         elif not rows:
             where = f" in work session '{args.session}'" if args.session else ""
             print(f'(no initiatives{where} -- hive worksession record --initiative '
                   f'--reason "..." or hive worksession initiative --reason "...")')
         else:
-            for r in rows:
+            for r in items:
                 step = f"  step {r['step_id']}" if r["step_id"] else ""
                 print(f"  {r['ts']}  {r['session_id']}{step}  {r['tag']}")
-            print(f"\n{len(rows)} initiative(s)")
+            print(f"\n{footer}")
         return 0
     rows = ws.session_rows(evs, project)
+    doc, items, _start, footer = _ws_listing(
+        args, rows, "work session", "; step ids: hive worksession list --session <id>")
     if args.json:
-        _ws_print(rows, True, "")
+        _ws_print(doc, True, "")
     elif not rows:
         print("(no work sessions -- hive worksession record --phase <phase> "
               "--action <key|text> --session <id>)")
     else:
-        for r in rows:
+        for r in items:
             print(f"  {r['session_id']}  [{r['phase']}] {r['steps']} step(s)  "
                   f"{r['status']}  {r['ws_tag']}")
-        print(f"\n{len(rows)} work session(s); step ids: hive worksession list --session <id>")
+        print(f"\n{footer}")
     return 0
 
 
