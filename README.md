@@ -43,6 +43,7 @@ On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 - `hive plugins scan [--cache dir] [--top N]` — catalog free (no API key / no pay) skills & plugins, score by breadth, store a `plugin_catalog` snapshot, print the top N
 - `hive plugins autoscan [--max-age-hours H] [--top N] [--force]` — scan **only when the catalog is missing or stale** (default 24h); a near-instant no-op otherwise, so it's safe to run every session
 - `hive plugins recommend` — print the top recommendations from the latest snapshot
+- `hive plugins cache-check [--json] [--sync] [--hook]` — is the plugin Claude Code loads the one this checkout holds? Compares the version **and** a content hash of the plugin's components (manifest, skills, commands, agents, `hooks/hooks.json`, `.mcp.json`) with the copy in `~/.claude/plugins/cache`, names the files that differ, and exits 1 on drift — a version compare alone misses a copy taken before a change that kept the version. `--sync` repairs through Claude Code's own `claude plugin update <plugin>@<marketplace>` (restart Claude Code to load it), and reports success only when a second comparison finds the copy in sync; `--hook` is the session-start form: one line only on drift, never fails, and syncs only when `MINDHIVE_PLUGIN_AUTOSYNC=1` (which adds the sync's outcome line and can hold session start for up to 45 s while `claude plugin update` runs)
 - `hive skills list [--json]` — list every installed plugin + skill from the live registry (updates the instant one is installed/removed)
 - `hive skills invoke <name> [--plugin p]` — call any installed skill through MindHive via a headless `claude`; records the outcome and exits non-zero on failure so callers can gate on it
 - `hive skills status` — green/red last-call outcome per skill from the ledger
@@ -361,6 +362,11 @@ The recommendation catalog refreshes three ways, so it's current in any session:
   stale-gated autoscan, so just looking at it keeps it fresh.
 - **Manual (force):** `hive plugins scan` or the dashboard **Plugins scan**
   (Heavy) button force a full rescan anytime, in any session.
+
+Each snapshot is stamped with the plugin version and inventory signature it was
+scanned under (`version_hash`). A plugin version bump, an install, an uninstall,
+or a skill added or removed makes the stored snapshot stale at once, whatever its
+age, and the next autoscan replaces it.
 
 Because every session shares one event store, a refresh by one session is
 immediately visible to all the others.

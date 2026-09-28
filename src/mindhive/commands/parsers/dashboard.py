@@ -16,6 +16,7 @@ from ..dashboard import (cmd_autosync_register,
                          cmd_sync,
                          cmd_ui)
 from ..skills import (cmd_plugins_autoscan,
+                      cmd_plugins_cache_check,
                       cmd_plugins_list,
                       cmd_plugins_recommend,
                       cmd_plugins_scan,
@@ -106,6 +107,21 @@ def add_plugins(sub) -> None:
                      help="rescan when the latest snapshot is older than this (default: 24)")
     pla.add_argument("--force", action="store_true", help="rescan even if the catalog is fresh")
     pla.set_defaults(func=cmd_plugins_autoscan)
+    plc = plsub.add_parser(
+        "cache-check",
+        help="compare this checkout's plugin with the copy Claude Code loads "
+             "(exit 1 on drift)")
+    plc.add_argument("--json", action="store_true", help="emit the status JSON")
+    plc.add_argument("--hook", action="store_true",
+                     help="session-start form: one line only on drift, never fails; "
+                          "syncs only when MINDHIVE_PLUGIN_AUTOSYNC=1")
+    plc.add_argument("--sync", action="store_true",
+                     help="on drift, run `claude plugin update` for the installed plugin")
+    plc.add_argument("--repo-root", default=None, dest="repo_root",
+                     help="plugin checkout to compare (default: this one)")
+    plc.add_argument("--claude-dir", default=None, dest="claude_dir",
+                     help="Claude config dir (default: ~/.claude)")
+    plc.set_defaults(func=cmd_plugins_cache_check)
     plsub.add_parser("recommend", help="print the latest catalog's top recommendations").set_defaults(func=cmd_plugins_recommend)
 
 

@@ -127,7 +127,10 @@ SURFACE = {'append': {},
              'enforce': {}},
  'autoresume': {'schedule': {}, 'list': {}, 'cancel': {}, 'fire': {}, 'wait': {}},
  'graph': {'build': {}, 'related': {}, 'export': {}},
- 'plugins': {'list': {}, 'scan': {}, 'autoscan': {}, 'recommend': {}},
+ # blueprint P4b (spec section 2.8, Bug 8): `cache-check` compares the plugin
+ # Claude Code loads with this checkout; registered after `autoscan`.
+ 'plugins': {'list': {}, 'scan': {}, 'autoscan': {}, 'cache-check': {},
+             'recommend': {}},
  'skills': {'list': {},
             'invoke': {},
             'status': {},
@@ -325,7 +328,8 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'watcher recover': 'cmd_watcher_recover',
  'watcher run': 'cmd_watcher_run',
  'watcher status': 'cmd_watcher_status',
- 'ui': 'cmd_ui'}
+ 'ui': 'cmd_ui',
+ 'plugins cache-check': 'cmd_plugins_cache_check'}
 
 
 def _sub(parser):

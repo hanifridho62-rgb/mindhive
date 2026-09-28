@@ -644,7 +644,7 @@ TOOL_SPAWNERS = {
     "commands/context_ops.py", "context.py", "dashboard.py",
     "mindnet/controller.py", "mindnet/worktree.py",
     "orchestrator/environment.py", "orchestrator/metrics.py", "paths.py",
-    "replenish.py", "repo.py",
+    "plugin_cache.py", "replenish.py", "repo.py",
 }
 
 
@@ -1473,7 +1473,11 @@ SPAWN_SITES = {
     "orchestrator/driver.py": (2, 1),
     "orchestrator/environment.py": (1, 0),
     "orchestrator/metrics.py": (1, 0), "orchestrator/resilience.py": (1, 1),
-    "paths.py": (3, 0), "replenish.py": (1, 0), "repo.py": (1, 0),
+    "paths.py": (3, 0),
+    # one site, no agent (Bug 8): `claude plugin update` is the CLI's own
+    # plugin-install flow -- no session, no model -- so it must NOT scrub.
+    "plugin_cache.py": (1, 0),
+    "replenish.py": (1, 0), "repo.py": (1, 0),
     "research.py": (5, 1), "rotation/supervisor.py": (1, 0), "verify.py": (1, 1),
     # three sites, one agent: `Manager.send` scrubs; `cli_auth_status` and
     # `profile_login` run the CLI's own `auth` flow for the operator -- no

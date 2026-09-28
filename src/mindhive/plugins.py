@@ -347,9 +347,17 @@ def _claude_dir(claude_dir=None) -> Path:
 
 
 def _read_registry(claude_dir=None) -> dict:
+    """`{plugin@marketplace: [install entries]}`; total over any file.
+
+    Only a list of entries is kept: JSON that parses into the wrong shape --
+    `[1]`, or a plugin mapped to `5` -- is dropped here, once, so no reader
+    (the inventory, its signature, the catalog stamp, the cache check) can
+    raise on it."""
     data = _read_json(_claude_dir(claude_dir) / "plugins" / "installed_plugins.json")
-    plugs = (data or {}).get("plugins")
-    return plugs if isinstance(plugs, dict) else {}
+    plugs = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugs, dict):
+        return {}
+    return {key: entries for key, entries in plugs.items() if isinstance(entries, list)}
 
 
 def inventory(claude_dir=None) -> dict:
@@ -738,14 +746,43 @@ def recommend_for(project=None, evs=None, top=None, incident_summaries=None) -> 
                                    needs=needs, top=top)
 
 
+def checkout_root() -> Path:
+    """The repository this module was imported from (`src/mindhive/../..`)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def plugin_manifest_version(repo_root=None) -> str:
+    """The version `.claude-plugin/plugin.json` declares in `repo_root` (default:
+    this checkout), or "" when there is no readable manifest -- an installed
+    wheel carries none, and "no version" must stamp the same way every time."""
+    root = Path(repo_root) if repo_root else checkout_root()
+    data = _read_json(root / ".claude-plugin" / "plugin.json")
+    version = data.get("version") if isinstance(data, dict) else None
+    return version if isinstance(version, str) else ""
+
+
+def catalog_version_hash(claude_dir=None, repo_root=None) -> str:
+    """The stamp a catalog snapshot is valid under (Bug 8): sha256 of the plugin
+    manifest version and `inventory_signature`. A version bump, an install, an
+    uninstall, or a skill added or removed all move it, so a snapshot taken
+    before any of them stops being served as the current catalog."""
+    basis = f"{plugin_manifest_version(repo_root)}\n{inventory_signature(claude_dir)}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
 def _catalog_path(project=None) -> Path:
     """Sidecar file holding the single latest plugin catalog snapshot."""
     return paths.project_dir(project) / "plugin_catalog.json"
 
 
-def _write_catalog(payload: dict, project=None) -> None:
+def _write_catalog(payload: dict, project=None, *, claude_dir=None,
+                   repo_root=None) -> dict:
+    """Store `payload` stamped with its `version_hash` and return what was
+    stored; the caller's dict is left as it was."""
     # atomic overwrite-in-place — no unbounded growth
-    paths.write_text_atomic(_catalog_path(project), ev_mod.canonical_json(payload))
+    stored = dict(payload, version_hash=catalog_version_hash(claude_dir, repo_root))
+    paths.write_text_atomic(_catalog_path(project), ev_mod.canonical_json(stored))
+    return stored
 
 
 def scan_and_store(cache_dir=None, top_n: int = 5, project=None) -> dict:
@@ -758,19 +795,28 @@ def scan_and_store(cache_dir=None, top_n: int = 5, project=None) -> dict:
     prune (pruning would break the hash chain). The sidecar sidesteps that
     entirely while keeping the latest snapshot instantly available."""
     payload = evaluate(cache_dir, top_n=top_n)
-    _write_catalog(payload, project=project)
-    return payload
+    return _write_catalog(payload, project=project)
 
 
-def latest_catalog(project=None) -> dict | None:
-    """Return the latest plugin catalog snapshot payload, or None if never scanned."""
+def latest_catalog(project=None, *, claude_dir=None, repo_root=None) -> dict | None:
+    """Return the latest plugin catalog snapshot payload, or None if never
+    scanned -- or if it is not current (Bug 8): a snapshot whose `version_hash`
+    is missing or no longer equals `catalog_version_hash` was taken under
+    another plugin version or install set, and serving it would present a
+    stale catalog as today's. The stamp is computed only once a snapshot has
+    been read, so a project with no catalog pays nothing for it."""
     p = _catalog_path(project)
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        payload = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version_hash") != catalog_version_hash(claude_dir, repo_root):
+        return None
+    return payload
 
 
 def _age_hours(ts: str):
@@ -790,9 +836,11 @@ def ensure_fresh(cache_dir=None, top_n: int = 5, max_age_hours: float = 24.0,
     """Auto-refresh the catalog only when it's missing or stale — cheap enough
     to call on every session start.
 
-    Rescans (overwriting the sidecar) when there is no snapshot, when the
-    snapshot's ``scanned_at`` is older than ``max_age_hours``, or when ``force``
-    is set. Otherwise it returns the existing snapshot without scanning.
+    Rescans (overwriting the sidecar) when there is no current snapshot -- none
+    at all, or one stamped under another plugin version or install set (Bug 8,
+    see ``latest_catalog``) -- when the snapshot's ``scanned_at`` is older than
+    ``max_age_hours``, or when ``force`` is set. Otherwise it returns the
+    existing snapshot without scanning.
 
     Returns ``{"scanned": bool, "age_hours": float|None, "payload": dict}``.
     The shared store means a refresh by one session is immediately seen by every

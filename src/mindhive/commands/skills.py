@@ -9,6 +9,8 @@ from .. import events, paths
 
 __all__ = ["_print_recommendations", "cmd_plugins_scan",
     "cmd_plugins_autoscan", "cmd_plugins_recommend", "cmd_plugins_list",
+    "_print_cache_status", "_print_sync", "_cache_check_hook",
+    "cmd_plugins_cache_check",
     "cmd_skills_list", "cmd_skills_invoke", "cmd_skills_status",
     "cmd_skills_stats", "cmd_skills_record", "cmd_skills_recommend",
     "cmd_skills_trail"]
@@ -91,6 +93,79 @@ def cmd_plugins_list(args) -> int | None:
         print(f"  {p.get('name', '?')} {p.get('version', '')} "
               f"  [paid: {p.get('free_reason', '')}]")
     return None
+
+def _print_cache_status(status: dict, plugin_cache) -> None:
+    state = status.get("state")
+    if state == "in_sync":
+        print(f"{status.get('plugin')} {status.get('repo_version')}: plugin cache "
+              f"in sync ({status.get('key')} at {status.get('install_path')}, "
+              f"tree {str(status.get('repo_hash') or '')[:8]})")
+        return
+    if state not in plugin_cache.DRIFT_STATES:
+        print(f"nothing to compare ({state}): {status.get('reason') or ''}")
+        return
+    print(plugin_cache.session_notice(status))
+    counts = status.get("diff_counts") or {}
+    for label, field in (("only in the cache", "only_in_cache"),
+                         ("only in this checkout", "only_in_repo"),
+                         ("changed", "changed")):
+        listed = status.get(field) or []
+        for rel in listed:
+            print(f"  {label}: {rel}")
+        hidden = int(counts.get(field) or 0) - len(listed)
+        if hidden > 0:
+            print(f"  {label}: ... {hidden} more")
+
+
+def _print_sync(res: dict, stream=None) -> None:
+    out = stream or sys.stdout
+    if res.get("ok"):
+        print(f"[mindhive] plugin cache synced ({' '.join(res.get('argv') or [])}); "
+              "restart Claude Code to load it", file=out)
+        return
+    detail = " ".join(str(x) for x in (res.get("reason"), res.get("output")) if x)
+    print(f"[mindhive] plugin cache sync failed: {detail}", file=out)
+
+
+def _cache_check_hook(plugin_cache, args) -> int:
+    status = plugin_cache.cache_status(repo_root=args.repo_root,
+                                       claude_dir=args.claude_dir)
+    note = plugin_cache.session_notice(status)
+    if not note:
+        return 0
+    print(note)
+    if plugin_cache.autosync_enabled():
+        _print_sync(plugin_cache.sync_cache(status))
+    return 0
+
+
+def cmd_plugins_cache_check(args) -> int | None:
+    """Bug 8: is the plugin Claude Code loads the one this checkout holds?
+
+    Exit 0 in sync (or with nothing to compare), 1 on drift; with `--sync` the
+    update's own outcome decides. `--hook` is the session-start form: a one-line
+    notice only on drift, the sync only when MINDHIVE_PLUGIN_AUTOSYNC is set,
+    and exit 0 whatever happens -- the hook fires in every session on the
+    machine, so a broken check may cost its own line and nothing else."""
+    from .. import plugin_cache
+    if getattr(args, "hook", False):
+        try:
+            return _cache_check_hook(plugin_cache, args)
+        except Exception:
+            return 0
+    status = plugin_cache.cache_status(repo_root=args.repo_root,
+                                       claude_dir=args.claude_dir)
+    drifted = status["state"] in plugin_cache.DRIFT_STATES
+    as_json = getattr(args, "json", False)
+    if as_json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+    else:
+        _print_cache_status(status, plugin_cache)
+    if getattr(args, "sync", False) and drifted:
+        res = plugin_cache.sync_cache(status)
+        _print_sync(res, sys.stderr if as_json else None)
+        return 0 if res.get("ok") else 1
+    return 1 if drifted else 0
 
 def cmd_skills_list(args) -> int | None:
     from .. import plugins as plugins_mod
