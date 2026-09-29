@@ -23,18 +23,12 @@ blank and malformed lines exactly as `events._segment_lines` and
 conversion happens in exactly one place on each side of
 `storage.postgres_driver`. `chain._scan`'s `line_index` is the same number
 minus one.
-
-**One naming rule for reads, beside the fold.** `listed_segment_name` is the
-read-only inverse of `list_sessions`. It lives here because both drivers read
-a listed session through this module's fold, and a driver that resolved the
-name with the WRITE rule (`events.segment_name`) quarantined a listed
-`unsafe-*` stem a second time and read a segment nothing ever wrote.
 """
-from .. import events
+from .. import events, paths
 from ..core.models import GENESIS_PREV_HASH, EventRecord, compute_chain_hash
 
 __all__ = ["record_row", "event_of", "build_record", "fold_rows",
-           "segment_rows", "listed_segment_name"]
+           "segment_rows", "is_quarantine_stem", "listed_segment_name"]
 
 
 def record_row(rec) -> dict:
@@ -130,38 +124,32 @@ def segment_rows(seg) -> list:
     return out
 
 
+def is_quarantine_stem(stem) -> bool:
+    """Whether *stem*, as `EventStore.list_sessions` reports it, names a
+    quarantine segment: one safe component (`events.SESSION_ID_RE`) carrying
+    the reserved prefix in any case -- exactly the ids `events.segment_name`
+    refuses for the reservation alone."""
+    raw = paths.text_of(stem)
+    return (isinstance(raw, str)
+            and events.SESSION_ID_RE.fullmatch(raw) is not None
+            and raw[:len(events.QUARANTINE_PREFIX)].casefold()
+            == events.QUARANTINE_PREFIX)
+
+
 def listed_segment_name(stem) -> str:
-    """The segment file for a *stem* that `list_sessions` answered -- the
-    read-only inverse of `list_sessions`, and the one place a quarantine stem
-    is taken at face value.
+    """The segment file a stem `list_sessions` reported names: the inverse
+    of that listing, for READS only.
 
-    `EventStore.list_sessions` promises that a quarantined session appears as
-    the `unsafe-<hash>` it was stored under because that IS the id the store
-    can address it by. `events.segment_name` cannot keep that promise on its
-    own: `paths.is_reserved_component` reserves the prefix so a conforming id
-    spelled `unsafe-<16 hex>` cannot CHOOSE a hostile writer's quarantine slot,
-    and the same reservation sends a listed stem round the hash a second time
-    -- to `unsafe-<sha256(stem)[:16]>.jsonl`, a segment nothing ever wrote. A
-    read by the listed name then yielded nothing, silently, for a session the
-    store had just listed.
-
-    So a stem under the reserved prefix -- in any case, as the reservation is
-    -- that is ONE safe component (`events.SESSION_ID_RE`, which admits no
-    separator and no traversal) is its own file. Everything else goes through
-    `events.segment_name`: a raw hostile id (`../escape`) still reads the
-    quarantine segment it was written to, and a non-string is quarantined the
-    way its write was.
-
-    Read-only, deliberately. `append` and `insert_record` keep resolving
-    through `events.segment_name`, so the reservation still blocks a WRITE by
-    a chosen quarantine name: a listed stem can be read back, never written
-    to by name. Do not reach for this on a write path."""
-    if isinstance(stem, str) and _is_listed_quarantine_stem(stem):
-        return stem + ".jsonl"
+    A quarantined session is listed by its `unsafe-<hash>` stem because that
+    is the only name the store can address it by (`storage.interface`). Put
+    back through `events.segment_name`, the stem is quarantined a SECOND
+    time -- the reservation that keeps a caller from writing into a
+    quarantine slot by naming it -- and lands on a segment nothing ever
+    wrote. That is how `hive db migrate` walked every quarantined session
+    reading zero rows and reported it as replayed. So a quarantine stem is
+    its own file here, and anything else is what `segment_name` makes of
+    it: a stem that is not one safe component cannot name a file by this
+    route either. Never for writes -- `append_event` keeps the reservation."""
+    if is_quarantine_stem(stem):
+        return paths.text_of(stem) + ".jsonl"
     return events.segment_name(stem)
-
-
-def _is_listed_quarantine_stem(stem: str) -> bool:
-    prefix = events.QUARANTINE_PREFIX
-    return (stem[:len(prefix)].casefold() == prefix
-            and events.SESSION_ID_RE.fullmatch(stem) is not None)

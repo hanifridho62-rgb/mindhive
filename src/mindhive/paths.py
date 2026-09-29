@@ -20,13 +20,29 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # environment this package builds for a child carries this variable.
 NO_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
 
+# Variables this process set for ITS OWN native libraries and never means for
+# a child: name -> the value it inserted. `vectors.apply_thread_env` registers
+# the BLAS/OpenMP thread caps it inserted here, and `no_bytecode_env` -- the
+# one builder of child environments -- strips each one while it still holds
+# that value, so a `claude`, a `pytest` or a `python -m mindhive` spawned from
+# a process that merely imported `vectors` does not inherit a two-thread cap
+# nothing there asked for. A value the operator set, before the insert or over
+# it, is never stripped: it propagates the way it would without mindhive. A
+# child that needs the cap applies it itself, at import, as `vectors` does.
+PROCESS_ONLY_ENV: dict = {}
+
 
 def no_bytecode_env(env=None) -> dict:
-    """A copy of *env* (``None``: this process's) with `NO_BYTECODE_ENV` set to
-    ``"1"`` unless it already carries a value -- the operator's choice wins,
-    even an empty one. The name is matched the way the platform matches it:
-    case-blind on Windows, where a second spelling would be a duplicate key."""
+    """A copy of *env* (``None``: this process's) for a CHILD: every variable
+    in `PROCESS_ONLY_ENV` that still holds the value this process inserted
+    removed, and `NO_BYTECODE_ENV` set to ``"1"`` unless it already carries a
+    value -- the operator's choice wins, even an empty one. The name is
+    matched the way the platform matches it: case-blind on Windows, where a
+    second spelling would be a duplicate key."""
     merged = dict(os.environ if env is None else env)
+    for name, inserted in PROCESS_ONLY_ENV.items():
+        if merged.get(name) == inserted:
+            del merged[name]
     names = {str(k).upper() for k in merged} if os.name == "nt" else set(merged)
     if NO_BYTECODE_ENV not in names:
         merged[NO_BYTECODE_ENV] = "1"
