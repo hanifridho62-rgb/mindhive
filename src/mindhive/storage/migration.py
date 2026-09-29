@@ -62,6 +62,7 @@ class MigrationReport:
     report nobody can cite."""
 
     sessions: int = 0
+    sessions_quarantined: int = 0
     events_read: int = 0
     events_inserted: int = 0
     events_skipped: int = 0
@@ -75,6 +76,7 @@ class MigrationReport:
         `asdict`, so adding a private field does not silently change a
         documented output."""
         return {"sessions": self.sessions,
+                "sessions_quarantined": self.sessions_quarantined,
                 "events_read": self.events_read,
                 "events_inserted": self.events_inserted,
                 "events_skipped": self.events_skipped,
@@ -168,15 +170,23 @@ class EventReplayMigrationEngine:
         The first chain break stops the RUN, not just its session. A ledger
         whose chain is broken at session 3 is a ledger under investigation, and
         migrating sessions 4 onward would produce a destination that is
-        partially trustworthy with nothing recording which part."""
+        partially trustworthy with nothing recording which part.
+
+        A session whose id was refused is listed by its `unsafe-<hash>` stem
+        and replayed like any other -- its rows carry the raw id, and the
+        destination files them under the segment that id maps to -- and the
+        report counts it (`sessions_quarantined`), so an operator can tell a
+        quarantined id from a lost one. It used to be walked empty: the stem
+        read back through `segment_name` names a segment nothing wrote."""
         started = self._clock()
         dry = self.dry_run or pg_engine is None
         total = _Counts()
-        sessions = 0
+        sessions = quarantined = 0
         error = None
 
         for session_id in local_store.list_sessions():
             sessions += 1
+            quarantined += records.is_quarantine_stem(session_id)
             got = self._replay_session(local_store, pg_engine, session_id)
             total.add(got)
             if got.error is not None:
@@ -184,7 +194,8 @@ class EventReplayMigrationEngine:
                 break
 
         return MigrationReport(
-            sessions=sessions, events_read=total.read,
+            sessions=sessions, sessions_quarantined=quarantined,
+            events_read=total.read,
             events_inserted=total.inserted, events_skipped=total.skipped,
             chain_ok=error is None, duration_s=self._clock() - started,
             dry_run=dry, error=error)
@@ -250,11 +261,19 @@ class EventReplayMigrationEngine:
 
 
 def _segment_of(pg_engine, session_id) -> str:
-    """The destination's name for a session's segment.
+    """The destination's name for a LISTED session's segment.
 
-    Asks the engine when it can answer, so a destination with its own naming
-    rule is not second-guessed, and falls back to the ledger's own rule --
-    which is what `PostgresEventStore.segment_of` returns anyway."""
+    A quarantined session is listed by its `unsafe-<hash>` stem, and that
+    stem IS its segment: `records.listed_segment_name` says so for every
+    store, because asking `segment_of` would quarantine the name a second
+    time and the answer would describe a segment nothing wrote -- so the
+    arithmetic skip (`max_seg_line`) asked about the wrong segment and every
+    re-run re-offered the rows. Any other stem asks the engine when it can
+    answer, so a destination with its own naming rule is not second-guessed,
+    and falls back to the ledger's own rule -- which is what
+    `PostgresEventStore.segment_of` returns anyway."""
+    if records.is_quarantine_stem(session_id):
+        return records.listed_segment_name(session_id)
     getter = getattr(pg_engine, "segment_of", None)
     if callable(getter):
         return getter(session_id)

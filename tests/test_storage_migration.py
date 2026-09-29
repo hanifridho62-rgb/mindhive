@@ -236,7 +236,7 @@ def test_the_coordinates_handed_over_are_the_mirrors_zero_based_ones():
 
 def test_an_empty_ledger_is_a_clean_report_not_an_error():
     report = _engine().migrate_to_postgres(LocalEventStore(), FakePg())
-    assert report.as_dict() == {"sessions": 0, "events_read": 0,
+    assert report.as_dict() == {"sessions": 0, "sessions_quarantined": 0, "events_read": 0,
                                 "events_inserted": 0, "events_skipped": 0,
                                 "chain_ok": True, "duration_s": 1,
                                 "dry_run": False, "error": None}
@@ -245,6 +245,42 @@ def test_an_empty_ledger_is_a_clean_report_not_an_error():
 # --------------------------------------------------------------------------
 # idempotency
 # --------------------------------------------------------------------------
+
+def test_a_quarantined_session_is_replayed_not_walked_empty():
+    """`list_sessions` names a quarantined segment by its `unsafe-<hash>`
+    stem, and a read by that stem used to find nothing: the run reported the
+    session with zero rows read, silently. Every row of it is offered now,
+    under the segment its rows' own raw id maps to -- the one the
+    destination's `insert_record` computes -- and the report counts it."""
+    events.append_event("decision", {"text": "q0"}, session_id="../escape")
+    events.append_event("decision", {"text": "q1"}, session_id="../escape")
+    events.append_event("decision", {"text": "q2"}, session_id="../escape")
+    _append(2)                                        # a plain session beside it
+    local = LocalEventStore()
+    quarantined = events.segment_name("../escape")
+    assert local.list_sessions() == sorted([quarantined[:-6], "s1"])
+    pg = FakePg()
+    report = _engine().migrate_to_postgres(local, pg)
+    assert (report.sessions, report.sessions_quarantined) == (2, 1)
+    assert (report.events_read, report.events_inserted) == (5, 5)
+    assert {seg for seg, *_ in pg.inserted} == {quarantined, "s1.jsonl"}
+    assert sorted(sid for _, _, _, sid, _ in pg.inserted) == \
+        ["../escape"] * 3 + ["s1"] * 2
+    # Idempotent by arithmetic for the quarantined session too: the second
+    # run asks the destination about the segment the rows really landed in.
+    pg.have = {quarantined: 2, "s1.jsonl": 1}
+    again = _engine().migrate_to_postgres(local, pg)
+    assert (again.events_read, again.events_inserted, again.events_skipped) == \
+        (5, 0, 5)
+    assert quarantined in pg.max_calls
+
+
+def test_a_plain_ledger_counts_no_quarantined_sessions():
+    _append(2)
+    report = _engine().migrate_to_postgres(LocalEventStore(), FakePg())
+    assert (report.sessions, report.sessions_quarantined) == (1, 0)
+    assert report.as_dict()["sessions_quarantined"] == 0
+
 
 def test_a_second_run_skips_everything_without_writing():
     """One SELECT per session and no writes at all — the number worth
@@ -446,7 +482,8 @@ def test_as_dict_carries_every_field_the_cli_prints():
     report = MigrationReport(sessions=1, events_read=2, events_inserted=2,
                              events_skipped=0, chain_ok=False,
                              duration_s=0.5, dry_run=True, error="boom")
-    assert report.as_dict() == {"sessions": 1, "events_read": 2,
+    assert report.as_dict() == {"sessions": 1, "sessions_quarantined": 0,
+                                "events_read": 2,
                                 "events_inserted": 2, "events_skipped": 0,
                                 "chain_ok": False, "duration_s": 0.5,
                                 "dry_run": True, "error": "boom"}
