@@ -24,11 +24,11 @@ conversion happens in exactly one place on each side of
 `storage.postgres_driver`. `chain._scan`'s `line_index` is the same number
 minus one.
 """
-from .. import events
+from .. import events, paths
 from ..core.models import GENESIS_PREV_HASH, EventRecord, compute_chain_hash
 
 __all__ = ["record_row", "event_of", "build_record", "fold_rows",
-           "segment_rows"]
+           "segment_rows", "is_quarantine_stem", "listed_segment_name"]
 
 
 def record_row(rec) -> dict:
@@ -122,3 +122,34 @@ def segment_rows(seg) -> list:
             continue                   # torn row: reads stay total
         out.append((i + 1, ev))        # 1-BASED, per the module docstring
     return out
+
+
+def is_quarantine_stem(stem) -> bool:
+    """Whether *stem*, as `EventStore.list_sessions` reports it, names a
+    quarantine segment: one safe component (`events.SESSION_ID_RE`) carrying
+    the reserved prefix in any case -- exactly the ids `events.segment_name`
+    refuses for the reservation alone."""
+    raw = paths.text_of(stem)
+    return (isinstance(raw, str)
+            and events.SESSION_ID_RE.fullmatch(raw) is not None
+            and raw[:len(events.QUARANTINE_PREFIX)].casefold()
+            == events.QUARANTINE_PREFIX)
+
+
+def listed_segment_name(stem) -> str:
+    """The segment file a stem `list_sessions` reported names: the inverse
+    of that listing, for READS only.
+
+    A quarantined session is listed by its `unsafe-<hash>` stem because that
+    is the only name the store can address it by (`storage.interface`). Put
+    back through `events.segment_name`, the stem is quarantined a SECOND
+    time -- the reservation that keeps a caller from writing into a
+    quarantine slot by naming it -- and lands on a segment nothing ever
+    wrote. That is how `hive db migrate` walked every quarantined session
+    reading zero rows and reported it as replayed. So a quarantine stem is
+    its own file here, and anything else is what `segment_name` makes of
+    it: a stem that is not one safe component cannot name a file by this
+    route either. Never for writes -- `append_event` keeps the reservation."""
+    if is_quarantine_stem(stem):
+        return paths.text_of(stem) + ".jsonl"
+    return events.segment_name(stem)

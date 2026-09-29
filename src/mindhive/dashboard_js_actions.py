@@ -65,8 +65,17 @@ JS = """\
     // the live one back and reports it as `progress_pct` (jobs.OutputRing),
     // precisely so a reader does not have to re-parse carriage returns it
     // cannot see. A finished job has no live frame, so it gets no bar.
-    const pct = (job.state !== 'finished'
-                 && typeof job.progress_pct === 'number') ? job.progress_pct : null;
+    //
+    // Clamped to 0..100 before a cell is drawn. `repeat` throws `RangeError`
+    // on a negative count, so a frame past 100% (`20 - filled` negative) or
+    // below 0% (`filled` negative) took the whole poll render down with it,
+    // and a render that throws mid-poll leaves the pane frozen on its last
+    // paint while the job runs on. The one producer keeps done <= total
+    // today; the pane does not get to depend on that. `Number.isFinite`
+    // rather than `typeof`: NaN is a number the pane cannot draw.
+    const raw = (job.state !== 'finished'
+                 && Number.isFinite(job.progress_pct)) ? job.progress_pct : null;
+    const pct = (raw === null) ? null : Math.min(100, Math.max(0, raw));
     const filled = (pct === null) ? 0 : Math.round(pct / 5);
     const bar = (pct === null) ? ''
       : '[' + '\\u2588'.repeat(filled) + '\\u00b7'.repeat(20 - filled)

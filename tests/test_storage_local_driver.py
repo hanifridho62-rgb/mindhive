@@ -194,6 +194,53 @@ def test_a_quarantined_id_appears_under_the_name_it_was_stored_as():
     assert list(store.read_stream("../escape"))[0].seg_line == 1
 
 
+def test_a_quarantined_segment_reads_back_by_the_name_it_is_listed_under():
+    """The other half of the contract above: the listed `unsafe-<hash>` stem
+    is the id the store can ADDRESS the segment by. `events.segment_name`
+    quarantines that stem a second time -- the reservation that keeps a
+    caller from writing into a quarantine slot by naming it -- so a read by
+    the listed name found an empty, never-written segment, and `hive db
+    migrate` walked every quarantined session reading nothing."""
+    store = _store(strict_session=False)
+    store.append("../escape", "decision", {"text": "a"})
+    store.append("../escape", "decision", {"text": "b"})
+    (name,) = store.list_sessions()
+    assert [r.seg_line for r in store.read_stream(name)] == [1, 2]
+    assert store.read_events(name)[0].session_id == "../escape"
+    assert [r.seg_line for r in store.read_stream(name, from_line=2)] == [2]
+    # The canary: naming the slot still does not let a WRITE into it. A
+    # fail-open store quarantines the name again, elsewhere; a strict one
+    # refuses it outright. The listed segment keeps exactly its two rows.
+    store.append(name, "decision", {"text": "c"})
+    assert len(store.list_sessions()) == 2
+    assert len(list(store.read_stream(name))) == 2
+    with pytest.raises(ValueError, match="Format session_id"):
+        _store().append(name, "decision", {"text": "d"})
+
+
+@pytest.mark.parametrize("stem,verbatim", [
+    ("unsafe-1ba7343c47dc442d", True),
+    ("UNSAFE-1ba7343c47dc442d", True),            # NTFS is case-blind
+    ("unsafe-unstringifiable", True),
+    ("unsafe-../escape", False),                  # no traversal by naming
+    ("../escape", False),
+    ("s1", False),
+])
+def test_a_listed_stem_names_its_own_file_only_when_it_is_a_safe_component(
+        stem, verbatim):
+    """`records.listed_segment_name` is the inverse of `list_sessions`, for
+    reads only. A quarantine stem is its own file; anything else -- a stem
+    that would not be one component, a raw id -- is what `segment_name`
+    makes of it, so the reservation holds and nothing traverses."""
+    name = records.listed_segment_name(stem)
+    assert records.is_quarantine_stem(stem) is verbatim
+    if verbatim:
+        assert name == stem + ".jsonl"
+    else:
+        assert name == events.segment_name(stem)
+    assert "/" not in name and "\\" not in name and ".." not in name
+
+
 def test_a_strict_store_refuses_the_bad_id_instead_of_renaming_it():
     with pytest.raises(ValueError, match="Format session_id"):
         _store().append("../escape", "decision", {"text": "a"})
