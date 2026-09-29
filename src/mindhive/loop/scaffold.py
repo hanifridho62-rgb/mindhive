@@ -34,6 +34,12 @@ permission_mode = "acceptEdits"
 no_progress_threshold = 3
 same_error_threshold = 5
 cooldown_minutes = 30
+
+[autoresume]
+# Absolute cap on one chain of usage-cap wake-ups (a capped run relaunched
+# every cooldown); a chain also ends after 6 wake-ups that move nothing on
+# the fix_plan checklist.
+max_wake_ups = 48
 """
 
 _FILES = {"PROMPT.md": _PROMPT, "fix_plan.md": _FIX_PLAN,

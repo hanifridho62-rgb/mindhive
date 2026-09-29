@@ -41,6 +41,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import advice as authorship
 from .. import chain, events, hookcapture, paths, roadmap, runlog, verify
 
 __all__ = ["APPROVAL_TEMPLATE", "CIRunResult", "CIRunnerError", "GATE1_FILES",
@@ -196,15 +197,15 @@ class NativeCIRunner:
         """The environment every gate child runs in (RP I.2, MEB K14).
 
         PYTHONPATH is PREPENDED, not assigned: without it the child imports
-        the editable install and the gate verifies a different tree than the
-        one it is judging, and assigning it would take the operator's own
-        entries away. The no-bytecode default comes from
-        `paths.no_bytecode_env`, so a gate leaves no `__pycache__` in the tree
-        it is about to delete -- unless the operator chose otherwise."""
-        env = paths.no_bytecode_env()
-        prior = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = (str(Path(wt) / "src")
-                             + ((os.pathsep + prior) if prior else ""))
+        the editable install and verifies a different tree than the one it is
+        judging; assigning it would take the operator's own entries away. The
+        no-bytecode default is `paths.no_bytecode_env`'s: a gate leaves no
+        `__pycache__` in the tree it is about to delete unless the operator
+        chose otherwise. Never the SOP secret or token (PR #136 review, P2):
+        `authorship.scrub_agent_env` says why code under test sees neither."""
+        env = paths.no_bytecode_env(authorship.scrub_agent_env(withhold_secret=True))
+        src, prior = str(Path(wt) / "src"), env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (src + os.pathsep + prior) if prior else src
         return env
 
     def _base_ref(self) -> str:

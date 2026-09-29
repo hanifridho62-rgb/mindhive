@@ -22,8 +22,10 @@ passes `--session s1` is, to that test, a human.
   agent wrote -- `claude_cli._child_env`, `mindnet.executor._child_env`,
   `workspace.Manager.send` (the board agents), `loop.driver.CLIDriver.run`,
   `orchestrator.resilience._run_capped` (the sandbox), `verify._stream` (a
-  lane's tests are the agent's) and `research._popen` (the trainer the research
-  agent edits) -- after any caller overlay, the same "forced last" rule the
+  lane's tests are the agent's), `research._popen` (the trainer the research
+  agent edits) and `ci.runner.NativeCIRunner._gate_env` (the branch a CI gate
+  executes -- handed neither the token nor the secret: `withhold_secret`) --
+  after any caller overlay, the same "forced last" rule the
   headless guard keeps. `tests/test_advice_authorship.py` counts every
   `subprocess` spawn SITE in every module, so neither a new spawning module
   nor a second launch inside a listed one can join unnoticed. What keeps the
@@ -180,32 +182,44 @@ def write_tags(tags, stamp=True) -> list:
     return kept
 
 
-def scrub_agent_env(env=None, os_name=None):
+def scrub_agent_env(env=None, os_name=None, *, withhold_secret=False):
     """The environment a SPAWNED AGENT may have: *env* without the process token.
 
-    ``None`` means "inherit": it stays ``None`` while `os.environ` holds no
-    token, so every existing caller that passes no environment keeps spawning
-    exactly as it did, and becomes a scrubbed copy of `os.environ` the moment
-    there is a token to withhold. The name is matched case-blind on Windows,
-    where the environment block is, so an overlay cannot hand the token down
-    under another spelling. The secret is left in place on purpose: a child
+    ``None`` means "inherit": it stays ``None`` while `os.environ` holds nothing
+    to withhold, so every existing caller that passes no environment keeps
+    spawning exactly as it did, and becomes a scrubbed copy of `os.environ` the
+    moment there is a token to withhold. The name is matched case-blind on
+    Windows, where the environment block is, so an overlay cannot hand the token
+    down under another spelling. The secret is left in place on purpose: a child
     that sees a secret and holds no token is REFUSED, while a child that sees
     neither would fall back to the session rule the token exists to replace.
     By default, that is: a child that blanks the variable for its own command is
     on the session rule again -- the same deliberate-environment limit as
     exporting the token, stated in this module's docstring.
-    *os_name* is the seam for that platform rule (default `os.name`)."""
+
+    *withhold_secret* takes the secret away as well, for the one child that is
+    neither an agent nor the operator: CODE UNDER TEST. A CI gate executes the
+    branch it is judging and the runner RECORDS what that code prints, so an
+    inherited secret is one `print` from the immutable ledger (PR #136
+    merge-safety review, P2). Such a child writes no SOP, so the refusal the
+    secret buys an agent buys it nothing; and a valid token IS the secret
+    (`compare_digest`), so withholding one without the other withholds nothing.
+    *os_name* is the seam for the platform rule (default `os.name`)."""
+    names = (TOKEN_ENV, SECRET_ENV) if withhold_secret else (TOKEN_ENV,)
     if env is None:
-        if not any(_is_token(k, os_name) for k in os.environ):
+        if not any(_is_named(k, names, os_name) for k in os.environ):
             return None
         env = os.environ
-    return {k: v for k, v in dict(env).items() if not _is_token(k, os_name)}
+    return {k: v for k, v in dict(env).items()
+            if not _is_named(k, names, os_name)}
 
 
-def _is_token(name, os_name=None) -> bool:
+def _is_named(name, wanted, os_name=None) -> bool:
+    """Whether *name* is one of the variables *wanted*, matched the way the
+    platform matches it: case-blind on Windows, exact anywhere else."""
     text = str(name)
     windows = (os.name if os_name is None else os_name) == "nt"
-    return (text.upper() if windows else text) == TOKEN_ENV
+    return (text.upper() if windows else text) in wanted
 
 
 def _tags(record) -> tuple:

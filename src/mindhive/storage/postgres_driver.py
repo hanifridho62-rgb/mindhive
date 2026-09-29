@@ -86,12 +86,17 @@ class PostgresEventStore(EventStore):
 
     @staticmethod
     def segment_of(session_id) -> str:
-        """The mirror's `segment` value for *session_id*.
+        """The mirror's `segment` value for *session_id* -- the WRITE rule.
 
         `events.segment_name`, not `session_id + ".jsonl"`: a quarantined id
         lands in `unsafe-<hash>.jsonl` on disk and therefore in the mirror too,
         and a driver that spelled the name itself would look for a segment
-        that does not exist."""
+        that does not exist.
+
+        `append` and `insert_record` resolve through this, and a listed
+        `unsafe-*` stem is deliberately quarantined AGAIN here, so nobody can
+        write into a chosen quarantine slot by spelling its name. Reads take
+        the listed name at face value instead: see `read_stream`."""
         return events.segment_name(session_id)
 
     @classmethod
@@ -156,8 +161,16 @@ class PostgresEventStore(EventStore):
         its own `prev_hash`, so a reader starting at line 400 still needs the
         399 hashes before it. Same rule, same shape, deliberately -- the two
         drivers producing different `chain_hash` values for one ledger is the
-        failure the shared `records` module exists to prevent."""
-        segment = self.segment_of(session_id)
+        failure the shared `records` module exists to prevent.
+
+        The segment is resolved with `records.listed_segment_name`, NOT
+        `segment_of`. *session_id* is whatever `list_sessions` answered, and
+        for a quarantined session that is the `unsafe-<hash>` stem itself --
+        the id the SPI says the store can address it by. `segment_of` is the
+        write rule and quarantines that stem a second time (the reservation),
+        which asked the mirror for a segment nothing ever wrote and yielded
+        nothing for a session this store lists."""
+        segment = records.listed_segment_name(session_id)
         rows = self._fetch(READ_SEGMENT_SQL, (self.name, segment))
         pairs = [(int(r[0]) + 1, _event_of_row(r)) for r in rows]
         for rec in records.fold_rows(pairs):
