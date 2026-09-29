@@ -297,6 +297,9 @@ iteration_timeout_minutes = 15
 no_progress_threshold = 3
 same_error_threshold  = 5
 cooldown_minutes      = 30
+
+[autoresume]
+max_wake_ups          = 48   # absolute cap on one chain of usage-cap wake-ups
 ```
 
 TOML is chosen over Ralph's shell `.ralphrc` to match MindHive's existing

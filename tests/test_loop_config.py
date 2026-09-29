@@ -162,3 +162,20 @@ def test_an_override_beats_the_position_it_sits_beside(tmp_path):
     assert round_cfg.max_per_round == 25
     assert round_cfg.max_injections_per_run == 25
     assert "innovation" in profile.lens_names
+
+
+def test_the_autoresume_section_is_read(tmp_path):
+    """`[autoresume] max_wake_ups` is the absolute cap on one chain of
+    loop-mode wake-ups; a threshold is data, not a code constant. Positive
+    only: 0 would end every chain at its first wake-up, so it falls back like
+    any uncoercible value, and a bare `autoresume = "on"` is not a table."""
+    assert config.load_config(tmp_path / "missing.toml").max_wake_ups == 48
+    p = tmp_path / "loop.toml"
+    p.write_text("[autoresume]\nmax_wake_ups = 3\n", encoding="utf-8")
+    assert config.load_config(p).max_wake_ups == 3
+    p.write_text("[autoresume]\nmax_wake_ups = 0\n", encoding="utf-8")
+    assert config.load_config(p).max_wake_ups == 48
+    p.write_text('[autoresume]\nmax_wake_ups = "7"\n', encoding="utf-8")
+    assert config.load_config(p).max_wake_ups == 7
+    p.write_text('autoresume = "on"\n', encoding="utf-8")
+    assert config.load_config(p).max_wake_ups == 48

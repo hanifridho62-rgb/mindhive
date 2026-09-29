@@ -453,9 +453,30 @@ def _toggle_first(text):
     return _check_one(text)
 
 
+def _clear_one(text):
+    """The agent deletes the finished item instead of checking it off."""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("- [ ]"):
+            del lines[i]
+            break
+    return "".join(lines)
+
+
 def _checked(rec):
     return (Path(rec["goal_dir"]) / "fix_plan.md").read_text(
         encoding="utf-8").count("- [x]")
+
+
+def _open(rec):
+    return (Path(rec["goal_dir"]) / "fix_plan.md").read_text(
+        encoding="utf-8").count("- [ ]")
+
+
+def _chain_rows(key):
+    """One value per scheduled row, in order: how the chain carried `key`."""
+    return [e.payload.get(key) for e in events.read_all()
+            if e.type == "autoresume" and e.payload.get("action") == "scheduled"]
 
 
 def _wake_up_chain(monkeypatch, rec, edit, between=None, cap=40):
@@ -658,6 +679,78 @@ def test_items_a_human_unchecks_between_wake_ups_lower_the_mark(tmp_path,
                          (1, 1), (2, 2)]
 
 
+def test_an_agent_that_clears_finished_items_still_makes_progress(tmp_path,
+                                                                  monkeypatch):
+    """Some agents delete a finished line rather than check it off. The checked
+    count then never rises, so every wake-up read as no progress and the chain
+    gave up after MAX_ATTEMPTS with three required items still open -- saying
+    it had checked off nothing new, which was true and beside the point. A
+    required item cleared from the checklist is progress too."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _clear_one)
+    assert (_checked(rec), _open(rec)) == (0, 0)
+    assert attempts == [1] * 9 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+    last = [e.payload["detail"] for e in events.read_all()
+            if e.type == "autoresume" and e.payload.get("action") == "fired"][-1]
+    assert "gave up" in last and "cleared" in last     # names both measures
+
+
+def test_items_a_human_adds_between_wake_ups_raise_the_open_mark(tmp_path,
+                                                                 monkeypatch):
+    """The mirror of the un-check case for the open count: a human who adds
+    items while the loop sleeps raises it, and that is not the relaunch
+    failing to clear anything. The low mark rises by as many, so the first
+    item the relaunch clears reads as progress."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+
+    def between(k):
+        if k == 5:                  # the launch and five wake-ups: 3 open
+            assert _open(rec) == 3
+            fix_plan.write_text(
+                fix_plan.read_text(encoding="utf-8")
+                + "".join(f"- [ ] review item {i}\n" for i in range(6)),
+                encoding="utf-8")
+
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _clear_one,
+                                           between=between)
+    assert _open(rec) == 0
+    assert attempts == [1] * 15 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+    marks = list(zip(_chain_rows("open_low"), _chain_rows("open_left")))
+    assert marks[:8] == [(None, None), (7, 7), (6, 6), (5, 5), (4, 4), (3, 3),
+                         (8, 8), (7, 7)]
+
+
+def test_a_chain_ends_at_its_wake_up_cap_whatever_the_progress(tmp_path,
+                                                               monkeypatch):
+    """A stuck agent that appends a pre-checked line every window reads as
+    progress every window, and nothing count-based can tell it from work. The
+    chain has an absolute cap on wake-ups, set in the goal dir's loop.toml,
+    and ends there with the marker in place -- here on a chain that really is
+    progressing, because the cap does not care."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+    toml = Path(rec["goal_dir"]) / "loop.toml"
+    capped = toml.read_text(encoding="utf-8").replace(
+        "max_wake_ups = 48", "max_wake_ups = 3")      # the scaffolded default
+    assert "max_wake_ups = 3" in capped                  # not testing 48
+    toml.write_text(capped, encoding="utf-8")
+    attempts, armed, gone = _wake_up_chain(monkeypatch, rec, _check_one)
+    assert attempts == [1, 1, 1]                 # progress every time, still
+    assert _checked(rec) == 4                    # the launch and three more
+    assert armed == [] and gone == [rec["fab_id"]]
+    assert _chain_rows("wake_ups") == [None, 1, 2]
+    last = [e.payload["detail"] for e in events.read_all()
+            if e.type == "autoresume" and e.payload.get("action") == "fired"][-1]
+    assert "gave up" in last and "max_wake_ups" in last
+    assert roadmap.get(events.read_all(), rec["fab_id"])["status"] == \
+        "interrupted"                            # the marker stays for a human
+
+
 def test_a_checklist_read_that_raises_anything_is_not_progress(tmp_path,
                                                                monkeypatch):
     """Whatever reading the checklist raises -- not only the OSError a missing
@@ -689,7 +782,7 @@ def test_a_checklist_past_the_mark_bound_still_re_arms(tmp_path, monkeypatch):
     """The count a wake-up carries is capped at the bound the contract
     enforces, so a checklist longer than any real one still re-arms instead
     of failing the re-arm's own validation."""
-    monkeypatch.setattr(autoresume, "MAX_CHECKED_ITEMS", 5)
+    monkeypatch.setattr(autoresume, "MAX_CHAIN_COUNT", 5)
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     (Path(rec["goal_dir"]) / "fix_plan.md").write_text(
         "".join(f"- [x] part {i}\n" for i in range(8)), encoding="utf-8")
@@ -1119,6 +1212,29 @@ def test_a_fabrication_wake_up_capped_again_is_armed_once_by_the_wake_up(
             and e.payload.get("action") == "scheduled"][n_sched:] == [2]
 
 
+def test_a_relaunch_stopped_by_its_budget_gate_ends_the_chain_with_the_marker(
+        tmp_path, monkeypatch):
+    """`on_cap = "stop"` is the operator saying stop. A relaunch that ends on
+    the budget gate used to read as still limited and re-arm one cooldown
+    later -- a slow pause the operator did not ask for, on a fresh budget
+    window the relaunch never earned. It is a delivery: the chain ends, the
+    marker stays interrupted for a human, and the detail says why."""
+    rec, bare, gone = _armed_fabrication(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        fabricate, "_run_loop",
+        lambda *a, **k: {"reason": "budget_cap", "iterations": 2,
+                         "run_id": "loop-r4"})
+    payload = autoresume.fire(
+        rec["fab_id"], runner=_no_prompt,
+        register=lambda *a: pytest.fail("a budget-capped chain re-armed"))
+    assert payload["outcome"] == "delivered"
+    assert "budget" in payload["detail"] and "on_cap" in payload["detail"]
+    evs = events.read_all()
+    assert roadmap.get(evs, rec["fab_id"])["status"] == "interrupted"
+    assert autoresume.pending(evs) == []
+    assert gone == [autoresume._task_name(rec["fab_id"])]   # delivery timer
+
+
 @pytest.mark.parametrize("launch", ["spawn_failed", "guard_refused"])
 def test_loop_mode_wake_up_of_a_fabrication_that_cannot_launch_is_an_error(
         tmp_path, monkeypatch, launch):
@@ -1170,17 +1286,20 @@ def test_autoresume_contract_rejects_bad_mode_payloads():
              "due": "2026-07-18T05:00:00Z", "attempt": 1, "mode": "loop"})
 
 
-def test_autoresume_contract_bounds_the_checklist_marks():
+def test_autoresume_contract_bounds_the_chain_counters():
     """A raw `hive append autoresume` could carry any integer, and a mark no
     checklist can reach would freeze progress detection for the rest of the
-    chain -- nothing is ever checked past it. Both marks share the bound."""
+    chain -- nothing is ever checked past it. Every counter a chain carries
+    shares the bound."""
     ok = {"action": "scheduled", "plan_id": "x-1",
           "due": "2026-07-18T05:00:00Z", "attempt": 1}
-    for key in ("checked_high", "checked_left"):
+    assert set(autoresume.CHAIN_KEYS) == {
+        "checked_high", "checked_left", "open_low", "open_left", "wake_ups"}
+    for key in autoresume.CHAIN_KEYS:
         autoresume.validate_payload(dict(ok, **{key: 0}))
         autoresume.validate_payload(
-            dict(ok, **{key: autoresume.MAX_CHECKED_ITEMS}))
-        for bad in (-1, True, "3", 2.5, autoresume.MAX_CHECKED_ITEMS + 1,
+            dict(ok, **{key: autoresume.MAX_CHAIN_COUNT}))
+        for bad in (-1, True, "3", 2.5, autoresume.MAX_CHAIN_COUNT + 1,
                     10 ** 30):
             with pytest.raises(ValueError, match=key):
                 autoresume.validate_payload(dict(ok, **{key: bad}))
@@ -1199,10 +1318,10 @@ def test_fold_drops_the_marks_a_terminal_record_cannot_use():
     def rec():
         return autoresume.fold(events.read_all())["x-1"]
 
-    sched(checked_high=10 ** 30, checked_left=10 ** 30)
-    assert "checked_high" not in rec() and "checked_left" not in rec()
-    sched(checked_high=3, checked_left=2)
-    assert (rec()["checked_high"], rec()["checked_left"]) == (3, 2)
+    sched(checked_high=10 ** 30, checked_left=10 ** 30, wake_ups=10 ** 30)
+    assert not set(autoresume.CHAIN_KEYS) & set(rec())
+    sched(checked_high=3, checked_left=2, open_low=4, open_left=5, wake_ups=1)
+    assert [rec()[k] for k in autoresume.CHAIN_KEYS] == [3, 2, 4, 5, 1]
     events.append_event(
         "autoresume", {"action": "fired", "plan_id": "x-1", "attempt": 1,
                        "outcome": "still_limited"}, session_id="s1")

@@ -201,18 +201,23 @@ unvalidated ledger string into the rendered trail), `memory_consolidated`,
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
 `autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
-model?, timer?, mode?, goal_dir?, checked_high?, checked_left?, outcome?,
-detail?}` —
+model?, timer?, mode?, goal_dir?, checked_high?, checked_left?, open_low?,
+open_left?, wake_ups?, outcome?, detail?}` —
 auto-resume delivery lifecycle, `autoresume.py`: action ∈ scheduled, fired,
 cancelled; after a usage-limit interruption the roadmap marker is scheduled
 to re-enter Claude once the ~5h window reopens — mode "prompt" as a one-shot
 headless session, mode "loop" by relaunching the loop engine on `goal_dir`
-(through `fabricate.run` when the plan is a fabrication's `fab_id`), whose
-re-arm carries `checked_high`, the most `fix_plan.md` items the chain has
-seen checked, so only a wake-up that checks off something new restarts the
-attempt count, and `checked_left`, how many the relaunch left checked, so
-items a human un-checks while the loop sleeps lower that mark; both are
-bounded by `MAX_CHECKED_ITEMS` and dropped from fired/cancelled records; a
+(through `fabricate.run` when the plan is a fabrication's `fab_id`); only
+`api_cap` and `max_hours` arm that delivery — `budget_cap` under
+`on_cap = "stop"` earns the marker alone, since the operator said stop; a
+loop-mode re-arm carries the chain's counters: `checked_high` / `open_low`,
+the most `fix_plan.md` items seen checked and the fewest required ones seen
+open, so only a wake-up that moves the checklist past them restarts the
+attempt count; `checked_left` / `open_left`, both counts as the relaunch
+left them, so items a human un-checks or adds while the loop sleeps move
+the marks back; and `wake_ups`, the chain's running count against
+loop.toml `[autoresume] max_wake_ups` (default 48), the absolute cap; all
+bounded by `MAX_CHAIN_COUNT` and dropped from fired/cancelled records; a
 `fired` row lands after the delivery returns, and a cancel, a hand-issued
 re-schedule or a retired plan meanwhile is honoured over its re-arm; these
 events are the delivery audit trail and the roadmap events remain the
