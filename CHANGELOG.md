@@ -17,6 +17,13 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Added
 
+- **Blueprint P11 — the traceability matrix and the audit that closes the
+  blueprint** (RP §3, §4.7, §10.3; MEB §3.1, §153):
+  - `IMPLEMENTATION_PLAN.md` at the root: the RTM for blueprint v1.0 and v1.1 with the commit that realised each row; the audit table `| Bab / Fitur PDF | Modul / Berkas Kode Sumber | Berkas Pengujian (Tests) | Status Verifikasi |` — one row per item, every status parsed from the junit of one full pytest run rather than typed; the MEB LOC forecast beside measured sizes; an ISO/IEC 25010 matrix of measured values; the three benches; the deviation register; and the real outcome of the one `hive mindnet ab --execute --record` run. `tests/test_implementation_plan.py` holds it to that: the commit it names must exist, every path it cites must exist, every status is one of seven words, the LOC rows equal `scripts/loc_report.py`'s.
+  - `scripts/loc_report.py`: the MEB §3.1 rows as baseline / target / measured / verdict (`python scripts/loc_report.py [--json] [--check]`; `--check` exits 1 only on the ceilings the MEB states as hard). `tests/test_loc_targets.py`.
+  - README `### Prerequisites`: the operating systems the CI matrix runs, the Python floor `pyproject.toml` declares, the Claude Code CLI the agent-spawning commands need, and measured hardware figures. `tests/test_readme_prerequisites.py` reads the answers from those files, not from the README.
+  - The five golden rules SOP is registered from `docs/SOP_FIVE_GOLDEN_RULES_COMPACT.md`: `hive sop add --file docs/SOP_FIVE_GOLDEN_RULES.md`, as the P8 doc instructed, is refused by `sop.MAX_TEXT_CHARS` (4000 — the doc is 12,423 chars). The doc now says so, and `tests/test_sop_golden_rules_doc.py` keeps the compact body under the cap and in step with the five rule headings.
+  - `docs/session-legend.md` gains the `fabricate.py` row P10 left out.
 - **Blueprint P8 — the operator surface, two benches, and the documentation
   that closes the foundation** (spec §1.5, §1.6, §4.7, §9.3, §9.4; MEB K15,
   §10.1):

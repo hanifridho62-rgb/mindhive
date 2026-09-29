@@ -33,6 +33,28 @@ the feature that needs them is described below.
 On Windows use PowerShell 5.1 syntax — no `&&`, no ternaries — see the
 **PowerShell 5.1 note** below.
 
+### Prerequisites
+
+- **Operating system:** Linux or Windows. CI runs the suite on `ubuntu-latest`
+  and `windows-latest` (`.github/workflows/ci.yml`); the reference run behind
+  `IMPLEMENTATION_PLAN.md` was Windows 11 with CPython 3.14.3. macOS is not
+  tested.
+- **Python 3.11 or newer** — `requires-python = ">=3.11"` in `pyproject.toml`;
+  CI covers 3.11, 3.12 and 3.14.
+- **Claude Code CLI** (`claude` on `PATH`; 2.1.198 at the time of writing) for
+  the commands that spawn agents — `hive lintester`, `hive mindnet orchestrate
+  --execute`, `hive mindnet ab --execute` (the spawn sites are enumerated in
+  `tests/test_advice_authorship.py`). Every other command, and the whole test
+  suite, runs without it.
+- **Hardware:** no GPU. The `vectors` extra is the one heavy dependency:
+  loading it peaks at about 500 MB of working set (14 MB for the bare
+  interpreter, 74 MB after `chromadb`, 455 MB with `all-MiniLM-L6-v2` loaded,
+  500 MB after the first query — measured on Windows 11, 2026-09-29), and the
+  event index for this repository's own 654-event ledger is 9.76 MB on disk
+  (`hive bench recall-semantic`). The full test suite ran 11,138 tests in
+  24 minutes on an idle laptop. The measurements, and the blueprint
+  traceability behind them, are in `IMPLEMENTATION_PLAN.md`.
+
 ## Commands
 - `hive append <type> <payload> [--json] [--stdin] [--tags a,b]` — add an event
 - `hive project` — rebuild STATE.md + LEDGER/ + index.json + chain.json

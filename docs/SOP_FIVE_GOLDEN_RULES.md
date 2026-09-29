@@ -189,19 +189,28 @@ refuses the "done" claim itself; the notice is what keeps the gap visible.
 None of the enforcement above depends on this step. Loading the rules as an SOP
 makes the text itself show up where SOPs are shown: STATE.md's SOP section,
 `hive sop preflight`, `hive sop list` and `hive sop show`. It is an ordinary,
-**non-mandatory** SOP unless you choose otherwise:
+**non-mandatory** SOP unless you choose otherwise.
 
-    hive sop add five-golden-rules --title "Five golden rules (spec 9.3)" --file docs/SOP_FIVE_GOLDEN_RULES.md --tags sop,golden-rules
+An SOP body is capped at `sop.MAX_TEXT_CHARS` (4,000 characters), because every
+active SOP auto-loads into every session, and this document is about three
+times that. `hive sop add --file docs/SOP_FIVE_GOLDEN_RULES.md` is therefore
+refused (`error: sop body exceeds 4000 chars`, measured on 2026-09-29). What
+gets registered is the compact form,
+[docs/SOP_FIVE_GOLDEN_RULES_COMPACT.md](SOP_FIVE_GOLDEN_RULES_COMPACT.md): the
+five rules in one paragraph each, pointing back here for the enforcement map.
+`tests/test_sop_golden_rules_doc.py` holds the compact form under the cap and
+its rule titles equal to the headings above.
+
+    hive sop add five-golden-rules --title "Five golden rules (spec 9.3)" --file docs/SOP_FIVE_GOLDEN_RULES_COMPACT.md --tags sop,golden-rules --no-mandatory
 
 Without a tier flag, `hive sop add` records an ordinary, scope-matched SOP.
 `--no-mandatory` says the same thing explicitly. `--mandatory` would re-assert
-the body on every prompt, and a body this long would exceed the per-prompt
-budget and arrive as a `hive sop show five-golden-rules` pointer instead, so it
-is not recommended here.
+the body on every prompt; the compact body fits the per-prompt budget, but the
+rules are the operator's to adopt, so it is not recommended here.
 
 - Check it: `hive sop list`, `hive sop show five-golden-rules`.
-- Refresh it after this file changes:
-  `hive sop update five-golden-rules --file docs/SOP_FIVE_GOLDEN_RULES.md`.
+- Refresh it after the compact file changes:
+  `hive sop update five-golden-rules --file docs/SOP_FIVE_GOLDEN_RULES_COMPACT.md`.
 - Remove it: `hive sop delete five-golden-rules --reason "…"`.
 
 **Who may run it.** Every `hive sop add|update|delete` — not only a mandatory
