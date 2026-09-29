@@ -20,9 +20,11 @@ closes that gap end to end:
 - ``run`` — execute the loop engine on the goal dir with the fabrication's
   plan_id. From here the existing resilience does the rest: a usage cap
   checkpoints progress into THE fabrication roadmap (the fix_plan checklist
-  is the source of truth) and re-arms a loop-mode auto-resume, so the cycle
-  is loop -> sleep -> loop until the exit gate passes, or until
-  autoresume.MAX_ATTEMPTS wake-ups in a row check off nothing new.
+  is the source of truth) and -- for the caps a wake-up can outwait, not the
+  loop's own budget gate under on_cap = "stop" -- re-arms a loop-mode
+  auto-resume, so the cycle is loop -> sleep -> loop until the exit gate
+  passes, until autoresume.MAX_ATTEMPTS wake-ups in a row move nothing on
+  the checklist, or until the chain's loop.toml wake-up cap.
   Completion earns the roadmap its exit from every view.
 
 Lifecycle is three ``fabrication`` events (deterministic telemetry;
@@ -34,6 +36,7 @@ import os
 import re
 import time
 import calendar
+import math
 from pathlib import Path
 
 from . import events as ev_mod
@@ -363,7 +366,20 @@ def dispatch(fab_id, *, project=None, evs=None, at=None, in_hours=None,
                              "2026-07-18T15:00:00Z")
         due = _iso(max(due_e, now + MIN_LEAD_S))
     elif in_hours is not None:
-        due = _iso(now + float(in_hours) * 3600)
+        try:
+            hours = float(in_hours)
+        except (TypeError, ValueError):
+            hours = math.nan
+        if not (math.isfinite(hours) and hours > 0):
+            # A lead of 0 or less puts the due time at or before now: the
+            # Task Scheduler trigger is armed in the past and never fires,
+            # while the dispatched event says it is scheduled.
+            raise ValueError("fabricate --in-hours must be a positive number "
+                             "of hours (0 or less would arm a trigger in the "
+                             "past, which never fires)")
+        # Lifted to the registrar's minimum lead the way --at is: a positive
+        # lead shorter than that is the same dead trigger by a smaller margin.
+        due = _iso(max(now + hours * 3600, now + MIN_LEAD_S))
     else:
         due = _iso(now + MIN_LEAD_S)
     cwd = str(Path(rec["goal_dir"]).parent.parent)   # the repo root

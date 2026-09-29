@@ -161,6 +161,61 @@ def test_importing_vectors_applies_the_lock_before_anything_numeric():
     assert out.stdout.split() == ["7", "false", "2"], out.stdout
 
 
+def test_the_caps_this_process_inserted_are_not_handed_to_a_child(monkeypatch):
+    """The cap is for THIS process's numeric stack. `os.environ` is what every
+    child inherits, so the six defaults `apply_thread_env` inserted rode along
+    into every `claude`, `pytest` and `python -m mindhive` this process
+    spawned -- a two-thread BLAS cap nothing there asked for. What it
+    inserts is registered as process-only (`paths.PROCESS_ONLY_ENV`) and
+    `paths.no_bytecode_env`, the one builder of child environments, strips
+    it while it still holds the inserted value. A value the operator set --
+    before the insert, or over it afterwards -- is not ours to strip: it
+    propagates the way it would without mindhive."""
+    import os
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.setenv("MKL_NUM_THREADS", "7")               # over the import-time insert
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    vectors.apply_thread_env()
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "5")          # over this call's insert
+    assert os.environ["OMP_NUM_THREADS"] == "2"               # this process keeps its cap
+    child = paths.no_bytecode_env()
+    assert "OMP_NUM_THREADS" not in child
+    assert child["MKL_NUM_THREADS"] == "7"
+    assert child["OPENBLAS_NUM_THREADS"] == "5"
+    assert child["PYTHONDONTWRITEBYTECODE"] == "1"             # the builder's own job, still done
+    # A caller-built mapping goes through the same strip.
+    assert "OMP_NUM_THREADS" not in paths.no_bytecode_env(dict(os.environ))
+    # A mapping handed in explicitly is configured, not registered: the
+    # registry describes the real environment only.
+    other = {}
+    vectors.apply_thread_env(other)
+    assert other["OMP_NUM_THREADS"] == "2"
+
+
+def test_a_child_that_imports_vectors_does_not_pass_the_cap_on():
+    """End to end, in a child: import `vectors`, build a child environment the
+    way every spawner here does, and read what a grandchild sees. The child
+    itself is capped; the grandchild is not."""
+    import os
+    env = dict(os.environ)
+    for name in vectors.THREAD_ENV:
+        env.pop(name, None)
+    env["PYTHONPATH"] = str(paths.__file__.rsplit("mindhive", 1)[0].rstrip("\\/"))
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    code = (
+        "import os, subprocess, sys, mindhive.vectors\n"
+        "from mindhive import paths\n"
+        "grand = subprocess.run([sys.executable, '-c', "
+        "\"import os; print(os.environ.get('OMP_NUM_THREADS'), "
+        "os.environ.get('TOKENIZERS_PARALLELISM'))\"], "
+        "env=paths.no_bytecode_env(), capture_output=True, text=True)\n"
+        "print(os.environ['OMP_NUM_THREADS'], grand.stdout.strip())")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, env=env, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["2", "None", "None"], out.stdout
+
+
 # --- HNSW tuning (K20, MEB section 8) ----------------------------------------
 
 def test_hnsw_metadata_carries_every_tuning_key_the_blueprint_names():
@@ -974,3 +1029,22 @@ def test_an_interrupted_embed_is_raised(monkeypatch, capsys, interrupt):
     with pytest.raises(interrupt) as got:
         maint.cmd_embed(_embed_args())
     assert got.value is stop and capsys.readouterr().err == ""
+
+
+# --- one vector per row, whatever the batch repeats --------------------------
+
+def test_a_batch_naming_a_row_twice_stores_one_vector(monkeypatch):
+    """chromadb refuses an `add` that repeats an id (DuplicateIDError). A claim
+    recovered twice named its rows twice, so the whole batch failed, the claim
+    stayed on disk, and the next recovery queued the same duplicates again."""
+    mgr, col = _mgr(monkeypatch)
+    assert mgr.embed_batch("proj", [_rec(seg_line=7), _rec(seg_line=7),
+                                    _rec(seg_line=8)]) == 2
+    assert [b["ids"] for b in col.batches] == [["alpha:7", "alpha:8"]]
+
+
+def test_missing_extras_is_the_install_line_or_none(monkeypatch):
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: False)
+    assert "pip install -e .[vectors]" in vectors.missing_extras()
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
+    assert vectors.missing_extras() is None

@@ -253,7 +253,7 @@ Manager, or `ps aux | grep mindhive`. Stop it if it is wedged.
 | `integration_breaker.lock` | `<ns>/state/` | `core.locks`, fail-open | 5 s timeout; older than 60 s it is stale |
 | `rules/incidents/.write.lock` | `<ns>/` | exclusive-create file | waits 30 s, then writes unlocked; older than 60 s it is stolen |
 | `rules/.reflect.lock` | `<ns>/` | the reflection gate | older than 600 s it is stale |
-| any other `core.locks` lock | | `core.locks.LockPolicy` defaults | 2 s timeout, 10–50 ms jittered backoff; older than 30 s it is stale |
+| any other `core.locks` lock | | `core.locks.LockPolicy` defaults | 2 s timeout, 10–50 ms jittered backoff; older than 30 s with its holder's process gone it is stale (the file carries `<pid> <clock>`; a live holder keeps it at any age, and a pid the OS reused for an unrelated live process holds it until that process exits or the file is removed by hand) |
 
 **Commands.** Usually none: wait out the stale age. For abandoned embed claims,
 use `hive watcher recover` (scenario 2). None of these ages is configurable.

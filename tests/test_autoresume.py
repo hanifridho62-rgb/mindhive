@@ -246,6 +246,28 @@ def test_schedule_survives_a_broken_timer_registrar():
     assert autoresume.pending(events.read_all())        # wait() can deliver
 
 
+def test_ps_quote_escapes_every_quote_powershell_reads_as_single():
+    """PowerShell's tokenizer takes U+2018, U+2019, U+201A and U+201B as
+    single quotes, exactly like the ASCII one: inside a single-quoted string
+    any of them ENDS the string unless doubled. A task name or a working
+    directory carrying a typographic apostrophe (a repo under "hanif’s
+    projects") therefore broke out of its quotes, and whatever followed ran
+    as PowerShell. Each is doubled with ITSELF, which is the tokenizer's
+    escape for every one of them, so the value round-trips unchanged."""
+    assert autoresume._ps_quote("it's") == "'it''s'"
+    for q in ("\u2018", "\u2019", "\u201a", "\u201b"):
+        assert autoresume._ps_quote(f"a{q}b") == f"'a{q}{q}b'", hex(ord(q))
+    # Every quote in one value, ASCII and typographic, each doubled in place.
+    mixed = "it's \u2018quoted\u2019, \u201aor\u201b not"
+    assert autoresume._ps_quote(mixed) == "'" + "".join(
+        c + c if c in "'\u2018\u2019\u201a\u201b" else c for c in mixed) + "'"
+    # Double quotes, their typographic twins and a backtick are inert inside
+    # single quotes and must stay untouched; a non-string is quoted as text.
+    assert autoresume._ps_quote('say "hi" \u201cthere\u201d `x`') == \
+        "'say \"hi\" \u201cthere\u201d `x`'"
+    assert autoresume._ps_quote(42) == "'42'"
+
+
 def test_register_timer_is_env_gated_off():
     # conftest sets MINDHIVE_AUTORESUME_TIMER=off: the default registrar must
     # not touch the real Task Scheduler from inside the suite.
@@ -326,8 +348,51 @@ def test_fire_stops_retrying_at_max_attempts():
                                           "stdout": LIMIT_ENVELOPE},
         register=_no_timer, unregister=gone.append)
     assert payload["outcome"] == "still_limited"
+    assert "gave up" in payload["detail"]               # says why nothing is next
     assert autoresume.fold(events.read_all())["mark-1"]["status"] == "fired"
     assert gone == ["mark-1"]                           # gave up cleanly
+
+
+def test_fire_honours_a_schedule_issued_while_the_delivery_ran():
+    """The one-shot delivery runs for up to an hour; a `hive autoresume
+    schedule --at` issued meanwhile is the human's word on when the next
+    delivery is due, not the RETRY_HOURS backoff."""
+    _interrupted()
+    autoresume.schedule("mark-1", register=_no_timer, now=T0_EPOCH)
+    quiet = autoresume._iso(time.time() + 30 * 3600)
+
+    def runner(prompt, model=None, cwd=None, timeout_s=None):
+        autoresume.schedule("mark-1", at=quiet, register=_no_timer)
+        return {"exit": 0, "stdout": LIMIT_ENVELOPE}
+
+    payload = autoresume.fire("mark-1", runner=runner, register=_no_timer,
+                              now=T0_EPOCH + 5 * 3600)
+    assert payload["outcome"] == "still_limited"
+    assert "by hand" in payload["detail"]
+    rec = autoresume.fold(events.read_all())["mark-1"]
+    assert (rec["status"], rec["due"], rec["attempt"]) == \
+        ("scheduled", quiet, 1)
+
+
+def test_fire_does_not_re_arm_a_plan_resumed_while_the_delivery_ran():
+    """A human who ran `hive roadmap resume` while the delivery was out has
+    the plan: the still-limited delivery records why nothing is next instead
+    of failing on the schedule's own guard after its row landed."""
+    _interrupted()
+    autoresume.schedule("mark-1", register=_no_timer, now=T0_EPOCH)
+
+    def runner(prompt, model=None, cwd=None, timeout_s=None):
+        roadmap.record("resume", "mark-1")
+        return {"exit": 0, "stdout": LIMIT_ENVELOPE}
+
+    gone = []
+    payload = autoresume.fire(
+        "mark-1", runner=runner, unregister=gone.append,
+        register=lambda *a: pytest.fail("a resumed plan re-armed"))
+    assert payload["outcome"] == "still_limited"
+    assert "no longer interrupted (active)" in payload["detail"]
+    assert autoresume.fold(events.read_all())["mark-1"]["status"] == "fired"
+    assert gone == ["mark-1"]
 
 
 def test_fire_error_records_without_retry():

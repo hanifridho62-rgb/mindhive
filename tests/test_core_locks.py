@@ -199,6 +199,116 @@ def test_a_stale_holder_is_reclaimed_without_waiting_and_a_fresh_one_is_not(tmp_
     assert clock.slept
 
 
+# --- stale is the holder's death, not the file's age alone -----------------------------
+
+def _finished_process():
+    """A process that has exited. The Popen is returned too: while it is
+    referenced Windows keeps the process object, so the pid is not reused."""
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    done.wait()
+    return done
+
+
+def test_the_liveness_probe_tells_running_from_finished():
+    assert locks.pid_alive(os.getpid()) is True
+    sleeper = subprocess.Popen([sys.executable, "-c",
+                                "import time; time.sleep(120)"])
+    try:
+        assert locks.pid_alive(sleeper.pid) is True
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert locks.pid_alive(sleeper.pid) is False, "a finished process read as running"
+    done = _finished_process()
+    assert locks.pid_alive(done.pid) is False
+
+
+def test_an_old_lock_whose_holder_is_alive_is_not_stale():
+    """THE case. `hive embed` holds the chroma lock for as long as the encode
+    takes; at 31 s the age rule alone called the holder dead, and a second
+    taker unlinked the lock from under a live one."""
+    path = _lock_path()
+    path.write_text(f"{os.getpid()} 1.0", encoding="ascii")   # this process
+    old = time.time() - 31
+    os.utime(path, (old, old))
+    assert locks.is_stale(path, 30.0) is False
+    # The canary: the same file, same age, holder gone -- stale, as before.
+    assert locks.is_stale(path, 30.0, alive=lambda pid: False) is True
+
+
+def test_a_holder_that_is_gone_is_stale_only_past_stale_s():
+    path = _lock_path()
+    path.write_text("424242 1.0", encoding="ascii")
+    old = time.time() - 31
+    os.utime(path, (old, old))
+    assert locks.is_stale(path, 30.0, alive=lambda pid: False) is True
+    assert locks.is_stale(path, 1000.0, alive=lambda pid: False) is False
+
+
+@pytest.mark.parametrize("body", ["", "dead 1.0", '{"json": true}', "-5 1.0",
+                                  "0 1.0", "99999999999 1.0"])
+def test_a_lock_with_no_readable_holder_falls_back_to_its_age(body):
+    """A file created but not yet written, a torn write, or a file that is
+    not this module's at all (`watcher`'s claim markers are JSON): the age
+    rule stands, so nothing that reclaimed before stops reclaiming."""
+    path = _lock_path()
+    path.write_text(body, encoding="ascii")
+    old = time.time() - 31
+    os.utime(path, (old, old))
+    assert locks.holder_pid(path) is None, body
+    assert locks.is_stale(path, 30.0, alive=lambda pid: True) is True, body
+    assert locks.is_stale(path, 1000.0, alive=lambda pid: True) is False, body
+
+
+def test_the_holder_written_by_acquire_is_the_one_read_back():
+    path = _lock_path()
+    handle = locks.acquire(path)
+    try:
+        assert locks.holder_pid(path) == os.getpid()
+    finally:
+        handle.release()
+    assert locks.holder_pid(path) is None                  # gone with the file
+
+
+def test_a_live_holder_is_not_reclaimed_however_long_it_holds():
+    """Through `acquire`: a fake `now` an hour ahead makes the held lock look
+    ancient to a second taker, which under the age rule unlinked it and took
+    it. The holder is this process, so the taker must wait and give up."""
+    path = _lock_path()
+    holder = locks.acquire(path)
+    assert holder is not None
+    try:
+        clock = _Clock()
+        taker = locks.acquire(path, locks.LockPolicy(timeout_s=0.05, fail_open=True),
+                              sleep=clock.sleep, monotonic=clock.monotonic,
+                              now=lambda: time.time() + 3600)
+        assert taker is None
+        assert clock.slept                                 # waited, did not steal
+        assert path.read_text(encoding="ascii").startswith(f"{os.getpid()} ")
+    finally:
+        holder.release()
+
+
+def test_a_dead_holder_is_still_reclaimed_without_waiting():
+    """The canary for the test above: same age, the holder gone (by the
+    seam, and `acquire` passes it through) -- reclaimed at once."""
+    path = _lock_path()
+    path.write_text("424242 1.0", encoding="ascii")
+    old = time.time() - 31
+    os.utime(path, (old, old))
+    clock = _Clock()
+    handle = locks.acquire(path, sleep=clock.sleep, monotonic=clock.monotonic,
+                           alive=lambda pid: False)
+    assert handle is not None and clock.slept == []
+    handle.release()
+    # And `file_lock` carries the seam the same way.
+    path.write_text("424242 1.0", encoding="ascii")
+    os.utime(path, (old, old))
+    with locks.file_lock(path, sleep=clock.sleep, monotonic=clock.monotonic,
+                         alive=lambda pid: False) as held:
+        assert held is True and clock.slept == []
+
+
 # --- ACCESS_DENIED: the DELETE-PENDING arm --------------------------------------------
 
 def test_three_access_denied_answers_are_waited_out_then_the_lock_is_held(tmp_path, monkeypatch):

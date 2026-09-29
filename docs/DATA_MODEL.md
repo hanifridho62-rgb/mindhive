@@ -36,7 +36,7 @@ the git main-repo directory name, normalized to a kebab-case slug
 | `pending_review.json`, `pending_changelog.json` | Sidecar gates: files awaiting thermo-review / a mandatory change-log entry. | `review`, `changelog` | self-healing |
 | `chroma/`                 | Optional vector index for `--semantic` recall: the `ledger` and `events` collections, plus the embedding watcher's `mindhive_<slug>` (§4.19). | `vectors.embed`, `vectors.embed_events`, `watcher` | yes (§4.19 names the one collection no command backfills) |
 | `orchestrator_memory.json` | Projection: the resolution set a lintester mission's breaker triggered, folded from `incidents.summaries`. The ledger stays the source of truth; delete this and `orchestrator.resilience.remember` rebuilds it byte-identically. | `orchestrator.resilience.remember` | yes |
-| `state/pending_embed.json` | Sidecar queue of semantic rows awaiting vector embedding: `{"entries": [{session_id, segment, seg_line, queued_at}]}`. `segment` is the basename actually written (`events.segment_name`, so a quarantined id names its `unsafe-*` slot); `seg_line` is the **1-based** physical line the row starts on. | `events._emit_pending_embed_marker` (`embedqueue`), inside the append lock after every `SEMANTIC_TYPES` append, fail-open; consumed and truncated by the background watcher only | yes — disposable: deleting it loses nothing, `hive embed` re-indexes from the ledger |
+| `state/pending_embed.json` | Sidecar queue of semantic rows awaiting vector embedding: one JSON object per line, `{session_id, segment, seg_line, queued_at}`, appended to (never rewritten) until it passes `embedqueue.QUEUE_MAX_BYTES` (256 KiB), when it is compacted to the newest rows that fit in half that; the older `{"entries": [...]}` document shape is still read. `segment` is the basename actually written (`events.segment_name`, so a quarantined id names its `unsafe-*` slot); `seg_line` is the **1-based** physical line the row starts on. | `events._emit_pending_embed_marker` (`embedqueue`), inside the append lock after every `SEMANTIC_TYPES` append, fail-open; consumed by the background watcher only, which claims nothing without the vector extras | yes — disposable: deleting it loses nothing, `hive embed` re-indexes from the ledger |
 
 `state/` (`paths.state_dir`, made on demand) is the namespace's directory for
 sidecars of that kind: neither the ledger nor a projection of it, written by
@@ -201,16 +201,27 @@ unvalidated ledger string into the rendered trail), `memory_consolidated`,
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
 `autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
-model?, timer?, mode?, goal_dir?, checked_high?, outcome?, detail?}` —
+model?, timer?, mode?, goal_dir?, checked_high?, checked_left?, open_low?,
+open_left?, wake_ups?, outcome?, detail?}` —
 auto-resume delivery lifecycle, `autoresume.py`: action ∈ scheduled, fired,
 cancelled; after a usage-limit interruption the roadmap marker is scheduled
 to re-enter Claude once the ~5h window reopens — mode "prompt" as a one-shot
 headless session, mode "loop" by relaunching the loop engine on `goal_dir`
-(through `fabricate.run` when the plan is a fabrication's `fab_id`), whose
-re-arm carries `checked_high`, the most `fix_plan.md` items the chain has
-seen checked, so only a wake-up that checks off something new restarts the
-attempt count; these events are the delivery audit trail and the roadmap
-events remain the semantic record),
+(through `fabricate.run` when the plan is a fabrication's `fab_id`); only
+`api_cap` and `max_hours` arm that delivery — `budget_cap` under
+`on_cap = "stop"` earns the marker alone, since the operator said stop; a
+loop-mode re-arm carries the chain's counters: `checked_high` / `open_low`,
+the most `fix_plan.md` items seen checked and the fewest required ones seen
+open, so only a wake-up that moves the checklist past them restarts the
+attempt count; `checked_left` / `open_left`, both counts as the relaunch
+left them, so items a human un-checks or adds while the loop sleeps move
+the marks back; and `wake_ups`, the chain's running count against
+loop.toml `[autoresume] max_wake_ups` (default 48), the absolute cap; all
+bounded by `MAX_CHAIN_COUNT` and dropped from fired/cancelled records; a
+`fired` row lands after the delivery returns, and a cancel, a hand-issued
+re-schedule or a retired plan meanwhile is honoured over its re-arm; these
+events are the delivery audit trail and the roadmap events remain the
+semantic record),
 `fabrication` (`{action, fab_id, goal_dir?, title?, steps?, source?, due?,
 timer?, cwd?, run_id?, reason?, iterations?}` — PRD assembly-line
 lifecycle, `fabricate.py` (blueprint P10, spec Bug 9): action ∈ compiled,
@@ -2313,13 +2324,17 @@ encoder's threads with `setdefault` (`OMP`/`MKL`/`OPENBLAS`/`VECLIB`/`NUMEXPR` =
 
 **The write paths.**
 
-1. `append_event` appends the row, then (still inside the append lock) queues
-   `{session_id, segment, seg_line, queued_at}` in `state/pending_embed.json`
-   (`embedqueue`). A failure to queue is swallowed: the append is what must
-   not be lost.
+1. `append_event` appends the row, then (still inside the append lock) appends
+   one line, `{session_id, segment, seg_line, queued_at}`, to
+   `state/pending_embed.json` (`embedqueue`; the segment's newline count that
+   gives `seg_line` is read BEFORE the lock and reconciled inside it). A failure
+   to queue is swallowed: the append is what must not be lost. Past
+   `embedqueue.QUEUE_MAX_BYTES` the queue is compacted to its newest rows.
 2. The embedding watcher (`watcher.py`) claims the queue by renaming it to
-   `processing_embed_<time_ns>.json` (backoff `0.02, 0.04, 0.08, 0.16, 0.32` s),
-   reads each physical record, embeds the batch into `mindhive_<slug>`,
+   `processing_embed_<time_ns>.json` (backoff `0.02, 0.04, 0.08, 0.16, 0.32` s)
+   — only with the vector extras installed; without them nothing is claimed and
+   the reason is said once — reads each physical record (each row once),
+   embeds the batch into `mindhive_<slug>`,
    appends `vector_sync_started` / `vector_sync_completed`
    (`{marker, count, duration_s}`), and deletes the claim. A failed embed leaves
    its claim on disk; `recover_stale_markers` returns a claim older than

@@ -180,6 +180,67 @@ def test_a_quarantined_session_id_reads_the_quarantined_segment():
     assert conn.executed[0][1][1].startswith("unsafe-")
 
 
+def test_a_listed_quarantine_stem_reads_the_segment_it_was_listed_from(
+        monkeypatch):
+    """`list_sessions` answers the `unsafe-<hash>` stem the mirror holds, and
+    the SPI says that stem IS the id the store addresses it by. Resolving it
+    through `segment_of` quarantined it a SECOND time -- the reservation in
+    `paths.is_reserved_component` -- so the read asked for a segment nothing
+    ever wrote and answered nothing, for a session the store had just listed.
+
+    `_fetch` is replaced rather than the connection faked, so rows come back
+    ONLY for the segment the row was written under: a driver asking for the
+    wrong one gets the empty list the real mirror would give it."""
+    written = events.segment_name("../escape")          # unsafe-<hash>.jsonl
+    stem = written[:-len(".jsonl")]
+    ev = _ev(0, session_id="../escape")
+    asked = []
+
+    def _fetch(self, sql, params):
+        asked.append((sql, tuple(params)))
+        if sql == postgres_driver.SEGMENTS_SQL:
+            return [(written,)]
+        if sql == postgres_driver.READ_SEGMENT_SQL and params[1] == written:
+            return _mirror_rows([(0, ev)], session_id="../escape")
+        return []
+
+    monkeypatch.setattr(PostgresEventStore, "_fetch", _fetch)
+    store = _store(FakeConn())
+    assert store.list_sessions() == [stem]
+    got = list(store.read_stream(store.list_sessions()[0]))
+    assert [(r.session_id, r.seg_line) for r in got] == [("../escape", 1)]
+    assert asked[-1] == (postgres_driver.READ_SEGMENT_SQL, ("p", written))
+    assert asked[-1][1][1] == stem + ".jsonl"
+
+
+def test_canary_segment_of_still_quarantines_the_listed_stem():
+    """Arms the test above, and pins the WRITE rule: `segment_of` must keep
+    sending a conforming `unsafe-*` stem round the hash, or a writer could
+    choose a hostile id's quarantine slot by spelling its name."""
+    stem = events.segment_name("../escape")[:-len(".jsonl")]
+    assert PostgresEventStore.segment_of(stem) != stem + ".jsonl"
+    assert PostgresEventStore.segment_of(stem).startswith("unsafe-")
+
+
+def test_a_quarantined_record_is_written_and_read_back_under_one_segment():
+    """The round trip for a refused id, at the fake's level: `insert_record`
+    files the row under the quarantine segment (the write rule),
+    `list_sessions` lists that stem, and `read_stream` by the listed stem asks
+    for the SAME segment -- the property the pg tier proves end to end."""
+    rec = records.build_record(_ev(0, session_id="../escape"), 1,
+                               GENESIS_PREV_HASH)
+    conn = FakeConn()
+    store = _store(conn)
+    store.insert_record(FakeCursor(conn), rec)
+    written = conn.executed[0][1][1]
+    assert written == events.segment_name("../escape")
+    conn.rows = {SEGS: [(written,)]}
+    (stem,) = store.list_sessions()
+    conn.executed.clear()
+    list(store.read_stream(stem))
+    assert conn.executed[0][1] == ("p", written)
+
+
 # --------------------------------------------------------------------------
 # list_sessions
 # --------------------------------------------------------------------------
@@ -378,6 +439,16 @@ def test_the_whole_append_is_one_transaction():
     _store(conn).append("s1", "decision", {"text": "x"})
     assert (conn.cursors, conn.commits, conn.closes) == (1, 1, 1)
     assert len(conn.executed) == 2, "one read, one insert"
+
+
+def test_a_chosen_quarantine_name_is_refused_on_append_as_well():
+    """`records.listed_segment_name` is a READ rule only. A caller cannot write
+    into a listed quarantine segment by spelling its stem as the session id:
+    the validator refuses the reserved prefix before any statement runs."""
+    conn = FakeConn()
+    with pytest.raises(ValueError, match="Format session_id"):
+        _store(conn).append("unsafe-" + "0" * 16, "decision", {})
+    assert conn.executed == []
 
 
 # --------------------------------------------------------------------------

@@ -87,12 +87,23 @@ class LocalEventStore(EventStore):
     # --- paths ------------------------------------------------------------
 
     def segment_path(self, session_id):
-        """The physical segment for *session_id*, quarantine rule included.
+        """The physical segment *session_id* WRITES to, quarantine rule
+        included -- the name `append_event` used for it.
 
         `paths.events_dir` MKDIRS, which is correct here -- a store asked for
         a segment path is about to read or write it -- and is the reason this
         is not spelled inline at three call sites with one of them forgetting."""
         return paths.events_dir(self.project) / events.segment_name(session_id)
+
+    def _listed_path(self, session_id):
+        """The segment a name from `list_sessions` READS from. A quarantined
+        session is listed by its `unsafe-<hash>` stem, and `segment_name`
+        would quarantine that stem again, onto a file nothing wrote --
+        `records.listed_segment_name` takes it verbatim instead. Reads only:
+        `append` still goes through `append_event`, whose reservation keeps
+        a caller from writing into a quarantine slot by naming it."""
+        return (paths.events_dir(self.project)
+                / records.listed_segment_name(session_id))
 
     def _state_path(self):
         return paths.project_dir(self.project) / STATE_FILE
@@ -146,7 +157,7 @@ class LocalEventStore(EventStore):
         hashes before it. A cache could supply the head at 400 but not the
         chain through it, and half a fold is the shape that reads as an answer
         while being one."""
-        seg = self.segment_path(session_id)
+        seg = self._listed_path(session_id)
         if not seg.exists():
             return
         for rec in records.fold_rows(records.segment_rows(seg)):

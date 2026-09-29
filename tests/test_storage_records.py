@@ -236,3 +236,71 @@ def test_canary_the_module_never_splits_a_line_itself():
     assert '.split("\\n")' not in text
     assert ".splitlines()" not in text
     assert "_segment_parts" in text
+
+
+# --------------------------------------------------------------------------
+# listed_segment_name: the read-only inverse of list_sessions
+# --------------------------------------------------------------------------
+
+def _stem(segment: str) -> str:
+    """What `list_sessions` answers for a segment file name."""
+    return segment[:-len(".jsonl")]
+
+
+def test_a_listed_quarantine_stem_names_the_segment_it_was_listed_from():
+    """The SPI's promise (`EventStore.list_sessions`): the `unsafe-<hash>` a
+    store lists IS the id it can be addressed by. `events.segment_name` cannot
+    keep it -- the reservation in `paths.is_reserved_component` sends a
+    conforming `unsafe-*` stem round the hash a SECOND time, naming a segment
+    nothing ever wrote -- and the second assertion pins that this is still so,
+    because it is what stops a writer CHOOSING a quarantine slot."""
+    written = events.segment_name("../escape")
+    stem = _stem(written)
+    assert records.listed_segment_name(stem) == written
+    assert events.segment_name(stem) != written
+
+
+@pytest.mark.parametrize("sid", ["s1", "manual", "Probe-1", "a.b_c-d"])
+def test_a_conforming_id_resolves_exactly_as_segment_name_does(sid):
+    assert records.listed_segment_name(sid) == events.segment_name(sid) \
+        == sid + ".jsonl"
+
+
+@pytest.mark.parametrize("hostile", ["../escape", "a/b", "unsafe-../x",
+                                     "unsafe-a b", ".hidden", ""])
+def test_a_hostile_id_still_reads_the_quarantine_segment_it_was_written_to(
+        hostile):
+    """Reading by the RAW id keeps working: anything that is not one safe
+    component goes through the quarantine rule exactly as the write did."""
+    assert records.listed_segment_name(hostile) == events.segment_name(hostile)
+    assert records.listed_segment_name(hostile).startswith(
+        events.QUARANTINE_PREFIX)
+
+
+def test_a_case_variant_of_the_prefix_is_a_listed_stem_too():
+    """The reservation is case-insensitive because NTFS is, so the inverse is
+    too: a stem a store lists under any spelling of the prefix is its own
+    file. `segment_name` still refuses to WRITE by it."""
+    stem = "UNSAFE-" + "0" * 16
+    assert records.listed_segment_name(stem) == stem + ".jsonl"
+    assert events.segment_name(stem) != stem + ".jsonl"
+
+
+def test_the_unstringifiable_slot_is_a_listed_stem_too():
+    """`segment_name` files a value with no string form under one fixed name;
+    listed, it reads back like any other quarantine stem."""
+    stem = "unsafe-unstringifiable"
+    assert records.listed_segment_name(stem) == stem + ".jsonl"
+
+
+def test_a_non_string_goes_through_the_quarantine_rule():
+    for odd in (None, 42, b"s1"):
+        assert records.listed_segment_name(odd) == events.segment_name(odd)
+
+
+@pytest.mark.parametrize("stem", [
+    "unsafe-" + "f" * 16, "UNSAFE-" + "0" * 16, "../x", "unsafe-../x", "a/b"])
+def test_the_resolved_name_is_always_one_component(stem):
+    name = records.listed_segment_name(stem)
+    assert "/" not in name and "\\" not in name
+    assert name.endswith(".jsonl") and not name.startswith(".")
