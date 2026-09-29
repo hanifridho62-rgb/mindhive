@@ -29,6 +29,15 @@ _MODEL = None
 # `setdefault`, never assignment: an operator who exported `OMP_NUM_THREADS=8`
 # on a 32-core box made a decision, and a library that silently overrode it
 # would be lying about who is in charge of the machine.
+#
+# For THIS process only. `os.environ` is what every child inherits, so the
+# defaults inserted here rode along into every `claude`, `pytest` and
+# `python -m mindhive` this process spawned -- a two-thread BLAS cap nothing
+# there asked for. What is inserted is registered in `paths.PROCESS_ONLY_ENV`
+# (name -> value), and `paths.no_bytecode_env` (the one builder of child
+# environments) strips each while it still holds that value; an operator's
+# own value, set before or over it, is not ours to strip and propagates as
+# it would without mindhive.
 THREAD_ENV = {
     "OMP_NUM_THREADS": "2",
     "MKL_NUM_THREADS": "2",
@@ -42,10 +51,18 @@ THREAD_ENV = {
 def apply_thread_env(env=None):
     """Fill in `THREAD_ENV` on *env* (default `os.environ`) without ever
     overwriting a value already there. Returns the mapping it configured,
-    so a caller building a child's environment can chain."""
-    env = os.environ if env is None else env
+    so a caller that WANTS a child capped can apply it to that child's
+    mapping and chain. What is inserted into the real environment is
+    registered in `paths.PROCESS_ONLY_ENV` (comment above `THREAD_ENV`), so
+    a child built by `paths.no_bytecode_env` does not inherit it; a mapping
+    handed in explicitly is configured, not registered."""
+    real = env is None or env is os.environ
+    env = os.environ if real else env
     for key, value in THREAD_ENV.items():
-        env.setdefault(key, value)
+        if key not in env:
+            env[key] = value
+            if real:
+                paths.PROCESS_ONLY_ENV[key] = value
     return env
 
 

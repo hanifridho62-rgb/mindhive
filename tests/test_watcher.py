@@ -400,6 +400,20 @@ def test_the_bar_is_twenty_cells_wide_at_every_percentage():
         assert 20 - filled >= 0, pct
 
 
+def test_the_bar_clamps_the_number_before_it_draws_a_cell():
+    """The arithmetic above holds only INSIDE 0..100. `repeat` throws
+    `RangeError` on a negative count, so a frame past 100% (`20 - filled`
+    negative) or below 0% (`filled` negative) took the whole poll render down
+    with it. The one producer keeps `done <= total` today; the pane does not
+    get to depend on that. `tests/test_dashboard_jobbar_node.py` runs the
+    fragment's own bytes against both; this pins the clamp in the default
+    tier, where node does not run."""
+    from mindhive import dashboard_js_actions
+    js = dashboard_js_actions.JS
+    assert "Math.min(100, Math.max(0, " in js
+    assert "Number.isFinite(job.progress_pct)" in js
+
+
 # --- startup recovery (PDF 4.5) ----------------------------------------------
 
 def test_a_stale_claim_is_returned_to_the_pending_queue():

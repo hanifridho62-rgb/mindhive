@@ -209,6 +209,30 @@ def test_dispatch_honors_at_and_in_hours(tmp_path):
         fabricate.dispatch(rec["fab_id"], at="weekend", register=_no_timer)
 
 
+@pytest.mark.parametrize("hours", [0, 0.0, -1, -0.5, float("nan"),
+                                   float("inf"), "soon"])
+def test_dispatch_refuses_a_lead_that_is_not_a_positive_number(tmp_path, hours):
+    """`--in-hours 0` and a negative value put the due time at or before now,
+    so the Task Scheduler trigger was armed in the past and never fired -- a
+    dispatch recorded as scheduled while nothing was. Refused the way junk
+    `--at` is: a `ValueError` naming the flag, before any event is written."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    before = len(events.read_all())
+    with pytest.raises(ValueError, match="--in-hours"):
+        fabricate.dispatch(rec["fab_id"], in_hours=hours, register=_no_timer,
+                           now=T0_EPOCH)
+    assert len(events.read_all()) == before            # nothing recorded
+
+
+def test_dispatch_keeps_a_tiny_lead_at_the_minimum(tmp_path):
+    """A positive lead shorter than the registrar needs is the same dead
+    trigger by a smaller margin; it is lifted to `MIN_LEAD_S`, as `--at` is."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    p = fabricate.dispatch(rec["fab_id"], in_hours=1e-6, register=_no_timer,
+                           now=T0_EPOCH)
+    assert p["due"] == fabricate._iso(T0_EPOCH + fabricate.MIN_LEAD_S)
+
+
 def test_dispatch_requires_a_compiled_fabrication(tmp_path):
     with pytest.raises(ValueError, match="compile the PRD first"):
         fabricate.dispatch("fab-ghost", register=_no_timer)
@@ -926,6 +950,66 @@ def test_loop_mode_wake_up_of_a_plain_loop_keeps_the_bare_engine(
     assert "loop-run-1" not in fabricate.fold(events.read_all())
 
 
+def _plain_loop(tmp_path, monkeypatch):
+    """A `hive loop` run's plan -- not a fabrication -- capped and armed for a
+    loop-mode wake-up, with the bare engine faked and `fabricate._run_loop`
+    forbidden, so the wake-up can only take the plain-loop path."""
+    from mindhive.loop import scaffold as scaffold_mod
+    goal_dir = tmp_path / ".hive-loop"
+    scaffold_mod.scaffold(goal_dir)
+    roadmap.record("set", "loop-run-1", prompt="Build it", steps=["step one"])
+    roadmap.record("interrupt", "loop-run-1", cause="api_cap")
+    autoresume.schedule("loop-run-1", mode="loop", goal_dir=str(goal_dir),
+                        register=_no_timer, now=T0_EPOCH)
+    bare, gone = _fake_engine(monkeypatch)
+    monkeypatch.setattr(fabricate, "_run_loop",
+                        lambda *a, **k: pytest.fail("not a fabrication"))
+    return bare, gone
+
+
+def test_a_plain_loop_wake_up_without_a_claude_cli_is_an_error(
+        tmp_path, monkeypatch):
+    """The bare engine's first error branch: `loop_driver.preflight` finds no
+    `claude` on PATH. The wake-up records the error in the branch's own words,
+    launches nothing, and drops its timer rather than re-arming into the same
+    missing binary."""
+    from mindhive.loop import driver as loop_driver
+    from mindhive.loop import engine as loop_engine
+    bare, gone = _plain_loop(tmp_path, monkeypatch)
+    monkeypatch.setattr(loop_driver, "preflight", lambda *a, **k: False)
+    monkeypatch.setattr(loop_engine, "run_loop",
+                        lambda **kw: pytest.fail("the engine must not run"))
+    payload = autoresume.fire("loop-run-1", runner=_no_prompt)
+    assert (payload["outcome"], payload["detail"]) == \
+        ("error", "claude CLI not found")
+    assert bare == []
+    assert gone == [autoresume._task_name("loop-run-1")]
+    assert autoresume.fold(events.read_all())["loop-run-1"]["status"] == "fired"
+
+
+def test_a_plain_loop_wake_up_refused_by_the_guard_is_an_error(
+        tmp_path, monkeypatch):
+    """The second: `run_loop` raising `RuntimeError` is the LIVE_LOCK guard's
+    refusal. The outcome is an error carrying the guard's own message --
+    exactly that, not the `RuntimeError: ...` rendering `fire`'s last-resort
+    catch would give an exception the delivery let through, and not a
+    `still_limited` that would re-arm into the same held lock."""
+    from mindhive.loop import engine as loop_engine
+    bare, gone = _plain_loop(tmp_path, monkeypatch)
+
+    def refused(**kw):
+        bare.append(kw.get("plan_id"))
+        raise RuntimeError("V17 LIVE_LOCK active")
+
+    monkeypatch.setattr(loop_engine, "run_loop", refused)
+    payload = autoresume.fire("loop-run-1", runner=_no_prompt)
+    assert (payload["outcome"], payload["detail"]) == \
+        ("error", "V17 LIVE_LOCK active")
+    assert bare == ["loop-run-1"]
+    assert gone == [autoresume._task_name("loop-run-1")]
+    assert autoresume.fold(events.read_all())["loop-run-1"]["status"] == "fired"
+
+
 def test_autoresume_contract_rejects_bad_mode_payloads():
     with pytest.raises(ValueError, match="mode"):
         autoresume.validate_payload(
@@ -990,6 +1074,20 @@ def test_cli_compile_dispatch_list(tmp_path, capsys):
     assert cli_mod.main(["fabricate", "list"]) == 0
     out = capsys.readouterr().out
     assert "[fab-toggle]" in out and "runs " in out
+
+
+def test_cli_dispatch_refuses_a_lead_that_is_not_positive(tmp_path, capsys):
+    prd = tmp_path / "prd.md"
+    prd.write_text(PRD_MD, encoding="utf-8")
+    assert cli_mod.main(["fabricate", "compile", str(prd),
+                         "--dir", str(tmp_path), "--id", "fab-toggle"]) == 0
+    capsys.readouterr()
+    for hours in ("0", "-2"):
+        assert cli_mod.main(["fabricate", "dispatch", "fab-toggle",
+                             "--in-hours", hours]) == 2
+        assert "--in-hours" in capsys.readouterr().err
+    assert not [e for e in events.read_all() if e.type == "fabrication"
+                and e.payload.get("action") == "dispatched"]
 
 
 def test_cli_compile_from_learning(tmp_path, capsys, monkeypatch):
