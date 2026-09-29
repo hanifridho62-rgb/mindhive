@@ -108,11 +108,14 @@ def _snapshot_interrupted_plan(project, run_id, loop_dir, cause,
         # Claude once the usage window reopens — same best-effort stance as
         # the snapshot itself. Loop mode: the wake-up relaunches THIS loop on
         # its goal dir (breaker, budgets, exit gate intact), running from the
-        # repo root (loop_dir is the goal dir inside it).
+        # repo root (loop_dir is the goal dir inside it). A run that IS such a
+        # wake-up leaves the re-arming to `autoresume.fire`, which counts the
+        # attempt: arming here too restarted the count on every relaunch.
         from .. import autoresume as autoresume_mod
-        autoresume_mod.schedule(plan_id, project=project,
-                                cwd=str(Path(loop_dir).parent),
-                                mode="loop", goal_dir=str(loop_dir))
+        if autoresume_mod.waking_attempt() is None:
+            autoresume_mod.schedule(plan_id, project=project,
+                                    cwd=str(Path(loop_dir).parent),
+                                    mode="loop", goal_dir=str(loop_dir))
     except Exception:
         pass
 

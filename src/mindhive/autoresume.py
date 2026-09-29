@@ -23,8 +23,9 @@ roadmap events stay the semantic record):
   prompt (the ask, per-step progress, the NEXT pointer, and directives to
   keep the roadmap updated) and fed to a headless ``claude -p``. Outcome is
   ``delivered`` / ``still_limited`` / ``error`` / ``skipped``; a
-  still-limited delivery re-schedules itself with a short backoff until
-  MAX_ATTEMPTS.
+  still-limited delivery re-schedules itself until MAX_ATTEMPTS -- a
+  one-shot after a short backoff, a relaunched loop one cooldown after the
+  interruption its run just recorded.
 - ``cancelled`` — a human picked the plan back up (``hive roadmap resume`` /
   ``complete``), so the pending delivery and its OS timer are withdrawn.
 
@@ -36,6 +37,7 @@ import subprocess
 import sys
 import time
 import calendar
+import contextvars
 
 from . import events as ev_mod
 from . import claude_cli
@@ -511,6 +513,21 @@ def _classify(res) -> tuple:
     return "error", err
 
 
+# The attempt of the loop-mode wake-up running in this context, None outside
+# one: `fire` sets it around the relaunch, and the engine's interruption
+# snapshot reads it through `waking_attempt` before re-arming anything.
+_WAKING = contextvars.ContextVar("mindhive_autoresume_waking", default=None)
+
+
+def waking_attempt():
+    """The attempt number of the loop-mode wake-up this code runs inside, or
+    None outside one. A relaunched run that is capped again must not re-arm
+    itself: its fresh schedule would restart the count at attempt 1 on every
+    relaunch -- a capped loop waking every cooldown with no end. Inside a
+    wake-up `fire` re-arms instead, one attempt later, until MAX_ATTEMPTS."""
+    return _WAKING.get()
+
+
 def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
     """Loop-mode delivery: relaunch the autonomous loop engine on its goal
     dir — for loop-originated interruptions and fabrication runs, which get
@@ -558,11 +575,11 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
          unregister=None) -> dict:
     """Deliver the marker now (normally invoked by the OS timer at the due
     time). Re-checks the plan first: one resumed or completed by a human is
-    skipped, never re-delivered. Prompt-mode still-limited deliveries
-    re-schedule themselves (RETRY_HOURS backoff) until MAX_ATTEMPTS;
-    loop-mode ones never self-reschedule — the loop's own interruption
-    snapshot has already re-armed the schedule (and re-registered the
-    -Force'd task), so touching the timer here would kill it. Returns the
+    skipped, never re-delivered. A still-limited delivery re-schedules
+    itself until MAX_ATTEMPTS: a one-shot RETRY_HOURS later, a relaunched
+    loop one cooldown after the interruption its run just recorded. The
+    relaunched run's own snapshot leaves that re-arming to this call
+    (`waking_attempt`), so every relaunch counts as an attempt. Returns the
     fired payload."""
     evs = ev_mod.read_all(project)
     sched = fold(evs).get(plan_id)
@@ -584,6 +601,7 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     goal_dir = (sched or {}).get("goal_dir") or ""
     if (sched or {}).get("mode") == "loop" and goal_dir \
             and os.path.isdir(goal_dir):
+        waking = _WAKING.set(attempt)
         try:
             outcome, detail = (loop_runner or _run_loop_delivery)(
                 plan_id, goal_dir, project)
@@ -593,13 +611,26 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
             # is recorded as its outcome, so the plan never reads as
             # scheduled while nothing is.
             outcome, detail = "error", f"{type(e).__name__}: {e}"
+        finally:
+            _WAKING.reset(waking)
         payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
                    "outcome": outcome,
                    "detail": str(detail)[:MAX_DETAIL_CHARS]}
         validate_payload(payload)
         ev_mod.append_event("autoresume", payload, session_id=session_id,
                             tags=["autoresume"], project=project)
-        if outcome != "still_limited":
+        rearmed = False
+        if outcome == "still_limited" and attempt < MAX_ATTEMPTS:
+            try:
+                schedule(plan_id, project=project, session_id=session_id,
+                         cooldown_hours=(sched or {}).get("cooldown_hours"),
+                         attempt=attempt + 1, cwd=(sched or {}).get("cwd"),
+                         mode="loop", goal_dir=goal_dir, register=register,
+                         now=now)
+                rearmed = True
+            except ValueError:
+                pass            # no longer interrupted: nothing to re-arm
+        if not rearmed:
             try:
                 (unregister or _unregister_timer)(plan_id)
             except Exception:

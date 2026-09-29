@@ -327,6 +327,59 @@ def test_engine_cap_arms_loop_mode_resume_for_the_fabrication(tmp_path,
     assert ar["goal_dir"] == str(rec["goal_dir"])
 
 
+def test_a_capped_loop_wakes_at_most_max_attempts_times(tmp_path,
+                                                        monkeypatch):
+    """The whole unattended chain, the engine's own snapshot included: every
+    relaunch is capped again, and the OS timer fires whatever is armed. The
+    snapshot used to re-arm each relaunch at attempt 1, so the chain never
+    ended -- a loop that kept being capped woke every cooldown for ever, where
+    the prompt-mode resume it replaced gave up after MAX_ATTEMPTS."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    from mindhive.loop import config as loop_config
+    from mindhive.loop import engine as loop_engine
+    from mindhive.loop.driver import DriverResult, Usage
+
+    class CappedDriver:
+        def run(self, prompt, loop_context, **kw):
+            return DriverResult(text="", usage=Usage(input_tokens=10),
+                                session_id="s1", num_turns=1,
+                                rate_limited=True)
+
+    def capped_run(plan_id, goal_dir, project):
+        result = loop_engine.run_loop(
+            project="test", loop_dir=goal_dir,
+            cfg=loop_config.LoopConfig(max_iterations=3),
+            driver=CappedDriver(), now_fn=lambda: T0_EPOCH,
+            sleep_fn=lambda s: None, progress_fn=lambda i: True,
+            plan_id=plan_id)
+        assert result["reason"] == "api_cap"
+        return "still_limited", "loop api_cap"
+
+    armed, gone = [], []
+    monkeypatch.setattr(autoresume, "_register_timer",
+                        lambda plan_id, *a: armed.append(plan_id)
+                        or "windows_task")
+    monkeypatch.setattr(autoresume, "_unregister_timer", gone.append)
+    capped_run(rec["fab_id"], rec["goal_dir"], "test")      # the launch
+    assert armed == [rec["fab_id"]]
+    fires = 0
+    while armed and fires <= autoresume.MAX_ATTEMPTS:        # the OS timer
+        armed.pop()
+        autoresume.fire(
+            rec["fab_id"], loop_runner=capped_run,
+            runner=lambda *a, **k: pytest.fail("prompt runner must not be "
+                                               "used"))
+        fires += 1
+    assert fires == autoresume.MAX_ATTEMPTS
+    assert armed == [] and gone == [rec["fab_id"]]
+    evs = events.read_all()
+    assert autoresume.pending(evs) == []
+    assert [e.payload["attempt"] for e in evs if e.type == "autoresume"
+            and e.payload.get("action") == "fired"] == \
+        list(range(1, autoresume.MAX_ATTEMPTS + 1))
+
+
 def test_loop_mode_fire_relaunches_the_loop(tmp_path):
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
@@ -348,31 +401,55 @@ def test_loop_mode_fire_relaunches_the_loop(tmp_path):
     assert gone == [rec["fab_id"]]
 
 
-def test_loop_mode_fire_still_limited_never_self_reschedules(tmp_path):
+def test_loop_mode_fire_still_limited_arms_the_next_attempt(tmp_path):
+    """A relaunch that was capped again is the next attempt, not a fresh
+    first one: the wake-up re-arms itself one attempt later, and tells the
+    relaunched run it is one so the engine's snapshot leaves the timer be."""
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
     autoresume.schedule(rec["fab_id"], mode="loop",
                         goal_dir=rec["goal_dir"], register=_no_timer,
                         now=T0_EPOCH)
-    gone = []
-    n_before = len([e for e in events.read_all()
-                    if e.type == "autoresume"
-                    and e.payload.get("action") == "scheduled"])
+    gone, waking = [], []
+
+    def loop_runner(plan_id, goal_dir, project):
+        waking.append(autoresume.waking_attempt())
+        return "still_limited", "loop api_cap"
+
     # `runner=` is not decoration: without it, a regression that drops the
     # loop mode falls through to the prompt path and spawns a REAL headless
     # `claude` (acceptEdits, 3600 s) in the checkout. It happened once under a
     # mutation probe (blueprint P10); the seam makes that a fast failure.
     payload = autoresume.fire(
+        rec["fab_id"], loop_runner=loop_runner,
+        runner=lambda *a, **k: pytest.fail("prompt runner must not be used"),
+        register=_no_timer, unregister=gone.append)
+    assert payload["outcome"] == "still_limited"
+    assert waking == [1]
+    assert autoresume.waking_attempt() is None      # reset once it returned
+    assert gone == []                               # re-armed, not dropped
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert (ar["status"], ar["attempt"], ar["mode"], ar["goal_dir"]) == \
+        ("scheduled", 2, "loop", str(rec["goal_dir"]))
+
+
+def test_loop_mode_fire_gives_up_at_max_attempts(tmp_path):
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop",
+                        goal_dir=rec["goal_dir"], register=_no_timer,
+                        now=T0_EPOCH, attempt=autoresume.MAX_ATTEMPTS)
+    gone = []
+    payload = autoresume.fire(
         rec["fab_id"],
         loop_runner=lambda *a: ("still_limited", "loop api_cap"),
         runner=lambda *a, **k: pytest.fail("prompt runner must not be used"),
+        register=lambda *a: pytest.fail("no attempt after the last"),
         unregister=gone.append)
     assert payload["outcome"] == "still_limited"
-    assert gone == []                     # the engine owns the re-armed timer
-    n_after = len([e for e in events.read_all()
-                   if e.type == "autoresume"
-                   and e.payload.get("action") == "scheduled"])
-    assert n_after == n_before            # no self-reschedule in loop mode
+    assert autoresume.fold(events.read_all())[rec["fab_id"]]["status"] == \
+        "fired"
+    assert gone == [rec["fab_id"]]                  # gave up cleanly
 
 
 def test_loop_mode_fire_records_an_outcome_whatever_the_delivery_raises(
@@ -500,8 +577,11 @@ def test_loop_mode_wake_up_of_a_capped_fabrication_keeps_it_open(
         ("stopped", "api_cap", "loop-r3")
     assert roadmap.get(evs, rec["fab_id"])["status"] == "interrupted"
     assert gone == []                      # both timers stay armed
-    assert len([e for e in evs if e.type == "autoresume"
-                and e.payload.get("action") == "scheduled"]) == n_sched
+    sched = [e for e in evs if e.type == "autoresume"
+             and e.payload.get("action") == "scheduled"]
+    assert len(sched) == n_sched + 1       # the wake-up re-armed itself
+    assert (sched[-1].payload["attempt"], sched[-1].payload["mode"]) == \
+        (2, "loop")
 
 
 @pytest.mark.parametrize("launch", ["spawn_failed", "guard_refused"])

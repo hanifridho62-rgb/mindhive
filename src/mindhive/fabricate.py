@@ -404,7 +404,8 @@ def run(fab_id, *, project=None, session_id=None, run_loop_fn=None,
         force=False, unregister=None) -> dict:
     """Execute one loop launch for the fabrication (what the dispatch timer
     runs). A usage-capped launch leaves the roadmap interrupted and a
-    loop-mode auto-resume armed (the engine does both), so the next window
+    loop-mode auto-resume armed (the engine does both; inside an auto-resume
+    wake-up the wake-up re-arms, one attempt later), so the next window
     continues it; a completed launch earns the roadmap its exit. Returns
     the recorded run payload."""
     evs = ev_mod.read_all(project)
