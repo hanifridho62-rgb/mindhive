@@ -291,10 +291,11 @@ def test_the_cli_exits_one_on_a_broken_index_and_says_how_to_fix_it(
     assert maintenance.cmd_recall(_recall_args()) == 1
     err = capsys.readouterr().err
     assert err.startswith("error: semantic count failed")
-    # A count that failed is damaged files: `--rebuild` opens the same live
-    # index to drop it, so the advice is to delete the directory it names.
-    assert str(paths.project_dir() / "chroma") in err and "hive embed" in err
-    assert "--rebuild" not in err
+    # A count that failed read a collection chromadb could open, which
+    # `--rebuild` drops unread: the rebuild comes first, and the directory it
+    # names is the delete if the read still fails.
+    assert "hive embed --rebuild" in err
+    assert str(paths.project_dir() / "chroma") in err
 
 
 def test_the_cli_exits_two_without_the_extras_and_opens_nothing(monkeypatch,
@@ -354,6 +355,19 @@ def test_a_keyword_search_below_one_hit_answers_none():
     assert len(recall.recall("ofi gate")) == 5
     assert recall.recall("ofi gate", limit=0) == []
     assert recall.recall("ofi gate", limit=-3) == []
+
+
+@pytest.mark.parametrize("limit", [0, -3])
+def test_a_semantic_search_below_one_hit_asks_the_index_nothing(monkeypatch,
+                                                                 limit):
+    """`/api/recall?semantic=1&limit=0` reaches `recall.recall` unclamped --
+    only the CLI refuses the limit. A search for no hits asks nothing: not
+    the count, not either index. Asked, a broken index answered a search for
+    nothing with a 500 and advice to delete it."""
+    seen = _fake_vectors(monkeypatch, count=_broken(), event_hits=[_EVENT_HIT],
+                         file_hits=[_FILE_HIT])
+    assert recall.recall("postgres", semantic=True, limit=limit) == []
+    assert seen == {"events": 0, "files": 0, "strict": []}
 
 
 def test_the_dashboard_says_a_failed_search_failed():
