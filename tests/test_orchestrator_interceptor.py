@@ -891,7 +891,15 @@ def test_neither_import_order_breaks():
     import sys
     from pathlib import Path
 
+    # `parents[2]` of `src/mindhive/orchestrator/interceptor.py` is `src/` --
+    # one level deeper than a top-level module, where the same index is the
+    # repo root. Checked before spawning: handed a directory with no package,
+    # the child falls back to the editable install (the MAIN checkout) with
+    # no error, and this test silently measures the wrong tree.
     root = Path(itc.__file__).resolve().parents[2]
+    assert (root / "mindhive" / "__init__.py").is_file(), (
+        f"{root} holds no mindhive package: the child would not import this "
+        "checkout")
     for first in ("mindhive.orchestrator.gateway",
                   "mindhive.orchestrator.interceptor"):
         done = subprocess.run(
@@ -911,6 +919,10 @@ def test_the_grammar_half_touches_nothing(store):
     from pathlib import Path
 
     root = Path(itc.__file__).resolve().parents[2]
+    # Guarded for the reason given in `test_neither_import_order_breaks`.
+    assert (root / "mindhive" / "__init__.py").is_file(), (
+        f"{root} holds no mindhive package: the child would not import this "
+        "checkout")
     # Measured as a DELTA over `mindhive.orchestrator` itself: the package's
     # own `__init__` is not this module's doing, and pinning the absolute set
     # would pin that instead of the thing under test.

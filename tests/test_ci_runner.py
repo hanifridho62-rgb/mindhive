@@ -730,7 +730,15 @@ def test_the_runner_module_stays_under_the_meb_ceiling():
 
 
 def test_importing_the_runner_does_not_drag_in_the_orchestrator():
+    # `parents[2]` of `src/mindhive/ci/runner.py` is `src/` -- one level deeper
+    # than a top-level module, where the same index is the repo root. Checked
+    # before spawning: handed a directory with no package, the child falls
+    # back to the editable install (the MAIN checkout) with no error, and this
+    # test silently measures the wrong tree.
     root = Path(rn.__file__).resolve().parents[2]
+    assert (root / "mindhive" / "__init__.py").is_file(), (
+        f"{root} holds no mindhive package: the child would not import this "
+        "checkout")
     done = subprocess.run(
         [sys.executable, "-c",
          "import sys, mindhive.ci.runner;"
