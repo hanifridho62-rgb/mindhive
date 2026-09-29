@@ -5,44 +5,106 @@
 import json
 import os
 import re
-import time
 from contextlib import contextmanager
 from pathlib import Path
 from . import events, hookcapture, paths
+
+# The harvest lock's mechanics are the append lock's (`events._append_lock`
+# holds the measurements): `msvcrt` on Windows, `fcntl` everywhere else, both a
+# real OS byte-range lock that the kernel releases when the holder dies.
+try:                                                    # pragma: no cover
+    import msvcrt
+    _flock = None
+except ImportError:                                     # pragma: no cover
+    msvcrt = None
+    import fcntl as _flock
 
 
 def _harvest_lock_path() -> Path:
     return paths.store_file("harvest.lock")
 
 
-@contextmanager
-def _harvest_lock(stale_secs: float = 120.0):
-    """Cross-process mutex so concurrent harvesters (the dashboard's fast loop
-    and the scheduled autosync task) never process the same transcript lines at
-    once and double-write events. Yields True if acquired, False if another
-    harvest already holds it. A lock older than ``stale_secs`` is presumed
-    orphaned (crashed process) and stolen."""
-    p = _harvest_lock_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
+def _try_lock(fd) -> bool:
+    """One non-blocking attempt on the first byte of *fd*: True when this
+    descriptor now holds it, False when a live holder does."""
     try:
-        if p.exists() and (time.time() - p.stat().st_mtime) > stale_secs:
-            p.unlink()
+        if msvcrt is not None:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            _flock.flock(fd, _flock.LOCK_EX | _flock.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(fd) -> None:
+    try:
+        if msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            _flock.flock(fd, _flock.LOCK_UN)
     except OSError:
         pass
+
+
+@contextmanager
+def harvest_lock():
+    """Cross-process mutex over one harvest PASS, so the dashboard's loop, the
+    scheduled autosync task and an operator's `hive harvest` never walk the
+    same cursor window at once. Yields True when held for the block, False when
+    a live harvester holds it -- the caller skips its tick, never waits.
+
+    A kernel byte-range lock on `<store>/harvest.lock`, taken on a descriptor
+    of this call's own and held for the length of the block. It used to be an
+    `O_CREAT|O_EXCL` file with a stale rule -- a holder older than 120 s was
+    presumed dead, its file unlinked, the lock retaken -- and that rule is what
+    wrote the same row twice into the live store:
+
+    * **A pass has no bound.** `harvest` reads every transcript in a directory
+      end to end on every tick (the cursor is applied after the read) and folds
+      the whole namespace twice for its dedup snapshot; `failures.capture_dir`
+      then reads the directory again. Over a hundred namespaces nothing holds
+      that under two minutes, and the scheduled task fires every two minutes
+      regardless. So a second harvester arriving once the window had expired
+      found a LIVE holder mid-pass and started its own pass over the same
+      cursor window -- the first saves its cursor only at the end of each
+      directory, and its dedup snapshot was taken before the second wrote.
+    * **Both stamp the transcript's own timestamp**, so the second pass minted
+      rows the canonical serialiser cannot tell from the first: byte-identical,
+      on adjacent lines, and permanent, since the ledger is append-only and
+      hash-chained. `vectors.event_id` is content-addressed, which is how the
+      twins surfaced -- `hive embed` refused the duplicate id.
+    * **The release unlinked whatever file stood at the path.** After a theft
+      that was the thief's lock, so the pass the thief had refused to wait for
+      then admitted a third.
+
+    The kernel lock has none of that. It is released with the process, so a
+    crashed harvester leaves a file behind and no lock, and there is no stale
+    age to get wrong in either direction (a fresh file from a dead holder used
+    to block every tick for two minutes). The file is never unlinked: on POSIX
+    `flock` binds to the inode, and a fresh one would be a second lock. Every
+    caller opens its own descriptor, so two threads of one dashboard contend
+    exactly as two processes do -- `flock`, never `lockf`, which is
+    per-process and would let the second thread through. Fail-CLOSED when the
+    file cannot be opened: a skipped tick loses nothing, since the cursor does
+    not move, while an unlocked pass can duplicate forever -- the opposite of
+    the append lock's choice, for the opposite reason."""
+    p = _harvest_lock_path()
     try:
-        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except OSError:               # already held by another harvester
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(p), os.O_CREAT | os.O_RDWR, 0o666)
+    except OSError:
         yield False
         return
+    held = False
     try:
-        os.write(fd, str(os.getpid()).encode("utf-8"))
-        os.close(fd)
-        yield True
+        held = _try_lock(fd)
+        yield held
     finally:
-        try:
-            p.unlink()
-        except OSError:
-            pass
+        if held:
+            _unlock(fd)
+        os.close(fd)
 
 _MARKERS = ("remember:", "memo:", "decision:", "caveat:")
 # Hint words only disambiguate the GENERIC markers (remember:/memo:). An explicit
@@ -764,7 +826,7 @@ def catch_up(now=None, skip_captured=True, known_only=True) -> dict:
     `skipped_captured` are dropped as before: neither is a signal anyone
     acts on, while an unclosed call says an invocation went on the record
     with no outcome, so any rate built from it is thinner than it looks."""
-    with _harvest_lock() as got:
+    with harvest_lock() as got:
         if not got:               # another harvester is running — skip this tick
             return {"projects": {}, "total_new": 0, "skipped_unknown": [],
                     "unclosed_skill_calls": 0, "locked": True}

@@ -165,6 +165,22 @@ history and grouped by what each release window introduced. They summarise;
 
 ### Fixed
 
+- **A harvest pass is never walked twice.** `harvest.lock` was an
+  exclusive-create file with a 120 s stale age, and a pass over the live
+  store can outlive that (every transcript in a directory is read end to end
+  on every tick, plus three full folds of the namespace) while the
+  scheduled `autosync` task fires every two minutes. So the task could take
+  a live harvester's lock mid-pass and walk the same cursor window; both stamp
+  the transcript's own timestamp, so the rows were byte-identical, and the
+  release then unlinked the thief's lock, admitting a third. Measured on a
+  copy of the live store: semantic rows held twice in 5 of 107
+  namespaces, 467 extra rows in `mindhive` across all types, and `hive
+  embed` refusing the content-addressed twin. `harvest.harvest_lock` is
+  now a kernel byte-range lock like `append.lock` -- released with the
+  process, no stale age, the file never unlinked -- and `hive harvest
+  --transcripts D --project P`, the one door that took no lock, holds it
+  too and answers `locked: true` when refused. The existing duplicates
+  stay: the ledger is append-only and hash-chained.
 - **A failed semantic read no longer looks like "no hits", and a read no
   longer writes the index** (docs/DATA_MODEL.md §4.19; merged from
   `claude/semantic-recall-observable`):
