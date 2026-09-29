@@ -24,10 +24,14 @@ from pathlib import Path
 
 import pytest
 
-from mindhive import chain, events, paths, verify
+from mindhive import advice, chain, events, paths, verify
 from mindhive.ci import runner as rn
 
 GIT = "git"
+#: The SOP authorship pair, by NAME. What a test sets is a fake, and what an
+#: assertion reads back is presence -- never a value.
+SECRET, TOKEN = advice.SECRET_ENV, advice.TOKEN_ENV
+FAKE_SECRET = "fake-sop-secret-for-this-test-only"
 
 
 # --- the world the runner runs in -----------------------------------------------------
@@ -206,6 +210,68 @@ def test_a_real_child_imports_the_worktrees_own_copy(tree):
         cwd=tree, env=run._gate_env(tree))
     assert rc == 0, err
     assert str(tree.resolve()) in str(Path(out.strip()).resolve()), out
+
+
+def test_the_gate_env_withholds_the_sop_secret_and_token(runner, tmp_path,
+                                                          monkeypatch):
+    """A gate executes the branch under test, and this runner RECORDS what it
+    prints: anything the child inherits is one `print` from the ledger (PR
+    #136 merge-safety review, P2). Both names go, not only the token an agent
+    is denied -- a gate writes no SOP, and a valid token IS the secret."""
+    run, _ = runner
+    monkeypatch.setenv(SECRET, FAKE_SECRET)
+    monkeypatch.setenv(TOKEN, FAKE_SECRET)
+    # The canary: what gate 3 DOES need still reaches the child, so the
+    # negatives below are about withholding, not about an empty environment.
+    monkeypatch.setenv(rn.PG_DSN_ENV, "postgresql://ci@localhost/fake")
+
+    env = run._gate_env(tmp_path / "wt")
+
+    assert env[rn.PG_DSN_ENV] == "postgresql://ci@localhost/fake"
+    # Names on both sides, so a failure prints names and never a value.
+    names = sorted(k for k in env if k.startswith("MINDHIVE_"))
+    assert SECRET not in names and TOKEN not in names
+    assert [k for k, v in env.items() if v == FAKE_SECRET] == []   # no alias
+
+
+def test_no_gate_child_is_handed_the_secret_in_env_or_argv(runner, monkeypatch):
+    """Through a whole run, with gate 3 switched on so every kind of gate
+    child is seen: three pytest children and `hive pg parity`."""
+    run, fake = runner
+    monkeypatch.setenv(SECRET, FAKE_SECRET)
+    monkeypatch.setenv(TOKEN, FAKE_SECRET)
+    monkeypatch.setenv(rn.PG_DSN_ENV, "postgresql://ci@localhost/fake")
+
+    res = run.run_pr_gate(7, "feature/one")
+
+    assert res.ok is True, res.report_text
+    gates = [c for c in fake.calls if c["argv"][0] == sys.executable]
+    assert len(gates) == 4, [c["argv"] for c in gates]
+    for call in gates:
+        assert call["env"] is not None                  # never "inherit"
+        names = sorted(k for k in call["env"] if k.startswith("MINDHIVE_"))
+        assert SECRET not in names and TOKEN not in names
+        assert [k for k, v in call["env"].items() if v == FAKE_SECRET] == []
+        assert call["env"][rn.PG_DSN_ENV]               # kept: gate 3 needs it
+    for call in fake.calls:                             # git and gh included
+        assert FAKE_SECRET not in " ".join(call["argv"])
+
+
+def test_a_real_gate_child_really_does_not_see_the_secret(tree, monkeypatch):
+    """End to end through `_default_runner`: the child reports the NAMES it
+    can see, never a value."""
+    monkeypatch.setenv(SECRET, FAKE_SECRET)
+    monkeypatch.setenv(TOKEN, FAKE_SECRET)
+    run = rn.NativeCIRunner(tree, project="test")
+    rc, out, err = run._run(
+        [sys.executable, "-c",
+         "import json, os; print(json.dumps(sorted("
+         "k for k in os.environ if k.startswith('MINDHIVE_'))))"],
+        cwd=tree, env=run._gate_env(tree))
+    assert rc == 0, err
+    seen = json.loads(out)
+    assert "MINDHIVE_HOME" in seen                      # the env DID reach it
+    assert SECRET not in seen and TOKEN not in seen
 
 
 # --- the worktree (KRITIK 2) ----------------------------------------------------------
