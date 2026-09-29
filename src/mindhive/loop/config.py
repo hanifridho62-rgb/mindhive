@@ -42,6 +42,13 @@ class LoopConfig:
     no_progress_threshold: int = 3
     same_error_threshold: int = 5
     cooldown_minutes: int = 30
+    # [autoresume] — the absolute cap on one chain of loop-mode wake-ups (a
+    # usage-capped run relaunched every cooldown). autoresume.MAX_ATTEMPTS
+    # bounds a chain that gets nowhere; this bounds one that only looks like it
+    # is getting somewhere, whatever its checklist says. 48 is ten days at the
+    # default cooldown: an agent doing one usage window of work per wake-up for
+    # ten days straight is not a run anyone meant to leave alone.
+    max_wake_ups: int = 48
     # [replenish] — the ambition dial. Two keys only: whether the injector runs
     # at all, and how hard it pushes. Everything else the dial governs (score
     # threshold, active lens set, per-run cap) is derived from the position by
@@ -131,6 +138,9 @@ def load_config(path: Path) -> LoopConfig:
     replenish = data.get("replenish", {})
     if not isinstance(replenish, dict):
         replenish = {}
+    autoresume = data.get("autoresume", {})
+    if not isinstance(autoresume, dict):
+        autoresume = {}
     return LoopConfig(
         context_window=model.get("context_window", cfg.context_window),
         smart_zone_ratio=model.get("smart_zone_ratio", cfg.smart_zone_ratio),
@@ -165,4 +175,8 @@ def load_config(path: Path) -> LoopConfig:
             replenish.get("dry_rounds_to_exit"),
             cfg.replenish_dry_rounds_to_exit),
         replenish_anti_lazy=replenish.get("anti_lazy", cfg.replenish_anti_lazy),
+        # Positive only: a cap of 0 would end every chain at its first
+        # wake-up, which is what `hive autoresume cancel` is for.
+        max_wake_ups=_positive_int_or(autoresume.get("max_wake_ups"),
+                                      cfg.max_wake_ups),
     )

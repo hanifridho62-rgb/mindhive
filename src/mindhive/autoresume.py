@@ -25,8 +25,12 @@ roadmap events stay the semantic record):
   ``delivered`` / ``still_limited`` / ``error`` / ``skipped``; a
   still-limited delivery re-schedules itself until MAX_ATTEMPTS -- a
   one-shot after a short backoff, a relaunched loop one cooldown after it
-  returned, where only a relaunch that checked off nothing new on its
-  fix_plan checklist spends an attempt.
+  returned, where only a relaunch that moved nothing on its fix_plan
+  checklist (nothing newly checked, no required item cleared) spends an
+  attempt -- and a loop chain ends in any case at the wake-up cap its
+  loop.toml sets. Whatever a human did while the delivery ran -- cancelled
+  it, re-scheduled it by hand, retired the plan -- is honoured over that
+  re-arm.
 - ``cancelled`` — a human picked the plan back up (``hive roadmap resume`` /
   ``complete``), so the pending delivery and its OS timer are withdrawn.
 
@@ -39,6 +43,7 @@ import sys
 import time
 import calendar
 import contextvars
+from pathlib import Path
 
 from . import events as ev_mod
 from . import claude_cli
@@ -75,6 +80,18 @@ TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 MAX_DETAIL_CHARS = 500
 MAX_PATH_CHARS = 500
 MAX_MODEL_CHARS = 100
+
+# What a loop chain carries from one wake-up to the next, on each scheduled
+# row: the checklist marks -- `checked_high` / `open_low`, the most fix_plan
+# items it has seen checked and the fewest required ones it has seen open;
+# `checked_left` / `open_left`, both counts as the last relaunch left them --
+# and `wake_ups`, how many wake-ups the chain has had. All bounded: no
+# checklist has this many items, no chain this many wake-ups, and a
+# hand-written value past every reachable count would freeze progress
+# detection for good.
+MAX_CHAIN_COUNT = 100_000
+MARKS = ("checked_high", "checked_left", "open_low", "open_left")
+CHAIN_KEYS = MARKS + ("wake_ups",)
 
 # Interrupt causes that mean "Claude usage ran out" — the ones worth an
 # automatic delivery. session_end (a normal close) deliberately matches
@@ -118,6 +135,15 @@ def due_at(interrupted_at, cooldown_hours=COOLDOWN_HOURS, now=None) -> str:
 
 
 # --- payload contract ---------------------------------------------------------
+
+def _count(value):
+    """A chain counter as the contract reads it -- an int within the bound --
+    or None for anything else (absent, a bool, past the bound)."""
+    if isinstance(value, int) and not isinstance(value, bool) \
+            and 0 <= value <= MAX_CHAIN_COUNT:
+        return value
+    return None
+
 
 def validate_payload(payload) -> None:
     """Enforce the autoresume event contract at every append surface (the
@@ -168,11 +194,11 @@ def validate_payload(payload) -> None:
         if mode == "loop" and not str(payload.get("goal_dir") or "").strip():
             raise ValueError(
                 "autoresume mode 'loop' requires the goal_dir to relaunch")
-        high = payload.get("checked_high")
-        if high is not None and (not isinstance(high, int)
-                                 or isinstance(high, bool) or high < 0):
-            raise ValueError(
-                "autoresume checked_high must be an integer >= 0")
+        for key in CHAIN_KEYS:
+            if payload.get(key) is not None and _count(payload[key]) is None:
+                raise ValueError(
+                    f"autoresume {key} must be an integer from 0 to "
+                    f"{MAX_CHAIN_COUNT}")
     elif action == "fired":
         if payload.get("outcome") not in OUTCOMES:
             raise ValueError(
@@ -226,14 +252,14 @@ def fold(evs) -> dict:
                 mode=p.get("mode") if p.get("mode") in MODES else "prompt",
                 goal_dir=str(p.get("goal_dir") or "")[:MAX_PATH_CHARS],
                 outcome="", detail="")
-            # A loop chain's high-water mark rides only the schedule that
-            # carried it forward: one without it starts the count over.
-            high = p.get("checked_high")
-            if isinstance(high, int) and not isinstance(high, bool) \
-                    and high >= 0:
-                rec["checked_high"] = high
-            else:
-                rec.pop("checked_high", None)
+            # A loop chain's counters ride only the schedule that carried
+            # them forward: one without them starts the chain over.
+            for key in CHAIN_KEYS:
+                count = _count(p.get(key))
+                if count is None:
+                    rec.pop(key, None)
+                else:
+                    rec[key] = count
         elif action == "fired":
             outcome = p.get("outcome")
             if outcome not in OUTCOMES:
@@ -246,6 +272,11 @@ def fold(evs) -> dict:
                        detail=str(p.get("detail") or "")[:MAX_DETAIL_CHARS])
         elif action == "cancelled":
             rec.update(status="cancelled")
+        if action != "scheduled":
+            # The counters belong to a pending chain; a delivered, given-up
+            # or cancelled record carries none.
+            for key in CHAIN_KEYS:
+                rec.pop(key, None)
         rec["updated"] = ev.ts
         recs[plan_id] = rec
     return recs
@@ -446,16 +477,26 @@ def _unregister_timer(plan_id) -> None:
 # --- lifecycle: schedule / cancel / fire / wait -------------------------------
 
 def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
-             attempt=1, model=None, cwd=None, mode="prompt", goal_dir=None,
-             checked_high=None, session_id=None, register=None, now=None):
+             attempt=1, model=None, cwd=None, mode=None, goal_dir=None,
+             checked_high=None, checked_left=None, open_low=None,
+             open_left=None, wake_ups=None, session_id=None, register=None,
+             now=None):
     """Schedule the plan's marker to re-enter Claude. Guards mirror
     roadmap.record: the plan must exist and be interrupted — auto-resume
     delivers interruption markers, nothing else. Re-scheduling replaces the
-    pending delivery (and the -Force'd OS task). ``checked_high`` carries a
-    loop chain's high-water mark of checked items from one wake-up to the
-    next (see `fire`). Returns the appended event."""
+    pending delivery (and the -Force'd OS task); ``mode`` None keeps the mode
+    and goal dir of the plan's last delivery record -- a re-schedule moves
+    the delivery, it does not change how the plan resumes -- and a plan
+    never scheduled resumes in prompt mode. The chain counters (CHAIN_KEYS)
+    carry a loop chain's state from one wake-up to the next: its checklist
+    marks (see `_progress`) and its wake-up count (see `fire`). Returns the
+    appended event."""
     if evs is None:
         evs = ev_mod.read_all(project)
+    if mode is None:
+        last = fold(evs).get(plan_id) or {}
+        mode = last.get("mode") or "prompt"
+        goal_dir = goal_dir or last.get("goal_dir")
     rec = roadmap.get(evs, plan_id)
     if rec is None:
         raise ValueError(
@@ -496,8 +537,10 @@ def schedule(plan_id, *, project=None, evs=None, cooldown_hours=None, at=None,
                "model": str(model or "")[:MAX_MODEL_CHARS], "timer": timer,
                "mode": mode,
                "goal_dir": str(goal_dir or "")[:MAX_PATH_CHARS]}
-    if checked_high is not None:
-        payload["checked_high"] = checked_high
+    for key, count in zip(CHAIN_KEYS, (checked_high, checked_left, open_low,
+                                       open_left, wake_ups)):
+        if count is not None:
+            payload[key] = count
     validate_payload(payload)
     return ev_mod.append_event("autoresume", payload, session_id=session_id,
                                tags=["autoresume"], project=project)
@@ -563,21 +606,97 @@ def waking_attempt():
     return _WAKING.get()
 
 
-def _checked_items(goal_dir):
-    """How many items the goal dir's fix_plan.md has checked off -- the
-    loop's own record of how far it got -- or None when it cannot be read.
-    Not the roadmap's done count: a session that adopts the interrupted plan
-    while the loop sleeps re-writes its steps with its own todos, and the
-    roadmap keeps at most roadmap.MAX_STEPS of them."""
-    from pathlib import Path
+def _checklist_counts(goal_dir):
+    """The goal dir's fix_plan.md as two counts -- items checked off, and
+    required items still open (unchecked above any Future/Optional heading)
+    -- or None when it cannot be read. The loop's own record of how far it
+    got, not the roadmap's done count: a session that adopts the interrupted
+    plan while the loop sleeps re-writes its steps with its own todos, and
+    the roadmap keeps at most roadmap.MAX_STEPS of them. Total: whatever the
+    read or the parse raises, the checklist counts as unreadable; each count
+    is capped at the bound the contract puts on a carried counter."""
     from .loop import task as task_mod
-    plan = Path(goal_dir) / "fix_plan.md"
     try:
+        plan = Path(goal_dir) / "fix_plan.md"
         text = plan.read_text(encoding="utf-8", errors="replace") \
             if plan.exists() else ""
-    except OSError:
+        items = task_mod.plan_items(text)
+        return (min(len(items["done"]), MAX_CHAIN_COUNT),
+                min(len(items["planned"]), MAX_CHAIN_COUNT))
+    except Exception:                                       # noqa: BLE001
         return None
-    return len(task_mod.plan_items(text)["done"])
+
+
+def _measure(mark, left, before, after, rising) -> tuple:
+    """One measure of a relaunch's progress: a count that is progress when it
+    rises (items checked) or when it falls (required items open).
+
+    Progress is a reading past the furthest this chain has ever seen (the
+    mark), so a step checked and un-checked by turns never counts twice, nor
+    does work done between wake-ups (`before` moves the mark first). What
+    moved while the loop slept moves the mark the other way too: a count that
+    stands short of where the last relaunch left it (`left`) -- items
+    un-checked, items added -- is a human reopening work, and re-doing that is
+    progress, so the mark gives back as much. A count that cannot be read is
+    no progress and sets no mark. Returns (progressed, mark, left)."""
+    if None not in (mark, left, before):
+        if rising and before < left:
+            mark -= left - before
+        elif not rising and before > left:
+            mark += before - left
+    seen = [n for n in (mark, before) if n is not None]
+    progressed = after is not None and bool(seen) and (
+        after > max(seen) if rising else after < min(seen))
+    edge = max if rising else min
+    return (progressed,
+            edge(seen + ([] if after is None else [after]), default=None),
+            after)
+
+
+def _progress(sched, before, after) -> tuple:
+    """Whether a relaunch got somewhere on its checklist -- something newly
+    checked off, or a required item cleared from it (an agent that deletes a
+    finished line rather than checking it off) -- and the marks the re-arm
+    carries (`_measure`, once per count)."""
+    before = before or (None, None)
+    after = after or (None, None)
+    checked, high, c_left = _measure(
+        sched.get("checked_high"), sched.get("checked_left"),
+        before[0], after[0], rising=True)
+    cleared, low, o_left = _measure(
+        sched.get("open_low"), sched.get("open_left"),
+        before[1], after[1], rising=False)
+    return checked or cleared, {"checked_high": high, "checked_left": c_left,
+                                "open_low": low, "open_left": o_left}
+
+
+def _wake_up_cap(goal_dir) -> int:
+    """The chain's absolute cap on wake-ups, from the goal dir's loop.toml
+    (`[autoresume] max_wake_ups`), or the default when there is none or it
+    cannot be read -- total, like every read a wake-up makes."""
+    from .loop import config as loop_config
+    try:
+        return loop_config.load_config(
+            Path(goal_dir) / "loop.toml").max_wake_ups
+    except Exception:                                       # noqa: BLE001
+        return loop_config.LoopConfig().max_wake_ups
+
+
+def _loop_outcome(reason, iterations) -> tuple:
+    """A relaunch's delivery outcome from how its run ended. A cap a wake-up
+    can outwait (engine.AUTORESUME_REASONS: Claude's window reopens, a fresh
+    run gets a fresh clock) is still_limited. The other usage interruption --
+    the loop's own budget gate under `on_cap = "stop"` -- is the operator
+    saying stop, so that relaunch is delivered and the chain ends, the marker
+    left in place for a human."""
+    from .loop import engine as loop_engine
+    detail = f"loop {reason} after {iterations} iteration(s)"
+    if reason in loop_engine.AUTORESUME_REASONS:
+        return "still_limited", detail
+    if reason in loop_engine.USAGE_INTERRUPT_REASONS:
+        return "delivered", (f"{detail} -- stopped by its own budget gate "
+                             "(on_cap = \"stop\"): nothing re-armed")
+    return "delivered", detail
 
 
 def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
@@ -588,7 +707,6 @@ def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
     `fabricate.run` instead, so the launch records its `run` event and a
     `completed` one closes the roadmap and drops the dispatch timer. Lazy
     imports avoid a cycle (the engine and fabricate import this module)."""
-    from pathlib import Path
     from . import fabricate as fabricate_mod
     from .loop import config as loop_config
     from .loop import driver as loop_driver
@@ -599,13 +717,10 @@ def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
             p = fabricate_mod.run(plan_id, project=project)
         except ValueError as e:              # PROMPT.md gone: not runnable
             return "error", str(e)
-        reason = p["reason"]
-        detail = f"loop {reason} after {p['iterations']} iteration(s)"
+        reason, n = p["reason"], p["iterations"]
         if reason in ("spawn_failed", "guard_refused"):
-            return "error", detail
-        if reason in loop_engine.USAGE_INTERRUPT_REASONS:
-            return "still_limited", detail
-        return "delivered", detail
+            return "error", f"loop {reason} after {n} iteration(s)"
+        return _loop_outcome(reason, n)
     if not loop_driver.preflight("claude"):
         return "error", "claude CLI not found"
     cfg = loop_config.load_config(Path(goal_dir) / "loop.toml")
@@ -615,11 +730,8 @@ def _run_loop_delivery(plan_id, goal_dir, project) -> tuple:
             driver=loop_driver.CLIDriver("claude"), plan_id=plan_id)
     except RuntimeError as e:            # LIVE_LOCK guard refusal
         return "error", str(e)
-    reason = result.get("reason", "")
-    detail = f"loop {reason} after {result.get('iterations', 0)} iteration(s)"
-    if reason in loop_engine.USAGE_INTERRUPT_REASONS:
-        return "still_limited", detail
-    return "delivered", detail
+    return _loop_outcome(result.get("reason", ""),
+                         result.get("iterations", 0))
 
 
 def fire(plan_id, *, project=None, session_id=None, runner=None,
@@ -631,10 +743,12 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     itself until MAX_ATTEMPTS: a one-shot RETRY_HOURS later, a relaunched
     loop one cooldown after the relaunch returned. The relaunched run's own
     snapshot leaves that re-arming to this call (`waking_attempt`), which
-    counts the attempts: a relaunch that left more items checked on its
-    fix_plan checklist than the chain had ever seen restarts the count, one
-    that did not spends one, and one cancelled while it ran is not re-armed
-    at all. Returns the fired payload."""
+    counts the attempts: a relaunch that moved its fix_plan checklist past
+    anything the chain had seen -- more items checked, fewer required ones
+    open -- restarts the count, one that did not spends one (`_progress`),
+    and the chain's wake-up cap ends it regardless. What a human did while
+    the delivery ran decides over all of that (`_settle`). Returns the fired
+    payload."""
     evs = ev_mod.read_all(project)
     sched = fold(evs).get(plan_id)
     attempt = sched["attempt"] if sched else 1
@@ -655,7 +769,7 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     goal_dir = (sched or {}).get("goal_dir") or ""
     if (sched or {}).get("mode") == "loop" and goal_dir \
             and os.path.isdir(goal_dir):
-        before = _checked_items(goal_dir)
+        before = _checklist_counts(goal_dir)
         waking = _WAKING.set(attempt)
         try:
             outcome, detail = (loop_runner or _run_loop_delivery)(
@@ -668,90 +782,112 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
             outcome, detail = "error", f"{type(e).__name__}: {e}"
         finally:
             _WAKING.reset(waking)
-        # What the relaunch left behind decides the next wake-up: its
-        # checklist, and any cancel a human issued while it ran -- the
-        # `fired` row lands only now, so a cancel meanwhile found the
-        # delivery still scheduled and succeeded.
-        after = ev_mod.read_all(project)
-        cancelled = sched["status"] != "cancelled" and \
-            (fold(after).get(plan_id) or {}).get("status") == "cancelled"
-        # Only a wake-up that checked off nothing new spends an attempt: the
-        # bound is for a loop capped without getting anywhere, not for one
-        # capped while it works through a plan longer than MAX_ATTEMPTS. New
-        # means past the most this chain has seen checked, so a step checked
-        # and un-checked by turns never counts twice, nor does work checked
-        # off between wake-ups.
-        seen = [n for n in (sched.get("checked_high"), before)
-                if n is not None]
-        checked = _checked_items(goal_dir)
-        progressed = checked is not None and bool(seen) \
-            and checked > max(seen)
-        high = max(seen + ([] if checked is None else [checked]),
-                   default=None)
-        next_attempt = 1 if progressed else attempt + 1
-        rearm = outcome == "still_limited" and not cancelled \
-            and next_attempt <= MAX_ATTEMPTS
-        if outcome == "still_limited" and not rearm:
-            detail = f"{detail} -- " + (
-                "not re-armed: cancelled while it ran" if cancelled else
-                f"gave up: {MAX_ATTEMPTS} wake-ups in a row checked off "
-                "nothing new")
-        payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
-                   "outcome": outcome,
-                   "detail": str(detail)[:MAX_DETAIL_CHARS]}
-        validate_payload(payload)
-        ev_mod.append_event("autoresume", payload, session_id=session_id,
-                            tags=["autoresume"], project=project)
-        rearmed = False
-        if rearm:
-            # One cooldown after the relaunch returned: the window has just
-            # closed on it. Not after the recorded interruption -- a relaunch
-            # whose best-effort snapshot recorded none would re-arm off the
-            # old one, long past its cooldown, and wake a minute later into
-            # a window that is still closed.
+        # Only a wake-up that moved nothing on the checklist spends an
+        # attempt: the bound is for a loop capped without getting anywhere,
+        # not for one capped while it works through a plan longer than
+        # MAX_ATTEMPTS. The chain's wake-up cap (loop.toml) is absolute: it
+        # ends a chain whatever the checklist says, the one answer to an
+        # agent that manufactures progress.
+        progressed, marks = _progress(sched, before,
+                                      _checklist_counts(goal_dir))
+        wake_ups = (sched.get("wake_ups") or 0) + 1
+        cap = _wake_up_cap(goal_dir)
+        # Due one cooldown after the relaunch returned: the window has just
+        # closed on it. Not after the recorded interruption -- a relaunch
+        # whose best-effort snapshot recorded none would re-arm off the old
+        # one, long past its cooldown, and wake a minute later into a window
+        # that is still closed.
+        nxt = dict(attempt=1 if progressed else attempt + 1,
+                   cooldown_hours=sched["cooldown_hours"], cwd=sched["cwd"],
+                   mode="loop", goal_dir=goal_dir, wake_ups=wake_ups, **marks)
+        wait_s = sched["cooldown_hours"] * 3600
+        if nxt["attempt"] > MAX_ATTEMPTS:
+            exhausted = (f"{MAX_ATTEMPTS} wake-ups in a row neither checked "
+                         "off nor cleared a required item")
+        elif wake_ups >= cap:
+            exhausted = (f"this chain's cap of {cap} wake-up(s) "
+                         "(loop.toml [autoresume] max_wake_ups)")
+        else:
+            exhausted = None
+    else:
+        # Prompt-mode delivery (also the degrade path when a loop schedule's
+        # goal dir vanished: the composed marker still works as a one-shot).
+        prompt = resume_prompt(rec, attempt=attempt)
+        cwd = (sched or {}).get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None        # the worktree moved; run from the default cwd
+        model = (sched or {}).get("model") or None
+        res = (runner or _run_claude)(
+            prompt, model=model, cwd=cwd,
+            timeout_s=FIRE_TIMEOUT_S if timeout_s is None else timeout_s)
+        outcome, detail = _classify(res)
+        nxt = dict(attempt=attempt + 1, model=model, cwd=cwd, mode="prompt")
+        wait_s = RETRY_HOURS * 3600
+        exhausted = (f"{MAX_ATTEMPTS} deliveries in a row still limited"
+                     if attempt + 1 > MAX_ATTEMPTS else None)
+    return _settle(plan_id, sched, attempt, outcome, detail, nxt, wait_s,
+                   exhausted, project=project, session_id=session_id,
+                   now=now, register=register, unregister=unregister)
+
+
+def _settle(plan_id, sched, attempt, outcome, detail, nxt, wait_s, exhausted,
+            *, project, session_id, now, register, unregister) -> dict:
+    """Record the delivery and arm the next one, from what the ledger says
+    NOW. The `fired` row lands only here, hours after the delivery began, so
+    anything a human did meanwhile -- `hive autoresume cancel`, a fresh
+    `hive autoresume schedule --at`, `hive roadmap complete` -- found the
+    delivery still scheduled and succeeded, and is honoured over the re-arm
+    the delivery earned (`nxt`, due `wait_s` after the delivery RETURNED --
+    the clock is read here, not when it began): a hand-issued schedule is
+    re-armed as written, whatever the outcome; a cancelled delivery or a plan
+    no longer interrupted is not re-armed at all; and a still-limited
+    delivery that is not re-armed says why in its detail (`exhausted` names
+    what ran out -- attempts, or a loop chain's wake-up cap -- when something
+    did). The spent OS timer is dropped unless something was armed in its
+    place."""
+    after = ev_mod.read_all(project)
+    live = fold(after).get(plan_id)
+    plan = roadmap.get(after, plan_id)
+    rearm = None
+    if plan is None or plan["status"] != "interrupted":
+        if outcome == "still_limited":
+            detail = (f"{detail} -- not re-armed: roadmap no longer "
+                      f"interrupted ({plan['status'] if plan else 'gone'})")
+    elif live is not None and live["status"] == "scheduled" and live != sched:
+        rearm = dict(at=live["due"], attempt=live["attempt"],
+                     cooldown_hours=live["cooldown_hours"],
+                     cwd=live["cwd"] or None, model=live["model"] or None,
+                     mode=live["mode"], goal_dir=live["goal_dir"] or None,
+                     **{key: live.get(key) for key in CHAIN_KEYS})
+        detail = (f"{detail} -- re-armed as scheduled by hand while it ran "
+                  f"(due {live['due']})")
+    elif outcome == "still_limited":
+        if (live or {}).get("status") == "cancelled":
+            detail = f"{detail} -- not re-armed: " + (
+                "fired by hand after a cancel"
+                if (sched or {}).get("status") == "cancelled"
+                else "cancelled while it ran")
+        elif exhausted:
+            detail = f"{detail} -- gave up: {exhausted}"
+        else:
             back = time.time() if now is None else now
-            try:
-                schedule(plan_id, project=project, session_id=session_id,
-                         cooldown_hours=sched["cooldown_hours"],
-                         at=_iso(back + sched["cooldown_hours"] * 3600),
-                         attempt=next_attempt, cwd=sched["cwd"],
-                         mode="loop", goal_dir=goal_dir, checked_high=high,
-                         register=register, now=now)
-                rearmed = True
-            except ValueError:
-                pass            # no longer interrupted: nothing to re-arm
-        if not rearmed:
-            try:
-                (unregister or _unregister_timer)(plan_id)
-            except Exception:
-                pass
-        return payload
-    # Prompt-mode delivery (also the degrade path when a loop schedule's
-    # goal dir vanished: the composed marker still works as a one-shot).
-    prompt = resume_prompt(rec, attempt=attempt)
-    cwd = (sched or {}).get("cwd") or None
-    if cwd and not os.path.isdir(cwd):
-        cwd = None            # the worktree moved; run from the default cwd
-    res = (runner or _run_claude)(
-        prompt, model=(sched or {}).get("model") or None, cwd=cwd,
-        timeout_s=FIRE_TIMEOUT_S if timeout_s is None else timeout_s)
-    outcome, detail = _classify(res)
+            rearm = dict(nxt, at=_iso(back + wait_s))
     payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
                "outcome": outcome, "detail": str(detail)[:MAX_DETAIL_CHARS]}
     validate_payload(payload)
     ev_mod.append_event("autoresume", payload, session_id=session_id,
                         tags=["autoresume"], project=project)
-    if outcome == "still_limited" and attempt < MAX_ATTEMPTS:
-        now = time.time() if now is None else now
-        schedule(plan_id, project=project, session_id=session_id,
-                 at=_iso(now + RETRY_HOURS * 3600), attempt=attempt + 1,
-                 model=(sched or {}).get("model") or None, cwd=cwd,
-                 register=register, now=now)
-    else:
+    if rearm is not None:
         try:
-            (unregister or _unregister_timer)(plan_id)
-        except Exception:
-            pass
+            schedule(plan_id, project=project, session_id=session_id,
+                     register=register, now=now, **rearm)
+            return payload
+        except ValueError:
+            pass          # retired between the two reads: nothing to arm
+    try:
+        (unregister or _unregister_timer)(plan_id)
+    except Exception:
+        pass
     return payload
 
 
