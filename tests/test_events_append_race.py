@@ -229,7 +229,16 @@ def test_concurrent_processes_appending_one_segment_lose_no_rows(tmp_path):
     a child launched from a worktree imports master unless told otherwise -- and
     a child running master's code would be testing the wrong tree while looking
     identical."""
-    src = str(__import__("pathlib").Path(events.__file__).resolve().parents[2])
+    # `parents[1]` of `src/mindhive/events.py` is `src/`, the directory that
+    # holds the package. `parents[2]` was the repo root, which holds no
+    # `mindhive` -- so the children could not import from PYTHONPATH at all and
+    # fell back to the editable install, the MAIN checkout, silently: the exact
+    # tree this variable exists to keep them off. Checked before spawning so a
+    # future layout change fails here, loudly, not there, silently.
+    src = str(__import__("pathlib").Path(events.__file__).resolve().parents[1])
+    assert os.path.isfile(os.path.join(src, "mindhive", "events.py")), (
+        f"{src} holds no mindhive/events.py, so the children would not import "
+        "this checkout -- they would fall back to the editable install, if any")
     script = tmp_path / "child.py"
     script.write_text(_CHILD, encoding="utf-8")
 
