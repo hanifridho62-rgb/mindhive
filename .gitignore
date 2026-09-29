@@ -4,6 +4,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# setuptools regenerates this beside the package on every `pip install -e .`,
+# so a tracked copy is stale by the time it lands, and CONTRIBUTING's own setup
+# step dirtied a fresh clone. Nothing in the repo reads the checked-in copy.
+*.egg-info/
+
 # PyInstaller desktop-app build artifacts
 /dist/
 /build/MindHive/
