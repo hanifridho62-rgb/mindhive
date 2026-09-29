@@ -45,6 +45,14 @@ A PR found CLOSED without being merged is abandoned work, and `roadmap.
 retire_landed` is the thing that already knows what to do with that. The
 interceptor calls it rather than inventing a second retirement path that would
 drift from the first.
+
+The whole probe runs under ONE budget (`PROBE_BUDGET_S`), not one timeout per
+call. Each subprocess is bounded by `timeout_s` on its own, but a `git merge`
+is probed with two of them (`merge-base`, then `rev-parse`), and two 20 s
+timeouts stack into 40 s inside a hook whose own runner allows 60. So every
+call is handed no more than what is left of the budget, a call nothing is left
+for is not made at all, and the reason names it -- a skipped question must
+never read as an answered one.
 """
 from __future__ import annotations
 
@@ -63,7 +71,8 @@ from .gateway import (ACTION_TYPES, COMMAND_SCAN_CHARS,  # noqa: F401
                       branch_of, merge_actor_of)
 
 __all__ = [
-    "ACTION_TYPES", "MERGE_ACTORS", "INTENT_TTL_S", "PHASE_SCAN_CHARS",
+    "ACTION_TYPES", "MERGE_ACTORS", "INTENT_TTL_S", "PROBE_BUDGET_S",
+    "PHASE_SCAN_CHARS",
     "InterceptorVerdict", "InterceptorPayload", "GatewayInterceptor",
     "validate_payload",
 ]
@@ -71,6 +80,11 @@ __all__ = [
 # Ten minutes. Long enough for a slow `gh pr merge` behind a CI wait, short
 # enough that a dead session's intent cannot attach to tomorrow's command.
 INTENT_TTL_S = 600.0
+
+# The whole probe, every subprocess together. Thirty seconds fits one full
+# `timeout_s` call with room for a second, shortened one, and stays inside the
+# 60 s a hook runner allows the stage that also has to append the signal.
+PROBE_BUDGET_S = 30.0
 
 # The stream a `post_tool_use` carries is a tool's whole output, which can be
 # megabytes. The phase line, when there is one, is at the top by construction.
@@ -186,6 +200,11 @@ class GatewayInterceptor:
     runner: object = None
     project: object = None
     timeout_s: float = 20.0
+    # One deadline across the probe's subprocesses (module docstring); a
+    # budget of 0 asks nothing. *monotonic* is the clock it is measured on,
+    # a seam so a test can spend the budget without waiting it out.
+    probe_budget_s: float = PROBE_BUDGET_S
+    monotonic: object = time.monotonic
     warnings: list = field(default_factory=list)
 
     # --- the two stages ---
@@ -354,17 +373,30 @@ class GatewayInterceptor:
 
     # --- the probe ---
 
-    def _run(self, argv):
+    def _left(self, deadline) -> float:
+        """Seconds of the probe's budget still unspent, never below zero."""
+        return max(0.0, deadline - self.monotonic())
+
+    def _run(self, argv, deadline=None):
+        """One subprocess, given `timeout_s` or what is left of the budget,
+        whichever is less. Nothing left means nothing is spawned: the answer
+        is the runner's own failure shape, so every caller reads one."""
+        timeout = self.timeout_s
+        if deadline is not None:
+            left = self._left(deadline)
+            if left <= 0:
+                return 1, "", "probe budget spent"
+            timeout = min(timeout, left)
         runner = self.runner
         if runner is None:
             from .. import repo as repo_mod
             runner = repo_mod._default_runner
         try:
-            return runner(list(argv), self.repo_root or None, self.timeout_s)
+            return runner(list(argv), self.repo_root or None, timeout)
         except Exception as exc:                        # noqa: BLE001
             return 1, "", f"{type(exc).__name__}: {exc}"
 
-    def _gh_record(self, number=0):
+    def _gh_record(self, number=0, deadline=None):
         """The PR record, or ``None``. `gh` is named rather than resolved on
         PATH: the runner already reports a missing executable as a non-zero
         code, and one shape of failure is easier to be total about than two.
@@ -376,7 +408,7 @@ class GatewayInterceptor:
         if number:
             argv.append(str(number))
         argv += ["--json", "state,mergedAt,url,mergedBy,author,number"]
-        rc, out, _err = self._run(argv)
+        rc, out, _err = self._run(argv, deadline)
         if rc != 0:
             return None
         try:
@@ -385,13 +417,14 @@ class GatewayInterceptor:
             return None
         return record if isinstance(record, dict) else None
 
-    def _is_ancestor(self, branch) -> bool:
+    def _is_ancestor(self, branch, deadline=None) -> bool:
         rc, _out, _err = self._run(["git", "merge-base", "--is-ancestor",
-                                    str(branch), "HEAD"])
+                                    str(branch), "HEAD"], deadline)
         return rc == 0
 
-    def _rev_of(self, branch) -> str:
-        rc, out, _err = self._run(["git", "rev-parse", "--verify", str(branch)])
+    def _rev_of(self, branch, deadline=None) -> str:
+        rc, out, _err = self._run(["git", "rev-parse", "--verify", str(branch)],
+                                  deadline)
         return out.strip() if rc == 0 else ""
 
     def _probe(self, row, record, session):
@@ -399,15 +432,27 @@ class GatewayInterceptor:
 
         Answers `(row, abandoned)`: *abandoned* is True for a PR closed WITHOUT
         merging, whose roadmap sweep `_result` runs after the signal is
-        recorded rather than here. See `_sweep`."""
-        reasons = []
+        recorded rather than here. See `_sweep`.
+
+        Every subprocess here shares one deadline, `probe_budget_s` from now
+        (module docstring). A step the budget cannot pay for is skipped and
+        listed in the reason as not asked; it is never recorded as answered."""
+        reasons, skipped = [], []
         merged, actor, status = False, "", ""
         number = row.pr_number
+        deadline = self.monotonic() + self.probe_budget_s
         # Every `pr_*` act is probed, with the number when the command named
         # one and without when it did not. Recording `merged: false` for a
         # `gh pr merge --squash` without asking anything would have written a
         # false fact about a PR that WAS merged.
-        pr = self._gh_record(number) if row.action_type.startswith("pr_") else None
+        pr = None
+        if row.action_type.startswith("pr_"):
+            if self._left(deadline) <= 0:
+                skipped.append("gh")
+            else:
+                pr = self._gh_record(number, deadline)
+                if pr is None:
+                    reasons.append("gh could not answer")
         abandoned = False
         if pr is not None:
             status = _text(pr.get("state")).upper()
@@ -417,17 +462,23 @@ class GatewayInterceptor:
             reasons.append(f"gh says {status or 'nothing'}")
             abandoned = status == "CLOSED" and not merged
             number = number or _int(pr.get("number"))
-        elif row.action_type.startswith("pr_"):
-            reasons.append("gh could not answer")
         sha = ""
         branch = self._branch_of(_text(record.get("command")))
         if not merged and row.action_type == "git_merge" and branch:
-            if self._is_ancestor(branch):
+            if self._left(deadline) <= 0:
+                skipped.append("git merge-base")
+            elif self._is_ancestor(branch, deadline):
                 merged, reasons = True, reasons + ["git says it is an ancestor"]
                 actor = actor or "unknown"
             else:
                 reasons.append("git says it is not an ancestor")
-            sha = self._rev_of(branch)
+            if self._left(deadline) <= 0:
+                skipped.append("git rev-parse")
+            else:
+                sha = self._rev_of(branch, deadline)
+        if skipped:
+            reasons.append(f"{', '.join(skipped)} not asked: probe budget "
+                           f"({self.probe_budget_s:g}s) spent")
         if not merged and not actor:
             actor = "unknown" if reasons else ""
         return _with(row, merged=merged, merge_actor=actor, ci_status=status,

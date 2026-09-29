@@ -1,7 +1,10 @@
 # tests/test_events.py
+import contextlib
+import json
+
 import pytest
 
-from mindhive import events, paths
+from mindhive import embedqueue, events, paths
 
 
 def test_read_all_skips_malformed_rows_and_stays_total(tmp_path):
@@ -385,3 +388,77 @@ def test_a_malformed_row_that_also_carries_a_separator_is_reported_once(sep):
     bad = events.corrupt_rows("test")
     assert [(r["segment"], r["line"]) for r in bad] == [("s.jsonl", 0)]
     assert "missing required field" in bad[0]["reason"]
+
+
+# --- the newline count stays outside the append lock ---------------------------
+#
+# `seg_line` for the pending-embed marker needs the count of `b"\n"` in the
+# segment before the write. Measured at 3.24 ms on the largest live segment,
+# and it ran INSIDE `_append_lock`, so every writer in the namespace paid it
+# while waiting. It now runs before the lock; inside, the cursor is only
+# reconciled against what other writers appended meanwhile.
+
+def _tracked_lock(monkeypatch, on_enter=None):
+    """`events._append_lock`, with a flag a test can read while it is held and
+    an *on_enter* hook that runs inside it, before the critical section."""
+    real = events._append_lock
+    state = {"held": False}
+
+    @contextlib.contextmanager
+    def tracked(project=None):
+        with real(project):
+            state["held"] = True
+            if on_enter is not None:
+                on_enter()
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+    monkeypatch.setattr(events, "_append_lock", tracked)
+    return state
+
+
+def test_the_segment_is_read_before_the_lock_and_only_reconciled_inside_it(
+        monkeypatch):
+    state = _tracked_lock(monkeypatch)
+    real = events._newline_cursor
+    calls = []
+
+    def spy(path, prior=None):
+        calls.append((prior is None, state["held"]))
+        return real(path, prior)
+
+    monkeypatch.setattr(events, "_newline_cursor", spy)
+    events.append_event("decision", {"text": "one"}, session_id="s")
+    assert calls == [(True, False), (False, True)], (
+        "the full read belongs outside the lock, the reconciliation inside it")
+    calls.clear()
+    events.append_event("command_run", {"cmd": "x"}, session_id="s")
+    assert calls == [], "a telemetry row has no marker and counts nothing"
+
+
+def test_a_row_another_writer_lands_before_the_lock_still_gets_its_true_line(
+        monkeypatch):
+    """Deterministic, not a race: the interloper's row is written inside the
+    lock's entry -- after this append's pre-lock read, before its critical
+    section -- which is exactly where a second process's append lands. An
+    implementation that trusted the pre-lock count would queue line 2, and the
+    watcher would embed the interloper's row under this one's name."""
+    events.append_event("decision", {"text": "first"}, session_id="s")
+    seg = paths.events_dir() / "s.jsonl"
+
+    def interloper():
+        row = events.Event(ts="2026-09-29T00:00:00Z", session_id="s",
+                           type="decision", payload={"text": "interloper"},
+                           tags=[])
+        with open(seg, "a", encoding="utf-8") as f:
+            f.write(events.canonical_json(events.to_dict(row)) + "\n")
+
+    _tracked_lock(monkeypatch, on_enter=interloper)
+    events.append_event("decision", {"text": "third"}, session_id="s")
+    queued = embedqueue.load_entries(
+        paths.project_dir() / "state" / embedqueue.MARKER_NAME)
+    assert [e["seg_line"] for e in queued] == [1, 3]
+    third = seg.read_text(encoding="utf-8").splitlines()[2]
+    assert json.loads(third)["payload"] == {"text": "third"}

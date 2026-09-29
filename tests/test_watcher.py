@@ -47,8 +47,8 @@ def _marker() -> Path:
     return paths.state_dir() / embedqueue.MARKER_NAME
 
 
-def _queue() -> dict:
-    return json.loads(_marker().read_text(encoding="utf-8"))
+def _queue() -> list:
+    return embedqueue.load_entries(_marker())
 
 
 def _processing() -> list:
@@ -78,6 +78,9 @@ def _stub_manager(monkeypatch, rec=None):
     monkeypatch.setattr(vectors.VectorStoreManager, "get_instance",
                         classmethod(lambda cls, project=None: rec))
     monkeypatch.setattr(vectors, "_require_deps", lambda: None)
+    # The extras read as installed: without them the watcher claims nothing
+    # (see "without the vector extras" below), and the recorder is never asked.
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: True)
     return rec
 
 
@@ -257,9 +260,9 @@ def test_a_claim_carries_the_entries_it_took():
     _append("one")
     _append("two")
     claimed = watcher.BackgroundEmbeddingWatcher().claim()
-    doc = json.loads(claimed.read_text(encoding="utf-8"))
-    assert [e["seg_line"] for e in doc["entries"]] == [1, 2]
-    assert all(e["segment"] == "alpha.jsonl" for e in doc["entries"])
+    entries = embedqueue.load_entries(claimed)
+    assert [e["seg_line"] for e in entries] == [1, 2]
+    assert all(e["segment"] == "alpha.jsonl" for e in entries)
 
 
 def test_two_claims_cannot_take_the_same_queue():
@@ -304,10 +307,12 @@ def test_an_entry_whose_row_vanished_is_skipped_not_fatal(monkeypatch):
     _append("one")
     w = watcher.BackgroundEmbeddingWatcher()
     claimed = w.claim()
-    doc = json.loads(claimed.read_text(encoding="utf-8"))
-    doc["entries"].append({"session_id": "ghost", "seg_line": 4,
-                           "segment": "ghost.jsonl", "queued_at": ""})
-    claimed.write_text(json.dumps(doc), encoding="utf-8")
+    ghost = {"session_id": "ghost", "seg_line": 4, "segment": "ghost.jsonl",
+             "queued_at": ""}
+    # Written in the DOCUMENT shape an older watcher's claim has, so this
+    # doubles as the check that such a claim still drains after the upgrade.
+    claimed.write_text(json.dumps(
+        {"entries": embedqueue.load_entries(claimed) + [ghost]}), encoding="utf-8")
     assert w.process_marker(claimed)["count"] == 1
     assert not claimed.exists()
 
@@ -400,6 +405,20 @@ def test_the_bar_is_twenty_cells_wide_at_every_percentage():
         assert 20 - filled >= 0, pct
 
 
+def test_the_bar_clamps_the_number_before_it_draws_a_cell():
+    """The arithmetic above holds only INSIDE 0..100. `repeat` throws
+    `RangeError` on a negative count, so a frame past 100% (`20 - filled`
+    negative) or below 0% (`filled` negative) took the whole poll render down
+    with it. The one producer keeps `done <= total` today; the pane does not
+    get to depend on that. `tests/test_dashboard_jobbar_node.py` runs the
+    fragment's own bytes against both; this pins the clamp in the default
+    tier, where node does not run."""
+    from mindhive import dashboard_js_actions
+    js = dashboard_js_actions.JS
+    assert "Math.min(100, Math.max(0, " in js
+    assert "Number.isFinite(job.progress_pct)" in js
+
+
 # --- startup recovery (PDF 4.5) ----------------------------------------------
 
 def test_a_stale_claim_is_returned_to_the_pending_queue():
@@ -410,7 +429,7 @@ def test_a_stale_claim_is_returned_to_the_pending_queue():
     _os.utime(claimed, (old, old))
     assert watcher.recover_stale_markers() == 1
     assert not claimed.exists()
-    assert [e["seg_line"] for e in _queue()["entries"]] == [1]
+    assert [e["seg_line"] for e in _queue()] == [1]
 
 
 def test_a_fresh_claim_belongs_to_a_live_watcher_and_is_left_alone():
@@ -435,7 +454,7 @@ def test_recovery_merges_rather_than_overwrites_a_live_queue():
     old = time.time() - (watcher.STALE_MARKER_S + 60)
     _os.utime(claimed, (old, old))
     watcher.recover_stale_markers()
-    assert sorted(e["seg_line"] for e in _queue()["entries"]) == [1, 2]
+    assert sorted(e["seg_line"] for e in _queue()) == [1, 2]
 
 
 def test_recovery_drops_entries_already_indexed(monkeypatch):
@@ -460,7 +479,7 @@ def test_recovery_drops_entries_already_indexed(monkeypatch):
     monkeypatch.setattr(vectors.VectorStoreManager, "get_instance",
                         classmethod(lambda cls, project=None: _Indexed()))
     assert watcher.recover_stale_markers() == 1
-    assert [e["seg_line"] for e in _queue()["entries"]] == [2]
+    assert [e["seg_line"] for e in _queue()] == [2]
 
 
 def test_recovery_with_nothing_to_recover_is_zero():
@@ -679,3 +698,172 @@ def test_the_marker_emit_is_cheap_enough_to_sit_inside_the_append_lock():
     print(f"\ntime_to_emit_marker: median {median:.2f} ms over 20 "
           f"(max {max(samples):.2f} ms)")
     assert median < 15.0, f"median {median:.2f} ms over 20 appends"
+
+
+# --- idempotent claims -------------------------------------------------------
+
+def _stale(marker) -> None:
+    old = time.time() - (watcher.STALE_MARKER_S + 60)
+    os.utime(marker, (old, old))
+
+
+def test_a_claim_naming_a_row_twice_embeds_it_once(monkeypatch):
+    """chromadb refuses an `add` that repeats an id (DuplicateIDError), so a
+    claim with a duplicate failed whole, stayed on disk, was recovered with its
+    duplicate intact, and failed again -- forever."""
+    rec = _stub_manager(monkeypatch)
+    _append("one")
+    w = watcher.BackgroundEmbeddingWatcher()
+    claimed = w.claim()
+    line = claimed.read_text(encoding="utf-8")
+    claimed.write_text(line * 3, encoding="utf-8")
+    out = w.process_marker(claimed)
+    assert out["count"] == 1
+    (_slug, records), = rec.calls
+    assert [r.seg_line for r in records] == [1]
+    started = [e for e in events.read_all() if e.type == watcher.SYNC_STARTED]
+    assert [e.payload["count"] for e in started] == [1]
+    assert not claimed.exists()
+
+
+def test_recovery_of_a_claim_whose_unlink_was_refused_queues_its_rows_once(
+        monkeypatch):
+    """The Windows shape: the requeue landed, then the claim's `unlink` was
+    refused by a scanner holding the file, so the next pass recovers the same
+    claim again. Each row must come back once."""
+    _append("one")
+    _append("two")
+    claimed = watcher.BackgroundEmbeddingWatcher().claim()
+    _stale(claimed)
+    real = Path.unlink
+    refused = []
+
+    def flaky(self, *a, **kw):
+        if self == claimed and not refused:
+            refused.append(self)
+            raise PermissionError(32, "sharing violation", str(self))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", flaky)
+    assert watcher.recover_stale_markers() == 0
+    assert claimed.exists() and refused == [claimed]       # positive control
+    assert watcher.recover_stale_markers() == 1
+    assert not claimed.exists()
+    assert [e["seg_line"] for e in _queue()] == [1, 2]
+
+
+def test_recovery_requeues_under_the_append_lock(monkeypatch):
+    """An appender that lands a line between recovery's read of the queue and
+    its publish over it would lose that line to the publish. The append lock
+    is what every appender already holds while it writes the queue."""
+    import contextlib
+    _append("one")
+    claimed = watcher.BackgroundEmbeddingWatcher().claim()
+    _stale(claimed)
+    real_lock = events._append_lock
+    held = {"now": False}
+
+    @contextlib.contextmanager
+    def tracked(project=None):
+        with real_lock(project):
+            held["now"] = True
+            try:
+                yield
+            finally:
+                held["now"] = False
+
+    monkeypatch.setattr(events, "_append_lock", tracked)
+    real_requeue = embedqueue.requeue_entries
+    seen = []
+    monkeypatch.setattr(embedqueue, "requeue_entries",
+                        lambda p, e: seen.append(held["now"]) or real_requeue(p, e))
+    assert watcher.recover_stale_markers() == 1
+    assert seen == [True]
+
+
+# --- without the vector extras -----------------------------------------------
+
+def _no_extras(monkeypatch) -> None:
+    monkeypatch.setattr(vectors, "has_vectors_support", lambda: False)
+
+
+def test_without_the_extras_a_cycle_claims_nothing_and_says_why_once(monkeypatch):
+    """Before this the watcher claimed the queue, appended
+    `vector_sync_started`, failed inside `embed_batch` on the missing import,
+    and left the claim on disk -- every two seconds, in every namespace with a
+    pending row: sync rows for syncs that never happened, and a claim per
+    cycle for recovery to chew on. Now the queue stays where it is, bounded,
+    for the install that can drain it, and the reason is said once."""
+    _no_extras(monkeypatch)
+    _append("one")
+    out = io.StringIO()
+    w = watcher.BackgroundEmbeddingWatcher(out=out)
+    first = w.run_once()
+    assert first["count"] == 0 and first["marker"] is None
+    assert "pip install -e .[vectors]" in first["skipped"]
+    assert _marker().exists() and _processing() == []
+    assert not any(e.type in (watcher.SYNC_STARTED, watcher.SYNC_COMPLETED)
+                   for e in events.read_all())
+    second = w.run_once()
+    assert second["skipped"] == first["skipped"]
+    text = out.getvalue()
+    assert text.count("\n") == 1 and "pip install -e .[vectors]" in text
+    assert text.startswith(watcher.PROGRESS_PREFIX)
+
+
+def test_without_the_extras_a_claim_is_left_intact_and_no_sync_row_is_written(
+        monkeypatch):
+    _append("one")
+    w = watcher.BackgroundEmbeddingWatcher()
+    claimed = w.claim()
+    before = claimed.read_bytes()
+    _no_extras(monkeypatch)
+    out = w.process_marker(claimed)
+    assert out["count"] == 0 and "pip install -e .[vectors]" in out["skipped"]
+    assert claimed.read_bytes() == before
+    assert [e.type for e in events.read_all()] == ["decision"]
+    # The canary: the same claim drains once the extras are there.
+    rec = _stub_manager(monkeypatch)
+    assert w.process_marker(claimed)["count"] == 1
+    assert len(rec.calls) == 1 and not claimed.exists()
+
+
+def test_an_idle_cycle_does_not_probe_for_the_extras(monkeypatch):
+    """No queue, no question: the probe is a spec lookup, but a daemon asks
+    every two seconds for the life of the dashboard."""
+    def probed():
+        raise AssertionError("probed with nothing queued")
+
+    monkeypatch.setattr(vectors, "has_vectors_support", probed)
+    assert watcher.BackgroundEmbeddingWatcher().run_once() == {
+        "marker": None, "count": 0, "duration_s": 0.0}
+
+
+def test_the_daemon_loop_says_it_once_not_once_per_tick(monkeypatch):
+    _no_extras(monkeypatch)
+    _append("one")
+    out = io.StringIO()
+    w = watcher.BackgroundEmbeddingWatcher(poll_interval_s=0.01, out=out)
+    w.start()
+    try:
+        for _ in range(200):
+            if out.getvalue():
+                break
+            time.sleep(0.02)
+        time.sleep(0.1)                  # more ticks, which must add nothing
+    finally:
+        w.stop()
+    assert out.getvalue().count("\n") == 1, out.getvalue()
+    assert _marker().exists() and _processing() == []
+
+
+def test_hive_watcher_run_once_without_the_extras_says_why(monkeypatch, capsys):
+    from mindhive.commands import verification as verif
+    _no_extras(monkeypatch)
+    _append("one")
+    assert verif.cmd_watcher_run(_args(once=True, json=False)) is None
+    assert "pip install -e .[vectors]" in capsys.readouterr().out
+    assert verif.cmd_watcher_run(_args(once=True, json=True)) is None
+    report = json.loads(capsys.readouterr().out)
+    assert "pip install -e .[vectors]" in report["skipped"] and report["count"] == 0
+    assert _marker().exists() and _processing() == []

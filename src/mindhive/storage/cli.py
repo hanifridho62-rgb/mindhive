@@ -150,6 +150,9 @@ def _migrate_lines(p):
     mode = "dry run" if p["dry_run"] else "replay"
     yield (f"{mode}: {p['events_read']} event(s) read across "
            f"{p['sessions']} session(s)")
+    if p.get("sessions_quarantined"):
+        yield (f"  quarantined: {p['sessions_quarantined']} session(s) whose id "
+               f"was refused, replayed under their unsafe-* segments")
     verb = "would insert" if p["dry_run"] else "inserted"
     yield f"  {verb}: {p['events_inserted']}   skipped: {p['events_skipped']}"
     yield f"  chain: {'ok' if p['chain_ok'] else 'BROKEN'}"

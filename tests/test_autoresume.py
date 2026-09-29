@@ -246,6 +246,28 @@ def test_schedule_survives_a_broken_timer_registrar():
     assert autoresume.pending(events.read_all())        # wait() can deliver
 
 
+def test_ps_quote_escapes_every_quote_powershell_reads_as_single():
+    """PowerShell's tokenizer takes U+2018, U+2019, U+201A and U+201B as
+    single quotes, exactly like the ASCII one: inside a single-quoted string
+    any of them ENDS the string unless doubled. A task name or a working
+    directory carrying a typographic apostrophe (a repo under "hanif’s
+    projects") therefore broke out of its quotes, and whatever followed ran
+    as PowerShell. Each is doubled with ITSELF, which is the tokenizer's
+    escape for every one of them, so the value round-trips unchanged."""
+    assert autoresume._ps_quote("it's") == "'it''s'"
+    for q in ("\u2018", "\u2019", "\u201a", "\u201b"):
+        assert autoresume._ps_quote(f"a{q}b") == f"'a{q}{q}b'", hex(ord(q))
+    # Every quote in one value, ASCII and typographic, each doubled in place.
+    mixed = "it's \u2018quoted\u2019, \u201aor\u201b not"
+    assert autoresume._ps_quote(mixed) == "'" + "".join(
+        c + c if c in "'\u2018\u2019\u201a\u201b" else c for c in mixed) + "'"
+    # Double quotes, their typographic twins and a backtick are inert inside
+    # single quotes and must stay untouched; a non-string is quoted as text.
+    assert autoresume._ps_quote('say "hi" \u201cthere\u201d `x`') == \
+        "'say \"hi\" \u201cthere\u201d `x`'"
+    assert autoresume._ps_quote(42) == "'42'"
+
+
 def test_register_timer_is_env_gated_off():
     # conftest sets MINDHIVE_AUTORESUME_TIMER=off: the default registrar must
     # not touch the real Task Scheduler from inside the suite.

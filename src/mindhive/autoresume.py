@@ -396,8 +396,24 @@ def _task_name(plan_id) -> str:
     return f"MindHive AutoResume {plan_id}"
 
 
+# Every character PowerShell's tokenizer reads as a single quote
+# (`CharExtensions.IsSingleQuote`): the ASCII one and the four typographic
+# ones, U+2018 LEFT, U+2019 RIGHT, U+201A LOW-9 and U+201B REVERSED-9. Inside
+# a single-quoted string any of them ENDS the string, so a value carrying one
+# -- a task name or a working directory under "hanif’s projects" -- broke
+# out of its quotes and the rest of it ran as PowerShell.
+_PS_SINGLE_QUOTES = ("'", "\u2018", "\u2019", "\u201a", "\u201b")
+
+
 def _ps_quote(s) -> str:
-    return "'" + str(s).replace("'", "''") + "'"
+    """*s* as a PowerShell single-quoted string literal. The tokenizer's one
+    escape inside single quotes is a quote character doubled, and it takes
+    any of the five doubled with itself as that one character -- so each is
+    doubled in place and the value round-trips unchanged."""
+    text = str(s)
+    for q in _PS_SINGLE_QUOTES:
+        text = text.replace(q, q + q)
+    return "'" + text + "'"
 
 
 def _run_powershell(script: str) -> bool:

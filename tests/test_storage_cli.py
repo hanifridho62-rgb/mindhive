@@ -142,8 +142,8 @@ def test_the_json_report_is_exactly_the_documented_shape(capsys):
     _seed(("s1", 2))
     assert _run("db", "migrate", "--dry-run", "--json") == 0
     assert set(_json_of(capsys)) == {
-        "sessions", "events_read", "events_inserted", "events_skipped",
-        "chain_ok", "duration_s", "dry_run", "error",
+        "sessions", "sessions_quarantined", "events_read", "events_inserted",
+        "events_skipped", "chain_ok", "duration_s", "dry_run", "error",
         "project", "destination", "checkpoint"}
 
 
@@ -163,6 +163,24 @@ def test_a_dry_run_names_the_namespace_it_read(capsys):
     _seed(("s1", 1))
     assert _run("db", "migrate", "--dry-run", "--json") == 0
     assert _json_of(capsys)["project"] == "test"
+
+
+def test_a_quarantined_session_is_replayed_and_counted(capsys):
+    """A session whose id was refused lives in an `unsafe-<hash>` segment,
+    and a dry run used to walk it reading nothing -- the session counted, its
+    rows not, silently. Its rows are read now, and the report says how many
+    sessions came in that way, so an operator can tell a quarantined id
+    from a lost one."""
+    _seed(("s1", 2))
+    assert _run("db", "migrate", "--dry-run") == 0     # no refused id: no line
+    assert "quarantined" not in capsys.readouterr().out
+    events.append_event("decision", {"text": "q"}, session_id="../escape")
+    assert _run("db", "migrate", "--dry-run", "--json") == 0
+    payload = _json_of(capsys)
+    assert (payload["sessions"], payload["sessions_quarantined"],
+            payload["events_read"]) == (2, 1, 3)
+    assert _run("db", "migrate", "--dry-run") == 0
+    assert "quarantined: 1 session(s)" in capsys.readouterr().out
 
 
 def test_the_human_lines_say_the_mode_the_counts_and_the_verdict(capsys):

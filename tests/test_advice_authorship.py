@@ -233,6 +233,23 @@ def test_a_spawned_child_really_does_not_see_the_token(tmp_path, monkeypatch):
                                                                TOKEN: None}
 
 
+def test_withhold_secret_takes_both_names_and_is_off_by_default(monkeypatch):
+    """The CI gate's variant (PR #136 merge-safety review, P2): code under
+    test sees neither name, while an agent still inherits the secret so its
+    `hive sop add` is refused rather than fall back to the session rule."""
+    monkeypatch.setenv(SECRET, "k")                     # a secret, no token
+    assert advice.scrub_agent_env(None) is None         # an agent inherits it
+    handed = advice.scrub_agent_env(None, withhold_secret=True)
+    assert handed is not None and SECRET not in sorted(handed)   # names only
+    assert advice.scrub_agent_env({SECRET: "k", TOKEN: "k", "KEEP": "1"},
+                                  withhold_secret=True) == {"KEEP": "1"}
+    assert advice.scrub_agent_env({"mindhive_orchestration_secret": "k"},
+                                  os_name="nt", withhold_secret=True) == {}
+    assert advice.scrub_agent_env({"mindhive_orchestration_secret": "k"},
+                                  os_name="posix", withhold_secret=True) == {
+        "mindhive_orchestration_secret": "k"}          # exact off Windows
+
+
 # --- classify_author ----------------------------------------------------------------
 
 @pytest.mark.parametrize("row, expected", [
@@ -636,6 +653,11 @@ SPAWNERS = {
     "workspace.py": "agent", "loop/driver.py": "agent", "research.py": "agent",
     "orchestrator/resilience.py": "agent", "verify.py": "agent",
     "orchestrator/driver.py": "agent",
+    # blueprint P1g: the gates run pytest on the BRANCH UNDER TEST -- code an
+    # agent may have written, whose output the runner then RECORDS -- and sat
+    # under TOOL_SPAWNERS until the PR #136 merge-safety review read the gate
+    # env (P2).
+    "ci/runner.py": "agent",
     "rotation/supervisor.py": "operator",
 }
 
@@ -644,7 +666,7 @@ TOOL_SPAWNERS = {
     # blueprint P8 (MEB K15): `hive bench cli-startup` times children of THIS
     # interpreter importing the CLI -- no session, no model, no agent.
     "bench_scenarios.py",
-    "changelog.py", "ci/runner.py", "clusters.py",
+    "changelog.py", "clusters.py",
     "commands/context_ops.py", "context.py", "dashboard.py",
     "mindnet/controller.py", "mindnet/worktree.py",
     "orchestrator/environment.py", "orchestrator/metrics.py", "paths.py",
@@ -1469,11 +1491,12 @@ SPAWN_SITES = {
     # scrub appearing here would mean the benchmark had started launching
     # agents.
     "bench_scenarios.py": (1, 0), "changelog.py": (1, 0),
-    # One site, no agent (blueprint P1g): the native CI runner spawns `git`,
-    # `gh` and `pytest` through a single `_default_runner`, and never the
-    # `claude` CLI -- so it must NOT scrub, and a scrub appearing here would
-    # mean it had started launching agents.
-    "ci/runner.py": (1, 0),
+    # One site, one scrub (blueprint P1g): a single `_default_runner` spawns
+    # `git`, `gh` and `pytest`, and the pytest children EXECUTE the branch under
+    # test, whose output the runner records. Read as "no agent" until the PR
+    # #136 merge-safety review (P2): `_gate_env` now withholds the token and,
+    # for this child alone, the secret too (`scrub_agent_env(withhold_secret=True)`).
+    "ci/runner.py": (1, 1),
     "claude_cli.py": (1, 1),
     "clusters.py": (1, 0), "commands/context_ops.py": (1, 0), "context.py": (1, 0),
     "dashboard.py": (1, 0), "loop/driver.py": (1, 1),

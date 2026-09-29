@@ -354,6 +354,95 @@ def test_the_pr_probe_asks_gh_about_the_number_the_command_named(store):
     assert "mergedBy" in ask[-1]
 
 
+# --- one budget for the whole probe -------------------------------------------------
+
+class _Ticking(_Runner):
+    """A `_Runner` whose every call costs *cost* seconds on a fake clock and
+    records the timeout it was handed -- the two things a budget is about."""
+
+    def __init__(self, answers, cost):
+        super().__init__(answers)
+        self.now, self.cost, self.timeouts = 0.0, cost, []
+
+    def __call__(self, argv, cwd=None, timeout_s=None):
+        self.timeouts.append(timeout_s)
+        self.now += self.cost
+        return super().__call__(argv, cwd, timeout_s)
+
+
+def _budgeted(store, runner, budget, timeout=20.0):
+    return itc.GatewayInterceptor(repo_root=str(store), runner=runner,
+                                  timeout_s=timeout, probe_budget_s=budget,
+                                  monotonic=lambda: runner.now)
+
+
+def test_the_probe_runs_under_one_budget_not_one_timeout_per_call(store):
+    """A `git merge` is probed with up to two subprocesses, each bounded by
+    `timeout_s`, so two 20 s timeouts stacked into 40 s inside a hook whose
+    own runner allows 60. One deadline for the whole probe: a call gets no
+    more than what is left of the budget, and a call nothing is left for is
+    not made -- and is named in the reason, so a skipped question is never
+    read as an answered one."""
+    runner = _Ticking({"merge-base": (0, "", ""),
+                       "rev-parse": (0, EMPTY_TREE_OID, "")}, cost=20.0)
+    g = _budgeted(store, runner, budget=15.0)
+    g.observe_intent(_pre("git merge lint/m/0"))
+    v = g.observe_result(_post("git merge lint/m/0", stdout="Fast-forward"))
+    assert runner.timeouts == [15.0]                 # the budget, not timeout_s
+    assert [c[1] for c in runner.calls] == ["merge-base"]
+    (sig,) = _signals()
+    assert sig.payload["merged"] is True             # what arrived in time counts
+    assert sig.payload["lane_commit_sha"] == ""      # rev-parse was not asked
+    assert "budget" in sig.payload["reason"] and "budget" in v.reason
+
+
+def test_a_budget_the_probe_can_afford_changes_nothing(store):
+    """The canary for the test above: with room to spare every call is made
+    with the full per-call timeout and the reason never mentions a budget."""
+    runner = _Ticking({"merge-base": (0, "", ""),
+                       "rev-parse": (0, EMPTY_TREE_OID, "")}, cost=1.0)
+    g = _budgeted(store, runner, budget=30.0)
+    g.observe_intent(_pre("git merge lint/m/0"))
+    g.observe_result(_post("git merge lint/m/0", stdout="Fast-forward"))
+    assert runner.timeouts == [20.0, 20.0]
+    (sig,) = _signals()
+    assert sig.payload["merged"] is True
+    assert sig.payload["lane_commit_sha"] == EMPTY_TREE_OID
+    assert "budget" not in sig.payload["reason"]
+
+
+def test_the_second_git_call_gets_only_what_the_first_left(store):
+    """The deadline is shared, not reset per call: after a 12 s merge-base
+    under a 20 s budget, rev-parse is handed the 8 s that remain."""
+    runner = _Ticking({"merge-base": (0, "", ""),
+                       "rev-parse": (0, EMPTY_TREE_OID, "")}, cost=12.0)
+    g = _budgeted(store, runner, budget=20.0)
+    g.observe_intent(_pre("git merge lint/m/0"))
+    g.observe_result(_post("git merge lint/m/0", stdout="Fast-forward"))
+    assert runner.timeouts == [20.0, 8.0]
+
+
+def test_a_spent_budget_asks_gh_nothing_and_claims_nothing(store):
+    """A `pr_*` act with no budget left is recorded as unproven, the reason
+    saying gh was not asked -- never as `merged: false` on gh's authority, and
+    never as merged."""
+    runner = _Ticking({"gh": (0, MERGED_PR, "")}, cost=0.0)
+    g = _budgeted(store, runner, budget=0.0)
+    g.observe_intent(_pre("gh pr merge 7 --squash"))
+    g.observe_result(_post("gh pr merge 7 --squash"))
+    assert runner.calls == []
+    (sig,) = _signals()
+    assert sig.payload["merged"] is False
+    assert sig.payload["merge_actor"] == "unknown"
+    assert "gh not asked" in sig.payload["reason"]
+
+
+def test_the_default_budget_is_the_module_constant_and_fits_one_call():
+    g = itc.GatewayInterceptor()
+    assert g.probe_budget_s == itc.PROBE_BUDGET_S == 30.0
+    assert itc.PROBE_BUDGET_S >= g.timeout_s
+
+
 @pytest.mark.parametrize("command,branch", [
     ("git merge lint/m/0", "lint/m/0"),
     ("git merge --no-ff lane", "lane"),

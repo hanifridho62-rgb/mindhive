@@ -36,6 +36,7 @@ import os
 import re
 import time
 import calendar
+import math
 from pathlib import Path
 
 from . import events as ev_mod
@@ -365,7 +366,20 @@ def dispatch(fab_id, *, project=None, evs=None, at=None, in_hours=None,
                              "2026-07-18T15:00:00Z")
         due = _iso(max(due_e, now + MIN_LEAD_S))
     elif in_hours is not None:
-        due = _iso(now + float(in_hours) * 3600)
+        try:
+            hours = float(in_hours)
+        except (TypeError, ValueError):
+            hours = math.nan
+        if not (math.isfinite(hours) and hours > 0):
+            # A lead of 0 or less puts the due time at or before now: the
+            # Task Scheduler trigger is armed in the past and never fires,
+            # while the dispatched event says it is scheduled.
+            raise ValueError("fabricate --in-hours must be a positive number "
+                             "of hours (0 or less would arm a trigger in the "
+                             "past, which never fires)")
+        # Lifted to the registrar's minimum lead the way --at is: a positive
+        # lead shorter than that is the same dead trigger by a smaller margin.
+        due = _iso(max(now + hours * 3600, now + MIN_LEAD_S))
     else:
         due = _iso(now + MIN_LEAD_S)
     cwd = str(Path(rec["goal_dir"]).parent.parent)   # the repo root
