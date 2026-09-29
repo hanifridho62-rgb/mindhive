@@ -18,6 +18,7 @@ Everything here runs with the extras absent: the encoder, the client and the
 collection are stubs, exactly as in `tests/test_vectors.py`.
 """
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -446,8 +447,13 @@ def test_provenance_names_the_segment_the_row_is_actually_in():
     would send a reader to the exact path the quarantine closed."""
     assert vectors.record_provenance(_rec(session_id="../x")).startswith(
         "events/unsafe-")
-    assert vectors.record_provenance(_rec(session_id="CON")).startswith(
-        "events/unsafe-")
+    # `CON` is a device, and so quarantined, on Windows alone; POSIX keeps it
+    # as the ordinary name it is there (`paths.is_reserved_component`).
+    con = vectors.record_provenance(_rec(session_id="CON"))
+    if os.name == "nt":
+        assert con.startswith("events/unsafe-")
+    else:
+        assert con == "events/CON.jsonl"
     assert vectors.record_provenance(_rec(session_id="alpha")) == (
         "events/alpha.jsonl")
 

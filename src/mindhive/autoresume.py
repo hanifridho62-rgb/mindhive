@@ -584,8 +584,15 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     goal_dir = (sched or {}).get("goal_dir") or ""
     if (sched or {}).get("mode") == "loop" and goal_dir \
             and os.path.isdir(goal_dir):
-        outcome, detail = (loop_runner or _run_loop_delivery)(
-            plan_id, goal_dir, project)
+        try:
+            outcome, detail = (loop_runner or _run_loop_delivery)(
+                plan_id, goal_dir, project)
+        except Exception as e:                          # noqa: BLE001
+            # The OS timer ran this once and will not again: whatever the
+            # delivery raised -- a malformed loop.toml, one it cannot read --
+            # is recorded as its outcome, so the plan never reads as
+            # scheduled while nothing is.
+            outcome, detail = "error", f"{type(e).__name__}: {e}"
         payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
                    "outcome": outcome,
                    "detail": str(detail)[:MAX_DETAIL_CHARS]}

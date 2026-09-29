@@ -173,6 +173,15 @@ _FAILED: dict = {}         # (source, collection) -> {fingerprint: (error, when)
 _PASSED: dict = {}         # (source, collection) -> the latest way in past its
                            # memos: failures before it count toward no cap
 _UNCHECKED = object()      # a copy's collection the segment check has not seen
+#: The clock every ORDER here is read off -- when a copy was taken, when a read
+#: failed, when a way in got past the memos -- and every expiry too, so the two
+#: never mix clocks. `perf_counter`, not `monotonic`: before Python 3.13,
+#: Windows' `monotonic` ticks every ~15.6 ms, so a failure and the read that
+#: got past it, or two copies, shared one stamp -- and a repaired source stayed
+#: refused past the limit, and an older copy replaced a newer one, on Windows
+#: 3.11 and 3.12 alone. Both are monotonic and system-wide; this one has the
+#: finest tick on every platform.
+_clock = time.perf_counter
 
 
 class SnapshotError(RuntimeError):
@@ -534,7 +543,7 @@ def _copy_stable(src):
     for attempt in range(COPY_ATTEMPTS):
         if attempt:
             time.sleep(COPY_RETRY_PAUSE_S)
-        taken = time.monotonic()
+        taken = _clock()
         before = fingerprint(src)
         if before is None:
             return None, None, None
@@ -581,7 +590,7 @@ def _poison(snap, name, error) -> None:
     isolated = getattr(snap.client, "isolated", False)
     with _GUARD:
         _FAILED.setdefault((snap.key, name), {})[snap.fingerprint] = (
-            error, time.monotonic())
+            error, _clock())
         if _CURRENT.get(snap.key) is snap:
             del _CURRENT[snap.key]
         if isolated:
@@ -629,7 +638,7 @@ def _refused(key, name, fp, since=None) -> None:
     by, and a reader failed on what it left -- so it still counts. Only the
     way in expires memos and marks: the checks once the copy is taken never
     do, since a copy can be OLDER than a failure. Called under `_GUARD`."""
-    now = time.monotonic()
+    now = _clock()
     memo = _FAILED.get((key, name), {})
     hit = memo.get(fp)
     if hit is not None and now - hit[1] < FAILED_RETRY_S:
@@ -667,7 +676,7 @@ def _dispose(snap) -> None:
 
 def _acquire(src, opener, name=None):
     key = str(Path(src))
-    since = time.monotonic()          # before the fingerprint: see `_refused`
+    since = _clock()                  # before the fingerprint: see `_refused`
     fp = fingerprint(src)
     if fp is None:
         return None

@@ -24,6 +24,7 @@ Four things are load-bearing and each has its own section below:
 """
 import io
 import json
+import os
 import statistics
 import threading
 import time
@@ -195,7 +196,13 @@ def test_a_missing_segment_is_none():
     assert watcher.read_physical_record("nobody", 1) is None
 
 
-@pytest.mark.parametrize("session_id", ["../x", "CON", "a\nb"])
+@pytest.mark.parametrize("session_id", [
+    "../x",
+    # A device, and so quarantined, on Windows alone: POSIX keeps `CON.jsonl`
+    # as the ordinary name it is there (`paths.is_reserved_component`).
+    pytest.param("CON", marks=pytest.mark.skipif(
+        os.name != "nt", reason="CON is quarantined only where it is a device")),
+    "a\nb"])
 def test_a_quarantined_id_is_read_from_the_segment_it_was_written_to(
         session_id, monkeypatch):
     """`append_event` quarantines these to `unsafe-<sha256[:16]>.jsonl`. A

@@ -567,9 +567,12 @@ Bacaan:
 
 1. **Cabang hook**: keluarga hook POSIX + PowerShell sudah di master sebelum
    cetak biru (`5b5cdf9`, `677e0ac`); P5 menambah `extract_json_field` dan
-   alias `Resolve-MindHivePython` di cabang ini. Setelah merge, jalankan
-   `hive hooks install` (README "Installing the hooks on a new machine") pada
-   mesin yang memakai `~/.claude/settings.json` lama.
+   alias `Resolve-MindHivePython` di cabang ini. Tidak ada verb
+   `hive hooks install`: setelah merge, pada mesin yang memakai
+   `~/.claude/settings.json` lama, daftarkan shim hook (`session_start.ps1`
+   dan kawan-kawannya) sesuai README "Installing the hooks on a new machine",
+   dan hook `Stop` lewat `hive session install-hook <settings.json>`, yang
+   mencadangkan settings.json lebih dulu.
 2. **CI**: `.github/workflows/ci.yml` hanya `workflow_dispatch` + tag `v*`;
    `hive ci run --branch claude/blueprint-foundation-v1` adalah gerbang lokal.
    Pemicu otomatis dari langkah integrasi (§11 butir 9) belum ada.

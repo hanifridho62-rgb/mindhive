@@ -375,6 +375,35 @@ def test_loop_mode_fire_still_limited_never_self_reschedules(tmp_path):
     assert n_after == n_before            # no self-reschedule in loop mode
 
 
+def test_loop_mode_fire_records_an_outcome_whatever_the_delivery_raises(
+        tmp_path):
+    """The OS timer runs `hive autoresume fire` once. A delivery that raised
+    anything but the two errors it expects -- a malformed loop.toml, one it
+    cannot read -- left a traceback and no `fired` row: the roadmap stayed
+    interrupted under a schedule that looked live and never fired again.
+    Every outcome is recorded, and the spent timer is dropped."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop",
+                        goal_dir=rec["goal_dir"], register=_no_timer,
+                        now=T0_EPOCH)
+    gone = []
+
+    def loop_runner(plan_id, goal_dir, project):
+        raise KeyError("loop.toml has no [budget] table")
+
+    payload = autoresume.fire(
+        rec["fab_id"], loop_runner=loop_runner,
+        runner=lambda *a, **k: pytest.fail("prompt runner must not be used"),
+        unregister=gone.append)
+    assert payload["outcome"] == "error"
+    assert "KeyError" in payload["detail"]
+    fired = [e for e in events.read_all() if e.type == "autoresume"
+             and e.payload.get("action") == "fired"]
+    assert fired and fired[-1].payload["outcome"] == "error"
+    assert gone == [rec["fab_id"]]
+
+
 def test_loop_mode_degrades_to_prompt_when_goal_dir_vanished(tmp_path):
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     roadmap.record("interrupt", rec["fab_id"], cause="api_cap")

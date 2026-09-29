@@ -901,7 +901,20 @@ def test_a_way_in_on_newer_bytes_keeps_the_failure_an_older_copy_needs(
     assert not log[2].closed
 
 
-def test_an_older_copy_never_replaces_a_newer_one(tmp_path):
+@pytest.fixture(params=["fine", "coarse"])
+def monotonic_tick(request, monkeypatch):
+    """Each ORDER test runs twice: on the real clocks, and with
+    `time.monotonic` frozen on one tick -- which is what it is between two
+    stamps under ~15.6 ms apart on Windows before Python 3.13. Read off that
+    clock, a failure and the read that got past it shared one stamp there,
+    and so did two copies: both tests below failed on Windows 3.11 and 3.12
+    alone."""
+    if request.param == "coarse":
+        monkeypatch.setattr(vector_snapshot.time, "monotonic", lambda: 1000.0)
+    return request.param
+
+
+def test_an_older_copy_never_replaces_a_newer_one(tmp_path, monotonic_tick):
     """A copies X and is still opening it when a writer moves the index to Y
     and C reads Y. A's copy, installed last, took the place of C's newer one
     and closed it, so the next read of Y copied the index again. The older
@@ -928,7 +941,8 @@ def test_an_older_copy_never_replaces_a_newer_one(tmp_path):
 
 
 def test_a_source_read_since_it_failed_is_read_past_the_limit(tmp_path, kept,
-                                                             monkeypatch):
+                                                             monkeypatch,
+                                                             monotonic_tick):
     """Past the limit, a source is refused while its failure stands -- not
     once a read got past it on bytes that moved on since. Kept for good, a
     failure refused the source repaired and read fine since, until the

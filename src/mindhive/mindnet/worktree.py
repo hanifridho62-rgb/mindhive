@@ -646,14 +646,17 @@ def is_link(path) -> bool:
     second, `Path.resolve` follows both, and `Path.is_symlink` sees only the
     first; the readers that must not cross into another tree -- the judge's
     walk, `is_toplevel` -- ask this. ``False`` for a path that cannot be
-    stat'ed. Never raises."""
+    stat'ed. Never raises: `stat.IO_REPARSE_TAG_MOUNT_POINT` exists on
+    Windows alone, and where it is missing there are no junctions to find."""
     try:
         st = os.lstat(str(path))
     except (OSError, ValueError):
         return False
     if stat.S_ISLNK(st.st_mode):
         return True
-    return getattr(st, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT
+    junction = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None)
+    return (junction is not None
+            and getattr(st, "st_reparse_tag", 0) == junction)
 
 
 # --- the merge-back's primitives ------------------------------------------------

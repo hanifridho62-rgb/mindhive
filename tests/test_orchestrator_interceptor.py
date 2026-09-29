@@ -696,11 +696,22 @@ def test_the_conflict_type_is_registered_too(store):
 
 # --- the PR probe gained two fields ------------------------------------------------
 
-def test_the_repo_probe_asks_for_the_merging_actor(store):
+def _gh_on_path(monkeypatch):
+    """`repo._probe_pr` asks `shutil.which("gh")` before it asks the runner:
+    on a machine without the CLI the fake was never consulted, and the probe
+    answered UNKNOWN."""
+    from mindhive import repo
+
+    monkeypatch.setattr(repo.shutil, "which",
+                        lambda name, *a, **k: "gh" if name == "gh" else None)
+
+
+def test_the_repo_probe_asks_for_the_merging_actor(store, monkeypatch):
     """`repo._probe_pr` already runs `gh pr view`; adding two fields to the
     same call is free, and the interceptor reuses the answer."""
     from mindhive import repo
 
+    _gh_on_path(monkeypatch)
     runner = _Runner({"remote": (0, "origin https://github.com/o/r (fetch)", ""),
                       "gh": (0, MERGED_PR, "")})
     repo._probe_pr(7, runner, str(store), 5)
@@ -710,11 +721,12 @@ def test_the_repo_probe_asks_for_the_merging_actor(store):
                                       "mergedBy", "author"}
 
 
-def test_the_old_probe_answer_is_unchanged(store):
+def test_the_old_probe_answer_is_unchanged(store, monkeypatch):
     """CANARY. `roadmap.retire_landed` reads `state`/`evidence` out of this;
     the two new fields must not change either."""
     from mindhive import repo
 
+    _gh_on_path(monkeypatch)
     runner = _Runner({"remote": (0, "origin https://github.com/o/r (fetch)", ""),
                       "gh": (0, MERGED_PR, "")})
     answer = repo._probe_pr(7, runner, str(store), 5)

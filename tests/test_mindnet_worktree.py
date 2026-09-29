@@ -1118,6 +1118,24 @@ def test_a_link_standing_where_a_lane_should_be_is_not_the_lane(repo,
     assert _git(lane, "diff", "--cached", "--name-only").stdout.strip() == ""
 
 
+def test_is_link_needs_nothing_only_windows_defines(repo, tmp_path,
+                                                    monkeypatch):
+    """`stat.IO_REPARSE_TAG_MOUNT_POINT` exists on Windows alone. Read
+    unguarded, `is_link` raised AttributeError on every call anywhere else,
+    and the judge's walk and `is_toplevel` ask it first -- on Linux every
+    lane read as broken. Without the constant a directory, a file and a
+    missing path are not links, a checkout is still its own top level, and
+    the question never raises."""
+    import stat
+    monkeypatch.delattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", raising=False)
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x\n", encoding="utf-8")
+    assert wt.is_link(tmp_path) is False
+    assert wt.is_link(plain) is False
+    assert wt.is_link(tmp_path / "nowhere") is False
+    assert wt.is_toplevel(repo) is True
+
+
 def test_a_worktree_registered_with_relative_paths_is_a_top_level(repo,
                                                                   tmp_path):
     """git 2.48+ can write both links of a linked worktree relative
