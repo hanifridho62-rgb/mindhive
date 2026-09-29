@@ -1,5 +1,5 @@
 import json
-from mindhive import __main__ as cli, events
+from mindhive import __main__ as cli, events, harvest
 
 
 def _write_transcript(tmp_path):
@@ -96,3 +96,34 @@ def test_capture_flow_reaches_auto_demotion(tmp_path):
     assert incidents.leaks(project="test", signature="pymodule:zzz") == 2
     rec = incidents.load("pymodule:zzz", project="test")
     assert rec["status"] == "demoted"
+
+
+def test_capture_refused_while_harvest_lock_held_then_captures_after_release(tmp_path, capsys):
+    """`hive failures capture` is a second writer over the transcript directory
+    the dashboard's auto-harvest loop sweeps under `harvest._harvest_lock`.
+    Both stamp `tool_failed` rows with the transcript line's own timestamp and
+    dedup against a snapshot taken BEFORE the walk, so two concurrent passes
+    mint byte-identical rows the append-only, hash-chained ledger keeps for
+    good. The CLI must therefore take the same lock: like `hive harvest
+    --catch-up`, answer `locked: true`, append nothing and exit 0 while a live
+    harvester holds it, then capture normally once it is released."""
+    tdir = _write_transcript(tmp_path)
+    argv = ["failures", "capture", "--transcripts", str(tdir), "--project", "test"]
+
+    with harvest._harvest_lock() as held:
+        # The test process really holds the mutex, so the refusal asserted
+        # below cannot be vacuous.
+        assert held is True
+        rc = cli.main(argv)
+        refused = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert refused.get("locked") is True
+    assert refused.get("new_failures") == 0      # a caller reading the count must not KeyError
+    assert [e for e in events.read_all("test") if e.type == "tool_failed"] == []
+
+    rc = cli.main(argv)                          # lock released: same command, real capture
+    captured = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert not captured.get("locked")
+    assert captured["new_failures"] == 1
+    assert len([e for e in events.read_all("test") if e.type == "tool_failed"]) == 1

@@ -195,13 +195,24 @@ def cmd_consolidate(args) -> int | None:
     return None
 
 def cmd_failures_capture(args) -> int | None:
-    from .. import failures as failures_mod, incidents as incidents_mod
-    res = failures_mod.capture_dir(args.transcripts, project=args.project)
-    # Advance the rule lifecycle on capture: stamp activation for signatures that
-    # just crossed the recurrence threshold, so leak-based auto-demotion is
-    # reachable from the natural flow without a separate `hive rules audit`.
-    incidents_mod.audit(project=args.project)
-    incidents_mod.project(project=args.project)
+    from .. import failures as failures_mod, harvest as harvest_mod, incidents as incidents_mod
+    # Under the same cross-process mutex `harvest.catch_up` holds around its own
+    # `capture_dir` call. `capture_dir` stamps every `tool_failed` row with the
+    # transcript line's own timestamp and dedups against a snapshot taken BEFORE
+    # the walk, so a pass racing the dashboard's auto-harvest sweep over the same
+    # directory mints byte-identical rows the append-only, hash-chained ledger
+    # keeps for good. Refused the way `hive harvest --catch-up` is: report
+    # `locked`, append nothing, exit 0 — rerun once that pass is over.
+    with harvest_mod._harvest_lock() as got:
+        if not got:
+            print(json.dumps({"new_failures": 0, "files": 0, "locked": True}))
+            return None
+        res = failures_mod.capture_dir(args.transcripts, project=args.project)
+        # Advance the rule lifecycle on capture: stamp activation for signatures
+        # that just crossed the recurrence threshold, so leak-based auto-demotion
+        # is reachable from the natural flow without a separate `hive rules audit`.
+        incidents_mod.audit(project=args.project)
+        incidents_mod.project(project=args.project)
     print(json.dumps(res))
     return None
 
