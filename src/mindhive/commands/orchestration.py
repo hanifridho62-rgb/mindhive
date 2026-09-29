@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Autonomous-loop and work-session handlers: `hive loop` and `hive
-worksession` (blueprint P1b). The blueprint's later phases add the `ci`
-pass-through here.
+worksession` (blueprint P1b), and `hive fabricate`, the PRD assembly line
+that compiles a PRD into a loop work order and runs it unattended
+(blueprint P10, spec Bug 9; the module is `fabricate.py`). The blueprint's
+later phases add the `ci` pass-through here.
 """
 import json
 import os
@@ -11,7 +13,8 @@ from .. import events
 __all__ = ["cmd_loop", "_ws_session", "_ws_print", "_ws_record", "_ws_status",
            "_ws_initiative", "_step_doc", "_ws_list_command", "_ws_listing",
            "_ws_list_steps", "_ws_list", "_ws_migrate", "_WS_ACTIONS",
-           "cmd_worksession"]
+           "cmd_worksession", "_latest_learning_report", "cmd_fabricate_compile",
+           "cmd_fabricate_dispatch", "cmd_fabricate_run", "cmd_fabricate_list"]
 
 
 def cmd_loop(args) -> int | None:
@@ -342,3 +345,122 @@ def cmd_worksession(args) -> int | None:
     and the command every payload-contract hint for those two types names."""
     from .. import worksessions as ws
     return _WS_ACTIONS[args.ws_cmd](args, ws)
+
+
+# --- fabricate (blueprint P10, spec Bug 9): the PRD assembly line -------------
+# Ported by hand from branch claude/prd-assembly-line-40e466 (3a45aea), where
+# these four handlers and their helper lived in `__main__.py`; the behaviour
+# is the branch's, only the imports are relative to this package.
+
+def _latest_learning_report(evs) -> str:
+    """The most recent Self-Reliant PRD report from the ledger's learning
+    events (the structured ``report`` field; the display ``text`` is a
+    fallback for history written before the field existed)."""
+    for e in reversed(evs):
+        if e.type == "learning" and isinstance(e.payload, dict):
+            report = str(e.payload.get("report")
+                         or e.payload.get("text") or "").strip()
+            if report:
+                return report
+    return ""
+
+
+def cmd_fabricate_compile(args) -> int | None:
+    from .. import fabricate as fabricate_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    project = getattr(args, "project", None)
+    if args.prd_file:
+        from pathlib import Path
+        try:
+            text = Path(args.prd_file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"error: cannot read PRD file: {e}", file=sys.stderr)
+            return 2
+        source = args.prd_file
+    elif args.from_learning:
+        text = _latest_learning_report(events.read_all(project))
+        if not text:
+            print("error: no Self-Reliant learning (PRD) in the ledger — "
+                  "run a learn-mode research cycle first, or pass a PRD "
+                  "file", file=sys.stderr)
+            return 2
+        source = "learning:latest"
+    else:
+        print("error: pass a PRD file, or --from-learning for the latest "
+              "Self-Reliant PRD", file=sys.stderr)
+        return 2
+    try:
+        rec = fabricate_mod.compile_work_order(
+            text, fab_id=args.id, base_dir=args.dir, source=source,
+            project=project, session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"fabricate compiled: {rec['fab_id']} — {rec['title']} "
+          f"({rec['steps']} SOP step(s))")
+    print(f"  goal dir: {rec['goal_dir']}")
+    print(f"  next: hive fabricate dispatch {rec['fab_id']} "
+          f"[--at <ts> | --in-hours <h>]")
+    return None
+
+
+def cmd_fabricate_dispatch(args) -> int | None:
+    from .. import fabricate as fabricate_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        p = fabricate_mod.dispatch(args.fab_id,
+                                   project=getattr(args, "project", None),
+                                   at=args.at, in_hours=args.in_hours,
+                                   session_id=sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"fabricate dispatched: {args.fab_id} -> runs {p['due']} "
+          f"(timer: {p['timer']})")
+    if p["timer"] == "none":
+        print("note: no OS timer registered — run it yourself when due: "
+              f"hive fabricate run {args.fab_id}")
+    return None
+
+
+def cmd_fabricate_run(args) -> int | None:
+    from .. import fabricate as fabricate_mod
+    sid = args.session or os.environ.get("MINDHIVE_SESSION")
+    try:
+        p = fabricate_mod.run(args.fab_id,
+                              project=getattr(args, "project", None),
+                              session_id=sid, force=args.force)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"fabricate run: {args.fab_id} -> {p['reason']} "
+          f"({p['iterations']} iteration(s), loop run {p['run_id']})")
+    return 0 if p["reason"] in ("completed", "api_cap", "budget_cap") else 1
+
+
+def cmd_fabricate_list(args) -> int | None:
+    from .. import fabricate as fabricate_mod
+    recs = sorted(
+        fabricate_mod.fold(events.read_all(getattr(args, "project",
+                                                   None))).values(),
+        key=lambda r: (r["updated"], r["fab_id"]))
+    if args.json:
+        print(json.dumps(recs, indent=2, ensure_ascii=False))
+        return None
+    if not recs:
+        print("(no fabrications — compile a PRD: "
+              "hive fabricate compile <prd.md>)")
+        return None
+    marks = {"compiled": "·", "dispatched": "!", "completed": "x",
+             "stopped": "?"}
+    for i, r in enumerate(recs, 1):
+        if r["status"] == "dispatched":
+            tail = f"runs {r['due']} (timer {r['timer']})"
+        elif r["status"] in ("completed", "stopped"):
+            tail = f"{r['reason']} ({r['iterations']} iteration(s))"
+        else:
+            tail = f"{r['steps']} step(s) compiled"
+        print(f"  {i}. {marks.get(r['status'], '?')} [{r['fab_id']}] "
+              f"{r['title'] or '(untitled)'} — {tail}")
+    print(f"\n{len(recs)} fabrication(s)")
+    return None

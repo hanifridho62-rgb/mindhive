@@ -36,6 +36,11 @@ _PAYLOAD_CONTRACTS = {
     "roadmap": (".roadmap",
                 "hive roadmap set|step|interrupt|resume|complete …"),
     "autoresume": (".autoresume", "hive autoresume schedule|fire|cancel …"),
+    # Blueprint P10 (spec Bug 9): the PRD assembly line's audit row. Gated
+    # because `fabricate.fold` reads the lifecycle back out of these events --
+    # a hand-appended row with a bad `action` or no `fab_id` would corrupt
+    # the assembly-line record that `hive fabricate dispatch|run` act on.
+    "fabrication": (".fabricate", "hive fabricate compile|dispatch|run …"),
     # `state_set` has NO subcommand -- there is no `hive state --set`, and
     # `grep -rn state_set src/mindhive/commands/` finds nothing -- so the raw
     # append below is not one writer among several, it is the ONLY one. That is

@@ -66,6 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     registry_p.add_roadmap(sub)
     mindnet_p.add_mindnet(sub)
     registry_p.add_autoresume(sub)
+    orchestration_p.add_fabricate(sub)       # blueprint P10 (spec Bug 9)
     dashboard_p.add_graph(sub)
     dashboard_p.add_plugins(sub)
     dashboard_p.add_skills(sub)

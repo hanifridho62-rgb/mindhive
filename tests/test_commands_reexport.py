@@ -128,6 +128,10 @@ SURFACE = {'append': {},
              'ab': {},
              'enforce': {}},
  'autoresume': {'schedule': {}, 'list': {}, 'cancel': {}, 'fire': {}, 'wait': {}},
+ # blueprint P10 (spec Bug 9): the PRD assembly line, ported from branch
+ # claude/prd-assembly-line-40e466 (3a45aea); registered after `autoresume`,
+ # where that branch's `__main__.py` had it.
+ 'fabricate': {'compile': {}, 'dispatch': {}, 'run': {}, 'list': {}},
  'graph': {'build': {}, 'related': {}, 'export': {}},
  # blueprint P4b (spec section 2.8, Bug 8): `cache-check` compares the plugin
  # Claude Code loads with this checkout; registered after `autoscan`.
@@ -210,6 +214,10 @@ LEAF_HANDLERS = {'append': 'cmd_append',
  'enrich preview': 'cmd_enrich',
  'enrich status': 'cmd_enrich',
  'export': 'cmd_export',
+ 'fabricate compile': 'cmd_fabricate_compile',
+ 'fabricate dispatch': 'cmd_fabricate_dispatch',
+ 'fabricate list': 'cmd_fabricate_list',
+ 'fabricate run': 'cmd_fabricate_run',
  'failures capture': 'cmd_failures_capture',
  'failures list': 'cmd_failures_list',
  'flag': 'cmd_flag',

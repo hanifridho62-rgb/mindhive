@@ -440,7 +440,7 @@ absent silently.
 
 ---
 
-## 15. A merged PR whose code never reached master — the whole `fabricate` feature
+## 15. ~~A merged PR whose code never reached master — the whole `fabricate` feature~~ — DONE 2026-09-28
 
 **Source:** branch audit, 2026-08-14.
 
@@ -482,6 +482,46 @@ shipped.
 > (handler module listed in `commands.HANDLER_MODULES` and star-imported by the shim; the
 > `SURFACE` and `LEAF_HANDLERS` snapshots in `tests/test_commands_reexport.py` extended with
 > `fabricate`).
+
+> **2026-09-28 (blueprint P10, spec Bug 9).** Landed by hand, not by merge.
+> `src/mindhive/fabricate.py` and `tests/test_fabricate.py` are the branch's
+> files (`3a45aea`) plus the SPDX line and an `__all__`. The `fabrication`
+> type is registered in `events.DETERMINISTIC_TYPES`,
+> `pgschema.EVENT_TYPE_CLASSES` and `contracts._PAYLOAD_CONTRACTS` — the
+> branch's `elif args.type == "fabrication"` in `cmd_append` became a registry
+> row, because the blueprint's `cmd_append` validates every type through
+> `validate_typed_payload`. The `autoresume.py` hunks (`MODES`, `mode` /
+> `goal_dir` on the scheduled row, `register_windows_task` /
+> `unregister_windows_task` with `_register_timer` / `_unregister_timer` kept
+> as wrappers, the loop-mode branch of `fire`) and the `loop/engine.py` hunks
+> (`plan_id` through `_snapshot_interrupted_plan` and `run_loop`, the schedule
+> armed in loop mode on the goal dir) were re-applied over the blueprint's
+> relay-state and `max_hours` additions. The four handlers and the parser were
+> re-homed into `commands/orchestration.py` and
+> `commands/parsers/orchestration.py`, registered after `autoresume` where the
+> branch had them, with `SURFACE` and `LEAF_HANDLERS` extended and every
+> `--project` / `--session` on the new group wired to the `cliparse`
+> validators. Evidence: `tests/test_fabricate.py` 41 passed (it was 1 error at
+> collection before the port); `tests/test_autoresume.py`,
+> `tests/test_loop_events.py`, `tests/test_loop_engine.py` 73 passed; the
+> event-type, contract, pgschema and drift files 458 passed; the reexport,
+> docs-parity, arg-wiring, size-cap, authorship and license guards 310 passed.
+> The **do not delete** hold above existed only until this landed.
+>
+> One behaviour is new rather than ported. On the branch a loop-mode wake-up
+> relaunched the bare loop engine, which records no `fabrication` `run` event,
+> so a fabrication resumed after a usage cap could never close: its roadmap
+> stayed open and its `MindHive Fabricate <fab-id>` timer stayed registered.
+> `autoresume._run_loop_delivery` now sends a plan that `fabricate.fold` knows
+> through `fabricate.run` and maps the launch reason (`spawn_failed` /
+> `guard_refused` to `error`, a usage cap to `still_limited`, anything else to
+> `delivered`); every other loop-mode plan keeps the bare engine. The test file
+> is no longer byte-identical to `3a45aea`: one `fire` call that could fall
+> through to the prompt path now injects a runner that fails the test instead
+> of spawning a real `claude`, and five wake-up cases were added. Evidence:
+> `tests/test_fabricate.py` 4 failed, 42 passed before the fix and 46 passed
+> after; the fabricate, autoresume, loop-events and loop-engine files with the
+> six guards, 400 passed.
 
 **Depends on:** nothing. It is independent of every other item here.
 

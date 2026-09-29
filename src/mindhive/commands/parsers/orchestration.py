@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """argparse wiring for the autonomous loop and work sessions: `loop`,
-`worksession` (blueprint P1b). Later blueprint phases add `watcher` here;
+`worksession` (blueprint P1b), and the PRD assembly line `fabricate`
+(blueprint P10, spec Bug 9). Later blueprint phases add `watcher` here;
 `ci` registers itself.
 """
 import argparse
 
 from ... import cliparse
-from ..orchestration import cmd_loop, cmd_worksession
+from ..orchestration import (cmd_fabricate_compile,
+                             cmd_fabricate_dispatch,
+                             cmd_fabricate_list,
+                             cmd_fabricate_run,
+                             cmd_loop,
+                             cmd_worksession)
 
-__all__ = ["add_loop", "add_worksession",
+__all__ = ["add_fabricate", "add_loop", "add_worksession",
     "register_parsers"]
 
 
@@ -137,8 +143,59 @@ def add_worksession(sub) -> None:
     mg.set_defaults(func=cmd_worksession)
 
 
+def add_fabricate(sub) -> None:
+    """Register `hive fabricate` (blueprint P10, spec Bug 9): the PRD
+    assembly line, compile -> dispatch -> run. Ported from branch
+    claude/prd-assembly-line-40e466 (3a45aea), where this block sat in
+    `__main__.py`; every `--project`/`--session` now takes the `cliparse`
+    validator the rest of the surface is wired with."""
+    # --- fabricate (PRD assembly line: compile -> dispatch -> run) ---
+    fb = sub.add_parser("fabricate", help="PRD assembly line: compile an "
+                        "Executable PRD into a loop work order, put it on "
+                        "an OS timer, and run it unattended (usage caps "
+                        "sleep/wake via autoresume)")
+    fbsub = fb.add_subparsers(dest="fabricate_cmd", required=True)
+    fbc = fbsub.add_parser("compile", help="PRD -> goal dir + roadmap")
+    fbc.add_argument("prd_file", nargs="?", default=None,
+                     help="path to a PRD markdown file")
+    fbc.add_argument("--from-learning", action="store_true",
+                     dest="from_learning",
+                     help="use the latest Self-Reliant PRD from the ledger")
+    fbc.add_argument("--id", default=None,
+                     help="fab id (default: fab-<title-slug>)")
+    fbc.add_argument("--dir", default=None,
+                     help="repo root the work runs in (default: here)")
+    fbc.add_argument("--project", type=cliparse.project_arg, default=None)
+    fbc.add_argument("--session", type=cliparse.session_id_arg, default=None)
+    fbc.set_defaults(func=cmd_fabricate_compile)
+    fbd = fbsub.add_parser("dispatch", help="arm the OS timer that starts "
+                           "the run (default: ~now)")
+    fbd.add_argument("fab_id")
+    fbd.add_argument("--at", default=None,
+                     help="UTC start time, e.g. 2026-07-18T22:00:00Z")
+    fbd.add_argument("--in-hours", type=float, default=None, dest="in_hours",
+                     help="start this many hours from now")
+    fbd.add_argument("--project", type=cliparse.project_arg, default=None)
+    fbd.add_argument("--session", type=cliparse.session_id_arg, default=None)
+    fbd.set_defaults(func=cmd_fabricate_dispatch)
+    fbr = fbsub.add_parser("run", help="execute one loop launch now (what "
+                           "the dispatch timer runs)")
+    fbr.add_argument("fab_id")
+    fbr.add_argument("--force", action="store_true",
+                     help="bypass the LIVE_LOCK guard (use with care)")
+    fbr.add_argument("--project", type=cliparse.project_arg, default=None)
+    fbr.add_argument("--session", type=cliparse.session_id_arg, default=None)
+    fbr.set_defaults(func=cmd_fabricate_run)
+    fbl = fbsub.add_parser("list", help="list fabrications")
+    fbl.add_argument("--project", type=cliparse.project_arg, default=None)
+    fbl.add_argument("--json", action="store_true")
+    fbl.set_defaults(func=cmd_fabricate_list)
+
+
 def register_parsers(sub) -> None:
     """`base.CommandModule` (blueprint P9b): mount this domain's commands,
-    in the relative order `_build_parser` gives them."""
+    in the relative order `_build_parser` gives them (`fabricate` sits
+    after `autoresume` in the live tree, so it mounts first here)."""
+    add_fabricate(sub)
     add_loop(sub)
     add_worksession(sub)

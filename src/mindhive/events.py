@@ -265,6 +265,13 @@ DETERMINISTIC_TYPES = {
     # delivery audit trail (when it was due, whether it fired, what came
     # back).
     "autoresume",
+    # PRD assembly-line lifecycle (compiled/dispatched/run — see
+    # fabricate.py): a PRD compiled into a loop goal dir + roadmap, put on
+    # an OS timer, and executed unattended by the loop engine. Telemetry —
+    # the roadmap stays the semantic plan and loop_* the run telemetry;
+    # these events are the fabrication audit trail (what was compiled from
+    # where, when it was due, which loop run it launched and how it ended).
+    "fabrication",
     # MindNetwork MN-5 cat-status feed: one event per faculty waking or going
     # idle (skill-plugin, sop, improvements, history, task-graph, compatibility,
     # pr-green). Deterministic, NOT semantic — high-volume UI telemetry.

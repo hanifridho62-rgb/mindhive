@@ -94,6 +94,30 @@ history and grouped by what each release window introduced. They summarise;
     Bug 13 guard reads the whole rail; K12's `--border`, `--danger` and
     `--warning` reach the initiative pill, the CI-failed card and the tripped
     status pill; every contrast ratio the docs quote is pinned.
+- **The PRD assembly line** (blueprint P10, spec Bug 9, TODOS #15):
+  `hive fabricate compile|dispatch|run|list`, ported by hand from the branch
+  `claude/prd-assembly-line-40e466` (`3a45aea`), whose merged PR never reached
+  master. `compile` turns an Executable PRD into a loop goal dir
+  (`.hive-fab/<fab-id>/`: PROMPT.md, fix_plan.md, AGENT.md, loop.toml) plus a
+  `fabricate`-tagged roadmap keyed by the fab id; `dispatch` arms the
+  per-user Windows scheduled task that starts it; `run` executes one loop
+  launch keyed to the fabrication's plan, so a usage cap interrupts that plan
+  and a completed launch completes it. With it: the `fabrication` event type
+  (deterministic; its contract `fabricate.validate_payload` is enforced at the
+  raw append surfaces through `contracts._PAYLOAD_CONTRACTS`, and the type is
+  in `pgschema.EVENT_TYPE_CLASSES`), loop-mode auto-resume (`autoresume`
+  rows carry `mode` and `goal_dir`; a `loop`-mode delivery relaunches the loop
+  engine on its goal dir instead of composing a one-shot prompt, through the
+  shared `autoresume.register_windows_task` / `unregister_windows_task`
+  timer primitives) and `loop.engine.run_loop(plan_id=…)`, which keys the
+  interruption marker to an existing plan instead of the per-run id. A
+  loop-mode wake-up of a fabrication goes through `fabricate.run` rather than
+  the bare engine (new here, not on the branch), so it records its `run`
+  event and a completed wake-up closes the fabrication and drops its timer.
+  The handlers live in `commands/orchestration.py`, the parser in
+  `commands/parsers/orchestration.py`; `tests/test_fabricate.py` comes over
+  with its 41 tests, one of them now given a prompt runner that fails rather
+  than spawning `claude`, plus five wake-up cases (46).
 - **Plugin cache drift check** (blueprint P4b, spec §2.8 bug 8):
   `hive plugins cache-check [--json] [--sync] [--hook]` compares the plugin
   Claude Code loads with this checkout by version and by a content hash of its

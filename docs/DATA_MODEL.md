@@ -201,11 +201,20 @@ unvalidated ledger string into the rendered trail), `memory_consolidated`,
 recorded enrichment acts and the default-on toggle's audit trail — the
 settings sidecar `enrich.json` is the source of truth),
 `autoresume` (`{action, plan_id, due?, attempt?, cooldown_hours?, cwd?,
-model?, timer?, outcome?, detail?}` — auto-resume delivery lifecycle,
-`autoresume.py`: action ∈ scheduled, fired, cancelled; after a usage-limit
-interruption the roadmap marker is scheduled to re-enter Claude once the
-~5h window reopens, and these events are the delivery audit trail; the
-roadmap events remain the semantic record),
+model?, timer?, mode?, goal_dir?, outcome?, detail?}` — auto-resume delivery
+lifecycle, `autoresume.py`: action ∈ scheduled, fired, cancelled; after a
+usage-limit interruption the roadmap marker is scheduled to re-enter Claude
+once the ~5h window reopens — mode "prompt" as a one-shot headless session,
+mode "loop" by relaunching the loop engine on `goal_dir` (through
+`fabricate.run` when the plan is a fabrication's `fab_id`); these events are
+the delivery audit trail and the roadmap events remain the semantic record),
+`fabrication` (`{action, fab_id, goal_dir?, title?, steps?, source?, due?,
+timer?, cwd?, run_id?, reason?, iterations?}` — PRD assembly-line
+lifecycle, `fabricate.py` (blueprint P10, spec Bug 9): action ∈ compiled,
+dispatched, run; a PRD compiled into a loop goal dir + fabricate-tagged
+roadmap, armed on an OS timer, and executed unattended by the loop engine —
+`run_id` joins each launch to its `loop_*` telemetry; contract enforced at
+the raw append surfaces through `contracts._PAYLOAD_CONTRACTS`),
 `interceptor_signal` (`{tool_name, phase, action_type, pr_number, lane_commit_sha, merge_actor, merged, ci_status, reason, ts, exit_code?}` — one row per observed git-gateway act, blueprint P1f, `orchestrator/interceptor.py`. `action_type` ∈ pr_merge, pr_close, pr_create, git_merge; `merge_actor` ∈ claude_code, ci_bot, human_manual, unknown, "". The two empty-ish actors are distinct and neither may be rounded to `human_manual`, which is a claim about a person: `""` means no probe ran, `unknown` means one ran and could not tell. The `pre_tool_use` hook records the INTENT to a per-session sidecar (`state/interceptor_intent_<segment>.json`, expiring after `INTENT_TTL_S` = 600 s) and `post_tool_use` pairs the result with it, so a post for any other tool call costs one `stat` and no subprocess. Deterministic because the row carries no human intent — it is the answer to "who landed this", which a tool result cannot give), `merge_conflict_detected` (`{branch, conflicts, tree}` — one row per lane `mindnet/worktree.merge_probe` found colliding, written as the probe answers and best-effort: an unwritable ledger must never turn a probe that ANSWERED into one that raised. `tree` is the object name `git merge-tree` wrote while finding the conflicts, which is what separates a real collision from an unknown ref), `mindnet_activity` (`{faculty, status, task_id?, phase?}` — MN-1's faculty feed
 for MN-5's cat board, `mindnet/telemetry.py`: faculty ∈ skill-plugin, sop,
 improvements, history, task-graph, compatibility, pr-green; status ∈ active,
@@ -522,6 +531,15 @@ Key joins an AI reader should know:
   audit row to its work: the row explains WHY a step exists, the step IS the
   work. The key is optional on the row because a future sink need not land in a
   roadmap at all (the loop's checklist sink has no `plan_id`).
+- `fab_id` threads a fabrication's compiled/dispatched/run events into one
+  assembly-line record (`fabricate.fold`); it doubles as the roadmap
+  `plan_id` for the whole fabrication (`hive fabricate run` hands it to
+  `run_loop(plan_id=…)`, so a usage cap interrupts THAT plan and arms a
+  loop-mode `autoresume` on its `goal_dir`, instead of minting a per-run
+  plan; that wake-up runs back through `fabricate.run`, so it too records a
+  run event and can close the plan), and each run event's `run_id` joins the
+  launch to its
+  `loop_run_start`/`loop_iteration`/`loop_run_end` rows.
 - `work_branch` / `work_pr` / `work_commits[]` are the roadmap's join *outward*,
   to git and GitHub — the plan's only checkable link to the code it produced.
   All three are optional and independent (§4.15).

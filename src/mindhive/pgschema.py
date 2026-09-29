@@ -697,6 +697,7 @@ EVENT_TYPE_CLASSES = {
     "command_run":         "deterministic",
     "compaction":          "deterministic",
     "enrich_toggled":      "deterministic",
+    "fabrication":         "deterministic",
     "file_touched":        "deterministic",
     "git_diff":            "deterministic",
     "interceptor_signal":  "deterministic",
