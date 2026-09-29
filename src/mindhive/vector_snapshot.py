@@ -52,21 +52,36 @@ the heap (exit 0xC0000374); with fewer rows waiting in the log -- 130 at
 sync_threshold 100, 35 at 10 -- runs of the count itself crashed the process,
 hung past two minutes, or failed, the outcome varying between runs.
 `check_segments` refuses that damage before chromadb opens the copy, which
-contains every one of them. What it cannot see -- a header of whole length but wrong
-bytes, a cut `data_level0.bin` or `link_lists.bin` -- is met after the fact:
-when the caller's *judge* claims a failure as the client's own, the client is
-never closed and never freed (`_immortalise`), and its copy is left for the
-dead-pid sweep of a later process. Were chromadb to crash or hang on such
-damage, nothing in this process would contain it; a read in a child process
-would. The failure is remembered against the bytes it happened on: the same
+contains every one of them -- in a segment the copy's catalogue still names,
+since chromadb leaves a dropped collection's segment directory behind. In
+`ledger` or `events` that damage is repaired by `hive embed --rebuild`, which
+drops the collection without reading it. Damage it cannot see is met after
+the fact only
+where chromadb raises on it -- a header of whole length but garbage bytes
+failed the count with InternalError: when the caller's *judge* claims a failure
+as the client's own, the client is never closed and never freed
+(`_immortalise`), and its copy is left for the dead-pid sweep of a later
+process. The rest is NOT contained. Measured on four scratch indexes: a
+`link_lists.bin` cut in half crashed the reading process with a segfault in
+19 of 23 reads, hung it past 150 s in 2 and failed with InternalError in 2 --
+and under `python -X faulthandler`, which neither the CLI nor the dashboard
+sets, 4 reads of 4 failed with InternalError instead: the outcome follows the
+memory layout. A `data_level0.bin` cut in half answered every read but one
+count, which segfaulted, without an error; the one answer compared with the
+whole index's had silently lost its two best hits. Nothing in this process
+can contain a crash, a hang or a wrong answer; a read in a child process could
+contain the first two, and is not done here.
+
+The failure is remembered against the bytes it happened on: the same
 collection of an unchanged index is refused with `IndexUnreadable` rather than
 copied and opened again, for `FAILED_RETRY_S` -- a hiccup on an index nobody
 writes to must not end semantic search for the life of a dashboard. That memo
 is asked on the way in, again once the copy is taken and again at install, so
 a reader that overlapped a failure does not open, read and fail on the same
-bytes too; a client such a refusal leaves unread is closed like any other.
-Each client a read failed on, and its copy, is kept until the process ends, so
-once `POISON_LIMIT` of them
+bytes too; and the way in drops only a memo older than its own fingerprint,
+since a newer one may be of bytes that fingerprint never saw. A client such a
+refusal leaves unread is closed like any other. Each client a read failed on,
+and its copy, is kept until the process ends, so once `POISON_LIMIT` of them
 are held no collection of a source that has failed is read again until the
 process restarts; a source that first fails after that still keeps one more.
 """
@@ -155,7 +170,13 @@ class IndexUnreadable(RuntimeError):
 
 
 class DamagedSegment(RuntimeError):
-    """A persisted HNSW segment whose `header.bin` is shorter than a whole one."""
+    """A persisted HNSW segment whose `header.bin` is shorter than a whole one.
+    `collection` is the collection it belongs to, which need not be the one a
+    refused read asked for; None when the copy's catalogue could not say."""
+
+    def __init__(self, message, collection=None):
+        super().__init__(message)
+        self.collection = collection
 
 
 class _Snapshot:
@@ -201,15 +222,46 @@ def check_segments(copy) -> None:
     """Refuse a copy holding a persisted HNSW segment whose `header.bin` is
     cut short, before chromadb reads it. Only a segment chromadb persisted
     (it has `index_metadata.pickle`) is judged: an unpersisted one is rebuilt
-    from the log, and a short header there was measured harmless."""
+    from the log, and a short header there was measured harmless. And only
+    one the copy's catalogue still names: chromadb 1.5.9 leaves a dropped
+    collection's segment directory on disk and never opens it again, and
+    judged, the cut segment `hive embed --rebuild` had just dropped refused
+    every read after the rebuild. A catalogue that cannot be read names none,
+    and every segment is judged."""
+    live = _live_segments(copy)
     for header in Path(copy).glob("*/header.bin"):
-        if not (header.parent / "index_metadata.pickle").exists():
+        seg = header.parent
+        if not (seg / "index_metadata.pickle").exists():
+            continue
+        if live is not None and seg.name not in live:
             continue
         size = header.stat().st_size
         if size < HNSW_HEADER_BYTES:
+            owner = None if live is None else live[seg.name]
+            of = f" of {owner!r}" if owner else ""
             raise DamagedSegment(
-                f"HNSW segment {header.parent.name}: header.bin is {size} "
-                f"bytes, a whole one is {HNSW_HEADER_BYTES}")
+                f"HNSW segment {seg.name}{of}: header.bin is {size} bytes, a "
+                f"whole one is {HNSW_HEADER_BYTES}", collection=owner)
+
+
+def _live_segments(copy):
+    """`{segment id: collection name}` for every segment the copy's
+    `chroma.sqlite3` names, or None when it cannot be read. Opened read-only,
+    and only ever on a copy."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(
+            f"{(Path(copy).absolute() / _SQLITE).as_uri()}?mode=ro", uri=True)
+    except Exception:                              # noqa: BLE001 -- judge them all
+        return None
+    try:
+        return dict(con.execute(
+            "SELECT s.id, c.name FROM segments s "
+            "LEFT JOIN collections c ON s.collection = c.id"))
+    except Exception:                              # noqa: BLE001 -- judge them all
+        return None
+    finally:
+        con.close()
 
 
 def open_chroma(copy):
@@ -407,16 +459,19 @@ def _poison(snap, name, error) -> None:
                      name, snap.key, error, snap.root)
 
 
-def _refused(key, name, fp, *, forget=True) -> None:
+def _refused(key, name, fp, since=None) -> None:
     """Raise `IndexUnreadable` when a remembered failure answers this read:
     this collection of these very bytes failed within `FAILED_RETRY_S`, or
     `POISON_LIMIT` clients are held and ANY collection of this source has
     failed. Per source, not per collection: capped per collection, a read of
     `ledger` in an index whose `events` had failed was copied, opened and
     failed again, and each such sibling kept one more client past the limit.
-    *forget* drops a memo *fp* no longer matches -- only on the way in, where
-    *fp* is the source as it is now: a copy taken earlier can be OLDER than
-    the failure, and the bytes that failed may still be the source's.
+    *since*, given on the way in, is when *fp* was taken: a memo *fp* does
+    not match is dropped only if it is older than that. One recorded after
+    it may be of bytes *fp* never saw -- a writer came by, and a reader
+    failed on what it left -- and those may still be the source's: dropped,
+    the reader copied, opened and failed on them again. The checks once the
+    copy is taken never drop one: a copy can be OLDER than the failure.
     Called under `_GUARD`."""
     failed = _FAILED.get((key, name))
     if failed is not None:
@@ -429,7 +484,7 @@ def _refused(key, name, fp, *, forget=True) -> None:
             of, (_at, error, _when) = next(
                 ((n, f) for n, f in mine if n == name), mine[0])
             raise IndexUnreadable(key, name, error, capped=True, of=of)
-    if failed is not None and forget:
+    if failed is not None and since is not None and failed[2] < since:
         del _FAILED[(key, name)]
 
 
@@ -447,11 +502,12 @@ def _dispose(snap) -> None:
 
 def _acquire(src, opener, name=None):
     key = str(Path(src))
+    since = time.monotonic()          # before the fingerprint: see `_refused`
     fp = fingerprint(src)
     if fp is None:
         return None
     with _GUARD:
-        _refused(key, name, fp)
+        _refused(key, name, fp, since)
         snap = _CURRENT.get(key)
         if snap is not None and snap.fingerprint == fp:
             snap.users += 1
@@ -474,7 +530,7 @@ def _acquire(src, opener, name=None):
     # header corrupted the heap as it closed.
     try:
         with _GUARD:
-            _refused(key, name, built_fp, forget=False)
+            _refused(key, name, built_fp)
         client = opener(root / "chroma")
     except BaseException:
         _remove(root)
@@ -483,7 +539,7 @@ def _acquire(src, opener, name=None):
     doomed, refusal = [], None
     with _GUARD:
         try:
-            _refused(key, name, built_fp, forget=False)
+            _refused(key, name, built_fp)
         except IndexUnreadable as e:
             refusal = e
             doomed.append(fresh)           # it never read: closed as usual

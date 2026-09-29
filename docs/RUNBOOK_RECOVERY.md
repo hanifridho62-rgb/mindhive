@@ -69,24 +69,27 @@ and nothing below applies.
 
 **Commands.** Follow the repair the message names. By stage:
 
-1. `open` or `count` — the index files are damaged — or any stage on the
-   watcher's `mindhive_<slug>` collection: delete the directory and embed from
-   scratch. Not `hive embed --rebuild`: it opens the same damaged files to drop
-   the collections. First stop everything that WRITES the index: the dashboard
-   (`hive dashboard`) or `hive ui` (their background watcher thread keeps
-   `chroma.sqlite3` open, which on Windows makes the directory undeletable),
-   and any `hive watcher run`. Readers need not stop: each holds its own copy
-   in the temp directory. Then:
+1. `count` or `query` on `ledger` or `events`, or an `open` refused for a cut
+   segment of either (`DamagedSegment`; the message names the segment's
+   collection, whichever one was read): drop and refill both collections
+   recall reads. The rebuild drops a collection without reading it, which
+   mends this damage; if the read still fails, do step 2:
+
+       hive embed --rebuild --project <project>
+
+2. Any other `open` — chromadb cannot open the files, and `hive embed
+   --rebuild` opens them the same way — or any stage on the watcher's
+   `mindhive_<slug>` collection, a cut segment of it included: delete the
+   directory and embed from scratch. First stop everything that WRITES the
+   index: the dashboard (`hive dashboard`) or `hive ui` (their background
+   watcher thread keeps `chroma.sqlite3` open, which on Windows makes the
+   directory undeletable), and any `hive watcher run`. Readers need not stop:
+   each holds its own copy in the temp directory. Then:
 
        rm -rf "${MINDHIVE_HOME:-$HOME/.mindhive}/<project>/chroma"          # POSIX
        Remove-Item -Recurse -Force "$env:USERPROFILE\.mindhive\<project>\chroma"   # PowerShell, default store root
 
        hive embed --project <project>
-
-2. `query` on `ledger` or `events`: drop and refill both collections recall
-   reads, and if that fails too, do step 1:
-
-       hive embed --rebuild --project <project>
 
 3. Return any claim a dead watcher left behind and drain the queue:
 
@@ -111,9 +114,13 @@ process restarts` needs a restart first.
   index is per namespace: `<store>/<project>/chroma/`.
 - The spec runs `hive embed --force --rebuild`. `--force` does not force a
   rebuild: it only overrides `LIVE_LOCK` (`guard.ensure_safe`). `--rebuild` is
-  what drops and refills the collections, and it opens the index to do it, so
-  on damaged files it repairs nothing. After the directory is deleted, neither
-  flag is needed.
+  what drops and refills the collections. It opens the index to do it, so it
+  repairs nothing chromadb cannot open — measured, it failed on a
+  `chroma.sqlite3` that is not a database and on a collection configuration
+  chromadb could not deserialize — but it drops a collection without reading
+  it, which mended every damaged `ledger` or `events` collection measured
+  that chromadb could open (docs/DATA_MODEL.md §4.19). After the directory is
+  deleted, neither flag is needed.
 - The spec says the index "recovers 100% in seconds". A rebuild re-encodes every
   semantic event with a local model. On a large ledger that takes minutes, not
   seconds: P8's bench measured the cold model load alone at 8 to 67 s on this

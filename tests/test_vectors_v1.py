@@ -643,6 +643,26 @@ def test_a_failed_id_probe_is_empty_and_says_why(monkeypatch, caplog):
     assert "semantic query failed" in caplog.text and "hnsw" in caplog.text
 
 
+def test_a_panic_in_the_id_probe_is_empty_and_says_why(monkeypatch, caplog):
+    """chromadb's Rust core panics on a malformed page, and pyo3 raises it as
+    `pyo3_runtime.PanicException`, a BaseException: it went past the probe's
+    `except Exception` and out of `already_indexed`, whose answer to any
+    failure is the empty set -- the dashboard's boot recovery included."""
+    col = _Col()
+    panic = type("PanicException", (BaseException,),
+                 {"__module__": "pyo3_runtime"})
+
+    def _raise(**_kw):
+        raise panic("Expect it to be fetched")
+
+    monkeypatch.setattr(col, "get", _raise)
+    mgr, _c = _mgr(monkeypatch, col)
+    with caplog.at_level("WARNING", logger="mindhive.vectors"):
+        assert mgr.already_indexed("proj", ["alpha:1"]) == set()
+    assert "semantic query failed" in caplog.text
+    assert "PanicException" in caplog.text
+
+
 def test_the_id_probe_asks_in_batches_sqlite_can_bind(monkeypatch):
     """chromadb binds one SQL variable per id, and SQLite refuses a statement
     with too many: a stale claim of 40k rows made one `get` raise

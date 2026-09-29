@@ -536,9 +536,11 @@ def test_a_broken_index_count_raises_when_strict_and_is_logged_otherwise(
 # --- the error says what to do, and the advice fits the failure ---------------
 #
 # One remedy for every stage told an operator to rebuild an index that a busy
-# writer, a full temp dir or a missing package had made unreadable -- and
-# `--rebuild` itself opens the live index, so on a damaged one it is not a
-# repair at all.
+# writer, a full temp dir or a missing package had made unreadable. Where the
+# files are damaged, what broke picks the repair: `hive embed --rebuild` opens
+# the live index the way a read does and then drops the collection unread, so
+# it mends a collection that opened and then failed, and not files chromadb
+# cannot open at all.
 
 from mindhive import vector_snapshot                  # noqa: E402
 
@@ -574,16 +576,91 @@ def test_a_copy_that_failed_says_to_free_space(tmp_path, monkeypatch):
     assert "free space" in msg and "--rebuild" not in msg
 
 
-def test_a_damaged_index_names_the_directory_to_delete(tmp_path, monkeypatch):
+def test_a_failed_count_is_rebuilt_first_and_then_names_the_directory(
+        tmp_path, monkeypatch):
+    """A count that failed read a collection chromadb could open, and
+    `hive embed --rebuild` drops such a collection without reading it:
+    measured, it repaired a garbage header, a cut pickle, a missing segment
+    and a damaged sequence number, each of which had failed the count. The
+    delete follows, for a read the rebuild did not mend."""
     _isolate(tmp_path, monkeypatch)
     _stub_events_backend(monkeypatch, _Angry(), [])
     with pytest.raises(vectors.SemanticQueryError) as err:
         vectors.indexed_event_count(strict=True)
     msg = str(err.value)
-    assert str(paths.project_dir() / "chroma") in msg
-    assert "hive embed" in msg and "--rebuild" not in msg
-    assert f"hive embed --project {paths.project_dir().name}" in msg, \
+    ns = paths.project_dir().name
+    assert f"hive embed --rebuild --project {ns}" in msg
+    assert f"delete {paths.project_dir() / 'chroma'}" in msg
+    assert f"hive embed --project {ns}" in msg, \
         "the repair does not say which namespace `hive embed` must run in"
+    assert msg.index("--rebuild") < msg.index("delete")
+
+
+def test_an_index_chromadb_cannot_open_is_deleted_not_rebuilt(tmp_path,
+                                                               monkeypatch):
+    """`hive embed --rebuild` opens the index the way a read does before it
+    drops anything. Measured: on a `chroma.sqlite3` that is not a database it
+    failed as the read had, and on a collection whose configuration chromadb
+    could not deserialize it failed to fetch the collections. The delete is
+    the repair that reaches such files."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    monkeypatch.setattr(vectors, "_reading",
+                        _refusing(RuntimeError("file is not a database")))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall_events("x")
+    msg = str(err.value)
+    assert err.value.stage == "open" and "--rebuild" not in msg
+    assert f"delete {paths.project_dir() / 'chroma'}" in msg
+    assert "hive embed --project test" in msg
+
+
+def _cut(owner):
+    """The header check's refusal of a segment of collection *owner*."""
+    return vector_snapshot.DamagedSegment(
+        "HNSW segment 5c5cc466: header.bin is 7 bytes, a whole one is 100",
+        collection=owner)
+
+
+def test_a_cut_segment_is_repaired_as_the_collection_it_belongs_to(
+        tmp_path, monkeypatch):
+    """The header check refuses the whole copy, whichever collection was
+    asked for, so the collection a refused read names need not be the one
+    damaged. A cut `events` segment refusing a read of `ledger` is rebuilt
+    -- the rebuild drops it unread -- and a cut segment of the watcher's
+    collection refusing a read of `events` is given the one repair that
+    reaches that collection, the delete."""
+    _isolate(tmp_path, monkeypatch)
+    watcher = vectors.collection_name("test")
+    _stub_backend(monkeypatch, _FakeCollection())
+    monkeypatch.setattr(vectors, "_reading",
+                        _refusing(_cut(vectors.EVENT_COLLECTION)))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.semantic_recall("x")
+    msg = str(err.value)
+    assert (err.value.stage, err.value.collection) == (
+        "open", vectors.LEDGER_COLLECTION)
+    assert "hive embed --rebuild --project test" in msg
+    assert "watcher's collection" not in msg
+    monkeypatch.setattr(vectors, "_reading", _refusing(_cut(watcher)))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.indexed_event_count(strict=True)
+    msg = str(err.value)
+    assert (err.value.stage, err.value.collection) == (
+        "open", vectors.EVENT_COLLECTION)
+    assert "--rebuild" not in msg
+    assert f"{watcher!r} is the watcher's collection" in msg
+    assert f"delete {paths.project_dir() / 'chroma'}" in msg
+
+
+def test_a_cut_segment_no_catalogue_names_is_deleted(tmp_path, monkeypatch):
+    """A copy whose `chroma.sqlite3` could not be read cannot say whose cut
+    segment it holds -- and a rebuild reads that file before anything else."""
+    _isolate(tmp_path, monkeypatch)
+    msg = str(vectors.SemanticQueryError(
+        "open", vectors.EVENT_COLLECTION, _cut(None), "test"))
+    assert "--rebuild" not in msg
+    assert f"delete {paths.project_dir('test') / 'chroma'}" in msg
 
 
 def test_a_failed_query_still_offers_the_rebuild_and_then_the_delete(
@@ -738,21 +815,71 @@ def test_an_overflowing_argument_is_not_claimed_as_the_clients_failure():
         "out of range integral type conversion attempted")))
 
 
-def test_chromadbs_own_argument_errors_are_not_claimed_either():
-    """chromadb validates a request -- the arguments, the embedding's
-    dimension -- before it reads anything; an internal error is how a
-    damaged index presents, and it stays claimed."""
+def test_an_id_named_twice_is_refused_and_a_query_of_the_wrong_width_rebuilt(
+        tmp_path, monkeypatch):
+    """chromadb refuses a request naming an id twice in Python, before it
+    reads anything (`validate_ids`): the index is not at fault. A query
+    embedding whose width is not the collection's is another matter -- the
+    collection was built by another model, and `hive embed --rebuild`
+    re-encodes it with this one. chromadb 1.5.9 raises that as
+    InvalidArgumentError, the class it also raises for a log it cannot read;
+    an internal error is how a damaged index presents. Both are claimed."""
     errors = pytest.importorskip("chromadb.errors")
-    for cause in (errors.InvalidArgumentError("n_results must be positive"),
+    _isolate(tmp_path, monkeypatch)
+    assert not vectors._judge(_failed("query", errors.DuplicateIDError(
+        "Expected IDs to be unique, found duplicates of: s1:5")))
+    for cause in (errors.InvalidArgumentError(
+                      "Collection expecting embedding with dimension of 384, "
+                      "got 8"),
                   errors.InvalidDimensionException(
                       "Embedding dimension 3 does not match collection "
-                      "dimensionality 384"),
-                  # `validate_ids`, before anything is read: an id named twice
-                  errors.DuplicateIDError(
-                      "Expected IDs to be unique, found duplicates of: s1:5")):
-        assert not vectors._judge(_failed("query", cause)), type(cause).__name__
+                      "dimensionality 384")):
+        err = _failed("query", cause)
+        assert vectors._judge(err), type(cause).__name__
+        assert "hive embed --rebuild --project test" in str(err)
+        assert "not at fault" not in str(err)
     assert vectors._judge(_failed("query", errors.InternalError(
         "Error loading hnsw index")))
+
+
+_LOG_DAMAGE = ("Error executing plan: Error sending backfill request to "
+               "compactor: Failed to pull logs from the log store")
+
+
+@pytest.mark.parametrize("stage", ["count", "query"])
+def test_a_log_chromadb_cannot_read_is_damage_to_repair(tmp_path, monkeypatch,
+                                                        stage):
+    """chromadb 1.5.9 raises InvalidArgumentError for a log it cannot read:
+    15 of 30 damaged-page seeds, at `count` -- which takes no arguments --
+    and at `query`. Classed by its type as an argument chromadb refused, the
+    message said the index was not at fault, named no repair, and the client
+    that failed stayed in service."""
+    errors = pytest.importorskip("chromadb.errors")
+    _isolate(tmp_path, monkeypatch)
+    cause = errors.InvalidArgumentError(_LOG_DAMAGE)
+    _stub_events_backend(monkeypatch, _Angry(cause), [])
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        if stage == "count":
+            vectors.indexed_event_count(strict=True)
+        else:
+            vectors.semantic_recall_events("x")
+    msg = str(err.value)
+    assert err.value.stage == stage and err.value.__cause__ is cause
+    assert "not at fault" not in msg
+    assert f"delete {paths.project_dir() / 'chroma'}" in msg
+    assert vectors._judge(err.value)
+
+
+def test_no_argument_is_refused_by_a_step_that_takes_none(tmp_path,
+                                                         monkeypatch):
+    """`open` and `count` are asked nothing a caller chose, so what they
+    raise is the index's to answer for -- a ValueError included."""
+    _isolate(tmp_path, monkeypatch)
+    for stage in ("open", "count"):
+        for cause in (ValueError("x"), TypeError("x"), OverflowError("x")):
+            err = _failed(stage, cause)
+            assert vectors._judge(err), (stage, cause)
+            assert "not at fault" not in str(err) and "delete" in str(err)
 
 
 def test_an_index_remembered_as_unreadable_reports_its_failure(tmp_path,
@@ -769,6 +896,240 @@ def test_an_index_remembered_as_unreadable_reports_its_failure(tmp_path,
         assert err.value.stage == "count"
         assert "Failed to apply logs" in str(err.value)
         assert ("restart" in str(err.value)) is capped
+
+
+def test_a_capped_refusal_is_reported_on_the_collection_that_failed(
+        tmp_path, monkeypatch):
+    """Past the cap, a read of `events` is refused for a sibling's failure --
+    here the watcher's collection. Reported as the `events` index, its
+    repair led with `hive embed --rebuild`, which never writes the
+    collection that failed."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _FakeEventCollection(), [])
+    watcher = vectors.collection_name("test")
+    cause = RuntimeError("Error loading hnsw index")
+    first = vectors.SemanticQueryError("query", watcher, cause)
+    first.__cause__ = cause
+    monkeypatch.setattr(vectors, "_reading", _refusing(
+        vector_snapshot.IndexUnreadable("src", vectors.EVENT_COLLECTION, first,
+                                        capped=True, of=watcher)))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        vectors.indexed_event_count(strict=True)
+    msg = str(err.value)
+    assert (err.value.stage, err.value.collection) == ("query", watcher)
+    assert "--rebuild" not in msg and "watcher's collection" in msg
+    assert "restart" in msg
+
+
+def test_a_quarantined_namespace_is_repaired_the_way_it_was_selected(
+        tmp_path, monkeypatch):
+    """A project `paths.namespace_name` quarantines -- a name starting
+    `unsafe-`, on Windows a device name -- is stored as `unsafe-<hash>`. The
+    repair named `hive embed --project unsafe-<hash>`, which `--project`
+    refuses (exit 2) as it refuses the name the project was stored under: no
+    `--project` reaches that namespace. `hive embed` run the way the project
+    was selected does. Every other namespace keeps its verbatim `--project`,
+    and every command advised for one parses."""
+    import argparse
+    import re
+    from mindhive import cliparse
+    monkeypatch.setenv("MINDHIVE_HOME", str(tmp_path / "store"))
+    for project, quarantined in (("unsafe-code-guidelines", True),
+                                 ("plain", False)):
+        monkeypatch.setenv("MINDHIVE_PROJECT", project)
+        ns = paths.project_dir().name
+        assert ns.startswith("unsafe-") is quarantined, ns
+        for stage in ("open", "count", "query"):
+            for coll in (vectors.EVENT_COLLECTION, vectors.collection_name("x")):
+                msg = str(vectors.SemanticQueryError(
+                    stage, coll, RuntimeError("Error loading hnsw index")))
+                advised = re.findall(r"`(hive [^`]*)`", msg)
+                assert any(a.startswith("hive embed") for a in advised), msg
+                for command in advised:
+                    for name in re.findall(r"--project (\S+)", command):
+                        assert cliparse.project_arg(name) == name, command
+                assert ("MINDHIVE_PROJECT" in msg) is quarantined, msg
+                assert ("--project" in " ".join(advised)) is not quarantined
+    for name in ("unsafe-code-guidelines", paths.project_dir(
+            "unsafe-code-guidelines").name):
+        with pytest.raises(argparse.ArgumentTypeError):
+            cliparse.project_arg(name)
+
+
+# --- a panic in chromadb's Rust core is a failed read --------------------------
+#
+# chromadb 1.5.9 panics in Rust on a malformed SQLite page, and pyo3 raises the
+# panic as `pyo3_runtime.PanicException` -- a BaseException, not an Exception.
+# Measured on damaged scratch indexes (2 of 30 page-damage seeds, 5 of 40), it
+# went past every `except Exception` of the read path: `hive recall --semantic`
+# printed a raw traceback, HIVE MIND lost every other namespace's hits, a count
+# for display raised, and the client that panicked stayed in service.
+
+def _panic(message="Expect it to be fetched: Database(SqliteError { code: "
+                   "11, message: \"database disk image is malformed\" })"):
+    """What pyo3 raises for a panic. Every pyo3 extension builds its own
+    class, so it is known by its module and name."""
+    panic = type("PanicException", (BaseException,),
+                 {"__module__": "pyo3_runtime"})
+    return panic(message)
+
+
+class _PanickyClient(_ReadClient):
+    """A client whose collection lookup panics, as `list_collections` did."""
+
+    def __init__(self, error):
+        super().__init__({})
+        self.error = error
+
+    def list_collections(self):
+        raise self.error
+
+
+def _reading_per_project(clients):
+    """A read seam yielding `clients[project]`."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _reading(project=None, name=None):
+        yield clients[project]
+
+    return _reading
+
+
+@pytest.mark.parametrize("at", ["open", "lookup", "count", "query"])
+def test_a_panic_in_chromadb_is_a_failed_read(tmp_path, monkeypatch, at):
+    _isolate(tmp_path, monkeypatch)
+    boom = _panic()
+    _stub_events_backend(monkeypatch, _Angry(boom) if at in ("count", "query")
+                         else _FakeEventCollection(), [])
+    if at == "open":
+        monkeypatch.setattr(vectors, "_reading", _refusing(boom))
+    elif at == "lookup":
+        monkeypatch.setattr(vectors, "_reading",
+                            _reading_per_project({None: _PanickyClient(boom)}))
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        if at == "query":
+            vectors.semantic_recall_events("x")
+        else:
+            vectors.indexed_event_count(strict=True)
+    msg = str(err.value)
+    assert err.value.stage == ("open" if at == "lookup" else at)
+    assert err.value.__cause__ is boom
+    assert "PanicException" in msg and "delete" in msg
+    assert vectors._judge(err.value), "the client that panicked stays in service"
+
+
+def test_a_panic_leaves_the_other_namespaces_and_the_display_count_alone(
+        tmp_path, monkeypatch, caplog):
+    """HIVE MIND answers per namespace by catching `SemanticQueryError`, and a
+    panic was not one: one malformed index sank every namespace's hits. A
+    count only displayed answers 0 and logs the failure, as for any other."""
+    from mindhive import recall
+    _isolate(tmp_path, monkeypatch)
+    good = _FakeEventCollection(present={"abc"})
+    good.set_query_result(docs=["[decision] t chose postgres"], ids=["abc"],
+                          distances=[0.25], metadatas=[
+                              {"type": "decision", "ts": "t", "session_id": "s"}])
+    _stub_events_backend(monkeypatch, good, [])
+    monkeypatch.setattr(vectors, "_reading", _reading_per_project({
+        "bad": _PanickyClient(_panic()),
+        "good": _ReadClient({vectors.EVENT_COLLECTION: good})}))
+    rows = recall.recall_across("postgres", ["bad", "good"], semantic=True)
+    assert [(r["project"], r.get("id")) for r in rows if "error" not in r] == [
+        ("good", "abc")]
+    [row] = [r for r in rows if "error" in r]
+    assert row["project"] == "bad" and "PanicException" in row["error"]
+    with caplog.at_level("WARNING", logger="mindhive.vectors"):
+        assert vectors.indexed_event_count("bad") == 0
+    assert "PanicException" in caplog.text
+
+
+def test_an_interrupt_is_not_taken_for_a_failed_read(tmp_path, monkeypatch):
+    """Ctrl-C during a search stops the search; it is no index to repair."""
+    _isolate(tmp_path, monkeypatch)
+    _stub_events_backend(monkeypatch, _Angry(KeyboardInterrupt()), [])
+    with pytest.raises(KeyboardInterrupt):
+        vectors.semantic_recall_events("x")
+    with pytest.raises(KeyboardInterrupt):
+        vectors.indexed_event_count()
+
+
+# --- a hit chromadb returns without its text -----------------------------------
+#
+# chromadb answers None for a stored document it cannot decode. Measured on a
+# scratch index whose `chroma:document` rows held invalid UTF-8: every `ledger`
+# and `events` hit came back without its text, and building the snippet raised
+# AttributeError -- no SemanticQueryError, so `hive recall --semantic` printed
+# a raw traceback and a HIVE MIND search lost every other namespace's hits.
+
+def _hitless_text(monkeypatch, coll):
+    """A copy whose second hit has no document; the read seam records any
+    exception that passes through it, which is what `vector_snapshot` judges."""
+    from contextlib import contextmanager
+    if coll == vectors.LEDGER_COLLECTION:
+        col = _FakeCollection()
+        col.set_query_result(docs=["use postgres", None], ids=["a.md", "b.md"])
+        _stub_backend(monkeypatch, col)
+        read = lambda: vectors.semantic_recall("postgres")       # noqa: E731
+    else:
+        col = _FakeEventCollection()
+        col.set_query_result(docs=["[decision] t use postgres", None],
+                             ids=["a", "b"], distances=[0.1, 0.2],
+                             metadatas=[{"type": "decision"}] * 2)
+        _stub_events_backend(monkeypatch, col, [])
+        read = lambda: vectors.semantic_recall_events("postgres")  # noqa: E731
+    judged = []
+
+    @contextmanager
+    def _reading(project=None, name=None):
+        try:
+            yield _ReadClient({coll: col})
+        except BaseException as e:
+            judged.append(e)
+            raise
+
+    monkeypatch.setattr(vectors, "_reading", _reading)
+    return read, judged
+
+
+@pytest.mark.parametrize("coll", ["ledger", "events"])
+def test_a_hit_without_its_text_is_a_failed_read(tmp_path, monkeypatch, coll):
+    """Reported as the query that failed, naming the hit, with the repair
+    that re-writes every document: `hive embed --rebuild`. The client
+    answered, so the failure is raised after it is handed back -- never
+    judged its own, never poisoned: a copy with one undecodable row still
+    answers every query that does not reach it."""
+    _isolate(tmp_path, monkeypatch)
+    read, judged = _hitless_text(monkeypatch, coll)
+    with pytest.raises(vectors.SemanticQueryError) as err:
+        read()
+    msg = str(err.value)
+    assert (err.value.stage, err.value.collection) == ("query", coll)
+    assert "'b" in msg and "without its document" in msg, msg
+    assert "hive embed --rebuild --project test" in msg
+    assert "not at fault" not in msg
+    assert judged == []
+
+
+def test_a_hit_without_its_text_is_one_namespace_of_a_hive_mind_search(
+        tmp_path, monkeypatch):
+    from mindhive import recall
+    _isolate(tmp_path, monkeypatch)
+    bad = _FakeEventCollection(present={"x"})
+    bad.set_query_result(docs=[None], ids=["x"], distances=[0.1],
+                         metadatas=[{"type": "decision"}])
+    good = _FakeEventCollection(present={"abc"})
+    good.set_query_result(docs=["[decision] t chose postgres"], ids=["abc"],
+                          distances=[0.25], metadatas=[{"type": "decision"}])
+    _stub_events_backend(monkeypatch, good, [])
+    monkeypatch.setattr(vectors, "_reading", _reading_per_project({
+        "bad": _ReadClient({vectors.EVENT_COLLECTION: bad}),
+        "good": _ReadClient({vectors.EVENT_COLLECTION: good})}))
+    rows = recall.recall_across("postgres", ["bad", "good"], semantic=True)
+    assert [(r["project"], r.get("id")) for r in rows if "error" not in r] == [
+        ("good", "abc")]
+    [row] = [r for r in rows if "error" in r]
+    assert row["project"] == "bad" and "without its document" in row["error"]
 
 
 # --- cosine space ------------------------------------------------------------

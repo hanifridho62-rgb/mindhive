@@ -8,6 +8,8 @@ import time
 from contextlib import ExitStack, contextmanager
 
 from . import paths, guard
+from .vector_errors import (SemanticQueryError, as_failure as _as_failure,
+                            judge as _judge, text_of as _text)
 
 _log = logging.getLogger("mindhive.vectors")
 _MODEL = None
@@ -136,106 +138,15 @@ def _client(project):
 # and can rewrite the HNSW segment files, so every read below goes through
 # `_reading`, which hands back a client on a private copy (`vector_snapshot`).
 #
-# And a read that FAILED says so. Each step that can break -- taking the copy,
+# And a read that FAILED says so: each step that can break -- taking the copy,
 # opening it, counting, encoding the query, querying -- raises
-# `SemanticQueryError` naming the step, instead of the `[]` or `0` that made a
-# broken index look exactly like one with nothing relevant in it. The message
-# names the namespace and the repair, which depends on what broke: a busy
-# writer is waited out, a full temp dir is freed, an argument chromadb refused
-# is nobody's index to repair, and only damaged files are deleted -- `hive
-# embed --rebuild` opens the same live index to drop it, so on damaged files it
-# is no repair at all, and on the watcher's collection it never reaches them.
-
-class SemanticQueryError(RuntimeError):
-    """A semantic read that failed, as opposed to one that found nothing.
-
-    `stage` is the step that broke -- `snapshot`, `open`, `count`, `encode` or
-    `query` -- and `collection` the collection being read; the original
-    exception is `__cause__`. A `RuntimeError` so that callers which already
-    catch the LIVE_LOCK and missing-extras refusals keep catching it."""
-
-    def __init__(self, stage, collection, cause, project=None, note=None):
-        self.stage = stage
-        self.collection = collection
-        ns, where = _namespace(project)
-        msg = (f"semantic {stage} failed on the {collection!r} index of project "
-               f"{ns!r}: {type(cause).__name__}: {cause} "
-               f"({_remedy(stage, cause, ns, where, collection)})")
-        super().__init__(msg + (f" [{note}]" if note else ""))
-
-
-def _namespace(project):
-    """`(namespace, chroma dir)` for an error message: the name `hive embed
-    --project` takes to repair this index, and what to delete."""
-    try:
-        pdir = paths.project_dir(project)
-        return pdir.name, pdir / "chroma"
-    except Exception:                              # noqa: BLE001 -- a message only
-        return str(project or "?"), "the project's chroma directory"
-
-
-def _remedy(stage, cause, ns, where, collection=None) -> str:
-    if stage == "snapshot":
-        return {"copy": "copying the index into the temp directory failed: "
-                        "free space there, or retry if a writer held a file",
-                "space": "the temp directory cannot hold a copy of the "
-                         "index: it is full or not writable",
-                }.get(getattr(cause, "reason", "busy"),
-                      "a writer is busy; retry when `hive embed` or the "
-                      "watcher has finished")
-    if stage == "encode":
-        return "the embedding model failed to load or run"
-    if _refused_arguments(cause):
-        return ("chromadb refused the read's arguments before touching the "
-                "index; the index is not at fault")
-    # `--project`, not MINDHIVE_PROJECT: `hive embed` reads the variable
-    # through `paths.normalize`, which turns `my_proj` into `my-proj` -- the
-    # advice repaired a different namespace. `--project` takes it verbatim.
-    if str(collection or "").startswith(COLLECTION_PREFIX):
-        # The watcher's collection: `hive embed` never writes it, `--rebuild`
-        # included, so the delete is the only repair that reaches it -- and
-        # nothing brings back the vectors of rows appended before it.
-        return (f"{collection!r} is the watcher's collection, which `hive "
-                f"embed` never writes: delete {where} and run `hive embed "
-                f"--project {ns}` for the ledger and events collections; the "
-                f"watcher's refills only with rows appended after that")
-    if stage == "query":
-        return (f"rebuild it with `hive embed --rebuild --project {ns}`; if "
-                f"that fails too, delete {where} and run `hive embed "
-                f"--project {ns}`")
-    return (f"the index files are damaged: delete {where} and run `hive "
-            f"embed --project {ns}`")
-
-
-#: The stages that ran inside the chroma client.
-_CLIENT_STAGES = ("open", "count", "query")
-
-
-def _refused_arguments(cause) -> bool:
-    """Whether *cause* is chromadb refusing a read's ARGUMENTS -- raised
-    before the index is touched, so it says nothing about the index: a bad
-    `n_results` (ValueError, TypeError; OverflowError past 2**32 - 1), a
-    request its validation refuses, an embedding of the wrong dimension, an
-    id named twice in one request."""
-    if isinstance(cause, (ValueError, TypeError, OverflowError)):
-        return True
-    try:
-        from chromadb.errors import (DuplicateIDError, InvalidArgumentError,
-                                     InvalidDimensionException)
-    except ImportError:
-        return False
-    return isinstance(cause, (DuplicateIDError, InvalidArgumentError,
-                              InvalidDimensionException))
-
-
-def _judge(exc) -> bool:
-    """Whether a failed read was the chroma client failing on its copy -- the
-    client `vector_snapshot` then never closes. Arguments chromadb refused
-    never reached the index, and claiming them poisoned a healthy one."""
-    return (isinstance(exc, SemanticQueryError)
-            and exc.stage in _CLIENT_STAGES
-            and not _refused_arguments(exc.__cause__))
-
+# `SemanticQueryError` naming the step and a repair chosen by what broke
+# (`vector_errors`), where the `[]` or `0` it answered made a broken index look
+# exactly like one with nothing relevant in it. `_as_failure` wraps what a step
+# raised, a panic in chromadb's Rust core included; `_judge` tells
+# `vector_snapshot` which failures were the client's own. A hit that came back
+# without its text is a failed query too (`_text`), raised once the client is
+# handed back: the client answered, so its copy is not poisoned.
 
 def _reading(project, name=None):
     """A client on a private copy of *project*'s index, or None when it has
@@ -282,23 +193,23 @@ def _read_view(project, name, open_col=None):
                 note=e.why) from e
         except vector_snapshot.SnapshotError as e:
             raise SemanticQueryError("snapshot", name, e, project) from e
-        except Exception as e:                     # noqa: BLE001 -- re-raised typed
-            raise SemanticQueryError("open", name, e, project) from e
+        except BaseException as e:                 # noqa: BLE001 -- re-raised typed
+            raise _as_failure("open", name, e, project) from e
         yield col
 
 
 def _embed_query(query, name, project=None):
     try:
         return _encoder()([query])
-    except Exception as e:                         # noqa: BLE001 -- re-raised typed
-        raise SemanticQueryError("encode", name, e, project) from e
+    except BaseException as e:                     # noqa: BLE001 -- re-raised typed
+        raise _as_failure("encode", name, e, project) from e
 
 
 def _ask(col, name, project=None, **kwargs):
     try:
         return col.query(**kwargs)
-    except Exception as e:                         # noqa: BLE001 -- re-raised typed
-        raise SemanticQueryError("query", name, e, project) from e
+    except BaseException as e:                     # noqa: BLE001 -- re-raised typed
+        raise _as_failure("query", name, e, project) from e
 
 
 def _open(project, name, *, refill=False, rebuild=False, client=None):
@@ -445,7 +356,9 @@ def semantic_recall(query, project=None, limit=10, force=False):
             return round(1.0 - dists[i], 6)
         return None
 
-    return [{"file": ids[i], "snippet": " ".join(d.split())[:200], "score": _score(i)}
+    return [{"file": ids[i], "snippet": " ".join(_text(
+                d, ids[i], LEDGER_COLLECTION, project).split())[:200],
+             "score": _score(i)}
             for i, d in enumerate(docs)]
 
 
@@ -596,10 +509,12 @@ def semantic_recall_events(query, project=None, limit=10, force=False,
         meta = metas[i] if i < len(metas) and metas[i] else {}
         score = (round(1.0 - dists[i], 6)
                  if i < len(dists) and dists[i] is not None else None)
-        out.append({"id": ids[i] if i < len(ids) else None,
-                    "type": meta.get("type"), "ts": meta.get("ts"),
+        hit = ids[i] if i < len(ids) else None
+        out.append({"id": hit, "type": meta.get("type"), "ts": meta.get("ts"),
                     "session_id": meta.get("session_id"),
-                    "snippet": " ".join(d.split())[:300], "score": score})
+                    "snippet": " ".join(_text(d, hit, EVENT_COLLECTION,
+                                              project).split())[:300],
+                    "score": score})
     return out
 
 
@@ -621,9 +536,8 @@ def indexed_event_count(project=None, *, strict=False) -> int:
                 return 0
             try:
                 return int(col.count())
-            except Exception as e:                 # noqa: BLE001 -- re-raised typed
-                raise SemanticQueryError("count", EVENT_COLLECTION, e,
-                                         project) from e
+            except BaseException as e:             # noqa: BLE001 -- re-raised typed
+                raise _as_failure("count", EVENT_COLLECTION, e, project) from e
     except SemanticQueryError as e:
         if strict:
             raise
@@ -799,9 +713,8 @@ class VectorStoreManager:
                         batch = ids[at:at + ID_PROBE_BATCH]
                         have.update(col.get(ids=batch).get("ids") or [])
                     return have
-                except Exception as e:             # noqa: BLE001 -- re-raised typed
-                    raise SemanticQueryError("query", name, e,
-                                             self.project) from e
+                except BaseException as e:         # noqa: BLE001 -- re-raised typed
+                    raise _as_failure("query", name, e, self.project) from e
         except Exception as e:                     # noqa: BLE001
             _log.warning("vectors: id probe failed for %s: %s", project_slug, e)
             return set()

@@ -162,6 +162,26 @@ history and grouped by what each release window introduced. They summarise;
     registry (`clear_system_cache`) to delete the copy. A long `unavailable`
     reason or search error now keeps both ends, so the repair survives the
     300-character cap.
+  - Round-3 review: a panic in chromadb's Rust core (pyo3's
+    `PanicException`, a `BaseException`) is a failed read like any other,
+    not a raw traceback or a HIVE MIND search that lost the other
+    namespaces' hits; a log chromadb cannot read (`InvalidArgumentError`
+    "Failed to pull logs from the log store") is damage to repair, not a
+    refused argument; a quarantined `unsafe-<hash>` namespace is told how to
+    reach it without `--project`, which refuses that name; a reader that
+    overlapped a failure no longer opens and fails on the same bytes again;
+    a hit chromadb returns without its document is a failed query instead of
+    an `AttributeError`. The error, its repair and the judge moved to
+    `vector_errors`.
+  - The repair follows how far the read got. `hive embed --rebuild` drops a
+    collection without reading it: measured, it mended every damaged
+    `ledger` or `events` collection chromadb could open, and failed where
+    chromadb cannot open the files. A failed count or query, or a cut
+    segment of either collection, is rebuilt first and deleted if the read
+    still fails; other `open` failures and the watcher's collection are
+    deleted. The header check judges only segments the index still names:
+    chromadb leaves a dropped collection's segment directory behind, and the
+    cut header a rebuild had just dropped refused every read after it.
 - README said the dashboard's auto-harvest polls every 180 seconds by default
   (`MINDHIVE_AUTOHARVEST_SECS`); the code's default is 3 seconds, floor 1
   (blueprint P8, found while building the environment-variable registry).

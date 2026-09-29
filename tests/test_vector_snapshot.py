@@ -697,6 +697,71 @@ def test_a_copy_older_than_a_failure_does_not_forget_it(tmp_path, kept,
         "the bytes that failed were opened again"
 
 
+def test_a_way_in_older_than_a_failure_does_not_forget_it(tmp_path, kept,
+                                                          monkeypatch):
+    """R fingerprints the index on its way in and stalls before it asks the
+    memo; a writer comes by, and A copies the new bytes and fails on them.
+    Asked on R's way in, the memo was dropped for not matching R's
+    fingerprint -- of bytes older than the failure -- so R copied, opened,
+    read and failed on the bytes A had failed on: a second client kept for
+    good. A memo newer than the fingerprint is not the fingerprint's to
+    judge."""
+    src = _source(tmp_path)
+    log, outcome = [], {}
+    r_has_fp, r_go = threading.Event(), threading.Event()
+    real_fp = vector_snapshot.fingerprint
+
+    def fingerprint(path):
+        got = real_fp(path)
+        if threading.current_thread().name == "R" and not r_has_fp.is_set():
+            r_has_fp.set()                  # R has its way-in fingerprint...
+            assert r_go.wait(10)            # ...and stalls before the memo
+        return got
+
+    monkeypatch.setattr(vector_snapshot, "fingerprint", fingerprint)
+
+    def reader():
+        try:
+            with _read(src, log):
+                raise _Boom("Error loading hnsw index (R)")
+        except BaseException as e:          # noqa: BLE001 -- recorded
+            outcome["R"] = e
+
+    r = threading.Thread(target=reader, name="R")
+    r.start()
+    assert r_has_fp.wait(10)
+    (src / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+    first = _fail(src, log)                 # A: the new bytes fail
+    r_go.set()
+    r.join(20)
+    assert isinstance(outcome["R"], vector_snapshot.IndexUnreadable), outcome
+    assert outcome["R"].original is first
+    assert kept == [log[0]] and len(log) == 1, \
+        "the bytes that failed were opened, read and failed on again"
+
+
+def test_past_the_limit_a_collection_is_refused_with_its_own_failure(
+        tmp_path, kept, monkeypatch):
+    """Two collections of one source have failed, `ledger` first. A capped
+    read of `events` is refused with the failure `events` had -- its stage,
+    so its repair -- not with the first one remembered, whose stage can name
+    another: a failed query is rebuilt first, a collection chromadb could not
+    open is deleted."""
+    monkeypatch.setattr(vector_snapshot, "POISON_LIMIT", 2)
+    src = _source(tmp_path)
+    log = []
+    _fail(src, log, name="ledger")
+    (src / "seg" / "data_level0.bin").write_bytes(b"a writer came by")
+    own = _fail(src, log, name="events")
+    (src / "seg" / "data_level0.bin").write_bytes(b"and came by again")
+    with pytest.raises(vector_snapshot.IndexUnreadable) as err:
+        with _read(src, log, name="events"):
+            pass
+    assert err.value.capped and err.value.of == "events"
+    assert err.value.original is own
+    assert len(log) == 2
+
+
 def test_a_failure_the_judge_does_not_claim_leaves_the_client_in_service(
         tmp_path, kept):
     """An encoder that would not load says nothing about the chroma client:
@@ -727,6 +792,58 @@ def test_a_persisted_hnsw_segment_with_a_short_header_is_refused(tmp_path):
     (cut / "index_metadata.pickle").write_bytes(b"m")
     with pytest.raises(vector_snapshot.DamagedSegment, match="seg-b"):
         vector_snapshot.check_segments(copy)
+
+
+def _catalogue(copy, segments):
+    """A `chroma.sqlite3` in *copy* naming *segments*, {segment: collection}."""
+    con = sqlite3.connect(str(copy / "chroma.sqlite3"))
+    try:
+        con.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT)")
+        con.execute("CREATE TABLE segments (id TEXT PRIMARY KEY, type TEXT, "
+                    "scope TEXT, collection TEXT)")
+        for seg, name in segments.items():
+            con.execute("INSERT OR IGNORE INTO collections VALUES (?, ?)",
+                        (f"c-{name}", name))
+            con.execute("INSERT INTO segments VALUES (?, 'hnsw', 'VECTOR', ?)",
+                        (seg, f"c-{name}"))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_a_segment_the_index_no_longer_names_is_not_judged(tmp_path):
+    """chromadb 1.5.9 leaves a dropped collection's segment directory on
+    disk. Judged, the cut header `hive embed --rebuild` had just dropped
+    refused every read after the rebuild: the repair repaired nothing. A
+    segment the copy's catalogue names is judged, and the refusal says whose
+    it is."""
+    copy = tmp_path / "chroma"
+    live, dropped = copy / "seg-live", copy / "seg-dropped"
+    for seg in (live, dropped):
+        seg.mkdir(parents=True)
+        (seg / "index_metadata.pickle").write_bytes(b"m")
+    (live / "header.bin").write_bytes(b"h" * vector_snapshot.HNSW_HEADER_BYTES)
+    (dropped / "header.bin").write_bytes(b"h" * 7)
+    _catalogue(copy, {"seg-live": "events"})
+    vector_snapshot.check_segments(copy)
+    (live / "header.bin").write_bytes(b"h" * 7)
+    with pytest.raises(vector_snapshot.DamagedSegment, match="seg-live") as err:
+        vector_snapshot.check_segments(copy)
+    assert err.value.collection == "events" and "'events'" in str(err.value)
+
+
+def test_a_catalogue_that_cannot_be_read_leaves_every_segment_judged(tmp_path):
+    """Without a catalogue to say which segments are live, none is taken for
+    dropped: the check stays whole, and says it cannot name the collection."""
+    copy = tmp_path / "chroma"
+    seg = copy / "seg-a"
+    seg.mkdir(parents=True)
+    (seg / "index_metadata.pickle").write_bytes(b"m")
+    (seg / "header.bin").write_bytes(b"h" * 7)
+    (copy / "chroma.sqlite3").write_bytes(b"not a database " * 64)
+    with pytest.raises(vector_snapshot.DamagedSegment, match="seg-a") as err:
+        vector_snapshot.check_segments(copy)
+    assert err.value.collection is None
 
 
 def test_a_client_kept_after_a_failure_outlives_every_other_reference():
@@ -951,6 +1068,14 @@ if mode == "build":
             header.write_bytes(header.read_bytes()[:7])
             print("damaged", header.parent.name)
     sys.exit(0)
+if mode == "rebuild":     # the events half of `hive embed --rebuild`
+    vectors._encoder = lambda: (lambda texts: [
+        [((len(t) * 7 + j) % 11) / 11.0 for j in range(8)] for t in texts])
+    print("rebuilt", vectors.embed_events(rebuild=True)["embedded"])
+    from chromadb.api.shared_system_client import SharedSystemClient as S
+    S._identifier_to_refcount.pop(str(chroma), None)
+    S._identifier_to_system.pop(str(chroma)).stop()
+    sys.exit(0)
 if mode == "unchecked":
     vector_snapshot.check_segments = lambda copy: None
 for attempt in range(3):
@@ -1020,3 +1145,19 @@ def test_the_damage_that_crashed_or_hung_the_count_never_reaches_chromadb(
     out = _child("checked", snaps, tmp_path)
     assert out.count("failed open") == 3, out
     assert "copies 0" in out, out
+
+
+def test_a_rebuild_repairs_a_cut_header_it_drops(tmp_path):
+    """The repair a failed read names first. `hive embed --rebuild` drops the
+    damaged collection without reading its segment and fills a new one, and
+    chromadb leaves the dropped segment's directory -- cut header and all --
+    on disk. Measured before the check asked the catalogue: every read after
+    the rebuild still failed at `open` on that directory."""
+    pytest.importorskip("chromadb")
+    pytest.importorskip("sentence_transformers")
+    snaps = tmp_path / "child-snaps"
+    assert "damaged" in _child("build", snaps, tmp_path)
+    assert _child("checked", snaps, tmp_path).count("failed open") == 3
+    assert "rebuilt 1" in _child("rebuild", snaps, tmp_path)
+    out = _child("checked", snaps, tmp_path)
+    assert out.count("count 1") == 3, out

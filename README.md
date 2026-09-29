@@ -304,13 +304,15 @@ how to confirm the fix — is [docs/RUNBOOK_RECOVERY.md](docs/RUNBOOK_RECOVERY.m
 The short form:
 
 - **Semantic recall fails**: `hive recall --semantic` exits 1 and names the
-  failing stage and the repair. Damaged files (stage `open` or `count`):
-  stop the writers (the dashboard, `hive ui`, `hive watcher run`), delete the
-  `chroma/` directory the message names, and run `hive embed --project <ns>`;
-  a failed `query`: `hive embed --rebuild --project <ns>`. An empty answer
-  means nothing is indexed yet: `hive embed --project <ns>`. Then
-  `hive watcher recover` and `hive watcher run --once`; confirm with
-  `hive recall "<query>" --semantic`.
+  failing stage and the repair. A failed `count` or `query`, or a cut segment
+  of `ledger` or `events`: `hive embed --rebuild --project <ns>`, which drops
+  the collection without reading it, and the delete below if the read still
+  fails. Files chromadb cannot open (any other `open`) or damage to the
+  watcher's collection: stop the writers (the dashboard, `hive ui`,
+  `hive watcher run`), delete the `chroma/` directory the message names, and
+  run `hive embed --project <ns>`. An empty answer means nothing is indexed
+  yet: `hive embed --project <ns>`. Then `hive watcher recover` and
+  `hive watcher run --once`; confirm with `hive recall "<query>" --semantic`.
 - **A lock left behind by a dead process**: every lock expires on its own
   (the runbook lists each one's staleness rule); `hive watcher recover`
   returns abandoned embed claims.
@@ -510,13 +512,24 @@ For both commands the refusal — and a missing `[vectors]` extras install — i
 `error: …` on stderr and exit 2, as is a `recall --limit` below 1. A semantic
 index that cannot be read is exit 1, never an empty result: the message names
 the failing stage, the project namespace and a remedy that depends on what
-broke — wait out a busy writer, free the temp directory, `hive embed --rebuild
---project <ns>` after a failed query, or delete the damaged `chroma/` directory
-it names and run `hive embed --project <ns>` (a rebuild opens the same damaged
-files; on the watcher's collection it never reaches them, and that collection
-refills only from rows appended afterwards). An argument chromadb refused is
-reported as such, with no repair: the index is not at fault. A semantic read
-never writes the index: it queries a private copy (docs/DATA_MODEL.md §4.19).
+broke — wait out a busy writer, free the temp directory, or repair the
+damaged index. Where a collection opened and then failed, or a cut segment
+belongs to `ledger` or `events`, that is `hive embed --rebuild --project <ns>`
+first, which drops the collection without reading it, and the delete of the
+`chroma/` directory it names if the read still fails. Where chromadb cannot
+open the files — a rebuild opens them too — or the damage is the watcher's
+collection, which a rebuild never writes, it is the delete alone: delete the
+directory and run `hive embed --project <ns>`; the watcher's collection
+refills only from rows appended afterwards. A quarantined namespace — an
+`unsafe-<hash>` directory, whose name `--project` refuses — is repaired without
+`--project`: run `hive embed` from the project's checkout, or with the same
+`MINDHIVE_PROJECT`, and the message says so. An argument chromadb refused at
+the query — a bad `n_results`, an id named twice — is reported as such, with
+no repair: the index is not at fault. A panic in chromadb's Rust core is a
+failed read like any other. A semantic read never writes the index: it
+queries a private copy (docs/DATA_MODEL.md §4.19). Not contained: a cut
+`link_lists.bin` mostly crashes the reading process, and a cut
+`data_level0.bin` answers without an error but can miss the best hits.
 
 ## Usage-cap fallback
 When the Opus window is nearly spent, run `hive export` and paste handoff.md into
