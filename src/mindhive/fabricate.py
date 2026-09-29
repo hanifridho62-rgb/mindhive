@@ -21,8 +21,9 @@ closes that gap end to end:
   plan_id. From here the existing resilience does the rest: a usage cap
   checkpoints progress into THE fabrication roadmap (the fix_plan checklist
   is the source of truth) and re-arms a loop-mode auto-resume, so the cycle
-  is loop -> sleep -> loop until the exit gate passes. Completion earns the
-  roadmap its exit from every view.
+  is loop -> sleep -> loop until the exit gate passes, or until
+  autoresume.MAX_ATTEMPTS wake-ups in a row check off no step. Completion
+  earns the roadmap its exit from every view.
 
 Lifecycle is three ``fabrication`` events (deterministic telemetry;
 ``roadmap`` events remain the semantic plan, ``loop_*`` the run telemetry):
@@ -405,9 +406,9 @@ def run(fab_id, *, project=None, session_id=None, run_loop_fn=None,
     """Execute one loop launch for the fabrication (what the dispatch timer
     runs). A usage-capped launch leaves the roadmap interrupted and a
     loop-mode auto-resume armed (the engine does both; inside an auto-resume
-    wake-up the wake-up re-arms, one attempt later), so the next window
-    continues it; a completed launch earns the roadmap its exit. Returns
-    the recorded run payload."""
+    wake-up the wake-up itself re-arms and counts the attempt), so the next
+    window continues it; a completed launch earns the roadmap its exit.
+    Returns the recorded run payload."""
     evs = ev_mod.read_all(project)
     rec = fold(evs).get(fab_id)
     if rec is None or not rec.get("goal_dir") \

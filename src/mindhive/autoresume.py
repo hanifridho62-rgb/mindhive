@@ -24,8 +24,9 @@ roadmap events stay the semantic record):
   keep the roadmap updated) and fed to a headless ``claude -p``. Outcome is
   ``delivered`` / ``still_limited`` / ``error`` / ``skipped``; a
   still-limited delivery re-schedules itself until MAX_ATTEMPTS -- a
-  one-shot after a short backoff, a relaunched loop one cooldown after the
-  interruption its run just recorded.
+  one-shot after a short backoff, a relaunched loop one cooldown after it
+  returned, where only a relaunch that checked off no plan step spends an
+  attempt.
 - ``cancelled`` — a human picked the plan back up (``hive roadmap resume`` /
   ``complete``), so the pending delivery and its OS timer are withdrawn.
 
@@ -524,7 +525,8 @@ def waking_attempt():
     None outside one. A relaunched run that is capped again must not re-arm
     itself: its fresh schedule would restart the count at attempt 1 on every
     relaunch -- a capped loop waking every cooldown with no end. Inside a
-    wake-up `fire` re-arms instead, one attempt later, until MAX_ATTEMPTS."""
+    wake-up `fire` re-arms instead, and spends an attempt unless the
+    relaunch checked off a plan step, until MAX_ATTEMPTS."""
     return _WAKING.get()
 
 
@@ -577,10 +579,11 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
     time). Re-checks the plan first: one resumed or completed by a human is
     skipped, never re-delivered. A still-limited delivery re-schedules
     itself until MAX_ATTEMPTS: a one-shot RETRY_HOURS later, a relaunched
-    loop one cooldown after the interruption its run just recorded. The
-    relaunched run's own snapshot leaves that re-arming to this call
-    (`waking_attempt`), so every relaunch counts as an attempt. Returns the
-    fired payload."""
+    loop one cooldown after the relaunch returned. The relaunched run's own
+    snapshot leaves that re-arming to this call (`waking_attempt`), which
+    counts the attempts: a relaunch that checked off a plan step restarts
+    the count, one that checked off none spends one, and one cancelled while
+    it ran is not re-armed at all. Returns the fired payload."""
     evs = ev_mod.read_all(project)
     sched = fold(evs).get(plan_id)
     attempt = sched["attempt"] if sched else 1
@@ -613,6 +616,27 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
             outcome, detail = "error", f"{type(e).__name__}: {e}"
         finally:
             _WAKING.reset(waking)
+        # What the relaunch left behind decides the next wake-up: the plan
+        # its snapshot re-interrupted, and any cancel a human issued while it
+        # ran -- the `fired` row lands only now, so a cancel meanwhile found
+        # the delivery still scheduled and succeeded.
+        after = ev_mod.read_all(project)
+        rec_after = roadmap.get(after, plan_id)
+        cancelled = sched["status"] != "cancelled" and \
+            (fold(after).get(plan_id) or {}).get("status") == "cancelled"
+        # Only a wake-up that checked off no step spends an attempt: the
+        # bound is for a loop capped without getting anywhere, not for one
+        # capped while it works through a plan longer than MAX_ATTEMPTS.
+        progressed = rec_after is not None and \
+            rec_after["progress"]["done"] > rec["progress"]["done"]
+        next_attempt = 1 if progressed else attempt + 1
+        rearm = outcome == "still_limited" and not cancelled \
+            and next_attempt <= MAX_ATTEMPTS
+        if outcome == "still_limited" and not rearm:
+            detail = f"{detail} -- " + (
+                "not re-armed: cancelled while it ran" if cancelled else
+                f"gave up: {MAX_ATTEMPTS} wake-ups in a row checked off "
+                "no step")
         payload = {"action": "fired", "plan_id": plan_id, "attempt": attempt,
                    "outcome": outcome,
                    "detail": str(detail)[:MAX_DETAIL_CHARS]}
@@ -620,11 +644,18 @@ def fire(plan_id, *, project=None, session_id=None, runner=None,
         ev_mod.append_event("autoresume", payload, session_id=session_id,
                             tags=["autoresume"], project=project)
         rearmed = False
-        if outcome == "still_limited" and attempt < MAX_ATTEMPTS:
+        if rearm:
+            # One cooldown after the relaunch returned: the window has just
+            # closed on it. Not after the recorded interruption -- a relaunch
+            # whose best-effort snapshot recorded none would re-arm off the
+            # old one, long past its cooldown, and wake a minute later into
+            # a window that is still closed.
+            back = time.time() if now is None else now
             try:
                 schedule(plan_id, project=project, session_id=session_id,
-                         cooldown_hours=(sched or {}).get("cooldown_hours"),
-                         attempt=attempt + 1, cwd=(sched or {}).get("cwd"),
+                         cooldown_hours=sched["cooldown_hours"],
+                         at=_iso(back + sched["cooldown_hours"] * 3600),
+                         attempt=next_attempt, cwd=sched["cwd"],
                          mode="loop", goal_dir=goal_dir, register=register,
                          now=now)
                 rearmed = True

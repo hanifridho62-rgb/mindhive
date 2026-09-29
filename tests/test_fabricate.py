@@ -5,6 +5,7 @@ and the `hive fabricate` CLI."""
 import calendar
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -380,6 +381,87 @@ def test_a_capped_loop_wakes_at_most_max_attempts_times(tmp_path,
         list(range(1, autoresume.MAX_ATTEMPTS + 1))
 
 
+# Nine SOP steps: more than MAX_ATTEMPTS, so a chain that spends an attempt on
+# every wake-up runs out before the plan does.
+PRD_LONG = """TITLE: Build the nine-part panel
+SUMMARY: Nine parts, each one usage window of work.
+
+## Goal
+
+All nine parts built.
+
+## SOP
+
+""" + "\n".join(f"{i}. Use the python-development:python-code-style skill to "
+                f"build part {i}." for i in range(1, 10)) + """
+
+## Acceptance criteria
+
+- All nine parts built.
+"""
+
+
+def test_only_wake_ups_that_check_off_no_step_spend_an_attempt(tmp_path,
+                                                             monkeypatch):
+    """MAX_ATTEMPTS bounds a loop that is capped without getting anywhere, not
+    one that is capped while it works: a fabrication that checks off one step
+    per usage window is carried to the end of its plan. Every wake-up that
+    checked a step off restarts the count, so once the plan stops moving --
+    here every step is checked and the window is still closed -- MAX_ATTEMPTS
+    more wake-ups end the chain. Counting every wake-up dropped the plan at
+    7/9 with nothing left to resume it."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_LONG, base_dir=tmp_path)
+    fix_plan = Path(rec["goal_dir"]) / "fix_plan.md"
+    from mindhive.loop import config as loop_config
+    from mindhive.loop import engine as loop_engine
+    from mindhive.loop.driver import DriverResult, Usage
+
+    class OneStepThenCapped:
+        def run(self, prompt, loop_context, **kw):
+            text = fix_plan.read_text(encoding="utf-8")
+            fix_plan.write_text(text.replace("- [ ]", "- [x]", 1),
+                                encoding="utf-8")
+            return DriverResult(text="", usage=Usage(input_tokens=10),
+                                session_id="s1", num_turns=1,
+                                rate_limited=True)
+
+    def capped_run(plan_id, goal_dir, project):
+        result = loop_engine.run_loop(
+            project="test", loop_dir=goal_dir,
+            cfg=loop_config.LoopConfig(max_iterations=3),
+            driver=OneStepThenCapped(), now_fn=lambda: T0_EPOCH,
+            sleep_fn=lambda s: None, progress_fn=lambda i: True,
+            plan_id=plan_id)
+        assert result["reason"] == "api_cap"
+        return "still_limited", "loop api_cap"
+
+    armed, gone = [], []
+    monkeypatch.setattr(autoresume, "_register_timer",
+                        lambda plan_id, *a: armed.append(plan_id)
+                        or "windows_task")
+    monkeypatch.setattr(autoresume, "_unregister_timer", gone.append)
+    capped_run(rec["fab_id"], rec["goal_dir"], "test")   # the launch: step 1
+    fires = 0
+    while armed and fires < 30:                           # the OS timer
+        armed.pop()
+        autoresume.fire(
+            rec["fab_id"], loop_runner=capped_run,
+            runner=lambda *a, **k: pytest.fail("prompt runner must not be "
+                                               "used"))
+        fires += 1
+    evs = events.read_all()
+    assert roadmap.get(evs, rec["fab_id"])["progress"] == \
+        {"done": 9, "total": 9}
+    # Wake-ups 1-8 each checked a step off and re-armed at attempt 1; the
+    # ninth found nothing left, and from there every wake-up spent one.
+    assert [e.payload["attempt"] for e in evs if e.type == "autoresume"
+            and e.payload.get("action") == "fired"] == \
+        [1] * 9 + list(range(2, autoresume.MAX_ATTEMPTS + 1))
+    assert armed == [] and gone == [rec["fab_id"]]
+    assert autoresume.pending(evs) == []
+
+
 def test_loop_mode_fire_relaunches_the_loop(tmp_path):
     rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
     roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
@@ -447,9 +529,62 @@ def test_loop_mode_fire_gives_up_at_max_attempts(tmp_path):
         register=lambda *a: pytest.fail("no attempt after the last"),
         unregister=gone.append)
     assert payload["outcome"] == "still_limited"
+    assert "gave up" in payload["detail"]           # says why nothing is next
     assert autoresume.fold(events.read_all())[rec["fab_id"]]["status"] == \
         "fired"
     assert gone == [rec["fab_id"]]                  # gave up cleanly
+
+
+def test_a_cancel_issued_while_the_relaunch_runs_is_honoured(tmp_path):
+    """A relaunch runs for hours, and its `fired` row lands only when it
+    returns, so a `hive autoresume cancel` (or the cancel inside `hive roadmap
+    resume`) issued meanwhile finds the delivery still scheduled and succeeds.
+    The wake-up must not then re-arm what the human just withdrew."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop",
+                        goal_dir=rec["goal_dir"], register=_no_timer,
+                        now=T0_EPOCH)
+    gone = []
+
+    def loop_runner(plan_id, goal_dir, project):
+        autoresume.cancel(plan_id, unregister=gone.append)   # another shell
+        return "still_limited", "loop api_cap"
+
+    payload = autoresume.fire(
+        rec["fab_id"], loop_runner=loop_runner,
+        runner=lambda *a, **k: pytest.fail("prompt runner must not be used"),
+        register=lambda *a: pytest.fail("a withdrawn delivery re-armed"),
+        unregister=gone.append)
+    assert payload["outcome"] == "still_limited"
+    assert "cancelled" in payload["detail"]
+    evs = events.read_all()
+    assert autoresume.pending(evs) == []
+    assert autoresume.fold(evs)[rec["fab_id"]]["status"] == "fired"
+    assert gone == [rec["fab_id"]] * 2              # the cancel's, the fire's
+
+
+def test_a_capped_relaunch_is_due_one_cooldown_after_it_returned(tmp_path):
+    """The window just closed on the relaunch, so the next wake-up is one
+    cooldown after it returned. Keyed to the recorded interruption instead, a
+    relaunch whose best-effort snapshot recorded nothing re-armed off the OLD
+    interruption, long past its cooldown: due a minute later into a window
+    that is still closed, the remaining attempts spent a minute apart."""
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop",
+                        goal_dir=rec["goal_dir"], register=_no_timer)
+    due = autoresume.fold(events.read_all())[rec["fab_id"]]["due"]
+    back = autoresume._parse_ts(due) + 1800     # returned half an hour later
+    autoresume.fire(
+        rec["fab_id"],
+        loop_runner=lambda *a: ("still_limited", "loop api_cap"),
+        runner=lambda *a, **k: pytest.fail("prompt runner must not be used"),
+        register=_no_timer, now=back)
+    ar = autoresume.fold(events.read_all())[rec["fab_id"]]
+    assert (ar["status"], ar["attempt"]) == ("scheduled", 2)
+    assert autoresume._parse_ts(ar["due"]) - back == \
+        autoresume.COOLDOWN_HOURS * 3600
 
 
 def test_loop_mode_fire_records_an_outcome_whatever_the_delivery_raises(
@@ -475,6 +610,7 @@ def test_loop_mode_fire_records_an_outcome_whatever_the_delivery_raises(
         unregister=gone.append)
     assert payload["outcome"] == "error"
     assert "KeyError" in payload["detail"]
+    assert autoresume.waking_attempt() is None      # reset on the raise too
     fired = [e for e in events.read_all() if e.type == "autoresume"
              and e.payload.get("action") == "fired"]
     assert fired and fired[-1].payload["outcome"] == "error"
@@ -582,6 +718,48 @@ def test_loop_mode_wake_up_of_a_capped_fabrication_keeps_it_open(
     assert len(sched) == n_sched + 1       # the wake-up re-armed itself
     assert (sched[-1].payload["attempt"], sched[-1].payload["mode"]) == \
         (2, "loop")
+
+
+def test_a_fabrication_wake_up_capped_again_is_armed_once_by_the_wake_up(
+        tmp_path, monkeypatch):
+    """The real delivery path inside a wake-up -- `_run_loop_delivery` ->
+    `fabricate.run` -> the engine and its snapshot: the snapshot records the
+    new interruption and leaves the timer to the wake-up, so exactly one
+    delivery is armed, at the next attempt, rather than a second one restarted
+    at attempt 1."""
+    monkeypatch.chdir(tmp_path)
+    rec = fabricate.compile_work_order(PRD_MD, base_dir=tmp_path)
+    roadmap.record("interrupt", rec["fab_id"], cause="api_cap")
+    autoresume.schedule(rec["fab_id"], mode="loop", goal_dir=rec["goal_dir"],
+                        register=_no_timer, now=T0_EPOCH)
+    from mindhive.loop import config as loop_config
+    from mindhive.loop import engine as loop_engine
+    from mindhive.loop.driver import DriverResult, Usage
+
+    class CappedDriver:
+        def run(self, prompt, loop_context, **kw):
+            return DriverResult(text="", usage=Usage(input_tokens=10),
+                                session_id="s1", num_turns=1,
+                                rate_limited=True)
+
+    def fab_loop(project, goal_dir, plan_id, force=False):
+        return loop_engine.run_loop(
+            project=project, loop_dir=Path(goal_dir),
+            cfg=loop_config.LoopConfig(max_iterations=3),
+            driver=CappedDriver(), now_fn=lambda: T0_EPOCH,
+            sleep_fn=lambda s: None, progress_fn=lambda i: True,
+            plan_id=plan_id)
+
+    monkeypatch.setattr(fabricate, "_run_loop", fab_loop)
+    n_sched = len([e for e in events.read_all() if e.type == "autoresume"
+                   and e.payload.get("action") == "scheduled"])
+    payload = autoresume.fire(rec["fab_id"], runner=_no_prompt,
+                              register=_no_timer)
+    assert payload["outcome"] == "still_limited"
+    evs = events.read_all()
+    assert roadmap.get(evs, rec["fab_id"])["status"] == "interrupted"
+    assert [e.payload["attempt"] for e in evs if e.type == "autoresume"
+            and e.payload.get("action") == "scheduled"][n_sched:] == [2]
 
 
 @pytest.mark.parametrize("launch", ["spawn_failed", "guard_refused"])
