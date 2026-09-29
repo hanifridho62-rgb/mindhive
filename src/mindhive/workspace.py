@@ -737,12 +737,12 @@ class Manager:
         a.emit(f"❯ {prompt}")
         self._log(a, "user_prompt", {"text": prompt, "agent": a.name,
                                      "role": a.role})
-        t = threading.Thread(target=self._reader, args=(a, a.proc, rl),
-                             daemon=True)
-        t.start()
+        # Armed first: the reader cancels it, and an EOF stream ends the reader at once.
         a._timer = threading.Timer(RUN_TIMEOUT_S, self._timeout_kill, args=(a, a.proc))
         a._timer.daemon = True
         a._timer.start()
+        threading.Thread(target=self._reader, args=(a, a.proc, rl),
+                         daemon=True).start()
         return {"ok": True, "agent": a.snapshot()}
 
     def settle(self, agent_id) -> dict:

@@ -23,7 +23,6 @@ exactly like their work was deleted. `test_the_existing_swarm_page_hooks_survive
 is cheap insurance against precisely that.
 """
 import json
-import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -34,17 +33,16 @@ from mindhive.mindnet import telemetry as tel
 from mindhive.mindnet import ui_cats as ui
 from mindhive.swarm_page import render_swarm
 
+from tests.serving import serve_in_thread
+
 
 @pytest.fixture
 def server():
     token = "cat-token-123"
     handler = dashboard.make_handler(token)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(srv):
         yield f"http://127.0.0.1:{srv.server_address[1]}", token
-    finally:
-        srv.shutdown()
 
 
 def _get(base, path, token=None, expect=200):
@@ -164,8 +162,7 @@ def test_a_finished_faculty_is_gone_at_the_endpoint_too():
     # Deliberately not the `server` fixture: this needs two separate feeds.
     handler = dashboard.make_handler("t")
     srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(srv):
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         _emit("sop", status=tel.STATUS_IDLE, ago=ui.IDLE_VANISH_SECS + 30)
         _status, body = _get(base, "/api/mindnet/cats", "t")
@@ -177,8 +174,6 @@ def test_a_finished_faculty_is_gone_at_the_endpoint_too():
               ago=ui.IDLE_VANISH_SECS + 30)
         _status, body = _get(base, "/api/mindnet/cats", "t")
         assert [c["faculty"] for c in body["cats"]] == ["task-graph"]
-    finally:
-        srv.shutdown()
 
 
 def test_the_page_does_not_hardcode_the_threshold_numbers():

@@ -21,13 +21,14 @@ tests/conftest.py, like every other dashboard test.
 import collections
 import json
 import socket
-import threading
 from http.server import ThreadingHTTPServer
 from urllib.parse import quote
 
 import pytest
 
 from mindhive import dashboard, events, paths
+
+from tests.serving import serve_in_thread
 
 TOKEN = "test-token-123"
 
@@ -64,11 +65,8 @@ def server():
     into the next — and because the limits under test are class attributes."""
     handler = dashboard.make_handler(TOKEN)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(httpd):
         yield httpd.server_address, TOKEN, handler
-    finally:
-        httpd.shutdown()
 
 
 def _connect(address, timeout=10.0):

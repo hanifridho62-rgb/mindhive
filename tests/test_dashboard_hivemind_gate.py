@@ -29,7 +29,6 @@ the memos are process-global, so they are swept around every test here.
 """
 import collections
 import json
-import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -37,6 +36,8 @@ from http.server import ThreadingHTTPServer
 import pytest
 
 from mindhive import dashboard, dashboard_memo, events, paths, plugins
+
+from tests.serving import serve_in_thread
 
 TOKEN = "test-token-p5-hivemind"
 STATUS = "/api/skills/status?project=*"
@@ -117,12 +118,8 @@ def _clean_memos():
 def base():
     """A real dashboard on an ephemeral port, threaded like the live one."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(TOKEN))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(server):
         yield f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown()
-        server.server_close()
 
 
 def _raw(base, path):

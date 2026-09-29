@@ -22,13 +22,14 @@ on a throwaway namespace.
 """
 import pathlib
 import re
-import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
 
 import pytest
 
 from mindhive import dashboard, dashboard_page, taskview
+
+from tests.serving import serve_in_thread
 
 SWARM_NAV = 'data-sec="ws-swarm"'
 
@@ -40,11 +41,8 @@ def swarm_server():
     per-request read has to be proven on."""
     token = "swarm-toggle-token"
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(token))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(server):
         yield f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown()
 
 
 def _page(base) -> str:

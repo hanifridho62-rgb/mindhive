@@ -36,7 +36,6 @@ premise instead of assuming it.
 """
 import contextlib
 import json
-import threading
 from http.server import ThreadingHTTPServer
 from unittest import mock
 
@@ -49,6 +48,8 @@ playwright_api = pytest.importorskip(
            "`pip install -e .[browser]` and `playwright install chromium`.")
 
 from mindhive import dashboard, dashboard_get, events  # noqa: E402
+
+from tests.serving import serve_in_thread
 
 pytestmark = pytest.mark.browser
 
@@ -134,11 +135,8 @@ def serving(mutation=None):
             stack.enter_context(mock.patch.object(module, attr, render))
 
         srv = _QuietServer(("127.0.0.1", 0), dashboard.make_handler(TOKEN))
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        try:
+        with serve_in_thread(srv):
             yield f"http://127.0.0.1:{srv.server_address[1]}"
-        finally:
-            srv.shutdown()
 
 
 @pytest.fixture(scope="module")

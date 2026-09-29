@@ -13,6 +13,7 @@ those AFTER this fixture, so the in-body values win — those files keep their
 local helper on purpose.
 """
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,49 @@ def isolate_store(tmp_path, monkeypatch):
         "function-scoped monkeypatch; restore the one attribute you patched "
         "instead, or scope it with `with monkeypatch.context() as m:`."
         % (home or "unset -> ~/.mindhive"))
+
+
+# --------------------------------------------------------------------------
+# `threading.Thread` is looked up by NAME, at call time, by every server fixture
+# --------------------------------------------------------------------------
+#
+# `tests/serving.py` starts each test server's `serve_forever` loop through the
+# name `threading.Thread`, so a test that replaces that name and does not put
+# it back hands every later fixture whatever the stand-in does instead. A
+# stand-in whose `start` raises is loud; one whose `start` does nothing hands
+# the fixture a server whose loop never ran, and the stdlib's `shutdown()` on
+# that server waits forever. `tests/test_jobs.py` replaces it on purpose and
+# restores it in-body; this keeps that the only shape.
+#
+# A hook wrapper rather than an autouse fixture, because ORDER is the whole
+# point: `isolate_store` above requests `monkeypatch`, which puts that
+# monkeypatch ahead of any later autouse fixture in setup and therefore
+# BEHIND it in teardown -- a fixture-based check ran before `monkeypatch.undo`
+# and reported every `monkeypatch.setattr(threading, ...)` as a leak (it did,
+# on a probe, before this was rewritten). After `pytest_runtest_teardown`
+# yields, every fixture of the test is gone, undo included; what is still
+# replaced then is replaced for the next test.
+
+_REAL_THREADING = {name: getattr(threading, name)
+                   for name in ("Thread", "Timer", "Event", "Lock")}
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Error the test that left a `threading` class replaced. Four identity
+    checks per test, once its own fixtures have been torn down."""
+    result = yield
+    stale = sorted(name for name, real in _REAL_THREADING.items()
+                   if getattr(threading, name) is not real)
+    if stale:
+        raise AssertionError(
+            "%s left threading.%s replaced (%s). Every server fixture that "
+            "runs after it starts its serve_forever loop through that name; "
+            "restore the real class before the test returns, or patch it with "
+            "`monkeypatch.setattr` so pytest restores it."
+            % (item.nodeid, ", threading.".join(stale),
+               ", ".join(repr(getattr(threading, n)) for n in stale)))
+    return result
 
 
 # --------------------------------------------------------------------------

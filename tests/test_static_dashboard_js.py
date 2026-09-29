@@ -45,7 +45,6 @@ import json
 import re
 import shutil
 import subprocess
-import threading
 import tomllib
 import urllib.error
 import urllib.request
@@ -58,6 +57,8 @@ import pytest
 from mindhive import dashboard, dashboard_page, taskview
 from mindhive.dashboard_get import GetRoutes
 from mindhive.dashboard_get_v1 import GetRoutesV1
+
+from tests.serving import serve_in_thread
 
 REPO = Path(__file__).resolve().parents[1]
 PKG_DIR = REPO / "src" / "mindhive"
@@ -87,12 +88,8 @@ def _page_script() -> str:
 @pytest.fixture
 def server():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(TOKEN))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(srv):
         yield f"http://127.0.0.1:{srv.server_address[1]}"
-    finally:
-        srv.shutdown()
-        srv.server_close()
 
 
 def _fetch(base, path, token=TOKEN):

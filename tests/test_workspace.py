@@ -1279,3 +1279,45 @@ def test_historical_assistant_response_without_an_artifact_still_folds():
     rows = oversee.interactive_sessions(evs=evs)
     row = next(s for s in rows if s["run_id"] == "ws-legacy")
     assert "an answer from before MN-0" in row["doing"]   # folded, not skipped
+
+
+# --- the run-timeout timer is armed before the reader can finish --------------
+
+def test_a_run_already_at_eof_still_has_its_timeout_timer_cancelled():
+    """`send` armed the RUN_TIMEOUT_S kill timer AFTER starting the reader. A
+    stream already at EOF -- every fake here, a real claude that exits at once
+    -- let the reader finish, look for a timer to cancel and find `None`; the
+    timer armed a moment later then ran its full 1800 s on a daemon thread.
+    One leaked per suite run (py-spy found it parked in `Timer.run` while a
+    hang was being investigated), and a real one would have fired
+    `_timeout_kill` at an agent that had long since settled.
+
+    The first assertion is the ordering the fix guarantees, observed from the
+    reader's very first read; the second is the leak itself."""
+    seen = []
+    holder = {}
+
+    class _EOFAtOnce:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            seen.append(holder["agent"]._timer)
+            raise StopIteration
+
+    def spawn(argv, env, cwd):
+        proc = FakeProc([])
+        proc.stdout = _EOFAtOnce()
+        return proc
+
+    mgr = workspace.Manager(spawn=spawn, append_event=lambda *a, **k: None)
+    agent_id = mgr.spawn(name="w", project="test")["agent"]["id"]
+    holder["agent"] = agent = mgr.get(agent_id)
+    assert mgr.send(agent_id, "go")["ok"] is True
+    _wait_settled(agent)
+
+    assert seen and seen[0] is not None, \
+        "the reader started reading before the kill timer was armed"
+    agent._timer.join(2.0)
+    assert not agent._timer.is_alive(), \
+        "the run settled but its RUN_TIMEOUT_S timer is still armed"

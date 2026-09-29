@@ -33,7 +33,6 @@ gate exists to skip. Never elapsed time (a flaky proxy), never source strings
 import collections
 import importlib
 import json
-import threading
 import time
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -41,6 +40,8 @@ from http.server import ThreadingHTTPServer
 import pytest
 
 from mindhive import dashboard, dashboard_get, events, oversee
+
+from tests.serving import serve_in_thread
 
 OVERSEE = "/api/oversee?project=test"
 OVERSEE_ALL = "/api/oversee?project=*"
@@ -65,11 +66,8 @@ def clean_module_state():
 def dashboard_server():
     token = "test-token-123"
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(token))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(server):
         yield f"http://127.0.0.1:{server.server_address[1]}", token
-    finally:
-        server.shutdown()
 
 
 def _get(base, path, token):

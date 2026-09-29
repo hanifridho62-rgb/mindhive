@@ -9,7 +9,6 @@ is pointed at a temporary home through `worksession_usage.memory_path_index`,
 the one seam the route calls, so no test here reads the real ``~/.claude``.
 """
 import json
-import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -21,6 +20,8 @@ from mindhive import worksession_usage as wu
 from mindhive import worksessions as ws
 from mindhive.dashboard_get import GetRoutes
 from mindhive.dashboard_get_v1 import GetRoutesV1
+
+from tests.serving import serve_in_thread
 
 TOKEN = "test-token-v1"
 
@@ -35,12 +36,8 @@ def _empty_memo():
 @pytest.fixture
 def server():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.make_handler(TOKEN))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
+    with serve_in_thread(srv):
         yield f"http://127.0.0.1:{srv.server_address[1]}"
-    finally:
-        srv.shutdown()
-        srv.server_close()
 
 
 @pytest.fixture
